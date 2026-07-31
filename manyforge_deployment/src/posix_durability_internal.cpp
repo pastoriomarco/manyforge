@@ -9,7 +9,6 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
-#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -50,30 +49,6 @@ void write_all_and_sync(int descriptor, std::string_view bytes,
 }
 
 }  // namespace
-
-std::filesystem::path normalize_existing_plain_root(
-    const std::filesystem::path& root, const ErrorPolicy& errors,
-    const TrustedRootMessages& messages) {
-  if (root.empty()) {
-    fail_semantic(errors, messages.empty);
-  }
-  std::error_code error;
-  std::filesystem::path absolute = std::filesystem::absolute(root, error);
-  if (error) {
-    throw std::filesystem::filesystem_error(
-        std::string(messages.resolve), root, error);
-  }
-  absolute = absolute.lexically_normal();
-  while (absolute != absolute.root_path() && absolute.filename().empty()) {
-    absolute = absolute.parent_path();
-  }
-  const auto status = std::filesystem::symlink_status(absolute, error);
-  if (error || !std::filesystem::is_directory(status) ||
-      std::filesystem::is_symlink(status)) {
-    fail_semantic(errors, messages.not_existing_plain_directory);
-  }
-  return absolute;
-}
 
 void sync_directory(const std::filesystem::path& directory,
                     const DirectorySyncMessages& messages) {
@@ -130,21 +105,6 @@ void ensure_owned_plain_directory(
     }
   }
   sync_directory(directory.parent_path(), parent_sync_messages);
-}
-
-void require_existing_plain_directory(
-    const std::filesystem::path& directory, const ErrorPolicy& errors,
-    const ExistingDirectoryMessages& messages) {
-  std::error_code error;
-  const auto status = std::filesystem::symlink_status(directory, error);
-  if (error && error != std::errc::no_such_file_or_directory) {
-    throw std::filesystem::filesystem_error(
-        std::string(messages.inspect), directory, error);
-  }
-  if (error || !std::filesystem::is_directory(status) ||
-      std::filesystem::is_symlink(status)) {
-    fail_semantic(errors, messages.not_existing_plain_directory);
-  }
 }
 
 ScopedAdvisoryLock::ScopedAdvisoryLock(
@@ -206,64 +166,6 @@ ScopedAdvisoryLock ProcessAffineLockFile::acquire(int operation) const {
   require_owner_process();
   return ScopedAdvisoryLock(
       descriptor_, operation, lock_failure_message_);
-}
-
-std::optional<std::string> read_exact_regular_file(
-    const std::filesystem::path& path, std::uint64_t maximum_bytes,
-    bool missing_is_empty, const ErrorPolicy& errors,
-    const ReadMessages& messages) {
-  const int descriptor =
-      ::open(path.c_str(),
-             O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-  if (descriptor < 0) {
-    if (missing_is_empty && errno == ENOENT) {
-      return std::nullopt;
-    }
-    fail_errno(messages.open);
-  }
-  struct Close final {
-    int descriptor;
-    ~Close() {
-      if (descriptor >= 0) {
-        (void)::close(descriptor);
-      }
-    }
-  } close{descriptor};
-
-  struct stat status {};
-  if (::fstat(descriptor, &status) != 0) {
-    fail_errno(messages.stat);
-  }
-  if (!S_ISREG(status.st_mode) || status.st_size < 0 ||
-      static_cast<std::uint64_t>(status.st_size) > maximum_bytes ||
-      static_cast<std::uint64_t>(status.st_size) >
-          static_cast<std::uint64_t>(
-              std::numeric_limits<std::size_t>::max())) {
-    fail_semantic(errors, messages.immutable_bound);
-  }
-
-  std::string bytes(static_cast<std::size_t>(status.st_size), '\0');
-  std::size_t offset = 0U;
-  while (offset < bytes.size()) {
-    const ssize_t read_count =
-        ::read(descriptor, bytes.data() + offset, bytes.size() - offset);
-    if (read_count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (read_count <= 0) {
-      fail_semantic(errors, messages.changed);
-    }
-    offset += static_cast<std::size_t>(read_count);
-  }
-  char extra = '\0';
-  ssize_t extra_count = 0;
-  do {
-    extra_count = ::read(descriptor, &extra, 1U);
-  } while (extra_count < 0 && errno == EINTR);
-  if (extra_count != 0) {
-    fail_semantic(errors, messages.grew);
-  }
-  return bytes;
 }
 
 bool publish_immutable_file_no_replace(

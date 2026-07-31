@@ -7,16 +7,10 @@
 
 #include "manyforge_deployment/build_manifest.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
+#include "build_manifest_contract_internal.hpp"
 #include "retained_bundle_internal.hpp"
 
 namespace manyforge::deployment::detail {
-
-inline constexpr std::string_view kNodeEnvironmentManifestApiVersion =
-    "manyforge.node_environment_manifest.v1";
-inline constexpr std::string_view kCompilerContractManifestApiVersion =
-    "manyforge.compiler_contract_manifest.v1";
-inline constexpr std::string_view kCompilerBuildManifestApiVersion =
-    "manyforge.compiler_build_manifest.v1";
 
 [[nodiscard]] std::shared_ptr<const BuildQualifiedManifest>
 reload_self_verified_build_manifest(BuildManifestKind kind,

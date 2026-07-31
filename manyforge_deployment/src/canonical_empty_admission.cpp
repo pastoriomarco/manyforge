@@ -12,21 +12,14 @@
 #include <utility>
 #include <vector>
 
-#include "build_manifest_internal.hpp"
 #include "canonical_empty_admission_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "embedded_canonical_empty_deployment.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
-#include "manyforge_deployment/build_manifest.hpp"
-#include "manyforge_deployment/cell_applicability.hpp"
-#include "manyforge_deployment/cell_compiler.hpp"
-#include "manyforge_deployment/cell_composition.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/deployment_artifact_codec.hpp"
-#include "manyforge_deployment/retention_qualified_deployment.hpp"
-#include "manyforge_deployment/site_overlay_resolution.hpp"
 #include "posix_durability_internal.hpp"
-#include "retained_bundle_internal.hpp"
+#include "build_qualified_admission_profile_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -65,21 +58,6 @@ constexpr posix::ReadMessages kAdmissionReadMessages{
     "canonical-empty admission record changed during exact read",
     "canonical-empty admission record grew during exact read",
 };
-constexpr posix::DirectorySyncMessages kAdmissionDirectorySyncMessages{
-    "cannot open canonical-empty package root for fsync",
-    "cannot fsync canonical-empty package root",
-};
-constexpr posix::PublicationMessages kAdmissionPublicationMessages{
-    "cannot create canonical-empty admission temporary file",
-    "cannot allocate a unique canonical-empty admission temporary file",
-    "cannot write canonical-empty admission temporary file",
-    "cannot fsync canonical-empty admission temporary file",
-    "cannot close canonical-empty admission temporary file",
-    "cannot publish canonical-empty admission atomically",
-    "cannot remove idempotent canonical-empty admission temporary file",
-    "cannot remove canonical-empty admission temporary link",
-};
-
 [[nodiscard]] std::filesystem::path normalize_package_root(
     const std::filesystem::path& root) {
   try {
@@ -151,18 +129,7 @@ void require_digest(std::string_view value, std::string_view field) {
   }
 }
 
-struct CanonicalEmptyAdmissionRecord final {
-  std::string canonical_bytes;
-  std::string admission_digest;
-  std::string cell_id;
-  std::string deployment_artifact_id;
-  std::string deployment_revision;
-  std::string graph_revision;
-  std::string retained_bundle_id;
-  std::string environment_digest;
-  std::string compiler_contract_digest;
-  std::string compiler_build_digest;
-};
+using detail::CanonicalEmptyAdmissionRecord;
 
 [[nodiscard]] detail::ContentIdentitySpec admission_identity_spec() {
   return {
@@ -328,37 +295,12 @@ load_fixed_deployment() {
   return deployment;
 }
 
-[[nodiscard]] RetentionQualifiedDeployment
-compile_fixed_deployment(
-    const RevisionVerifiedDeploymentArtifact& deployment) {
-  const CompositionQualifiedCellIr composition =
-      compose_cell_occurrences(
-          deployment.graph(),
-          std::span<const SourceVerifiedModelAsset>{},
-          std::span<const QualifiedComponentType>{});
-  const QualifiedSelectedSiteOverlay selected_overlay =
-      select_site_overlay_for_deployment(
-          deployment.applicability_inputs().value().site_overlay_ref,
-          deployment.applicability_inputs().value().external_resources,
-          nullptr);
-  const ApplicabilityQualifiedCellIr applicability =
-      qualify_cell_applicability(
-          composition, deployment.applicability_inputs(),
-          std::span<const QualifiedRuntimeProfile>{},
-          std::span<const QualifiedCapabilityDefinition>{},
-          std::span<const QualifiedControlInterfaceContract>{},
-          std::span<const QualifiedControllerTopology>{},
-          std::span<const QualifiedProviderManifest>{},
-          std::span<const QualifiedStopEvidencePolicy>{},
-          selected_overlay);
-  return qualify_deployment_for_retention(
-      deployment, compile_cell_ir(applicability));
-}
-
 void require_bundle_matches_authorities(
     const RetainedBundle& bundle,
     const RevisionVerifiedDeploymentArtifact& deployment,
-    const detail::BuildQualifiedRetentionContext& context,
+    const core::RetainedNodeEnvironmentDTO& node_environment,
+    const core::ContentDigest& compiler_contract_digest,
+    const core::ContentDigest& compiler_build_digest,
     const CanonicalEmptyAdmissionRecord* record) {
   const auto& value = bundle.value();
   if (!verify_retained_bundle_identity(bundle) ||
@@ -368,11 +310,11 @@ void require_bundle_matches_authorities(
       value.deployment_revision != deployment.deployment_revision() ||
       value.cell_graph != deployment.graph().graph() ||
       value.cell_graph.cell_id != deployment.cell_id() ||
-      value.catalogs.node_environment != context.node_environment() ||
+      value.catalogs.node_environment != node_environment ||
       value.provenance.compiler_contract_digest !=
-          context.compiler_contract_digest() ||
+          compiler_contract_digest ||
       value.provenance.compiler_build_digest !=
-          context.compiler_build_digest()) {
+          compiler_build_digest) {
     fail("canonical-empty retained bundle differs from its fixed source or "
          "current build authority");
   }
@@ -408,6 +350,48 @@ read_admission_if_present(const std::filesystem::path& root) {
 }
 
 }  // namespace
+
+namespace detail {
+
+std::filesystem::path normalize_canonical_empty_package_root(
+    const std::filesystem::path& root) {
+  return normalize_package_root(root);
+}
+
+CanonicalEmptyAdmissionRecord make_canonical_empty_admission_record(
+    const RetainedBundle& bundle) {
+  return make_admission_record(bundle);
+}
+
+CanonicalEmptyAdmissionRecord parse_canonical_empty_admission_record(
+    const std::string_view bytes) {
+  return parse_admission_record(bytes);
+}
+
+RevisionVerifiedDeploymentArtifact
+load_canonical_empty_fixed_deployment() {
+  return load_fixed_deployment();
+}
+
+void require_canonical_empty_bundle_matches_authorities(
+    const RetainedBundle& bundle,
+    const RevisionVerifiedDeploymentArtifact& deployment,
+    const core::RetainedNodeEnvironmentDTO& node_environment,
+    const core::ContentDigest& compiler_contract_digest,
+    const core::ContentDigest& compiler_build_digest,
+    const CanonicalEmptyAdmissionRecord* record) {
+  require_bundle_matches_authorities(
+      bundle, deployment, node_environment, compiler_contract_digest,
+      compiler_build_digest, record);
+}
+
+std::optional<std::string>
+read_canonical_empty_admission_if_present(
+    const std::filesystem::path& root) {
+  return read_admission_if_present(root);
+}
+
+}  // namespace detail
 
 FilesystemCanonicalEmptyRetainedBundleSource::
     FilesystemCanonicalEmptyRetainedBundleSource(
@@ -447,9 +431,8 @@ FilesystemCanonicalEmptyRetainedBundleSource::load_verified() const {
            "deployment");
     }
 
-    const detail::BuildQualifiedRetentionContext context =
-        detail::BuildQualifiedRetentionAuthority::qualify_existing(
-            current_root);
+    const detail::BuildQualifiedAdmissionProfileAuthority profile =
+        detail::verify_build_qualified_admission_profile(current_root);
     FilesystemVerifiedRetainedBundleSource bundle_source(current_root);
     const auto bundle = bundle_source.get_verified(
         core::RetainedBundleId(record.retained_bundle_id));
@@ -457,7 +440,9 @@ FilesystemCanonicalEmptyRetainedBundleSource::load_verified() const {
       fail("canonical-empty retained bundle is missing");
     }
     require_bundle_matches_authorities(
-        *bundle, deployment, context, &record);
+        *bundle, deployment, profile.node_environment(),
+        profile.compiler_contract_digest(),
+        profile.compiler_build_digest(), &record);
 
     return CanonicalEmptyRetainedBundleAdmission(
         core::ContentDigest(std::move(record.admission_digest)),
@@ -484,83 +469,4 @@ FilesystemCanonicalEmptyRetainedBundleSource::load_verified() const {
   }
 }
 
-namespace detail {
-
-CanonicalEmptyRetainedBundleAdmission
-generate_canonical_empty_package(
-    const std::filesystem::path& output_root) {
-  try {
-    const std::filesystem::path root =
-        normalize_package_root(output_root);
-
-    // A visible commit record always wins. It is verified before any
-    // repository constructor or other write-capable operation is reached.
-    if (read_admission_if_present(root).has_value()) {
-      return FilesystemCanonicalEmptyRetainedBundleSource(root)
-          .load_verified();
-    }
-
-    const RevisionVerifiedDeploymentArtifact deployment =
-        load_fixed_deployment();
-    const RetentionQualifiedDeployment qualified =
-        compile_fixed_deployment(deployment);
-
-    FilesystemBuildManifestRepository manifest_repository(root);
-    FilesystemRawArtifactStore artifact_store(root);
-    FilesystemRetainedBundleRepository bundle_repository(root);
-    const auto produced =
-        RetainedBundleMaterializer::
-            materialize_store_and_reload_production(
-                qualified, manifest_repository, artifact_store,
-                bundle_repository);
-    if (produced == nullptr) {
-      throw std::logic_error(
-          "canonical-empty materializer returned null");
-    }
-
-    const BuildQualifiedRetentionContext context =
-        BuildQualifiedRetentionAuthority::qualify_existing(root);
-    FilesystemVerifiedRetainedBundleSource bundle_source(root);
-    const auto independently_reloaded =
-        bundle_source.get_verified(produced->retained_bundle_id());
-    if (independently_reloaded == nullptr ||
-        independently_reloaded->canonical_bytes() !=
-            produced->canonical_bytes()) {
-      fail("canonical-empty generator did not independently reload its "
-           "exact package closure");
-    }
-    require_bundle_matches_authorities(
-        *independently_reloaded, deployment, context, nullptr);
-
-    CanonicalEmptyAdmissionRecord record =
-        make_admission_record(*independently_reloaded);
-    const std::filesystem::path admission_path =
-        root / std::string(kAdmissionFilename);
-    (void)posix::publish_immutable_file_no_replace(
-        admission_path, record.canonical_bytes,
-        kMaxCanonicalEmptyAdmissionBytes, kPosixErrors,
-        kAdmissionReadMessages, kAdmissionDirectorySyncMessages,
-        kAdmissionPublicationMessages,
-        [&record](std::string_view existing) {
-          const CanonicalEmptyAdmissionRecord existing_record =
-              parse_admission_record(existing);
-          if (existing != record.canonical_bytes ||
-              existing_record.admission_digest !=
-                  record.admission_digest) {
-            fail("canonical-empty admission publication collided with a "
-                 "different immutable record");
-          }
-        });
-
-    return FilesystemCanonicalEmptyRetainedBundleSource(root)
-        .load_verified();
-  } catch (const CanonicalEmptyAdmissionError&) {
-    throw;
-  } catch (const std::exception& error) {
-    fail(std::string("canonical-empty package generation failed: ") +
-         error.what());
-  }
-}
-
-}  // namespace detail
 }  // namespace manyforge::deployment

@@ -44,7 +44,17 @@ set_target_properties(manyforge_deployment_archive PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES
     "${MANYFORGE_DEPLOYMENT_INCLUDE_DIR}"
 )
+
+add_library(manyforge_deployment_verification_core_archive STATIC IMPORTED)
+set_target_properties(
+  manyforge_deployment_verification_core_archive PROPERTIES
+  IMPORTED_LOCATION
+    "${MANYFORGE_DEPLOYMENT_DIR}/libmanyforge_deployment_verification_core.a"
+  INTERFACE_INCLUDE_DIRECTORIES
+    "${MANYFORGE_DEPLOYMENT_INCLUDE_DIR}"
+)
 target_link_libraries(manyforge_deployment_archive INTERFACE
+  manyforge_deployment_verification_core_archive
   OpenSSL::Crypto
   EXPAT::EXPAT
   PkgConfig::LIBYAML

@@ -406,31 +406,66 @@ manyforge_embed_closed_schema(
   resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml
   mf_pempty)
 
-add_library(manyforge_deployment
+set(MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${MANYFORGE_CORE_INCLUDE_DIR}>
+  $<INSTALL_INTERFACE:include>
+)
+set(MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES
+  OpenSSL::Crypto
+  EXPAT::EXPAT
+  PkgConfig::LIBYAML
+  PkgConfig::UTF8PROC
+  double-conversion::double-conversion
+)
+
+# Read-neutral parsing, identity, and exact retained-bundle verification.
+# This private substrate is deliberately free of compiler, materializer,
+# repository-writer, package-generator, and admission-selection effects.
+add_library(manyforge_deployment_verification_core
   src/artifact_codec.cpp
-  src/build_manifest.cpp
-  src/build_manifest_repository.cpp
-  src/canonical_empty_admission.cpp
-  src/capability_definition_codec.cpp
   src/canonical_value.cpp
-  src/cell_applicability.cpp
-  src/cell_compiler.cpp
-  src/cell_composition.cpp
   src/cell_graph_codec.cpp
-  src/cell_structure.cpp
   src/closed_schema.cpp
-  src/component_type_codec.cpp
-  src/control_interface_contract_codec.cpp
-  src/controller_topology_codec.cpp
   src/content_identity.cpp
   src/deployment_applicability_codec.cpp
   src/deployment_artifact_codec.cpp
   src/deployment_catalog_codec.cpp
+  src/posix_read_only_internal.cpp
+  src/verified_retained_bundle.cpp
+  src/verified_retained_bundle_store.cpp
+)
+target_include_directories(manyforge_deployment_verification_core PUBLIC
+  ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
+target_include_directories(manyforge_deployment_verification_core PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(manyforge_deployment_verification_core PUBLIC
+  ${MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES})
+set_target_properties(
+  manyforge_deployment_verification_core
+  PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Full offline compiler and writer surface. Admission is intentionally not a
+# dependency: the build-profile emitter must be able to link this target
+# before the admission reader's generated profile exists.
+add_library(manyforge_deployment
+  src/build_manifest.cpp
+  src/build_manifest_repository.cpp
+  src/capability_definition_codec.cpp
+  src/cell_applicability.cpp
+  src/cell_compiler.cpp
+  src/cell_composition.cpp
+  src/cell_structure.cpp
+  src/component_type_codec.cpp
+  src/control_interface_contract_codec.cpp
+  src/controller_topology_codec.cpp
   src/model_asset_codec.cpp
   src/model_source.cpp
   src/posix_durability_internal.cpp
   src/provider_manifest_codec.cpp
   src/retained_bundle.cpp
+  src/retained_bundle_materializer.cpp
   src/retained_bundle_store.cpp
   src/retention_qualified_deployment.cpp
   src/runtime_profile_codec.cpp
@@ -440,31 +475,91 @@ add_library(manyforge_deployment
 add_library(manyforge::deployment ALIAS manyforge_deployment)
 
 target_include_directories(manyforge_deployment PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<BUILD_INTERFACE:${MANYFORGE_CORE_INCLUDE_DIR}>
-  $<INSTALL_INTERFACE:include>
-)
+  ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
 target_include_directories(manyforge_deployment PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(manyforge_deployment PUBLIC
-  OpenSSL::Crypto
-  EXPAT::EXPAT
-  PkgConfig::LIBYAML
-  PkgConfig::UTF8PROC
-  double-conversion::double-conversion
-)
+  manyforge_deployment_verification_core)
 set_target_properties(
   manyforge_deployment PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_executable(
+  manyforge_emit_build_qualified_admission_profile
+  tools/emit_build_qualified_admission_profile.cpp)
+target_include_directories(
+  manyforge_emit_build_qualified_admission_profile PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(
+  manyforge_emit_build_qualified_admission_profile PRIVATE
+  manyforge::deployment)
+
+set(
+  MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/build_qualified_admission_profile_generated.hpp")
+add_custom_command(
+  OUTPUT "${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}"
+  COMMAND
+    "${CMAKE_COMMAND}" -E make_directory
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  COMMAND
+    "$<TARGET_FILE:manyforge_emit_build_qualified_admission_profile>"
+    --output
+    "${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}"
+  DEPENDS
+    manyforge_emit_build_qualified_admission_profile
+    ${MANYFORGE_COMPILER_SOURCE_INPUTS}
+    ${MANYFORGE_COMPILER_RECIPE_INPUTS}
+  COMMENT "Generating exact build-qualified admission profile"
+  VERBATIM)
+add_custom_target(
+  manyforge_build_qualified_admission_profile
+  DEPENDS "${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}")
+
+add_library(manyforge_deployment_admission
+  src/build_qualified_admission_profile.cpp
+  src/canonical_empty_admission.cpp
+  "${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}"
+)
+add_library(
+  manyforge::deployment_admission ALIAS manyforge_deployment_admission)
+add_dependencies(
+  manyforge_deployment_admission
+  manyforge_build_qualified_admission_profile)
+target_include_directories(manyforge_deployment_admission PUBLIC
+  ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
+target_include_directories(manyforge_deployment_admission PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(manyforge_deployment_admission PRIVATE
+  manyforge_deployment_verification_core)
+set_target_properties(
+  manyforge_deployment_admission PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(manyforge_deployment_canonical_package_generator STATIC
+  src/canonical_empty_package_generator.cpp)
+target_include_directories(
+  manyforge_deployment_canonical_package_generator PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(
+  manyforge_deployment_canonical_package_generator PRIVATE
+  manyforge::deployment
+  manyforge::deployment_admission)
+set_target_properties(
+  manyforge_deployment_canonical_package_generator
+  PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_executable(
   manyforge_generate_canonical_empty_package
   tools/generate_canonical_empty_package.cpp)
 target_include_directories(
   manyforge_generate_canonical_empty_package PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${MANYFORGE_CORE_INCLUDE_DIR}")
 target_link_libraries(
   manyforge_generate_canonical_empty_package PRIVATE
-  manyforge_deployment)
+  manyforge_deployment_canonical_package_generator)
 
 option(BUILD_TESTING "Build unit tests" ON)
 option(
@@ -517,6 +612,23 @@ if(BUILD_TESTING)
     message(FATAL_ERROR
       "The retained-bundle public-header compile control failed:\n"
       "${MANYFORGE_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES_OUTPUT}")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_VERIFIED_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES
+    verified_retained_bundle_public_header_compiles.cpp)
+  if(NOT MANYFORGE_VERIFIED_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES)
+    message(FATAL_ERROR
+      "The verified retained-bundle public-header compile control failed:\n"
+      "${MANYFORGE_VERIFIED_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES_OUTPUT}")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_VERIFIED_RETAINED_BUNDLE_WRITER_API_IS_PUBLIC
+    verified_retained_bundle_writer_api_is_private.cpp)
+  if(MANYFORGE_VERIFIED_RETAINED_BUNDLE_WRITER_API_IS_PUBLIC)
+    message(FATAL_ERROR
+      "The narrow verified retained-bundle header exposes writer APIs")
   endif()
 
   manyforge_try_public_header(
@@ -790,9 +902,30 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(
     test_canonical_empty_admission PRIVATE
-    manyforge_deployment GTest::gtest_main)
+    manyforge_deployment
+    manyforge_deployment_admission
+    manyforge_deployment_canonical_package_generator
+    GTest::gtest_main)
   gtest_discover_tests(
     test_canonical_empty_admission
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(
+    test_build_qualified_admission_profile
+    test/test_build_qualified_admission_profile.cpp)
+  add_dependencies(
+    test_build_qualified_admission_profile
+    manyforge_build_qualified_admission_profile)
+  target_include_directories(
+    test_build_qualified_admission_profile PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  target_link_libraries(
+    test_build_qualified_admission_profile PRIVATE
+    manyforge_deployment_admission
+    GTest::gtest_main)
+  gtest_discover_tests(
+    test_build_qualified_admission_profile
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_test(
@@ -803,6 +936,16 @@ if(BUILD_TESTING)
       "-DMANYFORGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/canonical_empty_cli_package"
       -P
       "${CMAKE_CURRENT_SOURCE_DIR}/test/canonical_empty_generator_cli.cmake")
+
+  add_test(
+    NAME BuildQualifiedAdmissionProfileIsDeterministic
+    COMMAND
+      "${CMAKE_COMMAND}"
+      "-DMANYFORGE_PROFILE_EMITTER=$<TARGET_FILE:manyforge_emit_build_qualified_admission_profile>"
+      "-DMANYFORGE_GENERATED_PROFILE=${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}"
+      "-DMANYFORGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/profile_determinism"
+      -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/build_qualified_admission_profile_determinism.cmake")
 
   add_executable(test_stop_evidence_policy_codec
     test/test_stop_evidence_policy_codec.cpp)

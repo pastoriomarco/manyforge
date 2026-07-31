@@ -8,6 +8,7 @@
 #include "manyforge_deployment/build_manifest.hpp"
 #include "manyforge_deployment/retention_qualified_deployment.hpp"
 #include "manyforge_deployment/retained_bundle.hpp"
+#include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment::detail {
 
@@ -109,17 +110,6 @@ class RetainedBundleMaterializer final {
       IRawArtifactStore& artifact_store);
 };
 
-/// Sole reconstruction authority for durable semantic repository bytes.
-///
-/// Reload reparses the exact canonical envelope, verifies the complete
-/// currently qualified retained-bundle projection and semantic identity, and
-/// only then reconstructs the sealed RetainedBundle value.
-class RetainedBundleReloadAuthority final {
- public:
-  [[nodiscard]] static std::shared_ptr<const RetainedBundle> reload(
-      std::string_view canonical_bytes);
-};
-
 /// Compiler-internal input for one product-contract artifact role.
 ///
 /// This type and the retention functions below are deliberately absent from
@@ -141,12 +131,5 @@ struct RetainedArtifactInput final {
     const core::ProductContractRevision &product_contract_revision,
     std::span<const RetainedArtifactInput> artifacts,
     IRawArtifactStore &artifact_store);
-
-[[nodiscard]] CanonicalValue
-retained_product_projection(const core::RetainedProductDTO &product);
-
-/// Domain-separated digest used by the product's sole provenance output row.
-[[nodiscard]] core::ContentDigest
-retained_product_output_digest(const core::RetainedProductDTO &product);
 
 }  // namespace manyforge::deployment::detail

@@ -2,7 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <manyforge_deployment/retained_bundle.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <memory>
 #include <stdexcept>
 #include <string>

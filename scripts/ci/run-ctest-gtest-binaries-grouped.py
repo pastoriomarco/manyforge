@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Run each CTest-discovered GTest executable once under a sanitizer.
+"""Run a CTest registry efficiently and completely under a sanitizer.
 
 CTest normally registers one process per GTest case. That is useful for
 ordinary CI, but sanitizer process startup/teardown (especially LeakSanitizer
 on ARM) can dominate a full suite. This runner consumes CTest's JSON registry,
 groups the exact enabled filters by executable, and verifies that each grouped
-process ran the same number of cases that CTest registered.
+process ran the same number of cases that CTest registered. Non-GTest CTest
+entries remain owned by CTest and are executed individually with their exact
+registered name; they are never mistaken for malformed GTest filters or
+silently omitted.
 """
 
 from __future__ import annotations
@@ -30,6 +33,13 @@ class BinaryGroup:
     registered_count: int = 0
     disabled_count: int = 0
     timeout_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
+class OrdinaryCTest:
+    name: str
+    disabled: bool
+    timeout_seconds: float
 
 
 def properties(test: dict[str, Any]) -> dict[str, Any]:
@@ -83,14 +93,22 @@ def load_registry(
 
 def group_registry(
     tests: list[dict[str, Any]], timeout_ceiling: float
-) -> collections.OrderedDict[str, BinaryGroup]:
+) -> tuple[
+    collections.OrderedDict[str, BinaryGroup],
+    list[OrdinaryCTest],
+]:
     groups: collections.OrderedDict[str, BinaryGroup] = collections.OrderedDict()
+    ordinary_tests: list[OrdinaryCTest] = []
     allowed_extra_arguments = {"--gtest_also_run_disabled_tests"}
 
     for test in tests:
         command = test.get("command", [])
         if not command:
             raise RuntimeError(f"CTest entry has no command: {test.get('name')}")
+        test_name = test.get("name")
+        if not isinstance(test_name, str) or not test_name:
+            raise RuntimeError(f"CTest entry has no valid name: {test_name!r}")
+        props = properties(test)
         filters = [
             argument.removeprefix("--gtest_filter=")
             for argument in command[1:]
@@ -101,12 +119,24 @@ def group_registry(
             for argument in command[1:]
             if not argument.startswith("--gtest_filter=")
         }
+        has_gtest_argument = any(
+            argument.startswith("--gtest_") for argument in command[1:]
+        )
+        if not filters and not has_gtest_argument:
+            timeout_seconds = float(props.get("TIMEOUT", timeout_ceiling))
+            ordinary_tests.append(
+                OrdinaryCTest(
+                    name=test_name,
+                    disabled=props.get("DISABLED") is True,
+                    timeout_seconds=min(timeout_ceiling, timeout_seconds),
+                )
+            )
+            continue
         if len(filters) != 1 or not extras.issubset(allowed_extra_arguments):
             raise RuntimeError(
-                f"unsupported CTest GTest command for {test.get('name')}: {command}"
+                f"unsupported CTest GTest command for {test_name}: {command}"
             )
 
-        props = properties(test)
         working_directory = str(props.get("WORKING_DIRECTORY", Path(command[0]).parent))
         timeout_seconds = float(props.get("TIMEOUT", timeout_ceiling))
         binary = command[0]
@@ -131,7 +161,7 @@ def group_registry(
         else:
             group.enabled_filters.append(filters[0])
 
-    return groups
+    return groups, ordinary_tests
 
 
 def summary_count(pattern: str, output: str) -> int:
@@ -272,19 +302,71 @@ def run_group(index: int, group: BinaryGroup) -> tuple[int, int, int, bool]:
     return ran, passed, skipped, True
 
 
+def run_ordinary_test(
+    index: int,
+    test: OrdinaryCTest,
+    build_dir: Path,
+) -> tuple[int, int, int]:
+    if test.disabled:
+        print(
+            f"CTEST_DISABLED index={index} name={test.name}",
+            flush=True,
+        )
+        return 0, 0, 0
+
+    print(
+        f"CTEST_START index={index} timeout_seconds={test.timeout_seconds:g} "
+        f"name={test.name}",
+        flush=True,
+    )
+    command = [
+        "ctest",
+        "--test-dir",
+        str(build_dir),
+        "--output-on-failure",
+        "--no-tests=error",
+        "-R",
+        f"^{re.escape(test.name)}$",
+    ]
+    status, output, timed_out = execute(
+        command,
+        str(build_dir),
+        test.timeout_seconds + 30.0,
+    )
+    print(output, end="", flush=True)
+    print(
+        f"CTEST_RESULT index={index} status={status} "
+        f"timed_out={int(timed_out)} name={test.name}",
+        flush=True,
+    )
+    if has_sanitizer_finding(status, output):
+        raise RuntimeError(
+            f"sanitizer finding in ordinary CTest: {test.name}"
+        )
+    if status != 0 or timed_out:
+        raise RuntimeError(f"ordinary CTest execution failed: {test.name}")
+    return 1, 1, 0
+
+
 def main() -> int:
     args = parse_args()
     build_dir = Path(args.build_dir).resolve()
     tests = load_registry(
         build_dir, args.test_regex, args.exclude_test_regex
     )
-    groups = group_registry(tests, args.timeout_seconds)
-    disabled = sum(group.disabled_count for group in groups.values())
-    enabled = sum(len(group.enabled_filters) for group in groups.values())
+    groups, ordinary_tests = group_registry(tests, args.timeout_seconds)
+    disabled = (
+        sum(group.disabled_count for group in groups.values())
+        + sum(test.disabled for test in ordinary_tests)
+    )
+    enabled = (
+        sum(len(group.enabled_filters) for group in groups.values())
+        + sum(not test.disabled for test in ordinary_tests)
+    )
     print(
         f"{args.summary_prefix}_REGISTRY registered_tests={len(tests)} "
         f"enabled_tests={enabled} disabled_tests={disabled} "
-        f"unique_binaries={len(groups)}",
+        f"unique_binaries={len(groups)} ordinary_tests={len(ordinary_tests)}",
         flush=True,
     )
 
@@ -299,6 +381,14 @@ def main() -> int:
             executed_binaries += 1
         if used_fallback:
             fallback_binaries += 1
+        total_ran += ran
+        total_passed += passed
+        total_skipped += skipped
+
+    for index, test in enumerate(ordinary_tests, start=1):
+        ran, passed, skipped = run_ordinary_test(index, test, build_dir)
+        if not test.disabled:
+            executed_binaries += 1
         total_ran += ran
         total_passed += passed
         total_skipped += skipped

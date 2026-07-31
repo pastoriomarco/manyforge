@@ -3,7 +3,6 @@
 #include <sys/file.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -17,12 +16,12 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "manyforge_deployment/content_identity.hpp"
 #include "posix_durability_internal.hpp"
 #include "retained_bundle_internal.hpp"
+#include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -52,8 +51,6 @@ struct DurableStoreLayout final {
 
 constexpr std::size_t kMaximumStaleTemporaryCount = 256U;
 constexpr std::size_t kDigestHexLength = 64U;
-constexpr std::string_view kDigestPrefix = "sha256:";
-constexpr std::string_view kStoreKeyPrefix = "sha256/";
 
 [[noreturn]] void fail(std::string_view message) {
   throw RetainedBundleError(std::string(message));
@@ -82,12 +79,6 @@ constexpr posix::DirectoryMessages kDirectoryMessages{
     "concurrently created durable retention path is unsafe",
     "created durable retention directory is unsafe",
 };
-constexpr posix::ExistingDirectoryMessages
-    kReadOnlyDirectoryMessages{
-        "cannot inspect read-only durable retention directory",
-        "read-only durable retention path must be an existing plain "
-        "directory",
-    };
 constexpr posix::DirectorySyncMessages kDirectorySyncMessages{
     "cannot open durable retention directory for fsync",
     "cannot fsync durable retention directory",
@@ -117,29 +108,6 @@ constexpr posix::PublicationMessages kPublicationMessages{
     "cannot remove durable retention temporary link",
 };
 
-[[nodiscard]] bool is_lower_hex(std::string_view value) noexcept {
-  return !value.empty() &&
-         std::all_of(value.begin(), value.end(), [](unsigned char byte) {
-           return (byte >= '0' && byte <= '9') ||
-                  (byte >= 'a' && byte <= 'f');
-         });
-}
-
-[[nodiscard]] std::optional<std::string_view> digest_hex(
-    std::string_view digest) noexcept {
-  if (!is_sha256_digest(digest)) {
-    return std::nullopt;
-  }
-  return digest.substr(kDigestPrefix.size());
-}
-
-[[nodiscard]] std::string digest_from_hex(std::string_view hex) {
-  if (hex.size() != kDigestHexLength || !is_lower_hex(hex)) {
-    fail("durable retention entry has an invalid digest filename");
-  }
-  return std::string(kDigestPrefix) + std::string(hex);
-}
-
 [[nodiscard]] bool is_stale_temporary_filename(
     std::string_view filename, std::string_view suffix) noexcept {
   if (!filename.starts_with('.') ||
@@ -149,7 +117,8 @@ constexpr posix::PublicationMessages kPublicationMessages{
   const std::string_view hex = filename.substr(1U, kDigestHexLength);
   const std::string_view remainder =
       filename.substr(1U + kDigestHexLength);
-  return is_lower_hex(hex) && remainder.starts_with(suffix) &&
+  return detail::is_retained_digest_hex(hex) &&
+         remainder.starts_with(suffix) &&
          remainder.substr(suffix.size()).starts_with(".tmp.") &&
          remainder.size() > suffix.size() +
                                 std::string_view(".tmp.").size();
@@ -162,13 +131,14 @@ constexpr posix::PublicationMessages kPublicationMessages{
     fail("durable retention store contains an unknown entry");
   }
   const std::string_view hex = filename.substr(0U, kDigestHexLength);
-  (void)digest_from_hex(hex);
+  (void)detail::retained_digest_from_hex(hex);
   return std::string(hex);
 }
 
 void verify_entry_bytes(DurableValueKind kind, std::string_view hex,
                         std::string_view bytes) {
-  const std::string expected_digest = digest_from_hex(hex);
+  const std::string expected_digest =
+      detail::retained_digest_from_hex(hex);
   switch (kind) {
     case DurableValueKind::kRawArtifact:
       if (sha256_digest(bytes) != expected_digest) {
@@ -246,7 +216,7 @@ class DurableFileCollection final {
   [[nodiscard]] bool put_if_absent(std::string_view hex,
                                    std::string_view bytes) {
     require_insert_size(bytes.size());
-    (void)digest_from_hex(hex);
+    (void)detail::retained_digest_from_hex(hex);
     verify_entry_bytes(kind_, hex, bytes);
 
     std::lock_guard process_lock(mutex_);
@@ -295,7 +265,7 @@ class DurableFileCollection final {
   [[nodiscard]] std::optional<std::string> get_verified(
       std::string_view hex) {
     require_owner_process();
-    (void)digest_from_hex(hex);
+    (void)detail::retained_digest_from_hex(hex);
     std::lock_guard process_lock(mutex_);
     const auto file_lock = lock_->acquire(LOCK_SH);
     const auto bytes = posix::read_exact_regular_file(
@@ -446,181 +416,6 @@ class DurableFileCollection final {
   std::mutex mutex_;
 };
 
-[[nodiscard]] std::optional<std::string_view> raw_key_hex(
-    const core::ContentAddressedStoreKey& key,
-    const core::ContentDigest& expected_digest) noexcept {
-  const auto hex = digest_hex(expected_digest.value());
-  if (!hex.has_value() ||
-      key.value() != std::string(kStoreKeyPrefix) + std::string(*hex)) {
-    return std::nullopt;
-  }
-  return hex;
-}
-
-struct ReadOnlyRetentionPaths final {
-  std::filesystem::path bundle_data;
-  std::filesystem::path raw_data;
-};
-
-[[nodiscard]] ReadOnlyRetentionPaths require_read_only_retention_paths(
-    const std::filesystem::path& trusted_root) {
-  const std::filesystem::path bundle_namespace =
-      trusted_root / "retained-bundles";
-  const std::filesystem::path bundle_data =
-      bundle_namespace / "sha256";
-  const std::filesystem::path raw_namespace =
-      trusted_root / "raw-artifacts";
-  const std::filesystem::path raw_data = raw_namespace / "sha256";
-  for (const auto& directory :
-       {bundle_namespace, bundle_data, raw_namespace, raw_data}) {
-    posix::require_existing_plain_directory(
-        directory, kPosixErrors, kReadOnlyDirectoryMessages);
-  }
-  return {bundle_data, raw_data};
-}
-
-[[nodiscard]] std::shared_ptr<const RetainedBundle>
-read_verified_bundle_entry(
-    const std::filesystem::path& bundle_data,
-    const core::RetainedBundleId& retained_bundle_id) {
-  const auto hex = digest_hex(retained_bundle_id.value());
-  if (!hex.has_value()) {
-    return nullptr;
-  }
-  const auto bytes = posix::read_exact_regular_file(
-      bundle_data / (std::string(*hex) + ".json"),
-      kMaxDurableRetainedBundleBytes, true, kPosixErrors,
-      kReadMessages);
-  if (!bytes.has_value()) {
-    return nullptr;
-  }
-  const auto bundle =
-      detail::RetainedBundleReloadAuthority::reload(*bytes);
-  if (bundle->retained_bundle_id() != retained_bundle_id) {
-    fail("read-only retained-bundle key/content mismatch");
-  }
-  return bundle;
-}
-
-[[nodiscard]] std::string read_verified_raw_reference(
-    const std::filesystem::path& raw_data,
-    const core::ContentAddressedStoreKey& key,
-    const core::ContentDigest& digest,
-    std::optional<std::uint64_t> expected_size,
-    std::string_view reference_label) {
-  const auto hex = raw_key_hex(key, digest);
-  if (!hex.has_value()) {
-    fail(std::string(reference_label) +
-         " has an inconsistent digest-derived raw-CAS key");
-  }
-  auto bytes = posix::read_exact_regular_file(
-      raw_data / (std::string(*hex) + ".blob"),
-      kMaxDurableRetainedBlobBytes, true, kPosixErrors,
-      kReadMessages);
-  if (!bytes.has_value()) {
-    fail(std::string(reference_label) +
-         " is absent from the durable raw-artifact CAS");
-  }
-  if ((expected_size.has_value() &&
-       static_cast<std::uint64_t>(bytes->size()) != *expected_size) ||
-      sha256_digest(*bytes) != digest.value()) {
-    fail(std::string(reference_label) +
-         " failed exact durable raw-artifact verification");
-  }
-  return std::move(*bytes);
-}
-
-void require_verified_product_artifacts(
-    const std::filesystem::path& raw_data,
-    const core::RetainedProductDTO& product) {
-  for (const auto& artifact : product.artifact_refs) {
-    static_cast<void>(read_verified_raw_reference(
-        raw_data, artifact.content_addressed_store_key,
-        artifact.content_digest, artifact.byte_size,
-        "retained product artifact reference"));
-  }
-}
-
-void require_verified_bundle_references(
-    const std::filesystem::path& raw_data, const RetainedBundle& bundle) {
-  const auto& value = bundle.value();
-  for (const auto& record : value.catalogs.records) {
-    std::visit(
-        [&raw_data](const auto& typed_record) {
-          static_cast<void>(read_verified_raw_reference(
-              raw_data, typed_record.content_addressed_store_key,
-              typed_record.content_digest, std::nullopt,
-              "retained catalog-record reference"));
-        },
-        record);
-  }
-  for (const auto& schema : value.catalogs.schema_artifacts) {
-    static_cast<void>(read_verified_raw_reference(
-        raw_data, schema.content_addressed_store_key,
-        schema.content_digest, std::nullopt,
-        "retained schema-artifact reference"));
-  }
-
-  const auto& products = value.compiled_products;
-  require_verified_product_artifacts(
-      raw_data, products.planning_collision_model);
-  if (products.viewer_model.has_value()) {
-    require_verified_product_artifacts(
-        raw_data, *products.viewer_model);
-  }
-  for (const auto& group : products.control_domain_products) {
-    for (const auto& product : group.products) {
-      require_verified_product_artifacts(raw_data, product);
-    }
-  }
-  for (const auto& product : products.symbol_role_maps) {
-    require_verified_product_artifacts(raw_data, product);
-  }
-  for (const auto& group : products.runtime_unit_products) {
-    for (const auto& product : group.products) {
-      require_verified_product_artifacts(raw_data, product);
-    }
-  }
-}
-
-[[nodiscard]] const core::RetainedProductDTO*
-find_exact_product(const core::RetainedBundleDTO& bundle,
-                   const RetainedProductArtifactQuery& query) {
-  const core::RetainedProductDTO* match = nullptr;
-  const auto consider =
-      [&query, &match](const core::RetainedProductDTO& candidate) {
-        if (candidate.product_id != query.product_id ||
-            candidate.product_kind != query.product_kind) {
-          return;
-        }
-        if (match != nullptr) {
-          fail("verified retained bundle contains duplicate exact product "
-               "coordinates");
-        }
-        match = &candidate;
-      };
-
-  const auto& products = bundle.compiled_products;
-  consider(products.planning_collision_model);
-  if (products.viewer_model.has_value()) {
-    consider(*products.viewer_model);
-  }
-  for (const auto& group : products.control_domain_products) {
-    for (const auto& product : group.products) {
-      consider(product);
-    }
-  }
-  for (const auto& product : products.symbol_role_maps) {
-    consider(product);
-  }
-  for (const auto& group : products.runtime_unit_products) {
-    for (const auto& product : group.products) {
-      consider(product);
-    }
-  }
-  return match;
-}
-
 }  // namespace
 
 struct FilesystemRawArtifactStore::Storage final {
@@ -646,7 +441,7 @@ StoredRawArtifact FilesystemRawArtifactStore::put_if_absent(
     std::string_view bytes) {
   storage_->files.require_insert_size(bytes.size());
   const std::string digest = sha256_digest(bytes);
-  const auto hex = digest_hex(digest);
+  const auto hex = detail::retained_digest_hex(digest);
   if (!hex.has_value()) {
     throw std::logic_error("SHA-256 helper returned an invalid digest");
   }
@@ -654,7 +449,7 @@ StoredRawArtifact FilesystemRawArtifactStore::put_if_absent(
   return {
       core::ContentDigest(digest),
       core::ContentAddressedStoreKey(
-          std::string(kStoreKeyPrefix) + std::string(*hex)),
+          detail::retained_store_key_for_digest(digest)),
       static_cast<std::uint64_t>(bytes.size()),
       inserted,
   };
@@ -665,7 +460,8 @@ std::optional<std::string> FilesystemRawArtifactStore::get_verified(
     const core::ContentDigest& expected_digest,
     std::uint64_t expected_size) const {
   storage_->files.require_owner_process();
-  const auto hex = raw_key_hex(key, expected_digest);
+  const auto hex =
+      detail::retained_raw_key_hex(key, expected_digest);
   if (!hex.has_value()) {
     return std::nullopt;
   }
@@ -729,7 +525,8 @@ bool FilesystemRetainedBundleRepository::put_if_absent(
     fail("durable retained-bundle repository rejects divergent typed and "
          "canonical values");
   }
-  const auto hex = digest_hex(bundle->retained_bundle_id().value());
+  const auto hex =
+      detail::retained_digest_hex(bundle->retained_bundle_id().value());
   if (!hex.has_value()) {
     fail("durable retained bundle has an invalid strong identity");
   }
@@ -741,7 +538,8 @@ std::shared_ptr<const RetainedBundle>
 FilesystemRetainedBundleRepository::get_verified_envelope(
     const core::RetainedBundleId& retained_bundle_id) const {
   storage_->files.require_owner_process();
-  const auto hex = digest_hex(retained_bundle_id.value());
+  const auto hex =
+      detail::retained_digest_hex(retained_bundle_id.value());
   if (!hex.has_value()) {
     return nullptr;
   }
@@ -765,85 +563,6 @@ std::size_t FilesystemRetainedBundleRepository::size() const {
 std::uint64_t
 FilesystemRetainedBundleRepository::retained_bytes() const {
   return storage_->files.retained_bytes();
-}
-
-FilesystemVerifiedRetainedBundleSource::
-    FilesystemVerifiedRetainedBundleSource(
-        std::filesystem::path trusted_package_root)
-    : trusted_package_root_(posix::normalize_existing_plain_root(
-          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
-  (void)require_read_only_retention_paths(trusted_package_root_);
-}
-
-std::shared_ptr<const RetainedBundle>
-FilesystemVerifiedRetainedBundleSource::get_verified(
-    const core::RetainedBundleId& retained_bundle_id) const {
-  const std::filesystem::path current_root =
-      posix::normalize_existing_plain_root(
-          trusted_package_root_, kPosixErrors, kTrustedRootMessages);
-  if (current_root != trusted_package_root_) {
-    fail("read-only retained-bundle trusted root changed after "
-         "construction");
-  }
-  const ReadOnlyRetentionPaths paths =
-      require_read_only_retention_paths(current_root);
-  const auto bundle =
-      read_verified_bundle_entry(paths.bundle_data, retained_bundle_id);
-  if (bundle == nullptr) {
-    return nullptr;
-  }
-  require_verified_bundle_references(paths.raw_data, *bundle);
-  return bundle;
-}
-
-FilesystemVerifiedRetainedProductArtifactSource::
-    FilesystemVerifiedRetainedProductArtifactSource(
-        std::filesystem::path trusted_package_root)
-    : trusted_package_root_(posix::normalize_existing_plain_root(
-          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
-  (void)require_read_only_retention_paths(trusted_package_root_);
-}
-
-std::optional<VerifiedRetainedProductArtifact>
-FilesystemVerifiedRetainedProductArtifactSource::get_verified(
-    const RetainedProductArtifactQuery& query) const {
-  const std::filesystem::path current_root =
-      posix::normalize_existing_plain_root(
-          trusted_package_root_, kPosixErrors, kTrustedRootMessages);
-  if (current_root != trusted_package_root_) {
-    fail("read-only retained-product trusted root changed after "
-         "construction");
-  }
-  const ReadOnlyRetentionPaths paths =
-      require_read_only_retention_paths(current_root);
-  const auto bundle =
-      read_verified_bundle_entry(paths.bundle_data,
-                                 query.retained_bundle_id);
-  if (bundle == nullptr) {
-    return std::nullopt;
-  }
-  const core::RetainedProductDTO* product =
-      find_exact_product(bundle->value(), query);
-  if (product == nullptr) {
-    return std::nullopt;
-  }
-  const auto artifact = std::find_if(
-      product->artifact_refs.begin(), product->artifact_refs.end(),
-      [&query](const core::RetainedArtifactRefDTO& candidate) {
-        return candidate.artifact_role_id == query.artifact_role_id;
-      });
-  if (artifact == product->artifact_refs.end()) {
-    return std::nullopt;
-  }
-
-  std::string bytes = read_verified_raw_reference(
-      paths.raw_data, artifact->content_addressed_store_key,
-      artifact->content_digest, artifact->byte_size,
-      "selected retained product artifact");
-  return VerifiedRetainedProductArtifact(
-      query, product->product_contract_id,
-      product->product_contract_revision, *artifact,
-      std::move(bytes));
 }
 
 }  // namespace manyforge::deployment

@@ -222,10 +222,12 @@ if(BUILD_TESTING)
       unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
     endif()
     if(NOT TARGET manyforge_deployment OR
+       NOT TARGET manyforge_deployment_admission OR
        NOT TARGET manyforge_generate_canonical_empty_package)
       message(FATAL_ERROR
         "I3 retained-product consumer qualification requires the "
-        "manyforge_deployment library and canonical-empty package generator")
+        "compiler, focused admission library, and canonical-empty package "
+        "generator")
     endif()
 
     set(_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE
@@ -260,6 +262,7 @@ if(BUILD_TESTING)
       MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT="${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}")
     target_link_libraries(test_retained_product_consumer PRIVATE
       manyforge_deployment
+      manyforge_deployment_admission
       roboplan::roboplan
       GTest::gtest_main)
 

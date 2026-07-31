@@ -29,7 +29,12 @@ set(
   "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment"
   CACHE PATH
   "Path to the manyforge_deployment source tree")
-if(NOT TARGET manyforge_deployment)
+if(NOT TARGET manyforge_deployment_admission)
+  if(TARGET manyforge_deployment)
+    message(FATAL_ERROR
+      "manyforge_component_manager found a partial deployment target set "
+      "without the focused admission target")
+  endif()
   if(NOT EXISTS
      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/include/manyforge_deployment/canonical_empty_admission.hpp")
     message(FATAL_ERROR
@@ -55,9 +60,10 @@ if(NOT TARGET manyforge_deployment)
     unset(BUILD_TESTING)
   endif()
 endif()
-if(NOT TARGET manyforge::deployment)
+if(NOT TARGET manyforge::deployment_admission)
   message(FATAL_ERROR
-    "manyforge_component_manager could not resolve manyforge_deployment")
+    "manyforge_component_manager could not resolve the focused "
+    "manyforge_deployment admission target")
 endif()
 
 set(
@@ -129,10 +135,23 @@ target_include_directories(manyforge_component_manager PRIVATE
 target_link_libraries(manyforge_component_manager PRIVATE
   OpenSSL::Crypto
   SQLite::SQLite3
+  manyforge::deployment_admission
 )
-target_link_libraries(manyforge_component_manager PUBLIC
-  manyforge::deployment
-)
+get_target_property(
+  MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS
+  manyforge_component_manager
+  LINK_LIBRARIES)
+if(NOT "manyforge::deployment_admission" IN_LIST
+       MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS)
+  message(FATAL_ERROR
+    "manyforge_component_manager lost its focused admission dependency")
+endif()
+if("manyforge::deployment" IN_LIST MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS OR
+   "manyforge_deployment" IN_LIST MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS)
+  message(FATAL_ERROR
+    "manyforge_component_manager must not directly link the full deployment "
+    "compiler target")
+endif()
 set_target_properties(
   manyforge_component_manager PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -185,9 +204,26 @@ if(BUILD_TESTING)
   target_compile_definitions(test_manager_bootstrap_journal PRIVATE
     MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
   target_link_libraries(test_manager_bootstrap_journal PRIVATE
-    manyforge_component_manager GTest::gtest_main SQLite::SQLite3)
+    manyforge_component_manager
+    manyforge::deployment_admission
+    GTest::gtest_main
+    SQLite::SQLite3)
+  set(
+    MANYFORGE_MANAGER_ADMISSION_LINK_MAP
+    "${CMAKE_CURRENT_BINARY_DIR}/test_manager_bootstrap_journal.map")
+  target_link_options(test_manager_bootstrap_journal PRIVATE
+    "-Wl,-Map,${MANYFORGE_MANAGER_ADMISSION_LINK_MAP}")
   gtest_discover_tests(test_manager_bootstrap_journal
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+  add_test(
+    NAME ManagerAdmissionLinkBoundary
+    COMMAND
+      "${CMAKE_COMMAND}"
+      "-DMANYFORGE_LINK_MAP=${MANYFORGE_MANAGER_ADMISSION_LINK_MAP}"
+      "-DMANYFORGE_BINARY=$<TARGET_FILE:test_manager_bootstrap_journal>"
+      "-DMANYFORGE_NM=${CMAKE_NM}"
+      -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/verify_admission_link_boundary.cmake")
 
   add_executable(test_active_bundle_publication_store
     test/test_active_bundle_publication_store.cpp)
@@ -206,7 +242,9 @@ if(BUILD_TESTING)
     MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
   target_link_libraries(
     test_canonical_empty_bootstrap_coordinator PRIVATE
-    manyforge_component_manager GTest::gtest_main)
+    manyforge_component_manager
+    manyforge::deployment_admission
+    GTest::gtest_main)
   gtest_discover_tests(test_canonical_empty_bootstrap_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
@@ -220,7 +258,10 @@ if(BUILD_TESTING)
     MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
   target_link_libraries(
     test_canonical_empty_bootstrap_advance PRIVATE
-    manyforge_component_manager OpenSSL::Crypto GTest::gtest_main)
+    manyforge_component_manager
+    manyforge::deployment_admission
+    OpenSSL::Crypto
+    GTest::gtest_main)
   gtest_discover_tests(test_canonical_empty_bootstrap_advance
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 endif()
