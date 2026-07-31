@@ -133,11 +133,21 @@ static_assert(
 static_assert(std::is_base_of_v<
               IVerifiedRetainedBundleSource,
               FilesystemVerifiedRetainedBundleSource>);
+static_assert(std::is_base_of_v<
+              IVerifiedRetainedProductArtifactSource,
+              FilesystemVerifiedRetainedProductArtifactSource>);
 static_assert(!std::is_base_of_v<
               IVerifiedRetainedBundleSource,
               FilesystemRetainedBundleRepository>);
+static_assert(!std::is_default_constructible_v<
+              VerifiedRetainedProductArtifact>);
+static_assert(!std::is_aggregate_v<
+              VerifiedRetainedProductArtifact>);
 static_assert(std::is_constructible_v<
               FilesystemVerifiedRetainedBundleSource,
+              std::filesystem::path>);
+static_assert(std::is_constructible_v<
+              FilesystemVerifiedRetainedProductArtifactSource,
               std::filesystem::path>);
 static_assert(!std::is_constructible_v<
               FilesystemVerifiedRetainedBundleSource,
@@ -895,6 +905,171 @@ TEST(FilesystemVerifiedRetainedBundleSourceTest,
     EXPECT_THROW(
         static_cast<void>(
             source.get_verified(bundle->retained_bundle_id())),
+        RetainedBundleError);
+  }
+}
+
+TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
+     ExactTupleReturnsEchoedMetadataAndIndependentlyVerifiedBytes) {
+  ScopedTrustedRoot root;
+  const auto bundle = materialize_durable_bundle(
+      root.path(), "durable_product_point_read");
+  const auto& product =
+      bundle->value().compiled_products.planning_collision_model;
+  ASSERT_EQ(product.artifact_refs.size(), 2U);
+
+  const RetainedProductArtifactQuery urdf_query{
+      bundle->retained_bundle_id(), product.product_id,
+      product.product_kind, core::ArtifactRoleId("urdf")};
+  const FilesystemVerifiedRetainedProductArtifactSource source(
+      root.path());
+  const auto first = source.get_verified(urdf_query);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first->query(), urdf_query);
+  EXPECT_EQ(first->product_contract_id(),
+            product.product_contract_id);
+  EXPECT_EQ(first->product_contract_revision(),
+            product.product_contract_revision);
+  const auto expected_urdf = std::find_if(
+      product.artifact_refs.begin(), product.artifact_refs.end(),
+      [](const core::RetainedArtifactRefDTO& artifact) {
+        return artifact.artifact_role_id.value() == "urdf";
+      });
+  ASSERT_NE(expected_urdf, product.artifact_refs.end());
+  EXPECT_EQ(first->artifact_ref(), *expected_urdf);
+  EXPECT_EQ(first->bytes().size(), expected_urdf->byte_size);
+  EXPECT_EQ(sha256_digest(first->bytes()),
+            expected_urdf->content_digest.value());
+  EXPECT_NE(first->bytes().find("<robot"), std::string_view::npos);
+
+  const FilesystemVerifiedRetainedProductArtifactSource reopened(
+      root.path());
+  const auto second = reopened.get_verified(urdf_query);
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(second->query(), first->query());
+  EXPECT_EQ(second->product_contract_id(),
+            first->product_contract_id());
+  EXPECT_EQ(second->product_contract_revision(),
+            first->product_contract_revision());
+  EXPECT_EQ(second->artifact_ref(), first->artifact_ref());
+  EXPECT_EQ(second->bytes(), first->bytes());
+}
+
+TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
+     CorruptOrSubstitutedSemanticBundleFailsClosed) {
+  {
+    ScopedTrustedRoot root;
+    const auto bundle = materialize_durable_bundle(
+        root.path(), "durable_product_corrupt_bundle");
+    const auto& product =
+        bundle->value().compiled_products.planning_collision_model;
+    const RetainedProductArtifactQuery query{
+        bundle->retained_bundle_id(), product.product_id,
+        product.product_kind, product.artifact_refs.front().artifact_role_id};
+    const FilesystemVerifiedRetainedProductArtifactSource source(
+        root.path());
+
+    std::string corrupted(bundle->canonical_bytes());
+    ASSERT_FALSE(corrupted.empty());
+    corrupted[corrupted.size() / 2U] =
+        corrupted[corrupted.size() / 2U] == 'x' ? 'y' : 'x';
+    write_file(
+        bundle_path(root.path(), bundle->retained_bundle_id()),
+        corrupted);
+    EXPECT_THROW(
+        static_cast<void>(source.get_verified(query)),
+        RetainedBundleError);
+  }
+
+  {
+    ScopedTrustedRoot root;
+    const auto bundle = materialize_durable_bundle(
+        root.path(), "durable_product_substituted_bundle");
+    const auto substitute =
+        make_sealed_bundle("durable_product_substitute");
+    const auto& product =
+        bundle->value().compiled_products.planning_collision_model;
+    const RetainedProductArtifactQuery query{
+        bundle->retained_bundle_id(), product.product_id,
+        product.product_kind, product.artifact_refs.front().artifact_role_id};
+    const FilesystemVerifiedRetainedProductArtifactSource source(
+        root.path());
+
+    write_file(
+        bundle_path(root.path(), bundle->retained_bundle_id()),
+        substitute->canonical_bytes());
+    EXPECT_THROW(
+        static_cast<void>(source.get_verified(query)),
+        RetainedBundleError);
+  }
+}
+
+TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
+     UnknownBundleProductKindOrRoleIsAbsent) {
+  ScopedTrustedRoot root;
+  const auto bundle = materialize_durable_bundle(
+      root.path(), "durable_product_unknown_tuple");
+  const auto& product =
+      bundle->value().compiled_products.planning_collision_model;
+  const FilesystemVerifiedRetainedProductArtifactSource source(
+      root.path());
+  RetainedProductArtifactQuery query{
+      bundle->retained_bundle_id(), product.product_id,
+      product.product_kind, core::ArtifactRoleId("urdf")};
+
+  query.retained_bundle_id =
+      core::RetainedBundleId(std::string(kZeroDigest));
+  EXPECT_FALSE(source.get_verified(query).has_value());
+  query.retained_bundle_id = bundle->retained_bundle_id();
+
+  query.product_id = core::ProductId("unknown_product");
+  EXPECT_FALSE(source.get_verified(query).has_value());
+  query.product_id = product.product_id;
+
+  query.product_kind = core::RetainedProductKind::kViewerModel;
+  EXPECT_FALSE(source.get_verified(query).has_value());
+  query.product_kind = product.product_kind;
+
+  query.artifact_role_id = core::ArtifactRoleId("unknown_role");
+  EXPECT_FALSE(source.get_verified(query).has_value());
+}
+
+TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
+     MissingOrCorruptSelectedBytesFailClosed) {
+  {
+    ScopedTrustedRoot root;
+    const auto bundle = materialize_durable_bundle(
+        root.path(), "durable_product_missing_bytes");
+    const auto& product =
+        bundle->value().compiled_products.planning_collision_model;
+    const auto& artifact = product.artifact_refs.front();
+    const RetainedProductArtifactQuery query{
+        bundle->retained_bundle_id(), product.product_id,
+        product.product_kind, artifact.artifact_role_id};
+    const FilesystemVerifiedRetainedProductArtifactSource source(
+        root.path());
+    ASSERT_TRUE(
+        std::filesystem::remove(raw_path(root.path(), artifact)));
+    EXPECT_THROW(
+        static_cast<void>(source.get_verified(query)),
+        RetainedBundleError);
+  }
+
+  {
+    ScopedTrustedRoot root;
+    const auto bundle = materialize_durable_bundle(
+        root.path(), "durable_product_corrupt_bytes");
+    const auto& product =
+        bundle->value().compiled_products.planning_collision_model;
+    const auto& artifact = product.artifact_refs.back();
+    const RetainedProductArtifactQuery query{
+        bundle->retained_bundle_id(), product.product_id,
+        product.product_kind, artifact.artifact_role_id};
+    const FilesystemVerifiedRetainedProductArtifactSource source(
+        root.path());
+    write_file(raw_path(root.path(), artifact), "corrupt");
+    EXPECT_THROW(
+        static_cast<void>(source.get_verified(query)),
         RetainedBundleError);
   }
 }

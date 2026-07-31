@@ -276,6 +276,88 @@ private:
 [[nodiscard]] bool
 verify_retained_bundle_identity(const RetainedBundle &bundle);
 
+/// Exact immutable coordinates for one retained product artifact.
+///
+/// The query carries no path, alias, candidate, or active-selection input.
+/// Every field must match the selected semantic envelope before any raw bytes
+/// are returned.
+struct RetainedProductArtifactQuery final {
+  core::RetainedBundleId retained_bundle_id;
+  core::ProductId product_id;
+  core::RetainedProductKind product_kind;
+  core::ArtifactRoleId artifact_role_id;
+
+  friend bool operator==(const RetainedProductArtifactQuery &,
+                         const RetainedProductArtifactQuery &) = default;
+};
+
+/// Sealed result of one exact semantic-product and raw-artifact verification.
+///
+/// The returned metadata is copied from the independently reconstructed
+/// retained bundle and its exact artifact reference. `bytes()` are read from
+/// the immutable raw CAS and independently checked against that reference.
+class VerifiedRetainedProductArtifact final {
+public:
+  VerifiedRetainedProductArtifact(
+      const VerifiedRetainedProductArtifact &) = default;
+  VerifiedRetainedProductArtifact &
+  operator=(const VerifiedRetainedProductArtifact &) = default;
+  VerifiedRetainedProductArtifact(
+      VerifiedRetainedProductArtifact &&) noexcept = default;
+  VerifiedRetainedProductArtifact &
+  operator=(VerifiedRetainedProductArtifact &&) noexcept = default;
+  ~VerifiedRetainedProductArtifact() = default;
+
+  [[nodiscard]] const RetainedProductArtifactQuery &query() const noexcept {
+    return query_;
+  }
+  [[nodiscard]] const core::ProductContractId &
+  product_contract_id() const noexcept {
+    return product_contract_id_;
+  }
+  [[nodiscard]] const core::ProductContractRevision &
+  product_contract_revision() const noexcept {
+    return product_contract_revision_;
+  }
+  [[nodiscard]] const core::RetainedArtifactRefDTO &
+  artifact_ref() const noexcept {
+    return artifact_ref_;
+  }
+  [[nodiscard]] std::string_view bytes() const noexcept { return bytes_; }
+
+private:
+  VerifiedRetainedProductArtifact(
+      RetainedProductArtifactQuery query,
+      core::ProductContractId product_contract_id,
+      core::ProductContractRevision product_contract_revision,
+      core::RetainedArtifactRefDTO artifact_ref, std::string bytes)
+      : query_(std::move(query)),
+        product_contract_id_(std::move(product_contract_id)),
+        product_contract_revision_(std::move(product_contract_revision)),
+        artifact_ref_(std::move(artifact_ref)),
+        bytes_(std::move(bytes)) {}
+
+  RetainedProductArtifactQuery query_;
+  core::ProductContractId product_contract_id_;
+  core::ProductContractRevision product_contract_revision_;
+  core::RetainedArtifactRefDTO artifact_ref_;
+  std::string bytes_;
+
+  friend class FilesystemVerifiedRetainedProductArtifactSource;
+};
+
+/// Exact verified retained-product artifact point-read capability.
+///
+/// Unknown bundle/product/kind/role tuples return no value. A present
+/// semantic or raw value that cannot be verified fails closed.
+class IVerifiedRetainedProductArtifactSource {
+public:
+  virtual ~IVerifiedRetainedProductArtifactSource() = default;
+
+  [[nodiscard]] virtual std::optional<VerifiedRetainedProductArtifact>
+  get_verified(const RetainedProductArtifactQuery &query) const = 0;
+};
+
 /// Narrow lower-level verified-bundle lookup capability.
 ///
 /// The returned value is sealed and was independently reconstructed from the
@@ -385,6 +467,36 @@ public:
   [[nodiscard]] std::shared_ptr<const RetainedBundle>
   get_verified(
       const core::RetainedBundleId &retained_bundle_id) const override;
+
+private:
+  std::filesystem::path trusted_package_root_;
+};
+
+/// Filesystem-backed exact retained-product artifact point reader.
+///
+/// Construction validates the fixed package directories without creating or
+/// enumerating them. Each call point-reads one strong bundle identity, matches
+/// one exact product/kind/role tuple in its verified semantic envelope, and
+/// returns only the independently verified selected bytes. It has no path,
+/// listing, alias, candidate, Apply, or mutation surface.
+class FilesystemVerifiedRetainedProductArtifactSource final
+    : public IVerifiedRetainedProductArtifactSource {
+public:
+  explicit FilesystemVerifiedRetainedProductArtifactSource(
+      std::filesystem::path trusted_package_root);
+  ~FilesystemVerifiedRetainedProductArtifactSource() override = default;
+
+  FilesystemVerifiedRetainedProductArtifactSource(
+      const FilesystemVerifiedRetainedProductArtifactSource &) = delete;
+  FilesystemVerifiedRetainedProductArtifactSource &
+  operator=(const FilesystemVerifiedRetainedProductArtifactSource &) = delete;
+  FilesystemVerifiedRetainedProductArtifactSource(
+      FilesystemVerifiedRetainedProductArtifactSource &&) = delete;
+  FilesystemVerifiedRetainedProductArtifactSource &
+  operator=(FilesystemVerifiedRetainedProductArtifactSource &&) = delete;
+
+  [[nodiscard]] std::optional<VerifiedRetainedProductArtifact>
+  get_verified(const RetainedProductArtifactQuery &query) const override;
 
 private:
   std::filesystem::path trusted_package_root_;

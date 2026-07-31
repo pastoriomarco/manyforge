@@ -118,9 +118,9 @@ constexpr std::string_view kExpectedNodeEnvironmentDigest =
 constexpr std::string_view kExpectedCompilerContractDigest =
     "sha256:5af892e007d2f839aa9ce3f7a77a73feaf41e397c8f085f1f86afbed88e5e6d2";
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:ab166acf5892c8c986f0d313124e91f492a0b61b34a0e1cadb444cca92f9ce08";
+    "sha256:dd8a613ebcdd63ccd901643d26ce3135ddf76d90c16fe902b146f31e6c2f600e";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:157711426011fa81ab40c2458222fc30d3823ea000c81e77c2ba2968292a8a9f";
+    "sha256:973ebedf8b5d736f59e1e506d4a43a0960a07f217655929d66fce7444b188572";
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);
 static_assert(!std::is_aggregate_v<BuildQualifiedManifest>);

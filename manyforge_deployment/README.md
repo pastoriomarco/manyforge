@@ -84,9 +84,19 @@ Current limits are explicit:
   A visible invalid marker is never repaired, unrelated repository entries are
   ignored, and missing, substituted, malformed, stale, or identity-incoherent
   owned entries fail closed;
+- retained product consumers can point-read only one exact
+  `(RetainedBundleId, ProductId, RetainedProductKind, ArtifactRoleId)` tuple.
+  A successful sealed result echoes the immutable product-contract and
+  artifact-reference metadata and carries independently verified raw bytes;
+  unknown tuples are absent and present corruption fails closed. The
+  canonical-empty URDF/SRDF pair is qualified through a real RoboPlan
+  planning/collision `Scene`, including the semantic cell frame, zero
+  coordinates, zero geometry/pairs, collision-query behavior, and
+  deterministic reopen;
 - this does not complete I3 or the complete C1 exit: no build-owned public
   runtime selection or active alias exists, and remaining products, consumer
-  equivalence, and runtime-shadow behavior remain later I3 work; and
+  equivalence outside canonical-empty planning/collision, and runtime-shadow
+  behavior remain later I3 work; and
 - Apply, active publication, process ownership, runtime convergence,
   simulation, controllers, execution, and lane restoration belong to later
   packages and plan checkpoints.

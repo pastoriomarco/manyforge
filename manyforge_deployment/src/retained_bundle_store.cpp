@@ -502,7 +502,7 @@ read_verified_bundle_entry(
   return bundle;
 }
 
-void require_verified_raw_reference(
+[[nodiscard]] std::string read_verified_raw_reference(
     const std::filesystem::path& raw_data,
     const core::ContentAddressedStoreKey& key,
     const core::ContentDigest& digest,
@@ -513,7 +513,7 @@ void require_verified_raw_reference(
     fail(std::string(reference_label) +
          " has an inconsistent digest-derived raw-CAS key");
   }
-  const auto bytes = posix::read_exact_regular_file(
+  auto bytes = posix::read_exact_regular_file(
       raw_data / (std::string(*hex) + ".blob"),
       kMaxDurableRetainedBlobBytes, true, kPosixErrors,
       kReadMessages);
@@ -527,16 +527,17 @@ void require_verified_raw_reference(
     fail(std::string(reference_label) +
          " failed exact durable raw-artifact verification");
   }
+  return std::move(*bytes);
 }
 
 void require_verified_product_artifacts(
     const std::filesystem::path& raw_data,
     const core::RetainedProductDTO& product) {
   for (const auto& artifact : product.artifact_refs) {
-    require_verified_raw_reference(
+    static_cast<void>(read_verified_raw_reference(
         raw_data, artifact.content_addressed_store_key,
         artifact.content_digest, artifact.byte_size,
-        "retained product artifact reference");
+        "retained product artifact reference"));
   }
 }
 
@@ -546,18 +547,18 @@ void require_verified_bundle_references(
   for (const auto& record : value.catalogs.records) {
     std::visit(
         [&raw_data](const auto& typed_record) {
-          require_verified_raw_reference(
+          static_cast<void>(read_verified_raw_reference(
               raw_data, typed_record.content_addressed_store_key,
               typed_record.content_digest, std::nullopt,
-              "retained catalog-record reference");
+              "retained catalog-record reference"));
         },
         record);
   }
   for (const auto& schema : value.catalogs.schema_artifacts) {
-    require_verified_raw_reference(
+    static_cast<void>(read_verified_raw_reference(
         raw_data, schema.content_addressed_store_key,
         schema.content_digest, std::nullopt,
-        "retained schema-artifact reference");
+        "retained schema-artifact reference"));
   }
 
   const auto& products = value.compiled_products;
@@ -580,6 +581,44 @@ void require_verified_bundle_references(
       require_verified_product_artifacts(raw_data, product);
     }
   }
+}
+
+[[nodiscard]] const core::RetainedProductDTO*
+find_exact_product(const core::RetainedBundleDTO& bundle,
+                   const RetainedProductArtifactQuery& query) {
+  const core::RetainedProductDTO* match = nullptr;
+  const auto consider =
+      [&query, &match](const core::RetainedProductDTO& candidate) {
+        if (candidate.product_id != query.product_id ||
+            candidate.product_kind != query.product_kind) {
+          return;
+        }
+        if (match != nullptr) {
+          fail("verified retained bundle contains duplicate exact product "
+               "coordinates");
+        }
+        match = &candidate;
+      };
+
+  const auto& products = bundle.compiled_products;
+  consider(products.planning_collision_model);
+  if (products.viewer_model.has_value()) {
+    consider(*products.viewer_model);
+  }
+  for (const auto& group : products.control_domain_products) {
+    for (const auto& product : group.products) {
+      consider(product);
+    }
+  }
+  for (const auto& product : products.symbol_role_maps) {
+    consider(product);
+  }
+  for (const auto& group : products.runtime_unit_products) {
+    for (const auto& product : group.products) {
+      consider(product);
+    }
+  }
+  return match;
 }
 
 }  // namespace
@@ -755,6 +794,56 @@ FilesystemVerifiedRetainedBundleSource::get_verified(
   }
   require_verified_bundle_references(paths.raw_data, *bundle);
   return bundle;
+}
+
+FilesystemVerifiedRetainedProductArtifactSource::
+    FilesystemVerifiedRetainedProductArtifactSource(
+        std::filesystem::path trusted_package_root)
+    : trusted_package_root_(posix::normalize_existing_plain_root(
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
+  (void)require_read_only_retention_paths(trusted_package_root_);
+}
+
+std::optional<VerifiedRetainedProductArtifact>
+FilesystemVerifiedRetainedProductArtifactSource::get_verified(
+    const RetainedProductArtifactQuery& query) const {
+  const std::filesystem::path current_root =
+      posix::normalize_existing_plain_root(
+          trusted_package_root_, kPosixErrors, kTrustedRootMessages);
+  if (current_root != trusted_package_root_) {
+    fail("read-only retained-product trusted root changed after "
+         "construction");
+  }
+  const ReadOnlyRetentionPaths paths =
+      require_read_only_retention_paths(current_root);
+  const auto bundle =
+      read_verified_bundle_entry(paths.bundle_data,
+                                 query.retained_bundle_id);
+  if (bundle == nullptr) {
+    return std::nullopt;
+  }
+  const core::RetainedProductDTO* product =
+      find_exact_product(bundle->value(), query);
+  if (product == nullptr) {
+    return std::nullopt;
+  }
+  const auto artifact = std::find_if(
+      product->artifact_refs.begin(), product->artifact_refs.end(),
+      [&query](const core::RetainedArtifactRefDTO& candidate) {
+        return candidate.artifact_role_id == query.artifact_role_id;
+      });
+  if (artifact == product->artifact_refs.end()) {
+    return std::nullopt;
+  }
+
+  std::string bytes = read_verified_raw_reference(
+      paths.raw_data, artifact->content_addressed_store_key,
+      artifact->content_digest, artifact->byte_size,
+      "selected retained product artifact");
+  return VerifiedRetainedProductArtifact(
+      query, product->product_contract_id,
+      product->product_contract_revision, *artifact,
+      std::move(bytes));
 }
 
 }  // namespace manyforge::deployment

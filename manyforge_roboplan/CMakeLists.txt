@@ -204,6 +204,65 @@ if(BUILD_TESTING)
       roboplan_example_models::roboplan_example_models
       GTest::gtest_main)
 
+    # I3 consumer-equivalence integration: embed the production deployment
+    # compiler without its package-local tests, generate the ordinary sealed
+    # canonical-empty package, then point-read its exact URDF/SRDF into a real
+    # RoboPlan Scene. This is test-only composition; production RoboPlan code
+    # does not acquire a deployment/compiler dependency.
+    if(NOT TARGET manyforge_deployment)
+      set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
+      cmake_policy(PUSH)
+      cmake_policy(SET CMP0077 NEW)
+      set(BUILD_TESTING OFF)
+      add_subdirectory(
+        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment"
+        "${CMAKE_CURRENT_BINARY_DIR}/manyforge_deployment")
+      cmake_policy(POP)
+      set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
+      unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
+    endif()
+    if(NOT TARGET manyforge_deployment OR
+       NOT TARGET manyforge_generate_canonical_empty_package)
+      message(FATAL_ERROR
+        "I3 retained-product consumer qualification requires the "
+        "manyforge_deployment library and canonical-empty package generator")
+    endif()
+
+    set(_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE
+      "${CMAKE_CURRENT_BINARY_DIR}/canonical_empty_product_package")
+    set(_MANYFORGE_CANONICAL_EMPTY_PRODUCT_ADMISSION
+      "${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}/canonical-empty-admission.json")
+    add_custom_command(
+      OUTPUT "${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_ADMISSION}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E rm -rf
+        "${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}"
+      COMMAND
+        "$<TARGET_FILE:manyforge_generate_canonical_empty_package>"
+        --output-root
+        "${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}"
+      DEPENDS manyforge_generate_canonical_empty_package
+      VERBATIM)
+    add_custom_target(
+      generate_canonical_empty_product_package
+      DEPENDS "${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_ADMISSION}")
+
+    add_executable(test_retained_product_consumer
+      test/test_retained_product_consumer.cpp)
+    add_dependencies(
+      test_retained_product_consumer
+      generate_canonical_empty_product_package)
+    target_compile_definitions(
+      test_retained_product_consumer PRIVATE
+      MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT="${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}")
+    target_link_libraries(test_retained_product_consumer PRIVATE
+      manyforge_deployment
+      roboplan::roboplan
+      GTest::gtest_main)
+
     # Informational perf measurement for the collision-ownership Chunk 1
     # mapper. Not a ctest case: invoked by scripts/run-collision-mapper-perf.sh
     # and reports JSON to stdout / MANYFORGE_PERF_JSON_OUT. Phase 1 is
@@ -278,6 +337,12 @@ if(BUILD_TESTING)
       DISCOVERY_EXTRA_ARGS --gtest_filter=*)
 
     gtest_discover_tests(test_roboplan_scene_generation
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+
+    gtest_discover_tests(test_retained_product_consumer
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
