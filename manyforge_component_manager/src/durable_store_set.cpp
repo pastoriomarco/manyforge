@@ -15,8 +15,29 @@
 #include <system_error>
 #include <utility>
 
+#include <manyforge_deployment/canonical_empty_admission.hpp>
+
 namespace manyforge::component_manager {
 namespace {
+
+core::CellId CellIdFromAdmission(
+    const deployment::CanonicalEmptyRetainedBundleAdmission& admission) {
+  const auto& bundle = admission.retained_bundle();
+  const auto& value = bundle.value();
+  if (!deployment::verify_retained_bundle_identity(bundle) ||
+      admission.cell_id().empty() ||
+      admission.retained_bundle_id().empty() ||
+      admission.graph_revision().empty() ||
+      bundle.retained_bundle_id() != admission.retained_bundle_id() ||
+      value.retained_bundle_id != admission.retained_bundle_id() ||
+      value.cell_graph.cell_id != admission.cell_id() ||
+      value.cell_graph.graph_revision != admission.graph_revision()) {
+    throw std::invalid_argument(
+        "manager durable stores require one internally consistent "
+        "canonical-empty admission");
+  }
+  return admission.cell_id();
+}
 
 std::filesystem::path ValidateStableStateDirectory(
     std::filesystem::path directory) {
@@ -268,9 +289,10 @@ class ExternallyProvisionedManagerStores::Impl final {
 
 ExternallyProvisionedManagerStores::ExternallyProvisionedManagerStores(
     std::filesystem::path stable_state_directory,
-    core::CellId cell_id)
+    const deployment::CanonicalEmptyRetainedBundleAdmission& admission)
     : impl_(std::make_unique<Impl>(
-          std::move(stable_state_directory), std::move(cell_id))) {}
+          std::move(stable_state_directory),
+          CellIdFromAdmission(admission))) {}
 
 ExternallyProvisionedManagerStores::~ExternallyProvisionedManagerStores() =
     default;

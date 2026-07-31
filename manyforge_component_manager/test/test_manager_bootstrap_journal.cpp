@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include <manyforge_deployment/canonical_empty_admission.hpp>
+
 namespace manyforge::component_manager {
 namespace {
 
@@ -25,6 +27,13 @@ constexpr std::string_view kSceneDigest =
     "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 constexpr std::string_view kOtherSceneDigest =
     "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+
+deployment::CanonicalEmptyRetainedBundleAdmission
+LoadCanonicalEmptyAdmission() {
+  const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
+      MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  return source.load_verified();
+}
 
 class TemporaryDirectory final {
  public:
@@ -666,9 +675,10 @@ TEST(
     ExternallyProvisionedManagerStores,
     OpensSameCellStoresAndDoesNotPublishOrCreateBootstrapIntent) {
   TemporaryDirectory directory;
+  const auto admission = LoadCanonicalEmptyAdmission();
   {
     ExternallyProvisionedManagerStores stores(
-        directory.path(), core::CellId("cell-a"));
+        directory.path(), admission);
     const auto inventory = stores.StartupInventory();
     EXPECT_EQ(
         inventory.bootstrap_journal.phase,
@@ -684,10 +694,11 @@ TEST(
         stores.active_bundle_publication_store()
             .database_path().filename(),
         kActiveBundlePublicationStoreFilename);
+    EXPECT_EQ(stores.cell_id(), admission.cell_id());
   }
 
   ExternallyProvisionedManagerStores reopened(
-      directory.path(), core::CellId("cell-a"));
+      directory.path(), admission);
   const auto inventory = reopened.StartupInventory();
   EXPECT_EQ(
       inventory.bootstrap_journal.bootstrap_attempt_count,
@@ -699,9 +710,11 @@ TEST(
     ExternallyProvisionedManagerStores,
     RejectsMissingSymlinkOrConflictingCellDirectoryState) {
   TemporaryDirectory directory;
+  const auto admission = LoadCanonicalEmptyAdmission();
+  const auto foreign_cell = core::CellId("foreign-cell");
   EXPECT_THROW(
       ExternallyProvisionedManagerStores(
-          directory.path() / "missing", core::CellId("cell-a")),
+          directory.path() / "missing", admission),
       std::invalid_argument);
 
   const auto actual = directory.path() / "actual";
@@ -710,16 +723,20 @@ TEST(
   std::filesystem::create_directory_symlink(actual, alias);
   EXPECT_THROW(
       ExternallyProvisionedManagerStores(
-          alias, core::CellId("cell-a")),
+          alias, admission),
       std::invalid_argument);
 
   {
-    ExternallyProvisionedManagerStores stores(
-        actual, core::CellId("cell-a"));
+    SqliteManagerBootstrapJournal journal(
+        actual / std::string(kManagerBootstrapJournalFilename),
+        foreign_cell);
+    SqliteActiveBundlePublicationStore publication(
+        actual / std::string(kActiveBundlePublicationStoreFilename),
+        foreign_cell);
   }
   EXPECT_THROW(
       ExternallyProvisionedManagerStores(
-          actual, core::CellId("cell-b")),
+          actual, admission),
       ManagerBootstrapJournalConflictError);
 
   const auto publication_only = directory.path() / "publication-only";
@@ -728,11 +745,11 @@ TEST(
     SqliteActiveBundlePublicationStore publication(
         publication_only /
             std::string(kActiveBundlePublicationStoreFilename),
-        core::CellId("cell-a"));
+        foreign_cell);
   }
   EXPECT_THROW(
       ExternallyProvisionedManagerStores(
-          publication_only, core::CellId("cell-b")),
+          publication_only, admission),
       ActiveBundlePublicationConflictError);
   EXPECT_FALSE(std::filesystem::exists(
       publication_only /
@@ -743,15 +760,65 @@ TEST(
   {
     SqliteManagerBootstrapJournal journal(
         journal_only / std::string(kManagerBootstrapJournalFilename),
-        core::CellId("cell-a"));
+        foreign_cell);
   }
   EXPECT_THROW(
       ExternallyProvisionedManagerStores(
-          journal_only, core::CellId("cell-b")),
+          journal_only, admission),
       ManagerBootstrapJournalConflictError);
   EXPECT_FALSE(std::filesystem::exists(
       journal_only /
       std::string(kActiveBundlePublicationStoreFilename)));
+
+  const auto foreign_empty_journal_peer =
+      directory.path() / "foreign-empty-journal-peer";
+  std::filesystem::create_directory(foreign_empty_journal_peer);
+  {
+    SqliteActiveBundlePublicationStore publication(
+        foreign_empty_journal_peer /
+            std::string(kActiveBundlePublicationStoreFilename),
+        foreign_cell);
+  }
+  {
+    std::ofstream empty(
+        foreign_empty_journal_peer /
+        std::string(kManagerBootstrapJournalFilename));
+    ASSERT_TRUE(empty);
+  }
+  EXPECT_THROW(
+      ExternallyProvisionedManagerStores(
+          foreign_empty_journal_peer, admission),
+      ActiveBundlePublicationConflictError);
+  EXPECT_EQ(
+      std::filesystem::file_size(
+          foreign_empty_journal_peer /
+          std::string(kManagerBootstrapJournalFilename)),
+      0U);
+
+  const auto foreign_empty_publication_peer =
+      directory.path() / "foreign-empty-publication-peer";
+  std::filesystem::create_directory(foreign_empty_publication_peer);
+  {
+    SqliteManagerBootstrapJournal journal(
+        foreign_empty_publication_peer /
+            std::string(kManagerBootstrapJournalFilename),
+        foreign_cell);
+  }
+  {
+    std::ofstream empty(
+        foreign_empty_publication_peer /
+        std::string(kActiveBundlePublicationStoreFilename));
+    ASSERT_TRUE(empty);
+  }
+  EXPECT_THROW(
+      ExternallyProvisionedManagerStores(
+          foreign_empty_publication_peer, admission),
+      ManagerBootstrapJournalConflictError);
+  EXPECT_EQ(
+      std::filesystem::file_size(
+          foreign_empty_publication_peer /
+          std::string(kActiveBundlePublicationStoreFilename)),
+      0U);
 
   const auto empty_journal_peer =
       directory.path() / "empty-journal-peer";
@@ -760,7 +827,7 @@ TEST(
     SqliteActiveBundlePublicationStore publication(
         empty_journal_peer /
             std::string(kActiveBundlePublicationStoreFilename),
-        core::CellId("cell-a"));
+        admission.cell_id());
   }
   {
     std::ofstream empty(
@@ -768,18 +835,9 @@ TEST(
         std::string(kManagerBootstrapJournalFilename));
     ASSERT_TRUE(empty);
   }
-  EXPECT_THROW(
-      ExternallyProvisionedManagerStores(
-          empty_journal_peer, core::CellId("cell-b")),
-      ActiveBundlePublicationConflictError);
-  EXPECT_EQ(
-      std::filesystem::file_size(
-          empty_journal_peer /
-          std::string(kManagerBootstrapJournalFilename)),
-      0U);
   EXPECT_NO_THROW(
       ExternallyProvisionedManagerStores(
-          empty_journal_peer, core::CellId("cell-a")));
+          empty_journal_peer, admission));
 
   const auto empty_publication_peer =
       directory.path() / "empty-publication-peer";
@@ -788,7 +846,7 @@ TEST(
     SqliteManagerBootstrapJournal journal(
         empty_publication_peer /
             std::string(kManagerBootstrapJournalFilename),
-        core::CellId("cell-a"));
+        admission.cell_id());
   }
   {
     std::ofstream empty(
@@ -796,18 +854,9 @@ TEST(
         std::string(kActiveBundlePublicationStoreFilename));
     ASSERT_TRUE(empty);
   }
-  EXPECT_THROW(
-      ExternallyProvisionedManagerStores(
-          empty_publication_peer, core::CellId("cell-b")),
-      ManagerBootstrapJournalConflictError);
-  EXPECT_EQ(
-      std::filesystem::file_size(
-          empty_publication_peer /
-          std::string(kActiveBundlePublicationStoreFilename)),
-      0U);
   EXPECT_NO_THROW(
       ExternallyProvisionedManagerStores(
-          empty_publication_peer, core::CellId("cell-a")));
+          empty_publication_peer, admission));
 }
 
 }  // namespace

@@ -39,6 +39,10 @@ class IManagerSceneProjectionBootstrapPort {
  public:
   virtual ~IManagerSceneProjectionBootstrapPort() = default;
 
+  [[nodiscard]] virtual ProjectionBootstrapPrerequisiteStatusDTO
+  ObserveProjectionBootstrapPrerequisites(
+      const ProjectionBootstrapPrerequisiteQueryDTO& query) const = 0;
+
   [[nodiscard]] virtual ProjectionBootstrapAcceptedDTO
   BeginProjectionBootstrap(const ProjectionBootstrapIntentDTO& intent) = 0;
 

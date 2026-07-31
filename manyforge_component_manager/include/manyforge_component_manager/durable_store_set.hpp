@@ -7,6 +7,10 @@
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/manager_bootstrap_journal.hpp>
 
+namespace manyforge::deployment {
+class CanonicalEmptyRetainedBundleAdmission;
+}
+
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerBootstrapJournalFilename =
@@ -22,15 +26,18 @@ struct ManagerDurableStoreStartupInventory final {
 /// External composition-root owner for the two independently durable stores.
 ///
 /// The supplied directory must already exist and be owned by deployment
-/// bootstrap. This object opens both stores with one exact CellId and fsyncs
-/// the directory after successful initialization. It does not make the two
-/// SQLite databases one transaction, infer cross-store recovery, start the
-/// Manager process, or invoke any Manager state-machine operation.
+/// bootstrap. The cell identity is derived only from a sealed, verified
+/// canonical-empty admission; callers cannot inject a parallel CellId. This
+/// object opens both stores with that exact identity and fsyncs the directory
+/// after successful initialization. It does not make the two SQLite databases
+/// one transaction, infer cross-store recovery, start the Manager process, or
+/// invoke any Manager state-machine operation.
 class ExternallyProvisionedManagerStores final {
  public:
   ExternallyProvisionedManagerStores(
       std::filesystem::path stable_state_directory,
-      manyforge::core::CellId cell_id);
+      const manyforge::deployment::
+          CanonicalEmptyRetainedBundleAdmission& admission);
   ~ExternallyProvisionedManagerStores();
 
   ExternallyProvisionedManagerStores(

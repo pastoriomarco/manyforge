@@ -1,19 +1,24 @@
 # ManyForge Component Manager C++ foundation
 
 This ROS-free C++ package is the selected semantic-owner foundation for the
-Composable Cell Component Manager. It currently owns three bounded mechanisms:
+Composable Cell Component Manager. It currently owns four bounded mechanisms:
 
 - receiver-local runtime-unit observation and convergence reduction;
 - a typed durable journal for one canonical-empty bootstrap intent and its
   scene-owner-accepted target; and
-- the separate durable `IActiveBundlePublicationStore` public-pointer owner.
+- the separate durable `IActiveBundlePublicationStore` public-pointer owner;
+  and
+- the canonical-empty prerequisite/Begin coordinator that consumes the sealed
+  I3 admission and stops after durably recording the scene-owner-accepted
+  target.
 
 The adjacent ROS-free contracts in `manyforge_core` additionally define the
 bounded owner-to-owner substrate that this package will consume:
 
 - strongly separated Apply, bootstrap, stage, publication, runtime-epoch, and
   configuration-fence identities/generations;
-- focused Manager-to-scene-owner Apply and canonical-empty bootstrap ports;
+- focused Manager-to-scene-owner Apply and canonical-empty bootstrap ports,
+  including the read-only pre-Begin prerequisite observation;
 - separate active-bundle publish and read-only receipt-verification
   capabilities; and
 - an Apply-only Kernel fence acquire/rehydrate capability that exposes neither
@@ -45,15 +50,18 @@ or newer and `SQLITE_OPEN_NOFOLLOW` are mandatory.
 
 `ExternallyProvisionedManagerStores` is the composition-root startup helper.
 It requires a trusted, existing, non-symlink stable-state directory; opens the
-bootstrap journal and publication store at fixed filenames with one exact
-`CellId`; verifies both stores; and `fsync`s the directory before exposing
-them. It neither makes the two databases one transaction nor infers
-cross-store recovery. Deployment bootstrap remains responsible for directory
-ownership and permissions. When exactly one store already exists, startup
-uses a cell-neutral directory lock and read-only SQLite classification to
-validate an initialized peer before creating or initializing the missing or
-schema-empty store. A foreign-cell startup attempt therefore cannot poison the
-directory with a mismatched database.
+bootstrap journal and publication store at fixed filenames with the exact
+`CellId` derived from a sealed
+`CanonicalEmptyRetainedBundleAdmission`; verifies both stores; and `fsync`s
+the directory before exposing them. There is no caller-supplied parallel cell
+identity. It neither makes the two databases one transaction nor infers
+cross-store recovery. Deployment bootstrap remains responsible for loading
+the admission first and for directory ownership and permissions. When exactly
+one store already exists, startup uses a cell-neutral directory lock and
+read-only SQLite classification to validate an initialized peer before
+creating or initializing the missing or schema-empty store. A foreign-cell
+startup attempt therefore cannot poison the directory with a mismatched
+database.
 
 The bootstrap journal retains one bounded append-only generation sequence
 under the first durable `BootstrapId`. Its latest attempt has exactly three
@@ -94,18 +102,30 @@ SQLite/POSIX filesystem contract. The digests are accidental-corruption and
 replay-consistency checks, not tamper evidence against a writer that can
 rewrite the databases and recompute them.
 
+`CanonicalEmptyBootstrapCoordinator::BeginOrRecover` is the first operational
+I4 ordering slice. It verifies that the sealed admission, both durable stores,
+and the empty publication head identify the same cell; observes the scene
+owner’s exact command-fenced prerequisites; mints at least 128 bits of random
+bootstrap identity; and persists the exact empty-binding intent before any
+effectful external call or Begin. It then reconciles scene-owner status,
+repeats the prerequisite observation immediately before no-native-effect
+Begin, and records the exact accepted target durably. Crash replay and
+concurrent coordinators reuse the single durable winner. An exact
+accepted-or-later status may confirm an already durable target, while absence,
+mismatch, conflicting later state before durable acceptance, or projection
+uncertainty fails closed.
+
 ## Deliberate non-claims
 
 These checkpoints have no ROS types or callbacks and perform no process,
-scene, Kernel, controller, robot, command, lifecycle, or motion effect. Opaque
-bundle and graph identities in the journal do not prove that an I3 artifact
-exists, was loaded, or matches the canonical-empty golden. The journal does
-not choose or mint a bootstrap identity/generation for its caller, call
-`BeginProjectionBootstrap`, retain the scene owner's logical-scene value,
-invoke native rebuild/status, publish a receipt, or open scene writes and
-leases. It only enforces and exposes the durable high-water mark so the later
-coordinator can recover it before minting the next generation. Those ordered
-coordinator steps remain later I4 work.
+native-projection, Kernel, controller, robot, lifecycle, or motion effect.
+The lower-level journal still treats bundle and graph identities as opaque;
+only the external store composition root and coordinator require the sealed,
+verified I3 admission. The coordinator now mints the first bootstrap identity,
+uses read-only status, and calls strictly no-native-effect
+`BeginProjectionBootstrap`, but it does not retain the scene owner's logical
+scene value, invoke Rebuild or Finalize, publish a receipt, or open scene
+writes and leases.
 
 The focused publication store implements only publication persistence and
 current-head reread. It does not implement a scene owner, Apply coordinator,

@@ -117,6 +117,10 @@ static_assert(std::is_same_v<
 using BeginBootstrapSignature = ProjectionBootstrapAcceptedDTO (
     IManagerSceneProjectionBootstrapPort::*)(
     const ProjectionBootstrapIntentDTO&);
+using ObserveBootstrapPrerequisitesSignature =
+    ProjectionBootstrapPrerequisiteStatusDTO (
+        IManagerSceneProjectionBootstrapPort::*)(
+        const ProjectionBootstrapPrerequisiteQueryDTO&) const;
 using RebuildBootstrapSignature = ProjectionBootstrapRebuildResultDTO (
     IManagerSceneProjectionBootstrapPort::*)(
     const ProjectionBootstrapRebuildRequestDTO&);
@@ -126,6 +130,10 @@ using BootstrapStatusSignature = ProjectionBootstrapStatusDTO (
 using FinalizeBootstrapSignature = ProjectionBootstrapFinalizeResultDTO (
     IManagerSceneProjectionBootstrapPort::*)(
     const ProjectionBootstrapFinalizeDTO&);
+static_assert(std::is_same_v<
+              decltype(&IManagerSceneProjectionBootstrapPort::
+                           ObserveProjectionBootstrapPrerequisites),
+              ObserveBootstrapPrerequisitesSignature>);
 static_assert(std::is_same_v<
               decltype(&IManagerSceneProjectionBootstrapPort::
                            BeginProjectionBootstrap),
@@ -1234,6 +1242,141 @@ TEST(ComponentManagerPortContracts,
       LogicalSceneSnapshotRoot{
           std::shared_ptr<const LogicalSceneSnapshotDTO>{}},
       std::invalid_argument);
+}
+
+TEST(ComponentManagerPortContracts,
+     BootstrapPrerequisiteQueryRequiresEveryAdmissionIdentity) {
+  ProjectionBootstrapPrerequisiteQueryDTO query{
+      CellId{"cell-a"},
+      RetainedBundleId{kDigest},
+      GraphRevision{kOtherDigest},
+  };
+  EXPECT_TRUE(query.valid());
+
+  query.cell_id = CellId{""};
+  EXPECT_FALSE(query.valid());
+  query.cell_id = CellId{"cell-a"};
+  query.canonical_empty_retained_bundle_id = RetainedBundleId{""};
+  EXPECT_FALSE(query.valid());
+  query.canonical_empty_retained_bundle_id = RetainedBundleId{kDigest};
+  query.canonical_empty_graph_revision = GraphRevision{""};
+  EXPECT_FALSE(query.valid());
+}
+
+TEST(ComponentManagerPortContracts,
+     BootstrapPrerequisitePresenceExhaustsTheClosedStateCombinations) {
+  const ProjectionBootstrapPrerequisiteQueryDTO query{
+      CellId{"cell-a"},
+      RetainedBundleId{kDigest},
+      GraphRevision{kOtherDigest},
+  };
+  const ErrorDTO error{
+      "bootstrap_prerequisite_unavailable",
+      "test prerequisite failure",
+      {},
+  };
+  for (const auto state :
+       {ProjectionBootstrapPrerequisiteState::kReadyCommandFenced,
+        ProjectionBootstrapPrerequisiteState::kUnavailable,
+        ProjectionBootstrapPrerequisiteState::
+            kConflictingActiveProjection}) {
+    for (const bool scene_writes_closed : {false, true}) {
+      for (const bool projection_leases_closed : {false, true}) {
+        for (const bool has_active_projection : {false, true}) {
+          for (const bool has_error : {false, true}) {
+            SCOPED_TRACE(static_cast<int>(state));
+            SCOPED_TRACE(scene_writes_closed);
+            SCOPED_TRACE(projection_leases_closed);
+            SCOPED_TRACE(has_active_projection);
+            SCOPED_TRACE(has_error);
+            ProjectionBootstrapPrerequisiteStatusDTO status{
+                query,
+                state,
+                scene_writes_closed,
+                projection_leases_closed,
+                has_active_projection
+                    ? std::optional<ProjectionRevisionDTO>{Projection()}
+                    : std::nullopt,
+                has_error ? std::optional<ErrorDTO>{error} : std::nullopt,
+            };
+
+            bool expected = false;
+            switch (state) {
+              case ProjectionBootstrapPrerequisiteState::
+                  kReadyCommandFenced:
+                expected = scene_writes_closed &&
+                           projection_leases_closed &&
+                           !has_active_projection && !has_error;
+                break;
+              case ProjectionBootstrapPrerequisiteState::kUnavailable:
+                expected = !has_active_projection && has_error;
+                break;
+              case ProjectionBootstrapPrerequisiteState::
+                  kConflictingActiveProjection:
+                expected = has_active_projection && has_error;
+                break;
+            }
+            EXPECT_EQ(status.presence_valid(), expected);
+            EXPECT_EQ(status.ready_for(query),
+                      expected &&
+                          state ==
+                              ProjectionBootstrapPrerequisiteState::
+                                  kReadyCommandFenced);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(ComponentManagerPortContracts,
+     BootstrapPrerequisiteReadyForRequiresAnExactEchoAndKnownState) {
+  const ProjectionBootstrapPrerequisiteQueryDTO query{
+      CellId{"cell-a"},
+      RetainedBundleId{kDigest},
+      GraphRevision{kOtherDigest},
+  };
+  ProjectionBootstrapPrerequisiteStatusDTO status{
+      query,
+      ProjectionBootstrapPrerequisiteState::kReadyCommandFenced,
+      true,
+      true,
+      std::nullopt,
+      std::nullopt,
+  };
+  ASSERT_TRUE(status.presence_valid());
+  EXPECT_TRUE(status.ready_for(query));
+
+  auto mismatch = query;
+  mismatch.cell_id = CellId{"cell-b"};
+  EXPECT_FALSE(status.ready_for(mismatch));
+  mismatch = query;
+  mismatch.canonical_empty_retained_bundle_id =
+      RetainedBundleId{kOtherDigest};
+  EXPECT_FALSE(status.ready_for(mismatch));
+  mismatch = query;
+  mismatch.canonical_empty_graph_revision = GraphRevision{kDigest};
+  EXPECT_FALSE(status.ready_for(mismatch));
+
+  status.query.cell_id = CellId{"cell-b"};
+  ASSERT_TRUE(status.presence_valid());
+  EXPECT_FALSE(status.ready_for(query));
+  status.query = query;
+
+  status.active_projection = Projection();
+  status.state =
+      ProjectionBootstrapPrerequisiteState::kConflictingActiveProjection;
+  status.error =
+      ErrorDTO{"bootstrap_projection_conflict", "test conflict", {}};
+  ASSERT_TRUE(status.presence_valid());
+  status.active_projection->retained_bundle_id = RetainedBundleId{""};
+  EXPECT_FALSE(status.presence_valid());
+
+  status.active_projection.reset();
+  status.state =
+      static_cast<ProjectionBootstrapPrerequisiteState>(999);
+  EXPECT_FALSE(status.presence_valid());
+  EXPECT_FALSE(status.ready_for(query));
 }
 
 TEST(ComponentManagerPortContracts,

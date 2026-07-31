@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(manyforge_component_manager VERSION 0.1.0 LANGUAGES CXX)
 
+cmake_policy(SET CMP0077 NEW)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -20,6 +22,42 @@ if(NOT EXISTS
   message(FATAL_ERROR
     "manyforge_component_manager requires the manyforge_core publication "
     "port headers")
+endif()
+
+set(
+  MANYFORGE_DEPLOYMENT_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment"
+  CACHE PATH
+  "Path to the manyforge_deployment source tree")
+if(NOT TARGET manyforge_deployment)
+  if(NOT EXISTS
+     "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/include/manyforge_deployment/canonical_empty_admission.hpp")
+    message(FATAL_ERROR
+      "manyforge_component_manager requires the manyforge_deployment "
+      "canonical-empty admission target")
+  endif()
+  set(_MANYFORGE_MANAGER_BUILD_TESTING_WAS_DEFINED FALSE)
+  if(DEFINED BUILD_TESTING)
+    set(_MANYFORGE_MANAGER_BUILD_TESTING_WAS_DEFINED TRUE)
+    set(_MANYFORGE_MANAGER_BUILD_TESTING "${BUILD_TESTING}")
+  endif()
+  # Manager owns its focused tests. The embedded deployment target supplies
+  # production admission/generation code without duplicating deployment's
+  # independent test suite in this standalone CTest tree.
+  set(BUILD_TESTING OFF)
+  add_subdirectory(
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_deployment"
+    EXCLUDE_FROM_ALL)
+  if(_MANYFORGE_MANAGER_BUILD_TESTING_WAS_DEFINED)
+    set(BUILD_TESTING "${_MANYFORGE_MANAGER_BUILD_TESTING}")
+  else()
+    unset(BUILD_TESTING)
+  endif()
+endif()
+if(NOT TARGET manyforge::deployment)
+  message(FATAL_ERROR
+    "manyforge_component_manager could not resolve manyforge_deployment")
 endif()
 
 set(
@@ -74,6 +112,7 @@ configure_file(
 
 add_library(manyforge_component_manager
   src/active_bundle_publication_store.cpp
+  src/canonical_empty_bootstrap_coordinator.cpp
   src/durable_store_set.cpp
   src/manager_bootstrap_journal.cpp
   src/runtime_observation.cpp
@@ -91,6 +130,9 @@ target_link_libraries(manyforge_component_manager PRIVATE
   OpenSSL::Crypto
   SQLite::SQLite3
 )
+target_link_libraries(manyforge_component_manager PUBLIC
+  manyforge::deployment
+)
 set_target_properties(
   manyforge_component_manager PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -101,6 +143,30 @@ if(BUILD_TESTING)
   include(GoogleTest)
   set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
       "Per-test timeout for manyforge_component_manager gtest cases")
+
+  set(
+    MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/canonical-empty-test-package")
+  set(
+    MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_MARKER
+    "${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}/canonical-empty-admission.json")
+  add_custom_command(
+    OUTPUT "${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_MARKER}"
+    COMMAND
+      "${CMAKE_COMMAND}" -E remove_directory
+      "${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
+    COMMAND
+      "${CMAKE_COMMAND}" -E make_directory
+      "${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
+    COMMAND
+      "$<TARGET_FILE:manyforge_generate_canonical_empty_package>"
+      --output-root
+      "${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
+    DEPENDS manyforge_generate_canonical_empty_package
+    VERBATIM)
+  add_custom_target(
+    manyforge_manager_test_canonical_empty_package
+    DEPENDS "${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_MARKER}")
 
   add_executable(test_runtime_observation
     test/test_runtime_observation.cpp)
@@ -113,6 +179,11 @@ if(BUILD_TESTING)
 
   add_executable(test_manager_bootstrap_journal
     test/test_manager_bootstrap_journal.cpp)
+  add_dependencies(
+    test_manager_bootstrap_journal
+    manyforge_manager_test_canonical_empty_package)
+  target_compile_definitions(test_manager_bootstrap_journal PRIVATE
+    MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
   target_link_libraries(test_manager_bootstrap_journal PRIVATE
     manyforge_component_manager GTest::gtest_main SQLite::SQLite3)
   gtest_discover_tests(test_manager_bootstrap_journal
@@ -123,5 +194,19 @@ if(BUILD_TESTING)
   target_link_libraries(test_active_bundle_publication_store PRIVATE
     manyforge_component_manager GTest::gtest_main)
   gtest_discover_tests(test_active_bundle_publication_store
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_canonical_empty_bootstrap_coordinator
+    test/test_canonical_empty_bootstrap_coordinator.cpp)
+  add_dependencies(
+    test_canonical_empty_bootstrap_coordinator
+    manyforge_manager_test_canonical_empty_package)
+  target_compile_definitions(
+    test_canonical_empty_bootstrap_coordinator PRIVATE
+    MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
+  target_link_libraries(
+    test_canonical_empty_bootstrap_coordinator PRIVATE
+    manyforge_component_manager GTest::gtest_main)
+  gtest_discover_tests(test_canonical_empty_bootstrap_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 endif()

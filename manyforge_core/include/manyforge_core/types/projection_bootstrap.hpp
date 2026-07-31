@@ -62,6 +62,75 @@ class LogicalSceneSnapshotRoot final {
   std::shared_ptr<const LogicalSceneSnapshotDTO> snapshot_;
 };
 
+/// Point-in-time query for the scene-owner prerequisites that must hold before
+/// Manager may mint a canonical-empty bootstrap identity.
+///
+/// This value carries no generation, reservation, lease, or authority. Begin
+/// independently rechecks the same facts against current same-owner state.
+struct ProjectionBootstrapPrerequisiteQueryDTO final {
+  CellId cell_id;
+  RetainedBundleId canonical_empty_retained_bundle_id;
+  GraphRevision canonical_empty_graph_revision;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !cell_id.empty() &&
+           !canonical_empty_retained_bundle_id.empty() &&
+           !canonical_empty_graph_revision.empty();
+  }
+
+  friend bool operator==(
+      const ProjectionBootstrapPrerequisiteQueryDTO&,
+      const ProjectionBootstrapPrerequisiteQueryDTO&) = default;
+};
+
+enum class ProjectionBootstrapPrerequisiteState {
+  kReadyCommandFenced,
+  kUnavailable,
+  kConflictingActiveProjection,
+};
+
+/// Read-only observation of the scene-owner state required before Begin.
+///
+/// A ready observation is deliberately ephemeral: it does not reserve the
+/// owner or permit a native effect. Unavailable and conflicting observations
+/// retain only positively observed facts and a required error.
+struct ProjectionBootstrapPrerequisiteStatusDTO final {
+  ProjectionBootstrapPrerequisiteQueryDTO query;
+  ProjectionBootstrapPrerequisiteState state;
+  bool scene_writes_closed;
+  bool projection_leases_closed;
+  std::optional<ProjectionRevisionDTO> active_projection;
+  std::optional<ErrorDTO> error;
+
+  [[nodiscard]] bool presence_valid() const noexcept {
+    if (!query.valid() ||
+        (active_projection.has_value() &&
+         !active_projection->valid())) {
+      return false;
+    }
+    switch (state) {
+      case ProjectionBootstrapPrerequisiteState::kReadyCommandFenced:
+        return scene_writes_closed && projection_leases_closed &&
+               !active_projection.has_value() && !error.has_value();
+      case ProjectionBootstrapPrerequisiteState::kUnavailable:
+        return !active_projection.has_value() && error.has_value();
+      case ProjectionBootstrapPrerequisiteState::
+          kConflictingActiveProjection:
+        return active_projection.has_value() && error.has_value();
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool ready_for(
+      const ProjectionBootstrapPrerequisiteQueryDTO& expected_query)
+      const noexcept {
+    return presence_valid() &&
+           query == expected_query &&
+           state ==
+               ProjectionBootstrapPrerequisiteState::kReadyCommandFenced;
+  }
+};
+
 struct ProjectionBootstrapIntentDTO final {
   BootstrapId bootstrap_id;
   BootstrapGeneration bootstrap_generation;
