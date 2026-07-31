@@ -5,8 +5,10 @@ on:
     paths:
       - "manyforge_core/**"
       - "manyforge_deployment/**"
+      - "manyforge_component_manager/**"
       - "scripts/ci/run-core-asan.sh"
       - "scripts/ci/run-deployment-asan.sh"
+      - "scripts/ci/run-component-manager-asan.sh"
       - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
       - ".github/workflows/cpp-asan.yml"
   push:
@@ -14,8 +16,10 @@ on:
     paths:
       - "manyforge_core/**"
       - "manyforge_deployment/**"
+      - "manyforge_component_manager/**"
       - "scripts/ci/run-core-asan.sh"
       - "scripts/ci/run-deployment-asan.sh"
+      - "scripts/ci/run-component-manager-asan.sh"
       - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
       - ".github/workflows/cpp-asan.yml"
   workflow_dispatch:
@@ -35,8 +39,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake g++ libdouble-conversion-dev libgtest-dev libssl-dev \
-            libexpat1-dev libutf8proc-dev libyaml-dev pkg-config
+            libexpat1-dev libsqlite3-dev libutf8proc-dev libyaml-dev pkg-config
       - name: Run core C++ tests under AddressSanitizer
         run: bash scripts/ci/run-core-asan.sh
       - name: Run deployment C++ tests under AddressSanitizer
         run: bash scripts/ci/run-deployment-asan.sh
+      - name: Run Component Manager C++ tests under AddressSanitizer
+        run: bash scripts/ci/run-component-manager-asan.sh

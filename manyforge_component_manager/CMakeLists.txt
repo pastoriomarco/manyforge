@@ -209,4 +209,18 @@ if(BUILD_TESTING)
     manyforge_component_manager GTest::gtest_main)
   gtest_discover_tests(test_canonical_empty_bootstrap_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_canonical_empty_bootstrap_advance
+    test/test_canonical_empty_bootstrap_advance.cpp)
+  add_dependencies(
+    test_canonical_empty_bootstrap_advance
+    manyforge_manager_test_canonical_empty_package)
+  target_compile_definitions(
+    test_canonical_empty_bootstrap_advance PRIVATE
+    MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
+  target_link_libraries(
+    test_canonical_empty_bootstrap_advance PRIVATE
+    manyforge_component_manager OpenSSL::Crypto GTest::gtest_main)
+  gtest_discover_tests(test_canonical_empty_bootstrap_advance
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 endif()

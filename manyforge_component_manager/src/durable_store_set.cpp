@@ -20,11 +20,22 @@
 namespace manyforge::component_manager {
 namespace {
 
-core::CellId CellIdFromAdmission(
+struct RetainedAdmissionIdentity final {
+  core::ContentDigest admission_digest;
+  core::CellId cell_id;
+  core::RetainedBundleId retained_bundle_id;
+  core::GraphRevision graph_revision;
+};
+
+RetainedAdmissionIdentity IdentityFromAdmission(
     const deployment::CanonicalEmptyRetainedBundleAdmission& admission) {
   const auto& bundle = admission.retained_bundle();
   const auto& value = bundle.value();
-  if (!deployment::verify_retained_bundle_identity(bundle) ||
+  if (admission.api_version() !=
+          deployment::kCanonicalEmptyAdmissionApiVersion ||
+      admission.admission_digest().empty() ||
+      admission.canonical_bytes().empty() ||
+      !deployment::verify_retained_bundle_identity(bundle) ||
       admission.cell_id().empty() ||
       admission.retained_bundle_id().empty() ||
       admission.graph_revision().empty() ||
@@ -36,7 +47,12 @@ core::CellId CellIdFromAdmission(
         "manager durable stores require one internally consistent "
         "canonical-empty admission");
   }
-  return admission.cell_id();
+  return {
+      admission.admission_digest(),
+      admission.cell_id(),
+      admission.retained_bundle_id(),
+      admission.graph_revision(),
+  };
 }
 
 std::filesystem::path ValidateStableStateDirectory(
@@ -223,11 +239,18 @@ void FsyncDirectory(const std::filesystem::path& directory) {
 
 class ExternallyProvisionedManagerStores::Impl final {
  public:
-  Impl(std::filesystem::path stable_state_directory, core::CellId cell_id)
+  Impl(
+      std::filesystem::path stable_state_directory,
+      RetainedAdmissionIdentity admission_identity)
       : stable_state_directory_(
             ValidateStableStateDirectory(
                 std::move(stable_state_directory))),
-        cell_id_(std::move(cell_id)) {
+        admission_digest_(
+            std::move(admission_identity.admission_digest)),
+        cell_id_(std::move(admission_identity.cell_id)),
+        retained_bundle_id_(
+            std::move(admission_identity.retained_bundle_id)),
+        graph_revision_(std::move(admission_identity.graph_revision)) {
     StableStateDirectoryLock startup_lock(stable_state_directory_);
     const auto journal_path =
         stable_state_directory_ /
@@ -281,7 +304,10 @@ class ExternallyProvisionedManagerStores::Impl final {
   }
 
   std::filesystem::path stable_state_directory_;
+  core::ContentDigest admission_digest_;
   core::CellId cell_id_;
+  core::RetainedBundleId retained_bundle_id_;
+  core::GraphRevision graph_revision_;
   std::unique_ptr<SqliteManagerBootstrapJournal> bootstrap_journal_;
   std::unique_ptr<SqliteActiveBundlePublicationStore>
       active_bundle_publication_store_;
@@ -292,7 +318,7 @@ ExternallyProvisionedManagerStores::ExternallyProvisionedManagerStores(
     const deployment::CanonicalEmptyRetainedBundleAdmission& admission)
     : impl_(std::make_unique<Impl>(
           std::move(stable_state_directory),
-          CellIdFromAdmission(admission))) {}
+          IdentityFromAdmission(admission))) {}
 
 ExternallyProvisionedManagerStores::~ExternallyProvisionedManagerStores() =
     default;
@@ -312,6 +338,15 @@ ExternallyProvisionedManagerStores::stable_state_directory() const noexcept {
 const core::CellId&
 ExternallyProvisionedManagerStores::cell_id() const noexcept {
   return impl_->cell_id_;
+}
+
+bool ExternallyProvisionedManagerStores::matches_admission(
+    const deployment::CanonicalEmptyRetainedBundleAdmission& admission)
+    const noexcept {
+  return impl_->admission_digest_ == admission.admission_digest() &&
+         impl_->cell_id_ == admission.cell_id() &&
+         impl_->retained_bundle_id_ == admission.retained_bundle_id() &&
+         impl_->graph_revision_ == admission.graph_revision();
 }
 
 SqliteManagerBootstrapJournal&

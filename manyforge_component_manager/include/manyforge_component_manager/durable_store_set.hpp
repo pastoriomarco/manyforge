@@ -58,8 +58,17 @@ class ExternallyProvisionedManagerStores final {
   [[nodiscard]] ManagerDurableStoreStartupInventory StartupInventory() const;
 
  private:
+  /// Private coordinator invariant for the exact sealed admission that opened
+  /// this in-memory store set. SQLite remains keyed by CellId, but the
+  /// coordinator cannot substitute another package for this process.
+  [[nodiscard]] bool matches_admission(
+      const manyforge::deployment::
+          CanonicalEmptyRetainedBundleAdmission& admission) const noexcept;
+
   class Impl;
   std::unique_ptr<Impl> impl_;
+
+  friend class CanonicalEmptyBootstrapCoordinator;
 };
 
 }  // namespace manyforge::component_manager
