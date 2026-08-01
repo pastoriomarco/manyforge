@@ -1,9 +1,12 @@
 # Opt-in strict target resource profile.
 #
-# Activated only when scripts/lib/compose.sh sees
-# MANYFORGE_RT_RESOURCE_PROFILE=strict. It grants the minimum container-level
-# capability needed for controller_manager and ManyForge's named native worker
-# threads to request their own policies. Python, routes, planner/validation,
+# Historical product-lane overlay retained for I9/I10 acceptance; no current
+# launcher activates it. scripts/lib/compose.sh now retains only bounded
+# resource-argument derivation and typed runtime gates. When a qualified owner
+# later selects MANYFORGE_RT_RESOURCE_PROFILE=strict, this grants the minimum
+# container-level capability needed for controller_manager and ManyForge's
+# named native worker threads to request their own policies. Python, routes,
+# planner/validation,
 # viewer, recorder, and DDS threads remain SCHED_OTHER and inherit the NRT CPU
 # set selected by the startup wrappers. Host-wide CPU/IRQ isolation and an RT
 # kernel remain deployment properties and are reported rather than implied.

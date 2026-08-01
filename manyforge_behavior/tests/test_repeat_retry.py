@@ -6,14 +6,11 @@ retry(5) over a fail-then-succeed child takes N+1 tree ticks (N failures + 1 suc
 """
 
 import py_trees
+import pytest
 from pathlib import Path
-from manyforge_behavior.node_environment import build_node_environment
 
 from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.kernel_client import MockKernelClient
-from manyforge_behavior.program import Program
-from manyforge_behavior.runner import OrchestratorRunner
 
 
 class CountingLeaf(py_trees.behaviour.Behaviour):
@@ -64,17 +61,11 @@ class TestRepeatDecorator:
         assert tree.root.status == py_trees.common.Status.SUCCESS
         assert leaf.tick_count == 1
 
-    def test_repeat_forever_caps(self):
-        """repeat(num_cycles=-1): infinite repeat. After 10 ticks, still RUNNING."""
+    @pytest.mark.parametrize("count", [-1, 0, 1_000_001])
+    def test_repeat_rejects_unbounded_or_out_of_schema_counts(self, count):
         leaf = CountingLeaf("leaf", fail_until=0)
-        repeat = RepeatDecorator("repeat", child=leaf, num_cycles=-1)
-        tree = py_trees.trees.BehaviourTree(root=repeat)
-        tree.setup()
-
-        for _ in range(10):
-            tree.tick()
-            assert tree.root.status == py_trees.common.Status.RUNNING
-        assert leaf.tick_count == 10
+        with pytest.raises(ValueError):
+            RepeatDecorator("repeat", child=leaf, num_cycles=count)
 
     def test_repeat_propagates_failure(self):
         """repeat(num_cycles=5) with a leaf that always fails.
@@ -130,20 +121,11 @@ class TestRetryDecorator:
         assert tree.root.status == py_trees.common.Status.FAILURE
         assert leaf.tick_count == 2
 
-    def test_retry_forever(self):
-        """retry(num_attempts=-1) with leaf that fails 10 times then succeeds.
-        Takes 11 tree ticks."""
-        leaf = CountingLeaf("leaf", fail_until=10)
-        retry = RetryDecorator("retry", child=leaf, num_attempts=-1)
-        tree = py_trees.trees.BehaviourTree(root=retry)
-        tree.setup()
-
-        for _ in range(10):
-            tree.tick()
-            assert tree.root.status == py_trees.common.Status.RUNNING
-        tree.tick()
-        assert tree.root.status == py_trees.common.Status.SUCCESS
-        assert leaf.tick_count == 11
+    @pytest.mark.parametrize("count", [-1, 0, 1_000_001])
+    def test_retry_rejects_unbounded_or_out_of_schema_counts(self, count):
+        leaf = CountingLeaf("leaf", fail_until=0)
+        with pytest.raises(ValueError):
+            RetryDecorator("retry", child=leaf, num_attempts=count)
 
     def test_retry_immediate_success(self):
         """retry(num_attempts=5) with leaf that succeeds immediately.
@@ -163,12 +145,12 @@ class TestNestedRetryRepeat:
 
     def test_nested_retry_repeat(self):
         """The cycle manager pattern:
-        retry(-1) > repeat(3) > sequence([leaf]).
+        retry(2) > repeat(3) > sequence([leaf]).
         Takes 3 tree ticks — repeat advances once per tick, then retry sees SUCCESS."""
         leaf = CountingLeaf("leaf", fail_until=0)
         sequence = py_trees.composites.Sequence("sequence", memory=True, children=[leaf])
         repeat = RepeatDecorator("repeat", child=sequence, num_cycles=3)
-        retry = RetryDecorator("retry", child=repeat, num_attempts=-1)
+        retry = RetryDecorator("retry", child=repeat, num_attempts=2)
         tree = py_trees.trees.BehaviourTree(root=retry)
         tree.setup()
 
@@ -207,68 +189,24 @@ class TestCatalogEntries:
         assert repeat_entry.children_min == 1
         assert repeat_entry.children_max == 1
         assert len(repeat_entry.parameters) == 1
-        assert repeat_entry.parameters[0].name == "num_cycles"
-        assert repeat_entry.parameters[0].type == "int"
-        assert repeat_entry.parameters[0].default == -1
+        assert repeat_entry.parameters[0].id == "num_cycles"
+        assert repeat_entry.parameters[0].required is True
+        assert repeat_entry.parameters[0].has_default is False
+        assert repeat_entry.parameters[0].schema.schema_type == "int"
+        assert dict(repeat_entry.parameters[0].schema.constraints) == {
+            "min_inclusive": 1,
+            "max_inclusive": 1_000_000,
+        }
 
         assert retry_entry.kind == "decorator"
         assert retry_entry.children_min == 1
         assert retry_entry.children_max == 1
         assert len(retry_entry.parameters) == 1
-        assert retry_entry.parameters[0].name == "num_attempts"
-        assert retry_entry.parameters[0].type == "int"
-        assert retry_entry.parameters[0].default == -1
-
-
-class TestFixtureProgram:
-    """Tests for the looping_program fixture."""
-
-    def test_load_fixture_program(self):
-        """Load the looping_program fixture via Program and build it via the runner.
-        retry(-1) > repeat(3) > sequence > set_key_bool_value."""
-        catalog_path = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-        program_path = Path(__file__).parent / "fixtures" / "looping_program.program.yaml"
-
-        catalog = NodeCatalog(catalog_path)
-        program = Program(program_path, catalog)
-
-        assert program.tree.id == "retry"
-        assert program.tree.name == "cycle_manager"
-        assert program.tree.params["num_attempts"] == -1
-
-        retry_child = program.tree.children[0]
-        assert retry_child.id == "repeat"
-        assert retry_child.name == "work_cycle"
-        assert retry_child.params["num_cycles"] == 3
-
-        repeat_child = retry_child.children[0]
-        assert repeat_child.id == "sequence"
-        assert repeat_child.name == "cycle_body"
-
-        sequence_child = repeat_child.children[0]
-        assert sequence_child.id == "set_key_bool_value"
-        assert sequence_child.name == "mark_done"
-        assert sequence_child.params["key"] == {"key_ref": "cycle_ran"}
-        assert sequence_child.params["value"] is True
-
-        # Build and run via the runner
-        kernel = MockKernelClient()
-        runner = OrchestratorRunner(
-            node_environment=build_node_environment(catalog_path),
-            program_path=str(program_path),
-            kernel=kernel,
-        )
-        runner.load()
-        tree = runner.build_tree()
-
-        assert tree.root.name == "cycle_manager"
-        assert isinstance(tree.root, RetryDecorator)
-
-        retry_child = tree.root.children[0]
-        assert retry_child.name == "work_cycle"
-        assert isinstance(retry_child, RepeatDecorator)
-
-        # Run: retry(-1) > repeat(3) completes in 3 ticks
-        result = runner.run(max_ticks=100)
-        assert result is True
-        assert tree.root.status == py_trees.common.Status.SUCCESS
+        assert retry_entry.parameters[0].id == "num_attempts"
+        assert retry_entry.parameters[0].required is True
+        assert retry_entry.parameters[0].has_default is False
+        assert retry_entry.parameters[0].schema.schema_type == "int"
+        assert dict(retry_entry.parameters[0].schema.constraints) == {
+            "min_inclusive": 1,
+            "max_inclusive": 1_000_000,
+        }

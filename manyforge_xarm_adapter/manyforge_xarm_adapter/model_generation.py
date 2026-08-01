@@ -1,4 +1,4 @@
-"""Generate the fixed pneumatic Lite6 model from the installed xArm builder."""
+"""Generate offline fixed-pneumatic Lite6 qualification artifacts."""
 
 from __future__ import annotations
 

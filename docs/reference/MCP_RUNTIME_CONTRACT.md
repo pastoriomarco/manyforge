@@ -1,10 +1,11 @@
+> **Historical reference only.** This contract describes the last committed full Composer/MCP interaction tree at `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1` (tree `bc749b9879d3c8f36fe7bf3036f9cc1f2ef1e60f`). MCP runtime tools and their semantic owners are unavailable in the current cutover. This file is not a current API contract or qualification claim; any future workflow must be ported onto headless C++ semantic owners and thin clients. It is a frozen generated snapshot: the current `scripts/regen-public-contracts.py` owns only `REST_API.md` and deliberately does not regenerate this file.
+
 <!--
-  THIS FILE IS GENERATED — do not hand-edit. Source of truth: code.
-  Regenerate with:
-    cd /workspace
-    python3 scripts/regen-public-contracts.py
+  FROZEN HISTORICAL GENERATED SNAPSHOT — DO NOT REGENERATE.
+  The metadata below records the former generator at the captured revision.
+  The current REST-only generator does not own or update this file.
   Last regenerated: 2026-07-16 23:53:24 UTC
-  Generator source: scripts/regen-public-contracts.py:gen_mcp_contract
+  Former generator source: scripts/regen-public-contracts.py:gen_mcp_contract
 -->
 
 # ManyForge MCP Runtime Contract

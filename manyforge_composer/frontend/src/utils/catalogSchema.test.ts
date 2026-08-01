@@ -18,42 +18,22 @@ const shapeSchema: CatalogJsonSchema = {
   },
   allOf: [
     {
-      if: {
-        required: ['type'],
-        properties: { type: { const: 'box' } },
-      },
+      if: { required: ['type'], properties: { type: { const: 'box' } } },
       then: { required: ['box_dimensions_m'] },
     },
     {
-      if: {
-        required: ['type'],
-        properties: { type: { const: 'sphere' } },
-      },
+      if: { required: ['type'], properties: { type: { const: 'sphere' } } },
       then: { required: ['sphere_radius_m'] },
     },
     {
-      if: {
-        not: {
-          required: ['type'],
-          properties: { type: { const: 'box' } },
-        },
-      },
+      if: { not: { required: ['type'], properties: { type: { const: 'box' } } } },
       then: { not: { required: ['box_dimensions_m'] } },
-    },
-    {
-      if: {
-        not: {
-          required: ['type'],
-          properties: { type: { const: 'sphere' } },
-        },
-      },
-      then: { not: { required: ['sphere_radius_m'] } },
     },
   ],
 };
 
 describe('validateCatalogJsonSchemaValue', () => {
-  it('accepts valid conditional shape variants', () => {
+  it('accepts valid conditional values', () => {
     expect(
       validateCatalogJsonSchemaValue(
         shapeSchema,
@@ -61,32 +41,23 @@ describe('validateCatalogJsonSchemaValue', () => {
         'shape',
       ),
     ).toEqual([]);
+  });
+
+  it('rejects missing and stale conditional fields', () => {
+    expect(
+      validateCatalogJsonSchemaValue(shapeSchema, { type: 'sphere' }, 'shape')
+        .map((issue) => issue.path),
+    ).toContain('shape.sphere_radius_m');
     expect(
       validateCatalogJsonSchemaValue(
         shapeSchema,
-        { type: 'sphere', sphere_radius_m: 0.05 },
+        { type: 'sphere', sphere_radius_m: 0.05, box_dimensions_m: [1, 2, 3] },
         'shape',
-      ),
-    ).toEqual([]);
+      ).map((issue) => issue.path),
+    ).toContain('shape.box_dimensions_m');
   });
 
-  it('rejects missing and stale conditional shape fields', () => {
-    const missing = validateCatalogJsonSchemaValue(shapeSchema, { type: 'sphere' }, 'shape');
-    expect(missing.map((issue) => issue.path)).toContain('shape.sphere_radius_m');
-
-    const stale = validateCatalogJsonSchemaValue(
-      shapeSchema,
-      {
-        type: 'sphere',
-        sphere_radius_m: 0.05,
-        box_dimensions_m: [0.1, 0.2, 0.3],
-      },
-      'shape',
-    );
-    expect(stale.map((issue) => issue.path)).toContain('shape.box_dimensions_m');
-  });
-
-  it('validates assistant-projected anyOf binding forms', () => {
+  it('supports literal or reference alternatives without knowing program DTOs', () => {
     const schema: CatalogJsonSchema = {
       anyOf: [
         { type: 'string' },
@@ -98,10 +69,13 @@ describe('validateCatalogJsonSchemaValue', () => {
         },
       ],
     };
-
-    expect(validateCatalogJsonSchemaValue(schema, 'object_1', 'object_id')).toEqual([]);
-    expect(validateCatalogJsonSchemaValue(schema, { key_ref: 'target_object' }, 'object_id')).toEqual([]);
-    expect(validateCatalogJsonSchemaValue(schema, { field_ref: 'target_object' }, 'object_id')).toEqual([
+    expect(validateCatalogJsonSchemaValue(schema, 'object-1', 'object_id')).toEqual([]);
+    expect(
+      validateCatalogJsonSchemaValue(schema, { key_ref: 'target_object' }, 'object_id'),
+    ).toEqual([]);
+    expect(
+      validateCatalogJsonSchemaValue(schema, { field_ref: 'target_object' }, 'object_id'),
+    ).toEqual([
       {
         path: 'object_id',
         message: 'object_id must match at least one allowed schema',

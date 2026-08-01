@@ -1,7 +1,13 @@
 # Troubleshooting — Symptom → Cause → Diagnostic Step
 
-Cross-cutting symptom-to-diagnostic-step matrix for ManyForge runtime
-issues. Use this as the entry point when something is wrong; from each
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until the owning H0/N/I/R gate passes. Present-tense
+> symptoms, endpoints, and container names below refer to the captured
+> runtime, not currently available services.
+
+Cross-cutting symptom-to-diagnostic-step matrix for the captured ManyForge
+runtime. Use it as restoration and diagnostic-design input; from each
 row jump to the right detailed runbook.
 
 For where to look (log paths, REST endpoints, container names), see

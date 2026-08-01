@@ -9,12 +9,26 @@ add_compile_options(-Wall -Wextra -Werror -Wno-deprecated-copy)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 option(BUILD_TESTING "Build unit tests" ON)
 
-message(STATUS
-  "manyforge_roboplan destructive cutover: native, ROS, Python, mutable "
-  "scene-projection, dynamic-object collision, and execution surfaces are "
-  "unavailable until their composable-cell target adapters are restored")
+# The wall clock and scheduler are factory-neutral implementations of Core's
+# time ports.  Build Core without its package-local tests so this bounded
+# support library remains compiled in ordinary builds without restoring a
+# Kernel factory, event collector, planner, execution backend, or entrypoint.
+if(NOT TARGET manyforge_core)
+  set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
+  cmake_policy(PUSH)
+  cmake_policy(SET CMP0077 NEW)
+  set(BUILD_TESTING OFF)
+  add_subdirectory(
+    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_core"
+    EXCLUDE_FROM_ALL)
+  cmake_policy(POP)
+  set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
+  unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
+endif()
 
 # I3 keeps only the bounded, file-only bridge required to qualify exact
 # retained planning products against RoboPlan/Pinocchio. This target owns no
@@ -29,6 +43,22 @@ target_include_directories(manyforge_roboplan_retained_consumer PUBLIC
 
 target_link_libraries(manyforge_roboplan_retained_consumer
   PUBLIC OpenSSL::Crypto)
+
+add_library(manyforge_roboplan_native_runtime_support
+  src/native_runtime_support.cpp)
+target_include_directories(manyforge_roboplan_native_runtime_support PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_roboplan_native_runtime_support
+  PUBLIC manyforge_core
+  PRIVATE Threads::Threads)
+
+message(STATUS
+  "manyforge_roboplan destructive cutover: retained-product staging and "
+  "factory-neutral clock/scheduler support are built; native runtime "
+  "construction, event collection, gripper/planning/execution adapters, "
+  "ROS/Python, mutable scene projection, and product lanes remain "
+  "unavailable until their gates")
 
 # Tests
 if(BUILD_TESTING)
@@ -58,9 +88,84 @@ if(BUILD_TESTING)
     find_package(Eigen3 REQUIRED)
     find_package(pinocchio REQUIRED)
     find_package(roboplan REQUIRED)
+    find_package(roboplan_rrt REQUIRED)
+    find_package(roboplan_simple_ik REQUIRED)
+    find_package(roboplan_example_models REQUIRED)
 
     set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
         "Per-test timeout for manyforge_roboplan gtest cases")
+
+    add_executable(test_native_runtime_support
+      test/test_native_runtime_support.cpp)
+    target_link_libraries(test_native_runtime_support PRIVATE
+      manyforge_roboplan_native_runtime_support GTest::gtest_main)
+    gtest_discover_tests(test_native_runtime_support
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+    # Bounded qualification-only evidence capture. It is deliberately not a
+    # production target and supplies no planner, factory, scene, execution, or
+    # gripper implementation.
+    add_library(manyforge_roboplan_planning_evidence STATIC
+      src/roboplan_planning_qualification.cpp)
+    target_include_directories(manyforge_roboplan_planning_evidence PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    target_link_libraries(manyforge_roboplan_planning_evidence
+      PUBLIC manyforge_core
+      PRIVATE Threads::Threads)
+
+    # Qualification-only compilation of bounded planning contracts. The
+    # former Cartesian request body and planner/scene/execution owners are not
+    # part of this target, and production staging keeps no planner dependency.
+    add_library(manyforge_roboplan_planning_contracts STATIC
+      src/cartesian_planning_contract.cpp
+      src/roboplan_cartesian_trajectory_dynamics.cpp
+      src/joint_cap_contract.cpp)
+    target_include_directories(manyforge_roboplan_planning_contracts PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:include>)
+    target_compile_definitions(manyforge_roboplan_planning_contracts PRIVATE
+      COAL_DISABLE_HPP_FCL_WARNINGS)
+    target_link_libraries(manyforge_roboplan_planning_contracts PUBLIC
+      manyforge_core
+      Eigen3::Eigen
+      pinocchio::pinocchio
+      roboplan::roboplan)
+
+    add_library(manyforge_roboplan_planner_options_contract INTERFACE)
+    target_include_directories(
+      manyforge_roboplan_planner_options_contract INTERFACE
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:include>)
+    target_link_libraries(
+      manyforge_roboplan_planner_options_contract INTERFACE
+      manyforge_core
+      roboplan::roboplan
+      roboplan_rrt::roboplan_rrt
+      roboplan_simple_ik::roboplan_simple_ik)
+
+    add_executable(test_roboplan_planning_qualification
+      test/test_roboplan_planning_qualification.cpp)
+    target_link_libraries(test_roboplan_planning_qualification PRIVATE
+      manyforge_roboplan_planning_evidence GTest::gtest_main)
+    gtest_discover_tests(test_roboplan_planning_qualification
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+    add_executable(test_roboplan_planner_options
+      test/test_roboplan_planner_options.cpp)
+    target_link_libraries(test_roboplan_planner_options PRIVATE
+      manyforge_roboplan_planner_options_contract GTest::gtest_main)
+
+    add_executable(test_cartesian_planning_contract
+      test/test_cartesian_planning_contract.cpp)
+    target_compile_definitions(test_cartesian_planning_contract PRIVATE
+      COAL_DISABLE_HPP_FCL_WARNINGS)
+    target_link_libraries(test_cartesian_planning_contract PRIVATE
+      manyforge_roboplan_planning_contracts GTest::gtest_main)
+
+    add_executable(test_joint_cap_contract
+      test/test_joint_cap_contract.cpp)
+    target_link_libraries(test_joint_cap_contract PRIVATE
+      manyforge_roboplan_planning_contracts GTest::gtest_main)
 
     add_executable(test_retained_planning_model_stage
       test/test_retained_planning_model_stage.cpp)
@@ -68,6 +173,16 @@ if(BUILD_TESTING)
       manyforge_roboplan_retained_consumer GTest::gtest_main)
     gtest_discover_tests(test_retained_planning_model_stage
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+    add_executable(test_roboplan_scene_generation
+      test/test_roboplan_scene_generation.cpp)
+    target_compile_definitions(test_roboplan_scene_generation PRIVATE
+      COAL_DISABLE_HPP_FCL_WARNINGS)
+    target_link_libraries(test_roboplan_scene_generation PRIVATE
+      roboplan::roboplan
+      roboplan_example_models::roboplan_example_models
+      Threads::Threads
+      GTest::gtest_main)
 
     # I3 consumer-equivalence integration: embed the production deployment
     # compiler without its package-local tests, generate the ordinary sealed
@@ -134,6 +249,10 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_BINARY_DIR}/lite6_structural_consumer_fixture")
     set(_MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL
       "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/tools/prepare_structural_model.py")
+    get_filename_component(
+      _MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL
+      "${_MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL}"
+      REALPATH)
     file(GLOB_RECURSE _MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS
       CONFIGURE_DEPENDS
       LIST_DIRECTORIES false
@@ -259,6 +378,26 @@ if(BUILD_TESTING)
     endforeach()
 
     gtest_discover_tests(test_retained_product_consumer
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+    gtest_discover_tests(test_roboplan_scene_generation
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+    gtest_discover_tests(test_roboplan_planner_options
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+    gtest_discover_tests(test_cartesian_planning_contract
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+    gtest_discover_tests(test_joint_cap_contract
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}

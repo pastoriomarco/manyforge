@@ -6,6 +6,9 @@
 > execution and all three lanes are intentionally unavailable. The new Core,
 > retained-product, canonical-empty scene-owner, and Manager foundations are
 > not yet a restored end-to-end runtime.
+> Unless a section explicitly identifies a retained foundation or target
+> design, present-tense ownership and flow descriptions below refer to the
+> captured three-lane baseline.
 
 A coherent, mid-depth map of how ManyForge is put together: the components, how
 a program flows through them, and — most importantly — which layer owns which
@@ -13,8 +16,9 @@ decision. For install and operation see
 [`../INDEX.md`](../INDEX.md); for exact wire contracts see the generated
 references linked at the end.
 
-This document describes **observable runtime behavior and structure**. It is
-not a tutorial and not a spec; it is the picture you need before reading any
+This document records the baseline's **observable runtime behavior and
+structure** together with explicitly identified target foundations. It is not
+a tutorial and not a spec; it is the picture to recover before rebuilding any
 single component in depth.
 
 ______________________________________________________________________
@@ -56,7 +60,7 @@ ______________________________________________________________________
 | `manyforge_behavior`                      | Python                | Behavior-tree runner, node catalog, program/deployment loader, cycle orchestration, one versioned recovery offer, and Robot Model Authority.                                                        |
 | `manyforge_composer`                      | FastAPI + React + MCP | Authoring/operator surface, condition-backed alarm manager, scene-initialization barrier, bounded native viewer, REST, and MCP.                                                                     |
 | `manyforge_ros` / `manyforge_ros_bringup` | C++/Python            | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                        |
-| `manyforge_assistant_bridge`              | Python                | Optional direct-lane LLM assistant provider (HTTP).                                                                                                                                                 |
+| `manyforge_assistant_bridge`              | Python                | Retained protocol/supervisor client logic and historical direct-lane reference; live HTTP provider unavailable during the cutover.                                                                  |
 
 ### Layers
 
@@ -580,14 +584,22 @@ ______________________________________________________________________
 
 ## Reference contracts
 
-The exact, versioned wire contracts (auto-generated from the running code):
+The only current generated contract is:
 
-- [`REST_API.md`](REST_API.md) — Composer REST surface.
-- [`MCP_RUNTIME_CONTRACT.md`](MCP_RUNTIME_CONTRACT.md) — MCP tool surface.
+- [`REST_API.md`](REST_API.md) — the retained structural Composer REST surface,
+  generated from the current FastAPI application.
+
+The following files are pinned historical reimplementation inputs. Their
+product surfaces are unavailable on the current cutover branch; they are not
+generated from, or evidence for, a running current product:
+
+- [`MCP_RUNTIME_CONTRACT.md`](MCP_RUNTIME_CONTRACT.md) — historical MCP tool
+  surface.
 - [`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md) —
-  assistant-provider HTTP contract.
+  historical assistant-provider HTTP contract.
 - [`VIEWER_DATA_PLANE_V1.schema.json`](VIEWER_DATA_PLANE_V1.schema.json) —
-  manifest, transform-frame, diagnostics, and lease/control wire contracts.
+  historical manifest, transform-frame, diagnostics, and lease/control wire
+  contracts.
 
 For the repository/component index and assistant-provider setup, see
 [`../../AGENTS.md`](../../AGENTS.md).

@@ -1,6 +1,12 @@
 # Controlled Stop Profiles
 
-This runbook covers the operator-facing controlled-stop behavior in Composer.
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until I8/P5 and the selected execution lane gate pass.
+> Present-tense Composer and runtime descriptions below refer to the captured
+> baseline; retained stop math alone is not a live Stop owner.
+
+This runbook records the former operator-facing controlled-stop behavior in Composer.
 Implementation details live in
 [`../reference/STOP_PROFILES_INTERNALS.md`](../reference/STOP_PROFILES_INTERNALS.md).
 

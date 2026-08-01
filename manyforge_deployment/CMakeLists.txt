@@ -143,7 +143,8 @@ set(
   "${MANYFORGE_NODE_ENVIRONMENT_CHECK}"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_deployment.hpp.in"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in")
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_structural_model_preparation.hpp.in")
 list(SORT MANYFORGE_COMPILER_RECIPE_INPUTS)
 
 function(

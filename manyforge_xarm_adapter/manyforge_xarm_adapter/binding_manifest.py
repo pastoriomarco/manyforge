@@ -1,4 +1,4 @@
-"""Compile an immutable experimental Lite6 binding manifest."""
+"""Compile an offline experimental Lite6 binding-manifest input."""
 
 from __future__ import annotations
 

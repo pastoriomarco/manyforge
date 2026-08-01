@@ -39,20 +39,50 @@ contains no mutex: mutation has one owner, and readers receive immutable
 snapshots instead of sharing mutable reducer state.
 
 All three SQLite owners are internally synchronized because several NRT
-clients or replacement processes may race on one store. Each owns a distinct
-embedded schema artifact, uses WAL with `synchronous=FULL`, and enforces fixed
+clients may race on one store. Their direct constructors, Close/destruction,
+and `ExternallyProvisionedManagerStores` share one recursive process-local
+lifecycle gate. Direct construction holds it from read-only preflight through
+WAL configuration, schema initialization, and first integrity verification;
+Close/destruction holds it through checkpoint and close, including sidecar
+removal when it owns the last handle; and the composition root holds it across preliminary classification,
+all three ordered nested opens, and partial-construction cleanup. This prevents
+one same-process opener from mistaking a peer's transient pre-WAL rollback
+journal for crash residue, inspecting a WAL that last-close is removing, or
+invalidating the root's validate-existing-peers-before-creating-missing-peers
+order. Cooperating multi-process root startup/classification is additionally
+serialized through the stable-state-directory lock. Already-open processes
+coordinate ordinary database operations through SQLite/WAL. Overlap between
+one process's root teardown and another process's root startup is not qualified
+by this foundation; it requires the future operational process-lifecycle owner
+and forked shutdown/replacement coverage. Each owner has a distinct embedded
+schema artifact, uses WAL with `synchronous=FULL`, and enforces fixed
 cardinality and database page-image ceilings. Before any read-write open or
 persistent PRAGMA, each owner performs an exact read-only identity, schema,
 metadata, resource-limit, and cell preflight. Clean at-rest WAL databases use
-an immutable connection so inspection cannot create sidecars. A WAL crash
-residue without SHM is validated through a bounded private copy; source
-database and WAL bytes remain untouched. A live database whose WAL and SHM
-already exist is read coherently in place; SQLite may update transient
-coordination bytes in that existing SHM, but the preflight does not create a
-sidecar or change database/WAL/header content. Schema-empty files are adoptable
-only when both SQLite identity headers remain zero. Orphan WAL/SHM/journal
-files, SHM without WAL, rollback-journal residue, and over-ceiling main/WAL
-images fail closed before a missing peer can be created.
+an immutable connection so
+inspection cannot create sidecars. A WAL crash residue without SHM is
+validated through a bounded private copy; source database and WAL bytes remain
+untouched. A live database whose WAL and SHM already exist is read coherently
+in place; SQLite may update transient coordination bytes in that existing SHM,
+but the preflight does not create a sidecar or change database/WAL/header
+content. Schema-empty files are adoptable only when both SQLite identity
+headers remain zero. Orphan WAL/SHM/journal files, SHM without WAL,
+rollback-journal residue, and over-ceiling main/WAL images fail closed before a
+missing peer can be created.
+
+The lifecycle lock order is stable-state-directory `flock` (when the
+composition root is used), then the process-local lifecycle mutex, then each
+store's per-instance mutex and SQLite transaction or close. No operation
+acquires those locks in reverse. Direct concurrent first creation from separate
+processes outside `ExternallyProvisionedManagerStores` is not a supported
+startup path and has no per-database lock-file fallback. The
+constructor's process-local acquisition and SQLite busy waits are bounded to
+ten seconds; Close/destruction intentionally waits for the process-local gate
+so teardown cannot abandon a live SQLite handle merely because lifecycle-gate
+acquisition timed out. This does not claim that either Close/destruction or the
+composition root's cross-process directory `flock` is time-bounded, nor does it
+turn an underlying SQLite close failure into a successful close.
+
 The mechanical filesystem/WAL inspection is supplied by the adjacent
 `manyforge_persistence` library so other semantic owners can reuse the same
 qualified startup primitive. Manager still owns all three schemas, records,
@@ -201,8 +231,10 @@ publishes nothing.
 
 The old generic raw persistence fixture and its `FoundationHead` compare-and-
 swap surface have been removed rather than retained as compatibility
-architecture. The Python runtime-observation reducer remains temporary
-reference evidence until C++ observation cutover; it is not a fallback owner.
+architecture. The former production Python runtime-observation reducer is also
+removed now that this C++ package is selected as the semantic owner. The
+independent sources under `verification/composable_cell_i4/` remain test-only
+reference fixtures and are never a fallback runtime owner.
 
 ## Focused build
 

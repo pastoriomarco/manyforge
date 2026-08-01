@@ -1,19 +1,43 @@
-import type { CandidateCreateRequest, CandidateSourceSurface } from '../types/api';
+export type ActuatedCoordinateKind = 'revolute' | 'continuous' | 'prismatic';
+export type CoordinateUnit = 'rad' | 'm';
+export type GripperDraftSource = 'gripper_slider' | 'gripper_preset';
+
+export interface GripperPositionDraft {
+  source: GripperDraftSource;
+  address: {
+    componentId: string;
+    targetId: string;
+  };
+  coordinate: {
+    kind: ActuatedCoordinateKind;
+    value: number;
+    unit: CoordinateUnit;
+  };
+}
+
+export function coordinateUnitForKind(
+  kind: ActuatedCoordinateKind,
+): CoordinateUnit {
+  return kind === 'prismatic' ? 'm' : 'rad';
+}
 
 /**
- * Build the gripper candidate request a gripper slider release or preset click
- * authors. The default Robot Control gripper widget authors this validated
- * candidate instead of calling `/api/scene/gripper/command` directly; the robot
- * moves only via the shared Approve action.
+ * Retain an addressed, unit-tagged UI draft. It cannot be submitted directly;
+ * I6 owns the exact gripper.command_position transport shape and validation.
  */
-export function gripperCandidateRequest(
-  gripperId: string,
-  targetPosition: number,
-  surface: Extract<CandidateSourceSurface, 'gripper_slider' | 'gripper_preset'>,
-): CandidateCreateRequest {
+export function gripperPositionDraft(
+  componentId: string,
+  targetId: string,
+  kind: ActuatedCoordinateKind,
+  value: number,
+  source: GripperDraftSource,
+): GripperPositionDraft | null {
+  const component = componentId.trim();
+  const target = targetId.trim();
+  if (!component || !target || !Number.isFinite(value)) return null;
   return {
-    sourceSurface: surface,
-    inputMode: 'gripper',
-    gripperTarget: { gripperId, targetPosition },
+    source,
+    address: { componentId: component, targetId: target },
+    coordinate: { kind, value, unit: coordinateUnitForKind(kind) },
   };
 }

@@ -1,44 +1,48 @@
-"""Scene-object mesh asset route for the native Composer viewer.
+"""Bounded mesh transport primitives and the explicit I9 client gate.
 
-Scene state carries authored/runtime mesh_resource_uri values. The
-browser should not resolve local paths itself, and it should not need to
-load OBJ/STL/DAE variants directly. This module resolves allowlisted
-mesh resources server-side, converts them to content-addressed GLB
-assets in a killable worker process, and exposes operator-visible status
-metadata back through /api/scene/state.
+The last full Composer implementation is pinned at
+``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1``.  Source blob
+``b0a37123e4cb89de32e7cdec055a63b2352bede3`` records limit parsing and
+scale validation at lines 63-113, the descriptor and state-bound cache/service
+at lines 116-633, content identity at lines 636-659, path-based conversion at
+lines 662-739, and state/router integration at lines 742-794.  Removed scene
+lookup, resource resolution, cache, prewarming, and HTTP behavior remain exact
+I9 restoration inputs, not dormant fallback code.
+
+This module retains only owner-neutral identity, exact DTO validation, one
+contained no-symlink source snapshot, and subprocess-isolated conversion of
+that immutable snapshot.  The worker receives no source path or external
+resource resolver.  OBJ materials and GLTF external buffers/images are not
+loaded; DAE returns at I9 because the pinned image has no pycollada parser and
+its XML/resource closure is not captured here.  Worker address space, output
+file size, CPU time, and post-start parent wait/teardown are bounded; OS process
+creation and a kernel task that remains alive after SIGKILL cannot be made a
+hard user-space wall-time guarantee.  The parent accepts only a bounded regular
+structurally valid GLB from a private temporary directory.  All state-bound and
+route entrypoints fail before reading state.
 """
+
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import io
 import json
-import logging
+import math
 import multiprocessing as mp
 import os
-import queue
-import tempfile
-import threading
-import time
-from collections import OrderedDict
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, TYPE_CHECKING
+import stat as stat_module
+import struct
+import tempfile
+import time
+from typing import Any, Final, Literal, TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse, Response
-
-from manyforge_behavior.model_paths import (
-    default_package_paths,
-    normalize_package_paths,
-    resolve_resource_path,
-)
-
-from .security import is_path_within_roots
+from fastapi import APIRouter
 
 if TYPE_CHECKING:
     from .state import ComposerState
 
-logger = logging.getLogger(__name__)
 
 MeshAssetStatus = Literal[
     "ok",
@@ -51,586 +55,677 @@ MeshAssetStatus = Literal[
     "outside_allowed_roots",
 ]
 
-_ASSET_SCHEMA_VERSION = "scene-object-glb-v1"
-_CONVERTER_VERSION_TAG = "trimesh-4"
-_SUPPORTED_EXTENSIONS = {".obj", ".stl", ".ply", ".dae", ".glb", ".gltf"}
-_DEFAULT_MAX_FILE_BYTES = 32 * 1024 * 1024
-_DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
-_DEFAULT_MAX_ENTRIES = 1024
-_DEFAULT_CONVERSION_TIMEOUT_S = 15.0
+_MESH_ASSET_STATUSES: Final = frozenset(
+    {
+        "ok",
+        "pending",
+        "missing",
+        "unsupported_format",
+        "parse_failed",
+        "conversion_timeout",
+        "too_large",
+        "outside_allowed_roots",
+    }
+)
+_SUPPORTED_EXTENSIONS: Final = frozenset(
+    {".obj", ".stl", ".ply", ".glb", ".gltf"}
+)
+_DEFERRED_EXTENSIONS: Final = frozenset({".dae"})
+_ASSET_SCHEMA_VERSION: Final = "scene-object-glb-v1"
+_CONVERTER_VERSION_TAG: Final = "trimesh-4"
+
+_DEFAULT_MAX_FILE_BYTES: Final = 32 * 1024 * 1024
+_HARD_MAX_FILE_BYTES: Final = 64 * 1024 * 1024
+_DEFAULT_MAX_OUTPUT_BYTES: Final = 64 * 1024 * 1024
+_HARD_MAX_OUTPUT_BYTES: Final = 128 * 1024 * 1024
+_DEFAULT_WORKER_MEMORY_BYTES: Final = 1024 * 1024 * 1024
+_MIN_WORKER_MEMORY_BYTES: Final = 256 * 1024 * 1024
+_HARD_MAX_WORKER_MEMORY_BYTES: Final = 2 * 1024 * 1024 * 1024
+_DEFAULT_CONVERSION_TIMEOUT_S: Final = 15.0
+_HARD_MAX_CONVERSION_TIMEOUT_S: Final = 60.0
+_WORKER_STOP_GRACE_S: Final = 1.0
+_WORKER_NATIVE_THREAD_ENV: Final = (
+    "BLIS_NUM_THREADS",
+    "GOTO_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OMP_THREAD_LIMIT",
+    "OPENBLAS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+_MAX_ALLOWED_ROOTS: Final = 64
+_MAX_PATH_CHARS: Final = 4096
+_MAX_PATH_COMPONENTS: Final = 256
+_MAX_URI_CHARS: Final = 4096
+_MAX_ERROR_CHARS: Final = 1024
+_MAX_ENV_VALUE_CHARS: Final = 64
+_MAX_SCALE_COMPONENT: Final = 1_000_000.0
+_GLB_HEADER: Final = struct.Struct("<4sII")
+_GLB_CHUNK_HEADER: Final = struct.Struct("<I4s")
+_GLB_JSON_CHUNK_TYPE: Final = b"JSON"
+_GLB_BINARY_CHUNK_TYPE: Final = b"BIN\x00"
+_MIN_GLB_BYTES: Final = 24
+_MAX_GLB_JSON_BYTES: Final = 4 * 1024 * 1024
+
+SCENE_MESH_CLIENT_UNAVAILABLE_REASON_CODE: Final = (
+    "composable_cell_scene_mesh_client_unavailable"
+)
+SCENE_MESH_RESTORATION_GATE: Final = "I9"
 
 
-def _env_float(name: str, default: float) -> float:
+class SceneMeshInputError(ValueError):
+    """Raised when a retained mesh input is malformed or unauthorized."""
+
+
+class SceneMeshBoundsError(SceneMeshInputError):
+    """Raised before retained mesh work can exceed a hard resource bound."""
+
+
+class SceneMeshClientUnavailableError(RuntimeError):
+    """Raised before state lookup, cache creation, or route registration."""
+
+
+def _raise_scene_mesh_client_unavailable() -> None:
+    raise SceneMeshClientUnavailableError(
+        f"{SCENE_MESH_CLIENT_UNAVAILABLE_REASON_CODE}: state-bound scene mesh "
+        "lookup and routing return at I9 on the new observer owner"
+    )
+
+
+def _env_float(name: str, default: float, *, hard_max: float) -> float:
     raw = os.environ.get(name)
     if raw is None:
+        return default
+    if (
+        not raw
+        or len(raw) > _MAX_ENV_VALUE_CHARS
+        or raw != raw.strip()
+    ):
         return default
     try:
         value = float(raw)
     except ValueError:
         return default
-    return value if value > 0.0 else default
+    if not math.isfinite(value) or value <= 0.0:
+        return default
+    return min(value, hard_max)
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    hard_max: int,
+    minimum: int = 1,
+) -> int:
     raw = os.environ.get(name)
-    if raw is None:
+    if (
+        raw is None
+        or not raw
+        or len(raw) > _MAX_ENV_VALUE_CHARS
+        or not raw.isascii()
+        or not raw.isdigit()
+    ):
         return default
-    try:
-        value = int(raw)
-    except ValueError:
+    value = int(raw)
+    if value < minimum:
         return default
-    return value if value > 0 else default
+    return min(value, hard_max)
 
 
-def _conversion_timeout_s() -> float:
-    return _env_float("MANYFORGE_MESH_CONVERSION_TIMEOUT_S", _DEFAULT_CONVERSION_TIMEOUT_S)
+def _require_exact_int(
+    value: object,
+    *,
+    label: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if type(value) is not int:
+        raise SceneMeshInputError(f"{label} must be an integer")
+    if value < minimum or value > maximum:
+        raise SceneMeshBoundsError(
+            f"{label} must be between {minimum} and {maximum}"
+        )
+    return value
 
 
-def _max_file_bytes() -> int:
-    return _env_int("MANYFORGE_MESH_MAX_FILE_BYTES", _DEFAULT_MAX_FILE_BYTES)
+def _require_exact_float(
+    value: object,
+    *,
+    label: str,
+    maximum: float,
+) -> float:
+    if type(value) is not float:
+        raise SceneMeshInputError(f"{label} must be a float")
+    if not math.isfinite(value) or value <= 0.0 or value > maximum:
+        raise SceneMeshBoundsError(
+            f"{label} must be finite, positive, and at most {maximum}"
+        )
+    return value
 
 
-def _max_total_bytes() -> int:
-    return _env_int("MANYFORGE_MESH_CACHE_MAX_BYTES", _DEFAULT_MAX_TOTAL_BYTES)
+@dataclass(frozen=True, slots=True)
+class MeshConversionLimits:
+    """One exact bounded configuration snapshot for a conversion request."""
+
+    max_source_bytes: int = _DEFAULT_MAX_FILE_BYTES
+    max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES
+    worker_memory_bytes: int = _DEFAULT_WORKER_MEMORY_BYTES
+    timeout_s: float = _DEFAULT_CONVERSION_TIMEOUT_S
+
+    def __post_init__(self) -> None:
+        _require_exact_int(
+            self.max_source_bytes,
+            label="max_source_bytes",
+            minimum=1,
+            maximum=_HARD_MAX_FILE_BYTES,
+        )
+        _require_exact_int(
+            self.max_output_bytes,
+            label="max_output_bytes",
+            minimum=_MIN_GLB_BYTES,
+            maximum=_HARD_MAX_OUTPUT_BYTES,
+        )
+        _require_exact_int(
+            self.worker_memory_bytes,
+            label="worker_memory_bytes",
+            minimum=_MIN_WORKER_MEMORY_BYTES,
+            maximum=_HARD_MAX_WORKER_MEMORY_BYTES,
+        )
+        _require_exact_float(
+            self.timeout_s,
+            label="timeout_s",
+            maximum=_HARD_MAX_CONVERSION_TIMEOUT_S,
+        )
+
+    @classmethod
+    def from_environment(cls) -> "MeshConversionLimits":
+        return cls(
+            max_source_bytes=_env_int(
+                "MANYFORGE_MESH_MAX_FILE_BYTES",
+                _DEFAULT_MAX_FILE_BYTES,
+                hard_max=_HARD_MAX_FILE_BYTES,
+            ),
+            max_output_bytes=_env_int(
+                "MANYFORGE_MESH_MAX_OUTPUT_BYTES",
+                _DEFAULT_MAX_OUTPUT_BYTES,
+                hard_max=_HARD_MAX_OUTPUT_BYTES,
+                minimum=_MIN_GLB_BYTES,
+            ),
+            worker_memory_bytes=_env_int(
+                "MANYFORGE_MESH_WORKER_MEMORY_BYTES",
+                _DEFAULT_WORKER_MEMORY_BYTES,
+                hard_max=_HARD_MAX_WORKER_MEMORY_BYTES,
+                minimum=_MIN_WORKER_MEMORY_BYTES,
+            ),
+            timeout_s=_env_float(
+                "MANYFORGE_MESH_CONVERSION_TIMEOUT_S",
+                _DEFAULT_CONVERSION_TIMEOUT_S,
+                hard_max=_HARD_MAX_CONVERSION_TIMEOUT_S,
+            ),
+        )
 
 
-def _max_entries() -> int:
-    return _env_int("MANYFORGE_MESH_CACHE_MAX_ENTRIES", _DEFAULT_MAX_ENTRIES)
-
-
-def _normalize_scale(mesh_scale: list[float] | tuple[float, ...] | None) -> tuple[float, float, float]:
+def _normalize_scale(
+    mesh_scale: list[float] | tuple[float, ...] | None,
+) -> tuple[float, float, float]:
     if mesh_scale is None:
         return (1.0, 1.0, 1.0)
-    if len(mesh_scale) != 3:
-        return (1.0, 1.0, 1.0)
-    try:
-        values = tuple(float(v) for v in mesh_scale)
-    except (TypeError, ValueError):
-        return (1.0, 1.0, 1.0)
-    if any(v <= 0.0 for v in values):
-        return (1.0, 1.0, 1.0)
-    return values  # type: ignore[return-value]
+    if type(mesh_scale) not in (list, tuple) or len(mesh_scale) != 3:
+        raise SceneMeshInputError(
+            "mesh_scale must be an exact three-item list or tuple"
+        )
+    normalized: list[float] = []
+    for index, value in enumerate(mesh_scale):
+        if type(value) not in (int, float):
+            raise SceneMeshInputError(
+                f"mesh_scale[{index}] must be an integer or float"
+            )
+        numeric = float(value)
+        if (
+            not math.isfinite(numeric)
+            or numeric <= 0.0
+            or numeric > _MAX_SCALE_COMPONENT
+        ):
+            raise SceneMeshBoundsError(
+                f"mesh_scale[{index}] must be finite, positive, and at most "
+                f"{_MAX_SCALE_COMPONENT}"
+            )
+        normalized.append(numeric)
+    return (normalized[0], normalized[1], normalized[2])
 
 
-@dataclass
+def _bounded_text(
+    value: object,
+    *,
+    label: str,
+    maximum: int,
+    allow_empty: bool = False,
+) -> str:
+    if type(value) is not str or (not allow_empty and not value):
+        qualifier = "a string" if allow_empty else "a non-empty string"
+        raise SceneMeshInputError(f"{label} must be {qualifier}")
+    if len(value) > maximum:
+        raise SceneMeshBoundsError(
+            f"{label} exceeds the {maximum}-character bound"
+        )
+    if "\x00" in value:
+        raise SceneMeshInputError(f"{label} must not contain NUL bytes")
+    return value
+
+
+def _validate_lower_hex(value: object, *, label: str, length: int) -> str:
+    text = _bounded_text(value, label=label, maximum=length)
+    if len(text) != length or any(
+        character not in "0123456789abcdef" for character in text
+    ):
+        raise SceneMeshInputError(
+            f"{label} must be exactly {length} lowercase hexadecimal characters"
+        )
+    return text
+
+
+def _canonical_absolute_path_text(value: object, *, label: str) -> str:
+    text = _bounded_text(value, label=label, maximum=_MAX_PATH_CHARS)
+    path = Path(text)
+    if not path.is_absolute() or os.path.normpath(text) != text:
+        raise SceneMeshInputError(
+            f"{label} must be a normalized absolute filesystem path"
+        )
+    if len(path.parts) > _MAX_PATH_COMPONENTS:
+        raise SceneMeshBoundsError(
+            f"{label} exceeds the {_MAX_PATH_COMPONENTS}-component bound"
+        )
+    return text
+
+
+@dataclass(frozen=True, slots=True)
 class MeshAssetDescriptor:
+    """Presentation-neutral content identity returned by a future client."""
+
     asset_hash: str
     source_uri: str
     resolved_realpath: str | None
     file_content_sha256: str | None
     mesh_scale: tuple[float, float, float]
-    schema_version: str = _ASSET_SCHEMA_VERSION
-    converter_version: str = _CONVERTER_VERSION_TAG
     status: MeshAssetStatus = "pending"
     last_error: str | None = None
-    updated_ns: int = field(default_factory=time.monotonic_ns)
-    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
-    in_progress: bool = False
+    schema_version: str = _ASSET_SCHEMA_VERSION
+    converter_version: str = _CONVERTER_VERSION_TAG
 
-    @property
-    def url(self) -> str:
-        return f"/api/scene/object-meshes/{self.asset_hash}.glb"
-
-
-class SceneMeshAssetService:
-    """Resolve, convert, cache, and serve scene-object GLB assets."""
-
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._descriptors: dict[str, MeshAssetDescriptor] = {}
-        self._source_index: dict[tuple[str, tuple[float, float, float]], str] = {}
-        self._content_digest_cache: dict[tuple[str, int, int], str] = {}
-        self._bytes_cache: OrderedDict[str, bytes] = OrderedDict()
-        self._bytes_total = 0
-
-    def metadata_for_shape(
-        self,
-        state: "ComposerState",
-        mesh_resource_uri: str | None,
-        mesh_scale: list[float] | tuple[float, ...] | None,
-        *,
-        schedule_conversion: bool = True,
-    ) -> dict[str, str | None]:
-        descriptor = self._descriptor_for_resource(
-            state,
-            mesh_resource_uri,
-            mesh_scale,
-            register=True,
+    def __post_init__(self) -> None:
+        _validate_lower_hex(self.asset_hash, label="asset_hash", length=16)
+        _bounded_text(
+            self.source_uri,
+            label="source_uri",
+            maximum=_MAX_URI_CHARS,
+            allow_empty=True,
         )
-        if descriptor.status == "ok":
-            return {
-                "mesh_asset_url": descriptor.url,
-                "mesh_asset_status": descriptor.status,
-            }
-        if descriptor.status == "pending" and schedule_conversion:
-            self._schedule_conversion(descriptor)
-        if descriptor.status == "ok":
-            return {
-                "mesh_asset_url": descriptor.url,
-                "mesh_asset_status": descriptor.status,
-            }
-        return {
-            "mesh_asset_url": None,
-            "mesh_asset_status": descriptor.status,
-        }
-
-    def validate_boundary_or_409(
-        self,
-        state: "ComposerState",
-        mesh_resource_uri: str | None,
-        mesh_scale: list[float] | tuple[float, ...] | None,
-    ) -> None:
-        descriptor = self._descriptor_for_resource(
-            state,
-            mesh_resource_uri,
-            mesh_scale,
-            register=True,
-        )
-        if descriptor.status in {"pending", "ok", "parse_failed", "conversion_timeout"}:
-            return
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "mesh_resource_invalid",
-                "mesh_asset_status": descriptor.status,
-                "mesh_resource_uri": mesh_resource_uri,
-                "detail": descriptor.last_error,
-            },
-        )
-
-    def prewarm(self, state: "ComposerState") -> None:
-        if state.kernel is None:
-            return
-        for scene_object in state.kernel.get_scene_objects():
-            shape = getattr(scene_object, "shape", None)
-            if shape is None or getattr(shape, "type", None) != "mesh":
-                continue
-            descriptor = self._descriptor_for_resource(
-                state,
-                getattr(shape, "mesh_resource_uri", None),
-                getattr(shape, "mesh_scale", None),
-                register=True,
+        if self.resolved_realpath is not None:
+            _canonical_absolute_path_text(
+                self.resolved_realpath,
+                label="resolved_realpath",
             )
-            if descriptor.status == "pending":
-                self._schedule_conversion(descriptor)
-
-    def get_glb_response(self, asset_hash: str) -> Response:
-        descriptor = self._descriptors.get(asset_hash)
-        if descriptor is None:
-            return JSONResponse(
-                status_code=404,
-                content={"detail": "Unknown scene mesh asset", "asset_hash": asset_hash},
+        if self.file_content_sha256 is not None:
+            _validate_lower_hex(
+                self.file_content_sha256,
+                label="file_content_sha256",
+                length=64,
             )
-        if descriptor.status not in {"ok", "pending"}:
-            status_code = 404 if descriptor.status in {"missing", "outside_allowed_roots"} else 422
-            return JSONResponse(
-                status_code=status_code,
-                content={
-                    "detail": descriptor.last_error or descriptor.status,
-                    "mesh_asset_status": descriptor.status,
-                    "asset_hash": asset_hash,
-                },
-            )
-        try:
-            glb_bytes = self._ensure_glb_bytes(descriptor)
-        except TimeoutError:
-            return JSONResponse(
-                status_code=504,
-                content={
-                    "detail": descriptor.last_error or "Mesh conversion timed out",
-                    "mesh_asset_status": descriptor.status,
-                    "asset_hash": asset_hash,
-                },
-            )
-        except Exception:
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "detail": descriptor.last_error or "Mesh conversion failed",
-                    "mesh_asset_status": descriptor.status,
-                    "asset_hash": asset_hash,
-                },
-            )
-        return Response(
-            content=glb_bytes,
-            media_type="model/gltf-binary",
-            headers={
-                "Cache-Control": "public, max-age=31536000, immutable",
-                "ETag": f'"{asset_hash}"',
-            },
-        )
-
-    def _allowed_roots(self, state: "ComposerState") -> list[str]:
-        roots: list[str] = list(getattr(state, "allowed_fs_roots", []) or [])
-        for raw in (state.program_source_path, state.deployment_source_path):
-            if raw:
-                roots.append(str(Path(raw).resolve().parent))
-        deployment = state.deployment
-        package_paths: list[str] = []
-        if deployment is not None and deployment.robot_config is not None:
-            base_dir = (
-                Path(state.deployment_source_path).resolve().parent
-                if state.deployment_source_path
-                else Path.cwd()
-            )
-            extra_package_paths = (
-                [] if deployment.robot_config.package_paths else default_package_paths()
-            )
-            package_paths = normalize_package_paths(
-                deployment.robot_config.package_paths,
-                base_dir=base_dir,
-                extra_package_paths=extra_package_paths,
-            )
-            roots.extend(package_paths)
-        normalized: list[str] = []
-        for root in roots:
-            try:
-                resolved = str(Path(root).expanduser().resolve())
-            except Exception:
-                continue
-            if resolved not in normalized:
-                normalized.append(resolved)
-        return normalized or [str(Path.cwd().resolve())]
-
-    def _descriptor_for_resource(
-        self,
-        state: "ComposerState",
-        mesh_resource_uri: str | None,
-        mesh_scale: list[float] | tuple[float, ...] | None,
-        *,
-        register: bool,
-    ) -> MeshAssetDescriptor:
-        scale = _normalize_scale(mesh_scale)
-        source_uri = str(mesh_resource_uri or "").strip()
-        if not source_uri:
-            return MeshAssetDescriptor(
-                asset_hash=_hash_error_descriptor("missing-uri", scale),
-                source_uri=source_uri,
-                resolved_realpath=None,
-                file_content_sha256=None,
-                mesh_scale=scale,
-                status="missing",
-                last_error="mesh_resource_uri is empty",
-            )
-
-        try:
-            resolved = self._resolve_mesh_resource_path(state, source_uri)
-        except FileNotFoundError as exc:
-            return self._record_error_descriptor(
-                source_uri,
-                scale,
-                "missing",
-                str(exc),
-                register=register,
-            )
-        except Exception as exc:
-            return self._record_error_descriptor(
-                source_uri,
-                scale,
-                "missing",
-                f"Could not resolve mesh resource: {exc}",
-                register=register,
-            )
-
-        allowed_roots = self._allowed_roots(state)
-        if not is_path_within_roots(resolved, allowed_roots):
-            return self._record_error_descriptor(
-                source_uri,
-                scale,
-                "outside_allowed_roots",
-                f"Mesh path is outside allowed roots: {resolved}",
-                register=register,
-            )
-        if not resolved.exists():
-            return self._record_error_descriptor(
-                source_uri,
-                scale,
-                "missing",
-                f"Mesh file not found: {resolved}",
-                register=register,
-            )
-        if not resolved.is_file():
-            return self._record_error_descriptor(
-                source_uri,
-                scale,
-                "missing",
-                f"Mesh path is not a file: {resolved}",
-                register=register,
-            )
-        extension = resolved.suffix.lower()
-        if extension not in _SUPPORTED_EXTENSIONS:
-            return self._record_error_descriptor(
-                source_uri,
-                scale,
-                "unsupported_format",
-                f"Unsupported mesh format '{extension}'",
-                register=register,
-            )
-        try:
-            stat = resolved.stat()
-        except OSError as exc:
-            return self._record_error_descriptor(
-                source_uri,
-                scale,
-                "missing",
-                f"Could not stat mesh file: {exc}",
-                register=register,
-            )
-        max_file_bytes = _max_file_bytes()
-        if stat.st_size > max_file_bytes:
-            return self._record_error_descriptor(
-                source_uri,
-                scale,
-                "too_large",
-                f"Mesh file is {stat.st_size} bytes; cap is {max_file_bytes} bytes",
-                register=register,
-            )
-        digest = self._file_content_digest(resolved, stat)
-        asset_hash = _asset_hash(str(resolved), digest, scale)
-        with self._lock:
-            existing = self._descriptors.get(asset_hash)
-            if existing is not None:
-                return existing
-            descriptor = MeshAssetDescriptor(
-                asset_hash=asset_hash,
-                source_uri=source_uri,
-                resolved_realpath=str(resolved),
-                file_content_sha256=digest,
-                mesh_scale=scale,
-                status="pending",
-            )
-            if register:
-                self._descriptors[asset_hash] = descriptor
-                self._source_index[(source_uri, scale)] = asset_hash
-            return descriptor
-
-    def _package_paths(self, state: "ComposerState") -> list[str]:
-        deployment = state.deployment
-        if deployment is None or deployment.robot_config is None:
-            return []
-        base_dir = (
-            Path(state.deployment_source_path).resolve().parent
-            if state.deployment_source_path
-            else Path.cwd()
-        )
-        extra_package_paths = (
-            [] if deployment.robot_config.package_paths else default_package_paths()
-        )
-        return normalize_package_paths(
-            deployment.robot_config.package_paths,
-            base_dir=base_dir,
-            extra_package_paths=extra_package_paths,
-        )
-
-    def _resolve_mesh_resource_path(self, state: "ComposerState", source_uri: str) -> Path:
-        """Resolve a local mesh resource with the same practical semantics as RoboPlan.
-
-        Program-authored mesh paths are local filesystem resources. They may be
-        absolute, file://, package://, relative to the loaded program, or relative
-        to the Composer workspace root. The final resolved path is still checked
-        against allowlisted roots before use.
-        """
-        base_dir = (
-            Path(state.program_source_path).resolve().parent
-            if state.program_source_path
-            else Path.cwd()
-        )
-        package_paths = self._package_paths(state)
-        if source_uri.startswith("file://") or source_uri.startswith("package://"):
-            if source_uri.startswith("file://"):
-                resolved_raw = source_uri[len("file://") :]
-            else:
-                resolved_raw = resolve_resource_path(
-                    source_uri,
-                    base_dir=base_dir,
-                    package_paths=package_paths,
-                )
-            return Path(resolved_raw).expanduser().resolve()
-
-        raw_path = Path(source_uri).expanduser()
-        if raw_path.is_absolute():
-            return raw_path.resolve()
-
-        candidates: list[Path] = []
-
-        def add_candidate(path: Path) -> None:
-            try:
-                resolved = path.resolve()
-            except Exception:
-                return
-            if resolved not in candidates:
-                candidates.append(resolved)
-
-        add_candidate(base_dir / raw_path)
-        add_candidate(Path.cwd() / raw_path)
-        add_candidate(Path("/workspace") / raw_path)
-        for root in self._allowed_roots(state):
-            add_candidate(Path(root) / raw_path)
-
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-        if candidates:
-            raise FileNotFoundError(
-                "Mesh resource does not exist at any candidate path: "
-                + ", ".join(str(candidate) for candidate in candidates)
-            )
-        raise FileNotFoundError(f"Mesh resource does not exist: {source_uri}")
-
-    def _file_content_digest(self, path: Path, stat: os.stat_result) -> str:
-        cache_key = (str(path), int(stat.st_size), int(stat.st_mtime_ns))
-        cached = self._content_digest_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        value = digest.hexdigest()
-        self._content_digest_cache[cache_key] = value
-        return value
-
-    def _record_error_descriptor(
-        self,
-        source_uri: str,
-        scale: tuple[float, float, float],
-        status: MeshAssetStatus,
-        message: str,
-        *,
-        register: bool,
-    ) -> MeshAssetDescriptor:
-        asset_hash = _hash_error_descriptor(f"{source_uri}|{status}|{message}", scale)
-        descriptor = MeshAssetDescriptor(
-            asset_hash=asset_hash,
-            source_uri=source_uri,
-            resolved_realpath=None,
-            file_content_sha256=None,
-            mesh_scale=scale,
-            status=status,
-            last_error=message,
-        )
-        if register:
-            with self._lock:
-                self._descriptors[asset_hash] = descriptor
-                self._source_index[(source_uri, scale)] = asset_hash
-        return descriptor
-
-    def _schedule_conversion(self, descriptor: MeshAssetDescriptor) -> None:
-        with descriptor.lock:
-            if descriptor.status != "pending" or descriptor.in_progress:
-                return
-            descriptor.in_progress = True
-        thread = threading.Thread(
-            target=self._background_convert,
-            args=(descriptor,),
-            name=f"scene-mesh-convert-{descriptor.asset_hash}",
-            daemon=True,
-        )
-        thread.start()
-
-    def _background_convert(self, descriptor: MeshAssetDescriptor) -> None:
-        try:
-            self._ensure_glb_bytes(descriptor)
-        except Exception:
-            logger.debug(
-                "Scene mesh background conversion failed for %s",
-                descriptor.asset_hash,
-                exc_info=True,
-            )
-
-    def _ensure_glb_bytes(self, descriptor: MeshAssetDescriptor) -> bytes:
-        with self._lock:
-            cached = self._bytes_cache.get(descriptor.asset_hash)
-            if cached is not None:
-                self._bytes_cache.move_to_end(descriptor.asset_hash)
-                return cached
-        with descriptor.lock:
-            descriptor.in_progress = True
-            try:
-                with self._lock:
-                    cached = self._bytes_cache.get(descriptor.asset_hash)
-                    if cached is not None:
-                        self._bytes_cache.move_to_end(descriptor.asset_hash)
-                        return cached
-                if descriptor.resolved_realpath is None:
-                    descriptor.status = "missing"
-                    descriptor.last_error = "Mesh asset has no resolved path"
-                    raise FileNotFoundError(descriptor.last_error)
-                logger.info(
-                    "mesh_asset_cache_miss",
-                    extra={
-                        "event": "mesh_asset_cache_miss",
-                        "asset_hash": descriptor.asset_hash,
-                        "source_uri": descriptor.source_uri,
-                    },
-                )
-                glb_bytes = _convert_mesh_asset_subprocess(
-                    Path(descriptor.resolved_realpath),
-                    descriptor.mesh_scale,
-                    timeout_s=_conversion_timeout_s(),
-                )
-                self._record_cache(descriptor.asset_hash, glb_bytes)
-                descriptor.status = "ok"
-                descriptor.last_error = None
-                descriptor.updated_ns = time.monotonic_ns()
-                return glb_bytes
-            except TimeoutError as exc:
-                descriptor.status = "conversion_timeout"
-                descriptor.last_error = str(exc)
-                descriptor.updated_ns = time.monotonic_ns()
-                logger.warning(
-                    "mesh_asset_conversion_failed",
-                    extra={
-                        "event": "mesh_asset_conversion_failed",
-                        "asset_hash": descriptor.asset_hash,
-                        "source_uri": descriptor.source_uri,
-                        "mesh_asset_status": descriptor.status,
-                    },
-                )
-                raise
-            except Exception as exc:
-                descriptor.status = "parse_failed"
-                descriptor.last_error = str(exc)
-                descriptor.updated_ns = time.monotonic_ns()
-                logger.warning(
-                    "mesh_asset_conversion_failed",
-                    extra={
-                        "event": "mesh_asset_conversion_failed",
-                        "asset_hash": descriptor.asset_hash,
-                        "source_uri": descriptor.source_uri,
-                        "mesh_asset_status": descriptor.status,
-                    },
-                )
-                raise
-            finally:
-                descriptor.in_progress = False
-
-    def _record_cache(self, asset_hash: str, glb_bytes: bytes) -> None:
-        with self._lock:
-            prior = self._bytes_cache.pop(asset_hash, None)
-            if prior is not None:
-                self._bytes_total -= len(prior)
-            self._bytes_cache[asset_hash] = glb_bytes
-            self._bytes_total += len(glb_bytes)
-            self._evict_if_needed()
-
-    def _evict_if_needed(self) -> None:
-        max_bytes = _max_total_bytes()
-        max_entries = _max_entries()
-        while self._bytes_cache and (
-            self._bytes_total > max_bytes or len(self._bytes_cache) > max_entries
+        if type(self.mesh_scale) is not tuple or any(
+            type(value) is not float for value in self.mesh_scale
         ):
-            evicted_hash, evicted = self._bytes_cache.popitem(last=False)
-            self._bytes_total -= len(evicted)
-            logger.info(
-                "mesh_asset_cache_evicted",
-                extra={
-                    "event": "mesh_asset_cache_evicted",
-                    "asset_hash": evicted_hash,
-                    "evicted_bytes": len(evicted),
-                    "remaining_bytes": self._bytes_total,
-                },
+            raise SceneMeshInputError(
+                "mesh_scale DTO must be a normalized tuple of floats"
             )
+        _normalize_scale(self.mesh_scale)
+        if type(self.status) is not str or self.status not in _MESH_ASSET_STATUSES:
+            raise SceneMeshInputError("status is not a supported mesh asset status")
+        if self.last_error is not None:
+            _bounded_text(
+                self.last_error,
+                label="last_error",
+                maximum=_MAX_ERROR_CHARS,
+            )
+        if self.schema_version != _ASSET_SCHEMA_VERSION:
+            raise SceneMeshInputError("schema_version is not supported")
+        if self.converter_version != _CONVERTER_VERSION_TAG:
+            raise SceneMeshInputError("converter_version is not supported")
+
+        has_resolved_identity = self.resolved_realpath is not None
+        if has_resolved_identity != (self.file_content_sha256 is not None):
+            raise SceneMeshInputError(
+                "resolved_realpath and file_content_sha256 must be present together"
+            )
+
+        identity_statuses = {
+            "ok",
+            "pending",
+            "parse_failed",
+            "conversion_timeout",
+        }
+        if (self.status in identity_statuses) != has_resolved_identity:
+            raise SceneMeshInputError(
+                "mesh status does not match resolved identity availability"
+            )
+        if self.status in {"ok", "pending"}:
+            if self.last_error is not None:
+                raise SceneMeshInputError(
+                    "successful or pending mesh status must not carry an error"
+                )
+        elif self.last_error is None:
+            raise SceneMeshInputError("failed mesh status must carry an error")
+
+        if has_resolved_identity:
+            if not self.source_uri:
+                raise SceneMeshInputError(
+                    "resolved mesh identity must carry a source_uri"
+                )
+            expected_asset_hash = _asset_hash(
+                self.resolved_realpath,
+                self.file_content_sha256,
+                self.mesh_scale,
+            )
+            if self.asset_hash != expected_asset_hash:
+                raise SceneMeshInputError(
+                    "asset_hash does not match the resolved mesh identity"
+                )
+        else:
+            # The preceding status/error invariant proves this is a failed
+            # descriptor with a concrete error string.
+            if self.last_error is None:  # defensive against future reordering
+                raise SceneMeshInputError(
+                    "failed mesh status must carry an error"
+                )
+            expected_asset_hash = _hash_error_descriptor(
+                f"{self.source_uri}|{self.status}|{self.last_error}",
+                self.mesh_scale,
+            )
+            if self.asset_hash != expected_asset_hash:
+                raise SceneMeshInputError(
+                    "asset_hash does not match the unresolved mesh identity"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizedMeshInput:
+    """Immutable bytes captured from one authorized, single-open source."""
+
+    resolved_realpath: str
+    source_suffix: str
+    content: bytes
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        _canonical_absolute_path_text(
+            self.resolved_realpath,
+            label="resolved_realpath",
+        )
+        if (
+            type(self.source_suffix) is not str
+            or self.source_suffix not in _SUPPORTED_EXTENSIONS
+        ):
+            raise SceneMeshInputError("source_suffix is not supported")
+        if Path(self.resolved_realpath).suffix.lower() != self.source_suffix:
+            raise SceneMeshInputError(
+                "source_suffix does not match resolved_realpath"
+            )
+        if type(self.content) is not bytes or not self.content:
+            raise SceneMeshInputError("content must be non-empty bytes")
+        if len(self.content) > _HARD_MAX_FILE_BYTES:
+            raise SceneMeshBoundsError(
+                f"content exceeds the {_HARD_MAX_FILE_BYTES}-byte hard bound"
+            )
+        digest = _validate_lower_hex(
+            self.content_sha256,
+            label="content_sha256",
+            length=64,
+        )
+        if hashlib.sha256(self.content).hexdigest() != digest:
+            raise SceneMeshInputError("content_sha256 does not match content")
+
+
+def _absolute_path(value: str | Path, *, label: str) -> Path:
+    if type(value) is str:
+        text = value
+    elif isinstance(value, Path):
+        text = str(value)
+    else:
+        raise SceneMeshInputError(f"{label} must be a string or Path")
+    return Path(_canonical_absolute_path_text(text, label=label))
+
+
+def _resolved_allowed_roots(
+    allowed_roots: list[str | Path] | tuple[str | Path, ...],
+) -> tuple[Path, ...]:
+    if type(allowed_roots) not in (list, tuple) or not allowed_roots:
+        raise SceneMeshInputError("allowed_roots must be a non-empty list or tuple")
+    if len(allowed_roots) > _MAX_ALLOWED_ROOTS:
+        raise SceneMeshBoundsError(
+            f"allowed_roots exceeds the {_MAX_ALLOWED_ROOTS}-root bound"
+        )
+    result: list[Path] = []
+    for index, raw_root in enumerate(allowed_roots):
+        root = _absolute_path(raw_root, label=f"allowed_roots[{index}]")
+        try:
+            metadata = root.lstat()
+            resolved = root.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise SceneMeshInputError(
+                f"allowed_roots[{index}] is not accessible: {exc}"
+            ) from exc
+        if stat_module.S_ISLNK(metadata.st_mode) or resolved != root:
+            raise SceneMeshInputError(
+                f"allowed_roots[{index}] must not traverse a symlink"
+            )
+        if not stat_module.S_ISDIR(metadata.st_mode):
+            raise SceneMeshInputError(
+                f"allowed_roots[{index}] must be a directory"
+            )
+        if root not in result:
+            result.append(root)
+    return tuple(result)
+
+
+def _relative_to_deepest_root(candidate: Path, roots: tuple[Path, ...]) -> tuple[Path, Path]:
+    matches: list[tuple[Path, Path]] = []
+    for root in roots:
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            continue
+        if relative.parts:
+            matches.append((root, relative))
+    if not matches:
+        raise SceneMeshInputError("mesh file is outside every allowed root")
+    return max(matches, key=lambda pair: len(pair[0].parts))
+
+
+def _require_no_follow_support() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow or os.open not in os.supports_dir_fd:
+        raise RuntimeError(
+            "this platform cannot enforce no-symlink descriptor traversal"
+        )
+    return no_follow
+
+
+def _attest_open_descriptor_path(
+    descriptor: int,
+    *,
+    expected_path: Path,
+    label: str,
+) -> None:
+    """Bind captured bytes to the canonical pathname authorized for them."""
+    try:
+        actual_path = Path(f"/proc/self/fd/{descriptor}").resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SceneMeshInputError(
+            f"{label} changed while it was being authorized"
+        ) from exc
+    if actual_path != expected_path:
+        raise SceneMeshInputError(
+            f"{label} changed while it was being authorized"
+        )
+
+
+def _read_stable_descriptor(
+    descriptor: int,
+    initial: os.stat_result,
+    *,
+    maximum: int,
+    label: str,
+    require_single_link: bool = False,
+) -> bytes:
+    if initial.st_size <= 0:
+        raise SceneMeshInputError(f"{label} is empty")
+    if initial.st_size > maximum:
+        raise SceneMeshBoundsError(
+            f"{label} exceeds the {maximum}-byte bound"
+        )
+    payload = bytearray()
+    try:
+        while len(payload) <= maximum:
+            remaining = maximum + 1 - len(payload)
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        final = os.fstat(descriptor)
+    except OSError as exc:
+        raise SceneMeshInputError(f"cannot read {label}: {exc}") from exc
+    if len(payload) > maximum:
+        raise SceneMeshBoundsError(
+            f"{label} exceeds the {maximum}-byte bound"
+        )
+    identity_before = (
+        initial.st_dev,
+        initial.st_ino,
+        initial.st_size,
+        initial.st_mtime_ns,
+        initial.st_ctime_ns,
+    )
+    identity_after = (
+        final.st_dev,
+        final.st_ino,
+        final.st_size,
+        final.st_mtime_ns,
+        final.st_ctime_ns,
+    )
+    if identity_before != identity_after or len(payload) != final.st_size:
+        raise SceneMeshInputError(f"{label} changed while it was being read")
+    if require_single_link and (initial.st_nlink != 1 or final.st_nlink != 1):
+        raise SceneMeshInputError(f"{label} must have exactly one link")
+    return bytes(payload)
+
+
+def _read_authorized_mesh_input(
+    mesh_file: str | Path,
+    allowed_roots: list[str | Path] | tuple[str | Path, ...],
+    *,
+    limits: MeshConversionLimits,
+) -> AuthorizedMeshInput:
+    """Capture one regular contained source through one no-follow file open."""
+    if type(limits) is not MeshConversionLimits:
+        raise SceneMeshInputError("limits must be a MeshConversionLimits DTO")
+    candidate = _absolute_path(mesh_file, label="mesh_file")
+    suffix = candidate.suffix.lower()
+    if suffix in _DEFERRED_EXTENSIONS:
+        raise SceneMeshInputError(
+            "DAE conversion is unavailable until I9 captures and qualifies its "
+            "XML/resource closure"
+        )
+    if suffix not in _SUPPORTED_EXTENSIONS:
+        raise SceneMeshInputError(f"unsupported mesh format {suffix!r}")
+    roots = _resolved_allowed_roots(allowed_roots)
+    root, relative = _relative_to_deepest_root(candidate, roots)
+    if len(relative.parts) > _MAX_PATH_COMPONENTS:
+        raise SceneMeshBoundsError(
+            f"mesh_file exceeds the {_MAX_PATH_COMPONENTS}-component bound"
+        )
+
+    probe = root
+    try:
+        for part in relative.parts:
+            probe = probe / part
+            metadata = probe.lstat()
+            if stat_module.S_ISLNK(metadata.st_mode):
+                raise SceneMeshInputError(
+                    "mesh_file must not traverse a symlink"
+                )
+    except FileNotFoundError as exc:
+        raise SceneMeshInputError("mesh_file does not exist") from exc
+    except OSError as exc:
+        raise SceneMeshInputError(f"cannot inspect mesh_file: {exc}") from exc
+
+    no_follow = _require_no_follow_support()
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | no_follow
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
+    directory_descriptor = -1
+    file_descriptor = -1
+    try:
+        expected_root = root.stat(follow_symlinks=False)
+        directory_descriptor = os.open(root, directory_flags)
+        opened_root = os.fstat(directory_descriptor)
+        if (
+            not stat_module.S_ISDIR(opened_root.st_mode)
+            or (opened_root.st_dev, opened_root.st_ino)
+            != (expected_root.st_dev, expected_root.st_ino)
+        ):
+            raise SceneMeshInputError("allowed root changed during authorization")
+        for part in relative.parts[:-1]:
+            next_descriptor = os.open(
+                part,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        file_descriptor = os.open(
+            relative.parts[-1],
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+        initial = os.fstat(file_descriptor)
+        if not stat_module.S_ISREG(initial.st_mode):
+            raise SceneMeshInputError("mesh_file must be a regular file")
+        content = _read_stable_descriptor(
+            file_descriptor,
+            initial,
+            maximum=limits.max_source_bytes,
+            label="mesh_file",
+        )
+        _attest_open_descriptor_path(
+            file_descriptor,
+            expected_path=candidate,
+            label="mesh_file",
+        )
+    except SceneMeshInputError:
+        raise
+    except OSError as exc:
+        raise SceneMeshInputError(
+            f"mesh_file authorization failed closed: {exc}"
+        ) from exc
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+
+    digest = hashlib.sha256(content).hexdigest()
+    return AuthorizedMeshInput(
+        resolved_realpath=str(root / relative),
+        source_suffix=suffix,
+        content=content,
+        content_sha256=digest,
+    )
 
 
 def _asset_hash(
@@ -638,157 +733,473 @@ def _asset_hash(
     file_content_sha256: str,
     mesh_scale: tuple[float, float, float],
 ) -> str:
-    digest = hashlib.sha256()
-    digest.update(_ASSET_SCHEMA_VERSION.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(_CONVERTER_VERSION_TAG.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(resolved_realpath.encode("utf-8", errors="replace"))
-    digest.update(b"\0")
-    digest.update(file_content_sha256.encode("ascii"))
-    digest.update(b"\0")
-    digest.update(json.dumps(mesh_scale, separators=(",", ":")).encode("ascii"))
-    return digest.hexdigest()[:16]
-
-
-def _hash_error_descriptor(seed: str, mesh_scale: tuple[float, float, float]) -> str:
-    digest = hashlib.sha256()
-    digest.update(b"scene-object-error")
-    digest.update(seed.encode("utf-8", errors="replace"))
-    digest.update(json.dumps(mesh_scale, separators=(",", ":")).encode("ascii"))
-    return digest.hexdigest()[:16]
-
-
-def _convert_mesh_asset_subprocess(
-    mesh_file: Path,
-    mesh_scale: tuple[float, float, float],
-    *,
-    timeout_s: float,
-) -> bytes:
-    with tempfile.NamedTemporaryFile(prefix="manyforge-scene-mesh-", suffix=".glb", delete=False) as tmp:
-        output_path = Path(tmp.name)
-    ctx = mp.get_context("spawn")
-    status_queue: mp.Queue[tuple[str, str]] = ctx.Queue(maxsize=1)
-    process = ctx.Process(
-        target=_mesh_conversion_worker,
-        args=(str(mesh_file), tuple(mesh_scale), str(output_path), status_queue),
+    path = _canonical_absolute_path_text(
+        resolved_realpath,
+        label="resolved_realpath",
     )
-    process.start()
-    process.join(timeout_s)
-    try:
-        if process.is_alive():
-            process.terminate()
-            process.join(1.0)
-            if process.is_alive():
-                process.kill()
-                process.join(1.0)
-            raise TimeoutError(f"Mesh conversion timed out after {timeout_s:.1f}s")
-        try:
-            status, message = status_queue.get_nowait()
-        except queue.Empty:
-            status, message = (
-                "ok" if process.exitcode == 0 and output_path.exists() else "error",
-                f"mesh conversion worker exited with {process.exitcode}",
+    content_digest = _validate_lower_hex(
+        file_content_sha256,
+        label="file_content_sha256",
+        length=64,
+    )
+    scale = _normalize_scale(mesh_scale)
+    digest = hashlib.sha256()
+    for value in (
+        _ASSET_SCHEMA_VERSION,
+        _CONVERTER_VERSION_TAG,
+        path,
+        content_digest,
+        json.dumps(scale, separators=(",", ":")),
+    ):
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+def _hash_error_descriptor(
+    seed: str,
+    mesh_scale: tuple[float, float, float],
+) -> str:
+    bounded_seed = _bounded_text(
+        seed,
+        label="error identity seed",
+        maximum=_MAX_URI_CHARS + _MAX_ERROR_CHARS + 64,
+        allow_empty=True,
+    )
+    scale = _normalize_scale(mesh_scale)
+    digest = hashlib.sha256()
+    digest.update(b"scene-object-error\0")
+    digest.update(bounded_seed.encode("utf-8"))
+    digest.update(json.dumps(scale, separators=(",", ":")).encode("ascii"))
+    return digest.hexdigest()[:16]
+
+
+def _validate_glb_payload(payload: bytes, *, maximum: int) -> None:
+    if type(payload) is not bytes:
+        raise SceneMeshInputError("GLB payload must be bytes")
+    if type(maximum) is not int or maximum < _MIN_GLB_BYTES:
+        raise SceneMeshInputError(
+            f"GLB maximum must be an integer of at least {_MIN_GLB_BYTES} bytes"
+        )
+    if len(payload) < _MIN_GLB_BYTES:
+        raise SceneMeshInputError("GLB payload is shorter than a valid GLB")
+    if len(payload) > maximum:
+        raise SceneMeshBoundsError(
+            f"GLB payload exceeds the {maximum}-byte bound"
+        )
+    magic, version, declared_length = _GLB_HEADER.unpack_from(payload)
+    if magic != b"glTF" or version != 2:
+        raise SceneMeshInputError("GLB payload has an unsupported header")
+    if declared_length != len(payload):
+        raise SceneMeshInputError("GLB payload length does not match its header")
+    if declared_length % 4:
+        raise SceneMeshInputError("GLB payload length is not four-byte aligned")
+
+    chunks: list[tuple[bytes, int, int]] = []
+    offset = _GLB_HEADER.size
+    while offset < declared_length:
+        if declared_length - offset < _GLB_CHUNK_HEADER.size:
+            raise SceneMeshInputError("GLB payload has a truncated chunk header")
+        chunk_length, chunk_type = _GLB_CHUNK_HEADER.unpack_from(payload, offset)
+        if chunk_length % 4:
+            raise SceneMeshInputError("GLB chunk length is not four-byte aligned")
+        chunk_start = offset + _GLB_CHUNK_HEADER.size
+        chunk_end = chunk_start + chunk_length
+        if chunk_end > declared_length:
+            raise SceneMeshInputError("GLB chunk exceeds the declared payload length")
+        if len(chunks) >= 2:
+            raise SceneMeshInputError(
+                "GLB may contain only one JSON chunk and one optional BIN chunk"
             )
-        if status != "ok":
-            raise RuntimeError(message)
-        glb_bytes = output_path.read_bytes()
-        if not glb_bytes:
-            raise RuntimeError("mesh conversion produced an empty GLB")
-        return glb_bytes
+        chunks.append((chunk_type, chunk_start, chunk_end))
+        offset = chunk_end
+
+    if not chunks or chunks[0][0] != _GLB_JSON_CHUNK_TYPE:
+        raise SceneMeshInputError("GLB first chunk must be JSON")
+    if len(chunks) > 2 or (
+        len(chunks) == 2 and chunks[1][0] != _GLB_BINARY_CHUNK_TYPE
+    ):
+        raise SceneMeshInputError(
+            "GLB may contain only one JSON chunk and one optional BIN chunk"
+        )
+
+    json_start, json_end = chunks[0][1], chunks[0][2]
+    if json_end - json_start > _MAX_GLB_JSON_BYTES:
+        raise SceneMeshBoundsError(
+            f"GLB JSON chunk exceeds the {_MAX_GLB_JSON_BYTES}-byte bound"
+        )
+    json_chunk = payload[json_start:json_end]
+    try:
+        document = json.loads(json_chunk.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SceneMeshInputError("GLB JSON chunk is invalid") from exc
+    if (
+        type(document) is not dict
+        or type(document.get("asset")) is not dict
+        or document["asset"].get("version") != "2.0"
+    ):
+        raise SceneMeshInputError("GLB JSON chunk is not a glTF 2.0 document")
+
+
+def _read_bounded_worker_output(output_path: Path, *, maximum: int) -> bytes:
+    no_follow = _require_no_follow_support()
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            output_path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow,
+        )
+        initial = os.fstat(descriptor)
+        if not stat_module.S_ISREG(initial.st_mode):
+            raise SceneMeshInputError("worker output must be a regular file")
+        payload = _read_stable_descriptor(
+            descriptor,
+            initial,
+            maximum=maximum,
+            label="worker output",
+            require_single_link=True,
+        )
+        _attest_open_descriptor_path(
+            descriptor,
+            expected_path=output_path,
+            label="worker output",
+        )
+    except SceneMeshInputError:
+        raise
+    except OSError as exc:
+        raise SceneMeshInputError(
+            f"cannot open bounded worker output: {exc}"
+        ) from exc
     finally:
-        try:
-            output_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if descriptor >= 0:
+            os.close(descriptor)
+    _validate_glb_payload(payload, maximum=maximum)
+    return payload
+
+
+def _bounded_worker_message(exc: Exception) -> str:
+    message = f"{type(exc).__name__}: {exc}".replace("\n", " ")
+    if len(message) <= _MAX_ERROR_CHARS:
+        return message
+    return message[: _MAX_ERROR_CHARS - 3] + "..."
+
+
+class _NoExternalMeshResolver:
+    """Fail closed if a retained parser asks for any non-snapshot asset."""
+
+    @staticmethod
+    def _reject() -> bytes:
+        raise SceneMeshInputError(
+            "external mesh resources are unavailable in snapshot conversion"
+        )
+
+    def __getitem__(self, _name: object) -> bytes:
+        return self._reject()
+
+    def get(self, _name: object) -> bytes:
+        return self._reject()
+
+    def keys(self) -> tuple[object, ...]:
+        return ()
+
+
+def _set_worker_limit(resource_module: Any, kind: int, requested: int) -> None:
+    _soft, current_hard = resource_module.getrlimit(kind)
+    if current_hard != resource_module.RLIM_INFINITY:
+        requested = min(requested, int(current_hard))
+    if requested <= 0:
+        raise RuntimeError("worker resource limit is unavailable")
+    resource_module.setrlimit(kind, (requested, requested))
+
+
+def _apply_worker_resource_limits(limits: MeshConversionLimits) -> None:
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    _set_worker_limit(
+        resource,
+        resource.RLIMIT_AS,
+        limits.worker_memory_bytes,
+    )
+    _set_worker_limit(
+        resource,
+        resource.RLIMIT_FSIZE,
+        limits.max_output_bytes,
+    )
+    _set_worker_limit(
+        resource,
+        resource.RLIMIT_CPU,
+        max(1, math.ceil(limits.timeout_s)),
+    )
+
+
+def _configure_worker_native_thread_limits() -> None:
+    # The spawned worker imports NumPy/trimesh only after this point.  Force
+    # native math libraries to one thread before import so a high host CPU
+    # count cannot reserve one stack/address-space arena per ambient thread and
+    # exhaust the worker's deliberate RLIMIT_AS ceiling.
+    for variable in _WORKER_NATIVE_THREAD_ENV:
+        os.environ[variable] = "1"
+
+
+def _write_worker_output(
+    staging_path: str,
+    output_path: str,
+    payload: bytes,
+    *,
+    maximum: int,
+) -> None:
+    _validate_glb_payload(payload, maximum=maximum)
+    no_follow = _require_no_follow_support()
+    descriptor = os.open(
+        staging_path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | no_follow,
+        0o600,
+    )
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("worker output write made no progress")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.link(staging_path, output_path, follow_symlinks=False)
+    os.unlink(staging_path)
 
 
 def _mesh_conversion_worker(
-    mesh_file: str,
+    mesh_input: AuthorizedMeshInput,
     mesh_scale: tuple[float, float, float],
+    staging_path: str,
     output_path: str,
-    status_queue: "mp.Queue[tuple[str, str]]",
+    limits: MeshConversionLimits,
+    status_connection: Any,
 ) -> None:
     try:
+        if type(limits) is not MeshConversionLimits:
+            raise SceneMeshInputError("worker limits DTO is invalid")
+        if type(mesh_input) is not AuthorizedMeshInput:
+            raise SceneMeshInputError("worker mesh input DTO is invalid")
+        _configure_worker_native_thread_limits()
+        _apply_worker_resource_limits(limits)
+        scale = _normalize_scale(mesh_scale)
+
         import trimesh
 
-        loaded = trimesh.load(mesh_file, force="mesh")
+        resolver = _NoExternalMeshResolver()
+        loaded = trimesh.load(
+            file_obj=io.BytesIO(mesh_input.content),
+            file_type=mesh_input.source_suffix.lstrip("."),
+            force="mesh",
+            resolver=resolver,
+            skip_materials=True,
+        )
         mesh: Any = loaded
         if hasattr(loaded, "dump"):
             try:
                 mesh = loaded.dump(concatenate=True)
             except Exception:
                 mesh = loaded
-        sx, sy, sz = mesh_scale
-        if (abs(sx - 1.0) + abs(sy - 1.0) + abs(sz - 1.0)) > 1e-9:
-            mesh.apply_scale([sx, sy, sz])
+        if scale != (1.0, 1.0, 1.0):
+            mesh.apply_scale(list(scale))
         data = mesh.export(file_type="glb")
-        if isinstance(data, str):
-            glb_bytes = data.encode("utf-8")
-        elif isinstance(data, bytes):
-            glb_bytes = data
+        if type(data) is str:
+            result = data.encode("utf-8")
+        elif type(data) is bytes:
+            result = data
         else:
             raise RuntimeError("trimesh returned unsupported GLB payload type")
-        trimesh.load(io.BytesIO(glb_bytes), file_type="glb", force="mesh")
-        Path(output_path).write_bytes(glb_bytes)
-        status_queue.put(("ok", ""))
+        _validate_glb_payload(result, maximum=limits.max_output_bytes)
+        trimesh.load(
+            file_obj=io.BytesIO(result),
+            file_type="glb",
+            force="mesh",
+            resolver=resolver,
+            skip_materials=True,
+        )
+        _write_worker_output(
+            staging_path,
+            output_path,
+            result,
+            maximum=limits.max_output_bytes,
+        )
+        status_connection.send(("ok", ""))
     except Exception as exc:
         try:
-            status_queue.put(("error", str(exc)))
+            status_connection.send(("error", _bounded_worker_message(exc)))
         except Exception:
             pass
+    finally:
+        status_connection.close()
 
 
-def get_scene_mesh_asset_service(state: "ComposerState") -> SceneMeshAssetService:
-    service = getattr(state, "_scene_mesh_asset_service", None)
-    if isinstance(service, SceneMeshAssetService):
-        return service
-    service = SceneMeshAssetService()
-    setattr(state, "_scene_mesh_asset_service", service)
-    return service
+def _stop_worker(process: mp.Process) -> None:
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(_WORKER_STOP_GRACE_S)
+    if process.is_alive():
+        process.kill()
+        process.join(_WORKER_STOP_GRACE_S)
+    if process.is_alive():
+        raise RuntimeError(
+            "mesh conversion worker remained alive after bounded SIGKILL teardown"
+        )
+
+
+def _validated_worker_status(value: object) -> tuple[str, str]:
+    if type(value) is not tuple or len(value) != 2:
+        raise RuntimeError("mesh conversion worker returned malformed status")
+    status, message = value
+    if type(status) is not str or status not in {"ok", "error"}:
+        raise RuntimeError("mesh conversion worker returned unknown status")
+    if type(message) is not str or len(message) > _MAX_ERROR_CHARS:
+        raise RuntimeError("mesh conversion worker returned malformed detail")
+    if status == "ok" and message:
+        raise RuntimeError("mesh conversion worker success carried error detail")
+    if status == "error" and not message:
+        raise RuntimeError("mesh conversion worker failure omitted error detail")
+    return status, message
+
+
+def _convert_mesh_asset_subprocess(
+    mesh_input: AuthorizedMeshInput,
+    mesh_scale: tuple[float, float, float],
+    *,
+    limits: MeshConversionLimits,
+) -> bytes:
+    """Convert one immutable authorized snapshot inside a bounded worker."""
+    if type(mesh_input) is not AuthorizedMeshInput:
+        raise SceneMeshInputError(
+            "mesh_input must be an AuthorizedMeshInput DTO"
+        )
+    if type(limits) is not MeshConversionLimits:
+        raise SceneMeshInputError("limits must be a MeshConversionLimits DTO")
+    scale = _normalize_scale(mesh_scale)
+    context = mp.get_context("spawn")
+
+    with tempfile.TemporaryDirectory(
+        prefix="manyforge-scene-mesh-"
+    ) as temporary_directory:
+        work_directory = Path(temporary_directory)
+        metadata = work_directory.stat(follow_symlinks=False)
+        if (
+            not stat_module.S_ISDIR(metadata.st_mode)
+            or metadata.st_mode & 0o077
+        ):
+            raise RuntimeError("mesh worker directory is not private")
+        staging_path = work_directory / "result.part"
+        output_path = work_directory / "result.glb"
+        receiver, sender = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_mesh_conversion_worker,
+            args=(
+                mesh_input,
+                scale,
+                str(staging_path),
+                str(output_path),
+                limits,
+                sender,
+            ),
+        )
+        started = False
+        try:
+            deadline = time.monotonic() + limits.timeout_s
+            process.start()
+            started = True
+            sender.close()
+            process.join(max(0.0, deadline - time.monotonic()))
+            if process.is_alive():
+                raise TimeoutError(
+                    "mesh conversion exceeded its bounded wall timeout"
+                )
+            if process.exitcode != 0:
+                raise RuntimeError(
+                    f"mesh conversion worker exited with {process.exitcode}"
+                )
+            if not receiver.poll():
+                raise RuntimeError("mesh conversion worker returned no status")
+            status, message = _validated_worker_status(receiver.recv())
+            if status != "ok":
+                raise RuntimeError(message)
+            return _read_bounded_worker_output(
+                output_path,
+                maximum=limits.max_output_bytes,
+            )
+        finally:
+            sender.close()
+            receiver.close()
+            if started:
+                _stop_worker(process)
+                if not process.is_alive():
+                    process.close()
+
+
+class SceneMeshAssetService:
+    """Stable I9 reconnection marker; it owns no state or cache today."""
+
+    def metadata_for_shape(
+        self,
+        *_args: object,
+        **_kwargs: object,
+    ) -> dict[str, str | None]:
+        _raise_scene_mesh_client_unavailable()
+
+    def validate_boundary_or_409(
+        self,
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        _raise_scene_mesh_client_unavailable()
+
+    def prewarm(self, *_args: object, **_kwargs: object) -> None:
+        _raise_scene_mesh_client_unavailable()
+
+    def get_glb_response(self, *_args: object, **_kwargs: object) -> None:
+        _raise_scene_mesh_client_unavailable()
+
+
+def get_scene_mesh_asset_service(_state: "ComposerState") -> SceneMeshAssetService:
+    _raise_scene_mesh_client_unavailable()
 
 
 def scene_mesh_shape_metadata(
-    state: "ComposerState",
-    mesh_resource_uri: str | None,
-    mesh_scale: list[float] | tuple[float, ...] | None,
+    _state: "ComposerState",
+    _mesh_resource_uri: str | None,
+    _mesh_scale: list[float] | tuple[float, ...] | None,
 ) -> dict[str, str | None]:
-    return get_scene_mesh_asset_service(state).metadata_for_shape(
-        state,
-        mesh_resource_uri,
-        mesh_scale,
-        schedule_conversion=True,
-    )
+    _raise_scene_mesh_client_unavailable()
 
 
 def validate_scene_mesh_resource_or_409(
-    state: "ComposerState",
-    mesh_resource_uri: str | None,
-    mesh_scale: list[float] | tuple[float, ...] | None,
+    _state: "ComposerState",
+    _mesh_resource_uri: str | None,
+    _mesh_scale: list[float] | tuple[float, ...] | None,
 ) -> None:
-    get_scene_mesh_asset_service(state).validate_boundary_or_409(
-        state,
-        mesh_resource_uri,
-        mesh_scale,
-    )
+    _raise_scene_mesh_client_unavailable()
 
 
-def create_scene_meshes_router(state: "ComposerState") -> APIRouter:
-    """Create the scene-object mesh asset router."""
-    service = get_scene_mesh_asset_service(state)
-    prior_callback = getattr(state, "_on_program_loaded", None)
+def create_scene_meshes_router(_state: "ComposerState") -> APIRouter:
+    _raise_scene_mesh_client_unavailable()
 
-    def _on_program_loaded_with_mesh_prewarm(st: "ComposerState") -> None:
-        if prior_callback is not None:
-            prior_callback(st)
-        service.prewarm(st)
 
-    setattr(state, "_on_program_loaded", _on_program_loaded_with_mesh_prewarm)
-
-    router = APIRouter()
-
-    @router.get("/{asset_hash}.glb")
-    def get_scene_object_mesh(asset_hash: str) -> Response:
-        return service.get_glb_response(asset_hash)
-
-    return router
+__all__ = [
+    "AuthorizedMeshInput",
+    "MeshAssetDescriptor",
+    "MeshConversionLimits",
+    "SceneMeshAssetService",
+    "SceneMeshBoundsError",
+    "SceneMeshClientUnavailableError",
+    "SceneMeshInputError",
+    "create_scene_meshes_router",
+    "get_scene_mesh_asset_service",
+    "scene_mesh_shape_metadata",
+    "validate_scene_mesh_resource_or_409",
+]

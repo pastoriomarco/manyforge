@@ -1,15 +1,20 @@
 #include "manyforge_scene/canonical_empty_scene_owner.hpp"
+#include "sqlite_scene_lifecycle_internal.hpp"
 
 #include <gtest/gtest.h>
 #include <sqlite3.h>
 
+#include <atomic>
 #include <barrier>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -23,6 +28,8 @@
 
 namespace manyforge::scene {
 namespace {
+
+using namespace std::chrono_literals;
 
 using core::ActiveBundlePublicationGeneration;
 using core::ActiveBundlePublicationReceiptDTO;
@@ -91,6 +98,12 @@ class TemporaryDirectory final {
   std::vector<char> buffer_;
   std::filesystem::path path_;
 };
+
+void ExpectNoSqliteSidecars(const std::filesystem::path& path) {
+  EXPECT_FALSE(std::filesystem::exists(path.string() + "-wal"));
+  EXPECT_FALSE(std::filesystem::exists(path.string() + "-shm"));
+  EXPECT_FALSE(std::filesystem::exists(path.string() + "-journal"));
+}
 
 deployment::CanonicalEmptyRetainedBundleAdmission LoadAdmission() {
   const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
@@ -165,6 +178,120 @@ class ControlledPublicationReader final
   std::optional<ErrorDTO> returned_error_;
   std::optional<ActiveBundlePublicationReceiptDTO> current_;
 };
+
+struct SceneLifecycleObservation final {
+  SceneLifecycleObservation(
+      const sqlite_lifecycle_internal::
+          CanonicalEmptySceneStoreLifecycleEvent attempt,
+      const sqlite_lifecycle_internal::
+          CanonicalEmptySceneStoreLifecycleEvent acquired)
+      : expected_attempt(attempt),
+        expected_acquired(acquired),
+        release_signal(release_after_acquired.get_future().share()) {}
+
+  sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent
+      expected_attempt;
+  sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent
+      expected_acquired;
+  std::promise<void> attempted;
+  std::promise<void> acquired;
+  std::promise<void> release_after_acquired;
+  std::shared_future<void> release_signal;
+  std::atomic<bool> attempt_notified{false};
+  std::atomic<bool> acquired_notified{false};
+};
+
+void ObserveSceneLifecycleEvent(
+    const sqlite_lifecycle_internal::
+        CanonicalEmptySceneStoreLifecycleEvent event,
+    void* const context) noexcept {
+  auto& observation =
+      *static_cast<SceneLifecycleObservation*>(context);
+  try {
+    if (event == observation.expected_attempt &&
+        !observation.attempt_notified.exchange(true)) {
+      observation.attempted.set_value();
+      return;
+    }
+    if (event == observation.expected_acquired &&
+        !observation.acquired_notified.exchange(true)) {
+      observation.acquired.set_value();
+      observation.release_signal.wait();
+    }
+  } catch (...) {
+  }
+}
+
+class ScopedSceneLifecycleObserver final {
+ public:
+  explicit ScopedSceneLifecycleObserver(
+      SceneLifecycleObservation& observation) {
+    sqlite_lifecycle_internal::
+        SetCanonicalEmptySceneStoreLifecycleEventObserverForTesting(
+            &ObserveSceneLifecycleEvent, &observation);
+  }
+
+  ~ScopedSceneLifecycleObserver() {
+    sqlite_lifecycle_internal::
+        ClearCanonicalEmptySceneStoreLifecycleEventObserverForTesting();
+  }
+
+  ScopedSceneLifecycleObserver(const ScopedSceneLifecycleObserver&) =
+      delete;
+  ScopedSceneLifecycleObserver& operator=(
+      const ScopedSceneLifecycleObserver&) = delete;
+};
+
+template <typename Action>
+void ExpectActionAcquiresSceneLifecycleGate(
+    const sqlite_lifecycle_internal::
+        CanonicalEmptySceneStoreLifecycleEvent expected_attempt,
+    const sqlite_lifecycle_internal::
+        CanonicalEmptySceneStoreLifecycleEvent expected_acquired,
+    Action action) {
+  sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleLock held(
+      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleMutex());
+  SceneLifecycleObservation observation(
+      expected_attempt, expected_acquired);
+  auto attempted = observation.attempted.get_future();
+  auto acquired = observation.acquired.get_future();
+  const ScopedSceneLifecycleObserver observer(observation);
+  auto completion = std::async(
+      std::launch::async,
+      [action = std::move(action)]() mutable { action(); });
+
+  const auto attempt_status = attempted.wait_for(2s);
+  if (attempt_status != std::future_status::ready) {
+    held.unlock();
+    observation.release_after_acquired.set_value();
+    ADD_FAILURE()
+        << "production action did not attempt the scene lifecycle gate";
+    EXPECT_NO_THROW(completion.get());
+    return;
+  }
+
+  held.unlock();
+  const auto acquired_status = acquired.wait_for(2s);
+  if (acquired_status != std::future_status::ready) {
+    observation.release_after_acquired.set_value();
+    ADD_FAILURE()
+        << "production action did not acquire the scene lifecycle gate";
+    EXPECT_NO_THROW(completion.get());
+    return;
+  }
+
+  auto& mutex =
+      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleMutex();
+  const bool acquired_by_test = mutex.try_lock();
+  if (acquired_by_test) {
+    mutex.unlock();
+  }
+  EXPECT_FALSE(acquired_by_test)
+      << "production action reported acquisition without holding the gate";
+
+  observation.release_after_acquired.set_value();
+  EXPECT_NO_THROW(completion.get());
+}
 
 ProjectionBootstrapIntentDTO Intent(
     const deployment::CanonicalEmptyRetainedBundleAdmission& admission,
@@ -593,6 +720,148 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
   EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
   EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 0);
+}
+
+TEST(
+    CanonicalEmptySceneOwner,
+    LifecycleGateSerializesConstructionCloseAndDestruction) {
+  TemporaryDirectory directory;
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  const auto database = directory.path() / "logical-scene.sqlite3";
+  const auto make_owner = [&] {
+    return std::make_unique<CanonicalEmptySceneOwner>(
+        database, admission, publication_reader);
+  };
+
+  ExpectActionAcquiresSceneLifecycleGate(
+      sqlite_lifecycle_internal::
+          CanonicalEmptySceneStoreLifecycleEvent::kStartupAttempt,
+      sqlite_lifecycle_internal::
+          CanonicalEmptySceneStoreLifecycleEvent::kStartupAcquired,
+      [&] {
+        auto owner = make_owner();
+        if (owner->VerifyIntegrity().acceptance_row_count != 0) {
+          throw std::runtime_error(
+              "fresh scene owner has an unexpected acceptance row");
+        }
+      });
+  ExpectNoSqliteSidecars(database);
+
+  auto explicitly_closed = make_owner();
+  ExpectActionAcquiresSceneLifecycleGate(
+      sqlite_lifecycle_internal::
+          CanonicalEmptySceneStoreLifecycleEvent::kCloseAttempt,
+      sqlite_lifecycle_internal::
+          CanonicalEmptySceneStoreLifecycleEvent::kCloseAcquired,
+      [owner = explicitly_closed.get()] { owner->Close(); });
+  ExpectNoSqliteSidecars(database);
+  {
+    auto reopened = make_owner();
+    EXPECT_EQ(reopened->VerifyIntegrity().acceptance_row_count, 0);
+  }
+
+  auto destructed = make_owner();
+  ExpectActionAcquiresSceneLifecycleGate(
+      sqlite_lifecycle_internal::
+          CanonicalEmptySceneStoreLifecycleEvent::kCloseAttempt,
+      sqlite_lifecycle_internal::
+          CanonicalEmptySceneStoreLifecycleEvent::kCloseAcquired,
+      [owner = std::move(destructed)]() mutable { owner.reset(); });
+  ExpectNoSqliteSidecars(database);
+  {
+    auto reopened = make_owner();
+    EXPECT_EQ(reopened->VerifyIntegrity().acceptance_row_count, 0);
+  }
+
+  auto final_reopen = make_owner();
+  EXPECT_EQ(final_reopen->VerifyIntegrity().acceptance_row_count, 0);
+}
+
+TEST(
+    CanonicalEmptySceneOwnerLifecycleGate,
+    ContendedStartupDeadlineReturnsWithoutOwnership) {
+  constexpr auto kTimeout = 50ms;
+  sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleLock held(
+      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleMutex());
+  std::promise<void> start_promise;
+  const auto start = start_promise.get_future().share();
+  auto waiter = std::async(
+      std::launch::async,
+      [start] {
+        start.get();
+        const auto started = std::chrono::steady_clock::now();
+        auto attempted = sqlite_lifecycle_internal::
+            TryAcquireCanonicalEmptySceneStoreLifecycleLock(kTimeout);
+        return std::pair{
+            attempted.owns_lock(),
+            std::chrono::steady_clock::now() - started};
+      });
+  start_promise.set_value();
+
+  const auto [owns_lock, elapsed] = waiter.get();
+  held.unlock();
+  EXPECT_FALSE(owns_lock);
+  EXPECT_GE(elapsed, kTimeout);
+}
+
+TEST(
+    CanonicalEmptySceneOwner,
+    ConcurrentFirstOpenConvergesOneExactEmptyStore) {
+  TemporaryDirectory directory;
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  const auto database = directory.path() / "logical-scene.sqlite3";
+  std::promise<void> start_promise;
+  const auto start = start_promise.get_future().share();
+  std::barrier open_together(4);
+  std::vector<std::future<CanonicalEmptySceneStoreIntegrityReport>> openings;
+  openings.reserve(4U);
+  try {
+    for (std::size_t index = 0U; index < 4U; ++index) {
+      openings.push_back(std::async(
+          std::launch::async,
+          [&, index, start] {
+            start.get();
+            open_together.arrive_and_wait();
+            CanonicalEmptySceneOwner owner(
+                database, admission, publication_reader);
+            const auto report = owner.VerifyIntegrity();
+            if (index % 2U == 0U) {
+              owner.Close();
+            }
+            return report;
+          }));
+    }
+  } catch (...) {
+    const auto launch_error = std::current_exception();
+    start_promise.set_exception(launch_error);
+    for (auto& opening : openings) {
+      try {
+        static_cast<void>(opening.get());
+      } catch (...) {
+      }
+    }
+    std::rethrow_exception(launch_error);
+  }
+  start_promise.set_value();
+
+  std::string schema_digest;
+  for (auto& opening : openings) {
+    const auto report = opening.get();
+    EXPECT_EQ(report.acceptance_row_count, 0);
+    EXPECT_EQ(report.rebuild_row_count, 0);
+    EXPECT_EQ(report.finalization_row_count, 0);
+    if (schema_digest.empty()) {
+      schema_digest = report.schema_artifact_digest;
+    } else {
+      EXPECT_EQ(report.schema_artifact_digest, schema_digest);
+    }
+  }
+  ExpectNoSqliteSidecars(database);
+  CanonicalEmptySceneOwner reopened(
+      database, admission, publication_reader);
+  EXPECT_EQ(reopened.VerifyIntegrity().acceptance_row_count, 0);
 }
 
 TEST(CanonicalEmptySceneOwner, ConcurrentExactBeginCommitsOneAcceptance) {

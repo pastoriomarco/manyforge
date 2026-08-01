@@ -1,619 +1,466 @@
 #!/usr/bin/env python3
-"""Run the version-neutral RP5 offline corpus inside a ManyForge container."""
+"""Relocation gate and pure reducers for the historical RP5 offline producer.
+
+The executable producer at
+manyforge@08222188293df8e12f90dc72e204c21f22f92ea1 built the removed Python
+runtime-model/factory composition and launched legacy benchmark binaries. The
+corpus validator remains in roboplan_05_qualification.py; only source-neutral
+evidence projection is retained here.
+"""
 
 from __future__ import annotations
 
-import argparse
-import hashlib
 import json
-import os
-import shlex
-import site
-import socket
-import subprocess
+import math
 import sys
-import time
-from pathlib import Path
-from typing import Any
+from itertools import islice
+from numbers import Real
+from typing import Any, Iterable, NamedTuple
 
 
-def _repo_root_from_script() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-REPO_ROOT = _repo_root_from_script()
-sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT / "manyforge_behavior"))
-
-from manyforge_behavior.model_paths import ResolvedRobotModel  # noqa: E402
-from manyforge_behavior.robot_model_runtime import (  # noqa: E402
-    RoboPlanRuntimeModelView,
-    prepare_roboplan_runtime_model_view,
+UNAVAILABLE_EXIT_CODE = 78
+HISTORICAL_SOURCE = "manyforge@08222188293df8e12f90dc72e204c21f22f92ea1"
+HISTORICAL_SOURCE_BLOB = "1f07b69faea96950fbbdbc35a4d8e3e9913cc2b1"
+HISTORICAL_TEST_BLOB = "0935aa3246f28dc7457706ae37db386759cf415d"
+MAX_FIXTURE_ROWS = 4096
+MAX_DETAIL_NODES = 65_536
+MAX_DETAIL_DEPTH = 16
+MAX_TEXT_CHARS = 4096
+MAX_IDENTIFIER_CHARS = 256
+_EXACT_BOOLEAN_DETAIL_KEYS = frozenset(
+    {
+        "decision_match",
+        "enabled",
+        "ordered_contact_summary_used",
+        "support_contact_active",
+        "support_contact_ordered_summary_verified",
+    }
 )
-from scripts.qualification.roboplan_05_qualification import (  # noqa: E402
-    EVIDENCE_SCHEMA,
-    collect_inventory,
-    require_source_inventory_stable,
-    validate_corpus,
-    validate_evidence,
-    write_evidence_exclusive,
+_NONNEGATIVE_INTEGER_DETAIL_KEYS = frozenset(
+    {
+        "allocation_bound_per_query",
+        "allocations",
+        "runs",
+        "waypoints",
+        "workers",
+        "workers_requested",
+    }
 )
 
 
-SUPPORTED_DIRECT_QUERY_CLASSES = {
-    "binary_complete",
-    "exact_distance",
-    "runtime_binary",
-    "runtime_distance",
-}
+class RestorationAssignment(NamedTuple):
+    historical_case: str
+    historical_source_lines: str
+    restoration_gate: str
+    required_behavior: str
 
 
-def _read_json(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError(f"{path}: expected a JSON object")
-    return value
-
-
-def _run_json(command: list[str], *, env: dict[str, str]) -> dict[str, Any]:
-    completed = subprocess.run(
-        command,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    lines = [line for line in completed.stdout.splitlines() if line.strip()]
-    if len(lines) != 1:
-        raise RuntimeError(
-            f"expected one JSON line from {command[0]}, got {len(lines)}; "
-            f"stderr={completed.stderr[-2000:]!r}"
-        )
-    value = json.loads(lines[0])
-    if not isinstance(value, dict):
-        raise RuntimeError(f"{command[0]} returned a non-object JSON value")
-    return value
+RESTORATION_ASSIGNMENTS = (
+    RestorationAssignment(
+        "corpus_capture_and_evidence_validation",
+        "historical source blob lines 365-371; retained in the standalone validator",
+        "retained/roboplan_05_qualification.py",
+        "validate serialized RP5 artifacts without constructing a product runtime",
+    ),
+    RestorationAssignment(
+        "runtime_model_view_and_kernel_fixture_construction",
+        "historical source blob lines 154-300 and 365-398",
+        "I6/N",
+        "resolve addressed model/program/deployment products through the native owner",
+    ),
+    RestorationAssignment(
+        "neutral_engine_matrix_and_trajectory_validation",
+        "historical source blob lines 399-518",
+        "I6/N+I8/P5",
+        "run direct collision evidence and final ordered multi-domain validation",
+    ),
+    RestorationAssignment(
+        "planner_policy_and_collision_attribution",
+        "historical source blob lines 450-540",
+        "I6/N",
+        "observe native planner facts without a Python scene or factory authority",
+    ),
+    RestorationAssignment(
+        "benchmark_binary_execution_and_evidence_publication",
+        "historical source blob lines 51-77, 349-363, and 365-618",
+        "I6/N+I8/P5",
+        "qualify restored native targets in the supported container lane",
+    ),
+    RestorationAssignment(
+        "source_bound_evidence_projection",
+        "retained source blob lines 79-151; old envelope lines 303-347 and "
+        "541-560 removed",
+        "retained/current",
+        "retain unit conversion and engine-record projection for captured artifacts",
+    ),
+)
 
 
 def _latency_us_to_ns(value: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: (None if item is None else float(item) * 1000.0)
-        for key, item in value.items()
-        if key in {"p50", "p95", "p99", "max", "mad"}
-    }
+    """Project a captured latency distribution without running a benchmark."""
+
+    if not isinstance(value, dict):
+        raise ValueError("latency distribution must be an object")
+    projected: dict[str, Any] = {}
+    for key in ("p50", "p95", "p99", "max", "mad"):
+        if key not in value:
+            continue
+        projected[key] = (
+            _nonnegative_real(value[key], label=f"latency.{key}") * 1000.0
+        )
+    return projected
 
 
 def _engine_matrix_records(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Retained source-neutral projection of an already-captured engine matrix."""
+
+    if not isinstance(raw, dict):
+        raise ValueError("engine matrix must be an object")
+    fixtures = _bounded_items(raw.get("fixtures", ()), label="fixtures")
     records: list[dict[str, Any]] = []
-    for fixture in raw.get("fixtures", []):
-        fixture_id = f"neutral_engine/{fixture['fixture']}"
-        runtime = fixture.get("runtime_query", {})
-        revision = runtime.get("revision_change", {})
-        if revision.get("max_us", 0.0) > 0.0:
+    seen_fixture_names: set[str] = set()
+    for index, fixture_value in enumerate(fixtures):
+        fixture = _object(fixture_value, label=f"fixtures[{index}]")
+        fixture_name = _bounded_text(
+            fixture.get("fixture"),
+            label=f"fixtures[{index}].fixture",
+            limit=MAX_IDENTIFIER_CHARS,
+        )
+        fixture_passed = _exact_bool(
+            fixture.get("passed"), label=f"fixtures[{index}].passed"
+        )
+        if fixture_name in seen_fixture_names:
+            raise ValueError(f"duplicate fixture identifier: {fixture_name}")
+        seen_fixture_names.add(fixture_name)
+        fixture_id = f"neutral_engine/{fixture_name}"
+        runtime = _optional_object(
+            fixture,
+            "runtime_query",
+            label=f"fixtures[{index}].runtime_query",
+        )
+        revision = _optional_object(
+            runtime,
+            "revision_change",
+            label=f"fixtures[{index}].runtime_query.revision_change",
+        )
+        revision_max_us = 0.0
+        if revision:
+            if "max_us" not in revision:
+                raise ValueError(
+                    f"fixtures[{index}].runtime_query.revision_change.max_us is required"
+                )
+            revision_max_us = _nonnegative_real(
+                revision["max_us"],
+                label=f"fixtures[{index}].runtime_query.revision_change.max_us",
+            )
+        if revision_max_us > 0.0:
+            revision_latency = {
+                key: _required_nonnegative_real(
+                    revision,
+                    f"{key}_us",
+                    label=(
+                        f"fixtures[{index}].runtime_query.revision_change.{key}_us"
+                    ),
+                )
+                for key in ("p50", "p95", "p99", "max")
+            }
+            revision_details = _validated_revision_details(
+                revision,
+                label=f"fixtures[{index}].runtime_query.revision_change",
+            )
             records.append(
                 {
                     "record_type": "collision_revision",
                     "fixture_id": fixture_id,
-                    "passed": bool(fixture["passed"]),
-                    "latency_ns": _latency_us_to_ns(
-                        {
-                            "p50": revision.get("p50_us"),
-                            "p95": revision.get("p95_us"),
-                            "p99": revision.get("p99_us"),
-                            "max": revision.get("max_us"),
-                        }
-                    ),
-                    "details": {
-                        "allocations": revision.get("allocations"),
-                        "allocations_per_query": revision.get(
-                            "allocations_per_query"
-                        ),
-                        "allocation_bound_per_query": revision.get(
-                            "allocation_bound_per_query"
-                        ),
-                        "wcet_budget_ns": revision.get("wcet_budget_ns"),
-                    },
+                    "passed": fixture_passed,
+                    "latency_ns": _latency_us_to_ns(revision_latency),
+                    "details": revision_details,
                 }
             )
-        validation = fixture.get("validation", {})
-        noncollision = fixture.get("noncollision_validation", {})
-        if validation.get("enabled") or noncollision.get("enabled"):
+        validation = _optional_object(
+            fixture,
+            "validation",
+            label=f"fixtures[{index}].validation",
+        )
+        noncollision = _optional_object(
+            fixture,
+            "noncollision_validation",
+            label=f"fixtures[{index}].noncollision_validation",
+        )
+        validation_enabled = _enabled_flag(
+            validation, label=f"fixtures[{index}].validation"
+        )
+        noncollision_enabled = _enabled_flag(
+            noncollision, label=f"fixtures[{index}].noncollision_validation"
+        )
+        if validation_enabled or noncollision_enabled:
+            _validate_bounded_detail(
+                validation, label=f"fixtures[{index}].validation"
+            )
+            _validate_bounded_detail(
+                noncollision,
+                label=f"fixtures[{index}].noncollision_validation",
+            )
+            decision_match = True
+            validation_runs = 0
+            if validation_enabled:
+                decision_match = _exact_bool(
+                    validation.get("decision_match"),
+                    label=f"fixtures[{index}].validation.decision_match",
+                )
+                validation_runs = _required_nonnegative_int(
+                    validation,
+                    "runs",
+                    label=f"fixtures[{index}].validation.runs",
+                )
+            elif "decision_match" in validation:
+                _exact_bool(
+                    validation["decision_match"],
+                    label=f"fixtures[{index}].validation.decision_match",
+                )
+            noncollision_runs = 0
+            if noncollision_enabled:
+                noncollision_runs = _required_nonnegative_int(
+                    noncollision,
+                    "runs",
+                    label=f"fixtures[{index}].noncollision_validation.runs",
+                )
+            support_verified = False
+            if "support_contact_ordered_summary_verified" in fixture:
+                support_verified = _exact_bool(
+                    fixture["support_contact_ordered_summary_verified"],
+                    label=(
+                        f"fixtures[{index}].support_contact_ordered_summary_verified"
+                    ),
+                )
             details = {
                 "collision_validation": validation,
                 "noncollision_validation": noncollision,
-                "support_contact_ordered_summary_verified": fixture.get(
-                    "support_contact_ordered_summary_verified", False
-                ),
+                "support_contact_ordered_summary_verified": support_verified,
             }
             record: dict[str, Any] = {
                 "record_type": "trajectory_validation",
                 "fixture_id": fixture_id,
-                "passed": bool(
-                    fixture["passed"] and validation.get("decision_match", True)
-                ),
-                "sample_count": max(
-                    int(validation.get("runs", 0)),
-                    int(noncollision.get("runs", 0)),
-                ),
+                "passed": fixture_passed and decision_match,
+                "sample_count": max(validation_runs, noncollision_runs),
                 "details": details,
             }
-            if noncollision.get("max_us", 0.0) > 0.0:
+            noncollision_max_us = 0.0
+            if "max_us" in noncollision:
+                noncollision_max_us = _nonnegative_real(
+                    noncollision["max_us"],
+                    label=f"fixtures[{index}].noncollision_validation.max_us",
+                )
+            if noncollision_max_us > 0.0:
                 record["latency_ns"] = _latency_us_to_ns(
                     {
-                        "p50": noncollision.get("p50_us"),
-                        "p95": noncollision.get("p95_us"),
-                        "p99": noncollision.get("p99_us"),
-                        "max": noncollision.get("max_us"),
+                        key: _required_nonnegative_real(
+                            noncollision,
+                            f"{key}_us",
+                            label=(
+                                f"fixtures[{index}].noncollision_validation.{key}_us"
+                            ),
+                        )
+                        for key in ("p50", "p95", "p99", "max")
                     }
                 )
             records.append(record)
     return records
 
 
-def _runtime_views(
-    corpus: dict[str, Any], repo_root: Path
-) -> dict[str, RoboPlanRuntimeModelView]:
-    views: dict[str, RoboPlanRuntimeModelView] = {}
-    for model_id, model in corpus["models"].items():
-        if model["source"] != "manyforge_example_models":
-            continue
-        package_paths = [str((repo_root / path).resolve()) for path in model["package_paths"]]
-        urdf_path = str((repo_root / model["urdf_path"]).resolve())
-        resolved = ResolvedRobotModel(
-            # Production resolve_robot_model() derives authority identity from
-            # the resolved URDF stem. The corpus model_name remains the
-            # planner-facing logical robot id and must not alter RMA hashes.
-            model_name=Path(urdf_path).stem or "robot_model",
-            urdf_path=urdf_path,
-            srdf_path=str((repo_root / model["srdf_path"]).resolve()),
-            package_paths=package_paths,
-        )
-        views[model_id] = prepare_roboplan_runtime_model_view(
-            resolved_model=resolved
-        )
-    return views
+def _bounded_items(values: Iterable[Any], *, label: str) -> tuple[Any, ...]:
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError(f"{label} must be an array")
+    try:
+        items = tuple(islice(iter(values), MAX_FIXTURE_ROWS + 1))
+    except TypeError as exc:
+        raise ValueError(f"{label} must be an array") from exc
+    if len(items) > MAX_FIXTURE_ROWS:
+        raise ValueError(f"{label} exceeds the {MAX_FIXTURE_ROWS}-row bound")
+    return items
 
 
-def _model_override_args(
-    model_id: str, views: dict[str, RoboPlanRuntimeModelView]
-) -> list[str]:
-    view = views.get(model_id)
-    if view is None:
-        return []
-    result = ["--urdf", view.urdf_path, "--srdf", view.srdf_path]
-    for package_path in view.package_paths:
-        result.extend(["--package-path", package_path])
+def _object(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    return value
+
+
+def _optional_object(
+    parent: dict[str, Any], key: str, *, label: str
+) -> dict[str, Any]:
+    if key not in parent:
+        return {}
+    return _object(parent[key], label=label)
+
+
+def _bounded_text(value: Any, *, label: str, limit: int) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    if len(value) > limit:
+        raise ValueError(f"{label} exceeds the {limit}-character bound")
+    return value
+
+
+def _exact_bool(value: Any, *, label: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{label} must be a boolean")
+    return value
+
+
+def _nonnegative_real(value: Any, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{label} must be a real number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(f"{label} must be finite and non-negative")
     return result
 
 
-def _rma_records(
-    corpus: dict[str, Any], views: dict[str, RoboPlanRuntimeModelView]
-) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for model_id, view in sorted(views.items()):
-        mapping = view.import_view.canonical_to_view_joint_names
-        inverse = view.import_view.view_to_canonical_joint_names
-        bijective = len(mapping) == len(inverse) and all(
-            inverse.get(view_name) == canonical
-            for canonical, view_name in mapping.items()
-        )
-        public_joint_names = set(corpus["models"][model_id]["joint_names"])
-        public_names_preserved = public_joint_names.issubset(mapping)
-        records.append(
-            {
-                "record_type": "rma_contract",
-                "fixture_id": model_id,
-                "passed": bool(
-                    bijective
-                    and public_names_preserved
-                    and Path(view.urdf_path).is_file()
-                    and Path(view.srdf_path).is_file()
-                ),
-                "details": {
-                    "canonical_fingerprint": view.authority.canonical_fingerprint,
-                    "view_fingerprint": view.import_view.view_fingerprint,
-                    "view_changed": view.import_view.changed,
-                    "mapping_bijective": bijective,
-                    "public_planning_joint_names_preserved": public_names_preserved,
-                    "renamed_joint_count": sum(
-                        canonical != view_name
-                        for canonical, view_name in mapping.items()
-                    ),
-                },
-            }
-        )
-    return records
+def _required_nonnegative_real(
+    parent: dict[str, Any], key: str, *, label: str
+) -> float:
+    if key not in parent:
+        raise ValueError(f"{label} is required")
+    return _nonnegative_real(parent[key], label=label)
 
 
-def _verify_capture_provenance(
-    *,
-    capture_path: Path,
-    repo_root: Path,
-    view: RoboPlanRuntimeModelView | None,
-    source_policy: str = "current_artifacts",
+def _required_nonnegative_int(
+    parent: dict[str, Any], key: str, *, label: str
+) -> int:
+    if key not in parent:
+        raise ValueError(f"{label} is required")
+    value = parent[key]
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _enabled_flag(value: dict[str, Any], *, label: str) -> bool:
+    if not value:
+        return False
+    if "enabled" not in value:
+        raise ValueError(f"{label}.enabled is required")
+    return _exact_bool(value["enabled"], label=f"{label}.enabled")
+
+
+def _validated_revision_details(
+    revision: dict[str, Any], *, label: str
 ) -> dict[str, Any]:
-    capture = _read_json(capture_path)
-    source = capture["source"]
-    if source_policy == "current_artifacts":
-        for field, digest_field in (
-            ("program", "program_sha256"),
-            ("deployment", "deployment_sha256"),
-        ):
-            artifact = (repo_root / source[field]).resolve()
-            if not artifact.is_relative_to(repo_root) or not artifact.is_file():
-                raise RuntimeError(
-                    f"captured source is unavailable: {source[field]}"
-                )
-            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-            if digest != source[digest_field]:
-                raise RuntimeError(
-                    f"captured {field} changed after capture; acquire a new fixture"
-                )
-    elif source_policy == "frozen_rp5_0_manifest":
-        manifest_path = (
-            repo_root
-            / "benchmarks/roboplan_05/baselines/roboplan-0.4.0-manifest.json"
-        ).resolve()
-        manifest = _read_json(manifest_path)
-        if (
-            manifest.get("status") != "complete"
-            or manifest.get("baseline_id")
-            != "rp5-0-roboplan-0.4.0-pinocchio-4"
-        ):
-            raise RuntimeError("frozen RP5-0 capture manifest is not complete")
-        evidence = manifest.get("evidence")
-        manifest_source = manifest.get("source")
-        if not isinstance(evidence, dict) or not isinstance(manifest_source, dict):
-            raise RuntimeError("frozen RP5-0 capture manifest is malformed")
-        expected_relative = evidence.get("captured_authority_fixture")
-        if not isinstance(expected_relative, str):
-            raise RuntimeError("frozen RP5-0 capture path is unavailable")
-        expected_path = (manifest_path.parent / expected_relative).resolve()
-        if capture_path.resolve() != expected_path:
-            raise RuntimeError("capture is not the manifest-pinned RP5-0 fixture")
-        if capture.get("semantic_sha256") != evidence.get(
-            "captured_authority_fixture_semantic_sha256"
-        ):
-            raise RuntimeError("frozen RP5-0 capture semantic hash changed")
-        for field, digest_field in (
-            ("program", "program_sha256"),
-            ("deployment", "deployment_sha256"),
-        ):
-            expected_source = manifest_source.get(field)
-            if not isinstance(expected_source, dict) or (
-                source.get(field) != expected_source.get("path")
-                or source.get(digest_field) != expected_source.get("sha256")
-            ):
-                raise RuntimeError(
-                    f"frozen RP5-0 capture {field} provenance changed"
-                )
-    else:
-        raise RuntimeError(f"unsupported capture source policy: {source_policy}")
-    if view is None:
-        raise RuntimeError("captured fixture requires a Robot Model Authority view")
-    authority = capture["robot_model_authority"]
-    if authority["canonical_fingerprint"] != view.authority.canonical_fingerprint:
-        raise RuntimeError("captured canonical model fingerprint does not match runtime")
-    if authority["view_fingerprint"] != view.import_view.view_fingerprint:
-        raise RuntimeError("captured RoboPlan view fingerprint does not match runtime")
-    return capture
-
-
-def _source_and_environment(
-    inventory: dict[str, Any], *, lane: str, command: str
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    source_inventory = inventory["source"]
-    versions = source_inventory["roboplan_packages"]
-    python_versions = source_inventory["python_packages"]
-    roboplan_version = versions.get("roboplan", "unknown")
-    source = {
-        "manyforge_commit": source_inventory["manyforge_commit"],
-        "manyforge_dirty": source_inventory["manyforge_dirty"],
-        "manyforge_worktree_sha256": source_inventory[
-            "manyforge_worktree_sha256"
-        ],
-        "roboplan_version": roboplan_version,
-        "roboplan_ref": source_inventory["roboplan_ref"],
-        "roboplan_commit": source_inventory["roboplan_commit"],
-        "roboplan_source_clean": source_inventory.get(
-            "roboplan_source_clean", False
-        ),
-        "roboplan_package_versions": versions,
-        "roboplan_patch_manifest_sha256": source_inventory.get(
-            "roboplan_patch_manifest_sha256"
-        ),
-        "roboplan_patches": source_inventory.get("roboplan_patches", []),
-        "pinocchio_version": python_versions.get("libpinocchio")
-        or python_versions.get("pin"),
-        "coal_version": python_versions.get("libcoal")
-        or python_versions.get("coal"),
-        "eigenpy_version": python_versions.get("eigenpy"),
-    }
-    inventory_environment = inventory["environment"]
-    affinity = inventory_environment.get("cpu_affinity", [])
-    environment = {
-        "lane": lane,
-        "container": socket.gethostname(),
-        "architecture": inventory_environment["architecture"],
-        "cpu_count": inventory_environment["cpu_count"],
-        "cpu_set": ",".join(str(cpu) for cpu in affinity) if affinity else None,
-        "cpu_governor": ",".join(inventory_environment["cpu_governors"])
-        or None,
-        "viewer_stratum": "not_applicable",
-        "command": command,
-    }
-    return source, environment
-
-
-def _cmeel_runtime_library_paths() -> list[Path]:
-    """Resolve cmeel libraries without pinning a Python minor version."""
-
-    candidates = {
-        Path(root).resolve() / "cmeel.prefix/lib"
-        for root in site.getsitepackages()
-    }
-    user_site = site.getusersitepackages()
-    if user_site:
-        candidates.add(Path(user_site).resolve() / "cmeel.prefix/lib")
-    paths = sorted(path for path in candidates if path.is_dir())
-    if not paths:
-        raise RuntimeError("no cmeel runtime library directory is available")
-    return paths
-
-
-def run(args: argparse.Namespace) -> dict[str, Any]:
-    repo_root = args.repo_root.resolve()
-    corpus_path = args.corpus.resolve()
-    validate_corpus(
-        corpus_path, allow_pending_capture=args.allow_pending_capture
-    )
-    corpus = _read_json(corpus_path)
-    defaults = corpus["defaults"]
-    build_dir = args.build_dir.resolve()
-    collision_binary = build_dir / "perf_collision_strategy"
-    planning_binary = build_dir / "perf_roboplan_planning_pipeline"
-    probe_library = build_dir / "libroboplan_collision_counter_probe.so"
-    for path in (collision_binary, planning_binary, probe_library):
-        if not path.is_file():
-            raise FileNotFoundError(f"required qualification target is missing: {path}")
-
-    env = dict(os.environ)
-    cmeel_libs = ":".join(str(path) for path in _cmeel_runtime_library_paths())
-    env["LD_LIBRARY_PATH"] = f"{cmeel_libs}:{env.get('LD_LIBRARY_PATH', '')}"
-    views = _runtime_views(corpus, repo_root)
-    inventory = collect_inventory(repo_root)
-    if inventory["source"]["manyforge_dirty"] and not args.allow_dirty_source:
-        raise RuntimeError(
-            f"formal {args.phase} evidence requires a clean ManyForge source tree; "
-            "use --allow-dirty-source only for an explicitly labeled preflight"
+    details: dict[str, Any] = {}
+    for key in (
+        "allocations",
+        "allocation_bound_per_query",
+        "wcet_budget_ns",
+    ):
+        if key in revision:
+            details[key] = _required_nonnegative_int(
+                revision, key, label=f"{label}.{key}"
+            )
+    if "allocations_per_query" in revision:
+        details["allocations_per_query"] = _nonnegative_real(
+            revision["allocations_per_query"],
+            label=f"{label}.allocations_per_query",
         )
-    source, environment = _source_and_environment(
-        inventory,
-        lane=args.lane,
-        command=args.command,
-    )
-    records = _rma_records(corpus, views)
-    selected_fixture = args.fixture
+    return details
 
-    if not args.skip_engine_matrix and not selected_fixture:
-        engine_matrix_binary = (
-            build_dir
-            / "manyforge_integration_tests/perf_collision_engine_qualification"
-        )
-        if not engine_matrix_binary.is_file():
-            raise FileNotFoundError(
-                f"required neutral-engine probe is missing: {engine_matrix_binary}"
-            )
-        raw_matrix = _run_json([str(engine_matrix_binary)], env=env)
-        if not raw_matrix.get("all_passed"):
-            raise RuntimeError("neutral collision-engine qualification failed")
-        records.extend(_engine_matrix_records(raw_matrix))
 
-    collision_warmup = args.collision_warmup or defaults["collision_warmup_queries"]
-    collision_queries = args.collision_queries or defaults["collision_measured_queries"]
-    collision_batches = args.collision_batches or defaults["collision_process_batches"]
-    for fixture in corpus["collision_fixtures"]:
-        if selected_fixture and fixture["id"] != selected_fixture:
-            continue
-        for query_class in fixture["query_classes"]:
-            if query_class not in SUPPORTED_DIRECT_QUERY_CLASSES:
-                continue
-            for batch_index in range(collision_batches):
-                command = [
-                    str(collision_binary),
-                    "--repo-root",
-                    str(repo_root),
-                    "--corpus",
-                    str(corpus_path),
-                    "--fixture",
-                    fixture["id"],
-                    "--query-class",
-                    query_class,
-                    "--warmup",
-                    str(collision_warmup),
-                    "--queries",
-                    str(collision_queries),
-                    *_model_override_args(fixture["model"], views),
-                ]
-                record = _run_json(command, env=env)
-                record["batch_index"] = batch_index
-                record["model_authority_view"] = (
-                    "private" if fixture["model"] in views else "upstream_canonical"
+def _validate_bounded_detail(value: Any, *, label: str) -> None:
+    node_count = 0
+    active_containers: set[int] = set()
+
+    def visit(
+        item: Any, *, path: str, depth: int, field_name: str | None = None
+    ) -> None:
+        nonlocal node_count
+        node_count += 1
+        if node_count > MAX_DETAIL_NODES:
+            raise ValueError(f"{label} exceeds the {MAX_DETAIL_NODES}-node bound")
+        if depth > MAX_DETAIL_DEPTH:
+            raise ValueError(f"{path} exceeds the {MAX_DETAIL_DEPTH}-level bound")
+        if item is None:
+            return
+        if field_name in _EXACT_BOOLEAN_DETAIL_KEYS:
+            if type(item) is not bool:
+                raise ValueError(f"{path} must be a boolean")
+            return
+        if type(item) is bool:
+            return
+        if isinstance(item, Real):
+            numeric = float(item)
+            if not math.isfinite(numeric):
+                raise ValueError(f"{path} must be finite")
+            if field_name in _NONNEGATIVE_INTEGER_DETAIL_KEYS:
+                if type(item) is not int or item < 0:
+                    raise ValueError(f"{path} must be a non-negative integer")
+            elif field_name is not None and (
+                field_name.endswith(("_us", "_ns", "_count"))
+                or "allocation" in field_name
+            ) and numeric < 0.0:
+                raise ValueError(f"{path} must be non-negative")
+            return
+        if isinstance(item, str):
+            if len(item) > MAX_TEXT_CHARS:
+                raise ValueError(
+                    f"{path} exceeds the {MAX_TEXT_CHARS}-character bound"
                 )
-                records.append(record)
-
-    planning_warmup = args.planning_warmup or defaults["planning_warmup_repetitions"]
-    planning_repetitions = (
-        args.planning_repetitions or defaults["planning_measured_repetitions"]
-    )
-    for fixture in corpus["planning_fixtures"]:
-        if selected_fixture and fixture["id"] != selected_fixture:
-            continue
-        capture_file = fixture.get("capture_file")
-        if capture_file and not (corpus_path.parent / capture_file).is_file():
-            if args.allow_pending_capture:
-                continue
-            raise FileNotFoundError(
-                f"captured planning fixture is missing: {capture_file}"
-            )
-        capture = None
-        if capture_file:
-            capture = _verify_capture_provenance(
-                capture_path=(corpus_path.parent / capture_file).resolve(),
-                repo_root=repo_root,
-                view=views.get(fixture["model"]),
-                source_policy=fixture.get(
-                    "capture_source_policy", "current_artifacts"
-                ),
-            )
-        base_command = [
-            str(planning_binary),
-            "--repo-root",
-            str(repo_root),
-            "--corpus",
-            str(corpus_path),
-            "--fixture",
-            fixture["id"],
-            "--warmup",
-            str(planning_warmup),
-            "--repetitions",
-            str(planning_repetitions),
-            "--rng-seed",
-            str(defaults["rng_seed"]),
-            *_model_override_args(fixture["model"], views),
-        ]
-        primary = _run_json(base_command, env=env)
-        if primary.get("collision_probe_available"):
-            raise RuntimeError("primary planner run unexpectedly loaded collision probe")
-        primary["measurement_mode"] = "primary"
-        if capture is not None:
-            primary["capture_source"] = {
-                "semantic_sha256": capture["semantic_sha256"],
-                "canonical_fingerprint": capture["robot_model_authority"][
-                    "canonical_fingerprint"
-                ],
-                "view_fingerprint": capture["robot_model_authority"][
-                    "view_fingerprint"
-                ],
-                "source_policy": fixture.get(
-                    "capture_source_policy", "current_artifacts"
-                ),
-            }
-        records.append(primary)
-        probe_env = dict(env)
-        probe_env["LD_PRELOAD"] = str(probe_library)
-        attributed = _run_json(base_command, env=probe_env)
-        if not attributed.get("collision_probe_available"):
-            raise RuntimeError("planner attribution run did not load collision probe")
-        if int(attributed.get("total_collision_query_count", 0)) <= 0:
-            raise RuntimeError("planner attribution run observed no collision queries")
-        if attributed.get("trajectory_hash_hex") != primary.get(
-            "trajectory_hash_hex"
-        ):
-            raise RuntimeError("collision probe changed the planned trajectory")
-        attributed["measurement_mode"] = "collision_probe_attribution"
-        if capture is not None:
-            attributed["capture_source"] = primary["capture_source"]
-        records.append(attributed)
-
-        if args.phase in {"rp5_3", "rp5_7"} and str(
-            source["roboplan_version"]
-        ).startswith("0.5"):
-            for planner_policy in ("rrt_star", "budget_spending"):
-                capability = _run_json(
-                    [
-                        *base_command,
-                        "--planner-policy",
-                        planner_policy,
-                    ],
-                    env=env,
-                )
-                if capability.get("collision_probe_available"):
-                    raise RuntimeError(
-                        "planner capability run unexpectedly loaded collision probe"
+            return
+        if not isinstance(item, (dict, list, tuple)):
+            raise ValueError(f"{path} is not JSON-compatible evidence")
+        identity = id(item)
+        if identity in active_containers:
+            raise ValueError(f"{path} contains a recursive container")
+        active_containers.add(identity)
+        try:
+            if isinstance(item, dict):
+                if len(item) > MAX_FIXTURE_ROWS:
+                    raise ValueError(
+                        f"{path} exceeds the {MAX_FIXTURE_ROWS}-entry bound"
                     )
-                capability["measurement_mode"] = "capability_opt_in"
-                if capture is not None:
-                    capability["capture_source"] = primary["capture_source"]
-                records.append(capability)
+                for key, child in item.items():
+                    if not isinstance(key, str) or len(key) > MAX_IDENTIFIER_CHARS:
+                        raise ValueError(f"{path} contains an invalid key")
+                    visit(
+                        child,
+                        path=f"{path}.{key}",
+                        depth=depth + 1,
+                        field_name=key,
+                    )
+            else:
+                if len(item) > MAX_FIXTURE_ROWS:
+                    raise ValueError(
+                        f"{path} exceeds the {MAX_FIXTURE_ROWS}-row bound"
+                    )
+                for index, child in enumerate(item):
+                    visit(
+                        child,
+                        path=f"{path}[{index}]",
+                        depth=depth + 1,
+                    )
+        finally:
+            active_containers.remove(identity)
 
-    evidence = {
-        "schema_version": EVIDENCE_SCHEMA,
-        "run_id": args.run_id
-        or f"{args.phase.replace('_', '-')}-offline-"
-        f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}",
-        "phase": args.phase,
-        "source": source,
-        "environment": environment,
-        "records": records,
-        "inventory": {
-            "build_references": inventory["build_references"],
-            "capabilities": inventory["capabilities"],
-            "workarounds": inventory["workarounds"],
-        },
+    visit(value, path=label, depth=0)
+
+
+def unavailable_payload() -> dict[str, Any]:
+    return {
+        "schema_version": "manyforge.qualification_unavailable.v1",
+        "script": "run_roboplan_05_offline_baseline.py",
+        "historical_source": HISTORICAL_SOURCE,
+        "exit_code": UNAVAILABLE_EXIT_CODE,
+        "assignments": [
+            assignment._asdict() for assignment in RESTORATION_ASSIGNMENTS
+        ],
+        "historical_source_blob": HISTORICAL_SOURCE_BLOB,
+        "historical_test_blob": HISTORICAL_TEST_BLOB,
     }
-    if not records or not all(record.get("passed") is True for record in records):
-        raise RuntimeError("one or more qualification records failed")
-    require_source_inventory_stable(inventory, collect_inventory(repo_root))
-    environment["source_verified_after_run"] = True
-    return evidence
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
-    parser.add_argument(
-        "--corpus",
-        type=Path,
-        default=REPO_ROOT / "benchmarks/roboplan_05/corpus/corpus-v1.json",
-    )
-    parser.add_argument(
-        "--build-dir", type=Path, default=Path("/tmp/manyforge-build/roboplan")
-    )
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--run-id")
-    parser.add_argument(
-        "--phase",
-        choices=("rp5_0", "rp5_3", "rp5_7"),
-        default="rp5_0",
-        help="Qualification phase recorded in the evidence artifact.",
-    )
-    parser.add_argument("--lane", default="ros_isaac_container")
-    parser.add_argument("--fixture")
-    parser.add_argument("--collision-warmup", type=int)
-    parser.add_argument("--collision-queries", type=int)
-    parser.add_argument("--collision-batches", type=int)
-    parser.add_argument("--planning-warmup", type=int)
-    parser.add_argument("--planning-repetitions", type=int)
-    parser.add_argument("--skip-engine-matrix", action="store_true")
-    parser.add_argument(
-        "--allow-dirty-source",
-        action="store_true",
-        help="permit an explicitly labeled development preflight on dirty source",
-    )
-    parser.add_argument(
-        "--allow-pending-capture",
-        action="store_true",
-        help="permit development smoke runs before the required live capture exists",
-    )
-    effective_argv = list(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(effective_argv)
-    args.command = shlex.join(
-        [sys.executable, str(Path(__file__).resolve()), *effective_argv]
-    )
-    try:
-        evidence = run(args)
-        write_evidence_exclusive(
-            args.output,
-            evidence,
-            validator=validate_evidence,
-        )
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-        print(f"RP5 offline baseline failed: {exc}", file=sys.stderr)
-        return 2
-    print(args.output)
-    return 0
+    del argv
+    print(json.dumps(unavailable_payload(), sort_keys=True), file=sys.stderr)
+    return UNAVAILABLE_EXIT_CODE
 
 
 if __name__ == "__main__":

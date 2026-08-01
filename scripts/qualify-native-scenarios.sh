@@ -1,25 +1,16 @@
 #!/usr/bin/env bash
+# Typed boundary for verification/matrices/native_live_evaluation.yaml.
+# Exact historical wrapper: manyforge@08222188293df8e12f90dc72e204c21f22f92ea1,
+# blob 7f843e6a7b92cbf5a471474f9cc6536a5538d48d.
+# Preserve at restoration: explicit output directory and port, Python/RoboPlan
+# artifact discovery, the native matrix identity, bounded local-process
+# readiness, and argument forwarding. The former auto-Kernel Composer launch
+# is absent until the resource-addressed native client is qualified.
+
 set -euo pipefail
 
-WORKSPACE="${WORKSPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-OUTPUT_DIR="${MANYFORGE_NATIVE_QUALIFICATION_OUTPUT_DIR:-/tmp/manyforge-native-qualification}"
-ROBOPLAN_BUILD_DIR="${MANYFORGE_ROBOPLAN_BUILD_DIR:-${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/roboplan}"
-PORT_ARGS=()
-if [[ -n "${MANYFORGE_QUALIFICATION_PORT:-}" ]]; then
-  PORT_ARGS=(--port "${MANYFORGE_QUALIFICATION_PORT}")
-fi
-
-export PYTHONPATH="$WORKSPACE:$WORKSPACE/manyforge_behavior:$WORKSPACE/manyforge_roboplan/python:${PYTHONPATH:-}"
-if compgen -G "$ROBOPLAN_BUILD_DIR/manyforge_roboplan_py*.so" >/dev/null; then
-  export PYTHONPATH="$ROBOPLAN_BUILD_DIR:$PYTHONPATH"
-fi
-
-cd "$WORKSPACE"
-./scripts/run-scenarios.py \
-  --matrix verification/matrices/native_live_evaluation.yaml \
-  --launch local-process \
-  --kernel-mode auto \
-  --wait-timeout-s 30 \
-  --output-dir "$OUTPUT_DIR" \
-  "${PORT_ARGS[@]}" \
-  "$@"
+_manyforge_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/composable-cell-runtime-availability.sh
+source "${_manyforge_script_dir}/lib/composable-cell-runtime-availability.sh"
+MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: native scenario qualification returns with the qualified headless Program and Kernel clients."
+manyforge_fail_composable_cell_runtime_unavailable

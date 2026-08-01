@@ -22,7 +22,98 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Any
+
+
+def _load_sibling_source_identity() -> ModuleType:
+    path = Path(__file__).resolve().with_name("source_identity.py")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as error:
+        raise ImportError(
+            f"cannot open shared source identity authority: {error}"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > 4 * 1024 * 1024
+        ):
+            raise ImportError(
+                "shared source identity authority is not one bounded regular file"
+            )
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            payload = os.read(descriptor, min(1024 * 1024, remaining))
+            if not payload:
+                raise ImportError(
+                    "shared source identity authority ended before its recorded size"
+                )
+            chunks.append(payload)
+            remaining -= len(payload)
+        if os.read(descriptor, 1):
+            raise ImportError("shared source identity authority grew while loading")
+        after = os.fstat(descriptor)
+        path_metadata = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise ImportError(
+            f"cannot read shared source identity authority: {error}"
+        ) from error
+    finally:
+        os.close(descriptor)
+    before_signature = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_nlink,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if (
+        before_signature
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        or before_signature
+        != (
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+            path_metadata.st_mode,
+            path_metadata.st_nlink,
+            path_metadata.st_size,
+            path_metadata.st_mtime_ns,
+            path_metadata.st_ctime_ns,
+        )
+    ):
+        raise ImportError("shared source identity authority changed while loading")
+    module = ModuleType("_manyforge_roboplan_shared_source_identity")
+    module.__file__ = str(path)
+    code = compile(b"".join(chunks), str(path), "exec", dont_inherit=True)
+    exec(code, module.__dict__)  # noqa: S102
+    return module
+
+
+_SHARED_SOURCE_IDENTITY = _load_sibling_source_identity()
+MANYFORGE_SOURCE_IDENTITY_SCHEMA = _SHARED_SOURCE_IDENTITY.SCHEMA
+_shared_source_fingerprint_sha256 = (
+    _SHARED_SOURCE_IDENTITY.source_fingerprint_sha256
+)
+_shared_source_identity = _SHARED_SOURCE_IDENTITY.source_identity
+_shared_worktree_delta_sha256 = _SHARED_SOURCE_IDENTITY.worktree_delta_sha256
 
 
 CORPUS_SCHEMA = "manyforge.roboplan_transition_corpus.v1"
@@ -30,7 +121,6 @@ CAPTURE_SCHEMA = "manyforge.roboplan_transition_capture.v1"
 EVIDENCE_SCHEMA = "manyforge.roboplan_transition_evidence.v1"
 CAPABILITY_SCHEMA = "manyforge.roboplan_capability_inventory.v1"
 WORKAROUND_SCHEMA = "manyforge.roboplan_workaround_inventory.v1"
-MANYFORGE_SOURCE_IDENTITY_SCHEMA = "manyforge.source_identity.v1"
 MANYFORGE_FROZEN_SOURCE_IDENTITY_MODE = (
     "frozen_source_fingerprint_sha256"
 )
@@ -2269,61 +2359,9 @@ def require_source_inventory_stable(
 
 
 def _manyforge_worktree_delta_sha256(repo_root: Path) -> str:
-    """Fingerprint every non-ignored source change relative to HEAD."""
+    """Delegate the historical wrapper to the shared v1 authority."""
 
-    digest = hashlib.sha256()
-    tracked = subprocess.check_output(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "diff",
-            "--binary",
-            "--full-index",
-            "--no-ext-diff",
-            "HEAD",
-            "--",
-        ]
-    )
-    digest.update(b"tracked-diff\0")
-    digest.update(len(tracked).to_bytes(8, "big"))
-    digest.update(tracked)
-
-    untracked_output = subprocess.check_output(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ]
-    )
-    untracked = sorted(name for name in untracked_output.split(b"\0") if name)
-    digest.update(b"untracked-files\0")
-    digest.update(len(untracked).to_bytes(8, "big"))
-    for encoded_name in untracked:
-        relative = os.fsdecode(encoded_name)
-        path = repo_root / relative
-        metadata = path.lstat()
-        mode = stat.S_IMODE(metadata.st_mode)
-        digest.update(len(encoded_name).to_bytes(8, "big"))
-        digest.update(encoded_name)
-        digest.update(mode.to_bytes(4, "big"))
-        if stat.S_ISLNK(metadata.st_mode):
-            digest.update(b"symlink\0")
-            payload = os.fsencode(os.readlink(path))
-        elif stat.S_ISREG(metadata.st_mode):
-            digest.update(b"regular\0")
-            payload = path.read_bytes()
-        else:
-            raise ValidationError(
-                f"{path}: unsupported untracked source file type"
-            )
-        digest.update(len(payload).to_bytes(8, "big"))
-        digest.update(payload)
-    return digest.hexdigest()
+    return _shared_worktree_delta_sha256(repo_root)
 
 
 def _manyforge_worktree_sha256(repo_root: Path) -> str:
@@ -2339,53 +2377,20 @@ def _manyforge_source_fingerprint_sha256(
     dirty: bool,
     delta_sha256: str,
 ) -> str:
-    """Frame and hash the complete v1 source identity deterministically."""
+    """Delegate the historical wrapper to the shared v1 authority."""
 
-    digest = hashlib.sha256()
-    digest.update(b"manyforge.source_identity.v1\0")
-    fields = (
-        (b"head_commit", head_commit.encode("ascii")),
-        (b"head_tree", head_tree.encode("ascii")),
-        (b"dirty", b"true" if dirty else b"false"),
-        (b"delta_sha256", delta_sha256.encode("ascii")),
-    )
-    for name, payload in fields:
-        digest.update(len(name).to_bytes(4, "big"))
-        digest.update(name)
-        digest.update(len(payload).to_bytes(8, "big"))
-        digest.update(payload)
-    return digest.hexdigest()
-
-
-def _manyforge_source_identity(
-    repo_root: Path, *, dirty: bool | None = None
-) -> dict[str, Any]:
-    """Collect a commit-, tree-, and delta-bound ManyForge identity."""
-
-    observed_dirty = (
-        bool(_git(repo_root, "status", "--porcelain"))
-        if dirty is None
-        else dirty
-    )
-    if not isinstance(observed_dirty, bool):
-        raise TypeError("dirty must be boolean")
-    head_commit = _git(repo_root, "rev-parse", "HEAD")
-    head_tree = _git(repo_root, "rev-parse", "HEAD^{tree}")
-    delta_sha256 = _manyforge_worktree_delta_sha256(repo_root)
-    fingerprint_sha256 = _manyforge_source_fingerprint_sha256(
+    return _shared_source_fingerprint_sha256(
         head_commit=head_commit,
         head_tree=head_tree,
-        dirty=observed_dirty,
+        dirty=dirty,
         delta_sha256=delta_sha256,
     )
-    return {
-        "schema_version": MANYFORGE_SOURCE_IDENTITY_SCHEMA,
-        "head_commit": head_commit,
-        "head_tree": head_tree,
-        "dirty": observed_dirty,
-        "delta_sha256": delta_sha256,
-        "fingerprint_sha256": fingerprint_sha256,
-    }
+
+
+def _manyforge_source_identity(repo_root: Path) -> dict[str, Any]:
+    """Delegate source collection, including dirty state, to shared v1."""
+
+    return _shared_source_identity(repo_root)
 
 
 def _git(repo_root: Path, *args: str) -> str:
@@ -2595,13 +2600,12 @@ def collect_inventory(repo_root: Path) -> dict[str, Any]:
             governors.add(governor.read_text(encoding="utf-8").strip())
         except OSError:
             pass
-    dirty = bool(_git(repo_root, "status", "--porcelain"))
-    manyforge_identity = _manyforge_source_identity(repo_root, dirty=dirty)
+    manyforge_identity = _manyforge_source_identity(repo_root)
     return {
         "schema_version": "manyforge.roboplan_transition_inventory.v1",
         "source": {
             "manyforge_commit": manyforge_identity["head_commit"],
-            "manyforge_dirty": dirty,
+            "manyforge_dirty": manyforge_identity["dirty"],
             # Keep the historical field for consumers of the v1 transition
             # inventory, but name the value accurately for new consumers.
             "manyforge_worktree_sha256": manyforge_identity["delta_sha256"],

@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 
 def _load_smoke_module() -> ModuleType:
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "smoke-assistant-e2e.py"
@@ -163,3 +165,122 @@ def test_golden_blackboard_validator_checks_namespace_and_key() -> None:
     errors = SMOKE._blackboard_result_errors(result, namespace, key, label="result")
 
     assert any(".type" in error for error in errors)
+
+
+def test_profile_selection_rejects_duplicates_and_unbounded_input() -> None:
+    with pytest.raises(SMOKE.SmokeFailure, match="duplicates"):
+        SMOKE._selected_profiles(["bridge-default", "bridge-default"])
+    with pytest.raises(SMOKE.SmokeFailure, match="64-item bound"):
+        SMOKE._selected_profiles(["bridge-default"] * 65)
+    with pytest.raises(SMOKE.SmokeFailure, match="256-character bound"):
+        SMOKE._selected_profiles(["x" * 257])
+
+
+def test_parameter_and_blackboard_validators_reject_duplicate_ids() -> None:
+    expected_parameter = {
+        "name": "golden_param_unit",
+        "type": "string",
+        "default": "golden_object",
+        "description": "Assistant golden E2E parameter.",
+    }
+    parameter_result = {
+        "draftMutation": "program_parameters_upsert",
+        "names": ["golden_param_unit"],
+        "parameters": [
+            copy.deepcopy(expected_parameter),
+            copy.deepcopy(expected_parameter),
+        ],
+    }
+    assert any(
+        "duplicate name" in error
+        for error in SMOKE._program_parameter_result_errors(
+            parameter_result, expected_parameter, label="result"
+        )
+    )
+
+    namespace = {
+        "id": "golden_ns_unit",
+        "contract": "selection_context_v1",
+        "prefix": "/golden/unit",
+        "description": "namespace",
+        "fields": [],
+    }
+    key = {
+        "id": "golden_key_unit",
+        "type": "bool",
+        "key": "/golden/unit/ready",
+        "description": "key",
+    }
+    blackboard_result = {
+        "blackboard": {
+            "namespaces": [copy.deepcopy(namespace), copy.deepcopy(namespace)],
+            "keys": [copy.deepcopy(key), copy.deepcopy(key)],
+        }
+    }
+    errors = SMOKE._blackboard_result_errors(
+        blackboard_result, namespace, key, label="result"
+    )
+    assert any("namespaces contains duplicate id" in error for error in errors)
+    assert any("keys contains duplicate id" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("radius", "tolerance"),
+    [
+        (True, 1e-6),
+        (float("nan"), 1e-6),
+        (0.025, True),
+        (0.025, float("nan")),
+    ],
+)
+def test_scene_validator_rejects_coercible_or_nonfinite_numbers(
+    radius, tolerance
+) -> None:
+    expected = SMOKE._golden_scene_resources("unit")[1]
+    actual = copy.deepcopy(expected)
+    actual["shape"]["sphere_radius_m"] = radius
+
+    errors = SMOKE._scene_resource_match_errors(
+        actual,
+        expected,
+        label="scene[golden_sphere_unit]",
+        tolerance=tolerance,
+    )
+
+    assert errors
+
+
+def test_scene_and_string_set_validators_reject_duplicates_and_bounds() -> None:
+    expected = SMOKE._golden_scene_resources("unit")
+    duplicate = [copy.deepcopy(expected[0]), copy.deepcopy(expected[0])]
+    duplicate_errors = SMOKE._scene_resource_set_match_errors(
+        duplicate,
+        expected,
+        label="scene",
+        require_exact=True,
+    )
+    assert any("duplicate objectIds" in error for error in duplicate_errors)
+
+    oversized_errors = SMOKE._scene_resource_set_match_errors(
+        [{} for _ in range(SMOKE.MAX_VALIDATION_ITEMS + 1)],
+        expected,
+        label="scene",
+        require_exact=True,
+    )
+    assert any("4096-item bound" in error for error in oversized_errors)
+    assert SMOKE._exact_string_set_errors(
+        ["same", "same"], ["same"], label="names"
+    ) == ["names contains duplicate values"]
+
+
+def test_float_list_comparison_rejects_bool_nan_and_wrong_vector_shape() -> None:
+    assert not SMOKE._float_lists_close([True], [1.0], tolerance=1e-6)
+    assert not SMOKE._float_lists_close(
+        [float("nan")], [float("nan")], tolerance=1e-6
+    )
+    assert not SMOKE._float_lists_close(
+        [1.0, 2.0],
+        [1.0, 2.0],
+        tolerance=1e-6,
+        expected_length=3,
+    )

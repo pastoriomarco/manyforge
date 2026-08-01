@@ -569,8 +569,15 @@ ExecutionKernel::~ExecutionKernel() {
   // Retire the lower-priority lookahead workers while every kernel authority
   // they may call is still alive. Relying on member destruction order would
   // permit a final result callback into partially torn-down state.
-  auto lookahead =
-      runtime_collision_lookahead_session_.exchange(nullptr, std::memory_order_acq_rel);
+  std::shared_ptr<RuntimeCollisionLookaheadSession> lookahead;
+  {
+    // The execute worker can finish concurrently and release collision
+    // protection from stop_collision_monitoring(). Serialize the retirement
+    // exchange with that release before joining the session's own worker.
+    std::lock_guard<std::mutex> lock(runtime_collision_protection_mutex_);
+    lookahead = runtime_collision_lookahead_session_.exchange(
+        nullptr, std::memory_order_acq_rel);
+  }
   if (lookahead) {
     lookahead->disarm();
     lookahead.reset();

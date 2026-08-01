@@ -4,17 +4,19 @@
 > intentionally unavailable during the composable-cell destructive cutover.
 > This remains the last qualified baseline and must not be read as evidence
 > that native, Isaac, or real-robot Stop paths are currently runnable.
+> Retained stop math and generic adapter sources are library-level inputs only;
+> present-tense call chains below are historical until I8/P5 and the selected
+> execution lane gate pass.
 
 Reference companion to [`operations/STOP_PROFILES.md`](../operations/STOP_PROFILES.md).
-This document describes the implemented stop architecture and the current
+This document describes the captured stop architecture and its historical
 qualification surface. It is intentionally code-facing: future maintainers should
 be able to verify the stop behavior from the files and symbols named here without
 reconstructing the design history.
 
-This is the maintained code-facing reference for the current implementation;
-source and generated contracts win if it drifts. Historical rationale belongs
-in development planning artifacts, while runtime/operator docs remain
-self-contained.
+This is a maintained restoration reference, not a current implementation map.
+Retained source and future generated contracts win if it drifts; absent native
+adapter symbols remain pinned by the historical Composer/source reference.
 
 ## 1. Architecture
 
@@ -29,11 +31,11 @@ ManyForge uses the modified Option A architecture:
 1. Stop success is claimed only after a terminal hold and measured/post-stop
    evidence, not merely because a command was sent.
 
-The current production stop math lives in
-`manyforge_core/src/soft_on_path_stop_planner.cpp`; ros2_control dispatch lives in
-`manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp`;
-native replay lives
-in `manyforge_roboplan/src/roboplan_execution_backend.cpp`.
+The stop math remains in `manyforge_core/src/soft_on_path_stop_planner.cpp`, and
+generic ros2_control dispatch remains in
+`manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp` as
+unwired library input. The captured native replay lived in the now-removed
+`manyforge_roboplan/src/roboplan_execution_backend.cpp`.
 
 The retired controller-native JTC plugin is not the target architecture. It is
 preserved historically on the `jtc_plugin` branch, but `main` uses stock JTC plus
@@ -252,7 +254,7 @@ If the quintic candidate fails and the jerk-limited retimer still cannot prove a
 dispatchable exact-time profile, the planner tries the private ALI/backtracking
 candidate set in `compute_ali_backtracking_stop_profile(...)`.
 
-Current implementation:
+Retained planner implementation:
 
 - generates bounded triangular S-curve path-rate brake candidates;
 - tries the full requested horizon first, then progressively earlier

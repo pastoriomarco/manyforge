@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
-# AddressSanitizer/UndefinedBehaviorSanitizer lane for the collision-engine
-# integration suite. The RoboPlan composition package is the CMake entry point
-# that wires manyforge_collision to its cross-package integration tests.
+# AddressSanitizer/UndefinedBehaviorSanitizer lane for the owner-neutral
+# manyforge_collision integration suite.
+#
+# The historical no-argument command built the RoboPlan cross-package engine
+# campaign (manyforge@082221... blob bd949000cb48af8c633e5e7acbb5398a16c95490).
+# That meaning is unavailable until I6/N and I8/P5.  The narrower retained
+# primitive registry is deliberately exposed only by an explicit selector.
 
 set -euo pipefail
+
+if [[ "$#" -ne 1 || "$1" != "retained-primitives" ]]; then
+  builtin printf '%s\n' \
+    'composable_cell_runtime_unavailable: historical cross-package collision sanitizer qualification returns at I6/N and I8/P5; use retained-primitives only for the owner-neutral manyforge_collision subset' \
+    >&2
+  exit 78
+fi
+shift
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -38,7 +50,7 @@ fi
 sanitizer_flags="-fsanitize=address,undefined -fno-omit-frame-pointer -g -DEIGEN_MALLOC_ALREADY_ALIGNED=1 -Wno-error=maybe-uninitialized -Wno-error=array-bounds"
 
 cmake \
-  -S "${REPO_ROOT}/manyforge_roboplan" \
+  -S "${REPO_ROOT}/manyforge_collision" \
   -B "${BUILD_DIR}" \
   -DBUILD_TESTING=ON \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -51,5 +63,5 @@ cmake --build "${BUILD_DIR}" --parallel "${PARALLEL}" \
   --target test_collision_engine_integration
 python3 "${SCRIPT_DIR}/run-ctest-gtest-binaries-grouped.py" \
   --build-dir "${BUILD_DIR}" \
-  --test-regex "ManyForgeCollisionEngineTest" \
+  --test-regex "(ManyForgeCollision|CollisionQualificationPrimitives)" \
   --summary-prefix COLLISION_ASAN_UBSAN

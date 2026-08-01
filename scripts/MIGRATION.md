@@ -1,3 +1,5 @@
+> **Historical migration reference only.** This document describes launcher compatibility behavior at `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`. Those shims and runtime lanes are removed and unavailable; none of the commands below are current operational guidance.
+
 # Demo-script migration notes
 
 The seven `scripts/demo-*.sh` scripts are now thin shims that delegate to

@@ -204,7 +204,7 @@ TEST(ProductContractRegistryTest,
             "manyforge.flattened_model");
   EXPECT_EQ(contract.product_contract_revision().value(),
             "sha256:"
-            "fe0fe30d7098f15443e50a5f228246b628d24f6ebda8c477f28f5468c7e5e7ff");
+            "fa2f55c8730bef074e21026ee33c489d645d0ca9f971682b0bc1d778215bc10e");
   EXPECT_EQ(contract.product_kind(),
             core::RetainedProductKind::kPlanningCollisionModel);
   EXPECT_EQ(contract.placement(),
@@ -446,7 +446,7 @@ TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
       detail::retained_product_output_digest(product);
   EXPECT_EQ(output_digest.value(),
             "sha256:"
-            "a87a55c23c21484f64d996a56fe8ff8f0c132aa49b8b1511fc107d871a2419e9");
+            "21cb755501cc00ef0c454c8aaf285f85e461aa8707f27b20a1cb24e8c6be74d3");
   EXPECT_NE(output_digest, product.artifact_refs[0].content_digest);
   EXPECT_NE(output_digest, product.artifact_refs[1].content_digest);
   EXPECT_NE(output_digest, product.artifact_refs[2].content_digest);

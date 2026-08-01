@@ -1,144 +1,75 @@
 #!/usr/bin/env python3
-"""Build a versioned ManyForge OpenClaw plugin artifact.
+"""OpenClaw artifact cutover gate with historical restoration mapping.
 
-This wraps generate-manyforge-openclaw-plugin.py and produces:
+The complete historical wrapper is pinned at
+``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` (blob
+``ceaba90fbe034f481e53d02a315e486c264cb22f``).  Its ``main`` function
+discovered the removed MCP surface by executing
+``generate-manyforge-openclaw-plugin.py`` and then published ``latest``
+metadata for that historical wire contract.  That live-contract workflow is
+not current and returns with the qualified assistant/MCP client.
 
-- a staged plugin directory
-- a versioned `.tar.gz` archive suitable for `openclaw plugins install`
-- a stable `*-latest.*` pointer set for operational scripts
-- metadata with tool-surface and artifact hashes
+The former content hash and archive helpers have no current producer or
+consumer.  They are removed rather than retained as an unbounded, untested
+publication path; the future qualified producer must restore bounded input,
+exclusive output, symlink/special-file rejection, and byte-reproducibility.
 """
 
 from __future__ import annotations
 
-import argparse
-import hashlib
 import json
-import pathlib
-import shutil
-import subprocess
 import sys
-import tarfile
-import tempfile
-from typing import Iterable
+from typing import Final, NamedTuple
 
 
-DEFAULT_OUTPUT_DIR = pathlib.Path.home() / ".manyforge" / "plugin-artifacts"
+UNAVAILABLE_EXIT_CODE: Final = 78
+UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
+HISTORICAL_SOURCE: Final = (
+    "manyforge@08222188293df8e12f90dc72e204c21f22f92ea1"
+)
 
 
-def _sha256_bytes(chunks: Iterable[bytes]) -> str:
-    digest = hashlib.sha256()
-    for chunk in chunks:
-        digest.update(chunk)
-    return digest.hexdigest()
+class RestorationAssignment(NamedTuple):
+    historical_symbols: str
+    required_behavior: str
 
 
-def _surface_hash(plugin_dir: pathlib.Path) -> str:
-    chunks: list[bytes] = []
-    for name in ("package.json", "openclaw.plugin.json", "dist/index.js"):
-        path = plugin_dir / name
-        chunks.extend((name.encode("utf-8"), b"\0", path.read_bytes(), b"\0"))
-    return _sha256_bytes(chunks)
+RESTORATION_ASSIGNMENTS: Final = (
+    RestorationAssignment(
+        "main: live generator invocation and latest-pointer publication",
+        "build a versioned artifact only from a qualified generated plugin",
+    ),
+    RestorationAssignment(
+        "main: tool_count and mcp_endpoint metadata",
+        "derive metadata from the future assistant contract, not MCP v0",
+    ),
+    RestorationAssignment(
+        "_sha256_bytes, _surface_hash, _write_reproducible_archive",
+        "H0 bounded artifact hashing and exclusive byte-reproducible archive "
+        "publication after a qualified plugin producer exists",
+    ),
+)
 
 
-def _write_reproducible_archive(plugin_dir: pathlib.Path, archive_path: pathlib.Path) -> None:
-    with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as tar:
-        for path in sorted(plugin_dir.rglob("*")):
-            arcname = pathlib.Path(plugin_dir.name) / path.relative_to(plugin_dir)
-            info = tar.gettarinfo(str(path), arcname=str(arcname))
-            info.uid = 0
-            info.gid = 0
-            info.uname = "root"
-            info.gname = "root"
-            info.mtime = 0
-            if path.is_file():
-                with path.open("rb") as handle:
-                    tar.addfile(info, handle)
-            else:
-                tar.addfile(info)
+def unavailable_payload() -> dict[str, object]:
+    return {
+        "schema_version": "manyforge.operator_unavailable.v1",
+        "reason_code": UNAVAILABLE_REASON_CODE,
+        "script": "build-manyforge-openclaw-plugin.py",
+        "historical_source": HISTORICAL_SOURCE,
+        "exit_code": UNAVAILABLE_EXIT_CODE,
+        "assignments": [
+            assignment._asdict() for assignment in RESTORATION_ASSIGNMENTS
+        ],
+    }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Build a versioned ManyForge OpenClaw plugin artifact")
-    parser.add_argument("--mcp-endpoint", default="http://localhost:9000/api/mcp")
-    parser.add_argument("--principal-id", default="system:manyforge-plugin-builder")
-    parser.add_argument("--plugin-id", default="manyforge-mcp")
-    parser.add_argument("--plugin-version", default="0.2.0")
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    args = parser.parse_args()
+def main(argv: list[str] | None = None) -> int:
+    """Fail before subprocess, filesystem publication, or network effects."""
 
-    script_dir = pathlib.Path(__file__).resolve().parent
-    generator = script_dir / "generate-manyforge-openclaw-plugin.py"
-    output_dir = pathlib.Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="manyforge-plugin-build-") as tmp_root:
-        tmp_root_path = pathlib.Path(tmp_root)
-        plugin_dir = tmp_root_path / args.plugin_id
-        subprocess.run(
-            [
-                sys.executable,
-                str(generator),
-                "--mcp-endpoint",
-                args.mcp_endpoint,
-                "--principal-id",
-                args.principal_id,
-                "--plugin-id",
-                args.plugin_id,
-                "--plugin-version",
-                args.plugin_version,
-                "--output-dir",
-                str(plugin_dir),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
-
-        manifest = json.loads((plugin_dir / "openclaw.plugin.json").read_text(encoding="utf-8"))
-        readme = (plugin_dir / "README.md").read_text(encoding="utf-8")
-        tool_count = 0
-        for line in readme.splitlines():
-            if line.startswith("- Tool count:"):
-                tool_count = int(line.split("`")[1])
-                break
-
-        surface_hash = _surface_hash(plugin_dir)
-        artifact_suffix = surface_hash[:12]
-        archive_name = f"{args.plugin_id}-{args.plugin_version}-{artifact_suffix}.tar.gz"
-        archive_path = output_dir / archive_name
-        _write_reproducible_archive(plugin_dir, archive_path)
-        artifact_sha256 = _sha256_bytes([archive_path.read_bytes()])
-
-        staged_dir = output_dir / args.plugin_id
-        if staged_dir.exists():
-            shutil.rmtree(staged_dir)
-        shutil.copytree(plugin_dir, staged_dir)
-
-        metadata = {
-            "plugin_id": args.plugin_id,
-            "plugin_version": manifest["version"],
-            "tool_count": tool_count,
-            "surface_sha256": surface_hash,
-            "artifact_sha256": artifact_sha256,
-            "archive_name": archive_name,
-            "archive_path": str(archive_path),
-            "mcp_endpoint": args.mcp_endpoint,
-        }
-
-        versioned_metadata = output_dir / f"{archive_path.name[:-7]}.json"
-        versioned_sha = output_dir / f"{archive_path.name[:-7]}.sha256"
-        versioned_metadata.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-        versioned_sha.write_text(f"{artifact_sha256}  {archive_path.name}\n", encoding="utf-8")
-
-        latest_archive = output_dir / f"{args.plugin_id}-latest.tar.gz"
-        latest_metadata = output_dir / f"{args.plugin_id}-latest.json"
-        latest_sha = output_dir / f"{args.plugin_id}-latest.sha256"
-        shutil.copyfile(archive_path, latest_archive)
-        latest_metadata.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-        latest_sha.write_text(f"{artifact_sha256}  {latest_archive.name}\n", encoding="utf-8")
-
-        print(json.dumps(metadata, indent=2))
-    return 0
+    del argv
+    print(json.dumps(unavailable_payload(), sort_keys=True), file=sys.stderr)
+    return UNAVAILABLE_EXIT_CODE
 
 
 if __name__ == "__main__":

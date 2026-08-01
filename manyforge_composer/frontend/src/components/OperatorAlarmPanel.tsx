@@ -1,85 +1,68 @@
-import type { OperatorAlarm } from '../types/api';
 import { KernelErrorPanel } from './KernelErrorPanel';
+import type { KernelErrorPresentation } from './KernelErrorPanel';
 
-function lifecycleLabel(alarm: OperatorAlarm): string {
-  switch (alarm.lifecycleState) {
-    case 'active_unacknowledged':
-      return 'ACTIVE — ACKNOWLEDGEMENT REQUIRED';
-    case 'active_acknowledged':
-      return 'ACTIVE — ACKNOWLEDGED';
-    case 'returned_unacknowledged':
-      return 'RESOLVED — ACKNOWLEDGEMENT REQUIRED';
-    case 'returned_acknowledged':
-      return 'RESOLVED — ACKNOWLEDGED';
-  }
+export interface OperatorAlarmView {
+  conditionId: string;
+  activationId: string;
+  recordRevision: number;
+  definitionId: string;
+  lifecycleLabel: string;
+  priorityLabel: string;
+  severity: KernelErrorPresentation['severity'];
+  title: string;
+  message: string;
+  operatorResponse: string;
+  details: Record<string, unknown>;
 }
 
-function diagnosticDetails(alarm: OperatorAlarm): Record<string, unknown> {
-  const details: Record<string, unknown> = {
-    lifecycle_state: alarm.lifecycleState,
-    priority: alarm.priority,
-    alarm_class: alarm.alarmClass,
-    condition_id: alarm.conditionId,
-    activation_id: alarm.activationId,
-    activation_count: alarm.activationCount,
-    occurrence_count: alarm.occurrenceCount,
-    record_revision: alarm.recordRevision,
-    source_id: alarm.sourceId,
-    source_epoch: alarm.sourceEpoch,
-    source_sequence: alarm.sourceSequence,
-    source_quality: alarm.sourceQuality,
-    consequence: alarm.consequence,
-    operator_response: alarm.operatorResponse,
-  };
-  Object.entries(alarm.scope).forEach(([key, value]) => {
-    details[`scope_${key}`] = value;
-  });
-  Object.entries(alarm.displayArgs).forEach(([key, value]) => {
-    details[`display_${key}`] = value;
-  });
-  Object.entries(alarm.correlations).forEach(([key, value]) => {
-    details[`correlation_${key}`] = value;
-  });
-  Object.entries(alarm.details).forEach(([key, value]) => {
-    details[key] = value;
-  });
-  if (alarm.evidenceRefs.length > 0) {
-    details.evidence_refs = alarm.evidenceRefs.join(', ');
-  }
-  return details;
+interface OperatorAlarmPanelProps {
+  alarm: OperatorAlarmView;
+  busy?: boolean;
+  onAcknowledge: (alarm: OperatorAlarmView) => void;
+  onMinimize: () => void;
 }
 
-export function incidentIdForAlarm(alarm: OperatorAlarm): string | null {
-  const value = alarm.correlations.incident_id ?? alarm.correlations.incidentId;
-  return typeof value === 'string' && value.length > 0 ? value : null;
-}
-
+/**
+ * Alarm presentation and exact-record callback binding retained for I5. The
+ * adapter owns lifecycle interpretation, freshness, and acknowledgement API.
+ */
 export function OperatorAlarmPanel({
   alarm,
-  incidentSnapshot,
+  busy = false,
   onAcknowledge,
   onMinimize,
-}: {
-  alarm: OperatorAlarm;
-  incidentSnapshot?: Record<string, unknown> | null;
-  onAcknowledge: () => void;
-  onMinimize: () => void;
-}) {
-  const status = lifecycleLabel(alarm);
-  const priority = `${alarm.priority.toUpperCase()} PRIORITY`;
+}: OperatorAlarmPanelProps) {
   return (
-    <KernelErrorPanel
-      message={alarm.message}
-      errorCode={alarm.definitionId}
-      errorDetails={diagnosticDetails(alarm)}
-      incidentSnapshot={incidentSnapshot}
-      presentationKey={alarm.activationId}
-      headlineOverride={`${status} · ${priority} · ${alarm.title}`}
-      hintOverride={alarm.operatorResponse}
-      onAcknowledge={onAcknowledge}
-      acknowledgeLabel="Acknowledge alarm"
-      acknowledgeTitle="Mark this exact alarm activation as seen. This does not clear the condition, change an interlock, resume execution, or move the robot."
-      onMinimize={onMinimize}
-    />
+    <div className="operator-alarm-panel">
+      <KernelErrorPanel
+        error={{
+          code: alarm.definitionId,
+          message: alarm.message,
+          details: {
+            ...alarm.details,
+            condition_id: alarm.conditionId,
+            activation_id: alarm.activationId,
+            record_revision: alarm.recordRevision,
+          },
+        }}
+        presentation={{
+          headline: `${alarm.lifecycleLabel} · ${alarm.priorityLabel} · ${alarm.title}`,
+          hint: alarm.operatorResponse,
+          severity: alarm.severity,
+        }}
+        presentationKey={`${alarm.conditionId}:${alarm.activationId}`}
+      />
+      <div className="operator-alarm-actions">
+        <button type="button" onClick={onMinimize}>Minimize</button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onAcknowledge(alarm)}
+          title="Acknowledge this exact activation and revision; this does not clear the condition or resume motion."
+        >
+          Acknowledge alarm
+        </button>
+      </div>
+    </div>
   );
 }

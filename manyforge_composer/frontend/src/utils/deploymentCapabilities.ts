@@ -1,22 +1,13 @@
-import type { FullDeployment } from '../types/api';
+import type { CatalogCapabilityRequirement } from '../types/api';
 
-export function deploymentCapabilityKeys(
-  deployment: FullDeployment | null | undefined,
-): Set<string> {
-  const capabilities = new Set<string>();
-  for (const adapter of Object.values(deployment?.adapters ?? {})) {
-    for (const capability of adapter.capabilityKeys ?? []) {
-      if (capability.trim()) {
-        capabilities.add(capability);
-      }
-    }
-  }
-  return capabilities;
-}
-
+/**
+ * Filter catalog entries against an already-qualified capability set. Extracting
+ * capabilities from a deployment remains I6 work; this helper owns no artifact
+ * or runtime schema.
+ */
 export function supportsRequiredCapabilities(
   available: ReadonlySet<string>,
-  required: readonly string[],
+  required: readonly CatalogCapabilityRequirement[],
 ): boolean {
-  return required.every((capability) => available.has(capability));
+  return required.every((requirement) => available.has(requirement.capabilityId));
 }

@@ -1,154 +1,35 @@
+"""Cutover evidence for the removed Isaac collider topic-RPC client."""
+
 from __future__ import annotations
 
-import json
-import threading
-
-import pytest
+from manyforge_ros import inspect_isaac_scene
 
 
-def test_inspect_isaac_scene_topic_rpc_returns_correlated_report():
-    rclpy = pytest.importorskip("rclpy")
-    from rclpy.executors import MultiThreadedExecutor
-    from std_msgs.msg import String
+def test_inspect_isaac_scene_is_a_pre_effect_i9_boundary(capsys) -> None:
+    assert inspect_isaac_scene.main(["--include-subtree", "must-not-be-read"]) == 78
+    assert capsys.readouterr().err.strip() == inspect_isaac_scene.UNAVAILABLE_MESSAGE
+    payload = inspect_isaac_scene.unavailable_payload()
 
-    from manyforge_ros.inspect_isaac_scene import (
-        InspectIsaacSceneClient,
-        IsaacSceneQuery,
+    assert payload["reason_code"] == "composable_cell_runtime_unavailable"
+    assert payload["restoration_gate"] == "I9/I"
+    assert payload["historical_source_blob"] == (
+        "1d074cc77f3a25ccb1af9f0616bdff2bf1298ccc"
     )
-
-    request_topic = "/test_manyforge/isaac_collider_query/request"
-    response_topic = "/test_manyforge/isaac_collider_query/response"
-    received_requests: list[dict[str, object]] = []
-
-    rclpy.init(args=None)
-    executor = MultiThreadedExecutor(num_threads=2)
-    server_node = rclpy.create_node("manyforge_fake_isaac_collider_service")
-    client_node = rclpy.create_node("manyforge_inspect_isaac_scene_client")
-    response_publisher = server_node.create_publisher(String, response_topic, 10)
-
-    def on_request(message: String) -> None:
-        request = json.loads(message.data)
-        received_requests.append(request)
-        response = String()
-        response.data = json.dumps(
-            {
-                "version": "manyforge.isaac.collider_report.v0.1",
-                "request_id": request["request_id"],
-                "success": True,
-                "summary": {
-                    "collider_count": 2,
-                    "object_count": 1,
-                    "error_count": 0,
-                },
-                "objects": [
-                    {
-                        "source_root": "/World/soup_can",
-                        "collider_count": 2,
-                    }
-                ],
-            }
-        )
-        response_publisher.publish(response)
-
-    request_subscription = server_node.create_subscription(
-        String,
-        request_topic,
-        on_request,
-        10,
+    assert payload["historical_test_blob"] == (
+        "03e1c87e5a8689fa2fa832b500395b115028bbff"
     )
-
-    executor.add_node(server_node)
-    executor.add_node(client_node)
-    thread = threading.Thread(target=executor.spin, daemon=True)
-    thread.start()
-
-    try:
-        query = IsaacSceneQuery(
-            include_subtrees=("/World/soup_can",),
-            request_id="test-request-1",
-        )
-        client = InspectIsaacSceneClient(
-            client_node,
-            request_topic=request_topic,
-            response_topic=response_topic,
-            timeout_s=2.0,
-        )
-        response = client.inspect(query)
-
-        assert response["request_id"] == "test-request-1"
-        assert response["success"] is True
-        assert response["summary"]["collider_count"] == 2
-        assert response["objects"][0]["source_root"] == "/World/soup_can"
-        assert received_requests
-        assert all(
-            request == query.to_request_payload()
-            for request in received_requests
-        )
-    finally:
-        executor.shutdown(timeout_sec=2.0)
-        thread.join(timeout=2.0)
-        assert not thread.is_alive()
-        server_node.destroy_subscription(request_subscription)
-        server_node.destroy_publisher(response_publisher)
-        server_node.destroy_node()
-        client_node.destroy_node()
-        rclpy.shutdown()
+    assert len(payload["historical_acceptance"]) == 2
+    source = inspect_isaac_scene.__file__
+    assert source is not None
 
 
-@pytest.mark.parametrize(
-    "payload,error_fragment",
-    [
-        (
-            {"version": "v0", "request_id": "id", "success": True, "summary": {}},
-            "Unexpected Isaac collider report version",
-        ),
-        (
-            {
-                "version": "manyforge.isaac.collider_report.v0.1",
-                "request_id": "other",
-                "success": True,
-                "summary": {},
-            },
-            "Response request_id does not match",
-        ),
-        (
-            {
-                "version": "manyforge.isaac.collider_report.v0.1",
-                "request_id": "id",
-                "success": "true",
-                "summary": {},
-            },
-            "success field must be boolean",
-        ),
-        (
-            {
-                "version": "manyforge.isaac.collider_report.v0.1",
-                "request_id": "id",
-                "success": False,
-                "error": "boom",
-                "summary": {},
-            },
-            "boom",
-        ),
-        (
-            {
-                "version": "manyforge.isaac.collider_report.v0.1",
-                "request_id": "id",
-                "success": True,
-                "summary": {"collider_count": 1, "object_count": 1},
-            },
-            "summary.error_count must be an integer",
-        ),
-    ],
-)
-def test_validate_inspection_response_rejects_invalid_payloads(
-    payload: dict[str, object],
-    error_fragment: str,
-) -> None:
-    from manyforge_ros.inspect_isaac_scene import (
-        IsaacSceneInspectionError,
-        validate_inspection_response,
-    )
-
-    with pytest.raises(IsaacSceneInspectionError, match=error_fragment):
-        validate_inspection_response(payload, "id")
+def test_all_six_historical_scene_inspection_cases_remain_assigned() -> None:
+    assignments = inspect_isaac_scene.unavailable_payload()["historical_acceptance"]
+    assert assignments == [
+        "lines 9-96: correlated read-only ROS topic RPC and bounded cleanup",
+        "lines 98-154: five fail-closed response validation cases",
+    ]
+    assert inspect_isaac_scene.unavailable_payload()["removed_contracts"] == [
+        "manyforge.isaac.collider_query.v0.1",
+        "manyforge.isaac.collider_report.v0.1",
+    ]

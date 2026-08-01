@@ -1,7 +1,23 @@
 # ManyForge roadmap
 
-This is the public direction document. It is not a commitment to delivery
-dates or versions - items can move, get reordered, or be deferred as
+> **Composable-cell cutover status (2026-07-31):** this document preserves the
+> public product outcomes and acceptance themes recorded before the destructive
+> runtime relocation. It is restoration backlog, not a statement that the old
+> runtime or its public wires are available, and it does not override the
+> dependency order of the active implementation plan. On current `dev`, only
+> the retained ROS-free C++ package qualifications, build-owned v2
+> node-environment inspection, and Composer's structural catalog/files/URDF
+> shell are available. Program execution, assistant/MCP operation, live scene
+> editing/viewing, native planning, Isaac/ROS product launch, and real-robot
+> operation are unavailable. Terms such as “existing”, “already”, “wired”,
+> “shipped”, and “currently” below refer to the captured pre-cutover baseline
+> at `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`, not the current
+> branch. Reuse the outcomes and tests, but reassign them to the new headless
+> owners and named restoration gates instead of reviving deleted Python
+> semantic owners or v0 wire contracts.
+
+This is the public product-direction backlog. It is not a commitment to
+delivery dates or versions: items can move, be reordered, or be deferred as
 integration work surfaces new constraints. See CHANGELOG.md for what is
 actually planned for the next tag and what has shipped after tags exist.
 

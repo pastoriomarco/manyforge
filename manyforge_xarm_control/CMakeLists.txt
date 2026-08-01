@@ -12,7 +12,6 @@ find_package(controller_manager_msgs REQUIRED)
 find_package(hardware_interface REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(manyforge_robot_lifecycle REQUIRED)
-find_package(manyforge_robot_lifecycle_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
@@ -62,37 +61,13 @@ target_link_libraries(${PROJECT_NAME}_plugin ${PROJECT_NAME}_core)
 add_executable(lite6_supervised_preflight
   src/lite6_supervised_preflight.cpp
 )
-target_link_libraries(
-  lite6_supervised_preflight
-  ${PROJECT_NAME}_core
-)
-ament_target_dependencies(lite6_supervised_preflight rclcpp)
 
 add_executable(lite6_lifecycle_command_evidence
   src/lite6_lifecycle_command_evidence.cpp
 )
-target_link_libraries(
-  lite6_lifecycle_command_evidence
-  ${PROJECT_NAME}_core
-)
-ament_target_dependencies(
-  lite6_lifecycle_command_evidence
-  manyforge_robot_lifecycle
-  rclcpp
-)
 
 add_executable(lite6_execution_admission_provider
   src/lite6_execution_admission_provider.cpp
-)
-target_link_libraries(
-  lite6_execution_admission_provider
-  ${PROJECT_NAME}_core
-)
-ament_target_dependencies(
-  lite6_execution_admission_provider
-  manyforge_robot_lifecycle
-  manyforge_robot_lifecycle_msgs
-  rclcpp
 )
 
 pluginlib_export_plugin_description_file(
@@ -197,7 +172,6 @@ ament_export_dependencies(
   hardware_interface
   lifecycle_msgs
   manyforge_robot_lifecycle
-  manyforge_robot_lifecycle_msgs
   pluginlib
   rclcpp
   rclcpp_lifecycle

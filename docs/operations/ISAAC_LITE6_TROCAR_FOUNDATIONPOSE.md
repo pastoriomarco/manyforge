@@ -1,6 +1,13 @@
 # Isaac Lite6 Trocar FoundationPose Bring-Up
 
-This runbook is the operator path for the Lite6 trocar pick scenario:
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until I9/I and its prerequisite headless gates pass.
+> Unless explicitly marked as retained static configuration, present-tense
+> wording below describes the captured baseline, not a live Isaac lane.
+
+This runbook records the former operator path for the Lite6 trocar pick
+scenario:
 
 - Isaac Sim runs the Lite6/trocar USD on the simulator host.
 - Isaac ROS 4.4 runs YOLOv8 + FoundationPose and publishes

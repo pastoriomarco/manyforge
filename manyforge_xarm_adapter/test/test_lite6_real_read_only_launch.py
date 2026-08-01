@@ -1,32 +1,30 @@
+"""Focused source contract for the pre-I10 real-Lite6 launch fence.
+
+The six historical launch definitions remain acceptance input at blob
+``e3cff1010dd18992066fafb9329fe9ce8c018fa4``. Driver parameters, model and
+observer construction, address/report validation, and shell coordination must
+be adapted to retained products at I10/R; they are not current lane evidence.
+"""
+
 from __future__ import annotations
 
+import ast
 import importlib.util
-import os
 from pathlib import Path
-import subprocess
 
-from launch import LaunchContext
-from launch.utilities import perform_substitutions
 import pytest
-import yaml
 
 
 _LAUNCH_FILE = (
     Path(__file__).resolve().parents[1]
-    / 'launch'
-    / 'lite6_real_read_only.launch.py'
-)
-_LAUNCH_SCRIPT = (
-    Path(__file__).resolve().parents[2]
-    / 'scripts'
-    / 'ros'
-    / 'launch-lite6-read-only.sh'
+    / "launch"
+    / "lite6_real_read_only.launch.py"
 )
 
 
 def _load_launch_module():
     spec = importlib.util.spec_from_file_location(
-        'manyforge_lite6_real_read_only_launch_test',
+        "manyforge_lite6_real_read_only_launch_test",
         _LAUNCH_FILE,
     )
     assert spec is not None
@@ -36,161 +34,126 @@ def _load_launch_module():
     return module
 
 
-def _model(tmp_path: Path) -> Path:
-    path = tmp_path / 'lite6.urdf'
-    path.write_text(
-        """\
-<robot name="lite6">
-  <link name="world"/>
-</robot>
-""",
-        encoding='utf-8',
-    )
-    return path
-
-
-def _context(
-    model: Path,
-    *,
-    connect: str = 'false',
-    robot_ip: str = '',
-    report_type: str = 'rich',
-):
-    context = LaunchContext()
-    values = {
-        'connect_to_robot': connect,
-        'robot_ip': robot_ip,
-        'report_type': report_type,
-        'ros_namespace': '',
-        'prefix': '',
-        'hardware_namespace': 'ufactory',
-        'controller_name': 'lite6_traj_controller',
-        'model_urdf_path': str(model),
-    }
-    for name, value in values.items():
-        context.launch_configurations[name] = value
-    return context
-
-
-def _resolved_text(value, context: LaunchContext) -> str:
-    if isinstance(value, str):
-        return value
-    return ''.join(item.perform(context) for item in value)
-
-
-def test_default_launch_has_observer_and_model_but_no_driver(tmp_path: Path) -> None:
-    module = _load_launch_module()
-    context = _context(_model(tmp_path))
-
-    nodes = module._launch_setup(context)
-    packages = [_resolved_text(node.node_package, context) for node in nodes]
-    executables = [_resolved_text(node.node_executable, context) for node in nodes]
-
-    assert packages == ['robot_state_publisher', 'manyforge_xarm_adapter']
-    assert executables == [
-        'robot_state_publisher',
-        'manyforge-xarm-read-only-observer',
+def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
+    matches = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
     ]
-    assert 'controller_manager' not in packages
+    assert len(matches) == 1
+    return matches[0]
 
 
-def test_explicit_connection_adds_only_enforced_read_only_driver(
-    tmp_path: Path,
-) -> None:
-    module = _load_launch_module()
-    context = _context(
-        _model(tmp_path),
-        connect='true',
-        robot_ip='192.0.2.10',
+def _body_after_docstring(function: ast.FunctionDef) -> list[ast.stmt]:
+    assert function.body
+    docstring = function.body[0]
+    assert isinstance(docstring, ast.Expr)
+    assert isinstance(docstring.value, ast.Constant)
+    assert isinstance(docstring.value.value, str)
+    return function.body[1:]
+
+
+def _assert_definition_is_import_safe(function: ast.FunctionDef) -> None:
+    """Reject decorators, defaults, or annotations that execute on import."""
+
+    assert function.decorator_list == []
+    assert getattr(function, "type_params", []) == []
+    assert not any(
+        isinstance(node, ast.Call) for node in ast.walk(function.args)
     )
+    if function.returns is not None:
+        assert not any(
+            isinstance(node, ast.Call) for node in ast.walk(function.returns)
+        )
 
-    nodes = module._launch_setup(context)
-    packages = [_resolved_text(node.node_package, context) for node in nodes]
 
-    assert packages == [
-        'xarm_api',
-        'robot_state_publisher',
-        'manyforge_xarm_adapter',
-    ]
-    raw_parameters = nodes[0]._Node__parameters
-    assert len(raw_parameters) == 1
-    driver_parameters = {
-        perform_substitutions(context, list(key)): value
-        for key, value in raw_parameters[0].items()
-    }
-    assert driver_parameters['read_only'] is True
-    assert driver_parameters['add_gripper'] is False
-    assert driver_parameters['add_bio_gripper'] is False
-    assert driver_parameters['add_vacuum_gripper'] is False
-    assert 'expected_robot_sn' not in driver_parameters
-    assert driver_parameters['expected_robot_device_type'] == 9
+def test_launch_fails_before_model_or_ros_node_construction() -> None:
+    source = _LAUNCH_FILE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
 
-    observer_parameters = nodes[2]._Node__parameters
-    assert len(observer_parameters) == 1
-    observer_values = {
-        perform_substitutions(context, list(key)): value
-        for key, value in observer_parameters[0].items()
-    }
-    assert (
-        yaml.safe_load(
-            _resolved_text(
-                observer_values['validated_joint_state_topic'],
-                context,
+    assert not any(isinstance(node, ast.Import) for node in tree.body)
+    assert [
+        node.module for node in tree.body if isinstance(node, ast.ImportFrom)
+    ] == ["__future__", "typing"]
+    assert {
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    } == {"UNAVAILABLE_REASON_CODE", "UNAVAILABLE_MESSAGE"}
+    assert {
+        node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+    } == {"_unavailable", "generate_launch_description"}
+    for statement in tree.body:
+        assert isinstance(
+            statement,
+            (ast.Expr, ast.ImportFrom, ast.Assign, ast.FunctionDef),
+        )
+        if isinstance(statement, ast.FunctionDef):
+            _assert_definition_is_import_safe(statement)
+        else:
+            assert not any(
+                isinstance(node, ast.Call) for node in ast.walk(statement)
             )
-        )
-        == '/manyforge/xarm/validated_joint_states'
-    )
 
+    unavailable = _function(tree, "_unavailable")
+    unavailable_body = _body_after_docstring(unavailable)
+    assert len(unavailable_body) == 2
+    delete_statement, raise_statement = unavailable_body
+    assert isinstance(delete_statement, ast.Delete)
+    assert [
+        target.id
+        for target in delete_statement.targets
+        if isinstance(target, ast.Name)
+    ] == ["context", "args", "kwargs"]
+    assert isinstance(raise_statement, ast.Raise)
+    assert raise_statement.cause is None
+    unavailable_error = raise_statement.exc
+    assert isinstance(unavailable_error, ast.Call)
+    assert isinstance(unavailable_error.func, ast.Name)
+    assert unavailable_error.func.id == "RuntimeError"
+    assert len(unavailable_error.args) == 1
+    assert isinstance(unavailable_error.args[0], ast.Name)
+    assert unavailable_error.args[0].id == "UNAVAILABLE_MESSAGE"
+    assert unavailable_error.keywords == []
 
-@pytest.mark.parametrize('address', ['', 'lite6.local', '::1'])
-def test_connection_rejects_missing_or_non_ipv4_address(
-    tmp_path: Path,
-    address: str,
-) -> None:
+    generate = _function(tree, "generate_launch_description")
+    generate_body = _body_after_docstring(generate)
+    assert len(generate_body) == 1
+    generate_statement = generate_body[0]
+    assert isinstance(generate_statement, ast.Expr)
+    generate_call = generate_statement.value
+    assert isinstance(generate_call, ast.Call)
+    assert isinstance(generate_call.func, ast.Name)
+    assert generate_call.func.id == "_unavailable"
+    assert len(generate_call.args) == 1
+    assert isinstance(generate_call.args[0], ast.Constant)
+    assert generate_call.args[0].value is None
+    assert generate_call.keywords == []
+
+    for forbidden in (
+        "from launch",
+        "LaunchDescription",
+        "OpaqueFunction",
+        "launch_ros.actions",
+        "xarm_driver_node",
+        "read_text(",
+        "compile_lite6_binding(",
+    ):
+        assert forbidden not in source
+
     module = _load_launch_module()
 
-    with pytest.raises(ValueError):
-        module._launch_setup(
-            _context(_model(tmp_path), connect='true', robot_ip=address)
-        )
+    with pytest.raises(
+        RuntimeError,
+        match=module.UNAVAILABLE_REASON_CODE,
+    ) as generation_error:
+        module.generate_launch_description()
 
+    assert str(generation_error.value) == module.UNAVAILABLE_MESSAGE
 
-def test_launch_rejects_non_rich_report_stream(tmp_path: Path) -> None:
-    module = _load_launch_module()
+    with pytest.raises(RuntimeError, match=module.UNAVAILABLE_REASON_CODE) as error:
+        module._unavailable(None)
 
-    with pytest.raises(ValueError, match="report_type must be 'rich'"):
-        module._launch_setup(
-            _context(_model(tmp_path), report_type='normal')
-        )
-
-
-def test_shell_gate_requires_runtime_address_before_build() -> None:
-    environment = os.environ.copy()
-    environment.update(
-        {
-            'MANYFORGE_LITE6_CONNECT_READ_ONLY': 'ON',
-            'MANYFORGE_LITE6_READ_ONLY_CONFIRM': 'CONNECT_READ_ONLY',
-        }
-    )
-    environment.pop('MANYFORGE_LITE6_ROBOT_IP', None)
-
-    result = subprocess.run(
-        [str(_LAUNCH_SCRIPT)],
-        cwd=_LAUNCH_SCRIPT.parents[2],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert result.returncode == 2
-    assert 'MANYFORGE_LITE6_ROBOT_IP is required' in result.stderr
-    assert 'Starting >>>' not in result.stdout
-
-
-def test_launch_and_shell_have_no_robot_serial_contract() -> None:
-    launch_text = _LAUNCH_FILE.read_text(encoding='utf-8')
-    shell_text = _LAUNCH_SCRIPT.read_text(encoding='utf-8')
-
-    assert 'expected_robot_sn' not in launch_text
-    assert 'MANYFORGE_LITE6_EXPECTED_ROBOT_SN' not in shell_text
+    assert str(error.value) == module.UNAVAILABLE_MESSAGE

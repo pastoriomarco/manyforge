@@ -131,7 +131,8 @@ configure_file(
   @ONLY)
 
 add_library(manyforge_scene
-  src/canonical_empty_scene_owner.cpp)
+  src/canonical_empty_scene_owner.cpp
+  src/sqlite_scene_lifecycle_internal.cpp)
 add_library(manyforge::scene ALIAS manyforge_scene)
 target_include_directories(manyforge_scene PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -183,6 +184,8 @@ if(BUILD_TESTING)
     manyforge_scene_test_canonical_empty_package)
   target_compile_definitions(test_canonical_empty_scene_owner PRIVATE
     MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
+  target_include_directories(test_canonical_empty_scene_owner PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_canonical_empty_scene_owner PRIVATE
     manyforge_scene
     manyforge::deployment_admission

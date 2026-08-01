@@ -8,11 +8,68 @@ from manyforge_ros.diagnostics_bridge import (
     LEVEL_ERROR,
     LEVEL_OK,
     LEVEL_WARN,
+    MAX_DETAIL_CHARS,
+    MAX_DETAIL_ROWS,
+    MAX_ID_CHARS,
+    MAX_STATUS_ROWS,
+    MAX_STATUS_VALUE_ROWS,
+    UNAVAILABLE_MESSAGE,
+    UNAVAILABLE_REASON_CODE,
     build_diagnostic_statuses,
     external_fault_code,
     fault_severity,
+    main,
     statuses_to_msg,
 )
+
+
+class _StringTrap:
+    def __str__(self) -> str:
+        raise AssertionError("an arbitrary object's __str__ must not be called")
+
+
+def _valid_status() -> dict:
+    return {
+        "name": "manyforge/execution",
+        "level": LEVEL_OK,
+        "message": "ok",
+        "hardware_id": "deployment",
+        "values": [("state", "running")],
+    }
+
+
+def test_effectful_bridge_entrypoint_is_fenced(capsys: pytest.CaptureFixture[str]):
+    assert main() == 78
+    assert capsys.readouterr().err.strip() == UNAVAILABLE_MESSAGE
+    assert UNAVAILABLE_REASON_CODE in UNAVAILABLE_MESSAGE
+
+
+@pytest.mark.parametrize(
+    "deployment_name",
+    [None, 7, "", " deployment", "deployment ", "x" * (MAX_ID_CHARS + 1)],
+)
+def test_deployment_name_is_an_exact_bounded_identifier(deployment_name) -> None:
+    with pytest.raises(ValueError):
+        build_diagnostic_statuses(None, deployment_name=deployment_name)
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    [None, 7, True, "", " reason", "reason ", "x" * (MAX_ID_CHARS + 1)],
+)
+def test_fault_helpers_reject_coercible_or_unbounded_reasons(reason_code) -> None:
+    with pytest.raises(ValueError):
+        external_fault_code(reason_code)
+    with pytest.raises(ValueError):
+        fault_severity(reason_code)
+
+
+def test_fault_helpers_do_not_stringify_arbitrary_objects() -> None:
+    value = _StringTrap()
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        external_fault_code(value)
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        fault_severity(value)
 
 
 def test_healthy_digest_emits_ok_heartbeat():
@@ -55,6 +112,139 @@ def test_tracking_fault_maps_taxonomy_measurements_and_alias():
     assert values["tracking_error_rad"] == "0.078"
 
 
+def test_json_details_use_bounded_deterministic_projection() -> None:
+    digest = {
+        "state": "stopped",
+        "error": "fault",
+        "errorCode": "custom_fault",
+        "errorDetails": {
+            "reason_code": "custom_fault",
+            "boolean": True,
+            "count": 7,
+            "nested": {"b": [2, None], "a": 1},
+        },
+    }
+    values = dict(
+        build_diagnostic_statuses(digest, deployment_name="d")[0]["values"]
+    )
+    assert values["boolean"] == "true"
+    assert values["count"] == "7"
+    assert values["nested"] == '{"a":1,"b":[2,null]}'
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        [],
+        {},
+        {"state": "idle"},
+        {"state": "", "error": None},
+        {"state": "idle", "error": "fault"},
+        {"state": "idle", "error": None, "errorCode": "fault"},
+        {"state": True, "error": None},
+        {"state": "running", "error": _StringTrap()},
+        {"state": "stopped", "error": "fault", "errorCode": _StringTrap()},
+        {"state": "stopped", "error": "fault", "errorDetails": []},
+        {
+            "state": "stopped",
+            "error": "fault",
+            "errorDetails": {"reason_code": _StringTrap()},
+        },
+        {
+            "state": "stopped",
+            "error": "fault",
+            "errorDetails": {"reason_code": "fault", "detail": _StringTrap()},
+        },
+        {
+            "state": "stopped",
+            "error": "fault",
+            "errorDetails": {"reason_code": "fault", "state": "spoofed"},
+        },
+        {
+            "state": "stopped",
+            "error": "fault",
+            "errorDetails": {"reason_code": "fault"},
+            "error_details": {"reason_code": "other"},
+        },
+        {
+            "state": "stopped",
+            "error": "fault",
+            "errorCode": "fault",
+            "error_code": "other",
+        },
+    ],
+)
+def test_malformed_digest_facts_fail_instead_of_becoming_healthy(digest) -> None:
+    with pytest.raises(ValueError):
+        build_diagnostic_statuses(digest, deployment_name="d")
+
+
+def test_digest_detail_bounds_are_enforced_before_projection() -> None:
+    too_many_details = {
+        f"detail_{index}": "value" for index in range(MAX_DETAIL_ROWS + 1)
+    }
+    with pytest.raises(ValueError, match="error details exceeds"):
+        build_diagnostic_statuses(
+            {
+                "state": "stopped",
+                "error": "fault",
+                "errorCode": "fault",
+                "errorDetails": too_many_details,
+            },
+            deployment_name="d",
+        )
+
+    with pytest.raises(ValueError, match="detail key"):
+        build_diagnostic_statuses(
+            {
+                "state": "stopped",
+                "error": "fault",
+                "errorCode": "fault",
+                "errorDetails": {"x" * (MAX_ID_CHARS + 1): "value"},
+            },
+            deployment_name="d",
+        )
+
+    with pytest.raises(ValueError, match="2048-character bound"):
+        build_diagnostic_statuses(
+            {
+                "state": "stopped",
+                "error": "fault",
+                "errorCode": "fault",
+                "errorDetails": {"detail": "x" * (MAX_DETAIL_CHARS + 1)},
+            },
+            deployment_name="d",
+        )
+
+
+def test_diagnostic_value_rows_are_bounded_without_silent_detail_loss() -> None:
+    allowed_details = {"reason_code": "fault"}
+    allowed_details.update({f"detail_{index}": "value" for index in range(60)})
+    statuses = build_diagnostic_statuses(
+        {
+            "state": "stopped",
+            "error": "fault",
+            "errorCode": "fault",
+            "errorDetails": allowed_details,
+        },
+        deployment_name="d",
+    )
+    assert len(statuses[0]["values"]) == MAX_STATUS_VALUE_ROWS
+
+    overflow_details = dict(allowed_details)
+    overflow_details["detail_60"] = "value"
+    with pytest.raises(ValueError, match="diagnostic values exceeds"):
+        build_diagnostic_statuses(
+            {
+                "state": "stopped",
+                "error": "fault",
+                "errorCode": "fault",
+                "errorDetails": overflow_details,
+            },
+            deployment_name="d",
+        )
+
+
 def test_critical_class_maps_to_error_level_with_severity_value():
     digest = {
         "state": "stopped",
@@ -93,7 +283,7 @@ def test_unknown_code_is_sanitized_to_fault_code_charset():
     assert values["fault_code"] == "MANYFORGE_TREE_FAILED"
 
 
-def test_unreachable_composer_reports_warn_not_silence():
+def test_unavailable_diagnostic_source_reports_warn_not_silence():
     statuses = build_diagnostic_statuses(None, deployment_name="d")
     assert len(statuses) == 1
     assert statuses[0]["level"] == LEVEL_WARN
@@ -111,6 +301,46 @@ def test_statuses_to_msg_builds_diagnostic_array():
     assert len(msg.status) == 1
     assert msg.status[0].name == "manyforge/execution"
     assert msg.status[0].level == bytes([LEVEL_OK])
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [
+        (),
+        [{**_valid_status(), "level": True}],
+        [{**_valid_status(), "level": 4}],
+        [{**_valid_status(), "name": "x" * (MAX_ID_CHARS + 1)}],
+        [{**_valid_status(), "message": "x" * (MAX_DETAIL_CHARS + 1)}],
+        [{**_valid_status(), "values": [["state", "running"]]}],
+        [{**_valid_status(), "values": [("state",)]}],
+        [{**_valid_status(), "values": [("state", 7)]}],
+        [{**_valid_status(), "values": [("state", "a"), ("state", "b")]}],
+        [{**_valid_status(), "extra": "unexpected"}],
+    ],
+)
+def test_status_translation_rejects_malformed_rows_before_ros_import(statuses) -> None:
+    with pytest.raises(ValueError):
+        statuses_to_msg(statuses, object())
+
+
+def test_status_translation_bounds_statuses_and_values_before_ros_import() -> None:
+    with pytest.raises(ValueError, match="statuses exceeds"):
+        statuses_to_msg(
+            [_valid_status() for _ in range(MAX_STATUS_ROWS + 1)], object()
+        )
+
+    status = _valid_status()
+    status["values"] = [
+        (f"key_{index}", "value")
+        for index in range(MAX_STATUS_VALUE_ROWS + 1)
+    ]
+    with pytest.raises(ValueError, match="values exceeds"):
+        statuses_to_msg([status], object())
+
+
+def test_status_translation_rejects_duplicate_status_names_before_ros_import() -> None:
+    with pytest.raises(ValueError, match="duplicate name"):
+        statuses_to_msg([_valid_status(), _valid_status()], object())
 
 
 def test_running_state_with_stale_error_text_emits_ok_heartbeat():

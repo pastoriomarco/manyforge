@@ -3,14 +3,17 @@
 > **Do not run this procedure from the current `dev` branch.** The
 > composable-cell destructive migration has intentionally taken the real-robot
 > product lane offline until the I10/R restoration gate. This document records
-> the last qualified baseline only.
+> the last qualified baseline only. Its exact source is
+> `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`, blob
+> `b6a6796ad8b14f1ed1d5c6585c3a5677ad848926`; it is a reimplementation and
+> acceptance reference, not a runnable fallback.
 
 This runbook qualifies one physical Lite6 for the experimental ManyForge
 real-robot lane. It separates safe observation, supervised lifecycle
 qualification, and physical motion. Passing an earlier stage never authorizes a
 later one.
 
-The current implementation supports:
+That last qualified baseline supported:
 
 - deterministic generation and validation of the exact production controller
   binding;
@@ -63,21 +66,23 @@ The current implementation supports:
 - a no-dispatch utility that prepares an attended, at-most-1-degree Robot
   Control preview from fresh observed state.
 
-The earlier direct-SDK candidate has been removed. Production now loads the
-fork's `UFRobotSystemHardware`, which owns one unmodified SDK 1.18.1 session;
-ManyForge and PLC/ROXSIE communicate with that owner only through ROS. The
-vendor lifecycle primitives and transition table remain live-gated. A resolver
-produces and verifies the retained address-bearing runtime artifact before
-configuration. Do not start a parallel legacy driver or call the SDK from
-ManyForge: either would violate sole ownership.
+The earlier direct-SDK candidate had been removed by that baseline. Its
+production path loaded the fork's `UFRobotSystemHardware`, which owned one
+unmodified SDK 1.18.1 session; ManyForge and PLC/ROXSIE communicated with that
+owner only through ROS. The vendor lifecycle primitives and transition table
+were live-gated. A resolver produced and verified the retained
+address-bearing runtime artifact before configuration. A future I10/R port
+must preserve sole SDK ownership rather than starting a parallel driver or
+calling the SDK from ManyForge.
 
-SDK teardown races remain a documented deferred hardening concern. The supported
-prototype mitigates them in `xarm_ros2`: configuration owns startup, teardown is
-serialized with the owner's session, no shutdown is requested while
-initialization is in flight, transport loss is terminal, and recovery requires a
-fresh process. The owner does not rely only on SDK socket flags: prolonged
-absence of rich reports or successful control reads independently promotes the
-session to terminal loss. No local SDK source modification is retained.
+SDK teardown races were a documented deferred hardening concern. The captured
+prototype mitigated them in `xarm_ros2`: configuration owned startup, teardown
+was serialized with the owner's session, no shutdown was requested while
+initialization was in flight, transport loss was terminal, and recovery
+required a fresh process. The owner did not rely only on SDK socket flags:
+prolonged absence of rich reports or successful control reads independently
+promoted the session to terminal loss. No local SDK source modification was
+retained.
 
 ## Frozen initial binding
 
@@ -1163,41 +1168,22 @@ state. State the expected result before each action:
 Capture after every row with a distinct label. A capture timeout or unavailable
 required endpoint is evidence of an incomplete/failed observation, never a pass.
 
-Before a component-loss test, first complete the no-motion rows above and keep
-the robot stationary with the independent E-stop immediately available. The
-first loss injection is the external supervisor heartbeat because it sends no
-robot command and leaves both containers running. Expected outcome before
-stopping that process: within the frozen stale budgets the component graph and
-selected authority become unhealthy, lifecycle and final-dispatch admission
-close, any active cycle becomes terminal/reset-required, and no robot state
-auto-recovers:
+The former component-loss row is historical and **must not be executed from
+this branch**. It read the third line of the old `active-run` record and sent
+`SIGSTOP`/`SIGCONT` to the Python
+`manyforge_supervision.cell_supervisor`. That semantic owner has been removed;
+the exact procedure remains recoverable from the pinned source above.
 
-```bash
-manyforge_supervisor_pid="$(
-  sed -n '3p' .manyforge-var/real-lite6/active-run
-)"
-tr '\0' ' ' <"/proc/${manyforge_supervisor_pid}/cmdline"
-kill -STOP "${manyforge_supervisor_pid}"
-```
-
-Verify that the displayed command line is
-`manyforge_supervision.cell_supervisor` for the active run before issuing
-`kill -STOP`. Capture the fenced state while the supervisor remains paused.
-Expected outcome before resuming the same process: its next reduced-health
-observation sees the terminal dependency loss, so the one-way policy stops
-Composer before the owner and records `restart_required`. It does not reopen the
-retired authority session/execution:
-
-```bash
-kill -CONT "${manyforge_supervisor_pid}"
-```
-
-After the process exits, retain `cell-supervisor-state.json`, verify both
-containers are absent, and start a new observation-only lane. The next run must
-have fresh epochs and no inherited session, execution, controller arm, or replay
-state. Do not test Composer/owner exit or force-kill until this same-epoch
-loss/terminal-teardown row passes. A later container-exit row proves the same
-terminal Composer-before-owner ordering from a different detection source.
+At I10/R, restore the acceptance intent against the then-current Manager and
+headless owners, not the old Python process contract. The approved fault
+injection must prove that receiver-local heartbeat loss makes the component
+graph and selected authority unhealthy within the qualified stale budgets,
+closes lifecycle and final-dispatch admission, makes any active cycle
+terminal/reset-required, and never auto-recovers robot state. It must retain
+the replacement owner evidence, prove dependency-ordered teardown, and require
+fresh epochs with no inherited session, execution, controller arm, or replay
+state. Only after that same-epoch loss row passes may a separately approved
+container/process-exit row qualify the equivalent detection path.
 
 Repeat controller loss, provider loss, Disable, and recovery rows only under
 their separately approved procedures. The ordinary main **Stop** is a

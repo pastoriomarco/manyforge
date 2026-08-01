@@ -8,6 +8,7 @@
 #include <barrier>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -907,16 +908,36 @@ TEST(ManagerApplyJournal, ExactConcurrentDuplicateHasOneDurableEffect) {
 TEST(ManagerApplyJournal, ConcurrentFirstOpenConvergesOneExactSchema) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
-  std::barrier start(2);
-  auto open = [&] {
-    start.arrive_and_wait();
+  std::promise<void> start_promise;
+  const auto start = start_promise.get_future().share();
+  std::barrier open_together(2);
+  const auto open = [&, start](const bool explicit_close) {
+    start.get();
+    open_together.arrive_and_wait();
     SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-    return journal.VerifyIntegrity();
+    const auto report = journal.VerifyIntegrity();
+    if (explicit_close) {
+      journal.Close();
+    }
+    return report;
   };
-  auto first = std::async(std::launch::async, open);
-  auto second = std::async(std::launch::async, open);
+  auto first = std::async(std::launch::async, open, true);
+  std::future<ManagerApplyJournalIntegrityReport> second;
+  try {
+    second = std::async(std::launch::async, open, false);
+  } catch (...) {
+    const auto launch_error = std::current_exception();
+    start_promise.set_exception(launch_error);
+    try {
+      static_cast<void>(first.get());
+    } catch (...) {
+    }
+    std::rethrow_exception(launch_error);
+  }
+  start_promise.set_value();
   EXPECT_EQ(first.get().apply_intent_count, 0);
   EXPECT_EQ(second.get().apply_intent_count, 0);
+  ExpectNoSqliteSidecars(path);
 
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   EXPECT_EQ(reopened.VerifyIntegrity().apply_intent_count, 0);

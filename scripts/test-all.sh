@@ -1,17 +1,40 @@
 #!/usr/bin/env bash
-# Run all ManyForge tests.
+# Run an explicitly selected ManyForge test suite.
 # Intended to run inside the Docker dev container.
 #
 # Usage (from /workspace):
-#   ./scripts/test-all.sh          # all tests
-#   ./scripts/test-all.sh cpp      # C++ only
-#   ./scripts/test-all.sh python   # Python only
-#   ./scripts/test-all.sh bindings # pybind11 only
+#   ./scripts/test-all.sh retained # current reduced aggregate
+#   ./scripts/test-all.sh cpp      # retained C++ only
+#   ./scripts/test-all.sh python   # retained Python only
+#   ./scripts/test-all.sh bindings # typed unavailable until I2/E0
 
 set -euo pipefail
 
+# Resolve the helper with Bash parameter expansion so the legacy aggregate
+# gate below runs before even a utility subprocess such as `dirname` or
+# `nproc`.  Sourcing this helper only defines fixed values and one function.
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+if [[ "$SCRIPT_DIR" == "${BASH_SOURCE[0]}" ]]; then
+    SCRIPT_DIR="."
+fi
 # shellcheck source=lib/composable-cell-runtime-availability.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib/composable-cell-runtime-availability.sh"
+source "$SCRIPT_DIR/lib/composable-cell-runtime-availability.sh"
+
+# No argument and literal `all` selected the historical product-wide matrix,
+# including bindings, integration, runtime qualification, and native lanes.
+# Reusing either spelling for today's smaller retained subset would report a
+# false green.  Reject both before build defaults, imports, or suite runners.
+if (( $# == 0 )); then
+    manyforge_fail_composable_cell_runtime_unavailable
+fi
+if (( $# > 1 )); then
+    echo "test-all.sh accepts exactly one suite name" >&2
+    exit 2
+fi
+if [[ "$1" == "all" ]]; then
+    manyforge_fail_composable_cell_runtime_unavailable
+fi
+FILTER="$1"
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/manyforge-pycache}"
@@ -32,11 +55,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-if (( $# > 1 )); then
-    echo "test-all.sh accepts at most one suite name" >&2
-    exit 2
-fi
-FILTER="${1:-all}"
 PASS=0
 FAIL=0
 
@@ -277,10 +295,34 @@ run_pybind_tests() {
 }
 
 run_python_tests() {
-    section "Python manyforge_behavior tests"
+    section "Retained Python behavior and observation tests"
     cd "$WORKSPACE"
     setup_pythonpath
-    if pytest manyforge_behavior/tests/ -v; then
+    if pytest \
+        manyforge_behavior/tests/ \
+        tests/composable_cell_i4/ \
+        tests/test_benchmark.py \
+        tests/test_public_contract_entrypoint_reconciliation.py \
+        tests/test_qualification_wrapper_entrypoints.py \
+        tests/test_ros_qualification_helpers.py \
+        tests/test_test_all_script_contract.py \
+        -v; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_observability_client_tests() {
+    section "Retained diagnostics and Medkit client tests"
+    cd "$WORKSPACE"
+    setup_pythonpath
+    export PYTHONPATH="$WORKSPACE/manyforge_ros:$WORKSPACE/manyforge_medkit_adapter:$PYTHONPATH"
+    if pytest \
+        manyforge_ros/tests/test_diagnostics_bridge.py \
+        manyforge_medkit_adapter/tests/test_forwarder.py \
+        -k 'not statuses_to_msg_builds_diagnostic_array' \
+        -v; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -293,14 +335,11 @@ run_integration_tests() {
 }
 
 run_bridge_tests() {
-    section "Assistant bridge tests"
+    section "Retained assistant protocol and supervisor tests"
     cd "$WORKSPACE"
     setup_pythonpath
-    # Hard failure, not a skip: the bridge suite's own importorskip("fastapi")
-    # already vanishes silently on dep-less hosts, so a skip here would make
-    # the lane green while running zero tests. The dev container has the deps.
     if ! python_has_modules fastapi httpx; then
-        echo -e "${RED}  FAIL: missing Python deps for assistant bridge tests (need fastapi, httpx) — run in the dev container${NC}"
+        echo -e "${RED}  FAIL: missing Python deps for retained assistant tests (need fastapi, httpx) — run in the dev container${NC}"
         FAIL=$((FAIL + 1))
         return
     fi
@@ -315,27 +354,13 @@ run_composer_backend_tests() {
     section "Composer backend tests"
     cd "$WORKSPACE"
     setup_pythonpath
-    # Hard failure, not a skip: many Composer backend tests use
-    # pytest.importorskip("fastapi") and related imports, so a dep-less host can
-    # otherwise turn this lane green while running only a frontend subset. The
-    # dev container has these declared dependencies; local lightweight runs
-    # should use a narrower filter instead of shrinking the Composer lane.
-    if ! python_has_modules fastapi py_trees httpx; then
-        echo -e "${RED}  FAIL: missing Python deps for composer backend tests (need fastapi, py_trees, httpx) — run in the dev container${NC}"
+    # The retained shell is intentionally structural. A missing declared
+    # dependency is a hard lane failure, never a skipped runtime test.
+    if ! python_has_modules fastapi httpx yaml; then
+        echo -e "${RED}  FAIL: missing Python deps for Composer structural-shell tests — run in the dev container${NC}"
         FAIL=$((FAIL + 1))
         return
     fi
-    # The full Composer lane runs ALL backend tests, including MCP. `mcp` is a
-    # declared image dependency (see Dockerfile); it is intentionally NOT part
-    # of the skip gate above, so a missing `mcp` fails the MCP tests loudly with
-    # a clear dependency error instead of silently skipping unrelated Composer
-    # coverage. A lightweight local lane may skip MCP-specific tests explicitly,
-    # but test-all must not.
-    #
-    # Provide a commit hash for the verification-runner metadata so
-    # test_scenario_runner stays meaningful even when the container workspace is
-    # not git-aware (uid mismatch / git absent). Honors a pre-set value.
-    export MANYFORGE_GIT_COMMIT="${MANYFORGE_GIT_COMMIT:-$(git -c safe.directory='*' -C "$WORKSPACE" rev-parse HEAD 2>/dev/null || true)}"
     if pytest manyforge_composer/tests/ -v; then
         PASS=$((PASS + 1))
     else
@@ -363,19 +388,18 @@ run_composer_frontend_build() {
 }
 
 run_composer_frontend_tests() {
-    section "Composer frontend unit tests"
+    section "Composer structural frontend unit tests"
     local frontend_dir="$WORKSPACE/manyforge_composer/frontend"
     if ! command -v npm >/dev/null 2>&1; then
-        skip "npm not available"
+        echo -e "${RED}  FAIL: npm is required for the retained structural frontend tests${NC}"
+        FAIL=$((FAIL + 1))
         return
     fi
     if [ ! -f "$frontend_dir/package.json" ]; then
-        skip "Composer frontend package.json not found"
+        echo -e "${RED}  FAIL: Composer frontend package.json not found${NC}"
+        FAIL=$((FAIL + 1))
         return
     fi
-    # No node_modules guard beyond the ones above: if npm exists but deps are
-    # missing, `npm test` must fail loudly rather than skip — a silent skip
-    # here would green-light untested frontend logic.
     cd "$frontend_dir"
     if npm test; then
         PASS=$((PASS + 1))
@@ -385,19 +409,8 @@ run_composer_frontend_tests() {
 }
 
 run_qualification_tests() {
-    section "Qualification scenario matrix"
-    cd "$WORKSPACE"
-    setup_pythonpath
-    if ! python_has_modules fastapi py_trees httpx uvicorn yaml; then
-        skip "Missing Python deps for qualification runner"
-        return
-    fi
-    chmod +x ./scripts/qualify-scenarios.sh ./scripts/run-scenarios.py
-    if ./scripts/qualify-scenarios.sh; then
-        PASS=$((PASS + 1))
-    else
-        FAIL=$((FAIL + 1))
-    fi
+    section "Scenario qualification"
+    manyforge_fail_composable_cell_runtime_unavailable
 }
 
 run_qualification_native_tests() {
@@ -406,48 +419,13 @@ run_qualification_native_tests() {
 }
 
 run_qualification_soak_tests() {
-    section "Soak qualification matrix"
-    cd "$WORKSPACE"
-    setup_pythonpath
-    if ! python_has_modules fastapi py_trees httpx uvicorn yaml; then
-        skip "Missing Python deps for soak qualification runner"
-        return
-    fi
-    chmod +x ./scripts/qualify-soak-scenarios.sh ./scripts/run-scenarios.py
-    if ./scripts/qualify-soak-scenarios.sh; then
-        PASS=$((PASS + 1))
-    else
-        FAIL=$((FAIL + 1))
-    fi
+    section "Soak qualification"
+    manyforge_fail_composable_cell_runtime_unavailable
 }
 
 run_ros_tests() {
-    section "ROS adapter tests"
-    if [ -f /opt/ros/jazzy/setup.bash ]; then
-        # The Isaac/ROS lane does not source ROS for non-interactive shells.
-        # Probe and execute against the lane's actual ROS environment rather
-        # than reporting a misleading zero-suite success.
-        # shellcheck disable=SC1091
-        set +u
-        source /opt/ros/jazzy/setup.bash
-        set -u
-    fi
-    cd "$WORKSPACE"
-    setup_pythonpath
-    # These are hermetic adapter/unit tests with in-process fake services. Do
-    # not let an active Isaac or hardware graph on domain 0 answer the same
-    # standard simulation_interfaces service names nondeterministically.
-    export ROS_DOMAIN_ID="${MANYFORGE_TEST_ROS_DOMAIN_ID:-119}"
-    export PYTHONPATH="$WORKSPACE/manyforge_ros:${PYTHONPATH:-}"
-    if ! python_has_modules rclpy control_msgs trajectory_msgs action_msgs; then
-        skip "Missing ROS 2 Python deps; run in the ros-jazzy image"
-        return
-    fi
-    if pytest manyforge_ros/tests/ -v; then
-        PASS=$((PASS + 1))
-    else
-        FAIL=$((FAIL + 1))
-    fi
+    section "ROS adapter/runtime"
+    manyforge_fail_composable_cell_runtime_unavailable
 }
 
 case "$FILTER" in
@@ -462,6 +440,7 @@ case "$FILTER" in
         ;;
     python)
         run_python_tests
+        run_observability_client_tests
         ;;
     composer)
         run_composer_backend_tests
@@ -491,21 +470,20 @@ case "$FILTER" in
     integration)
         run_integration_tests
         ;;
-    all)
+    retained)
+        # This name is deliberately narrower than the historical `all`: it
+        # covers only the currently retained structural/offline surfaces.
         run_cpp_tests
         run_roboplan_tests
-        run_pybind_tests
         run_python_tests
-        run_integration_tests
+        run_observability_client_tests
         run_bridge_tests
         run_composer_backend_tests
         run_composer_frontend_build
         run_composer_frontend_tests
-        run_qualification_tests
-        run_qualification_native_tests
         ;;
     *)
-        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|bridge|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
+        echo "Usage: $0 [retained|cpp|roboplan|bindings|python|composer|bridge|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
         exit 1
         ;;
 esac

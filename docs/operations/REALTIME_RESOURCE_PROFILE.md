@@ -1,9 +1,15 @@
 # Real-Time Resource Profile
 
-ManyForge provides an opt-in Linux resource profile for robot deployments. It
-partitions the ManyForge and ROS process threads, applies explicit scheduler
-policy and CPU affinity to named runtime workers, and fails startup when Linux
-rejects a required request.
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until the selected N/I/R execution gate passes.
+> Present-tense runtime and probe descriptions below record the captured
+> policy, not a currently scheduled product lane.
+
+The captured runtime provided an opt-in Linux resource profile for robot
+deployments. It partitioned the ManyForge and ROS process threads, applied
+explicit scheduler policy and CPU affinity to named runtime workers, and
+failed startup when Linux rejected a required request.
 
 This profile is deployment infrastructure, not a safety algorithm. It does not
 move collision, stop, execution, or controller authority, and it does not put

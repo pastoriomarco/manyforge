@@ -8,6 +8,7 @@
 #
 # Usage:
 #   ./scripts/setup-docker.sh
+#   ./scripts/setup-docker.sh --prepare-only
 #
 #   # Optional: clone a different RoboPlan ref instead of the pinned SHA.
 #   ROBOPLAN_REF=main ./scripts/setup-docker.sh
@@ -35,6 +36,16 @@ ROBOPLAN_SHA_MARKER="$REPO_DIR/.docker/.manyforge-roboplan-sha"
 info() { echo -e "\033[0;32m>>>\033[0m $1"; }
 warn() { echo -e "\033[1;33m>>>\033[0m $1"; }
 fail() { echo -e "\033[0;31m>>>\033[0m $1"; exit 1; }
+
+prepare_only=false
+if [ "$#" -gt 1 ]; then
+    fail "Usage: $0 [--prepare-only]"
+fi
+case "${1:-}" in
+    "") ;;
+    --prepare-only) prepare_only=true ;;
+    *) fail "Usage: $0 [--prepare-only]" ;;
+esac
 
 # 1. Pre-clone RoboPlan
 current_roboplan_ref=""
@@ -82,6 +93,11 @@ else
     info "RoboPlan ready ($(du -sh "$ROBOPLAN_DIR" | cut -f1)); SHA $resolved_roboplan_sha."
 fi
 
+if [ "$prepare_only" = true ]; then
+    info "Pinned RoboPlan Docker build context is ready."
+    exit 0
+fi
+
 # 2. Build Docker image
 info "Building Docker image (this takes several minutes on first run)..."
 cd "$REPO_DIR"
@@ -99,5 +115,5 @@ echo ""
 echo "  Run Python tests:"
 echo "    pytest manyforge_behavior/tests/"
 echo ""
-echo "  Run all tests:"
-echo "    ./scripts/test-all.sh"
+echo "  Run retained tests:"
+echo "    ./scripts/test-all.sh retained"

@@ -5,6 +5,8 @@
 > staging and offline import qualification; its former runtime planner,
 > projection, execution, gripper, Python, and dynamic-collision adapters have
 > been destructively removed.
+> Present-tense adapter behavior below is the captured baseline unless a
+> paragraph explicitly identifies retained offline staging or qualification.
 
 This document records backend-specific behavior in the ManyForge RoboPlan
 adapter that affects runtime semantics. It is deployment-facing documentation,
@@ -12,7 +14,8 @@ not a development plan.
 
 ## Detached Static Object Collision Filter
 
-Status: active temporary workaround in `manyforge_roboplan`.
+Historical baseline status: active temporary workaround in
+`manyforge_roboplan`.
 
 ManyForge scene resources can represent authored world objects that are useful
 for visualization, context, and later behavior-tree actions. Two detached scene
@@ -47,7 +50,8 @@ behavior-tree attach/detach semantics.
 
 ## Frame-Relative Attached Object Placement
 
-Status: active RoboPlan adapter convention in `manyforge_roboplan`.
+Historical baseline status: active RoboPlan adapter convention in
+`manyforge_roboplan`.
 
 ManyForge stores scene-object poses in the semantic frame named by the object
 state. For a detached world object, that frame is usually `universe`. For an
@@ -79,7 +83,8 @@ missed collision between the carried object and an external obstacle.
 
 ## Support Contacts
 
-Status: active temporary workaround in `manyforge_roboplan`, implementing a
+Historical baseline status: active temporary workaround in
+`manyforge_roboplan`, implementing a
 backend-neutral ManyForge scene-resource contract.
 
 When an attached object is intentionally resting on a support object at the
@@ -133,7 +138,9 @@ or an authorized pair beyond its bound still fail.
 All modes first obtain the colliding pair set. Signed penetration/distance is
 queried only for pairs already reported colliding, at both pre-dispatch
 validation and runtime monitoring. ManyForge does not perform an all-pairs
-minimum-clearance scan and does not expose `min_separation_clearance_m`.
+minimum-clearance scan and does not expose the retired all-pairs clearance
+parameter. Its exact v1 spelling remains pinned only in rejection tests and
+historical baseline evidence.
 
 RoboPlan diagnostic output may report raw geometry names instead of ManyForge
 scene-object IDs. During support-contact discovery and trajectory validation,
@@ -210,7 +217,8 @@ desirable upstream simplification, not a prerequisite for current authority.
 
 ## Robot Collision Mesh Preservation and AABB Proxy Warnings
 
-Status: active RoboPlan adapter behavior in `manyforge_roboplan`.
+Historical baseline status: active RoboPlan adapter behavior in
+`manyforge_roboplan`.
 
 Robot collision snapshots preserve backend mesh geometry when the model loader
 can expose a mesh resource. This is the preferred path: the validation and

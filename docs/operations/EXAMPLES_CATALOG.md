@@ -1,15 +1,28 @@
 # Examples Catalog — Program × Deployment Pairs
 
-This doc catalogues every `examples/*.program.yaml`,
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until their named product gate passes.
+> Every `manyforge.program.v0` and `manyforge.deployment.v0` YAML named below
+> is an exact historical migration input, not a currently accepted artifact.
+> The v1 schemas are breaking and have no compatibility loader. These inputs
+> will be ported by bounded authoring migration only after the v1 compiler,
+> retained products, and each lane-specific target contract exist; do not edit
+> them into an unverified partial-v1 shape or cite them as runnable examples.
+> Unless explicitly marked as retained static data, present-tense descriptions
+> below refer to the captured baseline. I6/N, I9/I, and I10/R respectively own
+> restoration of native, Isaac, and real-robot execution.
+
+This doc catalogues the captured `examples/*.program.yaml`,
 `examples/*.deployment.yaml`, and physical
-`examples/*.real-robot-cell.yaml` artifact and maps them to the scenarios the
-unified launcher (`scripts/launch.sh`) exposes. Use it to pick the right
+`examples/*.real-robot-cell.yaml` artifacts and maps them to the scenarios the
+unified launcher (`scripts/launch.sh`) exposed. Use it to recover the intended
 combination for a given test or demo.
 
 For the launcher itself, see
-[`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md). For the live source
-of truth on ordinary scenarios, see `compatibility.scenarios` in its
-deployment artifact. A physical scenario instead comes from its strict
+[`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md). The captured source of
+truth for ordinary scenarios was `compatibility.scenarios` in each deployment
+artifact. A physical scenario instead came from its strict
 cell/template/program bundle. `scripts/lib/scenarios.sh` only loads and
 presents those discovered definitions.
 

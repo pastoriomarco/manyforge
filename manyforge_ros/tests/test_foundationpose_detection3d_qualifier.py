@@ -1,208 +1,228 @@
+"""Owner-neutral FoundationPose evidence and pre-effect gate contracts.
+
+The four former live ROS cases remain exact I9/I acceptance input at
+ManyForge commit 08222188293df8e12f90dc72e204c21f22f92ea1, blob
+6e1af85d44d3304a3620cec30d1c83ff1f3ae9f5.  They are not runnable fallbacks
+for the deleted live subscriber.
+"""
+
 from __future__ import annotations
 
-import json
-import os
-import subprocess
+import importlib.util
+import inspect
 import sys
-import textwrap
-import time
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
-
-
-pytest.importorskip("rclpy")
-pytest.importorskip("vision_msgs")
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 QUALIFIER = REPO_ROOT / "scripts" / "ros" / "validate-foundationpose-detection3d-source.py"
 
 
-def _publisher_code(
-    *,
-    topic: str,
-    covariance: float,
-    detection_id: str = "box-01",
-    class_id: str = "mac_and_cheese",
-    score: float = 0.92,
-    frame_id: str = "world",
-) -> str:
-    return textwrap.dedent(
-        f"""
-        import signal
-        import time
+def _load_qualifier() -> ModuleType:
+    module_name = "manyforge_foundationpose_detection3d_qualifier_test_subject"
+    spec = importlib.util.spec_from_file_location(module_name, QUALIFIER)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
-        import rclpy
-        from vision_msgs.msg import Detection3DArray, Detection3D, ObjectHypothesisWithPose
 
-        rclpy.init(args=None)
-        node = rclpy.create_node("foundationpose_qualifier_test_publisher")
-        publisher = node.create_publisher(Detection3DArray, {topic!r}, 1)
-        stop_requested = False
-
-        def request_stop(_signum, _frame):
-            global stop_requested
-            stop_requested = True
-
-        signal.signal(signal.SIGTERM, request_stop)
-        deadline = time.time() + 6.0
-        while not stop_requested and time.time() < deadline:
-            msg = Detection3DArray()
-            msg.header.frame_id = {frame_id!r}
-            msg.header.stamp = node.get_clock().now().to_msg()
-            detection = Detection3D()
-            detection.header = msg.header
-            detection.id = {detection_id!r}
-            result = ObjectHypothesisWithPose()
-            result.hypothesis.class_id = {class_id!r}
-            result.hypothesis.score = {score!r}
-            result.pose.pose.position.x = 0.3
-            result.pose.pose.position.y = 0.1
-            result.pose.pose.position.z = 0.2
-            result.pose.pose.orientation.w = 1.0
-            result.pose.covariance[0] = {covariance!r}
-            result.pose.covariance[7] = {covariance!r}
-            result.pose.covariance[14] = {covariance!r}
-            detection.results.append(result)
-            msg.detections.append(detection)
-            publisher.publish(msg)
-            rclpy.spin_once(node, timeout_sec=0.0)
-            time.sleep(0.1)
-        node.destroy_node()
-        rclpy.shutdown()
-        """
+def _header(*, frame_id: str = "world", sec: int = 12, nanosec: int = 34):
+    return SimpleNamespace(
+        frame_id=frame_id,
+        stamp=SimpleNamespace(sec=sec, nanosec=nanosec),
     )
 
 
-def _run_qualifier(
-    *,
-    covariance: float,
-    min_samples: int,
-    association_args: list[str] | None = None,
-    confidence_min: float = 0.8,
-    extra_args: list[str] | None = None,
-    publisher_kwargs: dict[str, object] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    topic = f"/foundationpose_qualifier_test_{os.getpid()}_{time.monotonic_ns()}"
-    publisher_kwargs = dict(publisher_kwargs or {})
-    publisher = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            _publisher_code(
-                topic=topic,
-                covariance=covariance,
-                **publisher_kwargs,
-            ),
+def _result(*, class_id: str, score: float, variance: float):
+    covariance = [0.0] * 36
+    covariance[0] = variance
+    covariance[7] = variance
+    covariance[14] = variance
+    return SimpleNamespace(
+        hypothesis=SimpleNamespace(class_id=class_id, score=score),
+        pose=SimpleNamespace(covariance=covariance),
+    )
+
+
+def test_entrypoint_is_unavailable_before_argument_parsing(capsys):
+    qualifier = _load_qualifier()
+
+    assert qualifier.main(["--not-a-real-option"]) == 78
+    assert capsys.readouterr().err.strip() == qualifier.UNAVAILABLE_MESSAGE
+
+    source = inspect.getsource(qualifier.main)
+    assert "parse_args" not in source
+    assert "rclpy" not in source
+    assert "_qualify" not in source
+
+
+def test_deployment_v0_source_config_and_cli_schema_are_absent():
+    qualifier = _load_qualifier()
+
+    assert not hasattr(qualifier, "_source_config")
+    assert not hasattr(qualifier, "build_argument_parser")
+
+
+def test_raw_auditor_matches_class_and_records_header_covariance():
+    qualifier = _load_qualifier()
+    auditor = qualifier.RawDetectionAuditor(
+        detection_id="",
+        class_id="mac_and_cheese",
+        selection="",
+    )
+    message_header = _header()
+    detection = SimpleNamespace(
+        id="box-01",
+        header=_header(frame_id="", sec=0, nanosec=0),
+        results=[_result(class_id="mac_and_cheese", score=0.92, variance=0.001)],
+    )
+
+    auditor.observe(SimpleNamespace(header=message_header, detections=[detection]))
+
+    assert auditor.evidence.seen_messages == 1
+    assert auditor.evidence.matched_messages == 1
+    assert auditor.evidence.last_frame_id == "world"
+    assert auditor.evidence.last_detection_id == "box-01"
+    assert auditor.evidence.last_class_id == "mac_and_cheese"
+    assert auditor.evidence.last_score == pytest.approx(0.92)
+    assert auditor.evidence.last_position_variance_m2 == pytest.approx(0.001)
+    assert auditor.evidence.last_stamp_sec == 12
+    assert auditor.evidence.last_stamp_nanosec == 34
+
+
+def test_raw_auditor_best_score_selection_is_deterministic():
+    qualifier = _load_qualifier()
+    auditor = qualifier.RawDetectionAuditor(
+        detection_id="",
+        class_id="",
+        selection="best_score",
+    )
+    detection = SimpleNamespace(
+        id="box-01",
+        header=_header(),
+        results=[
+            _result(class_id="low", score=0.25, variance=0.004),
+            _result(class_id="high", score=0.95, variance=0.002),
         ],
-        cwd=REPO_ROOT,
-        text=True,
     )
-    try:
-        association = association_args or ["--class-id", "mac_and_cheese"]
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(QUALIFIER),
-                "--topic",
-                topic,
-                "--object-id",
-                "isaac_cheese_box",
-                *association,
-                "--confidence-min",
-                str(confidence_min),
-                "--max-position-variance-m2",
-                "0.01",
-                "--expected-frame-id",
-                "world",
-                "--min-accepted-samples",
-                str(min_samples),
-                "--timeout-s",
-                "5",
-                *(extra_args or []),
-            ],
-            cwd=REPO_ROOT,
-            text=True,
-            capture_output=True,
-            timeout=10,
+
+    auditor.observe(SimpleNamespace(header=_header(), detections=[detection]))
+
+    assert auditor.evidence.matched_messages == 1
+    assert auditor.evidence.last_selection == "best_score"
+    assert auditor.evidence.last_class_id == "high"
+    assert auditor.evidence.last_score == pytest.approx(0.95)
+    assert auditor.evidence.last_position_variance_m2 == pytest.approx(0.002)
+
+
+def test_position_covariance_rejects_short_or_nonfinite_values():
+    qualifier = _load_qualifier()
+
+    assert qualifier._position_covariance_max(None) is None
+    assert qualifier._position_covariance_max([0.0] * 14) is None
+    covariance = [0.0] * 36
+    covariance[7] = float("nan")
+    assert qualifier._position_covariance_max(covariance) is None
+
+
+def test_raw_auditor_rejects_unbounded_or_malformed_message_fields():
+    qualifier = _load_qualifier()
+    auditor = qualifier.RawDetectionAuditor(
+        detection_id="",
+        class_id="mac_and_cheese",
+        selection="",
+    )
+
+    with pytest.raises(ValueError, match="detections exceeds"):
+        auditor.observe(
+            SimpleNamespace(
+                header=_header(),
+                detections=(None for _ in range(qualifier.MAX_BATCH_ITEMS + 1)),
+            )
         )
-    finally:
-        publisher.terminate()
-        try:
-            publisher.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            publisher.kill()
-            publisher.wait(timeout=3)
-    return result
+
+    oversized_result = _result(class_id="mac_and_cheese", score=0.9, variance=0.1)
+    with pytest.raises(ValueError, match="detection results exceeds"):
+        auditor.observe(
+            SimpleNamespace(
+                header=_header(),
+                detections=[
+                    SimpleNamespace(
+                        id="box-01",
+                        header=_header(),
+                        results=(
+                            oversized_result
+                            for _ in range(qualifier.MAX_BATCH_ITEMS + 1)
+                        ),
+                    )
+                ],
+            )
+        )
+
+    with pytest.raises(ValueError, match="frame id exceeds"):
+        auditor.observe(
+            SimpleNamespace(
+                header=_header(frame_id="x" * (qualifier.MAX_SOURCE_TEXT_CHARS + 1)),
+                detections=[
+                    SimpleNamespace(
+                        id="box-01",
+                        header=_header(frame_id="", sec=0, nanosec=0),
+                        results=[oversized_result],
+                    )
+                ],
+            )
+        )
 
 
-def test_foundationpose_detection3d_qualifier_accepts_valid_stream():
-    result = _run_qualifier(covariance=0.001, min_samples=3)
+def test_raw_auditor_requires_one_bounded_association():
+    qualifier = _load_qualifier()
 
-    assert result.returncode == 0, result.stderr + result.stdout
-    payload = json.loads(result.stdout)
-    assert payload["passed"] is True
-    assert payload["accepted_samples"] == 3
-    assert payload["last_pose_frame_id"] == "world"
-    assert payload["last_confidence"] == pytest.approx(0.92)
-    assert payload["last_position_variance_m2"] == pytest.approx(0.001)
-    assert payload["raw_detection"]["matched_messages"] >= 3
+    with pytest.raises(ValueError, match="exactly one"):
+        qualifier.RawDetectionAuditor(
+            detection_id="box-01",
+            class_id="mac_and_cheese",
+            selection="",
+        )
+    with pytest.raises(ValueError, match="selection must"):
+        qualifier.RawDetectionAuditor(
+            detection_id="",
+            class_id="",
+            selection="highest",
+        )
 
 
-def test_foundationpose_detection3d_qualifier_rejects_zero_covariance_by_default():
-    result = _run_qualifier(covariance=0.0, min_samples=1)
-
-    assert result.returncode != 0
-    payload = json.loads(result.stdout)
-    assert payload["passed"] is False
-    assert any(
-        "zero position covariance" in reason
-        for reason in payload["failure_reasons"]
+@pytest.mark.parametrize(
+    ("sec", "nanosec", "message"),
+    [
+        (True, 0, "stamp.sec must be an exact integer"),
+        ("12", 0, "stamp.sec must be an exact integer"),
+        (12, 0.5, "stamp.nanosec must be an exact integer"),
+        (12, 1_000_000_000, "stamp.nanosec is outside"),
+        (2**31, 0, "stamp.sec is outside"),
+    ],
+)
+def test_raw_auditor_rejects_malformed_stamp_without_recording_evidence(
+    sec, nanosec, message
+):
+    qualifier = _load_qualifier()
+    auditor = qualifier.RawDetectionAuditor(
+        detection_id="",
+        class_id="mac_and_cheese",
+        selection="",
+    )
+    detection = SimpleNamespace(
+        id="box-01",
+        header=_header(frame_id="world", sec=sec, nanosec=nanosec),
+        results=[_result(class_id="mac_and_cheese", score=0.92, variance=0.001)],
     )
 
-
-def test_foundationpose_detection3d_qualifier_selection_accepts_bootstrap_stream():
-    result = _run_qualifier(
-        covariance=0.0,
-        min_samples=1,
-        association_args=["--selection", "first"],
-        confidence_min=0.0,
-        extra_args=["--allow-zero-confidence", "--allow-zero-covariance"],
-        publisher_kwargs={
-            "detection_id": "",
-            "class_id": "",
-            "score": 0.0,
-        },
-    )
-
-    assert result.returncode == 0, result.stderr + result.stdout
-    payload = json.loads(result.stdout)
-    assert payload["passed"] is True
-    assert payload["association"]["selection"] == "first"
-    assert payload["last_confidence"] == pytest.approx(0.0)
-    assert payload["last_position_variance_m2"] == pytest.approx(0.0)
-    assert payload["raw_detection"]["last_selection"] == "first"
-
-
-def test_foundationpose_detection3d_qualifier_rejects_zero_confidence_by_default():
-    result = _run_qualifier(
-        covariance=0.001,
-        min_samples=1,
-        association_args=["--selection", "first"],
-        confidence_min=0.0,
-        extra_args=["--allow-zero-covariance"],
-        publisher_kwargs={
-            "detection_id": "",
-            "class_id": "",
-            "score": 0.0,
-        },
-    )
-
-    assert result.returncode != 0
-    payload = json.loads(result.stdout)
-    assert payload["passed"] is False
-    assert any(
-        "zero" in reason and "confidence" in reason
-        for reason in payload["failure_reasons"]
-    )
+    with pytest.raises(ValueError, match=message):
+        auditor.observe(SimpleNamespace(header=_header(), detections=[detection]))
+    assert auditor.evidence.seen_messages == 0
+    assert auditor.evidence.matched_messages == 0

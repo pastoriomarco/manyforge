@@ -51,7 +51,7 @@ class Lite6BindingInputs:
 
 @dataclass(frozen=True)
 class ResolvedLite6Binding:
-    """Immutable names used by observation now and controller binding later."""
+    """Immutable names retained for offline and future adapter qualification."""
 
     generation_id: str
     ros_namespace: str

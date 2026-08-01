@@ -1,3 +1,5 @@
+> **Historical qualification runbook only.** Preserved from `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1` as design/evidence context. Its runtime targets were demolished and its commands must not be run or cited as current qualification until the named restoration gates pass.
+
 # Step 18 offline proof campaign
 
 > **History-rewrite provenance (2026-07-22):** The executable pins below
@@ -7,9 +9,15 @@
 > - `manyforge` `643fe9c399182419d38d4478750d7e6f692dc9ad` → `2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909` (tree `c900d971cdcbcfb6ec5d7f9b465ff18befa1dd89`);
 > - `manyforge_specs` `5e50a4872bbb9a2167c6bc14b9b5963061f2f09e` → `67c24447a117e14c8274b13d05d720766671aa7a` (tree `7529497b02758c14666f85bc9bf98e85abec075a`);
 
-Status: **implemented; formal evidence must be captured from one frozen final
-candidate**. This runbook covers the offline before/after performance and
-semantic-proof subgate only. It does not close Step 18 by itself.
+Historical status at the pinned source: **implemented but not closed; formal
+evidence still had to be captured from one frozen final candidate**. This
+runbook covered the offline before/after performance and semantic-proof subgate
+only; it did not close Step 18 by itself.
+
+Current branch status: **the aggregate producer is unavailable until I6/N and
+I8/P5**. Pure verifiers and focused retained Core/collision tests remain
+current, but the campaign commands below are restoration input rather than a
+current qualification lane.
 
 ## Fixed population
 

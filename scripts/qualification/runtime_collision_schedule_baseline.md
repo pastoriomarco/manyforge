@@ -1,3 +1,5 @@
+> **Historical qualification runbook only.** Preserved from `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1` as design/evidence context. Its runtime targets were demolished and its commands must not be run or cited as current qualification until the named restoration gates pass.
+
 # Step 18 scheduled-runtime baseline lane
 
 > **History-rewrite provenance (2026-07-22):** The executable pins below
@@ -7,9 +9,14 @@
 > - `manyforge` `643fe9c399182419d38d4478750d7e6f692dc9ad` → `2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909` (tree `c900d971cdcbcfb6ec5d7f9b465ff18befa1dd89`);
 > - `manyforge_specs` `5e50a4872bbb9a2167c6bc14b9b5963061f2f09e` → `67c24447a117e14c8274b13d05d720766671aa7a` (tree `7529497b02758c14666f85bc9bf98e85abec075a`);
 
-Status: **implemented; evidence must still be captured on the frozen final
-candidate**. The current-candidate runner cannot manufacture the historical
+Historical status at the pinned source: **implemented but not closed; formal
+evidence had not yet been captured against one frozen final candidate**. The
+historical current-candidate runner could not manufacture the
 `current_all_active_distance` arm.
+
+Current branch status: **unavailable until I6/N and I8/P5**. The commands below
+describe the former campaign and remain acceptance input only; they are not a
+current producer or qualification lane.
 
 ## Frozen identities and environment
 

@@ -1,19 +1,27 @@
 # ROS Environment Profiles
 
-This directory contains sourceable ROS 2 environment profiles for ManyForge
-operator workflows.
+> **Current `dev` boundary:** these profiles are retained configuration and
+> historical topology references. Sourcing one does not make an Isaac/ROS
+> product lane available or qualified. Do not execute the linked bring-up
+> recipes until I9/I restores the Isaac lane and its prerequisite headless
+> gates.
+
+This directory contains sourceable ROS 2 environment profiles from the last
+qualified ManyForge operator workflows.
 
 ## Isaac Lite6 Trocar FoundationPose
 
-Use `isaac_lite6_trocar_foundationpose.env.sh` for the multi-machine workflow
+The historical multi-machine workflow used
+`isaac_lite6_trocar_foundationpose.env.sh`
 where Isaac Sim runs on the laptop, Isaac ROS 4.4 YOLOv8/FoundationPose runs on
 Thor or another Jetson, and ManyForge runs its ROS-capable launcher on the
 Thor/Jetson host.
 
-Source the same profile in every ROS participant shell:
+Its captured setup sourced the same profile in every ROS participant shell:
 
 ```bash
-source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
+MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
+source "${MANYFORGE_ROOT}/config/ros/isaac_lite6_trocar_foundationpose.env.sh"
 ```
 
 The default topology is:
@@ -30,7 +38,8 @@ For a different LAN, override the host IPs before sourcing:
 ```bash
 export MANYFORGE_THOR_IP=<thor-or-jetson-ip>
 export MANYFORGE_ISAAC_SIM_IP=<isaac-sim-laptop-ip>
-source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
+MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
+source "${MANYFORGE_ROOT}/config/ros/isaac_lite6_trocar_foundationpose.env.sh"
 ```
 
 The profile intentionally overwrites existing `ROS_DOMAIN_ID`,
@@ -40,5 +49,6 @@ so stale shell state does not leak into a commissioning session. Override with
 `MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE`, or `MANYFORGE_ROS_STATIC_PEERS` only
 when intentionally qualifying a different topology.
 
-See `docs/operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md` for the full
-bring-up sequence, camera QoS settings, TF checks, and smoke validation.
+See `docs/operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md` for the retained
+bring-up sequence, camera QoS settings, TF checks, and future smoke-acceptance
+requirements. It is not a current command sequence.

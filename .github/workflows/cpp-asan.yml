@@ -3,46 +3,89 @@ name: cpp-asan
 on:
   pull_request:
     paths:
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
       - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
       - "manyforge_deployment/**"
       - "manyforge_component_manager/**"
+      - "manyforge_scene/**"
       - "scripts/ci/run-core-asan.sh"
       - "scripts/ci/run-deployment-asan.sh"
       - "scripts/ci/run-component-manager-asan.sh"
+      - "scripts/ci/run-relocation-packages-asan.sh"
       - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
+      - "scripts/setup-docker.sh"
       - ".github/workflows/cpp-asan.yml"
   push:
     branches: [main, dev]
     paths:
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
       - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
       - "manyforge_deployment/**"
       - "manyforge_component_manager/**"
+      - "manyforge_scene/**"
       - "scripts/ci/run-core-asan.sh"
       - "scripts/ci/run-deployment-asan.sh"
       - "scripts/ci/run-component-manager-asan.sh"
+      - "scripts/ci/run-relocation-packages-asan.sh"
       - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
+      - "scripts/setup-docker.sh"
       - ".github/workflows/cpp-asan.yml"
   workflow_dispatch:
 
 jobs:
   manyforge-cpp-asan:
-    name: ROS-free C++ AddressSanitizer
+    name: ROS-free C++ ASan/UBSan (AMD64 Docker)
     runs-on: ubuntu-24.04
-    env:
-      ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:exitcode=66
-      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1:exitcode=66
-      CMAKE_BUILD_PARALLEL_LEVEL: "2"
     steps:
       - uses: actions/checkout@v4
-      - name: Install C++ test dependencies
+
+      - name: Prepare pinned RoboPlan Docker context
+        run: ./scripts/setup-docker.sh --prepare-only
+
+      - name: Build development image
+        run: docker build --platform linux/amd64 -t manyforge-asan-ci:${GITHUB_SHA} .
+
+      - name: Run sanitizer registries in immutable image
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake g++ libdouble-conversion-dev libgtest-dev libssl-dev \
-            libexpat1-dev libsqlite3-dev libutf8proc-dev libyaml-dev pkg-config
-      - name: Run core C++ tests under AddressSanitizer
-        run: bash scripts/ci/run-core-asan.sh
-      - name: Run deployment C++ tests under AddressSanitizer
-        run: bash scripts/ci/run-deployment-asan.sh
-      - name: Run Component Manager C++ tests under AddressSanitizer
-        run: bash scripts/ci/run-component-manager-asan.sh
+          set -euo pipefail
+          image_id="$(docker image inspect "manyforge-asan-ci:${GITHUB_SHA}" --format '{{.Id}}')"
+          if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve immutable development image identity" >&2
+            exit 1
+          fi
+          echo "Qualified image: ${image_id}"
+          docker run --rm --platform linux/amd64 \
+            --network none \
+            --security-opt seccomp=unconfined \
+            -e ASAN_OPTIONS=halt_on_error=1:detect_leaks=1:exitcode=66 \
+            -e UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=66 \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            -e BUILD_DIR=/tmp/manyforge-asan/core \
+            -e DEPLOYMENT_BUILD_DIR=/tmp/manyforge-asan/deployment \
+            -e COMPONENT_MANAGER_BUILD_DIR=/tmp/manyforge-asan/component-manager \
+            -e RELOCATION_PACKAGES_BUILD_ROOT=/tmp/manyforge-asan/relocation-packages \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -w /workspace \
+            "${image_id}" \
+            setarch x86_64 -R bash -lc '
+              set -euo pipefail
+              expected_personality=00040000
+              parent_personality="$(cat /proc/self/personality)"
+              child_personality="$(sh -c "cat /proc/self/personality")"
+              if [[ "${parent_personality}" != "${expected_personality}" ||
+                    "${child_personality}" != "${expected_personality}" ]]; then
+                echo "ADDR_NO_RANDOMIZE inheritance check failed" >&2
+                exit 2
+              fi
+              bash scripts/ci/run-core-asan.sh
+              bash scripts/ci/run-deployment-asan.sh
+              bash scripts/ci/run-component-manager-asan.sh
+              bash scripts/ci/run-relocation-packages-asan.sh
+            '

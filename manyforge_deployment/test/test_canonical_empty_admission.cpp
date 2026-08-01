@@ -1115,6 +1115,8 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
       "canonical_empty.c1_build_authority.deployment.json"));
   EXPECT_TRUE(covers(
       "build-template:embedded_canonical_empty_deployment"));
+  EXPECT_TRUE(covers(
+      "build-template:embedded_structural_model_preparation"));
   EXPECT_TRUE(covers("build-recipe:manyforge_deployment"));
   for (const auto& input_id : input_ids) {
     EXPECT_EQ(input_id.find("test"), std::string::npos)

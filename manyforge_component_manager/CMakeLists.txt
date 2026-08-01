@@ -171,6 +171,7 @@ add_library(manyforge_component_manager
   src/manager_apply_journal.cpp
   src/manager_bootstrap_journal.cpp
   src/runtime_observation.cpp
+  src/sqlite_store_startup_internal.cpp
 )
 add_library(
   manyforge::component_manager ALIAS manyforge_component_manager)
@@ -249,6 +250,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_runtime_observation PRIVATE
     manyforge_component_manager GTest::gtest_main)
   gtest_discover_tests(test_runtime_observation
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_sqlite_store_startup_internal
+    test/test_sqlite_store_startup_internal.cpp)
+  target_include_directories(test_sqlite_store_startup_internal PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_sqlite_store_startup_internal PRIVATE
+    manyforge_component_manager GTest::gtest_main)
+  gtest_discover_tests(test_sqlite_store_startup_internal
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_manager_bootstrap_journal

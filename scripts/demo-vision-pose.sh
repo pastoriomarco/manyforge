@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-# demo-vision-pose.sh — backwards-compat shim for scripts/launch.sh.
+# Historical vision-pose demo entrypoint retained for truthful runbook links.
+# The former compatibility forwarding behavior is removed; restoration gate: N.
 
 set -euo pipefail
-exec "$(dirname "$0")/launch.sh" \
-    --lane manyforge-only \
-    --assistant on \
-    --scenario ur5-vision-pose-pick \
-    --non-interactive \
-    --yes \
-    "$@"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/composable-cell-runtime-availability.sh"
+manyforge_fail_composable_cell_runtime_unavailable

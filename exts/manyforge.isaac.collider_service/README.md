@@ -1,18 +1,37 @@
 # ManyForge Isaac Collider Service
 
-Native Isaac Sim extension that exposes the ManyForge collider probe over ROS 2.
+> **Current `dev` boundary:** this retained extension package is only a typed
+> I9/I unavailability gate, not a qualified ManyForge Isaac lane,
+> scene-authoring workflow, assistant surface, or viewer. Its standalone
+> protocol and installation notes remain restoration
+> inputs; do not use the recipes below as I9/I product evidence. The executable
+> `manyforge.isaac.collider_query.v0.1` and
+> `manyforge.isaac.mesh_transfer_request.v0.1` parser was removed rather than
+> kept as a dormant compatibility surface. Its exact historical source is blob
+> `395d16c3144186745882e9b09bc797fd63e601f7`; its seven test definitions and 16
+> expanded cases are assigned to future I9/I acceptance evidence in
+> `tests/test_isaac_collider_service_ros_contract.py`. The former live probe is
+> pinned at blob `380c7dc4ff873aa510290b5f6df5a080e9698ab0`; only its
+> owner-neutral recommendation, convex-normalization, and primitive-OBJ helpers
+> remain in `scripts/isaac_collider_probe_lib.py`. The duplicated extension copy
+> was removed with the live owner rather than retained as dormant code.
 
-The extension is read-only. It inspects the currently loaded Isaac Sim stage and
-returns a JSON collider report suitable for ManyForge scene-authoring tools and
-assistant workflows.
+Native Isaac Sim extension from the captured workflow that exposed the
+ManyForge collider probe over ROS 2.
+
+The historical extension exposed collider inspection, but it was not strictly
+side-effect-free: selected cooked/export paths created and removed temporary
+stage prims and wrote OBJ files. It returned a JSON collider report shaped for
+the former ManyForge scene-authoring tools and assistant workflows. The current
+gate performs none of those actions.
 
 ## Requirements
 
 - Isaac Sim with ROS 2 Python support available in the Isaac Python
   environment.
 - `rclpy`, `std_msgs`, and `std_srvs` importable from Isaac Sim Python.
-- The `manyforge.isaac.collider_service` extension folder. The probe library is
-  bundled in the extension package for copied installs.
+- The `manyforge.isaac.collider_service` extension folder. The live probe library
+  was bundled in the historical extension package for copied installs.
 
 ## Install
 
@@ -45,16 +64,21 @@ Equivalent launch shape:
   --enable manyforge.isaac.collider_service
 ```
 
-For normal copied installs, no environment variable is needed. The extension
-first looks for the bundled `isaac_collider_probe_lib.py`.
+For normal historical copied installs, no environment variable was needed. The
+extension first looked for the bundled `isaac_collider_probe_lib.py`; that
+duplicate live body is absent on current `dev`.
 
-Advanced override, only if you want to force a different probe library:
+Historical advanced override for forcing a different probe library:
 
 ```bash
 export MANYFORGE_PROBE_SCRIPTS_DIR=/path/to/manyforge/scripts
 ```
 
-## ROS Endpoints
+## Historical ROS Endpoints
+
+The endpoints and wire shapes in this section describe the captured pre-cutover
+extension. They are not registered by current `dev`, and no current parser
+accepts these v0.1 request envelopes.
 
 Default report service:
 
@@ -76,10 +100,10 @@ std_msgs/msg/String
 std_msgs/msg/String
 ```
 
-The topic route is a request/response RPC using versioned JSON strings. It
-exists because ROS 2 core packages do not provide a standard string-in /
-string-out service type. A future production interface may replace this with a
-ManyForge-specific service definition if that becomes preferable.
+The topic route was a request/response RPC using versioned JSON strings. It
+existed because ROS 2 core packages did not provide a standard string-in /
+string-out service type. I9/I owns the replacement transport and its explicit
+schema/version decision.
 
 Mesh-transfer topics:
 
@@ -94,8 +118,8 @@ std_msgs/msg/String
 std_msgs/msg/UInt8MultiArray
 ```
 
-Mesh transfer deliberately uses only standard ROS interfaces. The request and
-status topics carry versioned JSON. Each chunk message is self-describing:
+Mesh transfer deliberately used only standard ROS interfaces. The request and
+status topics carried versioned JSON. Each chunk message was self-describing:
 `UInt8MultiArray.data` contains a 4-byte big-endian JSON-header length, the JSON
 header, then raw mesh bytes. The header includes `request_id`, chunk index/count,
 byte offsets, total sha256, and per-chunk sha256.
@@ -121,7 +145,7 @@ Chunk header shape:
 }
 ```
 
-## Query JSON
+## Historical Query JSON (`v0.1`, removed)
 
 ```json
 {
@@ -159,11 +183,12 @@ Allowed `purpose` values:
 - `guide`
 - `all`
 
-All fields are validated strictly. Invalid JSON, invalid field types, and
-unsupported enum values return an error response instead of being silently
-coerced.
+The removed parser validated all fields strictly. Invalid JSON, invalid field
+types, and unsupported enum values returned an error response instead of being
+silently coerced. Those behaviors remain I9/I acceptance inputs; the v0.1
+envelope itself is not a compatibility requirement.
 
-## Mesh Transfer JSON
+## Historical Mesh Transfer JSON (`v0.1`, removed)
 
 Transfer an already exported local mesh URI:
 
@@ -191,18 +216,20 @@ Or ask Isaac to select/export the mesh from a scene root and stream it back:
 }
 ```
 
-The request must provide exactly one of `mesh_resource_uri` or `source_root`.
-Only local `file://` and plain local paths are transferable by this extension;
-remote asset references should first be exported by Isaac into a local OBJ.
-When a source root is converted to a ManyForge recommendation, the response
-includes the mesh pose and `mesh_scale` derived from the Isaac transform. This
-matters for Xform parents such as scaled tables where the OBJ vertices are
-exported root-local and the runtime must apply the authored scale separately.
+The historical request required exactly one of `mesh_resource_uri` or
+`source_root`. Only local `file://` and plain local paths were transferable by
+that extension; remote asset references first had to be exported by Isaac into
+a local OBJ. When a source root was converted to a ManyForge recommendation,
+the response included the mesh pose and `mesh_scale` derived from the Isaac
+transform. This mattered for Xform parents such as scaled tables where the OBJ
+vertices were exported root-local and the runtime had to apply the authored
+scale separately.
 
 ## Collider Vs Visual Mesh Sources
 
-ManyForge can import either a visual/object mesh or a collider-derived mesh.
-Use `mesh_source_preference` to make that choice explicit:
+The captured workflow could import either a visual/object mesh or a
+collider-derived mesh. It used `mesh_source_preference` to make that choice
+explicit:
 
 - `original` prefers the authored visual/object mesh. This is useful when the
   Composer scene should look like Isaac and planning cost is not the priority.
@@ -213,7 +240,7 @@ Use `mesh_source_preference` to make that choice explicit:
 - `auto` prefers visual/object meshes when available and falls back to collider
   or primitive data.
 
-For `collider`, the extension tries sources in this order:
+For `collider`, the historical extension tried sources in this order:
 
 1. A directly authored collider mesh prim under the requested source root.
 2. PhysX cooked convex data from the authored collider prim.
@@ -222,16 +249,16 @@ For `collider`, the extension tries sources in this order:
    on an `Xform` while storing the actual `UsdGeom.Mesh` on a child prim.
 5. Primitive collider geometry, when the collider is a cube/sphere/cylinder.
 
-The temporary recook path is intentionally not a scene edit. It creates a
-temporary `__manyforge_probe_cooking_*` prim, copies the descendant mesh geometry
-and convex-collider settings, asks PhysX for the cooked representation, exports
-the result, and removes the temporary prim before returning. It exists for Isaac
-assets whose UI shows a collider approximation such as `Convex Decomposition`
-on an `Xform`, while the PhysX cooking API rejects that Xform with
-`RESULT_ERROR_INVALID_PARSING` because the cookable mesh geometry lives below
+The temporary recook path was intended not to persist a scene edit. It created a
+temporary `__manyforge_probe_cooking_*` prim, copied the descendant mesh
+geometry and convex-collider settings, asked PhysX for the cooked representation,
+exported the result, and removed the temporary prim before returning. It existed
+for Isaac assets whose UI showed a collider approximation such as
+`Convex Decomposition` on an `Xform`, while the PhysX cooking API rejected that Xform with
+`RESULT_ERROR_INVALID_PARSING` because the cookable mesh geometry lived below
 it.
 
-When this path is used, raw reports identify it explicitly:
+When this path was used, raw reports identified it explicitly:
 
 ```json
 {
@@ -243,12 +270,12 @@ When this path is used, raw reports identify it explicitly:
 }
 ```
 
-The exported OBJ still uses the logical source root pose. A ManyForge scene
-resource should reference the copied OBJ from the program folder and keep the
-pose and `mesh_scale` returned by the report or mesh-transfer status.
+The exported OBJ used the logical source root pose. Future I9 acceptance must
+decide how owner-issued evidence carries the equivalent pose and scale; the old
+report and mesh-transfer status are not compatibility contracts.
 
-Example, importing the collider approximation for an Isaac object into a
-program-local mesh folder:
+Historical example, importing the collider approximation for an Isaac object
+into a program-local mesh folder (unavailable on current `dev`):
 
 ```bash
 docker run --rm --network host \
@@ -266,13 +293,13 @@ docker run --rm --network host \
       --output-dir /workspace/examples/isaac_manipulator_scene_light/meshes'
 ```
 
-For the current Isaac light scene, this produces
+For the captured Isaac light scene, this produced
 `mac_n_cheese_centered_collider_cooked.obj` from the cheese-box collider
 approximation. In the validated scene this collider is a compact cooked convex
 mesh with 25 vertices and 46 triangular faces, instead of the 12,502-vertex
 visual mesh.
 
-## CLI Examples
+## Historical CLI Examples (unavailable)
 
 Call the default Trigger service:
 
@@ -296,26 +323,27 @@ ros2 topic pub --once /manyforge/isaac_collider_query/request std_msgs/msg/Strin
 
 The response `data` field is JSON.
 
-## Operational Notes
+## Historical Operational Notes
 
-- USD and PhysX access runs on the Isaac/Kit update thread.
-- ROS callbacks only enqueue requests and wait for the Kit-thread result.
-- The extension does not call global `rclpy.shutdown()` on unload, so it does
+- USD and PhysX access ran on the Isaac/Kit update thread.
+- ROS callbacks only enqueued requests and waited for the Kit-thread result.
+- The extension did not call global `rclpy.shutdown()` on unload, so it did
   not tear down other ROS users inside Isaac Sim.
 - Large scenes can produce large JSON strings. Tooling should parse and
   summarize the response, not expose raw payloads directly to users by default.
 
-## How the extractor builds OBJ files
+## How the historical extractor built OBJ files
 
-When a query or transfer request supplies a `mesh_export_dir`, the extension
-walks the USD subtree under each logical object root and produces up to four
+When a query or transfer request supplied a `mesh_export_dir`, the extension
+walked the USD subtree under each logical object root and produced up to four
 variants per object (`exported_original_mesh`, `exported_collider_mesh`,
 `exported_cooked_convex_collider`, `exported_primitive_collider`; see
-"Collider Vs Visual Mesh Sources" above for selection). The extractor entry
-point is `_export_original_mesh_obj` in `isaac_collider_probe_lib.py`; the
-cooked-collider and primitive paths follow the same shape.
+"Collider Vs Visual Mesh Sources" above for selection). The historical live
+extractor entry point was `_export_original_mesh_obj`; it is removed. The
+owner-neutral primitive OBJ construction helper remains covered in
+`tests/test_isaac_collider_probe_lib.py` as I9 restoration input.
 
-For each `UsdGeom.Mesh` prim in the subtree the extractor reads:
+For each `UsdGeom.Mesh` prim in the subtree the extractor read:
 
 - `GetPointsAttr()` — array of `Gf.Vec3f` vertex positions in the prim's
   local frame.
@@ -348,11 +376,12 @@ contiguous within the file even when the source spans multiple
 `UsdGeom.Mesh` prims; the extractor accumulates a single vertex pool
 and offsets indices across prims.
 
-## OBJ format contract
+## Historical OBJ format acceptance input
 
-Downstream consumers (RoboPlan's planning context, the Composer
-visualizer's trimesh → GLB conversion) MAY rely on the following
-guarantees about the OBJ files this extension writes:
+Downstream consumers historically relied on the following guarantees. The
+retained primitive-OBJ helper still preserves the covered subset, but I9/I must
+requalify the complete format against its future owner before it becomes a
+current product contract:
 
 - **Positions-only.** `v x y z` lines for vertices, `f a b c` lines for
   triangles, plus a single `# ManyForge ...` comment header. No `vn`
@@ -375,14 +404,14 @@ guarantees about the OBJ files this extension writes:
   characters. Trimesh, MeshLab, and Blender all accept this; producers
   downstream that assume Windows CRLF do not.
 - **Deterministic across re-runs against the same scene revision.** The
-  extractor reads USD attributes in stage-iteration order with no
+  historical extractor read USD attributes in stage-iteration order with no
   shuffling. Two extractions of the same unedited stage produce
   byte-identical OBJ bytes; the Composer visualizer's content-addressed
   cache relies on this.
 
-What the contract intentionally does NOT promise:
+What the historical contract intentionally did NOT promise:
 
-- Mesh decimation or simplification. The extractor writes the raw
+- Mesh decimation or simplification. The extractor wrote the raw
   points and triangles from USD. If you need fewer triangles, decimate
   downstream.
 - Sanitisation against malformed USD authoring (zero-area triangles,

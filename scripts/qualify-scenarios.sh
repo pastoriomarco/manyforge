@@ -1,25 +1,16 @@
 #!/usr/bin/env bash
-# Run the core ManyForge qualification matrix in a production-like local process.
+# Typed boundary for verification/matrices/core_qualification.yaml.
+# Exact historical wrapper: manyforge@08222188293df8e12f90dc72e204c21f22f92ea1,
+# blob b8283a6ae55ee95acbad764a1c95e717296c18f2.
+# Preserve at restoration: matrix/output/catalog/port selection, workspace
+# identity, bounded readiness, result propagation, and artifact retention. The
+# former Python Composer plus mock-Kernel product selector is intentionally
+# absent and is never a compatibility or qualification lane.
+
 set -euo pipefail
 
-WORKSPACE="${WORKSPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-export PYTHONPATH="$WORKSPACE:$WORKSPACE/manyforge_behavior:${PYTHONPATH:-}"
-cd "$WORKSPACE"
-
-OUTPUT_DIR="${MANYFORGE_QUALIFICATION_OUTPUT_DIR:-/tmp/manyforge-qualification}"
-CATALOG_PATH="${MANYFORGE_CATALOG_PATH:-manyforge_behavior/resources/node_catalog.yaml}"
-PORT_ARGS=()
-if [[ -n "${MANYFORGE_QUALIFICATION_PORT:-}" ]]; then
-  PORT_ARGS=(--port "${MANYFORGE_QUALIFICATION_PORT}")
-fi
-
-python3 scripts/run-scenarios.py \
-  --matrix verification/matrices/core_qualification.yaml \
-  --launch local-process \
-  --catalog-path "$CATALOG_PATH" \
-  --kernel-mode mock \
-  --mock-execute-duration-s 0.2 \
-  --workspace-root "$(pwd)" \
-  --output-dir "$OUTPUT_DIR" \
-  "${PORT_ARGS[@]}" \
-  "$@"
+_manyforge_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/composable-cell-runtime-availability.sh
+source "${_manyforge_script_dir}/lib/composable-cell-runtime-availability.sh"
+MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: core scenario qualification returns with the qualified headless Program and Kernel clients."
+manyforge_fail_composable_cell_runtime_unavailable

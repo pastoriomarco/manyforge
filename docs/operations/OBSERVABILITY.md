@@ -1,8 +1,14 @@
 # Observability — Logs, Endpoints, Diagnostic Capture
 
-This doc inventories the observability surfaces an operator (human or
-LLM) has when ManyForge is running: where logs go, which REST endpoints
-to query for what state, and which scripts capture diagnostic
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until the owning H0/N/I/R gate passes. Present-tense
+> endpoint, process, and log-path descriptions below refer to the captured
+> runtime unless explicitly identified as structural-only.
+
+This doc inventories the observability surfaces an operator (human or LLM)
+had in the captured runtime: where logs went, which REST endpoints
+were queried for what state, and which scripts captured diagnostic
 artifacts.
 
 For symptom-to-cause mapping see
@@ -36,12 +42,15 @@ are surfaced through REST.
 
 ### Assistant bridge
 
-- **Where (stderr)**: `manyforge_assistant_bridge/bridge.py` uses
-  `logging.basicConfig(level=INFO)` — plain (not JSON) format, stderr
-  only. The supervisor reads `LOG_LEVEL` (default INFO) at
-  `manyforge_assistant_bridge/supervisor.py:33`.
-- **Where (audit JSONL)**: `BRIDGE_AUDIT_LOG` env var
-  (`bridge.py:47-52`). Default path is
+- **Where (stderr)**: the captured bridge blob
+  `a2f89b26da46355412a83362d3e4bcedc38137cd` used
+  `logging.basicConfig(level=INFO)` — plain (not JSON) format, stderr only.
+  The captured supervisor blob
+  `8c0ecee5ad79b553063c0f171740a3ccf617e8d7` read `LOG_LEVEL` (default
+  INFO). Those live effects are absent from the current gated bridge and
+  pure supervisor reducer.
+- **Where (audit JSONL)**: the captured bridge blob's
+  `BRIDGE_AUDIT_LOG` setting (lines 83–98). Its default path was
   `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.log` (size-rotated). The launcher
   overrides to `${LOG_DIR}/known-good-bridge-audit.jsonl` — see below.
 - **What's in the audit JSONL**: every assistant turn, fail-closed
@@ -184,10 +193,11 @@ observability artifacts.
   only. Use when `start` fails immediately.
 - **`./scripts/launch.sh smoke`** — full bring-up + smoke probe;
   writes `$LOG_DIR/launcher-smoke.json`.
-- **`./scripts/manyforge-stack.sh status`** — `docker ps` summary
-  for the `manyforge-dev` family + `/api/health` curl. Used only when
-  driving the legacy NemoClaw mux/plugin path; see
-  [`STACK_SETUP.md`](STACK_SETUP.md).
+- **Removed `scripts/manyforge-stack.sh status` baseline** — the former
+  `docker ps`/`api/health` diagnostic was exclusive to the deleted legacy
+  mux/plugin transport. Its source is retained in Git history at
+  `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`; it is not a current
+  command or restoration target.
 
 ### Smoke tests
 
@@ -207,7 +217,7 @@ observability artifacts.
 | `scripts/qualify-soak-scenarios.sh`                       | Long-duration soak qualification                                                     | `MANYFORGE_SOAK_QUALIFICATION_OUTPUT_DIR`                                     |
 | `scripts/qualify-visual-state-live.py`                    | Read-only probe of Composer visual-state snapshot routing during a live cycle        | (stdout)                                                                      |
 | `scripts/run-collision-engine-qualification.sh`           | Neutral `manyforge_collision` engine fixture/parity/latency probe                    | (writes Phase-4 JSON)                                                         |
-| `scripts/run-collision-mapper-perf.sh`                    | Collision mapper perf baseline                                                       | `MANYFORGE_PERF_JSON_OUT`                                                     |
+| `scripts/run-collision-mapper-perf.sh`                    | Executable typed tombstone; historical mapper performance returns at I3/C1 and I6/N | No current output                                                            |
 | `scripts/run-kernel-architecture-phase4-qualification.sh` | Kernel Architecture Sprint Phase 4 release-qualification harness (strict by default) | `MANYFORGE_PHASE4_OUT_DIR`                                                    |
 | `scripts/verify-kernel-architecture-phase4.py`            | Stricter verifier over Phase 4 evidence; `--allow-incomplete` for local              | (stdout)                                                                      |
 
@@ -215,7 +225,7 @@ observability artifacts.
 
 | Env var                                                                                                      | What it controls                                                                                                                                                                                                                                          |
 | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LOG_LEVEL`                                                                                                  | Assistant supervisor log level (default INFO). Consumed at `manyforge_assistant_bridge/supervisor.py:33`.                                                                                                                                                 |
+| `LOG_LEVEL`                                                                                                  | Historical assistant-supervisor log level (default INFO), consumed by captured blob `8c0ecee5ad79b553063c0f171740a3ccf617e8d7`; the current pure reducer does not consume it.                                                                                                    |
 | `LOG_DIR`                                                                                                    | Launcher log root. Default `/tmp/manyforge-assistant-e2e`. Set in `scripts/lib/assistant.sh:56`.                                                                                                                                                          |
 | `BRIDGE_AUDIT_LOG`                                                                                           | Path to the assistant audit JSONL. Default `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.log`, size-rotated via `BRIDGE_AUDIT_LOG_MAX_BYTES`/`BRIDGE_AUDIT_LOG_KEEP`; launcher pins to `$LOG_DIR/known-good-bridge-audit.jsonl`.                      |
 | `BRIDGE_LOG`, `SUPERVISOR_LOG`                                                                               | Per-process stdout/stderr capture paths inside `$LOG_DIR`.                                                                                                                                                                                                |
@@ -248,9 +258,10 @@ via `docker ps`):
   Both run with `network_mode: host` and `ipc: host`
   (`docker-compose.yaml:104-105,135-136`) to share DDS discovery with
   Isaac.
-- **Legacy NemoClaw mux/plugin path.** `scripts/manyforge-stack.sh` uses
-  `${CONTAINER_PREFIX:-manyforge-dev}-…` naming. The MCP-enabled
-  variant is `manyforge-dev-mcp`.
+- **Historical NemoClaw mux/plugin path.** The removed
+  `scripts/manyforge-stack.sh` used `${CONTAINER_PREFIX:-manyforge-dev}-…`
+  naming and an MCP-enabled `manyforge-dev-mcp` variant. These names are
+  archaeology only, not current process-discovery inputs.
 
 To tail Composer logs in the right lane:
 

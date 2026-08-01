@@ -1,56 +1,71 @@
-import type { CandidateCreateRequest } from '../types/api';
-import { relativePose } from './poseTransforms';
-import type { PoseTuple } from './poseTransforms';
+import { relativePose, type PoseTuple } from './poseTransforms';
+
+export interface GizmoTargetAddress {
+  componentId: string;
+  targetId: string;
+  referenceFrame: string;
+}
+
+export interface GizmoPoseDraft {
+  source: 'cartesian_gizmo';
+  address: GizmoTargetAddress;
+  pose: {
+    relative_to: string;
+    position_m: [number, number, number];
+    orientation_xyzw: [number, number, number, number];
+  };
+}
+
+function completeAddress(address: GizmoTargetAddress): boolean {
+  return address.componentId.trim().length > 0
+    && address.targetId.trim().length > 0
+    && address.referenceFrame.trim().length > 0;
+}
 
 /**
- * Build the Cartesian candidate request for a gizmo drag release, expressed in
- * the robot BASE frame. The anchor mesh lives in WORLD space, so converting to
- * the base frame requires the base link's world pose. When that pose is unknown
- * we cannot produce a correct base-frame target, so return null and let the
- * caller fail closed rather than author a mis-framed candidate.
+ * Convert a world-space gizmo anchor into a local, addressed authoring draft.
+ * This is deliberately not an API command or candidate DTO: I6 must bind the
+ * draft to its qualified Program-Binding and command-schema contracts.
  */
-export function gizmoCartesianRequest(
+export function gizmoPoseDraft(
   anchorWorld: PoseTuple,
-  baseWorldPose: PoseTuple | null,
-  tcpFrame: string | null,
-): CandidateCreateRequest | null {
-  if (baseWorldPose === null) return null;
-  const tcpInBase = relativePose(anchorWorld, baseWorldPose);
+  referenceWorld: PoseTuple | null,
+  address: GizmoTargetAddress,
+): GizmoPoseDraft | null {
+  if (referenceWorld === null || !completeAddress(address)) return null;
+  const targetInReference = relativePose(anchorWorld, referenceWorld);
   return {
-    sourceSurface: 'cartesian_gizmo',
-    inputMode: 'cartesian',
-    cartesianTarget: {
-      positionM: [...tcpInBase.position],
-      orientationXyzw: [...tcpInBase.quaternion],
-      frameId: 'base',
-      tcpFrame: tcpFrame ?? undefined,
+    source: 'cartesian_gizmo',
+    address: {
+      componentId: address.componentId.trim(),
+      targetId: address.targetId.trim(),
+      referenceFrame: address.referenceFrame.trim(),
+    },
+    pose: {
+      relative_to: address.referenceFrame.trim(),
+      position_m: [...targetInReference.position],
+      orientation_xyzw: [...targetInReference.quaternion],
     },
   };
 }
 
 export interface GizmoReleaseActions {
-  author: (request: CandidateCreateRequest) => void;
+  retainDraft: (draft: GizmoPoseDraft) => void;
   rejectDraft: (detail: string) => void;
 }
 
-/**
- * Decide what a gizmo drag release does. When the target frame can be resolved
- * it authors a validated candidate; otherwise it fails closed — it does NOT
- * author, and instead calls rejectDraft so any prior (e.g. ready) draft becomes
- * non-approvable. Never moves the robot either way.
- */
-export function authorGizmoRelease(
+export function retainGizmoRelease(
   anchorWorld: PoseTuple,
-  baseWorldPose: PoseTuple | null,
-  tcpFrame: string | null,
+  referenceWorld: PoseTuple | null,
+  address: GizmoTargetAddress,
   actions: GizmoReleaseActions,
 ): void {
-  const request = gizmoCartesianRequest(anchorWorld, baseWorldPose, tcpFrame);
-  if (request === null) {
+  const draft = gizmoPoseDraft(anchorWorld, referenceWorld, address);
+  if (draft === null) {
     actions.rejectDraft(
-      'Cannot author target: robot base frame pose is unavailable.',
+      'Cannot retain target: its component, target, or reference frame is unavailable.',
     );
     return;
   }
-  actions.author(request);
+  actions.retainDraft(draft);
 }

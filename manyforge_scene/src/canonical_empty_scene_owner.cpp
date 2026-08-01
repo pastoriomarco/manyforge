@@ -1,6 +1,7 @@
 #include "manyforge_scene/canonical_empty_scene_owner.hpp"
 
 #include "embedded_canonical_empty_scene_schema.hpp"
+#include "sqlite_scene_lifecycle_internal.hpp"
 
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
@@ -23,6 +24,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -1364,6 +1366,14 @@ class CanonicalEmptySceneOwner::Impl final {
       }
     }
 
+    auto lifecycle_lock =
+        sqlite_lifecycle_internal::
+            TryAcquireCanonicalEmptySceneStoreLifecycleLock(
+                std::chrono::milliseconds(kBusyTimeoutMilliseconds));
+    if (!lifecycle_lock.owns_lock()) {
+      throw CanonicalEmptySceneOwnerBusyError(
+          "timed out waiting for process-local scene-store startup");
+    }
     try {
       static_cast<void>(
           manyforge::persistence::PreflightExistingSqliteReadOnly(
@@ -1439,9 +1449,39 @@ class CanonicalEmptySceneOwner::Impl final {
   }
 
   ~Impl() {
-    if (database_ != nullptr) {
-      sqlite3_close(database_);
+    try {
+      std::lock_guard lock(mutex_);
+      auto lifecycle_lock =
+          sqlite_lifecycle_internal::
+              AcquireCanonicalEmptySceneStoreLifecycleLockForClose();
+      if (database_ != nullptr) {
+        if (sqlite3_close_v2(database_) == SQLITE_OK) {
+          database_ = nullptr;
+        }
+      }
+    } catch (...) {
     }
+  }
+
+  void Close() {
+    std::lock_guard lock(mutex_);
+    auto lifecycle_lock =
+        sqlite_lifecycle_internal::
+            AcquireCanonicalEmptySceneStoreLifecycleLockForClose();
+    if (database_ == nullptr) {
+      return;
+    }
+    const auto checkpoint = sqlite3_wal_checkpoint_v2(
+        database_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+    if (checkpoint != SQLITE_OK && checkpoint != SQLITE_BUSY &&
+        checkpoint != SQLITE_LOCKED) {
+      ThrowSqlite(database_, checkpoint, "checkpoint scene database");
+    }
+    const auto result = sqlite3_close(database_);
+    if (result != SQLITE_OK) {
+      ThrowSqlite(database_, result, "close scene database");
+    }
+    database_ = nullptr;
   }
 
   [[nodiscard]] sqlite3* database() const {
@@ -1818,21 +1858,7 @@ CanonicalEmptySceneOwner::VerifyIntegrity() const {
 }
 
 void CanonicalEmptySceneOwner::Close() {
-  std::lock_guard lock(impl_->mutex_);
-  if (impl_->database_ == nullptr) {
-    return;
-  }
-  const auto checkpoint = sqlite3_wal_checkpoint_v2(
-      impl_->database_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
-  if (checkpoint != SQLITE_OK && checkpoint != SQLITE_BUSY &&
-      checkpoint != SQLITE_LOCKED) {
-    ThrowSqlite(impl_->database_, checkpoint, "checkpoint scene database");
-  }
-  const auto result = sqlite3_close(impl_->database_);
-  if (result != SQLITE_OK) {
-    ThrowSqlite(impl_->database_, result, "close scene database");
-  }
-  impl_->database_ = nullptr;
+  impl_->Close();
 }
 
 }  // namespace manyforge::scene

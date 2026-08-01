@@ -31,20 +31,13 @@ export function DraftTextInput({
   const skipNextCommit = useRef(false);
 
   useEffect(() => {
-    if (!focused) {
-      setDraft(normalizedValue);
-    }
+    if (!focused) setDraft(normalizedValue);
   }, [focused, normalizedValue]);
 
   const commit = useCallback(() => {
-    if (draft !== normalizedValue) {
-      onCommit(draft);
-    }
+    if (draft !== normalizedValue) onCommit(draft);
   }, [draft, normalizedValue, onCommit]);
-
-  const reset = useCallback(() => {
-    setDraft(normalizedValue);
-  }, [normalizedValue]);
+  const reset = useCallback(() => setDraft(normalizedValue), [normalizedValue]);
 
   return (
     <input
@@ -56,11 +49,8 @@ export function DraftTextInput({
       }}
       onChange={(event) => setDraft(event.target.value)}
       onBlur={(event) => {
-        if (skipNextCommit.current) {
-          skipNextCommit.current = false;
-        } else {
-          commit();
-        }
+        if (skipNextCommit.current) skipNextCommit.current = false;
+        else commit();
         setFocused(false);
         onBlur?.(event);
       }}
@@ -105,20 +95,13 @@ export function DraftTextarea({
   const skipNextCommit = useRef(false);
 
   useEffect(() => {
-    if (!focused) {
-      setDraft(normalizedValue);
-    }
+    if (!focused) setDraft(normalizedValue);
   }, [focused, normalizedValue]);
 
   const commit = useCallback(() => {
-    if (draft !== normalizedValue) {
-      onCommit(draft);
-    }
+    if (draft !== normalizedValue) onCommit(draft);
   }, [draft, normalizedValue, onCommit]);
-
-  const reset = useCallback(() => {
-    setDraft(normalizedValue);
-  }, [normalizedValue]);
+  const reset = useCallback(() => setDraft(normalizedValue), [normalizedValue]);
 
   return (
     <textarea
@@ -130,11 +113,8 @@ export function DraftTextarea({
       }}
       onChange={(event) => setDraft(event.target.value)}
       onBlur={(event) => {
-        if (skipNextCommit.current) {
-          skipNextCommit.current = false;
-        } else {
-          commit();
-        }
+        if (skipNextCommit.current) skipNextCommit.current = false;
+        else commit();
         setFocused(false);
         onBlur?.(event);
       }}

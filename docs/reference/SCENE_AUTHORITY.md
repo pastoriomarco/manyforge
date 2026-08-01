@@ -6,6 +6,9 @@
 > `manyforge_scene` is currently implemented; live scene edits, queries,
 > projection leases, and scene-backed execution remain unavailable until their
 > composable-cell restoration gates.
+> The declared writers and wire behavior below describe the captured owner;
+> they are future acceptance requirements, not currently registered routes or
+> running processes.
 
 The live planning scene is execution state. It must not be reconciled from the
 authored program draft by background UI effects or other undeclared writers.

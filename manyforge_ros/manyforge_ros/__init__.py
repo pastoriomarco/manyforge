@@ -1,7 +1,7 @@
-"""ManyForge ROS adapter package.
+"""Retained ROS translations and unavailable runtime boundaries.
 
-ROS-specific helper scripts and launch-time configuration live here.  Runtime
-arm execution and observation for ros2_control deployments is implemented in
-the C++ ``manyforge_roboplan`` backend so timing-sensitive action, feedback,
-and freshness handling stays outside Python.
+This package currently exposes dependency-independent mappings, DTOs, and
+focused adapter mechanics. Product execution, simulation mutation, live scene
+inspection, and mesh transfer are unavailable until their addressed C++
+owners and selected ROS adapters pass the I6/I8/I9 restoration gates.
 """

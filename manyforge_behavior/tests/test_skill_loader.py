@@ -1,185 +1,42 @@
-"""Tests for the skill loader."""
-from __future__ import annotations
-
-from pathlib import Path
+"""Role-bound I6/N skill-artifact gate."""
 
 import pytest
 
 from manyforge_behavior.skill_loader import (
+    SKILL_ARTIFACT_RESTORATION_GATES,
+    SkillArtifactUnavailableError,
     SkillCatalog,
+    default_skills_dir,
     load_skill,
     load_skill_catalog,
-    default_skills_dir,
 )
 
 
-SKILLS_DIR = default_skills_dir()
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda poison: SkillCatalog(poison),
+        lambda poison: load_skill(poison),
+        lambda poison: load_skill_catalog(poison, catalog=poison),
+    ],
+)
+def test_v0_skill_surfaces_fail_before_path_or_catalog_access(operation) -> None:
+    class PoisonInput:
+        def __getattribute__(self, name: str) -> object:
+            raise AssertionError(f"skill input was accessed: {name}")
+
+    with pytest.raises(
+        SkillArtifactUnavailableError,
+        match="composable_cell_skill_artifact_unavailable",
+    ):
+        operation(PoisonInput())
+
+    assert SKILL_ARTIFACT_RESTORATION_GATES == ("I6", "N")
 
 
-class TestLoadSkill:
-    def test_loads_pick_object(self):
-        skill = load_skill(SKILLS_DIR / "pick_object.skill.yaml")
-        assert skill.id == "pick_object"
-        assert skill.version == "0.1.0"
-        assert "v0.1" in skill.compatible_profiles
-        assert "scene.edit.attach_detach" in skill.requires_capabilities
-        assert skill.requires_tools == []
-        assert len(skill.parameters) >= 1
-        assert skill.body["id"] == "sequence"
-        assert len(skill.requires) > 0
-        assert len(skill.provides) > 0
-
-    def test_loads_place_object(self):
-        skill = load_skill(SKILLS_DIR / "place_object.skill.yaml")
-        assert skill.id == "place_object"
-        assert "planning.motion.pose_goal" in skill.requires_capabilities
-        assert "context.pose.resolve_reference" in skill.requires_capabilities
-
-    def test_loads_move_to_named_config(self):
-        skill = load_skill(SKILLS_DIR / "move_to_named_config.skill.yaml")
-        assert skill.id == "move_to_named_config"
-        assert skill.body["id"] == "move_manipulator_action"
-
-    def test_rejects_missing_id(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text("api_version: manyforge.skill.v0\nbody: {id: x}\n")
-        with pytest.raises(ValueError, match="missing required field 'skill_id'"):
-            load_skill(bad)
-
-    def test_rejects_wrong_api_version(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text("api_version: wrong\nskill_id: test\nbody: {id: x}\n")
-        with pytest.raises(ValueError, match="api_version"):
-            load_skill(bad)
-
-    def test_rejects_missing_body(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text("api_version: manyforge.skill.v0\nskill_id: test\n")
-        with pytest.raises(ValueError, match="body"):
-            load_skill(bad)
-
-    def test_rejects_legacy_expands_to_without_body(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "expands_to: {id: reset_trajectories, name: noop}\n",
-        )
-        with pytest.raises(ValueError, match="body"):
-            load_skill(bad)
-
-    def test_rejects_requires_capabilities_when_not_list(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "requires_capabilities: planning.motion.pose_goal\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-        with pytest.raises(ValueError, match="requires_capabilities must be a list"):
-            load_skill(bad)
-
-    def test_rejects_unknown_requires_capabilities(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "requires_capabilities: [unknown.capability]\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-        with pytest.raises(ValueError, match="unknown requires_capabilities"):
-            load_skill(bad)
-
-    def test_parses_requires_tools(self, tmp_path):
-        skill_path = tmp_path / "tool_skill.skill.yaml"
-        skill_path.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: tool_skill\n"
-            "requires_tools: [program_read, tree.insert_node]\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-
-        skill = load_skill(skill_path)
-
-        assert skill.requires_tools == ["program_read", "tree.insert_node"]
-
-    def test_rejects_requires_tools_when_not_list(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "requires_tools: program_read\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-        with pytest.raises(ValueError, match="requires_tools must be a list"):
-            load_skill(bad)
-
-    def test_rejects_duplicate_requires_tools(self, tmp_path):
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text(
-            "api_version: manyforge.skill.v0\n"
-            "skill_id: test\n"
-            "requires_tools: [program_read, program_read]\n"
-            "body: {id: reset_trajectories, name: noop}\n",
-        )
-        with pytest.raises(ValueError, match="duplicate requires_tools"):
-            load_skill(bad)
-
-
-class TestLoadSkillCatalog:
-    def test_loads_all_default_skills(self):
-        catalog = load_skill_catalog(SKILLS_DIR)
-        assert len(catalog.skills) >= 3
-        assert "pick_object" in catalog.skill_ids
-        assert "place_object" in catalog.skill_ids
-        assert "move_to_named_config" in catalog.skill_ids
-
-    def test_get_by_id(self):
-        catalog = load_skill_catalog(SKILLS_DIR)
-        pick = catalog.get("pick_object")
-        assert pick is not None
-        assert pick.id == "pick_object"
-
-    def test_get_missing_returns_none(self):
-        catalog = load_skill_catalog(SKILLS_DIR)
-        assert catalog.get("nonexistent") is None
-
-    def test_validate_invocation_rejects_wrong_parameter_type(self):
-        catalog = load_skill_catalog(SKILLS_DIR)
-
-        with pytest.raises(
-            ValueError,
-            match="Parameter 'joint_names' for skill 'move_to_named_config' must be a list of strings",
-        ):
-            catalog.validate_invocation(
-                "move_to_named_config",
-                {
-                    "config_name": "home",
-                    "joint_names": "joint_1",
-                    "joint_positions_rad": [0.0],
-                },
-            )
-
-    def test_nonexistent_dir_returns_empty(self, tmp_path):
-        catalog = load_skill_catalog(tmp_path / "no_such_dir")
-        assert len(catalog.skills) == 0
-
-    def test_malformed_files_skipped(self, tmp_path):
-        good = tmp_path / "good.skill.yaml"
-        good.write_text(
-            "api_version: manyforge.skill.v0\nskill_id: good\nbody: {id: x, name: ok}\n"
-        )
-        bad = tmp_path / "bad.skill.yaml"
-        bad.write_text("not: valid: yaml: {{{{")
-
-        catalog = load_skill_catalog(tmp_path)
-        assert len(catalog.skills) == 1
-        assert catalog.skills[0].id == "good"
-
-    def test_duplicate_ids_skipped(self, tmp_path):
-        for name in ["a.skill.yaml", "b.skill.yaml"]:
-            (tmp_path / name).write_text(
-                "api_version: manyforge.skill.v0\nskill_id: dup\nbody: {id: x, name: ok}\n"
-            )
-        catalog = load_skill_catalog(tmp_path)
-        assert len(catalog.skills) == 1
+def test_default_v0_skill_directory_is_not_a_compatibility_path() -> None:
+    with pytest.raises(
+        SkillArtifactUnavailableError,
+        match="composable_cell_skill_artifact_unavailable",
+    ):
+        default_skills_dir()

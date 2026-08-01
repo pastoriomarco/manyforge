@@ -30,7 +30,8 @@ machine-readable companion to this doc.
   domain-separated content-digest primitives.
 - `manyforge_persistence/` — shared ROS-free mechanical durable-storage
   safety primitives; semantic owners retain their own schemas and state.
-- `manyforge_scene/` — ROS-free logical-scene semantic owner and persistence.
+- `manyforge_scene/` — ROS-free canonical-empty logical-scene owner
+  foundation; no live scene surface.
 - `manyforge_deployment/` — ROS-free composable-cell decoding, qualification,
   and compiler substrate.
 - `manyforge_component_manager/` — ROS-free C++ runtime-observation and
@@ -39,16 +40,18 @@ machine-readable companion to this doc.
   RoboPlan import qualification during the destructive cutover; native and
   ros2_control runtime adapters are intentionally unavailable until their
   plan restoration gates.
-- `manyforge_behavior/` — Python py_trees behavior-tree runner.
-- `manyforge_composer/` — FastAPI backend + React frontend for the
-  authoring UI and native 3D viewer.
-- `manyforge_assistant_bridge/` — Assistant-provider HTTP bridge +
-  status supervisor.
-- `manyforge_ros/`, `manyforge_ros_bringup/` — ROS adapter modules
-  and bringup helpers.
-- `scripts/` — operator-facing launchers (`launch.sh` is the
-  unified entry; `demo-*.sh` are backward-compat shims).
-- `docs/` — operator-facing guides, runbooks, reference.
+- `manyforge_behavior/` — build-owned v2 node environment plus explicitly
+  unavailable legacy execution entry points during the cutover.
+- `manyforge_composer/` — structural FastAPI/React authoring shell; runtime,
+  MCP, assistant, and live-viewer ownership is unavailable.
+- `manyforge_assistant_bridge/` — retained protocol hashing and pure
+  supervisor reduction plus historical interaction guidance; the live
+  provider bridge remains removed and unavailable.
+- `manyforge_ros/`, `manyforge_ros_bringup/` — retained ROS adapter modules
+  and bringup helpers; no current ROS product lane.
+- `scripts/` — container qualification and structural-shell helpers;
+  `launch.sh` is an explicit runtime-unavailable boundary.
+- `docs/` — current structural reference plus historical operator runbooks.
 
 Specs and ADRs are in a separate private repository (`manyforge_specs`)
 and are not required at runtime. They **are** required for maintainer
@@ -73,12 +76,12 @@ for dev. Prerequisites: Docker Engine + Docker Compose v2, plus `git`.
 git clone https://github.com/pastoriomarco/manyforge.git
 cd manyforge
 ./scripts/setup-docker.sh        # build the dev image
-./scripts/launch.sh              # interactive wizard
+docker compose run --rm dev bash # enter the qualification container
 ```
 
-See [README.md](README.md) for quickstart variants and
-[docs/operations/STACK_SETUP.md](docs/operations/STACK_SETUP.md) for the
-operational runbook.
+See [README.md](README.md) for the current structural/qualification boundary
+and [docs/operations/STACK_SETUP.md](docs/operations/STACK_SETUP.md) for the
+historical operational baseline. The latter is not current bring-up guidance.
 
 ### Local checks (both flows)
 
@@ -88,9 +91,11 @@ whether you're the maintainer or a forked contributor:
 - C++ kernel: `./scripts/test-all.sh cpp`
 - C++ RoboPlan: `./scripts/test-all.sh roboplan`
 - Python: `./scripts/test-all.sh python`
-- Frontend: `cd manyforge_composer/frontend && npm run build`
-- ROS adapter contracts: `docker compose --profile ros run --rm ros-jazzy ./scripts/test-ros.sh`
-- Full ros2_control contracts: `docker compose --profile ros-full run --rm ros-jazzy-full ./scripts/test-ros-full.sh`
+- Structural Composer: install/build its frontend and run
+  `./scripts/test-all.sh composer` inside the pinned dev container.
+- ROS toolchain-only checks may use the `ros-jazzy` image, but do not qualify
+  a runtime product during the cutover.
+- `test-ros-full.sh` and all product launchers remain explicitly unavailable.
 - All bash: `bash -n scripts/*.sh scripts/lib/*.sh`
 - Version sync: `./scripts/ci/verify-version-sync.sh`
 
@@ -117,6 +122,10 @@ During this plan only:
 - superseded code and its exclusive tests, configuration, and documentation
   may be removed before an end-to-end replacement exists, without a
   compatibility shim or backup implementation; and
+- disposition follows responsibility rather than directory, language, broken
+  imports, or current deletion status: retain or port same-role clients,
+  authoring, presentation, safety, tests, and evidence; split mixed files and
+  fence their effectful entrypoints until the named restoration gate; and
 - an operator recipe for an intentionally unavailable surface must be marked
   unavailable or removed, rather than kept apparently valid.
 

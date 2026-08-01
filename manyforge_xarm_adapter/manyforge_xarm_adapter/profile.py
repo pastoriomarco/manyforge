@@ -1,4 +1,4 @@
-"""Strict loader for the experimental fixed-tool Lite6 adapter profile."""
+"""Strict offline loader for the experimental fixed-tool Lite6 profile."""
 
 from __future__ import annotations
 

@@ -3,7 +3,7 @@
 <package format="3">
   <name>manyforge_xarm_adapter</name>
   <version>0.1.0</version>
-  <description>Dedicated xArm binding, model-generation, and observation adapter for ManyForge.</description>
+  <description>Offline xArm model/binding helpers and gated runtime entrypoints for ManyForge.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>
 

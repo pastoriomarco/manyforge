@@ -13,7 +13,6 @@
   <depend>controller_manager_msgs</depend>
   <depend>lifecycle_msgs</depend>
   <depend>manyforge_robot_lifecycle</depend>
-  <depend>manyforge_robot_lifecycle_msgs</depend>
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>

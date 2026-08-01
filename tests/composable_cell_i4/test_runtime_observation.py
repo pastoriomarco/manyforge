@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import fields, replace
+from inspect import signature
 
 import pytest
 
@@ -135,6 +136,17 @@ def test_source_report_has_no_manager_owned_dependency_or_bundle_fields() -> Non
     assert "dependency_runtime_epochs" not in field_names
     assert "retained_bundle_id" not in field_names
     assert "derived_state" not in field_names
+
+
+def test_receiver_clock_is_the_only_freshness_timestamp_source() -> None:
+    receiver_ingress_methods = (
+        RuntimeObservationFixtureReducer.observe_process,
+        RuntimeObservationFixtureReducer.replace_process_observer,
+        RuntimeObservationFixtureReducer.ingest_report,
+    )
+
+    for ingress_method in receiver_ingress_methods:
+        assert "received_at_ns" not in signature(ingress_method).parameters
 
 
 def test_duplicate_conflict_and_regression_do_not_renew_freshness() -> None:
@@ -688,6 +700,31 @@ def test_expectation_dependency_graph_is_strict_and_acyclic() -> None:
                 expectation("unit-b", dependencies=("unit-a",)),
             )
         )
+
+
+def test_maximum_length_dependency_id_keeps_precise_manager_reason() -> None:
+    dependency_id = "d" * 256
+    clock = ManualClock()
+    reducer = fixture_reducer(clock, dependency_id, "dependant")
+    assert reducer.observe_process(
+        presence("dependant", "dependant-epoch")
+    )
+    assert reducer.ingest_report(
+        report("dependant", "dependant-epoch")
+    )
+
+    observed = reducer.evaluate(
+        (
+            expectation("dependant", dependencies=(dependency_id,)),
+            expectation(dependency_id),
+        )
+    ).observation("dependant")
+
+    assert observed is not None
+    assert observed.derived_state is FixtureDerivedState.NONCONVERGED
+    assert observed.reason_codes == (
+        f"runtime_dependency_not_converged:{dependency_id}",
+    )
 
 
 def test_source_reason_and_role_sets_are_bounded() -> None:

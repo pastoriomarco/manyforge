@@ -1,39 +1,32 @@
-"""Artifact-owned scenario discovery routes."""
+"""Fenced Composer scenario route for the native-authoring cutover."""
 
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from manyforge_behavior.scenarios import ScenarioDiscoveryError, discover_scenarios
+from manyforge_behavior.scenarios import (
+    SCENARIO_DISCOVERY_UNAVAILABLE_REASON_CODE,
+)
 
 from .state import ComposerState
 
 
 def create_scenarios_router(state: ComposerState) -> APIRouter:
+    del state
     router = APIRouter()
 
     @router.get("")
     def list_scenarios() -> dict:
-        try:
-            catalog = discover_scenarios(
-                state.scenario_roots,
-                node_environment=state.node_environment,
-            )
-        except (OSError, ScenarioDiscoveryError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {
-            "scenarios": [
-                {
-                    "name": scenario.name,
-                    "lane": scenario.lane,
-                    "assistant": scenario.assistant,
-                    "programPath": str(scenario.program_path),
-                    "deploymentPath": str(scenario.deployment_path),
-                    "description": scenario.description,
-                    "aliases": list(scenario.aliases),
-                }
-                for scenario in catalog.scenarios
-            ]
-        }
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": SCENARIO_DISCOVERY_UNAVAILABLE_REASON_CODE,
+                "message": (
+                    "scenario discovery returns with native Program/addressing "
+                    "at I6/N"
+                ),
+                "restorationGates": ["I6", "N"],
+            },
+        )
 
     return router

@@ -1,88 +1,93 @@
-"""Geometry / frames behavior nodes for ManyForge orchestration."""
+"""Portable pose-distance math and I6/N geometry-node gates."""
 
 from __future__ import annotations
 
 import math
-from typing import Any
+from numbers import Real
+from typing import Final, Sequence
 
-import py_trees
 
-from manyforge_behavior.blackboard_namespace import (
-    read_blackboard_binding_value,
-    register_blackboard_binding_read,
+GEOMETRY_NODE_UNAVAILABLE_REASON_CODE: Final = (
+    "composable_cell_geometry_node_unavailable"
 )
-from manyforge_behavior.kernel_client import KernelClient
+GEOMETRY_NODE_RESTORATION_GATES: Final = ("I6", "N")
 
 
-class GetLinkPose(py_trees.behaviour.Behaviour):
-    """Query FK for a link pose and store result on the blackboard."""
-
-    def __init__(self, name: str, **kwargs: Any):
-        super().__init__(name=name)
-        self._target_frame = kwargs.get("target_frame", "")
-        self._base_frame = kwargs.get("base_frame", "")
-        self._output_key = kwargs.get("output_key", "")
-
-    def setup(self, **kwargs: Any) -> None:
-        self.blackboard = self.attach_blackboard_client()
-        self.blackboard.register_key(
-            key="kernel", access=py_trees.common.Access.READ
-        )
-        self.blackboard.register_key(
-            key=self._output_key, access=py_trees.common.Access.WRITE
-        )
-
-    def update(self) -> py_trees.common.Status:
-        kernel: KernelClient = self.blackboard.kernel
-        pose = kernel.get_link_pose(self._target_frame, self._base_frame)
-        if pose is None:
-            return py_trees.common.Status.FAILURE
-        self.blackboard.set(self._output_key, pose)
-        return py_trees.common.Status.SUCCESS
+class GeometryNodeUnavailableError(RuntimeError):
+    """Raised before blackboard or model/FK state is accessed."""
 
 
-class CheckPoseDistance(py_trees.behaviour.Behaviour):
-    """Condition: succeeds if distance between two poses is within thresholds."""
-
-    def __init__(self, name: str, **kwargs: Any):
-        super().__init__(name=name)
-        self._pose_key_a = kwargs.get("pose_key_a", "")
-        self._pose_key_b = kwargs.get("pose_key_b", "")
-        self._translation_threshold_m = float(
-            kwargs.get("translation_threshold_m", 0.01)
-        )
-        self._rotation_threshold_rad = float(
-            kwargs.get("rotation_threshold_rad", 0.1)
-        )
-
-    def setup(self, **kwargs: Any) -> None:
-        self.blackboard = self.attach_blackboard_client()
-        register_blackboard_binding_read(self.blackboard, self._pose_key_a)
-        register_blackboard_binding_read(self.blackboard, self._pose_key_b)
-
-    def update(self) -> py_trees.common.Status:
+def _finite_vector(values: Sequence[float], *, length: int, field: str) -> tuple[float, ...]:
+    if type(values) not in (list, tuple) or len(values) != length:
+        raise ValueError(f"{field} must contain exactly {length} values")
+    result_list: list[float] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"{field} must contain only finite numbers")
         try:
-            pose_a = read_blackboard_binding_value(self.blackboard, self._pose_key_a)
-            pose_b = read_blackboard_binding_value(self.blackboard, self._pose_key_b)
-        except KeyError:
-            return py_trees.common.Status.FAILURE
+            converted = float(value)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"{field} must contain only finite numbers"
+            ) from error
+        if not math.isfinite(converted):
+            raise ValueError(f"{field} must contain only finite numbers")
+        result_list.append(converted)
+    result = tuple(result_list)
+    return result
 
-        # Translation distance
-        pos_a = pose_a.get("position_m", [0, 0, 0])
-        pos_b = pose_b.get("position_m", [0, 0, 0])
-        trans_dist = math.sqrt(
-            sum((a - b) ** 2 for a, b in zip(pos_a, pos_b))
+
+def _normalized_quaternion(
+    values: tuple[float, ...], *, field: str
+) -> tuple[float, ...]:
+    scale = max(abs(value) for value in values)
+    if scale == 0.0:
+        raise ValueError(f"{field} must have non-zero norm")
+    scaled = tuple(value / scale for value in values)
+    norm = math.sqrt(sum(value * value for value in scaled))
+    return tuple(value / norm for value in scaled)
+
+
+def translation_distance_m(
+    first: Sequence[float],
+    second: Sequence[float],
+) -> float:
+    """Return Euclidean distance between two finite 3D positions."""
+    a = _finite_vector(first, length=3, field="first position")
+    b = _finite_vector(second, length=3, field="second position")
+    deltas = tuple(left - right for left, right in zip(a, b))
+    if any(not math.isfinite(value) for value in deltas):
+        raise ValueError("position difference exceeds finite numeric range")
+    distance = math.hypot(*deltas)
+    if not math.isfinite(distance):
+        raise ValueError("translation distance exceeds finite numeric range")
+    return distance
+
+
+def quaternion_angular_distance_rad(
+    first_xyzw: Sequence[float],
+    second_xyzw: Sequence[float],
+) -> float:
+    """Return shortest angular distance between two finite quaternions."""
+    first = _finite_vector(first_xyzw, length=4, field="first quaternion")
+    second = _finite_vector(second_xyzw, length=4, field="second quaternion")
+    first_unit = _normalized_quaternion(first, field="first quaternion")
+    second_unit = _normalized_quaternion(second, field="second quaternion")
+    dot = sum(a * b for a, b in zip(first_unit, second_unit))
+    return 2.0 * math.acos(max(-1.0, min(1.0, abs(dot))))
+
+
+class _UnavailableGeometryNode:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise GeometryNodeUnavailableError(
+            f"{GEOMETRY_NODE_UNAVAILABLE_REASON_CODE}: addressed model/FK "
+            "geometry nodes return at I6/N"
         )
-        if trans_dist > self._translation_threshold_m:
-            return py_trees.common.Status.FAILURE
 
-        # Rotation distance (quaternion angular distance)
-        q_a = pose_a.get("orientation_xyzw", [0, 0, 0, 1])
-        q_b = pose_b.get("orientation_xyzw", [0, 0, 0, 1])
-        dot = sum(a * b for a, b in zip(q_a, q_b))
-        dot = max(-1.0, min(1.0, abs(dot)))  # abs handles double-cover
-        rot_dist = 2.0 * math.acos(dot)
-        if rot_dist > self._rotation_threshold_rad:
-            return py_trees.common.Status.FAILURE
 
-        return py_trees.common.Status.SUCCESS
+class GetLinkPose(_UnavailableGeometryNode):
+    pass
+
+
+class CheckPoseDistance(_UnavailableGeometryNode):
+    pass

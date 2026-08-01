@@ -1,5 +1,6 @@
 #include "manyforge_component_manager/durable_store_set.hpp"
 
+#include "sqlite_store_startup_internal.hpp"
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 
 #include <fcntl.h>
@@ -9,8 +10,10 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -221,75 +224,94 @@ class ExternallyProvisionedManagerStores::Impl final {
             std::move(admission_identity.retained_bundle_id)),
         graph_revision_(std::move(admission_identity.graph_revision)) {
     StableStateDirectoryLock startup_lock(stable_state_directory_);
-    const auto journal_path =
-        stable_state_directory_ /
-        std::string(kManagerBootstrapJournalFilename);
-    const auto publication_path =
-        stable_state_directory_ /
-        std::string(kActiveBundlePublicationStoreFilename);
-    const auto apply_path =
-        stable_state_directory_ /
-        std::string(kManagerApplyJournalFilename);
-    const bool journal_requires_validation =
-        RequiresValidationBeforeInitialization(journal_path);
-    const bool publication_requires_validation =
-        RequiresValidationBeforeInitialization(publication_path);
-    const bool apply_requires_validation =
-        RequiresValidationBeforeInitialization(apply_path);
+    auto process_startup_lock =
+        sqlite_startup_internal::TryAcquireManagerSqliteStoreStartupLock(
+            std::chrono::seconds(10));
+    if (!process_startup_lock.owns_lock()) {
+      throw ManagerBootstrapJournalBusyError(
+          "timed out waiting for process-local manager-store startup");
+    }
+    try {
+      const auto journal_path =
+          stable_state_directory_ /
+          std::string(kManagerBootstrapJournalFilename);
+      const auto publication_path =
+          stable_state_directory_ /
+          std::string(kActiveBundlePublicationStoreFilename);
+      const auto apply_path =
+          stable_state_directory_ /
+          std::string(kManagerApplyJournalFilename);
+      const bool journal_requires_validation =
+          RequiresValidationBeforeInitialization(journal_path);
+      const bool publication_requires_validation =
+          RequiresValidationBeforeInitialization(publication_path);
+      const bool apply_requires_validation =
+          RequiresValidationBeforeInitialization(apply_path);
 
-    const auto open_journal = [&] {
-      bootstrap_journal_ =
-          std::make_unique<SqliteManagerBootstrapJournal>(
-              journal_path, cell_id_);
-    };
-    const auto open_publication = [&] {
-      active_bundle_publication_store_ =
-          std::make_unique<SqliteActiveBundlePublicationStore>(
-              publication_path, cell_id_);
-    };
-    const auto open_apply = [&] {
-      apply_journal_ = std::make_unique<SqliteManagerApplyJournal>(
-          apply_path, cell_id_);
-    };
+      const auto open_journal = [&] {
+        bootstrap_journal_ =
+            std::make_unique<SqliteManagerBootstrapJournal>(
+                journal_path, cell_id_);
+      };
+      const auto open_publication = [&] {
+        active_bundle_publication_store_ =
+            std::make_unique<SqliteActiveBundlePublicationStore>(
+                publication_path, cell_id_);
+      };
+      const auto open_apply = [&] {
+        apply_journal_ = std::make_unique<SqliteManagerApplyJournal>(
+            apply_path, cell_id_);
+      };
 
-    // Validate every initialized peer before initializing any missing or
-    // schema-empty path. A foreign-cell initialized store must not make this
-    // failed startup create another store under the requested (wrong) cell.
-    if (journal_requires_validation) {
-      open_journal();
-    }
-    if (publication_requires_validation) {
-      open_publication();
-    }
-    if (apply_requires_validation) {
-      open_apply();
-    }
-    if (!journal_requires_validation) {
-      open_journal();
-    }
-    if (!publication_requires_validation) {
-      open_publication();
-    }
-    if (!apply_requires_validation) {
-      open_apply();
-    }
+      // Validate every initialized peer before initializing any missing or
+      // schema-empty path. A foreign-cell initialized store must not make this
+      // failed startup create another store under the requested (wrong) cell.
+      if (journal_requires_validation) {
+        open_journal();
+      }
+      if (publication_requires_validation) {
+        open_publication();
+      }
+      if (apply_requires_validation) {
+        open_apply();
+      }
+      if (!journal_requires_validation) {
+        open_journal();
+      }
+      if (!publication_requires_validation) {
+        open_publication();
+      }
+      if (!apply_requires_validation) {
+        open_apply();
+      }
 
-    const auto journal_report = bootstrap_journal_->VerifyIntegrity();
-    const auto publication_report =
-        active_bundle_publication_store_->VerifyIntegrity();
-    const auto apply_report = apply_journal_->VerifyIntegrity();
-    if (journal_report.cell_id != cell_id_ ||
-        publication_report.cell_id != cell_id_ ||
-        apply_report.cell_id != cell_id_) {
-      throw ManagerBootstrapJournalIntegrityError(
-          "manager durable stores do not share the configured cell identity");
-    }
+      const auto journal_report = bootstrap_journal_->VerifyIntegrity();
+      const auto publication_report =
+          active_bundle_publication_store_->VerifyIntegrity();
+      const auto apply_report = apply_journal_->VerifyIntegrity();
+      if (journal_report.cell_id != cell_id_ ||
+          publication_report.cell_id != cell_id_ ||
+          apply_report.cell_id != cell_id_) {
+        throw ManagerBootstrapJournalIntegrityError(
+            "manager durable stores do not share the configured cell "
+            "identity");
+      }
 
-    // SQLite FULL durability covers database/WAL writes. The external
-    // composition root additionally persists any newly created directory
-    // entries before it exposes the store set. Repeating this on reopen is
-    // harmless and avoids a racy pre-open existence inference.
-    FsyncDirectory(stable_state_directory_);
+      // SQLite FULL durability covers database/WAL writes. The external
+      // composition root additionally persists any newly created directory
+      // entries before it exposes the store set. Repeating this on reopen is
+      // harmless and avoids a racy pre-open existence inference.
+      FsyncDirectory(stable_state_directory_);
+    } catch (...) {
+      // Constructor locals unwind before member subobjects. Close any partial
+      // store set explicitly while both startup gates are still held so no
+      // same-process peer or cooperating root startup can inspect a handle
+      // that is still checkpointing or closing.
+      apply_journal_.reset();
+      active_bundle_publication_store_.reset();
+      bootstrap_journal_.reset();
+      throw;
+    }
   }
 
   std::filesystem::path stable_state_directory_;

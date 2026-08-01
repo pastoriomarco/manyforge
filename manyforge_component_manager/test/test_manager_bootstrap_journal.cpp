@@ -6,7 +6,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <barrier>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -547,16 +549,39 @@ TEST(
 TEST(ManagerBootstrapJournal, ConcurrentFirstOpenConvergesExactSchema) {
   TemporaryDirectory directory;
   const auto database = directory.path() / "journal.sqlite3";
+  std::promise<void> start_promise;
+  const auto start = start_promise.get_future().share();
+  std::barrier open_together(4);
   std::vector<std::future<ManagerBootstrapJournalIntegrityReport>> openings;
-  for (std::size_t index = 0U; index < 4U; ++index) {
-    openings.push_back(std::async(
-        std::launch::async,
-        [&database] {
-          SqliteManagerBootstrapJournal journal(
-              database, core::CellId("cell-a"));
-          return journal.VerifyIntegrity();
-        }));
+  openings.reserve(4U);
+  try {
+    for (std::size_t index = 0U; index < 4U; ++index) {
+      openings.push_back(std::async(
+          std::launch::async,
+          [&database, &open_together, index, start] {
+            start.get();
+            open_together.arrive_and_wait();
+            SqliteManagerBootstrapJournal journal(
+                database, core::CellId("cell-a"));
+            const auto report = journal.VerifyIntegrity();
+            if (index % 2U == 0U) {
+              journal.Close();
+            }
+            return report;
+          }));
+    }
+  } catch (...) {
+    const auto launch_error = std::current_exception();
+    start_promise.set_exception(launch_error);
+    for (auto& opening : openings) {
+      try {
+        static_cast<void>(opening.get());
+      } catch (...) {
+      }
+    }
+    std::rethrow_exception(launch_error);
   }
+  start_promise.set_value();
   std::string schema_digest;
   for (auto& opening : openings) {
     const auto report = opening.get();
@@ -567,6 +592,7 @@ TEST(ManagerBootstrapJournal, ConcurrentFirstOpenConvergesExactSchema) {
       EXPECT_EQ(report.schema_artifact_digest, schema_digest);
     }
   }
+  ExpectNoSqliteSidecars(database);
 }
 
 TEST(ManagerBootstrapJournalCrash, CommittedChildWriteSurvivesProcessExit) {
@@ -817,6 +843,100 @@ TEST(
   EXPECT_EQ(
       inventory.bootstrap_journal.bootstrap_attempt_count,
       0);
+  EXPECT_EQ(inventory.active_bundle_publication.receipt_count, 0);
+  EXPECT_EQ(inventory.apply_journal.apply_intent_count, 0);
+
+  const auto mixed_startup = directory.path() / "mixed-startup";
+  std::filesystem::create_directory(mixed_startup);
+  std::promise<void> start_promise;
+  const auto start = start_promise.get_future().share();
+  std::barrier mixed_open_together(2);
+  auto root_open = std::async(
+      std::launch::async,
+      [&, start] {
+        start.get();
+        mixed_open_together.arrive_and_wait();
+        ExternallyProvisionedManagerStores stores(
+            mixed_startup, admission);
+        return stores.StartupInventory();
+      });
+  std::future<ActiveBundlePublicationStoreIntegrityReport> direct_open;
+  try {
+    direct_open = std::async(
+        std::launch::async,
+        [&, start] {
+          start.get();
+          mixed_open_together.arrive_and_wait();
+          SqliteActiveBundlePublicationStore publication(
+              mixed_startup /
+                  std::string(kActiveBundlePublicationStoreFilename),
+              admission.cell_id());
+          return publication.VerifyIntegrity();
+        });
+  } catch (...) {
+    const auto launch_error = std::current_exception();
+    start_promise.set_exception(launch_error);
+    try {
+      static_cast<void>(root_open.get());
+    } catch (...) {
+    }
+    std::rethrow_exception(launch_error);
+  }
+  start_promise.set_value();
+  EXPECT_EQ(
+      root_open.get().active_bundle_publication.receipt_count,
+      0);
+  EXPECT_EQ(direct_open.get().receipt_count, 0);
+  ExpectNoSqliteSidecars(
+      mixed_startup / std::string(kManagerBootstrapJournalFilename));
+  ExpectNoSqliteSidecars(
+      mixed_startup / std::string(kActiveBundlePublicationStoreFilename));
+  ExpectNoSqliteSidecars(
+      mixed_startup / std::string(kManagerApplyJournalFilename));
+}
+
+TEST(
+    ExternallyProvisionedManagerStores,
+    PartialConstructionFailureRecursivelyClosesOpenedPeer) {
+  TemporaryDirectory directory;
+  const auto admission = LoadCanonicalEmptyAdmission();
+  const auto bootstrap_path =
+      directory.path() / std::string(kManagerBootstrapJournalFilename);
+  const auto publication_path =
+      directory.path() / std::string(kActiveBundlePublicationStoreFilename);
+  const auto apply_path =
+      directory.path() / std::string(kManagerApplyJournalFilename);
+  {
+    SqliteManagerBootstrapJournal bootstrap(
+        bootstrap_path, admission.cell_id());
+  }
+  {
+    SqliteActiveBundlePublicationStore foreign_publication(
+        publication_path, core::CellId("foreign-cell"));
+  }
+
+  EXPECT_THROW(
+      ExternallyProvisionedManagerStores(directory.path(), admission),
+      ActiveBundlePublicationConflictError);
+  EXPECT_FALSE(std::filesystem::exists(apply_path));
+  ExpectNoSqliteSidecars(bootstrap_path);
+  ExpectNoSqliteSidecars(publication_path);
+  ExpectNoSqliteSidecars(apply_path);
+
+  {
+    SqliteManagerBootstrapJournal reopened_bootstrap(
+        bootstrap_path, admission.cell_id());
+    EXPECT_EQ(
+        reopened_bootstrap.VerifyIntegrity().phase,
+        ManagerBootstrapJournalPhase::kEmpty);
+  }
+  ASSERT_TRUE(std::filesystem::remove(publication_path));
+  ExternallyProvisionedManagerStores recovered(
+      directory.path(), admission);
+  const auto inventory = recovered.StartupInventory();
+  EXPECT_EQ(
+      inventory.bootstrap_journal.phase,
+      ManagerBootstrapJournalPhase::kEmpty);
   EXPECT_EQ(inventory.active_bundle_publication.receipt_count, 0);
   EXPECT_EQ(inventory.apply_journal.apply_intent_count, 0);
 }

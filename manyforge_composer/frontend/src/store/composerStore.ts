@@ -1,102 +1,58 @@
-import { create } from 'zustand';
-import { useCycleStore } from './cycleStore';
-import { useProgramStore } from './programStore';
-import { useViewerSelectionStore } from './viewerSelectionStore';
+import { useReducer } from 'react';
 
-type NodeStatus = 'idle' | 'running' | 'success' | 'failure';
-export type EdgeStyle = 'smoothstep' | 'default' | 'simplebezier' | 'straight' | 'step';
+export type NodePresentationStatus = 'idle' | 'running' | 'success' | 'failure';
+export type EdgeStyle =
+  | 'smoothstep'
+  | 'default'
+  | 'simplebezier'
+  | 'straight'
+  | 'step';
+export type LayoutDirection = 'vertical' | 'horizontal';
 
-interface ComposerStore {
-  mode: 'compose' | 'run';
-  nodeStatuses: Record<string, NodeStatus>;
+export interface ComposerViewState {
+  nodeStatuses: Record<string, NodePresentationStatus>;
   edgeStyle: EdgeStyle;
-  
-  // Actions
-  setNodeStatuses: (statuses: Record<string, string>) => void;
-  setNodeStatus: (nodeId: string, status: NodeStatus) => void;
-  setEdgeStyle: (style: EdgeStyle) => void;
-  clearNodeStatuses: () => void;
+  layoutDirection: LayoutDirection;
 }
 
-export const useComposerStore = create<ComposerStore>((set) => ({
-  mode: 'compose',
+export type ComposerViewAction =
+  | { type: 'set_node_status'; nodeId: string; status: NodePresentationStatus }
+  | { type: 'replace_node_statuses'; statuses: Record<string, NodePresentationStatus> }
+  | { type: 'clear_node_statuses' }
+  | { type: 'set_edge_style'; edgeStyle: EdgeStyle }
+  | { type: 'set_layout_direction'; layoutDirection: LayoutDirection };
+
+export const INITIAL_COMPOSER_VIEW_STATE: ComposerViewState = {
   nodeStatuses: {},
   edgeStyle: 'default',
-  
-  setNodeStatuses: (statuses) => {
-    const normalized: Record<string, NodeStatus> = {};
-    for (const [nodeId, status] of Object.entries(statuses)) {
-      normalized[nodeId] = status as NodeStatus;
-    }
-    set({ nodeStatuses: normalized });
-  },
-  
-  setNodeStatus: (nodeId, status) => {
-    set((state) => ({
-      nodeStatuses: { ...state.nodeStatuses, [nodeId]: status },
-    }));
-  },
+  layoutDirection: 'vertical',
+};
 
-  setEdgeStyle: (edgeStyle) => {
-    set({ edgeStyle });
-  },
-  
-  clearNodeStatuses: () => {
-    set({ nodeStatuses: {} });
-  },
-}));
-
-// Subscribe to cycleStore changes to auto-update mode and nodeStatuses.
-// We also treat an active TCP-jog gizmo drag as "run" so the UI doesn't
-// flicker back to compose between successive jog commands while the
-// operator is still dragging (the backend ping-pongs idle↔direct_control
-// in the gaps between motion segments).
-function computeMode(): 'compose' | 'run' {
-  const cycleState = useCycleStore.getState().state;
-  const dragging = useViewerSelectionStore.getState().isDraggingGizmo;
-  if (dragging) return 'run';
-  return cycleState === 'idle' ? 'compose' : 'run';
-}
-
-function syncMode(): void {
-  const newMode = computeMode();
-  if (useComposerStore.getState().mode !== newMode) {
-    useComposerStore.setState({ mode: newMode });
+/** Pure presentation state; it has no cycle subscription or runtime authority. */
+export function composerViewReducer(
+  state: ComposerViewState,
+  action: ComposerViewAction,
+): ComposerViewState {
+  switch (action.type) {
+    case 'set_node_status':
+      return {
+        ...state,
+        nodeStatuses: {
+          ...state.nodeStatuses,
+          [action.nodeId]: action.status,
+        },
+      };
+    case 'replace_node_statuses':
+      return { ...state, nodeStatuses: { ...action.statuses } };
+    case 'clear_node_statuses':
+      return { ...state, nodeStatuses: {} };
+    case 'set_edge_style':
+      return { ...state, edgeStyle: action.edgeStyle };
+    case 'set_layout_direction':
+      return { ...state, layoutDirection: action.layoutDirection };
   }
 }
 
-export function initComposerStore() {
-  const unsubscribeDrag = useViewerSelectionStore.subscribe(syncMode);
-  const unsubscribe = useCycleStore.subscribe((state) => {
-    const cycleState = state.state;
-    syncMode();
-
-    const wsStatuses = state.nodeStatuses || {};
-    if (Object.keys(wsStatuses).length > 0) {
-      // Build label→flowId lookup from current program nodes
-      const { nodes } = useProgramStore.getState();
-      const labelToId = new Map<string, string>();
-      for (const node of nodes) {
-        const label = (node.data as { label?: string }).label;
-        if (label) labelToId.set(label, node.id);
-      }
-
-      // Map WS nodeStatuses (keyed by instance name) to flow node IDs
-      const mapped: Record<string, string> = {};
-      for (const [instanceName, status] of Object.entries(wsStatuses)) {
-        const flowId = labelToId.get(instanceName);
-        if (flowId) {
-          mapped[flowId] = status.toLowerCase();
-        }
-      }
-      useComposerStore.getState().setNodeStatuses(mapped);
-    } else if (cycleState === 'idle') {
-      useComposerStore.getState().clearNodeStatuses();
-    }
-  });
-
-  return () => {
-    unsubscribe();
-    unsubscribeDrag();
-  };
+export function useComposerViewState() {
+  return useReducer(composerViewReducer, INITIAL_COMPOSER_VIEW_STATE);
 }

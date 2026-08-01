@@ -1,316 +1,419 @@
+"""Cutover-boundary contracts for repository entry points and test lanes."""
+
+from __future__ import annotations
+
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
+import pytest
 import yaml
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SCRIPT = _REPO_ROOT / "scripts" / "test-all.sh"
+_TEST_ALL = _REPO_ROOT / "scripts" / "test-all.sh"
+_BENCHMARK = _REPO_ROOT / "tests" / "test_benchmark.py"
+_COLLISION_MAPPER_PERF = _REPO_ROOT / "scripts" / "run-collision-mapper-perf.sh"
 _UNAVAILABLE_MESSAGE = (
-    "Composable-cell runtime unavailable: native planning and execution adapters "
+    "composable_cell_runtime_unavailable: native planning and execution adapters "
     "are intentionally removed during the active rebuild."
+)
+_BENCHMARK_UNAVAILABLE_MESSAGE = (
+    "composable_cell_runtime_unavailable: native benchmark execution returns "
+    "at I6/N and participates in I8/P5 regression qualification."
+)
+_COLLISION_MAPPER_UNAVAILABLE_MESSAGE = (
+    "composable_cell_collision_mapper_probe_unavailable: exact symbol/body "
+    "lookup performance returns at I3/C1 and I6/N"
 )
 
 
+@pytest.mark.parametrize("invocation", ((), ("all",)))
+def test_historical_aggregate_test_shapes_fail_before_any_runner(
+    invocation: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "external-effect"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for command in (
+        "cmake",
+        "ctest",
+        "docker",
+        "make",
+        "npm",
+        "nproc",
+        "pytest",
+        "python3",
+    ):
+        stub = fake_bin / command
+        stub.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' called >> {str(marker)!r}\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", str(_TEST_ALL), *invocation],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 78
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
+    assert not marker.exists()
+
+
+def test_reduced_aggregate_has_an_explicit_retained_selector() -> None:
+    source = _TEST_ALL.read_text(encoding="utf-8")
+    retained_body = source.split("    retained)", 1)[1].split("    *)", 1)[0]
+
+    assert "./scripts/test-all.sh retained # current reduced aggregate" in source
+    assert "    all)" not in source
+    assert "run_cpp_tests" in retained_body
+    assert "run_roboplan_tests" in retained_body
+    assert "run_python_tests" in retained_body
+    assert "run_observability_client_tests" in retained_body
+    assert "run_bridge_tests" in retained_body
+    assert "run_composer_backend_tests" in retained_body
+    assert "run_composer_frontend_build" in retained_body
+    assert "run_composer_frontend_tests" in retained_body
+    assert "tests/test_public_contract_entrypoint_reconciliation.py" in source
+    assert "tests/test_qualification_wrapper_entrypoints.py" in source
+
+
+def test_direct_benchmark_entrypoint_fails_before_product_import(
+    tmp_path: Path,
+) -> None:
+    source = _BENCHMARK.read_text(encoding="utf-8")
+    marker = tmp_path / "product-imported"
+    poison_root = tmp_path / "poison"
+    package = poison_root / "manyforge_behavior"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        (
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('imported', encoding='utf-8')\n"
+            "raise AssertionError('direct benchmark imported product code')\n"
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(_BENCHMARK)],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(poison_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert source.index('if __name__ == "__main__":') < source.index("import pytest")
+    assert source.index("import pytest") < source.index("from manyforge_behavior")
+    assert completed.returncode == 78
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == _BENCHMARK_UNAVAILABLE_MESSAGE
+    assert not marker.exists()
+
+
+def test_collision_mapper_perf_tombstone_is_directly_executable() -> None:
+    assert _COLLISION_MAPPER_PERF.stat().st_mode & 0o111 == 0o111
+
+    completed = subprocess.run(
+        [str(_COLLISION_MAPPER_PERF)],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 78
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == _COLLISION_MAPPER_UNAVAILABLE_MESSAGE
+
+
 def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
-    script = _SCRIPT.read_text(encoding="utf-8")
-    roboplan_body = script.split("run_roboplan_tests() {", maxsplit=1)[1].split(
-        "run_pybind_tests() {", maxsplit=1
+    source = _TEST_ALL.read_text(encoding="utf-8")
+    body = source.split("run_roboplan_tests() {", 1)[1].split(
+        "run_pybind_tests() {", 1
     )[0]
 
-    assert "C++ retained RoboPlan product-consumer tests" in roboplan_body
-    assert "MANYFORGE_ENABLE_ROS2_CONTROL" not in roboplan_body
-    assert "manyforge_roboplan_py" not in roboplan_body
-    assert "manyforge_roboplan/python" not in roboplan_body
+    assert "C++ retained RoboPlan product-consumer tests" in body
+    assert "MANYFORGE_ENABLE_ROS2_CONTROL" not in body
+    assert "manyforge_roboplan_py" not in body
+    assert "manyforge_roboplan/python" not in body
 
 
-def test_canonical_dev_tests_use_container_local_build_products() -> None:
-    script = _SCRIPT.read_text(encoding="utf-8")
+def test_compose_retains_fenced_runtime_clients_without_claiming_availability() -> None:
     compose = yaml.safe_load(
         (_REPO_ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
     )
-    local_ci = (
-        _REPO_ROOT / ".github" / "workflows" / "local-ci.yml"
-    ).read_text(encoding="utf-8")
-    entrypoint = (_REPO_ROOT / "docker-entrypoint.sh").read_text(
+    services = compose["services"]
+
+    for name in ("dev", "ros-jazzy", "ros-jazzy-full", "composer", "composer-api"):
+        assert services[name]["volumes"] == [".:/workspace"]
+    assert services["composer-ros"]["restart"] == "no"
+    assert services["composer-ros"]["command"][-1] == (
+        "./scripts/ros/start-composer-ros.sh"
+    )
+    assert services["isaac-topic-control"]["restart"] == "no"
+    assert services["isaac-topic-control"]["command"][-1] == (
+        "./scripts/ros/launch-isaac-topic-based-control.sh"
+    )
+    assert "ros-full-build-cache" in compose["volumes"]
+
+
+def test_current_build_lanes_use_fresh_container_local_products() -> None:
+    source = _TEST_ALL.read_text(encoding="utf-8")
+    local_ci = (_REPO_ROOT / ".github/workflows/local-ci.yml").read_text(
         encoding="utf-8"
     )
 
-    assert compose["services"]["dev"]["volumes"] == [".:/workspace"]
-    assert compose["services"]["ros-jazzy"]["volumes"] == [".:/workspace"]
-    assert compose["services"]["ros-jazzy-full"]["volumes"] == [".:/workspace"]
-    assert compose["services"]["composer"]["volumes"] == [".:/workspace"]
-    assert compose["services"]["composer-api"]["volumes"] == [".:/workspace"]
-    assert "build-cache" not in compose["volumes"]
-    assert 'cache_volume="manyforge-local-ci-build-' not in local_ci
-    assert '-v "${cache_volume}:/tmp/manyforge-build"' not in local_ci
+    assert "MANYFORGE_TEST_STAMP" not in source
+    assert ".manyforge-tested-" not in source
+    assert "rm -rf" not in source
+    assert 'BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"' in source
+    assert 'cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL"' in source
     assert '"${image_id}" \\' in local_ci
-    assert "reset_stale_cmake_build_dir" not in script
-    assert "reset_stale_python_build_dir" not in entrypoint
-    assert "rm -rf" not in script
-    assert 'BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"' in script
-    assert 'cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL"' in script
-    assert 'make -j"$BUILD_PARALLEL_LEVEL"' in script
-    assert re.search(r"^\s*(?:cmake|make)\s", entrypoint, re.MULTILINE) is None
-    assert "manyforge_roboplan/python" not in entrypoint
-    assert "ROBOPLAN_BUILD" not in entrypoint
-
-    for name in (
-        "docker-entrypoint.ros-jazzy.sh",
-        "docker-entrypoint.ros-jazzy-full.sh",
-    ):
-        ros_entrypoint = (_REPO_ROOT / name).read_text(encoding="utf-8")
-        assert "reset_stale_python_build_dir" not in ros_entrypoint
-        assert "rm -rf" not in ros_entrypoint
-        assert (
-            re.search(
-                r"^\s*(?:cmake|make)\s", ros_entrypoint, re.MULTILINE
-            )
-            is None
-        )
-        assert 'MANYFORGE_SOURCE_WORKSPACE_INSTALL:-OFF}" = "ON"' in ros_entrypoint
-        assert "manyforge_roboplan/python" not in ros_entrypoint
-        assert "ROBOPLAN_BUILD" not in ros_entrypoint
-
-    ros_test = (_REPO_ROOT / "scripts/test-ros.sh").read_text(encoding="utf-8")
-    assert 'source "${WORKSPACE}/install/setup.bash"' not in ros_test
-    assert "refuse the source-mounted workspace install overlay" in ros_test
+    assert 'cache_volume="manyforge-local-ci-build-' not in local_ci
 
 
-def test_native_launcher_fails_before_any_container_or_stale_artifact_probe(
+def test_product_launcher_gates_operational_verbs_before_external_effect(
     tmp_path: Path,
 ) -> None:
-    source = (
-        _REPO_ROOT / "scripts" / "lib" / "compose.sh"
-    ).read_text(encoding="utf-8")
+    launcher = _REPO_ROOT / "scripts" / "launch.sh"
+    source = launcher.read_text(encoding="utf-8")
 
-    function_body = source.split("start_composer_dev_container() {", 1)[1].split(
-        "stop_composer_dev_container() {", 1
-    )[0]
-    assert function_body.index(
-        "manyforge_fail_composable_cell_runtime_unavailable"
-    ) < function_body.index("docker run --rm")
     assert "manyforge_roboplan/python" not in source
-    assert "test-all.sh roboplan" not in source
+    assert "stop_assistant_stack" not in source
+    assert "pkill" not in source
+    assert "scripts/lib/assistant.sh" not in source
 
-    calls = tmp_path / "docker-calls"
+    marker = tmp_path / "external-effect"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for command in (
+        "docker",
+        "curl",
+        "ros2",
+        "dirname",
+        "realpath",
+        "stat",
+        "id",
+        "kill",
+        "sleep",
+        "python3",
+    ):
+        stub = fake_bin / command
+        stub.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' called >> {str(marker)!r}\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+    invocations = (
+        ("start",),
+        ("status",),
+        ("restart",),
+        ("smoke",),
+        ("preflight",),
+        ("stop",),
+        ("--help",),
+        ("start", "--lane", "not-a-lane"),
+        ("stop", "--help"),
+    )
+    for invocation in invocations:
+        completed = subprocess.run(
+            ["bash", str(launcher), *invocation],
+            cwd=_REPO_ROOT,
+            env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 78, invocation
+        assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
+        assert not marker.exists(), invocation
+
+
+def test_product_launcher_maps_removed_cleanup_without_dormant_effects() -> None:
+    launcher = _REPO_ROOT / "scripts" / "launch.sh"
+    source = launcher.read_text(encoding="utf-8")
+
+    assert "f11f1344ae2fc8b8d3875318f8d60aef7a1b6766" in source
+    assert "owner-issued process/container identities at I4/I5/I9/I10" in source
+    assert "verb_stop" not in source
+    assert "docker " not in source
+    assert "kill " not in source
+    assert "rm " not in source
+
+
+def test_assistant_supervisor_wrapper_is_only_a_typed_gate() -> None:
+    wrapper = _REPO_ROOT / "scripts" / "run-assistant-supervisor.sh"
+    source = wrapper.read_text(encoding="utf-8")
+
+    assert "3daf0d53a35ba250d825dc45d66d3a575c04f884" in source
+    assert "manyforge_fail_composable_cell_runtime_unavailable" in source
+    assert "manyforge_assistant_bridge.supervisor" not in source
+    assert "VENV_PYTHON" not in source
+    assert re.search(r"^exec\s", source, re.MULTILINE) is None
+
+
+def test_hermes_gateway_matrix_cannot_activate_the_deleted_bridge() -> None:
+    matrix_path = (
+        _REPO_ROOT / "scripts" / "hermes" / "managed-tool-gateway-matrix.json"
+    )
+    payload = json.loads(matrix_path.read_text(encoding="utf-8"))
+    source = matrix_path.read_text(encoding="utf-8")
+
+    assert "manyforge" not in payload
+    assert payload["_manyforge_cutover"]["available"] is False
+    assert payload["_manyforge_cutover"]["historical_blob"] == (
+        "e4097f2777ea45bcb3e9f09700aa357bcf378ad7"
+    )
+    assert "mcp_servers" not in source
+    assert "host.openshell.internal" not in source
+
+
+@pytest.mark.parametrize(
+    ("relative", "historical_blob", "entrypoint", "forbidden"),
+    (
+        (
+            "scripts/lib/composer.sh",
+            "40cb4124eee7d998ad18e820b4a369208a52a411",
+            "load_program",
+            ("curl", "/api/"),
+        ),
+        (
+            "scripts/lib/compose.sh",
+            "4d7e0ecc6a1be6aabd123417e03141f52da6755a",
+            "start_composer_dev_container",
+            ("docker run", "python -m manyforge_composer"),
+        ),
+        (
+            "scripts/lib/isaac.sh",
+            "cfe20a23a5a26d13f09cff879c11bb0ffc718c65",
+            "start_isaac_services",
+            ("ros2 ", "docker "),
+        ),
+        (
+            "scripts/lib/real_robot.sh",
+            "62da0b3f83d60750195e7d2154732a46f34262f2",
+            "start_real_robot_lane",
+            ("docker ", "/api/runtime"),
+        ),
+    ),
+)
+def test_launcher_libraries_have_no_dormant_runtime_body(
+    relative: str,
+    historical_blob: str,
+    entrypoint: str,
+    forbidden: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    path = _REPO_ROOT / relative
+    source = path.read_text(encoding="utf-8")
+    marker = tmp_path / "external-effect"
     completed = subprocess.run(
         [
             "bash",
             "-c",
             (
-                f"source {str(_REPO_ROOT / 'scripts/lib/compose.sh')!r}\n"
-                "docker() {\n"
-                '  printf "%s\\n" "$*" >>"${CALLS}"\n'
-                "  return 0\n"
-                "}\n"
-                "start_composer_dev_container\n"
+                f"docker() {{ printf 'called\\n' >> {str(marker)!r}; }}\n"
+                f"source {str(path)!r}\n"
+                f"{entrypoint}\n"
             ),
         ],
         cwd=_REPO_ROOT,
-        env={
-            **os.environ,
-            "CALLS": str(calls),
-            "MANYFORGE_ROOT": str(_REPO_ROOT),
-            "MANYFORGE_VLLM_STATUS_DIR": str(tmp_path / "vllm"),
-        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert historical_blob in source
+    assert not any(token in source for token in forbidden)
+    assert completed.returncode == 78
+    assert "composable_cell_runtime_unavailable" in completed.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "scripts/ros/build-ros2-control-runtime.sh",
+        "scripts/ros/start-composer-ros.sh",
+        "scripts/ros/start-lite6-real-robot-composer.sh",
+        "scripts/test-ros-full.sh",
+    ),
+)
+def test_ros_runtime_wrappers_share_one_explicit_unavailable_boundary(
+    relative: str,
+) -> None:
+    path = _REPO_ROOT / relative
+    source = path.read_text(encoding="utf-8")
+    assert "composable-cell-runtime-availability.sh" in source
+    assert "manyforge_fail_composable_cell_runtime_unavailable" in source
+    assert "manyforge_roboplan_py" not in source
+
+    completed = subprocess.run(
+        ["bash", str(path)],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "WORKSPACE": str(_REPO_ROOT)},
         capture_output=True,
         text=True,
         check=False,
     )
     assert completed.returncode == 78
     assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
-    assert not calls.exists()
 
 
-def test_ros_runtime_wrappers_share_one_explicit_unavailable_boundary() -> None:
-    wrappers = (
-        "scripts/ros/build-ros2-control-runtime.sh",
-        "scripts/ros/start-composer-ros.sh",
-        "scripts/ros/start-lite6-real-robot-composer.sh",
-        "scripts/test-ros-full.sh",
-    )
-    forbidden = (
-        "manyforge_roboplan_py",
-        "manyforge_roboplan/python",
-        "MANYFORGE_ENABLE_ROS2_CONTROL",
-        "MANYFORGE_ENABLE_QUALIFICATION_PROBES",
-    )
-
-    for relative in wrappers:
-        path = _REPO_ROOT / relative
-        source = path.read_text(encoding="utf-8")
-        assert "composable-cell-runtime-availability.sh" in source
-        assert "manyforge_fail_composable_cell_runtime_unavailable" in source
-        assert not any(token in source for token in forbidden)
-        completed = subprocess.run(
-            ["bash", str(path)],
-            cwd=_REPO_ROOT,
-            env={**os.environ, "WORKSPACE": str(_REPO_ROOT)},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert completed.returncode == 78, relative
-        assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
-
-
-def test_lane_preflights_fail_before_docker_or_robot_side_effects(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "suite",
+    (
+        "bindings",
+        "integration",
+        "qualification",
+        "qualification-all",
+        "qualification-native",
+        "qualification-soak",
+        "ros",
+    ),
+)
+def test_unavailable_test_suites_fail_instead_of_skipping_or_mocking(
+    suite: str,
 ) -> None:
-    cases = (
-        ("scripts/lib/isaac.sh", "maybe_build_isaac_image"),
-        ("scripts/lib/real_robot.sh", "real_robot_preflight"),
-        ("scripts/lib/real_robot.sh", "start_real_robot_lane"),
+    completed = subprocess.run(
+        ["bash", str(_TEST_ALL), suite],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "WORKSPACE": str(_REPO_ROOT)},
+        capture_output=True,
+        text=True,
+        check=False,
     )
-
-    for relative, function in cases:
-        calls = tmp_path / f"{function}-calls"
-        completed = subprocess.run(
-            [
-                "bash",
-                "-c",
-                (
-                    f"source {str(_REPO_ROOT / relative)!r}\n"
-                    "docker() { printf '%s\\n' \"$*\" >>\"${CALLS}\"; }\n"
-                    f"{function}\n"
-                ),
-            ],
-            cwd=_REPO_ROOT,
-            env={
-                **os.environ,
-                "CALLS": str(calls),
-                "MANYFORGE_ROOT": str(_REPO_ROOT),
-            },
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert completed.returncode == 78, relative
-        assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
-        assert not calls.exists()
+    assert completed.returncode == 78, suite
+    assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
 
 
-def test_bindings_and_integration_suites_fail_explicitly_during_cutover() -> None:
-    script = _SCRIPT.read_text(encoding="utf-8")
-    bindings_body = script.split("run_pybind_tests() {", maxsplit=1)[1].split(
-        "run_python_tests() {", maxsplit=1
+def test_retained_bridge_suite_qualifies_protocol_without_live_bridge() -> None:
+    source = _TEST_ALL.read_text(encoding="utf-8")
+    body = source.split("run_bridge_tests() {", 1)[1].split(
+        "run_composer_backend_tests() {", 1
     )[0]
-    integration_body = script.split("run_integration_tests() {", maxsplit=1)[
-        1
-    ].split("run_bridge_tests() {", maxsplit=1)[0]
 
-    for body in (bindings_body, integration_body):
-        assert "manyforge_fail_composable_cell_runtime_unavailable" in body
-        assert "pytest" not in body
-        assert "cmake" not in body
-
-    for suite in ("bindings", "integration"):
-        completed = subprocess.run(
-            ["bash", str(_SCRIPT), suite],
-            cwd=_REPO_ROOT,
-            env={**os.environ, "WORKSPACE": str(_REPO_ROOT)},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert completed.returncode == 78, suite
-        assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
+    assert "manyforge_assistant_bridge/tests/" in body
+    assert "pytest" in body
+    assert "manyforge_fail_composable_cell_runtime_unavailable" not in body
 
 
 def test_deployment_package_participates_in_repository_version_guard() -> None:
-    version_guard = (
-        _REPO_ROOT / "scripts" / "ci" / "verify-version-sync.sh"
-    ).read_text(encoding="utf-8")
-
-    assert 'check "manyforge_deployment CMakeLists.txt"' in version_guard
-
-
-def test_test_suites_are_never_skipped_from_a_head_only_success_stamp() -> None:
-    script = _SCRIPT.read_text(encoding="utf-8")
-
-    assert "MANYFORGE_TEST_STAMP" not in script
-    assert ".manyforge-tested-" not in script
-
-
-def test_isaac_runtime_cache_is_bound_to_immutable_image_id() -> None:
-    helper = _REPO_ROOT / "scripts" / "lib" / "isaac.sh"
-    image_id = "sha256:" + ("b" * 64)
-    completed = subprocess.run(
-        [
-            "bash",
-            "-lc",
-            (
-                f"source {str(helper)!r}; "
-                f"isaac_build_cache_volume_for_image_id {image_id!r}"
-            ),
-        ],
-        cwd=_REPO_ROOT,
-        env=os.environ.copy(),
-        capture_output=True,
-        text=True,
-        check=False,
+    source = (_REPO_ROOT / "scripts/ci/verify-version-sync.sh").read_text(
+        encoding="utf-8"
     )
-
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == (
-        "manyforge_ros-full-build-cache-" + ("b" * 64)
-    )
-
-    source = helper.read_text(encoding="utf-8")
-    assert 'export MANYFORGE_ROS_FULL_IMAGE="${image_id}"' in source
-    assert (
-        'export MANYFORGE_ROS_FULL_BUILD_CACHE_VOLUME="${ISAAC_BUILD_CACHE_VOLUME}"'
-        in source
-    )
-    assert '"${COMPOSE_CMD[@]}" up -d isaac-topic-control composer-ros' in source
-    isaac_runtime = (
-        _REPO_ROOT / "scripts" / "ros" / "launch-isaac-topic-based-control.sh"
-    ).read_text(encoding="utf-8")
-    assert (
-        'MANYFORGE_ROS_OVERLAY="${MANYFORGE_ROS_OVERLAY:-'
-        '${MANYFORGE_BUILD_DIR}/isaac-ros-overlay}"'
-    ) in isaac_runtime
-    assert 'rm -rf "${MANYFORGE_ROS_OVERLAY}"' not in isaac_runtime
-    assert "MANYFORGE_SOURCE_DEVELOPMENT_ROS_OVERLAYS" in isaac_runtime
-
-    pinned = subprocess.run(
-        [
-            "bash",
-            "-lc",
-            (
-                "docker() {\n"
-                "  [[ \"$1 $2 $3\" == "
-                '"image inspect manyforge-ros-jazzy-full" ]]\n'
-                f"  printf '%s\\n' {image_id!r}\n"
-                "}\n"
-                f"source {str(helper)!r}; "
-                "pin_isaac_runtime_image; "
-                "printf '%s|%s|%s\\n' "
-                '"${ISAAC_RUNTIME_IMAGE_ID}" '
-                '"${MANYFORGE_ROS_FULL_IMAGE}" '
-                '"${MANYFORGE_ROS_FULL_BUILD_CACHE_VOLUME}"'
-            ),
-        ],
-        cwd=_REPO_ROOT,
-        env={
-            key: value
-            for key, value in os.environ.items()
-            if key
-            not in {
-                "MANYFORGE_ROS_FULL_IMAGE",
-                "MANYFORGE_ROS_FULL_BUILD_CACHE_VOLUME",
-            }
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert pinned.returncode == 0, pinned.stderr
-    assert pinned.stdout.strip() == (
-        f"{image_id}|{image_id}|manyforge_ros-full-build-cache-"
-        + ("b" * 64)
-    )
+    assert 'check "manyforge_deployment CMakeLists.txt"' in source

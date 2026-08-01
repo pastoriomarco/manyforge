@@ -1,13 +1,15 @@
 # ManyForge Runtime Documentation Index
 
 This index covers documentation that travels with the implementation
-repository — install, operate, and reference. **Operators do not need any
-other repo for runtime tasks.** Maintainers can also follow the
-"Development / spec references" section at the bottom.
+repository: current structural inspection plus historical install, operation,
+and integration references. **No product runtime task is currently
+available.** When a lane is restored, its public operator documentation must
+remain self-contained here. Maintainers can also follow the "Development /
+spec references" section at the bottom.
 
 `README.md` remains the project entrypoint. For LLM agents,
-[`../AGENTS.md`](../AGENTS.md) is the canonical landing page (covers install,
-robot-execution and assistant-provider lane selection, boundary rules, and the
+[`../AGENTS.md`](../AGENTS.md) is the canonical landing page (covers the
+current outage, historical lane selection, boundary rules, and the
 branch/commit workflow).
 
 > **Current `dev` outage:** the composable-cell destructive migration has
@@ -21,24 +23,28 @@ branch/commit workflow).
 
 | Task                                        | Start here                                                                                                                          |
 | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Bring up, stop, restart, or inspect a stack | [`operations/LAUNCHER_QUICKSTART.md`](operations/LAUNCHER_QUICKSTART.md)                                                            |
-| Choose a bundled program/deployment         | [`operations/EXAMPLES_CATALOG.md`](operations/EXAMPLES_CATALOG.md)                                                                  |
-| Diagnose a runtime symptom                  | [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md), then [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md) |
-| Operate stop/recovery controls              | [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)                                                                        |
-| Add a robot                                 | [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md)                                                                    |
-| Qualify an experimental physical Lite6      | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md)                                                  |
+| Start the structural Composer shell         | `../scripts/compose-dev.sh`; catalog/files/URDF/health only                                                                          |
+| Study former stack workflows                | [`operations/LAUNCHER_QUICKSTART.md`](operations/LAUNCHER_QUICKSTART.md), marked historical                                           |
+| Study historical runtime diagnosis          | [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md) and [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md)     |
+| Study historical stop/recovery controls     | [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)                                                                         |
+| Study the historical robot-import workflow | [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md); v0 migration/reference input                                      |
+| Study historical physical-Lite6 qualification | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md); unavailable until R/I10                        |
 | Understand ownership and data flow          | [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)                                                                            |
-| Integrate an API/client                     | Generated REST/MCP/viewer contracts under [`reference/`](reference/)                                                                |
+| Integrate the current structural API        | Generated [`reference/REST_API.md`](reference/REST_API.md); former clients use the historical interaction index                       |
 
-## Operator runbooks (`docs/operations/`)
+## Historical operator runbooks (`docs/operations/`)
+
+These runbooks preserve workflow and qualification intent for later
+restoration. They do not describe currently available products, and their
+commands must not be run or cited as current lane evidence.
 
 - [`operations/LAUNCHER_QUICKSTART.md`](operations/LAUNCHER_QUICKSTART.md)
 
   - Canonical guide for the unified launcher (`scripts/launch.sh`).
     Interactive 7-step wizard, scripted / non-interactive use for CI,
     `start` / `status` / `stop` / `restart` / `smoke` / `preflight`
-    verbs, and the four-combination smoke-test matrix. **Start here
-    when bringing the stack up.**
+    verbs, and the four-combination smoke-test matrix. This was the historical
+    stack bring-up entrypoint; the current launcher is intentionally gated.
 
 - [`operations/STACK_SETUP.md`](operations/STACK_SETUP.md)
 
@@ -63,10 +69,9 @@ branch/commit workflow).
 
 - [`operations/ROS2_MEDKIT.md`](operations/ROS2_MEDKIT.md)
 
-  - ros2_medkit integration runbook: install/build medkit, run the
-    fault-manager + ManyForge adapter and the generic diagnostics bridge,
-    test layers (hermetic vs real-lifecycle), production checklist and
-    fail-closed semantics.
+  - Historical ros2_medkit restoration runbook: preserved fault/healing
+    behavior, former adapter and diagnostics-bridge recipes, and the I5/H0
+    gate that must provide their new headless diagnostic source.
 
 - [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)
 
@@ -104,22 +109,23 @@ branch/commit workflow).
 
 - [`../config/ros/isaac_lite6_trocar_foundationpose.env.sh`](../config/ros/isaac_lite6_trocar_foundationpose.env.sh)
 
-  - Sourceable ROS/DDS environment profile for that workflow. Source it in
-    the Isaac Sim laptop shell, the Isaac ROS perception container, and the
-    ManyForge launcher shell so all ROS participants share the same domain,
-    Fast DDS RMW, localhost discovery range, and static peers.
+  - Sourceable ROS/DDS environment profile from that workflow. The captured
+    procedure sourced it in the Isaac Sim laptop shell, Isaac ROS perception
+    container, and ManyForge launcher shell so all participants shared the
+    same domain, Fast DDS RMW, localhost discovery range, and static peers.
 
 - [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md)
 
-  - Operator runbook for adding a new robot deployment: URDF/SRDF
-    requirements, deployment-YAML schema (arm + gripper), capability
-    adapter selection, smoke-test curls.
+  - Historical v0 robot-import workflow and bounded migration reference:
+    URDF/SRDF requirements, arm/gripper intent, adapter selection, and smoke
+    acceptance cases. It is not the current artifact schema or runnable path.
 
 - [`operations/EXAMPLES_CATALOG.md`](operations/EXAMPLES_CATALOG.md)
 
-  - Catalog of every `examples/*.program.yaml` × `*.deployment.yaml`
-    pair, mapped to artifact-owned scenarios discovered from deployment
-    compatibility metadata. Use this to pick or add a test/demo combination.
+  - Migration and acceptance inventory of every captured
+    `examples/*.program.yaml` × `*.deployment.yaml` pair, mapped to its
+    historical scenario. It is not a source of runnable current combinations;
+    each artifact must be ported through its named compiler and lane gate.
 
 - [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md)
 
@@ -137,51 +143,62 @@ branch/commit workflow).
 
 - [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)
 
-  - **Start here for the big picture.** Component map, authority
-    boundaries (who owns terminal/stop/collision decisions), the three
-    deployment lanes, execution lifecycle, and the observability model.
-    Hand-maintained; keep in sync with material architecture changes.
+  - **Start here for the big picture.** Current cutover boundary plus the
+    captured component map, authority boundaries, three deployment lanes,
+    execution lifecycle, and observability model retained as restoration
+    input. Hand-maintained; keep in sync with material architecture changes.
 
 - [`reference/SCENE_AUTHORITY.md`](reference/SCENE_AUTHORITY.md)
 
-  - Contract for live planning-scene writers: program scene nodes,
-    explicit reset/load seed, lifecycle-safe operator edits, and
-    configured pose-source feeds.
+  - Captured contract for live planning-scene writers and the current
+    canonical-empty boundary. Its program nodes, reset/load seed, operator
+    edits, and pose-source feeds are unavailable restoration requirements.
 
 - [`reference/ROBOPLAN_ADAPTER_NOTES.md`](reference/ROBOPLAN_ADAPTER_NOTES.md)
 
-  - Runtime notes for the RoboPlan adapter: projection rules,
-    detached-static collision filter, support-contact handling, and
-    temporary backend workarounds.
+  - Captured runtime notes for the RoboPlan adapter plus the current retained
+    offline boundary: projection rules, detached-static collision filter,
+    support-contact handling, and temporary backend workarounds are
+    restoration inputs rather than a live adapter claim.
 
-### Generated public contracts
+### Current generated public contract
 
 These files are generated from owning code/models and must not be edited by
-hand. Regenerate with `scripts/regen-public-contracts.py`; CI guards freshness
-with `scripts/ci/check-public-contracts-fresh.sh`.
+hand. Regenerate the retained surface with
+`scripts/regen-public-contracts.py structural-rest`; CI guards freshness with
+`scripts/ci/check-public-contracts-fresh.sh structural-rest`. The historical
+no-argument aggregate forms are typed unavailable rather than silently
+checking only this reduced projection.
 
 - [`reference/REST_API.md`](reference/REST_API.md)
 
   - Composer REST surface generated from FastAPI/OpenAPI. The live schema is
     also at `:9000/openapi.json` while Composer is running.
 
-- [`reference/MCP_RUNTIME_CONTRACT.md`](reference/MCP_RUNTIME_CONTRACT.md)
+### Historical Composer/client interaction references
 
-  - MCP tool contract generated from Composer's registered tool surface.
-
-- [`reference/ASSISTANT_PROVIDER_CONTRACT.md`](reference/ASSISTANT_PROVIDER_CONTRACT.md)
-
-  - HTTP wire contract for the assistant-provider bridge service.
-
+- [`reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md)
+  records the exact full-Composer source tree and reimplementation rule.
+- [`reference/MCP_RUNTIME_CONTRACT.md`](reference/MCP_RUNTIME_CONTRACT.md) and
+  [`reference/ASSISTANT_PROVIDER_CONTRACT.md`](reference/ASSISTANT_PROVIDER_CONTRACT.md)
+  are non-operative historical contracts. They are not generated from or
+  exposed by the current shell.
 - [`reference/VIEWER_DATA_PLANE_V1.schema.json`](reference/VIEWER_DATA_PLANE_V1.schema.json)
-  and adjacent fixtures
+  and its
+  [`fixture`](reference/VIEWER_DATA_PLANE_V1.fixture.json), plus the historical
+  [`qualification artifact`](reference/VIEWER_QUALIFICATION_ARTIFACT_V1.schema.json)
+  and
+  [`qualification matrix`](reference/VIEWER_QUALIFICATION_MATRIX_V1.schema.json),
+  are non-operative wire/acceptance inputs. They do not describe the current
+  structural shell and must be translated rather than reactivated. Their
+  generated frontend types remain absent; the full interaction source is
+  pinned at `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`.
 
-  - Native-viewer manifest/frame/diagnostics/control wire contract.
+## Historical runtime-agent interaction artifacts
 
-## Runtime template artifacts
-
-These files are copied into OpenClaw/NemoClaw runtime sandboxes. They
-are runtime payloads, not repo-level development instructions.
+These files are retained with non-operative banners as future interaction and
+safety-design inputs. Their former frontmatter is deliberately disabled; they
+must not be copied into a runtime sandbox during the cutover.
 
 - [`../scripts/templates/AGENTS.md`](../scripts/templates/AGENTS.md)
 - [`../scripts/templates/SOUL.md`](../scripts/templates/SOUL.md)
@@ -197,10 +214,11 @@ ManyForge development is spec-driven. The architecture specs, ADRs,
 plans, open points, engineering references, and LLM-agent development
 guidance live in a sibling **private** repository, `manyforge_specs`.
 
-**Operators do not need any of this.** Runtime install, bring-up, and
-operation are fully documented above and do not require
-`manyforge_specs` to be on disk. The links below are dead unless you
-are a maintainer with that repo cloned alongside `manyforge`.
+**Operators do not need the private specifications to inspect the currently
+available structural shell or the retained historical workflows.** Product
+runtime install, bring-up, and operation remain unavailable during the
+cutover. The links below are dead unless you are a maintainer with
+`manyforge_specs` cloned alongside `manyforge`.
 
 Maintainers doing non-trivial behavior changes (kernel state machine,
 adapter contracts, deployment schema, assistant authority, observability
@@ -216,6 +234,6 @@ surfaces, ADR-level architecture) need:
 - `../../manyforge_specs/docs/plans/`
 - `../../manyforge_specs/docs/reference/`
 
-If `../../manyforge_specs/` is not on disk, this code repository is still
-fully operable — it is intentionally missing only the authoritative
-development guidance required for spec-governed code changes.
+If `../../manyforge_specs/` is not on disk, this repository still contains its
+public structural-shell documentation and historical operator references. It
+does not make the intentionally removed product runtime operable.

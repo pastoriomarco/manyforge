@@ -10,14 +10,21 @@ proof, benchmark, loaded-kernel, and live-service evidence families.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
+import math
 import os
 import re
+import secrets
+import selectors
+import signal
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, NamedTuple
 
 from source_identity import (
     SourceIdentityError,
@@ -80,7 +87,10 @@ _SANITIZER_SCRIPT = {
     "collision_tsan": "scripts/ci/run-collision-engine-tsan.sh",
 }
 HYGIENE_CHECKS = (
-    ("generated_public_contracts", "bash scripts/ci/check-public-contracts-fresh.sh"),
+    (
+        "generated_public_contracts",
+        "bash scripts/ci/check-public-contracts-fresh.sh structural-rest",
+    ),
     ("version_sync", "bash scripts/ci/verify-version-sync.sh"),
     ("private_spec_boundary", "bash scripts/ci/check-private-spec-boundary.sh"),
     ("terminal_commit_boundary", "bash scripts/ci/check-terminal-commit-boundary.sh"),
@@ -102,7 +112,7 @@ _BASE_INPUT_PATHS = {
     "scripts/qualification/verify_step18_release_gates.py",
 }
 _HYGIENE_INPUT_PATHS = {
-    command.split()[-1]
+    command.split()[1]
     for _, command in HYGIENE_CHECKS[:-1]
 }
 _LANE_INPUT_PATHS = {
@@ -149,20 +159,1075 @@ _SANITIZER_FINDING = re.compile(
     flags=re.IGNORECASE,
 )
 
+MAX_ARTIFACT_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_LANE_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_CONTAINER_INSPECT_BYTES = 4 * 1024 * 1024
+MAX_CONTAINER_LOG_BYTES = 64 * 1024 * 1024
+MAX_SECURITY_OVERRIDE_BYTES = 64 * 1024
+MAX_QUALIFICATION_INPUT_BYTES = 16 * 1024 * 1024
+MAX_OUTPUT_ARTIFACT_BYTES = 8 * 1024 * 1024
+MAX_REFERENCE_PATH_BYTES = 4096
+MAX_JSON_COLLECTION_ITEMS = 4096
+MAX_JSON_DEPTH = 32
+MAX_JSON_NODES = 65_536
+MAX_JSON_KEY_BYTES = 256
+MAX_JSON_STRING_BYTES = 1024 * 1024
+GIT_CHECK_TIMEOUT_SECONDS = 5
+MAX_HYGIENE_DIRECTORY_ENTRIES = 8192
+MAX_HYGIENE_DIRECTORIES = 8192
+MAX_HYGIENE_FILES = 8192
+MAX_HYGIENE_FILE_BYTES = 64 * 1024 * 1024
+MAX_HYGIENE_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_HYGIENE_DEPTH = 64
+HYGIENE_TIMEOUT_SECONDS = 120
+MAX_HYGIENE_GIT_INVENTORY_BYTES = 16 * 1024 * 1024
+
+_HYGIENE_EXCLUDED_COMPONENTS = frozenset(
+    {
+        ".git",
+        ".manyforge-var",
+        ".pytest_cache",
+        "build",
+        "__pycache__",
+        "node_modules",
+    }
+)
+_HYGIENE_ALLOWED_SYMLINKS = {
+    "agent-skills/manyforge-composer/manyforge-mcp-bridge.py": (
+        "../../scripts/manyforge-mcp-bridge.py"
+    ),
+}
+
+
+class _FileSnapshot(NamedTuple):
+    path: Path
+    payload: bytes
+    sha256: str
+    size: int
+    identity: tuple[int, int]
+
+
+class _BoundDirectory:
+    def __init__(self, path: Path, descriptors: list[int], names: list[str]) -> None:
+        self.path = path
+        self._descriptors = descriptors
+        self._names = names
+
+    @property
+    def descriptor(self) -> int:
+        return self._descriptors[-1]
+
+    def assert_current(self, label: str) -> None:
+        for parent, name, child in zip(
+            self._descriptors,
+            self._names,
+            self._descriptors[1:],
+        ):
+            try:
+                path_metadata = os.stat(
+                    name,
+                    dir_fd=parent,
+                    follow_symlinks=False,
+                )
+                descriptor_metadata = os.fstat(child)
+            except OSError as error:
+                raise ValidationError(f"{label} path changed: {error}") from error
+            if (
+                not stat.S_ISDIR(path_metadata.st_mode)
+                or (path_metadata.st_dev, path_metadata.st_ino)
+                != (descriptor_metadata.st_dev, descriptor_metadata.st_ino)
+            ):
+                raise ValidationError(f"{label} path changed")
+
+    def close(self) -> None:
+        for descriptor in reversed(self._descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self._descriptors.clear()
+
 
 class ValidationError(RuntimeError):
     """A retained release-gate claim is incomplete or inconsistent."""
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
+def _metadata_signature(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _lexical_absolute(path: Path, label: str) -> Path:
+    raw = os.fspath(path)
+    if not isinstance(raw, str) or not raw or "\0" in raw:
+        raise ValidationError(f"{label} path is invalid")
+    if len(os.fsencode(raw)) > MAX_REFERENCE_PATH_BYTES:
+        raise ValidationError(f"{label} path exceeds the reference bound")
+    return Path(os.path.abspath(os.path.normpath(raw)))
+
+
+def _open_absolute_directory(path: Path, label: str) -> _BoundDirectory:
+    absolute = _lexical_absolute(path, label)
     try:
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+        descriptors = [
+            os.open(
+                os.path.sep,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+        ]
     except OSError as error:
-        raise ValidationError(f"cannot hash {path}: {error}") from error
-    return digest.hexdigest()
+        raise ValidationError(f"cannot bind filesystem root: {error}") from error
+    names: list[str] = []
+    try:
+        for name in absolute.parts[1:]:
+            if name in ("", ".", ".."):
+                raise ValidationError(f"{label} path is not canonical")
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptors[-1],
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.close(descriptor)
+                raise ValidationError(f"{label} is not a directory")
+            descriptors.append(descriptor)
+            names.append(name)
+        binding = _BoundDirectory(absolute, descriptors, names)
+        binding.assert_current(label)
+        return binding
+    except OSError as error:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise ValidationError(
+            f"cannot bind {label} without symbolic-link traversal: {error}"
+        ) from error
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _path_matches_file(
+    parent_descriptor: int,
+    name: str,
+    identity: tuple[int, int],
+    *,
+    links: int = 1,
+) -> bool:
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == links
+        and (metadata.st_dev, metadata.st_ino) == identity
+    )
+
+
+def _read_bounded_regular_file(
+    path: Path,
+    label: str,
+    max_bytes: int,
+) -> _FileSnapshot:
+    absolute = _lexical_absolute(path, label)
+    if absolute.name in ("", ".", ".."):
+        raise ValidationError(f"{label} must name a file")
+    parent = _open_absolute_directory(absolute.parent, f"{label} parent")
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(
+                absolute.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent.descriptor,
+            )
+        except OSError as error:
+            raise ValidationError(f"cannot open {label}: {error}") from error
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValidationError(
+                f"{label} must be one non-hardlinked regular file"
+            )
+        if metadata.st_size < 0 or metadata.st_size > max_bytes:
+            raise ValidationError(f"{label} exceeds the {max_bytes}-byte bound")
+        payload = bytearray()
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValidationError(f"{label} ended before its recorded size")
+            payload.extend(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValidationError(f"{label} grew while being read")
+        after = os.fstat(descriptor)
+        identity = (metadata.st_dev, metadata.st_ino)
+        parent.assert_current(f"{label} parent")
+        if (
+            _metadata_signature(after) != _metadata_signature(metadata)
+            or not _path_matches_file(
+                parent.descriptor,
+                absolute.name,
+                identity,
+            )
+        ):
+            raise ValidationError(f"{label} changed while being read")
+        data = bytes(payload)
+        return _FileSnapshot(
+            absolute,
+            data,
+            hashlib.sha256(data).hexdigest(),
+            len(data),
+            identity,
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        parent.close()
+
+
+def _relative_parts(value: str | Path, label: str) -> tuple[str, ...]:
+    raw = os.fspath(value)
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or "\0" in raw
+        or os.path.isabs(raw)
+        or len(os.fsencode(raw)) > MAX_REFERENCE_PATH_BYTES
+    ):
+        raise ValidationError(f"{label} relative path is invalid")
+    parts = Path(raw).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise ValidationError(f"{label} relative path is not canonical")
+    return tuple(parts)
+
+
+def _open_relative_directory(
+    root_descriptor: int,
+    relative: str | Path,
+    label: str,
+) -> _BoundDirectory:
+    parts = _relative_parts(relative, label)
+    descriptors = [os.dup(root_descriptor)]
+    names: list[str] = []
+    try:
+        for name in parts:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptors[-1],
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.close(descriptor)
+                raise ValidationError(f"{label} is not a directory")
+            descriptors.append(descriptor)
+            names.append(name)
+        binding = _BoundDirectory(Path(*parts), descriptors, names)
+        binding.assert_current(label)
+        return binding
+    except OSError as error:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise ValidationError(
+            f"cannot bind {label} without symbolic-link traversal: {error}"
+        ) from error
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _read_bounded_regular_file_at(
+    root_descriptor: int,
+    relative: str | Path,
+    label: str,
+    max_bytes: int,
+) -> _FileSnapshot:
+    parts = _relative_parts(relative, label)
+    parent: _BoundDirectory | None = None
+    descriptor = -1
+    try:
+        if len(parts) == 1:
+            parent_descriptor = root_descriptor
+        else:
+            parent = _open_relative_directory(
+                root_descriptor,
+                Path(*parts[:-1]),
+                f"{label} parent",
+            )
+            parent_descriptor = parent.descriptor
+        try:
+            descriptor = os.open(
+                parts[-1],
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as error:
+            raise ValidationError(f"cannot open {label}: {error}") from error
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValidationError(
+                f"{label} must be one non-hardlinked regular file"
+            )
+        if before.st_size < 0 or before.st_size > max_bytes:
+            raise ValidationError(f"{label} exceeds the {max_bytes}-byte bound")
+        payload = bytearray()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValidationError(f"{label} ended before its recorded size")
+            payload.extend(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValidationError(f"{label} grew while being read")
+        after = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino)
+        if parent is not None:
+            parent.assert_current(f"{label} parent")
+        if (
+            _metadata_signature(after) != _metadata_signature(before)
+            or not _path_matches_file(
+                parent_descriptor,
+                parts[-1],
+                identity,
+            )
+        ):
+            raise ValidationError(f"{label} changed while being read")
+        data = bytes(payload)
+        return _FileSnapshot(
+            Path(*parts),
+            data,
+            hashlib.sha256(data).hexdigest(),
+            len(data),
+            identity,
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent is not None:
+            parent.close()
+
+
+def _open_relative_parent_binding(
+    repository: _BoundDirectory,
+    parts: tuple[str, ...],
+    label: str,
+) -> _BoundDirectory:
+    if len(parts) == 1:
+        return _BoundDirectory(Path("."), [os.dup(repository.descriptor)], [])
+    return _open_relative_directory(
+        repository.descriptor,
+        Path(*parts[:-1]),
+        label,
+    )
+
+
+def _resolve_hygiene_symlink_target(relative: str, target: str) -> str:
+    if not target or "\0" in target or target.startswith("/"):
+        raise ValidationError(
+            f"hygiene symbolic link target is not repository-relative: {relative}"
+        )
+    resolved = list(_relative_parts(relative, "hygiene symbolic link"))[:-1]
+    for component in target.split("/"):
+        if component in ("", "."):
+            continue
+        if component == "..":
+            if not resolved:
+                raise ValidationError(
+                    f"hygiene symbolic link escapes the repository: {relative}"
+                )
+            resolved.pop()
+            continue
+        if "\0" in component:
+            raise ValidationError(
+                f"hygiene symbolic link target is invalid: {relative}"
+            )
+        resolved.append(component)
+    if not resolved:
+        raise ValidationError(
+            f"hygiene symbolic link does not name a file: {relative}"
+        )
+    result = "/".join(resolved)
+    _relative_parts(result, "hygiene symbolic link target")
+    return result
+
+
+class _AllowedHygieneSymlink:
+    def __init__(
+        self,
+        *,
+        repository: _BoundDirectory,
+        relative: str,
+        expected_target: str,
+        observed_metadata: os.stat_result,
+        root_device: int,
+        attested_paths: frozenset[str] | None,
+    ) -> None:
+        self.relative = relative
+        self.expected_target = expected_target
+        self.target_relative = _resolve_hygiene_symlink_target(
+            relative,
+            expected_target,
+        )
+        if (
+            attested_paths is not None
+            and self.target_relative not in attested_paths
+        ):
+            raise ValidationError(
+                "hygiene symbolic link target is absent from the candidate "
+                f"identity: {self.target_relative}"
+            )
+        link_parts = _relative_parts(relative, "hygiene symbolic link")
+        target_parts = _relative_parts(
+            self.target_relative,
+            "hygiene symbolic link target",
+        )
+        self.link_parent = _open_relative_parent_binding(
+            repository,
+            link_parts,
+            f"hygiene symbolic link parent {relative}",
+        )
+        self.target_parent: _BoundDirectory | None = None
+        self.target_descriptor = -1
+        try:
+            self.target_parent = _open_relative_parent_binding(
+                repository,
+                target_parts,
+                f"hygiene symbolic link target parent {self.target_relative}",
+            )
+            link_metadata = os.stat(
+                link_parts[-1],
+                dir_fd=self.link_parent.descriptor,
+                follow_symlinks=False,
+            )
+            target_text = os.readlink(
+                link_parts[-1],
+                dir_fd=self.link_parent.descriptor,
+            )
+            if (
+                not stat.S_ISLNK(link_metadata.st_mode)
+                or _metadata_signature(link_metadata)
+                != _metadata_signature(observed_metadata)
+                or target_text != expected_target
+            ):
+                raise ValidationError(
+                    f"hygiene symbolic link changed while being bound: {relative}"
+                )
+            self.link_signature = _metadata_signature(link_metadata)
+            try:
+                self.target_descriptor = os.open(
+                    target_parts[-1],
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=self.target_parent.descriptor,
+                )
+            except OSError as error:
+                raise ValidationError(
+                    "cannot bind hygiene symbolic link target "
+                    f"{self.target_relative}: {error}"
+                ) from error
+            target_metadata = os.fstat(self.target_descriptor)
+            if (
+                not stat.S_ISREG(target_metadata.st_mode)
+                or target_metadata.st_nlink != 1
+                or target_metadata.st_dev != root_device
+            ):
+                raise ValidationError(
+                    "hygiene symbolic link target must be one in-repository "
+                    f"non-hardlinked regular file: {self.target_relative}"
+                )
+            self.target_signature = _metadata_signature(target_metadata)
+            self.target_identity = (
+                target_metadata.st_dev,
+                target_metadata.st_ino,
+            )
+            self.link_parent.assert_current(
+                f"hygiene symbolic link parent {relative}"
+            )
+            self.target_parent.assert_current(
+                f"hygiene symbolic link target parent {self.target_relative}"
+            )
+            if not _path_matches_file(
+                self.target_parent.descriptor,
+                target_parts[-1],
+                self.target_identity,
+            ):
+                raise ValidationError(
+                    f"hygiene symbolic link target changed: {self.target_relative}"
+                )
+        except BaseException:
+            self.close()
+            raise
+
+    def assert_current(self, scanned_regular_paths: set[str]) -> None:
+        if self.target_relative not in scanned_regular_paths:
+            raise ValidationError(
+                "hygiene symbolic link target was not scanned as source: "
+                f"{self.target_relative}"
+            )
+        link_parts = _relative_parts(self.relative, "hygiene symbolic link")
+        target_parts = _relative_parts(
+            self.target_relative,
+            "hygiene symbolic link target",
+        )
+        assert self.target_parent is not None
+        self.link_parent.assert_current(
+            f"hygiene symbolic link parent {self.relative}"
+        )
+        self.target_parent.assert_current(
+            f"hygiene symbolic link target parent {self.target_relative}"
+        )
+        try:
+            link_metadata = os.stat(
+                link_parts[-1],
+                dir_fd=self.link_parent.descriptor,
+                follow_symlinks=False,
+            )
+            target_text = os.readlink(
+                link_parts[-1],
+                dir_fd=self.link_parent.descriptor,
+            )
+            target_metadata = os.fstat(self.target_descriptor)
+        except OSError as error:
+            raise ValidationError(
+                f"hygiene symbolic link changed during traversal: {self.relative}: "
+                f"{error}"
+            ) from error
+        if (
+            not stat.S_ISLNK(link_metadata.st_mode)
+            or _metadata_signature(link_metadata) != self.link_signature
+            or target_text != self.expected_target
+        ):
+            raise ValidationError(
+                f"hygiene symbolic link changed during traversal: {self.relative}"
+            )
+        if (
+            _metadata_signature(target_metadata) != self.target_signature
+            or not _path_matches_file(
+                self.target_parent.descriptor,
+                target_parts[-1],
+                self.target_identity,
+            )
+        ):
+            raise ValidationError(
+                "hygiene symbolic link target changed during traversal: "
+                f"{self.target_relative}"
+            )
+
+    def close(self) -> None:
+        if self.target_descriptor >= 0:
+            try:
+                os.close(self.target_descriptor)
+            except OSError:
+                pass
+            self.target_descriptor = -1
+        if self.target_parent is not None:
+            self.target_parent.close()
+            self.target_parent = None
+        self.link_parent.close()
+
+
+@contextlib.contextmanager
+def _hygiene_repository(
+    value: Path | _BoundDirectory,
+) -> Iterator[_BoundDirectory]:
+    if isinstance(value, _BoundDirectory):
+        value.assert_current("hygiene repository")
+        yield value
+        value.assert_current("hygiene repository")
+        return
+    binding = _open_absolute_directory(value, "hygiene repository")
+    try:
+        yield binding
+        binding.assert_current("hygiene repository")
+    finally:
+        binding.close()
+
+
+def _hygiene_component_excluded(name: str) -> bool:
+    return name in _HYGIENE_EXCLUDED_COMPONENTS or name.startswith("build-")
+
+
+def _read_tree_file(
+    directory_descriptor: int,
+    name: str,
+    relative: str,
+    budget: dict[str, int],
+) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_descriptor,
+        )
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValidationError(
+                f"hygiene source must be one non-hardlinked regular file: {relative}"
+            )
+        if before.st_size < 0 or before.st_size > MAX_HYGIENE_FILE_BYTES:
+            raise ValidationError(
+                f"hygiene source exceeds the per-file byte bound: {relative}"
+            )
+        if budget["bytes"] + before.st_size > MAX_HYGIENE_TOTAL_BYTES:
+            raise ValidationError("hygiene source exceeds the aggregate byte bound")
+        budget["files"] += 1
+        budget["bytes"] += before.st_size
+        if budget["files"] > MAX_HYGIENE_FILES:
+            raise ValidationError("hygiene source exceeds the file-count bound")
+        payload = bytearray()
+        remaining = before.st_size
+        while remaining:
+            if time.monotonic_ns() > budget["deadline_ns"]:
+                raise ValidationError("hygiene source exceeds the wall-time bound")
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValidationError(
+                    f"hygiene source ended before its recorded size: {relative}"
+                )
+            payload.extend(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValidationError(f"hygiene source grew while being read: {relative}")
+        after = os.fstat(descriptor)
+        if (
+            _metadata_signature(after) != _metadata_signature(before)
+            or not _path_matches_file(
+                directory_descriptor,
+                name,
+                (before.st_dev, before.st_ino),
+            )
+        ):
+            raise ValidationError(f"hygiene source changed while being read: {relative}")
+        return bytes(payload)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _hygiene_attested_directories(
+    attested_paths: frozenset[str] | None,
+) -> frozenset[str] | None:
+    if attested_paths is None:
+        return None
+    if not isinstance(attested_paths, frozenset):
+        raise ValidationError("candidate source path inventory must be a frozenset")
+    if len(attested_paths) > MAX_HYGIENE_FILES:
+        raise ValidationError(
+            "candidate source identity inventory exceeds the file-count bound"
+        )
+    directories: set[str] = set()
+    input_bytes = 0
+    for path in attested_paths:
+        if not isinstance(path, str):
+            raise ValidationError("candidate source identity path must be text")
+        try:
+            encoded = os.fsencode(path)
+        except (TypeError, UnicodeEncodeError) as error:
+            raise ValidationError(
+                "candidate source identity path cannot be encoded"
+            ) from error
+        input_bytes += len(encoded) + 1
+        if input_bytes > MAX_HYGIENE_GIT_INVENTORY_BYTES:
+            raise ValidationError(
+                "candidate source identity inventory exceeds the byte bound"
+            )
+        parts = _relative_parts(path, "candidate source identity")
+        if "/".join(parts) != path:
+            raise ValidationError(
+                "candidate source identity path is not canonical"
+            )
+        if len(parts) > MAX_HYGIENE_DEPTH + 1:
+            raise ValidationError(
+                "candidate source identity path exceeds the directory-depth bound"
+            )
+        for index in range(1, len(parts)):
+            directories.add("/".join(parts[:index]))
+            if len(directories) > MAX_HYGIENE_DIRECTORIES:
+                raise ValidationError(
+                    "candidate source directory inventory exceeds the "
+                    "directory-count bound"
+                )
+    return frozenset(directories)
+
+
+def _iter_hygiene_files(
+    repository: _BoundDirectory,
+    *,
+    relative_root: str | None = None,
+    suffixes: frozenset[str] | None = None,
+    attested_paths: frozenset[str] | None = None,
+    reject_unattested: bool = False,
+) -> Iterator[tuple[str, bytes]]:
+    budget = {
+        "directories": 0,
+        "files": 0,
+        "bytes": 0,
+        "deadline_ns": time.monotonic_ns()
+        + HYGIENE_TIMEOUT_SECONDS * 1_000_000_000,
+    }
+    attested_directories = _hygiene_attested_directories(attested_paths)
+    root_binding: _BoundDirectory | None = None
+    if relative_root is None:
+        root_descriptor = os.dup(repository.descriptor)
+        root_prefix = ""
+    else:
+        root_binding = _open_relative_directory(
+            repository.descriptor,
+            relative_root,
+            f"production source root {relative_root}",
+        )
+        root_descriptor = os.dup(root_binding.descriptor)
+        root_prefix = "/".join(_relative_parts(relative_root, "production source root"))
+    root_device = os.fstat(root_descriptor).st_dev
+    allowed_symlinks: list[_AllowedHygieneSymlink] = []
+    scanned_regular_paths: set[str] = set()
+
+    def visit(
+        descriptor: int,
+        prefix: str,
+        depth: int,
+    ) -> Iterator[tuple[str, bytes]]:
+        if depth > MAX_HYGIENE_DEPTH:
+            raise ValidationError("hygiene source exceeds the directory-depth bound")
+        budget["directories"] += 1
+        if budget["directories"] > MAX_HYGIENE_DIRECTORIES:
+            raise ValidationError("hygiene source exceeds the directory-count bound")
+        directory_before = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(directory_before.st_mode)
+            or directory_before.st_dev != root_device
+        ):
+            raise ValidationError(
+                f"hygiene directory binding changed: {prefix or '.'}"
+            )
+        names: list[str] = []
+        try:
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    names.append(entry.name)
+                    if len(names) > MAX_HYGIENE_DIRECTORY_ENTRIES:
+                        raise ValidationError(
+                            f"hygiene directory exceeds the entry bound: {prefix or '.'}"
+                        )
+            for name in sorted(names):
+                if time.monotonic_ns() > budget["deadline_ns"]:
+                    raise ValidationError("hygiene source exceeds the wall-time bound")
+                if name in ("", ".", "..") or "\0" in name:
+                    raise ValidationError("hygiene source contains an invalid path name")
+                relative = f"{prefix}/{name}" if prefix else name
+                if len(os.fsencode(relative)) > MAX_REFERENCE_PATH_BYTES:
+                    raise ValidationError("hygiene source path exceeds the reference bound")
+                try:
+                    metadata = os.stat(
+                        name,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise ValidationError(
+                        f"cannot inspect hygiene source {relative}: {error}"
+                    ) from error
+                if stat.S_ISDIR(metadata.st_mode):
+                    excluded_without_attested_source = (
+                        _hygiene_component_excluded(name)
+                        and attested_directories is not None
+                        and relative not in attested_directories
+                    )
+                    if excluded_without_attested_source and not reject_unattested:
+                        continue
+                    if (
+                        attested_directories is not None
+                        and relative not in attested_directories
+                    ):
+                        if reject_unattested:
+                            raise ValidationError(
+                                "production source directory is absent from the "
+                                f"candidate identity: {relative}"
+                            )
+                        continue
+                    if metadata.st_dev != root_device:
+                        raise ValidationError(
+                            f"hygiene source crosses a filesystem boundary: {relative}"
+                        )
+                    try:
+                        child = os.open(
+                            name,
+                            os.O_RDONLY
+                            | os.O_CLOEXEC
+                            | os.O_DIRECTORY
+                            | os.O_NOFOLLOW,
+                            dir_fd=descriptor,
+                        )
+                    except OSError as error:
+                        raise ValidationError(
+                            f"cannot bind hygiene directory {relative}: {error}"
+                        ) from error
+                    try:
+                        child_metadata = os.fstat(child)
+                        if (
+                            not stat.S_ISDIR(child_metadata.st_mode)
+                            or _metadata_signature(child_metadata)
+                            != _metadata_signature(metadata)
+                        ):
+                            raise ValidationError(
+                                f"hygiene directory changed before traversal: {relative}"
+                            )
+                        yield from visit(child, relative, depth + 1)
+                        current = os.stat(
+                            name,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            _metadata_signature(os.fstat(child))
+                            != _metadata_signature(child_metadata)
+                            or _metadata_signature(current)
+                            != _metadata_signature(child_metadata)
+                        ):
+                            raise ValidationError(
+                                f"hygiene directory changed during traversal: {relative}"
+                            )
+                    finally:
+                        os.close(child)
+                    continue
+                if stat.S_ISLNK(metadata.st_mode):
+                    if attested_paths is not None and relative not in attested_paths:
+                        if reject_unattested:
+                            raise ValidationError(
+                                f"production source is absent from the candidate "
+                                f"identity: {relative}"
+                            )
+                        continue
+                    expected_target = _HYGIENE_ALLOWED_SYMLINKS.get(relative)
+                    if expected_target is None:
+                        raise ValidationError(
+                            f"hygiene source contains a symbolic link: {relative}"
+                        )
+                    try:
+                        target = os.readlink(name, dir_fd=descriptor)
+                    except OSError as error:
+                        raise ValidationError(
+                            f"cannot inspect hygiene symbolic link {relative}: {error}"
+                        ) from error
+                    if target != expected_target:
+                        raise ValidationError(
+                            f"hygiene symbolic link target changed: {relative}"
+                        )
+                    allowed_symlinks.append(
+                        _AllowedHygieneSymlink(
+                            repository=repository,
+                            relative=relative,
+                            expected_target=expected_target,
+                            observed_metadata=metadata,
+                            root_device=root_device,
+                            attested_paths=attested_paths,
+                        )
+                    )
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValidationError(
+                        f"hygiene source contains a special file: {relative}"
+                    )
+                if attested_paths is not None and relative not in attested_paths:
+                    if reject_unattested:
+                        raise ValidationError(
+                            f"production source is absent from the candidate "
+                            f"identity: {relative}"
+                        )
+                    continue
+                if suffixes is not None and Path(name).suffix not in suffixes:
+                    continue
+                payload = _read_tree_file(descriptor, name, relative, budget)
+                scanned_regular_paths.add(relative)
+                yield relative, payload
+        except OSError as error:
+            raise ValidationError(
+                f"cannot traverse hygiene directory {prefix or '.'}: {error}"
+            ) from error
+        finally:
+            try:
+                directory_after = os.fstat(descriptor)
+            except OSError as error:
+                raise ValidationError(
+                    f"hygiene directory changed during traversal: "
+                    f"{prefix or '.'}: {error}"
+                ) from error
+            if _metadata_signature(directory_after) != _metadata_signature(
+                directory_before
+            ):
+                raise ValidationError(
+                    f"hygiene directory changed during traversal: {prefix or '.'}"
+                )
+
+    try:
+        if (
+            reject_unattested
+            and attested_directories is not None
+            and root_prefix
+            and root_prefix not in attested_directories
+        ):
+            raise ValidationError(
+                "production source root is absent from the candidate identity: "
+                f"{root_prefix}"
+            )
+        yield from visit(root_descriptor, root_prefix, 0)
+        for allowed_symlink in allowed_symlinks:
+            allowed_symlink.assert_current(scanned_regular_paths)
+        if root_binding is not None:
+            root_binding.assert_current(
+                f"production source root {root_prefix}"
+            )
+        repository.assert_current("hygiene repository")
+    finally:
+        for allowed_symlink in reversed(allowed_symlinks):
+            allowed_symlink.close()
+        os.close(root_descriptor)
+        if root_binding is not None:
+            root_binding.close()
+
+
+def _step18_attested_source_paths(
+    repository: _BoundDirectory,
+) -> frozenset[str]:
+    environment = {
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    }
+    argv = [
+        "git",
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-C",
+        f"/proc/self/fd/{repository.descriptor}",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ]
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            pass_fds=(repository.descriptor,),
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise ValidationError(
+            f"cannot enumerate candidate source identity paths: {error}"
+        ) from error
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    output = bytearray()
+    deadline = time.monotonic() + GIT_CHECK_TIMEOUT_SECONDS
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValidationError(
+                    "candidate source identity inventory exceeded the time bound"
+                )
+            events = selector.select(remaining)
+            if not events:
+                raise ValidationError(
+                    "candidate source identity inventory exceeded the time bound"
+                )
+            for key, _ in events:
+                chunk = os.read(key.fd, 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output.extend(chunk)
+                if len(output) > MAX_HYGIENE_GIT_INVENTORY_BYTES:
+                    raise ValidationError(
+                        "candidate source identity inventory exceeds the byte bound"
+                    )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValidationError(
+                "candidate source identity inventory exceeded the time bound"
+            )
+        return_code = process.wait(timeout=remaining)
+        if return_code != 0:
+            raise ValidationError("Git could not enumerate candidate source paths")
+    except (OSError, subprocess.TimeoutExpired, ValidationError):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+
+    paths: set[str] = set()
+    for encoded_buffer in output.split(b"\0"):
+        encoded = bytes(encoded_buffer)
+        if not encoded:
+            continue
+        if (
+            len(encoded) > MAX_REFERENCE_PATH_BYTES
+            or encoded.startswith(b"/")
+            or any(part in (b"", b".", b"..") for part in encoded.split(b"/"))
+        ):
+            raise ValidationError("Git returned a non-canonical candidate source path")
+        paths.add(os.fsdecode(encoded))
+        if len(paths) > MAX_HYGIENE_FILES:
+            raise ValidationError(
+                "candidate source identity inventory exceeds the file-count bound"
+            )
+    repository.assert_current("hygiene repository")
+    return frozenset(paths)
 
 
 def _sha256_text(value: str) -> str:
@@ -187,14 +1252,92 @@ def _exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
     return value
 
 
-def _load_json(path: Path, label: str) -> dict[str, Any]:
+def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValidationError("JSON object repeats a field")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(token: str) -> None:
+    raise ValidationError(f"JSON contains non-finite number: {token}")
+
+
+def _validate_json_bounds(value: Any, label: str) -> None:
+    stack = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES:
+            raise ValidationError(f"{label} exceeds the JSON node bound")
+        if depth > MAX_JSON_DEPTH:
+            raise ValidationError(f"{label} exceeds the JSON depth bound")
+        if isinstance(item, dict):
+            if len(item) > MAX_JSON_COLLECTION_ITEMS:
+                raise ValidationError(f"{label} object exceeds the member bound")
+            for key, child in item.items():
+                try:
+                    key_bytes = len(key.encode("utf-8"))
+                except UnicodeEncodeError as error:
+                    raise ValidationError(f"{label} key is not valid Unicode") from error
+                if key_bytes > MAX_JSON_KEY_BYTES:
+                    raise ValidationError(f"{label} key exceeds the byte bound")
+                stack.append((child, depth + 1))
+        elif isinstance(item, list):
+            if len(item) > MAX_JSON_COLLECTION_ITEMS:
+                raise ValidationError(f"{label} array exceeds the item bound")
+            stack.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str):
+            try:
+                size = len(item.encode("utf-8"))
+            except UnicodeEncodeError as error:
+                raise ValidationError(f"{label} string is not valid Unicode") from error
+            if size > MAX_JSON_STRING_BYTES:
+                raise ValidationError(f"{label} string exceeds the byte bound")
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValidationError(f"{label} contains a non-finite number")
+        elif item is not None and not isinstance(item, (bool, int, float)):
+            raise ValidationError(f"{label} contains an unsupported JSON value")
+
+
+def _parse_json_value(snapshot: _FileSnapshot, label: str) -> Any:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        value = json.loads(
+            snapshot.payload.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValidationError(f"{label} is not readable JSON: {error}") from error
+    _validate_json_bounds(value, label)
+    return value
+
+
+def _parse_json_object(snapshot: _FileSnapshot, label: str) -> dict[str, Any]:
+    value = _parse_json_value(snapshot, label)
     if not isinstance(value, dict):
         raise ValidationError(f"{label} must contain one JSON object")
     return value
+
+
+def _load_json_snapshot(
+    path: Path,
+    label: str,
+    max_bytes: int,
+) -> tuple[dict[str, Any], _FileSnapshot]:
+    snapshot = _read_bounded_regular_file(path, label, max_bytes)
+    return _parse_json_object(snapshot, label), snapshot
+
+
+def _load_json(
+    path: Path,
+    label: str,
+    max_bytes: int = MAX_ARTIFACT_MANIFEST_BYTES,
+) -> dict[str, Any]:
+    return _load_json_snapshot(path, label, max_bytes)[0]
 
 
 def _resolve_file(
@@ -203,25 +1346,30 @@ def _resolve_file(
     expected_hash: Any,
     expected_bytes: Any,
     label: str,
-) -> tuple[Path, str, int]:
-    if not isinstance(raw_path, str) or not raw_path:
+    max_bytes: int,
+) -> _FileSnapshot:
+    if (
+        not isinstance(raw_path, str)
+        or not raw_path
+        or "\0" in raw_path
+        or len(os.fsencode(raw_path)) > MAX_REFERENCE_PATH_BYTES
+    ):
         raise ValidationError(f"{label} path must be a non-empty string")
     candidate = Path(raw_path)
     path = candidate if candidate.is_absolute() else owner_path.parent / candidate
-    path = path.resolve()
-    if not path.is_file():
-        raise ValidationError(f"{label} is not a retained regular file: {path}")
-    digest = _sha256(path)
-    if digest != _sha256_value(expected_hash, f"{label} hash"):
-        raise ValidationError(f"{label} hash changed")
     if (
         not isinstance(expected_bytes, int)
         or isinstance(expected_bytes, bool)
         or expected_bytes < 0
-        or path.stat().st_size != expected_bytes
+        or expected_bytes > max_bytes
     ):
+        raise ValidationError(f"{label} byte count is invalid or unbounded")
+    snapshot = _read_bounded_regular_file(path, label, max_bytes)
+    if snapshot.sha256 != _sha256_value(expected_hash, f"{label} hash"):
+        raise ValidationError(f"{label} hash changed")
+    if snapshot.size != expected_bytes:
         raise ValidationError(f"{label} byte count changed")
-    return path, digest, expected_bytes
+    return snapshot
 
 
 def _identity(value: Any, label: str) -> dict[str, Any]:
@@ -423,6 +1571,9 @@ set -u'''
 
 def _lane_body(lane: str) -> str:
     if lane == "full_dev_regression":
+        # Historical artifact contract only. The current command exits 78 and
+        # must not be replaced with the narrower `retained` aggregate: the
+        # unavailable Step 18 producer promised the complete product matrix.
         return "./scripts/test-all.sh all"
     if lane == "full_ros_regression":
         return rf'''{_gcc13_probe()}
@@ -456,6 +1607,10 @@ printf 'STEP18_ROS_PYTEST_END status=0\n' '''.rstrip()
             )
         return "\n".join(commands)
     if lane in SANITIZER_LANES:
+        # Collision sanitizer paths likewise retain the historical no-selector
+        # command in Step 18 evidence. Their current owner-neutral subset is a
+        # separate `retained-primitives` qualification and cannot satisfy this
+        # old cross-package lane.
         return f"{_gcc13_probe()}\nbash /workspace/{_SANITIZER_SCRIPT[lane]}"
     raise ValidationError(f"unknown release-gate lane: {lane}")
 
@@ -510,13 +1665,23 @@ def expected_outer_command(
         "docker",
         "compose",
         "-f",
-        str((repo_root / "docker-compose.yaml").resolve()),
+        str(_lexical_absolute(repo_root / "docker-compose.yaml", "Compose file")),
     ]
     override = lane_security_override(lane)
     if override is not None:
         if security_override_path is None:
             raise ValidationError(f"{lane} requires a Compose security override")
-        command.extend(["-f", str(security_override_path.resolve())])
+        command.extend(
+            [
+                "-f",
+                str(
+                    _lexical_absolute(
+                        security_override_path,
+                        "Compose security override",
+                    )
+                ),
+            ]
+        )
     elif security_override_path is not None:
         raise ValidationError(f"{lane} must not use a Compose security override")
     profile = lane_profile(lane)
@@ -534,7 +1699,12 @@ def expected_outer_command(
             "/bin/bash",
         ]
     )
-    command.extend(["-v", f"{specs_root.resolve()}:/step18-specs:ro"])
+    command.extend(
+        [
+            "-v",
+            f"{_lexical_absolute(specs_root, 'Specs root')}:/step18-specs:ro",
+        ]
+    )
     for key, value in sorted(labels.items()):
         command.extend(["--label", f"{key}={value}"])
     for key, value in sorted(environment.items()):
@@ -594,10 +1764,10 @@ def _one_marked_section(log: str, begin: str, end: str, label: str) -> str:
     return log[start:finish]
 
 
-def _verify_lane_log(lane: str, log_path: Path) -> dict[str, Any]:
-    if log_path.stat().st_size <= 0:
+def _verify_lane_log(lane: str, log_snapshot: _FileSnapshot) -> dict[str, Any]:
+    if log_snapshot.size <= 0:
         raise ValidationError(f"{lane} container log is empty")
-    text = _clean_log(log_path.read_text(encoding="utf-8", errors="replace"))
+    text = _clean_log(log_snapshot.payload.decode("utf-8", errors="replace"))
     begin = f"STEP18_RELEASE_GATE_BEGIN lane={lane}"
     end = f"STEP18_RELEASE_GATE_END lane={lane} status=0"
     section = _one_marked_section(text, begin, end, f"{lane} release gate")
@@ -764,17 +1934,14 @@ def _verify_lane_log(lane: str, log_path: Path) -> dict[str, Any]:
 
 def _verify_container(
     *,
-    inspect_path: Path,
+    inspect_snapshot: _FileSnapshot,
     repo_root: Path,
     specs_root: Path,
     lane: str,
     execution: dict[str, Any],
     security_override_path: Path | None,
 ) -> dict[str, Any]:
-    try:
-        value = json.loads(inspect_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValidationError(f"{lane} container inspect is invalid: {error}") from error
+    value = _parse_json_value(inspect_snapshot, f"{lane} container inspect")
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
         raise ValidationError(f"{lane} inspect must contain exactly one container")
     record = value[0]
@@ -884,14 +2051,33 @@ def _verify_container(
         raise ValidationError(f"{lane} exact mount inventory differs from inspect")
     workspace = [item for item in mounts if item["destination"] == "/workspace"]
     specs = [item for item in mounts if item["destination"] == "/step18-specs"]
+    try:
+        workspace_source = (
+            _lexical_absolute(
+                Path(workspace[0]["source"]),
+                f"{lane} workspace mount",
+            )
+            if len(workspace) == 1
+            else None
+        )
+        specs_source = (
+            _lexical_absolute(
+                Path(specs[0]["source"]),
+                f"{lane} Specs mount",
+            )
+            if len(specs) == 1
+            else None
+        )
+    except (TypeError, ValueError) as error:
+        raise ValidationError(f"{lane} source mount path is invalid") from error
     if (
         len(workspace) != 1
         or workspace[0]["type"] != "bind"
-        or Path(workspace[0]["source"]).resolve() != repo_root
+        or workspace_source != repo_root
         or workspace[0]["rw"] is not True
         or len(specs) != 1
         or specs[0]["type"] != "bind"
-        or Path(specs[0]["source"]).resolve() != specs_root
+        or specs_source != specs_root
         or specs[0]["rw"] is not False
     ):
         raise ValidationError(f"{lane} source or Specs mount is not exact")
@@ -920,14 +2106,15 @@ def _verify_container(
 
 def _verify_lane_manifest(
     *,
-    manifest_path: Path,
+    manifest_snapshot: _FileSnapshot,
     candidate_source: dict[str, Any],
     candidate_specs_source: dict[str, Any],
     candidate_specs_contract: dict[str, Any],
     repo_root: Path,
     specs_root: Path,
 ) -> dict[str, Any]:
-    manifest = _load_json(manifest_path, "release-gate lane manifest")
+    manifest = _parse_json_object(manifest_snapshot, "release-gate lane manifest")
+    manifest_path = manifest_snapshot.path
     _exact_keys(
         manifest,
         {
@@ -966,9 +2153,13 @@ def _verify_lane_manifest(
         {"manyforge_root", "specs_root"},
         f"{lane} paths",
     )
+    if not all(isinstance(paths[name], str) for name in ("manyforge_root", "specs_root")):
+        raise ValidationError(f"{lane} source roots must be strings")
     if (
-        Path(paths["manyforge_root"]).resolve() != repo_root
-        or Path(paths["specs_root"]).resolve() != specs_root
+        _lexical_absolute(Path(paths["manyforge_root"]), f"{lane} ManyForge root")
+        != repo_root
+        or _lexical_absolute(Path(paths["specs_root"]), f"{lane} Specs root")
+        != specs_root
     ):
         raise ValidationError(f"{lane} source roots differ from the campaign")
 
@@ -1012,7 +2203,7 @@ def _verify_lane_manifest(
         {"container_inspect", "container_log"},
         f"{lane} artifacts",
     )
-    resolved_artifacts: dict[str, tuple[Path, str, int]] = {}
+    resolved_artifacts: dict[str, _FileSnapshot] = {}
     for name in ("container_inspect", "container_log"):
         record = _exact_keys(
             artifacts[name], {"path", "sha256", "bytes"}, f"{lane} {name}"
@@ -1023,10 +2214,15 @@ def _verify_lane_manifest(
             record["sha256"],
             record["bytes"],
             f"{lane} {name}",
+            (
+                MAX_CONTAINER_INSPECT_BYTES
+                if name == "container_inspect"
+                else MAX_CONTAINER_LOG_BYTES
+            ),
         )
-    inspect_path, inspect_hash, _ = resolved_artifacts["container_inspect"]
-    log_path, log_hash, log_bytes = resolved_artifacts["container_log"]
-    if inspect_path == log_path:
+    inspect_snapshot = resolved_artifacts["container_inspect"]
+    log_snapshot = resolved_artifacts["container_log"]
+    if inspect_snapshot.identity == log_snapshot.identity:
         raise ValidationError(f"{lane} inspect and log artifacts alias")
 
     script_hash_bundle = _exact_keys(
@@ -1046,14 +2242,17 @@ def _verify_lane_manifest(
     if script_hash_bundle["before"] != script_hash_bundle["after"]:
         raise ValidationError(f"{lane} qualification inputs changed during execution")
     for relative in expected_inputs:
-        path = (repo_root / relative).resolve()
+        path = _lexical_absolute(repo_root / relative, f"{lane} qualification input")
         try:
             path.relative_to(repo_root)
         except ValueError as error:
             raise ValidationError(f"{lane} script path escapes source root") from error
-        if not path.is_file():
-            raise ValidationError(f"{lane} qualification input is missing: {relative}")
-        if _sha256(path) != _sha256_value(
+        input_snapshot = _read_bounded_regular_file(
+            path,
+            f"{lane} qualification input {relative}",
+            MAX_QUALIFICATION_INPUT_BYTES,
+        )
+        if input_snapshot.sha256 != _sha256_value(
             script_hash_bundle["after"][relative], relative
         ):
             raise ValidationError(f"{lane} qualification input hash changed: {relative}")
@@ -1119,40 +2318,52 @@ def _verify_lane_manifest(
             {"path", "sha256", "bytes"},
             f"{lane} security override",
         )
-        security_override_path, override_digest, override_bytes = _resolve_file(
+        override_snapshot = _resolve_file(
             manifest_path,
             override["path"],
             override["sha256"],
             override["bytes"],
             f"{lane} security override",
+            MAX_SECURITY_OVERRIDE_BYTES,
         )
         try:
-            observed_override = security_override_path.read_text(encoding="utf-8")
-        except OSError as error:
+            observed_override = override_snapshot.payload.decode("utf-8")
+        except UnicodeDecodeError as error:
             raise ValidationError(f"cannot read {lane} security override: {error}") from error
         if observed_override != expected_override:
             raise ValidationError(f"{lane} security override content differs")
+        security_override_path = override_snapshot.path
         security_override_binding = {
             "path": str(security_override_path),
-            "sha256": override_digest,
-            "bytes": override_bytes,
+            "sha256": override_snapshot.sha256,
+            "bytes": override_snapshot.size,
         }
     container = _verify_container(
-        inspect_path=inspect_path,
+        inspect_snapshot=inspect_snapshot,
         repo_root=repo_root,
         specs_root=specs_root,
         lane=lane,
         execution=execution,
         security_override_path=security_override_path,
     )
-    test_summary = _verify_lane_log(lane, log_path)
+    test_summary = _verify_lane_log(lane, log_snapshot)
     return {
         "name": lane,
         "run_id": run_id,
-        "lane_manifest": {"path": str(manifest_path), "sha256": _sha256(manifest_path)},
+        "lane_manifest": {
+            "path": str(manifest_path),
+            "sha256": manifest_snapshot.sha256,
+        },
         "container": container,
-        "container_inspect": {"path": str(inspect_path), "sha256": inspect_hash},
-        "container_log": {"path": str(log_path), "sha256": log_hash, "bytes": log_bytes},
+        "container_inspect": {
+            "path": str(inspect_snapshot.path),
+            "sha256": inspect_snapshot.sha256,
+        },
+        "container_log": {
+            "path": str(log_snapshot.path),
+            "sha256": log_snapshot.sha256,
+            "bytes": log_snapshot.size,
+        },
         "security_override": security_override_binding,
         "test_summary": test_summary,
         "passed": True,
@@ -1160,8 +2371,12 @@ def _verify_lane_manifest(
 
 
 def verify_artifact_manifest(manifest_path: Path) -> dict[str, Any]:
-    manifest_path = manifest_path.resolve()
-    manifest = _load_json(manifest_path, "release-gate artifact manifest")
+    manifest, manifest_snapshot = _load_json_snapshot(
+        manifest_path,
+        "release-gate artifact manifest",
+        MAX_ARTIFACT_MANIFEST_BYTES,
+    )
+    manifest_path = manifest_snapshot.path
     _exact_keys(
         manifest,
         {
@@ -1197,10 +2412,18 @@ def verify_artifact_manifest(manifest_path: Path) -> dict[str, Any]:
         },
         "release-gate candidate",
     )
-    repo_root = Path(candidate["manyforge_root"]).resolve()
-    specs_root = Path(candidate["specs_root"]).resolve()
-    if not repo_root.is_dir() or not specs_root.is_dir():
-        raise ValidationError("release-gate candidate roots are unavailable")
+    if not isinstance(candidate["manyforge_root"], str) or not isinstance(
+        candidate["specs_root"], str
+    ):
+        raise ValidationError("release-gate candidate roots must be strings")
+    repo_root = _lexical_absolute(
+        Path(candidate["manyforge_root"]),
+        "release-gate ManyForge root",
+    )
+    specs_root = _lexical_absolute(
+        Path(candidate["specs_root"]),
+        "release-gate Specs root",
+    )
     candidate_source = _identity(candidate["source_identity"], "candidate source")
     candidate_specs_source = _identity(
         candidate["specs_source_identity"], "candidate Specs source"
@@ -1240,6 +2463,7 @@ def verify_artifact_manifest(manifest_path: Path) -> dict[str, Any]:
         raise ValidationError("artifact manifest must contain exactly seven lane references")
     lane_names: list[str] = []
     manifest_paths: list[Path] = []
+    manifest_identities: list[tuple[int, int]] = []
     verified: dict[str, dict[str, Any]] = {}
     for index, raw in enumerate(references):
         reference = _exact_keys(
@@ -1251,16 +2475,18 @@ def verify_artifact_manifest(manifest_path: Path) -> dict[str, Any]:
         if lane not in LANES:
             raise ValidationError(f"lane reference {index} has unknown lane: {lane}")
         lane_names.append(lane)
-        lane_path, _, _ = _resolve_file(
+        lane_snapshot = _resolve_file(
             manifest_path,
             reference["manifest_path"],
             reference["manifest_sha256"],
             reference["manifest_bytes"],
             f"{lane} lane manifest",
+            MAX_LANE_MANIFEST_BYTES,
         )
-        manifest_paths.append(lane_path)
+        manifest_paths.append(lane_snapshot.path)
+        manifest_identities.append(lane_snapshot.identity)
         result = _verify_lane_manifest(
-            manifest_path=lane_path,
+            manifest_snapshot=lane_snapshot,
             candidate_source=candidate_source,
             candidate_specs_source=candidate_specs_source,
             candidate_specs_contract=candidate_specs_contract,
@@ -1274,6 +2500,8 @@ def verify_artifact_manifest(manifest_path: Path) -> dict[str, Any]:
         raise ValidationError("release-gate lanes are missing or duplicated")
     if len(set(manifest_paths)) != len(LANES):
         raise ValidationError("release-gate lane references alias the same manifest")
+    if len(set(manifest_identities)) != len(LANES):
+        raise ValidationError("release-gate lane manifests alias one inode")
 
     run_ids = [verified[lane]["run_id"] for lane in LANES]
     container_ids = [verified[lane]["container"]["id"] for lane in LANES]
@@ -1298,27 +2526,39 @@ def verify_artifact_manifest(manifest_path: Path) -> dict[str, Any]:
     if len(ros_images) != 1:
         raise ValidationError("ROS and sanitizer lanes used different ros-full images")
 
-    verifier_path = (
-        repo_root / "scripts/qualification/verify_step18_release_gates.py"
-    ).resolve()
-    runner_path = (
-        repo_root / "scripts/qualification/run_step18_release_gates.py"
-    ).resolve()
+    verifier_path = _lexical_absolute(
+        repo_root / "scripts/qualification/verify_step18_release_gates.py",
+        "release verifier",
+    )
+    runner_path = _lexical_absolute(
+        repo_root / "scripts/qualification/run_step18_release_gates.py",
+        "release runner",
+    )
+    verifier_snapshot = _read_bounded_regular_file(
+        verifier_path,
+        "release verifier",
+        MAX_QUALIFICATION_INPUT_BYTES,
+    )
+    runner_snapshot = _read_bounded_regular_file(
+        runner_path,
+        "release runner",
+        MAX_QUALIFICATION_INPUT_BYTES,
+    )
     retained_artifact_manifest: list[dict[str, Any]] = [
         {
             "role": "release_artifact_manifest",
             "path": str(manifest_path),
-            "sha256": _sha256(manifest_path),
+            "sha256": manifest_snapshot.sha256,
         },
         {
             "role": "release_verifier",
             "path": str(verifier_path),
-            "sha256": _sha256(verifier_path),
+            "sha256": verifier_snapshot.sha256,
         },
         {
             "role": "release_runner",
             "path": str(runner_path),
-            "sha256": _sha256(runner_path),
+            "sha256": runner_snapshot.sha256,
         },
     ]
     for lane in LANES:
@@ -1350,16 +2590,16 @@ def verify_artifact_manifest(manifest_path: Path) -> dict[str, Any]:
         "lanes": [verified[lane] for lane in LANES],
         "artifact_manifest": {
             "path": str(manifest_path),
-            "sha256": _sha256(manifest_path),
+            "sha256": manifest_snapshot.sha256,
         },
         "retained_artifact_manifest": retained_artifact_manifest,
         "runner": {
             "path": str(runner_path),
-            "sha256": _sha256(runner_path),
+            "sha256": runner_snapshot.sha256,
         },
         "verifier": {
             "path": str(verifier_path),
-            "sha256": _sha256(verifier_path),
+            "sha256": verifier_snapshot.sha256,
         },
         "failure_count": 0,
         "release_gates_passed": True,
@@ -1368,12 +2608,108 @@ def verify_artifact_manifest(manifest_path: Path) -> dict[str, Any]:
     }
 
 
-def _assert_retained_artifact_manifest_current(value: Any) -> None:
+class _RetainedArtifactHandle:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        label: str,
+        role: str,
+        expected_sha256: str,
+        expected_bytes: int | None,
+        max_bytes: int,
+    ) -> None:
+        self.path = _lexical_absolute(path, label)
+        self.label = label
+        self.role = role
+        self.expected_sha256 = expected_sha256
+        self.expected_bytes = expected_bytes
+        self.parent = _open_absolute_directory(
+            self.path.parent,
+            f"{label} parent",
+        )
+        self.descriptor = -1
+        try:
+            self.descriptor = os.open(
+                self.path.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=self.parent.descriptor,
+            )
+            before = os.fstat(self.descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise ValidationError(
+                    f"{label} must be one non-hardlinked regular file"
+                )
+            if before.st_size <= 0 or before.st_size > max_bytes:
+                raise ValidationError(f"{label} is empty or exceeds its byte bound")
+            self.signature = _metadata_signature(before)
+            self.identity = (before.st_dev, before.st_ino)
+            self.size = before.st_size
+            self._assert_payload_current()
+        except BaseException:
+            self.close()
+            raise
+
+    def _read_payload(self) -> bytes:
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        payload = bytearray()
+        remaining = self.size
+        while remaining:
+            chunk = os.read(self.descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValidationError(
+                    f"{self.label} ended before its recorded size"
+                )
+            payload.extend(chunk)
+            remaining -= len(chunk)
+        if os.read(self.descriptor, 1):
+            raise ValidationError(f"{self.label} grew while being read")
+        return bytes(payload)
+
+    def _assert_payload_current(self) -> None:
+        payload = self._read_payload()
+        if hashlib.sha256(payload).hexdigest() != self.expected_sha256:
+            raise ValidationError(f"release retained artifact changed: {self.path}")
+        if self.expected_bytes is not None and len(payload) != self.expected_bytes:
+            raise ValidationError(
+                f"release retained artifact byte count changed: {self.path}"
+            )
+        self.assert_metadata_current()
+
+    def assert_metadata_current(self) -> None:
+        after = os.fstat(self.descriptor)
+        self.parent.assert_current(f"{self.label} parent")
+        if (
+            _metadata_signature(after) != self.signature
+            or not _path_matches_file(
+                self.parent.descriptor,
+                self.path.name,
+                self.identity,
+            )
+        ):
+            raise ValidationError(f"release retained artifact changed: {self.path}")
+
+    def assert_payload_current(self) -> None:
+        self._assert_payload_current()
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            try:
+                os.close(self.descriptor)
+            except OSError:
+                pass
+            self.descriptor = -1
+        self.parent.close()
+
+
+def _retained_artifact_inventory(
+    value: Any,
+) -> list[tuple[int, dict[str, Any], str, int, str, int | None]]:
     if not isinstance(value, list) or len(value) != 28:
         raise ValidationError(
             "release retained artifact manifest must contain exactly 28 files"
         )
-    paths: list[Path] = []
+    inventory: list[tuple[int, dict[str, Any], str, int, str, int | None]] = []
     roles: list[str] = []
     for index, item in enumerate(value):
         if not isinstance(item, dict) or set(item) not in (
@@ -1387,26 +2723,45 @@ def _assert_retained_artifact_manifest_current(value: Any) -> None:
         role = item.get("role")
         if not isinstance(role, str) or not role:
             raise ValidationError(f"release retained artifact {index} has no role")
-        path = Path(str(item.get("path", ""))).resolve()
-        if not path.is_file():
-            raise ValidationError(f"release retained artifact disappeared: {path}")
-        if _sha256(path) != _sha256_value(
-            item.get("sha256"), f"release retained artifact {index}"
-        ):
-            raise ValidationError(f"release retained artifact changed: {path}")
-        if "bytes" in item and (
-            not isinstance(item["bytes"], int)
-            or isinstance(item["bytes"], bool)
-            or item["bytes"] <= 0
-            or path.stat().st_size != item["bytes"]
+        raw_path = item.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValidationError(f"release retained artifact {index} has no path")
+        role_bound = {
+            "release_artifact_manifest": MAX_ARTIFACT_MANIFEST_BYTES,
+            "release_verifier": MAX_QUALIFICATION_INPUT_BYTES,
+            "release_runner": MAX_QUALIFICATION_INPUT_BYTES,
+            "release_lane_manifest": MAX_LANE_MANIFEST_BYTES,
+            "release_container_inspect": MAX_CONTAINER_INSPECT_BYTES,
+            "release_container_log": MAX_CONTAINER_LOG_BYTES,
+            "release_security_override": MAX_SECURITY_OVERRIDE_BYTES,
+        }.get(role)
+        if role_bound is None:
+            raise ValidationError(f"release retained artifact {index} has unknown role")
+        expected_hash = _sha256_value(
+            item.get("sha256"),
+            f"release retained artifact {index}",
+        )
+        expected_bytes = item.get("bytes") if "bytes" in item else None
+        if expected_bytes is not None and (
+            not isinstance(expected_bytes, int)
+            or isinstance(expected_bytes, bool)
+            or expected_bytes <= 0
+            or expected_bytes > role_bound
         ):
             raise ValidationError(
-                f"release retained artifact byte count changed: {path}"
+                f"release retained artifact {index} byte count is invalid"
             )
-        paths.append(path)
+        inventory.append(
+            (
+                index,
+                item,
+                role,
+                role_bound,
+                expected_hash,
+                expected_bytes,
+            )
+        )
         roles.append(role)
-    if len(set(paths)) != len(paths):
-        raise ValidationError("release retained artifact paths are not globally unique")
     expected_counts = {
         "release_artifact_manifest": 1,
         "release_verifier": 1,
@@ -1434,10 +2789,78 @@ def _assert_retained_artifact_manifest_current(value: Any) -> None:
             raise ValidationError(
                 f"release retained {role} lane order/inventory is not exact"
             )
+    return inventory
 
 
-def _step18_removed_field_hygiene(repo_root: Path) -> list[str]:
+@contextlib.contextmanager
+def _bind_retained_artifact_manifest(
+    value: Any,
+) -> Iterator[list[_RetainedArtifactHandle]]:
+    inventory = _retained_artifact_inventory(value)
+    handles: list[_RetainedArtifactHandle] = []
+    try:
+        for index, item, role, role_bound, expected_hash, expected_bytes in inventory:
+            handles.append(
+                _RetainedArtifactHandle(
+                    path=Path(item["path"]),
+                    label=f"release retained artifact {index}",
+                    role=role,
+                    expected_sha256=expected_hash,
+                    expected_bytes=expected_bytes,
+                    max_bytes=role_bound,
+                )
+            )
+        paths = [handle.path for handle in handles]
+        identities = [handle.identity for handle in handles]
+        if len(set(paths)) != len(paths):
+            raise ValidationError(
+                "release retained artifact paths are not globally unique"
+            )
+        if len(set(identities)) != len(identities):
+            raise ValidationError("release retained artifacts alias one inode")
+        yield handles
+    finally:
+        for handle in reversed(handles):
+            handle.close()
+
+
+def _assert_retained_handles_current(
+    handles: list[_RetainedArtifactHandle],
+    *,
+    payload: bool,
+) -> None:
+    for handle in handles:
+        if payload:
+            handle.assert_payload_current()
+        else:
+            handle.assert_metadata_current()
+    # A second metadata pass detects a mutation of an early file while a later
+    # file was being read. Retained descriptors remain open through publication.
+    for handle in handles:
+        handle.assert_metadata_current()
+
+
+def _assert_retained_artifact_manifest_current(value: Any) -> None:
+    with _bind_retained_artifact_manifest(value) as handles:
+        _assert_retained_handles_current(handles, payload=True)
+
+
+def _hygiene_text(payload: bytes, relative: str) -> str:
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValidationError(
+            f"hygiene source is not valid UTF-8: {relative}"
+        ) from error
+
+
+def _step18_removed_field_hygiene(
+    repo_root: Path | _BoundDirectory,
+    *,
+    attested_paths: frozenset[str] | None = None,
+) -> list[str]:
     removed_field = "min_separation_" + "clearance_m"
+    removed_bytes = removed_field.encode("ascii")
     allowed_test_paths = {
         "manyforge_behavior/tests/test_kernel_client.py",
         "manyforge_behavior/tests/test_program.py",
@@ -1445,65 +2868,77 @@ def _step18_removed_field_hygiene(repo_root: Path) -> list[str]:
         "manyforge_roboplan/test/test_native_e2e.py",
     }
     failures: list[str] = []
-    for path in sorted(repo_root.rglob("*")):
-        if not path.is_file() or any(
-            part
-            in {
-                ".git",
-                ".manyforge-var",
-                ".pytest_cache",
-                "build",
-                "__pycache__",
-                "node_modules",
-            }
-            or part.startswith("build-")
-            for part in path.parts
-        ):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if removed_field not in text:
-            continue
-        relative = path.relative_to(repo_root).as_posix()
-        if relative.startswith("scripts/qualification/baseline/") and relative.endswith(".patch"):
-            continue
-        is_test_source = (
-            relative in allowed_test_paths
-            or ("tests" in path.relative_to(repo_root).parts and path.name.startswith("test_"))
-            or ("test" in path.relative_to(repo_root).parts and path.name.startswith("test_"))
+    with _hygiene_repository(repo_root) as repository:
+        files = _iter_hygiene_files(
+            repository,
+            attested_paths=attested_paths,
         )
-        if is_test_source:
-            lowered = text.lower()
-            if not any(word in lowered for word in ("unknown", "reject", "legacy", "baseline")):
-                failures.append(f"{relative}: removed field is not rejection/baseline evidence")
-            continue
-        if relative == "scripts/qualification/capture_isaac_drop_approach.py":
-            required_boundary_fragments = {
-                f'if "{removed_field}" in normalized:',
-                f'clearance = normalized.pop("{removed_field}")',
-                f'"Step 18 capture rejects nonzero {removed_field}"',
-                f'contact.pop("{removed_field}", None)',
-            }
-            matching = {
-                line.strip() for line in text.splitlines() if removed_field in line
-            }
-            if (
-                matching == required_boundary_fragments
-                and "historical baseline" in text
-                and "never preserves or silently emulates it" in text
-            ):
+        for relative, payload in files:
+            if removed_bytes not in payload:
                 continue
-        if relative == "tests/cpp/perf/perf_runtime_collision_schedule_qualification.cpp":
-            if (
-                text.count(removed_field) == 4
-                and text.count("#if MANYFORGE_RUNTIME_SCHEDULE_BASELINE") >= 2
-                and "baseline mechanism replay requires captured contact_release policy"
-                in text
-            ):
+            text = _hygiene_text(payload, relative)
+            if relative.startswith(
+                "scripts/qualification/baseline/"
+            ) and relative.endswith(".patch"):
                 continue
-        failures.append(f"{relative}: removed field remains outside strict test/baseline evidence")
+            relative_parts = Path(relative).parts
+            is_test_source = (
+                relative in allowed_test_paths
+                or (
+                    "tests" in relative_parts
+                    and Path(relative).name.startswith("test_")
+                )
+                or (
+                    "test" in relative_parts
+                    and Path(relative).name.startswith("test_")
+                )
+            )
+            if is_test_source:
+                lowered = text.lower()
+                if not any(
+                    word in lowered
+                    for word in ("unknown", "reject", "legacy", "baseline")
+                ):
+                    failures.append(
+                        f"{relative}: removed field is not rejection/baseline evidence"
+                    )
+                continue
+            if relative == "scripts/qualification/capture_isaac_drop_approach.py":
+                required_boundary_fragments = {
+                    f'if "{removed_field}" in normalized:',
+                    f'clearance = normalized.pop("{removed_field}")',
+                    f'"Step 18 capture rejects nonzero {removed_field}"',
+                    f'contact.pop("{removed_field}", None)',
+                }
+                matching = {
+                    line.strip()
+                    for line in text.splitlines()
+                    if removed_field in line
+                }
+                if (
+                    matching == required_boundary_fragments
+                    and "historical baseline" in text
+                    and "never preserves or silently emulates it" in text
+                ):
+                    continue
+            if relative == (
+                "tests/cpp/perf/"
+                "perf_runtime_collision_schedule_qualification.cpp"
+            ):
+                if (
+                    text.count(removed_field) == 4
+                    and text.count("#if MANYFORGE_RUNTIME_SCHEDULE_BASELINE") >= 2
+                    and (
+                        "baseline mechanism replay requires captured "
+                        "contact_release policy"
+                    )
+                    in text
+                ):
+                    continue
+            failures.append(
+                f"{relative}: removed field remains outside strict "
+                "test/baseline evidence"
+            )
     if failures:
         raise ValidationError("; ".join(failures))
     return [
@@ -1512,7 +2947,11 @@ def _step18_removed_field_hygiene(repo_root: Path) -> list[str]:
     ]
 
 
-def _step18_distance_scope_hygiene(repo_root: Path) -> list[str]:
+def _step18_distance_scope_hygiene(
+    repo_root: Path | _BoundDirectory,
+    *,
+    attested_paths: frozenset[str] | None = None,
+) -> list[str]:
     producer_roots = (
         "manyforge_core/include",
         "manyforge_core/src",
@@ -1526,37 +2965,58 @@ def _step18_distance_scope_hygiene(repo_root: Path) -> list[str]:
     )
     forbidden_tokens = ("kAllActivePairs", "all_active_pairs")
     failures: list[str] = []
-    for relative_root in producer_roots:
-        root = repo_root / relative_root
-        if not root.is_dir():
-            failures.append(f"missing production source root: {relative_root}")
-            continue
-        for path in root.rglob("*"):
-            if not path.is_file() or path.suffix not in {".cpp", ".hpp", ".h", ".py"}:
-                continue
-            if (
-                path.relative_to(repo_root).as_posix()
-                == "manyforge_core/include/manyforge_core/types/collision.hpp"
-            ):
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            for token in forbidden_tokens:
-                if token in text:
-                    failures.append(
-                        f"{path.relative_to(repo_root)}: production selects {token}"
+    fixed_paths = {
+        "evaluator": "manyforge_core/src/collision_policy_evaluator.cpp",
+        "coordinator": "manyforge_core/src/collision_validation_coordinator.cpp",
+        "runtime": "manyforge_core/src/runtime_collision_query_session.cpp",
+        "engine": "manyforge_collision/src/manyforge_collision_engine.cpp",
+    }
+    with _hygiene_repository(repo_root) as repository:
+        for relative_root in producer_roots:
+            try:
+                files = _iter_hygiene_files(
+                    repository,
+                    relative_root=relative_root,
+                    suffixes=frozenset({".cpp", ".hpp", ".h", ".py"}),
+                    attested_paths=attested_paths,
+                    reject_unattested=attested_paths is not None,
+                )
+                for relative, payload in files:
+                    if (
+                        relative
+                        == "manyforge_core/include/manyforge_core/types/collision.hpp"
+                    ):
+                        continue
+                    text = _hygiene_text(payload, relative)
+                    for token in forbidden_tokens:
+                        if token in text:
+                            failures.append(
+                                f"{relative}: production selects {token}"
+                            )
+            except ValidationError as error:
+                failures.append(str(error))
+
+        texts: dict[str, str] = {}
+        for name, relative in fixed_paths.items():
+            try:
+                if attested_paths is not None and relative not in attested_paths:
+                    raise ValidationError(
+                        "Step 18 distance-scope source is absent from the "
+                        f"candidate identity: {relative}"
                     )
+                snapshot = _read_bounded_regular_file_at(
+                    repository.descriptor,
+                    relative,
+                    f"Step 18 distance-scope source {relative}",
+                    MAX_HYGIENE_FILE_BYTES,
+                )
+                texts[name] = _hygiene_text(snapshot.payload, relative)
+            except ValidationError as error:
+                failures.append(str(error))
+        if failures:
+            raise ValidationError("; ".join(failures))
 
-    evaluator = repo_root / "manyforge_core/src/collision_policy_evaluator.cpp"
-    coordinator = repo_root / "manyforge_core/src/collision_validation_coordinator.cpp"
-    runtime = repo_root / "manyforge_core/src/runtime_collision_query_session.cpp"
-    engine = repo_root / "manyforge_collision/src/manyforge_collision_engine.cpp"
-    for path in (evaluator, coordinator, runtime, engine):
-        if not path.is_file():
-            failures.append(f"missing Step 18 distance-scope source: {path.relative_to(repo_root)}")
-    if failures:
-        raise ValidationError("; ".join(failures))
-
-    evaluator_text = evaluator.read_text(encoding="utf-8")
+    evaluator_text = texts["evaluator"]
     required_evaluator_fragments = (
         "entry.mode == CollisionContactPolicyMode::kBoundedPenetration",
         "ContactReleaseEvidenceMode::kSignedPenetration",
@@ -1566,19 +3026,20 @@ def _step18_distance_scope_hygiene(repo_root: Path) -> list[str]:
     for fragment in required_evaluator_fragments:
         if fragment not in evaluator_text:
             failures.append(f"distance selection lost required fragment: {fragment}")
-    for path in (coordinator, runtime):
-        text = path.read_text(encoding="utf-8")
+    for name in ("coordinator", "runtime"):
+        relative = fixed_paths[name]
+        text = texts[name]
         if "CollisionDistanceRequestMode::kSelectedCollidingPairs" not in text:
-            failures.append(f"{path.relative_to(repo_root)} no longer selects colliding pairs")
+            failures.append(f"{relative} no longer selects colliding pairs")
         modes = set(re.findall(r"CollisionDistanceRequestMode::(k[A-Za-z]+)", text))
         unexpected = modes - {"kNone", "kSelectedCollidingPairs"}
         if unexpected:
             failures.append(
-                f"{path.relative_to(repo_root)} selects unexpected distance "
+                f"{relative} selects unexpected distance "
                 f"modes: {sorted(unexpected)}"
             )
 
-    engine_text = engine.read_text(encoding="utf-8")
+    engine_text = texts["engine"]
     collision_calls = [
         match.start()
         for match in re.finditer(r"pinocchio::computeCollisions\(", engine_text)
@@ -1611,27 +3072,49 @@ def _step18_distance_scope_hygiene(repo_root: Path) -> list[str]:
         "signed_bounded_and_contact_grasp_select_configured_pairs",
         "collision_enumeration_precedes_sparse_distance_work",
     ]
-    checks.extend(_step18_distance_capability_hygiene(repo_root))
+    checks.extend(
+        _step18_distance_capability_hygiene(
+            repo_root,
+            attested_paths=attested_paths,
+        )
+    )
     return checks
 
 
-def _step18_distance_capability_hygiene(repo_root: Path) -> list[str]:
+def _step18_distance_capability_hygiene(
+    repo_root: Path | _BoundDirectory,
+    *,
+    attested_paths: frozenset[str] | None = None,
+) -> list[str]:
     paths = {
-        "types": repo_root / "manyforge_core/include/manyforge_core/types/collision.hpp",
-        "interface": repo_root
-        / "manyforge_core/include/manyforge_core/collision/i_collision_query_engine.hpp",
-        "engine": repo_root / "manyforge_collision/src/manyforge_collision_engine.cpp",
-        "coordinator": repo_root
-        / "manyforge_core/src/collision_validation_coordinator.cpp",
-        "runtime": repo_root / "manyforge_core/src/runtime_collision_query_session.cpp",
+        "types": "manyforge_core/include/manyforge_core/types/collision.hpp",
+        "interface": (
+            "manyforge_core/include/manyforge_core/collision/"
+            "i_collision_query_engine.hpp"
+        ),
+        "engine": "manyforge_collision/src/manyforge_collision_engine.cpp",
+        "coordinator": "manyforge_core/src/collision_validation_coordinator.cpp",
+        "runtime": "manyforge_core/src/runtime_collision_query_session.cpp",
     }
     failures: list[str] = []
     texts: dict[str, str] = {}
-    for name, path in paths.items():
-        if not path.is_file():
-            failures.append(f"missing distance-capability source: {path.relative_to(repo_root)}")
-            continue
-        texts[name] = path.read_text(encoding="utf-8", errors="replace")
+    with _hygiene_repository(repo_root) as repository:
+        for name, relative in paths.items():
+            try:
+                if attested_paths is not None and relative not in attested_paths:
+                    raise ValidationError(
+                        "distance-capability source is absent from the "
+                        f"candidate identity: {relative}"
+                    )
+                snapshot = _read_bounded_regular_file_at(
+                    repository.descriptor,
+                    relative,
+                    f"distance-capability source {relative}",
+                    MAX_HYGIENE_FILE_BYTES,
+                )
+                texts[name] = _hygiene_text(snapshot.payload, relative)
+            except ValidationError as error:
+                failures.append(str(error))
     if failures:
         raise ValidationError("; ".join(failures))
 
@@ -1788,96 +3271,587 @@ def _step18_distance_capability_hygiene(repo_root: Path) -> list[str]:
 
 
 def run_step18_hygiene(repo_root: Path) -> dict[str, Any]:
-    root = repo_root.resolve()
-    if not root.is_dir():
-        raise ValidationError(f"repository root is unavailable: {root}")
-    checks = _step18_removed_field_hygiene(root)
-    checks.extend(_step18_distance_scope_hygiene(root))
-    return {
-        "schema_version": "manyforge.step18.release_gate_hygiene.v1",
-        "checks": checks,
-        "check_count": len(checks),
-        "passed": True,
-        "overall_step18_closure_claimed": False,
+    binding = _open_absolute_directory(repo_root, "hygiene repository")
+    try:
+        try:
+            initial_identity = source_identity(binding.path)
+        except SourceIdentityError as error:
+            raise ValidationError(
+                f"cannot capture initial hygiene source identity: {error}"
+            ) from error
+        attested_paths = _step18_attested_source_paths(binding)
+        checks = _step18_removed_field_hygiene(
+            binding,
+            attested_paths=attested_paths,
+        )
+        checks.extend(
+            _step18_distance_scope_hygiene(
+                binding,
+                attested_paths=attested_paths,
+            )
+        )
+        binding.assert_current("hygiene repository")
+        final_attested_paths = _step18_attested_source_paths(binding)
+        try:
+            final_identity = source_identity(binding.path)
+        except SourceIdentityError as error:
+            raise ValidationError(
+                f"cannot capture final hygiene source identity: {error}"
+            ) from error
+        # Exact pre/post identity and inventory equality detects every
+        # persistent mutation of candidate source while the scan runs.  Like
+        # any userspace observer, it cannot detect an equally privileged
+        # process that edits and restores the same candidate bytes and path
+        # inventory between the two identity observations.
+        if final_attested_paths != attested_paths:
+            raise ValidationError(
+                "candidate source path inventory changed during Step 18 hygiene"
+            )
+        if final_identity != initial_identity:
+            raise ValidationError(
+                "candidate source identity changed during Step 18 hygiene"
+            )
+        binding.assert_current("hygiene repository")
+        return {
+            "schema_version": "manyforge.step18.release_gate_hygiene.v1",
+            "checks": checks,
+            "check_count": len(checks),
+            "passed": True,
+            "overall_step18_closure_claimed": False,
+        }
+    finally:
+        binding.close()
+
+
+@contextlib.contextmanager
+def _bind_publication_parent(
+    repo_root: Path,
+    destination: Path,
+) -> Iterator[tuple[_BoundDirectory, _BoundDirectory, str, Path]]:
+    repo = _open_absolute_directory(repo_root, "publication repository")
+    parent: _BoundDirectory | None = None
+    try:
+        absolute_destination = _lexical_absolute(destination, "release summary")
+        try:
+            relative = absolute_destination.relative_to(repo.path)
+        except ValueError as error:
+            raise ValidationError(
+                "release summary output must be inside the candidate repository"
+            ) from error
+        if (
+            len(relative.parts) < 3
+            or relative.parts[:2] != (".manyforge-var", "qualification")
+            or any(part in ("", ".", "..") for part in relative.parts)
+        ):
+            raise ValidationError(
+                "release summary output must be below .manyforge-var/qualification"
+            )
+        descriptors = [os.dup(repo.descriptor)]
+        names: list[str] = []
+        try:
+            for name in relative.parts[:-1]:
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=descriptors[-1])
+                    os.fsync(descriptors[-1])
+                except FileExistsError:
+                    pass
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW,
+                    dir_fd=descriptors[-1],
+                )
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or metadata.st_mode & 0o022
+                ):
+                    os.close(descriptor)
+                    raise ValidationError(
+                        "release summary directories must be current-user-owned "
+                        "and not group/world writable"
+                    )
+                descriptors.append(descriptor)
+                names.append(name)
+            parent = _BoundDirectory(
+                absolute_destination.parent,
+                descriptors,
+                names,
+            )
+            parent.assert_current("release summary parent")
+        except BaseException:
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+        yield repo, parent, relative.parts[-1], relative
+    finally:
+        if parent is not None:
+            parent.close()
+        repo.close()
+
+
+def _publication_path_is_ignored(
+    repo: _BoundDirectory,
+    relative: Path,
+    head_commit: str,
+) -> bool:
+    environment = {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     }
+    git_prefix = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-C",
+        f"/proc/self/fd/{repo.descriptor}",
+        "cat-file",
+    ]
+    object_name = f"{head_commit}:.gitignore"
+
+    def run_cat_file(mode: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [*git_prefix, mode, object_name],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            pass_fds=(repo.descriptor,),
+            timeout=GIT_CHECK_TIMEOUT_SECONDS,
+        )
+
+    try:
+        size_result = run_cat_file("-s")
+        if (
+            size_result.returncode != 0
+            or len(size_result.stdout) > 32
+            or not size_result.stdout.strip().isdigit()
+        ):
+            raise ValidationError(
+                "candidate HEAD does not provide a bounded .gitignore blob"
+            )
+        declared_size = int(size_result.stdout.strip())
+        if declared_size > MAX_QUALIFICATION_INPUT_BYTES:
+            raise ValidationError("candidate .gitignore exceeds the input byte bound")
+        ignored = run_cat_file("blob")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValidationError(
+            f"cannot prove release summary ignore provenance: {error}"
+        ) from error
+    if ignored.returncode != 0:
+        raise ValidationError(
+            "candidate HEAD does not provide the release summary ignore rule"
+        )
+    if len(ignored.stdout) != declared_size:
+        raise ValidationError("candidate .gitignore changed while being read")
+    try:
+        committed_text = ignored.stdout.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValidationError("candidate .gitignore is not valid UTF-8") from error
+    if committed_text.splitlines().count(".manyforge-var/") != 1:
+        return False
+    current = _read_bounded_regular_file_at(
+        repo.descriptor,
+        ".gitignore",
+        "publication .gitignore",
+        MAX_QUALIFICATION_INPUT_BYTES,
+    )
+    if current.payload != ignored.stdout:
+        raise ValidationError(
+            "publication .gitignore differs from its source-controlled version"
+        )
+    if relative.parts[:1] != (".manyforge-var",):
+        return False
+    try:
+        effective = subprocess.run(
+            [
+                "git",
+                "--no-pager",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "core.excludesFile=/dev/null",
+                "-C",
+                f"/proc/self/fd/{repo.descriptor}",
+                "check-ignore",
+                "--quiet",
+                "--no-index",
+                "--",
+                relative.as_posix(),
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            pass_fds=(repo.descriptor,),
+            timeout=GIT_CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValidationError(
+            f"cannot prove effective release summary ignore rule: {error}"
+        ) from error
+    if effective.returncode not in (0, 1):
+        raise ValidationError(
+            "Git could not evaluate the committed release summary ignore rule"
+        )
+    return effective.returncode == 0
 
 
-def _write_exclusive(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
-        stream.write("\n")
+def _unlink_matching_file(
+    directory_descriptor: int,
+    name: str,
+    identity: tuple[int, int] | None,
+) -> bool:
+    if identity is None:
+        return False
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ValidationError(
+            f"cannot inspect owned publication rollback file {name}: {error}"
+        ) from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != identity
+    ):
+        return False
+    try:
+        os.unlink(name, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
+    except OSError as error:
+        raise ValidationError(
+            f"cannot durably remove owned publication rollback file {name}: {error}"
+        ) from error
+    return True
+
+
+def _render_summary(result: dict[str, Any]) -> bytes:
+    try:
+        payload = (
+            json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as error:
+        raise ValidationError(f"cannot serialize release summary: {error}") from error
+    if len(payload) > MAX_OUTPUT_ARTIFACT_BYTES:
+        raise ValidationError("release summary exceeds the output artifact bound")
+    return payload
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise ValidationError("short write while staging release summary")
+        offset += written
+
+
+def _assert_descriptor_payload(
+    descriptor: int,
+    payload: bytes,
+    label: str,
+) -> os.stat_result:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_size != len(payload):
+        raise ValidationError(f"{label} identity or size changed")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    observed = bytearray()
+    while len(observed) < len(payload):
+        chunk = os.read(
+            descriptor,
+            min(1024 * 1024, len(payload) - len(observed)),
+        )
+        if not chunk:
+            break
+        observed.extend(chunk)
+    if bytes(observed) != payload or os.read(descriptor, 1):
+        raise ValidationError(f"{label} content changed")
+    after = os.fstat(descriptor)
+    if _metadata_signature(after) != _metadata_signature(before):
+        raise ValidationError(f"{label} changed while being read")
+    return after
+
+
+def _assert_publication_candidate_current(
+    *,
+    repo_root: Path,
+    specs_root: Path,
+    campaign_source: dict[str, Any],
+    campaign_specs: dict[str, Any],
+    campaign_contract: dict[str, Any],
+    phase: str,
+) -> None:
+    if source_identity(repo_root) != campaign_source:
+        raise ValidationError(
+            f"ManyForge source changed {phase} release summary publication"
+        )
+    publication_specs = source_identity(specs_root)
+    if (
+        publication_specs["head_commit"] != campaign_specs["head_commit"]
+        or publication_specs["head_tree"] != campaign_specs["head_tree"]
+    ):
+        raise ValidationError(
+            f"full Specs Git base changed {phase} release summary publication"
+        )
+    if specs_contract_identity(specs_root) != campaign_contract:
+        raise ValidationError(
+            f"Specs contract changed {phase} release summary publication"
+        )
 
 
 def publish_verification_summary(
     output: Path, result: dict[str, Any], manifest_path: Path
 ) -> None:
-    campaign = _load_json(manifest_path.resolve(), "release-gate artifact manifest")
+    payload = _render_summary(result)
+    campaign = _load_json(
+        manifest_path,
+        "release-gate artifact manifest",
+        MAX_ARTIFACT_MANIFEST_BYTES,
+    )
     candidate = campaign.get("candidate")
     if not isinstance(candidate, dict):
         raise ValidationError("release-gate publication candidate is missing")
-    repo_root = Path(str(candidate.get("manyforge_root", ""))).resolve()
-    specs_root = Path(str(candidate.get("specs_root", ""))).resolve()
-    destination = output.resolve()
-    evidence_root = (repo_root / ".manyforge-var/qualification").resolve()
-    try:
-        relative = destination.relative_to(evidence_root)
-    except ValueError as error:
-        raise ValidationError(
-            f"release summary output must be below {evidence_root}"
-        ) from error
-    if not relative.parts:
-        raise ValidationError("release summary output must name a file")
-    ignored = subprocess.run(
-        ["git", "-C", str(repo_root), "check-ignore", "--quiet", "--", str(destination)],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    repo_value = candidate.get("manyforge_root")
+    specs_value = candidate.get("specs_root")
+    if not isinstance(repo_value, str) or not isinstance(specs_value, str):
+        raise ValidationError("release-gate publication roots must be strings")
+    repo_root = _lexical_absolute(Path(repo_value), "publication ManyForge root")
+    specs_root = _lexical_absolute(Path(specs_value), "publication Specs root")
+    campaign_source = _identity(candidate.get("source_identity"), "campaign source")
+    campaign_specs = _identity(
+        candidate.get("specs_source_identity"),
+        "campaign Specs source",
     )
-    if ignored.returncode != 0:
-        raise ValidationError("release summary output is not ignored")
-    if destination.exists():
-        raise ValidationError(f"refusing to overwrite release summary: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
-    if temporary.exists():
-        raise ValidationError(f"release summary temporary output exists: {temporary}")
-    try:
-        with temporary.open("x", encoding="utf-8") as stream:
-            json.dump(result, stream, indent=2, sort_keys=True, allow_nan=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        _assert_retained_artifact_manifest_current(
-            result.get("retained_artifact_manifest")
+    campaign_contract = _contract_identity(
+        candidate.get("specs_contract_identity"),
+        "campaign Specs contract",
+    )
+    if campaign_source != _identity(
+        result.get("candidate_source_identity"),
+        "summary source",
+    ) or campaign_specs != _identity(
+        result.get("candidate_specs_source_identity"),
+        "summary Specs source",
+    ) or campaign_contract != _contract_identity(
+        result.get("candidate_specs_contract_identity"),
+        "summary Specs contract",
+    ):
+        raise ValidationError("release summary candidate differs from its campaign")
+
+    retained_value = result.get("retained_artifact_manifest")
+    # Preserve the public assertion hook and then retain the same exact files
+    # by descriptor until the publication linearization point.
+    _assert_retained_artifact_manifest_current(retained_value)
+    with contextlib.ExitStack() as publication_stack:
+        retained_handles = publication_stack.enter_context(
+            _bind_retained_artifact_manifest(retained_value)
         )
-        if source_identity(repo_root) != result.get("candidate_source_identity"):
-            raise ValidationError(
-                "ManyForge source changed before release summary publication"
-            )
-        publication_specs = source_identity(specs_root)
-        campaign_specs = result.get("candidate_specs_source_identity")
-        if not isinstance(campaign_specs, dict) or (
-            publication_specs["head_commit"] != campaign_specs.get("head_commit")
-            or publication_specs["head_tree"] != campaign_specs.get("head_tree")
+        repo, parent, destination_name, relative = publication_stack.enter_context(
+            _bind_publication_parent(repo_root, output)
+        )
+        if not _publication_path_is_ignored(
+            repo,
+            relative,
+            campaign_source["head_commit"],
         ):
-            raise ValidationError(
-                "full Specs Git base changed before release summary publication"
-            )
-        if specs_contract_identity(specs_root) != result.get(
-            "candidate_specs_contract_identity"
-        ):
-            raise ValidationError(
-                "Specs contract changed before release summary publication"
-            )
-        os.link(temporary, destination)
+            raise ValidationError("release summary output is not ignored")
         try:
-            temporary.unlink()
-        except OSError:
+            os.stat(
+                destination_name,
+                dir_fd=parent.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
             pass
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
+        except OSError as error:
+            raise ValidationError(f"cannot inspect release summary output: {error}") from error
+        else:
+            raise ValidationError(f"refusing to overwrite release summary: {output}")
+
+        temporary_name = (
+            f".{destination_name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        temporary_descriptor = -1
+        temporary_identity: tuple[int, int] | None = None
+        publication_identity: tuple[int, int] | None = None
+        try:
+            temporary_descriptor = os.open(
+                temporary_name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent.descriptor,
+            )
+            created = os.fstat(temporary_descriptor)
+            temporary_identity = (created.st_dev, created.st_ino)
+            if (
+                not stat.S_ISREG(created.st_mode)
+                or created.st_nlink != 1
+                or created.st_uid != os.getuid()
+            ):
+                raise ValidationError("release summary staging file is unsafe")
+            _write_all(temporary_descriptor, payload)
+            os.fsync(temporary_descriptor)
+
+            _assert_publication_candidate_current(
+                repo_root=repo_root,
+                specs_root=specs_root,
+                campaign_source=campaign_source,
+                campaign_specs=campaign_specs,
+                campaign_contract=campaign_contract,
+                phase="before",
+            )
+            repo.assert_current("publication repository")
+            parent.assert_current("release summary parent")
+            _assert_retained_handles_current(retained_handles, payload=True)
+
+            staged = _assert_descriptor_payload(
+                temporary_descriptor,
+                payload,
+                "release summary staging",
+            )
+            if (
+                staged.st_nlink != 1
+                or (staged.st_dev, staged.st_ino) != temporary_identity
+                or staged.st_size != len(payload)
+                or not _path_matches_file(
+                    parent.descriptor,
+                    temporary_name,
+                    temporary_identity,
+                )
+            ):
+                raise ValidationError("release summary staging identity changed")
+
+            # Bind the would-be destination identity before the syscall so
+            # rollback can safely detect and remove our inode even if link(2)
+            # creates the name but its wrapper still reports an error.
+            publication_identity = temporary_identity
+            os.link(
+                temporary_name,
+                destination_name,
+                src_dir_fd=parent.descriptor,
+                dst_dir_fd=parent.descriptor,
+                follow_symlinks=False,
+            )
+            if not _path_matches_file(
+                parent.descriptor,
+                destination_name,
+                temporary_identity,
+                links=2,
+            ) or not _path_matches_file(
+                parent.descriptor,
+                temporary_name,
+                temporary_identity,
+                links=2,
+            ):
+                raise ValidationError("release summary publication identity changed")
+            os.unlink(temporary_name, dir_fd=parent.descriptor)
+            temporary_identity = None
+            if not _path_matches_file(
+                parent.descriptor,
+                destination_name,
+                publication_identity,
+            ):
+                raise ValidationError("published release summary is not one bound file")
+            repo.assert_current("publication repository")
+            parent.assert_current("release summary parent")
+            os.fsync(temporary_descriptor)
+            os.fsync(parent.descriptor)
+            _assert_descriptor_payload(
+                temporary_descriptor,
+                payload,
+                "published release summary",
+            )
+            if not _path_matches_file(
+                parent.descriptor,
+                destination_name,
+                publication_identity,
+            ):
+                raise ValidationError(
+                    "published release summary changed after directory sync"
+                )
+            _assert_retained_handles_current(retained_handles, payload=False)
+            _assert_publication_candidate_current(
+                repo_root=repo_root,
+                specs_root=specs_root,
+                campaign_source=campaign_source,
+                campaign_specs=campaign_specs,
+                campaign_contract=campaign_contract,
+                phase="during",
+            )
+            repo.assert_current("publication repository")
+            parent.assert_current("release summary parent")
+            # The final pass re-reads every retained byte through the descriptors
+            # held since binding, then proves each pathname still names that inode.
+            _assert_retained_handles_current(retained_handles, payload=True)
+            _assert_descriptor_payload(
+                temporary_descriptor,
+                payload,
+                "published release summary",
+            )
+            if not _path_matches_file(
+                parent.descriptor,
+                destination_name,
+                publication_identity,
+            ):
+                raise ValidationError(
+                    "published release summary path changed at final validation"
+                )
+        except BaseException as publication_error:
+            cleanup_errors: list[BaseException] = []
+            cleanup_targets = []
+            if publication_identity is not None:
+                cleanup_targets.append(
+                    (destination_name, publication_identity)
+                )
+            cleanup_targets.append((temporary_name, temporary_identity))
+            for cleanup_name, cleanup_identity in cleanup_targets:
+                try:
+                    _unlink_matching_file(
+                        parent.descriptor,
+                        cleanup_name,
+                        cleanup_identity,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise ValidationError(
+                    "release summary rollback could not durably remove an "
+                    f"owned file: {cleanup_errors[0]}"
+                ) from publication_error
+            raise
+        finally:
+            if temporary_descriptor >= 0:
+                try:
+                    os.close(temporary_descriptor)
+                except OSError:
+                    pass
 
 
 def main(argv: list[str] | None = None) -> int:

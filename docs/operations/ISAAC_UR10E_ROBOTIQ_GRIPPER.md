@@ -1,24 +1,30 @@
 # Isaac UR10e + Robotiq Gripper Operations
 
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until I9/I and its prerequisite headless gates pass.
+> Unless explicitly marked as retained adapter logic, present-tense wording
+> below describes the captured baseline, not a live Isaac lane.
+
 ## Scope
 
-This runbook covers the position-commanded Robotiq 2F-140 in the ManyForge
-Isaac UR10e full and light scenes. It does not apply to the Lite6 pneumatic
+This runbook records the position-commanded Robotiq 2F-140 in the former
+ManyForge Isaac UR10e full and light scenes. It does not apply to the Lite6 pneumatic
 gripper profile, which uses effort-and-dwell semantics.
 
-The program-facing command remains the standard
+The captured program-facing command was the standard
 `control_msgs/action/GripperCommand`. Isaac-specific JointState transport is
-contained in `manyforge_isaac_gripper_action_bridge`; behavior programs do not
+contained in `manyforge_isaac_gripper_action_bridge`; behavior programs did not
 contain simulator-specific gripper nodes.
 
-The C++ ros2_control execution backend owns the ManyForge gripper lifecycle:
+The C++ ros2_control execution backend owned the ManyForge gripper lifecycle:
 admission, progress/dwell, timeout, terminal result, and immutable status. The
 Python Isaac bridge is only the simulator transport/action server; it is not a
 second ManyForge lifecycle owner.
 
 ## Authority Model
 
-The qualified path is:
+The captured qualified path was:
 
 ```text
 ManyForge command_gripper

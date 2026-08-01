@@ -1,9 +1,16 @@
 # Lane bring-up — direct / openclaw / hermes
 
-Authoritative reference for bringing up any of the three **assistant lanes**
-and running the smoke corpus against it. The lane is selected by the
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until I5/H0 restores the assistant/headless boundary
+> and every selected execution lane's gate passes. Present-tense descriptions
+> below are historical unless a section explicitly says it is retained and
+> offline.
+
+Authoritative historical reference for bringing up any of the three
+**assistant lanes** and running the smoke corpus against it. The lane was selected by the
 `ASSISTANT_PROVIDER` env var; everything else (vLLM, proxy, Composer) is
-shared across lanes.
+shared across lanes at the captured baseline.
 
 > **Build-around invariant** — the host-side ManyForge repo
 > (`src/manyforge`) and the editable sibling
@@ -70,10 +77,11 @@ ______________________________________________________________________
 
 `scripts/launch.sh stop` and `restart` both run `docker rm -f manyforge-e2e-vllm` (`scripts/lib/assistant.sh:902`). On the next `start`,
 `start_model` cold-loads the model again — **60+ minutes** for a fresh
-gemma4-12b QAT load. `start_model` *is* idempotent when the container is
+gemma4-12b QAT load. `start_model` *was* idempotent when the container was
 already up serving the right `MODEL_PROFILE`
 (`scripts/lib/assistant.sh:267`), but `launch.sh start` refuses to run while
-launcher-managed components are up (`scripts/lib/preflight.sh:74`), so the
+launcher-managed components are up (captured `scripts/lib/preflight.sh`, blob
+`ffdaace61ab3c29a8ebe50dc4c17d99632146eea`, now deleted), so the
 only launcher path to a lane switch is `restart` → which kills vLLM.
 
 **Two supported paths:**

@@ -2,26 +2,12 @@
 version = "0.1.7"
 category = "Robotics"
 title = "ManyForge Isaac Collider Service"
-description = "Exposes Isaac Sim collider inventory for ManyForge scene authoring over ROS 2."
+description = "I9 porting gate for the future ManyForge Isaac collider adapter."
 keywords = ["manyforge", "isaac", "ros2", "collider", "scene"]
-changelog = "Adds temporary descendant-mesh recooking for Xform-authored convex collider settings."
-
-[dependencies]
-"omni.usd" = {}
-"omni.physx" = {}
+changelog = "Disables the superseded ROS/String collider service during the composable-cell relocation."
 
 [[python.module]]
 name = "manyforge.isaac.collider_service"
 
 [settings]
-exts."manyforge.isaac.collider_service".enabled = true
-exts."manyforge.isaac.collider_service".node_name = "manyforge_isaac_collider_service"
-exts."manyforge.isaac.collider_service".trigger_service_name = "/manyforge/isaac_collider_report"
-exts."manyforge.isaac.collider_service".request_topic_name = "/manyforge/isaac_collider_query/request"
-exts."manyforge.isaac.collider_service".response_topic_name = "/manyforge/isaac_collider_query/response"
-exts."manyforge.isaac.collider_service".mesh_transfer_request_topic_name = "/manyforge/isaac_mesh_transfer/request"
-exts."manyforge.isaac.collider_service".mesh_transfer_status_topic_name = "/manyforge/isaac_mesh_transfer/status"
-exts."manyforge.isaac.collider_service".mesh_transfer_chunk_topic_name = "/manyforge/isaac_mesh_transfer/chunk"
-exts."manyforge.isaac.collider_service".request_timeout_s = 30.0
-exts."manyforge.isaac.collider_service".probe_scripts_dir = ""
-exts."manyforge.isaac.collider_service".default_query = "{\"version\":\"manyforge.isaac.collider_query.v0.1\",\"exclude_subtrees\":[\"/World/ur10e_robotiq2f_140_ROS\"],\"probe_prims\":[\"/World/ur10e_robotiq2f_140_ROS\"],\"include_hidden\":false,\"include_cooked_convex\":true,\"output_profile\":\"llm_scene_authoring\"}"
+exts."manyforge.isaac.collider_service".enabled = false

@@ -5,7 +5,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <barrier>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -415,17 +417,40 @@ TEST(
     ConcurrentFirstOpenConvergesOneExactEmptyStore) {
   TemporaryDirectory directory;
   const auto database = directory.path() / "publication.sqlite3";
+  std::promise<void> start_promise;
+  const auto start = start_promise.get_future().share();
+  std::barrier open_together(4);
   std::vector<std::future<ActiveBundlePublicationStoreIntegrityReport>>
       openings;
-  for (std::size_t index = 0; index < 4U; ++index) {
-    openings.push_back(std::async(
-        std::launch::async,
-        [&database] {
-          SqliteActiveBundlePublicationStore store(
-              database, CellId{"cell-a"});
-          return store.VerifyIntegrity();
-        }));
+  openings.reserve(4U);
+  try {
+    for (std::size_t index = 0; index < 4U; ++index) {
+      openings.push_back(std::async(
+          std::launch::async,
+          [&database, &open_together, index, start] {
+            start.get();
+            open_together.arrive_and_wait();
+            SqliteActiveBundlePublicationStore store(
+                database, CellId{"cell-a"});
+            const auto report = store.VerifyIntegrity();
+            if (index % 2U == 0U) {
+              store.Close();
+            }
+            return report;
+          }));
+    }
+  } catch (...) {
+    const auto launch_error = std::current_exception();
+    start_promise.set_exception(launch_error);
+    for (auto& opening : openings) {
+      try {
+        static_cast<void>(opening.get());
+      } catch (...) {
+      }
+    }
+    std::rethrow_exception(launch_error);
   }
+  start_promise.set_value();
   std::string schema_digest;
   for (auto& opening : openings) {
     const auto report = opening.get();
@@ -437,6 +462,7 @@ TEST(
       EXPECT_EQ(report.schema_artifact_digest, schema_digest);
     }
   }
+  ExpectNoSqliteSidecars(database);
   SqliteActiveBundlePublicationStore reopened(
       database, CellId{"cell-a"});
   EXPECT_EQ(reopened.VerifyIntegrity().receipt_count, 0);

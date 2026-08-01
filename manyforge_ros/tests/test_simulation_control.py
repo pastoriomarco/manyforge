@@ -1,218 +1,266 @@
+"""Pure and unavailable-boundary evidence for simulator control.
+
+Historical live source blob ``769e97215b0df885dd7002ca20ded0e0469b6ef7``
+contains the removed client at lines 47-415, one-shot runner/CLI at lines
+418-463, and dynamic import hook at lines 519-522.  Historical test blob
+``1d9c3d6bb93f7ccc7f377ef7e151e91f338f890f`` contains three live cases at
+lines 9-67, 69-112, and 114-218.  Their exact I9/I assignments are recorded
+below instead of leaving a runnable pre-I9 ROS fallback.
+"""
+
 from __future__ import annotations
 
-import threading
-import time
+import inspect
+import math
 
 import pytest
 
+from manyforge_ros import simulation_control
 
-def test_simulation_control_resets_state_without_touching_command_gate():
-    # Single gate authority: the execution backend owns the command-enable
-    # gate topic. The simulation-control client must NOT publish it (a second
-    # transient-local publisher makes the latched value reader-dependent).
-    rclpy = pytest.importorskip("rclpy")
-    pytest.importorskip("simulation_interfaces")
 
-    from rclpy.executors import MultiThreadedExecutor
-    from simulation_interfaces.srv import ResetSimulation
+HISTORICAL_LIVE_CASES = (
+    (
+        "test_simulation_control_resets_state_without_touching_command_gate",
+        "lines 9-67",
+        "I9/I selected simulation adapter: ResetSimulation success, bounded cleanup, "
+        "and proof that the adapter does not publish a second command gate",
+    ),
+    (
+        "test_simulation_control_surfaces_reset_service_failure",
+        "lines 69-112",
+        "I9/I selected simulation adapter: ResetSimulation result code and message "
+        "propagate as a failed typed outcome",
+    ),
+    (
+        "test_simulation_control_state_step_and_entity_services",
+        "lines 114-218",
+        "I9/I selected simulation adapter: pause, bounded step, and entity-pose "
+        "mutation use the retained simulation_interfaces contract",
+    ),
+)
 
-    from manyforge_ros.simulation_control import SimulationControlClient
 
-    assert not hasattr(SimulationControlClient, "publish_command_gate"), (
-        "SimulationControlClient must not regrow a command-gate publisher; "
-        "the execution backend is the single gate authority"
+def test_simulator_result_records_remain_owner_neutral() -> None:
+    reset = simulation_control.SimulationResetResult(
+        success=False,
+        service_name="/reset_simulation",
+        scope="state",
+        duration_s=0.25,
+        result_code=7,
+        result_message="rejected",
+        error="7: rejected",
+    )
+    control = simulation_control.SimulationControlResult(
+        success=True,
+        operation="step",
+        service_name="/step_simulation",
+        duration_s=0.5,
+        steps=3,
     )
 
-    rclpy.init(args=None)
-    executor = MultiThreadedExecutor(num_threads=2)
-    server_node = rclpy.create_node("manyforge_sim_control_fake_sim")
-    client_node = rclpy.create_node("manyforge_sim_control_client")
-    scopes: list[int] = []
+    assert reset.to_dict() == {
+        "success": False,
+        "service_name": "/reset_simulation",
+        "scope": "state",
+        "duration_s": 0.25,
+        "result_code": 7,
+        "result_message": "rejected",
+        "error": "7: rejected",
+    }
+    assert control.to_dict()["steps"] == 3
+    assert control.to_dict()["operation"] == "step"
 
-    def reset_service(request, response):
-        scopes.append(int(request.scope))
-        response.result.result = response.result.RESULT_OK
-        return response
 
-    service = server_node.create_service(
-        ResetSimulation,
-        "/reset_simulation",
-        reset_service,
-    )
-
-    executor.add_node(server_node)
-    executor.add_node(client_node)
-    thread = threading.Thread(target=executor.spin, daemon=True)
-    thread.start()
-
-    try:
-        client = SimulationControlClient(client_node, service_timeout_s=2.0)
-        result = client.reset(scope="state")
-
-        assert result.success is True
-        assert result.service_name == "/reset_simulation"
-        assert scopes == [ResetSimulation.Request.SCOPE_STATE]
-        # The client node must not have created any publisher on the gate
-        # topic during the reset.
-        gate_publishers = client_node.get_publishers_info_by_topic(
-            "/manyforge/test_command_enable"
+def test_service_selection_is_deterministic_and_prefix_bounded() -> None:
+    assert simulation_control.select_simulation_service_name(
+        ["/vendor/reset", "/reset_simulation"],
+        service_type=simulation_control.RESET_SERVICE_TYPE,
+    ) == "/reset_simulation"
+    assert simulation_control.select_simulation_service_name(
+        ["/other/reset", "/isaacsim/reset_simulation"],
+        service_type=simulation_control.RESET_SERVICE_TYPE,
+        service_prefix="/isaacsim/",
+    ) == "/isaacsim/reset_simulation"
+    assert (
+        simulation_control.select_simulation_service_name(
+            ["/other/reset"],
+            service_type=simulation_control.RESET_SERVICE_TYPE,
+            service_prefix="isaacsim",
         )
-        assert gate_publishers == []
-    finally:
-        server_node.destroy_service(service)
-        executor.shutdown()
-        server_node.destroy_node()
-        client_node.destroy_node()
-        rclpy.shutdown()
-
-
-def test_simulation_control_surfaces_reset_service_failure():
-    rclpy = pytest.importorskip("rclpy")
-    pytest.importorskip("simulation_interfaces")
-
-    from rclpy.executors import MultiThreadedExecutor
-    from simulation_interfaces.srv import ResetSimulation
-
-    from manyforge_ros.simulation_control import SimulationControlClient
-
-    rclpy.init(args=None)
-    executor = MultiThreadedExecutor(num_threads=2)
-    server_node = rclpy.create_node("manyforge_sim_control_failure_fake_sim")
-    client_node = rclpy.create_node("manyforge_sim_control_failure_client")
-
-    def reset_service(_request, response):
-        response.result.result = response.result.RESULT_OPERATION_FAILED
-        response.result.error_message = "reset rejected"
-        return response
-
-    service = server_node.create_service(
-        ResetSimulation,
-        "/isaacsim/reset_simulation",
-        reset_service,
-    )
-    executor.add_node(server_node)
-    executor.add_node(client_node)
-    thread = threading.Thread(target=executor.spin, daemon=True)
-    thread.start()
-
-    try:
-        client = SimulationControlClient(client_node, service_timeout_s=2.0)
-        result = client.reset(scope="state")
-
-        assert result.success is False
-        assert result.service_name == "/isaacsim/reset_simulation"
-        assert result.result_code == ResetSimulation.Response().result.RESULT_OPERATION_FAILED
-        assert "reset rejected" in result.error
-    finally:
-        server_node.destroy_service(service)
-        executor.shutdown()
-        server_node.destroy_node()
-        client_node.destroy_node()
-        rclpy.shutdown()
-
-
-def test_simulation_control_state_step_and_entity_services():
-    rclpy = pytest.importorskip("rclpy")
-    pytest.importorskip("simulation_interfaces")
-
-    from rclpy.executors import MultiThreadedExecutor
-    from simulation_interfaces.msg import SimulationState
-    from simulation_interfaces.srv import (
-        SetEntityState,
-        SetSimulationState,
-        StepSimulation,
+        is None
     )
 
-    from manyforge_ros.simulation_control import SimulationControlClient
 
-    rclpy.init(args=None)
-    executor = MultiThreadedExecutor(num_threads=2)
-    server_node = rclpy.create_node("manyforge_sim_control_ops_fake_sim")
-    client_node = rclpy.create_node("manyforge_sim_control_ops_client")
-    requested_states: list[int] = []
-    requested_steps: list[int] = []
-    requested_entities: list[tuple[str, str, list[float], list[float]]] = []
-
-    def set_state_service(request, response):
-        requested_states.append(int(request.state.state))
-        response.result.result = response.result.RESULT_OK
-        return response
-
-    def step_service(request, response):
-        requested_steps.append(int(request.steps))
-        response.result.result = response.result.RESULT_OK
-        return response
-
-    def set_entity_state_service(request, response):
-        pose = request.state.pose
-        requested_entities.append(
-            (
-                request.entity,
-                request.state.header.frame_id,
-                [pose.position.x, pose.position.y, pose.position.z],
-                [
-                    pose.orientation.x,
-                    pose.orientation.y,
-                    pose.orientation.z,
-                    pose.orientation.w,
-                ],
-            )
+def test_service_selection_rejects_unbounded_or_duplicate_candidates() -> None:
+    with pytest.raises(ValueError, match="candidates exceed"):
+        simulation_control.select_simulation_service_name(
+            [f"/service/{index}" for index in range(4097)],
+            service_type=simulation_control.RESET_SERVICE_TYPE,
         )
-        response.result.result = response.result.RESULT_OK
-        return response
+    with pytest.raises(ValueError, match="candidates must be unique"):
+        simulation_control.select_simulation_service_name(
+            ["/reset_simulation", " /reset_simulation "],
+            service_type=simulation_control.RESET_SERVICE_TYPE,
+        )
+    with pytest.raises(ValueError, match="prefix exceeds"):
+        simulation_control.select_simulation_service_name(
+            ["/reset_simulation"],
+            service_type=simulation_control.RESET_SERVICE_TYPE,
+            service_prefix="p" * 1025,
+        )
 
-    services = [
-        server_node.create_service(
-            SetSimulationState,
-            "/set_simulation_state",
-            set_state_service,
-        ),
-        server_node.create_service(
-            StepSimulation,
-            "/step_simulation",
-            step_service,
-        ),
-        server_node.create_service(
-            SetEntityState,
-            "/set_entity_state",
-            set_entity_state_service,
-        ),
-    ]
-    executor.add_node(server_node)
-    executor.add_node(client_node)
-    thread = threading.Thread(target=executor.spin, daemon=True)
-    thread.start()
 
-    try:
-        client = SimulationControlClient(client_node, service_timeout_s=2.0)
-        state_result = client.set_simulation_state(state="paused")
-        step_result = client.step(steps=3)
-        entity_result = client.set_entity_state(
-            entity="/World/box",
-            pose={
-                "frame_id": "world",
-                "position_m": [1.0, 2.0, 3.0],
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(" play ", "playing"), ("PLAYING", "playing"), ("pause", "paused")],
+)
+def test_simulation_state_normalization(raw: str, expected: str) -> None:
+    assert simulation_control.normalize_simulation_state(raw) == expected
+
+
+def test_reset_scope_and_entity_pose_normalization() -> None:
+    assert simulation_control.normalize_reset_scope(" STATE ") == "state"
+    frame_id, position, orientation = simulation_control.normalize_entity_pose(
+        {
+            "frame_id": " world ",
+            "position_m": [1, 2.5, 3],
+            "orientation_rpy_deg": [0.0, 0.0, 90.0],
+        }
+    )
+
+    assert frame_id == "world"
+    assert position == (1.0, 2.5, 3.0)
+    assert orientation == pytest.approx(
+        (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5))
+    )
+
+    _, _, direct_orientation = simulation_control.normalize_entity_pose(
+        {
+            "frame_id": "world",
+            "position_m": [0.0, 0.0, 0.0],
+            "orientation_xyzw": [0.0, 0.0, 0.0, 2.0],
+        }
+    )
+    assert direct_orientation == (0.0, 0.0, 0.0, 1.0)
+
+
+@pytest.mark.parametrize(
+    ("pose", "message"),
+    [
+        ({}, "frame_id is required"),
+        ({"frame_id": "world", "position_m": [1, 2]}, "must have length 3"),
+        (
+            {"frame_id": "world", "position_m": [1, 2, 3]},
+            "must include orientation_xyzw or orientation_rpy_deg",
+        ),
+    ],
+)
+def test_entity_pose_normalization_rejects_incomplete_shapes(
+    pose: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        simulation_control.normalize_entity_pose(pose)
+
+
+@pytest.mark.parametrize(
+    ("pose", "message"),
+    [
+        (
+            {
+                "frame_id": "f" * 1025,
+                "position_m": [0.0, 0.0, 0.0],
                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
             },
+            "frame_id exceeds",
+        ),
+        (
+            {
+                "frame_id": "world",
+                "position_m": [True, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            "text or boolean",
+        ),
+        (
+            {
+                "frame_id": "world",
+                "position_m": ["1.0", 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            "text or boolean",
+        ),
+        (
+            {
+                "frame_id": "world",
+                "position_m": [float("inf"), 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            "must be finite",
+        ),
+        (
+            {
+                "frame_id": "world",
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 0.0],
+            },
+            "finite nonzero norm",
+        ),
+        (
+            {
+                "frame_id": "world",
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation_rpy_deg": [False, 0.0, 0.0],
+            },
+            "text or boolean",
+        ),
+    ],
+)
+def test_entity_pose_normalization_rejects_unbounded_or_non_finite_values(
+    pose: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        simulation_control.normalize_entity_pose(pose)
+
+
+def test_live_simulation_control_is_not_a_dormant_callable_body(capsys) -> None:
+    assert not hasattr(simulation_control, "SimulationControlClient")
+    source = inspect.getsource(simulation_control)
+    for forbidden in ("_import_module", "create_client", "call_async", "create_node"):
+        assert forbidden not in source
+
+    assert simulation_control.main() == simulation_control.UNAVAILABLE_EXIT_CODE
+    assert capsys.readouterr().err.strip() == simulation_control.UNAVAILABLE_MESSAGE
+    with pytest.raises(
+        simulation_control.SimulationControlUnavailableError,
+        match=simulation_control.UNAVAILABLE_REASON_CODE,
+    ):
+        simulation_control.reset_once(
+            scope="ignored-before-validation",
+            service_prefix="ignored-before-selection",
+            service_timeout_s=-1.0,
         )
 
-        assert state_result.success is True
-        assert step_result.success is True
-        assert entity_result.success is True
-        assert requested_states == [SimulationState.STATE_PAUSED]
-        assert requested_steps == [3]
-        assert requested_entities == [
-            (
-                "/World/box",
-                "world",
-                [1.0, 2.0, 3.0],
-                [0.0, 0.0, 0.0, 1.0],
-            )
-        ]
-    finally:
-        for service in services:
-            server_node.destroy_service(service)
-        executor.shutdown()
-        server_node.destroy_node()
-        client_node.destroy_node()
-        rclpy.shutdown()
+
+def test_all_three_historical_live_cases_remain_assigned_to_i9() -> None:
+    assert simulation_control.HISTORICAL_SOURCE_BLOB == (
+        "769e97215b0df885dd7002ca20ded0e0469b6ef7"
+    )
+    assert simulation_control.HISTORICAL_TEST_BLOB == (
+        "1d9c3d6bb93f7ccc7f377ef7e151e91f338f890f"
+    )
+    assert [case[0] for case in HISTORICAL_LIVE_CASES] == [
+        "test_simulation_control_resets_state_without_touching_command_gate",
+        "test_simulation_control_surfaces_reset_service_failure",
+        "test_simulation_control_state_step_and_entity_services",
+    ]
+    assert [case[1] for case in HISTORICAL_LIVE_CASES] == [
+        "lines 9-67",
+        "lines 69-112",
+        "lines 114-218",
+    ]
+    assert all(
+        "I9/I selected simulation adapter" in case[2]
+        for case in HISTORICAL_LIVE_CASES
+    )

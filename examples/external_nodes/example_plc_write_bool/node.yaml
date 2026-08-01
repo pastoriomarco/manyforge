@@ -1,0 +1,51 @@
+# NON-OPERATIVE V2 AUTHORING REFERENCE
+#
+# This file intentionally contains comments only and therefore parses as no
+# YAML document. It is not a descriptor, package manifest, catalog overlay, or
+# installable node. The closed v2 extension-package manifest/compiler does not
+# exist in the current implementation. Do not uncomment this fragment and do
+# not supply guessed digest, source, module, class, or path fields.
+#
+# A future compiler-owned extension catalog entry for this intent would use the
+# exact v2 entry schema and resemble the following portable meaning:
+#
+# entries:
+#   - id: example.plc_write_bool
+#     name: Example PLC write boolean
+#     category: io
+#     description: Request one semantic boolean output through its target owner.
+#     stability: experimental
+#     tags: [io, example]
+#     profiles: {min_program_profile: composable-cell-v1}
+#     kind: leaf
+#     children: {min: 0, max: 0}
+#     parameters:
+#       - id: target_role
+#         required: true
+#         schema: {type: string, semantic_type: target_role}
+#       - id: resource_role
+#         required: true
+#         schema: {type: string, semantic_type: resource_role}
+#       - id: value
+#         required: true
+#         schema: {type: bool}
+#     required_capabilities:
+#       - capability_id: io.gpio.set_output
+#         scope: target_binding
+#         target_parameter: target_role
+#     execution:
+#       blocking: true
+#       cancellable: true
+#       owner_api: kernel.command_target
+#     outcomes:
+#       success: command_succeeded
+#       failure: command_failed
+#       interrupted: command_terminal
+#     runners:
+#       py_trees: {implementation_id: example_plc_write_bool_v1}
+#     observability: {event_family: manyforge.program.node}
+#
+# Even this commented entry is only illustrative. A usable extension also
+# requires the future compiler-owned extension identity, compatibility,
+# executable-package digest, source provenance, dependency, and bounded NRT
+# cancellation contract. Availability returns at I5/H0; execution at I6/N.

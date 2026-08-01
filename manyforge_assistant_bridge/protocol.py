@@ -1,54 +1,78 @@
-"""Protocol-level helpers shared between Composer and the assistant bridge.
-
-This module is the single source of truth for any helper whose contract
-must stay byte-identical across the manifest emitter (Composer) and the
-manifest consumer (the assistant bridge). Anything here that changes
-shape, ordering, or normalisation rules MUST treat the change as a wire
-breaking change — every running deployment will recompute hashes,
-session keys, etc., from this code.
-
-Add helpers here only when they're shared across the protocol boundary.
-Logic that lives entirely on one side does not belong here.
-"""
+"""Pure catalog-identity helper retained for the H0 assistant-client port."""
 from __future__ import annotations
 
 import hashlib
 import json
+from typing import Any, Final
+
+
+MAX_CATALOG_FAMILY_ITEMS: Final = 512
+MAX_CATALOG_IDENTIFIER_CHARS: Final = 256
+MAX_CATALOG_JSON_BYTES: Final = 4 * 1024 * 1024
+CATALOG_FAMILIES: Final = ("skills", "tools", "nodes")
 
 
 def compute_catalog_hash(catalog: dict[str, list[str]], mode: str) -> str:
-    """Deterministic SHA-256 of the resolved catalog and active mode.
+    """Deterministic identity of a resolved catalog and active mode.
 
-    The hash gates the catalog-freshness contract:
+    This is not an authenticity or tamper-detection primitive by itself. A
+    future bridge must compare it with an independently trusted expected hash;
+    recomputing it only from an untrusted envelope proves nothing about which
+    tools were authorized.
 
-      1. The Composer manifest endpoint emits this hash on
-         /api/assistant/modes/{mode}.
-      2. The MCP wrapper echoes it on every tools/call.
-      3. The bridge endpoint validates that the echoed hash matches
-         the currently-resolved hash; mismatch returns 409, catching
-         deployment reloads that happened mid-conversation.
-      4. The direct-lane bridge recomputes the hash from the envelope
-         it received, so it can detect tampering or skew.
-
-    Both sides MUST produce byte-identical output for the same input.
-    The previous duplicated implementations in
-    ``manyforge_composer/backend/routes_assistant.py`` and
-    ``manyforge_assistant_bridge/bridge.py`` were collapsed into this
-    one canonical helper to remove the dual-maintenance hazard.
-
-    The input is the resolved bare-id catalog dict (skills/tools/nodes
-    visible in the active mode). The hash is computed on internal
-    Composer state, not on the wire envelope — so the wire-format
-    cleanup that dropped the bare-id lists from the envelope did not
-    change what's hashed. Changing what is hashed would invalidate
-    every running session's cached hash; the contract is conservative
-    by design.
+    The input is an already-resolved set of visible identifiers. H0 must bind
+    it to independently trusted owner state; callers must never derive both
+    the catalog and the value used to authenticate that catalog from the same
+    untrusted request.
     """
-    payload = {
-        "mode": mode,
-        "skills": sorted(catalog.get("skills", []) or []),
-        "tools": sorted(catalog.get("tools", []) or []),
-        "nodes": sorted(catalog.get("nodes", []) or []),
-    }
+    normalized_mode = _bounded_identifier(mode, label="mode")
+    if type(catalog) is not dict:
+        raise TypeError("catalog must be an object")
+    if len(catalog) > len(CATALOG_FAMILIES):
+        raise ValueError("catalog contains too many families")
+    unknown_families: list[str] = []
+    for family in catalog:
+        if type(family) is not str:
+            raise TypeError("catalog family names must be strings")
+        if family not in CATALOG_FAMILIES:
+            unknown_families.append(family)
+    if unknown_families:
+        raise ValueError(
+            "catalog contains unsupported families: "
+            + ", ".join(sorted(unknown_families))
+        )
+    payload: dict[str, Any] = {"mode": normalized_mode}
+    for family in CATALOG_FAMILIES:
+        raw_values = catalog.get(family, [])
+        if type(raw_values) is not list:
+            raise TypeError(f"catalog.{family} must be a list")
+        if len(raw_values) > MAX_CATALOG_FAMILY_ITEMS:
+            raise ValueError(
+                f"catalog.{family} exceeds the "
+                f"{MAX_CATALOG_FAMILY_ITEMS}-item bound"
+            )
+        values = [
+            _bounded_identifier(value, label=f"catalog.{family}[{index}]")
+            for index, value in enumerate(raw_values)
+        ]
+        if len(set(values)) != len(values):
+            raise ValueError(f"catalog.{family} contains duplicate identifiers")
+        payload[family] = sorted(values)
     blob = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    if len(blob) > MAX_CATALOG_JSON_BYTES:
+        raise ValueError(
+            f"catalog exceeds the {MAX_CATALOG_JSON_BYTES}-byte bound"
+        )
     return hashlib.sha256(blob).hexdigest()
+
+
+def _bounded_identifier(value: Any, *, label: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    if value != value.strip():
+        raise ValueError(f"{label} must not contain surrounding whitespace")
+    if len(value) > MAX_CATALOG_IDENTIFIER_CHARS:
+        raise ValueError(
+            f"{label} exceeds the {MAX_CATALOG_IDENTIFIER_CHARS}-character bound"
+        )
+    return value

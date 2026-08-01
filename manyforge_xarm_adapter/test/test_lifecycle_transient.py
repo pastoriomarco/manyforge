@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from manyforge_xarm_adapter.lifecycle_transient import summarize_transient
 from manyforge_xarm_adapter.lifecycle_transient import TransientJointSample
+from manyforge_xarm_adapter.lifecycle_transient import HISTORICAL_SOURCE_BLOB
+
+
+HISTORICAL_TEST_BLOB = "2532213557764ac05823bd97d22a5f3f85d88ec7"
+HISTORICAL_CASES = (
+    "test_invalid_zero_initialization_is_not_treated_as_motion",
+    "test_explicit_transient_bound_is_enforced",
+)
 
 
 def _sample(
@@ -64,3 +72,13 @@ def test_explicit_transient_bound_is_enforced() -> None:
     assert summary['capture_complete'] is True
     assert summary['within_explicit_bound'] is False
     assert summary['assessment'] == 'exceeds_explicit_bound'
+
+
+def test_pure_cases_and_removed_ros_sampler_source_remain_pinned() -> None:
+    assert HISTORICAL_SOURCE_BLOB == (
+        "cd4a2a765ac484dd80d0d797c3c691ab297654e8"
+    )
+    assert HISTORICAL_TEST_BLOB == (
+        "2532213557764ac05823bd97d22a5f3f85d88ec7"
+    )
+    assert len(HISTORICAL_CASES) == 2

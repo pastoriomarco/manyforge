@@ -5,8 +5,18 @@
 > its replacement. This launcher guide records the last qualified baseline;
 > it must not be used to claim a working product lane until H0/N and the
 > lane-specific I/R restoration gates pass.
+> Unless explicitly identified as a retained parser or typed-unavailable
+> boundary, every present-tense command, process, endpoint, scenario, and
+> readiness claim below describes that baseline rather than current behavior.
+> The captured `scripts/lib/preflight.sh` (blob
+> `ffdaace61ab3c29a8ebe50dc4c17d99632146eea`) and
+> `scripts/lib/vllm-status-watch.sh` (blob
+> `0d3f6a6d4a32fad8ea1ec6fa2086ad38f80d8cf2`) are intentionally absent from
+> the current tree: their port/PID/container and model-status ownership moves
+> to I4/H0 and the lane gates. Bounded presentation, prompt, wait, and frontend
+> build helpers remain only as owner-neutral restoration inputs.
 
-This is the operator's recipe for bringing up the ManyForge stack with
+This was the operator's recipe for bringing up the ManyForge stack with
 the unified launcher (`scripts/launch.sh`). Two flows are covered:
 
 1. **Interactive wizard** — the primary way to use the launcher. No
@@ -29,9 +39,10 @@ the unified launcher (`scripts/launch.sh`). Two flows are covered:
 > [`docs/operations/STACK_SETUP.md`](STACK_SETUP.md) Primary Scripts,
 > [`scripts/MIGRATION.md`](../../scripts/MIGRATION.md) footer.
 
-Run everything from the **manyforge repo root** on the host. The
-launcher orchestrates Docker for you — you do not need to be inside a
-container.
+The captured launcher was invoked from the **manyforge repo root** on the host
+and orchestrated Docker itself. Do not invoke it as a product launcher on the
+current branch; the command below records only the former working-directory
+convention.
 
 ```bash
 cd ~/workspaces/dev_ws/src/manyforge   # adjust to your checkout path
@@ -47,8 +58,9 @@ and a first-time NemoClaw sandbox created with `nemoclaw onboard`.
 For a fresh Thor/workstation, follow
 [`STACK_SETUP.md`](STACK_SETUP.md#clean-machine-install-order). For Jetson Orin
 AGX, follow [`ORIN_STACK_SETUP.md`](ORIN_STACK_SETUP.md) first. After those
-one-time prerequisites exist, this launcher is the supported repeatable way to
-start, stop, restart, and smoke the stack.
+one-time prerequisites existed, this launcher was the supported repeatable way
+to start, stop, restart, and smoke the stack. Those verbs now return the stable
+typed cutover result before effects.
 
 ## What the launcher offers
 
@@ -70,9 +82,9 @@ Two orthogonal selectors:
     nemoclaw bridge + supervisor). AI button visible if the
     deployment declares `assistant.enabled: true`.
 
-Plus a named **scenario** selecting the program + deployment YAML pair (or,
-for `real-robot`, a committed cell/template/program bundle). Thirteen
-scenarios today (including a 3-step `ur5-simple-pick-place`
+Plus a named **scenario** selected the program + deployment YAML pair (or, for
+`real-robot`, a committed cell/template/program bundle). The captured registry
+had thirteen scenarios (including a 3-step `ur5-simple-pick-place`
 test fixture, the new `--simple` replacement); four of them cover the
 lane × assistant matrix.
 
@@ -683,8 +695,10 @@ ______________________________________________________________________
   part of the maintained operator set. See
   [`EXAMPLES_CATALOG.md`](EXAMPLES_CATALOG.md#adding-a-new-scenario).
 - **Add a new lane or assistant value**: bigger surgery —
-  [`scripts/launch.sh`](../../scripts/launch.sh) wizard steps,
-  [`scripts/lib/compose.sh`](../../scripts/lib/compose.sh) profile
-  mapping, [`scripts/lib/preflight.sh`](../../scripts/lib/preflight.sh)
-  port owner table. Update the full Interactive + Step 0-5 matrix in
-  this file when done.
+  use the captured `scripts/launch.sh` wizard, `scripts/lib/compose.sh`
+  profile map, and deleted `scripts/lib/preflight.sh` port-owner table only as
+  historical acceptance input. The exact current launcher boundary is
+  [`scripts/launch.sh`](../../scripts/launch.sh); future lane/process/status
+  facts must come from I4/H0 and the lane owner rather than restoring those
+  shell tables. Update the full Interactive + Step 0-5 matrix in this file
+  when the qualified client returns.

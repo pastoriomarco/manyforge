@@ -1,198 +1,143 @@
 import { describe, expect, it } from 'vitest';
-
-import { ApiError } from '../api/client';
-import type { AssistantRequestStatus } from '../types/api';
 import {
   reconcileAssistantRequest,
   shouldReconcileAssistantRequest,
 } from './assistantRequestRecovery';
 
-function status(
-  state: AssistantRequestStatus['status'],
-  overrides: Partial<AssistantRequestStatus> = {},
-): AssistantRequestStatus {
-  return {
-    requestId: 'request-1',
-    conversationId: 'conversation-1',
-    providerId: 'openclaw',
-    assistantMode: 'composer-assistant',
-    status: state,
-    message: state === 'completed' ? 'Draft updated.' : '',
-    error: null,
-    warnings: [],
-    draftMutated: state === 'completed',
-    toolCallCount: 1,
-    recentToolCalls: [],
-    startedAtNs: 1,
-    updatedAtNs: 2,
-    finishedAtNs: state === 'running' ? null : 2,
-    ...overrides,
-  };
+interface Status {
+  status: 'accepted' | 'running' | 'completed' | 'failed';
+  detail: string;
 }
 
+function status(state: Status['status']): Status {
+  return { status: state, detail: state };
+}
+
+const isTerminal = (value: Status) =>
+  value.status === 'completed' || value.status === 'failed';
 const noWait = async () => undefined;
 
-describe('assistant request reconciliation', () => {
-  it('reconciles transport and server failures, but not definitive client errors', () => {
-    expect(shouldReconcileAssistantRequest(
-      new TypeError('NetworkError when attempting to fetch resource.'),
-    )).toBe(true);
-    expect(shouldReconcileAssistantRequest(
-      new ApiError('Internal Server Error', 500, null),
-    )).toBe(true);
-    expect(shouldReconcileAssistantRequest(
-      new ApiError('Invalid assistant request', 422, null),
-    )).toBe(false);
+describe('authoritative request reconciliation', () => {
+  it('reconciles transport/server failures but not definitive client errors', () => {
+    expect(shouldReconcileAssistantRequest(new TypeError('network error'))).toBe(true);
+    expect(shouldReconcileAssistantRequest({ status: 500 })).toBe(true);
+    expect(shouldReconcileAssistantRequest({ status: 422 })).toBe(false);
   });
 
-  it('waits for a running request and returns its authoritative completion', async () => {
+  it('returns the complete authoritative terminal record', async () => {
     const responses = [status('running'), status('completed')];
-
-    const result = await reconcileAssistantRequest({
-      readStatus: async () => responses.shift() ?? status('completed'),
-      wait: noWait,
-    });
-
-    expect(result).toEqual({ kind: 'terminal', status: status('completed') });
+    await expect(
+      reconcileAssistantRequest({
+        readStatus: async () => responses.shift() ?? status('completed'),
+        isTerminal,
+        wait: noWait,
+      }),
+    ).resolves.toEqual({ kind: 'terminal', status: status('completed') });
   });
 
-  it('tolerates initial 404 responses so a status read may not overtake acceptance', async () => {
-    let attempts = 0;
-
+  it('bounds initial 404 races and remembers an observed request', async () => {
+    let attempt = 0;
     const result = await reconcileAssistantRequest({
       readStatus: async () => {
-        attempts += 1;
-        if (attempts < 3) {
-          throw { status: 404 };
-        }
-        return status('completed');
-      },
-      maxNotFoundAttempts: 3,
-      wait: noWait,
-    });
-
-    expect(result.kind).toBe('terminal');
-    expect(attempts).toBe(3);
-  });
-
-  it('reports an unknown outcome after repeated missing status records', async () => {
-    let attempts = 0;
-
-    const result = await reconcileAssistantRequest({
-      readStatus: async () => {
-        attempts += 1;
+        attempt += 1;
+        if (attempt === 1) return status('running');
         throw { status: 404 };
       },
-      maxNotFoundAttempts: 3,
-      wait: noWait,
-    });
-
-    expect(result).toEqual({ kind: 'not_found', requestObserved: false });
-    expect(attempts).toBe(3);
-  });
-
-  it('remembers when a request was observed before its status record disappears', async () => {
-    let attempts = 0;
-
-    const result = await reconcileAssistantRequest({
-      readStatus: async () => {
-        attempts += 1;
-        if (attempts === 1) {
-          return status('running');
-        }
-        throw { status: 404 };
-      },
+      isTerminal,
       maxNotFoundAttempts: 2,
       wait: noWait,
     });
-
     expect(result).toEqual({ kind: 'not_found', requestObserved: true });
   });
 
-  it('recovers from transient read failures and returns the server failure', async () => {
-    let attempts = 0;
-    const failed = status('failed', {
-      message: 'Provider failed.',
-      error: { code: 'upstream_call_error', detail: 'Provider failed.' },
-      draftMutated: false,
-    });
-
-    const result = await reconcileAssistantRequest({
+  it('survives initial not-found races until the request becomes terminal', async () => {
+    let attempt = 0;
+    await expect(reconcileAssistantRequest({
       readStatus: async () => {
-        attempts += 1;
-        if (attempts < 3) {
-          throw new TypeError('NetworkError when attempting to fetch resource.');
-        }
-        return failed;
+        attempt += 1;
+        if (attempt < 3) throw { status: 404 };
+        return status('completed');
       },
+      isTerminal,
+      maxNotFoundAttempts: 3,
+      wait: noWait,
+    })).resolves.toEqual({ kind: 'terminal', status: status('completed') });
+    expect(attempt).toBe(3);
+  });
+
+  it('reports when repeated not-found responses never observed the request', async () => {
+    await expect(reconcileAssistantRequest({
+      readStatus: async () => { throw { status: 404 }; },
+      isTerminal,
+      maxNotFoundAttempts: 2,
+      wait: noWait,
+    })).resolves.toEqual({ kind: 'not_found', requestObserved: false });
+  });
+
+  it('bounds repeated read failures and non-terminal polling', async () => {
+    await expect(
+      reconcileAssistantRequest({
+        readStatus: async () => {
+          throw new TypeError('network error');
+        },
+        isTerminal,
+        maxReadFailures: 2,
+        wait: noWait,
+      }),
+    ).resolves.toEqual({ kind: 'unreachable', detail: 'network error' });
+    await expect(
+      reconcileAssistantRequest({
+        readStatus: async () => status('running'),
+        isTerminal,
+        maxPollAttempts: 2,
+        wait: noWait,
+      }),
+    ).resolves.toEqual({ kind: 'exhausted' });
+  });
+
+  it('recovers from transient status-read errors before a terminal response', async () => {
+    let attempt = 0;
+    await expect(reconcileAssistantRequest({
+      readStatus: async () => {
+        attempt += 1;
+        if (attempt < 3) throw new TypeError('temporary transport failure');
+        return status('failed');
+      },
+      isTerminal,
       maxReadFailures: 3,
       wait: noWait,
-    });
-
-    expect(result).toEqual({ kind: 'terminal', status: failed });
+    })).resolves.toEqual({ kind: 'terminal', status: status('failed') });
   });
 
-  it('reports an unreachable outcome after repeated status read failures', async () => {
-    const result = await reconcileAssistantRequest({
-      readStatus: async () => {
-        throw new TypeError('NetworkError when attempting to fetch resource.');
-      },
-      maxReadFailures: 3,
-      wait: noWait,
-    });
-
-    expect(result).toEqual({
-      kind: 'unreachable',
-      detail: 'NetworkError when attempting to fetch resource.',
-    });
-  });
-
-  it('reports an unknown outcome when a request remains non-terminal too long', async () => {
-    let attempts = 0;
-
-    const result = await reconcileAssistantRequest({
-      readStatus: async () => {
-        attempts += 1;
-        return status('running');
-      },
-      maxPollAttempts: 3,
-      wait: noWait,
-    });
-
-    expect(result).toEqual({ kind: 'exhausted' });
-    expect(attempts).toBe(3);
-  });
-
-  it('stops without producing an outcome when recovery is aborted', async () => {
+  it('does not read status when reconciliation is already aborted', async () => {
     const controller = new AbortController();
     controller.abort();
-
-    const result = await reconcileAssistantRequest({
-      readStatus: async () => status('completed'),
+    let reads = 0;
+    await expect(reconcileAssistantRequest({
+      readStatus: async () => {
+        reads += 1;
+        return status('completed');
+      },
+      isTerminal,
       signal: controller.signal,
       wait: noWait,
-    });
-
-    expect(result).toEqual({ kind: 'aborted' });
+    })).resolves.toEqual({ kind: 'aborted' });
+    expect(reads).toBe(0);
   });
 
-  it('lets an abort win over a terminal response already being read', async () => {
+  it('lets abort win over a terminal response already being read', async () => {
     const controller = new AbortController();
-    let resolveRead!: (value: AssistantRequestStatus) => void;
-    const resultPromise = reconcileAssistantRequest({
-      readStatus: async (signal) => {
-        expect(signal).toBe(controller.signal);
-        return new Promise<AssistantRequestStatus>((resolve) => {
-          resolveRead = resolve;
-        });
-      },
+    let resolveRead!: (value: Status) => void;
+    const result = reconcileAssistantRequest({
+      readStatus: async () => new Promise<Status>((resolve) => {
+        resolveRead = resolve;
+      }),
+      isTerminal,
       signal: controller.signal,
       wait: noWait,
     });
-
     controller.abort();
     resolveRead(status('completed'));
-
-    await expect(resultPromise).resolves.toEqual({ kind: 'aborted' });
+    await expect(result).resolves.toEqual({ kind: 'aborted' });
   });
 });

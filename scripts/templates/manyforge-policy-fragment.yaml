@@ -1,3 +1,7 @@
+# HISTORICAL / NON-OPERATIVE during the composable-cell runtime cutover.
+# Do not install or merge this policy until the assistant/headless endpoint
+# gate is qualified and the paths below are audited against its new contract.
+#
 # ManyForge network policy fragment for NemoClaw sandbox.
 # Merge into the sandbox's existing policy — do NOT apply standalone.
 #

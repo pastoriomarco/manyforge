@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/manager_apply_journal.hpp"
 
 #include "embedded_manager_apply_journal_schema.hpp"
+#include "sqlite_store_startup_internal.hpp"
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 
 #include <openssl/evp.h>
@@ -1047,7 +1048,7 @@ void ValidateApplyJournalMetadata(
   }
 }
 
-void ValidateApplyJournalBeforeConfiguration(
+void ValidateApplyJournalIdentityAndSchema(
     sqlite3* database,
     const CellId& cell_id) {
   const auto existing = ReadSchemaObjects(database);
@@ -1091,7 +1092,7 @@ void PreflightApplyJournal(
                 kMaximumManagerApplyJournalDatabasePageImageBytes),
         },
         [&cell_id](sqlite3* database) {
-          ValidateApplyJournalBeforeConfiguration(database, cell_id);
+          ValidateApplyJournalIdentityAndSchema(database, cell_id);
         }));
   } catch (const persistence::SqliteReadOnlyPreflightError& error) {
     throw ManagerApplyJournalIntegrityError(
@@ -1124,6 +1125,13 @@ class SqliteManagerApplyJournal::Impl final {
       throw ManagerApplyJournalError(
           "manyforge_component_manager requires SQLite 3.37.0 or newer");
     }
+    auto startup_lock =
+        sqlite_startup_internal::TryAcquireManagerSqliteStoreStartupLock(
+            std::chrono::milliseconds(kBusyTimeoutMilliseconds));
+    if (!startup_lock.owns_lock()) {
+      throw ManagerApplyJournalBusyError(
+          "timed out waiting for process-local Apply-journal startup");
+    }
     PreflightApplyJournal(database_path_, cell_id_);
     const int flags =
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX |
@@ -1146,8 +1154,14 @@ class SqliteManagerApplyJournal::Impl final {
           database_,
           sqlite3_busy_timeout(database_, kBusyTimeoutMilliseconds),
           "configure SQLite busy timeout");
-      ValidateApplyJournalBeforeConfiguration(database_, cell_id_);
       Configure();
+      // Read schema and SQLite identity from one serialized WAL snapshot.  A
+      // non-transactional first-open check can otherwise interleave those
+      // reads with a peer's schema commit and misclassify that legitimate
+      // initializer as a foreign database.
+      Transaction validation(database_, "BEGIN EXCLUSIVE");
+      ValidateApplyJournalIdentityAndSchema(database_, cell_id_);
+      validation.Commit();
       InitializeOrValidateSchema();
       Transaction transaction(database_, "BEGIN");
       static_cast<void>(VerifyIntegrityLocked());
@@ -1174,6 +1188,9 @@ class SqliteManagerApplyJournal::Impl final {
   }
 
   void Close() {
+    auto startup_lock =
+        sqlite_startup_internal::
+            AcquireManagerSqliteStoreStartupLockForClose();
     std::lock_guard lock(mutex_);
     if (closed_) {
       return;

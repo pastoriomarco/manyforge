@@ -1,9 +1,28 @@
 #!/usr/bin/env python3
-"""Validate Lite6 runtime scaffolds against Robot Model Authority metadata.
+"""Validate owner-neutral static Lite6 ROS/control/gripper artifacts.
 
-This is a non-live RMA-7 gate. It does not contact ROS, Isaac, or Composer; it
-checks that the static Isaac/ros2_control lane files agree with the canonical
-Lite6 authority contract.
+This validator intentionally does not read or accept a deployment document.
+Its retained CLI is available only through the explicit ``static-artifacts``
+mode; the historical command shape is a typed unavailable boundary.
+The historical version mixed reusable static artifact checks with the removed
+``manyforge.deployment.v0`` ``robot_config``/``adapters`` schema and the old
+Python RobotModelAuthority owner.  Those portions return through I3/I6 and the
+I9/I, I10/R, and I11/T product gates; no replacement catalog, identifier, or
+runtime contract is invented here.  JSON output is an unversioned diagnostic,
+not durable qualification evidence.
+
+Retained checks are limited to facts present in the supplied artifacts:
+
+* the topic-based ros2_control plugin and six position-command joints;
+* the Lite-gripper command/mimic relationship in the URDF;
+* controller joint/interface and fail-closed cancel-deceleration settings; and
+* the static Isaac gripper bridge joint, topic, effort, and dwell settings.
+
+Exact historical source: ManyForge
+``08222188293df8e12f90dc72e204c21f22f92ea1``, blob
+``b228171c782c0b9a81c9d3683ab5edf6fbd5fd92``.  Historical lines 107-236
+and 289-367 are assigned to I3/I6, I9/I, I10/R, and I11/T; the static
+ros2_control and bridge assertions are retained below.
 """
 
 from __future__ import annotations
@@ -11,44 +30,87 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
+import sys
+from typing import Any, Final, NoReturn, Sequence
+import xml.etree.ElementTree as ET
 
 import yaml
 
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-if str(REPO_ROOT / "manyforge_behavior") not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT / "manyforge_behavior"))
-
-from manyforge_behavior.robot_model_authority import (  # noqa: E402
-    RobotModelGripperConfig,
-    load_robot_model_authority,
+ARM_JOINTS: Final = tuple(f"joint{index}" for index in range(1, 7))
+GRIPPER_COMMAND_JOINT: Final = "right_finger_joint"
+GRIPPER_DERIVED_JOINT: Final = "left_finger_joint"
+HISTORICAL_SOURCE_COMMIT: Final = (
+    "08222188293df8e12f90dc72e204c21f22f92ea1"
 )
-
-ARM_GROUP = "lite6"
-GRIPPER_ID = "primary"
-GRIPPER_GROUP = "lite_gripper"
-ARM_JOINTS = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
-GRIPPER_COMMAND_JOINT = "right_finger_joint"
-GRIPPER_DERIVED_JOINT = "left_finger_joint"
+HISTORICAL_SOURCE_BLOB: Final = (
+    "b228171c782c0b9a81c9d3683ab5edf6fbd5fd92"
+)
+LEGACY_DEPLOYMENT_AUTHORITY_UNAVAILABLE_REASON_CODE: Final = (
+    "composable_cell_lite6_deployment_authority_unavailable"
+)
+_MAX_ARTIFACT_BYTES: Final = 4 * 1024 * 1024
+STATIC_ARTIFACT_MODE: Final = "static-artifacts"
 
 
 class ContractFailure(RuntimeError):
-    pass
+    """A supplied static artifact violates the retained Lite6 facts."""
+
+
+class LegacyDeploymentAuthorityUnavailableError(RuntimeError):
+    """Raised before inspecting the removed deployment/authority contract."""
+
+
+def validate_legacy_deployment_authority(
+    *_args: object,
+    **_kwargs: object,
+) -> NoReturn:
+    """Reject the old authority validator without inspecting caller input."""
+
+    raise LegacyDeploymentAuthorityUnavailableError(
+        f"{LEGACY_DEPLOYMENT_AUTHORITY_UNAVAILABLE_REASON_CODE}: "
+        "compiler-owned model products and resource addresses return at "
+        "I3/I6; real-Lite6 product validation returns at I10/R"
+    )
+
+
+def _bounded_text(path: Path) -> str:
+    try:
+        with path.open("rb") as stream:
+            encoded = stream.read(_MAX_ARTIFACT_BYTES + 1)
+    except OSError as exc:
+        raise ContractFailure(f"failed to read artifact {path}: {exc}") from exc
+    if len(encoded) > _MAX_ARTIFACT_BYTES:
+        raise ContractFailure(f"artifact exceeds {_MAX_ARTIFACT_BYTES} bytes: {path}")
+    try:
+        return encoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContractFailure(f"artifact must be UTF-8: {path}") from exc
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
     try:
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # pragma: no cover - reported through CLI.
-        raise ContractFailure(f"failed to read YAML {path}: {exc}") from exc
+        loaded = yaml.safe_load(_bounded_text(path))
+    except yaml.YAMLError as exc:
+        raise ContractFailure(f"failed to parse YAML {path}: {exc}") from exc
     if not isinstance(loaded, dict):
         raise ContractFailure(f"{path} must contain a mapping")
     return loaded
+
+
+def _load_xml(path: Path) -> ET.Element:
+    try:
+        return ET.fromstring(_bounded_text(path))
+    except ET.ParseError as exc:
+        raise ContractFailure(f"failed to parse XML {path}: {exc}") from exc
+
+
+def _mapping(value: object, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ContractFailure(f"{label} must be a mapping")
+    return value
 
 
 def _assert_equal(actual: Any, expected: Any, label: str) -> None:
@@ -56,30 +118,40 @@ def _assert_equal(actual: Any, expected: Any, label: str) -> None:
         raise ContractFailure(f"{label}: expected {expected!r}, got {actual!r}")
 
 
-def _assert_true(value: Any, label: str) -> None:
-    if not value:
+def _assert_true(value: object, label: str) -> None:
+    if value is not True:
         raise ContractFailure(label)
 
 
-def _assert_finite_number(value: Any, label: str) -> float:
+def _finite_number(value: object, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ContractFailure(f"{label}: expected a finite number")
     try:
         result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ContractFailure(f"{label}: expected finite number, got {value!r}") from exc
+    except ValueError as exc:
+        raise ContractFailure(f"{label}: expected a finite number") from exc
     if not math.isfinite(result):
-        raise ContractFailure(f"{label}: expected finite number, got {value!r}")
+        raise ContractFailure(f"{label}: expected a finite number")
     return result
 
 
-def _canonical_path_from_package_uri(uri: str) -> Path:
-    prefix = "package://manyforge_example_models/"
-    if not uri.startswith(prefix):
-        raise ContractFailure(f"expected manyforge_example_models package URI: {uri}")
-    return REPO_ROOT / "manyforge_example_models" / uri.removeprefix(prefix)
+def _required_text(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or "\x00" in value
+        or "\n" in value
+    ):
+        raise ContractFailure(f"{label}: expected a bounded non-empty string")
+    return value
 
 
-def _ros2_control_joint_contract(path: Path) -> dict[str, Any]:
-    root = ET.parse(path).getroot()
+def _ros2_control_joint_contract(
+    root: ET.Element,
+    *,
+    path: Path,
+) -> dict[str, dict[str, list[str]]]:
     ros2_control = root.find("ros2_control")
     if ros2_control is None:
         raise ContractFailure(f"{path} is missing <ros2_control>")
@@ -92,149 +164,64 @@ def _ros2_control_joint_contract(path: Path) -> dict[str, Any]:
     joints: dict[str, dict[str, list[str]]] = {}
     for joint in ros2_control.findall("joint"):
         name = joint.attrib.get("name", "")
-        commands = [
-            child.attrib.get("name", "")
-            for child in joint.findall("command_interface")
-        ]
-        states = [
-            child.attrib.get("name", "")
-            for child in joint.findall("state_interface")
-        ]
-        joints[name] = {"command_interfaces": commands, "state_interfaces": states}
+        if not name or name in joints:
+            raise ContractFailure(
+                "ros2_control joint names must be unique and non-empty"
+            )
+        joints[name] = {
+            "command_interfaces": [
+                child.attrib.get("name", "")
+                for child in joint.findall("command_interface")
+            ],
+            "state_interfaces": [
+                child.attrib.get("name", "")
+                for child in joint.findall("state_interface")
+            ],
+        }
     return joints
 
 
-def validate(args: argparse.Namespace) -> dict[str, Any]:
-    deployment = _load_yaml(args.deployment)
-    robot_config = deployment.get("robot_config")
-    if not isinstance(robot_config, dict):
-        raise ContractFailure("deployment.robot_config must be a mapping")
-    grippers = deployment.get("grippers")
-    if not isinstance(grippers, dict) or GRIPPER_ID not in grippers:
-        raise ContractFailure(f"deployment.grippers.{GRIPPER_ID} is required")
-    gripper_config = grippers[GRIPPER_ID]
-    if not isinstance(gripper_config, dict):
-        raise ContractFailure(f"deployment.grippers.{GRIPPER_ID} must be a mapping")
-
-    urdf_path = _canonical_path_from_package_uri(str(robot_config.get("urdf_path", "")))
-    srdf_path = _canonical_path_from_package_uri(str(robot_config.get("srdf_path", "")))
-    authority = load_robot_model_authority(
-        model_name="lite6_lite_gripper",
-        urdf_path=urdf_path,
-        srdf_path=srdf_path,
-        package_paths=(str(REPO_ROOT),),
-        grippers={
-            GRIPPER_GROUP: RobotModelGripperConfig(
-                group_id=GRIPPER_GROUP,
-                joint_name=GRIPPER_COMMAND_JOINT,
-                touch_links=tuple(gripper_config.get("touch_links") or ()),
-                mount_frame=str(gripper_config.get("mount_frame") or ""),
-                attach_frame=str(gripper_config.get("attach_frame") or ""),
-                tcp_frame=str(gripper_config.get("tcp_frame") or ""),
-                auxiliary_frames=tuple(gripper_config.get("auxiliary_frames") or ()),
-            )
-        },
-    )
-
-    _assert_equal(robot_config.get("robot_id"), "lite6", "deployment robot_id")
-    _assert_equal(robot_config.get("group_id"), ARM_GROUP, "deployment group_id")
+def _validate_gripper_urdf(root: ET.Element) -> None:
+    joints = {
+        joint.attrib.get("name", ""): joint
+        for joint in root.findall("joint")
+        if joint.attrib.get("name")
+    }
+    if GRIPPER_COMMAND_JOINT not in joints or GRIPPER_DERIVED_JOINT not in joints:
+        raise ContractFailure("Lite-gripper command and derived joints are required")
+    mimic = joints[GRIPPER_DERIVED_JOINT].find("mimic")
+    if mimic is None:
+        raise ContractFailure("Lite-gripper derived joint must contain <mimic>")
     _assert_equal(
-        authority.group_commandable_joints(ARM_GROUP),
-        ARM_JOINTS,
-        "authority arm commandable joints",
-    )
-    _assert_equal(
-        authority.group_commandable_joints(GRIPPER_GROUP),
-        (GRIPPER_COMMAND_JOINT,),
-        "authority gripper commandable joints",
-    )
-    _assert_equal(
-        authority.grippers[GRIPPER_GROUP].derived_joints,
-        (GRIPPER_DERIVED_JOINT,),
-        "authority gripper derived joints",
-    )
-    _assert_equal(
-        gripper_config.get("joint_name"),
+        mimic.attrib.get("joint"),
         GRIPPER_COMMAND_JOINT,
-        "deployment gripper command joint",
+        "Lite-gripper mimic source",
     )
     _assert_equal(
-        gripper_config.get("actuation_kind"),
-        "pneumatic",
-        "deployment gripper actuation_kind",
+        _finite_number(mimic.attrib.get("multiplier"), label="mimic multiplier"),
+        1.0,
+        "Lite-gripper mimic multiplier",
     )
     _assert_equal(
-        gripper_config.get("state_authority"),
-        "sim_observed",
-        "deployment gripper state_authority",
+        _finite_number(mimic.attrib.get("offset"), label="mimic offset"),
+        0.0,
+        "Lite-gripper mimic offset",
     )
-    _assert_equal(
-        gripper_config.get("completion_policy"),
-        "dwell_elapsed",
-        "deployment gripper completion_policy",
-    )
-    _assert_equal(
-        gripper_config.get("open_state_ref"),
-        "open",
-        "deployment gripper open_state_ref",
-    )
-    _assert_equal(
-        gripper_config.get("closed_state_ref"),
-        "closed",
-        "deployment gripper closed_state_ref",
-    )
-    transport = gripper_config.get("transport")
-    if not isinstance(transport, dict):
-        raise ContractFailure("deployment gripper transport must be a mapping")
-    gripper_transport_kind = str(transport.get("kind") or "")
-    if gripper_transport_kind == "isaac_joint_state_effort":
-        _assert_equal(
-            transport.get("command_topic"),
-            "/isaac_joint_commands_gripper",
-            "Lite6 direct gripper command_topic",
-        )
-        _assert_equal(
-            transport.get("state_topic"),
-            "/isaac_joint_states",
-            "Lite6 direct gripper state_topic",
-        )
-        _assert_equal(
-            transport.get("joint_names"),
-            [GRIPPER_COMMAND_JOINT],
-            "Lite6 direct gripper joint_names",
-        )
-        close_effort = _assert_finite_number(
-            transport.get("close_effort"), "Lite6 direct close_effort"
-        )
-        open_effort = _assert_finite_number(
-            transport.get("open_effort"), "Lite6 direct open_effort"
-        )
-        dwell_s = _assert_finite_number(
-            transport.get("dwell_s"), "Lite6 direct dwell_s"
-        )
-        _assert_true(
-            close_effort < 0.0,
-            "Lite6 direct close_effort must close with negative effort",
-        )
-        _assert_true(
-            open_effort > 0.0,
-            "Lite6 direct open_effort must open with positive effort",
-        )
-        _assert_true(
-            dwell_s > 0.0,
-            "Lite6 direct dwell_s must be positive",
-        )
-        _assert_true(
-            transport.get("publish_nominal_position") is True,
-            "Lite6 direct transport must publish nominal position for Isaac",
-        )
-    elif gripper_transport_kind != "ros_gripper_command":
-        raise ContractFailure(
-            "deployment gripper transport.kind must be isaac_joint_state_effort "
-            f"or ros_gripper_command, got {gripper_transport_kind!r}"
-        )
 
-    ros2_joints = _ros2_control_joint_contract(args.ros2_control_urdf)
+
+def validate_static_artifacts(
+    *,
+    ros2_control_urdf: Path,
+    controllers: Path,
+    gripper_bridge: Path,
+) -> dict[str, object]:
+    """Validate static files without deployment, ROS, process, or network access."""
+
+    urdf_root = _load_xml(ros2_control_urdf)
+    ros2_joints = _ros2_control_joint_contract(
+        urdf_root,
+        path=ros2_control_urdf,
+    )
     _assert_equal(tuple(ros2_joints), ARM_JOINTS, "ros2_control URDF joint list")
     for joint_name, interfaces in ros2_joints.items():
         _assert_equal(
@@ -247,14 +234,17 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
             ["position", "velocity"],
             f"ros2_control {joint_name} state interfaces",
         )
+    _validate_gripper_urdf(urdf_root)
 
-    controllers = _load_yaml(args.controllers)
-    arm_controller = controllers.get("isaac_arm_controller")
-    if not isinstance(arm_controller, dict):
-        raise ContractFailure("isaac_arm_controller config is required")
-    arm_params = arm_controller.get("ros__parameters")
-    if not isinstance(arm_params, dict):
-        raise ContractFailure("isaac_arm_controller.ros__parameters is required")
+    controller_document = _load_yaml(controllers)
+    arm_controller = _mapping(
+        controller_document.get("isaac_arm_controller"),
+        label="isaac_arm_controller",
+    )
+    arm_params = _mapping(
+        arm_controller.get("ros__parameters"),
+        label="isaac_arm_controller.ros__parameters",
+    )
     _assert_equal(
         tuple(arm_params.get("joints") or ()),
         ARM_JOINTS,
@@ -270,112 +260,120 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         ["position", "velocity"],
         "JTC state interfaces",
     )
-    constraints = arm_params.get("constraints")
-    if not isinstance(constraints, dict):
-        raise ContractFailure("JTC constraints mapping is required")
+    constraints = _mapping(
+        arm_params.get("constraints"),
+        label="JTC constraints",
+    )
     _assert_true(
-        constraints.get("decelerate_on_cancel") is True,
-        "JTC decelerate_on_cancel must be true for hard_deceleration evidence",
+        constraints.get("decelerate_on_cancel"),
+        "JTC decelerate_on_cancel must be true",
     )
     for joint_name in ARM_JOINTS:
-        joint_constraints = constraints.get(joint_name)
-        if not isinstance(joint_constraints, dict):
-            raise ContractFailure(f"missing JTC constraints for {joint_name}")
-        _assert_true(
-            float(joint_constraints.get("max_deceleration_on_cancel", 0.0)) > 0.0,
-            f"{joint_name} max_deceleration_on_cancel must be positive",
+        joint_constraints = _mapping(
+            constraints.get(joint_name),
+            label=f"JTC constraints.{joint_name}",
         )
+        deceleration = _finite_number(
+            joint_constraints.get("max_deceleration_on_cancel"),
+            label=f"{joint_name} max_deceleration_on_cancel",
+        )
+        if deceleration <= 0.0:
+            raise ContractFailure(
+                f"{joint_name} max_deceleration_on_cancel must be positive"
+            )
 
-    execution = (
-        deployment.get("adapters", {})
-        .get("execution", {})
-        .get("config", {})
+    bridge_document = _load_yaml(gripper_bridge)
+    bridge_node = _mapping(
+        bridge_document.get("manyforge_isaac_gripper_action_bridge"),
+        label="manyforge_isaac_gripper_action_bridge",
     )
-    if not isinstance(execution, dict):
-        raise ContractFailure("deployment execution config must be a mapping")
+    bridge_params = _mapping(
+        bridge_node.get("ros__parameters"),
+        label="gripper bridge ros__parameters",
+    )
+    _required_text(bridge_params.get("action_name"), label="gripper action_name")
     _assert_equal(
-        tuple(execution.get("required_joints") or ()),
-        ARM_JOINTS,
-        "deployment execution required_joints",
+        bridge_params.get("command_topic"),
+        "/isaac_joint_commands_gripper",
+        "gripper command_topic",
     )
     _assert_equal(
-        tuple(execution.get("velocity_state_interface_joints") or ()),
-        ARM_JOINTS,
-        "deployment velocity_state_interface_joints",
+        bridge_params.get("state_topic"),
+        "/isaac_joint_states",
+        "gripper state_topic",
     )
-    decel_limits = execution.get("max_deceleration_on_cancel_rad_s2")
-    if not isinstance(decel_limits, dict):
-        raise ContractFailure("deployment max_deceleration_on_cancel_rad_s2 required")
     _assert_equal(
-        tuple(decel_limits.keys()),
-        ARM_JOINTS,
-        "deployment cancel-deceleration joint keys",
+        bridge_params.get("commanded_joint"),
+        GRIPPER_COMMAND_JOINT,
+        "gripper commanded_joint",
+    )
+    _assert_equal(
+        bridge_params.get("command_joint_names"),
+        [GRIPPER_COMMAND_JOINT],
+        "gripper command_joint_names",
+    )
+    _assert_equal(
+        bridge_params.get("completion_joint_names"),
+        [GRIPPER_COMMAND_JOINT],
+        "gripper completion_joint_names",
+    )
+    _assert_equal(
+        bridge_params.get("actuation_kind"),
+        "pneumatic",
+        "gripper actuation_kind",
+    )
+    _assert_equal(
+        bridge_params.get("completion_policy"),
+        "dwell_elapsed",
+        "gripper completion_policy",
+    )
+    close_effort = _finite_number(
+        bridge_params.get("close_effort"),
+        label="gripper close_effort",
+    )
+    open_effort = _finite_number(
+        bridge_params.get("open_effort"),
+        label="gripper open_effort",
+    )
+    dwell_s = _finite_number(
+        bridge_params.get("dwell_s"),
+        label="gripper dwell_s",
+    )
+    if close_effort >= 0.0 or open_effort <= 0.0 or dwell_s <= 0.0:
+        raise ContractFailure(
+            "gripper efforts must open positive/close negative and dwell "
+            "must be positive"
+        )
+    _assert_true(
+        bridge_params.get("publish_nominal_position"),
+        "gripper bridge must publish nominal position",
     )
     _assert_true(
-        execution.get("decelerate_on_cancel") is True,
-        "deployment decelerate_on_cancel must be true",
+        bridge_params.get("require_all_state_joints"),
+        "gripper bridge must require all state joints",
     )
-    if gripper_transport_kind == "ros_gripper_command":
-        exec_gripper = execution.get("gripper")
-        if not isinstance(exec_gripper, dict):
-            raise ContractFailure("deployment execution gripper config required")
-        bridge = _load_yaml(args.gripper_bridge)
-        bridge_node = bridge.get("manyforge_isaac_gripper_action_bridge")
-        if not isinstance(bridge_node, dict):
-            raise ContractFailure("manyforge_isaac_gripper_action_bridge is required")
-        bridge_params = bridge_node.get("ros__parameters")
-        if not isinstance(bridge_params, dict):
-            raise ContractFailure("gripper bridge ros__parameters are required")
-        _assert_equal(
-            bridge_params.get("commanded_joint"),
-            GRIPPER_COMMAND_JOINT,
-            "gripper bridge commanded_joint",
-        )
-        _assert_equal(
-            bridge_params.get("joint_names"),
-            [GRIPPER_COMMAND_JOINT],
-            "gripper bridge joint_names",
-        )
-        _assert_true(
-            bridge_params.get("require_all_state_joints") is True,
-            "gripper bridge must require all state joints",
-        )
-        _assert_equal(
-            exec_gripper.get("action_name"),
-            bridge_params.get("action_name"),
-            "deployment gripper action must match bridge action",
-        )
 
     return {
-        "schema": "manyforge.lite6_authority_runtime_contract.v1",
-        "canonical_fingerprint": authority.canonical_fingerprint,
-        "robot_id": "lite6",
-        "arm_group": ARM_GROUP,
         "arm_joints": list(ARM_JOINTS),
-        "gripper_group": GRIPPER_GROUP,
         "gripper_command_joint": GRIPPER_COMMAND_JOINT,
-        "gripper_derived_joints": [GRIPPER_DERIVED_JOINT],
-        "ros2_control_urdf": str(args.ros2_control_urdf),
-        "controller_config": str(args.controllers),
-        "gripper_transport_kind": gripper_transport_kind,
-        "gripper_bridge_config": (
-            str(args.gripper_bridge)
-            if gripper_transport_kind == "ros_gripper_command"
-            else None
-        ),
-        "deployment": str(args.deployment),
+        "gripper_derived_joint": GRIPPER_DERIVED_JOINT,
+        "ros2_control_urdf": str(ros2_control_urdf),
+        "controller_config": str(controllers),
+        "gripper_bridge_config": str(gripper_bridge),
     }
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    raw_argv = tuple(sys.argv[1:] if argv is None else argv)
+    if not raw_argv or raw_argv[0] != STATIC_ARTIFACT_MODE:
+        try:
+            validate_legacy_deployment_authority()
+        except LegacyDeploymentAuthorityUnavailableError as exc:
+            print(str(exc), file=sys.stderr)
+            return 78
+        raise AssertionError("legacy authority gate unexpectedly returned")
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--deployment",
-        type=Path,
-        default=REPO_ROOT
-        / "examples"
-        / "isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
-    )
     parser.add_argument(
         "--ros2-control-urdf",
         type=Path,
@@ -407,21 +405,22 @@ def main() -> int:
         ),
     )
     parser.add_argument("--json", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(raw_argv[1:])
 
     try:
-        report = validate(args)
+        report = validate_static_artifacts(
+            ros2_control_urdf=args.ros2_control_urdf,
+            controllers=args.controllers,
+            gripper_bridge=args.gripper_bridge,
+        )
     except ContractFailure as exc:
-        print(f"Lite6 authority runtime contract failed: {exc}", file=sys.stderr)
+        print(f"Lite6 static artifact validation failed: {exc}", file=sys.stderr)
         return 1
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
-        print(
-            "Lite6 authority runtime contract passed: "
-            f"{report['canonical_fingerprint']}"
-        )
+        print("Lite6 static ROS/control/gripper artifacts passed.")
     return 0
 
 

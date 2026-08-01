@@ -1,17 +1,81 @@
-"""ROS ``simulation_interfaces`` lifecycle-control helpers."""
+"""Pure simulator-control records plus the pre-I9 unavailable boundary.
+
+The former live ROS client is retained in Git blob
+``769e97215b0df885dd7002ca20ded0e0469b6ef7``.  Its effectful client,
+one-shot runner, and dynamic import hook occupied lines 47-415, 418-463, and
+519-522.  I9/I must restore those capabilities through the selected simulation
+adapter; this module deliberately keeps only owner-neutral records, validation,
+service selection, and pose math.
+"""
 
 from __future__ import annotations
 
-import argparse
-import json
-import time
+import math
+import sys
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from typing import Any
+from itertools import islice
+from numbers import Real
+from typing import Any, Final
+
+
+UNAVAILABLE_EXIT_CODE: Final = 78
+UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
+RESTORATION_GATE: Final = "I9/I"
+UNAVAILABLE_MESSAGE: Final = (
+    f"{UNAVAILABLE_REASON_CODE}: simulator mutation requires the "
+    f"{RESTORATION_GATE} restoration gate"
+)
+HISTORICAL_SOURCE_BLOB: Final = "769e97215b0df885dd7002ca20ded0e0469b6ef7"
+HISTORICAL_TEST_BLOB: Final = "1d9c3d6bb93f7ccc7f377ef7e151e91f338f890f"
+
+_MAX_ADAPTER_ROWS: Final = 4096
+_MAX_IDENTIFIER_CHARS: Final = 1024
+
+RESET_SERVICE_TYPE: Final = "simulation_interfaces/srv/ResetSimulation"
+SET_SIMULATION_STATE_SERVICE_TYPE: Final = (
+    "simulation_interfaces/srv/SetSimulationState"
+)
+STEP_SIMULATION_SERVICE_TYPE: Final = "simulation_interfaces/srv/StepSimulation"
+SET_ENTITY_STATE_SERVICE_TYPE: Final = "simulation_interfaces/srv/SetEntityState"
+
+_RESET_SCOPE_VALUES: Final = {"state"}
+_SIMULATION_STATE_VALUES: Final = {"playing", "paused"}
+_PREFERRED_SERVICES_BY_TYPE: Final = {
+    RESET_SERVICE_TYPE: {
+        "/reset_simulation",
+        "/ResetSimulation",
+        "/isaacsim/reset_simulation",
+        "/isaacsim/ResetSimulation",
+    },
+    SET_SIMULATION_STATE_SERVICE_TYPE: {
+        "/set_simulation_state",
+        "/SetSimulationState",
+        "/isaacsim/set_simulation_state",
+        "/isaacsim/SetSimulationState",
+    },
+    STEP_SIMULATION_SERVICE_TYPE: {
+        "/step_simulation",
+        "/StepSimulation",
+        "/isaacsim/step_simulation",
+        "/isaacsim/StepSimulation",
+    },
+    SET_ENTITY_STATE_SERVICE_TYPE: {
+        "/set_entity_state",
+        "/SetEntityState",
+        "/isaacsim/set_entity_state",
+        "/isaacsim/SetEntityState",
+    },
+}
+
+
+class SimulationControlUnavailableError(RuntimeError):
+    """Raised when the pre-I9 one-shot mutation surface is invoked."""
 
 
 @dataclass(frozen=True)
 class SimulationResetResult:
-    """Structured outcome for a simulator reset request."""
+    """Structured outcome record retained for future thin adapters."""
 
     success: bool
     service_name: str | None
@@ -27,7 +91,7 @@ class SimulationResetResult:
 
 @dataclass(frozen=True)
 class SimulationControlResult:
-    """Structured outcome for a simulator-control request."""
+    """Structured simulator-control outcome retained without an active owner."""
 
     success: bool
     operation: str
@@ -44,463 +108,146 @@ class SimulationControlResult:
         return asdict(self)
 
 
-class SimulationControlClient:
-    """Client for ROS 2 ``simulation_interfaces`` control services."""
-
-    _RESET_SERVICE_TYPE = "simulation_interfaces/srv/ResetSimulation"
-    _SET_SIMULATION_STATE_SERVICE_TYPE = "simulation_interfaces/srv/SetSimulationState"
-    _STEP_SIMULATION_SERVICE_TYPE = "simulation_interfaces/srv/StepSimulation"
-    _SET_ENTITY_STATE_SERVICE_TYPE = "simulation_interfaces/srv/SetEntityState"
-    _RESET_SCOPE_VALUES = {
-        "state": "SCOPE_STATE",
-    }
-    _SIMULATION_STATE_VALUES = {
-        "playing": "STATE_PLAYING",
-        "paused": "STATE_PAUSED",
-    }
-
-    def __init__(
-        self,
-        node: object,
-        *,
-        service_prefix: str = "auto",
-        service_timeout_s: float = 3.0,
-    ) -> None:
-        self.node = node
-        self.service_prefix = (service_prefix or "auto").strip() or "auto"
-        self.service_timeout_s = float(service_timeout_s)
-
-        self._rclpy = _import_module("rclpy")
-        self._srv = _import_module("simulation_interfaces.srv")
-        self._msg = _import_module("simulation_interfaces.msg")
-        self._std_msgs = _import_module("std_msgs.msg")
-        self._qos = _import_module("rclpy.qos")
-
-    def reset(self, *, scope: str = "state") -> SimulationResetResult:
-        """Call ``ResetSimulation`` with a bounded timeout."""
-        started = time.monotonic()
-        service_name = self._resolve_reset_service_name()
-        if service_name is None:
-            return SimulationResetResult(
-                success=False,
-                service_name=None,
-                scope=scope,
-                duration_s=time.monotonic() - started,
-                error="ResetSimulation service not available",
-            )
-
-        request = self._srv.ResetSimulation.Request()
-        request.scope = self._reset_scope_value(scope)
-        try:
-            response = self._call_service(service_name, self._srv.ResetSimulation, request)
-        except Exception as exc:
-            return SimulationResetResult(
-                success=False,
-                service_name=service_name,
-                scope=scope,
-                duration_s=time.monotonic() - started,
-                error=str(exc),
-            )
-
-        result = getattr(response, "result", None)
-        if result is None:
-            return SimulationResetResult(
-                success=False,
-                service_name=service_name,
-                scope=scope,
-                duration_s=time.monotonic() - started,
-                error="ResetSimulation response did not include a result field",
-            )
-        return SimulationResetResult(
-            success=self._result_ok(result),
-            service_name=service_name,
-            scope=scope,
-            duration_s=time.monotonic() - started,
-            result_code=int(getattr(result, "result", 0)),
-            result_message=str(getattr(result, "error_message", "") or ""),
-            error="" if self._result_ok(result) else self._result_message(result),
-        )
-
-    def set_simulation_state(self, *, state: str) -> SimulationControlResult:
-        """Call ``SetSimulationState`` with a bounded timeout."""
-        operation = "set_state"
-        target_state = self._normalize_simulation_state(state)
-        started = time.monotonic()
-        service_name = self._resolve_service_name(self._SET_SIMULATION_STATE_SERVICE_TYPE)
-        if service_name is None:
-            return SimulationControlResult(
-                success=False,
-                operation=operation,
-                service_name=None,
-                duration_s=time.monotonic() - started,
-                state=target_state,
-                error="SetSimulationState service not available",
-            )
-
-        request = self._srv.SetSimulationState.Request()
-        request.state.state = self._simulation_state_value(target_state)
-        try:
-            response = self._call_service(service_name, self._srv.SetSimulationState, request)
-        except Exception as exc:
-            return SimulationControlResult(
-                success=False,
-                operation=operation,
-                service_name=service_name,
-                duration_s=time.monotonic() - started,
-                state=target_state,
-                error=str(exc),
-            )
-        result = getattr(response, "result", None)
-        if result is None:
-            return SimulationControlResult(
-                success=False,
-                operation=operation,
-                service_name=service_name,
-                duration_s=time.monotonic() - started,
-                state=target_state,
-                error="SetSimulationState response did not include a result field",
-            )
-        success = self._result_ok(result) or int(result.result) == int(
-            self._srv.SetSimulationState.Response.ALREADY_IN_TARGET_STATE
-        )
-        return SimulationControlResult(
-            success=success,
-            operation=operation,
-            service_name=service_name,
-            duration_s=time.monotonic() - started,
-            result_code=int(getattr(result, "result", 0)),
-            result_message=str(getattr(result, "error_message", "") or ""),
-            error="" if success else self._result_message(result),
-            state=target_state,
-        )
-
-    def step(self, *, steps: int = 1) -> SimulationControlResult:
-        """Call ``StepSimulation`` with a bounded timeout."""
-        operation = "step"
-        step_count = int(steps)
-        if step_count < 1:
-            raise ValueError("StepSimulation steps must be >= 1")
-        started = time.monotonic()
-        service_name = self._resolve_service_name(self._STEP_SIMULATION_SERVICE_TYPE)
-        if service_name is None:
-            return SimulationControlResult(
-                success=False,
-                operation=operation,
-                service_name=None,
-                duration_s=time.monotonic() - started,
-                steps=step_count,
-                error="StepSimulation service not available",
-            )
-
-        request = self._srv.StepSimulation.Request()
-        request.steps = step_count
-        try:
-            response = self._call_service(service_name, self._srv.StepSimulation, request)
-        except Exception as exc:
-            return SimulationControlResult(
-                success=False,
-                operation=operation,
-                service_name=service_name,
-                duration_s=time.monotonic() - started,
-                steps=step_count,
-                error=str(exc),
-            )
-        result = getattr(response, "result", None)
-        if result is None:
-            return SimulationControlResult(
-                success=False,
-                operation=operation,
-                service_name=service_name,
-                duration_s=time.monotonic() - started,
-                steps=step_count,
-                error="StepSimulation response did not include a result field",
-            )
-        return SimulationControlResult(
-            success=self._result_ok(result),
-            operation=operation,
-            service_name=service_name,
-            duration_s=time.monotonic() - started,
-            result_code=int(getattr(result, "result", 0)),
-            result_message=str(getattr(result, "error_message", "") or ""),
-            error="" if self._result_ok(result) else self._result_message(result),
-            steps=step_count,
-        )
-
-    def set_entity_state(self, *, entity: str, pose: dict[str, Any]) -> SimulationControlResult:
-        """Call ``SetEntityState`` with a pose-only entity state."""
-        operation = "set_entity_state"
-        entity_name = str(entity or "").strip()
-        if not entity_name:
-            raise ValueError("SetEntityState entity is required")
-        started = time.monotonic()
-        service_name = self._resolve_service_name(self._SET_ENTITY_STATE_SERVICE_TYPE)
-        if service_name is None:
-            return SimulationControlResult(
-                success=False,
-                operation=operation,
-                service_name=None,
-                duration_s=time.monotonic() - started,
-                entity=entity_name,
-                error="SetEntityState service not available",
-            )
-
-        request = self._srv.SetEntityState.Request()
-        request.entity = entity_name
-        self._populate_entity_state(request.state, pose)
-        try:
-            response = self._call_service(service_name, self._srv.SetEntityState, request)
-        except Exception as exc:
-            return SimulationControlResult(
-                success=False,
-                operation=operation,
-                service_name=service_name,
-                duration_s=time.monotonic() - started,
-                entity=entity_name,
-                error=str(exc),
-            )
-        result = getattr(response, "result", None)
-        if result is None:
-            return SimulationControlResult(
-                success=False,
-                operation=operation,
-                service_name=service_name,
-                duration_s=time.monotonic() - started,
-                entity=entity_name,
-                error="SetEntityState response did not include a result field",
-            )
-        return SimulationControlResult(
-            success=self._result_ok(result),
-            operation=operation,
-            service_name=service_name,
-            duration_s=time.monotonic() - started,
-            result_code=int(getattr(result, "result", 0)),
-            result_message=str(getattr(result, "error_message", "") or ""),
-            error="" if self._result_ok(result) else self._result_message(result),
-            entity=entity_name,
-        )
-
-    # NOTE: this client deliberately has NO command-gate publisher. The
-    # ros2_control execution backend is the single publishing authority for
-    # the gate topic (reliable + transient_local); a second transient-local
-    # publisher here made the latched gate value reader-dependent and could
-    # strand the gate closed when this short-lived node was destroyed.
-    # Flows that need command suppression request it through the kernel
-    # client's `set_command_gate` instead.
-
-    def _resolve_reset_service_name(self) -> str | None:
-        return self._resolve_service_name(self._RESET_SERVICE_TYPE)
-
-    def _resolve_service_name(self, service_type: str) -> str | None:
-        deadline = time.monotonic() + self.service_timeout_s
-        while True:
-            candidates = self._discover_service_names(service_type)
-            selected = self._select_service_name(candidates)
-            if selected is not None:
-                return selected
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(0.05)
-
-    def _discover_reset_service_names(self) -> list[str]:
-        return self._discover_service_names(self._RESET_SERVICE_TYPE)
-
-    def _discover_service_names(self, service_type: str) -> list[str]:
-        services = self.node.get_service_names_and_types()
-        names: list[str] = []
-        for service_name, service_types in services:
-            if service_type in service_types:
-                names.append(service_name)
-        return sorted(names, key=lambda name: _service_sort_key(name, service_type))
-
-    def _select_service_name(self, candidates: list[str]) -> str | None:
-        if not candidates:
-            return None
-        if self.service_prefix == "auto":
-            return candidates[0]
-        prefix = "/" + self.service_prefix.strip("/")
-        scoped = [
-            name
-            for name in candidates
-            if name == prefix or name.startswith(prefix + "/")
-        ]
-        return scoped[0] if scoped else None
-
-    def _reset_scope_value(self, scope: str) -> int:
-        scope_key = str(scope or "").strip().lower()
-        constant_name = self._RESET_SCOPE_VALUES.get(scope_key)
-        if constant_name is None:
-            allowed = ", ".join(sorted(self._RESET_SCOPE_VALUES))
-            raise ValueError(f"ResetSimulation scope must be one of: {allowed}")
-        return int(getattr(self._srv.ResetSimulation.Request, constant_name))
-
-    def _simulation_state_value(self, state: str) -> int:
-        constant_name = self._SIMULATION_STATE_VALUES[state]
-        return int(getattr(self._msg.SimulationState, constant_name))
-
-    def _normalize_simulation_state(self, state: str) -> str:
-        state_key = str(state or "").strip().lower()
-        aliases = {
-            "play": "playing",
-            "playing": "playing",
-            "pause": "paused",
-            "paused": "paused",
-        }
-        normalized = aliases.get(state_key)
-        if normalized is None:
-            allowed = ", ".join(sorted(self._SIMULATION_STATE_VALUES))
-            raise ValueError(f"SetSimulationState state must be one of: {allowed}")
-        return normalized
-
-    def _populate_entity_state(self, state_msg: object, pose: dict[str, Any]) -> None:
-        if not isinstance(pose, dict):
-            raise ValueError("SetEntityState pose must be a mapping")
-        frame_id = str(pose.get("frame_id") or "").strip()
-        if not frame_id:
-            raise ValueError("SetEntityState pose.frame_id is required")
-        position = pose.get("position_m")
-        if not isinstance(position, list) or len(position) != 3:
-            raise ValueError("SetEntityState pose.position_m must have length 3")
-        orientation = pose.get("orientation_xyzw")
-        if orientation is None and "orientation_rpy_deg" in pose:
-            orientation = _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
-        if not isinstance(orientation, list) or len(orientation) != 4:
-            raise ValueError(
-                "SetEntityState pose must include orientation_xyzw or orientation_rpy_deg"
-            )
-
-        state_msg.header.frame_id = frame_id
-        state_msg.pose.position.x = float(position[0])
-        state_msg.pose.position.y = float(position[1])
-        state_msg.pose.position.z = float(position[2])
-        state_msg.pose.orientation.x = float(orientation[0])
-        state_msg.pose.orientation.y = float(orientation[1])
-        state_msg.pose.orientation.z = float(orientation[2])
-        state_msg.pose.orientation.w = float(orientation[3])
-
-    def _call_service(self, service_name: str, service_type: type, request: object) -> object:
-        client = self.node.create_client(service_type, service_name)
-        try:
-            if not client.wait_for_service(timeout_sec=self.service_timeout_s):
-                raise TimeoutError(f"Timed out waiting for service {service_name}")
-            future = client.call_async(request)
-            return self._wait_for_future(future)
-        finally:
-            self.node.destroy_client(client)
-
-    def _wait_for_future(self, future: object) -> object:
-        deadline = time.monotonic() + self.service_timeout_s
-        executor = getattr(self.node, "executor", None)
-        if executor is None or not getattr(executor, "is_spinning", False):
-            remaining = max(0.0, deadline - time.monotonic())
-            self._rclpy.spin_until_future_complete(
-                self.node,
-                future,
-                timeout_sec=remaining,
-            )
-            if future.done():
-                return future.result()
-        else:
-            while time.monotonic() < deadline:
-                if future.done():
-                    return future.result()
-                time.sleep(0.01)
-        raise TimeoutError("Timed out waiting for simulation_interfaces response")
-
-    @staticmethod
-    def _result_ok(result: object) -> bool:
-        return int(result.result) == int(result.RESULT_OK)
-
-    @staticmethod
-    def _result_message(result: object) -> str:
-        return f"{result.result}: {result.error_message}"
-
-
 def reset_once(
     *,
     scope: str = "state",
     service_prefix: str = "auto",
     service_timeout_s: float = 3.0,
 ) -> SimulationResetResult:
-    """One-shot CLI/programmatic reset helper.
+    """Reject the old one-shot mutation entrypoint before any effects."""
 
-    Deliberately does NOT touch the command-enable gate: the execution
-    backend is the gate's single publishing authority, and gated resets are
-    owned by the Composer flow (`POST /api/simulation/reset`), which
-    requests gating through the kernel client.
-    """
-    rclpy = _import_module("rclpy")
-    initialized_here = False
-    if not rclpy.ok():
-        rclpy.init(args=None)
-        initialized_here = True
-    node = rclpy.create_node("manyforge_simulation_control_reset")
-    try:
-        client = SimulationControlClient(
-            node,
-            service_prefix=service_prefix,
-            service_timeout_s=service_timeout_s,
-        )
-        return client.reset(scope=scope)
-    finally:
-        node.destroy_node()
-        if initialized_here:
-            rclpy.shutdown()
+    del scope, service_prefix, service_timeout_s
+    raise SimulationControlUnavailableError(UNAVAILABLE_MESSAGE)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scope", default="state", choices=sorted(SimulationControlClient._RESET_SCOPE_VALUES))
-    parser.add_argument("--service-prefix", default="auto")
-    parser.add_argument("--timeout", type=float, default=3.0)
-    args = parser.parse_args()
+    """Fail before argument parsing, ROS import, or simulator mutation."""
 
-    result = reset_once(
-        scope=args.scope,
-        service_prefix=args.service_prefix,
-        service_timeout_s=args.timeout,
+    print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+    return UNAVAILABLE_EXIT_CODE
+
+
+def select_simulation_service_name(
+    candidates: Sequence[str],
+    *,
+    service_type: str,
+    service_prefix: str = "auto",
+) -> str | None:
+    """Select one service deterministically without reading the ROS graph."""
+
+    normalized_candidates = _bounded_service_candidates(candidates)
+    normalized_service_type = _bounded_text(service_type, label="service type")
+    ordered = sorted(
+        normalized_candidates,
+        key=lambda name: _service_sort_key(name, normalized_service_type),
     )
-    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
-    return 0 if result.success else 2
+    if not ordered:
+        return None
+
+    if service_prefix is None:
+        normalized_prefix = "auto"
+    else:
+        if not isinstance(service_prefix, str):
+            raise ValueError("service prefix must be a string")
+        if len(service_prefix) > _MAX_IDENTIFIER_CHARS:
+            raise ValueError("service prefix exceeds the adapter bound")
+        normalized_prefix = service_prefix.strip() or "auto"
+    if normalized_prefix == "auto":
+        return ordered[0]
+
+    prefix = "/" + normalized_prefix.strip("/")
+    scoped = [
+        name for name in ordered if name == prefix or name.startswith(prefix + "/")
+    ]
+    return scoped[0] if scoped else None
 
 
-def _service_sort_key(service_name: str, service_type: str) -> tuple[int, str]:
-    preferred_by_type = {
-        "simulation_interfaces/srv/ResetSimulation": {
-            "/reset_simulation",
-            "/ResetSimulation",
-            "/isaacsim/reset_simulation",
-            "/isaacsim/ResetSimulation",
-        },
-        "simulation_interfaces/srv/SetSimulationState": {
-            "/set_simulation_state",
-            "/SetSimulationState",
-            "/isaacsim/set_simulation_state",
-            "/isaacsim/SetSimulationState",
-        },
-        "simulation_interfaces/srv/StepSimulation": {
-            "/step_simulation",
-            "/StepSimulation",
-            "/isaacsim/step_simulation",
-            "/isaacsim/StepSimulation",
-        },
-        "simulation_interfaces/srv/SetEntityState": {
-            "/set_entity_state",
-            "/SetEntityState",
-            "/isaacsim/set_entity_state",
-            "/isaacsim/SetEntityState",
-        },
-    }
-    preferred = preferred_by_type.get(service_type, set())
-    return (0 if service_name in preferred else 1, service_name)
+def normalize_reset_scope(scope: str) -> str:
+    """Normalize the retained reset scope without ROS message constants."""
+
+    normalized = _bounded_enum_token(scope, label="ResetSimulation scope")
+    if normalized not in _RESET_SCOPE_VALUES:
+        allowed = ", ".join(sorted(_RESET_SCOPE_VALUES))
+        raise ValueError(f"ResetSimulation scope must be one of: {allowed}")
+    return normalized
 
 
-def _rpy_deg_to_xyzw(rpy_deg: Any) -> list[float]:
+def normalize_simulation_state(state: str) -> str:
+    """Normalize the historical play/pause aliases without mutating state."""
+
+    state_key = _bounded_enum_token(state, label="SetSimulationState state")
+    normalized = {
+        "play": "playing",
+        "playing": "playing",
+        "pause": "paused",
+        "paused": "paused",
+    }.get(state_key)
+    if normalized not in _SIMULATION_STATE_VALUES:
+        allowed = ", ".join(sorted(_SIMULATION_STATE_VALUES))
+        raise ValueError(f"SetSimulationState state must be one of: {allowed}")
+    return normalized
+
+
+def normalize_entity_pose(
+    pose: dict[str, Any],
+) -> tuple[
+    str,
+    tuple[float, float, float],
+    tuple[float, float, float, float],
+]:
+    """Validate a pose payload and return fixed-shape numeric components."""
+
+    if not isinstance(pose, dict):
+        raise ValueError("SetEntityState pose must be a mapping")
+
+    raw_frame_id = pose.get("frame_id")
+    if raw_frame_id in (None, ""):
+        raise ValueError("SetEntityState pose.frame_id is required")
+    frame_id = _bounded_text(
+        raw_frame_id,
+        label="SetEntityState pose.frame_id",
+    )
+
+    position = pose.get("position_m")
+    if not isinstance(position, list) or len(position) != 3:
+        raise ValueError("SetEntityState pose.position_m must have length 3")
+
+    orientation = pose.get("orientation_xyzw")
+    if orientation is None and "orientation_rpy_deg" in pose:
+        orientation = rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
+    if not isinstance(orientation, list) or len(orientation) != 4:
+        raise ValueError(
+            "SetEntityState pose must include orientation_xyzw or orientation_rpy_deg"
+        )
+
+    normalized_position = tuple(
+        _finite_float(value, label=f"SetEntityState pose.position_m[{index}]")
+        for index, value in enumerate(position)
+    )
+    normalized_orientation = _normalized_quaternion(
+        tuple(
+            _finite_float(
+                value,
+                label=f"SetEntityState pose.orientation_xyzw[{index}]",
+            )
+            for index, value in enumerate(orientation)
+        )
+    )
+    return frame_id, normalized_position, normalized_orientation
+
+
+def rpy_deg_to_xyzw(rpy_deg: Any) -> list[float]:
+    """Convert roll/pitch/yaw degrees to an XYZW quaternion."""
+
     if not isinstance(rpy_deg, list) or len(rpy_deg) != 3:
         raise ValueError("orientation_rpy_deg must have length 3")
-    roll = float(rpy_deg[0]) * 3.141592653589793 / 180.0
-    pitch = float(rpy_deg[1]) * 3.141592653589793 / 180.0
-    yaw = float(rpy_deg[2]) * 3.141592653589793 / 180.0
-    import math
+    rpy = tuple(
+        _finite_float(value, label=f"orientation_rpy_deg[{index}]")
+        for index, value in enumerate(rpy_deg)
+    )
+    roll = math.radians(rpy[0])
+    pitch = math.radians(rpy[1])
+    yaw = math.radians(rpy[2])
 
     cr = math.cos(roll * 0.5)
     sr = math.sin(roll * 0.5)
@@ -508,18 +255,82 @@ def _rpy_deg_to_xyzw(rpy_deg: Any) -> list[float]:
     sp = math.sin(pitch * 0.5)
     cy = math.cos(yaw * 0.5)
     sy = math.sin(yaw * 0.5)
-    return [
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-        cr * cp * cy + sr * sp * sy,
-    ]
+    return list(
+        _normalized_quaternion(
+            (
+                sr * cp * cy - cr * sp * sy,
+                cr * sp * cy + sr * cp * sy,
+                cr * cp * sy - sr * sp * cy,
+                cr * cp * cy + sr * sp * sy,
+            )
+        )
+    )
 
 
-def _import_module(module_name: str) -> Any:
-    import importlib
+def _service_sort_key(service_name: str, service_type: str) -> tuple[int, str]:
+    preferred = _PREFERRED_SERVICES_BY_TYPE.get(service_type, set())
+    return (0 if service_name in preferred else 1, service_name)
 
-    return importlib.import_module(module_name)
+
+def _bounded_service_candidates(candidates: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(candidates, (str, bytes, bytearray)):
+        raise ValueError("service candidates must be a row sequence")
+    try:
+        rows = tuple(islice(iter(candidates), _MAX_ADAPTER_ROWS + 1))
+    except TypeError as exc:
+        raise ValueError("service candidates must be a row sequence") from exc
+    if len(rows) > _MAX_ADAPTER_ROWS:
+        raise ValueError("service candidates exceed the adapter bound")
+    normalized = tuple(
+        _bounded_text(candidate, label="service candidate") for candidate in rows
+    )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("service candidates must be unique")
+    return normalized
+
+
+def _bounded_text(value: Any, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if len(value) > _MAX_IDENTIFIER_CHARS:
+        raise ValueError(f"{label} exceeds the adapter bound")
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{label} must be non-empty")
+    if len(text) > _MAX_IDENTIFIER_CHARS:
+        raise ValueError(f"{label} exceeds the adapter bound")
+    return text
+
+
+def _bounded_enum_token(value: Any, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if len(value) > _MAX_IDENTIFIER_CHARS:
+        raise ValueError(f"{label} exceeds the adapter bound")
+    return value.strip().lower()
+
+
+def _finite_float(value: Any, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{label} must be a numeric value, not text or boolean")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} must be numeric") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{label} must be finite")
+    return number
+
+
+def _normalized_quaternion(
+    quaternion: tuple[float, ...],
+) -> tuple[float, float, float, float]:
+    if len(quaternion) != 4:
+        raise ValueError("orientation quaternion must have length 4")
+    norm = math.hypot(*quaternion)
+    if not math.isfinite(norm) or norm <= 1e-12:
+        raise ValueError("orientation quaternion must have finite nonzero norm")
+    return tuple(value / norm for value in quaternion)  # type: ignore[return-value]
 
 
 if __name__ == "__main__":

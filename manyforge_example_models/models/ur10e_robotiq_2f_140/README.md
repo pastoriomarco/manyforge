@@ -1,7 +1,12 @@
 # UR10e + Robotiq 2F-140 Example Model
 
-This preview model bundle is vendored into `manyforge_example_models` to make
-the ManyForge Isaac/preview path self-contained.
+> **Current boundary:** the static files and provenance remain valid reference
+> assets, but no Isaac or native product lane is currently available. Keeping
+> the bundle self-contained does not qualify a viewer, planner, or simulator
+> integration.
+
+This preview model bundle was vendored into `manyforge_example_models` to make
+the captured ManyForge Isaac/preview path self-contained.
 
 Contents:
 - `ur10e_robotiq_2f_140.urdf`

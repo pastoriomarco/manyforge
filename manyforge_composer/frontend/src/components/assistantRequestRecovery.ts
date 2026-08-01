@@ -1,33 +1,21 @@
-import type { AssistantRequestStatus } from '../types/api';
+export interface ReconciliableRequestStatus {
+  status: string;
+}
 
-const TERMINAL_ASSISTANT_STATUSES = new Set<AssistantRequestStatus['status']>([
-  'completed',
-  'failed',
-  'cancelled',
-]);
+export type AssistantRequestReconciliationResult<
+  TStatus extends ReconciliableRequestStatus,
+> =
+  | { kind: 'terminal'; status: TStatus }
+  | { kind: 'not_found'; requestObserved: boolean }
+  | { kind: 'unreachable'; detail: string }
+  | { kind: 'exhausted' }
+  | { kind: 'aborted' };
 
-export type AssistantRequestReconciliationResult =
-  | {
-      kind: 'terminal';
-      status: AssistantRequestStatus;
-    }
-  | {
-      kind: 'not_found';
-      requestObserved: boolean;
-    }
-  | {
-      kind: 'unreachable';
-      detail: string;
-    }
-  | {
-      kind: 'exhausted';
-    }
-  | {
-      kind: 'aborted';
-    };
-
-export interface AssistantRequestReconciliationOptions {
-  readStatus: (signal?: AbortSignal) => Promise<AssistantRequestStatus>;
+export interface AssistantRequestReconciliationOptions<
+  TStatus extends ReconciliableRequestStatus,
+> {
+  readStatus: (signal?: AbortSignal) => Promise<TStatus>;
+  isTerminal: (status: TStatus) => boolean;
   signal?: AbortSignal;
   retryDelayMs?: number;
   maxNotFoundAttempts?: number;
@@ -37,9 +25,7 @@ export interface AssistantRequestReconciliationOptions {
 }
 
 function errorStatus(error: unknown): number | null {
-  if (!error || typeof error !== 'object' || !('status' in error)) {
-    return null;
-  }
+  if (!error || typeof error !== 'object' || !('status' in error)) return null;
   const status = (error as { status?: unknown }).status;
   return typeof status === 'number' ? status : null;
 }
@@ -47,7 +33,7 @@ function errorStatus(error: unknown): number | null {
 function errorDetail(error: unknown): string {
   return error instanceof Error
     ? error.message
-    : 'The assistant status endpoint could not be reached.';
+    : 'The request status endpoint could not be reached.';
 }
 
 function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
@@ -56,12 +42,9 @@ function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
       resolve();
       return;
     }
-
     let settled = false;
     const finish = () => {
-      if (settled) {
-        return;
-      }
+      if (settled) return;
       settled = true;
       signal?.removeEventListener('abort', onAbort);
       resolve();
@@ -80,12 +63,19 @@ export function shouldReconcileAssistantRequest(error: unknown): boolean {
   return status === null || status >= 500;
 }
 
-export async function reconcileAssistantRequest(
-  options: AssistantRequestReconciliationOptions,
-): Promise<AssistantRequestReconciliationResult> {
+/**
+ * Reconcile an uncertain request against its authoritative status reader.
+ * Terminal semantics are supplied by the eventual I5 client contract rather
+ * than re-created here from the deleted assistant DTO.
+ */
+export async function reconcileAssistantRequest<
+  TStatus extends ReconciliableRequestStatus,
+>(
+  options: AssistantRequestReconciliationOptions<TStatus>,
+): Promise<AssistantRequestReconciliationResult<TStatus>> {
   const retryDelayMs = options.retryDelayMs ?? 2_000;
-  const maxNotFoundAttempts = options.maxNotFoundAttempts ?? 5;
-  const maxReadFailures = options.maxReadFailures ?? 5;
+  const maxNotFoundAttempts = Math.max(1, options.maxNotFoundAttempts ?? 5);
+  const maxReadFailures = Math.max(1, options.maxReadFailures ?? 5);
   const maxPollAttempts = Math.max(1, options.maxPollAttempts ?? 150);
   const wait = options.wait ?? waitForRetry;
   let notFoundAttempts = 0;
@@ -97,19 +87,13 @@ export async function reconcileAssistantRequest(
     pollAttempts += 1;
     try {
       const status = await options.readStatus(options.signal);
-      if (options.signal?.aborted) {
-        return { kind: 'aborted' };
-      }
+      if (options.signal?.aborted) return { kind: 'aborted' };
       requestObserved = true;
       notFoundAttempts = 0;
       readFailures = 0;
-      if (TERMINAL_ASSISTANT_STATUSES.has(status.status)) {
-        return { kind: 'terminal', status };
-      }
+      if (options.isTerminal(status)) return { kind: 'terminal', status };
     } catch (error) {
-      if (options.signal?.aborted) {
-        return { kind: 'aborted' };
-      }
+      if (options.signal?.aborted) return { kind: 'aborted' };
       if (errorStatus(error) === 404) {
         notFoundAttempts += 1;
         if (notFoundAttempts >= maxNotFoundAttempts) {
@@ -122,12 +106,8 @@ export async function reconcileAssistantRequest(
         }
       }
     }
-
-    if (pollAttempts >= maxPollAttempts) {
-      return { kind: 'exhausted' };
-    }
+    if (pollAttempts >= maxPollAttempts) return { kind: 'exhausted' };
     await wait(retryDelayMs, options.signal);
   }
-
   return { kind: 'aborted' };
 }

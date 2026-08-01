@@ -29,15 +29,6 @@ _RUNNER_SPEC = importlib.util.spec_from_file_location(
 assert _RUNNER_SPEC is not None and _RUNNER_SPEC.loader is not None
 _RUNNER = importlib.util.module_from_spec(_RUNNER_SPEC)
 _RUNNER_SPEC.loader.exec_module(_RUNNER)
-_CAPTURE_SCRIPT = (
-    _REPO_ROOT / "scripts/qualification/capture_isaac_drop_approach.py"
-)
-_CAPTURE_SPEC = importlib.util.spec_from_file_location(
-    "capture_isaac_drop_approach", _CAPTURE_SCRIPT
-)
-assert _CAPTURE_SPEC is not None and _CAPTURE_SPEC.loader is not None
-_CAPTURE = importlib.util.module_from_spec(_CAPTURE_SPEC)
-_CAPTURE_SPEC.loader.exec_module(_CAPTURE)
 _LIVE_SCRIPT = (
     _REPO_ROOT / "scripts/qualification/run_roboplan_05_live_baseline.py"
 )
@@ -1147,6 +1138,86 @@ def test_engine_matrix_translation_preserves_revision_and_validation_evidence() 
     )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("truthy_passed", "passed must be a boolean"),
+        ("truthy_enabled", "enabled must be a boolean"),
+        ("missing_decision", "decision_match must be a boolean"),
+        ("truthy_decision", "decision_match must be a boolean"),
+        ("nested_truthy_decision", "decision_match must be a boolean"),
+        ("nonfinite_latency", "must be finite and non-negative"),
+        ("negative_nested_latency", "must be non-negative"),
+        ("coercible_runs", "runs must be a non-negative integer"),
+    ],
+)
+def test_engine_matrix_translation_rejects_malformed_pass_evidence(
+    mutation: str, message: str
+) -> None:
+    fixture = {
+        "fixture": "support",
+        "passed": True,
+        "runtime_query": {
+            "revision_change": {
+                "p50_us": 1.0,
+                "p95_us": 2.0,
+                "p99_us": 3.0,
+                "max_us": 4.0,
+                "allocations": 0,
+            }
+        },
+        "validation": {
+            "enabled": True,
+            "runs": 9,
+            "decision_match": True,
+        },
+        "noncollision_validation": {"enabled": False},
+    }
+    if mutation == "truthy_passed":
+        fixture["passed"] = "true"
+    elif mutation == "truthy_enabled":
+        fixture["validation"]["enabled"] = "false"
+    elif mutation == "missing_decision":
+        del fixture["validation"]["decision_match"]
+    elif mutation == "truthy_decision":
+        fixture["validation"]["decision_match"] = "false"
+    elif mutation == "nested_truthy_decision":
+        fixture["validation"]["worker_sweep"] = [
+            {"workers_requested": 1, "decision_match": "true"}
+        ]
+    elif mutation == "nonfinite_latency":
+        fixture["runtime_query"]["revision_change"]["p95_us"] = float("nan")
+    elif mutation == "negative_nested_latency":
+        fixture["validation"]["worker_sweep"] = [
+            {"workers_requested": 1, "wall_us": -1.0}
+        ]
+    elif mutation == "coercible_runs":
+        fixture["validation"]["runs"] = "9"
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(mutation)
+
+    with pytest.raises(ValueError, match=message):
+        _RUNNER._engine_matrix_records({"fixtures": [fixture]})
+
+
+def test_engine_matrix_translation_bounds_fixture_rows() -> None:
+    fixture = {
+        "fixture": "support",
+        "passed": True,
+        "validation": {"enabled": False},
+        "noncollision_validation": {"enabled": False},
+    }
+
+    with pytest.raises(ValueError, match="4096-row bound"):
+        _RUNNER._engine_matrix_records(
+            {
+                "fixtures": (
+                    fixture for _ in range(_RUNNER.MAX_FIXTURE_ROWS + 1)
+                )
+            }
+        )
+
+
 def _ordered_summary_validation_record() -> dict:
     worker_sweep = [
         {
@@ -1237,649 +1308,167 @@ def test_live_summary_omits_p99_for_thirty_sample_stratum() -> None:
     assert summary["max"] == 30.0
 
 
-def test_live_planner_records_pair_by_serial_admission_and_move_identity() -> None:
-    events = [
-        {
-            "type": "cache_miss",
-            "execution_id": 7,
-            "details": {"move_id": "pick_retreat"},
-        },
-        {"type": "plan_started", "execution_id": 7},
-        {
-            "type": "cache_miss",
-            "execution_id": 8,
-            "details": {"move_id": "drop_approach"},
-        },
-        {"type": "plan_started", "execution_id": 8},
-    ]
-    records = [
-        {"sequence": 1, "request": {"move_id": "pick_retreat"}},
-        {"sequence": 2, "request": {"move_id": "drop_approach"}},
-    ]
-    paired = _LIVE._pair_planner_records(events, records)
-    assert paired[8]["sequence"] == 2
-
-    records[1]["request"]["move_id"] = "wrong"
-    with pytest.raises(RuntimeError, match="admission order"):
-        _LIVE._pair_planner_records(events, records)
+@pytest.mark.parametrize("values", ([True], [1.0], ["1"]))
+def test_live_summary_requires_exact_bounded_integer_samples(values) -> None:
+    with pytest.raises(TypeError, match="exact integer"):
+        _LIVE._summary(values)
 
 
-def test_live_success_requires_behavior_consumption_of_kernel_completion() -> None:
-    events = [
-        {
-            "type": "cache_miss",
-            "execution_id": 4,
-            "details": {"move_id": "drop_approach"},
-        },
-        *(
-            {"type": event_type, "execution_id": 4}
-            for event_type in (
-                "plan_started",
-                "plan_completed",
-                "validation_started",
-                "validation_passed",
-                "execute_started",
-                "execute_completed",
-            )
+def test_live_summary_rejects_oversized_and_out_of_range_samples() -> None:
+    with pytest.raises(ValueError, match="sample bound"):
+        _LIVE._summary(range(_LIVE.MAX_LATENCY_SAMPLES + 1))
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        _LIVE._summary([_LIVE.MAX_LATENCY_NS + 1])
+    with pytest.raises(TypeError, match="exact bool"):
+        _LIVE._summary([1], include_p99=1)
+
+
+@pytest.mark.parametrize("percentile", (True, "0.5"))
+def test_live_percentile_rejects_non_real_or_bool_percentiles(percentile) -> None:
+    with pytest.raises(TypeError, match="real number, not bool"):
+        _LIVE._percentile([1, 2], percentile)
+
+
+def test_live_percentile_requires_finite_range_and_sorted_input() -> None:
+    with pytest.raises(ValueError, match=r"finite and in \[0, 1\]"):
+        _LIVE._percentile([1, 2], float("nan"))
+    with pytest.raises(ValueError, match="sorted"):
+        _LIVE._percentile([2, 1], 0.5)
+
+
+
+# Historical producer-only tests are acceptance inputs, not runnable fallbacks.
+# Source blobs:
+#   offline producer: 1f07b69faea96950fbbdbc35a4d8e3e9913cc2b1
+#   live producer:    5d31237c04a5c3266a50572159921eeb515aa385
+# Historical test blob: 0935aa3246f28dc7457706ae37db386759cf415d
+HISTORICAL_TEST_DEFINITION_COUNT = 74
+RETAINED_HISTORICAL_TEST_DEFINITION_COUNT = 39
+REMOVED_HISTORICAL_CASE_COHORTS = (
+    {
+        "cohort": "planner_event_and_kernel_completion",
+        "historical_lines": "1240-1290",
+        "case_names": (
+            "test_live_planner_records_pair_by_serial_admission_and_move_identity",
+            "test_live_success_requires_behavior_consumption_of_kernel_completion",
         ),
-    ]
-    assert _LIVE._successful_drop_execution_ids(events) == []
-    events.append({"type": "acknowledge_completed", "execution_id": 4})
-    assert _LIVE._successful_drop_execution_ids(events) == [4]
-
-
-def test_live_runtime_metrics_capture_is_complete_and_scoped(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = {
-        key: 0
-        for key in (
-            _LIVE._KERNEL_RUNTIME_REQUIRED_METRICS
-            | _LIVE._KERNEL_RUNTIME_COUNTER_METRICS
-        )
-    }
-    payload["runtime_collision_lookahead_max_samples"] = 32
-    payload["unrelated_metric"] = 99
-
-    def request_json(_base_url: str, path: str, **_kwargs: object) -> dict:
-        assert path == "/api/kernel/metrics"
-        return payload
-
-    monkeypatch.setattr(_LIVE, "_request_json", request_json)
-    captured = _LIVE._kernel_runtime_metrics("http://composer")
-
-    assert captured["runtime_collision_lookahead_max_samples"] == 32
-    assert "controller_command_progress_samples_total" in captured
-    assert "unrelated_metric" not in captured
-
-
-def test_live_runtime_metric_deltas_reject_counter_regression() -> None:
-    before = {key: 7 for key in _LIVE._KERNEL_RUNTIME_COUNTER_METRICS}
-    after = {key: 9 for key in _LIVE._KERNEL_RUNTIME_COUNTER_METRICS}
-
-    deltas = _LIVE._kernel_runtime_counter_deltas(before, after)
-    assert set(deltas) == set(_LIVE._KERNEL_RUNTIME_COUNTER_METRICS)
-    assert set(deltas.values()) == {2}
-
-    after["runtime_collision_ticks_completed"] = 6
-    with pytest.raises(
-        RuntimeError, match="runtime_collision_ticks_completed.*regressed"
-    ):
-        _LIVE._kernel_runtime_counter_deltas(before, after)
-
-
-def test_live_runtime_metrics_require_fresh_attributable_baseline() -> None:
-    baseline = {
-        key: 0 for key in _LIVE._KERNEL_RUNTIME_FRESH_BASELINE_METRICS
-    }
-    _LIVE._require_fresh_kernel_runtime_baseline(baseline)
-
-    baseline["runtime_collision_lookahead_jobs_started"] = 1
-    with pytest.raises(
-        RuntimeError,
-        match="fresh kernel metric baseline.*lookahead_jobs_started=1",
-    ):
-        _LIVE._require_fresh_kernel_runtime_baseline(baseline)
-
-
-def test_live_controller_progress_tracker_retains_every_exact_transition() -> None:
-    baseline = {
-        "controller_command_progress_samples_total": 0,
-        "controller_last_command_progress_latency_ns": 0,
-        "controller_max_command_progress_latency_ns": 0,
-    }
-    tracker = _LIVE._ControllerProgressSampleTracker(baseline)
-    tracker.observe(baseline, observed_monotonic_ns=10)
-    tracker.observe(
-        {
-            "controller_command_progress_samples_total": 1,
-            "controller_last_command_progress_latency_ns": 70,
-            "controller_max_command_progress_latency_ns": 70,
-        },
-        observed_monotonic_ns=20,
-    )
-    final_metrics = {
-        "controller_command_progress_samples_total": 2,
-        "controller_last_command_progress_latency_ns": 50,
-        "controller_max_command_progress_latency_ns": 70,
-    }
-    result = tracker.finalize(final_metrics)
-
-    assert result["native_counter_delta"] == 2
-    assert result["native_max_ns"] == 70
-    assert result["latency_ns"]["max"] == 70.0
-    assert [sample["latency_ns"] for sample in result["samples"]] == [70, 50]
-    assert [sample["observed_monotonic_ns"] for sample in result["samples"]][0] == 20
-
-
-def test_live_controller_progress_tracker_fails_on_poll_gap() -> None:
-    tracker = _LIVE._ControllerProgressSampleTracker(
-        {
-            "controller_command_progress_samples_total": 0,
-            "controller_last_command_progress_latency_ns": 0,
-            "controller_max_command_progress_latency_ns": 0,
-        }
-    )
-    with pytest.raises(RuntimeError, match="advanced by 2"):
-        tracker.observe(
-            {
-                "controller_command_progress_samples_total": 2,
-                "controller_last_command_progress_latency_ns": 50,
-                "controller_max_command_progress_latency_ns": 70,
-            }
-        )
-
-
-@pytest.mark.parametrize(
-    ("mode", "expected"),
-    [
-        (
-            "binary_contact",
-            {
-                "mode": "contact_release",
-                "release_evidence_mode": "binary_contact",
-                "enforce_max_start_penetration": False,
-                "max_start_penetration_m": 0.0,
-                "release_tolerance_m": 0.0,
-                "min_release_progress_m": 0.0,
-                "require_separation_by_end": True,
-                "require_strictly_decreasing_penetration": False,
-                "allow_recontact": False,
-            },
+        "future_gates": ("I5/H0", "I6/N"),
+        "acceptance": (
+            "Rebuild serial-admission, move-correlation, and "
+            "behavior-consumption evidence against owner-issued Program and "
+            "Kernel facts."
         ),
-        (
-            "bounded_penetration",
-            {
-                "mode": "bounded_penetration",
-                "max_contact_penetration_m": 0.03,
-            },
+    },
+    {
+        "cohort": "runtime_metrics_controller_progress_and_stop",
+        "historical_lines": "1291-1418",
+        "case_names": (
+            "test_live_runtime_metrics_capture_is_complete_and_scoped",
+            "test_live_runtime_metric_deltas_reject_counter_regression",
+            "test_live_runtime_metrics_require_fresh_attributable_baseline",
+            "test_live_controller_progress_tracker_retains_every_exact_transition",
+            "test_live_controller_progress_tracker_fails_on_poll_gap",
         ),
-    ],
+        "future_gates": ("I8/P5", "I9/I"),
+        "acceptance": (
+            "Rebuild fresh scoped runtime counters and exact "
+            "controller-progress evidence against final Stop and the "
+            "registered Isaac manager."
+        ),
+    },
+    {
+        "cohort": "contact_policy_scene_projection",
+        "historical_lines": "1419-1567",
+        "case_names": (
+            "test_live_step18_mode_projection_has_only_mode_valid_fields",
+            "test_live_step18_mode_apply_captures_authored_and_resolved_identity",
+            "test_live_step18_baseline_mode_preserves_legacy_precise_shape",
+        ),
+        "future_gates": ("I6/N", "I8/P5", "I9/I"),
+        "acceptance": (
+            "Rebuild contact-mode authoring, resolution, and evidence "
+            "projection on addressed scene products and final Stop policy."
+        ),
+    },
+    {
+        "cohort": "failure_wait_sample_sequence_and_publication",
+        "historical_lines": "1568-1872",
+        "case_names": (
+            "test_live_failed_run_retains_cycle_and_kernel_evidence",
+            "test_live_failed_run_records_secondary_capture_errors",
+            "test_live_wait_prepares_fresh_plan_after_nonfinal_success",
+            "test_live_sample_reports_true_behavior_node_envelope",
+            "test_live_event_sequence_tracker_accepts_cross_batch_producer_reordering",
+            "test_live_event_sequence_gap_is_fail_closed_at_quiescence",
+            "test_live_event_sequence_tracker_rejects_duplicate_or_regressed_values",
+            "test_live_evidence_writes_are_atomic_and_never_clobber",
+            "test_live_evidence_validation_failure_publishes_nothing",
+        ),
+        "future_gates": ("I5/H0", "I6/N", "I8/P5", "I9/I"),
+        "acceptance": (
+            "Rebuild fault-fast waits, event sequencing, node envelopes, "
+            "and atomic live-evidence publication using the restored public "
+            "facts."
+        ),
+    },
+    {
+        "cohort": "failed_output_identity",
+        "historical_lines": "1873-1884",
+        "case_names": ("test_live_failed_output_path_is_distinct_from_success_target",),
+        "future_gates": ("I6/N", "I8/P5", "I9/I"),
+        "acceptance": (
+            "Reintroduce distinct failure artifacts only with the restored "
+            "source-bound live producer."
+        ),
+    },
+    {
+        "cohort": "process_cpu_sampling",
+        "historical_lines": "1916-1934",
+        "case_names": ("test_live_process_cpu_interval_reports_conservative_bounds",),
+        "future_gates": ("I9/I",),
+        "acceptance": (
+            "Reintroduce bounded process CPU evidence for the manager-owned "
+            "live qualification process."
+        ),
+    },
+    {
+        "cohort": "python_runtime_model_view",
+        "historical_lines": "1935-2234",
+        "case_names": (
+            "test_qualification_rma_view_uses_production_resolved_model_identity",
+        ),
+        "future_gates": ("I6/N",),
+        "acceptance": (
+            "Replace the deleted Python Robot Model Authority view with "
+            "resource-addressed native model products."
+        ),
+    },
+    {
+        "cohort": "isaac_capture_and_replay",
+        "historical_lines": "2235-2913",
+        "case_names": (
+            "test_capture_payload_resolves_base_frame_goal_and_validates_semantic_hash",
+            "test_capture_support_contact_modes_are_mode_scoped",
+            "test_capture_rejects_invalid_support_contact_mode_fields",
+            "test_resolved_collision_policy_support_modes_are_canonical",
+            "test_capture_wait_uses_active_drop_planning_window_and_fresh_snapshot",
+            "test_capture_wait_fails_promptly_on_composer_fault",
+            "test_capture_waits_for_complete_successful_drop_plan_record",
+            "test_capture_correlates_planner_attempt_by_run_and_execution",
+            "test_capture_simulation_reset_and_play_use_deployment_control_contract",
+            "test_capture_requires_loaded_saved_artifacts_to_match",
+            "test_live_row_force_reloads_exact_disk_artifacts",
+            "test_captured_replay_rejects_changed_source_or_model_view",
+            "test_frozen_rp5_0_capture_requires_exact_manifest_identity",
+        ),
+        "future_gates": ("I6/N", "I8/P5", "I9/I"),
+        "acceptance": (
+            "Rebuild capture, reset/play, artifact reload, provenance, and "
+            "replay acceptance through the native, final-Stop, and registered "
+            "Isaac owners."
+        ),
+    },
 )
-def test_live_step18_mode_projection_has_only_mode_valid_fields(
-    mode: str, expected: dict[str, object]
-) -> None:
-    precise = {
-        "support_object_id": "isaac_table_low_327",
-        "mode": "contact_release",
-        "release_evidence_mode": "signed_penetration",
-        "enforce_max_start_penetration": True,
-        "max_start_penetration_m": 0.03,
-        "release_tolerance_m": 0.001,
-        "min_release_progress_m": 0.0,
-        "require_separation_by_end": True,
-        "require_strictly_decreasing_penetration": True,
-        "allow_recontact": False,
-    }
-
-    projected = _LIVE._step18_contact_for_mode(precise, mode, 0.03)
-
-    assert projected["support_object_id"] == "isaac_table_low_327"
-    for key, value in expected.items():
-        assert projected[key] == value
-    if mode == "bounded_penetration":
-        assert "release_evidence_mode" not in projected
-        assert "require_separation_by_end" not in projected
-    else:
-        assert "max_contact_penetration_m" not in projected
-
-
-def test_live_step18_mode_apply_captures_authored_and_resolved_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    precise = {
-        "support_object_id": "isaac_table_low_327",
-        "mode": "contact_release",
-        "release_evidence_mode": "signed_penetration",
-        "enforce_max_start_penetration": True,
-        "max_start_penetration_m": 0.03,
-        "release_tolerance_m": 0.001,
-        "min_release_progress_m": 0.0,
-        "require_separation_by_end": True,
-        "require_strictly_decreasing_penetration": True,
-        "allow_recontact": False,
-    }
-    saved = {
-        "sceneResources": [
-            {
-                "objectId": "isaac_cheese_box",
-                "metadata": {"support_contacts": [precise]},
-            },
-            {"objectId": "isaac_table_low_327"},
-        ]
-    }
-    effective: dict[str, object] = {}
-
-    def request_json(
-        _base_url: str,
-        path: str,
-        *,
-        method: str = "GET",
-        payload: dict | None = None,
-        **_kwargs: object,
-    ) -> dict:
-        if path == "/api/program/saved":
-            return saved
-        if path == "/api/session/apply":
-            assert method == "POST" and payload is not None
-            effective["sceneResources"] = payload["scene"]
-            return {"status": "ok"}
-        if path == "/api/program":
-            return effective
-        if path == "/api/debug/qualification/scene-authority-snapshot":
-            return {
-                "revision": {"revision_id": 7, "content_hash": "scene-seven"},
-                "transaction_sequence": 8,
-                "scene_admission_epoch": 9,
-                "topology_epoch": 10,
-                "policy_epoch": 11,
-                "configured_collision_policy": {
-                    "policy_id": "default_free_space",
-                    "revision": {
-                        "revision_id": 12,
-                        "content_hash": "policy-twelve",
-                    },
-                    "support_contacts": [
-                        {
-                            "pair": {
-                                "body_a": "isaac_cheese_box",
-                                "body_b": "isaac_table_low_327",
-                            },
-                            "mode": "contact_release",
-                            "release_evidence_mode": "binary_contact",
-                        }
-                    ],
-                },
-            }
-        raise AssertionError(path)
-
-    monkeypatch.setattr(_LIVE, "_request_json", request_json)
-
-    evidence = _LIVE._apply_step18_support_contact_mode(
-        "http://composer", mode="binary_contact", bounded_penetration_m=0.03
-    )
-
-    assert evidence["mode"] == "binary_contact"
-    assert evidence["bounded_penetration_m"] is None
-    assert evidence["authored_contact"]["release_evidence_mode"] == "binary_contact"
-    assert evidence["resolved_contact"]["release_evidence_mode"] == "binary_contact"
-    assert evidence["saved_scene_sha256"] != evidence["effective_scene_sha256"]
-
-
-def test_live_step18_baseline_mode_preserves_legacy_precise_shape() -> None:
-    legacy = {
-        "support_object_id": "isaac_table_low_327",
-        "mode": "contact_release",
-        "enforce_max_start_penetration": True,
-        "max_start_penetration_m": 0.03,
-        "min_separation_clearance_m": 0.0,
-        "release_tolerance_m": 0.001,
-        "min_release_progress_m": 0.0,
-        "require_separation_by_end": True,
-        "require_strictly_decreasing_penetration": True,
-        "allow_recontact": False,
-    }
-
-    projected = _LIVE._step18_contact_for_mode(
-        legacy, "current_all_active_distance", 0.03
-    )
-    resolved = _LIVE._resolved_step18_contact(
-        {
-            "configured_collision_policy": {
-                "support_contacts": [
-                    {
-                        "pair": {
-                            "body_a": "isaac_cheese_box",
-                            "body_b": "isaac_table_low_327",
-                        },
-                        "mode": "contact_release",
-                        "min_separation_clearance_m": 0.0,
-                    }
-                ]
-            }
-        },
-        "current_all_active_distance",
-    )
-
-    assert projected == legacy
-    assert resolved["min_separation_clearance_m"] == 0.0
-
-
-def test_live_failed_run_retains_cycle_and_kernel_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    metrics = {
-        key: 0
-        for key in (
-            _LIVE._KERNEL_RUNTIME_REQUIRED_METRICS
-            | _LIVE._KERNEL_RUNTIME_COUNTER_METRICS
-        )
-    }
-
-    def request_json(_base_url: str, path: str, **_kwargs: object) -> dict:
-        if path == "/api/cycle/status":
-            return {"state": "stopped", "errorCode": "execution_aborted"}
-        if path == "/api/kernel/metrics":
-            return metrics
-        raise AssertionError(path)
-
-    monkeypatch.setattr(_LIVE, "_request_json", request_json)
-    evidence = _LIVE._failure_runtime_evidence("http://composer")
-
-    assert evidence["cycle_status"]["errorCode"] == "execution_aborted"
-    assert "runtime_collision_ticks_completed" in evidence["kernel_runtime_metrics"]
-    assert "capture_errors" not in evidence
-
-
-def test_live_failed_run_records_secondary_capture_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fail_request(*_args: object, **_kwargs: object) -> dict:
-        raise ConnectionError("offline")
-
-    monkeypatch.setattr(_LIVE, "_request_json", fail_request)
-
-    evidence = _LIVE._failure_runtime_evidence("http://composer")
-
-    assert set(evidence["capture_errors"]) == {
-        "cycle_status",
-        "kernel_runtime_metrics",
-    }
-
-
-def test_live_wait_prepares_fresh_plan_after_nonfinal_success(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    required_types = (
-        "plan_started",
-        "plan_completed",
-        "validation_started",
-        "validation_passed",
-        "execute_started",
-        "execute_completed",
-        "acknowledge_completed",
-    )
-
-    def success_batch(execution_id: int, first_index: int) -> list[dict]:
-        return [
-            {
-                "type": event_type,
-                "execution_id": execution_id,
-                "event_index": first_index + offset,
-                "sequence": first_index + offset,
-                "details": {"move_id": "drop_approach"},
-            }
-            for offset, event_type in enumerate(required_types)
-        ]
-
-    batches = [success_batch(1, 1), success_batch(2, 8)]
-
-    def request_json(_base_url: str, path: str) -> dict:
-        if path.startswith("/api/kernel/events"):
-            batch = batches.pop(0)
-            return {"events": batch}
-        if path == "/api/cycle/status":
-            return {"state": "running"}
-        raise AssertionError(path)
-
-    monkeypatch.setattr(_LIVE, "_request_json", request_json)
-    monkeypatch.setattr(_LIVE, "_enforce_viewer_stratum", lambda *args, **kwargs: 0)
-    invalidations: list[str] = []
-    tracker = _LIVE._KernelSequenceTracker(0)
-    events, cursor, invalidated_count = _LIVE._wait_for_successes(
-        "http://composer",
-        cursor=0,
-        sequence_tracker=tracker,
-        required_successes=2,
-        timeout_s=1.0,
-        viewer_stratum="disconnected",
-        focused_attested=False,
-        poll_period_s=0.0,
-        prepare_next_fresh_plan=lambda: invalidations.append("clear"),
-    )
-
-    assert len(events) == 14
-    assert cursor == 14
-    assert invalidated_count == 1
-    assert invalidations == ["clear"]
-
-
-def test_live_sample_reports_true_behavior_node_envelope() -> None:
-    timestamps = {
-        "plan_started": 110,
-        "plan_completed": 200,
-        "validation_started": 210,
-        "validation_passed": 400,
-        "execute_started": 410,
-        "execute_completed": 700,
-    }
-    events = [
-        {
-            "type": "state_transition",
-            "execution_id": 4,
-            "to_state": "Planning",
-            "timestamp_ns": 100,
-        },
-        *(
-            {
-                "type": event_type,
-                "execution_id": 4,
-                "timestamp_ns": timestamp,
-                "sequence": 50 if event_type == "validation_passed" else 0,
-                **(
-                    {
-                        "details": {
-                            "collision_workers_requested": 4,
-                            "collision_workers_effective": 4,
-                            "collision_workers_used": 4,
-                            "collision_parallel_fallback_reason": "",
-                            "collision_ordered_contact_summary_used": True,
-                            "collision_validation_wall_ns": 190,
-                        }
-                    }
-                    if event_type == "validation_passed"
-                    else {}
-                ),
-            }
-            for event_type, timestamp in timestamps.items()
-        ),
-    ]
-    planner_record = {
-        "sequence": 1,
-        "request": {
-            "contact_policy_id": "default_free_space",
-            "scene_binding": {
-                "revision_id": 7,
-                "content_hash": "scene-7",
-                "projection_lease_id": "lease-7",
-            },
-        },
-        "metrics": {
-            "total_duration_ns": 80,
-            "measurement_complete": True,
-            "collision_probe_available": False,
-            "succeeded": True,
-            "waypoint_count": 2,
-            "trajectory_duration_s": 1.0,
-            "rng_base_seed": 12345,
-            "rng_seed": 12345,
-            "shortcut_rng_seed_argument": -12346,
-        },
-        "result": {
-            "scene_revision": {
-                "revision_id": 7,
-                "content_hash": "scene-7",
-            },
-            "trajectory": {
-                "joint_names": ["j1"],
-                "waypoints": [
-                    {"time_from_start_s": 0.0, "positions_rad": [0.0]},
-                    {"time_from_start_s": 1.0, "positions_rad": [0.5]},
-                ],
-            },
-        },
-        "behavior_node": {
-            "terminal_phase": "succeeded",
-            "started_monotonic_ns": 90,
-            "completed_monotonic_ns": 710,
-            "thread_cpu_duration_ns": 12,
-        },
-    }
-
-    class _Sampler:
-        @staticmethod
-        def interval_bounds(start_ns, end_ns):
-            return {
-                "estimate_ns": end_ns - start_ns,
-                "lower_bound_ns": end_ns - start_ns,
-                "upper_bound_ns": end_ns - start_ns,
-                "uncertainty_ns": 0,
-                "start_bracket_ns": 1,
-                "end_bracket_ns": 1,
-            }
-
-    sample = _LIVE._sample_payload(
-        4, events, planner_record, _Sampler(), "primary"
-    )
-    assert sample["wall_duration_ns"]["behavior_pre_admission"] == 10
-    assert sample["wall_duration_ns"]["behavior_post_kernel"] == 10
-    assert sample["wall_duration_ns"]["total_behavior_node"] == 620
-    assert sample["process_cpu"]["behavior_node"]["estimate_ns"] == 620
-    assert sample["result"]["joint_space_path_length_rad"] == 0.5
-    assert len(sample["result"]["trajectory_sha256"]) == 64
-    assert sample["result"]["rng_seed"] == 12345
-    assert sample["request"] == {
-        "contact_policy_id": "default_free_space",
-        "contact_policy_resolution": "explicit",
-        "scene_binding": {
-            "revision_id": 7,
-            "content_hash": "scene-7",
-            "projection_lease_id": "lease-7",
-        },
-    }
-    assert sample["result"]["authoritative_validation"] == {
-        "decision": "passed",
-        "event_sequence": 50,
-        "joint_limit_and_dynamics_compliance": True,
-        "collision_workers_requested": 4,
-        "collision_workers_effective": 4,
-        "collision_workers_used": 4,
-        "collision_parallel_fallback_reason": "",
-        "collision_ordered_contact_summary_used": True,
-        "collision_validation_wall_ns": 190,
-    }
-
-    planner_record["result"]["scene_revision"]["revision_id"] = 8
-    with pytest.raises(RuntimeError, match="changed its bound scene revision"):
-        _LIVE._sample_payload(4, events, planner_record, _Sampler(), "primary")
-    planner_record["result"]["scene_revision"]["revision_id"] = 7
-
-    planner_record["metrics"]["collision_probe_available"] = True
-    planner_record["metrics"]["total_collision_query_count"] = 4
-    with pytest.raises(RuntimeError, match="primary latency was contaminated"):
-        _LIVE._sample_payload(4, events, planner_record, _Sampler(), "primary")
-
-    planner_record["metrics"]["collision_probe_available"] = False
-    with pytest.raises(RuntimeError, match="has no planner collision probe"):
-        _LIVE._sample_payload(
-            4,
-            events,
-            planner_record,
-            _Sampler(),
-            "collision_probe_attribution",
-        )
-
-
-def test_live_event_sequence_tracker_accepts_cross_batch_producer_reordering() -> None:
-    tracker = _LIVE._KernelSequenceTracker(1258)
-
-    tracker.observe([{"sequence": 1260}, {"sequence": 1261}])
-    assert tracker.committed_sequence == 1258
-    assert tracker.settled is False
-
-    tracker.observe([{"sequence": 1259}])
-    assert tracker.committed_sequence == 1261
-    assert tracker.settled is True
-
-
-def test_live_event_sequence_gap_is_fail_closed_at_quiescence() -> None:
-    tracker = _LIVE._KernelSequenceTracker(11)
-    tracker.observe([{"sequence": 13}])
-
-    with pytest.raises(
-        RuntimeError,
-        match="expected 12, next available 13, missing through 12",
-    ):
-        tracker.require_settled(reason="test quiescence")
-
-
-def test_live_event_sequence_tracker_rejects_duplicate_or_regressed_values() -> None:
-    tracker = _LIVE._KernelSequenceTracker(10)
-    tracker.observe([{"sequence": 11}])
-    with pytest.raises(RuntimeError, match="duplicate or regressed"):
-        tracker.observe([{"sequence": 11}])
-
-
-def test_live_evidence_writes_are_atomic_and_never_clobber(tmp_path: Path) -> None:
-    path = tmp_path / "live.json"
-    first = {"run_id": "first"}
-    second = {"run_id": "second"}
-
-    _LIVE._write_evidence_exclusive(path, first)
-    with pytest.raises(FileExistsError):
-        _LIVE._write_evidence_exclusive(path, second)
-
-    assert json.loads(path.read_text(encoding="utf-8")) == first
-    assert list(tmp_path.glob(".*.tmp")) == []
-
-
-def test_live_evidence_validation_failure_publishes_nothing(tmp_path: Path) -> None:
-    path = tmp_path / "invalid.json"
-
-    def reject(_path: Path) -> None:
-        raise ValueError("invalid evidence")
-
-    with pytest.raises(ValueError, match="invalid evidence"):
-        _LIVE._write_evidence_exclusive(
-            path,
-            {"run_id": "invalid"},
-            validator=reject,
-        )
-
-    assert path.exists() is False
-    assert list(tmp_path.glob(".*.tmp")) == []
-
-
-def test_live_failed_output_path_is_distinct_from_success_target(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(_LIVE.time, "strftime", lambda *_args: "20260713T010203Z")
-    monkeypatch.setattr(_LIVE.os, "getpid", lambda: 42)
-    requested = tmp_path / "focused.json"
-
-    failed = _LIVE._failed_output_path(requested)
-
-    assert failed == tmp_path / "focused.failed-20260713T010203Z-42.json"
 
 
 @pytest.mark.parametrize(
@@ -1910,1072 +1499,34 @@ def test_live_failed_output_path_is_distinct_from_success_target(
 def test_live_cycle_failure_detection_covers_composer_stopped_faults(
     status: dict, expected: str | None
 ) -> None:
-    assert _LIVE._cycle_failure_reason(status) == expected
+    assert _MODULE.cycle_failure_reason(status) == expected
 
 
-def test_live_process_cpu_interval_reports_conservative_bounds() -> None:
-    sampler = _LIVE._ProcessCpuSampler(1, 1.0)
-    sampler._samples = [
-        _LIVE._CpuSample(90, 1_000),
-        _LIVE._CpuSample(110, 1_100),
-        _LIVE._CpuSample(190, 1_400),
-        _LIVE._CpuSample(210, 1_500),
+def test_legacy_roboplan_producers_gate_before_argument_parsing(capsys) -> None:
+    assert _RUNNER.main(["--not-a-real-offline-option"]) == 78
+    assert _LIVE.main(["--not-a-real-live-option"]) == 78
+    payloads = [
+        json.loads(line)
+        for line in capsys.readouterr().err.splitlines()
+        if line.strip()
     ]
-    bounds = sampler.interval_bounds(100, 200)
-    assert bounds == {
-        "estimate_ns": 400,
-        "lower_bound_ns": 300,
-        "upper_bound_ns": 500,
-        "uncertainty_ns": 200,
-        "start_bracket_ns": 20,
-        "end_bracket_ns": 20,
-    }
-
-
-def test_qualification_rma_view_uses_production_resolved_model_identity() -> None:
-    corpus = json.loads(
-        (_REPO_ROOT / "benchmarks/roboplan_05/corpus/corpus-v1.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    view = _RUNNER._runtime_views(corpus, _REPO_ROOT)["ur10e_robotiq"]
-    assert view.authority.model_name == "ur10e_robotiq_2f_140"
-
-
-def _capture_scene_state() -> dict:
-    return {
-        "robot": {
-            "robot_id": "ur10e",
-            "group_id": "arm",
-            "base_frame": "base_link",
-            "base_pose": {
-                "position_m": [0.0, 0.0, 0.0],
-                "orientation_rpy_deg": [0.0, 0.0, 90.0],
-            },
-            "joint_names": ["joint_a", "joint_b"],
-            "joint_positions": {"joint_a": 0.25, "joint_b": -0.5},
-            "state_source": "controller_state",
-            "source_timestamp_ns": 100,
-            "source_age_ns": 1_000_000,
-        },
-        "grippers": [
-            {
-                "gripper_id": "gripper",
-                "joint_name": "finger_joint",
-                "current_position": 0.66,
-            }
-        ],
-        "objects": [
-            {
-                "object_id": "drop_box",
-                "shape": {
-                    "type": "box",
-                    "box_dimensions_m": [0.2, 0.3, 0.4],
-                },
-                "pose_in_universe": {
-                    "position_m": [0.0, 1.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "attached": False,
-                "attached_to": None,
-            },
-            {
-                "object_id": "isaac_cheese_box",
-                "shape": {
-                    "type": "mesh",
-                    "mesh_resource_uri": "examples/cheese.obj",
-                    "mesh_scale": [1.0, 1.0, 1.0],
-                },
-                "pose_in_universe": {
-                    "position_m": [0.2, 0.3, 0.4],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "attached": True,
-                "attached_to": "grasp_frame",
-            },
-        ],
-        "visual_state_diagnostics": {
-            "served_from_visual_snapshot": True,
-            "snapshot_stale": False,
-            "snapshot_publisher_error": None,
-            "objects_source": "visual_snapshot",
-        },
-    }
-
-
-def _capture_program() -> dict:
-    return {
-        "name": "capture-test",
-        "scene": [
-            {
-                "object_id": "isaac_cheese_box",
-                "metadata": {
-                    "support_contacts": [
-                        {
-                            "support_object_id": "drop_box",
-                            "mode": "contact_release",
-                            "release_evidence_mode": "signed_penetration",
-                            "max_start_penetration_m": 0.03,
-                        }
-                    ]
-                },
-            }
-        ],
-        "tree": {
-            "id": "sequence",
-            "name": "root",
-            "children": [
-                {"id": "move_manipulator_action", "name": "pick_retreat"},
-                {
-                    "id": "move_manipulator_action",
-                    "name": "move_to_drop_approach",
-                    "params": {
-                        "motion_type": "pose",
-                        "target_mode": "relative",
-                        "target_reference": {
-                            "type": "object",
-                            "id": "drop_box",
-                        },
-                        "offset_reference": {
-                            "type": "frame",
-                            "id": "base_link",
-                        },
-                        "pose_goal": {
-                            "position_m": [0.0, 0.0, 0.4],
-                            "orientation_rpy_deg": [0.0, 0.0, 0.0],
-                        }
-                    },
-                },
-            ],
-        },
-    }
-
-
-def _capture_authority_snapshot() -> dict:
-    return {
-        "revision": {"revision_id": 7, "content_hash": "scene-seven"},
-        "transaction_sequence": 11,
-        "scene_admission_epoch": 3,
-        "topology_epoch": 5,
-        "policy_epoch": 2,
-        "world_frame": "universe",
-        "configured_collision_policy": {
-            "policy_id": "default_free_space",
-            "revision": {"revision_id": 1, "content_hash": "policy-one"},
-            "allowed_static_static_pairs": [],
-            "allowed_touch_link_pairs": [],
-            "support_contacts": [],
-            "contact_grasps": [],
-            "require_full_diagnostics": False,
-        },
-        "robot_placements": [
-            {
-                "robot_id": "ur10e",
-                "pose_in_world": {
-                    "position_m": [0.0, 0.0, 0.0],
-                    "orientation_xyzw": [
-                        0.0,
-                        0.0,
-                        0.7071067811865475,
-                        0.7071067811865476,
-                    ],
-                },
-            }
-        ],
-        "objects": [
-            {
-                "object_id": "drop_box",
-                "shape": {
-                    "type": "box",
-                    "box_dimensions_m": [0.2, 0.3, 0.4],
-                },
-                "pose_in_universe": {
-                    "position_m": [0.0, 1.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "attached": False,
-                "frame_id": "universe",
-                "touch_links": [],
-                "support_contacts": [],
-            },
-            {
-                "object_id": "isaac_cheese_box",
-                "shape": {
-                    "type": "mesh",
-                    "mesh_resource_uri": "examples/cheese.obj",
-                    "mesh_scale": [1.0, 1.0, 1.0],
-                },
-                "pose_in_universe": {
-                    "position_m": [0.2, 0.3, 0.4],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "attached": True,
-                "frame_id": "grasp_frame",
-                "touch_links": ["finger"],
-                "support_contacts": [
-                    {
-                        "support_object_id": "drop_box",
-                        "mode": "contact_release",
-                        "release_evidence_mode": "signed_penetration",
-                        "max_start_penetration_m": 0.03,
-                    }
-                ],
-            },
-        ],
-    }
-
-
-def _capture_planning_record() -> dict:
-    return {
-        "sequence": 4,
-        "request": {
-            "robot_id": "ur10e",
-            "group_id": "arm",
-            "move_id": "drop_approach",
-            "base_frame": "base_link",
-            "tcp_frame": "grasp_frame",
-            "start_state": {
-                "joint_names": ["joint_a", "joint_b"],
-                "positions_rad": [0.25, -0.5],
-                "velocities_rad_s": [0.0, 0.0],
-            },
-            "motion": {
-                "type": "pose",
-                "pose": {
-                    "position_m": [1.0, 0.0, 0.4],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-            "tolerances": {
-                "joint_position_tol_rad": 0.05,
-                "translation_tol_m": 0.005,
-                "rotation_tol_rad": 0.05,
-            },
-            "speed_profile": {
-                "velocity_scale": 0.2,
-                "acceleration_scale": 1.0,
-                "max_tcp_linear_speed_mps": 0.25,
-            },
-            "planning_timeout_s": 10.0,
-            "planning_attempt_index": 0,
-            "per_joint_dynamics_limits": {},
-            "contact_policy_id": "",
-            "action_span": None,
-            "scene_binding": {
-                "revision_id": 7,
-                "content_hash": "scene-seven",
-                "projection_lease_id": "lease-seven",
-            },
-        },
-        "result": {
-            "scene_revision": {
-                "revision_id": 7,
-                "content_hash": "scene-seven",
-            },
-            "trajectory": {
-                "joint_names": ["joint_a", "joint_b"],
-                "waypoints": [
-                    {
-                        "time_from_start_s": 0.0,
-                        "positions_rad": [0.25, -0.5],
-                        "velocities_rad_s": [0.0, 0.0],
-                    },
-                    {
-                        "time_from_start_s": 1.0,
-                        "positions_rad": [0.5, -0.25],
-                        "velocities_rad_s": [0.0, 0.0],
-                    },
-                ],
-            },
-            "error": None,
-        },
-        "metrics": {
-            "rng_base_seed": 12345,
-            "rng_seed": 12345,
-            "shortcut_rng_seed_argument": -12346,
-            "planning_attempt_index": 0,
-        },
-    }
-
-
-def _generated_capture(tmp_path: Path) -> dict:
-    program_path = tmp_path / "example.program.yaml"
-    deployment_path = tmp_path / "example.deployment.yaml"
-    program_path.write_text("name: test\n", encoding="utf-8")
-    deployment_path.write_text("name: test\n", encoding="utf-8")
-    return _CAPTURE._capture_payload(
-        program=_capture_program(),
-        visual_scene_state=_capture_scene_state(),
-        authority_snapshot=_capture_authority_snapshot(),
-        planning_record=_capture_planning_record(),
-        run_id="run-new",
-        planning_execution_id=17,
-        program_path=program_path,
-        deployment_path=deployment_path,
-        repo_root=tmp_path,
-        model_manifest={
-            "authority": {
-                "canonical_fingerprint": "a" * 64,
-                "view_fingerprint": "b" * 64,
-                "view_changed": True,
-            }
-        },
-    )
-
-
-def _write_rehashed_capture(path: Path, payload: dict) -> None:
-    unsigned = dict(payload)
-    unsigned.pop("semantic_sha256", None)
-    payload["semantic_sha256"] = hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def test_capture_payload_resolves_base_frame_goal_and_validates_semantic_hash(
-    tmp_path: Path,
-) -> None:
-    payload = _generated_capture(tmp_path)
-    assert payload["resolved_motion"]["pose_goal"]["position_m"] == pytest.approx(
-        [1.0, 0.0, 0.4], abs=1e-12
-    )
-    assert payload["start_state"] == {
-        "joint_names": ["joint_a", "joint_b"],
-        "positions_rad": [0.25, -0.5],
-        "velocities_rad_s": [0.0, 0.0],
-        "state_source": "exact_plan_request",
-        "provenance": {
-            "execution_state_source_mode": "commanded_sim",
-            "capture_method": "planner_qualification_observer",
-            "predecessor_move_id": "pick_retreat",
-        },
-    }
-    assert payload["plan_request"]["speed_profile"] == {
-        "velocity_scale": 0.2,
-        "acceleration_scale": 1.0,
-        "max_tcp_linear_speed_mps": 0.25,
-    }
-    assert payload["planning_result"]["trajectory_sha256"] == hashlib.sha256(
-        json.dumps(
-            payload["planning_result"]["trajectory"],
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
-    assert payload["scene"]["robot"]["collision_projection_seed"]["groups"] == [
-        {
-            "group_id": "arm",
-            "joint_names": ["joint_a", "joint_b"],
-            "positions_rad": [0.25, -0.5],
-            "source": "exact_plan_request",
-        },
-        {
-            "group_id": "gripper",
-            "joint_names": ["finger_joint"],
-            "positions_rad": [0.66],
-            "source": "fresh_visual_snapshot_gripper",
-        },
+    assert [payload["historical_source_blob"] for payload in payloads] == [
+        "1f07b69faea96950fbbdbc35a4d8e3e9913cc2b1",
+        "5d31237c04a5c3266a50572159921eeb515aa385",
     ]
-    assert payload["scene"]["authority"]["revision"] == {
-        "revision_id": 7,
-        "content_hash": "scene-seven",
-    }
-    cheese = next(
-        item
-        for item in payload["scene"]["objects"]
-        if item["object_id"] == "isaac_cheese_box"
-    )
-    assert cheese["support_contacts"] == [
-        {
-            "support_object_id": "drop_box",
-            "mode": "contact_release",
-            "release_evidence_mode": "signed_penetration",
-            "max_start_penetration_m": 0.03,
-        }
+    assert all(payload["exit_code"] == 78 for payload in payloads)
+
+
+def test_removed_roboplan_cases_have_exact_future_acceptance_owners() -> None:
+    removed = [
+        case
+        for cohort in REMOVED_HISTORICAL_CASE_COHORTS
+        for case in cohort["case_names"]
     ]
-    path = tmp_path / "capture.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    summary = _MODULE.validate_capture(
-        path,
-        expected_capture_id="isaac-light-drop-approach-v1",
-        expected_joint_names=["joint_a", "joint_b"],
-        required_attachment="isaac_cheese_box",
+    assert len(removed) == (
+        HISTORICAL_TEST_DEFINITION_COUNT
+        - RETAINED_HISTORICAL_TEST_DEFINITION_COUNT
     )
-    assert summary["objects"] == 2
-    nonzero_velocity = json.loads(json.dumps(payload))
-    nonzero_velocity["start_state"]["velocities_rad_s"][0] = 0.1
-    nonzero_velocity["plan_request"]["start_state"]["velocities_rad_s"][0] = 0.1
-    unsigned = dict(nonzero_velocity)
-    unsigned.pop("semantic_sha256")
-    nonzero_velocity["semantic_sha256"] = hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    path.write_text(json.dumps(nonzero_velocity), encoding="utf-8")
-    with pytest.raises(_MODULE.ValidationError, match="velocities must.*zero"):
-        _MODULE.validate_capture(path)
-    tiny_nonzero_velocity = json.loads(json.dumps(payload))
-    tiny_nonzero_velocity["start_state"]["velocities_rad_s"][0] = 1e-15
-    tiny_nonzero_velocity["plan_request"]["start_state"]["velocities_rad_s"][
-        0
-    ] = 1e-15
-    unsigned = dict(tiny_nonzero_velocity)
-    unsigned.pop("semantic_sha256")
-    tiny_nonzero_velocity["semantic_sha256"] = hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    path.write_text(json.dumps(tiny_nonzero_velocity), encoding="utf-8")
-    with pytest.raises(_MODULE.ValidationError, match="velocities must.*zero"):
-        _MODULE.validate_capture(path)
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    payload["source"]["captured_at_wall_ns"] += 1
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(_MODULE.ValidationError, match="semantic_sha256"):
-        _MODULE.validate_capture(path)
-
-
-def test_capture_support_contact_modes_are_mode_scoped(tmp_path: Path) -> None:
-    schema = json.loads(
-        (
-            _REPO_ROOT / "benchmarks/roboplan_05/schema/capture-v1.schema.json"
-        ).read_text(encoding="utf-8")
-    )
-    validator = Draft202012Validator(schema)
-    path = tmp_path / "capture.json"
-
-    def validate_contact(contact: dict) -> None:
-        payload = _generated_capture(tmp_path)
-        cheese = next(
-            item
-            for item in payload["scene"]["objects"]
-            if item["object_id"] == "isaac_cheese_box"
-        )
-        cheese["support_contacts"] = [contact]
-        _write_rehashed_capture(path, payload)
-        validator.validate(payload)
-        _MODULE.validate_capture(path, required_attachment="isaac_cheese_box")
-
-    # Omitted mode/evidence retains the authored Precise default.
-    validate_contact({"support_object_id": "drop_box"})
-    validate_contact(
-        {
-            "support_object_id": "drop_box",
-            "mode": "contact_release",
-            "release_evidence_mode": "binary_contact",
-            "require_separation_by_end": True,
-            "allow_recontact": False,
-        }
-    )
-    validate_contact(
-        {
-            "support_object_id": "drop_box",
-            "mode": "bounded_penetration",
-            "max_contact_penetration_m": 0.004,
-        }
-    )
-
-
-@pytest.mark.parametrize(
-    ("contact", "message"),
-    [
-        (
-            {
-                "support_object_id": "drop_box",
-                "mode": "contact_release",
-                "release_evidence_mode": "binary_contact",
-                "release_tolerance_m": 0.001,
-            },
-            "release_tolerance_m must be 0",
-        ),
-        (
-            {
-                "support_object_id": "drop_box",
-                "mode": "bounded_penetration",
-            },
-            "max_contact_penetration_m must be a number",
-        ),
-        (
-            {
-                "support_object_id": "drop_box",
-                "mode": "bounded_penetration",
-                "max_contact_penetration_m": -0.001,
-            },
-            "max_contact_penetration_m must be non-negative",
-        ),
-        (
-            {
-                "support_object_id": "drop_box",
-                "mode": "bounded_penetration",
-                "max_contact_penetration_m": 0.004,
-                "release_evidence_mode": "signed_penetration",
-            },
-            "fields are not valid for mode bounded_penetration",
-        ),
-        (
-            {
-                "support_object_id": "drop_box",
-                "mode": "contact_release",
-                "max_contact_penetration_m": 0.004,
-            },
-            "fields are not valid for mode contact_release",
-        ),
-        (
-            {
-                "support_object_id": "drop_box",
-                "min_separation_clearance_m": 0.0,
-            },
-            "contains unknown fields",
-        ),
-    ],
-)
-def test_capture_rejects_invalid_support_contact_mode_fields(
-    tmp_path: Path, contact: dict, message: str
-) -> None:
-    payload = _generated_capture(tmp_path)
-    cheese = next(
-        item
-        for item in payload["scene"]["objects"]
-        if item["object_id"] == "isaac_cheese_box"
-    )
-    cheese["support_contacts"] = [contact]
-    path = tmp_path / "capture.json"
-    _write_rehashed_capture(path, payload)
-
-    schema = json.loads(
-        (
-            _REPO_ROOT / "benchmarks/roboplan_05/schema/capture-v1.schema.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert not Draft202012Validator(schema).is_valid(payload)
-    with pytest.raises(_MODULE.ValidationError, match=message):
-        _MODULE.validate_capture(path)
-
-
-def test_resolved_collision_policy_support_modes_are_canonical() -> None:
-    pair = {"body_a": "carried", "body_b": "table"}
-    signed = {
-        "pair": pair,
-        "mode": "contact_release",
-        "release_evidence_mode": "signed_penetration",
-        "enforce_max_start_penetration": True,
-        "max_start_penetration_m": 0.01,
-        "release_tolerance_m": 0.001,
-        "min_release_progress_m": 0.0,
-        "require_separation_by_end": True,
-        "require_strictly_decreasing_penetration": True,
-        "allow_recontact": False,
-    }
-    binary = {
-        **signed,
-        "release_evidence_mode": "binary_contact",
-        "enforce_max_start_penetration": False,
-        "max_start_penetration_m": 0.0,
-        "release_tolerance_m": 0.0,
-        "require_strictly_decreasing_penetration": False,
-    }
-    bounded = {
-        "pair": pair,
-        "mode": "bounded_penetration",
-        "max_contact_penetration_m": 0.004,
-    }
-    contact_process = {"pair": pair, "mode": "contact_process"}
-
-    def policy(contact: dict) -> dict:
-        return {
-            "policy_id": "test",
-            "revision": {"revision_id": 1, "content_hash": "hash"},
-            "allowed_static_static_pairs": [],
-            "allowed_touch_link_pairs": [],
-            "support_contacts": [contact],
-            "contact_grasps": [],
-            "require_full_diagnostics": False,
-        }
-
-    schema = json.loads(
-        (
-            _REPO_ROOT / "benchmarks/roboplan_05/schema/capture-v1.schema.json"
-        ).read_text(encoding="utf-8")
-    )
-    validator = Draft202012Validator(schema)
-    checked_capture = json.loads(
-        (
-            _REPO_ROOT
-            / "benchmarks/roboplan_05/corpus/captures/isaac-light-drop-approach-v1.json"
-        ).read_text(encoding="utf-8")
-    )
-    for contact in (signed, binary, bounded, contact_process):
-        _MODULE._validate_collision_policy(policy(contact), "policy")  # noqa: SLF001
-        candidate = json.loads(json.dumps(checked_capture))
-        candidate["scene"]["authority"]["configured_collision_policy"] = policy(
-            contact
-        )
-        validator.validate(candidate)
-
-    with pytest.raises(_MODULE.ValidationError, match="contains unknown fields"):
-        _MODULE._validate_collision_policy(  # noqa: SLF001
-            policy({**signed, "min_separation_clearance_m": 0.0}), "policy"
-        )
-    invalid_unknown = json.loads(json.dumps(checked_capture))
-    invalid_unknown["scene"]["authority"]["configured_collision_policy"] = policy(
-        {**signed, "min_separation_clearance_m": 0.0}
-    )
-    assert not validator.is_valid(invalid_unknown)
-    with pytest.raises(
-        _MODULE.ValidationError,
-        match="fields are not valid for mode bounded_penetration",
-    ):
-        _MODULE._validate_collision_policy(  # noqa: SLF001
-            policy({**bounded, "release_evidence_mode": "signed_penetration"}),
-            "policy",
-        )
-
-
-def test_capture_wait_uses_active_drop_planning_window_and_fresh_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    responses = iter(
-        [
-            {
-                "state": "planning",
-                "active_move_id": "drop_approach",
-                "execution_id": 17,
-                "joint_positions_rad": [0.25, -0.5],
-            },
-            {"runId": "run-new"},
-            {
-                **_capture_scene_state(),
-            },
-            _capture_authority_snapshot(),
-            {
-                "state": "planning",
-                "active_move_id": "drop_approach",
-                "execution_id": 17,
-                "joint_positions_rad": [0.25, -0.5],
-            },
-        ]
-    )
-    monkeypatch.setattr(_CAPTURE, "_request_json", lambda *_args, **_kwargs: next(responses))
-    (
-        run_id,
-        execution_id,
-        scene,
-        planning_snapshot,
-        authority_snapshot,
-    ) = _CAPTURE._wait_for_capture_point(
-        "http://composer",
-        1.0,
-        previous_run_id="run-old",
-        previous_execution_id=16,
-        max_source_age_ns=250_000_000,
-    )
-    assert run_id == "run-new"
-    assert execution_id == 17
-    assert scene["robot"]["state_source"] == "controller_state"
-    assert planning_snapshot["joint_positions_rad"] == [0.25, -0.5]
-    assert authority_snapshot["revision"]["revision_id"] == 7
-
-
-def test_capture_wait_fails_promptly_on_composer_fault(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    responses = iter(
-        [
-            {"state": "idle", "execution_id": 0},
-            {
-                "state": "stopped",
-                "errorCode": "gripper_goal_aborted",
-                "error": "Gripper action aborted",
-            },
-        ]
-    )
-    monkeypatch.setattr(
-        _CAPTURE, "_request_json", lambda *_args, **_kwargs: next(responses)
-    )
-
-    with pytest.raises(RuntimeError, match="gripper_goal_aborted"):
-        _CAPTURE._wait_for_capture_point(
-            "http://composer",
-            1.0,
-            previous_run_id="run-old",
-            previous_execution_id=16,
-            max_source_age_ns=250_000_000,
-        )
-
-
-def test_capture_waits_for_complete_successful_drop_plan_record(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    responses = iter(
-        [
-            {"records": [], "status": {"in_flight": 1}},
-            {"state": "running"},
-            {
-                "records": [
-                    {
-                        "request": {
-                            "move_id": "drop_approach",
-                            "action_span": {
-                                "program_run_id": "run-prior",
-                                "node_attempt_id": "attempt-prior",
-                            },
-                        },
-                        "result": {"trajectory": {"waypoints": [{}]}},
-                        "metrics": {
-                            "measurement_complete": True,
-                            "succeeded": True,
-                            "shortcut_rng_seed_argument": -12346,
-                        },
-                    },
-                    {
-                        "request": {
-                            "move_id": "drop_approach",
-                            "action_span": {
-                                "program_run_id": "run-new",
-                                "node_attempt_id": "attempt-new",
-                            },
-                        },
-                        "result": {"trajectory": {"waypoints": [{}]}},
-                        "metrics": {
-                            "measurement_complete": True,
-                            "succeeded": True,
-                            "shortcut_rng_seed_argument": -12346,
-                        },
-                    }
-                ],
-                "status": {"in_flight": 0},
-            },
-        ]
-    )
-    monkeypatch.setattr(
-        _CAPTURE, "_request_json", lambda *_args, **_kwargs: next(responses)
-    )
-    monkeypatch.setattr(_CAPTURE.time, "sleep", lambda _duration: None)
-
-    records = _CAPTURE._wait_for_completed_drop_plan_record(
-        "http://composer",
-        generation=3,
-        timeout_s=1.0,
-        expected_program_run_id="run-new",
-        expected_node_attempt_id="attempt-new",
-    )
-
-    assert len(records) == 2
-    assert records[1]["metrics"]["shortcut_rng_seed_argument"] == -12346
-
-
-def test_capture_correlates_planner_attempt_by_run_and_execution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        _CAPTURE,
-        "_request_json",
-        lambda *_args, **_kwargs: {
-            "events": [
-                {
-                    "type": "plan_started",
-                    "execution_id": 7,
-                    "program_run_id": "run-old",
-                    "details": {"node_attempt_id": "attempt-old"},
-                },
-                {
-                    "type": "plan_started",
-                    "execution_id": 7,
-                    "program_run_id": "run-new",
-                    "details": {"node_attempt_id": "attempt-new"},
-                },
-            ]
-        },
-    )
-
-    assert _CAPTURE._planning_attempt_id_for_execution(
-        "http://composer",
-        program_run_id="run-new",
-        execution_id=7,
-    ) == "attempt-new"
-
-
-def test_capture_simulation_reset_and_play_use_deployment_control_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, str, dict, float]] = []
-
-    def request(
-        _base_url: str,
-        path: str,
-        *,
-        method: str,
-        payload: dict,
-        timeout_s: float,
-    ) -> dict:
-        calls.append((path, method, payload, timeout_s))
-        if path == "/api/simulation/state":
-            return {"success": True, "state": payload["state"]}
-        return {"success": True}
-
-    monkeypatch.setattr(_CAPTURE, "_request_json", request)
-    _CAPTURE.reset_and_start_simulation("http://composer", 42.0)
-    assert calls == [
-        ("/api/simulation/reset", "POST", {}, 42.0),
-        (
-            "/api/simulation/state",
-            "POST",
-            {"state": "playing", "reason": "rp5_qualification_start"},
-            42.0,
-        ),
-    ]
-
-
-def test_capture_requires_loaded_saved_artifacts_to_match(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    program_path = (tmp_path / "program.yaml").resolve()
-    deployment_path = (tmp_path / "deployment.yaml").resolve()
-    program_path.write_text("program-v1\n", encoding="utf-8")
-    deployment_path.write_text("deployment-v1\n", encoding="utf-8")
-    responses = {
-        "/api/program": {
-            "name": "isaac-light",
-            "sourcePath": str(program_path),
-            "programSessionGeneration": 7,
-            "programTreeHash": "loaded-tree-hash",
-        },
-        "/api/program/saved": {
-            "name": "isaac-light",
-            "sourcePath": str(program_path),
-            "programSessionGeneration": 0,
-            "programTreeHash": "",
-        },
-        "/api/program/tree": {"tree": {"id": "sequence"}},
-        "/api/program/saved/tree": {"tree": {"id": "sequence"}},
-        "/api/deployment/full": {
-            "name": "isaac-light-ros",
-            "sourcePath": str(deployment_path),
-        },
-        "/api/deployment/saved/full": {
-            "name": "isaac-light-ros",
-            "sourcePath": str(deployment_path),
-        },
-    }
-    monkeypatch.setattr(
-        _CAPTURE,
-        "_request_json",
-        lambda _base_url, path, **_kwargs: responses[path],
-    )
-
-    provenance = _CAPTURE.require_loaded_artifacts_match(
-        "http://composer",
-        program_path=program_path,
-        deployment_path=deployment_path,
-        expected_program_name="isaac-light",
-    )
-    assert provenance == {
-        "program": {
-            "name": "isaac-light",
-            "path": str(program_path),
-            "sha256": hashlib.sha256(program_path.read_bytes()).hexdigest(),
-            "loaded_payload_sha256": _CAPTURE.loaded_program_payload_sha256(
-                responses["/api/program/saved"]
-            ),
-        },
-        "deployment": {
-            "name": "isaac-light-ros",
-            "path": str(deployment_path),
-            "sha256": hashlib.sha256(deployment_path.read_bytes()).hexdigest(),
-            "loaded_payload_sha256": _CAPTURE._canonical_json_sha256(  # noqa: SLF001
-                responses["/api/deployment/saved/full"]
-            ),
-        },
-        "matched_input_sha256": _CAPTURE._canonical_json_sha256(  # noqa: SLF001
-            {
-                "program": _CAPTURE._step18_matched_program_payload(  # noqa: SLF001
-                    responses["/api/program/saved"]
-                ),
-                "deployment": _CAPTURE._step18_matched_deployment_payload(  # noqa: SLF001
-                    responses["/api/deployment/saved/full"]
-                ),
-            }
-        ),
-    }
-
-    responses["/api/program/tree"] = {"tree": {"id": "modified"}}
-    with pytest.raises(RuntimeError, match="unsaved or runtime-overridden"):
-        _CAPTURE.require_loaded_artifacts_match(
-            "http://composer",
-            program_path=program_path,
-            deployment_path=deployment_path,
-            expected_program_name="isaac-light",
-        )
-
-    responses["/api/program/tree"] = responses["/api/program/saved/tree"]
-    responses["/api/program"]["description"] = "stale in-memory payload"
-    with pytest.raises(RuntimeError, match="runtime-overridden content"):
-        _CAPTURE.require_loaded_artifacts_match(
-            "http://composer",
-            program_path=program_path,
-            deployment_path=deployment_path,
-            expected_program_name="isaac-light",
-        )
-
-
-def test_live_row_force_reloads_exact_disk_artifacts(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    program = (tmp_path / "program.yaml").resolve()
-    deployment = (tmp_path / "deployment.yaml").resolve()
-    calls: list[tuple[str, str, dict, float]] = []
-    response = {
-        "name": "isaac-light",
-        "sourcePath": str(program),
-        "programSessionGeneration": 17,
-        "programTreeHash": "tree-seventeen",
-    }
-
-    def request(
-        _base_url: str,
-        path: str,
-        *,
-        method: str,
-        payload: dict,
-        timeout_s: float,
-    ) -> dict:
-        calls.append((path, method, payload, timeout_s))
-        return response
-
-    monkeypatch.setattr(_LIVE, "_request_json", request)
-    evidence = _LIVE._reload_matched_artifacts(  # noqa: SLF001
-        "http://composer", program_path=program, deployment_path=deployment
-    )
-
-    assert calls == [
-        (
-            "/api/program/load",
-            "POST",
-            {
-                "path": str(program),
-                "deploymentPath": str(deployment),
-                "forceDiscardOverrides": True,
-            },
-            60.0,
-        )
-    ]
-    assert evidence["response_payload_sha256"] == (
-        _CAPTURE.loaded_program_payload_sha256(response)
-    )
-
-
-def test_captured_replay_rejects_changed_source_or_model_view(tmp_path: Path) -> None:
-    program = tmp_path / "program.yaml"
-    deployment = tmp_path / "deployment.yaml"
-    program.write_text("program-v1", encoding="utf-8")
-    deployment.write_text("deployment-v1", encoding="utf-8")
-    capture = {
-        "source": {
-            "program": "program.yaml",
-            "program_sha256": hashlib.sha256(program.read_bytes()).hexdigest(),
-            "deployment": "deployment.yaml",
-            "deployment_sha256": hashlib.sha256(
-                deployment.read_bytes()
-            ).hexdigest(),
-        },
-        "robot_model_authority": {
-            "canonical_fingerprint": "a" * 64,
-            "view_fingerprint": "b" * 64,
-        },
-    }
-    capture_path = tmp_path / "capture.json"
-    capture_path.write_text(json.dumps(capture), encoding="utf-8")
-    view = SimpleNamespace(
-        authority=SimpleNamespace(canonical_fingerprint="a" * 64),
-        import_view=SimpleNamespace(view_fingerprint="b" * 64),
-    )
-    assert _RUNNER._verify_capture_provenance(
-        capture_path=capture_path,
-        repo_root=tmp_path,
-        view=view,
-    ) == capture
-    program.write_text("program-v2", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="changed after capture"):
-        _RUNNER._verify_capture_provenance(
-            capture_path=capture_path,
-            repo_root=tmp_path,
-            view=view,
-        )
-    program.write_text("program-v1", encoding="utf-8")
-    view.import_view.view_fingerprint = "c" * 64
-    with pytest.raises(RuntimeError, match="view fingerprint"):
-        _RUNNER._verify_capture_provenance(
-            capture_path=capture_path,
-            repo_root=tmp_path,
-            view=view,
-        )
-
-
-def test_frozen_rp5_0_capture_requires_exact_manifest_identity(
-    tmp_path: Path,
-) -> None:
-    capture_path = (
-        tmp_path
-        / "benchmarks/roboplan_05/corpus/captures/isaac-light-drop-approach-v1.json"
-    )
-    manifest_path = (
-        tmp_path
-        / "benchmarks/roboplan_05/baselines/roboplan-0.4.0-manifest.json"
-    )
-    capture_path.parent.mkdir(parents=True)
-    manifest_path.parent.mkdir(parents=True)
-    capture = {
-        "semantic_sha256": "c" * 64,
-        "source": {
-            "program": "examples/program.yaml",
-            "program_sha256": "a" * 64,
-            "deployment": "examples/deployment.yaml",
-            "deployment_sha256": "b" * 64,
-        },
-        "robot_model_authority": {
-            "canonical_fingerprint": "d" * 64,
-            "view_fingerprint": "e" * 64,
-        },
-    }
-    manifest = {
-        "baseline_id": "rp5-0-roboplan-0.4.0-pinocchio-4",
-        "status": "complete",
-        "source": {
-            "program": {
-                "path": "examples/program.yaml",
-                "sha256": "a" * 64,
-            },
-            "deployment": {
-                "path": "examples/deployment.yaml",
-                "sha256": "b" * 64,
-            },
-        },
-        "evidence": {
-            "captured_authority_fixture": (
-                "../corpus/captures/isaac-light-drop-approach-v1.json"
-            ),
-            "captured_authority_fixture_semantic_sha256": "c" * 64,
-        },
-    }
-    capture_path.write_text(json.dumps(capture), encoding="utf-8")
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    view = SimpleNamespace(
-        authority=SimpleNamespace(canonical_fingerprint="d" * 64),
-        import_view=SimpleNamespace(view_fingerprint="e" * 64),
-    )
-
-    assert _RUNNER._verify_capture_provenance(
-        capture_path=capture_path,
-        repo_root=tmp_path,
-        view=view,
-        source_policy="frozen_rp5_0_manifest",
-    ) == capture
-
-    capture["semantic_sha256"] = "f" * 64
-    capture_path.write_text(json.dumps(capture), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="semantic hash changed"):
-        _RUNNER._verify_capture_provenance(
-            capture_path=capture_path,
-            repo_root=tmp_path,
-            view=view,
-            source_policy="frozen_rp5_0_manifest",
-        )
+    assert len(set(removed)) == len(removed)
+    assert all(cohort["future_gates"] for cohort in REMOVED_HISTORICAL_CASE_COHORTS)
+    assert all(cohort["acceptance"] for cohort in REMOVED_HISTORICAL_CASE_COHORTS)

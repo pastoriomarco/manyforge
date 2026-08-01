@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/active_bundle_publication_store.hpp"
 
 #include "embedded_active_bundle_publication_schema.hpp"
+#include "sqlite_store_startup_internal.hpp"
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 
 #include <openssl/evp.h>
@@ -675,7 +676,7 @@ void ValidatePublicationStoreMetadata(
   }
 }
 
-void ValidatePublicationStoreBeforeConfiguration(
+void ValidatePublicationStoreIdentityAndSchema(
     sqlite3* database,
     const core::CellId& cell_id) {
   const auto existing = ReadSchemaObjects(database);
@@ -720,7 +721,7 @@ void PreflightPublicationStore(
                 kMaximumActiveBundlePublicationDatabasePageImageBytes),
         },
         [&cell_id](sqlite3* database) {
-          ValidatePublicationStoreBeforeConfiguration(database, cell_id);
+          ValidatePublicationStoreIdentityAndSchema(database, cell_id);
         }));
   } catch (const persistence::SqliteReadOnlyPreflightError& error) {
     throw ActiveBundlePublicationIntegrityError(
@@ -747,6 +748,13 @@ class SqliteActiveBundlePublicationStore::Impl final {
           "active-bundle publication storage requires SQLite 3.37.0 or "
           "newer");
     }
+    auto startup_lock =
+        sqlite_startup_internal::TryAcquireManagerSqliteStoreStartupLock(
+            std::chrono::milliseconds(kBusyTimeoutMilliseconds));
+    if (!startup_lock.owns_lock()) {
+      throw ActiveBundlePublicationConflictError(
+          "timed out waiting for process-local publication-store startup");
+    }
     PreflightPublicationStore(database_path_, cell_id_);
     const int flags =
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX |
@@ -769,8 +777,14 @@ class SqliteActiveBundlePublicationStore::Impl final {
           database_,
           sqlite3_busy_timeout(database_, kBusyTimeoutMilliseconds),
           "configure SQLite busy timeout");
-      ValidatePublicationStoreBeforeConfiguration(database_, cell_id_);
       Configure();
+      // Read schema and SQLite identity from one serialized WAL snapshot.  A
+      // non-transactional first-open check can otherwise interleave those
+      // reads with a peer's schema commit and misclassify that legitimate
+      // initializer as a foreign database.
+      Transaction validation(database_, "BEGIN EXCLUSIVE");
+      ValidatePublicationStoreIdentityAndSchema(database_, cell_id_);
+      validation.Commit();
       InitializeOrValidateSchema();
       Transaction transaction(database_, "BEGIN");
       static_cast<void>(VerifyIntegrityLocked());
@@ -797,6 +811,9 @@ class SqliteActiveBundlePublicationStore::Impl final {
   }
 
   void Close() {
+    auto startup_lock =
+        sqlite_startup_internal::
+            AcquireManagerSqliteStoreStartupLockForClose();
     std::lock_guard lock(mutex_);
     if (closed_) {
       return;

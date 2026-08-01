@@ -1,56 +1,114 @@
 # ManyForge xArm adapter
 
-Experimental, dedicated ROS 2 boundary for the Lite6 real-robot work. It keeps
-xArm model generation, endpoint resolution, vendor-state observation, and
-attended command-evidence capture out of the ROS-free kernel and out of
-generic deployment code.
+> **Current `dev` boundary:** no Lite6 observation, supervised-runtime,
+> execution-admission, command-evidence, or real-robot lane is available.
+> Runtime-effectful console and launch entrypoints are stable
+> typed-unavailable gates; they reject before input parsing, ROS
+> initialization, process launch,
+> filesystem mutation, network access, or hardware access. The retained
+> surface is offline model/binding work plus effect-free validation,
+> evidence-planning, and reduction helpers. None of it qualifies a product
+> lane.
 
-The connected XC-6 slice remains deliberately observation-only:
+This package is the retained xArm authoring and qualification boundary. It
+does not currently own an SDK session, measured robot state, lifecycle,
+admission, Stop, command dispatch, or evidence capture. The full pre-cutover
+implementation remains reimplementation and acceptance input at ManyForge
+commit `08222188293df8e12f90dc72e204c21f22f92ea1`; the selected xArm fork is
+`xarm_ros2@c3172e57c1c1bb2982fc008304ad6bc886357c87`.
 
-- the fixed pneumatic tool is generated from the xArm builder as geometry,
+## Current retained surface
+
+- `profile.py`, `binding.py`, `model_generation.py`,
+  `controller_binding.py`, `binding_manifest.py`, and
+  `controller_binding_validation.py` retain offline profile, naming, model,
+  controller-artifact, and integrity work. Their experimental artifacts are
+  qualification/reimplementation inputs, not proof of an active runtime.
+- `live_controller_parameter_validation.py` retains pure expected-value
+  projection and supplied-observation comparison. Live ROS lookup returns at
+  I10/R.
+- `live_evidence.py` retains command-free probe descriptions, bounded supplied
+  result classification, and postcondition reduction. It does not run probes
+  or write evidence; those capabilities return at I10/R.
+- `lifecycle_transient.py` and `controller_gate_evidence.py` retain
+  effect-free joint-sample and pose-deviation reducers. Lifecycle transactions
+  return at I7/L0, Kernel admission and Stop evidence at I8/P5, and attended
+  xArm evidence at I10/R.
+- `supervised_runtime_binding.py` retains only literal usable-unicast IPv4
+  validation from its old resolver. Retained products and addressing must pass
+  I3 and I6/N, lifecycle and Kernel ownership must pass I7/L0 and I8/P5, and
+  the focused runtime client returns at I10/R.
+
+The following installed names remain deliberately present as stable failure
+boundaries, not dormant implementations:
+
+| Entrypoint | Current disposition | Restoration responsibility |
+| --- | --- | --- |
+| `manyforge-xarm-read-only-observer` | Duplicate observer removed; typed unavailable | Selected measured-state adapter at I10/R; headless status/alarm projection at I5/H0 |
+| `manyforge-xarm-resolve-supervised-runtime` | Old singleton resolver removed; typed unavailable | I3, I6/N, I7/L0, I8/P5, then I10/R |
+| `manyforge-xarm-run-execution-admission-provider` | Brand-specific legacy provider removed; typed unavailable | I7/L0, I8/P5, and I10/R |
+| `manyforge-xarm-resolve-real-robot-deployment` | Old deployment-v0 resolver removed; typed unavailable | I3, I6/N, I7/L0, I8/P5, then I10/R |
+| `manyforge-xarm-validate-live-controller-parameters` | Pure comparison retained; live lookup unavailable | I10/R |
+| `manyforge-xarm-capture-live-evidence` | Pure planning/reduction retained; runner unavailable | I10/R |
+| `manyforge-xarm-capture-supervised-command` | Legacy authority/session runner removed; typed unavailable | I7/L0, I8/P5, and I10/R |
+| `manyforge-xarm-capture-controller-gate` | Renewable-gate runner removed; typed unavailable | I7/L0, I8/P5, and I10/R |
+| `lite6_real_read_only.launch.py` | Direct observer launch removed; typed unavailable | I10/R |
+
+## Historical commissioning baseline — unavailable
+
+Everything below this heading records how the last connected XC-6 slice was
+designed and qualified. Its commands, environment variables, ROS graph, old
+runtime manifests, authority/session model, and renewable command gate are
+historical acceptance input only. **Do not execute these recipes on current
+`dev` or treat their named endpoints as supported contracts.**
+
+The last connected XC-6 slice was deliberately observation-only:
+
+- the fixed pneumatic tool was generated from the xArm builder as geometry,
   with no invented tool joint or actuation;
-- the robot address is accepted only at launch from
-  `MANYFORGE_LITE6_ROBOT_IP` and is not stored in model or binding manifests;
-- the connected endpoint must report six axes and the Lite6 SDK device type;
-  the adapter does not query, configure, compare, or retain a unit serial;
-- startup does not create a controller manager, trajectory controller, tool
+- the robot address was accepted only at launch from
+  `MANYFORGE_LITE6_ROBOT_IP` and was not stored in model or binding manifests;
+- the connected endpoint had to report six axes and the Lite6 SDK device type;
+  the adapter did not query, configure, compare, or retain a unit serial;
+- startup did not create a controller manager, trajectory controller, tool
   provider, vendor command subscription/service, or action server (ordinary
-  ROS parameter/introspection services remain); and
-- the patched xArm standalone driver suppresses automatic fault clearing and
-  shutdown mode changes when `read_only=true`, and closes its observation
+  ROS parameter/introspection services remained); and
+- the patched xArm standalone driver suppressed automatic fault clearing and
+  shutdown mode changes when `read_only=true`, and closed its observation
   threads before ROS invalidates the node context.
 
-The raw `/ufactory/joint_states` stream is not projected directly into the
+The raw `/ufactory/joint_states` stream was not projected directly into the
 robot model. Some Lite6 firmware reports a zero-filled placeholder while the
 drives are disabled and has not yet established the physical joint position.
-The observer therefore withholds model projection until one error-free sample
-has all expected brake/servo bits enabled and the rich report angles agree
-with the polled joint stream within 0.002 rad. It then latches initialization
-and republishes only structurally valid samples on
-`/manyforge/xarm/validated_joint_states`. A later stop may freeze the angles in
+The historical observer therefore withheld model projection until one
+error-free sample had all expected brake/servo bits enabled and the rich
+report angles agreed with the polled joint stream within 0.002 rad. It then
+latched initialization and republished only structurally valid samples on
+`/manyforge/xarm/validated_joint_states`. A later stop could freeze the angles in
 the rich status report while the joint stream records mechanical settling;
-that divergence is diagnosed explicitly while the validated joint stream
-continues to represent the observed pose. None of these observations opens
+that divergence was diagnosed explicitly while the validated joint stream
+continued to represent the observed pose. None of those observations opened
 motion admission.
 
-The production supervised URDF separates fast motion fencing from terminal
-session-loss classification. A provisional 1000 ms producer observation lease bounds both
-robot-state validity and the internal xArm write gate; generic admission
-publication retains its independent 250 ms lease. If rich reports or
-successful control reads remain absent for 2000 ms, the xarm_ros2 owner marks
-that SDK session terminal and requires replacement of the controller-manager
-process. Reconnecting the cable never reuses or re-arms the old session.
+The captured supervised URDF contract separated fast motion fencing from
+terminal session-loss classification. A provisional 1000 ms producer
+observation lease bounded both robot-state validity and the internal xArm
+write gate; generic admission publication retained its independent 250 ms
+lease. If rich reports or successful control reads remained absent for 2000
+ms, the xarm_ros2 owner marked that SDK session terminal and required
+replacement of the controller-manager process. Reconnecting the cable never
+reused or re-armed the old session.
 
 This package and its image are local experimental inputs, not a supported
-real-robot lane. The production binding now selects the supervised
-`xarm_ros2` hardware plugin as the sole SDK owner. ManyForge reaches its
+real-robot lane. The captured production binding selected the supervised
+`xarm_ros2` hardware plugin as the sole SDK owner. ManyForge reached its
 restricted state/request/result surface only through ROS; the separate
-ManyForge hardware plugin is fake/HIL-only. Lifecycle primitives, arming, and
-all motion remain later physical gates. See
+ManyForge hardware plugin was fake/HIL-only. Lifecycle primitives, arming, and
+all motion remained later physical gates. See
 [`../docs/operations/LITE6_LIVE_QUALIFICATION.md`](../docs/operations/LITE6_LIVE_QUALIFICATION.md)
 for the staged acceptance boundary and evidence rules.
 
-## Offline workflow
+### Historical offline workflow
 
 Build the image from the exact local XC-6 xArm worktree:
 
@@ -59,10 +117,10 @@ MANYFORGE_XARM_SOURCE_CONTEXT=/path/to/xarm_ros2 \
   ./scripts/xarm/build-real-lite6-image.sh
 ```
 
-The image build compiles the fork and must pass the focused xArm access-policy,
-driver-lifecycle, supervised-session, and restricted ROS command-contract C++
-tests. It intentionally does not use the fork's package-wide legacy lint suite
-as an XC-6 gate.
+At that baseline, the image build compiled the fork and had to pass the focused
+xArm access-policy, driver-lifecycle, supervised-session, and restricted ROS
+command-contract C++ tests. It intentionally did not use the fork's
+package-wide legacy lint suite as an XC-6 gate.
 
 Generate the fixed-tool model, immutable endpoint/controller binding, and
 independent validation result without network access:
@@ -74,54 +132,56 @@ docker run --rm --network none \
   ./scripts/ros/generate-lite6-fixed-pneumatic-model.sh
 ```
 
-The generated binding freezes the controller-manager identity, JTC
+The generated binding froze the controller-manager identity, JTC
 name/type, action endpoint, joint order, position/velocity command and state
 interfaces, update/publication rates, activity QoS, runtime freshness policy,
 supervised state/request/gate endpoints, JTC cancel-deceleration contract, and
-artifact digests. The focused fake lane loads the fake-owned equivalent
-through the real Jazzy controller manager; the production artifact names the
+artifact digests. The focused fake lane loaded the fake-owned equivalent
+through the real Jazzy controller manager; the production artifact named the
 xarm owner plugin.
 
-The resolved runtime manifest also projects those already-validated facts into
+At that baseline, the resolved runtime manifest projected those
+already-validated facts into
 `ros2_control_execution_binding` using the robot-neutral schema
 `manyforge.ros2_control.execution_binding.v0.experimental`. This projection
-adds no inferred prefix, namespace, endpoint, or vendor state: the generic
-execution backend consumes exact resolved names and verifies them against
-controller-manager activity and services. The xArm-specific binding remains
+added no inferred prefix, namespace, endpoint, or vendor state: the generic
+execution backend consumed exact resolved names and verified them against
+controller-manager activity and services. The xArm-specific binding remained
 the source of generation identity and artifact provenance.
 
-The resolved runtime manifest now also carries:
+The captured runtime manifest also carried:
 
-- `execution_admission`, which freezes the topic, per-process provider
+- `execution_admission`, which froze the topic, per-process provider
   identity, supervisor identity, refresh period, and maximum lease; and
-- `manyforge_execution_config`, which projects the exact action/state/joint
+- `manyforge_execution_config`, which projected the exact action/state/joint
   endpoints, controller binding, observed-state policy, and mandatory
   admission transport into one ready-to-inject generic execution config; and
-- `cell_supervision`, which freezes the cell/component dependency graph,
+- `cell_supervision`, which froze the cell/component dependency graph,
   receiver-local stale budgets, restart domains, and the external
   supervisor's per-start epoch and heartbeat path.
 
-The supervised-owner qualification launcher starts the manifest-bound
-admission provider beside `controller_manager` and robot-state publication,
-validates the loaded JTC's read-only cancel-deceleration parameters before
-publishing owner readiness, and treats an unexpected exit of any managed
-process as a topology failure. A generated/runtime/live mismatch therefore
-keeps execution admission closed. This remains an isolated qualification
-surface. The product-shaped `real-robot` launcher consumes
+At the captured baseline, the supervised-owner qualification launcher started
+the manifest-bound admission provider beside `controller_manager` and
+robot-state publication, validated the loaded JTC's read-only
+cancel-deceleration parameters before publishing owner readiness, and treated
+an unexpected exit of any managed process as a topology failure. A
+generated/runtime/live mismatch therefore kept execution admission closed.
+This remained an isolated qualification
+surface. The former product-shaped `real-robot` launcher consumed
 `manyforge_execution_config` and the retained runtime record from a separate,
-non-owner Composer service. A host-side cell supervisor observes both
-containers and owns bounded dependency-ordered teardown; its arm/shutdown
-channel is not writable from either container. Startup remains fail-closed
-until the selected headless authority establishes a lifecycle session.
-Credential authentication and the PLC/ROXSIE authority adapter remain
+non-owner Composer service. A host-side cell supervisor observed both
+containers and owned bounded dependency-ordered teardown; its arm/shutdown
+channel was not writable from either container. Startup remained fail-closed
+until the selected headless authority established a lifecycle session.
+Credential authentication and the PLC/ROXSIE authority adapter remained
 separate release work.
 
-Resolve the runtime-only values without network access. The resolver verifies
-the source manifest, template and controller digests, exact token count,
-portable identities, authority profile, model equivalence, and every
+The historical resolver resolved runtime-only values without network access.
+It verified the source manifest, template and controller digests, exact token
+count, portable identities, authority profile, model equivalence, and every
 controller-binding field before writing a new runtime manifest. Only the
-robot address and xarm transport-owner ID are substituted into the URDF;
-robot-instance and authority identity remain supervisory manifest data:
+robot address and xarm transport-owner ID were substituted into the URDF;
+robot-instance and authority identity remained supervisory manifest data:
 
 ```bash
 docker run --rm --network none \
@@ -135,8 +195,8 @@ docker run --rm --network none \
   ./scripts/ros/resolve-lite6-supervised-runtime.sh
 ```
 
-The resolved artifact retains the deployment address by design and therefore
-lives only under ignored runtime state. It is not a source/model artifact.
+The resolved artifact retained the deployment address by design and therefore
+lived only under ignored runtime state. It was not a source/model artifact.
 
 Run the focused package, launch-graph, and lint suite:
 
@@ -147,7 +207,7 @@ docker run --rm --network none \
   ./scripts/ros/test-real-lite6-runtime.sh
 ```
 
-The default launch remains disconnected:
+The historical default launch was disconnected:
 
 ```bash
 docker run --rm --network none \
@@ -163,9 +223,9 @@ scheduled with the independent stop path available. Connection requires both
 deployment-network prerequisite: an IP collision must be resolved before
 launch rather than disambiguated in the robot adapter.
 
-## Physical read-only checkpoint
+### Historical physical read-only checkpoint
 
-This checkpoint observes one stationary robot. It does not start
+This historical checkpoint observed one stationary robot. It did not start
 `controller_manager`, a trajectory controller, or a tool provider, and it
 does not authorize motion.
 
@@ -220,20 +280,21 @@ docker exec manyforge-lite6-read-only bash -lc '
 '
 ```
 
-Or capture the same gate automatically, with bounded raw output, return codes,
-timeouts, postconditions, digests, and host-side provenance:
+The historical helper could capture the same gate automatically, with bounded
+raw output, return codes, timeouts, postconditions, digests, and host-side
+provenance:
 
 ```bash
 ./scripts/xarm/capture-lite6-live-evidence.sh
 ```
 
-The output is retained under the ignored
+The output was retained under the ignored
 `.manyforge-var/real-lite6/live-evidence/` runtime tree. A timeout never
 counts as a pass. The validated joint-state observation alone is optional
 because a drive-disabled robot may not yet expose a trustworthy physical
 pose.
 
-The expected graph contains only `/ufactory_driver`,
+The expected historical graph contained only `/ufactory_driver`,
 `/lite6_robot_state_publisher`, and
 `/manyforge_xarm_read_only_observer`. The action list must be empty. Services
 must be limited to ordinary ROS parameter/introspection services for those
@@ -260,11 +321,11 @@ and remove the runtime address from the shell:
 unset MANYFORGE_LITE6_ROBOT_IP
 ```
 
-## Supervised ROS observation preflight
+### Historical supervised ROS observation preflight
 
-This checkpoint attaches to the restricted ROS state surface of an
-already-running supervised xarm controller-manager process. It never creates
-a second SDK session and issues no lifecycle or trajectory command:
+This historical checkpoint attached to the restricted ROS state surface of an
+already-running supervised xarm controller-manager process. It never created
+a second SDK session and issued no lifecycle or trajectory command:
 
 ```bash
 docker run --rm --init --network host \
@@ -279,10 +340,10 @@ the observed lifecycle-command counter did not change during the window.
 Robot state depends on the attended test stage; observation alone does not
 qualify a lifecycle primitive.
 
-## Attended supervised command evidence
+### Historical attended supervised command evidence
 
-The qualification-only supervised owner launcher starts the exact xarm_ros2
-owner with the hardware component inactive. It requires clean ManyForge
+The qualification-only supervised owner launcher started the exact xarm_ros2
+owner with the hardware component inactive. It required clean ManyForge
 source, the experimental real-Lite6 image label, one literal confirmation,
 host networking, host IPC, and no already-labeled owner:
 
@@ -292,10 +353,10 @@ export MANYFORGE_LITE6_SUPERVISED_CONFIRM=START_SUPERVISED_OWNER_INACTIVE
 ./scripts/xarm/launch-lite6-supervised-owner.sh
 ```
 
-Startup builds the four ManyForge ROS packages in the container, generates
-and resolves the ignored runtime binding with a fresh provider-session UUID,
-then starts robot-state publication, controller manager with `lite6_system`
-inactive, and the observation-only admission provider. It does not establish
+Startup built the four ManyForge ROS packages in the container, generated
+and resolved the ignored runtime binding with a fresh provider-session UUID,
+then started robot-state publication, controller manager with `lite6_system`
+inactive, and the observation-only admission provider. It did not establish
 authority, issue a lifecycle primitive, activate hardware/JTC, or send a
 trajectory. Keep this terminal attached and stop it with `Ctrl-C`.
 
@@ -308,27 +369,28 @@ export MANYFORGE_LITE6_ACTION_CONFIRMATION=robot.stop_control
 ./scripts/xarm/capture-lite6-supervised-command.sh
 ```
 
-The wrapper refuses an unlabeled container, private network/IPC topology,
+The wrapper refused an unlabeled container, private network/IPC topology,
 missing runtime binding/install, unknown action, or inexact confirmation. The
-installed client routes the action through
+installed client routed the action through
 `LocalOperatorGateway -> XArmLifecycleRosPort -> restricted xarm_ros2 ROS
-service`; it never uses the SDK directly. The retained ignored evidence binds
+service`; it never used the SDK directly. The retained ignored evidence bound
 the action/request/session/principal, before/after observations, catalog
 postcondition, exact primitive and owner return, gateway audit, timeouts, raw
-output digest, image, and source tree. It reports success only after the
-observed postcondition and authority closure both pass.
+output digest, image, and source tree. It reported success only after the
+observed postcondition and authority closure both passed.
 
-This is not a sequence runner. Run one command at a time, inspect its evidence,
-and obtain the next physical approval separately. It is also not the future
-credential-authenticated Composer/PLC ingress.
+This was not a sequence runner: operators ran one command at a time, inspected
+its evidence, and obtained the next physical approval separately. It was also
+not the future credential-authenticated Composer/PLC ingress.
 
-Enable and Start Control additionally arm `lifecycle_transient.py` before the
-command. It records joint/state initialization and computes deviation only
-from owner-qualified poses. If the sampler cannot arm, the physical request is
-not sent. A missing explicit bound remains visible as pending adjudication
-rather than being replaced by a default tolerance.
+The historical Enable and Start Control path additionally armed the then-live
+sampler from `lifecycle_transient.py` before the command. It recorded
+joint/state initialization and computed deviation only from owner-qualified
+poses. If the sampler could not arm, the physical request was not sent. A
+missing explicit bound remained visible as pending adjudication rather than
+being replaced by a default tolerance.
 
-The separate no-trajectory controller/gate row is:
+The separate no-trajectory controller/gate row was:
 
 ```bash
 export MANYFORGE_LITE6_CONTROLLER_GATE_CONFIRMATION=\
@@ -337,43 +399,26 @@ export MANYFORGE_LITE6_CONTROLLER_GATE_POSE_LIMIT_RAD=0.001
 ./scripts/xarm/capture-lite6-controller-gate.sh
 ```
 
-`controller_gate_evidence.py` switches only the binding-selected JTC, never
-publishes a trajectory, and binds controller activity, the 100 ms gate lease,
-automatic expiry, write/lifecycle counters, joint samples, and the explicit
-pose limit into one ignored evidence artifact. Its offline tests qualify the
-capture path only; physical promotion still requires the attended runbook.
+The historical `controller_gate_evidence.py` runner switched only the
+binding-selected JTC, never published a trajectory, and bound controller
+activity, the 100 ms gate lease, automatic expiry, write/lifecycle counters,
+joint samples, and the explicit pose limit into one ignored evidence artifact.
+Its historical offline tests qualified the capture path only; physical
+promotion still required the attended runbook.
 
-## Ownership
+## Current ownership boundary
 
-- `profile.py` validates builder inputs and contains no cell-local network
-  value.
-- `model_generation.py` generates and hashes URDF, SRDF, kinematics, joint
-  limits, and controller artifacts from the image-pinned builder.
-- `binding.py` is a ROS-free, deterministic compiler for namespaced/prefixed
-  endpoints.
-- `binding_manifest.py` ties the source, generated model, and resolved
-  endpoints/controller contract together without retaining the robot address.
-- `controller_binding.py` compiles and freezes the exact generated
-  controller-manager/JTC contract and projects it into the generic
-  ros2_control execution-binding schema.
-- `supervised_runtime_binding.py` replaces the two hardware-owned runtime
-  tokens, records robot/authority/provider identity separately, recompiles the
-  controller binding, and emits a digest-bound runtime-only manifest plus its
-  exact generic execution configuration.
-- `execution_admission_provider_launch.py` validates that manifest and launches
-  the provider with exact ROS parameters; it never derives vendor endpoints.
-- `live_evidence.py` captures bounded read-only and supervised-preflight
-  observations with explicit postconditions.
-- `supervised_command_evidence.py` runs one installed, gateway-routed
-  lifecycle command and retains bounded identity/postcondition/audit evidence.
-- `lifecycle_transient.py` samples owner-qualified joint/state transitions
-  around Enable and Start without creating a command endpoint.
-- `controller_gate_evidence.py` captures one explicit, no-trajectory named-JTC
-  re-arm and 100 ms current-pose gate transaction.
-- `read_only_observer.py` turns vendor state topics into diagnostics while
-  keeping motion admission closed.
+This package currently owns only its retained offline authoring/qualification
+logic and pure helper behavior. It owns no live robot fact or transition.
+Responsibility returns in dependency order: retained deployment products at
+I3; headless status and alarm projections at I5/H0; addressed components,
+resources, and Program Binding at I6/N; caller-neutral lifecycle at I7/L0;
+Kernel admission and Stop at I8/P5; and the selected xArm measured-state,
+ROS-translation, real-hardware, commissioning, and evidence adapter at I10/R.
 
-The xArm fork owns vendor-driver behavior, the production ros2_control data
-path, and the sole SDK session. `manyforge_xarm_control` owns the NRT ROS
-client, xArm semantic mapping, and fake/HIL plugin; this model and observation
-package must not acquire or duplicate the production transport.
+At I10/R, the selected vendor adapter must again prove that exactly one owner
+holds the SDK session and production ros2_control data path. The historical
+`xarm_ros2` and `manyforge_xarm_control` division is acceptance input for that
+gate, not a current ownership claim. This package must not recreate a second
+observer, lifecycle provider, command gate, or transport path while the lane
+is unavailable.

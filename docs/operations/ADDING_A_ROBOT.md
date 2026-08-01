@@ -1,8 +1,20 @@
 # Adding a robot (and optional gripper)
 
-This is the operator's recipe for importing a new robot — or a new
-robot+gripper pair — into ManyForge. It is written so both humans and
-LLM agents can follow it without re-discovering the conventions.
+> **Cutover status (2026-07-31):** this is the detailed historical v0 import
+> and behavior reference from
+> `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`, not the current
+> program/deployment schema. Its `manyforge.deployment.v0` and
+> `manyforge.program.v0` examples are preserved byte-for-byte as bounded
+> migration inputs and are rejected by the current breaking schemas; no
+> compatibility loader exists. I2/I3 define the new artifacts, H0/N restore
+> Composer and execution clients, and T restores generalized tools/grippers.
+> Do not execute or partially modernize the recipes before those contracts
+> exist.
+
+This records the former operator recipe for importing a new robot—or a new
+robot+gripper pair—into ManyForge. It remains detailed so humans and LLM
+agents can recover the conventions without mistaking them for a current
+schema or runnable workflow.
 
 > **Scope.** This document covers the *integration* steps: where files
 > go, which fields in the deployment/program YAMLs have to be filled
@@ -10,16 +22,14 @@ LLM agents can follow it without re-discovering the conventions.
 > cover authoring a behavior tree, gripper-controller adapter
 > development, or planner tuning — those have their own references.
 
-> **Schema authority.** This public runtime guide mirrors the current
-> program/deployment schema used by ManyForge. Maintainers changing
-> schema-governed behavior must update the canonical private development
-> specs first, then keep this operator guide and the implementation in sync.
+> **Schema authority.** The accepted specifications and composable-cell plan,
+> not this historical guide, define the current schema. This guide records the
+> user workflow and behavior that the bounded migration must recover.
 
-> **Maintenance rule** — keep this file in sync with the deployment
-> spec and `manyforge_behavior/manyforge_behavior/deployment.py`. If
-> you add a new gripper `command_mode`, a new required field, or a new
-> mesh-resolution rule, update the relevant section below in the same
-> commit.
+> **Maintenance rule** — keep historical requirements intact until their
+> replacement fields and clients qualify. When the v1 operator workflow is
+> restored, replace examples deliberately and record the v0-to-v1 mapping;
+> do not edit this guide piecemeal to make rejected v0 look current.
 
 ## TL;DR — what a clean import looks like
 

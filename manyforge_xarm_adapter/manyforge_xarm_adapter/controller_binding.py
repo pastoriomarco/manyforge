@@ -1,4 +1,4 @@
-"""Compile and verify the exact generated Lite6 controller binding."""
+"""Compile and verify a generated Lite6 controller artifact offline."""
 
 from __future__ import annotations
 
@@ -166,7 +166,7 @@ class ProductionControllerBinding:
         return payload
 
     def to_ros2_control_execution_binding(self) -> dict[str, object]:
-        """Project resolved vendor facts into the generic dispatch contract."""
+        """Project vendor facts into the retained generic-contract fixture."""
         return {
             'schema': ROS2_CONTROL_EXECUTION_BINDING_SCHEMA,
             'generation_id': self.generation_id,
@@ -204,7 +204,7 @@ def compile_production_controller_binding(
     ros2_controllers_yaml: str,
     binding_snapshot_max_age_ms: int = 1000,
 ) -> ProductionControllerBinding:
-    """Compile exact production facts and reject any cross-artifact drift."""
+    """Compile production-shaped facts offline and reject artifact drift."""
     if (
         not isinstance(binding_snapshot_max_age_ms, int)
         or isinstance(binding_snapshot_max_age_ms, bool)

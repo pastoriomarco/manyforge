@@ -1,30 +1,23 @@
 #!/usr/bin/env bash
-# compose-dev.sh — Start raw Composer frontend/API debug profiles
+# compose-dev.sh — Start structural-only Composer frontend/API debug profiles
 #
-# These profiles do not build or load qualified native execution products.
-# Use scripts/launch.sh for every product/runtime lane.
+# These profiles serve the retained catalog, bounded filesystem, structural
+# URDF, and presentation surfaces. They do not build or load qualified native
+# execution products, and every former runtime route fails closed.
+#
+# Historical runtime/E2E recipe:
+# manyforge@08222188293df8e12f90dc72e204c21f22f92ea1, blob
+# a84828d749fc2a63f409965cb8e1319773b1ef1c. Its Program load/tree and cycle
+# control interactions return as thin clients at H0/I5 and N/I6; live runtime
+# state and Stop bind only to their new headless owners at N/I6 and P5/I8.
 #
 # Usage:
 #   ./scripts/compose-dev.sh              # Start API (9000) + Vite HMR (3000)
 #   ./scripts/compose-dev.sh --prod       # Start backend/static-UI debug mode
 #   ./scripts/compose-dev.sh --stop       # Stop all composer services
 #
-# Dev mode:   http://localhost:3000  (Vite + hot reload, proxies API to :9000)
-# --prod:     http://localhost:9000  (debug backend serves image-baked dist/)
-#
-# Pick-and-place E2E test:
-#   1. Start the composer (this script)
-#   2. Open the UI in a browser
-#   3. POST to load the example program:
-#      curl -X POST http://localhost:9000/api/program/load \
-#        -H 'Content-Type: application/json' \
-#        -d '{"path":"/workspace/examples/pick_and_place_minimal.program.yaml",
-#             "deploymentPath":"/workspace/manyforge_behavior/tests/fixtures/ur5_roboplan.deployment.yaml"}'
-#   4. GET /api/program/tree to see the behavior tree
-#   5. POST /api/cycle/run to start the cycle
-#   6. Watch /ws/state WebSocket for live node statuses
-#   7. POST /api/cycle/stop to stop
-#   8. POST /api/cycle/reset to reset
+# Dev mode:   http://localhost:3000  (Vite + hot reload, proxies structural API)
+# --prod:     http://localhost:9000  (structural shell serves image-baked dist/)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -35,16 +28,16 @@ case "${1:-}" in
     exit 0
     ;;
   --prod)
-    echo "Starting raw Composer backend debug mode (port 9000)."
-    echo "This is not a qualified execution lane; use scripts/launch.sh for runtime work."
+    echo "Starting structural-only Composer backend debug mode (port 9000)."
+    echo "Runtime and product lanes remain intentionally unavailable."
     docker compose --profile composer up --build -d
     echo ""
     echo "Composer running at http://localhost:9000"
     echo "Stop with: $0 --stop"
     ;;
   *)
-    echo "Starting raw Composer source/API debug mode (API :9000 + Vite :3000)."
-    echo "This is not a qualified execution lane; use scripts/launch.sh for runtime work."
+    echo "Starting structural-only Composer source/API debug mode (API :9000 + Vite :3000)."
+    echo "Runtime and product lanes remain intentionally unavailable."
     docker compose --profile dev-composer up --build -d
     echo ""
     echo "API:      http://localhost:9000"

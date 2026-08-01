@@ -25,7 +25,7 @@ setup(
     maintainer='Marco Pastorio',
     maintainer_email='pastoriomarco@gmail.com',
     description=(
-        'Dedicated xArm binding, model-generation, and observation adapter '
+        'Offline xArm model/binding helpers and gated runtime entrypoints '
         'for ManyForge.'
     ),
     license='Apache-2.0',

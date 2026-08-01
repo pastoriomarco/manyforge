@@ -1,0 +1,86 @@
+import { useEffect, useReducer, useState } from 'react';
+
+export type StructuralResourceState<T> =
+  | { status: 'loading' }
+  | { status: 'ready'; data: T }
+  | { status: 'absent'; message: string }
+  | { status: 'error'; message: string };
+
+export type StructuralResourceAction<T> =
+  | { type: 'load' }
+  | { type: 'resolve'; data: T }
+  | { type: 'absent'; message: string }
+  | { type: 'reject'; message: string };
+
+export function structuralResourceReducer<T>(
+  _state: StructuralResourceState<T>,
+  action: StructuralResourceAction<T>,
+): StructuralResourceState<T> {
+  switch (action.type) {
+    case 'load':
+      return { status: 'loading' };
+    case 'resolve':
+      return { status: 'ready', data: action.data };
+    case 'absent':
+      return { status: 'absent', message: action.message };
+    case 'reject':
+      return { status: 'error', message: action.message };
+  }
+}
+
+export function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : fallback;
+}
+
+interface StructuralResourceOptions {
+  absentWhen?: (error: unknown) => boolean;
+  absentMessage?: string;
+  failureMessage: string;
+}
+
+export function useStructuralResource<T>(
+  load: (signal: AbortSignal) => Promise<T>,
+  options: StructuralResourceOptions,
+): [StructuralResourceState<T>, () => void] {
+  const [reloadToken, setReloadToken] = useState(0);
+  const [state, dispatch] = useReducer(structuralResourceReducer<T>, {
+    status: 'loading',
+  });
+  const { absentMessage, absentWhen, failureMessage } = options;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let current = true;
+    dispatch({ type: 'load' });
+    void load(controller.signal)
+      .then((data) => {
+        if (current) {
+          dispatch({ type: 'resolve', data });
+        }
+      })
+      .catch((error: unknown) => {
+        if (!current || controller.signal.aborted) {
+          return;
+        }
+        if (absentWhen?.(error)) {
+          dispatch({
+            type: 'absent',
+            message: absentMessage ?? 'No authored resource is available.',
+          });
+          return;
+        }
+        dispatch({
+          type: 'reject',
+          message: errorMessage(error, failureMessage),
+        });
+      });
+    return () => {
+      current = false;
+      controller.abort();
+    };
+  }, [absentMessage, absentWhen, failureMessage, load, reloadToken]);
+
+  return [state, () => setReloadToken((current) => current + 1)];
+}

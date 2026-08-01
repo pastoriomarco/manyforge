@@ -6,10 +6,14 @@
 > migration has intentionally taken product-lane startup offline. This runbook
 > records the last qualified baseline until H0/N and the lane-specific I/R
 > restoration gates pass.
+> Unless explicitly identified as current structural/offline tooling,
+> present-tense commands, services, and availability claims below describe
+> that baseline rather than the current branch.
 
-Operational runbook for bringing up ManyForge locally, with or without an
-assistant provider. This file intentionally stays compact. It points to scripts
-and live configuration sources instead of embedding their contents.
+Historical operational runbook for bringing up ManyForge locally, with or
+without an assistant provider. This file intentionally stays compact and
+points to the captured scripts and configuration sources instead of embedding
+their contents.
 
 User-facing product overview belongs in [`../../README.md`](../../README.md).
 
@@ -356,11 +360,12 @@ Notes:
 
 ### `scripts/manyforge-stack.sh`
 
-**Legacy / diagnostic; not a replacement for `scripts/launch.sh`.** This
-script belongs to the older NemoClaw mux/plugin integration path. Use
-`launch.sh` for ManyForge bring-up and the assistant-provider bridge path; use
-`manyforge-stack.sh` only when you intentionally need to reproduce or debug the
-legacy mux/plugin workflow.
+**Removed legacy transport, not a restoration target.** This script belonged
+to the older NemoClaw mux/plugin integration path and is intentionally absent
+from the current tree together with its direct-route and mux proxies. Its exact
+source remains available at
+`manyforge@08222188293df8e12f90dc72e204c21f22f92ea1` for archaeology; the
+commands below describe that historical baseline only.
 
 Purpose:
 
@@ -382,10 +387,10 @@ MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true ./scripts/manyforge-stack.sh smoke all
 
 ### `scripts/configure-manyforge-provider.sh`
 
-Legacy NemoClaw/OpenClaw configuration helper, not a ManyForge entrypoint.
-Configures the mux/plugin-based ManyForge provider path on the NemoClaw side.
-It is outside the current assistant-provider bridge path; use it only for
-historical repro, plugin diagnostics, or mux-specific debugging.
+Removed NemoClaw/OpenClaw mux/plugin configuration helper. It was exclusive to
+the deleted direct-route/mux transport and is not a future assistant-client
+port target. Consult the historical commit named above if its interaction is
+needed for archaeology; do not recreate it as a compatibility path.
 
 ### `scripts/dev-agent-session-start.sh` (dev-only)
 
@@ -548,8 +553,8 @@ ManyForge-authored state. In this profile:
 
 1. Bring up the current assistant path with `scripts/launch.sh` or
    `scripts/demo-assistant-known-good.sh`.
-1. Use `scripts/configure-manyforge-provider.sh` only for legacy mux/plugin
-   reproduction.
+1. Do not recreate the removed `configure-manyforge-provider.sh` mux/plugin
+   compatibility transport.
 1. Validate tool discovery and health before testing agent behavior.
 
 (Maintainers working on specs/ADRs additionally run

@@ -1,370 +1,202 @@
+"""Disposition and fail-before-effects tests for the old Lite6 resolver.
+
+Historical test blob ``bd97dc8bd64179f3db1fb299b97ea28a4064798e``
+contains six acceptance families.  Their restoration assignments are kept
+explicit here so removing the old runnable contract does not erase the work:
+
+* template resolution plus complete artifact/runtime record: I3, I6-I8, I10/R;
+* artifact-drift rejection: I3 identity plus I10/R product admission;
+* authority-health-policy drift: I7/I8 plus I10/R;
+* control-owner/Composer process separation: I4 plus I10/R;
+* immutable-image-scoped build cache: I3 retention plus I10/R; and
+* bounded lifecycle-history capture: I5/H0 observability plus I10/R.
+"""
+
 from __future__ import annotations
 
-import hashlib
-import json
+import importlib.util
 from pathlib import Path
-import shlex
-import subprocess
+import sys
 
-from manyforge_composer.backend.robot_lifecycle import (
-    validate_real_robot_runtime_record,
-)
-from manyforge_xarm_adapter.model_generation import ARTIFACT_NAMES
-from manyforge_xarm_adapter.real_robot_deployment import (
-    resolve_real_robot_deployment,
-    RUNTIME_RECORD_SCHEMA,
-)
-from manyforge_xarm_adapter.supervised_runtime_binding import (
-    RUNTIME_BINDING_SCHEMA,
-)
 import pytest
-import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CELL = REPO_ROOT / 'examples' / (
-    'lite6_fixed_pneumatic_commissioning.real-robot-cell.yaml'
+from manyforge_xarm_adapter.real_robot_deployment import (
+    HISTORICAL_SOURCE_BLOB,
+    HISTORICAL_SOURCE_COMMIT,
+    REAL_ROBOT_DEPLOYMENT_RESTORATION_GATES,
+    REAL_ROBOT_DEPLOYMENT_UNAVAILABLE_REASON_CODE,
+    RealRobotDeploymentUnavailableError,
+    XARM_ROS2_REFERENCE_COMMIT,
+    main,
+    resolve_real_robot_deployment,
 )
-TEMPLATE = REPO_ROOT / 'examples' / (
-    'lite6_fixed_pneumatic_commissioning.deployment.template.yaml'
+
+
+HISTORICAL_TEST_BLOB = "bd97dc8bd64179f3db1fb299b97ea28a4064798e"
+HISTORICAL_CASE_DISPOSITION = {
+    "resolve_template_and_runtime_record": ("I3", "I6", "I7", "I8", "I10", "R"),
+    "reject_artifact_drift": ("I3", "I10", "R"),
+    "reject_authority_health_policy_drift": ("I7", "I8", "I10", "R"),
+    "separate_control_owner_from_composer": ("I4", "I10", "R"),
+    "bind_build_cache_to_immutable_image": ("I3", "I10", "R"),
+    "retain_bounded_lifecycle_history": ("I5", "H0", "I10", "R"),
+}
+
+_STATIC_VALIDATOR_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "models"
+    / "validate_lite6_authority_runtime_contract.py"
 )
-PROGRAM = REPO_ROOT / 'examples' / (
-    'lite6_fixed_pneumatic_commissioning.program.yaml'
+_STATIC_VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "validate_lite6_static_runtime_artifacts",
+    _STATIC_VALIDATOR_PATH,
 )
+assert (
+    _STATIC_VALIDATOR_SPEC is not None
+    and _STATIC_VALIDATOR_SPEC.loader is not None
+)
+_STATIC_VALIDATOR = importlib.util.module_from_spec(_STATIC_VALIDATOR_SPEC)
+sys.modules[_STATIC_VALIDATOR_SPEC.name] = _STATIC_VALIDATOR
+_STATIC_VALIDATOR_SPEC.loader.exec_module(_STATIC_VALIDATOR)
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+class _PoisonInput:
+    def __getattribute__(self, _name: str) -> object:
+        raise AssertionError("the unavailable gate inspected caller input")
 
 
-def _fixture(tmp_path: Path) -> tuple[Path, Path]:
-    model_root = tmp_path / 'model'
-    model_root.mkdir()
-    for name in {
-        ARTIFACT_NAMES['model_urdf'],
-        ARTIFACT_NAMES['srdf'],
-        ARTIFACT_NAMES['ros2_controllers'],
-        'MODEL_MANIFEST.json',
-    }:
-        (model_root / name).write_text(f'{name}\n', encoding='utf-8')
-    runtime_urdf = tmp_path / 'runtime.urdf'
-    runtime_urdf.write_text('<robot name="lite6"/>\n', encoding='utf-8')
-    provider = {
-        'schema': 'manyforge.robot_lifecycle.ros_provider.v1',
-        'robot_id': 'lite6-a',
-        'runtime_generation_id': 'b' * 64,
-        'cell_supervisor_component_epoch': 'supervisor-epoch-1',
-        'provider_instance_id': 'lite6-a:provider:test',
-        'status_topic': '/manyforge/robot_lifecycle/status',
-        'open_session_service': '/manyforge/robot_lifecycle/open',
-        'close_session_service': '/manyforge/robot_lifecycle/close',
-        'submit_command_service': '/manyforge/robot_lifecycle/submit',
-        'reconcile_command_service': '/manyforge/robot_lifecycle/reconcile',
-        'caller_assurance': 'unverified',
-        'maximum_authority_lease_ms': 300_000,
-        'authority_lease_duration_ms': 5_000,
-        'authority_heartbeat_period_ms': 1_000,
-        'authority_health_max_age_ms': 2_000,
-    }
-    controller = {
-        'generation_id': 'c' * 64,
-        'follow_joint_trajectory_action': (
-            '/lite6_traj_controller/follow_joint_trajectory'
-        ),
-    }
-    cell_supervision = {
-        'schema': 'manyforge.cell_supervision.v1',
-        'cell_id': 'lite6-a',
-        'robot_ids': ['lite6-a'],
-        'authority_profile': 'local_operator',
-        'supervisor_heartbeat_path': (
-            str(tmp_path / 'cell-supervisor-heartbeat.json')
-        ),
-        'cell_supervisor_component_epoch': 'supervisor-epoch-1',
-        'components': [
-            {
-                'role': 'cell_supervisor',
-                'id': 'lite6-a:cell-supervisor',
-                'maximum_heartbeat_age_ms': 1_000,
-                'maximum_critical_progress_age_ms': 2_000,
-                'dependencies': [],
-                'restart_domain': 'cell-control',
-            },
-        ],
-    }
-    binding = {
-        'schema': RUNTIME_BINDING_SCHEMA,
-        'generation_id': 'b' * 64,
-        'runtime': {
-            'robot_instance_id': 'lite6-a',
-            'robot_ip': '192.168.1.31',
-            'transport_owner_id': 'lite6-a:sole-owner',
-            'authority_profile': 'local_operator',
-            'lifecycle_provider_instance_id': 'lite6-a:provider:test',
-            'urdf_path': str(runtime_urdf),
-            'urdf_sha256': _sha256(runtime_urdf),
-        },
-        'controller_binding': controller,
-        'robot_lifecycle_provider': provider,
-        'cell_supervision': cell_supervision,
-        'manyforge_execution_config': {
-            'action_name': controller['follow_joint_trajectory_action'],
-            'arm_action': controller['follow_joint_trajectory_action'],
-            'decelerate_on_cancel': True,
-            'velocity_state_interface_joints': [
-                f'joint{index}' for index in range(1, 7)
-            ],
-            'max_deceleration_on_cancel_rad_s2': {
-                f'joint{index}': 2.0 for index in range(1, 7)
-            },
-            'controller_binding': controller,
-            'robot_lifecycle_provider': provider,
-            'cell_supervision': cell_supervision,
-            'require_execution_admission_snapshot': True,
-        },
-    }
-    binding_path = tmp_path / 'runtime-binding.json'
-    binding_path.write_text(
-        json.dumps(binding),
-        encoding='utf-8',
-    )
-    return model_root, binding_path
+def test_resolver_fails_before_inspecting_any_old_contract_input() -> None:
+    poison = _PoisonInput()
 
-
-def test_resolves_template_and_validates_every_retained_artifact(
-    tmp_path: Path,
-) -> None:
-    model_root, binding_path = _fixture(tmp_path)
-    output_deployment = tmp_path / 'resolved' / 'commissioning.deployment.yaml'
-    output_record = tmp_path / 'resolved' / 'runtime-record.json'
-
-    record = resolve_real_robot_deployment(
-        cell_path=CELL,
-        template_path=TEMPLATE,
-        program_path=PROGRAM,
-        model_root=model_root,
-        runtime_binding_path=binding_path,
-        output_deployment_path=output_deployment,
-        output_record_path=output_record,
-    )
-
-    assert record['schema'] == RUNTIME_RECORD_SCHEMA
-    assert record['robot']['address'] == '192.168.1.31'
-    assert record['robot']['authorityHealthPolicy'] == {
-        'leaseDurationMs': 5_000,
-        'heartbeatPeriodMs': 1_000,
-        'criticalProgressMaxAgeMs': 2_000,
-        'providerMaximumLeaseMs': 300_000,
-    }
-    assert record['cellSupervision']['supervisorComponentEpoch'] == (
-        'supervisor-epoch-1'
-    )
-    resolved = yaml.safe_load(output_deployment.read_text(encoding='utf-8'))
-    config = resolved['adapters']['execution']['config']
-    assert '__MANYFORGE_' not in output_deployment.read_text(encoding='utf-8')
-    assert config['robot_lifecycle_provider']['provider_instance_id'] == (
-        'lite6-a:provider:test'
-    )
-    assert config['operator_stop_profile']['stop_mode'] == 'soft_on_path'
-    assert config['default_fault_stop_profile']['deceleration_time_s'] == 2.0
-    assert config['decelerate_on_cancel'] is True
-    assert config['velocity_state_interface_joints'] == [
-        f'joint{index}' for index in range(1, 7)
-    ]
-    assert config['max_deceleration_on_cancel_rad_s2'] == {
-        f'joint{index}': 2.0 for index in range(1, 7)
-    }
-    assert config['start_tolerance_rad'] == 0.01
-    assert config['final_tolerance_rad'] == 0.01
-    assert config['real_robot_runtime_record']['path'] == str(output_record)
-    joint_limits = resolved['robot_config']['robot_control_joint_limits']
-    assert set(joint_limits) == {
-        'joint1',
-        'joint2',
-        'joint3',
-        'joint4',
-        'joint5',
-        'joint6',
-    }
-    assert all(
-        limit == {
-            'max_velocity_rad_s': 0.1,
-            'max_acceleration_rad_s2': 0.2,
-        }
-        for limit in joint_limits.values()
-    )
-    validated = validate_real_robot_runtime_record(
-        deployment_path=output_deployment,
-        execution_config=config,
-    )
-    assert validated['runtimeGenerationId'] == 'b' * 64
-
-
-def test_runtime_record_rejects_artifact_drift(tmp_path: Path) -> None:
-    model_root, binding_path = _fixture(tmp_path)
-    output_deployment = tmp_path / 'resolved' / 'commissioning.deployment.yaml'
-    output_record = tmp_path / 'resolved' / 'runtime-record.json'
-    resolve_real_robot_deployment(
-        cell_path=CELL,
-        template_path=TEMPLATE,
-        program_path=PROGRAM,
-        model_root=model_root,
-        runtime_binding_path=binding_path,
-        output_deployment_path=output_deployment,
-        output_record_path=output_record,
-    )
-    resolved = yaml.safe_load(output_deployment.read_text(encoding='utf-8'))
-    config = resolved['adapters']['execution']['config']
-    (model_root / ARTIFACT_NAMES['model_urdf']).write_text(
-        'drift\n',
-        encoding='utf-8',
-    )
-
-    with pytest.raises(ValueError, match='modelUrdf.*digest mismatch'):
-        validate_real_robot_runtime_record(
-            deployment_path=output_deployment,
-            execution_config=config,
+    with pytest.raises(
+        RealRobotDeploymentUnavailableError,
+        match=REAL_ROBOT_DEPLOYMENT_UNAVAILABLE_REASON_CODE,
+    ):
+        resolve_real_robot_deployment(
+            cell_path=poison,
+            template_path=poison,
+            program_path=poison,
+            model_root=poison,
+            runtime_binding_path=poison,
+            output_deployment_path=poison,
+            output_record_path=poison,
         )
 
 
-def test_runtime_record_rejects_authority_health_policy_drift(
-    tmp_path: Path,
-) -> None:
-    model_root, binding_path = _fixture(tmp_path)
-    output_deployment = tmp_path / 'resolved' / 'commissioning.deployment.yaml'
-    output_record = tmp_path / 'resolved' / 'runtime-record.json'
-    resolve_real_robot_deployment(
-        cell_path=CELL,
-        template_path=TEMPLATE,
-        program_path=PROGRAM,
-        model_root=model_root,
-        runtime_binding_path=binding_path,
-        output_deployment_path=output_deployment,
-        output_record_path=output_record,
+def test_cli_reports_the_stable_i10_gate_without_argument_access(capsys) -> None:
+    assert main() == 78
+    assert REAL_ROBOT_DEPLOYMENT_UNAVAILABLE_REASON_CODE in capsys.readouterr().err
+
+
+def test_historical_sources_and_all_six_case_families_remain_pinned() -> None:
+    assert HISTORICAL_SOURCE_COMMIT == (
+        "08222188293df8e12f90dc72e204c21f22f92ea1"
     )
-    resolved = yaml.safe_load(output_deployment.read_text(encoding='utf-8'))
-    config = resolved['adapters']['execution']['config']
-    config['robot_lifecycle_provider']['authority_lease_duration_ms'] = 6_000
+    assert HISTORICAL_SOURCE_BLOB == (
+        "20b4a9d4d7930dc550f6931a4f32c17c585e8212"
+    )
+    assert HISTORICAL_TEST_BLOB == (
+        "bd97dc8bd64179f3db1fb299b97ea28a4064798e"
+    )
+    assert XARM_ROS2_REFERENCE_COMMIT == (
+        "c3172e57c1c1bb2982fc008304ad6bc886357c87"
+    )
+    assert len(HISTORICAL_CASE_DISPOSITION) == 6
+    assigned_gates = {
+        gate
+        for gates in HISTORICAL_CASE_DISPOSITION.values()
+        for gate in gates
+    }
+    assert assigned_gates <= set(REAL_ROBOT_DEPLOYMENT_RESTORATION_GATES) | {
+        "I4",
+        "I5",
+        "H0",
+    }
 
-    with pytest.raises(ValueError, match='authority-health policy mismatch'):
-        validate_real_robot_runtime_record(
-            deployment_path=output_deployment,
-            execution_config=config,
-        )
+
+def test_owner_neutral_static_artifact_validation_survives() -> None:
+    root = _STATIC_VALIDATOR.REPO_ROOT
+
+    report = _STATIC_VALIDATOR.validate_static_artifacts(
+        ros2_control_urdf=(
+            root
+            / "manyforge_ros_bringup"
+            / "urdf"
+            / "isaac_lite6_topic_based.ros2_control.urdf"
+        ),
+        controllers=(
+            root
+            / "manyforge_ros_bringup"
+            / "config"
+            / "isaac_lite6_topic_based_controllers.yaml"
+        ),
+        gripper_bridge=(
+            root
+            / "manyforge_ros_bringup"
+            / "config"
+            / "isaac_lite6_gripper_bridge.yaml"
+        ),
+    )
+
+    assert report["arm_joints"] == [f"joint{index}" for index in range(1, 7)]
+    assert report["gripper_command_joint"] == "right_finger_joint"
+    assert report["gripper_derived_joint"] == "left_finger_joint"
+    assert "schema" not in report
+    assert "deployment" not in report
 
 
-def test_product_launcher_separates_control_owner_from_composer() -> None:
-    owner = (
-        REPO_ROOT / 'scripts' / 'ros' / 'start-lite6-real-robot-owner.sh'
-    ).read_text(encoding='utf-8')
-    composer = (
-        REPO_ROOT
-        / 'scripts'
-        / 'ros'
-        / 'start-lite6-real-robot-composer.sh'
-    ).read_text(encoding='utf-8')
-    launcher = (
-        REPO_ROOT / 'scripts' / 'lib' / 'real_robot.sh'
-    ).read_text(encoding='utf-8')
-    launch_entrypoint = (
-        REPO_ROOT / 'scripts' / 'launch.sh'
-    ).read_text(encoding='utf-8')
-    smoke_validator = (
-        REPO_ROOT
-        / 'scripts'
-        / 'xarm'
-        / 'validate-lite6-product-lane-smoke.py'
-    ).read_text(encoding='utf-8')
-    transport_source = (
-        REPO_ROOT
-        / 'manyforge_xarm_control'
-        / 'src'
-        / 'xarm_ros_transport_session.cpp'
-    ).read_text(encoding='utf-8')
-    builder = (
-        REPO_ROOT / 'scripts' / 'xarm' / 'build-real-lite6-image.sh'
-    ).read_text(encoding='utf-8')
-    dockerfile = (
-        REPO_ROOT / 'Dockerfile.ros-jazzy-real-lite6'
-    ).read_text(encoding='utf-8')
+def test_old_deployment_authority_validator_fails_before_input_access() -> None:
+    poison = _PoisonInput()
+    reason_code = (
+        _STATIC_VALIDATOR.LEGACY_DEPLOYMENT_AUTHORITY_UNAVAILABLE_REASON_CODE
+    )
 
-    assert 'controller_manager ros2_control_node' in owner
-    assert 'manyforge-xarm-run-execution-admission-provider' in owner
-    assert 'manyforge_composer' not in owner
-    assert 'manyforge_fail_composable_cell_runtime_unavailable' in composer
-    assert 'python -m manyforge_composer' not in composer
-    assert 'controller_manager ros2_control_node' not in composer
-    assert 'manyforge-xarm-run-execution-admission-provider' not in composer
-    assert 'manyforge-real-robot-owner' in launcher
-    assert 'manyforge-real-robot-composer' in launcher
-    assert '--cap-add SYS_NICE' in launcher
-    assert '--ulimit rtprio=99:99' in launcher
-    assert '--ulimit memlock=-1:-1' in launcher
-    assert 'docker image inspect' in launcher
-    assert 'immutable image identity' in launcher
-    assert launcher.count('"${REAL_ROBOT_IMAGE_ID}"') == 2
-    assert launcher.count(
-        '"${REAL_ROBOT_BUILD_CACHE_VOLUME}:/tmp/manyforge-build"'
-    ) == 2
-    assert 'manyforge_real-lite6-build-cache:/tmp/manyforge-build' not in launcher
-    assert 'manyforge_build-cache:/tmp/manyforge-build' not in launcher
-    assert 'REAL_ROBOT_SUPERVISED_CONTRACT="1"' in launcher
-    assert 'org.manyforge.xarm.supervised-contract' in launcher
-    assert 'MANYFORGE_REAL_ROBOT_SMOKE_TIMEOUT_S' in launch_entrypoint
-    assert 'validate-lite6-product-lane-smoke.py' in launch_entrypoint
-    assert 'deadline = clock() + float(timeout_s)' in smoke_validator
-    assert 'options.use_global_arguments(false);' in transport_source
+    with pytest.raises(
+        _STATIC_VALIDATOR.LegacyDeploymentAuthorityUnavailableError,
+        match=reason_code,
+    ):
+        _STATIC_VALIDATOR.validate_legacy_deployment_authority(poison)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        (),
+        ("--deployment", "/must/not/be/read.yaml"),
+        ("--deployment=/must/not/be/read.yaml",),
+        ("--json",),
+        ("--ros2-control-urdf", "/must/not/be/read.urdf"),
+    ),
+)
+def test_historical_static_validator_cli_is_typed_unavailable_before_parse(
+    arguments: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def reject_argument_parsing(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("historical Lite6 command reached argparse before its gate")
+
+    monkeypatch.setattr(
+        _STATIC_VALIDATOR.argparse.ArgumentParser,
+        "parse_args",
+        reject_argument_parsing,
+    )
+
+    assert _STATIC_VALIDATOR.main(arguments) == 78
     assert (
-        'SUPERVISED_CONTRACT_MIN_COMMIT='
-        'b951ad1f4ce7f1bceb077c74778327f2155e42b7'
-    ) in builder
-    assert 'XARM_SUPERVISED_CONTRACT_VERSION' in dockerfile
-    assert 'org.manyforge.xarm.supervised-contract' in dockerfile
-
-
-def test_real_robot_build_cache_is_bound_to_immutable_image_id() -> None:
-    launcher = REPO_ROOT / 'scripts' / 'lib' / 'real_robot.sh'
-
-    def resolve(image_id: str) -> subprocess.CompletedProcess[str]:
-        command = (
-            f'source {shlex.quote(str(launcher))}; '
-            'real_robot_build_cache_volume_for_image_id '
-            f'{shlex.quote(image_id)}'
-        )
-        return subprocess.run(
-            ['bash', '-c', command],
-            check=False,
-            capture_output=True,
-            text=True,
-            env={'MANYFORGE_ROOT': str(REPO_ROOT), 'PATH': '/usr/bin:/bin'},
-        )
-
-    first_digest = 'a' * 64
-    second_digest = 'b' * 64
-    first = resolve(f'sha256:{first_digest}')
-    second = resolve(f'sha256:{second_digest}')
-    malformed = resolve('not-an-image-id')
-
-    assert first.returncode == 0
-    assert first.stdout.strip() == (
-        f'manyforge_real-lite6-build-cache-{first_digest}'
+        _STATIC_VALIDATOR.LEGACY_DEPLOYMENT_AUTHORITY_UNAVAILABLE_REASON_CODE
+        in capsys.readouterr().err
     )
-    assert second.returncode == 0
-    assert second.stdout.strip() == (
-        f'manyforge_real-lite6-build-cache-{second_digest}'
+
+
+def test_static_validator_cli_requires_explicit_static_artifact_mode(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _STATIC_VALIDATOR.main(
+        (_STATIC_VALIDATOR.STATIC_ARTIFACT_MODE,)
+    ) == 0
+    assert (
+        "Lite6 static ROS/control/gripper artifacts passed."
+        in capsys.readouterr().out
     )
-    assert first.stdout != second.stdout
-    assert malformed.returncode != 0
-    assert malformed.stdout == ''
-
-
-def test_product_capture_retains_bounded_recent_lifecycle_history() -> None:
-    capture = (
-        REPO_ROOT
-        / 'scripts'
-        / 'xarm'
-        / 'capture-lite6-product-lane-state.sh'
-    ).read_text(encoding='utf-8')
-
-    assert '"robot-lifecycle-history"' in capture
-    assert '?limit=300&channels=robot_lifecycle' in capture
-    assert 'manyforge.robot_lifecycle.history_capture.v1' in capture

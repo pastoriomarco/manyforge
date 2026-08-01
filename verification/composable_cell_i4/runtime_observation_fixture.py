@@ -502,8 +502,6 @@ class RuntimeObservationFixtureReducer:
     def observe_process(
         self,
         sample: FixtureProcessPresence,
-        *,
-        received_at_ns: int | None = None,
     ) -> bool:
         if not isinstance(sample, FixtureProcessPresence):
             return self._reject("process_presence_invalid")
@@ -522,7 +520,7 @@ class RuntimeObservationFixtureReducer:
             ):
                 return self._reject("process_observer_session_retired")
             return self._reject("process_observer_session_not_active")
-        now_ns = self._receipt_time(received_at_ns)
+        now_ns = self._receipt_time()
         return self._accept_process_presence(
             sample,
             received_at_ns=now_ns,
@@ -532,8 +530,6 @@ class RuntimeObservationFixtureReducer:
     def replace_process_observer(
         self,
         sample: FixtureProcessPresence,
-        *,
-        received_at_ns: int | None = None,
     ) -> bool:
         """Explicitly fence one observer session before accepting its replacement."""
 
@@ -547,10 +543,7 @@ class RuntimeObservationFixtureReducer:
             active_observer_id is None
             or active_observer_id == sample.observer_instance_id
         ):
-            return self.observe_process(
-                sample,
-                received_at_ns=received_at_ns,
-            )
+            return self.observe_process(sample)
         if (
             sample.observer_instance_id
             in self._retired_observer_ids[runtime_unit_id]
@@ -563,7 +556,7 @@ class RuntimeObservationFixtureReducer:
             >= _MAX_OBSERVER_SESSIONS_PER_RUNTIME_UNIT
         ):
             return self._reject("process_observer_session_limit_exceeded")
-        now_ns = self._receipt_time(received_at_ns)
+        now_ns = self._receipt_time()
         return self._accept_process_presence(
             sample,
             received_at_ns=now_ns,
@@ -650,8 +643,6 @@ class RuntimeObservationFixtureReducer:
     def ingest_report(
         self,
         report: FixtureSourceReport,
-        *,
-        received_at_ns: int | None = None,
     ) -> bool:
         if not isinstance(report, FixtureSourceReport):
             return self._reject("source_report_invalid")
@@ -678,7 +669,7 @@ class RuntimeObservationFixtureReducer:
             report.process_incarnation,
         ):
             return False
-        now_ns = self._receipt_time(received_at_ns)
+        now_ns = self._receipt_time()
         reports_by_incarnation = self._reports[runtime_unit_id]
         current = reports_by_incarnation.get(report.process_incarnation)
         if current is not None:
@@ -986,9 +977,8 @@ class RuntimeObservationFixtureReducer:
             reason_codes=reason_codes,
         )
 
-    def _receipt_time(self, value: int | None) -> int:
-        receipt = self._clock_ns() if value is None else value
-        return _positive_integer(receipt, "receipt time")
+    def _receipt_time(self) -> int:
+        return _positive_integer(self._clock_ns(), "receipt time")
 
     def _evaluation_time(self, value: int | None) -> int:
         evaluated = self._clock_ns() if value is None else value

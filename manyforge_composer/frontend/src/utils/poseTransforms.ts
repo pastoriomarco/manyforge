@@ -1,4 +1,4 @@
-import { Euler, Matrix4, Quaternion, Vector3 } from 'three';
+import { Matrix4, Quaternion, Vector3 } from 'three';
 
 export interface PoseTuple {
   position: [number, number, number];
@@ -7,49 +7,29 @@ export interface PoseTuple {
 
 function finiteTuple(values: unknown, length: number): number[] | null {
   if (!Array.isArray(values) || values.length !== length) return null;
-  const out = values.map((value) => Number(value));
-  return out.every(Number.isFinite) ? out : null;
+  const tuple = values.map((value) => Number(value));
+  return tuple.every(Number.isFinite) ? tuple : null;
 }
 
-export function poseFromRecord(pose: Record<string, unknown> | null | undefined): PoseTuple | null {
+/** Parse the canonical metre/xyzw pose shape used by retained projections. */
+export function poseFromRecord(
+  pose: Record<string, unknown> | null | undefined,
+): PoseTuple | null {
   const position = finiteTuple(pose?.position_m, 3);
   const quaternion = finiteTuple(pose?.orientation_xyzw, 4);
   if (position === null || quaternion === null) return null;
-  const q = new Quaternion(
+
+  const normalized = new Quaternion(
     quaternion[0],
     quaternion[1],
     quaternion[2],
     quaternion[3],
   );
-  if (q.lengthSq() < 1e-12) return null;
-  q.normalize();
+  if (normalized.lengthSq() < 1e-12) return null;
+  normalized.normalize();
   return {
     position: position as [number, number, number],
-    quaternion: [q.x, q.y, q.z, q.w],
-  };
-}
-
-export function poseFromBasePoseRecord(
-  pose: Record<string, unknown> | null | undefined,
-): PoseTuple | null {
-  const direct = poseFromRecord(pose);
-  if (direct !== null) return direct;
-  const position = finiteTuple(pose?.position_m, 3);
-  if (position === null) return null;
-  const rpyDeg =
-    finiteTuple(pose?.orientation_rpy_deg, 3)
-    ?? finiteTuple(pose?.orientationRPYDeg, 3);
-  const rpyRad =
-    finiteTuple(pose?.orientation_rpy_rad, 3)
-    ?? finiteTuple(pose?.orientationRPYRad, 3)
-    ?? (rpyDeg === null ? null : rpyDeg.map((v) => (v * Math.PI) / 180));
-  const q = new Quaternion();
-  if (rpyRad !== null) {
-    q.setFromEuler(new Euler(rpyRad[0], rpyRad[1], rpyRad[2], 'XYZ'));
-  }
-  return {
-    position: position as [number, number, number],
-    quaternion: [q.x, q.y, q.z, q.w],
+    quaternion: [normalized.x, normalized.y, normalized.z, normalized.w],
   };
 }
 
@@ -73,11 +53,19 @@ function poseFromMatrix(matrix: Matrix4): PoseTuple {
   };
 }
 
-export function composePose(parentWorld: PoseTuple, childInParent: PoseTuple): PoseTuple {
-  return poseFromMatrix(matrixFromPose(parentWorld).multiply(matrixFromPose(childInParent)));
+export function composePose(
+  parentWorld: PoseTuple,
+  childInParent: PoseTuple,
+): PoseTuple {
+  return poseFromMatrix(
+    matrixFromPose(parentWorld).multiply(matrixFromPose(childInParent)),
+  );
 }
 
-export function relativePose(childWorld: PoseTuple, parentWorld: PoseTuple): PoseTuple {
+export function relativePose(
+  childWorld: PoseTuple,
+  parentWorld: PoseTuple,
+): PoseTuple {
   return poseFromMatrix(
     matrixFromPose(parentWorld).invert().multiply(matrixFromPose(childWorld)),
   );

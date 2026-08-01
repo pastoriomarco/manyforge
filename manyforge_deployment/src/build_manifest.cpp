@@ -1930,11 +1930,14 @@ BuildQualifiedRetentionAuthority::qualify_persisted(
     }
     reloaded_manifests.push_back(reloaded);
   }
+  const auto retained_environment =
+      retained_node_environment_from_manifest(*reloaded_manifests[0]);
+  const auto compiler_contract_digest =
+      reloaded_manifests[1]->key().content_digest;
+  const auto compiler_build_digest =
+      reloaded_manifests[2]->key().content_digest;
   return BuildQualifiedRetentionContext(
-      retained_node_environment_from_manifest(
-          *reloaded_manifests[0]),
-      reloaded_manifests[1]->key().content_digest,
-      reloaded_manifests[2]->key().content_digest,
+      retained_environment, compiler_contract_digest, compiler_build_digest,
       std::move(reloaded_manifests));
 }
 
@@ -1978,10 +1981,14 @@ BuildQualifiedRetentionAuthority::qualify_existing(
     reloaded_manifests.push_back(reloaded);
   }
 
+  const auto retained_environment =
+      retained_node_environment_from_manifest(*reloaded_manifests[0]);
+  const auto compiler_contract_digest =
+      reloaded_manifests[1]->key().content_digest;
+  const auto compiler_build_digest =
+      reloaded_manifests[2]->key().content_digest;
   return BuildQualifiedRetentionContext(
-      retained_node_environment_from_manifest(*reloaded_manifests[0]),
-      reloaded_manifests[1]->key().content_digest,
-      reloaded_manifests[2]->key().content_digest,
+      retained_environment, compiler_contract_digest, compiler_build_digest,
       std::move(reloaded_manifests));
 }
 

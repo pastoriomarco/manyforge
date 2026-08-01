@@ -1,50 +1,65 @@
-import {
-  BaseEdge,
-  getBezierPath,
-  getSimpleBezierPath,
-  getSmoothStepPath,
-  getStraightPath,
-} from '@xyflow/react';
-import type { EdgeProps } from '@xyflow/react';
-import { useComposerStore } from '../store/composerStore';
+import type { CSSProperties } from 'react';
+import type { EdgeStyle, NodePresentationStatus } from '../store/composerStore';
 
-const EDGE_STATUS_COLORS: Record<string, string> = {
+const EDGE_STATUS_COLORS: Record<NodePresentationStatus, string> = {
   idle: '#6b7280',
   running: '#fbbf24',
   success: '#4ade80',
   failure: '#f87171',
 };
 
-export function StatusEdge(props: EdgeProps) {
-  const edgeStyle = useComposerStore((state) => state.edgeStyle);
-  const nodeStatuses = useComposerStore((state) => state.nodeStatuses);
+export interface StatusEdgeGeometry {
+  sourceX: number;
+  sourceY: number;
+  targetX: number;
+  targetY: number;
+}
 
-  const edgeStatus = nodeStatuses[props.target] ?? 'idle';
-  const stroke = EDGE_STATUS_COLORS[edgeStatus] || EDGE_STATUS_COLORS.idle;
-
-  let path = '';
-  if (edgeStyle === 'straight') {
-    [path] = getStraightPath(props);
-  } else if (edgeStyle === 'simplebezier') {
-    [path] = getSimpleBezierPath(props);
-  } else if (edgeStyle === 'smoothstep') {
-    [path] = getSmoothStepPath({ ...props, borderRadius: 18 });
-  } else if (edgeStyle === 'step') {
-    [path] = getSmoothStepPath({ ...props, borderRadius: 0 });
-  } else {
-    [path] = getBezierPath(props);
+export function statusEdgePath(
+  geometry: StatusEdgeGeometry,
+  style: EdgeStyle,
+): string {
+  const { sourceX, sourceY, targetX, targetY } = geometry;
+  if (style === 'straight') return `M ${sourceX} ${sourceY} L ${targetX} ${targetY}`;
+  const middleX = (sourceX + targetX) / 2;
+  const middleY = (sourceY + targetY) / 2;
+  if (style === 'step') {
+    return `M ${sourceX} ${sourceY} L ${middleX} ${sourceY} L ${middleX} ${targetY} L ${targetX} ${targetY}`;
   }
+  if (style === 'smoothstep') {
+    return `M ${sourceX} ${sourceY} C ${middleX} ${sourceY}, ${middleX} ${targetY}, ${targetX} ${targetY}`;
+  }
+  if (style === 'simplebezier') {
+    return `M ${sourceX} ${sourceY} Q ${middleX} ${middleY}, ${targetX} ${targetY}`;
+  }
+  const offset = Math.max(40, Math.abs(targetY - sourceY) * 0.45);
+  return `M ${sourceX} ${sourceY} C ${sourceX} ${sourceY + offset}, ${targetX} ${targetY - offset}, ${targetX} ${targetY}`;
+}
 
+interface StatusEdgeProps extends StatusEdgeGeometry {
+  edgeStyle: EdgeStyle;
+  targetStatus?: NodePresentationStatus;
+  markerEnd?: string;
+  style?: CSSProperties;
+}
+
+/** SVG edge presentation; the I6 graph adapter owns interaction and identity. */
+export function StatusEdge({
+  edgeStyle,
+  targetStatus = 'idle',
+  markerEnd,
+  style,
+  ...geometry
+}: StatusEdgeProps) {
   return (
-    <BaseEdge
-      path={path}
-      markerEnd={props.markerEnd}
-      interactionWidth={28}
+    <path
+      d={statusEdgePath(geometry, edgeStyle)}
+      markerEnd={markerEnd}
+      fill="none"
       style={{
-        ...props.style,
-        cursor: 'pointer',
-        stroke,
+        stroke: EDGE_STATUS_COLORS[targetStatus],
         strokeWidth: 2,
+        ...style,
       }}
     />
   );

@@ -43,6 +43,20 @@ is safely initialized on restart; any foreign application/version marker or
 partial schema is rejected. Initial schema publication also fsyncs the owning
 directory.
 
+Construction and WAL-topology-changing Close/destruction share one
+process-local scene-store lifecycle gate. Construction takes the lifecycle gate
+before SQLite. Close/destruction takes the per-instance mutex, then the
+lifecycle gate, then SQLite; ordinary scene transactions take only the
+per-instance mutex and SQLite. No path holds the lifecycle gate while waiting
+for an instance mutex, so an injected publication reader cannot reverse this
+order through another scene-store lifecycle operation. This prevents a
+same-process constructor from preflighting a WAL while last-close removes it.
+Constructor acquisition is bounded to ten seconds; Close/destruction waits for
+the gate so teardown cannot abandon a live SQLite handle merely because gate
+acquisition timed out. Concurrent teardown in one process and startup in
+another process is not qualified by this I4 foundation and requires the future
+operational process-lifecycle owner plus forked replacement coverage.
+
 Not implemented in this slice: nonzero native projection materialization,
 named Apply/stage/activation/retirement, public scene edits, projection lease
 objects, ROS adapters, or process/Kernel/controller/robot effects. Destructive

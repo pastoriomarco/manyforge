@@ -1,86 +1,116 @@
 # shellcheck shell=bash
-# scripts/lib/runner.sh — primitive output + command helpers.
+# Bounded, owner-neutral operator presentation helpers.
 #
-# Sourced by every other lib module and by launch.sh. Defines:
-#   step / info / pass / warn / fail / run / run_capture
+# Exact historical source:
+#   manyforge@08222188293df8e12f90dc72e204c21f22f92ea1
+#   blob d31708e592aa2cece604ccfca9bd37e7b64e2ac8
 #
-# Convention: helpers print to stderr unless they're producing data the
-# caller intends to capture. step/info/pass/warn/fail are operator
-# messages and go to stderr so they don't pollute stdout pipelines.
+# Retained responsibility: render short step/info/success/warning/failure
+# messages to stderr without interpreting their contents.
+#
+# Removed responsibility: the historical run/run_capture helpers executed
+# arbitrary shell strings (and run_capture swallowed failures); the ERR trap
+# inferred launcher step/process state and tailed an arbitrary path. Runtime
+# execution, recovery, and owner-issued status return through I4/H0/N and the
+# lane-specific I9/I10 gates. This file is presentation only.
 
-if [[ -n "${_MANYFORGE_LIB_RUNNER:-}" ]]; then return 0; fi
+if [[ -n "${_MANYFORGE_LIB_RUNNER:-}" ]]; then
+    return 0
+fi
 _MANYFORGE_LIB_RUNNER=1
 
+readonly _MANYFORGE_PRESENT_MAX_ARGUMENTS=8
+readonly _MANYFORGE_PRESENT_MAX_CHARACTERS=4096
+
 if [[ -t 2 ]]; then
-    _C_RESET=$'\033[0m'
-    _C_BOLD=$'\033[1m'
-    _C_BLUE=$'\033[34m'
-    _C_GREEN=$'\033[32m'
-    _C_YELLOW=$'\033[33m'
-    _C_RED=$'\033[31m'
-    _C_DIM=$'\033[2m'
+    readonly _MANYFORGE_COLOR_RESET=$'\033[0m'
+    readonly _MANYFORGE_COLOR_BOLD=$'\033[1m'
+    readonly _MANYFORGE_COLOR_BLUE=$'\033[34m'
+    readonly _MANYFORGE_COLOR_GREEN=$'\033[32m'
+    readonly _MANYFORGE_COLOR_YELLOW=$'\033[33m'
+    readonly _MANYFORGE_COLOR_RED=$'\033[31m'
+    readonly _MANYFORGE_COLOR_DIM=$'\033[2m'
 else
-    _C_RESET=""
-    _C_BOLD=""
-    _C_BLUE=""
-    _C_GREEN=""
-    _C_YELLOW=""
-    _C_RED=""
-    _C_DIM=""
+    readonly _MANYFORGE_COLOR_RESET=""
+    readonly _MANYFORGE_COLOR_BOLD=""
+    readonly _MANYFORGE_COLOR_BLUE=""
+    readonly _MANYFORGE_COLOR_GREEN=""
+    readonly _MANYFORGE_COLOR_YELLOW=""
+    readonly _MANYFORGE_COLOR_RED=""
+    readonly _MANYFORGE_COLOR_DIM=""
 fi
 
-# step "[3/7] Heading text"  — section banner.
-step() {
-    printf '\n%s==> %s%s\n' "${_C_BLUE}${_C_BOLD}" "$*" "${_C_RESET}" >&2
-}
-
-# info "informational message"
-info() {
-    printf '    %s%s%s\n' "${_C_DIM}" "$*" "${_C_RESET}" >&2
-}
-
-# pass "✓ ready"
-pass() {
-    printf '%s  ✓ %s%s\n' "${_C_GREEN}" "$*" "${_C_RESET}" >&2
-}
-
-# warn "non-fatal warning"
-warn() {
-    printf '%s  ! %s%s\n' "${_C_YELLOW}" "$*" "${_C_RESET}" >&2
-}
-
-# fail "error" — prints, does not exit. Caller decides.
-fail() {
-    printf '%s  ✗ %s%s\n' "${_C_RED}" "$*" "${_C_RESET}" >&2
-}
-
-# run "<command...>"  — echo+execute; bash -c so quoting collapses
-# cleanly when callers pass already-quoted command strings.
-run() {
-    info "\$ $*"
-    bash -c "$*"
-}
-
-# run_capture "<command...>"  — execute, return stdout, swallow stderr.
-# Useful for probes (`docker ps`, `port_listeners`, …) where stderr
-# noise would derail the surrounding logic.
-run_capture() {
-    bash -c "$*" 2>/dev/null || true
-}
-
-# Install an ERR trap that prints which step failed.
-# Callers (launch.sh) set _CURRENT_STEP_LABEL before each major step.
-install_error_trap() {
-    trap '__manyforge_on_error $? $LINENO' ERR
-}
-
-__manyforge_on_error() {
-    local code="$1"
-    local line="$2"
-    fail "Step '${_CURRENT_STEP_LABEL:-unknown}' failed (exit ${code} at line ${line})."
-    if [[ -n "${_CURRENT_STEP_LOG:-}" && -f "${_CURRENT_STEP_LOG}" ]]; then
-        printf '%s  --- tail of %s ---%s\n' "${_C_DIM}" "${_CURRENT_STEP_LOG}" "${_C_RESET}" >&2
-        tail -n 40 "${_CURRENT_STEP_LOG}" >&2 || true
+_manyforge_present() {
+    if (( $# < 2 || $# > _MANYFORGE_PRESENT_MAX_ARGUMENTS + 1 )); then
+        printf 'manyforge presentation error: expected 1..%d message arguments\n' \
+            "${_MANYFORGE_PRESENT_MAX_ARGUMENTS}" >&2
+        return 2
     fi
-    info "Partial state has been left in place. Inspect with 'scripts/launch.sh status' and tear down with 'scripts/launch.sh stop'."
+    local kind="$1"
+    shift
+
+    local IFS=' '
+    local message="$*"
+    local LC_ALL=C
+    if (( ${#message} > _MANYFORGE_PRESENT_MAX_CHARACTERS )); then
+        printf 'manyforge presentation error: message exceeds %d characters\n' \
+            "${_MANYFORGE_PRESENT_MAX_CHARACTERS}" >&2
+        return 2
+    fi
+    if [[ "${message}" =~ [[:cntrl:]] ]]; then
+        printf 'manyforge presentation error: message contains control characters\n' >&2
+        return 2
+    fi
+
+    case "${kind}" in
+        step)
+            printf '\n%s==> %s%s\n' \
+                "${_MANYFORGE_COLOR_BLUE}${_MANYFORGE_COLOR_BOLD}" \
+                "${message}" "${_MANYFORGE_COLOR_RESET}" >&2
+            ;;
+        info)
+            printf '    %s%s%s\n' \
+                "${_MANYFORGE_COLOR_DIM}" "${message}" \
+                "${_MANYFORGE_COLOR_RESET}" >&2
+            ;;
+        pass)
+            printf '%s  ✓ %s%s\n' \
+                "${_MANYFORGE_COLOR_GREEN}" "${message}" \
+                "${_MANYFORGE_COLOR_RESET}" >&2
+            ;;
+        warn)
+            printf '%s  ! %s%s\n' \
+                "${_MANYFORGE_COLOR_YELLOW}" "${message}" \
+                "${_MANYFORGE_COLOR_RESET}" >&2
+            ;;
+        fail)
+            printf '%s  ✗ %s%s\n' \
+                "${_MANYFORGE_COLOR_RED}" "${message}" \
+                "${_MANYFORGE_COLOR_RESET}" >&2
+            ;;
+        *)
+            printf 'manyforge presentation error: unknown message kind\n' >&2
+            return 2
+            ;;
+    esac
+}
+
+step() {
+    _manyforge_present step "$@"
+}
+
+info() {
+    _manyforge_present info "$@"
+}
+
+pass() {
+    _manyforge_present pass "$@"
+}
+
+warn() {
+    _manyforge_present warn "$@"
+}
+
+fail() {
+    _manyforge_present fail "$@"
 }

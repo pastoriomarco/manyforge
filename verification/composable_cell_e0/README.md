@@ -1,9 +1,25 @@
 # E0 Python-Boundary Feasibility Proof
 
-This directory is non-production qualification evidence for the bounded E0
-checkpoint. It builds two disposable modules over the same representative
-ManyForge types and operations. It does not create a production binding
-choice, compatibility layer, feature flag, or runtime path.
+> **Cutover status (2026-07-31):** the disposable E0 feasibility evidence and
+> its historical decision remain valid only for their pinned source. The
+> production-coexistence recipe below required the now-deleted
+> `create_native_kernel`/`NativeKernelBundle` surface and is not a current
+> command. The current CMake entry point fails before project hooks,
+> compiler/dependency discovery, or proof-source evaluation. The
+> dependency-free PEP 517 entry point fails before external build-dependency
+> installation, CMake invocation, or E0 extension build-tree/proof-source
+> evaluation. `verify_production_coexistence.py` exits 78 before
+> imports. Their
+> import-order, strong-ID, source-identity, and clean-shutdown requirements
+> return in the atomic I2 Python/compiler binding qualification. The deleted
+> factory/bundle assertions do not return.
+
+At pinned commit `637894c460172b47faf64c7ece2e865bb8d69593`, this directory
+built two disposable modules over the same representative ManyForge types and
+operations. Current HEAD retains the exact proof translation units only as
+non-production historical evidence for the bounded E0 checkpoint; it does not
+create a production binding choice, compatibility layer, feature flag, or
+runtime path.
 
 The proof covers the actual `CellId`, strict parser, empty-cell identity and
 structural-qualification calls, closed-schema compilation, actual
@@ -14,19 +30,25 @@ nonconstructibility, optional `None`, structured exceptions, borrowed and
 shared lifetimes, a representative concurrent released-GIL schema compile,
 synthetic released-GIL wait overlap, asyncio observation-only cancellation,
 imports, and clean interpreter shutdown.
-`verify_production_coexistence.py` separately imports the two actual production
-pybind11 modules from their clean build/install directories. The separate
+Historically, `verify_production_coexistence.py` separately imported the two
+actual production pybind11 modules from their clean build/install directories.
+The separate
 `e0_nanobind_roboplan_peer` module provides a bounded two-module nanobind
 coexistence check in both import orders. Neither subset is a substitute for
 building and testing both complete production modules during an approved
 atomic cutover.
 
-Run it only in the documented ManyForge development image. Pin
-`MANYFORGE_SOURCE_DIR` to the exact clean commit being evaluated; a dirty
-source tree invalidates the retained result.
+The commands below are a historical recipe, not current-branch instructions.
+The original proof can be replayed only by checking out exact ManyForge commit
+`637894c460172b47faf64c7ece2e865bb8d69593` and following the README from that
+checkout in the documented development image. Pointing `MANYFORGE_SOURCE_DIR`
+at the current relocation worktree is invalid. Do not restore the removed
+public structure header or add a compatibility shim to make this recipe run.
+There is no current-branch bypass: both this harness and
+`MANYFORGE_SOURCE_DIR` must come from the same clean pinned checkout.
 
 ```bash
-export E0_SOURCE_COMMIT=<full-clean-manyforge-commit>
+export E0_SOURCE_COMMIT=637894c460172b47faf64c7ece2e865bb8d69593
 python3 verification/composable_cell_e0/verify_source_state.py \
   --source-root /workspace \
   --expected-commit "${E0_SOURCE_COMMIT}"
@@ -155,8 +177,10 @@ read-only build input; it records the commit and a deterministic source-tree
 hash alongside the image identity. An unpinned download invalidates the
 baseline.
 
-Then verify the current production pybind11 coexistence baseline in both
-initialization orders:
+The following commands record the historical production-pybind11 coexistence
+baseline in both initialization orders. They must not be executed against the
+current cutover worktree; I2 must replace this recipe with the final production
+binding matrix:
 
 ```bash
 LD_LIBRARY_PATH="${E0_CMEEL_PREFIX}/lib:${LD_LIBRARY_PATH:-}" \

@@ -1840,10 +1840,12 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
       relative_path = source->relative_path;
       descriptor_bytes = source->descriptor_yaml;
     }
+    const auto qualification =
+        compiled_schema == nullptr ? CatalogSchemaQualification::kUnqualified
+                                   : CatalogSchemaQualification::kQualified;
     storage->catalog_schemas.push_back(BuildCatalogSchemaEntry(
         descriptor.record_kind, core::SchemaId(std::string(descriptor.schema_family)),
-        compiled_schema == nullptr ? CatalogSchemaQualification::kUnqualified
-                                   : CatalogSchemaQualification::kQualified,
+        qualification,
         std::move(compiled_schema), std::move(relative_path),
         std::move(descriptor_bytes)));
   }
@@ -1858,9 +1860,10 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
     auto compiled_schema = std::make_shared<const CompiledClosedSchema>(
         compile_closed_schema_descriptor(
             parse_strict_json_model_yaml(source.descriptor_yaml)));
+    const auto schema_id = compiled_schema->schema_id();
+    const auto schema_revision = compiled_schema->schema_revision();
     storage->value_schemas.push_back(BuildQualifiedValueSchemaEntry(
-        compiled_schema->schema_id(), compiled_schema->schema_revision(),
-        std::move(compiled_schema), std::string(source.relative_path),
+        schema_id, schema_revision, std::move(compiled_schema), std::string(source.relative_path),
         std::string(source.descriptor_yaml)));
   }
   std::sort(

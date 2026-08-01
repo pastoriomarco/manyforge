@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+from types import ModuleType
+import uuid
+
+import pytest
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_GENERATOR = _REPO_ROOT / "scripts" / "regen-public-contracts.py"
+_FRESHNESS_WRAPPER = (
+    _REPO_ROOT / "scripts" / "ci" / "check-public-contracts-fresh.sh"
+)
+_STEP18_RELEASE_GATE_VERIFIER = (
+    _REPO_ROOT / "scripts" / "qualification" / "verify_step18_release_gates.py"
+)
+_UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+
+
+def _load_generator_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        f"regen_public_contracts_{uuid.uuid4().hex}",
+        _GENERATOR,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("arguments", ((), ("--check",)))
+def test_historical_generator_shapes_fail_before_import_or_output_access(
+    arguments: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    isolated_root = tmp_path / "isolated-repository"
+    isolated_script = isolated_root / "scripts" / _GENERATOR.name
+    isolated_script.parent.mkdir(parents=True)
+    shutil.copyfile(_GENERATOR, isolated_script)
+
+    reference = isolated_root / "docs" / "reference" / "REST_API.md"
+    reference.parent.mkdir(parents=True)
+    reference.write_text("sentinel-rest-reference\n", encoding="utf-8")
+
+    import_marker = tmp_path / "composer-imported"
+    fake_backend = isolated_root / "manyforge_composer" / "backend"
+    fake_backend.mkdir(parents=True)
+    (isolated_root / "manyforge_composer" / "__init__.py").write_text(
+        "", encoding="utf-8"
+    )
+    (fake_backend / "__init__.py").write_text("", encoding="utf-8")
+    (fake_backend / "app.py").write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['PUBLIC_CONTRACT_IMPORT_MARKER']).write_text('called')\n"
+        "def create_app(state):\n"
+        "    raise AssertionError('legacy aggregate imported Composer')\n",
+        encoding="utf-8",
+    )
+    (fake_backend / "state.py").write_text(
+        "class ComposerState:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(isolated_script), *arguments],
+        cwd=isolated_root,
+        env={
+            **os.environ,
+            "PUBLIC_CONTRACT_IMPORT_MARKER": str(import_marker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 78
+    assert _UNAVAILABLE_REASON_CODE in completed.stderr
+    assert "structural-rest" in completed.stderr
+    assert reference.read_text(encoding="utf-8") == "sentinel-rest-reference\n"
+    assert not import_marker.exists()
+
+    source = isolated_script.read_text(encoding="utf-8")
+    assert source.index('if __name__ == "__main__"') < source.index(
+        "import argparse"
+    )
+    assert source.index('if __name__ == "__main__"') < source.index(
+        "from pathlib import Path"
+    )
+
+
+def test_explicit_structural_rest_generator_routes_write_and_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_generator_module()
+    reference = tmp_path / "REST_API.md"
+    calls: list[str] = []
+
+    def generate() -> str:
+        calls.append("structural-rest")
+        return "generated structural REST\n"
+
+    monkeypatch.setattr(module, "REST_REFERENCE_PATH", reference)
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(module, "gen_rest_api", generate)
+
+    assert module.main(["structural-rest"]) == 0
+    assert reference.read_text(encoding="utf-8") == "generated structural REST\n"
+    assert module.main(["structural-rest", "--check"]) == 0
+
+    reference.write_text("stale structural REST\n", encoding="utf-8")
+    assert module.main(["structural-rest", "--check"]) == 1
+    assert reference.read_text(encoding="utf-8") == "stale structural REST\n"
+    assert calls == ["structural-rest"] * 3
+
+
+def _write_recording_command(path: Path) -> None:
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "builtin printf '%s\\n' \"$*\" >>\"${PUBLIC_CONTRACT_CALLS}\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def test_historical_freshness_wrapper_cannot_reach_python_or_docker(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_recording_command(fake_bin / "python3")
+    _write_recording_command(fake_bin / "docker")
+    calls = tmp_path / "external-calls"
+
+    completed = subprocess.run(
+        ["bash", str(_FRESHNESS_WRAPPER)],
+        cwd=_REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "PUBLIC_CONTRACT_CALLS": str(calls),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 78
+    assert _UNAVAILABLE_REASON_CODE in completed.stderr
+    assert "structural-rest" in completed.stderr
+    assert not calls.exists()
+
+
+@pytest.mark.parametrize(
+    ("inside_container", "expected"),
+    (
+        (
+            True,
+            "scripts/regen-public-contracts.py structural-rest --check",
+        ),
+        (
+            False,
+            "compose run --rm -e INSIDE_MANYFORGE_DEV_CONTAINER=1 dev "
+            "python3 scripts/regen-public-contracts.py structural-rest --check",
+        ),
+    ),
+)
+def test_explicit_freshness_selector_routes_to_the_bounded_generator(
+    inside_container: bool,
+    expected: str,
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_recording_command(fake_bin / "python3")
+    _write_recording_command(fake_bin / "docker")
+    calls = tmp_path / "external-calls"
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "PUBLIC_CONTRACT_CALLS": str(calls),
+    }
+    environment.pop("INSIDE_MANYFORGE_DEV_CONTAINER", None)
+    if inside_container:
+        environment["INSIDE_MANYFORGE_DEV_CONTAINER"] = "1"
+
+    completed = subprocess.run(
+        ["bash", str(_FRESHNESS_WRAPPER), "structural-rest"],
+        cwd=_REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == [expected]
+
+
+def test_step18_hygiene_uses_the_explicit_check_and_tracks_its_script() -> None:
+    source = _STEP18_RELEASE_GATE_VERIFIER.read_text(encoding="utf-8")
+
+    assert (
+        '"bash scripts/ci/check-public-contracts-fresh.sh structural-rest"'
+        in source
+    )
+    assert "command.split()[1]" in source

@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
-# scripts/run-assistant-supervisor.sh — convenience launcher for the
-# manyforge_assistant_bridge.supervisor (foreground, for debugging).
+# Typed boundary for the historical assistant status-feeder wrapper.
 #
-# In normal operation the supervisor is started in detached form by
-# scripts/launch.sh (via lib/assistant.sh:start_assistant_supervisor).
-# This wrapper is for manual inspection: tail its logs, exit with Ctrl-C.
+# Exact implementation source:
+# manyforge@08222188293df8e12f90dc72e204c21f22f92ea1, blob
+# 3daf0d53a35ba250d825dc45d66d3a575c04f884.
+#
+# Its interpreter selection and foreground process lifecycle return as bounded
+# operator workflow support. Its Composer runtime-status feeder becomes a thin
+# owner-issued status client at H0/I5; assistant operation returns at N/I6.
+# No venv probe, working-directory change, import, or process launch occurs now.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MANYFORGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-
-VENV_PYTHON="${MANYFORGE_ROOT}/manyforge_assistant_bridge/.venv/bin/python"
-if [[ -x "${VENV_PYTHON}" ]]; then
-    PY="${VENV_PYTHON}"
-else
-    PY="python3"
-fi
-
-cd "${MANYFORGE_ROOT}"
-exec "${PY}" -m manyforge_assistant_bridge.supervisor
+# shellcheck source=lib/composable-cell-runtime-availability.sh
+source "${SCRIPT_DIR}/lib/composable-cell-runtime-availability.sh"
+MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: assistant supervision"
+MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE+=" returns with the qualified headless status client."
+manyforge_fail_composable_cell_runtime_unavailable

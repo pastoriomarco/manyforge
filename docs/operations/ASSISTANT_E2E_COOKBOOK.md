@@ -1,21 +1,29 @@
 # Assistant E2E Cookbook
 
-This cookbook is the live operator recipe set for ManyForge assistant
-workflows. It covers the current v0.1 path:
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until I5/H0 restores the assistant/headless boundary
+> and every workflow-dependent execution gate has passed. Unless explicitly
+> marked as retained offline logic, present-tense wording below describes the
+> captured baseline, not a live service.
+
+This cookbook records the former live operator recipe set for ManyForge
+assistant workflows. It covers the captured v0.1 path:
 
 ```text
 Composer -> manyforge_assistant_bridge -> local vLLM
          <- Composer bridge callbacks <-
 ```
 
-Use it for practical end-to-end assistant checks, model/profile bake-offs, and
-new assistant workflow validation as ManyForge grows. It is not a replacement
-for CI: when a workflow graduates from manual E2E check to regression coverage,
-keep the recipe here and add the corresponding automated test or verification
+It preserves practical end-to-end acceptance cases, model/profile bake-offs,
+and assistant workflow intent for later restoration. When a workflow returns,
+the recipe complements rather than replaces its automated test or verification
 matrix.
 
-NemoClaw-Thor owns model serving. ManyForge owns the assistant provider
-contract, mode catalog, bridge service, Composer callbacks, and this cookbook.
+At the captured baseline, NemoClaw-Thor owned model serving while ManyForge
+owned the assistant-provider contract, mode catalog, bridge service, Composer
+callbacks, and this cookbook. Those ManyForge runtime owners are not current
+services; future ownership must follow the H0 boundary.
 
 ## How Recipes Evolve
 

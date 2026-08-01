@@ -1,39 +1,49 @@
 #!/usr/bin/env bash
-# check-public-contracts-fresh.sh — guard that auto-generated reference
-# docs in `docs/reference/` are up-to-date with the live code.
+# check-public-contracts-fresh.sh — guard that the generated structural
+# Composer REST reference is up-to-date with the retained FastAPI app.
 #
-# The three docs (REST_API.md, MCP_RUNTIME_CONTRACT.md,
-# ASSISTANT_PROVIDER_CONTRACT.md) are produced by
-# `scripts/regen-public-contracts.py` from FastAPI's openapi() output and
-# the FastMCP tool registry. They drift silently when factory functions
-# get renamed or new tools/routes are added without rerunning the
-# regenerator — exactly the failure that landed `build_app` →
-# `create_app` and `build_mcp_server` → `create_mcp_server` rename in the
-# code, with the regen script + the docs left frozen against the old
-# names for an unknown number of months.
+# `docs/reference/REST_API.md` is produced by
+# `scripts/regen-public-contracts.py` from
+# `create_app(ComposerState()).openapi()`. MCP, assistant, viewer, scene,
+# execution, lifecycle, and runtime contracts are intentionally not generated
+# while those product owners are unavailable during the composable-cell
+# cutover.
 #
-# This script runs the regenerator in `--check` mode; exit 1 on drift.
+# The historical no-argument form represented the removed aggregate contract
+# check and is unavailable.  The retained REST-only check requires the
+# explicit `structural-rest` selector and exits 1 on drift.
 #
 # It MUST run inside the manyforge dev container — the regen script
-# imports `manyforge_composer.backend.app` and
-# `manyforge_composer.backend.mcp_server`, which require the dev
-# image's installed dependencies (FastAPI, FastMCP, the kernel client,
-# etc.). Running on the host without those deps would itself produce
-# a failure stub and a misleading drift result.
+# imports the retained Composer app and structural state, which require the
+# dev image's installed FastAPI and ManyForge Python dependencies. The
+# generator fails closed on import or construction errors.
 #
 # Wire into CI:
 #   .github/workflows/...   - run as a step; non-zero fails the build.
 #   pre-commit              - or invoke from a pre-commit hook.
-#   manual                  - bash scripts/ci/check-public-contracts-fresh.sh
+#   manual                  - bash scripts/ci/check-public-contracts-fresh.sh structural-rest
 
 set -euo pipefail
+
+readonly UNAVAILABLE_REASON_CODE="composable_cell_runtime_unavailable"
+readonly LEGACY_AGGREGATE_UNAVAILABLE_MESSAGE="${UNAVAILABLE_REASON_CODE}: aggregate public-contract freshness is unavailable while its former runtime contract owners are removed; use the explicit structural-rest selector for the retained Composer REST projection."
+
+if (( $# == 0 )); then
+  builtin printf '%s\n' "${LEGACY_AGGREGATE_UNAVAILABLE_MESSAGE}" >&2
+  exit 78
+fi
+
+if (( $# != 1 )) || [[ "$1" != "structural-rest" ]]; then
+  builtin printf 'Usage: %s structural-rest\n' "$0" >&2
+  exit 64
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
 if [[ -n "${INSIDE_MANYFORGE_DEV_CONTAINER:-}" ]]; then
   # Already inside the dev image — run the check directly.
-  exec python3 scripts/regen-public-contracts.py --check
+  exec python3 scripts/regen-public-contracts.py structural-rest --check
 fi
 
 # Host invocation: shell out to docker compose. The `dev` service mounts
@@ -47,4 +57,4 @@ fi
 exec docker compose run --rm \
   -e INSIDE_MANYFORGE_DEV_CONTAINER=1 \
   dev \
-  python3 scripts/regen-public-contracts.py --check
+  python3 scripts/regen-public-contracts.py structural-rest --check

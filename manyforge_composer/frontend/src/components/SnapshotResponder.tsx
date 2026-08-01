@@ -7,38 +7,50 @@ import {
   UnsignedByteType,
   WebGLRenderTarget,
 } from 'three';
-
 import {
-  applyLatestViewerFrame,
-  waitForViewerFrameGeneration,
-} from '../store/viewerFrameStore';
-import { canvasToBlobWithTimeout, flipRgbaRowsInPlace } from '../utils/snapshotCapture';
+  canvasToBlobWithTimeout,
+  flipRgbaRowsInPlace,
+} from '../utils/snapshotCapture';
+
+export interface SnapshotRequestView {
+  requestId: string;
+  width: number;
+  height: number;
+  mime: 'image/png' | 'image/jpeg';
+  requiredFrame?: { streamEpoch: bigint; sequence: bigint };
+}
+
+export function validateSnapshotRequest(request: SnapshotRequestView): string | null {
+  if (!request.requestId.trim()) return 'Snapshot request ID is required';
+  if (
+    !Number.isInteger(request.width)
+    || !Number.isInteger(request.height)
+    || request.width < 1
+    || request.height < 1
+  ) {
+    return 'Snapshot dimensions must be positive integers';
+  }
+  return null;
+}
+
+interface SnapshotResponderProps {
+  subscribe: (handler: (request: SnapshotRequestView) => void) => () => void;
+  upload: (requestId: string, result: Blob | null) => Promise<void>;
+  ensureFrame?: (frame: NonNullable<SnapshotRequestView['requiredFrame']>) => Promise<boolean>;
+  applyFrame?: () => void;
+}
 
 /**
- * Native R3F visualizer Day 3: round-trips scene-snapshot requests
- * from the backend snapshot broker. Mounted inside the operator's Canvas so
- * the offscreen render uses the same scene and camera state without resizing
- * or preserving the visible framebuffer.
- *
- * Wire:
- *   backend SnapshotBroker -> WS /ws/scene/snapshot -> this component
- *   captureFrame(width, height, mime) -> POST /api/scene/snapshot/upload/{id}
- *
- * Capture uses a reusable offscreen render target. The visible framebuffer is
- * never preserved or resized, so snapshot support has no permanent render cost
- * and cannot perturb the operator camera/canvas.
+ * Reusable offscreen R3F capture client. I5/I9 own the exact snapshot request,
+ * freshness, and upload adapters; no deleted WebSocket or route is embedded.
  */
-export function SnapshotResponder() {
-  // R3F's `useThree(selector)` returns the selected value, but every
-  // change to the underlying R3F store fires the selector — when those
-  // selected values end up in a `useEffect` dep list the effect
-  // re-mounts on every frame and the WebSocket thrashes, which in
-  // turn pumps the React reconciler into update-depth-exceeded (the
-  // minified React error #185 the operator saw). Subscribe to the
-  // store itself (stable reference) and pull live values via
-  // `.getState()` inside the effect.
+export function SnapshotResponder({
+  subscribe,
+  upload,
+  ensureFrame,
+  applyFrame,
+}: SnapshotResponderProps) {
   const store = useStore();
-  const wsRef = useRef<WebSocket | null>(null);
   const targetRef = useRef<WebGLRenderTarget | null>(null);
   const pixelsRef = useRef<{
     bytes: Uint8Array<ArrayBuffer>;
@@ -48,30 +60,14 @@ export function SnapshotResponder() {
 
   useEffect(() => {
     let active = true;
-    let reconnectTimer: number | null = null;
-    let reconnectAttempts = 0;
 
-    const wsUrl = (() => {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const apiBase = import.meta.env.VITE_API_URL as string | undefined;
-      if (apiBase) {
-        return apiBase.replace(/^https?:/, proto) + '/ws/scene/snapshot';
-      }
-      return `${proto}//${window.location.host}/ws/scene/snapshot`;
-    })();
-
-    async function captureFrame(
-      width: number,
-      height: number,
-      mime: string,
-    ): Promise<Blob> {
-      if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
-        throw new Error('Snapshot dimensions must be positive integers');
-      }
+    const capture = async (request: SnapshotRequestView): Promise<Blob> => {
+      const validation = validateSnapshotRequest(request);
+      if (validation) throw new Error(validation);
       const { gl, scene, camera } = store.getState();
       let target = targetRef.current;
       if (target === null) {
-        target = new WebGLRenderTarget(width, height, {
+        target = new WebGLRenderTarget(request.width, request.height, {
           format: RGBAFormat,
           type: UnsignedByteType,
           depthBuffer: true,
@@ -79,10 +75,11 @@ export function SnapshotResponder() {
         });
         target.texture.colorSpace = SRGBColorSpace;
         targetRef.current = target;
-      } else if (target.width !== width || target.height !== height) {
-        target.setSize(width, height);
+      } else if (target.width !== request.width || target.height !== request.height) {
+        target.setSize(request.width, request.height);
       }
-      const requiredBytes = width * height * 4;
+
+      const requiredBytes = request.width * request.height * 4;
       let pixelViews = pixelsRef.current;
       if (pixelViews === null || pixelViews.bytes.byteLength !== requiredBytes) {
         const buffer = new ArrayBuffer(requiredBytes);
@@ -92,151 +89,80 @@ export function SnapshotResponder() {
         };
         pixelsRef.current = pixelViews;
       }
-      let outputCanvas = canvasRef.current;
-      if (outputCanvas === null) {
-        outputCanvas = document.createElement('canvas');
-        canvasRef.current = outputCanvas;
+      let canvas = canvasRef.current;
+      if (canvas === null) {
+        canvas = document.createElement('canvas');
+        canvasRef.current = canvas;
       }
-      outputCanvas.width = width;
-      outputCanvas.height = height;
-      const context = outputCanvas.getContext('2d');
+      canvas.width = request.width;
+      canvas.height = request.height;
+      const context = canvas.getContext('2d');
       if (context === null) throw new Error('2D snapshot encoder is unavailable');
 
       const captureCamera = camera.clone();
       if (captureCamera instanceof PerspectiveCamera) {
-        captureCamera.aspect = width / height;
+        captureCamera.aspect = request.width / request.height;
         captureCamera.updateProjectionMatrix();
       }
       const previousTarget = gl.getRenderTarget();
-
       try {
         gl.setRenderTarget(target);
         gl.clear(true, true, true);
         gl.render(scene, captureCamera);
-        gl.readRenderTargetPixels(target, 0, 0, width, height, pixelViews.bytes);
+        gl.readRenderTargetPixels(
+          target,
+          0,
+          0,
+          request.width,
+          request.height,
+          pixelViews.bytes,
+        );
       } finally {
         gl.setRenderTarget(previousTarget);
       }
-      flipRgbaRowsInPlace(pixelViews.bytes, width, height);
-      context.putImageData(new ImageData(pixelViews.clamped, width, height), 0, 0);
-      return canvasToBlobWithTimeout(outputCanvas, mime, 0.9, 1_000);
-    }
+      flipRgbaRowsInPlace(pixelViews.bytes, request.width, request.height);
+      context.putImageData(
+        new ImageData(pixelViews.clamped, request.width, request.height),
+        0,
+        0,
+      );
+      return canvasToBlobWithTimeout(canvas, request.mime, 0.9, 1_000);
+    };
 
-    async function handleRequest(msg: {
-      requestId: string;
-      width: number;
-      height: number;
-      format: string;
-      requiredProducerEpoch?: string;
-      requiredFrameSequence?: number;
-      timeoutMs?: number;
-    }): Promise<void> {
-      const mime = msg.format === 'png' ? 'image/png' : 'image/jpeg';
+    const handle = async (request: SnapshotRequestView) => {
       try {
-        if (
-          typeof msg.requiredProducerEpoch === 'string'
-          && Number.isInteger(msg.requiredFrameSequence)
-        ) {
-          const available = await waitForViewerFrameGeneration(
-            msg.requiredProducerEpoch,
-            msg.requiredFrameSequence as number,
-            Number.isFinite(msg.timeoutMs) ? Number(msg.timeoutMs) : 1_000,
-          );
-          if (!available) {
-            throw new Error('Required viewer frame did not arrive before capture');
+        if (request.requiredFrame) {
+          if (!ensureFrame || !await ensureFrame(request.requiredFrame)) {
+            throw new Error('Required viewer frame is unavailable');
           }
-          // Apply refs synchronously so hidden-tab animation throttling cannot
-          // make an offscreen snapshot lag the generation the backend prepared.
-          applyLatestViewerFrame(Date.now(), 0);
+          applyFrame?.();
         }
-        const blob = await captureFrame(msg.width, msg.height, mime);
-        await fetch(
-          `/api/scene/snapshot/upload/${encodeURIComponent(msg.requestId)}`,
-          {
-            method: 'POST',
-            body: blob,
-            headers: { 'Content-Type': mime },
-          },
-        );
-      } catch (err) {
-        console.warn('snapshot capture/upload failed', err);
-        // Send an empty body so the broker resolves to None promptly
-        // instead of timing out the full 2 s window.
-        try {
-          await fetch(
-            `/api/scene/snapshot/upload/${encodeURIComponent(msg.requestId)}`,
-            {
-              method: 'POST',
-              body: new Blob([], { type: 'application/octet-stream' }),
-            },
-          );
-        } catch {
-          /* the broker times out on its own */
+        const blob = await capture(request);
+        if (active) await upload(request.requestId, blob);
+      } catch (error) {
+        console.warn('snapshot capture failed', error);
+        if (active) {
+          try {
+            await upload(request.requestId, null);
+          } catch (uploadError) {
+            console.warn('snapshot failure report could not be uploaded', uploadError);
+          }
         }
       }
-    }
+    };
 
-    function connect(): void {
-      if (!active) return;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        // Successful connection resets the back-off ladder.
-        reconnectAttempts = 0;
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg && msg.type === 'snapshot_request' && typeof msg.requestId === 'string') {
-            void handleRequest(msg);
-          }
-        } catch {
-          /* ignore malformed messages */
-        }
-      };
-
-      ws.onclose = () => {
-        wsRef.current = null;
-        if (!active) return;
-        // Exponential back-off (1.5 s, 3 s, 6 s, ... capped at 30 s)
-        // avoids spamming the console with reconnect attempts when
-        // the snapshot route is unavailable for an extended period.
-        // The snapshot service is best-effort — if it's down the
-        // viewer continues to work, only VLM nodes degrade.
-        reconnectAttempts += 1;
-        const delay = Math.min(30000, 1500 * 2 ** (reconnectAttempts - 1));
-        reconnectTimer = window.setTimeout(connect, delay);
-      };
-
-      ws.onerror = () => {
-        try {
-          ws.close();
-        } catch {
-          /* already closed */
-        }
-      };
-    }
-
-    connect();
-
+    const unsubscribe = subscribe((request) => {
+      void handle(request);
+    });
     return () => {
       active = false;
-      if (reconnectTimer !== null) {
-        window.clearTimeout(reconnectTimer);
-      }
-      try {
-        wsRef.current?.close();
-      } catch {
-        /* already closed */
-      }
+      unsubscribe();
       targetRef.current?.dispose();
       targetRef.current = null;
       pixelsRef.current = null;
       canvasRef.current = null;
     };
-  }, [store]);
+  }, [applyFrame, ensureFrame, store, subscribe, upload]);
 
   return null;
 }

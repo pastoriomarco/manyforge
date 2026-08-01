@@ -114,13 +114,13 @@ namespace {
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::string_view kExpectedNodeEnvironmentDigest =
-    "sha256:ad3e1dbcb9f15fdb55599da846a8da9bf4c80a0cdf784786363c484008c5375b";
+    "sha256:c1a6f5fcdcabc18c30ade4761a64ff7fd10dfbeb473514ccde3a69e3bd11dd6a";
 constexpr std::string_view kExpectedCompilerContractDigest =
-    "sha256:5af892e007d2f839aa9ce3f7a77a73feaf41e397c8f085f1f86afbed88e5e6d2";
+    "sha256:2197422750ff536028772ff44c555c4cc0725859fd6763236fe5ef14ba641fb5";
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:9bb2013e7d9a46695a010997790659230867b9a4f6ccc4fc16458fba1cf2894a";
+    "sha256:1a0004374353968bc4b0b1fb50229ab95c48790ddb4b58c35f5f5f39862c3d72";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:68f457ff69d7ecaf77693b6424179050824c764130f2384e14ff33279d4f2c4e";
+    "sha256:58bbf96c6990ca84bae1d1d5986323984704f0842334acd898d6cddb41f61858";
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);
 static_assert(!std::is_aggregate_v<BuildQualifiedManifest>);
@@ -1519,6 +1519,7 @@ TEST(BuildManifestAuthority,
   }
   bool covers_node_environment_freshness_check = false;
   bool covers_structural_preparation_tool = false;
+  bool covers_structural_preparation_template = false;
   for (const std::string_view table_name :
        {"source_inputs", "recipe_inputs"}) {
     std::string previous;
@@ -1532,6 +1533,10 @@ TEST(BuildManifestAuthority,
           "compiler-python-tool:prepare_structural_model") {
         covers_structural_preparation_tool = true;
       }
+      if (input_id ==
+          "build-template:embedded_structural_model_preparation") {
+        covers_structural_preparation_template = true;
+      }
       EXPECT_FALSE(input_id.empty());
       EXPECT_EQ(input_id.find('/'), std::string::npos);
       EXPECT_EQ(input_id.find(".."), std::string::npos);
@@ -1543,6 +1548,7 @@ TEST(BuildManifestAuthority,
   }
   EXPECT_TRUE(covers_node_environment_freshness_check);
   EXPECT_TRUE(covers_structural_preparation_tool);
+  EXPECT_TRUE(covers_structural_preparation_template);
   EXPECT_TRUE(is_sha256_digest(
       text_member(build, "build_configuration_digest")));
   const CanonicalValue changed_configuration = reidentify(

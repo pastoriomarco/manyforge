@@ -1,11 +1,34 @@
 # ManyForge xArm control
 
+> **Current `dev` boundary:** this retained adapter code is not a runnable
+> xArm control product. The provider/launcher wiring and all physical
+> qualification remain unavailable until I10/R. Present-tense protocol detail
+> below records the intended/captured boundary and must not be read as proof
+> that a process or command endpoint is live.
+
 `manyforge_xarm_control` maps the generic robot-lifecycle contract onto xArm
 semantics. It does not own, include, link, or instantiate the xArm SDK.
 
-## Production boundary
+The reusable I7/I10 seed is vendor observation and result normalization,
+declarative xArm action/postcondition mapping, bounded primitive audit, the
+no-SDK wrapper boundary, and fake-backend/plugin evidence. The old
+caller-session coordinator, singleton identities, execution-admission
+projection, controller-manager sequencing, and renewable command-gate service
+are migration inputs, not the target architecture. Generic lifecycle policy
+moves to I7; the renewable gate can be removed only when I10 replacement
+evidence exists.
 
-One `xarm_ros2` `UFRobotSystemHardware` instance owns the only SDK 1.18.1
+The three installed native names (`lite6_supervised_preflight`,
+`lite6_lifecycle_command_evidence`, and
+`lite6_execution_admission_provider`) are currently stable unavailable gates.
+They print `composable_cell_runtime_unavailable` and exit 78 before argument
+parsing or ROS initialization, and they do not link the retained runtime
+libraries.
+
+## Captured production boundary
+
+At the last commissioning baseline, one `xarm_ros2`
+`UFRobotSystemHardware` instance owned the only SDK 1.18.1
 session and the real Joint Trajectory Controller data path:
 
 ```text
@@ -30,10 +53,10 @@ xarm_ros2 supervised state topic
   -> strict generic execution ingress
 ```
 
-The installed `lite6_execution_admission_provider` owns one
-`XArmLifecycleRosPort`, consumes the exact supervised state and
+The former installed `lite6_execution_admission_provider` owned one
+`XArmLifecycleRosPort`, consumed the exact supervised state and
 controller-manager activity endpoints from the resolved runtime manifest, and
-publishes `manyforge_robot_lifecycle_msgs/ExecutionAdmissionSnapshot` every
+published `manyforge_robot_lifecycle_msgs/ExecutionAdmissionSnapshot` every
 50 ms with a maximum 250 ms lease. Its process identity, robot identity, and
 controller-binding generation are exact-match fences. The generic
 `manyforge_ros` ingress preserves the publisher's source deadline, rejects
@@ -126,9 +149,10 @@ explanation](https://docs.supportarticle.ufactory.cc/support_articles/developer/
 and the upstream [ROS mode-change
 sequence](https://github.com/xArm-Developer/xarm_ros#6-mode-change).
 
-The guarded shutdown path is offline-qualified only. Its matching xarm_ros2
-service remains an experimental local candidate and the physical action has
-not been invoked or accepted. Do not expose it in Composer or a PLC lane until
+At that baseline, the guarded shutdown path was offline-qualified only. Its
+matching xarm_ros2 service was an experimental local candidate and the
+physical action had not been invoked or accepted. Do not expose it in Composer
+or a PLC lane until
 the attended preconditions, electrical postcondition, ambiguous-result
 handling, and fresh-process restart procedure pass their dedicated live gate.
 ROS/component teardown and physical controller shutdown remain different
@@ -152,9 +176,11 @@ The fake lane exercises the generic supervisor, xArm transition coordinator,
 admission lease, controller re-arm fence, real Jazzy `controller_manager`,
 and real `joint_trajectory_controller`. It does not validate vendor transport.
 
-## Verification
+## Historical verification and acceptance coverage
 
-Build an image from the intended clean xArm super-plan branch, then run:
+The following recipe records the last qualification shape for later I7/I10
+porting. It is not a current runnable product recipe; the installed native
+entrypoints and their shell wrappers now stop at the typed relocation gate.
 
 ```bash
 export MANYFORGE_XC7A_IMAGE=manyforge-ros-jazzy-real-lite6:xc7a-local
@@ -172,8 +198,8 @@ The offline gate covers:
 
 - xarm owner command mapping, replay, generation, and request validation;
 - ManyForge state mapping, stale-state and owner-session replacement fencing;
-- installed provider publication, source-expiry closure, and proof that the
-  observation-only provider issues no lifecycle or controller-shutdown call;
+- former installed provider publication, source-expiry closure, and proof that
+  the observation-only provider issued no lifecycle or controller-shutdown call;
 - strict ROS admission transport, generation/identity fencing, and native
   execution handoff;
 - the seven ordinary operations, separate guarded shutdown transaction, and
@@ -189,7 +215,7 @@ The offline gate covers:
   `manyforge_xarm_control`; and
 - package lint plus shell validation.
 
-Additional stress and sanitizer lanes remain:
+The historical stress and sanitizer invocations were:
 
 ```bash
 ./scripts/ros/test-xarm-controller-manager-stress.sh
@@ -197,41 +223,43 @@ Additional stress and sanitizer lanes remain:
 ./scripts/ros/test-xarm-lifecycle-thread-sanitizer.sh
 ```
 
-The installed `lite6_lifecycle_command_evidence` executable is an attended,
-headless qualification client. It opens a short local-operator session through
-`LocalOperatorGateway`, verifies the selected capability is currently
-available, submits exactly one explicitly confirmed action through the
-restricted ROS owner, waits for the catalog postcondition, closes authority,
-and emits one JSON document containing the gateway and primitive audits.
-Timeout, identity drift, an inexact audit, a failed postcondition, or failed
-authority closure makes the capture fail. It is covered as a separate ROS
-process against a fake restricted owner.
+At the captured baseline, the installed
+`lite6_lifecycle_command_evidence` executable was an attended, headless
+qualification client. It opened a short local-operator session through
+`LocalOperatorGateway`, verified the selected capability was available,
+submitted exactly one explicitly confirmed action through the restricted ROS
+owner, waited for the catalog postcondition, closed authority, and emitted one
+JSON document containing the gateway and primitive audits. Timeout, identity
+drift, an inexact audit, a failed postcondition, or failed authority closure
+made the capture fail. It was covered as a separate ROS process against a fake
+restricted owner.
 
-One physical lifecycle request has a four-second total
+In that baseline, one physical lifecycle request had a four-second total
 discovery-plus-response budget inside the catalog's five-second transaction
-budget. The transport waits for the original in-flight request and never
-retries it. A timeout before dispatch is a known failure; a timeout or
-transport exception after dispatch is retained as
-`outcome_unknown_after_dispatch`, closes admission, and requires explicit
-state reconciliation. This leaves approximately one second for fresh
+budget. The transport waited for the original in-flight request and never
+retried it. A timeout before dispatch was a known failure; a timeout or
+transport exception after dispatch was retained as
+`outcome_unknown_after_dispatch`, closed admission, and required explicit
+state reconciliation. This left approximately one second for fresh
 postcondition reports under the initial Lite6 timing profile.
 
-The ROS-only preflight observes an already-running supervised xarm owner and
-does not contact the robot independently:
+The former ROS-only preflight observed an already-running supervised xarm
+owner and did not contact the robot independently. Its historical invocation
+was:
 
 ```bash
 MANYFORGE_SKIP_REAL_LITE6_BUILD=1 \
   ./scripts/ros/run-lite6-supervised-preflight.sh
 ```
 
-It accepts owner and namespace binding through
+It accepted owner and namespace binding through
 `MANYFORGE_LITE6_TRANSPORT_OWNER_ID`,
 `MANYFORGE_LITE6_ROS_NAMESPACE`, and
 `MANYFORGE_LITE6_HARDWARE_NAMESPACE`.
 
-The attended executable creates an in-process authenticated-principal
-assertion only after the operator has supplied the exact action confirmation
-to the local shell wrapper. It is qualification tooling, not credential
+The former attended executable created an in-process authenticated-principal
+assertion only after the operator had supplied the exact action confirmation
+to the local shell wrapper. It was qualification tooling, not credential
 authentication or a public ingress. Authentication and a Composer mutation
-route are later hardening work; no browser, HTTP, or public ROS
-lifecycle-command ingress is added by this slice.
+route remained later hardening work; no browser, HTTP, or public ROS
+lifecycle-command ingress was added by that slice.

@@ -1,18 +1,34 @@
-"""Regression tests for qualification launcher process cleanup."""
+"""Cutover tests for the historical qualification process launcher.
+
+The three original safety cases are pinned at blob
+30410567b74434c990c072c7a40a9a1be907befa. They return with the future
+headless scenario client and remain named in RESTORATION_ASSIGNMENTS.
+"""
+
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_HISTORICAL_CASES = {
+    "test_local_process_launcher_cleans_up_on_forced_health_timeout",
+    "test_local_process_launcher_refuses_port_already_serving_a_composer",
+    "test_local_process_launcher_rejects_foreign_readiness_after_child_death",
+}
 
 
 def _load_run_scenarios_module() -> Any:
     module_path = _REPO_ROOT / "scripts" / "run-scenarios.py"
-    spec = importlib.util.spec_from_file_location("manyforge_run_scenarios_test", module_path)
+    spec = importlib.util.spec_from_file_location(
+        "manyforge_run_scenarios_test",
+        module_path,
+    )
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -20,199 +36,111 @@ def _load_run_scenarios_module() -> Any:
     return module
 
 
-class _NeverHealthyClient:
-    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def __enter__(self) -> "_NeverHealthyClient":
-        return self
-
-    def __exit__(self, *_args: Any) -> None:
-        return None
-
-    def get(self, _path: str) -> None:
-        raise RuntimeError("not ready")
-
-
-class _FakeProcess:
-    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        self.terminated = False
-        self.killed = False
-        self.wait_timeouts: list[float] = []
-        self.returncode: int | None = None
-
-    def poll(self) -> int | None:
-        return self.returncode
-
-    def terminate(self) -> None:
-        self.terminated = True
-
-    def wait(self, timeout: float | None = None) -> int:
-        self.wait_timeouts.append(float(timeout or 0.0))
-        self.returncode = -15 if self.terminated else -9
-        return self.returncode
-
-    def kill(self) -> None:
-        self.killed = True
-        self.returncode = -9
+def _load_scenario_rows_module() -> Any:
+    module_path = _REPO_ROOT / "scripts" / "lib" / "scenarios_loader.py"
+    spec = importlib.util.spec_from_file_location(
+        "manyforge_scenario_rows_test",
+        module_path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-class _FakeMonotonic:
-    def __init__(self) -> None:
-        self.now = 0.0
+def test_managed_composer_process_is_a_pre_effect_typed_gate() -> None:
+    run_scenarios = _load_run_scenarios_module()
 
-    def __call__(self) -> float:
-        self.now += 0.01
-        return self.now
+    with pytest.raises(
+        run_scenarios.ScenarioExecutionUnavailableError,
+        match="composable_cell_runtime_unavailable",
+    ):
+        run_scenarios.ManagedComposerProcess(
+            workspace_root=_REPO_ROOT,
+            catalog_path="must-not-be-read.yaml",
+            host="127.0.0.1",
+            port=19000,
+            output_dir="must-not-be-created",
+        )
+
+    source = (_REPO_ROOT / "scripts" / "run-scenarios.py").read_text(
+        encoding="utf-8"
+    )
+    assert "subprocess" not in source
+    assert "httpx" not in source
+    assert "Popen" not in source
+    assert "/api/health" not in source
 
 
-def test_local_process_launcher_cleans_up_on_forced_health_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+def test_unavailable_payload_preserves_all_process_safety_assignments(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     run_scenarios = _load_run_scenarios_module()
-    fake_process = _FakeProcess()
 
-    monkeypatch.setattr(
-        run_scenarios.subprocess,
-        "Popen",
-        lambda *_args, **_kwargs: fake_process,
-    )
-    monkeypatch.setattr(run_scenarios.httpx, "Client", _NeverHealthyClient)
-    monkeypatch.setattr(run_scenarios.time, "monotonic", _FakeMonotonic())
-    monkeypatch.setattr(run_scenarios.time, "sleep", lambda _seconds: None)
+    assert run_scenarios.main(["--scenario", "must-not-be-read.yaml"]) == 78
+    payload = json.loads(capsys.readouterr().err)
+    mapped = {
+        assignment["historical_symbols_or_cases"]
+        for assignment in payload["assignments"]
+    }
 
-    launcher = run_scenarios.ManagedComposerProcess(
-        workspace_root=_REPO_ROOT,
-        catalog_path=_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml",
-        host="127.0.0.1",
-        port=19000,
-        log_level="INFO",
-        kernel_mode="mock",
-        mock_execute_duration_s=0.0,
-        output_dir=tmp_path,
-        wait_timeout_s=0.02,
-    )
-
-    with pytest.raises(RuntimeError, match="Timed out waiting for Composer health endpoint"):
-        launcher.start()
-
-    assert fake_process.terminated is True
-    assert fake_process.killed is False
-    assert fake_process.wait_timeouts == [10.0]
-    assert launcher._stdout_handle is not None
-    assert launcher._stderr_handle is not None
-    assert launcher._stdout_handle.closed
-    assert launcher._stderr_handle.closed
-
-
-class _AlwaysHealthyClient:
-    """Answers /api/health like a composer that was already listening."""
-
-    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def __enter__(self) -> "_AlwaysHealthyClient":
-        return self
-
-    def __exit__(self, *_args: Any) -> None:
-        return None
-
-    def get(self, _path: str) -> Any:
-        class _Response:
-            status_code = 200
-
-        return _Response()
-
-
-def _make_launcher(run_scenarios: Any, tmp_path: Path) -> Any:
-    return run_scenarios.ManagedComposerProcess(
-        workspace_root=_REPO_ROOT,
-        catalog_path=_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml",
-        host="127.0.0.1",
-        port=19000,
-        log_level="INFO",
-        kernel_mode="mock",
-        mock_execute_duration_s=0.0,
-        output_dir=tmp_path,
-        wait_timeout_s=0.02,
+    assert _HISTORICAL_CASES <= mapped
+    assert payload["historical_source"].endswith(
+        "08222188293df8e12f90dc72e204c21f22f92ea1"
     )
 
 
-def test_local_process_launcher_refuses_port_already_serving_a_composer(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+def test_scenario_row_adapter_gates_before_legacy_catalog_or_path_work(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The launcher must never adopt a composer this harness did not spawn."""
-    run_scenarios = _load_run_scenarios_module()
-    spawned: list[Any] = []
+    scenario_rows = _load_scenario_rows_module()
 
-    def _forbidden_popen(*_args: Any, **_kwargs: Any) -> Any:
-        spawned.append(True)
-        return _FakeProcess()
+    assert scenario_rows.main(["must-not-be-read.yaml"]) == 78
+    payload = json.loads(capsys.readouterr().err)
+    assert payload == {
+        "schema_version": "manyforge.qualification_unavailable.v1",
+        "reason_code": "composable_cell_scenario_discovery_unavailable",
+        "restoration_gate": "I6/N",
+        "historical_source_blob": "916b265d221ee13b47f046e3a7f8a8d553de8403",
+        "exit_code": 78,
+        "removed_contract": "legacy_pipe_delimited_deployment_v0_scenario_rows",
+    }
 
-    monkeypatch.setattr(run_scenarios.subprocess, "Popen", _forbidden_popen)
-    monkeypatch.setattr(run_scenarios.httpx, "Client", _AlwaysHealthyClient)
-
-    launcher = _make_launcher(run_scenarios, tmp_path)
-
-    with pytest.raises(RuntimeError, match="Refusing to launch"):
-        launcher.start()
-
-    assert spawned == []
-
-
-def test_local_process_launcher_rejects_foreign_readiness_after_child_death(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A readiness 200 racing a bind-failed child must not become adoption.
-
-    The pre-spawn probe sees a free port (the foreign composer comes up in
-    the race window); the child dies during the post-readiness grace while
-    the foreign composer keeps answering 200.
-    """
-    run_scenarios = _load_run_scenarios_module()
-    fake_process = _FakeProcess()
-    probe_calls: list[bool] = []
-
-    class _ForeignAfterSpawnClient:
-        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-            pass
-
-        def __enter__(self) -> "_ForeignAfterSpawnClient":
-            return self
-
-        def __exit__(self, *_args: Any) -> None:
-            return None
-
-        def get(self, _path: str) -> Any:
-            if not probe_calls:
-                probe_calls.append(True)
-                raise RuntimeError("pre-spawn probe sees a free port")
-
-            class _Response:
-                status_code = 200
-
-            return _Response()
-
-    def _dies_during_grace(_seconds: float) -> None:
-        if _seconds == run_scenarios.ManagedComposerProcess._POST_READY_GRACE_S:
-            fake_process.returncode = 1
-
-    monkeypatch.setattr(
-        run_scenarios.subprocess,
-        "Popen",
-        lambda *_args, **_kwargs: fake_process,
+    source = (_REPO_ROOT / "scripts" / "lib" / "scenarios_loader.py").read_text(
+        encoding="utf-8"
     )
-    monkeypatch.setattr(run_scenarios.httpx, "Client", _ForeignAfterSpawnClient)
-    monkeypatch.setattr(run_scenarios.time, "monotonic", _FakeMonotonic())
-    monkeypatch.setattr(run_scenarios.time, "sleep", _dies_during_grace)
+    for forbidden in (
+        "os.environ",
+        "sys.path.insert",
+        "build_node_environment",
+        "discover_scenarios",
+        "Path(",
+    ):
+        assert forbidden not in source
 
-    launcher = _make_launcher(run_scenarios, tmp_path)
 
-    with pytest.raises(RuntimeError, match="foreign composer"):
-        launcher.start()
-
-    assert launcher._stdout_handle is not None
-    assert launcher._stdout_handle.closed
+def test_scenario_shell_library_contains_only_typed_boundaries() -> None:
+    source = (_REPO_ROOT / "scripts" / "lib" / "scenarios.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "f6045793d753354bbe0fecf8fb153aee235b9d9e" in source
+    assert "I6/N" in source
+    for symbol in (
+        "_load_scenarios",
+        "scenario_canonical",
+        "scenario_lookup",
+        "scenario_field",
+        "scenarios_for",
+        "scenario_describe",
+        "scenarios_print_table",
+    ):
+        assert f"{symbol}()" in source
+    for forbidden in (
+        "python3",
+        "awk -F",
+        "_SCENARIO_TABLE",
+        "_SCENARIO_ALIASES",
+        "mapfile",
+    ):
+        assert forbidden not in source

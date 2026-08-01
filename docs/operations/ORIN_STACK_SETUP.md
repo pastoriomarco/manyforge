@@ -1,9 +1,16 @@
 # Orin AGX — full stack install & run (master index)
 
-**This is the entry point for bringing up the entire ManyForge + NemoClaw +
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until I5/H0 and every selected execution lane's gate
+> pass. Present-tense install/run descriptions below record the captured
+> platform baseline, not a currently operable ManyForge stack.
+
+**This was the entry point for bringing up the entire ManyForge + NemoClaw +
 OpenClaw stack on a Jetson Orin AGX Dev Kit (64 GB).** The instructions are
 split across the repos that own each layer; this file is the ordered checklist
-with links. (All repos here are LLM-operated — follow the linked docs in order.)
+with links. It preserves the former order; it does not authorize executing the
+linked product recipes now.
 
 > **Why a split + index:** the stack spans three repos — host storage
 > (`isaac_ros_custom_bringup`), model serving + the NemoClaw/OpenShell/OpenClaw

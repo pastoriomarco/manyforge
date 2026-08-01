@@ -1,18 +1,41 @@
 # ManyForge ros2_control execution
 
+> **Current `dev` boundary:** this retained C++ adapter and its focused tests
+> are library-level inputs only. No native, Isaac/ROS, or real-robot product
+> launcher currently wires it to a qualified runtime owner. The relevant
+> execution and lane gates are I6/N, I9/I, and I10/R.
+
 `manyforge_ros2_control_execution` is the generic C++ ROS 2 execution
 adapter. It sends `FollowJointTrajectory` goals, observes controller and joint
 state, implements bounded stop/reset behavior, and projects observed state
 without placing ROS types in `manyforge_core`.
 
-Physical deployments can additionally enable an exact controller-binding and
-lifecycle-admission gate. The gate is robot-family-neutral: xArm, UR, or
-another adapter must resolve vendor-specific names and lifecycle semantics
-before they reach this package.
+## Relocation responsibility split
+
+The retained I6/I7/I8 inputs are exact controller and joint binding checks,
+controller-manager discovery, ROS action observation/cancellation, bounded NRT
+queues, generation/freshness fencing, and the controller-specific anchored
+FollowJointTrajectory Stop mechanics. They remain C++ porting and acceptance
+material; no installed executable, product factory, or launch path constructs
+this backend today.
+
+The current `manyforge.ros2_control.execution_binding.v0.experimental`
+lifecycle-admission projection, singleton robot/group identities, old
+environment epoch pinning, command-gate topic, and backend-local scene,
+simulation, and gripper semantics are pre-relocation inputs rather than the
+new contract. I6 must consume addressed Program Binding, I7 must supply the
+new lifecycle facts, and I8 must place Stop policy behind the Kernel owner
+before a product route is restored.
+
+In the captured pre-relocation contract, physical deployments could
+additionally enable an exact controller-binding and lifecycle-admission gate.
+The gate was robot-family-neutral: xArm, UR, or another adapter resolved
+vendor-specific names and lifecycle semantics before they reached this
+package.
 
 ## Exact binding contract
 
-A physical deployment supplies
+The captured physical deployment contract supplied
 `execution.config.controller_binding` using schema
 `manyforge.ros2_control.execution_binding.v0.experimental`. The immutable
 contract identifies:
@@ -39,10 +62,11 @@ and after the two service reads fences manager changes during that refresh.
 
 ## Lifecycle admission
 
-Set `execution.config.require_execution_admission_snapshot: true` for a
-physical deployment that requires lifecycle authority. The selected
-robot-lifecycle provider publishes immutable
-`ExecutionAdmissionSnapshot` values through the native bundle:
+The captured contract set
+`execution.config.require_execution_admission_snapshot: true` for a physical
+deployment requiring lifecycle authority. Its selected robot-lifecycle
+provider published immutable `ExecutionAdmissionSnapshot` values through the
+former native bundle:
 
 - `publish_ros2_control_execution_admission_snapshot(...)`;
 - `get_ros2_control_execution_admission_snapshot()`; and
@@ -55,9 +79,9 @@ codes, or a semantic change without a new lifecycle generation. A publication
 may renew timestamps and its lease within the same lifecycle generation, but
 may not silently change readiness or admission.
 
-The current xArm adapter emits the generic binding in its resolved runtime
-manifest. Product launch wiring that continuously projects the selected
-lifecycle authority into these admission snapshots remains a separate
+The captured xArm runtime manifest carried this generic binding. Retained
+artifact tooling preserves its validation inputs, but product wiring that
+projects lifecycle authority into admission snapshots remains a separate
 real-robot integration gate.
 
 ## Dispatch and runtime behavior
@@ -79,9 +103,10 @@ change, or lost admission cancels the known goal and fails the execution
 closed. A delayed goal response is cancelled if it arrives after its
 execution generation lost authority.
 
-Deployments without `controller_binding` preserve the existing simulation and
-non-physical behavior. Requiring lifecycle admission without an exact binding
-is invalid configuration.
+The historical contract allowed non-physical deployments without
+`controller_binding`; that statement is not current simulation availability.
+Requiring lifecycle admission without an exact binding remains invalid
+configuration for the future consumer.
 
 ## Concurrency and observability
 
@@ -97,15 +122,15 @@ rejection/loss from lifecycle-admission rejection/loss.
 
 ## Qualification boundary
 
-The deterministic tests cover configuration validation, the admission
+The retained deterministic tests cover configuration validation, the admission
 matrix, generation and lease rules, initial activity fencing, missing
 manager/services, inactive or conflicting controllers, restart churn,
 pre-dispatch rejection, authority loss during execution, and delayed action
-responses. The xArm fake/HIL lane additionally loads the exact generated
-Lite6 contract in a real Jazzy `controller_manager` and
+responses. The captured xArm fake/HIL qualification additionally loaded the
+exact generated Lite6 contract in a real Jazzy `controller_manager` and
 `joint_trajectory_controller`.
 
-These tests qualify the generic consumer and fake controller path. They do
-not qualify a physical trajectory, a vendor lifecycle transition, the
-production lifecycle-to-admission launcher wiring, or a public
-operator/PLC ingress.
+When they pass in the approved container, these focused tests can qualify only
+the retained generic consumer substrate. They do not qualify a physical
+trajectory, a vendor lifecycle transition, production lifecycle-to-admission
+launcher wiring, or a public operator/PLC ingress.

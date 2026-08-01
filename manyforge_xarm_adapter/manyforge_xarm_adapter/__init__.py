@@ -1,4 +1,4 @@
-"""Dedicated xArm integration boundary for ManyForge."""
+"""Retained ROS-free xArm endpoint-authoring helpers for ManyForge."""
 
 from .binding import compile_lite6_binding
 from .binding import Lite6BindingInputs

@@ -1,26 +1,7 @@
 #!/usr/bin/env bash
-# demo-assistant-known-good.sh — backwards-compat shim for scripts/launch.sh.
-#
-# Forwards verbs (start/stop/status/restart/smoke/preflight) and selects the
-# manyforge-only + assistant=on + ur10e-scene-authoring scenario. The
-# previously-supported `restart-bridge` and `reload-composer` verbs are
-# now covered by `restart` (full restart). Env-var overrides
-# (MODEL_PROFILE, ASSISTANT_PROVIDER, …) are unchanged and read by
-# scripts/lib/assistant.sh.
+# Historical assistant demo entrypoint retained for truthful runbook links.
+# The former compatibility forwarding behavior is removed; restoration gate: H0/N.
 
 set -euo pipefail
-
-case "${1:-}" in
-    restart-bridge|reload-composer|restart-composer)
-        echo "  note: '$1' is deprecated; mapping to 'restart'." >&2
-        set -- restart "${@:2}"
-        ;;
-esac
-
-exec "$(dirname "$0")/launch.sh" \
-    --lane manyforge-only \
-    --assistant on \
-    --scenario ur10e-scene-authoring \
-    --non-interactive \
-    --yes \
-    "$@"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/composable-cell-runtime-availability.sh"
+manyforge_fail_composable_cell_runtime_unavailable

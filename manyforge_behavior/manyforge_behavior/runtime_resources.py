@@ -1,145 +1,66 @@
-"""Deployment-owned runtime resource factories and immutable node handles."""
+"""Typed gate for the removed deployment-owned runtime-resource registry.
+
+The former module selected arbitrary Python provider factories from raw
+``runtime_resources`` mappings, opened handles, owned rollback/close state, and
+served alias-based resources to behavior nodes.  That is runtime binding and
+lifecycle authority, not portable authoring logic.  Dynamic implementation
+availability returns through the headless resolver at I5/H0; native
+resource-addressed behavior binding returns at I6/N.  The raw v0 registry is
+never restored.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import threading
-from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Final, NoReturn
 
 
-class RuntimeResourceError(ValueError):
-    pass
+RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE: Final = (
+    "composable_cell_runtime_resource_binding_unavailable"
+)
+RUNTIME_RESOURCE_BINDING_RESTORATION_GATES: Final = ("I5", "H0", "I6", "N")
 
 
-RuntimeResourceFactory = Callable[[Mapping[str, Any]], Any]
+class RuntimeResourceBindingUnavailableError(RuntimeError):
+    """Raised before provider lookup, handle creation, or lifecycle effects."""
+
+
+def _raise_runtime_resource_binding_unavailable() -> NoReturn:
+    raise RuntimeResourceBindingUnavailableError(
+        f"{RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE}: dynamic "
+        "implementation availability returns at I5/H0 and resource-addressed "
+        "native behavior binding returns at I6/N"
+    )
 
 
 class RuntimeResourceFactoryRegistry:
-    def __init__(self, factories: Mapping[str, RuntimeResourceFactory] | None = None):
-        self._factories = MappingProxyType(dict(factories or {}))
+    """Unavailable former Python provider-factory owner."""
 
-    def create(self, provider: str, config: Mapping[str, Any]) -> Any:
-        try:
-            factory = self._factories[provider]
-        except KeyError as exc:
-            raise RuntimeResourceError(
-                f"runtime resource provider '{provider}' is not registered"
-            ) from exc
-        return factory(config)
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        _raise_runtime_resource_binding_unavailable()
 
 
-@dataclass
 class RuntimeResourceRegistry:
-    resources: Mapping[str, Mapping[str, Any]]
+    """Unavailable former mutable handle and close-state owner."""
 
-    def __post_init__(self) -> None:
-        self._close_lock = threading.Lock()
-        self._closed = False
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        _raise_runtime_resource_binding_unavailable()
 
     @classmethod
-    def empty(cls) -> "RuntimeResourceRegistry":
-        return cls(MappingProxyType({}))
-
-    def get(self, resource_type: str, alias: str = "default") -> Any:
-        with self._close_lock:
-            if self._closed:
-                raise RuntimeResourceError("runtime resource registry is closed")
-            aliases = self.resources.get(resource_type)
-            if aliases is None:
-                aliases = self.resources.get(f"{resource_type}s")
-            if aliases is not None and alias in aliases:
-                return aliases[alias]
-        raise RuntimeResourceError(
-            f"runtime resource '{resource_type}:{alias}' is unavailable"
-        )
-
-    def get_plc_client(self, alias: str = "default") -> Any:
-        return self.get("plc_client", alias)
-
-    def close(self) -> None:
-        with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-        seen: set[int] = set()
-        errors: list[str] = []
-        for aliases in self.resources.values():
-            for handle in aliases.values():
-                if id(handle) in seen:
-                    continue
-                seen.add(id(handle))
-                close = getattr(handle, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except (Exception, SystemExit) as exc:
-                        errors.append(f"{type(exc).__name__}: {exc}")
-        if errors:
-            raise RuntimeResourceError(
-                "runtime resource close failed after all handles were attempted: "
-                + "; ".join(errors)
-            )
+    def empty(cls) -> NoReturn:
+        _raise_runtime_resource_binding_unavailable()
 
 
-def build_runtime_resource_registry(
-    raw: Mapping[str, Any],
-    factories: RuntimeResourceFactoryRegistry,
-) -> RuntimeResourceRegistry:
-    built: dict[str, Mapping[str, Any]] = {}
-    opened: list[Any] = []
-    try:
-        for resource_type, aliases_raw in raw.items():
-            if not isinstance(resource_type, str) or not resource_type:
-                raise RuntimeResourceError("runtime resource type must be non-empty")
-            if not isinstance(aliases_raw, Mapping):
-                raise RuntimeResourceError(
-                    f"runtime_resources.{resource_type} must be a mapping of aliases"
-                )
-            aliases: dict[str, Any] = {}
-            for alias, declaration in aliases_raw.items():
-                if not isinstance(alias, str) or not alias:
-                    raise RuntimeResourceError(
-                        f"runtime_resources.{resource_type} alias must be non-empty"
-                    )
-                if not isinstance(declaration, Mapping):
-                    raise RuntimeResourceError(
-                        f"runtime_resources.{resource_type}.{alias} must be a mapping"
-                    )
-                provider = declaration.get("provider")
-                if not isinstance(provider, str) or not provider:
-                    raise RuntimeResourceError(
-                        f"runtime_resources.{resource_type}.{alias}.provider is required"
-                    )
-                # Provider and capability declarations are ManyForge routing /
-                # admission metadata, not provider configuration.
-                config = {
-                    key: value
-                    for key, value in declaration.items()
-                    if key not in {"provider", "capabilities"}
-                }
-                handle = factories.create(provider, config)
-                opened.append(handle)
-                aliases[alias] = handle
-            built[resource_type] = MappingProxyType(aliases)
-    except (Exception, SystemExit) as exc:
-        close_errors: list[str] = []
-        closed: set[int] = set()
-        for handle in reversed(opened):
-            if id(handle) in closed:
-                continue
-            closed.add(id(handle))
-            close = getattr(handle, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except (Exception, SystemExit) as close_exc:
-                    close_errors.append(
-                        f"{type(close_exc).__name__}: {close_exc}"
-                    )
-        if close_errors:
-            exc.add_note(
-                "runtime-resource rollback close errors: " + "; ".join(close_errors)
-            )
-        raise
-    return RuntimeResourceRegistry(MappingProxyType(built))
+def build_runtime_resource_registry(*_args: object, **_kwargs: object) -> NoReturn:
+    """Reject the old raw mapping before iteration or provider effects."""
+
+    _raise_runtime_resource_binding_unavailable()
+
+
+__all__ = [
+    "RUNTIME_RESOURCE_BINDING_RESTORATION_GATES",
+    "RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE",
+    "RuntimeResourceBindingUnavailableError",
+    "RuntimeResourceFactoryRegistry",
+    "RuntimeResourceRegistry",
+    "build_runtime_resource_registry",
+]

@@ -27,10 +27,7 @@ services:
     stdin_open: true
     tty: true
 
-  # Raw Composer backend debug profile. Product/runtime launches use
-  # scripts/launch.sh, which qualifies native products and binds them to the
-  # immutable image it starts. This profile intentionally has no compiled
-  # build cache and is not a lane-qualification surface.
+  # Structural-only Composer shell. This is not a runtime or lane surface.
   composer:
     build:
       context: .
@@ -42,26 +39,13 @@ services:
     volumes:
       - .:/workspace
     environment:
-      MANYFORGE_VALIDATION_COLLISION_WORKERS: ${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
-      MANYFORGE_NODE_ROOTS: ${MANYFORGE_NODE_ROOTS:-}
-      MANYFORGE_NODE_STRICT: ${MANYFORGE_NODE_STRICT:-}
-      MANYFORGE_SCENARIO_ROOTS: ${MANYFORGE_SCENARIO_ROOTS:-}
-      MANYFORGE_POINTCLOUD_QUALIFICATION_FIXTURE: ${MANYFORGE_POINTCLOUD_QUALIFICATION_FIXTURE:-OFF}
-      MANYFORGE_POINTCLOUD_QUALIFICATION_POINTS: ${MANYFORGE_POINTCLOUD_QUALIFICATION_POINTS:-20000}
-      MANYFORGE_POINTCLOUD_QUALIFICATION_RATE_HZ: ${MANYFORGE_POINTCLOUD_QUALIFICATION_RATE_HZ:-10}
-      MANYFORGE_VIEWER_QUALIFICATION_FIXTURES: ${MANYFORGE_VIEWER_QUALIFICATION_FIXTURES:-OFF}
-      # Traces live under the repo bind mount so they survive reboots and
-      # container recreation with correct (host-user) ownership; a fresh
-      # named volume would be root-owned while Composer runs non-root.
-      MANYFORGE_TRACE_DIR: /workspace/.manyforge-var/traces
+      MANYFORGE_CORS_ORIGINS: ${MANYFORGE_CORS_ORIGINS:-http://localhost:3000}
+      MANYFORGE_API_TOKEN: ${MANYFORGE_API_TOKEN:-}
+      MANYFORGE_FS_ROOTS: ${MANYFORGE_FS_ROOTS:-/workspace}
     working_dir: /workspace
-    command: ["bash", "-lc", "python -m manyforge_composer --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml --host 0.0.0.0 --port 9000"]
-    # Heartbeat, not /api/health: the heartbeat computes real kernel state,
-    # so "healthy" means the app can actually read its kernel. Degraded /
-    # intervention states still return 200 on purpose — a robot waiting for
-    # an operator must never be restart-looped by the supervisor.
+    command: ["bash", "-lc", "python -m manyforge_composer --host 0.0.0.0 --port 9000"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/api/infra/heartbeat >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/api/health >/dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -81,13 +65,11 @@ services:
     volumes:
       - .:/workspace
     environment:
-      MANYFORGE_VALIDATION_COLLISION_WORKERS: ${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
-      MANYFORGE_NODE_ROOTS: ${MANYFORGE_NODE_ROOTS:-}
-      MANYFORGE_NODE_STRICT: ${MANYFORGE_NODE_STRICT:-}
-      MANYFORGE_SCENARIO_ROOTS: ${MANYFORGE_SCENARIO_ROOTS:-}
-      MANYFORGE_TRACE_DIR: /workspace/.manyforge-var/traces
+      MANYFORGE_CORS_ORIGINS: ${MANYFORGE_CORS_ORIGINS:-http://localhost:3000}
+      MANYFORGE_API_TOKEN: ${MANYFORGE_API_TOKEN:-}
+      MANYFORGE_FS_ROOTS: ${MANYFORGE_FS_ROOTS:-/workspace}
     working_dir: /workspace
-    command: ["bash", "-lc", "python -m manyforge_composer --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml --host 0.0.0.0 --port 9000"]
+    command: ["bash", "-lc", "python -m manyforge_composer --host 0.0.0.0 --port 9000"]
     profiles:
       - dev-composer
 
@@ -127,12 +109,11 @@ services:
     profiles:
       - ros
 
-  # Full ROS-capable ManyForge runtime/test image.
+  # Full ROS-capable ManyForge development/build/test toolchain image.
   # Host networking is intentional for ROS 2 DDS discovery during development.
   ros-jazzy-full:
-    # This is the sole build owner for the ROS-full image. Runtime services
-    # below consume this exact tag instead of maintaining independently cached
-    # images from the same Dockerfile.
+    # This is the sole build owner for the ROS-full toolchain image. Runtime
+    # services below remain fenced port targets until their restoration gates.
     image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
     build:
       context: .
@@ -155,34 +136,19 @@ services:
     profiles:
       - ros-full
 
-  # Composer in the ROS-capable full image. Use this profile for deployments
-  # selecting execution.ros2_control_follow_joint_trajectory so Composer can
-  # load ROS adapter code and discover Isaac/robot ROS endpoints over DDS.
+  # ROS Composer porting target. Its start script exits with the stable
+  # composable-cell unavailable result before loading ROS adapters or touching
+  # a runtime. Only the shared ROS toolchain/container inputs remain here;
+  # deleted Composer runtime wires are not kept as dormant environment fields.
   composer-ros:
     image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
     logging: *default-logging
-    restart: unless-stopped
+    restart: "no"
     network_mode: host
     ipc: host
     volumes:
       - .:/workspace
       - ros-full-build-cache:/tmp/manyforge-build
-    # Heartbeat healthcheck: see the `composer` service note — degraded /
-    # intervention states stay 200 by design so a robot awaiting operator
-    # action is never restart-looped.
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${MANYFORGE_COMPOSER_PORT:-9000}/api/infra/heartbeat >/dev/null || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 120s
-    # Assistant provider/endpoint env vars are passed through so the unified
-    # launcher (scripts/launch.sh) can wire Composer to the bridge of its
-    # chosen ASSISTANT_PROVIDER lane (openclaw -> :8200, nemoclaw -> :8100).
-    # Empty defaults mean Composer falls back to the deployment YAML's
-    # pinned base_url, which is the existing behaviour when the lane
-    # selector is `--assistant off` or compose is invoked without the
-    # launcher.
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
       - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
@@ -190,39 +156,18 @@ services:
       - ROS_STATIC_PEERS
       - FASTRTPS_DEFAULT_PROFILES_FILE
       - FASTDDS_DEFAULT_PROFILES_FILE
-      - MANYFORGE_ASSISTANT_PROVIDER=${MANYFORGE_ASSISTANT_PROVIDER:-}
-      - MANYFORGE_ASSISTANT_ENDPOINT_URL=${MANYFORGE_ASSISTANT_ENDPOINT_URL:-}
-      - MANYFORGE_ASSISTANT_TIMEOUT_S=${MANYFORGE_ASSISTANT_TIMEOUT_S:-}
-      - MANYFORGE_COMPOSER_PORT=${COMPOSER_PORT:-9000}
-      - MANYFORGE_VALIDATION_COLLISION_WORKERS=${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
-      - MANYFORGE_FRONTEND_SOURCE_MODE=${MANYFORGE_FRONTEND_SOURCE_MODE:-committed}
-      - MANYFORGE_FRONTEND_FORCE_REBUILD=${MANYFORGE_FRONTEND_FORCE_REBUILD:-}
-      - MANYFORGE_NODE_ROOTS=${MANYFORGE_NODE_ROOTS:-}
-      - MANYFORGE_NODE_STRICT=${MANYFORGE_NODE_STRICT:-}
-      - MANYFORGE_SCENARIO_ROOTS=${MANYFORGE_SCENARIO_ROOTS:-}
-      - MANYFORGE_POINTCLOUD_QUALIFICATION_FIXTURE=${MANYFORGE_POINTCLOUD_QUALIFICATION_FIXTURE:-OFF}
-      - MANYFORGE_POINTCLOUD_QUALIFICATION_POINTS=${MANYFORGE_POINTCLOUD_QUALIFICATION_POINTS:-20000}
-      - MANYFORGE_POINTCLOUD_QUALIFICATION_RATE_HZ=${MANYFORGE_POINTCLOUD_QUALIFICATION_RATE_HZ:-10}
-      - MANYFORGE_VIEWER_QUALIFICATION_FIXTURES=${MANYFORGE_VIEWER_QUALIFICATION_FIXTURES:-OFF}
-      # Opt-in RP5 qualification instrumentation. The start script exports the
-      # preload only after the requested probe has built successfully, so
-      # normal runtime commands never inherit a missing or test-only library.
-      - MANYFORGE_ENABLE_QUALIFICATION_PROBES=${MANYFORGE_ENABLE_QUALIFICATION_PROBES:-OFF}
-      - MANYFORGE_QUALIFICATION_LD_PRELOAD=${MANYFORGE_QUALIFICATION_LD_PRELOAD:-}
-      # See the `composer` service note on trace persistence/ownership.
-      - MANYFORGE_TRACE_DIR=/workspace/.manyforge-var/traces
     working_dir: /workspace
     command: ["bash", "-lc", "./scripts/ros/start-composer-ros.sh"]
     profiles:
       - ros-full
 
-  # Isaac Sim ros2_control bridge. Start this alongside composer-ros when
-  # executing against Isaac's /isaac_joint_states and /isaac_joint_commands
-  # topics through the standard FollowJointTrajectory surface.
+  # Isaac ros2_control I9 porting target. Its launch script currently exits
+  # unavailable before ROS or simulator effects. Old Composer/DemoSupervisor
+  # auto-load and fixed v0 artifact wires are intentionally absent.
   isaac-topic-control:
     image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
     logging: *default-logging
-    restart: unless-stopped
+    restart: "no"
     network_mode: host
     ipc: host
     volumes:
@@ -235,15 +180,6 @@ services:
       - ROS_STATIC_PEERS
       - FASTRTPS_DEFAULT_PROFILES_FILE
       - FASTDDS_DEFAULT_PROFILES_FILE
-      # LOAD_ARTIFACTS is the operator-facing escape hatch inherited from
-      # the old demo-isaac-ros2-control.sh. SUPERVISOR_AUTO_LOAD takes
-      # precedence when set explicitly (scripts/lib/isaac.sh exports it);
-      # debug-only raw Compose users can set LOAD_ARTIFACTS=false directly.
-      - COMPOSER_URL=${COMPOSER_URL:-http://127.0.0.1:9000}
-      - PROGRAM_PATH=${PROGRAM_PATH:-/workspace/examples/isaac_manipulator_scene_light.program.yaml}
-      - DEPLOYMENT_PATH=${DEPLOYMENT_PATH:-/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml}
-      - ISAAC_TOPIC_CONTROL_PROFILE=${ISAAC_TOPIC_CONTROL_PROFILE:-}
-      - SUPERVISOR_AUTO_LOAD=${SUPERVISOR_AUTO_LOAD:-${LOAD_ARTIFACTS:-true}}
     working_dir: /workspace
     command: ["bash", "-lc", "./scripts/ros/launch-isaac-topic-based-control.sh"]
     profiles:

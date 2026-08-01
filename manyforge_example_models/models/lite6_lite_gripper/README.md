@@ -1,5 +1,11 @@
 # UFACTORY Lite6 + Lite Pneumatic Gripper
 
+> **Current boundary:** this static, provenance-pinned model bundle remains
+> usable as authoring/qualification input. It does not provide native, Isaac,
+> or real-robot runtime availability. The generation command and runtime notes
+> below record the captured source revision; do not reinterpret them as a
+> current xArm checkout or runnable lane.
+
 Self-contained ManyForge preview model for UFACTORY Lite6 with the lite
 pneumatic gripper. `lite6_lite_gripper.urdf` and
 `lite6_lite_gripper.srdf` are the canonical ManyForge-vendored robot model and
@@ -24,11 +30,11 @@ Generation-time source:
 - Arguments: `prefix=''`, `robot_type=lite`, `dof=6`, `add_gripper=true`,
   `limited=true`, `ros2_control_plugin=isaac`
 
-Runtime boundary:
+Historical runtime boundary:
 
-- ManyForge native execution uses this static mesh/model bundle only.
+- ManyForge native execution used this static mesh/model bundle only.
 - It does not require xarm_ros2, uf_ros_lib, MoveIt, or ROS at runtime.
-- Real robot execution still uses xarm_ros2 externally through ROS2 contracts.
+- Real-robot execution used xarm_ros2 externally through ROS 2 contracts.
 
 Notes:
 

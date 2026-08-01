@@ -1,9 +1,8 @@
-"""ManyForge assistant-provider bridge service (v0.1 skeleton).
+"""Retained assistant-client port inputs for the composable-cell cutover.
 
-Implements the assistant-provider HTTP contract against a local
-OpenAI-compatible LLM endpoint (typically vLLM on the deployment host).
-
-Operator-facing wire contract: `docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`.
+The live provider bridge is unavailable. ``protocol`` and ``supervisor`` keep
+deterministic client/reducer inputs, while ``bridge`` is a fail-before-effects
+entrypoint shell for H0/I5.
 """
 
-__all__ = ["bridge"]
+__all__ = ["bridge", "protocol", "supervisor"]

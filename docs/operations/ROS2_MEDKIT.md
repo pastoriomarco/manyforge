@@ -1,14 +1,25 @@
-# ros2_medkit integration — install, test, operate
+# ros2_medkit integration — historical restoration reference
 
-ManyForge integrates with [ros2_medkit](https://github.com/selfpatch/ros2_medkit)
-(AUTOSAR-DEM-style fault manager + SOVD REST gateway for ROS 2) through three
-surfaces. ManyForge core is **medkit-free**; only the adapter package couples.
+> **Cutover status (2026-07-31):** there is no runnable ManyForge Medkit or
+> generic diagnostics process on the current composable-cell branch. The
+> pure fault reducer, diagnostic mapping, and ROS message translation remain;
+> both effectful entrypoints exit 78 before network or ROS effects. I5/H0 must
+> restore them as thin clients of owner-issued headless diagnostics, not by
+> reviving Composer runtime authority. The recipes and operational behavior
+> below describe the implementation at
+> `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`; they are acceptance
+> inputs, not current commands or qualification claims.
 
-| Surface | What it does | Medkit dependency |
+The historical implementation integrated with
+[ros2_medkit](https://github.com/selfpatch/ros2_medkit) through three
+surfaces. ManyForge core remains **medkit-free**; only the future adapter
+boundary may couple to medkit.
+
+| Historical surface | Preserved requirement | Current disposition |
 | --- | --- | --- |
-| `manyforge_ros.diagnostics_bridge` | Publishes standard `diagnostic_msgs/DiagnosticArray` on `/diagnostics` from the Composer digest (one status per active fault, taxonomy-mapped, OK heartbeat when healthy). Works with ANY diagnostics consumer; medkit ingests it via its stock `diagnostic_bridge`. | none |
-| `manyforge_medkit_adapter` | Forwards core faults directly to `/fault_manager/report_fault` (FAILED on latch, PASSED healing stream on clear), announces the ManyForge entity via `MedkitDiscoveryHint`. | `ros2_medkit_msgs` at runtime |
-| `GET /api/debug/export/ros2-medkit` | Normalized trace export, schema `manyforge.ros2_medkit_trace.v1` (pinned in specs `docs/spec/520` §7.2.1). Served, never pushed — a medkit gateway plugin can proxy it. | none |
+| `manyforge_ros.diagnostics_bridge` | Taxonomy-mapped statuses plus an OK heartbeat on `/diagnostics`. | Pure mapping and ROS translation retained; process awaits H0 source/API. |
+| `manyforge_medkit_adapter` | FAILED on latch, PASSED healing, archive reference, severity, and discovery mapping. | Pure reducer retained; ROS service process awaits H0 source/API. |
+| `GET /api/debug/export/ros2-medkit` | Normalized, served trace export rather than an implicit push owner. | Historical API requirement; future owner/API assigned at H0. |
 
 Fault codes are `MANYFORGE_<REASON_CODE>` (UPPER_SNAKE, ≤64 chars, from the
 Phase 6A taxonomy in `manyforge_behavior.cycle_manager.

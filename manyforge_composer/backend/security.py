@@ -1,9 +1,10 @@
 """Security configuration and middleware for ManyForge Composer."""
 from __future__ import annotations
 
+import hashlib
 import os
-import re
 import secrets
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,14 +16,18 @@ from starlette.types import ASGIApp
 # Maximum WebSocket text message size (bytes).
 WS_MAX_MESSAGE_SIZE = 256
 
-# Principal-ID format: printable ASCII, 1-128 chars, no control characters.
-# Matches identifiers like "human:alice", "token:ab12cd34", "service:planner-v2".
-_PRINCIPAL_ID_RE = re.compile(r"^[\x20-\x7E]{1,128}$")
-_PRINCIPAL_ID_MAX_LEN = 128
 
+def principal_id_for_api_token(token: str) -> str:
+    """Return a bounded server-derived identity for one configured token.
 
-def is_valid_principal_id(value: str) -> bool:
-    return bool(_PRINCIPAL_ID_RE.match(value))
+    The token is the authentication input configured by the server. Request
+    headers and payload fields never participate in this value. H0 may replace
+    this single-token boundary with a configured external authentication
+    adapter, but open callers must never self-assert trusted identity.
+    """
+
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return f"token:{digest[:24]}"
 
 
 @dataclass
@@ -92,25 +97,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if not check_bearer_token(request, self._token):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-        # Set server-authoritative principal identity.
-        # X-Principal-ID header is accepted only because the bearer token was
-        # already validated — the token proves the caller is trusted, and the
-        # header identifies *which* trusted principal is acting.  When no
-        # header is supplied, fall back to a token-derived sentinel so that
-        # every authenticated request carries a non-empty principal_id.
-        principal_header = request.headers.get("x-principal-id", "").strip()
-        if principal_header and not is_valid_principal_id(principal_header):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "detail": (
-                        "Invalid X-Principal-ID: must be 1-128 printable ASCII characters"
-                    )
-                },
-            )
-        request.state.principal_id = (
-            principal_header or f"token:{self._token[:8]}"
-        )
+        # This middleware is the configured authentication boundary. Derive
+        # identity only from its server-side credential; X-Principal-ID and
+        # payload fields are untrusted caller attribution and are deliberately
+        # ignored. A future external adapter may stamp a different trusted
+        # principal only after its own H0 contract is qualified.
+        request.state.principal_id = principal_id_for_api_token(self._token)
         return await call_next(request)
 
 
@@ -141,11 +133,17 @@ def normalize_allowed_roots(roots: list[str] | None) -> list[str]:
     valid allowlist entries; route handlers will surface a filesystem error
     when callers try to use them.
     """
-    if not roots:
+    if roots is None:
         return ["/workspace"]
 
     normalized: list[str] = []
     for root in roots:
+        # ``Path("")`` means the current working directory.  Treating an
+        # explicitly empty configured root that way would silently widen a
+        # malformed allowlist to whichever directory happens to launch the
+        # server.
+        if type(root) is not str or not root or "\x00" in root:
+            continue
         try:
             resolved = Path(root).expanduser().resolve()
         except Exception:
@@ -154,7 +152,10 @@ def normalize_allowed_roots(roots: list[str] | None) -> list[str]:
         if root_str not in normalized:
             normalized.append(root_str)
 
-    return normalized or [str(Path("/workspace").resolve())]
+    # An explicit empty or wholly invalid allowlist must not silently widen to
+    # the development default. The route constructor rejects this empty result
+    # before serving a filesystem request.
+    return normalized
 
 
 def normalize_existing_file_path(
@@ -184,11 +185,12 @@ def normalize_writable_file_path(
     *,
     kind_label: str = "Path",
 ) -> Path:
-    """Resolve and validate a writable file path within allowed roots.
+    """Perform lexical preflight for a prospective file path.
 
-    Existing symlink targets are rejected so writes cannot be redirected
-    outside the allowlisted roots by planting a symlink inside an allowed
-    directory.
+    Existing symlinks and non-regular filesystem objects are rejected.  The
+    returned ``Path`` is not a write capability: a later write must still use
+    descriptor-relative no-follow creation/opening and attest the opened
+    inode, because another process can replace any pathname after this check.
     """
     try:
         candidate = Path(raw_path).expanduser()
@@ -206,13 +208,40 @@ def normalize_writable_file_path(
     if not is_path_within_roots(resolved_parent, allowed_roots):
         raise HTTPException(status_code=403, detail=f"{kind_label} is outside allowed roots")
     target = resolved_parent / candidate.name
-    if target.exists():
-        if target.is_symlink():
-            raise HTTPException(status_code=400, detail=f"{kind_label} must not be a symlink")
-        resolved_target = target.resolve()
-        if not is_path_within_roots(resolved_target, allowed_roots):
-            raise HTTPException(status_code=403, detail=f"{kind_label} is outside allowed roots")
-        if resolved_target.is_dir():
-            raise HTTPException(status_code=400, detail=f"{kind_label} is a directory")
+    try:
+        target_metadata = target.lstat()
+    except FileNotFoundError:
+        return target
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="Permission denied") from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {kind_label.lower()}",
+        ) from exc
+
+    if stat.S_ISLNK(target_metadata.st_mode):
+        # ``lstat`` makes this include dangling symlinks, for which
+        # ``Path.exists()`` would otherwise be false.
+        raise HTTPException(status_code=400, detail=f"{kind_label} must not be a symlink")
+    if not stat.S_ISREG(target_metadata.st_mode):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{kind_label} must be a regular file",
+        )
+    try:
+        resolved_target = target.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{kind_label} changed during lexical preflight",
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {kind_label.lower()}",
+        ) from exc
+    if not is_path_within_roots(resolved_target, allowed_roots):
+        raise HTTPException(status_code=403, detail=f"{kind_label} is outside allowed roots")
 
     return target

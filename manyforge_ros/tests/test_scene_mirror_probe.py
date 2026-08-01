@@ -1,147 +1,275 @@
+"""Pure and unavailable-boundary evidence for simulation scene mirroring.
+
+Historical source blob ``07de241694d2e7738a55d8c6c74bab1ef5d11b20``
+contains the removed live client at lines 88-424, CLI at lines 427-454, and
+dynamic import hook at lines 473-476.  Historical test blob
+``a911cb32c772fd1e672676eb8d319213eebab8cb`` contains one live case at lines
+8-147.  Its exact I9/I assignment is recorded below while the owner-neutral DTO
+and translation coverage remains active.
+"""
+
 from __future__ import annotations
 
-import threading
+import inspect
+from types import SimpleNamespace
 
 import pytest
 
+from manyforge_ros import scene_mirror_probe
 
-def test_scene_mirror_probe_captures_entities_info_state_and_bounds():
-    rclpy = pytest.importorskip("rclpy")
-    pytest.importorskip("simulation_interfaces")
 
-    from geometry_msgs.msg import Vector3
-    from rclpy.executors import MultiThreadedExecutor
-    from simulation_interfaces.msg import EntityCategory, SimulatorFeatures
-    from simulation_interfaces.srv import (
-        GetEntities,
-        GetEntityBounds,
-        GetEntityInfo,
-        GetEntityState,
-        GetSimulatorFeatures,
+HISTORICAL_LIVE_CASE = (
+    "test_scene_mirror_probe_captures_entities_info_state_and_bounds",
+    "lines 8-147",
+    "I9/I selected simulation adapter: discover the five standard read-only "
+    "services, capture features/entities/info/state/bounds, preserve filters and "
+    "limits, propagate per-entity failures, and prove bounded ROS cleanup",
+)
+
+
+def test_scene_snapshot_records_remain_owner_neutral() -> None:
+    pose = scene_mirror_probe.PoseSnapshot(
+        frame_id="world",
+        stamp_sec=12.5,
+        position_xyz=(1.0, 2.0, 3.0),
+        orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+    )
+    bounds = scene_mirror_probe.BoundsSnapshot(
+        type_code=1,
+        type_name="TYPE_BOX",
+        points_xyz=((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)),
+    )
+    snapshot = scene_mirror_probe.SceneMirrorSnapshot(
+        service_names={"get_entities": "/get_entities"},
+        features=("ENTITY_STATE_GETTING",),
+        spawn_formats=("usd",),
+        custom_info="offline fixture",
+        entities=(
+            scene_mirror_probe.EntitySnapshot(
+                name="/World/block",
+                category_code=2,
+                category_name="CATEGORY_OBJECT",
+                pose=pose,
+                bounds=bounds,
+            ),
+        ),
     )
 
-    from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
+    payload = snapshot.to_dict()
+    assert payload["entities"][0]["pose"]["frame_id"] == "world"
+    assert payload["entities"][0]["bounds"]["type_name"] == "TYPE_BOX"
 
-    rclpy.init(args=None)
-    executor = MultiThreadedExecutor(num_threads=2)
-    server_node = rclpy.create_node("manyforge_scene_mirror_fake_sim")
-    client_node = rclpy.create_node("manyforge_scene_mirror_client")
-    services = []
 
-    def get_features(_request, response):
-        response.features.features = [
-            SimulatorFeatures.ENTITY_INFO_GETTING,
-            SimulatorFeatures.ENTITY_STATE_GETTING,
-            SimulatorFeatures.ENTITY_BOUNDS,
-            SimulatorFeatures.ENTITY_BOUNDS_BOX,
+def test_configured_service_names_win_and_discovery_fills_gaps() -> None:
+    configured = scene_mirror_probe.SimulationServiceNames(
+        get_entities="/configured/get_entities",
+    )
+    discovered = scene_mirror_probe.SimulationServiceNames(
+        get_entities="/get_entities",
+        get_entity_state="/get_entity_state",
+    )
+
+    assert configured.with_discovered(discovered).to_dict() == {
+        "get_simulator_features": None,
+        "get_entities": "/configured/get_entities",
+        "get_entity_info": None,
+        "get_entity_state": "/get_entity_state",
+        "get_entity_bounds": None,
+    }
+
+
+def test_service_selection_is_pure_and_deterministic() -> None:
+    selected = scene_mirror_probe.select_simulation_service_names(
+        [
+            (
+                "/vendor/entities",
+                ["simulation_interfaces/srv/GetEntities"],
+            ),
+            (
+                "/get_entities",
+                ["simulation_interfaces/srv/GetEntities"],
+            ),
+            (
+                "/isaacsim/GetEntityState",
+                ["simulation_interfaces/srv/GetEntityState"],
+            ),
         ]
-        response.features.spawn_formats = ["usd"]
-        response.features.custom_info = "fake simulator"
-        return response
-
-    def get_entities(request, response):
-        response.result.result = response.result.RESULT_OK
-        names = ["/World/robot", "/World/table", "/World/block"]
-        response.entities = [
-            name for name in names if not request.filters.filter or "World" in name
-        ]
-        return response
-
-    def get_entity_info(request, response):
-        response.result.result = response.result.RESULT_OK
-        response.info.category.category = (
-            EntityCategory.CATEGORY_ROBOT
-            if request.entity.endswith("robot")
-            else EntityCategory.CATEGORY_OBJECT
-        )
-        response.info.description = f"description for {request.entity}"
-        response.info.tags = ["test", "mirror"]
-        return response
-
-    def get_entity_state(request, response):
-        response.result.result = response.result.RESULT_OK
-        response.state.header.frame_id = "world"
-        response.state.header.stamp.sec = 12
-        response.state.header.stamp.nanosec = 500_000_000
-        response.state.pose.position.x = 1.0 if request.entity.endswith("block") else 0.0
-        response.state.pose.position.y = 2.0 if request.entity.endswith("block") else 0.0
-        response.state.pose.position.z = 3.0 if request.entity.endswith("block") else 0.0
-        response.state.pose.orientation.w = 1.0
-        return response
-
-    def get_entity_bounds(_request, response):
-        response.result.result = response.result.RESULT_OK
-        response.bounds.type = response.bounds.TYPE_BOX
-        lower = Vector3(x=-0.05, y=-0.10, z=-0.15)
-        upper = Vector3(x=0.05, y=0.10, z=0.15)
-        response.bounds.points = [lower, upper]
-        return response
-
-    services.append(
-        server_node.create_service(
-            GetSimulatorFeatures,
-            "/get_simulator_features",
-            get_features,
-        )
-    )
-    services.append(server_node.create_service(GetEntities, "/get_entities", get_entities))
-    services.append(
-        server_node.create_service(GetEntityInfo, "/get_entity_info", get_entity_info)
-    )
-    services.append(
-        server_node.create_service(GetEntityState, "/get_entity_state", get_entity_state)
-    )
-    services.append(
-        server_node.create_service(GetEntityBounds, "/get_entity_bounds", get_entity_bounds)
     )
 
-    executor.add_node(server_node)
-    executor.add_node(client_node)
-    thread = threading.Thread(target=executor.spin, daemon=True)
-    thread.start()
+    assert selected.get_entities == "/get_entities"
+    assert selected.get_entity_state == "/isaacsim/GetEntityState"
+    assert selected.get_entity_info is None
 
-    try:
-        client = SimulationSceneMirrorClient(client_node, service_timeout_s=2.0)
-        snapshot = client.capture(entity_filter="World", entity_limit=3)
 
-        assert snapshot.errors == ()
-        assert snapshot.service_names["get_entities"] == "/get_entities"
-        assert "ENTITY_STATE_GETTING" in snapshot.features
-        assert "ENTITY_BOUNDS" in snapshot.features
-        assert snapshot.spawn_formats == ("usd",)
-        assert len(snapshot.entities) == 3
+def test_pose_and_bounds_translation_remain_ros_free() -> None:
+    state = SimpleNamespace(
+        header=SimpleNamespace(
+            frame_id="world",
+            stamp=SimpleNamespace(sec=12, nanosec=500_000_000),
+        ),
+        pose=SimpleNamespace(
+            position=SimpleNamespace(x=1, y=2, z=3),
+            orientation=SimpleNamespace(x=0, y=0, z=0, w=1),
+        ),
+    )
 
-        robot = snapshot.entities[0]
-        assert robot.name == "/World/robot"
-        assert robot.category_name == "CATEGORY_ROBOT"
+    class BoundsConstants:
+        TYPE_BOX = 4
 
-        block = snapshot.entities[2]
-        assert block.name == "/World/block"
-        assert block.category_name == "CATEGORY_OBJECT"
-        assert block.pose is not None
-        assert block.pose.frame_id == "world"
-        assert block.pose.stamp_sec == 12.5
-        assert block.pose.position_xyz == (1.0, 2.0, 3.0)
-        assert block.bounds is not None
-        assert block.bounds.type_name == "TYPE_BOX"
-        assert block.bounds.points_xyz == (
-            (-0.05, -0.10, -0.15),
-            (0.05, 0.10, 0.15),
+    bounds = SimpleNamespace(
+        type=4,
+        points=[
+            SimpleNamespace(x=-0.5, y=-0.25, z=-0.1),
+            SimpleNamespace(x=0.5, y=0.25, z=0.1),
+        ],
+    )
+
+    assert scene_mirror_probe.pose_snapshot_from_state(state) == (
+        scene_mirror_probe.PoseSnapshot(
+            frame_id="world",
+            stamp_sec=12.5,
+            position_xyz=(1.0, 2.0, 3.0),
+            orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+        )
+    )
+    assert scene_mirror_probe.bounds_snapshot_from_value(
+        bounds,
+        bounds_type=BoundsConstants,
+    ) == scene_mirror_probe.BoundsSnapshot(
+        type_code=4,
+        type_name="TYPE_BOX",
+        points_xyz=((-0.5, -0.25, -0.1), (0.5, 0.25, 0.1)),
+    )
+    assert scene_mirror_probe.constant_name(BoundsConstants, 99) == "UNKNOWN_99"
+    assert scene_mirror_probe.constant_names(BoundsConstants, [4, 99]) == [
+        "TYPE_BOX",
+        "UNKNOWN_99",
+    ]
+
+
+def test_pose_translation_is_finite_bounded_and_normalizes_xyzw() -> None:
+    state = SimpleNamespace(
+        header=SimpleNamespace(
+            frame_id="world",
+            stamp=SimpleNamespace(sec=12, nanosec=500_000_000),
+        ),
+        pose=SimpleNamespace(
+            position=SimpleNamespace(x=1, y=2, z=3),
+            orientation=SimpleNamespace(x=0, y=0, z=0, w=2),
+        ),
+    )
+
+    assert scene_mirror_probe.pose_snapshot_from_state(state).orientation_xyzw == (
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
+
+    state.header.frame_id = "f" * 1025
+    with pytest.raises(ValueError, match="frame_id exceeds"):
+        scene_mirror_probe.pose_snapshot_from_state(state)
+    state.header.frame_id = "world"
+    state.header.stamp.nanosec = 1_000_000_000
+    with pytest.raises(ValueError, match="nanosec must be in"):
+        scene_mirror_probe.pose_snapshot_from_state(state)
+    state.header.stamp.nanosec = 0
+    state.pose.position.x = float("inf")
+    with pytest.raises(ValueError, match="position.x must be finite"):
+        scene_mirror_probe.pose_snapshot_from_state(state)
+    state.pose.position.x = 0.0
+    state.pose.orientation.w = 0.0
+    with pytest.raises(ValueError, match="finite nonzero norm"):
+        scene_mirror_probe.pose_snapshot_from_state(state)
+
+
+def test_scene_graph_constants_and_bounds_reject_rows_over_4096() -> None:
+    service_row = (
+        "/get_entities",
+        ["simulation_interfaces/srv/GetEntities"],
+    )
+    with pytest.raises(ValueError, match="service graph exceed"):
+        scene_mirror_probe.select_simulation_service_names([service_row] * 4097)
+
+    with pytest.raises(ValueError, match="feature rows exceed"):
+        scene_mirror_probe.feature_enabled_or_unknown(
+            {f"feature-{index}" for index in range(4097)},
+            "feature-0",
         )
 
-        configured_snapshot = client.capture(
-            entity_names=["/World/block"],
-            include_bounds=False,
+    class BoundsConstants:
+        TYPE_BOX = 4
+
+    with pytest.raises(ValueError, match="constant values exceed"):
+        scene_mirror_probe.constant_names(BoundsConstants, [4] * 4097)
+
+    bounds = SimpleNamespace(
+        type=4,
+        points=[SimpleNamespace(x=0.0, y=0.0, z=0.0)] * 4097,
+    )
+    with pytest.raises(ValueError, match="bounds points exceed"):
+        scene_mirror_probe.bounds_snapshot_from_value(
+            bounds,
+            bounds_type=BoundsConstants,
         )
-        assert configured_snapshot.errors == ()
-        assert len(configured_snapshot.entities) == 1
-        assert configured_snapshot.entities[0].name == "/World/block"
-        assert configured_snapshot.entities[0].pose is not None
-        assert configured_snapshot.entities[0].bounds is None
-    finally:
-        for service in services:
-            server_node.destroy_service(service)
-        executor.shutdown()
-        server_node.destroy_node()
-        client_node.destroy_node()
-        rclpy.shutdown()
+
+
+def test_bounds_translation_rejects_non_finite_or_boolean_values() -> None:
+    class BoundsConstants:
+        TYPE_BOX = 4
+
+    with pytest.raises(ValueError, match="bounds type must be an integer"):
+        scene_mirror_probe.bounds_snapshot_from_value(
+            SimpleNamespace(type=True, points=[]),
+            bounds_type=BoundsConstants,
+        )
+    with pytest.raises(ValueError, match="point.x must be finite"):
+        scene_mirror_probe.bounds_snapshot_from_value(
+            SimpleNamespace(
+                type=4,
+                points=[SimpleNamespace(x=float("nan"), y=0.0, z=0.0)],
+            ),
+            bounds_type=BoundsConstants,
+        )
+
+
+def test_absent_feature_report_is_not_mistaken_for_a_negative_report() -> None:
+    assert scene_mirror_probe.feature_enabled_or_unknown(set(), "ENTITY_BOUNDS")
+    assert scene_mirror_probe.feature_enabled_or_unknown(
+        {"ENTITY_BOUNDS"},
+        "ENTITY_BOUNDS",
+    )
+    assert not scene_mirror_probe.feature_enabled_or_unknown(
+        {"ENTITY_STATE_GETTING"},
+        "ENTITY_BOUNDS",
+    )
+
+
+def test_live_scene_mirror_is_not_a_dormant_callable_body(capsys) -> None:
+    assert not hasattr(scene_mirror_probe, "SimulationSceneMirrorClient")
+    source = inspect.getsource(scene_mirror_probe)
+    for forbidden in (
+        "_import_module",
+        "create_client",
+        "call_async",
+        "create_node",
+        "time.sleep",
+    ):
+        assert forbidden not in source
+
+    assert scene_mirror_probe.main() == scene_mirror_probe.UNAVAILABLE_EXIT_CODE
+    assert capsys.readouterr().err.strip() == scene_mirror_probe.UNAVAILABLE_MESSAGE
+
+
+def test_historical_live_case_remains_assigned_to_i9() -> None:
+    assert scene_mirror_probe.HISTORICAL_SOURCE_BLOB == (
+        "07de241694d2e7738a55d8c6c74bab1ef5d11b20"
+    )
+    assert scene_mirror_probe.HISTORICAL_TEST_BLOB == (
+        "a911cb32c772fd1e672676eb8d319213eebab8cb"
+    )
+    assert HISTORICAL_LIVE_CASE[0] == (
+        "test_scene_mirror_probe_captures_entities_info_state_and_bounds"
+    )
+    assert HISTORICAL_LIVE_CASE[1] == "lines 8-147"
+    assert HISTORICAL_LIVE_CASE[2].startswith("I9/I selected simulation adapter")

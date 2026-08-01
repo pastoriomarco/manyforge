@@ -1,59 +1,54 @@
-import { useEffect } from 'react';
-import { Layout } from './components/Layout';
-import { useCycleStore } from './store/cycleStore';
-import { useCatalogStore } from './store/catalogStore';
-import { useProgramStore } from './store/programStore';
-import { useDeploymentStore } from './store/deploymentStore';
-import { initComposerStore } from './store/composerStore';
+import { ApiError, api } from './api/client';
+import { ArtifactBrowser } from './components/ArtifactBrowser';
+import { CatalogPanel } from './components/CatalogPanel';
+import { StructuralViewer } from './components/StructuralViewer';
+import { UnavailableBanner } from './components/UnavailableBanner';
+import { useStructuralResource } from './state/structuralResource';
 
-let composerUnsubscribe: (() => void) | null = null;
+function isNotFound(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404;
+}
 
 export default function App() {
-  const connectWs = useCycleStore(s => s.connectWs);
-  const disconnectWs = useCycleStore(s => s.disconnectWs);
-  const fetchCatalog = useCatalogStore(s => s.fetchCatalog);
-  const hydrateLoadedProgram = useProgramStore(s => s.hydrateLoadedProgram);
-  const fetchDeployment = useDeploymentStore(s => s.fetchDeployment);
+  const [health, retryHealth] = useStructuralResource(api.health.get, {
+    failureMessage: 'Could not read the Composer structural boundary.',
+  });
+  const [catalog, retryCatalog] = useStructuralResource(api.catalog.list, {
+    failureMessage: 'Could not read the immutable v2 node catalog.',
+  });
+  const [manifest, retryManifest] = useStructuralResource(api.urdf.manifest, {
+    absentWhen: isNotFound,
+    absentMessage: 'No complete URDF is available for the authored deployment.',
+    failureMessage: 'Could not read the authored-neutral URDF manifest.',
+  });
 
-  useEffect(() => {
-    connectWs();
-    void fetchCatalog();
-    void hydrateLoadedProgram({
-      retries: 6,
-      retryDelayMs: 500,
-    });
-    void fetchDeployment();
+  return (
+    <main className="app-shell">
+      <header className="app-header">
+        <div className="brand-mark" aria-hidden="true">MF</div>
+        <div>
+          <p className="eyebrow">ManyForge Composer</p>
+          <p className="app-title">Structural inspection shell</p>
+        </div>
+        <div className="header-boundary">
+          <span className="boundary-dot" aria-hidden="true" />
+          Read-only structural mode
+        </div>
+      </header>
 
-    // Initialize composer store subscription
-    composerUnsubscribe = initComposerStore();
+      <UnavailableBanner health={health} onRetry={retryHealth} />
 
-    return () => {
-      disconnectWs();
-      composerUnsubscribe?.();
-    };
-  }, [connectWs, disconnectWs, fetchCatalog, hydrateLoadedProgram, fetchDeployment]);
+      <StructuralViewer manifest={manifest} onRetry={retryManifest} />
 
-  useEffect(() => {
-    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-      const programStore = useProgramStore.getState();
-      const deploymentStore = useDeploymentStore.getState();
+      <div className="lower-grid">
+        <CatalogPanel catalog={catalog} onRetry={retryCatalog} />
+        <ArtifactBrowser />
+      </div>
 
-      const hasUnsavedProgram =
-        JSON.stringify(programStore.flowToTree()) !== JSON.stringify(programStore.savedTree);
-      const hasUnsavedDeployment =
-        JSON.stringify(deploymentStore.deployment) !== JSON.stringify(deploymentStore.savedDeployment);
-
-      if (!hasUnsavedProgram && !hasUnsavedDeployment) {
-        return;
-      }
-
-      event.preventDefault();
-      event.returnValue = '';
-    };
-
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, []);
-
-  return <Layout />;
+      <footer className="app-footer">
+        This shell is a replaceable client of retained structural APIs. It owns no
+        runtime, scene, lifecycle, alarm, assistant, or command semantics.
+      </footer>
+    </main>
+  );
 }

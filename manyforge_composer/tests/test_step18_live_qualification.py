@@ -16,7 +16,8 @@ import pytest
 
 from scripts.qualification import roboplan_05_qualification as _QUAL
 from scripts.qualification import generate_step18_live_contact_modes_manifest as _GEN
-from scripts.qualification import run_step18_live_contact_mode as _RUN
+from scripts.qualification import run_step18_live_contact_mode as _CONTACT_RUN
+from scripts.qualification import run_step18_live_mechanism_replay as _REPLAY_RUN
 from scripts.qualification import source_identity as _SOURCE_ID
 
 
@@ -1586,7 +1587,7 @@ def test_step18_live_rejects_bounded_release_only_policy_fields(
         "evidence_only",
     ),
 )
-def test_specs_contract_identity_module_live_runner_and_cli_are_identical(
+def test_specs_contract_identity_module_and_cli_are_identical(
     tmp_path: Path, mutation: str
 ) -> None:
     repo = tmp_path / "specs"
@@ -1623,7 +1624,6 @@ def test_specs_contract_identity_module_live_runner_and_cli_are_identical(
         evidence.write_text("post-run evidence\n", encoding="utf-8")
 
     module_identity = _SOURCE_ID.specs_contract_identity(repo)
-    live_runner_identity = _RUN._specs_contract_identity(repo)  # noqa: SLF001
     cli = json.loads(
         subprocess.check_output(
             [
@@ -1637,7 +1637,6 @@ def test_specs_contract_identity_module_live_runner_and_cli_are_identical(
         )
     )
 
-    assert live_runner_identity == module_identity
     assert cli["specs_contract_identity"] == module_identity
     assert cli["source_identity"] == _SOURCE_ID.source_identity(repo)
     assert cli["source_identity"] == _QUAL._manyforge_source_identity(  # noqa: SLF001
@@ -2097,3 +2096,255 @@ def test_step18_live_generator_cli_rejects_unignored_outputs(
     assert _GEN.main(argv) == 2
     assert not (tmp_path / "generated-parity.json").exists()
     assert not (tmp_path / "generated-manifest.json").exists()
+
+# The live producer's shared Specs-identity call was removed with its runtime body.
+# Historical source blobs: contact runner 48cbabff75bfba9a8a2a920cc2422df813fb4494;
+# mechanism replay 43fc8c7ed2ef1b51cb34744319f05da821d3689d.
+# Historical test blob: 8e79f5f0ad6e92e368500a59dbd2c83acf8913d1.
+REMOVED_LIVE_RUNNER_ACCEPTANCE = {
+    "historical_lines": "1589-1647",
+    "historical_case": (
+        "test_specs_contract_identity_module_live_runner_and_cli_are_identical"
+    ),
+    "retained_case": "test_specs_contract_identity_module_and_cli_are_identical",
+    "removed_assertion": (
+        "the deleted live row producer calls the shared Specs identity helper"
+    ),
+    "future_gates": ("I9/I",),
+    "acceptance": (
+        "The restored live row producer consumes the shared Specs identity and "
+        "binds it into immutable row evidence; the module and CLI equality "
+        "checks remain active above."
+    ),
+}
+
+
+def test_live_wrappers_gate_before_argument_parsing(capsys) -> None:
+    assert _CONTACT_RUN.main(["--not-a-real-live-option"]) == 78
+    assert _REPLAY_RUN.main(["--not-a-real-replay-option"]) == 78
+    payloads = [
+        json.loads(line)
+        for line in capsys.readouterr().err.splitlines()
+        if line.strip()
+    ]
+    assert [payload["historical_source_blob"] for payload in payloads] == [
+        "48cbabff75bfba9a8a2a920cc2422df813fb4494",
+        "43fc8c7ed2ef1b51cb34744319f05da821d3689d",
+    ]
+    assert all(payload["exit_code"] == 78 for payload in payloads)
+
+
+def test_contact_row_validation_retains_the_offline_selector_contract() -> None:
+    assert _CONTACT_RUN.canonical_sha256({"b": 2, "a": 1}) == (
+        _canonical_sha256({"a": 1, "b": 2})
+    )
+    value = _CONTACT_RUN.validate_row_shape(
+        row_kind="candidate_observation",
+        viewer_stratum="focused",
+        support_contact_mode="bounded_penetration",
+        max_contact_penetration_m=0.03,
+        successful_observations=30,
+        operator_attests_viewer_focused=True,
+    )
+    assert value["controller_progress_observer_mode"] == "coherent_native"
+    with pytest.raises(ValueError, match="baseline rows require"):
+        _CONTACT_RUN.validate_row_shape(
+            row_kind="baseline_observation",
+            viewer_stratum="disconnected",
+            support_contact_mode="binary_contact",
+            max_contact_penetration_m=0.0,
+            successful_observations=30,
+            operator_attests_viewer_focused=False,
+        )
+
+
+def test_contact_canonical_hash_rejects_unbounded_or_non_json_values() -> None:
+    too_deep: Any = None
+    for _ in range(_CONTACT_RUN.MAX_JSON_DEPTH + 1):
+        too_deep = [too_deep]
+    too_many_nodes = [
+        [None] * _CONTACT_RUN.MAX_JSON_CONTAINER_ITEMS
+        for _ in range(
+            _CONTACT_RUN.MAX_JSON_NODES
+            // _CONTACT_RUN.MAX_JSON_CONTAINER_ITEMS
+        )
+    ]
+    oversized_document = [
+        "x" * _CONTACT_RUN.MAX_JSON_TEXT_BYTES
+    ] * (_CONTACT_RUN.MAX_JSON_DOCUMENT_BYTES // _CONTACT_RUN.MAX_JSON_TEXT_BYTES + 1)
+
+    with pytest.raises(ValueError, match="depth bound"):
+        _CONTACT_RUN.canonical_sha256(too_deep)
+    with pytest.raises(ValueError, match="node bound"):
+        _CONTACT_RUN.canonical_sha256(too_many_nodes)
+    with pytest.raises(ValueError, match="row bound"):
+        _CONTACT_RUN.canonical_sha256(
+            [None] * (_CONTACT_RUN.MAX_JSON_CONTAINER_ITEMS + 1)
+        )
+    with pytest.raises(ValueError, match="text bound"):
+        _CONTACT_RUN.canonical_sha256(
+            "x" * (_CONTACT_RUN.MAX_JSON_TEXT_BYTES + 1)
+        )
+    with pytest.raises(ValueError, match="document bound"):
+        _CONTACT_RUN.canonical_sha256(oversized_document)
+    with pytest.raises(ValueError, match="finite"):
+        _CONTACT_RUN.canonical_sha256(float("nan"))
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        _CONTACT_RUN.canonical_sha256(_CONTACT_RUN.MAX_JSON_INTEGER + 1)
+    with pytest.raises(TypeError, match="exact JSON"):
+        _CONTACT_RUN.canonical_sha256((1, 2))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    (
+        ("successful_observations", True, TypeError),
+        ("operator_attests_viewer_focused", 1, TypeError),
+        ("max_contact_penetration_m", True, TypeError),
+        ("max_contact_penetration_m", float("inf"), ValueError),
+        ("row_kind", 1, TypeError),
+    ),
+)
+def test_contact_row_validation_rejects_coercive_scalar_types(
+    field: str, value: Any, error: type[Exception]
+) -> None:
+    kwargs = {
+        "row_kind": "candidate_observation",
+        "viewer_stratum": "focused",
+        "support_contact_mode": "binary_contact",
+        "max_contact_penetration_m": 0.03,
+        "successful_observations": 30,
+        "operator_attests_viewer_focused": True,
+    }
+    kwargs[field] = value
+    with pytest.raises(error):
+        _CONTACT_RUN.validate_row_shape(**kwargs)
+
+
+def test_contact_row_validation_bounds_observation_count_and_text() -> None:
+    kwargs = {
+        "row_kind": "candidate_observation",
+        "viewer_stratum": "focused",
+        "support_contact_mode": "binary_contact",
+        "max_contact_penetration_m": 0.03,
+        "successful_observations": 30,
+        "operator_attests_viewer_focused": True,
+    }
+    with pytest.raises(ValueError, match="between 30"):
+        _CONTACT_RUN.validate_row_shape(
+            **{
+                **kwargs,
+                "successful_observations": (
+                    _CONTACT_RUN.MAX_SUCCESSFUL_OBSERVATIONS + 1
+                ),
+            }
+        )
+    with pytest.raises(ValueError, match="text bound"):
+        _CONTACT_RUN.validate_row_shape(
+            **{
+                **kwargs,
+                "row_kind": "x" * (_CONTACT_RUN.MAX_ROW_TEXT_BYTES + 1),
+            }
+        )
+
+
+def test_mechanism_replay_retains_the_offline_role_matrix() -> None:
+    assert _REPLAY_RUN.validate_replay_request(
+        observation_row_count=8, bounded_penetration_m=0.03
+    ) == {"observation_row_count": 8, "bounded_penetration_m": 0.03}
+    baseline = _REPLAY_RUN._execution_specs(  # noqa: SLF001
+        {"row_kind": "baseline_observation", "mode": "current_all_active_distance"}
+    )
+    candidate = _REPLAY_RUN._execution_specs(  # noqa: SLF001
+        {"row_kind": "candidate_observation", "mode": "binary_contact"}
+    )
+    assert [row[0] for row in baseline] == [
+        "baseline_decision",
+        "baseline_observation",
+    ]
+    assert [row[0] for row in candidate] == [
+        "baseline_decision",
+        "baseline_observation",
+        "candidate_decision",
+        "candidate_observation",
+    ]
+    assert candidate[-1][2] == "binary_contact"
+    with pytest.raises(ValueError, match="exactly eight"):
+        _REPLAY_RUN.validate_replay_request(
+            observation_row_count=7, bounded_penetration_m=0.03
+        )
+
+
+def _replay_observation_matrix() -> list[dict[str, str]]:
+    return [
+        {
+            "row_kind": "baseline_observation",
+            "mode": _REPLAY_RUN.BASELINE_MODE,
+            "viewer_stratum": stratum,
+        }
+        for stratum in _REPLAY_RUN.VIEWER_STRATA
+    ] + [
+        {
+            "row_kind": "candidate_observation",
+            "mode": mode,
+            "viewer_stratum": stratum,
+        }
+        for mode in _REPLAY_RUN.MODE_TO_ARM
+        for stratum in _REPLAY_RUN.VIEWER_STRATA
+    ]
+
+
+def test_mechanism_replay_matrix_is_exact_bounded_and_duplicate_free() -> None:
+    rows = _replay_observation_matrix()
+    assert _REPLAY_RUN.validate_observation_matrix(rows)[
+        "observation_row_count"
+    ] == 8
+
+    duplicate = [dict(row) for row in rows]
+    duplicate[-1] = dict(duplicate[0])
+    with pytest.raises(ValueError, match="duplicate"):
+        _REPLAY_RUN.validate_observation_matrix(duplicate)
+    with pytest.raises(ValueError, match="exactly eight"):
+        _REPLAY_RUN.validate_observation_matrix(rows + [dict(rows[0])])
+
+
+def test_mechanism_replay_rejects_coercive_and_unbounded_selectors() -> None:
+    with pytest.raises(TypeError, match="exact integer"):
+        _REPLAY_RUN.validate_replay_request(
+            observation_row_count=True,
+            bounded_penetration_m=0.03,
+        )
+    with pytest.raises(TypeError, match="real number, not bool"):
+        _REPLAY_RUN.validate_replay_request(
+            observation_row_count=8,
+            bounded_penetration_m=True,
+        )
+    with pytest.raises(ValueError, match="finite"):
+        _REPLAY_RUN.validate_replay_request(
+            observation_row_count=8,
+            bounded_penetration_m=float("nan"),
+        )
+    oversized_row = {
+        f"field_{index}": index
+        for index in range(_REPLAY_RUN.MAX_ROW_FIELDS + 1)
+    }
+    oversized_row.update(
+        row_kind="candidate_observation",
+        mode="binary_contact",
+    )
+    with pytest.raises(ValueError, match="field bound"):
+        _REPLAY_RUN._execution_specs(oversized_row)  # noqa: SLF001
+    with pytest.raises(ValueError, match="baseline mode"):
+        _REPLAY_RUN._execution_specs(  # noqa: SLF001
+            {"row_kind": "baseline_observation", "mode": "binary_contact"}
+        )
+
+
+def test_removed_live_runner_behavior_has_a_future_owner() -> None:
+    assert REMOVED_LIVE_RUNNER_ACCEPTANCE["historical_case"] == (
+        "test_specs_contract_identity_module_live_runner_and_cli_are_identical"
+    )
+    assert REMOVED_LIVE_RUNNER_ACCEPTANCE["future_gates"] == ("I9/I",)
+    assert REMOVED_LIVE_RUNNER_ACCEPTANCE["retained_case"] == (
+        "test_specs_contract_identity_module_and_cli_are_identical"
+    )

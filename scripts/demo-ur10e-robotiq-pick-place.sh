@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-# demo-ur10e-robotiq-pick-place.sh — backwards-compat shim for scripts/launch.sh.
+# Historical UR10e/Robotiq demo entrypoint retained for truthful runbook links.
+# The former compatibility forwarding behavior is removed; restoration gate: N.
 
 set -euo pipefail
-exec "$(dirname "$0")/launch.sh" \
-    --lane manyforge-only \
-    --assistant off \
-    --scenario ur10e-pick-place \
-    --non-interactive \
-    --yes \
-    "$@"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/composable-cell-runtime-availability.sh"
+manyforge_fail_composable_cell_runtime_unavailable

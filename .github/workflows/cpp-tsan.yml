@@ -3,31 +3,82 @@ name: cpp-tsan
 on:
   pull_request:
     paths:
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
       - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
+      - "manyforge_deployment/**"
+      - "manyforge_component_manager/**"
+      - "manyforge_scene/**"
       - "scripts/ci/run-core-tsan.sh"
+      - "scripts/ci/run-relocation-packages-tsan.sh"
+      - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
       - "scripts/ci/tsan.supp"
+      - "scripts/setup-docker.sh"
       - ".github/workflows/cpp-tsan.yml"
   push:
     branches: [main, dev]
     paths:
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
       - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
+      - "manyforge_deployment/**"
+      - "manyforge_component_manager/**"
+      - "manyforge_scene/**"
       - "scripts/ci/run-core-tsan.sh"
+      - "scripts/ci/run-relocation-packages-tsan.sh"
+      - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
       - "scripts/ci/tsan.supp"
+      - "scripts/setup-docker.sh"
       - ".github/workflows/cpp-tsan.yml"
   workflow_dispatch:
 
 jobs:
   manyforge-core-tsan:
-    name: manyforge_core ThreadSanitizer
+    name: C++ ThreadSanitizer (AMD64 Docker)
     runs-on: ubuntu-24.04
-    env:
-      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 history_size=7 exitcode=66
-      CMAKE_BUILD_PARALLEL_LEVEL: "2"
     steps:
       - uses: actions/checkout@v4
-      - name: Install C++ test dependencies
+
+      - name: Prepare pinned RoboPlan Docker context
+        run: ./scripts/setup-docker.sh --prepare-only
+
+      - name: Build development image
+        run: docker build --platform linux/amd64 -t manyforge-tsan-ci:${GITHUB_SHA} .
+
+      - name: Run sanitizer registries in immutable image
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake g++ libgtest-dev
-      - name: Run core C++ tests under ThreadSanitizer
-        run: bash scripts/ci/run-core-tsan.sh
+          set -euo pipefail
+          image_id="$(docker image inspect "manyforge-tsan-ci:${GITHUB_SHA}" --format '{{.Id}}')"
+          if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve immutable development image identity" >&2
+            exit 1
+          fi
+          echo "Qualified image: ${image_id}"
+          docker run --rm --platform linux/amd64 \
+            --network none \
+            --security-opt seccomp=unconfined \
+            -e TSAN_OPTIONS='halt_on_error=1 second_deadlock_stack=1 history_size=7 exitcode=66' \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            -e BUILD_DIR=/tmp/manyforge-tsan/core \
+            -e RELOCATION_PACKAGES_BUILD_ROOT=/tmp/manyforge-tsan/relocation-packages \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -w /workspace \
+            "${image_id}" \
+            setarch x86_64 -R bash -lc '
+              set -euo pipefail
+              expected_personality=00040000
+              parent_personality="$(cat /proc/self/personality)"
+              child_personality="$(sh -c "cat /proc/self/personality")"
+              if [[ "${parent_personality}" != "${expected_personality}" ||
+                    "${child_personality}" != "${expected_personality}" ]]; then
+                echo "ADDR_NO_RANDOMIZE inheritance check failed" >&2
+                exit 2
+              fi
+              bash scripts/ci/run-core-tsan.sh
+              bash scripts/ci/run-relocation-packages-tsan.sh
+            '

@@ -6,23 +6,35 @@
 > where to find the canonical reference docs. Read referenced docs
 > before editing code or running scripts.
 
+> **Current `dev` cutover status:** only the retained ROS-free C++ package
+> qualifications, build-owned v2 node-environment inspection, and Composer's
+> structural catalog/files/URDF shell are available. Program execution,
+> assistant/MCP operation, live scene editing/viewing, native planning,
+> Isaac/ROS product launch, and real-robot operation are explicitly
+> unavailable. Do not run the historical recipes below or recreate their
+> superseded Python semantic owners. Retain or port same-role Python/TypeScript
+> clients, authoring, presentation, safety, and evidence surfaces at their
+> responsible gates. The last full Composer interaction tree is
+> `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`; use
+> [`docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md)
+> only as reimplementation input.
+
 ______________________________________________________________________
 
 ## What this repo is
 
-ManyForge is the deployment-side robot-execution framework: a behavior
-tree runtime, motion planner, scene/program/blackboard data model, Composer
-(web UI + FastAPI backend + native 3D viewer), and an LLM assistant-provider
-HTTP bridge. **Everything required to install,
-deploy, and operate ManyForge at runtime is in this repo**, including
-when the optional Composer-assistant lane is enabled.
+ManyForge is the deployment-side repository for the target robot-execution
+framework. During the active destructive cutover it intentionally does not
+ship an operable product runtime. Surviving headless packages and the
+structural Composer shell live here; removed products return only after their
+named restoration gates.
 
 Three sibling repositories form the full stack; the cross-repo
 authority map is:
 
 | Question                                                          | Authoritative repo          | Notes                                                                                                                             |
 | ----------------------------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| **How do I install / deploy / run ManyForge?**                    | this repo (`manyforge`)     | self-sufficient at runtime — no other repo required for non-AI use                                                                |
+| **How do I install / deploy / run ManyForge?**                    | this repo (`manyforge`)     | deployment-side authority; current `dev` exposes only the structural/offline cutover subset, not a runnable non-AI product lane   |
 | **How do I run the LLM assistant on Jetson Thor?**                | `NemoClaw-Thor`             | platform glue: vLLM serving, sandbox provisioner, OpenClaw bridge launcher. Required only when using the `openclaw` lane on Thor. |
 | **What is the spec / contract / ADR — what should this code do?** | `manyforge_specs` (private) | dev-only; **not required at runtime**. Specs/ADRs/plans live there for maintainer use.                                            |
 
@@ -39,49 +51,56 @@ repo is missing locally, inspect or clone the matching repository under
 | `manyforge_specs`          | `${HOME}/workspaces/dev_ws/src/manyforge_specs`          | -                                                               | `https://github.com/pastoriomarco/manyforge_specs`          |
 | `isaac_ros_custom_bringup` | `${HOME}/workspaces/dev_ws/src/isaac_ros_custom_bringup` | `${HOME}/workspaces/isaac_ros-dev/src/isaac_ros_custom_bringup` | `https://github.com/pastoriomarco/isaac_ros_custom_bringup` |
 
-**This file covers the runtime/operator side completely.** A brief
-section at the bottom points dev maintainers at `manyforge_specs` for
-spec-level work; that's the only reason an operator/LLM should ever
-follow that link.
+**This file covers the runtime/operator boundary completely.** On the current
+cutover branch, that coverage includes the explicit product outage; it is not a
+promise that a runtime lane can be started. A brief section at the bottom
+points dev maintainers at `manyforge_specs` for spec-level work; that's the
+only reason an operator/LLM should ever follow that link.
 
 For development, the distinction is load-bearing: ManyForge is
-implemented according to `manyforge_specs`. If that repo is missing,
-runtime operation is still fully supported, but non-trivial behavior
-development is limited and needs maintainer audit before it should be
-treated as spec-compliant.
+implemented according to `manyforge_specs`. If that repo is missing, current
+structural/offline inspection remains self-contained, but non-trivial behavior
+development is limited and needs maintainer audit before it should be treated
+as spec-compliant. Historical operator material does not make the unavailable
+product lanes runnable.
 
 ______________________________________________________________________
 
-## Install
+## Development image and current qualification
 
-Container-based, single command:
+The container workflow prepares the development toolchain and runs the
+currently retained qualifications. It does not restore or start a product
+lane:
 
 ```bash
 git clone <manyforge>            # this repo
 cd manyforge
 ./scripts/setup-docker.sh        # clones RoboPlan dependency + builds manyforge-dev:latest (~10 min first time)
 docker compose run --rm dev bash # enter the dev container
-./scripts/test-all.sh            # builds C++ core + runs all tests
+./scripts/test-all.sh retained   # runs the explicit retained aggregate checks
 ```
 
-Hard requirements: Docker (with BuildKit), git, ~10 GB disk for the
-Docker image, and the host Python toolchain only if you want to run
-scripts outside the container.
+Hard requirements: Docker (with BuildKit), git, and ~10 GB disk for the Docker
+image. Host Python or build commands are not qualification evidence, and
+effectful product scripts must remain behind their typed cutover gates.
 
-For a comprehensive operator runbook (deterministic-only mode,
-direct-LLM mode, full assistant mode), see
+For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
-For a freshly formatted machine that needs the whole ManyForge +
-NemoClaw/OpenClaw assistant stack, start with
+That runbook is restoration input, not current bring-up guidance. Its
+historical clean-machine sequence begins at
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md#clean-machine-install-order)
-(`scripts/launch.sh` is a runtime launcher, not the first-time NemoClaw
-installer). On Jetson Orin AGX, use
+(`scripts/launch.sh` was a runtime launcher, not the first-time NemoClaw
+installer). The corresponding historical Jetson Orin AGX sequence is
 [`docs/operations/ORIN_STACK_SETUP.md`](docs/operations/ORIN_STACK_SETUP.md)
-instead so the NVMe/eMMC storage contract is handled first.
+and retains the NVMe/eMMC storage contract for the future restoration gate.
 
 ______________________________________________________________________
 
-## Runtime
+## Historical runtime baseline — unavailable on current `dev`
+
+The remainder of this section documents the pre-cutover interaction baseline.
+It is retained to help audit future thin clients, not as current operator
+guidance. Its commands and endpoints must not be run or cited as available.
 
 Runtime selection has two independent axes:
 
@@ -97,18 +116,17 @@ for execution lanes and
 [`docs/operations/LANE_BRINGUP.md`](docs/operations/LANE_BRINGUP.md) for the
 three engine-backed assistant lanes.
 
-**Operator-facing launcher quickstart:**
+**Historical operator-facing launcher quickstart:**
 [`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)
-is the canonical guide for the unified launcher
-(`scripts/launch.sh`). The primary use is the **interactive wizard**
+records the canonical baseline for the unified launcher
+(`scripts/launch.sh`). Its primary use was the **interactive wizard**
 (7-step NemoClaw-onboard-style menu — just run `./scripts/launch.sh`
 with no arguments). The doc also covers scripted / non-interactive
 use for CI, the four-combination smoke-test matrix, and the seven
-`demo-*.sh` backward-compat shims. Read it before bringing up the
-stack for the first time, when verifying a launcher change, or when
-an end-to-end issue needs a known-good reference. **If you (LLM
-agent) modify the launcher scripts, update that doc in the same
-commit.**
+`demo-*.sh` backward-compat shims. Use it to study the former stack and as
+acceptance input when verifying a future launcher change.
+Do not use it to bring up the current branch. **If you (LLM agent) modify the
+launcher scripts, update that doc in the same commit.**
 
 **Adding a new robot deployment:** see
 [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md)
@@ -199,36 +217,34 @@ ______________________________________________________________________
 
 ## Operator-facing reference docs (this repo)
 
-These generated contracts are the exact public runtime wire surfaces. They
-live in this repo so an operator never needs private specs to operate or
-integrate ManyForge. Use
+Only the generated structural REST contract is current. Historical interaction
+contracts remain in this repo as non-operative reimplementation inputs. Use
 [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md) for the
 hand-maintained ownership and end-to-end flow map.
 
 | Topic                   | Doc                                                                                                  | Source-of-truth                                                                                                   |
 | ----------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | Composer REST API       | [`docs/reference/REST_API.md`](docs/reference/REST_API.md)                                           | FastAPI app's `/openapi.json` (live at `:9000/openapi.json` when Composer is running)                             |
-| MCP runtime contract    | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md)                   | `manyforge_composer/backend/mcp_server.py` (`@mcp.tool()` decorators)                                             |
-| Assistant-provider HTTP | [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)     | `manyforge_assistant_bridge/bridge.py` + `protocol.py`                                                            |
-| Viewer data plane       | [`docs/reference/VIEWER_DATA_PLANE_V1.schema.json`](docs/reference/VIEWER_DATA_PLANE_V1.schema.json) | Strict backend Pydantic wire models; the same generator emits frontend TypeScript types and preservation fixtures |
+| MCP runtime contract    | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md)                   | Historical at `082221...`; unavailable                                                                          |
+| Assistant-provider HTTP | [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)     | Historical at `082221...`; live bridge removed and unavailable; retained protocol/supervisor logic is porting input |
+| Viewer data plane       | [`docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md) | Pinned historical implementation plus responsibility/test ledger; unavailable               |
 
-The Markdown contracts, viewer schemas/fixtures, and frontend viewer types are
-generated from their owning FastAPI, FastMCP, protocol, and Pydantic models.
-Do not edit generated outputs by hand. To regenerate:
+`REST_API.md` alone is generated from the retained FastAPI application. To
+regenerate it:
 
 ```bash
-docker compose run --rm dev python3 scripts/regen-public-contracts.py
+docker compose run --rm dev \
+  python3 scripts/regen-public-contracts.py structural-rest
 ```
 
-The script must run inside the manyforge dev image — it imports
-`manyforge_composer.backend.app` / `mcp_server` which require the
-container's installed deps (FastAPI, FastMCP, kernel client). Running
-on the host without those deps produces a failure stub.
+The script must run inside the ManyForge dev image. It fails rather than
+writing a synthetic contract when the structural application cannot be
+constructed.
 
 A CI guard verifies the docs stay in sync with the code:
 
 ```bash
-bash scripts/ci/check-public-contracts-fresh.sh
+bash scripts/ci/check-public-contracts-fresh.sh structural-rest
 ```
 
 It runs the regenerator in `--check` mode (exit 1 on drift). Wire this
@@ -255,21 +271,21 @@ What lives where in this repo, and what it's for:
 | [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                                                      |
 | [`manyforge_content_identity/`](manyforge_content_identity/)             | Shared ROS-free RFC 8785 serialization and domain-separated content-digest primitives                                      |
 | [`manyforge_persistence/`](manyforge_persistence/)                       | Shared ROS-free mechanical durable-storage safety primitives; no semantic state ownership                                  |
-| [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free logical-scene semantic owner and durable state                                                                     |
+| [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free canonical-empty logical-scene owner foundation; no live scene surface                                               |
 | [`manyforge_deployment/`](manyforge_deployment/)                         | ROS-free composable-cell artifact decoding, identity, validation, and compiler substrate                                    |
-| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ Component Manager runtime-observation and durable-persistence foundation                                       |
-| [`manyforge_behavior/`](manyforge_behavior/)                             | Behavior-tree runtime (py_trees), node catalog, tests                                                                       |
+| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ Component Manager foundation; no operational Apply process                                                      |
+| [`manyforge_behavior/`](manyforge_behavior/)                             | Build-owned node catalog/environment inspection plus explicit runtime-unavailable boundaries                                |
 | [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
 | [`manyforge_roboplan/`](manyforge_roboplan/)                             | Retained planning-model staging and offline RoboPlan import qualification; runtime adapters are intentionally unavailable   |
-| [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | C++ ROS controller execution, exact binding/admission, feedback/progress, bounded stop/reset, and isolated scene projection |
-| [`manyforge_robot_lifecycle/`](manyforge_robot_lifecycle/)               | ROS-independent lifecycle supervision, authority sessions, and admission projection                                         |
+| [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | Retained C++ ROS execution/admission library; no current product-lane wiring                                                  |
+| [`manyforge_robot_lifecycle/`](manyforge_robot_lifecycle/)               | Retained ROS-independent lifecycle core; no current physical ingress                                                         |
 | [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                                           |
-| [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model generation, endpoint binding, and read-only observation boundary                                    |
-| [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle coordinator and sole-backend ros2_control boundary                                              |
-| [`manyforge_composer/`](manyforge_composer/)                             | FastAPI backend + React frontend + MCP server                                                                               |
-| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Direct-lane assistant provider HTTP service (port 8100)                                                                     |
-| [`manyforge_ros/`](manyforge_ros/)                                       | ROS 2 bridge (optional)                                                                                                     |
-| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | ManyForge assistant skill installed by sandboxed provider deployments                                                       |
+| [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model/binding/observation inputs; no current real-robot lane                                               |
+| [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle adapter; provider wiring unavailable until I10/R                                                 |
+| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell; runtime, MCP, viewer and assistant ownership unavailable                                    |
+| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Retained protocol hashing and pure supervisor reduction; live provider bridge unavailable pending H0+                         |
+| [`manyforge_ros/`](manyforge_ros/)                                       | Retained pure mappings/contracts plus explicit unavailable runtime entry points                                              |
+| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Non-activatable historical assistant interaction references                                                                 |
 | [`examples/`](examples/)                                                 | Reference `*.program.yaml` + `*.deployment.yaml`                                                                            |
 | [`scripts/`](scripts/)                                                   | Operator scripts (`demo-assistant-known-good.sh`, `setup-docker.sh`, etc.)                                                  |
 | [`docs/`](docs/)                                                         | Operator docs (`operations/`, `guides/`, `reference/`)                                                                      |
@@ -290,7 +306,7 @@ When making changes here, check the boundary you're touching:
    CI guard at [`scripts/ci/check-private-spec-boundary.sh`](scripts/ci/check-private-spec-boundary.sh)
    enforces this; run it before committing if your change touches docs
    under `docs/operations/`, `docs/reference/`, `docs/guides/`,
-   `manyforge_assistant_bridge/`, `manyforge_composer/`, etc. The
+   `manyforge_composer/`, etc. The
    guard has an explicit allowlist for docs that legitimately *describe*
    the boundary (this file, `STACK_SETUP.md`, the dev-only session
    script).
@@ -307,18 +323,19 @@ When making changes here, check the boundary you're touching:
    `docker compose --profile ros run --rm ros-jazzy ...` for minimal ROS
    adapter checks; use `docker compose --profile ros-full run --rm ros-jazzy-full ...` or the launcher `isaac-sim` lane for full
    ROS/Isaac/ros2_control checks.
-1. **Launcher lane matters.** `manyforge-only` / native
-   `manyforge-e2e-composer` containers are ROS-free. They are valid for
-   deterministic native tests only. ROS packages require the
-   `isaac-sim` lane or the `ros-full` compose profile.
-1. **Tests fall into deterministic + assistant lanes.** Run
-   `./scripts/test-all.sh` inside the `dev` container for the
-   deterministic suite. The assistant bridge has its own pytest suite
-   under `manyforge_assistant_bridge/tests/`.
-1. **Schema changes are wire-breaking.** If you touch
-   `manyforge_assistant_bridge/protocol.py` (the catalog-hash function
-   or any shared envelope helper), every running deployment will
-   recompute hashes — treat as a wire-version bump.
+1. **Unavailable lanes are not test lanes.** Native, assistant, Isaac, ROS
+   product, and real-robot selectors must fail with the stable typed cutover
+   result until their restoration gates pass. Do not use a toolchain image or
+   historical test as product evidence.
+1. **Run current tests in the pinned development container.**
+   `./scripts/test-all.sh retained` covers only the explicitly retained
+   structural/offline surfaces. The historical no-argument and `all` forms
+   fail with the typed cutover result because they formerly promised the full
+   product matrix; unavailable selectors likewise fail instead of skipping or
+   mocking success.
+1. **Historical wire shapes are inputs, not compatibility obligations.** Audit
+   them through the historical Composer reference and introduce a new public
+   contract only with a real owner and its named qualification gate.
 
 ______________________________________________________________________
 
@@ -346,6 +363,11 @@ For those plan slices only:
    documentation may be deleted before an end-to-end replacement exists.
    Do not add a compatibility shim, backup implementation, copied legacy tree,
    or old/new runtime switch.
+1. File disposition follows responsibility, not directory, language, broken
+   imports, or current deletion status. A removed dependency makes a caller
+   unavailable; it does not make every client, UI, adapter, instruction, or
+   test an obsolete semantic owner. Retain or port same-role surfaces, split
+   mixed files, and fence effectful entrypoints until their named gate passes.
 1. Operator documentation must remain truthful. When a documented surface is
    intentionally unavailable, mark or remove that recipe instead of repairing
    the implementation solely to preserve the old workflow.
@@ -440,12 +462,12 @@ Authoritative dev-side instructions:
 If `../manyforge_specs/` isn't present, first check whether it exists at
 `${HOME}/workspaces/dev_ws/src/manyforge_specs` or can be cloned from
 `https://github.com/pastoriomarco/manyforge_specs`. If it is still unavailable,
-it means this checkout is for *deployment* use or limited implementation work,
-not full maintainer development. **Don't fail the operator's runtime task** —
-answer their runtime question from this repo's content (which is complete for
-operation). For code changes, be explicit: small fixes may proceed from local
-code and tests, but spec-governed behavior changes need maintainer audit
-against `manyforge_specs` before merge.
+it means this checkout is for deployment-side inspection or limited
+implementation work, not full maintainer development. Answer operator questions
+from this repo's self-contained current-status and historical material, but do
+not infer that an unavailable lane works. For code changes, be explicit: small
+fixes may proceed from local code and tests, but spec-governed behavior changes
+need maintainer audit against `manyforge_specs` before merge.
 
 To seed an OpenClaw agent sandbox with the specs repo for development
 assistance, the dev-only script is at

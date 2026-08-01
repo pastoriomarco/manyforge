@@ -1,11 +1,17 @@
 # Authoring a ManyForge scene from an Isaac Sim stage
 
-This is the operator runbook for taking a freshly-authored Isaac Sim
-scene and producing the ManyForge artefacts (program YAML + static
-`.obj` meshes) that drive Composer planning and the native viewer.
-Run it once per scene revision; the resulting OBJ files are static
-inputs to subsequent program loads and should be committed alongside
-the program YAML.
+> **Cutover status:** retained as a restoration and behavior reference. The
+> command recipes below are not qualified on the current `dev` branch and
+> must not be executed until I9/I and its prerequisite headless gates pass.
+> Unless explicitly marked as retained standalone extractor detail,
+> present-tense wording below describes the captured baseline, not a live
+> Composer/viewer workflow.
+
+This records the former operator runbook for taking a freshly-authored Isaac
+Sim scene and producing the ManyForge artefacts (program YAML + static `.obj`
+meshes) that drove Composer planning and the native viewer. The captured
+workflow ran once per scene revision; the resulting OBJ files were static
+inputs committed alongside the program YAML.
 
 For the extractor's wire contract, filename rules, and OBJ format see
 [`../../exts/manyforge.isaac.collider_service/README.md`](../../exts/manyforge.isaac.collider_service/README.md).

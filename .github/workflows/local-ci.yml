@@ -39,39 +39,22 @@ jobs:
               ./scripts/ci/check-terminal-commit-boundary.sh
               python3 scripts/ci/check-authority-port-alignment.py
               python3 scripts/ci/check-planner-portability.py
-              python3 scripts/ci/check-viewer-data-plane-boundaries.py
               # Runs inside the dev image already (this whole command executes
               # in manyforge-dev:latest), so take the direct in-container path.
-              INSIDE_MANYFORGE_DEV_CONTAINER=1 ./scripts/ci/check-public-contracts-fresh.sh
+              INSIDE_MANYFORGE_DEV_CONTAINER=1 ./scripts/ci/check-public-contracts-fresh.sh structural-rest
           - name: core-cpp
             suite: core-cpp
             command: ./scripts/test-all.sh cpp
           - name: roboplan
             suite: roboplan
             command: ./scripts/test-all.sh roboplan
-          - name: bindings
-            suite: bindings
-            command: |
-              ./scripts/test-all.sh cpp
-              ./scripts/test-all.sh bindings
           - name: python-composer
             suite: python-composer
             command: |
               ./scripts/test-all.sh python
-              (cd manyforge_composer/frontend && npm ci && npx tsc --noEmit -p tsconfig.app.json)
+              ./scripts/test-all.sh bridge
+              (cd manyforge_composer/frontend && npm ci --ignore-scripts)
               ./scripts/test-all.sh composer
-          - name: integration
-            suite: integration
-            command: ./scripts/test-all.sh integration
-          - name: qualification
-            suite: qualification
-            command: |
-              ./scripts/test-all.sh qualification
-              python3 manyforge_core/tools/collect_qualification_evidence.py \
-                --lane local-ci/qualification \
-                --source soft-on-path-planner \
-                --require-evidence \
-                -- ./scripts/run-soft-on-path-planner-qualification.sh --in-container
           - name: core-tsan
             suite: core-tsan
             command: bash scripts/ci/run-core-tsan.sh

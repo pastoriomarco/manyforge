@@ -17,7 +17,7 @@
 # Usage:
 #   docker compose run --rm dev bash
 #   # Inside container:
-#   cd /workspace && ./scripts/test-all.sh all
+#   cd /workspace && ./scripts/test-all.sh retained
 
 # --- Stage 1: Build React frontend ---
 FROM node:22-slim AS frontend-builder
