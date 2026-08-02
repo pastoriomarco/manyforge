@@ -1,0 +1,1991 @@
+{
+  "schema_version": "manyforge.composable_cell_i2.build_provenance_contract.v1",
+  "implementation_base": {
+    "commit": "9252769feb7e57a054bb2e7b6067325758d0d09a",
+    "tree": "6b582fc5a1bb6c37ec8bba8f01bd5bf2020e04c9"
+  },
+  "closed_shape_policy": {
+    "all_objects_reject_unknown_members": true,
+    "all_arrays_have_exact_membership": true,
+    "all_paths_are_normalized_repository_or_build_relative_posix_paths": true,
+    "duplicate_json_members_are_forbidden": true,
+    "target_and_source_arrays_are_lexicographically_ordered": true
+  },
+  "toolchain_contract": {
+    "schema_version": "manyforge.composable_cell_i2.toolchain_contract.v1",
+    "cmake": {
+      "lexical_path": "/usr/bin/cmake",
+      "resolved_path": "/usr/bin/cmake",
+      "sha256": "bad2e2bae7a1cc2c885d1aa06f19ae91be6684819aaeaf03f89410cf4854ecea",
+      "version_first_line": "cmake version 3.25.1"
+    },
+    "git": {
+      "lexical_path": "/usr/bin/git",
+      "resolved_path": "/usr/bin/git",
+      "sha256": "2540879925a6881e3877ff7e3330746ba3027b04edf16a3a12dccd1644c4f32d",
+      "version_first_line": "git version 2.39.5"
+    },
+    "python": {
+      "lexical_path": "/usr/local/bin/python3",
+      "resolved_path": "/usr/local/bin/python3.12",
+      "sha256": "4dbf3143240288fb2170257ffaa7bd030cdda5d2703d1f5f30b627042267e2e3",
+      "version_first_line": "Python 3.12.13"
+    },
+    "cxx_compiler": {
+      "lexical_path": "/usr/bin/c++",
+      "resolved_path": "/usr/bin/x86_64-linux-gnu-g++-12",
+      "sha256": "dd91977c184e327710578363ad93ebb175c3a457b6236b874fd3911b7c055c65",
+      "version_first_line": "c++ (Debian 12.2.0-14+deb12u1) 12.2.0"
+    },
+    "archiver": {
+      "lexical_path": "/usr/bin/ar",
+      "resolved_path": "/usr/bin/x86_64-linux-gnu-ar",
+      "sha256": "3acbee2794e3668a74bcb90f2eaf7d981211fb95288ab940f0e3ac380e8f6023"
+    },
+    "ranlib": {
+      "lexical_path": "/usr/bin/ranlib",
+      "resolved_path": "/usr/bin/x86_64-linux-gnu-ranlib",
+      "sha256": "a502e11f3c9aac3554493cd4827fd488f9a8f3da8bcd4580b2c3172607bd51f6"
+    },
+    "ninja": {
+      "lexical_path": "/usr/bin/ninja",
+      "resolved_path": "/usr/bin/ninja",
+      "sha256": "cb1f22b33e58fc69c47728e751b6ff6f5a1d78d60f46d734c02076dc90a78b19"
+    },
+    "compile_modes": {
+      "cxx_standard_flag": "-std=c++20",
+      "project_source_required_flags": {
+        "manyforge_roboplan": {
+          "-fopenmp": [
+            "src/cartesian_planning_contract.cpp",
+            "src/joint_cap_contract.cpp",
+            "src/roboplan_cartesian_trajectory_dynamics.cpp",
+            "test/test_cartesian_planning_contract.cpp",
+            "test/test_joint_cap_contract.cpp",
+            "test/test_retained_product_consumer.cpp",
+            "test/test_roboplan_planner_options.cpp",
+            "test/test_roboplan_scene_generation.cpp"
+          ]
+        },
+        "roboplan": {
+          "-fopenmp": [
+            "src/core/collision_context.cpp",
+            "src/core/path_utils.cpp",
+            "src/core/pose_utils.cpp",
+            "src/core/scene.cpp",
+            "src/core/scene_utils.cpp",
+            "src/core/types.cpp",
+            "src/filters/se3_low_pass_filter.cpp"
+          ]
+        }
+      },
+      "Release": {
+        "optimization_flag": "-O3",
+        "debug_flag": null,
+        "require_ndebug": true
+      },
+      "RelWithDebInfo": {
+        "optimization_flag": "-O2",
+        "debug_flag": "-g",
+        "require_ndebug": true
+      }
+    }
+  },
+  "production_exclusions": {
+    "forbidden_target_name_patterns": [
+      "^perf_.*$",
+      "^test_.*$"
+    ],
+    "forbidden_repository_source_path_patterns": [
+      "(^|/)test(/|$)",
+      "(^|/)tests(/|$)"
+    ],
+    "forbidden_dependency_name_patterns": [
+      "(^|::)GTest(::|$)",
+      "(^|::)[A-Za-z0-9_.+-]*test_support[A-Za-z0-9_.+-]*(::|$)",
+      "(?i)gmock",
+      "(?i)gtest"
+    ]
+  },
+  "configure_generated_input_contracts": [
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_build_evidence.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_build_evidence.hpp", "manyforge_deployment/generated/embedded_build_evidence.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_build_evidence.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_behavior/resources/node_environment_manifest.yaml", "manyforge_behavior/scripts/generate_node_environment_manifest.py"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_structural_model_preparation.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_structural_model_preparation.hpp", "manyforge_deployment/generated/embedded_structural_model_preparation.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_structural_model_preparation.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/tools/prepare_structural_model.py"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_canonical_empty_deployment.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_canonical_empty_deployment.hpp", "manyforge_deployment/generated/embedded_canonical_empty_deployment.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_canonical_empty_deployment.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/canonical_empty/c1_build_authority.deployment.json"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_capability_definition_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_capability_definition_schema.hpp", "manyforge_deployment/generated/embedded_capability_definition_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/catalog/manyforge.capability_definition.v1.yaml"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_component_type_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_component_type_schema.hpp", "manyforge_deployment/generated/embedded_component_type_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/catalog/manyforge.component_type.v1.yaml"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_control_interface_contract_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_control_interface_contract_schema.hpp", "manyforge_deployment/generated/embedded_control_interface_contract_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/catalog/manyforge.control_interface_contract.v1.yaml"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_controller_topology_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_controller_topology_schema.hpp", "manyforge_deployment/generated/embedded_controller_topology_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/catalog/manyforge.controller_topology.v1.yaml"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_model_asset_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_model_asset_schema.hpp", "manyforge_deployment/generated/embedded_model_asset_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/catalog/manyforge.model_asset.v1.yaml"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_provider_manifest_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_provider_manifest_schema.hpp", "manyforge_deployment/generated/embedded_provider_manifest_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/catalog/manyforge.provider_manifest.v1.yaml"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_runtime_profile_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_runtime_profile_schema.hpp", "manyforge_deployment/generated/embedded_runtime_profile_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/catalog/manyforge.runtime_profile.v1.yaml"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_stop_evidence_policy_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_stop_evidence_policy_schema.hpp", "manyforge_deployment/generated/embedded_stop_evidence_policy_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/catalog/manyforge.stop_evidence_policy.v1.yaml"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_empty_runtime_configuration_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_empty_runtime_configuration_schema.hpp", "manyforge_deployment/generated/embedded_empty_runtime_configuration_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/value/manyforge.value_schema.runtime.empty.v1.yaml"]
+    },
+    {
+      "owner_project_id": "manyforge_deployment",
+      "output_name": "embedded_empty_provider_contract_schema.hpp",
+      "allowed_build_relative_paths": ["generated/embedded_empty_provider_contract_schema.hpp", "manyforge_deployment/generated/embedded_empty_provider_contract_schema.hpp"],
+      "template_repository_path": "manyforge_deployment/src/embedded_closed_schema.hpp.in",
+      "semantic_input_policy": "all_authenticated_cmake_inputs_and_exact_cache",
+      "required_semantic_repository_paths": ["manyforge_deployment/resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml"]
+    }
+  ],
+  "configure_executed_fixture_contracts": [
+    {
+      "accepted_package_uri_prefix": "package://manyforge_example_models/models/lite6_lite_gripper/",
+      "cmake_repository_path": "manyforge_deployment/CMakeLists.txt",
+      "exact_output_relative_paths": [
+        "model.srdf",
+        "model.urdf",
+        "preparation-manifest.json"
+      ],
+      "execution_policy": "exact_cmake_execute_process_and_fresh_replay",
+      "interpreter_toolchain_key": "python",
+      "model_asset_id": "lite6_lite_gripper",
+      "output_root_relative_path": "generated/lite6_lite_gripper_structural",
+      "owner_project_id": "manyforge_deployment",
+      "required_build_testing": true,
+      "resource_repository_paths": [
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_body.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_body.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link1.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link2.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link3.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link4.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link5.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link6.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link_base.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link1.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link2.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link3.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link4.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link5.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link6.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link_base.stl"
+      ],
+      "resource_root_repository_path": "manyforge_example_models/models/lite6_lite_gripper",
+      "srdf_repository_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf",
+      "tool_repository_path": "manyforge_deployment/tools/prepare_structural_model.py",
+      "urdf_repository_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"
+    },
+    {
+      "accepted_package_uri_prefix": "package://qualified_models/example/",
+      "cmake_repository_path": "manyforge_deployment/CMakeLists.txt",
+      "exact_output_relative_paths": [
+        "model.srdf",
+        "model.urdf",
+        "preparation-manifest.json"
+      ],
+      "execution_policy": "exact_cmake_execute_process_and_fresh_replay",
+      "interpreter_toolchain_key": "python",
+      "model_asset_id": "qualified_model",
+      "output_root_relative_path": "generated/structural_model_preparation_test",
+      "owner_project_id": "manyforge_deployment",
+      "required_build_testing": true,
+      "resource_repository_paths": [
+        "manyforge_deployment/test/fixtures/structural_model_preparation/meshes/tool.stl"
+      ],
+      "resource_root_repository_path": "manyforge_deployment/test/fixtures/structural_model_preparation",
+      "srdf_repository_path": "manyforge_deployment/test/fixtures/structural_model_preparation/source.srdf",
+      "tool_repository_path": "manyforge_deployment/tools/prepare_structural_model.py",
+      "urdf_repository_path": "manyforge_deployment/test/fixtures/structural_model_preparation/source.urdf"
+    },
+    {
+      "accepted_package_uri_prefix": "package://manyforge_example_models/models/lite6_lite_gripper/",
+      "cmake_repository_path": "manyforge_roboplan/CMakeLists.txt",
+      "exact_output_relative_paths": [
+        "model.srdf",
+        "model.urdf",
+        "preparation-manifest.json"
+      ],
+      "execution_policy": "exact_cmake_execute_process_and_fresh_replay",
+      "interpreter_toolchain_key": "python",
+      "model_asset_id": "lite6_lite_gripper",
+      "output_root_relative_path": "lite6_structural_consumer_fixture",
+      "owner_project_id": "manyforge_roboplan",
+      "required_build_testing": true,
+      "resource_repository_paths": [
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_body.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_body.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link1.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link2.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link3.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link4.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link5.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link6.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link_base.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link1.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link2.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link3.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link4.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link5.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link6.stl",
+        "manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link_base.stl"
+      ],
+      "resource_root_repository_path": "manyforge_example_models/models/lite6_lite_gripper",
+      "srdf_repository_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf",
+      "tool_repository_path": "manyforge_deployment/tools/prepare_structural_model.py",
+      "urdf_repository_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"
+    }
+  ],
+  "configured_target_graph_contract": {
+    "schema_version": "manyforge.composable_cell_i2.configured_target_graph_contract.v1",
+    "options_sha256": "ec913f17e083398b33872f5c56557883610bcd896db07446addad60adfc2d8e7",
+    "project_node_alias_contracts": {
+      "manyforge_core_py": {
+        "absolute_build_sibling_nodes": [
+          {
+            "alias": "<owner:manyforge_core/manyforge_core>",
+            "artifact_relative_path": "libmanyforge_core.a",
+            "expected_raw_shape": "septagon",
+            "sibling_build_directory": "core"
+          }
+        ],
+        "named_nodes": [
+          {
+            "alias": "<owner:manyforge_core/manyforge_content_identity>",
+            "expected_raw_shape": "octagon",
+            "source": "manyforge_content_identity_archive"
+          },
+          {
+            "alias": "<owner:manyforge_deployment/manyforge_deployment>",
+            "expected_raw_shape": "octagon",
+            "source": "manyforge_deployment_archive"
+          },
+          {
+            "alias": "<owner:manyforge_deployment/manyforge_deployment_verification_core>",
+            "expected_raw_shape": "octagon",
+            "source": "manyforge_deployment_verification_core_archive"
+          }
+        ]
+      }
+    },
+    "profiles": {
+      "manyforge_core.testing_on": {
+        "project_id": "manyforge_core",
+        "build_testing": true,
+        "projection_sha256": "abbd97822ec90d0d4966d1da1e6fef650e11945adc382ea3cee537861c1bee04",
+        "local_target_roles": {
+          "production": [
+            "manyforge_content_identity",
+            "manyforge_core"
+          ],
+          "test_only": [
+            "manyforge_planner_conformance_test_support",
+            "perf_kernel_event_pipeline",
+            "perf_soft_on_path_planner",
+            "test_cache",
+            "test_collision_engine_mismatch_ledger",
+            "test_collision_failure_archive",
+            "test_collision_policy_evaluator",
+            "test_collision_resource_manager",
+            "test_collision_validation_coordinator",
+            "test_collision_world_snapshot",
+            "test_component_manager_ports",
+            "test_composable_cell_contracts",
+            "test_content_hash",
+            "test_contracts_compile",
+            "test_error_code_mapping",
+            "test_execution_correlation_tracker",
+            "test_execution_kernel",
+            "test_execution_progress_publication",
+            "test_execution_recovery_support",
+            "test_execution_snapshot_publisher",
+            "test_execution_state_sink",
+            "test_execution_worker_signals",
+            "test_fake_clock",
+            "test_interrupt_manager",
+            "test_kernel_event_factories",
+            "test_kernel_event_publisher",
+            "test_kernel_flight_recorder",
+            "test_logical_scene_identity",
+            "test_logical_scene_snapshot",
+            "test_manual_scheduler",
+            "test_motion_target_resolution",
+            "test_motion_trip_stop_coordinator",
+            "test_observed_robot_state_publication",
+            "test_operator_stop_worker",
+            "test_ordered_contact_validation",
+            "test_parallel_collision_validation_worker_pool",
+            "test_planner_backend_conformance",
+            "test_pose_math",
+            "test_runtime_collision_lookahead_session",
+            "test_runtime_collision_monitor",
+            "test_runtime_collision_query_session",
+            "test_scene_snapshot_lease",
+            "test_soft_on_path_stop_planner",
+            "test_state_machine",
+            "test_stop_policy",
+            "test_trajectory_cache_compatibility",
+            "test_trajectory_progress_projection",
+            "test_trajectory_sampler",
+            "test_trajectory_sampler_parity",
+            "test_version"
+          ],
+          "configured_only": [],
+          "external": [
+            "/usr/lib/x86_64-linux-gnu/libutf8proc.so",
+            "GTest::gtest",
+            "GTest::gtest_main",
+            "OpenSSL::Crypto",
+            "PkgConfig::UTF8PROC",
+            "Threads::Threads",
+            "double-conversion::double-conversion"
+          ]
+        }
+      },
+      "manyforge_core.testing_off": {
+        "project_id": "manyforge_core",
+        "build_testing": false,
+        "projection_sha256": "c92d928191ee9fe45e0a6c1bc2054cd701bab87e1e72d239be86e2744c70c86b",
+        "local_target_roles": {
+          "production": [
+            "manyforge_content_identity",
+            "manyforge_core"
+          ],
+          "test_only": [],
+          "configured_only": [],
+          "external": [
+            "/usr/lib/x86_64-linux-gnu/libutf8proc.so",
+            "OpenSSL::Crypto",
+            "PkgConfig::UTF8PROC",
+            "double-conversion::double-conversion"
+          ]
+        }
+      },
+      "manyforge_core_py.testing_off": {
+        "project_id": "manyforge_core_py",
+        "build_testing": false,
+        "projection_sha256": "a58158b375091a5cab44cafad827002d1c68ce06721b93df07daf8d3787f9a69",
+        "local_target_roles": {
+          "production": [
+            "<owner:manyforge_core/manyforge_content_identity>",
+            "<owner:manyforge_core/manyforge_core>",
+            "<owner:manyforge_deployment/manyforge_deployment>",
+            "<owner:manyforge_deployment/manyforge_deployment_verification_core>",
+            "manyforge_core_py"
+          ],
+          "test_only": [],
+          "configured_only": [],
+          "external": [
+            "/usr/lib/x86_64-linux-gnu/libutf8proc.so",
+            "/usr/lib/x86_64-linux-gnu/libyaml.so",
+            "EXPAT::EXPAT",
+            "OpenSSL::Crypto",
+            "PkgConfig::LIBYAML",
+            "PkgConfig::UTF8PROC",
+            "double-conversion::double-conversion",
+            "pybind11::headers",
+            "pybind11::module",
+            "pybind11::pybind11",
+            "pybind11::pybind11_headers",
+            "pybind11::python_headers",
+            "pybind11::python_link_helper"
+          ]
+        }
+      },
+      "manyforge_deployment.testing_on": {
+        "project_id": "manyforge_deployment",
+        "build_testing": true,
+        "projection_sha256": "b3fe57a3d8e5e9e6f26dce4d9ce164e5dd6e5a8cc12d56683d997f02f5e40e54",
+        "local_target_roles": {
+          "production": [
+            "manyforge_build_qualified_admission_profile",
+            "manyforge_content_identity",
+            "manyforge_deployment",
+            "manyforge_deployment_admission",
+            "manyforge_deployment_canonical_package_generator",
+            "manyforge_deployment_verification_core",
+            "manyforge_emit_build_qualified_admission_profile",
+            "manyforge_generate_canonical_empty_package"
+          ],
+          "test_only": [
+            "test_artifact_codec",
+            "test_build_manifest",
+            "test_build_qualified_admission_profile",
+            "test_canonical_empty_admission",
+            "test_catalog_artifact_store",
+            "test_cell_applicability",
+            "test_cell_applicability_budget",
+            "test_cell_compiler",
+            "test_cell_graph_codec",
+            "test_cell_structure",
+            "test_closed_schema",
+            "test_component_type_codec",
+            "test_content_identity",
+            "test_control_interface_contract_codec",
+            "test_controller_topology_codec",
+            "test_deployment_applicability_codec",
+            "test_deployment_artifact_codec",
+            "test_deployment_catalog_codec",
+            "test_mf2_joint_name",
+            "test_model_asset_codec",
+            "test_model_source",
+            "test_provider_manifest_codec",
+            "test_retained_bundle",
+            "test_retained_bundle_materializer",
+            "test_retained_bundle_store",
+            "test_retention_qualified_deployment",
+            "test_runtime_profile_codec",
+            "test_site_overlay_resolution",
+            "test_stop_evidence_policy_codec",
+            "test_structural_model_preparation"
+          ],
+          "configured_only": [],
+          "external": [
+            "/usr/lib/x86_64-linux-gnu/libutf8proc.so",
+            "/usr/lib/x86_64-linux-gnu/libyaml.so",
+            "EXPAT::EXPAT",
+            "GTest::gtest",
+            "GTest::gtest_main",
+            "OpenSSL::Crypto",
+            "PkgConfig::LIBYAML",
+            "PkgConfig::UTF8PROC",
+            "Threads::Threads",
+            "double-conversion::double-conversion"
+          ]
+        }
+      },
+      "manyforge_deployment.testing_off": {
+        "project_id": "manyforge_deployment",
+        "build_testing": false,
+        "projection_sha256": "7f3477c5dc38ff0da5af6d94603e2d172048e9494fe5601c4181936d1128d1fe",
+        "local_target_roles": {
+          "production": [
+            "manyforge_build_qualified_admission_profile",
+            "manyforge_content_identity",
+            "manyforge_deployment",
+            "manyforge_deployment_admission",
+            "manyforge_deployment_canonical_package_generator",
+            "manyforge_deployment_verification_core",
+            "manyforge_emit_build_qualified_admission_profile",
+            "manyforge_generate_canonical_empty_package"
+          ],
+          "test_only": [],
+          "configured_only": [],
+          "external": [
+            "/usr/lib/x86_64-linux-gnu/libutf8proc.so",
+            "/usr/lib/x86_64-linux-gnu/libyaml.so",
+            "EXPAT::EXPAT",
+            "OpenSSL::Crypto",
+            "PkgConfig::LIBYAML",
+            "PkgConfig::UTF8PROC",
+            "double-conversion::double-conversion"
+          ]
+        }
+      },
+      "manyforge_roboplan.testing_on": {
+        "project_id": "manyforge_roboplan",
+        "build_testing": true,
+        "projection_sha256": "b0202c1d2da03bb71ecd59f7ad8625086719f0bfc85ba7a84c794da6255ee6eb",
+        "local_target_roles": {
+          "production": [
+            "manyforge_content_identity",
+            "manyforge_core",
+            "manyforge_roboplan_native_runtime_support",
+            "manyforge_roboplan_retained_consumer"
+          ],
+          "test_only": [
+            "generate_canonical_empty_product_package",
+            "generate_lite6_retained_consumer_fixture",
+            "generate_lite6_retained_consumer_product",
+            "manyforge_build_qualified_admission_profile",
+            "manyforge_deployment",
+            "manyforge_deployment_admission",
+            "manyforge_deployment_canonical_package_generator",
+            "manyforge_deployment_verification_core",
+            "manyforge_emit_build_qualified_admission_profile",
+            "manyforge_generate_canonical_empty_package",
+            "manyforge_roboplan_planner_options_contract",
+            "manyforge_roboplan_planning_contracts",
+            "manyforge_roboplan_planning_evidence",
+            "test_cartesian_planning_contract",
+            "test_joint_cap_contract",
+            "test_native_runtime_support",
+            "test_retained_planning_model_stage",
+            "test_retained_product_consumer",
+            "test_roboplan_planner_options",
+            "test_roboplan_planning_qualification",
+            "test_roboplan_scene_generation"
+          ],
+          "configured_only": [],
+          "external": [
+            "/usr/lib/gcc/x86_64-linux-gnu/12/libgomp.so",
+            "/usr/lib/x86_64-linux-gnu/libpthread.a",
+            "/usr/lib/x86_64-linux-gnu/libutf8proc.so",
+            "/usr/lib/x86_64-linux-gnu/libyaml.so",
+            "Boost::boost",
+            "Boost::filesystem",
+            "Boost::headers",
+            "Boost::serialization",
+            "EXPAT::EXPAT",
+            "Eigen3::Eigen",
+            "GTest::gtest",
+            "GTest::gtest_main",
+            "OpenMP::OpenMP_CXX",
+            "OpenSSL::Crypto",
+            "PkgConfig::LIBYAML",
+            "PkgConfig::UTF8PROC",
+            "Threads::Threads",
+            "coal::coal",
+            "console_bridge::console_bridge",
+            "double-conversion::double-conversion",
+            "octomap",
+            "octomath",
+            "pinocchio::pinocchio",
+            "pinocchio::pinocchio_collision",
+            "pinocchio::pinocchio_collision_parallel",
+            "pinocchio::pinocchio_default",
+            "pinocchio::pinocchio_headers",
+            "pinocchio::pinocchio_parallel",
+            "pinocchio::pinocchio_parsers",
+            "roboplan::roboplan",
+            "roboplan_example_models::roboplan_example_models",
+            "roboplan_rrt::roboplan_rrt",
+            "roboplan_simple_ik::roboplan_simple_ik",
+            "tinyxml2::tinyxml2",
+            "urdfdom::urdf_parser",
+            "urdfdom::urdfdom_model",
+            "urdfdom::urdfdom_sensor",
+            "urdfdom::urdfdom_world",
+            "urdfdom_headers::urdfdom_headers"
+          ]
+        }
+      },
+      "roboplan.testing_off": {
+        "project_id": "roboplan",
+        "build_testing": false,
+        "projection_sha256": "dc0e69db23f732e68e54d86176baa962d6e6817dc0d79f4b6cee53e703abdcdd",
+        "local_target_roles": {
+          "production": [
+            "filters",
+            "roboplan"
+          ],
+          "test_only": [],
+          "configured_only": [
+            "tl_expected"
+          ],
+          "external": [
+            "/usr/lib/gcc/x86_64-linux-gnu/12/libgomp.so",
+            "/usr/lib/x86_64-linux-gnu/libpthread.a",
+            "Boost::boost",
+            "Boost::filesystem",
+            "Boost::headers",
+            "Boost::serialization",
+            "Eigen3::Eigen",
+            "OpenMP::OpenMP_CXX",
+            "coal::coal",
+            "console_bridge::console_bridge",
+            "octomap",
+            "octomath",
+            "pinocchio::pinocchio",
+            "pinocchio::pinocchio_collision",
+            "pinocchio::pinocchio_collision_parallel",
+            "pinocchio::pinocchio_default",
+            "pinocchio::pinocchio_headers",
+            "pinocchio::pinocchio_parallel",
+            "pinocchio::pinocchio_parsers",
+            "tinyxml2::tinyxml2",
+            "urdfdom::urdf_parser",
+            "urdfdom::urdfdom_model",
+            "urdfdom::urdfdom_sensor",
+            "urdfdom::urdfdom_world",
+            "urdfdom_headers::urdfdom_headers",
+            "yaml-cpp"
+          ]
+        }
+      },
+      "roboplan_example_models.testing_off": {
+        "project_id": "roboplan_example_models",
+        "build_testing": false,
+        "projection_sha256": "9a4cbbe6a501ed3321b9f1fd94f97f9c616798bc5fc8ee701e2b4106ccd5fb97",
+        "local_target_roles": {
+          "production": [
+            "roboplan_example_models"
+          ],
+          "test_only": [],
+          "configured_only": [],
+          "external": []
+        }
+      }
+    }
+  },
+  "cross_profile_parity_contract": {
+    "schema_version": "manyforge.composable_cell_i2.cross_profile_parity_contract.v1",
+    "path_normalization_policy": "exact_lane_local_longest_prefix_preserve_suffix_and_reject_unaliased_qualification_output",
+    "configuration_command_deltas": {
+      "Release": {
+        "compile": [
+          {"token": "-O3", "count": 1}
+        ],
+        "link": [
+          {"token": "-O3", "count": 1}
+        ],
+        "archive": [],
+        "generated": []
+      },
+      "RelWithDebInfo": {
+        "compile": [
+          {"token": "-O2", "count": 1},
+          {"token": "-g", "count": 1}
+        ],
+        "link": [
+          {"token": "-O2", "count": 1},
+          {"token": "-g", "count": 1}
+        ],
+        "archive": [],
+        "generated": []
+      }
+    },
+    "sanitizer_lane_command_deltas": {
+      "bindings_asan_ubsan": {
+        "sanitizer": "address+undefined",
+        "common": {
+          "compile": [
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=address,undefined", "count": 1}
+          ],
+          "link": [
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=address,undefined", "count": 2}
+          ],
+          "archive": [],
+          "generated": []
+        },
+        "projects": {}
+      },
+      "bindings_tsan": {
+        "sanitizer": "thread",
+        "common": {
+          "compile": [
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=thread", "count": 1}
+          ],
+          "link": [
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=thread", "count": 2}
+          ],
+          "archive": [],
+          "generated": []
+        },
+        "projects": {}
+      },
+      "core_asan_ubsan": {
+        "sanitizer": "address+undefined",
+        "common": {
+          "compile": [
+            {"token": "-Wno-error=array-bounds", "count": 1},
+            {"token": "-Wno-error=maybe-uninitialized", "count": 1},
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=address,undefined", "count": 1}
+          ],
+          "link": [
+            {"token": "-Wno-error=array-bounds", "count": 1},
+            {"token": "-Wno-error=maybe-uninitialized", "count": 1},
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=address,undefined", "count": 2}
+          ],
+          "archive": [],
+          "generated": []
+        },
+        "projects": {}
+      },
+      "core_tsan": {
+        "sanitizer": "thread",
+        "common": {
+          "compile": [
+            {"token": "-Wno-error=array-bounds", "count": 1},
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=thread", "count": 1}
+          ],
+          "link": [
+            {"token": "-Wno-error=array-bounds", "count": 1},
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=thread", "count": 2}
+          ],
+          "archive": [],
+          "generated": []
+        },
+        "projects": {}
+      },
+      "deployment_asan_ubsan": {
+        "sanitizer": "address+undefined",
+        "common": {
+          "compile": [
+            {"token": "-Wno-error=array-bounds", "count": 1},
+            {"token": "-Wno-error=maybe-uninitialized", "count": 1},
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=address,undefined", "count": 1}
+          ],
+          "link": [
+            {"token": "-Wno-error=array-bounds", "count": 1},
+            {"token": "-Wno-error=maybe-uninitialized", "count": 1},
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=address,undefined", "count": 2}
+          ],
+          "archive": [],
+          "generated": []
+        },
+        "projects": {}
+      },
+      "roboplan_asan_ubsan": {
+        "sanitizer": "address+undefined",
+        "common": {
+          "compile": [
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=address,undefined", "count": 1}
+          ],
+          "link": [
+            {"token": "-fno-omit-frame-pointer", "count": 2},
+            {"token": "-fsanitize=address,undefined", "count": 2}
+          ],
+          "archive": [],
+          "generated": []
+        },
+        "projects": {
+          "manyforge_roboplan": {
+            "compile": [
+              {"token": "-DEIGEN_MALLOC_ALREADY_ALIGNED=1", "count": 1}
+            ],
+            "link": [
+              {"token": "-DEIGEN_MALLOC_ALREADY_ALIGNED=1", "count": 2}
+            ],
+            "archive": [],
+            "generated": []
+          },
+          "roboplan": {
+            "compile": [
+              {"token": "-DEIGEN_MALLOC_ALREADY_ALIGNED=1", "count": 1}
+            ],
+            "link": [
+              {"token": "-DEIGEN_MALLOC_ALREADY_ALIGNED=1", "count": 2}
+            ],
+            "archive": [],
+            "generated": []
+          },
+          "roboplan_example_models": {
+            "compile": [
+              {"token": "-DEIGEN_MALLOC_ALREADY_ALIGNED=1", "count": 1}
+            ],
+            "link": [
+              {"token": "-DEIGEN_MALLOC_ALREADY_ALIGNED=1", "count": 2}
+            ],
+            "archive": [],
+            "generated": []
+          }
+        }
+      },
+      "roboplan_tsan": {
+        "sanitizer": "thread",
+        "common": {
+          "compile": [
+            {"token": "-fno-omit-frame-pointer", "count": 1},
+            {"token": "-fsanitize=thread", "count": 1}
+          ],
+          "link": [
+            {"token": "-fno-omit-frame-pointer", "count": 2},
+            {"token": "-fsanitize=thread", "count": 2}
+          ],
+          "archive": [],
+          "generated": []
+        },
+        "projects": {}
+      }
+    },
+    "comparisons": [
+      {
+        "comparison_id": "core_release_asan_tsan",
+        "kind": "native_cross_profile",
+        "lane_ids": ["core_release", "core_asan_ubsan", "core_tsan"],
+        "target_owners": [
+          {"project_id": "manyforge_core", "target": "manyforge_content_identity"},
+          {"project_id": "manyforge_core", "target": "manyforge_core"}
+        ]
+      },
+      {
+        "comparison_id": "deployment_release_asan",
+        "kind": "native_cross_profile",
+        "lane_ids": ["deployment_release", "deployment_asan_ubsan"],
+        "target_owners": [
+          {"project_id": "manyforge_deployment", "target": "manyforge_build_qualified_admission_profile"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_content_identity"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_deployment"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_deployment_admission"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_deployment_canonical_package_generator"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_deployment_verification_core"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_emit_build_qualified_admission_profile"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_generate_canonical_empty_package"}
+        ]
+      },
+      {
+        "comparison_id": "binding_release_asan_tsan",
+        "kind": "binding_cross_profile",
+        "lane_ids": ["bindings_release", "bindings_asan_ubsan", "bindings_tsan"],
+        "target_owners": [
+          {"project_id": "manyforge_core", "target": "manyforge_content_identity"},
+          {"project_id": "manyforge_core", "target": "manyforge_core"},
+          {"project_id": "manyforge_core_py", "target": "manyforge_core_py"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_build_qualified_admission_profile"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_content_identity"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_deployment"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_deployment_admission"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_deployment_canonical_package_generator"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_deployment_verification_core"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_emit_build_qualified_admission_profile"},
+          {"project_id": "manyforge_deployment", "target": "manyforge_generate_canonical_empty_package"}
+        ]
+      },
+      {
+        "comparison_id": "roboplan_scene_asan_tsan",
+        "kind": "native_cross_profile",
+        "lane_ids": ["roboplan_asan_ubsan", "roboplan_tsan"],
+        "target_owners": [
+          {"project_id": "manyforge_roboplan", "target": "test_roboplan_scene_generation"},
+          {"project_id": "roboplan", "target": "filters"},
+          {"project_id": "roboplan", "target": "roboplan"},
+          {"project_id": "roboplan_example_models", "target": "roboplan_example_models"}
+        ]
+      },
+      {
+        "comparison_id": "roboplan_release_focused",
+        "kind": "native_same_profile_exact",
+        "lane_ids": ["roboplan_release", "roboplan_consumer_focused"],
+        "target_owners": [
+          {"project_id": "manyforge_roboplan", "target": "manyforge_content_identity"},
+          {"project_id": "manyforge_roboplan", "target": "manyforge_core"},
+          {"project_id": "manyforge_roboplan", "target": "manyforge_roboplan_native_runtime_support"},
+          {"project_id": "manyforge_roboplan", "target": "manyforge_roboplan_retained_consumer"}
+        ]
+      }
+    ]
+  },
+  "auxiliary_install_contract": {
+    "schema_version": "manyforge.composable_cell_i2.auxiliary_install_contract.v1",
+    "source_generation": {
+      "base_commit": "e06d1a2f1b749c38742aee9e401bbe97fa967f7b",
+      "base_tree": "d918767326a19d44886c0a4560cabe5a4ebe044d",
+      "patched_index_tree": "687405b677d50965c9ce5701016cb67c4579c563",
+      "staged_diff_sha256": "3505ad3d5d71bf738cb369658312eba7f1b67eeddce83037dafb0c2bb9ef00bf",
+      "staged_path_count": 24,
+      "staged_paths_sha256": "2f3cd1f83cd55709b9b8d2c68cd050c02a53e6f4dcd21ecf0d9a33c04b714f93"
+    },
+    "projects": {
+      "roboplan": {
+        "manifest": {
+          "row_count": 30,
+          "distinct_path_count": 29,
+          "relative_rows_sha256": "159843dd0929afd42c8546e71df16da6fb4c41c600ecc3482ffb40ae8d125316",
+          "repeated_relative_paths": [
+            {
+              "path": "lib/libroboplan.so",
+              "count": 2
+            }
+          ]
+        },
+        "source_copy_prefixes": [
+          {
+            "install_prefix": "include",
+            "source_prefix": "include"
+          },
+          {
+            "install_prefix": "lib/cmake/roboplan",
+            "source_prefix": "include/roboplan"
+          }
+        ],
+        "expected_source_copy_count": 23,
+        "generated_files": [
+          {
+            "install_relative_path": "lib/cmake/roboplan/roboplanConfig.cmake",
+            "build_relative_path": "roboplanConfig.cmake",
+            "producer_kind": "configure_package_config_file_final",
+            "cmake_source_relative_path": "CMakeLists.txt",
+            "template_source_relative_path": "cmake/roboplanConfig.cmake.in",
+            "required_logical_targets": []
+          },
+          {
+            "install_relative_path": "lib/cmake/roboplan/roboplanConfigVersion.cmake",
+            "build_relative_path": "roboplanConfigVersion.cmake",
+            "producer_kind": "write_basic_package_version_file",
+            "cmake_source_relative_path": "CMakeLists.txt",
+            "template_source_relative_path": null,
+            "required_logical_targets": []
+          },
+          {
+            "install_relative_path": "lib/cmake/roboplan/roboplanTargets-relwithdebinfo.cmake",
+            "build_relative_path": "CMakeFiles/Export/802f9a5bc7e8c130e177a9b6974ee268/roboplanTargets-relwithdebinfo.cmake",
+            "producer_kind": "install_export_configuration",
+            "cmake_source_relative_path": "CMakeLists.txt",
+            "template_source_relative_path": null,
+            "required_logical_targets": [
+              "roboplan::filters",
+              "roboplan::roboplan"
+            ]
+          },
+          {
+            "install_relative_path": "lib/cmake/roboplan/roboplanTargets.cmake",
+            "build_relative_path": "CMakeFiles/Export/802f9a5bc7e8c130e177a9b6974ee268/roboplanTargets.cmake",
+            "producer_kind": "install_export_main",
+            "cmake_source_relative_path": "CMakeLists.txt",
+            "template_source_relative_path": null,
+            "required_logical_targets": [
+              "roboplan::filters",
+              "roboplan::roboplan",
+              "roboplan::tl_expected"
+            ]
+          }
+        ],
+        "library_files": [
+          {
+            "install_relative_path": "lib/libfilters.so",
+            "target": "filters",
+            "type": "SHARED_LIBRARY",
+            "build_artifact_relative_path": "libfilters.so",
+            "required_sources": [
+              "src/filters/se3_low_pass_filter.cpp"
+            ]
+          },
+          {
+            "install_relative_path": "lib/libroboplan.so",
+            "target": "roboplan",
+            "type": "SHARED_LIBRARY",
+            "build_artifact_relative_path": "libroboplan.so",
+            "required_sources": [
+              "src/core/collision_context.cpp",
+              "src/core/path_utils.cpp",
+              "src/core/pose_utils.cpp",
+              "src/core/scene.cpp",
+              "src/core/scene_utils.cpp",
+              "src/core/types.cpp"
+            ]
+          }
+        ]
+      },
+      "roboplan_example_models": {
+        "manifest": {
+          "row_count": 208,
+          "distinct_path_count": 207,
+          "relative_rows_sha256": "9700f17d435d07147fd588af4b7de25944e056d59837cb46d5bfe3cf75d5299e",
+          "repeated_relative_paths": [
+            {
+              "path": "lib/libroboplan_example_models.so",
+              "count": 2
+            }
+          ]
+        },
+        "source_copy_prefixes": [
+          {
+            "install_prefix": "include",
+            "source_prefix": "include"
+          },
+          {
+            "install_prefix": "lib/cmake/roboplan_example_models",
+            "source_prefix": "include/roboplan_example_models"
+          },
+          {
+            "install_prefix": "share/roboplan_example_models/models",
+            "source_prefix": "models"
+          }
+        ],
+        "expected_source_copy_count": 202,
+        "generated_files": [
+          {
+            "install_relative_path": "lib/cmake/roboplan_example_models/roboplan_example_modelsConfig.cmake",
+            "build_relative_path": "roboplan_example_modelsConfig.cmake",
+            "producer_kind": "configure_package_config_file_final",
+            "cmake_source_relative_path": "CMakeLists.txt",
+            "template_source_relative_path": "cmake/roboplan_example_modelsConfig.cmake.in",
+            "required_logical_targets": []
+          },
+          {
+            "install_relative_path": "lib/cmake/roboplan_example_models/roboplan_example_modelsConfigVersion.cmake",
+            "build_relative_path": "roboplan_example_modelsConfigVersion.cmake",
+            "producer_kind": "write_basic_package_version_file",
+            "cmake_source_relative_path": "CMakeLists.txt",
+            "template_source_relative_path": null,
+            "required_logical_targets": []
+          },
+          {
+            "install_relative_path": "lib/cmake/roboplan_example_models/roboplan_example_modelsTargets-relwithdebinfo.cmake",
+            "build_relative_path": "CMakeFiles/Export/cbb5524d09ae10e1f14dff67b0727658/roboplan_example_modelsTargets-relwithdebinfo.cmake",
+            "producer_kind": "install_export_configuration",
+            "cmake_source_relative_path": "CMakeLists.txt",
+            "template_source_relative_path": null,
+            "required_logical_targets": [
+              "roboplan_example_models::roboplan_example_models"
+            ]
+          },
+          {
+            "install_relative_path": "lib/cmake/roboplan_example_models/roboplan_example_modelsTargets.cmake",
+            "build_relative_path": "CMakeFiles/Export/cbb5524d09ae10e1f14dff67b0727658/roboplan_example_modelsTargets.cmake",
+            "producer_kind": "install_export_main",
+            "cmake_source_relative_path": "CMakeLists.txt",
+            "template_source_relative_path": null,
+            "required_logical_targets": [
+              "roboplan_example_models::roboplan_example_models"
+            ]
+          }
+        ],
+        "library_files": [
+          {
+            "install_relative_path": "lib/libroboplan_example_models.so",
+            "target": "roboplan_example_models",
+            "type": "SHARED_LIBRARY",
+            "build_artifact_relative_path": "libroboplan_example_models.so",
+            "required_sources": [
+              "src/anchor.cpp",
+              "src/resources.cpp"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "production_release_parity_lanes": [
+    {
+      "production_lane_id": "core_production_release",
+      "project_id": "manyforge_core",
+      "test_enabled_release_lane_id": "core_release"
+    },
+    {
+      "production_lane_id": "deployment_production_release",
+      "project_id": "manyforge_deployment",
+      "test_enabled_release_lane_id": "deployment_release"
+    }
+  ],
+  "native_lane_target_partitions": {
+    "schema_version": "manyforge.composable_cell_i2.native_lane_target_partitions.v1",
+    "lanes": {
+      "c02_tail_focused_release": {
+        "production_targets": [
+          "manyforge_content_identity",
+          "manyforge_deployment",
+          "manyforge_deployment_verification_core"
+        ],
+        "test_only_targets": []
+      },
+      "core_asan_ubsan": {
+        "production_targets": [
+          "manyforge_content_identity",
+          "manyforge_core"
+        ],
+        "test_only_targets": [
+          "manyforge_planner_conformance_test_support",
+          "perf_kernel_event_pipeline",
+          "perf_soft_on_path_planner"
+        ]
+      },
+      "core_release": {
+        "production_targets": [
+          "manyforge_content_identity",
+          "manyforge_core"
+        ],
+        "test_only_targets": [
+          "manyforge_planner_conformance_test_support",
+          "perf_kernel_event_pipeline",
+          "perf_soft_on_path_planner"
+        ]
+      },
+      "core_tsan": {
+        "production_targets": [
+          "manyforge_content_identity",
+          "manyforge_core"
+        ],
+        "test_only_targets": [
+          "manyforge_planner_conformance_test_support",
+          "perf_kernel_event_pipeline",
+          "perf_soft_on_path_planner"
+        ]
+      },
+      "deployment_asan_ubsan": {
+        "production_targets": [
+          "manyforge_build_qualified_admission_profile",
+          "manyforge_content_identity",
+          "manyforge_deployment",
+          "manyforge_deployment_admission",
+          "manyforge_deployment_canonical_package_generator",
+          "manyforge_deployment_verification_core",
+          "manyforge_emit_build_qualified_admission_profile",
+          "manyforge_generate_canonical_empty_package"
+        ],
+        "test_only_targets": []
+      },
+      "deployment_release": {
+        "production_targets": [
+          "manyforge_build_qualified_admission_profile",
+          "manyforge_content_identity",
+          "manyforge_deployment",
+          "manyforge_deployment_admission",
+          "manyforge_deployment_canonical_package_generator",
+          "manyforge_deployment_verification_core",
+          "manyforge_emit_build_qualified_admission_profile",
+          "manyforge_generate_canonical_empty_package"
+        ],
+        "test_only_targets": []
+      },
+      "roboplan_asan_ubsan": {
+        "production_targets": [],
+        "test_only_targets": []
+      },
+      "roboplan_consumer_focused": {
+        "production_targets": [
+          "manyforge_content_identity",
+          "manyforge_core",
+          "manyforge_roboplan_native_runtime_support",
+          "manyforge_roboplan_retained_consumer"
+        ],
+        "test_only_targets": [
+          "generate_canonical_empty_product_package",
+          "generate_lite6_retained_consumer_fixture",
+          "generate_lite6_retained_consumer_product",
+          "manyforge_build_qualified_admission_profile",
+          "manyforge_deployment",
+          "manyforge_deployment_admission",
+          "manyforge_deployment_canonical_package_generator",
+          "manyforge_deployment_verification_core",
+          "manyforge_emit_build_qualified_admission_profile",
+          "manyforge_generate_canonical_empty_package",
+          "manyforge_roboplan_planning_contracts",
+          "manyforge_roboplan_planning_evidence",
+          "test_cartesian_planning_contract",
+          "test_joint_cap_contract",
+          "test_native_runtime_support",
+          "test_retained_planning_model_stage",
+          "test_roboplan_planner_options",
+          "test_roboplan_planning_qualification",
+          "test_roboplan_scene_generation"
+        ]
+      },
+      "roboplan_release": {
+        "production_targets": [
+          "manyforge_content_identity",
+          "manyforge_core",
+          "manyforge_roboplan_native_runtime_support",
+          "manyforge_roboplan_retained_consumer"
+        ],
+        "test_only_targets": [
+          "generate_canonical_empty_product_package",
+          "generate_lite6_retained_consumer_fixture",
+          "generate_lite6_retained_consumer_product",
+          "manyforge_build_qualified_admission_profile",
+          "manyforge_deployment",
+          "manyforge_deployment_admission",
+          "manyforge_deployment_canonical_package_generator",
+          "manyforge_deployment_verification_core",
+          "manyforge_emit_build_qualified_admission_profile",
+          "manyforge_generate_canonical_empty_package",
+          "manyforge_roboplan_planning_contracts",
+          "manyforge_roboplan_planning_evidence"
+        ]
+      },
+      "roboplan_tsan": {
+        "production_targets": [],
+        "test_only_targets": []
+      }
+    }
+  },
+  "utility_target_contracts": [
+    {
+      "consumer_relationships": [
+        {
+          "kind": "compiled_generated_input",
+          "target": "manyforge_deployment_admission"
+        },
+        {
+          "kind": "target_dependency",
+          "target": "manyforge_deployment_admission"
+        }
+      ],
+      "declared_byproduct_relative_paths": [],
+      "file_api_artifact_policy": "absent_for_utility",
+      "file_api_type": "UTILITY",
+      "generator_output_option": "--output",
+      "generator_output_relative_path": "generated/build_qualified_admission_profile_generated.hpp",
+      "housekeeping_policy": "make_output_parent",
+      "output_inventory_policy": "single_file",
+      "primary_output_relative_path": "generated/build_qualified_admission_profile_generated.hpp",
+      "producer_executable_artifact_relative_path": "manyforge_emit_build_qualified_admission_profile",
+      "producer_target": "manyforge_emit_build_qualified_admission_profile",
+      "project_id": "manyforge_deployment",
+      "target_name": "manyforge_build_qualified_admission_profile"
+    },
+    {
+      "consumer_relationships": [
+        {
+          "kind": "target_dependency",
+          "target": "test_retained_product_consumer"
+        }
+      ],
+      "declared_byproduct_relative_paths": [],
+      "file_api_artifact_policy": "absent_for_utility",
+      "file_api_type": "UTILITY",
+      "generator_output_option": "--output-root",
+      "generator_output_relative_path": "canonical_empty_product_package",
+      "housekeeping_policy": "replace_output_root",
+      "output_inventory_policy": "exact_bounded_tree",
+      "primary_output_relative_path": "canonical_empty_product_package/canonical-empty-admission.json",
+      "producer_executable_artifact_relative_path": "manyforge_deployment/manyforge_generate_canonical_empty_package",
+      "producer_target": "manyforge_generate_canonical_empty_package",
+      "project_id": "manyforge_roboplan",
+      "target_name": "generate_canonical_empty_product_package"
+    },
+    {
+      "consumer_relationships": [
+        {
+          "kind": "target_dependency",
+          "target": "test_retained_product_consumer"
+        }
+      ],
+      "declared_byproduct_relative_paths": [
+        "lite6_retained_consumer_fixture/retained-model.srdf",
+        "lite6_retained_consumer_fixture/retained-model.urdf"
+      ],
+      "file_api_artifact_policy": "absent_for_utility",
+      "file_api_type": "UTILITY",
+      "generator_output_option": "--output-root",
+      "generator_output_relative_path": "lite6_retained_consumer_fixture",
+      "housekeeping_policy": "replace_output_root",
+      "output_inventory_policy": "exact_bounded_tree",
+      "primary_output_relative_path": "lite6_retained_consumer_fixture/manifest.json",
+      "producer_executable_artifact_relative_path": "generate_lite6_retained_consumer_fixture",
+      "producer_target": "generate_lite6_retained_consumer_fixture",
+      "project_id": "manyforge_roboplan",
+      "target_name": "generate_lite6_retained_consumer_product"
+    },
+    {
+      "consumer_relationships": [
+        {
+          "kind": "compiled_generated_input",
+          "target": "manyforge_deployment_admission"
+        },
+        {
+          "kind": "target_dependency",
+          "target": "manyforge_deployment_admission"
+        }
+      ],
+      "declared_byproduct_relative_paths": [],
+      "file_api_artifact_policy": "absent_for_utility",
+      "file_api_type": "UTILITY",
+      "generator_output_option": "--output",
+      "generator_output_relative_path": "manyforge_deployment/generated/build_qualified_admission_profile_generated.hpp",
+      "housekeeping_policy": "make_output_parent",
+      "output_inventory_policy": "single_file",
+      "primary_output_relative_path": "manyforge_deployment/generated/build_qualified_admission_profile_generated.hpp",
+      "producer_executable_artifact_relative_path": "manyforge_deployment/manyforge_emit_build_qualified_admission_profile",
+      "producer_target": "manyforge_emit_build_qualified_admission_profile",
+      "project_id": "manyforge_roboplan",
+      "target_name": "manyforge_build_qualified_admission_profile"
+    }
+  ],
+  "projects": {
+    "manyforge_core": {
+      "schema_version": "manyforge.composable_cell_i2.production_target_contract.v1",
+      "project_id": "manyforge_core",
+      "source_root": "manyforge_core",
+      "targets": [
+        {
+          "artifact": "manyforge_content_identity/libmanyforge_content_identity.a",
+          "name": "manyforge_content_identity",
+          "required_sources": [
+            "manyforge_content_identity/src/canonical_value.cpp",
+            "manyforge_content_identity/src/content_identity.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "libmanyforge_core.a",
+          "name": "manyforge_core",
+          "required_sources": [
+            "manyforge_core/src/collision_policy_evaluator.cpp",
+            "manyforge_core/src/collision_validation_coordinator.cpp",
+            "manyforge_core/src/collision_world_snapshot_builder.cpp",
+            "manyforge_core/src/error_code_mapping.cpp",
+            "manyforge_core/src/execution_admission_support.cpp",
+            "manyforge_core/src/execution_collision_support.cpp",
+            "manyforge_core/src/execution_correlation_tracker.cpp",
+            "manyforge_core/src/execution_gripper_support.cpp",
+            "manyforge_core/src/execution_interrupt_support.cpp",
+            "manyforge_core/src/execution_kernel.cpp",
+            "manyforge_core/src/execution_progress_publication.cpp",
+            "manyforge_core/src/execution_recovery_support.cpp",
+            "manyforge_core/src/execution_snapshot_publisher.cpp",
+            "manyforge_core/src/execution_stop_support.cpp",
+            "manyforge_core/src/execution_worker_signals.cpp",
+            "manyforge_core/src/interrupt_manager.cpp",
+            "manyforge_core/src/kernel_event_factories.cpp",
+            "manyforge_core/src/kernel_event_publisher.cpp",
+            "manyforge_core/src/kernel_flight_recorder.cpp",
+            "manyforge_core/src/logical_scene_identity_internal.cpp",
+            "manyforge_core/src/motion_target_resolution.cpp",
+            "manyforge_core/src/motion_trip_stop_coordinator.cpp",
+            "manyforge_core/src/observed_robot_state_provider.cpp",
+            "manyforge_core/src/observed_robot_state_publication.cpp",
+            "manyforge_core/src/operator_stop_worker.cpp",
+            "manyforge_core/src/ordered_contact_validation.cpp",
+            "manyforge_core/src/parallel_collision_validation_worker_pool.cpp",
+            "manyforge_core/src/pose_math.cpp",
+            "manyforge_core/src/runtime_collision_lookahead_session.cpp",
+            "manyforge_core/src/runtime_collision_monitor.cpp",
+            "manyforge_core/src/runtime_collision_query_session.cpp",
+            "manyforge_core/src/scene_snapshot_lease.cpp",
+            "manyforge_core/src/soft_on_path_stop_planner.cpp",
+            "manyforge_core/src/state_machine.cpp",
+            "manyforge_core/src/stop_policy.cpp",
+            "manyforge_core/src/terminal_committer.cpp",
+            "manyforge_core/src/trajectory_cache.cpp",
+            "manyforge_core/src/trajectory_cache_compatibility.cpp",
+            "manyforge_core/src/trajectory_cache_intent.cpp",
+            "manyforge_core/src/trajectory_progress_projection.cpp",
+            "manyforge_core/src/trajectory_sampler.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        }
+      ],
+      "test_only_targets": [
+        {
+          "artifact": "libmanyforge_planner_conformance_test_support.a",
+          "name": "manyforge_planner_conformance_test_support",
+          "required_sources": [
+            "manyforge_core/test_support/src/planner_backend_conformance.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "perf_kernel_event_pipeline",
+          "name": "perf_kernel_event_pipeline",
+          "required_sources": [
+            "manyforge_core/test/perf/perf_kernel_event_pipeline.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "perf_soft_on_path_planner",
+          "name": "perf_soft_on_path_planner",
+          "required_sources": [
+            "manyforge_core/test/perf/perf_soft_on_path_planner.cpp"
+          ],
+          "type": "EXECUTABLE"
+        }
+      ]
+    },
+    "manyforge_deployment": {
+      "schema_version": "manyforge.composable_cell_i2.production_target_contract.v1",
+      "project_id": "manyforge_deployment",
+      "source_root": "manyforge_deployment",
+      "targets": [
+        {
+          "artifact": "generated/build_qualified_admission_profile_generated.hpp",
+          "name": "manyforge_build_qualified_admission_profile",
+          "required_sources": [],
+          "type": "UTILITY"
+        },
+        {
+          "artifact": "manyforge_content_identity/libmanyforge_content_identity.a",
+          "name": "manyforge_content_identity",
+          "required_sources": [
+            "manyforge_content_identity/src/canonical_value.cpp",
+            "manyforge_content_identity/src/content_identity.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "libmanyforge_deployment.a",
+          "name": "manyforge_deployment",
+          "required_sources": [
+            "manyforge_deployment/src/build_manifest.cpp",
+            "manyforge_deployment/src/build_manifest_repository.cpp",
+            "manyforge_deployment/src/capability_definition_codec.cpp",
+            "manyforge_deployment/src/cell_applicability.cpp",
+            "manyforge_deployment/src/cell_compiler.cpp",
+            "manyforge_deployment/src/cell_composition.cpp",
+            "manyforge_deployment/src/cell_structure.cpp",
+            "manyforge_deployment/src/component_type_codec.cpp",
+            "manyforge_deployment/src/composed_model_symbol_role_map_internal.cpp",
+            "manyforge_deployment/src/control_interface_contract_codec.cpp",
+            "manyforge_deployment/src/controller_topology_codec.cpp",
+            "manyforge_deployment/src/mf2_joint_name_internal.cpp",
+            "manyforge_deployment/src/posix_durability_internal.cpp",
+            "manyforge_deployment/src/provider_manifest_codec.cpp",
+            "manyforge_deployment/src/retained_bundle.cpp",
+            "manyforge_deployment/src/retained_bundle_materializer.cpp",
+            "manyforge_deployment/src/retained_bundle_store.cpp",
+            "manyforge_deployment/src/retention_qualified_deployment.cpp",
+            "manyforge_deployment/src/runtime_profile_codec.cpp",
+            "manyforge_deployment/src/site_overlay_resolution.cpp",
+            "manyforge_deployment/src/stop_evidence_policy_codec.cpp",
+            "manyforge_deployment/src/structural_model_preparation.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "libmanyforge_deployment_admission.a",
+          "name": "manyforge_deployment_admission",
+          "required_generated_sources": [
+            "generated/build_qualified_admission_profile_generated.hpp"
+          ],
+          "required_sources": [
+            "manyforge_deployment/src/build_qualified_admission_profile.cpp",
+            "manyforge_deployment/src/canonical_empty_admission.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "libmanyforge_deployment_canonical_package_generator.a",
+          "name": "manyforge_deployment_canonical_package_generator",
+          "required_sources": [
+            "manyforge_deployment/src/canonical_empty_package_generator.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "libmanyforge_deployment_verification_core.a",
+          "name": "manyforge_deployment_verification_core",
+          "required_sources": [
+            "manyforge_deployment/src/artifact_codec.cpp",
+            "manyforge_deployment/src/cell_graph_codec.cpp",
+            "manyforge_deployment/src/closed_schema.cpp",
+            "manyforge_deployment/src/composed_model_symbol_role_map_verifier.cpp",
+            "manyforge_deployment/src/content_identity.cpp",
+            "manyforge_deployment/src/deployment_applicability_codec.cpp",
+            "manyforge_deployment/src/deployment_artifact_codec.cpp",
+            "manyforge_deployment/src/deployment_catalog_codec.cpp",
+            "manyforge_deployment/src/model_asset_codec.cpp",
+            "manyforge_deployment/src/model_source.cpp",
+            "manyforge_deployment/src/planning_resource_map_internal.cpp",
+            "manyforge_deployment/src/posix_read_only_internal.cpp",
+            "manyforge_deployment/src/verified_retained_bundle.cpp",
+            "manyforge_deployment/src/verified_retained_bundle_store.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "manyforge_emit_build_qualified_admission_profile",
+          "name": "manyforge_emit_build_qualified_admission_profile",
+          "required_sources": [
+            "manyforge_deployment/tools/emit_build_qualified_admission_profile.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "manyforge_generate_canonical_empty_package",
+          "name": "manyforge_generate_canonical_empty_package",
+          "required_sources": [
+            "manyforge_deployment/tools/generate_canonical_empty_package.cpp"
+          ],
+          "type": "EXECUTABLE"
+        }
+      ],
+      "test_only_targets": []
+    },
+    "manyforge_roboplan": {
+      "schema_version": "manyforge.composable_cell_i2.production_target_contract.v1",
+      "project_id": "manyforge_roboplan",
+      "source_root": "manyforge_roboplan",
+      "targets": [
+        {
+          "artifact": "manyforge_core/manyforge_content_identity/libmanyforge_content_identity.a",
+          "name": "manyforge_content_identity",
+          "required_sources": [
+            "manyforge_content_identity/src/canonical_value.cpp",
+            "manyforge_content_identity/src/content_identity.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "manyforge_core/libmanyforge_core.a",
+          "name": "manyforge_core",
+          "required_sources": [
+            "manyforge_core/src/collision_policy_evaluator.cpp",
+            "manyforge_core/src/collision_validation_coordinator.cpp",
+            "manyforge_core/src/collision_world_snapshot_builder.cpp",
+            "manyforge_core/src/error_code_mapping.cpp",
+            "manyforge_core/src/execution_admission_support.cpp",
+            "manyforge_core/src/execution_collision_support.cpp",
+            "manyforge_core/src/execution_correlation_tracker.cpp",
+            "manyforge_core/src/execution_gripper_support.cpp",
+            "manyforge_core/src/execution_interrupt_support.cpp",
+            "manyforge_core/src/execution_kernel.cpp",
+            "manyforge_core/src/execution_progress_publication.cpp",
+            "manyforge_core/src/execution_recovery_support.cpp",
+            "manyforge_core/src/execution_snapshot_publisher.cpp",
+            "manyforge_core/src/execution_stop_support.cpp",
+            "manyforge_core/src/execution_worker_signals.cpp",
+            "manyforge_core/src/interrupt_manager.cpp",
+            "manyforge_core/src/kernel_event_factories.cpp",
+            "manyforge_core/src/kernel_event_publisher.cpp",
+            "manyforge_core/src/kernel_flight_recorder.cpp",
+            "manyforge_core/src/logical_scene_identity_internal.cpp",
+            "manyforge_core/src/motion_target_resolution.cpp",
+            "manyforge_core/src/motion_trip_stop_coordinator.cpp",
+            "manyforge_core/src/observed_robot_state_provider.cpp",
+            "manyforge_core/src/observed_robot_state_publication.cpp",
+            "manyforge_core/src/operator_stop_worker.cpp",
+            "manyforge_core/src/ordered_contact_validation.cpp",
+            "manyforge_core/src/parallel_collision_validation_worker_pool.cpp",
+            "manyforge_core/src/pose_math.cpp",
+            "manyforge_core/src/runtime_collision_lookahead_session.cpp",
+            "manyforge_core/src/runtime_collision_monitor.cpp",
+            "manyforge_core/src/runtime_collision_query_session.cpp",
+            "manyforge_core/src/scene_snapshot_lease.cpp",
+            "manyforge_core/src/soft_on_path_stop_planner.cpp",
+            "manyforge_core/src/state_machine.cpp",
+            "manyforge_core/src/stop_policy.cpp",
+            "manyforge_core/src/terminal_committer.cpp",
+            "manyforge_core/src/trajectory_cache.cpp",
+            "manyforge_core/src/trajectory_cache_compatibility.cpp",
+            "manyforge_core/src/trajectory_cache_intent.cpp",
+            "manyforge_core/src/trajectory_progress_projection.cpp",
+            "manyforge_core/src/trajectory_sampler.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "libmanyforge_roboplan_native_runtime_support.a",
+          "name": "manyforge_roboplan_native_runtime_support",
+          "required_sources": [
+            "manyforge_roboplan/src/native_runtime_support.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "libmanyforge_roboplan_retained_consumer.a",
+          "name": "manyforge_roboplan_retained_consumer",
+          "required_sources": [
+            "manyforge_roboplan/src/retained_planning_model_stage.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        }
+      ],
+      "test_only_targets": [
+        {
+          "artifact": "canonical_empty_product_package/canonical-empty-admission.json",
+          "name": "generate_canonical_empty_product_package",
+          "type": "UTILITY"
+        },
+        {
+          "artifact": "generate_lite6_retained_consumer_fixture",
+          "name": "generate_lite6_retained_consumer_fixture",
+          "required_sources": [
+            "manyforge_deployment/test/generate_lite6_retained_consumer_fixture.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "lite6_retained_consumer_fixture/manifest.json",
+          "name": "generate_lite6_retained_consumer_product",
+          "type": "UTILITY"
+        },
+        {
+          "artifact": "manyforge_deployment/generated/build_qualified_admission_profile_generated.hpp",
+          "name": "manyforge_build_qualified_admission_profile",
+          "type": "UTILITY"
+        },
+        {
+          "artifact": "manyforge_deployment/libmanyforge_deployment.a",
+          "name": "manyforge_deployment",
+          "required_sources": [
+            "manyforge_deployment/src/build_manifest.cpp",
+            "manyforge_deployment/src/build_manifest_repository.cpp",
+            "manyforge_deployment/src/capability_definition_codec.cpp",
+            "manyforge_deployment/src/cell_applicability.cpp",
+            "manyforge_deployment/src/cell_compiler.cpp",
+            "manyforge_deployment/src/cell_composition.cpp",
+            "manyforge_deployment/src/cell_structure.cpp",
+            "manyforge_deployment/src/component_type_codec.cpp",
+            "manyforge_deployment/src/composed_model_symbol_role_map_internal.cpp",
+            "manyforge_deployment/src/control_interface_contract_codec.cpp",
+            "manyforge_deployment/src/controller_topology_codec.cpp",
+            "manyforge_deployment/src/mf2_joint_name_internal.cpp",
+            "manyforge_deployment/src/posix_durability_internal.cpp",
+            "manyforge_deployment/src/provider_manifest_codec.cpp",
+            "manyforge_deployment/src/retained_bundle.cpp",
+            "manyforge_deployment/src/retained_bundle_materializer.cpp",
+            "manyforge_deployment/src/retained_bundle_store.cpp",
+            "manyforge_deployment/src/retention_qualified_deployment.cpp",
+            "manyforge_deployment/src/runtime_profile_codec.cpp",
+            "manyforge_deployment/src/site_overlay_resolution.cpp",
+            "manyforge_deployment/src/stop_evidence_policy_codec.cpp",
+            "manyforge_deployment/src/structural_model_preparation.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "manyforge_deployment/libmanyforge_deployment_admission.a",
+          "name": "manyforge_deployment_admission",
+          "required_generated_sources": [
+            "manyforge_deployment/generated/build_qualified_admission_profile_generated.hpp"
+          ],
+          "required_sources": [
+            "manyforge_deployment/src/build_qualified_admission_profile.cpp",
+            "manyforge_deployment/src/canonical_empty_admission.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "manyforge_deployment/libmanyforge_deployment_canonical_package_generator.a",
+          "name": "manyforge_deployment_canonical_package_generator",
+          "required_sources": [
+            "manyforge_deployment/src/canonical_empty_package_generator.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "manyforge_deployment/libmanyforge_deployment_verification_core.a",
+          "name": "manyforge_deployment_verification_core",
+          "required_sources": [
+            "manyforge_deployment/src/artifact_codec.cpp",
+            "manyforge_deployment/src/cell_graph_codec.cpp",
+            "manyforge_deployment/src/closed_schema.cpp",
+            "manyforge_deployment/src/composed_model_symbol_role_map_verifier.cpp",
+            "manyforge_deployment/src/content_identity.cpp",
+            "manyforge_deployment/src/deployment_applicability_codec.cpp",
+            "manyforge_deployment/src/deployment_artifact_codec.cpp",
+            "manyforge_deployment/src/deployment_catalog_codec.cpp",
+            "manyforge_deployment/src/model_asset_codec.cpp",
+            "manyforge_deployment/src/model_source.cpp",
+            "manyforge_deployment/src/planning_resource_map_internal.cpp",
+            "manyforge_deployment/src/posix_read_only_internal.cpp",
+            "manyforge_deployment/src/verified_retained_bundle.cpp",
+            "manyforge_deployment/src/verified_retained_bundle_store.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "manyforge_deployment/manyforge_emit_build_qualified_admission_profile",
+          "name": "manyforge_emit_build_qualified_admission_profile",
+          "required_sources": [
+            "manyforge_deployment/tools/emit_build_qualified_admission_profile.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "manyforge_deployment/manyforge_generate_canonical_empty_package",
+          "name": "manyforge_generate_canonical_empty_package",
+          "required_sources": [
+            "manyforge_deployment/tools/generate_canonical_empty_package.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "libmanyforge_roboplan_planning_contracts.a",
+          "name": "manyforge_roboplan_planning_contracts",
+          "required_sources": [
+            "manyforge_roboplan/src/cartesian_planning_contract.cpp",
+            "manyforge_roboplan/src/joint_cap_contract.cpp",
+            "manyforge_roboplan/src/roboplan_cartesian_trajectory_dynamics.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "libmanyforge_roboplan_planning_evidence.a",
+          "name": "manyforge_roboplan_planning_evidence",
+          "required_sources": [
+            "manyforge_roboplan/src/roboplan_planning_qualification.cpp"
+          ],
+          "type": "STATIC_LIBRARY"
+        },
+        {
+          "artifact": "test_cartesian_planning_contract",
+          "name": "test_cartesian_planning_contract",
+          "required_sources": [
+            "manyforge_roboplan/test/test_cartesian_planning_contract.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "test_joint_cap_contract",
+          "name": "test_joint_cap_contract",
+          "required_sources": [
+            "manyforge_roboplan/test/test_joint_cap_contract.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "test_native_runtime_support",
+          "name": "test_native_runtime_support",
+          "required_sources": [
+            "manyforge_roboplan/test/test_native_runtime_support.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "test_retained_planning_model_stage",
+          "name": "test_retained_planning_model_stage",
+          "required_sources": [
+            "manyforge_roboplan/test/test_retained_planning_model_stage.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "test_retained_product_consumer",
+          "name": "test_retained_product_consumer",
+          "required_sources": [
+            "manyforge_roboplan/test/test_retained_product_consumer.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "test_roboplan_planner_options",
+          "name": "test_roboplan_planner_options",
+          "required_sources": [
+            "manyforge_roboplan/test/test_roboplan_planner_options.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "test_roboplan_planning_qualification",
+          "name": "test_roboplan_planning_qualification",
+          "required_sources": [
+            "manyforge_roboplan/test/test_roboplan_planning_qualification.cpp"
+          ],
+          "type": "EXECUTABLE"
+        },
+        {
+          "artifact": "test_roboplan_scene_generation",
+          "name": "test_roboplan_scene_generation",
+          "required_sources": [
+            "manyforge_roboplan/test/test_roboplan_scene_generation.cpp"
+          ],
+          "type": "EXECUTABLE"
+        }
+      ]
+    }
+  },
+  "binding_build_contract": {
+    "artifact": "manyforge_core_py.cpython-312-x86_64-linux-gnu.so",
+    "dependency_projects": {
+      "manyforge_core": {
+        "build_testing_cache_key": "BUILD_TESTING",
+        "module_linked_archive_targets": [
+          "manyforge_content_identity",
+          "manyforge_core"
+        ],
+        "production_catalog_project_id": "manyforge_core",
+        "production_targets_source": "shared_projects_catalog",
+        "source_root": "manyforge_core"
+      },
+      "manyforge_deployment": {
+        "build_testing_cache_key": "BUILD_TESTING",
+        "module_linked_archive_targets": [
+          "manyforge_deployment",
+          "manyforge_deployment_verification_core"
+        ],
+        "production_catalog_project_id": "manyforge_deployment",
+        "production_targets_source": "shared_projects_catalog",
+        "source_root": "manyforge_deployment"
+      }
+    },
+    "schema_version": "manyforge.composable_cell_i2.binding_build_contract.v1",
+    "source_root": "manyforge_core/python"
+  },
+  "binding_builder_constraints": {
+    "schema_version": "manyforge.composable_cell_i2.binding_builder_constraints.v1",
+    "build_recipe": "manyforge_core/python/CMakeLists.txt",
+    "framework": "pybind11",
+    "pybind11_build_provenance": {
+      "include_root": "/usr/local/lib/python3.12/site-packages/pybind11/include",
+      "required_public_headers": [
+        {
+          "path": "/usr/local/lib/python3.12/site-packages/pybind11/include/pybind11/pybind11.h",
+          "sha256": "8171c8ee463f7f5bdb8655ef6eb6aa8e8c34d18b74bb5e07d3e259149dc526ad"
+        }
+      ],
+      "version": "3.0.3"
+    },
+    "production_modules": [
+      "manyforge_core_py"
+    ],
+    "forbidden_production_modules": [
+      "e0_nanobind",
+      "e0_pybind",
+      "manyforge_roboplan_py"
+    ],
+    "target": {
+      "artifact_relative_path": "manyforge_core_py.cpython-312-x86_64-linux-gnu.so",
+      "file_api_type": "MODULE_LIBRARY",
+      "name": "manyforge_core_py",
+      "required_header_dependencies": [
+        "manyforge_core/python/binding_registrations.hpp"
+      ],
+      "required_translation_units": [
+        "manyforge_core/python/bindings.cpp",
+        "manyforge_core/python/bindings_catalog.cpp",
+        "manyforge_core/python/bindings_cell_graph.cpp",
+        "manyforge_core/python/bindings_component_type.cpp",
+        "manyforge_core/python/bindings_deployment.cpp",
+        "manyforge_core/python/bindings_model_compiler.cpp",
+        "manyforge_core/python/bindings_strong_identity.cpp"
+      ],
+      "required_upstream_archive_owners": [
+        {
+          "project_id": "manyforge_core",
+          "target": "manyforge_content_identity"
+        },
+        {
+          "project_id": "manyforge_core",
+          "target": "manyforge_core"
+        },
+        {
+          "project_id": "manyforge_deployment",
+          "target": "manyforge_deployment"
+        },
+        {
+          "project_id": "manyforge_deployment",
+          "target": "manyforge_deployment_verification_core"
+        }
+      ]
+    },
+    "cpython_abi": {
+      "extension_suffix": ".cpython-312-x86_64-linux-gnu.so",
+      "implementation": "CPython",
+      "major_minor": "3.12",
+      "module_filename": "manyforge_core_py.cpython-312-x86_64-linux-gnu.so",
+      "required_exported_pyinit_symbols": [
+        "PyInit_manyforge_core_py"
+      ],
+      "soabi": "cpython-312-x86_64-linux-gnu"
+    },
+    "lanes": [
+      {
+        "configuration": "Release",
+        "lane_id": "bindings_release",
+        "sanitizer_profile": "none",
+        "required_sanitizers": []
+      },
+      {
+        "configuration": "Release",
+        "lane_id": "bindings_selector",
+        "sanitizer_profile": "none",
+        "required_sanitizers": []
+      },
+      {
+        "configuration": "RelWithDebInfo",
+        "lane_id": "bindings_asan_ubsan",
+        "sanitizer_profile": "address+undefined",
+        "required_sanitizers": [
+          "address",
+          "undefined"
+        ]
+      },
+      {
+        "configuration": "RelWithDebInfo",
+        "lane_id": "bindings_tsan",
+        "sanitizer_profile": "thread",
+        "required_sanitizers": [
+          "thread"
+        ]
+      }
+    ],
+    "forbidden_ros_or_roboplan_dependency_or_export_tokens": [
+      "ament",
+      "coal",
+      "control_msgs",
+      "controller_manager",
+      "gazebo",
+      "geometry_msgs",
+      "ignition",
+      "isaac",
+      "launch_ros",
+      "manyforge_roboplan",
+      "moveit",
+      "pinocchio",
+      "rcl",
+      "roboplan",
+      "ros",
+      "ros2",
+      "sensor_msgs",
+      "std_msgs",
+      "tf2",
+      "xarm"
+    ],
+    "forbidden_python_module_exports": [
+      "manyforge_roboplan_py"
+    ]
+  }
+}

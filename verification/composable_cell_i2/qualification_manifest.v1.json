@@ -1,0 +1,1656 @@
+{
+  "schema_version": "manyforge.composable_cell_i2.qualification_manifest.v1",
+  "status": "preimplementation_freeze_packet",
+  "implementation_base": {
+    "manyforge": {
+      "repository_path": ".",
+      "source_identity": {
+        "schema_version": "manyforge.source_identity.v1",
+        "head_commit": "9252769feb7e57a054bb2e7b6067325758d0d09a",
+        "head_tree": "6b582fc5a1bb6c37ec8bba8f01bd5bf2020e04c9",
+        "dirty": false,
+        "delta_sha256": "231be27a2a9546fef3543a3b9db4ebc12e6e654872be7babff59dd4147ab17c6",
+        "fingerprint_sha256": "6af345f64d3e549f23c4bffc466b647ee1992d9e00960fb9188d8b4c3763acbc"
+      }
+    },
+    "manyforge_specs": {
+      "repository_path": "../manyforge_specs",
+      "source_identity": {
+        "schema_version": "manyforge.source_identity.v1",
+        "head_commit": "38a11788503bae33cf536fa3e54b2837f05eefd4",
+        "head_tree": "2212f526c052b4b0d08aa37e7565e9d3987227a7",
+        "dirty": false,
+        "delta_sha256": "231be27a2a9546fef3543a3b9db4ebc12e6e654872be7babff59dd4147ab17c6",
+        "fingerprint_sha256": "ab59fedb7fb97698dc45436a7f399e3f077b9d5aeda6939d64f4d2197e38751f"
+      }
+    }
+  },
+  "packet_freeze_contract": {
+    "implementation_base_commit": "9252769feb7e57a054bb2e7b6067325758d0d09a",
+    "new_packet_paths": [
+      "scripts/ci/run-composable-cell-i2-core-asan.sh",
+      "scripts/ci/run-composable-cell-i2-core-tsan.sh",
+      "scripts/ci/run-composable-cell-i2-deployment-asan.sh",
+      "scripts/ci/run-composable-cell-i2-native-evidence.py",
+      "scripts/ci/run-composable-cell-i2-qualification.sh",
+      "scripts/ci/run-composable-cell-i2-roboplan-scene-sanitizer.sh",
+      "tests/test_composable_cell_i2_build_provenance.py",
+      "tests/test_composable_cell_i2_qualification_manifest.py",
+      "verification/composable_cell_i2/README.md",
+      "verification/composable_cell_i2/adversarial_review_template.v1.json",
+      "verification/composable_cell_i2/baseline_test_inventory.v1.json",
+      "verification/composable_cell_i2/binding_contract_tests.py",
+      "verification/composable_cell_i2/build_provenance_contract.v1.json",
+      "verification/composable_cell_i2/native_build_provenance.py",
+      "verification/composable_cell_i2/native_target_contract.v1.json",
+      "verification/composable_cell_i2/qualification_manifest.v1.json",
+      "verification/composable_cell_i2/verify_qualification_manifest.py"
+    ],
+    "existing_packet_paths": [
+      "scripts/ci/tsan.supp",
+      "scripts/qualification/source_identity.py"
+    ],
+    "packet_paths": [
+      "scripts/ci/run-composable-cell-i2-core-asan.sh",
+      "scripts/ci/run-composable-cell-i2-core-tsan.sh",
+      "scripts/ci/run-composable-cell-i2-deployment-asan.sh",
+      "scripts/ci/run-composable-cell-i2-native-evidence.py",
+      "scripts/ci/run-composable-cell-i2-qualification.sh",
+      "scripts/ci/run-composable-cell-i2-roboplan-scene-sanitizer.sh",
+      "scripts/ci/tsan.supp",
+      "scripts/qualification/source_identity.py",
+      "tests/test_composable_cell_i2_build_provenance.py",
+      "tests/test_composable_cell_i2_qualification_manifest.py",
+      "verification/composable_cell_i2/README.md",
+      "verification/composable_cell_i2/adversarial_review_template.v1.json",
+      "verification/composable_cell_i2/baseline_test_inventory.v1.json",
+      "verification/composable_cell_i2/binding_contract_tests.py",
+      "verification/composable_cell_i2/build_provenance_contract.v1.json",
+      "verification/composable_cell_i2/native_build_provenance.py",
+      "verification/composable_cell_i2/native_target_contract.v1.json",
+      "verification/composable_cell_i2/qualification_manifest.v1.json",
+      "verification/composable_cell_i2/verify_qualification_manifest.py"
+    ],
+    "one_shared_first_add_commit": true,
+    "freeze_commit_directly_follows_implementation_base": true,
+    "freeze_commit_contains_only_packet_changes": true,
+    "existing_paths_bound_to_base_and_freeze": true,
+    "blob_and_mode_immutable_after_freeze": true,
+    "external_anchor_path": "../manyforge_specs/docs/plans/COMPOSABLE_CELL_RUNTIME_IMPLEMENTATION_PLAN.md",
+    "external_anchor_prefix": "I2 qualification packet freeze commit:"
+  },
+  "candidate_identity": {
+    "capture_tool": "scripts/qualification/source_identity.py",
+    "require_clean_committed_manyforge_tree": true,
+    "require_clean_committed_specs_tree": true,
+    "capture_before_first_lane": true,
+    "recheck_after_last_lane": true,
+    "require_unchanged_fingerprint": true,
+    "note": "The implementation base is immutable history. Every qualification run records its own candidate commit, tree, delta and fingerprint."
+  },
+  "qualification_environment": {
+    "image": {
+      "id": "sha256:9dcf29cd84e7df0c9539a0edb872afce6b3bcf2b4da62ea57731f7bfba4f7c1c",
+      "os": "linux",
+      "architecture": "amd64",
+      "platform": "linux/amd64"
+    },
+    "docker_prefix": [
+      "docker",
+      "run",
+      "--rm",
+      "--init",
+      "--user",
+      "{host_uid}:{host_gid}",
+      "--platform",
+      "linux/amd64",
+      "--network",
+      "none",
+      "--security-opt",
+      "seccomp=unconfined",
+      "--mount",
+      "type=bind,src={repository_root},dst=/workspace,readonly",
+      "--mount",
+      "type=bind,src={output_root},dst=/qualification-output",
+      "--workdir",
+      "/workspace",
+      "{image_id}"
+    ],
+    "machine": "x86_64",
+    "address_bits": 64,
+    "glibc": "2.36",
+    "cmake": "3.25.1",
+    "ninja": "1.11.1",
+    "cxx_compiler": "g++ (Debian 12.2.0-14+deb12u1) 12.2.0",
+    "production_build": {
+      "generator": "Ninja",
+      "configuration": "Release",
+      "cxx_standard": 20,
+      "single_configuration": true
+    },
+    "sanitizer_builds": [
+      "address+undefined",
+      "thread"
+    ],
+    "python": {
+      "implementation": "CPython",
+      "version": "3.12.13",
+      "cache_tag": "cpython-312",
+      "soabi": "cpython-312-x86_64-linux-gnu",
+      "extension_suffix": ".cpython-312-x86_64-linux-gnu.so",
+      "multiarch": "x86_64-linux-gnu",
+      "py_debug": false,
+      "gil_disabled": false
+    },
+    "pybind11": {
+      "version": "3.0.3",
+      "cmake_dir": "/usr/local/lib/python3.12/site-packages/pybind11/share/cmake/pybind11"
+    }
+  },
+  "binding_contract": {
+    "production_modules": [
+      "manyforge_core_py"
+    ],
+    "forbidden_production_modules": [
+      "manyforge_roboplan_py",
+      "e0_nanobind",
+      "e0_pybind"
+    ],
+    "framework": "pybind11",
+    "registration_units": [
+      "manyforge_core/python/bindings.cpp",
+      "manyforge_core/python/bindings_catalog.cpp",
+      "manyforge_core/python/bindings_cell_graph.cpp",
+      "manyforge_core/python/bindings_component_type.cpp",
+      "manyforge_core/python/bindings_deployment.cpp",
+      "manyforge_core/python/bindings_model_compiler.cpp",
+      "manyforge_core/python/bindings_strong_identity.cpp",
+      "manyforge_core/python/binding_registrations.hpp"
+    ],
+    "build_contract": "manyforge_core/python/CMakeLists.txt",
+    "closure_integration": {
+      "must_update": [
+        "scripts/test-all.sh",
+        ".github/workflows/python-tests.yml",
+        "README.md"
+      ],
+      "must_add": [
+        "scripts/ci/run-core-bindings.sh",
+        "scripts/ci/run-core-bindings-sanitizer.sh",
+        "scripts/ci/run-core-bindings-contract.sh",
+        "scripts/ci/run-composable-cell-i2-determinism.sh"
+      ]
+    },
+    "existing_test_files": [
+      "manyforge_core/python/tests/test_bindings_smoke.py",
+      "manyforge_core/python/tests/test_collision_bindings.py",
+      "manyforge_core/python/tests/test_component_type_bindings.py",
+      "manyforge_core/python/tests/test_composable_cell_bindings.py",
+      "manyforge_core/python/tests/test_controller_topology_bindings.py",
+      "manyforge_core/python/tests/test_model_asset_bindings.py",
+      "manyforge_core/python/tests/test_model_compiler_bindings.py",
+      "manyforge_core/python/tests/test_provider_manifest_bindings.py",
+      "manyforge_core/python/tests/test_runtime_profile_bindings.py"
+    ],
+    "generated_outputs": [
+      {
+        "role": "extension",
+        "path": "/qualification-output/generated/manyforge_core_py.cpython-312-x86_64-linux-gnu.so"
+      },
+      {
+        "role": "typed_stub",
+        "path": "/qualification-output/generated/manyforge_core_py.pyi"
+      },
+      {
+        "role": "api_inventory",
+        "path": "/qualification-output/generated/manyforge_core_py.api.json"
+      },
+      {
+        "role": "api_documentation",
+        "path": "/qualification-output/generated/manyforge_core_py-api.md"
+      }
+    ],
+    "generated_api_contract": {
+      "schema_version": "manyforge.composable_cell_i2.binding_api_inventory.v1",
+      "required_read_only_nonconstructible_exports": [
+        "GraphRevisionVerifiedCellGraph",
+        "VerifiedModelSourceArtifact",
+        "SourceVerifiedModelAsset",
+        "CompositionQualifiedCellIr",
+        "ApplicabilityQualifiedCellIr",
+        "CompilerQualifiedCellIr"
+      ],
+      "forbidden_exports": [
+        "StructurallyQualifiedCellGraph",
+        "TrustedCellGraph",
+        "TrustedCellGraphCandidate",
+        "ParsedModelSourceIr",
+        "ParsedUrdfJoint",
+        "ParsedUrdfJointType",
+        "ParsedSrdfChain",
+        "ParsedSrdfDisabledCollision",
+        "ParsedSrdfEndEffector",
+        "ParsedSrdfGroup",
+        "ParsedSrdfGroupState",
+        "ParsedSrdfGroupStateJoint"
+      ]
+    },
+    "required_final_cases": [
+      "ros_free_import_and_sole_module_inventory",
+      "cpp_python_field_enum_default_ordering_and_error_parity",
+      "final_compiler_projection_nonconstructible_and_read_only",
+      "all_trusted_predecessor_projections_nonconstructible_and_read_only",
+      "detached_predecessor_and_final_value_lifetime",
+      "blocking_compile_releases_gil_with_progress_witness",
+      "concurrent_pure_compiles_are_deterministic",
+      "exception_translation_after_released_gil",
+      "repeated_fresh_interpreter_import_use_and_clean_shutdown",
+      "generated_stub_inventory_and_documentation_parity",
+      "complete_forbidden_surface_absence"
+    ],
+    "case_witness_contracts": [
+      {
+        "case_id": "ros_free_import_and_sole_module_inventory",
+        "required_measurements": [
+          "imported_module_count",
+          "forbidden_module_count",
+          "ros_module_count",
+          "extension_suffix_matches"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "cpp_python_field_enum_default_ordering_and_error_parity",
+        "required_measurements": [
+          "cpp_vector_sha256",
+          "python_vector_sha256",
+          "vectors_equal"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "final_compiler_projection_nonconstructible_and_read_only",
+        "required_measurements": [
+          "construct_attempts",
+          "construct_rejections",
+          "write_attempts",
+          "write_rejections"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "all_trusted_predecessor_projections_nonconstructible_and_read_only",
+        "required_measurements": [
+          "projection_count",
+          "construct_attempts",
+          "construct_rejections",
+          "write_attempts",
+          "write_rejections"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "detached_predecessor_and_final_value_lifetime",
+        "required_measurements": [
+          "detached_projection_count",
+          "post_owner_read_iterations",
+          "failed_reads"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "blocking_compile_releases_gil_with_progress_witness",
+        "required_measurements": [
+          "compiler_calls",
+          "worker_progress_events",
+          "distinct_worker_thread"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "concurrent_pure_compiles_are_deterministic",
+        "required_measurements": [
+          "concurrent_calls",
+          "unique_result_digests",
+          "result_digest_sha256"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "exception_translation_after_released_gil",
+        "required_measurements": [
+          "translated_exception_count",
+          "released_gil_failure_count",
+          "exact_payload_match"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "repeated_fresh_interpreter_import_use_and_clean_shutdown",
+        "required_measurements": [
+          "fresh_interpreter_runs",
+          "clean_exit_count",
+          "nonzero_exit_count"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "generated_stub_inventory_and_documentation_parity",
+        "required_measurements": [
+          "generated_output_count",
+          "api_export_count",
+          "parity_mismatches"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      },
+      {
+        "case_id": "complete_forbidden_surface_absence",
+        "required_measurements": [
+          "forbidden_export_count",
+          "forbidden_module_count",
+          "forbidden_scan_match_count"
+        ],
+        "required_evidence_roles": [
+          "direct_case_evidence"
+        ]
+      }
+    ],
+    "skip_policy": "forbid",
+    "minimum_collected_tests": 1
+  },
+  "test_inventory_contract": {
+    "baseline_inventory_path": "verification/composable_cell_i2/baseline_test_inventory.v1.json",
+    "baseline_inventory_sha256": "a59745622c9047ef00c0533e5065067254787699ef0f53e509be000b7b366a9b",
+    "native_target_contract_path": "verification/composable_cell_i2/native_target_contract.v1.json",
+    "native_target_contract_sha256": "a5161424a62319cea8baa61ca15ceed318ca272b6c0654968f355593d5bffb9d",
+    "build_provenance_contract_path": "verification/composable_cell_i2/build_provenance_contract.v1.json",
+    "build_provenance_contract_sha256": "aa087f5cc90f90ce41a3e992c68101483269d1c0cd3865d63f4a0538cf174ad1",
+    "native_execution_lanes": [
+      {
+        "lane_id": "core_release",
+        "required_group": "core_release_baseline",
+        "inventory_output": "core-release/ctest-inventory.json",
+        "execution_index_output": "core-release/execution-index.json",
+        "provenance_output": "core-release/native-build-provenance.json",
+        "build_root": "build/core-release",
+        "sanitizer": "none",
+        "required_flag": null,
+        "timeout_ceiling": 120,
+        "test_regex": null,
+        "allow_additional_tests": true,
+        "allow_additional_targets": false,
+        "allowed_exclusions": []
+      },
+      {
+        "lane_id": "deployment_release",
+        "required_group": "deployment_release_baseline",
+        "inventory_output": "deployment-release/ctest-inventory.json",
+        "execution_index_output": "deployment-release/execution-index.json",
+        "provenance_output": "deployment-release/native-build-provenance.json",
+        "build_root": "build/deployment-release",
+        "sanitizer": "none",
+        "required_flag": null,
+        "timeout_ceiling": 120,
+        "test_regex": null,
+        "allow_additional_tests": true,
+        "allow_additional_targets": false,
+        "allowed_exclusions": []
+      },
+      {
+        "lane_id": "c02_tail_focused_release",
+        "required_group": "c02_tail_required",
+        "inventory_output": "c02-tail/ctest-inventory.json",
+        "execution_index_output": "c02-tail/execution-index.json",
+        "provenance_output": "c02-tail/native-build-provenance.json",
+        "build_root": "build/c02-tail-release",
+        "sanitizer": "none",
+        "required_flag": null,
+        "timeout_ceiling": 180,
+        "test_regex": "^(Mf2JointName|CellComposition|CellApplicability|CellApplicabilityBudget|DeploymentApplicabilityCodec|SiteOverlayResolution|CellCompiler|BuildManifestAuthority|RetentionQualifiedDeployment)\\.",
+        "allow_additional_tests": false,
+        "allow_additional_targets": false,
+        "allowed_exclusions": []
+      },
+      {
+        "lane_id": "roboplan_release",
+        "required_group": "roboplan_release_baseline",
+        "inventory_output": "roboplan-release/ctest-inventory.json",
+        "execution_index_output": "roboplan-release/execution-index.json",
+        "provenance_output": "roboplan-release/native-build-provenance.json",
+        "build_root": "build/roboplan-release/roboplan",
+        "sanitizer": "none",
+        "required_flag": null,
+        "timeout_ceiling": 180,
+        "test_regex": null,
+        "allow_additional_tests": true,
+        "allow_additional_targets": false,
+        "allowed_exclusions": []
+      },
+      {
+        "lane_id": "roboplan_consumer_focused",
+        "required_group": "roboplan_consumer_required",
+        "inventory_output": "roboplan-focused/ctest-inventory.json",
+        "execution_index_output": "roboplan-focused/execution-index.json",
+        "provenance_output": "roboplan-focused/native-build-provenance.json",
+        "build_root": "build/roboplan-focused/roboplan",
+        "sanitizer": "none",
+        "required_flag": null,
+        "timeout_ceiling": 180,
+        "test_regex": "^(RetainedProductRoboPlanConsumer\\.|retained_compiled_visual_fk_composer_consumer$|retained_compiled_model_independent_standard_parser$)",
+        "allow_additional_tests": false,
+        "allow_additional_targets": false,
+        "allowed_exclusions": []
+      },
+      {
+        "lane_id": "core_asan_ubsan",
+        "required_group": "core_release_baseline",
+        "inventory_output": "core-asan/ctest-inventory.json",
+        "execution_index_output": "core-asan/execution-index.json",
+        "provenance_output": "core-asan/native-build-provenance.json",
+        "build_root": "build/core-asan",
+        "sanitizer": "address+undefined",
+        "required_flag": "-fsanitize=address,undefined",
+        "timeout_ceiling": 300,
+        "test_regex": null,
+        "allow_additional_tests": true,
+        "allow_additional_targets": false,
+        "allowed_exclusions": []
+      },
+      {
+        "lane_id": "core_tsan",
+        "required_group": "core_release_baseline",
+        "inventory_output": "core-tsan/ctest-inventory.json",
+        "execution_index_output": "core-tsan/execution-index.json",
+        "provenance_output": "core-tsan/native-build-provenance.json",
+        "build_root": "build/core-tsan",
+        "sanitizer": "thread",
+        "required_flag": "-fsanitize=thread",
+        "timeout_ceiling": 300,
+        "test_regex": null,
+        "allow_additional_tests": true,
+        "allow_additional_targets": false,
+        "allowed_exclusions": []
+      },
+      {
+        "lane_id": "deployment_asan_ubsan",
+        "required_group": "deployment_release_baseline",
+        "inventory_output": "deployment-asan/ctest-inventory.json",
+        "execution_index_output": "deployment-asan/execution-index.json",
+        "provenance_output": "deployment-asan/native-build-provenance.json",
+        "build_root": "build/deployment-asan",
+        "sanitizer": "address+undefined",
+        "required_flag": "-fsanitize=address,undefined",
+        "timeout_ceiling": 300,
+        "test_regex": null,
+        "allow_additional_tests": true,
+        "allow_additional_targets": false,
+        "allowed_exclusions": [
+          "CanonicalEmptyAdmissionPackageTest.ReleasePackageMatchesTheCheckedQualificationGolden"
+        ]
+      },
+      {
+        "lane_id": "roboplan_asan_ubsan",
+        "required_group": "roboplan_scene_sanitizer_required",
+        "inventory_output": "roboplan-asan/ctest-inventory.json",
+        "execution_index_output": "roboplan-asan/execution-index.json",
+        "provenance_output": "roboplan-asan/native-build-provenance.json",
+        "build_root": "build/roboplan-asan/build/manyforge_roboplan",
+        "sanitizer": "address+undefined",
+        "required_flag": "-fsanitize=address,undefined",
+        "timeout_ceiling": 300,
+        "test_regex": "^RoboPlanSceneGenerationTest\\.",
+        "allow_additional_tests": false,
+        "allow_additional_targets": false,
+        "allowed_exclusions": []
+      },
+      {
+        "lane_id": "roboplan_tsan",
+        "required_group": "roboplan_scene_sanitizer_required",
+        "inventory_output": "roboplan-tsan/ctest-inventory.json",
+        "execution_index_output": "roboplan-tsan/execution-index.json",
+        "provenance_output": "roboplan-tsan/native-build-provenance.json",
+        "build_root": "build/roboplan-tsan/build/manyforge_roboplan",
+        "sanitizer": "thread",
+        "required_flag": "-fsanitize=thread",
+        "timeout_ceiling": 300,
+        "test_regex": "^RoboPlanSceneGenerationTest\\.",
+        "allow_additional_tests": false,
+        "allow_additional_targets": false,
+        "allowed_exclusions": []
+      }
+    ],
+    "binding_result_lanes": [
+      {
+        "lane_id": "bindings_selector",
+        "producer_lane_id": "bindings_selector",
+        "build_provenance_output": "bindings-selector/build-provenance.json",
+        "collection_output": "bindings-selector/collection.txt",
+        "result_output": "bindings-selector/junit.xml",
+        "witness_output": "bindings-selector/witness.json",
+        "require_python_baseline": true,
+        "required_case_ids": [
+          "ros_free_import_and_sole_module_inventory",
+          "cpp_python_field_enum_default_ordering_and_error_parity",
+          "final_compiler_projection_nonconstructible_and_read_only",
+          "all_trusted_predecessor_projections_nonconstructible_and_read_only",
+          "detached_predecessor_and_final_value_lifetime",
+          "blocking_compile_releases_gil_with_progress_witness",
+          "concurrent_pure_compiles_are_deterministic",
+          "exception_translation_after_released_gil",
+          "repeated_fresh_interpreter_import_use_and_clean_shutdown",
+          "generated_stub_inventory_and_documentation_parity",
+          "complete_forbidden_surface_absence"
+        ]
+      },
+      {
+        "lane_id": "bindings_release",
+        "producer_lane_id": "bindings_release",
+        "build_provenance_output": "bindings-release/build-provenance.json",
+        "collection_output": "bindings-release/collection.txt",
+        "result_output": "bindings-release/junit.xml",
+        "witness_output": "bindings-release/witness.json",
+        "require_python_baseline": true,
+        "required_case_ids": [
+          "ros_free_import_and_sole_module_inventory",
+          "cpp_python_field_enum_default_ordering_and_error_parity",
+          "final_compiler_projection_nonconstructible_and_read_only",
+          "all_trusted_predecessor_projections_nonconstructible_and_read_only",
+          "detached_predecessor_and_final_value_lifetime",
+          "blocking_compile_releases_gil_with_progress_witness",
+          "concurrent_pure_compiles_are_deterministic",
+          "exception_translation_after_released_gil",
+          "repeated_fresh_interpreter_import_use_and_clean_shutdown",
+          "generated_stub_inventory_and_documentation_parity",
+          "complete_forbidden_surface_absence"
+        ]
+      },
+      {
+        "lane_id": "bindings_asan_ubsan",
+        "producer_lane_id": "bindings_asan_ubsan",
+        "build_provenance_output": "bindings-asan/build-provenance.json",
+        "collection_output": "bindings-asan/collection.txt",
+        "result_output": "bindings-asan/junit.xml",
+        "witness_output": "bindings-asan/witness.json",
+        "require_python_baseline": false,
+        "required_case_ids": [
+          "detached_predecessor_and_final_value_lifetime",
+          "exception_translation_after_released_gil",
+          "repeated_fresh_interpreter_import_use_and_clean_shutdown"
+        ]
+      },
+      {
+        "lane_id": "bindings_tsan",
+        "producer_lane_id": "bindings_tsan",
+        "build_provenance_output": "bindings-tsan/build-provenance.json",
+        "collection_output": "bindings-tsan/collection.txt",
+        "result_output": "bindings-tsan/junit.xml",
+        "witness_output": "bindings-tsan/witness.json",
+        "require_python_baseline": false,
+        "required_case_ids": [
+          "concurrent_pure_compiles_are_deterministic"
+        ]
+      },
+      {
+        "lane_id": "bindings_import",
+        "producer_lane_id": "bindings_release",
+        "build_provenance_output": null,
+        "collection_output": "bindings-contract/import.collection.txt",
+        "result_output": "bindings-contract/import.junit.xml",
+        "witness_output": "bindings-contract/import.witness.json",
+        "require_python_baseline": false,
+        "required_case_ids": [
+          "ros_free_import_and_sole_module_inventory"
+        ]
+      },
+      {
+        "lane_id": "bindings_parity",
+        "producer_lane_id": "bindings_release",
+        "build_provenance_output": null,
+        "collection_output": "bindings-contract/parity.collection.txt",
+        "result_output": "bindings-contract/parity.junit.xml",
+        "witness_output": "bindings-contract/parity.witness.json",
+        "require_python_baseline": false,
+        "required_case_ids": [
+          "cpp_python_field_enum_default_ordering_and_error_parity",
+          "final_compiler_projection_nonconstructible_and_read_only",
+          "all_trusted_predecessor_projections_nonconstructible_and_read_only"
+        ]
+      },
+      {
+        "lane_id": "bindings_lifetime",
+        "producer_lane_id": "bindings_release",
+        "build_provenance_output": null,
+        "collection_output": "bindings-contract/lifetime.collection.txt",
+        "result_output": "bindings-contract/lifetime.junit.xml",
+        "witness_output": "bindings-contract/lifetime.witness.json",
+        "require_python_baseline": false,
+        "required_case_ids": [
+          "detached_predecessor_and_final_value_lifetime"
+        ]
+      },
+      {
+        "lane_id": "bindings_exception",
+        "producer_lane_id": "bindings_release",
+        "build_provenance_output": null,
+        "collection_output": "bindings-contract/exception.collection.txt",
+        "result_output": "bindings-contract/exception.junit.xml",
+        "witness_output": "bindings-contract/exception.witness.json",
+        "require_python_baseline": false,
+        "required_case_ids": [
+          "exception_translation_after_released_gil"
+        ]
+      },
+      {
+        "lane_id": "bindings_gil_concurrency",
+        "producer_lane_id": "bindings_release",
+        "build_provenance_output": null,
+        "collection_output": "bindings-contract/gil-concurrency.collection.txt",
+        "result_output": "bindings-contract/gil-concurrency.junit.xml",
+        "witness_output": "bindings-contract/gil-concurrency.witness.json",
+        "require_python_baseline": false,
+        "required_case_ids": [
+          "blocking_compile_releases_gil_with_progress_witness",
+          "concurrent_pure_compiles_are_deterministic"
+        ]
+      },
+      {
+        "lane_id": "bindings_shutdown",
+        "producer_lane_id": "bindings_release",
+        "build_provenance_output": null,
+        "collection_output": "bindings-contract/shutdown.collection.txt",
+        "result_output": "bindings-contract/shutdown.junit.xml",
+        "witness_output": "bindings-contract/shutdown.witness.json",
+        "require_python_baseline": false,
+        "required_case_ids": [
+          "repeated_fresh_interpreter_import_use_and_clean_shutdown"
+        ]
+      },
+      {
+        "lane_id": "bindings_generated_api",
+        "producer_lane_id": "bindings_release",
+        "build_provenance_output": null,
+        "collection_output": "bindings-contract/generated-api.collection.txt",
+        "result_output": "bindings-contract/generated-api.junit.xml",
+        "witness_output": "bindings-contract/generated-api.witness.json",
+        "require_python_baseline": false,
+        "required_case_ids": [
+          "generated_stub_inventory_and_documentation_parity",
+          "complete_forbidden_surface_absence"
+        ]
+      }
+    ],
+    "binding_build_lanes": [
+      {
+        "lane_id": "bindings_selector",
+        "build_root": "build/bindings-selector",
+        "core_build_root": "build/bindings-selector/core",
+        "deployment_build_root": "build/bindings-selector/deployment",
+        "module_build_root": "build/bindings-selector/module",
+        "stage_root": "bindings-selector/staged",
+        "generated_extension": "bindings-selector/generated/manyforge_core_py.cpython-312-x86_64-linux-gnu.so",
+        "provenance_output": "bindings-selector/build-provenance.json",
+        "sanitizer": "none"
+      },
+      {
+        "lane_id": "bindings_release",
+        "build_root": "build/bindings-release",
+        "core_build_root": "build/bindings-release/core",
+        "deployment_build_root": "build/bindings-release/deployment",
+        "module_build_root": "build/bindings-release/module",
+        "stage_root": "bindings-release/staged",
+        "generated_extension": "generated/manyforge_core_py.cpython-312-x86_64-linux-gnu.so",
+        "provenance_output": "bindings-release/build-provenance.json",
+        "sanitizer": "none"
+      },
+      {
+        "lane_id": "bindings_asan_ubsan",
+        "build_root": "build/bindings-asan",
+        "core_build_root": "build/bindings-asan/core",
+        "deployment_build_root": "build/bindings-asan/deployment",
+        "module_build_root": "build/bindings-asan/module",
+        "stage_root": "bindings-asan/staged",
+        "generated_extension": null,
+        "provenance_output": "bindings-asan/build-provenance.json",
+        "sanitizer": "address+undefined"
+      },
+      {
+        "lane_id": "bindings_tsan",
+        "build_root": "build/bindings-tsan",
+        "core_build_root": "build/bindings-tsan/core",
+        "deployment_build_root": "build/bindings-tsan/deployment",
+        "module_build_root": "build/bindings-tsan/module",
+        "stage_root": "bindings-tsan/staged",
+        "generated_extension": null,
+        "provenance_output": "bindings-tsan/build-provenance.json",
+        "sanitizer": "thread"
+      }
+    ],
+    "production_build_lanes": [
+      {
+        "lane_id": "core_production_release",
+        "project_id": "manyforge_core",
+        "test_enabled_release_lane_id": "core_release",
+        "source_root": "manyforge_core",
+        "build_root": "build/core-production-release",
+        "inventory_output": "core-production-release/ctest-inventory.json",
+        "provenance_output": "core-production-release/build-provenance.json",
+        "execution_index_output": "core-production-release/execution-index.json",
+        "configuration": "Release",
+        "build_testing": false,
+        "sanitizer": "none",
+        "configure_argv": ["/usr/bin/cmake", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_TESTING=OFF", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "--graphviz=/qualification-output/build/core-production-release/manyforge-i2-target-graph.dot", "-S", "/workspace/manyforge_core", "-B", "/qualification-output/build/core-production-release"],
+        "build_argv": ["/usr/bin/ninja", "-C", "/qualification-output/build/core-production-release", "-j", "2", "-d", "keeprsp", "manyforge_content_identity", "manyforge_core"],
+        "inventory_argv": ["/usr/bin/ctest", "--test-dir", "/qualification-output/build/core-production-release", "--show-only=json-v1"]
+      },
+      {
+        "lane_id": "deployment_production_release",
+        "project_id": "manyforge_deployment",
+        "test_enabled_release_lane_id": "deployment_release",
+        "source_root": "manyforge_deployment",
+        "build_root": "build/deployment-production-release",
+        "inventory_output": "deployment-production-release/ctest-inventory.json",
+        "provenance_output": "deployment-production-release/build-provenance.json",
+        "execution_index_output": "deployment-production-release/execution-index.json",
+        "configuration": "Release",
+        "build_testing": false,
+        "sanitizer": "none",
+        "configure_argv": ["/usr/bin/cmake", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_TESTING=OFF", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "--graphviz=/qualification-output/build/deployment-production-release/manyforge-i2-target-graph.dot", "-DMANYFORGE_CORE_INCLUDE_DIR=/workspace/manyforge_core/include", "-S", "/workspace/manyforge_deployment", "-B", "/qualification-output/build/deployment-production-release"],
+        "build_argv": ["/usr/bin/ninja", "-C", "/qualification-output/build/deployment-production-release", "-j", "2", "-d", "keeprsp", "manyforge_build_qualified_admission_profile", "manyforge_content_identity", "manyforge_deployment", "manyforge_deployment_admission", "manyforge_deployment_canonical_package_generator", "manyforge_deployment_verification_core", "manyforge_emit_build_qualified_admission_profile", "manyforge_generate_canonical_empty_package"],
+        "inventory_argv": ["/usr/bin/ctest", "--test-dir", "/qualification-output/build/deployment-production-release", "--show-only=json-v1"]
+      }
+    ],
+    "cross_lane_exclusion_proofs": [
+      {
+        "test_name": "CanonicalEmptyAdmissionPackageTest.ReleasePackageMatchesTheCheckedQualificationGolden",
+        "must_pass_lane": "deployment_release",
+        "excluded_lane": "deployment_asan_ubsan",
+        "reason": "The checked Release golden is intentionally unavailable in the RelWithDebInfo sanitizer profile; Release proves the exact golden while sanitizer executes every other registered case with zero skips."
+      }
+    ]
+  },
+  "pinned_inputs": {
+    "roboplan": {
+      "role": "file_only_regression_consumer",
+      "version": "0.5.1",
+      "checkout_path": ".docker/roboplan",
+      "commit": "e06d1a2f1b749c38742aee9e401bbe97fa967f7b",
+      "tree": "d918767326a19d44886c0a4560cabe5a4ebe044d",
+      "patched_index_tree": "687405b677d50965c9ce5701016cb67c4579c563",
+      "require_clean": true,
+      "must_not_change_in_i2": true,
+      "pin_manifest_sha256": "6e5fdb33adba8b67253a627c2aa643964bdcc6ff18b1273cba4dbf0bd54b7717",
+      "patch_manifest_sha256": "06d0c235d7cba107468d89f642f76b3459ff9d0c4884fbfbbcdc8f40e60504ed",
+      "patches": [
+        {
+          "path": "third_party/roboplan/patches/0001-explicit-isolated-scene-clone.patch",
+          "sha256": "cfa676dca94d8a8e9d4f61fb76b4988dc0810a5484b4d3a42416b5d294363344"
+        },
+        {
+          "path": "third_party/roboplan/patches/0002-cartesian-planner-cooperative-cancellation.patch",
+          "sha256": "344123b71a6eb2bcf8217ca7aea77413f68e70c5e96a397f6deb856c0cf8c9bf"
+        },
+        {
+          "path": "third_party/roboplan/patches/0003-own-collision-context-scene-generation.patch",
+          "sha256": "0e83a7b644bf033e9d00d3ec1f638f8126593602c04416ab9fc70e98d186c81c"
+        },
+        {
+          "path": "third_party/roboplan/patches/0004-configurable-source-build-cmake-arguments.patch",
+          "sha256": "8867a87ea695b4196e9d05b424c1a4be0219fe9017ab21fa8e89aeb7b89ac086"
+        },
+        {
+          "path": "third_party/roboplan/patches/0005-construct-scene-scratch-without-copy-assignment.patch",
+          "sha256": "e13cdc712cd98c411f8f1a0dbc2ee9944fed536745fc92ddf64e60c41ed2b537"
+        },
+        {
+          "path": "third_party/roboplan/patches/0006-bound-cartesian-duration-arithmetic.patch",
+          "sha256": "c0b699d5f2eb28edda43290710b328aca6837cee2290ec5b3a339b1d1051a581"
+        },
+        {
+          "path": "third_party/roboplan/patches/0007-explicit-serialized-collision-query-view.patch",
+          "sha256": "d14a8eb7b2f99dfc37a59475e0add3514fe1d96d78a818ca4c7ce658cbc2e14d"
+        }
+      ]
+    },
+    "consumer_stack": {
+      "pinocchio": "4.1.0",
+      "coal": "3.0.3",
+      "check_urdf_path": "/usr/local/bin/check_urdf",
+      "check_urdf_sha256": "83352c180a270474e19ac0d960871ee5104263bd03ec1402d4905a4024d2a109"
+    },
+    "tracked_files": [
+      {
+        "path": "third_party/roboplan/README.md",
+        "sha256": "6e5fdb33adba8b67253a627c2aa643964bdcc6ff18b1273cba4dbf0bd54b7717",
+        "policy": "immutable_in_i2"
+      },
+      {
+        "path": "third_party/roboplan/patches.sha256",
+        "sha256": "06d0c235d7cba107468d89f642f76b3459ff9d0c4884fbfbbcdc8f40e60504ed",
+        "policy": "immutable_in_i2"
+      },
+      {
+        "path": "manyforge_deployment/test/golden/canonical_empty_admission.release.json",
+        "sha256": "816497df5b13d71b9cdce4755a159d7ec66764e07b51aabac6d71cfe8385c36a",
+        "policy": "rotate_and_requalify"
+      },
+      {
+        "path": "manyforge_deployment/test/generate_lite6_retained_consumer_fixture.cpp",
+        "sha256": "380d72b07b530ae4537cac0f011fcac6f19d178dd0a0fae34e8e855809a2992d",
+        "policy": "retain_behavior_and_record_final_digest"
+      },
+      {
+        "path": "manyforge_deployment/test/qualify_retained_model_standard_parsers.py",
+        "sha256": "dfa47407d13653e48bdbac5ae29e1ecc6decdf83820c09fa98990858da864162",
+        "policy": "retain_behavior_and_record_final_digest"
+      },
+      {
+        "path": "manyforge_composer/tests/qualify_retained_compiled_visual_fk.py",
+        "sha256": "8d494f14a171432a7162260edfda0495067cb07de6283a357299a46ba5578569",
+        "policy": "retain_behavior_and_record_final_digest"
+      },
+      {
+        "path": "manyforge_deployment/tools/prepare_structural_model.py",
+        "sha256": "f22d5f4a2b652a8f0872722490405aa7f41b635280c35600d7979b4cf26008c2",
+        "policy": "immutable_in_i2"
+      },
+      {
+        "path": "manyforge_core/python/CMakeLists.txt",
+        "sha256": "d40e71cf18238e7221b8dba32cf30feb38bde1f1850d8812bede9693aa9d2770",
+        "policy": "must_change_and_requalify"
+      },
+      {
+        "path": "manyforge_roboplan/test/test_retained_product_consumer.cpp",
+        "sha256": "b839bfaa7e93a30672f79be9fab463fea9a209616b028d34a0a35e93acd69298",
+        "policy": "retain_behavior_and_record_final_digest"
+      },
+      {
+        "path": "scripts/qualification/source_identity.py",
+        "sha256": "d018ca8e0817070d14311af90b3c005c94cc1ff6af97cb4a8f511acb6d179dbf",
+        "policy": "immutable_in_i2"
+      }
+    ],
+    "consumer_targets": [
+      "generate_canonical_empty_product_package",
+      "generate_lite6_retained_consumer_fixture",
+      "generate_lite6_retained_consumer_product",
+      "test_retained_product_consumer"
+    ],
+    "consumer_tests": [
+      "RetainedProductRoboPlanConsumer.Mf2CrossBranchTraversalImportsDeeperMasterBeforeFollower",
+      "RetainedProductRoboPlanConsumer.CanonicalEmptyExactBytesYieldDeterministicPlanningCollisionScene",
+      "RetainedProductRoboPlanConsumer.DurableLite6ReopensStagesAndBuildsDeterministicNonEmptyScene",
+      "retained_compiled_visual_fk_composer_consumer",
+      "retained_compiled_model_independent_standard_parser"
+    ]
+  },
+  "rotating_identities": {
+    "baseline": {
+      "node_environment_digest": "sha256:c1a6f5fcdcabc18c30ade4761a64ff7fd10dfbeb473514ccde3a69e3bd11dd6a",
+      "compiler_contract_digest": "sha256:2197422750ff536028772ff44c555c4cc0725859fd6763236fe5ef14ba641fb5",
+      "release_compiler_build_digest": "sha256:1a0004374353968bc4b0b1fb50229ab95c48790ddb4b58c35f5f5f39862c3d72",
+      "canonical_empty_retained_bundle_id": "sha256:58bbf96c6990ca84bae1d1d5986323984704f0842334acd898d6cddb41f61858",
+      "canonical_empty_admission_digest": "sha256:d8add4248a9089eb3c2b43d58df4ef46c7c0503c1ed8ff4eb415a252d5db9d69"
+    },
+    "rule": "Recompute all identities from exact final inputs. The mf2 composition-contract change must rotate compiler-contract-dependent identities together; environment-only identity rotates only if its exact inputs changed.",
+    "candidate_expectations": {
+      "node_environment_digest": "unchanged",
+      "compiler_contract_digest": "changed",
+      "release_compiler_build_digest": "changed",
+      "canonical_empty_retained_bundle_id": "changed",
+      "canonical_empty_admission_digest": "changed"
+    },
+    "determinism_artifact_roots": [
+      "determinism/build-a",
+      "determinism/build-b"
+    ],
+    "identity_artifact": {
+      "path": "canonical_empty_product_package/canonical-empty-admission.json",
+      "field_map": {
+        "node_environment_digest": "environment_digest",
+        "compiler_contract_digest": "compiler_contract_digest",
+        "release_compiler_build_digest": "compiler_build_digest",
+        "canonical_empty_retained_bundle_id": "retained_bundle_id",
+        "canonical_empty_admission_digest": "admission_digest"
+      }
+    },
+    "fixture_ir_outputs": {
+      "c02m_empty_passive_aggregate_attached_internal_and_mixed_vendor": "fixture-ir/c02m_empty_passive_aggregate_attached_internal_and_mixed_vendor.json",
+      "c02m_two_same_type_robot_and_tool_and_independent_attachments": "fixture-ir/c02m_two_same_type_robot_and_tool_and_independent_attachments.json",
+      "c02m_mobile_rail_gantry_floating_prismatic_and_mimic_coordinates": "fixture-ir/c02m_mobile_rail_gantry_floating_prismatic_and_mimic_coordinates.json",
+      "c02m_mf2_rank_digest_collision_rewrite_and_shuffle_determinism": "fixture-ir/c02m_mf2_rank_digest_collision_rewrite_and_shuffle_determinism.json",
+      "c02m_sibling_cross_branch_safe_chain_descendant_and_cycle_mimic_cases": "fixture-ir/c02m_sibling_cross_branch_safe_chain_descendant_and_cycle_mimic_cases.json",
+      "c02m_parser_validity_and_pinocchio_child_order_assumption": "fixture-ir/c02m_parser_validity_and_pinocchio_child_order_assumption.json",
+      "c02n_contract_route_activation_provider_stop_and_external_overlay_matrix": "fixture-ir/c02n_contract_route_activation_provider_stop_and_external_overlay_matrix.json",
+      "c02n_65536_and_1000000_exact_bounds_plus_overflow": "fixture-ir/c02n_65536_and_1000000_exact_bounds_plus_overflow.json",
+      "c02n_site_overlay_presence_digest_values_and_secrets_absence": "fixture-ir/c02n_site_overlay_presence_digest_values_and_secrets_absence.json",
+      "c02o_single_final_operation_empty_nonempty_equality_and_nonforgeability": "fixture-ir/c02o_single_final_operation_empty_nonempty_equality_and_nonforgeability.json"
+    },
+    "regression_products": [
+      "canonical_empty_product_package/canonical-empty-admission.json",
+      "lite6_retained_consumer_fixture/manifest.json",
+      "lite6_retained_consumer_fixture/retained-model.urdf",
+      "lite6_retained_consumer_fixture/retained-model.srdf",
+      "lite6_retained_consumer_fixture/retained-package/**/*",
+      "deployment-build/generated/embedded_build_evidence.hpp",
+      "deployment-build/generated/build_qualified_admission_profile_generated.hpp",
+      "deployment-build/generated/closed_schema/**/*",
+      "fixture-raw/**/*.json",
+      "fixture-ir/*.json"
+    ]
+  },
+  "fixture_matrix": [
+    {
+      "id": "c02a_l_cumulative_regression",
+      "evidence_lanes": ["deployment_release", "deployment_asan_ubsan"],
+      "native_test_witnesses": [
+        {"lane_id": "deployment_release", "group_id": "deployment_release_baseline"},
+        {"lane_id": "deployment_asan_ubsan", "group_id": "deployment_release_baseline"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": [],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02m_empty_passive_aggregate_attached_internal_and_mixed_vendor",
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "deployment_release", "group_id": "c02m_composition_shapes_required"},
+        {"lane_id": "c02_tail_focused_release", "group_id": "c02m_composition_shapes_required"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": ["fixture-ir/c02m_empty_passive_aggregate_attached_internal_and_mixed_vendor.json"],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02m_two_same_type_robot_and_tool_and_independent_attachments",
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "deployment_release", "group_id": "c02m_repeated_identity_required"},
+        {"lane_id": "c02_tail_focused_release", "group_id": "c02m_repeated_identity_required"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": ["fixture-ir/c02m_two_same_type_robot_and_tool_and_independent_attachments.json"],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02m_mobile_rail_gantry_floating_prismatic_and_mimic_coordinates",
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "deployment_release", "group_id": "c02m_coordinate_projection_required"},
+        {"lane_id": "c02_tail_focused_release", "group_id": "c02m_coordinate_projection_required"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": ["fixture-ir/c02m_mobile_rail_gantry_floating_prismatic_and_mimic_coordinates.json"],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02m_mf2_rank_digest_collision_rewrite_and_shuffle_determinism",
+      "evidence_lanes": ["c02_tail_focused_release", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "c02_tail_focused_release", "group_id": "c02m_mf2_determinism_required"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": ["fixture-ir/c02m_mf2_rank_digest_collision_rewrite_and_shuffle_determinism.json"],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02m_sibling_cross_branch_safe_chain_descendant_and_cycle_mimic_cases",
+      "evidence_lanes": ["c02_tail_focused_release", "deployment_asan_ubsan", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "c02_tail_focused_release", "group_id": "c02m_mimic_dependency_required"},
+        {"lane_id": "deployment_asan_ubsan", "group_id": "c02m_mimic_dependency_required"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": ["fixture-ir/c02m_sibling_cross_branch_safe_chain_descendant_and_cycle_mimic_cases.json"],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02m_parser_validity_and_pinocchio_child_order_assumption",
+      "evidence_lanes": ["roboplan_release", "roboplan_consumer_focused", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "roboplan_release", "group_id": "roboplan_consumer_required"},
+        {"lane_id": "roboplan_consumer_focused", "group_id": "roboplan_consumer_required"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": ["fixture-ir/c02m_parser_validity_and_pinocchio_child_order_assumption.json"],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02n_contract_route_activation_provider_stop_and_external_overlay_matrix",
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "deployment_release", "group_id": "c02n_applicability_matrix_required"},
+        {"lane_id": "c02_tail_focused_release", "group_id": "c02n_applicability_matrix_required"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": ["fixture-ir/c02n_contract_route_activation_provider_stop_and_external_overlay_matrix.json"],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02n_65536_and_1000000_exact_bounds_plus_overflow",
+      "evidence_lanes": ["c02_tail_focused_release", "deployment_asan_ubsan", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "c02_tail_focused_release", "group_id": "c02n_bounds_required"},
+        {"lane_id": "deployment_asan_ubsan", "group_id": "c02n_bounds_required"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": ["fixture-ir/c02n_65536_and_1000000_exact_bounds_plus_overflow.json"],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02n_site_overlay_presence_digest_values_and_secrets_absence",
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "deployment_release", "group_id": "c02n_site_overlay_required"},
+        {"lane_id": "c02_tail_focused_release", "group_id": "c02n_site_overlay_required"}
+      ],
+      "binding_case_witnesses": [],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": ["fixture-ir/c02n_site_overlay_presence_digest_values_and_secrets_absence.json"],
+      "generated_output_roles": []
+    },
+    {
+      "id": "c02o_single_final_operation_empty_nonempty_equality_and_nonforgeability",
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "bindings_parity", "deterministic_rebuild"],
+      "native_test_witnesses": [
+        {"lane_id": "deployment_release", "group_id": "c02o_final_compiler_required"},
+        {"lane_id": "c02_tail_focused_release", "group_id": "c02o_final_compiler_required"}
+      ],
+      "binding_case_witnesses": [
+        {
+          "lane_id": "bindings_parity",
+          "case_ids": [
+            "cpp_python_field_enum_default_ordering_and_error_parity",
+            "final_compiler_projection_nonconstructible_and_read_only",
+            "all_trusted_predecessor_projections_nonconstructible_and_read_only"
+          ]
+        }
+      ],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": [
+        "fixture-ir/c02o_single_final_operation_empty_nonempty_equality_and_nonforgeability.json",
+        "canonical_empty_product_package/canonical-empty-admission.json"
+      ],
+      "generated_output_roles": []
+    },
+    {
+      "id": "python_ros_free_import_parity_errors_immutability_and_strong_ids",
+      "evidence_lanes": ["bindings_selector", "bindings_release", "bindings_import", "bindings_parity"],
+      "native_test_witnesses": [],
+      "binding_case_witnesses": [
+        {"lane_id": "bindings_import", "case_ids": ["ros_free_import_and_sole_module_inventory"]},
+        {
+          "lane_id": "bindings_parity",
+          "case_ids": [
+            "cpp_python_field_enum_default_ordering_and_error_parity",
+            "final_compiler_projection_nonconstructible_and_read_only",
+            "all_trusted_predecessor_projections_nonconstructible_and_read_only"
+          ]
+        }
+      ],
+      "python_binding_floor_lanes": ["bindings_selector", "bindings_release"],
+      "scan_ids": [],
+      "determinism_artifacts": [],
+      "generated_output_roles": []
+    },
+    {
+      "id": "python_lifetime_released_gil_concurrency_exception_and_shutdown",
+      "evidence_lanes": ["bindings_asan_ubsan", "bindings_tsan", "bindings_lifetime", "bindings_exception", "bindings_gil_concurrency", "bindings_shutdown"],
+      "native_test_witnesses": [],
+      "binding_case_witnesses": [
+        {"lane_id": "bindings_asan_ubsan", "case_ids": ["detached_predecessor_and_final_value_lifetime", "exception_translation_after_released_gil", "repeated_fresh_interpreter_import_use_and_clean_shutdown"]},
+        {"lane_id": "bindings_tsan", "case_ids": ["concurrent_pure_compiles_are_deterministic"]},
+        {"lane_id": "bindings_lifetime", "case_ids": ["detached_predecessor_and_final_value_lifetime"]},
+        {"lane_id": "bindings_exception", "case_ids": ["exception_translation_after_released_gil"]},
+        {"lane_id": "bindings_gil_concurrency", "case_ids": ["blocking_compile_releases_gil_with_progress_witness", "concurrent_pure_compiles_are_deterministic"]},
+        {"lane_id": "bindings_shutdown", "case_ids": ["repeated_fresh_interpreter_import_use_and_clean_shutdown"]}
+      ],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": [],
+      "generated_output_roles": []
+    },
+    {
+      "id": "stub_api_inventory_and_documentation_parity",
+      "evidence_lanes": ["bindings_release", "bindings_generated_api"],
+      "native_test_witnesses": [],
+      "binding_case_witnesses": [
+        {"lane_id": "bindings_generated_api", "case_ids": ["generated_stub_inventory_and_documentation_parity", "complete_forbidden_surface_absence"]}
+      ],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [],
+      "determinism_artifacts": [],
+      "generated_output_roles": ["extension", "typed_stub", "api_inventory", "api_documentation"]
+    },
+    {
+      "id": "legacy_and_bypass_surface_deletion",
+      "evidence_lanes": ["bindings_generated_api", "forbidden_surface_scan"],
+      "native_test_witnesses": [],
+      "binding_case_witnesses": [
+        {"lane_id": "bindings_generated_api", "case_ids": ["complete_forbidden_surface_absence"]}
+      ],
+      "python_binding_floor_lanes": [],
+      "scan_ids": [
+        "stale_public_structure_header",
+        "public_or_python_structural_stage",
+        "deleted_roboplan_module",
+        "trusted_graph_alias",
+        "old_parsed_source_api",
+        "old_experimental_import",
+        "trusted_stage_python_constructor",
+        "test_only_final_trust_bypass",
+        "ros_or_backend_header_in_core_binding",
+        "direct_graph_to_retention_bypass",
+        "compatibility_fallback_or_alias"
+      ],
+      "determinism_artifacts": [],
+      "generated_output_roles": ["api_inventory"]
+    }
+  ],
+  "qualification_lanes": [
+    {
+      "ordinal": 1,
+      "id": "preflight",
+      "claim": "Exact clean candidate, image-contained ABI, dependency and regression-input preflight",
+      "container_command": ["bash", "-lc", "set -euo pipefail; python3 scripts/qualification/source_identity.py --repo-root /workspace > /qualification-output/candidate-source.json; test \"$(git --no-optional-locks -C .docker/roboplan rev-parse HEAD)\" = e06d1a2f1b749c38742aee9e401bbe97fa967f7b; test -z \"$(git --no-optional-locks -C .docker/roboplan status --porcelain=v1 --untracked-files=all --ignore-submodules=none)\"; (cd third_party/roboplan && sha256sum -c patches.sha256); test \"$(sha256sum /usr/local/bin/check_urdf | cut -d' ' -f1)\" = 83352c180a270474e19ac0d960871ee5104263bd03ec1402d4905a4024d2a109; python3 - <<'PY'\nimport json, sys, sysconfig\nimport coal, pinocchio, pybind11\nprint(json.dumps({'python': sys.version.split()[0], 'soabi': sysconfig.get_config_var('SOABI'), 'py_debug': bool(sysconfig.get_config_var('Py_DEBUG')), 'gil_disabled': bool(sysconfig.get_config_var('Py_GIL_DISABLED')), 'pybind11': pybind11.__version__, 'pinocchio': pinocchio.__version__, 'coal': coal.__version__}, sort_keys=True))\nPY"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["candidate-source.json"]
+    },
+    {
+      "ordinal": 2,
+      "id": "core_release",
+      "claim": "Fresh complete ROS-free Core Release suite",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "core_release", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["core-release/ctest-inventory.json", "core-release/execution-index.json", "core-release/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 3,
+      "id": "core_production_release",
+      "claim": "Exact ROS-free Core BUILD_TESTING=OFF Release products and test-enabled parity",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-production-lane", "core_production_release", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["core-production-release/ctest-inventory.json", "core-production-release/build-provenance.json", "core-production-release/execution-index.json"]
+    },
+    {
+      "ordinal": 4,
+      "id": "deployment_release",
+      "claim": "Fresh complete Deployment Release suite and golden verification",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "deployment_release", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["deployment-release/ctest-inventory.json", "deployment-release/execution-index.json", "deployment-release/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 5,
+      "id": "deployment_production_release",
+      "claim": "Exact Deployment BUILD_TESTING=OFF Release products, generated-owner closure, and test-enabled parity",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-production-lane", "deployment_production_release", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["deployment-production-release/ctest-inventory.json", "deployment-production-release/build-provenance.json", "deployment-production-release/execution-index.json"]
+    },
+    {
+      "ordinal": 6,
+      "id": "c02_tail_focused_release",
+      "claim": "Focused C0.2m, C0.2n and C0.2o ordered-tail Release tests",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "c02_tail_focused_release", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["c02-tail/ctest-inventory.json", "c02-tail/execution-index.json", "c02-tail/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 7,
+      "id": "roboplan_release",
+      "claim": "Complete file-only RoboPlan/Pinocchio Release consumer with no dependency skip",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "roboplan_release", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["roboplan-release/ctest-inventory.json", "roboplan-release/execution-index.json", "roboplan-release/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 8,
+      "id": "roboplan_consumer_focused",
+      "claim": "Exact retained-product, visual-FK and independent-standard-parser regressions",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "roboplan_consumer_focused", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["roboplan-focused/ctest-inventory.json", "roboplan-focused/execution-index.json", "roboplan-focused/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 9,
+      "id": "bindings_selector",
+      "claim": "Restored repository-owned bindings selector executes the real module",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_selector", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["bindings-selector/collection.txt", "bindings-selector/junit.xml", "bindings-selector/witness.json", "bindings-selector/build-provenance.json", "bindings-selector/staged/manyforge_core_py.cpython-312-x86_64-linux-gnu.so", "bindings-selector/generated/manyforge_core_py.cpython-312-x86_64-linux-gnu.so", "bindings-selector/generated/manyforge_core_py.pyi", "bindings-selector/generated/manyforge_core_py.api.json", "bindings-selector/generated/manyforge_core_py-api.md"]
+    },
+    {
+      "ordinal": 10,
+      "id": "bindings_release",
+      "claim": "Fresh Release binding build, required import, nonzero collection and zero skips",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_release", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["generated/manyforge_core_py.cpython-312-x86_64-linux-gnu.so", "generated/manyforge_core_py.pyi", "generated/manyforge_core_py.api.json", "generated/manyforge_core_py-api.md", "bindings-release/staged/manyforge_core_py.cpython-312-x86_64-linux-gnu.so", "bindings-release/collection.txt", "bindings-release/junit.xml", "bindings-release/witness.json", "bindings-release/build-provenance.json"]
+    },
+    {
+      "ordinal": 11,
+      "id": "core_asan_ubsan",
+      "claim": "Complete Core ASan/UBSan suite",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "core_asan_ubsan", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["core-asan/ctest-inventory.json", "core-asan/execution-index.json", "core-asan/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 12,
+      "id": "core_tsan",
+      "claim": "Complete Core TSan suite",
+      "container_command": ["/usr/bin/setarch", "x86_64", "-R", "python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "core_tsan", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["core-tsan/ctest-inventory.json", "core-tsan/execution-index.json", "core-tsan/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 13,
+      "id": "deployment_asan_ubsan",
+      "claim": "Complete Deployment ASan/UBSan suite including ordered C0.2 tail",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "deployment_asan_ubsan", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["deployment-asan/ctest-inventory.json", "deployment-asan/execution-index.json", "deployment-asan/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 14,
+      "id": "roboplan_asan_ubsan",
+      "claim": "Patched RoboPlan scene consumer ASan/UBSan regression",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "roboplan_asan_ubsan", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["roboplan-asan/ctest-inventory.json", "roboplan-asan/execution-index.json", "roboplan-asan/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 15,
+      "id": "roboplan_tsan",
+      "claim": "Patched RoboPlan scene consumer TSan regression",
+      "container_command": ["/usr/bin/setarch", "x86_64", "-R", "python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "roboplan_tsan", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["roboplan-tsan/ctest-inventory.json", "roboplan-tsan/execution-index.json", "roboplan-tsan/native-build-provenance.json"]
+    },
+    {
+      "ordinal": 16,
+      "id": "bindings_asan_ubsan",
+      "claim": "Binding-specific ASan/UBSan, lifetime and interpreter-shutdown suite",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_asan_ubsan", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["bindings-asan/staged/manyforge_core_py.cpython-312-x86_64-linux-gnu.so", "bindings-asan/collection.txt", "bindings-asan/junit.xml", "bindings-asan/witness.json", "bindings-asan/build-provenance.json"]
+    },
+    {
+      "ordinal": 17,
+      "id": "bindings_tsan",
+      "claim": "Binding-specific TSan concurrency suite",
+      "container_command": ["/usr/bin/setarch", "x86_64", "-R", "python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_tsan", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["bindings-tsan/staged/manyforge_core_py.cpython-312-x86_64-linux-gnu.so", "bindings-tsan/collection.txt", "bindings-tsan/junit.xml", "bindings-tsan/witness.json", "bindings-tsan/build-provenance.json"]
+    },
+    {
+      "ordinal": 18,
+      "id": "bindings_import",
+      "claim": "Sole-module ROS-free import and ABI contract",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_import", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["bindings-contract/import.collection.txt", "bindings-contract/import.junit.xml", "bindings-contract/import.witness.json"]
+    },
+    {
+      "ordinal": 19,
+      "id": "bindings_parity",
+      "claim": "C++/Python field, enum, ordering, error and non-forgeability parity",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_parity", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["bindings-contract/parity.collection.txt", "bindings-contract/parity.junit.xml", "bindings-contract/parity.witness.json"]
+    },
+    {
+      "ordinal": 20,
+      "id": "bindings_lifetime",
+      "claim": "Owned immutable projection lifetime after producer and predecessor scope ends",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_lifetime", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["bindings-contract/lifetime.collection.txt", "bindings-contract/lifetime.junit.xml", "bindings-contract/lifetime.witness.json"]
+    },
+    {
+      "ordinal": 21,
+      "id": "bindings_exception",
+      "claim": "Structured exception translation including released-GIL failure paths",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_exception", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["bindings-contract/exception.collection.txt", "bindings-contract/exception.junit.xml", "bindings-contract/exception.witness.json"]
+    },
+    {
+      "ordinal": 22,
+      "id": "bindings_gil_concurrency",
+      "claim": "Released-GIL compiler progress and deterministic concurrent calls",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_gil_concurrency", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["bindings-contract/gil-concurrency.collection.txt", "bindings-contract/gil-concurrency.junit.xml", "bindings-contract/gil-concurrency.witness.json"]
+    },
+    {
+      "ordinal": 23,
+      "id": "bindings_shutdown",
+      "claim": "Repeated fresh-interpreter import, destruction and clean shutdown",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_shutdown", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["bindings-contract/shutdown.collection.txt", "bindings-contract/shutdown.junit.xml", "bindings-contract/shutdown.witness.json"]
+    },
+    {
+      "ordinal": 24,
+      "id": "bindings_generated_api",
+      "claim": "Generated typed stub, API inventory and documentation parity",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_generated_api", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["generated/manyforge_core_py.pyi", "generated/manyforge_core_py.api.json", "generated/manyforge_core_py-api.md", "bindings-contract/generated-api.collection.txt", "bindings-contract/generated-api.junit.xml", "bindings-contract/generated-api.witness.json"]
+    },
+    {
+      "ordinal": 25,
+      "id": "deterministic_build_a",
+      "claim": "First isolated clean compiler/product build with verifier-owned raw-product indexing",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-determinism-build", "deterministic_build_a", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["determinism/build-a/build-index.json"]
+    },
+    {
+      "ordinal": 26,
+      "id": "deterministic_build_b",
+      "claim": "Second independently isolated clean compiler/product build with verifier-owned raw-product indexing",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-determinism-build", "deterministic_build_b", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["determinism/build-b/build-index.json"]
+    },
+    {
+      "ordinal": 27,
+      "id": "deterministic_rebuild",
+      "claim": "Packet-owned comparison of two read-only isolated builds and independently recomputed identities",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-determinism-compare", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["determinism/comparison.json"]
+    },
+    {
+      "ordinal": 28,
+      "id": "forbidden_surface_scan",
+      "claim": "All stale public, Python, module, alias and bypass surfaces are absent",
+      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--scan", "--output-root", "/qualification-output"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["forbidden-surface-scan.json"]
+    },
+    {
+      "ordinal": 29,
+      "id": "manifest_contract_tests",
+      "claim": "Frozen manifest, verifier, and build-provenance adversarial contract tests pass in the exact image",
+      "container_command": ["bash", "-lc", "set -euo pipefail; python3 -m pytest -p no:cacheprovider tests/test_composable_cell_i2_qualification_manifest.py tests/test_composable_cell_i2_build_provenance.py -q --junitxml=/qualification-output/manifest-contract-junit.xml"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["manifest-contract-junit.xml"]
+    },
+    {
+      "ordinal": 30,
+      "id": "final_recheck",
+      "claim": "Candidate source, image inputs and pinned dependencies are unchanged after qualification",
+      "container_command": ["bash", "-lc", "set -euo pipefail; python3 scripts/qualification/source_identity.py --repo-root /workspace > /qualification-output/final-candidate-source.json; test \"$(git --no-optional-locks -C .docker/roboplan rev-parse HEAD)\" = e06d1a2f1b749c38742aee9e401bbe97fa967f7b; test -z \"$(git --no-optional-locks -C .docker/roboplan status --porcelain=v1 --untracked-files=all --ignore-submodules=none)\"; (cd third_party/roboplan && sha256sum -c patches.sha256)"],
+      "skip_policy": "forbid",
+      "expected_outputs": ["final-candidate-source.json"]
+    }
+  ],
+  "artifact_dependency_graph": {
+    "lane_output_namespace": "one dedicated writable root per lane",
+    "producer_inputs": {
+      "bindings_exception": [
+        "bindings_release"
+      ],
+      "bindings_generated_api": [
+        "bindings_release"
+      ],
+      "bindings_gil_concurrency": [
+        "bindings_release"
+      ],
+      "bindings_import": [
+        "bindings_release"
+      ],
+      "bindings_lifetime": [
+        "bindings_release"
+      ],
+      "bindings_parity": [
+        "bindings_release"
+      ],
+    "bindings_shutdown": [
+      "bindings_release"
+    ],
+    "core_production_release": [
+      "core_release"
+    ],
+    "deployment_production_release": [
+      "deployment_release"
+    ],
+    "deterministic_rebuild": [
+        "deterministic_build_a",
+        "deterministic_build_b"
+      ]
+    },
+    "producer_input_mount": "each declared producer root is mounted read-only below /qualification-input/<producer-lane>",
+    "host_seal": "host captures the exact path/type/mode/size/content inventory immediately after each successful lane",
+    "closure_recheck": "every lane inventory must remain byte-for-byte unchanged through closure"
+  },
+  "forbidden_scans": [
+    {
+      "id": "stale_public_structure_header",
+      "mode": "line_rg",
+      "roots": ["manyforge_core/python", "manyforge_deployment/include", "manyforge_roboplan"],
+      "pattern": "manyforge_deployment/cell_structure\\.hpp",
+      "globs": ["*.cpp", "*.hpp", "CMakeLists.txt"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    },
+    {
+      "id": "public_or_python_structural_stage",
+      "mode": "line_rg",
+      "roots": ["manyforge_core/python", "manyforge_deployment/include", "manyforge_roboplan"],
+      "pattern": "StructurallyQualifiedCellGraph",
+      "globs": ["*.cpp", "*.hpp", "*.py", "*.pyi", "CMakeLists.txt"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    },
+    {
+      "id": "deleted_roboplan_module",
+      "mode": "line_rg",
+      "roots": ["manyforge_core", "manyforge_deployment", "manyforge_roboplan", "scripts"],
+      "pattern": "manyforge_roboplan_py",
+      "globs": ["*.cpp", "*.hpp", "*.py", "*.sh", "CMakeLists.txt"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    },
+    {
+      "id": "trusted_graph_alias",
+      "mode": "line_rg",
+      "roots": ["manyforge_core", "manyforge_deployment", "manyforge_roboplan"],
+      "pattern": "TrustedCellGraph(Candidate)?",
+      "globs": ["*.cpp", "*.hpp", "*.py", "*.pyi"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    },
+    {
+      "id": "old_parsed_source_api",
+      "mode": "line_rg",
+      "roots": ["manyforge_core/python", "manyforge_deployment/include"],
+      "pattern": "Parsed(ModelSourceIr|Urdf|Srdf)|parsed_ir\\(",
+      "globs": ["*.cpp", "*.hpp", "*.py", "*.pyi"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    },
+    {
+      "id": "old_experimental_import",
+      "mode": "line_rg",
+      "roots": ["manyforge_core", "manyforge_deployment", "manyforge_roboplan", "scripts"],
+      "pattern": "manyforge\\.experimental\\.composable_cell\\.i1a\\.v0",
+      "globs": ["*.cpp", "*.hpp", "*.py", "*.pyi", "*.sh", "CMakeLists.txt"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    },
+    {
+      "id": "trusted_stage_python_constructor",
+      "mode": "file_regex",
+      "roots": ["manyforge_core/python"],
+      "pattern": "(?s)py::class_<\\s*(?:CompositionQualifiedCellIr|ApplicabilityQualifiedCellIr|CompilerQualifiedCellIr)\\b(?:(?!py::class_<).)*?\\.def\\(\\s*py::init",
+      "globs": ["*.cpp", "*.hpp"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    },
+    {
+      "id": "test_only_final_trust_bypass",
+      "mode": "file_regex",
+      "roots": ["manyforge_deployment/include", "manyforge_deployment/src", "manyforge_deployment/test", "manyforge_core/python"],
+      "pattern": "(?is)(?:friend[^;]{0,300}(?:Test|Fixture|Proxy|Access)[^;]*(?:CompositionQualifiedCellIr|ApplicabilityQualifiedCellIr|CompilerQualifiedCellIr)[^;]*;|friend[^;]{0,300}(?:CompositionQualifiedCellIr|ApplicabilityQualifiedCellIr|CompilerQualifiedCellIr)[^;]*(?:Test|Fixture|Proxy|Access)[^;]*;|(?:TestOnly|ForTest|test_only)[A-Za-z0-9_:<> ]{0,160}(?:CompositionQualifiedCellIr|ApplicabilityQualifiedCellIr|CompilerQualifiedCellIr)|(?:CompositionQualifiedCellIr|ApplicabilityQualifiedCellIr|CompilerQualifiedCellIr)[A-Za-z0-9_:<> ]{0,160}(?:TestAccess|TestProxy|ForTest))",
+      "globs": ["*.cpp", "*.hpp", "*.py", "*.pyi"],
+      "exclude_globs": [],
+      "expected_matches": 0
+    },
+    {
+      "id": "ros_or_backend_header_in_core_binding",
+      "mode": "line_rg",
+      "roots": ["manyforge_core/python"],
+      "pattern": "#include[[:space:]]*[<\"](rclcpp|rclpy|moveit|roboplan|pinocchio|coal|geometry_msgs|sensor_msgs)/",
+      "globs": ["*.cpp", "*.hpp"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    },
+    {
+      "id": "direct_graph_to_retention_bypass",
+      "mode": "file_regex",
+      "roots": ["manyforge_deployment/include", "manyforge_deployment/src", "manyforge_core/python", "manyforge_roboplan"],
+      "pattern": "(?s)(?:\\b(?:retain|materializ|build_and_retain)[A-Za-z0-9_]*\\s*\\([^;{}]{0,1000}\\bGraphRevisionVerifiedCellGraph\\b|\\bGraphRevisionVerifiedCellGraph\\b[^;{}]{0,1000}\\b(?:retain|materializ|build_and_retain)[A-Za-z0-9_]*\\s*\\()",
+      "globs": ["*.cpp", "*.hpp", "*.py", "*.pyi"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    },
+    {
+      "id": "compatibility_fallback_or_alias",
+      "mode": "file_regex",
+      "roots": ["manyforge_core/python", "manyforge_deployment/include"],
+      "pattern": "(?i)(?:legacy|deprecated|compatib(?:ility|le))[\\s_-]*(?:alias|fallback|overload)|fallback[\\s_-]*import",
+      "globs": ["*.cpp", "*.hpp", "*.py", "*.pyi", "CMakeLists.txt"],
+      "exclude_globs": ["manyforge_core/python/tests/**"],
+      "expected_matches": 0
+    }
+  ],
+  "deferred_requirements": [
+    {
+      "requirement": "ProgramBinding and Program execution bindings",
+      "owner": "I6/N"
+    },
+    {
+      "requirement": "Apply request, replay and durable Manager observations",
+      "owner": "I4/M0"
+    },
+    {
+      "requirement": "Lifecycle request and observation bindings",
+      "owner": "I7/L0"
+    },
+    {
+      "requirement": "Runtime status, progress and provider-replacement lifetime",
+      "owner": "owning I5-I11 runtime milestone"
+    },
+    {
+      "requirement": "Stop request, participant evidence and certificate bindings",
+      "owner": "I8/P5"
+    },
+    {
+      "requirement": "RoboPlan 0.6.0 adoption or patch reduction",
+      "owner": "E1 after I5/H0"
+    },
+    {
+      "requirement": "Alternative binding-framework evaluation",
+      "owner": "separately approved post-I12 work"
+    }
+  ],
+  "historical_non_satisfying_inputs": [
+    {
+      "name": "C0.2m mf1 historical checkpoint",
+      "commit": "9e41b30378959465640ae2e2239e83807000d864"
+    },
+    {
+      "name": "C0.2n historical checkpoint",
+      "commit": "e0ede0aa64f5340ddad5ad33387d6d349ae2fc87"
+    },
+    {
+      "name": "C0.2o historical C++ checkpoint",
+      "commit": "153195a692c50e606f50e40bd755da6081dd24c5"
+    },
+    {
+      "name": "E0 historical binding experiment",
+      "commit": "637894c460172b47faf64c7ece2e865bb8d69593"
+    },
+    {
+      "name": "historical implementation image",
+      "image": "sha256:08863b21e0908f5400443eebc5c32a6412b356f34e6468799cd1e5b0490918ff"
+    }
+  ],
+  "evidence_contract": {
+    "output_root": ".manyforge-var/qualification/composable-cell-i2",
+    "result_schema": "manyforge.composable_cell_i2.qualification_result.v1",
+    "required_fields": [
+      "manifest_sha256",
+      "verifier_sha256",
+      "qualification_packet_freeze",
+      "candidate_manyforge_source_identity",
+      "candidate_specs_source_identity",
+      "candidate_source_snapshot",
+      "source_identity_file_evidence",
+      "candidate_tracked_input_digests",
+      "resolved_image_inspection",
+      "abi_and_dependency_probe",
+      "pinned_container_replay",
+      "exact_lane_argv",
+      "lane_exit_statuses",
+      "lane_artifact_seals",
+      "test_inventory_counts_and_digests",
+      "binding_junit_summary",
+      "log_sha256",
+      "generated_output_sha256_and_size",
+      "fixture_ir_manifest_golden_and_product_digests",
+      "identity_rotation_comparison",
+      "forbidden_scan_results",
+      "final_unchanged_source_identity",
+      "independent_adversarial_review"
+    ],
+    "commit_raw_results": false,
+    "require_independent_adversarial_review": true,
+    "completion_claim": "Only one all-green cumulative result bound to one unchanged candidate tree may close C0.2m, C0.2n, C0.2o and I2 together."
+  }
+}

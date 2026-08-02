@@ -1,0 +1,110 @@
+{
+  "schema_version": "manyforge.composable_cell_i2.adversarial_review.v1",
+  "independent": false,
+  "reviewer": "INCOMPLETE: replace with the independent reviewer identity",
+  "reviewed_at_utc": "1970-01-01T00:00:00Z",
+  "status": "incomplete",
+  "reviewed_result_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "verifier_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "candidate_manyforge_source_identity": {
+    "schema_version": "manyforge.source_identity.v1",
+    "head_commit": "0000000000000000000000000000000000000000",
+    "head_tree": "0000000000000000000000000000000000000000",
+    "dirty": false,
+    "delta_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "fingerprint_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "candidate_specs_source_identity": {
+    "schema_version": "manyforge.source_identity.v1",
+    "head_commit": "0000000000000000000000000000000000000000",
+    "head_tree": "0000000000000000000000000000000000000000",
+    "dirty": false,
+    "delta_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "fingerprint_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "scope": {
+    "checks": [
+      "candidate_diff_and_packet_freeze",
+      "manifest_verifier_and_exact_lane_commands",
+      "all_native_test_artifacts_and_raw_logs",
+      "native_production_and_binding_build_provenance_closure",
+      "exact_image_pinned_container_file_replay",
+      "source_identity_and_tracked_input_rotation",
+      "c02m_mf2_composition_and_determinism",
+      "c02n_applicability_bounds_and_secret_absence",
+      "c02o_exclusive_trust_binding_and_deletion_boundary",
+      "false_green_unsafe_path_and_relabeling_attempts",
+      "i2_nonclaims_and_later_owner_exclusions"
+    ],
+    "reviewed_lane_ids": [
+      "preflight",
+      "core_release",
+      "core_production_release",
+      "deployment_release",
+      "deployment_production_release",
+      "c02_tail_focused_release",
+      "roboplan_release",
+      "roboplan_consumer_focused",
+      "bindings_selector",
+      "bindings_release",
+      "core_asan_ubsan",
+      "core_tsan",
+      "deployment_asan_ubsan",
+      "roboplan_asan_ubsan",
+      "roboplan_tsan",
+      "bindings_asan_ubsan",
+      "bindings_tsan",
+      "bindings_import",
+      "bindings_parity",
+      "bindings_lifetime",
+      "bindings_exception",
+      "bindings_gil_concurrency",
+      "bindings_shutdown",
+      "bindings_generated_api",
+      "deterministic_build_a",
+      "deterministic_build_b",
+      "deterministic_rebuild",
+      "forbidden_surface_scan",
+      "manifest_contract_tests",
+      "final_recheck"
+    ],
+    "reviewed_evidence_fields": [
+      "abi_and_dependency_probe",
+      "binding_junit_summary",
+      "candidate_manyforge_source_identity",
+      "candidate_source_snapshot",
+      "candidate_specs_source_identity",
+      "candidate_tracked_input_digests",
+      "exact_lane_argv",
+      "final_unchanged_source_identity",
+      "fixture_ir_manifest_golden_and_product_digests",
+      "forbidden_scan_results",
+      "generated_output_sha256_and_size",
+      "identity_rotation_comparison",
+      "lane_artifact_seals",
+      "lane_exit_statuses",
+      "log_sha256",
+      "manifest_sha256",
+      "pinned_container_replay",
+      "qualification_packet_freeze",
+      "resolved_image_inspection",
+      "source_identity_file_evidence",
+      "test_inventory_counts_and_digests",
+      "verifier_sha256"
+    ],
+    "reviewed_log_count": 30,
+    "finding_policy": "blocker/high findings must be resolved; medium/low may be resolved or accepted_non_blocking; unresolved findings forbid pass"
+  },
+  "findings": [
+    {
+      "id": "template_incomplete",
+      "severity": "blocker",
+      "disposition": "unresolved",
+      "evidence": "Template only: bind this review to the exact passing result and independently review every listed check, lane, evidence field, and raw log before resolving this finding."
+    }
+  ],
+  "unresolved_findings": [
+    "template_incomplete"
+  ]
+}
