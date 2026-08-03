@@ -4438,10 +4438,44 @@ def _utility_executable_owner_fixture(
             "sha256": producer_digest,
         },
     }
+    consumer_artifact = f"{build_root}/libconsumer.a"
+    consumer_object = f"{build_root}/CMakeFiles/consumer.dir/consumer.cpp.o"
+    generated_dependency = {
+        "path": generated_path,
+        "sha256": generated_digest,
+        "scope": "generated_build_input",
+        "producer": {
+            "kind": "executable_build_generator",
+            "project_id": "project",
+            "target": "generator",
+            "artifact": producer_path,
+            "artifact_sha256": producer_digest,
+            "argv_sha256": "3" * 64,
+            "parity_argv_sha256": "4" * 64,
+        },
+    }
     consumer = {
         "project_id": "project",
         "target": "consumer",
         "target_type": "STATIC_LIBRARY",
+        "artifact": {
+            "path": consumer_artifact,
+            "resolved_path": consumer_artifact,
+            "sha256": "6" * 64,
+        },
+        "commands": [
+            {
+                "kind": "compile",
+                "output": consumer_object,
+                "dependency_closure": {"files": [generated_dependency]},
+            },
+            {
+                "kind": "archive",
+                "output": consumer_artifact,
+                "inputs": [consumer_object],
+                "dependency_closure": None,
+            },
+        ],
         "required_generated_inputs": [
             {
                 "path": generated_path,
@@ -4449,6 +4483,7 @@ def _utility_executable_owner_fixture(
                 "producer_target": "generator",
                 "producer_artifact": producer_path,
                 "producer_sha256": producer_digest,
+                "argv_sha256": "3" * 64,
             }
         ],
     }
@@ -4478,6 +4513,72 @@ def test_utility_target_rejects_chmod_only_nonexecutable_producer(
     assert _sha256(producer) == claimed_digest
     assert producer.stat().st_mode & 0o111 == 0
     with pytest.raises(verifier.ManifestError, match="executable"):
+        verifier._validate_utility_target_relationships(
+            relationships,
+            targets,
+            "synthetic utility owner",
+            lane_root=lane_root,
+        )
+
+
+def test_host_joins_generated_input_to_direct_consumer_object(
+    tmp_path: Path,
+) -> None:
+    relationships, targets, lane_root, _producer = (
+        _utility_executable_owner_fixture(tmp_path)
+    )
+
+    assert verifier._validate_utility_target_relationships(
+        relationships,
+        targets,
+        "synthetic utility owner",
+        lane_root=lane_root,
+    ) == relationships
+
+
+def test_host_rejects_generated_input_used_only_by_transitive_compile(
+    tmp_path: Path,
+) -> None:
+    relationships, targets, lane_root, _producer = (
+        _utility_executable_owner_fixture(tmp_path)
+    )
+    consumer = targets[2]
+    generated_dependency = consumer["commands"][0]["dependency_closure"][
+        "files"
+    ].pop()
+    consumer["commands"].insert(
+        1,
+        {
+            "kind": "compile",
+            "output": (
+                "/qualification-output/build/project/"
+                "CMakeFiles/dependency.dir/dependency.cpp.o"
+            ),
+            "dependency_closure": {"files": [generated_dependency]},
+        },
+    )
+
+    with pytest.raises(
+        verifier.ManifestError,
+        match="not joined to its direct-object compiler dependency",
+    ):
+        verifier._validate_utility_target_relationships(
+            relationships,
+            targets,
+            "synthetic utility owner",
+            lane_root=lane_root,
+        )
+
+
+def test_host_rejects_generated_input_generator_argv_drift(
+    tmp_path: Path,
+) -> None:
+    relationships, targets, lane_root, _producer = (
+        _utility_executable_owner_fixture(tmp_path)
+    )
+    targets[2]["required_generated_inputs"][0]["argv_sha256"] = "f" * 64
+
+    with pytest.raises(verifier.ManifestError, match="owner/byte join drifted"):
         verifier._validate_utility_target_relationships(
             relationships,
             targets,
@@ -4557,6 +4658,295 @@ def _target_spec(name: str) -> provenance._ProductTargetSpec:
         required_sources=(),
         required_generated_sources=(),
     )
+
+
+def _prove_required_generated_input_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_file_api_source: bool,
+    include_compile_dependency: bool,
+    transitive_compile_dependency: bool = False,
+    dependency_producer_target: str = "emit_profile",
+    generator_executable: bool = True,
+) -> tuple[dict[str, Any], str, str]:
+    repository, output, roots = _roots(tmp_path)
+    source_root = repository / "project"
+    source = _write(source_root / "src/consumer.cpp")
+    build_root = output / "build/project"
+    generated = _write(build_root / "generated/profile.hpp", b"#pragma once\n")
+    artifact = _write(build_root / "libconsumer.a", b"!<arch>\n")
+    generator = _write(
+        build_root / "emit_profile",
+        b"\x7fELFsynthetic-generator\n",
+        executable=generator_executable,
+    )
+    target = provenance._TargetReply(
+        name="consumer",
+        target_type="STATIC_LIBRARY",
+        artifacts=(artifact,),
+        sources=(source, generated) if include_file_api_source else (source,),
+        virtual_sources=(),
+        build_base=build_root,
+        reply_path=build_root / "target-consumer.json",
+        reply_sha256="0" * 64,
+    )
+    generator_target = provenance._TargetReply(
+        name="emit_profile",
+        target_type="EXECUTABLE",
+        artifacts=(generator,),
+        sources=(),
+        virtual_sources=(),
+        build_base=build_root,
+        reply_path=build_root / "target-emit-profile.json",
+        reply_sha256="1" * 64,
+    )
+    build = provenance._Build(
+        lane_id="synthetic",
+        project_id="project",
+        root=build_root,
+        source_root=source_root,
+        compiler_path="/usr/bin/c++",
+        archiver_path="/usr/bin/ar",
+        targets={"consumer": target, "emit_profile": generator_target},
+        compile_commands={},
+        configure_inputs={},
+        configure_generated_contracts={},
+        qualified_install_inputs={},
+        evidence={},
+        parity_path_aliases=(
+            (roots.logical(build_root), "<build:project>"),
+        ),
+    )
+    generated_path = roots.logical(generated)
+    generator_argv = (generator.as_posix(), generated.as_posix())
+    generator_argv_sha256 = provenance._canonical_sha256(list(generator_argv))
+    generator_parity_argv_sha256 = provenance._parity_argv_sha256(
+        generator_argv, build, roots
+    )
+    generated_dependency = {
+        "path": generated_path,
+        "sha256": hashlib.sha256(b"#pragma once\n").hexdigest(),
+        "scope": "generated_build_input",
+        "producer": {
+            "kind": "executable_build_generator",
+            "project_id": "project",
+            "target": dependency_producer_target,
+            "artifact": roots.logical(generator),
+            "artifact_sha256": hashlib.sha256(
+                b"\x7fELFsynthetic-generator\n"
+            ).hexdigest(),
+            "argv_sha256": generator_argv_sha256,
+            "parity_argv_sha256": generator_parity_argv_sha256,
+        },
+    }
+    direct_object = roots.logical(
+        build_root / "CMakeFiles/consumer.dir/src/consumer.cpp.o"
+    )
+    transitive_object = roots.logical(
+        build_root / "CMakeFiles/dependency.dir/src/dependency.cpp.o"
+    )
+    direct_dependencies = (
+        [generated_dependency] if include_compile_dependency else []
+    )
+    transitive_dependencies = (
+        [generated_dependency] if transitive_compile_dependency else []
+    )
+    target_proof = {
+        "artifact": {
+            "path": roots.logical(artifact),
+            "resolved_path": roots.logical(artifact),
+            "sha256": hashlib.sha256(b"!<arch>\n").hexdigest(),
+        },
+        "ninja_query": [
+            {
+                "node": "libconsumer.a",
+                "rule": "CXX_STATIC_LIBRARY_LINKER",
+                "edges": [
+                    {
+                        "type": "order_only",
+                        "path": roots.logical(build_root / "emit_profile"),
+                    }
+                ],
+                "raw_sha256": "2" * 64,
+            }
+        ],
+        "commands": [
+            {
+                "kind": "compile",
+                "output": direct_object,
+                "source": {
+                    "path": roots.logical(source),
+                    "sha256": hashlib.sha256(b"test\n").hexdigest(),
+                },
+                "dependency_closure": {"files": direct_dependencies},
+            },
+            {
+                "kind": "compile",
+                "output": transitive_object,
+                "source": {
+                    "path": "/workspace/project/src/dependency.cpp",
+                    "sha256": "4" * 64,
+                },
+                "dependency_closure": {"files": transitive_dependencies},
+            },
+            {
+                "kind": "archive",
+                "output": roots.logical(artifact),
+                "inputs": [direct_object],
+                "dependency_closure": None,
+            },
+        ],
+    }
+    generated_command = provenance._Command(
+        kind="generated",
+        output=generated,
+        inputs=(generator,),
+        auxiliary_outputs=(),
+        source=None,
+        directory=build_root,
+        argv=generator_argv,
+        argv_sha256=generator_argv_sha256,
+    )
+    monkeypatch.setattr(
+        provenance,
+        "_prove_target",
+        lambda **_kwargs: copy.deepcopy(target_proof),
+    )
+    monkeypatch.setattr(
+        provenance,
+        "_run_text",
+        lambda *_args, **_kwargs: "synthetic generated-input command\n",
+    )
+    monkeypatch.setattr(
+        provenance,
+        "_parse_ninja_commands",
+        lambda *_args, **_kwargs: {generated: generated_command},
+    )
+    proof = provenance._prove_spec(
+        build=build,
+        spec=provenance._ProductTargetSpec(
+            name="consumer",
+            target_type="STATIC_LIBRARY",
+            artifact=Path("libconsumer.a"),
+            required_sources=(source,),
+            required_generated_sources=(Path("generated/profile.hpp"),),
+        ),
+        role="production",
+        profile="none",
+        roots=roots,
+        responses=provenance._ResponseCollector(roots),
+    )
+    return proof, generated_path, generator_argv_sha256
+
+
+def test_required_generated_input_uses_compiler_depfile_not_query_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof, generated_path, generator_argv_sha256 = (
+        _prove_required_generated_input_fixture(
+            tmp_path,
+            monkeypatch,
+            include_file_api_source=True,
+            include_compile_dependency=True,
+        )
+    )
+
+    assert all(
+        edge["path"] != generated_path
+        for query in proof["ninja_query"]
+        for edge in query["edges"]
+    )
+    assert proof["required_generated_inputs"] == [
+        {
+            "path": generated_path,
+            "sha256": hashlib.sha256(b"#pragma once\n").hexdigest(),
+            "producer_target": "emit_profile",
+            "producer_artifact": (
+                "/qualification-output/build/project/emit_profile"
+            ),
+            "producer_sha256": hashlib.sha256(
+                b"\x7fELFsynthetic-generator\n"
+            ).hexdigest(),
+            "argv_sha256": generator_argv_sha256,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("include_file_api_source", "include_compile_dependency", "message"),
+    [
+        (False, True, "absent from its File API source set"),
+        (True, False, "absent from its direct-object compiler dependency closure"),
+    ],
+    ids=["missing-file-api-source", "missing-compiler-dependency"],
+)
+def test_required_generated_input_requires_both_source_and_compile_membership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_file_api_source: bool,
+    include_compile_dependency: bool,
+    message: str,
+) -> None:
+    with pytest.raises(provenance.NativeBuildProvenanceError, match=message):
+        _prove_required_generated_input_fixture(
+            tmp_path,
+            monkeypatch,
+            include_file_api_source=include_file_api_source,
+            include_compile_dependency=include_compile_dependency,
+        )
+
+
+def test_required_generated_input_rejects_transitive_only_compile_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="absent from its direct-object compiler dependency closure",
+    ):
+        _prove_required_generated_input_fixture(
+            tmp_path,
+            monkeypatch,
+            include_file_api_source=True,
+            include_compile_dependency=False,
+            transitive_compile_dependency=True,
+        )
+
+
+def test_required_generated_input_rejects_dependency_producer_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="dependency and generator evidence disagree",
+    ):
+        _prove_required_generated_input_fixture(
+            tmp_path,
+            monkeypatch,
+            include_file_api_source=True,
+            include_compile_dependency=True,
+            dependency_producer_target="wrong_generator",
+        )
+
+
+def test_required_generated_input_rejects_nonexecutable_producer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="generated-input producer is not executable",
+    ):
+        _prove_required_generated_input_fixture(
+            tmp_path,
+            monkeypatch,
+            include_file_api_source=True,
+            include_compile_dependency=True,
+            generator_executable=False,
+        )
 
 
 @pytest.mark.parametrize("explicit_contract", [False, True])

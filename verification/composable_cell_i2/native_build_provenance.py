@@ -8446,11 +8446,77 @@ def _prove_spec(
         target_sources = {
             Path(os.path.normpath(source)) for source in build.targets[spec.name].sources
         }
-        query_edges = {
-            _text(_object(edge, "generated-input query edge").get("path"), "generated-input path")
-            for query in _list(proof.get("ninja_query"), "generated-input Ninja query")
-            for edge in _list(_object(query, "generated-input query row").get("edges"), "generated-input query edges")
-        }
+        proof_commands = [
+            _object(command_value, f"generated-input target command[{command_index}]")
+            for command_index, command_value in enumerate(
+                _list(proof.get("commands"), "generated-input target commands")
+            )
+        ]
+        artifact_path = _text(
+            _object(proof.get("artifact"), "generated-input target artifact").get(
+                "path"
+            ),
+            "generated-input target artifact path",
+        )
+        final_kind = "archive" if spec.target_type == "STATIC_LIBRARY" else "link"
+        final_commands = [
+            command
+            for command in proof_commands
+            if command.get("kind") == final_kind
+            and command.get("output") == artifact_path
+        ]
+        if len(final_commands) != 1:
+            _fail(
+                f"{build.project_id} target {spec.name} generated-input proof has "
+                "no unique final artifact command"
+            )
+        direct_objects: set[str] = set()
+        for input_index, input_value in enumerate(
+            _list(
+                final_commands[0].get("inputs"),
+                "generated-input final command inputs",
+            )
+        ):
+            input_path = _text(
+                input_value,
+                f"generated-input final command input[{input_index}]",
+            )
+            if _artifact_kind(Path(input_path)) == "object":
+                direct_objects.add(input_path)
+        direct_compile_dependencies: dict[str, list[dict[str, Any]]] = {}
+        for command_index, command in enumerate(proof_commands):
+            if (
+                command.get("kind") != "compile"
+                or command.get("output") not in direct_objects
+            ):
+                continue
+            closure = _object(
+                command.get("dependency_closure"),
+                f"generated-input target command[{command_index}] dependency closure",
+            )
+            for dependency_index, dependency_value in enumerate(
+                _list(
+                    closure.get("files"),
+                    f"generated-input target command[{command_index}] dependency files",
+                )
+            ):
+                dependency = _object(
+                    dependency_value,
+                    (
+                        f"generated-input target command[{command_index}] "
+                        f"dependency[{dependency_index}]"
+                    ),
+                )
+                dependency_path = _text(
+                    dependency.get("path"),
+                    (
+                        f"generated-input target command[{command_index}] "
+                        f"dependency[{dependency_index}].path"
+                    ),
+                )
+                direct_compile_dependencies.setdefault(dependency_path, []).append(
+                    dependency
+                )
         for relative in spec.required_generated_sources:
             generated = Path(os.path.normpath(build.root / relative))
             generated_file = _regular_file(
@@ -8458,10 +8524,18 @@ def _prove_spec(
                 f"{build.project_id} target {spec.name} contracted generated input",
                 contained_by=build.root,
             )
-            if generated not in target_sources or roots.logical(generated) not in query_edges:
+            if generated not in target_sources:
                 _fail(
                     f"{build.project_id} target {spec.name} generated input is absent "
-                    "from its File API source and Ninja dependency closure"
+                    "from its File API source set"
+                )
+            dependency_rows = direct_compile_dependencies.get(
+                roots.logical(generated), []
+            )
+            if not dependency_rows:
+                _fail(
+                    f"{build.project_id} target {spec.name} generated input is absent "
+                    "from its direct-object compiler dependency closure"
                 )
             if generated not in commands or commands[generated].kind != "generated":
                 _fail(
@@ -8492,13 +8566,48 @@ def _prove_spec(
                 f"{build.project_id} target {spec.name} generated-input producer",
                 contained_by=build.root,
             )
+            if not os.access(producer_file, os.X_OK):
+                _fail(
+                    f"{build.project_id} target {spec.name} generated-input producer "
+                    "is not executable"
+                )
+            generated_digest = _sha256_file(generated_file)
+            producer_digest = _sha256_file(producer_file)
+            expected_dependency_producer = {
+                "kind": "executable_build_generator",
+                "project_id": build.project_id,
+                "target": owners[0],
+                "artifact": roots.logical(producer_path),
+                "artifact_sha256": producer_digest,
+                "argv_sha256": producer.argv_sha256,
+                "parity_argv_sha256": _parity_argv_sha256(
+                    producer.argv, build, roots
+                ),
+            }
+            for dependency in dependency_rows:
+                dependency_producer = _object(
+                    dependency.get("producer"),
+                    f"{build.project_id} target {spec.name} generated dependency producer",
+                )
+                if (
+                    dependency.get("sha256") != generated_digest
+                    or dependency.get("scope") != "generated_build_input"
+                    or any(
+                        dependency_producer.get(key) != value
+                        for key, value in expected_dependency_producer.items()
+                    )
+                ):
+                    _fail(
+                        f"{build.project_id} target {spec.name} generated input "
+                        "dependency and generator evidence disagree"
+                    )
             generated_rows.append(
                 {
                     "path": roots.logical(generated),
-                    "sha256": _sha256_file(generated_file),
+                    "sha256": generated_digest,
                     "producer_target": owners[0],
                     "producer_artifact": roots.logical(producer_path),
-                    "producer_sha256": _sha256_file(producer_file),
+                    "producer_sha256": producer_digest,
                     "argv_sha256": producer.argv_sha256,
                 }
             )

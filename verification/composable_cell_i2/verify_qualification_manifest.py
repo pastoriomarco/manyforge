@@ -4986,6 +4986,70 @@ def _ctest_inventory_names(path: Path, label: str) -> set[str]:
     return set(names)
 
 
+def _direct_object_compile_dependency_rows(
+    target: dict[str, Any], label: str
+) -> dict[str, list[dict[str, Any]]]:
+    artifact_path = _require_text(
+        _require_object(target.get("artifact"), f"{label} artifact").get("path"),
+        f"{label} artifact path",
+    )
+    target_type = _require_text(target.get("target_type"), f"{label} target type")
+    final_kind = "archive" if target_type == "STATIC_LIBRARY" else "link"
+    commands = [
+        _require_object(command_value, f"{label} command[{command_index}]")
+        for command_index, command_value in enumerate(
+            _require_list(target.get("commands"), f"{label} commands")
+        )
+    ]
+    final_commands = [
+        command
+        for command in commands
+        if command.get("kind") == final_kind
+        and command.get("output") == artifact_path
+    ]
+    if len(final_commands) != 1:
+        fail(f"{label} has no unique final artifact command")
+    direct_objects: set[str] = set()
+    for input_index, input_value in enumerate(
+        _require_list(final_commands[0].get("inputs"), f"{label} final inputs")
+    ):
+        input_path = _require_text(
+            input_value, f"{label} final input[{input_index}]"
+        )
+        if PurePosixPath(input_path).suffix in {".o", ".obj"}:
+            direct_objects.add(input_path)
+    dependencies: dict[str, list[dict[str, Any]]] = {}
+    for command_index, command in enumerate(commands):
+        if (
+            command.get("kind") != "compile"
+            or command.get("output") not in direct_objects
+        ):
+            continue
+        closure = _require_object(
+            command.get("dependency_closure"),
+            f"{label} direct compile[{command_index}] dependency closure",
+        )
+        for dependency_index, dependency_value in enumerate(
+            _require_list(
+                closure.get("files"),
+                f"{label} direct compile[{command_index}] dependencies",
+            )
+        ):
+            dependency = _require_object(
+                dependency_value,
+                f"{label} direct compile[{command_index}] dependency[{dependency_index}]",
+            )
+            dependency_path = _require_text(
+                dependency.get("path"),
+                (
+                    f"{label} direct compile[{command_index}] "
+                    f"dependency[{dependency_index}].path"
+                ),
+            )
+            dependencies.setdefault(dependency_path, []).append(dependency)
+    return dependencies
+
+
 def _validate_utility_target_relationships(
     value: Any,
     target_value: Any,
@@ -5181,6 +5245,28 @@ def _validate_utility_target_relationships(
             or generator.get("sha256") != producer_digest
         ):
             fail(f"{row_label} utility/producer byte-owner join drifted")
+        utility_generator_commands = [
+            command
+            for command_index, command_value in enumerate(
+                _require_list(
+                    utility.get("commands"), f"{row_label} utility commands"
+                )
+            )
+            if (
+                command := _require_object(
+                    command_value,
+                    f"{row_label} utility command[{command_index}]",
+                )
+            ).get("kind")
+            == "generated"
+            and command.get("output") == generated_path
+        ]
+        if len(utility_generator_commands) != 1:
+            fail(f"{row_label} has no unique generated-output command")
+        utility_generator_argv_sha256 = _require_text(
+            utility_generator_commands[0].get("argv_sha256"),
+            f"{row_label} generated-output command argv digest",
+        )
 
         try:
             generated_in_inventory = PurePosixPath(generated_path).relative_to(
@@ -5302,19 +5388,56 @@ def _validate_utility_target_relationships(
                 or generated.get("producer_target") != producer_target
                 or generated.get("producer_artifact") != producer_path
                 or generated.get("producer_sha256") != producer_digest
+                or generated.get("argv_sha256")
+                != utility_generator_argv_sha256
             ):
                 fail(f"{row_label} consumer {proof_target} owner/byte join drifted")
+            dependency_matches = _direct_object_compile_dependency_rows(
+                proof, f"{row_label} consumer {proof_target}"
+            ).get(generated_path, [])
+            expected_dependency_producer = {
+                "kind": "executable_build_generator",
+                "project_id": project_id,
+                "target": producer_target,
+                "artifact": producer_path,
+                "artifact_sha256": producer_digest,
+                "argv_sha256": utility_generator_argv_sha256,
+            }
+            if not dependency_matches:
+                fail(
+                    f"{row_label} consumer {proof_target} generated input is not "
+                    "joined to its direct-object compiler dependency"
+                )
+            for dependency in dependency_matches:
+                dependency_producer = _require_object(
+                    dependency.get("producer"),
+                    f"{row_label} consumer {proof_target} dependency producer",
+                )
+                if (
+                    dependency.get("sha256") != generated_digest
+                    or dependency.get("scope") != "generated_build_input"
+                    or any(
+                        dependency_producer.get(producer_field) != expected
+                        for producer_field, expected in (
+                            expected_dependency_producer.items()
+                        )
+                    )
+                ):
+                    fail(
+                        f"{row_label} consumer {proof_target} generated input is not "
+                        "joined to its direct-object compiler dependency"
+                    )
             compiled_relationships[(proof_target, "compiled_generated_input")] = generated
 
         utility_relationships: set[tuple[str, str]] = set()
-        for relationship_index, raw_utility_relationship in enumerate(
+        for utility_relationship_index, raw_utility_relationship in enumerate(
             _require_list(
                 utility.get("consumer_relationships"),
                 f"{row_label} utility consumer relationships",
             )
         ):
             utility_label = (
-                f"{row_label} utility consumer relationship[{relationship_index}]"
+                f"{row_label} utility consumer relationship[{utility_relationship_index}]"
             )
             utility_relationship = _require_object(
                 raw_utility_relationship, utility_label
