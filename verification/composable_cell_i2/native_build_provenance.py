@@ -10480,10 +10480,24 @@ def _auxiliary_install_states(
         relative_rows: list[str] = []
         files_by_relative: dict[Path, Path] = {}
         for index, line in enumerate(lines):
+            if (
+                not line.startswith("/")
+                or line.startswith("//")
+                or line.endswith("/")
+                or "\\" in line
+                or any(part in {".", ".."} for part in line.split("/"))
+            ):
+                _fail(
+                    f"{project_id} install manifest[{index}] has an unsafe path: "
+                    f"{line}"
+                )
+            normalized_line = posixpath.normpath(line)
             installed = Path(
                 os.path.normpath(
                     roots.decode(
-                        line, build.root, f"{project_id} install manifest[{index}]"
+                        normalized_line,
+                        build.root,
+                        f"{project_id} install manifest[{index}]",
                     )
                 )
             )

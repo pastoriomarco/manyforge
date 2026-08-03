@@ -5982,10 +5982,19 @@ def _validate_auxiliary_install_projects(
         relative_rows: list[str] = []
         install_root_pure = PurePosixPath(install_root)
         for line_index, line in enumerate(lines):
-            if posixpath.normpath(line) != line or not line.startswith("/"):
-                fail(f"{project_label} manifest[{line_index}] is not canonical")
+            if (
+                not line.startswith("/")
+                or line.startswith("//")
+                or line.endswith("/")
+                or "\\" in line
+                or any(part in {".", ".."} for part in line.split("/"))
+            ):
+                fail(f"{project_label} manifest[{line_index}] has an unsafe path")
+            normalized_line = posixpath.normpath(line)
             try:
-                relative = PurePosixPath(line).relative_to(install_root_pure)
+                relative = PurePosixPath(normalized_line).relative_to(
+                    install_root_pure
+                )
             except ValueError:
                 fail(f"{project_label} manifest[{line_index}] escapes its prefix")
             if not relative.parts:
