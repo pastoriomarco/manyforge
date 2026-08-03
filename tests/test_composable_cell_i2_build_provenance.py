@@ -2128,6 +2128,25 @@ def test_host_rejects_auxiliary_manifest_unsafe_path(
         _validate_synthetic_auxiliary_install_fixture(fixture)
 
 
+def test_native_parity_alias_accepts_quote_delimited_exact_path(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    output = tmp_path / "qualification-output"
+    repository.mkdir()
+    output.mkdir()
+    roots = provenance._Roots(repository=repository, output=output)
+    install = output / "build/roboplan/install/roboplan_example_models"
+    logical_install = roots.logical(install)
+
+    assert provenance._normalize_parity_text(
+        f'-DROBOPLAN_INSTALL_PREFIX="{logical_install}"',
+        aliases=((logical_install, "<install:roboplan_example_models>"),),
+        roots=roots,
+        label="quoted parity path",
+    ) == '-DROBOPLAN_INSTALL_PREFIX="<install:roboplan_example_models>"'
+
+
 def test_host_rejects_auxiliary_generated_export_target_drift(
     tmp_path: Path,
 ) -> None:

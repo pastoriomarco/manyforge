@@ -7847,7 +7847,7 @@ def _normalize_parity_text(
     normalized = roots.normalize_tool_output(value)
     for prefix, alias in aliases:
         normalized = re.sub(
-            re.escape(prefix) + r"(?=$|[/,:;])",
+            re.escape(prefix) + r"(?=$|[/,:;'\"])",
             alias,
             normalized,
         )
