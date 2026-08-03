@@ -4,6 +4,7 @@ import copy
 import dataclasses
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1834,19 +1835,51 @@ def _embedded_build_evidence_header(
 
 
 def _build_qualified_profile_header(
-    *, profile: str, configuration_digest: str, sentinel: str = "stable"
+    *,
+    profile: str,
+    configuration_digest: str,
+    sentinel: str = "stable",
+    manifest_identity_override: str | None = None,
+    header_identity_override: str | None = None,
+    canonical_manifest: bool = True,
 ) -> bytes:
-    manifest = json.dumps(
-        {
-            "build_configuration_digest": configuration_digest,
-            "build_profile": profile,
-            "sentinel": sentinel,
-        },
+    identity_payload = {
+        "api_version": "manyforge.compiler_build_manifest.v1",
+        "build_configuration_digest": configuration_digest,
+        "build_profile": profile,
+        "sentinel": sentinel,
+    }
+    canonical_payload = json.dumps(
+        identity_payload,
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
+    identity_preimage = (
+        b"manyforge.content-identity.v1\0"
+        b"compiler-build-digest\0"
+        b"manyforge.compiler_build_manifest.v1\0"
+        + canonical_payload
+    )
+    computed_identity = f"sha256:{hashlib.sha256(identity_preimage).hexdigest()}"
+    manifest_identity = manifest_identity_override or computed_identity
+    manifest_document = {
+        **identity_payload,
+        "compiler_build_digest": manifest_identity,
+    }
+    if canonical_manifest:
+        manifest = json.dumps(
+            manifest_document,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    else:
+        manifest = json.dumps(
+            manifest_document,
+            sort_keys=True,
+            indent=2,
+        ).encode()
     byte_array = ", ".join(f"0x{value:02x}U" for value in manifest)
-    digest = hashlib.sha256(manifest).hexdigest()
+    header_identity = header_identity_override or manifest_identity
     return (
         "#pragma once\n"
         "#include <array>\n"
@@ -1857,7 +1890,7 @@ def _build_qualified_profile_header(
         f"    {byte_array}\n"
         "}};\n\n"
         "inline constexpr std::string_view kCompilerBuildManifestDigest = "
-        f'"sha256:{digest}";\n'
+        f'"{header_identity}";\n'
     ).encode()
 
 
@@ -1933,6 +1966,74 @@ def test_cross_profile_generated_headers_normalize_only_sanctioned_facts(
             mutated_profile, "generated_build_input"
         )
     )
+
+
+def test_build_qualified_profile_requires_framed_non_circular_identity(
+    tmp_path: Path,
+) -> None:
+    valid = _write(
+        tmp_path / "valid/build_qualified_admission_profile_generated.hpp",
+        _build_qualified_profile_header(
+            profile="Release", configuration_digest=f"sha256:{'1' * 64}"
+        ),
+    )
+    stale_manifest = _write(
+        tmp_path / "stale/build_qualified_admission_profile_generated.hpp",
+        _build_qualified_profile_header(
+            profile="Release",
+            configuration_digest=f"sha256:{'1' * 64}",
+            manifest_identity_override=f"sha256:{'2' * 64}",
+        ),
+    )
+    mismatched_header = _write(
+        tmp_path / "mismatch/build_qualified_admission_profile_generated.hpp",
+        _build_qualified_profile_header(
+            profile="Release",
+            configuration_digest=f"sha256:{'1' * 64}",
+            header_identity_override=f"sha256:{'3' * 64}",
+        ),
+    )
+    noncanonical_manifest = _write(
+        tmp_path / "noncanonical/build_qualified_admission_profile_generated.hpp",
+        _build_qualified_profile_header(
+            profile="Release",
+            configuration_digest=f"sha256:{'1' * 64}",
+            canonical_manifest=False,
+        ),
+    )
+
+    valid_text = valid.read_text(encoding="utf-8")
+    valid_match = re.search(
+        r"kCompilerBuildManifestBytes\{\{\n(?P<body>.*?)\}\};\n\n"
+        r"inline constexpr std::string_view kCompilerBuildManifestDigest = "
+        r'"(?P<digest>sha256:[0-9a-f]{64})";',
+        valid_text,
+        re.DOTALL,
+    )
+    assert valid_match is not None
+    valid_manifest_bytes = bytes(
+        int(value, 16)
+        for value in re.findall(r"0x([0-9a-f]{2})U", valid_match.group("body"))
+    )
+    assert f"sha256:{hashlib.sha256(valid_manifest_bytes).hexdigest()}" != (
+        valid_match.group("digest")
+    )
+    assert provenance.generated_output_cross_profile_sha256(valid)
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="content identity does not match its exact document",
+    ):
+        provenance.generated_output_cross_profile_sha256(stale_manifest)
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="digest disagrees with its manifest",
+    ):
+        provenance.generated_output_cross_profile_sha256(mismatched_header)
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="not exact canonical JSON",
+    ):
+        provenance.generated_output_cross_profile_sha256(noncanonical_manifest)
 
 
 @pytest.mark.parametrize(

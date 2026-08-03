@@ -274,6 +274,48 @@ def _canonical_sha256(value: Any) -> str:
     return _sha256_bytes(encoded)
 
 
+def _verify_framed_content_identity(
+    document: Mapping[str, Any],
+    *,
+    identity_domain: str,
+    api_version: str,
+    own_field: str,
+    label: str,
+) -> str:
+    if document.get("api_version") != api_version:
+        _fail(f"{label} api_version drifted")
+    declared = document.get(own_field)
+    if (
+        not isinstance(declared, str)
+        or not declared.startswith("sha256:")
+        or not _HEX64.fullmatch(declared[7:])
+    ):
+        _fail(f"{label} own identity is malformed")
+    payload = {key: value for key, value in document.items() if key != own_field}
+    try:
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        _fail(f"{label} cannot be canonically serialized: {error}")
+    preimage = (
+        b"manyforge.content-identity.v1\0"
+        + identity_domain.encode("ascii")
+        + b"\0"
+        + api_version.encode("ascii")
+        + b"\0"
+        + canonical
+    )
+    computed = f"sha256:{_sha256_bytes(preimage)}"
+    if declared != computed:
+        _fail(f"{label} content identity does not match its exact document")
+    return computed
+
+
 _GIT_INDEX_CACHE: dict[
     tuple[str, str], tuple[str, dict[str, tuple[str, str]]]
 ] = {}
@@ -4396,7 +4438,14 @@ def _configure_header_cross_profile_sha256(path: Path) -> str:
 
 
 def _build_qualified_profile_cross_profile_sha256(path: Path) -> str:
-    """Normalize only the two qualified compiler-build profile facts."""
+    """Normalize only the two qualified compiler-build profile facts.
+
+    The compiler-build digest is a derived, non-circular framed content
+    identity, not the raw SHA-256 of JSON bytes that contain that identity.
+    Validate the exact identity first, then omit the derived own field from the
+    normalized projection so Release and RelWithDebInfo can compare equal when
+    their only semantic differences are the two sanctioned profile facts.
+    """
 
     raw = _read_bytes(path, "generated build-qualified admission profile")
     try:
@@ -4423,23 +4472,50 @@ def _build_qualified_profile_cross_profile_sha256(path: Path) -> str:
     )
     if len(manifest_bytes) != int(match.group("size")):
         _fail("generated compiler-build byte-array size drifted")
-    expected_digest = f"sha256:{_sha256_bytes(manifest_bytes)}"
-    if match.group("digest") != expected_digest:
-        _fail("generated compiler-build manifest digest disagrees with its bytes")
     try:
         manifest = json.loads(
-            manifest_bytes.decode("utf-8"), object_pairs_hook=_unique_object
+            manifest_bytes.decode("utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda token: _fail(
+                f"generated compiler-build manifest contains {token}"
+            ),
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         _fail(f"generated compiler-build manifest is invalid JSON: {error}")
     manifest = _object(manifest, "generated compiler-build manifest")
+    try:
+        canonical_manifest_bytes = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        _fail(
+            "generated compiler-build manifest cannot be canonically "
+            f"serialized: {error}"
+        )
+    if manifest_bytes != canonical_manifest_bytes:
+        _fail("generated compiler-build manifest is not exact canonical JSON")
+    manifest_digest = _verify_framed_content_identity(
+        manifest,
+        identity_domain="compiler-build-digest",
+        api_version="manyforge.compiler_build_manifest.v1",
+        own_field="compiler_build_digest",
+        label="generated compiler-build manifest",
+    )
+    if match.group("digest") != manifest_digest:
+        _fail("generated profile compiler-build digest disagrees with its manifest")
     profile = manifest.get("build_profile")
     configuration_digest = manifest.get("build_configuration_digest")
     if profile not in {"Release", "RelWithDebInfo"} or not isinstance(
         configuration_digest, str
     ) or not re.fullmatch(r"sha256:[0-9a-f]{64}", configuration_digest):
         _fail("generated compiler-build profile/configuration facts drifted")
-    normalized_manifest = dict(manifest)
+    normalized_manifest = {
+        key: value for key, value in manifest.items() if key != "compiler_build_digest"
+    }
     normalized_manifest["build_profile"] = "<I2_ALLOWED_BUILD_PROFILE>"
     normalized_manifest["build_configuration_digest"] = (
         "<I2_ALLOWED_BUILD_CONFIGURATION_DIGEST>"
