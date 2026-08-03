@@ -23,9 +23,10 @@ import shlex
 import stat
 import subprocess
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any
 
 
@@ -316,9 +317,47 @@ def _verify_framed_content_identity(
     return computed
 
 
-_GIT_INDEX_CACHE: dict[
-    tuple[str, str], tuple[str, dict[str, tuple[str, str]]]
-] = {}
+@dataclass(frozen=True)
+class _GitIndexSnapshot:
+    git_root: Path
+    index_tree: str
+    object_format: str
+    entries: Mapping[str, tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class _PhysicalFileIdentity:
+    device: int
+    inode: int
+    mode: int
+    user_id: int
+    group_id: int
+    link_count: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True)
+class _DependencyResolutionCacheEntry:
+    path: Path
+    allowed_root: Path
+    resolved_path: Path
+    symlink_chain: tuple[str, ...]
+    require_single_link: bool
+
+
+@dataclass(frozen=True)
+class _CompileDependencyClosureCacheEntry:
+    closure: dict[str, Any]
+    ninja_deps_path: Path
+    ninja_deps_sha256: str
+    dependency_resolutions: tuple[_DependencyResolutionCacheEntry, ...]
+    referenced_files: tuple[tuple[Path, _PhysicalFileIdentity], ...]
+    generated_command_fingerprints: tuple[
+        tuple[Path, tuple[Any, ...]], ...
+    ]
+    configure_generated_without_command: tuple[Path, ...]
 
 
 def _git_index_tree(
@@ -394,9 +433,8 @@ def _git_index_tree(
     return tree_ids[()]
 
 
-def _git_index(
-    git_root: Path, label: str
-) -> tuple[str, str, dict[str, tuple[str, str]]]:
+def _read_git_index(git_root: Path, label: str) -> _GitIndexSnapshot:
+    git_root = _directory(git_root, f"{label} Git root")
     object_format = _run_text(
         [
             "/usr/bin/git",
@@ -451,33 +489,37 @@ def _git_index(
     if not entries:
         _fail(f"{label} Git index is empty")
     index_tree = _git_index_tree(object_format, entries, label)
-    cache_key = (git_root.as_posix(), index_tree)
-    cached = _GIT_INDEX_CACHE.get(cache_key)
-    if cached is not None:
-        cached_format, cached_entries = cached
-        return index_tree, cached_format, cached_entries
-    result = (object_format, entries)
-    _GIT_INDEX_CACHE[cache_key] = result
-    return index_tree, *result
+    return _GitIndexSnapshot(
+        git_root=git_root,
+        index_tree=index_tree,
+        object_format=object_format,
+        entries=MappingProxyType(dict(entries)),
+    )
 
 
-def _git_tracked_file_identity(path: Path, git_root: Path, label: str) -> dict[str, str]:
+def _git_tracked_file_identity(
+    path: Path,
+    git_root: Path,
+    label: str,
+    *,
+    roots: "_Roots",
+) -> dict[str, str]:
     git_root = _directory(git_root, f"{label} Git root")
     try:
         relative = path.relative_to(git_root).as_posix()
     except ValueError:
         _fail(f"{label} escapes its Git root")
-    _index_tree, object_format, entries = _git_index(git_root, label)
-    entry = entries.get(relative)
+    snapshot = roots.git_index_snapshot(git_root, label)
+    entry = snapshot.entries.get(relative)
     if entry is None:
         _fail(f"{label} is not tracked by the qualified Git tree: {relative}")
     mode, expected_blob = entry
     if mode not in {"100644", "100755"}:
         _fail(f"{label} uses unsupported tracked mode {mode}")
     file_path = _regular_file(path, label, contained_by=git_root)
-    raw = _read_bytes(file_path, label)
-    prefix = f"blob {len(raw)}\0".encode("ascii")
-    digest = hashlib.new(object_format, prefix + raw).hexdigest()
+    digest = roots.git_blob_digest(
+        file_path, snapshot.object_format, label
+    )
     executable = bool(file_path.stat().st_mode & stat.S_IXUSR)
     if digest != expected_blob or executable != (mode == "100755"):
         _fail(f"{label} working bytes/mode differ from tracked Git blob {expected_blob}")
@@ -490,11 +532,18 @@ def _git_tracked_file_identity(path: Path, git_root: Path, label: str) -> dict[s
 
 
 def _validate_git_worktree_against_index(
-    git_root: Path, label: str
+    git_root: Path,
+    label: str,
+    *,
+    snapshot: _GitIndexSnapshot,
 ) -> tuple[int, str]:
     """Hash raw tracked bytes/modes directly, without Git filters or stat hints."""
 
-    _index_tree, object_format, entries = _git_index(git_root, label)
+    git_root = _directory(git_root, f"{label} Git root")
+    if snapshot.git_root != git_root:
+        _fail(f"{label} Git-index snapshot belongs to a different root")
+    object_format = snapshot.object_format
+    entries = snapshot.entries
     projection: list[dict[str, str]] = []
     for relative, (mode, expected_blob) in sorted(entries.items()):
         pure = PurePosixPath(relative)
@@ -547,10 +596,10 @@ def _validate_git_worktree_against_index(
     return len(projection), _canonical_sha256(projection)
 
 
-def replay_git_source_generation(
+def _replay_git_source_generation(
     git_root: str | os.PathLike[str],
     allowed_untracked_paths: Sequence[str] = (),
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], _GitIndexSnapshot]:
     """Recompute exact raw worktree/index facts with no Git filter trust."""
 
     git_root = _directory(Path(git_root), "source Git generation root")
@@ -605,7 +654,8 @@ def replay_git_source_generation(
         git_root,
         f"{label} HEAD tree",
     ).strip()
-    index_tree, _object_format, _entries = _git_index(git_root, label)
+    snapshot = _read_git_index(git_root, label)
+    index_tree = snapshot.index_tree
     staged_diff = _run_bytes(
         [*git_prefix, "diff", "--cached", *stable_diff],
         git_root,
@@ -668,24 +718,44 @@ def replay_git_source_generation(
     except UnicodeDecodeError as error:
         _fail(f"{label} has a non-UTF-8 untracked path: {error}")
     tracked_path_count, tracked_projection_sha256 = (
-        _validate_git_worktree_against_index(git_root, label)
+        _validate_git_worktree_against_index(
+            git_root,
+            label,
+            snapshot=snapshot,
+        )
     )
-    return {
-        "base_commit": head,
-        "base_tree": head_tree,
-        "patched_index_tree": index_tree,
-        "staged_diff_sha256": _sha256_bytes(staged_diff),
-        "staged_path_count": staged_path_count,
-        "staged_paths_sha256": _sha256_bytes(staged_paths),
-        "unstaged_path_count": 0,
-        "untracked_path_count": len(untracked_records),
-        "allowed_untracked_paths": allowed_untracked_paths,
-        "undeclared_untracked_path_count": 0,
-        "unmerged_path_count": 0,
-        "submodule_path_count": 0,
-        "tracked_path_count": tracked_path_count,
-        "tracked_index_projection_sha256": tracked_projection_sha256,
-    }
+    return (
+        {
+            "base_commit": head,
+            "base_tree": head_tree,
+            "patched_index_tree": index_tree,
+            "staged_diff_sha256": _sha256_bytes(staged_diff),
+            "staged_path_count": staged_path_count,
+            "staged_paths_sha256": _sha256_bytes(staged_paths),
+            "unstaged_path_count": 0,
+            "untracked_path_count": len(untracked_records),
+            "allowed_untracked_paths": allowed_untracked_paths,
+            "undeclared_untracked_path_count": 0,
+            "unmerged_path_count": 0,
+            "submodule_path_count": 0,
+            "tracked_path_count": tracked_path_count,
+            "tracked_index_projection_sha256": tracked_projection_sha256,
+        },
+        snapshot,
+    )
+
+
+def replay_git_source_generation(
+    git_root: str | os.PathLike[str],
+    allowed_untracked_paths: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Freshly recompute exact raw worktree/index facts for a public caller."""
+
+    facts, _snapshot = _replay_git_source_generation(
+        git_root,
+        allowed_untracked_paths,
+    )
+    return facts
 
 
 def _git_source_generation_evidence(
@@ -698,7 +768,7 @@ def _git_source_generation_evidence(
     """Capture one exact source generation and join its prebuild contract."""
 
     label = f"{project_id} source Git generation"
-    facts = replay_git_source_generation(
+    facts, snapshot = _replay_git_source_generation(
         git_root,
         [".docker/roboplan/"] if git_root == roots.repository else [],
     )
@@ -750,6 +820,7 @@ def _git_source_generation_evidence(
         or facts["staged_path_count"] != 0
     ):
         _fail(f"{label} repository source is not one clean committed generation")
+    roots.remember_git_index_snapshot(snapshot, label)
     return {
         "git_root": roots.logical(git_root),
         **facts,
@@ -773,6 +844,239 @@ def _containing_git_root(path: Path, boundary: Path, label: str) -> Path:
 class _Roots:
     repository: Path
     output: Path
+    _git_index_snapshots: dict[Path, _GitIndexSnapshot] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _physical_digest_cache: dict[
+        tuple[str, _PhysicalFileIdentity], str
+    ] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _compile_dependency_closure_cache: dict[
+        tuple[Path, Path, Path, str], _CompileDependencyClosureCacheEntry
+    ] = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    def remember_git_index_snapshot(
+        self, snapshot: _GitIndexSnapshot, label: str
+    ) -> None:
+        git_root = _directory(snapshot.git_root, f"{label} Git root")
+        if snapshot.git_root != git_root:
+            _fail(f"{label} Git-index snapshot root is not canonical")
+        existing = self._git_index_snapshots.get(git_root)
+        if existing is not None and existing != snapshot:
+            _fail(f"{label} Git index changed within one validation scope")
+        self._git_index_snapshots[git_root] = snapshot
+
+    def git_index_snapshot(
+        self, git_root: Path, label: str
+    ) -> _GitIndexSnapshot:
+        canonical_root = _directory(git_root, f"{label} Git root")
+        snapshot = self._git_index_snapshots.get(canonical_root)
+        if snapshot is None:
+            snapshot = _read_git_index(canonical_root, label)
+            self.remember_git_index_snapshot(snapshot, label)
+        return snapshot
+
+    @staticmethod
+    def _physical_file_identity(
+        path: Path, label: str
+    ) -> tuple[Path, _PhysicalFileIdentity]:
+        physical = Path(os.path.abspath(path))
+        try:
+            metadata = physical.stat()
+        except OSError as error:
+            _fail(f"{label} cannot be inspected for cached hashing: {error}")
+        if not stat.S_ISREG(metadata.st_mode):
+            _fail(f"{label} is not a regular file for cached hashing")
+        return physical, _PhysicalFileIdentity(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            mode=metadata.st_mode,
+            user_id=metadata.st_uid,
+            group_id=metadata.st_gid,
+            link_count=metadata.st_nlink,
+            size=metadata.st_size,
+            modified_ns=metadata.st_mtime_ns,
+            changed_ns=metadata.st_ctime_ns,
+        )
+
+    def cached_physical_digest(
+        self,
+        path: Path,
+        *,
+        domain: str,
+        label: str,
+        compute: Callable[[Path], str],
+    ) -> str:
+        """Hash one unchanged physical file once per validation scope."""
+
+        if not domain or not callable(compute):
+            _fail(f"{label} cached digest request is malformed")
+        physical, before = self._physical_file_identity(path, label)
+        key = (domain, before)
+        cached = self._physical_digest_cache.get(key)
+        if cached is not None:
+            return cached
+        digest = compute(physical)
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", digest) is None
+        ):
+            _fail(f"{label} cached digest computation is malformed")
+        _physical, after = self._physical_file_identity(path, label)
+        if before != after:
+            _fail(f"{label} changed while its cached digest was computed")
+        self._physical_digest_cache[key] = digest
+        return digest
+
+    def sha256_file(self, path: Path, label: str) -> str:
+        return self.cached_physical_digest(
+            path,
+            domain="raw-sha256-v1",
+            label=label,
+            compute=_sha256_file,
+        )
+
+    def reject_untracked_assembler_file_inputs(
+        self, path: Path, label: str
+    ) -> None:
+        self.cached_physical_digest(
+            path,
+            domain="inline-assembler-file-input-scan-v1",
+            label=label,
+            compute=lambda physical: _assembler_input_scan_digest(
+                physical, label
+            ),
+        )
+
+    def git_blob_digest(
+        self, path: Path, object_format: str, label: str
+    ) -> str:
+        if object_format not in {"sha1", "sha256"}:
+            _fail(f"{label} uses unsupported Git object format")
+
+        def compute(physical: Path) -> str:
+            try:
+                size = physical.stat().st_size
+                if size > _MAX_JSON_BYTES:
+                    _fail(
+                        f"{label} exceeds its {_MAX_JSON_BYTES}-byte tracked-input bound"
+                    )
+                digest = hashlib.new(object_format)
+                digest.update(f"blob {size}\0".encode("ascii"))
+                with physical.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        digest.update(chunk)
+            except OSError as error:
+                _fail(f"{label} cannot be hashed as a Git blob: {error}")
+            return digest.hexdigest()
+
+        return self.cached_physical_digest(
+            path,
+            domain=f"git-blob-{object_format}-v1",
+            label=label,
+            compute=compute,
+        )
+
+    @staticmethod
+    def _compile_dependency_key(
+        build_root: Path,
+        output: Path,
+        source: Path,
+        argv_sha256: str,
+    ) -> tuple[Path, Path, Path, str]:
+        if _HEX64.fullmatch(argv_sha256) is None:
+            _fail("compile dependency cache received a malformed argv digest")
+        return (
+            Path(os.path.abspath(build_root)),
+            Path(os.path.abspath(output)),
+            Path(os.path.abspath(source)),
+            argv_sha256,
+        )
+
+    def cached_compile_dependency_closure(
+        self,
+        *,
+        build_root: Path,
+        output: Path,
+        source: Path,
+        argv_sha256: str,
+    ) -> _CompileDependencyClosureCacheEntry | None:
+        return self._compile_dependency_closure_cache.get(
+            self._compile_dependency_key(
+                build_root, output, source, argv_sha256
+            )
+        )
+
+    def remember_compile_dependency_closure(
+        self,
+        *,
+        build_root: Path,
+        output: Path,
+        source: Path,
+        argv_sha256: str,
+        entry: _CompileDependencyClosureCacheEntry,
+    ) -> _CompileDependencyClosureCacheEntry:
+        key = self._compile_dependency_key(
+            build_root, output, source, argv_sha256
+        )
+        existing = self._compile_dependency_closure_cache.get(key)
+        if existing is not None and existing != entry:
+            _fail("compile dependency closure changed within one validation scope")
+        self._compile_dependency_closure_cache[key] = entry
+        return entry
+
+    def validate_cached_compile_dependencies(self) -> None:
+        """Recheck each cached filesystem input once before evidence escapes."""
+
+        ninja_databases: dict[Path, str] = {}
+        resolutions: dict[
+            tuple[Path, Path, bool], _DependencyResolutionCacheEntry
+        ] = {}
+        referenced_files: dict[Path, _PhysicalFileIdentity] = {}
+        for entry in self._compile_dependency_closure_cache.values():
+            existing_ninja = ninja_databases.setdefault(
+                entry.ninja_deps_path,
+                entry.ninja_deps_sha256,
+            )
+            if existing_ninja != entry.ninja_deps_sha256:
+                _fail("cached Ninja dependency database identity is inconsistent")
+            for resolution in entry.dependency_resolutions:
+                key = (
+                    resolution.path,
+                    resolution.allowed_root,
+                    resolution.require_single_link,
+                )
+                existing_resolution = resolutions.setdefault(key, resolution)
+                if existing_resolution != resolution:
+                    _fail("cached compiler dependency resolution is inconsistent")
+            for path, identity in entry.referenced_files:
+                existing_identity = referenced_files.setdefault(path, identity)
+                if existing_identity != identity:
+                    _fail("cached compiler dependency identity is inconsistent")
+
+        for path, expected_sha256 in ninja_databases.items():
+            if self.sha256_file(
+                path,
+                "final cached Ninja dependency database",
+            ) != expected_sha256:
+                _fail(
+                    "Ninja dependency database changed within one validation scope"
+                )
+        for resolution in resolutions.values():
+            _revalidate_dependency_resolution(
+                resolution,
+                self,
+                "final cached compiler dependency",
+            )
+        for path, expected_identity in referenced_files.items():
+            _physical, current_identity = self._physical_file_identity(
+                path,
+                "final cached compiler dependency",
+            )
+            if current_identity != expected_identity:
+                _fail("compiler dependency changed within one validation scope")
 
     def decode(self, value: str, base: Path, label: str) -> Path:
         text = _text(value, label)
@@ -1217,7 +1521,7 @@ def _validate_compile_driver_argv(
         r"sanitize=[A-Za-z0-9_,+-]+|no-sanitize=[A-Za-z0-9_,+-]+|"
         r"sanitize-recover=[A-Za-z0-9_,+-]+|"
         r"no-sanitize-recover=[A-Za-z0-9_,+-]+|"
-        r"visibility(?:-inlines)?-hidden|no-semantic-interposition|"
+        r"visibility=hidden|visibility-inlines-hidden|no-semantic-interposition|"
         r"function-sections|data-sections|"
         r"stack-protector(?:-strong|-all)?|"
         r"cf-protection(?:=[A-Za-z0-9_-]+)?|"
@@ -1682,20 +1986,22 @@ def _cmake_files_evidence(
         if not pure.is_absolute():
             identity = {
                 "kind": "git_tracked_source",
-                **_git_tracked_file_identity(path, source_git_root, label),
+                **_git_tracked_file_identity(
+                    path, source_git_root, label, roots=roots
+                ),
             }
         elif _is_within(path, roots.repository):
             git_root = _containing_git_root(path, roots.repository, label)
             identity = {
                 "kind": "git_tracked_source",
-                **_git_tracked_file_identity(path, git_root, label),
+                **_git_tracked_file_identity(path, git_root, label, roots=roots),
             }
         elif in_source:
             boundary = roots.output
             git_root = _containing_git_root(path, boundary, label)
             identity = {
                 "kind": "git_tracked_source",
-                **_git_tracked_file_identity(path, git_root, label),
+                **_git_tracked_file_identity(path, git_root, label, roots=roots),
             }
         elif in_build:
             identity = {
@@ -2137,18 +2443,48 @@ def _native_configured_file_api_target_names(
     )
     if set(roles) != {"production", "test_only", "configured_only", "external"}:
         _fail(f"{label} configured-target role keys drifted")
-    names: list[str] = []
+    local_names: list[str] = []
+    role_names: list[str] = []
     for role in ("production", "test_only", "configured_only"):
-        names.extend(
+        values = [
             _text(value, f"{label} configured-target {role} role")
             for value in _list(
                 roles.get(role),
                 f"{label} configured-target {role} roles",
             )
+        ]
+        local_names.extend(values)
+        role_names.extend(values)
+    role_names.extend(
+        _text(value, f"{label} configured-target external role")
+        for value in _list(
+            roles.get("external"),
+            f"{label} configured-target external roles",
         )
-    if len(names) != len(set(names)):
+    )
+    if len(role_names) != len(set(role_names)):
         _fail(f"{label} configured-target local roles overlap")
-    return set(names)
+    node_shapes: dict[str, str] = {}
+    for index, raw_node in enumerate(
+        _list(target_graph.get("nodes"), f"{label} configured-target nodes")
+    ):
+        node = _object(raw_node, f"{label} configured-target node[{index}]")
+        name = _text(node.get("name"), f"{label} configured-target node name")
+        shape = _text(node.get("shape"), f"{label} configured-target node shape")
+        if name in node_shapes or shape not in _GRAPHVIZ_SHAPES:
+            _fail(f"{label} configured-target nodes are malformed or duplicated")
+        node_shapes[name] = shape
+    if set(role_names) != set(node_shapes):
+        _fail(f"{label} configured-target roles disagree with graph nodes")
+
+    # CMake's File API codemodel omits INTERFACE libraries because they do not
+    # generate build rules. The separately authenticated GraphViz projection
+    # still proves every such local target, its role, and its dependency edges.
+    return {
+        name
+        for name in local_names
+        if node_shapes[name] != "pentagon"
+    }
 
 
 def _validate_native_configured_file_api_target_set(
@@ -3241,6 +3577,51 @@ class _Command:
     argv_sha256: str
 
 
+def _command_cache_fingerprint(command: _Command) -> tuple[Any, ...]:
+    return (
+        command.kind,
+        command.output,
+        command.inputs,
+        command.auxiliary_outputs,
+        command.source,
+        command.directory,
+        command.argv,
+        command.argv_sha256,
+    )
+
+
+def _revalidate_dependency_resolution(
+    cached: _DependencyResolutionCacheEntry,
+    roots: _Roots,
+    label: str,
+) -> None:
+    if cached.require_single_link:
+        resolved, chain = _symlink_chain(
+            cached.path,
+            cached.allowed_root,
+            roots,
+            label,
+        )
+    else:
+        resolved = _regular_file(
+            cached.path,
+            label,
+            allow_symlink=True,
+            contained_by=cached.allowed_root,
+            require_single_link=False,
+        )
+        chain = list(
+            dict.fromkeys(
+                (roots.logical(cached.path), roots.logical(resolved))
+            )
+        )
+    if (
+        resolved != cached.resolved_path
+        or tuple(chain) != cached.symlink_chain
+    ):
+        _fail(f"{label} symlink resolution changed within one validation scope")
+
+
 def _artifact_kind(path: Path) -> str | None:
     name = path.name
     if name.endswith((".o", ".obj")):
@@ -3881,7 +4262,7 @@ def _driver_linker_tokens(argv: Sequence[str], label: str) -> list[str]:
             r"f(?:PIC|PIE|pic|pie|no-omit-frame-pointer|omit-frame-pointer|"
             r"sanitize=[A-Za-z0-9_,+-]+|no-sanitize=[A-Za-z0-9_,+-]+|"
             r"sanitize-recover=[A-Za-z0-9_,+-]+|no-sanitize-recover=[A-Za-z0-9_,+-]+|"
-            r"visibility(?:-inlines)?-hidden|no-semantic-interposition|"
+            r"visibility=hidden|visibility-inlines-hidden|no-semantic-interposition|"
             r"function-sections|data-sections|stack-protector(?:-strong|-all)?|"
             r"cf-protection(?:=[A-Za-z0-9_-]+)?))",
             token,
@@ -4335,7 +4716,7 @@ def _compile_semantic_argv(argv: Sequence[str]) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _reject_untracked_assembler_file_inputs(path: Path, label: str) -> None:
+def _assembler_input_scan_digest(path: Path, label: str) -> str:
     """Depfiles do not report files read by inline assembler directives."""
 
     raw = _read_bytes(path, label)
@@ -4344,6 +4725,11 @@ def _reject_untracked_assembler_file_inputs(path: Path, label: str) -> None:
             f"{label} contains inline assembly, whose external file reads are not "
             "covered by the frozen Ninja dependency evidence"
         )
+    return _sha256_bytes(raw)
+
+
+def _reject_untracked_assembler_file_inputs(path: Path, label: str) -> None:
+    _assembler_input_scan_digest(path, label)
 
 
 def _configure_generated_dependency_evidence(
@@ -4556,6 +4942,26 @@ def compile_dependency_cross_profile_sha256(
     return _sha256_file(physical)
 
 
+def _cached_compile_dependency_cross_profile_sha256(
+    path: Path, scope: str, roots: _Roots, label: str
+) -> str:
+    if scope == "configure_generated_input":
+        return roots.cached_physical_digest(
+            path,
+            domain="configure-generated-cross-profile-v1",
+            label=label,
+            compute=_configure_header_cross_profile_sha256,
+        )
+    if scope == "generated_build_input":
+        return roots.cached_physical_digest(
+            path,
+            domain="generated-build-cross-profile-v1",
+            label=label,
+            compute=_generated_output_cross_profile_sha256,
+        )
+    return roots.sha256_file(path, label)
+
+
 def _file_api_source_evidence(
     source: Path,
     *,
@@ -4588,6 +4994,32 @@ def _compile_dependency_closure(
 ) -> dict[str, Any]:
     """Authenticate every file the compiler reports reading for one object."""
 
+    cached = roots.cached_compile_dependency_closure(
+        build_root=build.root,
+        output=record.output,
+        source=record.source,
+        argv_sha256=record.argv_sha256,
+    )
+    if cached is not None:
+        if roots.sha256_file(
+            cached.ninja_deps_path,
+            f"{label} cached Ninja dependency database",
+        ) != cached.ninja_deps_sha256:
+            _fail(f"{label} Ninja dependency database changed within one validation scope")
+        for output, expected_fingerprint in cached.generated_command_fingerprints:
+            current = commands.get(output)
+            if (
+                current is None
+                or _command_cache_fingerprint(current) != expected_fingerprint
+            ):
+                _fail(f"{label} generated dependency command changed within one validation scope")
+        if any(
+            dependency in commands
+            for dependency in cached.configure_generated_without_command
+        ):
+            _fail(f"{label} configure-generated dependency gained a command")
+        return cached.closure
+
     try:
         object_node = record.output.relative_to(build.root).as_posix()
     except ValueError:
@@ -4606,6 +5038,14 @@ def _compile_dependency_closure(
     )
     if match is None:
         _fail(f"{label} Ninja deps has an unsupported header")
+    ninja_deps_path = _regular_file(
+        build.root / ".ninja_deps",
+        f"{label} Ninja dependency database",
+        contained_by=build.root,
+    )
+    ninja_deps_sha256 = roots.sha256_file(
+        ninja_deps_path, f"{label} Ninja dependency database"
+    )
     declared_count = int(match.group(1))
     dependencies: list[Path] = []
     for line_index, line in enumerate(lines[1:], 1):
@@ -4635,15 +5075,23 @@ def _compile_dependency_closure(
         )
 
     rows: list[dict[str, Any]] = []
+    dependency_resolutions: list[_DependencyResolutionCacheEntry] = []
+    referenced_files: dict[Path, _PhysicalFileIdentity] = {}
+    generated_command_fingerprints: dict[Path, tuple[Any, ...]] = {}
+    configure_generated_without_command: set[Path] = set()
     for dependency in sorted(dependencies, key=roots.logical):
         producer: dict[str, Any] | None = None
         source_identity: dict[str, str] | None = None
         inspect_assembler_inputs = False
+        resolution_root: Path
+        resolution_requires_single_link: bool
         if _is_within(dependency, roots.repository):
             scope = "repository_source"
+            resolution_root = roots.repository
+            resolution_requires_single_link = True
             resolved, chain = _symlink_chain(
                 dependency,
-                roots.repository,
+                resolution_root,
                 roots,
                 f"{label} repository dependency",
             )
@@ -4653,13 +5101,16 @@ def _compile_dependency_closure(
                 resolved,
                 roots.repository,
                 f"{label} repository compiler dependency",
+                roots=roots,
             )
             inspect_assembler_inputs = True
         elif _is_within(dependency, build.source_root):
             scope = "qualified_external_source"
+            resolution_root = build.source_root
+            resolution_requires_single_link = True
             resolved, chain = _symlink_chain(
                 dependency,
-                build.source_root,
+                resolution_root,
                 roots,
                 f"{label} qualified external-source dependency",
             )
@@ -4674,14 +5125,17 @@ def _compile_dependency_closure(
                 resolved,
                 external_git_root,
                 f"{label} qualified external compiler dependency",
+                roots=roots,
             )
             inspect_assembler_inputs = True
         elif dependency in build.qualified_install_inputs:
             scope = "qualified_install_input"
+            resolution_root = roots.output
+            resolution_requires_single_link = True
             installed_owner = build.qualified_install_inputs[dependency]
             resolved, chain = _symlink_chain(
                 dependency,
-                roots.output,
+                resolution_root,
                 roots,
                 f"{label} qualified install dependency",
             )
@@ -4700,15 +5154,20 @@ def _compile_dependency_closure(
             )
             if configure_producer is not None:
                 scope = "configure_generated_input"
+                resolution_root = roots.output
+                resolution_requires_single_link = True
                 resolved, chain = _symlink_chain(
                     dependency,
-                    roots.output,
+                    resolution_root,
                     roots,
                     f"{label} configure-generated dependency",
                 )
                 producer = configure_producer
+                configure_generated_without_command.add(dependency)
             else:
                 scope = "generated_build_input"
+                resolution_root = roots.output
+                resolution_requires_single_link = True
                 command = commands.get(dependency)
                 if command is None or command.kind != "generated" or len(command.inputs) != 1:
                     _fail(
@@ -4736,9 +5195,23 @@ def _compile_dependency_closure(
                 )
                 if not os.access(producer_file, os.X_OK):
                     _fail(f"{label} generated dependency producer is not executable")
+                producer_physical, producer_identity = (
+                    roots._physical_file_identity(
+                        producer_file,
+                        f"{label} generated dependency producer",
+                    )
+                )
+                previous_producer_identity = referenced_files.setdefault(
+                    producer_physical, producer_identity
+                )
+                if previous_producer_identity != producer_identity:
+                    _fail(
+                        f"{label} generated dependency producer changed during "
+                        "closure construction"
+                    )
                 resolved, chain = _symlink_chain(
                     dependency,
-                    roots.output,
+                    resolution_root,
                     roots,
                     f"{label} generated dependency",
                 )
@@ -4747,20 +5220,28 @@ def _compile_dependency_closure(
                     "project_id": build.project_id,
                     "target": owners[0],
                     "artifact": roots.logical(producer_artifact),
-                    "artifact_sha256": _sha256_file(producer_file),
+                    "artifact_sha256": roots.sha256_file(
+                        producer_file,
+                        f"{label} generated dependency producer",
+                    ),
                     "argv_sha256": command.argv_sha256,
                     "parity_argv_sha256": _parity_argv_sha256(
                         command.argv, build, roots
                     ),
                 }
+                generated_command_fingerprints[dependency] = (
+                    _command_cache_fingerprint(command)
+                )
             inspect_assembler_inputs = True
         elif _compile_system_path(dependency):
             scope = "pinned_container"
+            resolution_root = Path("/")
+            resolution_requires_single_link = False
             resolved = _regular_file(
                 dependency,
                 f"{label} pinned-system dependency",
                 allow_symlink=True,
-                contained_by=Path("/"),
+                contained_by=resolution_root,
                 require_single_link=False,
             )
             if not _compile_system_path(resolved):
@@ -4776,25 +5257,50 @@ def _compile_dependency_closure(
                 f"{label} compiler dependency escapes source, output, and "
                 f"pinned-system roots: {roots.logical(dependency)}"
             )
+        dependency_resolutions.append(
+            _DependencyResolutionCacheEntry(
+                path=dependency,
+                allowed_root=resolution_root,
+                resolved_path=resolved,
+                symlink_chain=tuple(chain),
+                require_single_link=resolution_requires_single_link,
+            )
+        )
         if inspect_assembler_inputs:
-            _reject_untracked_assembler_file_inputs(
+            roots.reject_untracked_assembler_file_inputs(
                 resolved, f"{label} non-system compiler dependency"
             )
+        raw_digest = roots.sha256_file(
+            resolved, f"{label} compiler dependency"
+        )
+        physical, physical_identity = roots._physical_file_identity(
+            resolved, f"{label} compiler dependency"
+        )
+        previous_identity = referenced_files.setdefault(
+            physical, physical_identity
+        )
+        if previous_identity != physical_identity:
+            _fail(f"{label} compiler dependency changed during closure construction")
         rows.append(
             {
                 "path": roots.logical(dependency),
                 "resolved_path": roots.logical(resolved),
                 "symlink_chain": chain,
-                "sha256": _sha256_file(resolved),
+                "sha256": raw_digest,
                 "cross_profile_sha256": (
-                    compile_dependency_cross_profile_sha256(resolved, scope)
+                    _cached_compile_dependency_cross_profile_sha256(
+                        resolved,
+                        scope,
+                        roots,
+                        f"{label} cross-profile compiler dependency",
+                    )
                 ),
                 "scope": scope,
                 "producer": producer,
                 "source_identity": source_identity,
             }
         )
-    return {
+    closure = {
         "object": roots.logical(record.output),
         "declared_dependency_count": declared_count,
         "raw_sha256": _sha256_bytes(
@@ -4802,6 +5308,26 @@ def _compile_dependency_closure(
         ),
         "files": rows,
     }
+    entry = _CompileDependencyClosureCacheEntry(
+        closure=closure,
+        ninja_deps_path=ninja_deps_path,
+        ninja_deps_sha256=ninja_deps_sha256,
+        dependency_resolutions=tuple(dependency_resolutions),
+        referenced_files=tuple(sorted(referenced_files.items())),
+        generated_command_fingerprints=tuple(
+            sorted(generated_command_fingerprints.items())
+        ),
+        configure_generated_without_command=tuple(
+            sorted(configure_generated_without_command)
+        ),
+    )
+    return roots.remember_compile_dependency_closure(
+        build_root=build.root,
+        output=record.output,
+        source=record.source,
+        argv_sha256=record.argv_sha256,
+        entry=entry,
+    ).closure
 
 
 def _parse_query(text: str, requested: str, label: str) -> tuple[str, list[tuple[str, str]]]:
@@ -5333,8 +5859,8 @@ def _configure_executed_fixture_contracts(
         outer.get("configure_executed_fixture_contracts"),
         "configure_executed_fixture_contracts",
     )
-    if len(rows) != 3:
-        _fail("configure-executed fixture contract must contain exactly three rows")
+    if len(rows) != 4:
+        _fail("configure-executed fixture contract must contain exactly four rows")
     expected_keys = {
         "accepted_package_uri_prefix",
         "cmake_repository_path",
@@ -5470,6 +5996,10 @@ def _configure_executed_fixture_contracts(
     expected_catalog = {
         ("manyforge_deployment", Path("generated/lite6_lite_gripper_structural")),
         ("manyforge_deployment", Path("generated/structural_model_preparation_test")),
+        (
+            "manyforge_deployment",
+            Path("generated/ur10e_robotiq_2f_140_structural"),
+        ),
         ("manyforge_roboplan", Path("lite6_structural_consumer_fixture")),
     }
     if set(result) != expected_catalog or catalog_order != sorted(catalog_order):
@@ -7167,6 +7697,23 @@ def _one_query(
     )
 
 
+def _file_api_target_ninja_node(build: _Build, target: _TargetReply) -> str:
+    """Return the canonical Ninja node named by one File API target reply."""
+
+    try:
+        build_base = target.build_base.relative_to(build.root)
+    except ValueError:
+        _fail(
+            f"{build.project_id} target {target.name} build base escapes its build"
+        )
+    target_name = _safe_relative(
+        target.name, f"{build.project_id} target Ninja node name"
+    )
+    if len(target_name.parts) != 1:
+        _fail(f"{build.project_id} target {target.name} name is not one Ninja node")
+    return (build_base / target_name).as_posix()
+
+
 def _exact_custom_command_output_edge(
     *,
     build: _Build,
@@ -7973,6 +8520,108 @@ def _require_cmake_utility_virtual_sources(
         )
 
 
+def _cmake_utility_order_only_dependency(
+    *,
+    build: _Build,
+    current_target: str,
+    edge_type: str,
+    path: Path,
+    utility_contracts: Mapping[tuple[str, str], _UtilityTargetContract],
+    roots: _Roots,
+) -> dict[str, Any] | None:
+    """Authenticate one nonphysical Ninja ordering edge as a CMake UTILITY."""
+
+    normalized = Path(os.path.normpath(path))
+    if edge_type != "order_only":
+        return None
+    if normalized.is_symlink():
+        _fail(
+            f"{build.project_id} UTILITY {current_target} order-only dependency "
+            "is a filesystem entry rather than a CMake target"
+        )
+    candidates = [
+        (name, target)
+        for name, target in build.targets.items()
+        if Path(os.path.normpath(target.build_base / name)) == normalized
+    ]
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        _fail(
+            f"{build.project_id} UTILITY {current_target} order-only dependency "
+            "has ambiguous File API ownership"
+        )
+    owner_name, owner = candidates[0]
+    if owner_name == current_target or owner.target_type != "UTILITY":
+        _fail(
+            f"{build.project_id} UTILITY {current_target} order-only dependency "
+            "is self-owned or is not a File API UTILITY"
+        )
+    contract = utility_contracts.get((build.project_id, owner_name))
+    if (
+        contract is None
+        or contract.project_id != build.project_id
+        or contract.target_name != owner_name
+    ):
+        _fail(
+            f"{build.project_id} UTILITY {current_target} order-only dependency "
+            f"{owner_name} is not exactly contracted"
+        )
+    owner_output = Path(os.path.normpath(build.root / contract.primary_output))
+    _require_cmake_utility_virtual_sources(
+        owner,
+        build=build,
+        primary_output=owner_output,
+    )
+    owner_output_file = _regular_file(
+        owner_output,
+        f"{build.project_id} nested utility {owner_name} generated artifact",
+        contained_by=build.root,
+    )
+
+    graph = _object(
+        build.evidence.get("configured_target_graph"),
+        f"{build.project_id} configured target graph",
+    )
+    adjacency: dict[str, set[str]] = {}
+    for index, raw_edge in enumerate(
+        _list(graph.get("edges"), f"{build.project_id} target graph edges")
+    ):
+        edge = _object(raw_edge, f"{build.project_id} target graph edge[{index}]")
+        source = _text(edge.get("source"), "utility target graph source")
+        target = _text(edge.get("target"), "utility target graph target")
+        adjacency.setdefault(source, set()).add(target)
+    pending = [current_target]
+    reachable: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        pending.extend(adjacency.get(current, set()) - reachable)
+    if owner_name not in reachable:
+        _fail(
+            f"{build.project_id} UTILITY {current_target} does not reach "
+            f"order-only UTILITY owner {owner_name} in its configured graph"
+        )
+
+    return {
+        "type": "order_only",
+        "path": roots.logical(normalized),
+        "dependency_kind": "cmake_utility_target",
+        "owner_project_id": build.project_id,
+        "owner_target": owner_name,
+        "owner_file_api_target_reply": {
+            "path": roots.logical(owner.reply_path),
+            "sha256": owner.reply_sha256,
+        },
+        "owner_generated_output": {
+            "path": roots.logical(owner_output_file),
+            "sha256": _sha256_file(owner_output_file),
+        },
+    }
+
+
 def _prove_utility_target(
     *,
     build: _Build,
@@ -7982,6 +8631,7 @@ def _prove_utility_target(
     profile: str,
     roots: _Roots,
     responses: _ResponseCollector,
+    utility_contracts: Mapping[tuple[str, str], _UtilityTargetContract],
 ) -> dict[str, Any]:
     """Prove one generated output closure and its build-owned producer target."""
 
@@ -8012,9 +8662,10 @@ def _prove_utility_target(
     generator_output = Path(
         os.path.normpath(build.root / contract.generator_output)
     )
+    target_node = _file_api_target_ninja_node(build, target)
     target_query, target_dependencies = _one_query(
         build,
-        spec.name,
+        target_node,
         roots,
         f"{build.project_id} Ninja query {spec.name}",
     )
@@ -8041,7 +8692,7 @@ def _prove_utility_target(
         )
 
     commands_text = _run_text(
-        ["/usr/bin/ninja", "-C", str(build.root), "-t", "commands", spec.name],
+        ["/usr/bin/ninja", "-C", str(build.root), "-t", "commands", target_node],
         build.root,
         f"{build.project_id} Ninja commands {spec.name}",
     )
@@ -8247,10 +8898,21 @@ def _prove_utility_target(
             )
             continue
         if not normalized.exists():
-            _fail(
-                f"{build.project_id} UTILITY {spec.name} has an unauthenticated "
-                f"generated-input dependency: {roots.logical(normalized)}"
+            utility_dependency = _cmake_utility_order_only_dependency(
+                build=build,
+                current_target=spec.name,
+                edge_type=edge_type,
+                path=normalized,
+                utility_contracts=utility_contracts,
+                roots=roots,
             )
+            if utility_dependency is None:
+                _fail(
+                    f"{build.project_id} UTILITY {spec.name} has an unauthenticated "
+                    f"generated-input dependency: {roots.logical(normalized)}"
+                )
+            dependency_rows.append(utility_dependency)
+            continue
         dependency_file = _regular_file(
             normalized,
             f"{build.project_id} UTILITY {spec.name} dependency",
@@ -8260,6 +8922,7 @@ def _prove_utility_target(
                 dependency_file,
                 roots.repository,
                 f"{build.project_id} UTILITY {spec.name} repository dependency",
+                roots=roots,
             )
         elif _is_within(dependency_file, build.root):
             if normalized not in commands:
@@ -8401,11 +9064,12 @@ def _prove_spec(
     profile: str,
     roots: _Roots,
     responses: _ResponseCollector,
-    utility_contract: _UtilityTargetContract | None = None,
+    utility_contracts: Mapping[tuple[str, str], _UtilityTargetContract],
 ) -> dict[str, Any]:
     if spec.name not in build.targets or build.targets[spec.name].target_type != spec.target_type:
         _fail(f"{build.project_id} target {spec.name} type differs from its contract")
     if spec.target_type == "UTILITY":
+        utility_contract = utility_contracts.get((build.project_id, spec.name))
         if utility_contract is None:
             _fail(f"{build.project_id} utility {spec.name} lacks its exact contract")
         return _prove_utility_target(
@@ -8416,6 +9080,7 @@ def _prove_spec(
             profile=profile,
             roots=roots,
             responses=responses,
+            utility_contracts=utility_contracts,
         )
     artifact = build.root / spec.artifact
     proof = _prove_target(
@@ -8427,6 +9092,7 @@ def _prove_spec(
         profile=profile,
         roots=roots,
         responses=responses,
+        utility_contracts=utility_contracts,
     )
     proof["contract_artifact"] = spec.artifact.as_posix()
     generated_rows: list[dict[str, Any]] = []
@@ -9121,6 +9787,122 @@ def _command_input_evidence(
     }
 
 
+def _material_target_commands(
+    *,
+    build: _Build,
+    target_name: str,
+    commands: Mapping[Path, _Command],
+    query_rows: Sequence[Mapping[str, Any]],
+    roots: _Roots,
+    utility_contracts: Mapping[tuple[str, str], _UtilityTargetContract],
+) -> dict[Path, _Command]:
+    """Exclude only separately proved tree-producing UTILITY prerequisites."""
+
+    utility_outputs: dict[Path, _UtilityTargetContract] = {}
+    for (project_id, utility_name), contract in utility_contracts.items():
+        relationships = set(contract.consumer_relationships)
+        if (
+            project_id != build.project_id
+            or contract.project_id != build.project_id
+            or contract.target_name != utility_name
+            or (target_name, "target_dependency") not in relationships
+            or contract.output_inventory_policy != "exact_bounded_tree"
+        ):
+            continue
+        if (target_name, "compiled_generated_input") in relationships:
+            continue
+        if (
+            contract.generator_output_option != "--output-root"
+            or contract.housekeeping_policy != "replace_output_root"
+        ):
+            _fail(
+                f"{build.project_id} target {target_name} tree prerequisite "
+                f"{utility_name} has the wrong output policy"
+            )
+        owner = build.targets.get(utility_name)
+        if owner is None or owner.target_type != "UTILITY":
+            _fail(
+                f"{build.project_id} target {target_name} tree prerequisite "
+                f"{utility_name} lacks its File API UTILITY owner"
+            )
+        output = Path(os.path.normpath(build.root / contract.generator_output))
+        if not _is_within(output, build.root) or output in utility_outputs:
+            _fail(
+                f"{build.project_id} target {target_name} tree prerequisite output "
+                "is escaped or ambiguous"
+            )
+        utility_outputs[output] = contract
+
+    for output, contract in utility_outputs.items():
+        command = commands.get(output)
+        producer = Path(os.path.normpath(build.root / contract.producer_artifact))
+        expected_argv = (
+            producer.as_posix(),
+            "--output-root",
+            output.as_posix(),
+        )
+        owner = build.targets[contract.target_name]
+        owner_node = Path(
+            os.path.normpath(
+                build.root / _file_api_target_ninja_node(build, owner)
+            )
+        )
+        expected_edge = roots.logical(owner_node)
+        edge_matches = 0
+        for raw_query in query_rows:
+            query = _object(raw_query, f"{build.project_id} material target query")
+            for raw_edge in _list(
+                query.get("edges"),
+                f"{build.project_id} material target query edges",
+            ):
+                edge = _object(
+                    raw_edge, f"{build.project_id} material target query edge"
+                )
+                if (
+                    edge.get("type") == "order_only"
+                    and edge.get("path") == expected_edge
+                ):
+                    edge_matches += 1
+        if (
+            command is None
+            or command.kind != "generated"
+            or command.inputs != (producer,)
+            or command.argv != expected_argv
+            or edge_matches != 1
+        ):
+            _fail(
+                f"{build.project_id} target {target_name} lacks the exact command/edge "
+                f"for tree UTILITY {contract.target_name}"
+            )
+        resolved_output = _directory(
+            output,
+            f"{build.project_id} target {target_name} tree UTILITY "
+            f"{contract.target_name} output",
+        )
+        if resolved_output != output:
+            _fail(
+                f"{build.project_id} target {target_name} tree UTILITY "
+                f"{contract.target_name} output is aliased"
+            )
+
+    material = {
+        output: command
+        for output, command in commands.items()
+        if output not in utility_outputs
+    }
+    for output in material:
+        try:
+            metadata = output.lstat()
+        except OSError:
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            _fail(
+                f"{build.project_id} target {target_name} has an uncontracted "
+                f"directory-output command: {output}"
+            )
+    return material
+
+
 def _prove_target(
     *,
     build: _Build,
@@ -9131,6 +9913,7 @@ def _prove_target(
     profile: str,
     roots: _Roots,
     responses: _ResponseCollector,
+    utility_contracts: Mapping[tuple[str, str], _UtilityTargetContract],
 ) -> dict[str, Any]:
     target = _target_reply(build, target_name, artifact, expected_sources, roots, role)
     artifact = Path(os.path.normpath(artifact))
@@ -9143,12 +9926,20 @@ def _prove_target(
         build.root,
         f"{build.project_id} Ninja commands {target_name}",
     )
-    commands = _parse_ninja_commands(
+    parsed_commands = _parse_ninja_commands(
         commands_text,
         build,
         roots,
         responses,
         f"{build.project_id} target {target_name}",
+    )
+    commands = _material_target_commands(
+        build=build,
+        target_name=target_name,
+        commands=parsed_commands,
+        query_rows=query_rows,
+        roots=roots,
+        utility_contracts=utility_contracts,
     )
     if artifact not in commands:
         _fail(f"{build.project_id} target {target_name} has no exact Ninja artifact producer")
@@ -9258,7 +10049,9 @@ def _prove_target(
             compiled_sources.add(command.source)
             source_evidence: dict[str, Any] | None = {
                 "path": roots.logical(command.source),
-                "sha256": _sha256_file(source_file),
+                "sha256": roots.sha256_file(
+                    source_file, f"compiled source for {target_name}"
+                ),
             }
         else:
             source_evidence = None
@@ -9815,6 +10608,7 @@ def _validate_generated_install_owner(
         cmake_source,
         source_git_root,
         f"{project_id} generated install CMake owner",
+        roots=roots,
     )
     template_evidence: dict[str, Any] | None = None
     if contract.template_source_relative is not None:
@@ -9830,6 +10624,7 @@ def _validate_generated_install_owner(
                 template,
                 source_git_root,
                 f"{project_id} generated install template owner",
+                roots=roots,
             ),
         }
 
@@ -9937,9 +10732,10 @@ def _qualified_install_input_inventory(
             )
         except ValueError:
             _fail(f"{project_id} source root escapes its Git root")
-        _index_tree, _object_format, git_entries = _git_index(
-            source_git_root, f"{project_id} exact install source index"
-        )
+        git_entries = roots.git_index_snapshot(
+            source_git_root,
+            f"{project_id} exact install source index",
+        ).entries
         source_owners: dict[Path, Path] = {}
         for install_prefix, source_prefix in state.contract.source_copy_prefixes:
             pure_source_prefix = PurePosixPath(source_prefix.as_posix())
@@ -9990,6 +10786,7 @@ def _qualified_install_input_inventory(
                     source,
                     source_git_root,
                     f"{project_id} exact installed source {install_relative}",
+                    roots=roots,
                 ),
             }
             row = {
@@ -10686,6 +11483,113 @@ def _require_utility_generator_owners(rows: Sequence[Mapping[str, Any]]) -> None
             _fail(f"UTILITY target {row.get('target')} generator ownership drifted")
 
 
+def _join_cmake_utility_order_only_dependencies(
+    *,
+    project_id: str,
+    target_name: str,
+    utility: Mapping[str, Any],
+    proof_index: Mapping[str, Mapping[str, Any]],
+    project_contracts: Mapping[str, _UtilityTargetContract],
+) -> None:
+    dependencies = [
+        _object(raw, f"{project_id} utility {target_name} generator dependency")
+        for raw in _list(
+            utility.get("generator_dependencies"),
+            f"{project_id} utility {target_name} generator dependencies",
+        )
+    ]
+    nested = [
+        dependency
+        for dependency in dependencies
+        if dependency.get("dependency_kind") is not None
+    ]
+    if not nested:
+        return
+    seen_paths: set[str] = set()
+    seen_owners: set[str] = set()
+    expected_keys = {
+        "type",
+        "path",
+        "dependency_kind",
+        "owner_project_id",
+        "owner_target",
+        "owner_file_api_target_reply",
+        "owner_generated_output",
+    }
+    for dependency in nested:
+        if set(dependency) != expected_keys:
+            _fail(
+                f"{project_id} utility {target_name} CMake UTILITY dependency "
+                "keys drifted"
+            )
+        path = _text(dependency.get("path"), "CMake UTILITY dependency path")
+        owner_target = _text(
+            dependency.get("owner_target"), "CMake UTILITY dependency owner"
+        )
+        if (
+            dependency.get("type") != "order_only"
+            or dependency.get("dependency_kind") != "cmake_utility_target"
+            or dependency.get("owner_project_id") != project_id
+            or owner_target == target_name
+            or path in seen_paths
+            or owner_target in seen_owners
+        ):
+            _fail(
+                f"{project_id} utility {target_name} CMake UTILITY dependency "
+                "identity drifted"
+            )
+        seen_paths.add(path)
+        seen_owners.add(owner_target)
+        owner_contract = project_contracts.get(owner_target)
+        owner = proof_index.get(owner_target)
+        if owner_contract is None or owner is None:
+            _fail(
+                f"{project_id} utility {target_name} CMake UTILITY dependency "
+                "is uncontracted or unproved"
+            )
+        owner_artifact = _object(
+            owner.get("artifact"), "nested utility owner artifact"
+        )
+        owner_build_root = _text(
+            owner.get("build_root"), "nested utility owner build root"
+        )
+        expected_owner_output = (
+            f"{owner_build_root}/{owner_contract.primary_output.as_posix()}"
+        )
+        owner_reply = _object(
+            dependency.get("owner_file_api_target_reply"),
+            "nested utility owner File API reply",
+        )
+        owner_output = _object(
+            dependency.get("owner_generated_output"),
+            "nested utility owner generated output",
+        )
+        proved_reply = _object(
+            owner.get("file_api_target_reply"),
+            "proved nested utility File API reply",
+        )
+        if (
+            owner_contract.project_id != project_id
+            or owner_contract.target_name != owner_target
+            or owner.get("project_id") != project_id
+            or owner.get("target") != owner_target
+            or owner.get("target_type") != "UTILITY"
+            or owner_build_root != utility.get("build_root")
+            or owner.get("contract_artifact")
+            != owner_contract.primary_output.as_posix()
+            or owner_artifact.get("path") != expected_owner_output
+            or set(owner_reply) != {"path", "sha256"}
+            or dict(owner_reply) != dict(proved_reply)
+            or set(owner_output) != {"path", "sha256"}
+            or owner_output.get("path") != expected_owner_output
+            or owner_output.get("sha256") != owner_artifact.get("sha256")
+        ):
+            _fail(
+                f"{project_id} utility {target_name} CMake UTILITY dependency "
+                "owner join drifted"
+            )
+
+
 def _join_utility_relationships(
     *,
     project_id: str,
@@ -10778,6 +11682,13 @@ def _join_utility_relationships(
         ]
         if not generator_dependency_matches:
             _fail(f"{project_id} utility {target_name} generator dependency is unjoined")
+        _join_cmake_utility_order_only_dependencies(
+            project_id=project_id,
+            target_name=target_name,
+            utility=utility,
+            proof_index=proof_index,
+            project_contracts=project_contracts,
+        )
 
         actual_relationships: dict[tuple[str, str], Mapping[str, Any]] = {}
         for proof_target, proof in proof_index.items():
@@ -11212,7 +12123,7 @@ def validate_production_build_provenance(
             profile="none",
             roots=roots,
             responses=responses,
-            utility_contract=utility_contracts.get((project_id, name)),
+            utility_contracts=utility_contracts,
         )
         if spec.target_type in {"EXECUTABLE", "SHARED_LIBRARY", "MODULE_LIBRARY"}:
             proof["elf"] = _elf_evidence(
@@ -11265,6 +12176,7 @@ def validate_production_build_provenance(
         "inspection_tools": _inspection_tool_evidence(),
         "passed": True,
     }
+    roots.validate_cached_compile_dependencies()
     evidence["evidence_sha256"] = _canonical_sha256(evidence)
     return evidence
 
@@ -11394,7 +12306,7 @@ def validate_binding_build_provenance(
                 profile=profile,
                 roots=roots,
                 responses=responses,
-                utility_contract=utility_contracts.get((project_id, target_name)),
+                utility_contracts=utility_contracts,
             )
             if spec.target_type in {
                 "EXECUTABLE",
@@ -11472,6 +12384,7 @@ def validate_binding_build_provenance(
         profile=profile,
         roots=roots,
         responses=responses,
+        utility_contracts=utility_contracts,
     )
     all_proofs = dependency_rows + [module_proof]
     _bind_output_dependency_owners(
@@ -11694,6 +12607,7 @@ def validate_binding_build_provenance(
         "inspection_tools": _inspection_tool_evidence(),
         "passed": True,
     }
+    roots.validate_cached_compile_dependencies()
     evidence["evidence_sha256"] = _canonical_sha256(evidence)
     return evidence
 
@@ -11937,7 +12851,7 @@ def validate_native_build_provenance(
             profile=profile,
             roots=roots,
             responses=responses,
-            utility_contract=utility_contracts.get((package, target_name)),
+            utility_contracts=utility_contracts,
         )
         if spec.target_type in {"EXECUTABLE", "SHARED_LIBRARY", "MODULE_LIBRARY"}:
             proof["elf"] = _elf_evidence(
@@ -11960,7 +12874,7 @@ def validate_native_build_provenance(
                 profile=profile,
                 roots=roots,
                 responses=responses,
-                utility_contract=utility_contracts.get((package, target_name)),
+                utility_contracts=utility_contracts,
             )
         )
     for target_name in sorted(registry_targets):
@@ -11980,7 +12894,7 @@ def validate_native_build_provenance(
             profile=profile,
             roots=roots,
             responses=responses,
-            utility_contract=None,
+            utility_contracts=utility_contracts,
         )
         proof["registered_test_count"] = len(registration["names"])
         proof["registered_test_names_sha256"] = _name_digest(registration["names"])
@@ -12040,7 +12954,7 @@ def validate_native_build_provenance(
                 profile=profile,
                 roots=roots,
                 responses=responses,
-                utility_contract=None,
+                utility_contracts=utility_contracts,
             )
             helper_proof["elf"] = _elf_evidence(
                 helper,
@@ -12107,6 +13021,7 @@ def validate_native_build_provenance(
                     profile=profile,
                     roots=roots,
                     responses=responses,
+                    utility_contracts={},
                 )
                 proof["contract_artifact"] = (
                     target_contract.build_artifact_relative.as_posix()
@@ -12239,6 +13154,7 @@ def validate_native_build_provenance(
         "inspection_tools": _inspection_tool_evidence(),
         "passed": True,
     }
+    roots.validate_cached_compile_dependencies()
     evidence["evidence_sha256"] = _canonical_sha256(evidence)
     return evidence
 

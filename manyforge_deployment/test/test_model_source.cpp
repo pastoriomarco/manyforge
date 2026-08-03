@@ -1245,6 +1245,31 @@ TEST(ModelSource, ResolvesMaterialReferencesOnceAndRetainsTheirIdentity) {
       0.25);
   EXPECT_NE(referenced_source.source_ir(), changed_source.source_ir());
 
+  Fixture empty_named_definition = referenced;
+  replace_once(blob_for(empty_named_definition,
+                        empty_named_definition.urdf_uri).bytes,
+               "<material name=\"Steel\"/>",
+               "<material name=\"\"><color rgba=\"0.5 0.5 0.5 1\"/>"
+               "</material>");
+  const auto empty_named_source = verify(empty_named_definition);
+  const auto& empty_named_visual =
+      empty_named_source.source_ir().urdf().links.front().visuals.front();
+  ASSERT_TRUE(empty_named_visual.material.has_value());
+  EXPECT_FALSE(empty_named_visual.material->name.has_value());
+  ASSERT_TRUE(empty_named_visual.material->color.has_value());
+  EXPECT_FALSE(empty_named_visual.material->resolved_reference.has_value());
+  const auto empty_named_canonical =
+      emit_canonical_urdf(empty_named_source.source_ir());
+  EXPECT_NE(empty_named_canonical.find(
+                "<material name=\"\"><color rgba=\"0.5 0.5 0.5 1\"/>"
+                "</material>"),
+            std::string::npos);
+  Fixture empty_named_round_trip = empty_named_definition;
+  blob_for(empty_named_round_trip, empty_named_round_trip.urdf_uri).bytes =
+      empty_named_canonical;
+  EXPECT_EQ(verify(empty_named_round_trip).source_ir(),
+            empty_named_source.source_ir());
+
   Fixture anonymous_definition = referenced;
   replace_once(blob_for(anonymous_definition,
                         anonymous_definition.urdf_uri).bytes,
@@ -1541,6 +1566,19 @@ TEST(ModelSource, RejectsAmbiguousOrUnknownUrdfMaterials) {
       named_reference, std::string_view("<material name=\"Steel\"/>").size(),
       "<material/>");
   EXPECT_THROW(verify(anonymous_empty), ModelSourceError);
+
+  Fixture empty_named_reference;
+  replace_once(blob_for(empty_named_reference,
+                        empty_named_reference.urdf_uri).bytes,
+               "<material name=\"Steel\"/>", "<material name=\"\"/>");
+  EXPECT_THROW(verify(empty_named_reference), ModelSourceError);
+
+  Fixture empty_named_top_level;
+  replace_once(blob_for(empty_named_top_level,
+                        empty_named_top_level.urdf_uri).bytes,
+               "<material name=\"Steel\"><color",
+               "<material name=\"\"><color");
+  EXPECT_THROW(verify(empty_named_top_level), ModelSourceError);
 
   Fixture empty_top_level;
   auto& empty_top_level_urdf =

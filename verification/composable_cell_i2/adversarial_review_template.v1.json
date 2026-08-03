@@ -78,7 +78,7 @@
       "candidate_tracked_input_digests",
       "exact_lane_argv",
       "final_unchanged_source_identity",
-      "fixture_ir_manifest_golden_and_product_digests",
+      "fixture_witnesses_and_real_product_digests",
       "forbidden_scan_results",
       "generated_output_sha256_and_size",
       "historical_packet_lineage",

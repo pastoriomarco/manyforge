@@ -4,12 +4,14 @@ import copy
 import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from verification.composable_cell_i2 import binding_contract_tests as binding_cases
 from verification.composable_cell_i2 import verify_qualification_manifest as verifier
 
 
@@ -63,6 +65,9 @@ def test_manifest_is_strict_and_declares_the_active_qualification_contract() -> 
         range(1, len(lanes) + 1)
     )
     assert all(lane["skip_policy"] == "forbid" for lane in lanes.values())
+    assert set(binding_cases._PREDECESSORS) == (
+        verifier.REQUIRED_NONCONSTRUCTIBLE_EXPORTS - {"CompilerQualifiedCellIr"}
+    )
 
 
 def test_adversarial_review_template_covers_the_exact_closure_scope() -> None:
@@ -165,7 +170,7 @@ def test_binding_and_generated_output_inventory_is_exact() -> None:
         ".github/workflows/python-tests.yml",
         "README.md",
     ]
-    assert len(binding["closure_integration"]["must_add"]) == 4
+    assert len(binding["closure_integration"]["must_add"]) == 6
     assert {row["role"] for row in binding["generated_outputs"]} == {
         "extension",
         "typed_stub",
@@ -174,14 +179,24 @@ def test_binding_and_generated_output_inventory_is_exact() -> None:
     }
 
 
-def test_only_tsan_lanes_disable_aslr_for_the_complete_executor() -> None:
+def test_required_sanitizer_lanes_disable_aslr_for_the_complete_executor() -> None:
     manifest = loaded_manifest()
     lanes = verifier.validate_manifest(manifest, REPOSITORY_ROOT)
 
+    assert verifier.NO_ASLR_EXECUTION_LANES == {
+        "core_asan_ubsan",
+        "core_tsan",
+        "deployment_asan_ubsan",
+        "roboplan_asan_ubsan",
+        "roboplan_tsan",
+        "bindings_asan_ubsan",
+        "bindings_tsan",
+    }
+
     for lane_id, lane in lanes.items():
         command = lane["container_command"]
-        if lane_id in verifier.TSAN_EXECUTION_LANES:
-            assert command[:3] == verifier.TSAN_EXECUTOR_PREFIX
+        if lane_id in verifier.NO_ASLR_EXECUTION_LANES:
+            assert command[:3] == verifier.NO_ASLR_EXECUTOR_PREFIX
             assert command[3] == "python3"
             rendered = verifier.render_lane(
                 manifest,
@@ -194,10 +209,10 @@ def test_only_tsan_lanes_disable_aslr_for_the_complete_executor() -> None:
                 manifest["qualification_environment"]["image"]["id"]
             )
             assert rendered[image_index + 1 : image_index + 4] == (
-                verifier.TSAN_EXECUTOR_PREFIX
+                verifier.NO_ASLR_EXECUTOR_PREFIX
             )
         else:
-            assert command[:3] != verifier.TSAN_EXECUTOR_PREFIX
+            assert command[:3] != verifier.NO_ASLR_EXECUTOR_PREFIX
 
     missing_prefix = loaded_manifest()
     next(
@@ -228,7 +243,7 @@ def test_only_tsan_lanes_disable_aslr_for_the_complete_executor() -> None:
         if lane["id"] == "core_release"
     )
     release_lane["container_command"] = [
-        *verifier.TSAN_EXECUTOR_PREFIX,
+        *verifier.NO_ASLR_EXECUTOR_PREFIX,
         *release_lane["container_command"],
     ]
     with pytest.raises(verifier.ManifestError, match="undeclared executable"):
@@ -284,6 +299,7 @@ def test_test_inventory_lane_cannot_drop_its_frozen_baseline() -> None:
 def test_fixture_and_scan_references_are_closed() -> None:
     manifest = loaded_manifest()
     lanes = verifier.validate_manifest(manifest, REPOSITORY_ROOT)
+    rotating = manifest["rotating_identities"]
 
     assert all(
         set(requirement["evidence_lanes"]).issubset(lanes)
@@ -310,6 +326,150 @@ def test_fixture_and_scan_references_are_closed() -> None:
         "line_rg",
         "file_regex",
     }
+    assert "fixture_ir_outputs" not in rotating
+    assert not any(
+        pattern.startswith(("fixture-raw/", "fixture-ir/"))
+        for pattern in rotating["regression_products"]
+    )
+    semantic_fixtures = [
+        fixture
+        for fixture in manifest["fixture_matrix"]
+        if fixture["id"].startswith(("c02m_", "c02n_", "c02o_"))
+    ]
+    assert semantic_fixtures
+    assert all(
+        fixture["native_test_witnesses"] or fixture["binding_case_witnesses"]
+        for fixture in semantic_fixtures
+    )
+    assert all(
+        fixture["determinism_artifacts"] == []
+        and "deterministic_rebuild" not in fixture["evidence_lanes"]
+        for fixture in semantic_fixtures
+        if fixture["id"].startswith(("c02m_", "c02n_"))
+    )
+    final_fixture = next(
+        fixture
+        for fixture in semantic_fixtures
+        if fixture["id"].startswith("c02o_")
+    )
+    assert final_fixture["determinism_artifacts"] == [
+        "canonical_empty_product_package/canonical-empty-admission.json"
+    ]
+
+
+def test_binding_asan_uses_linked_host_and_keeps_leak_boundary_explicit() -> None:
+    assert (
+        verifier.NATIVE_SANITIZER_ENVIRONMENT["address+undefined"][
+            "ASAN_OPTIONS"
+        ]
+        == "halt_on_error=1:detect_leaks=1:exitcode=66"
+    )
+    assert verifier.BINDING_ASAN_UBSAN_ENVIRONMENT == {
+        "ASAN_OPTIONS": "halt_on_error=1:detect_leaks=0:exitcode=66",
+        "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1:exitcode=66",
+    }
+    assert verifier.BINDING_ASAN_HOST == Path(
+        "/qualification-output/build/bindings-asan/sanitizer-host/"
+        "manyforge-python-asan-ubsan"
+    )
+    assert verifier.BINDING_ASAN_HOST_REQUIRED_NEEDED == (
+        "libasan.so.8",
+        "libubsan.so.1",
+        "libstdc++.so.6",
+        "libpython3.12.so.1.0",
+    )
+    manifest = loaded_manifest()
+    assert verifier.BINDING_ASAN_HOST_OUTPUT in next(
+        lane["expected_outputs"]
+        for lane in manifest["qualification_lanes"]
+        if lane["id"] == "bindings_asan_ubsan"
+    )
+    row = next(
+        item
+        for item in manifest["test_inventory_contract"]["binding_result_lanes"]
+        if item["lane_id"] == "bindings_asan_ubsan"
+    )
+    assert verifier._binding_collection_argv(row)[0] == str(
+        verifier.BINDING_ASAN_HOST
+    )
+    assert verifier._binding_run_argv(row)[0] == str(verifier.BINDING_ASAN_HOST)
+    assert "scripts/ci/core-bindings-sanitizer-host.cpp" in manifest[
+        "binding_contract"
+    ]["closure_integration"]["must_add"]
+
+
+def test_binding_sanitizer_host_inspection_and_artifact_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    lane_root = artifact_root / "lanes/bindings_asan_ubsan"
+    host = verifier._binding_sanitizer_host_artifact_path(
+        artifact_root, "bindings_asan_ubsan"
+    )
+    assert host == lane_root / verifier.BINDING_ASAN_HOST_OUTPUT
+    assert (
+        verifier._binding_sanitizer_host_artifact_path(
+            artifact_root, "bindings_release"
+        )
+        is None
+    )
+    assert host is not None
+    host.parent.mkdir(parents=True)
+    host.write_bytes(b"\x7fELFlinked-host-fixture")
+    host.chmod(0o755)
+
+    valid_output = "\n".join(
+        f"Shared library: [{library}]"
+        for library in (
+            "libasan.so.8",
+            "libstdc++.so.6",
+            "libpython3.12.so.1.0",
+            "libm.so.6",
+            "libubsan.so.1",
+            "libgcc_s.so.1",
+            "libc.so.6",
+        )
+    )
+    dynamic_output = {"value": valid_output}
+
+    def inspect(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=dynamic_output["value"],
+            stderr="",
+        )
+
+    monkeypatch.setattr(verifier.subprocess, "run", inspect)
+    evidence = verifier._inspect_binding_sanitizer_host(
+        host,
+        lane_root,
+        rendered_path=str(verifier.BINDING_ASAN_HOST),
+    )
+    assert evidence["path"] == str(verifier.BINDING_ASAN_HOST)
+    assert evidence["needed"][0] == "libasan.so.8"
+
+    dynamic_output["value"] = valid_output.replace(
+        "Shared library: [libasan.so.8]\nShared library: [libstdc++.so.6]",
+        "Shared library: [libstdc++.so.6]\nShared library: [libasan.so.8]",
+    )
+    with pytest.raises(verifier.ManifestError, match="dynamic runtime order"):
+        verifier._inspect_binding_sanitizer_host(
+            host,
+            lane_root,
+            rendered_path=str(verifier.BINDING_ASAN_HOST),
+        )
+
+    dynamic_output["value"] = valid_output.replace(
+        "Shared library: [libubsan.so.1]", ""
+    )
+    with pytest.raises(verifier.ManifestError, match="dynamic runtime order"):
+        verifier._inspect_binding_sanitizer_host(
+            host,
+            lane_root,
+            rendered_path=str(verifier.BINDING_ASAN_HOST),
+        )
 
 
 def test_multiline_trusted_pybind_constructor_is_detected(tmp_path: Path) -> None:
@@ -1249,6 +1409,24 @@ def test_binding_measurement_counts_reject_json_booleans() -> None:
                 "ros_module_count": False,
                 "extension_suffix_matches": True,
             },
+        )
+
+    predecessor_measurements = {
+        "projection_count": len(binding_cases._PREDECESSORS),
+        "construct_attempts": 2 * len(binding_cases._PREDECESSORS),
+        "construct_rejections": 2 * len(binding_cases._PREDECESSORS),
+        "write_attempts": 1,
+        "write_rejections": 1,
+    }
+    verifier._validate_binding_measurements(
+        "all_trusted_predecessor_projections_nonconstructible_and_read_only",
+        predecessor_measurements,
+    )
+    predecessor_measurements["projection_count"] -= 1
+    with pytest.raises(verifier.ManifestError, match="measurements failed"):
+        verifier._validate_binding_measurements(
+            "all_trusted_predecessor_projections_nonconstructible_and_read_only",
+            predecessor_measurements,
         )
 
 

@@ -242,12 +242,15 @@ struct UrdfResolvedMaterialReferenceIr final {
 
 /// A complete top-level or inline URDF material occurrence.
 ///
-/// Every material in a source-qualified root has `name`. A top-level material
-/// also has color or texture, while an inline material with only `name` is a
-/// reference. Its exact reference identity and resolved immutable definition
-/// are both retained so no downstream consumer repeats name resolution. Named
-/// inline color/texture definitions remain complete occurrences rather than
-/// being flattened into the referenced material.
+/// Every material in a source-qualified root authored a `name` attribute. A
+/// top-level material has a non-empty name plus color or texture. An inline
+/// color/texture definition may use the common-consumer `name=""` spelling,
+/// represented by `nullopt` and re-emitted exactly as an empty attribute; an
+/// inline material with only a non-empty name is a reference. Exact reference
+/// identity and its resolved immutable definition are both retained so no
+/// downstream consumer repeats name resolution. Named inline color/texture
+/// definitions remain complete occurrences rather than being flattened into
+/// the referenced material.
 struct UrdfMaterialIr final {
   std::optional<std::string> name;
   std::optional<UrdfMaterialColorIr> color;

@@ -16,7 +16,10 @@
 
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/model_asset.hpp>
-#include <manyforge_deployment/cell_structure.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/cell_applicability.hpp>
+#include <manyforge_deployment/cell_compiler.hpp>
+#include <manyforge_deployment/cell_composition.hpp>
 #include <manyforge_deployment/model_source.hpp>
 
 #include "binding_registrations.hpp"
@@ -32,7 +35,8 @@ template <typename Values>
 [[nodiscard]] py::tuple immutable_snapshot(const Values& values) {
   py::tuple snapshot{values.size()};
   for (std::size_t index = 0U; index < values.size(); ++index) {
-    snapshot[index] = py::cast(values[index]);
+    snapshot[index] =
+        py::cast(values[index], py::return_value_policy::copy);
   }
   return snapshot;
 }
@@ -132,7 +136,7 @@ template <typename Qualified, typename KeyFunction>
   bounded.reserve(selected.size());
   for (const auto& item : values) {
     if (bounded.size() == selected.size()) {
-      throw deployment::CellStructureError(
+      throw deployment::CellCompositionError(
           std::string(argument_name) +
           " contains more values than the graph selects");
     }
@@ -149,17 +153,37 @@ template <typename Qualified, typename KeyFunction>
           [&key](const auto& selected_key) {
             return selected_key.first == key.first;
           });
-      throw deployment::CellStructureError(
+      throw deployment::CellCompositionError(
           std::string(selected_id ? "stale " : "unused extra ") +
           std::string(record_name) + " '" + key.first +
           "' at revision '" + key.second + "'");
     }
     if (!seen.insert(key).second) {
-      throw deployment::CellStructureError(
+      throw deployment::CellCompositionError(
           "duplicate exact " + std::string(record_name) + " '" +
           key.first + "' at revision '" + key.second + "'");
     }
     bounded.push_back(qualified);
+  }
+  return bounded;
+}
+
+template <typename Qualified>
+[[nodiscard]] std::vector<Qualified> bounded_qualified_closure_from_python(
+    const py::iterable& values, std::string_view argument_name,
+    std::string_view record_name) {
+  std::vector<Qualified> bounded;
+  for (const auto& item : values) {
+    if (bounded.size() == deployment::kMaxArtifactNodeCount) {
+      throw deployment::CellApplicabilityError(
+          std::string(argument_name) + " exceeds the bounded closure limit");
+    }
+    if (!py::isinstance<Qualified>(item)) {
+      throw py::type_error(std::string(argument_name) +
+                           " must contain only " +
+                           std::string(record_name) + " values");
+    }
+    bounded.push_back(item.cast<const Qualified&>());
   }
   return bounded;
 }
@@ -189,21 +213,6 @@ void register_model_compiler_bindings(py::module_& module) {
   using deployment::SrdfJointGroupMemberIr;
   using deployment::SrdfLinkGroupMemberIr;
   using deployment::SrdfSubgroupMemberIr;
-  using deployment::StructurallyQualifiedCellGraph;
-  using deployment::StructuralAttachmentEndpointResolution;
-  using deployment::StructuralAttachmentInterfaceResolution;
-  using deployment::StructuralAttachmentResolution;
-  using deployment::StructuralCollisionBodyResolution;
-  using deployment::StructuralCommandTargetResolution;
-  using deployment::StructuralComponentLocalResourceResolution;
-  using deployment::StructuralComponentResolution;
-  using deployment::StructuralFrameResolution;
-  using deployment::StructuralModelGroupResolution;
-  using deployment::StructuralModelInstanceResolution;
-  using deployment::StructuralModelMountResolution;
-  using deployment::StructuralModelOccurrence;
-  using deployment::StructuralModelResourceResolution;
-  using deployment::StructuralTargetFrameResolution;
   using deployment::UrdfAxisIr;
   using deployment::UrdfBoxGeometryIr;
   using deployment::UrdfCalibrationIr;
@@ -230,8 +239,12 @@ void register_model_compiler_bindings(py::module_& module) {
 
   py::register_exception<deployment::ModelSourceError>(
       module, "ModelSourceError", PyExc_ValueError);
-  py::register_exception<deployment::CellStructureError>(
-      module, "CellStructureError", PyExc_ValueError);
+  py::register_exception<deployment::CellCompositionError>(
+      module, "CellCompositionError", PyExc_ValueError);
+  py::register_exception<deployment::CellApplicabilityError>(
+      module, "CellApplicabilityError", PyExc_ValueError);
+  py::register_exception<deployment::CellCompilerError>(
+      module, "CellCompilerError", PyExc_ValueError);
 
   py::enum_<deployment::ModelSourceArtifactKind>(
       module, "ModelSourceArtifactKind")
@@ -284,20 +297,71 @@ void register_model_compiler_bindings(py::module_& module) {
       .value("kSubgroup",
              deployment::SrdfExpansionProvenanceKind::kSubgroup);
 
-  py::enum_<deployment::StructuralPlacementSource>(
-      module, "StructuralPlacementSource")
-      .value("kDirectModelPoseInCell",
-             deployment::StructuralPlacementSource::
-                 kDirectModelPoseInCell)
-      .value("kDirectComponentPoseInCell",
-             deployment::StructuralPlacementSource::
-                 kDirectComponentPoseInCell)
-      .value("kDerivedFromComponentAttachment",
-             deployment::StructuralPlacementSource::
-                 kDerivedFromComponentAttachment)
-      .value("kDerivedFromComponentModelMount",
-             deployment::StructuralPlacementSource::
-                 kDerivedFromComponentModelMount);
+  py::enum_<deployment::OccurrenceSymbolKind>(module,
+                                               "OccurrenceSymbolKind")
+      .value("kModel", deployment::OccurrenceSymbolKind::kModel)
+      .value("kRobot", deployment::OccurrenceSymbolKind::kRobot)
+      .value("kMaterial", deployment::OccurrenceSymbolKind::kMaterial)
+      .value("kLink", deployment::OccurrenceSymbolKind::kLink)
+      .value("kJoint", deployment::OccurrenceSymbolKind::kJoint)
+      .value("kVisual", deployment::OccurrenceSymbolKind::kVisual)
+      .value("kCollision", deployment::OccurrenceSymbolKind::kCollision)
+      .value("kSrdfGroup", deployment::OccurrenceSymbolKind::kSrdfGroup)
+      .value("kSrdfGroupState",
+             deployment::OccurrenceSymbolKind::kSrdfGroupState)
+      .value("kSrdfEndEffector",
+             deployment::OccurrenceSymbolKind::kSrdfEndEffector);
+
+  py::enum_<deployment::OccurrenceReferenceKind>(
+      module, "OccurrenceReferenceKind")
+      .value("kJointParentLink",
+             deployment::OccurrenceReferenceKind::kJointParentLink)
+      .value("kJointChildLink",
+             deployment::OccurrenceReferenceKind::kJointChildLink)
+      .value("kJointMimic",
+             deployment::OccurrenceReferenceKind::kJointMimic)
+      .value("kVisualMaterial",
+             deployment::OccurrenceReferenceKind::kVisualMaterial)
+      .value("kSrdfGroupLink",
+             deployment::OccurrenceReferenceKind::kSrdfGroupLink)
+      .value("kSrdfGroupJoint",
+             deployment::OccurrenceReferenceKind::kSrdfGroupJoint)
+      .value("kSrdfChainBaseLink",
+             deployment::OccurrenceReferenceKind::kSrdfChainBaseLink)
+      .value("kSrdfChainTipLink",
+             deployment::OccurrenceReferenceKind::kSrdfChainTipLink)
+      .value("kSrdfSubgroup",
+             deployment::OccurrenceReferenceKind::kSrdfSubgroup)
+      .value("kSrdfGroupStateGroup",
+             deployment::OccurrenceReferenceKind::kSrdfGroupStateGroup)
+      .value("kSrdfGroupStateJoint",
+             deployment::OccurrenceReferenceKind::kSrdfGroupStateJoint)
+      .value("kSrdfEndEffectorParentLink",
+             deployment::OccurrenceReferenceKind::
+                 kSrdfEndEffectorParentLink)
+      .value("kSrdfEndEffectorGroup",
+             deployment::OccurrenceReferenceKind::kSrdfEndEffectorGroup)
+      .value("kSrdfEndEffectorParentGroup",
+             deployment::OccurrenceReferenceKind::
+                 kSrdfEndEffectorParentGroup)
+      .value("kSrdfPassiveJoint",
+             deployment::OccurrenceReferenceKind::kSrdfPassiveJoint)
+      .value("kSrdfDisabledCollisionFirstLink",
+             deployment::OccurrenceReferenceKind::
+                 kSrdfDisabledCollisionFirstLink)
+      .value("kSrdfDisabledCollisionSecondLink",
+             deployment::OccurrenceReferenceKind::
+                 kSrdfDisabledCollisionSecondLink);
+
+  py::enum_<deployment::CompositionCoordinateUnit>(
+      module, "CompositionCoordinateUnit")
+      .value("kNone", deployment::CompositionCoordinateUnit::kNone)
+      .value("kRadians", deployment::CompositionCoordinateUnit::kRadians)
+      .value("kMeters", deployment::CompositionCoordinateUnit::kMeters)
+      .value("kPlanarMetersRadians",
+             deployment::CompositionCoordinateUnit::kPlanarMetersRadians)
+      .value("kFloatingMetersRadians",
+             deployment::CompositionCoordinateUnit::kFloatingMetersRadians);
 
   py::class_<ModelSourceRetrievalPlanRow>(
       module, "ModelSourceRetrievalPlanRow", py::is_final())
@@ -860,305 +924,1323 @@ void register_model_compiler_bindings(py::module_& module) {
 
   py::class_<SourceVerifiedModelAsset>(
       module, "SourceVerifiedModelAsset", py::is_final())
-      .def_property_readonly("value",
-                             &SourceVerifiedModelAsset::value)
+      .def_property_readonly(
+          "value", [](const SourceVerifiedModelAsset& asset) {
+            return asset.value();
+          })
       .def_property_readonly(
           "qualified_asset",
-          &SourceVerifiedModelAsset::qualified_asset)
+          [](const SourceVerifiedModelAsset& asset) {
+            return asset.qualified_asset();
+          })
+      .def_property_readonly(
+          "retrieval_plan",
+          [](const SourceVerifiedModelAsset& asset) {
+            return asset.retrieval_plan();
+          })
       .def_property_readonly(
           "verified_artifacts",
           [](const SourceVerifiedModelAsset& asset) {
             return immutable_snapshot(asset.verified_artifacts());
           })
-      .def_property_readonly("source_ir",
-                             &SourceVerifiedModelAsset::source_ir);
+      .def_property_readonly(
+          "source_ir", [](const SourceVerifiedModelAsset& asset) {
+            return asset.source_ir();
+          });
 
-  py::class_<StructuralModelInstanceResolution>(
-      module, "StructuralModelInstanceResolution", py::is_final())
+  py::class_<deployment::OccurrenceSymbolKey>(
+      module, "OccurrenceSymbolKey", py::is_final())
+      .def_readonly("model_instance_id",
+                    &deployment::OccurrenceSymbolKey::model_instance_id)
+      .def_readonly("kind", &deployment::OccurrenceSymbolKey::kind)
+      .def_readonly("scope_name",
+                    &deployment::OccurrenceSymbolKey::scope_name)
+      .def_readonly("source_name",
+                    &deployment::OccurrenceSymbolKey::source_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::OccurrenceSymbolRewrite>(
+      module, "OccurrenceSymbolRewrite", py::is_final())
+      .def_readonly("source", &deployment::OccurrenceSymbolRewrite::source)
+      .def_readonly("compiled_name",
+                    &deployment::OccurrenceSymbolRewrite::compiled_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::OccurrenceReverseSymbolRewrite>(
+      module, "OccurrenceReverseSymbolRewrite", py::is_final())
+      .def_readonly(
+          "compiled_name",
+          &deployment::OccurrenceReverseSymbolRewrite::compiled_name)
+      .def_readonly("source",
+                    &deployment::OccurrenceReverseSymbolRewrite::source)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::OccurrenceReferenceRewrite>(
+      module, "OccurrenceReferenceRewrite", py::is_final())
       .def_readonly(
           "model_instance_id",
-          &StructuralModelInstanceResolution::model_instance_id)
-      .def_readonly("model_asset_id",
-                    &StructuralModelInstanceResolution::model_asset_id)
-      .def_readonly("model_revision",
-                    &StructuralModelInstanceResolution::model_revision)
+          &deployment::OccurrenceReferenceRewrite::model_instance_id)
+      .def_readonly("kind", &deployment::OccurrenceReferenceRewrite::kind)
       .def_readonly(
-          "source_root_link_name",
-          &StructuralModelInstanceResolution::source_root_link_name)
+          "owner_scope_name",
+          &deployment::OccurrenceReferenceRewrite::owner_scope_name)
+      .def_readonly(
+          "owner_source_name",
+          &deployment::OccurrenceReferenceRewrite::owner_source_name)
+      .def_readonly(
+          "reference_ordinal",
+          &deployment::OccurrenceReferenceRewrite::reference_ordinal)
+      .def_readonly(
+          "source_target",
+          &deployment::OccurrenceReferenceRewrite::source_target)
+      .def_readonly(
+          "compiled_target_name",
+          &deployment::OccurrenceReferenceRewrite::compiled_target_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionPlanningResourceRewrite>(
+      module, "CompositionPlanningResourceRewrite", py::is_final())
+      .def_readonly(
+          "model_asset_id",
+          &deployment::CompositionPlanningResourceRewrite::model_asset_id)
+      .def_readonly(
+          "model_revision",
+          &deployment::CompositionPlanningResourceRewrite::model_revision)
+      .def_readonly(
+          "source_logical_uri",
+          &deployment::CompositionPlanningResourceRewrite::source_logical_uri)
+      .def_readonly(
+          "compiled_logical_uri",
+          &deployment::CompositionPlanningResourceRewrite::compiled_logical_uri)
+      .def_readonly(
+          "media_type",
+          &deployment::CompositionPlanningResourceRewrite::media_type)
+      .def_readonly(
+          "byte_size",
+          &deployment::CompositionPlanningResourceRewrite::byte_size)
+      .def_readonly(
+          "content_digest",
+          &deployment::CompositionPlanningResourceRewrite::content_digest)
+      .def_readonly(
+          "content_addressed_store_key",
+          &deployment::CompositionPlanningResourceRewrite::
+              content_addressed_store_key)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionModelOccurrence>(
+      module, "CompositionModelOccurrence", py::is_final())
+      .def_readonly(
+          "model_instance_id",
+          &deployment::CompositionModelOccurrence::model_instance_id)
+      .def_readonly("model_asset_id",
+                    &deployment::CompositionModelOccurrence::model_asset_id)
+      .def_readonly("model_revision",
+                    &deployment::CompositionModelOccurrence::model_revision)
       .def_readonly(
           "owner_component_id",
-          &StructuralModelInstanceResolution::owner_component_id)
+          &deployment::CompositionModelOccurrence::owner_component_id)
       .def_readonly(
           "owner_model_role_id",
-          &StructuralModelInstanceResolution::owner_model_role_id)
-      .def_readonly("placement_source",
-                    &StructuralModelInstanceResolution::placement_source)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<StructuralModelOccurrence>(
-      module, "StructuralModelOccurrence", py::is_final())
-      .def_readonly("model_role_id",
-                    &StructuralModelOccurrence::model_role_id)
-      .def_readonly("model_instance_id",
-                    &StructuralModelOccurrence::model_instance_id)
-      .def_readonly("model_asset_id",
-                    &StructuralModelOccurrence::model_asset_id)
-      .def_readonly("model_revision",
-                    &StructuralModelOccurrence::model_revision)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<StructuralFrameResolution>(
-      module, "StructuralFrameResolution", py::is_final())
-      .def_readonly("model", &StructuralFrameResolution::model)
-      .def_readonly("frame_role_id",
-                    &StructuralFrameResolution::frame_role_id)
-      .def_readonly("source_link_name",
-                    &StructuralFrameResolution::source_link_name)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<StructuralModelMountResolution>(
-      module, "StructuralModelMountResolution", py::is_final())
-      .def_readonly("parent",
-                    &StructuralModelMountResolution::parent)
-      .def_readonly("child", &StructuralModelMountResolution::child)
+          &deployment::CompositionModelOccurrence::owner_model_role_id)
       .def_readonly(
-          "child_frame_pose_in_parent_frame",
-          &StructuralModelMountResolution::
-              child_frame_pose_in_parent_frame)
+          "compiled_model_name",
+          &deployment::CompositionModelOccurrence::compiled_model_name)
+      .def_readonly(
+          "compiled_robot_name",
+          &deployment::CompositionModelOccurrence::compiled_robot_name)
+      .def_readonly(
+          "compiled_root_link_name",
+          &deployment::CompositionModelOccurrence::compiled_root_link_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionCellFrame>(
+      module, "CompositionCellFrame", py::is_final())
+      .def_readonly("cell_id", &deployment::CompositionCellFrame::cell_id)
+      .def_readonly(
+          "compiled_frame_name",
+          &deployment::CompositionCellFrame::compiled_frame_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionComponentModelFrame>(
+      module, "CompositionComponentModelFrame", py::is_final())
+      .def_readonly(
+          "controllable_component_id",
+          &deployment::CompositionComponentModelFrame::
+              controllable_component_id)
+      .def_readonly(
+          "model_instance_id",
+          &deployment::CompositionComponentModelFrame::model_instance_id)
+      .def_readonly(
+          "model_revision",
+          &deployment::CompositionComponentModelFrame::model_revision)
+      .def_readonly(
+          "frame_role_id",
+          &deployment::CompositionComponentModelFrame::frame_role_id)
+      .def_readonly(
+          "compiled_frame_name",
+          &deployment::CompositionComponentModelFrame::compiled_frame_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionPassiveModelFrame>(
+      module, "CompositionPassiveModelFrame", py::is_final())
+      .def_readonly(
+          "model_instance_id",
+          &deployment::CompositionPassiveModelFrame::model_instance_id)
+      .def_readonly(
+          "model_revision",
+          &deployment::CompositionPassiveModelFrame::model_revision)
+      .def_readonly(
+          "frame_role_id",
+          &deployment::CompositionPassiveModelFrame::frame_role_id)
+      .def_readonly(
+          "compiled_frame_name",
+          &deployment::CompositionPassiveModelFrame::compiled_frame_name)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<StructuralModelGroupResolution>(
-      module, "StructuralModelGroupResolution", py::is_final())
-      .def_readonly(
-          "model_group_role_id",
-          &StructuralModelGroupResolution::model_group_role_id)
-      .def_readonly("model", &StructuralModelGroupResolution::model)
-      .def_readonly(
-          "asset_model_group_role_id",
-          &StructuralModelGroupResolution::asset_model_group_role_id)
-      .def_readonly("source_group_name",
-                    &StructuralModelGroupResolution::source_group_name)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<StructuralModelResourceResolution>(
-      module, "StructuralModelResourceResolution", py::is_final())
-      .def_readonly("resource_role_id",
-                    &StructuralModelResourceResolution::resource_role_id)
-      .def_readonly("model",
-                    &StructuralModelResourceResolution::model)
-      .def_readonly(
-          "asset_resource_role_id",
-          &StructuralModelResourceResolution::asset_resource_role_id)
-      .def_property_readonly(
-          "source_joint_names",
-          [](const StructuralModelResourceResolution& resource) {
-            return immutable_snapshot(resource.source_joint_names);
-          })
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<StructuralComponentLocalResourceResolution>(
-      module, "StructuralComponentLocalResourceResolution",
-      py::is_final())
-      .def_readonly(
-          "resource_role_id",
-          &StructuralComponentLocalResourceResolution::resource_role_id)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::tuple structural_resource_types{2U};
-  structural_resource_types[0] =
-      module.attr("StructuralModelResourceResolution");
-  structural_resource_types[1] =
-      module.attr("StructuralComponentLocalResourceResolution");
-  module.attr("StructuralResourceResolution") =
+  py::tuple resolved_frame_types{3U};
+  resolved_frame_types[0] = module.attr("CompositionCellFrame");
+  resolved_frame_types[1] = module.attr("CompositionComponentModelFrame");
+  resolved_frame_types[2] = module.attr("CompositionPassiveModelFrame");
+  module.attr("CompositionResolvedFrame") =
       py::module_::import("typing")
           .attr("Union")
-          .attr("__getitem__")(structural_resource_types);
+          .attr("__getitem__")(resolved_frame_types);
 
-  py::class_<StructuralTargetFrameResolution>(
-      module, "StructuralTargetFrameResolution", py::is_final())
-      .def_readonly("frame_role_id",
-                    &StructuralTargetFrameResolution::frame_role_id)
-      .def_readonly("source",
-                    &StructuralTargetFrameResolution::source)
+  py::class_<deployment::CompositionFrameResolution>(
+      module, "CompositionFrameResolution", py::is_final())
+      .def_readonly("frame", &deployment::CompositionFrameResolution::frame)
+      .def_readonly(
+          "source_link_name",
+          &deployment::CompositionFrameResolution::source_link_name)
       .def(py::self == py::self)
       .def(py::self != py::self);
-
-  py::class_<StructuralCollisionBodyResolution>(
-      module, "StructuralCollisionBodyResolution", py::is_final())
+  py::class_<deployment::CompositionModelCoordinate>(
+      module, "CompositionModelCoordinate", py::is_final())
       .def_readonly(
-          "collision_body_role_id",
-          &StructuralCollisionBodyResolution::collision_body_role_id)
-      .def_readonly("model",
-                    &StructuralCollisionBodyResolution::model)
+          "model_instance_id",
+          &deployment::CompositionModelCoordinate::model_instance_id)
       .def_readonly(
-          "asset_collision_body_role_id",
-          &StructuralCollisionBodyResolution::
-              asset_collision_body_role_id)
+          "owner_component_id",
+          &deployment::CompositionModelCoordinate::owner_component_id)
+      .def_readonly(
+          "source_joint_index",
+          &deployment::CompositionModelCoordinate::source_joint_index)
+      .def_readonly(
+          "source_joint_name",
+          &deployment::CompositionModelCoordinate::source_joint_name)
+      .def_readonly(
+          "compiled_joint_name",
+          &deployment::CompositionModelCoordinate::compiled_joint_name)
+      .def_readonly("joint_type",
+                    &deployment::CompositionModelCoordinate::joint_type)
+      .def_readonly("coordinate_kind",
+                    &deployment::CompositionModelCoordinate::coordinate_kind)
+      .def_readonly("unit", &deployment::CompositionModelCoordinate::unit)
+      .def_readonly(
+          "mimic_source_compiled_joint_name",
+          &deployment::CompositionModelCoordinate::
+              mimic_source_compiled_joint_name)
+      .def_readonly(
+          "mimic_multiplier",
+          &deployment::CompositionModelCoordinate::mimic_multiplier)
+      .def_readonly("mimic_offset",
+                    &deployment::CompositionModelCoordinate::mimic_offset)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionCoordinateProjection>(
+      module, "CompositionCoordinateProjection", py::is_final())
+      .def_readonly(
+          "model_instance_id",
+          &deployment::CompositionCoordinateProjection::model_instance_id)
+      .def_readonly(
+          "source_joint_name",
+          &deployment::CompositionCoordinateProjection::source_joint_name)
+      .def_readonly(
+          "compiled_joint_name",
+          &deployment::CompositionCoordinateProjection::compiled_joint_name)
+      .def_readonly(
+          "coordinate_kind",
+          &deployment::CompositionCoordinateProjection::coordinate_kind)
+      .def_readonly("unit",
+                    &deployment::CompositionCoordinateProjection::unit)
+      .def_readonly(
+          "multiplier",
+          &deployment::CompositionCoordinateProjection::multiplier)
+      .def_readonly("offset",
+                    &deployment::CompositionCoordinateProjection::offset)
+      .def_readonly(
+          "derived_mimic",
+          &deployment::CompositionCoordinateProjection::derived_mimic)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionResourceCoordinateRow>(
+      module, "CompositionResourceCoordinateRow", py::is_final())
+      .def_readonly(
+          "resource_role_id",
+          &deployment::CompositionResourceCoordinateRow::resource_role_id)
+      .def_readonly(
+          "resource_id",
+          &deployment::CompositionResourceCoordinateRow::resource_id)
       .def_property_readonly(
-          "source_link_names",
-          [](const StructuralCollisionBodyResolution& body) {
-            return immutable_snapshot(body.source_link_names);
+          "coordinates",
+          [](const deployment::CompositionResourceCoordinateRow& value) {
+            return immutable_snapshot(value.coordinates);
           })
       .def(py::self == py::self)
       .def(py::self != py::self);
-
-  py::class_<StructuralCommandTargetResolution>(
-      module, "StructuralCommandTargetResolution", py::is_final())
+  py::class_<deployment::CompositionControlBindingCoordinateMap>(
+      module, "CompositionControlBindingCoordinateMap", py::is_final())
+      .def_readonly(
+          "control_binding_id",
+          &deployment::CompositionControlBindingCoordinateMap::
+              control_binding_id)
+      .def_readonly(
+          "controllable_component_id",
+          &deployment::CompositionControlBindingCoordinateMap::
+              controllable_component_id)
       .def_readonly(
           "command_target_id",
-          &StructuralCommandTargetResolution::command_target_id)
-      .def_property_readonly(
-          "model_groups",
-          [](const StructuralCommandTargetResolution& target) {
-            return immutable_snapshot(target.model_groups);
-          })
+          &deployment::CompositionControlBindingCoordinateMap::
+              command_target_id)
       .def_property_readonly(
           "resources",
-          [](const StructuralCommandTargetResolution& target) {
-            return immutable_snapshot(target.resources);
+          [](const deployment::CompositionControlBindingCoordinateMap& value) {
+            return immutable_snapshot(value.resources);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionTargetGroupResolution>(
+      module, "CompositionTargetGroupResolution", py::is_final())
+      .def_readonly(
+          "model_group_role_id",
+          &deployment::CompositionTargetGroupResolution::model_group_role_id)
+      .def_readonly(
+          "model_instance_id",
+          &deployment::CompositionTargetGroupResolution::model_instance_id)
+      .def_readonly(
+          "compiled_group_name",
+          &deployment::CompositionTargetGroupResolution::compiled_group_name)
+      .def_property_readonly(
+          "expanded_compiled_link_names",
+          [](const deployment::CompositionTargetGroupResolution& value) {
+            return immutable_snapshot(value.expanded_compiled_link_names);
+          })
+      .def_property_readonly(
+          "expanded_compiled_joint_names",
+          [](const deployment::CompositionTargetGroupResolution& value) {
+            return immutable_snapshot(value.expanded_compiled_joint_names);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionTargetFrameResolution>(
+      module, "CompositionTargetFrameResolution", py::is_final())
+      .def_readonly(
+          "frame_role_id",
+          &deployment::CompositionTargetFrameResolution::frame_role_id)
+      .def_readonly("frame",
+                    &deployment::CompositionTargetFrameResolution::frame)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionTargetCollisionResolution>(
+      module, "CompositionTargetCollisionResolution", py::is_final())
+      .def_readonly(
+          "collision_body_role_id",
+          &deployment::CompositionTargetCollisionResolution::
+              collision_body_role_id)
+      .def_readonly(
+          "model_instance_id",
+          &deployment::CompositionTargetCollisionResolution::model_instance_id)
+      .def_property_readonly(
+          "compiled_link_names",
+          [](const deployment::CompositionTargetCollisionResolution& value) {
+            return immutable_snapshot(value.compiled_link_names);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionTargetResolution>(
+      module, "CompositionTargetResolution", py::is_final())
+      .def_readonly(
+          "controllable_component_id",
+          &deployment::CompositionTargetResolution::controllable_component_id)
+      .def_readonly(
+          "command_target_id",
+          &deployment::CompositionTargetResolution::command_target_id)
+      .def_property_readonly(
+          "model_groups",
+          [](const deployment::CompositionTargetResolution& value) {
+            return immutable_snapshot(value.model_groups);
           })
       .def_property_readonly(
           "frames",
-          [](const StructuralCommandTargetResolution& target) {
-            return immutable_snapshot(target.frames);
+          [](const deployment::CompositionTargetResolution& value) {
+            return immutable_snapshot(value.frames);
           })
       .def_property_readonly(
           "collision_bodies",
-          [](const StructuralCommandTargetResolution& target) {
-            return immutable_snapshot(target.collision_bodies);
+          [](const deployment::CompositionTargetResolution& value) {
+            return immutable_snapshot(value.collision_bodies);
           })
       .def(py::self == py::self)
       .def(py::self != py::self);
-
-  py::class_<StructuralAttachmentInterfaceResolution>(
-      module, "StructuralAttachmentInterfaceResolution",
-      py::is_final())
+  py::class_<deployment::CompositionDirectModelAnchor>(
+      module, "CompositionDirectModelAnchor", py::is_final())
       .def_readonly(
-          "attachment_interface_id",
-          &StructuralAttachmentInterfaceResolution::
-              attachment_interface_id)
-      .def_readonly("frame",
-                    &StructuralAttachmentInterfaceResolution::frame)
-      .def_property_readonly(
-          "accepts_tags",
-          [](const StructuralAttachmentInterfaceResolution& interface) {
-            return immutable_snapshot(interface.accepts_tags);
-          })
+          "model_instance_id",
+          &deployment::CompositionDirectModelAnchor::model_instance_id)
       .def_readonly(
-          "max_attachments",
-          &StructuralAttachmentInterfaceResolution::max_attachments)
+          "root_pose_in_cell",
+          &deployment::CompositionDirectModelAnchor::root_pose_in_cell)
       .def(py::self == py::self)
       .def(py::self != py::self);
-
-  py::class_<StructuralComponentResolution>(
-      module, "StructuralComponentResolution", py::is_final())
+  py::class_<deployment::CompositionDirectComponentAnchor>(
+      module, "CompositionDirectComponentAnchor", py::is_final())
       .def_readonly(
           "controllable_component_id",
-          &StructuralComponentResolution::controllable_component_id)
-      .def_readonly("component_type_id",
-                    &StructuralComponentResolution::component_type_id)
-      .def_readonly(
-          "component_type_revision",
-          &StructuralComponentResolution::component_type_revision)
-      .def_property_readonly(
-          "component_tags",
-          [](const StructuralComponentResolution& component) {
-            return immutable_snapshot(component.component_tags);
-          })
-      .def_property_readonly(
-          "model_roles",
-          [](const StructuralComponentResolution& component) {
-            return immutable_snapshot(component.model_roles);
-          })
-      .def_readonly("component_root",
-                    &StructuralComponentResolution::component_root)
-      .def_property_readonly(
-          "model_mounts",
-          [](const StructuralComponentResolution& component) {
-            return immutable_snapshot(component.model_mounts);
-          })
-      .def_property_readonly(
-          "command_targets",
-          [](const StructuralComponentResolution& component) {
-            return immutable_snapshot(component.command_targets);
-          })
-      .def_property_readonly(
-          "attachment_interfaces",
-          [](const StructuralComponentResolution& component) {
-            return immutable_snapshot(component.attachment_interfaces);
-          })
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<StructuralAttachmentEndpointResolution>(
-      module, "StructuralAttachmentEndpointResolution",
-      py::is_final())
-      .def_readonly(
-          "controllable_component_id",
-          &StructuralAttachmentEndpointResolution::
+          &deployment::CompositionDirectComponentAnchor::
               controllable_component_id)
       .def_readonly(
-          "attachment_interface_id",
-          &StructuralAttachmentEndpointResolution::
-              attachment_interface_id)
-      .def_readonly("frame",
-                    &StructuralAttachmentEndpointResolution::frame)
+          "root_model_instance_id",
+          &deployment::CompositionDirectComponentAnchor::root_model_instance_id)
+      .def_readonly(
+          "root_pose_in_cell",
+          &deployment::CompositionDirectComponentAnchor::root_pose_in_cell)
       .def(py::self == py::self)
       .def(py::self != py::self);
-
-  py::class_<StructuralAttachmentResolution>(
-      module, "StructuralAttachmentResolution", py::is_final())
+  py::class_<deployment::CompositionModelMount>(
+      module, "CompositionModelMount", py::is_final())
+      .def_readonly(
+          "controllable_component_id",
+          &deployment::CompositionModelMount::controllable_component_id)
+      .def_readonly(
+          "parent_model_instance_id",
+          &deployment::CompositionModelMount::parent_model_instance_id)
+      .def_readonly(
+          "child_model_instance_id",
+          &deployment::CompositionModelMount::child_model_instance_id)
+      .def_readonly(
+          "child_frame_pose_in_parent_frame",
+          &deployment::CompositionModelMount::
+              child_frame_pose_in_parent_frame)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionComponentAttachment>(
+      module, "CompositionComponentAttachment", py::is_final())
       .def_readonly(
           "component_attachment_id",
-          &StructuralAttachmentResolution::component_attachment_id)
-      .def_readonly("parent",
-                    &StructuralAttachmentResolution::parent)
-      .def_readonly("child", &StructuralAttachmentResolution::child)
+          &deployment::CompositionComponentAttachment::component_attachment_id)
+      .def_readonly(
+          "parent_component_id",
+          &deployment::CompositionComponentAttachment::parent_component_id)
+      .def_readonly(
+          "child_component_id",
+          &deployment::CompositionComponentAttachment::child_component_id)
       .def_readonly(
           "child_interface_pose_in_parent_interface",
-          &StructuralAttachmentResolution::
+          &deployment::CompositionComponentAttachment::
               child_interface_pose_in_parent_interface)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<StructurallyQualifiedCellGraph>(
-      module, "StructurallyQualifiedCellGraph", py::is_final())
+  py::tuple connection_source_types{4U};
+  connection_source_types[0] = module.attr("CompositionDirectModelAnchor");
+  connection_source_types[1] =
+      module.attr("CompositionDirectComponentAnchor");
+  connection_source_types[2] = module.attr("CompositionModelMount");
+  connection_source_types[3] =
+      module.attr("CompositionComponentAttachment");
+  module.attr("CompositionConnectionSource") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(connection_source_types);
+
+  py::class_<deployment::CompositionFixedConnection>(
+      module, "CompositionFixedConnection", py::is_final())
+      .def_readonly("source",
+                    &deployment::CompositionFixedConnection::source)
+      .def_readonly(
+          "compiled_joint_name",
+          &deployment::CompositionFixedConnection::compiled_joint_name)
+      .def_readonly(
+          "compiled_parent_link_name",
+          &deployment::CompositionFixedConnection::compiled_parent_link_name)
+      .def_readonly(
+          "compiled_child_link_name",
+          &deployment::CompositionFixedConnection::compiled_child_link_name)
+      .def_readonly(
+          "child_pose_in_parent",
+          &deployment::CompositionFixedConnection::child_pose_in_parent)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionFixedPathSegment>(
+      module, "CompositionFixedPathSegment", py::is_final())
+      .def_readonly(
+          "fixed_connection_index",
+          &deployment::CompositionFixedPathSegment::fixed_connection_index)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CompositionModelJointPathSegment>(
+      module, "CompositionModelJointPathSegment", py::is_final())
+      .def_readonly(
+          "model_instance_id",
+          &deployment::CompositionModelJointPathSegment::model_instance_id)
+      .def_readonly(
+          "composition_coordinate_index",
+          &deployment::CompositionModelJointPathSegment::
+              composition_coordinate_index)
+      .def_readonly(
+          "source_joint_name",
+          &deployment::CompositionModelJointPathSegment::source_joint_name)
+      .def_readonly(
+          "compiled_joint_name",
+          &deployment::CompositionModelJointPathSegment::compiled_joint_name)
+      .def_readonly(
+          "compiled_parent_link_name",
+          &deployment::CompositionModelJointPathSegment::
+              compiled_parent_link_name)
+      .def_readonly(
+          "compiled_child_link_name",
+          &deployment::CompositionModelJointPathSegment::
+              compiled_child_link_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::tuple frame_path_segment_types{2U};
+  frame_path_segment_types[0] = module.attr("CompositionFixedPathSegment");
+  frame_path_segment_types[1] =
+      module.attr("CompositionModelJointPathSegment");
+  module.attr("CompositionFramePathSegment") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(frame_path_segment_types);
+
+  py::class_<deployment::CompositionFramePath>(
+      module, "CompositionFramePath", py::is_final())
+      .def_readonly(
+          "terminal_frame",
+          &deployment::CompositionFramePath::terminal_frame)
       .def_property_readonly(
-          "verified_graph",
-          &StructurallyQualifiedCellGraph::verified_graph)
-      .def_property_readonly("graph",
-                             &StructurallyQualifiedCellGraph::graph)
+          "segments", [](const deployment::CompositionFramePath& value) {
+            return immutable_snapshot(value.segments);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<deployment::CompositionQualifiedCellIr>(
+      module, "CompositionQualifiedCellIr", py::is_final())
       .def_property_readonly(
-          "model_assets",
-          [](const StructurallyQualifiedCellGraph& graph) {
-            return immutable_snapshot(graph.model_assets());
+          "cell_frame",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return value.cell_frame();
           })
       .def_property_readonly(
           "component_types",
-          [](const StructurallyQualifiedCellGraph& graph) {
-            return immutable_snapshot(graph.component_types());
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.component_types());
           })
       .def_property_readonly(
-          "model_instances",
-          [](const StructurallyQualifiedCellGraph& graph) {
-            return immutable_snapshot(graph.model_instances());
+          "control_binding_coordinate_maps",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.control_binding_coordinate_maps());
           })
       .def_property_readonly(
-          "components",
-          [](const StructurallyQualifiedCellGraph& graph) {
-            return immutable_snapshot(graph.components());
+          "coordinates",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.coordinates());
           })
       .def_property_readonly(
-          "attachments",
-          [](const StructurallyQualifiedCellGraph& graph) {
-            return immutable_snapshot(graph.attachments());
+          "fixed_connections",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.fixed_connections());
+          })
+      .def_property_readonly(
+          "flattened_srdf",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return value.flattened_srdf();
+          })
+      .def_property_readonly(
+          "flattened_urdf",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return value.flattened_urdf();
+          })
+      .def_property_readonly(
+          "frame_paths",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.frame_paths());
+          })
+      .def_property_readonly(
+          "frames",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.frames());
+          })
+      .def_property_readonly(
+          "graph", [](const deployment::CompositionQualifiedCellIr& value) {
+            return value.graph();
+          })
+      .def_property_readonly(
+          "model_assets",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.model_assets());
+          })
+      .def_property_readonly(
+          "model_occurrences",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.model_occurrences());
+          })
+      .def_property_readonly(
+          "planning_resource_rewrites",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.planning_resource_rewrites());
+          })
+      .def_property_readonly(
+          "reference_rewrites",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.reference_rewrites());
+          })
+      .def_property_readonly(
+          "reverse_symbol_rewrites",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.reverse_symbol_rewrites());
+          })
+      .def_property_readonly(
+          "symbol_rewrites",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.symbol_rewrites());
+          })
+      .def_property_readonly(
+          "targets",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return immutable_snapshot(value.targets());
+          })
+      .def_property_readonly(
+          "verified_graph",
+          [](const deployment::CompositionQualifiedCellIr& value) {
+            return value.verified_graph();
+          });
+
+  py::class_<deployment::ExpandedControlInterfaceClaim>(
+      module, "ExpandedControlInterfaceClaim", py::is_final())
+      .def_readonly(
+          "resource_role_id",
+          &deployment::ExpandedControlInterfaceClaim::resource_role_id)
+      .def_readonly("resource_id",
+                    &deployment::ExpandedControlInterfaceClaim::resource_id)
+      .def_readonly(
+          "interface_name",
+          &deployment::ExpandedControlInterfaceClaim::interface_name)
+      .def_readonly(
+          "logical_interface_symbol",
+          &deployment::ExpandedControlInterfaceClaim::
+              logical_interface_symbol)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalBindingInterfaceTemplate>(
+      module, "LogicalBindingInterfaceTemplate", py::is_final())
+      .def_readonly(
+          "control_binding_id",
+          &deployment::LogicalBindingInterfaceTemplate::control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &deployment::LogicalBindingInterfaceTemplate::
+              control_binding_revision)
+      .def_readonly(
+          "control_interface_contract_id",
+          &deployment::LogicalBindingInterfaceTemplate::
+              control_interface_contract_id)
+      .def_readonly(
+          "control_interface_revision",
+          &deployment::LogicalBindingInterfaceTemplate::
+              control_interface_revision)
+      .def_property_readonly(
+          "command_claims",
+          [](const deployment::LogicalBindingInterfaceTemplate& value) {
+            return immutable_snapshot(value.command_claims);
+          })
+      .def_property_readonly(
+          "state_claims",
+          [](const deployment::LogicalBindingInterfaceTemplate& value) {
+            return immutable_snapshot(value.state_claims);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalControllerBindingProjection>(
+      module, "LogicalControllerBindingProjection", py::is_final())
+      .def_readonly(
+          "control_binding_id",
+          &deployment::LogicalControllerBindingProjection::control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &deployment::LogicalControllerBindingProjection::
+              control_binding_revision)
+      .def_readonly(
+          "control_route_id",
+          &deployment::LogicalControllerBindingProjection::control_route_id)
+      .def_readonly(
+          "activation_set_id",
+          &deployment::LogicalControllerBindingProjection::activation_set_id)
+      .def_property_readonly(
+          "claimed_directions",
+          [](const deployment::LogicalControllerBindingProjection& value) {
+            return immutable_snapshot(value.claimed_directions);
+          })
+      .def_property_readonly(
+          "exported_reference_interfaces",
+          [](const deployment::LogicalControllerBindingProjection& value) {
+            return immutable_snapshot(value.exported_reference_interfaces);
+          })
+      .def_property_readonly(
+          "exported_state_interfaces",
+          [](const deployment::LogicalControllerBindingProjection& value) {
+            return immutable_snapshot(value.exported_state_interfaces);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalControllerTemplate>(
+      module, "LogicalControllerTemplate", py::is_final())
+      .def_readonly(
+          "control_domain_id",
+          &deployment::LogicalControllerTemplate::control_domain_id)
+      .def_readonly(
+          "control_domain_revision",
+          &deployment::LogicalControllerTemplate::control_domain_revision)
+      .def_readonly(
+          "controller_topology_id",
+          &deployment::LogicalControllerTemplate::controller_topology_id)
+      .def_readonly(
+          "topology_revision",
+          &deployment::LogicalControllerTemplate::topology_revision)
+      .def_readonly(
+          "controller_role_id",
+          &deployment::LogicalControllerTemplate::controller_role_id)
+      .def_readonly(
+          "logical_controller_symbol",
+          &deployment::LogicalControllerTemplate::logical_controller_symbol)
+      .def_property_readonly(
+          "binding_projections",
+          [](const deployment::LogicalControllerTemplate& value) {
+            return immutable_snapshot(value.binding_projections);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalRouteEndpointTemplate>(
+      module, "LogicalRouteEndpointTemplate", py::is_final())
+      .def_readonly(
+          "endpoint_role_id",
+          &deployment::LogicalRouteEndpointTemplate::endpoint_role_id)
+      .def_readonly(
+          "logical_endpoint_symbol",
+          &deployment::LogicalRouteEndpointTemplate::logical_endpoint_symbol)
+      .def_readonly(
+          "is_command_endpoint",
+          &deployment::LogicalRouteEndpointTemplate::is_command_endpoint)
+      .def_readonly(
+          "is_state_endpoint",
+          &deployment::LogicalRouteEndpointTemplate::is_state_endpoint)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalControlRouteTemplate>(
+      module, "LogicalControlRouteTemplate", py::is_final())
+      .def_readonly(
+          "control_binding_id",
+          &deployment::LogicalControlRouteTemplate::control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &deployment::LogicalControlRouteTemplate::control_binding_revision)
+      .def_readonly(
+          "control_domain_id",
+          &deployment::LogicalControlRouteTemplate::control_domain_id)
+      .def_readonly(
+          "control_domain_revision",
+          &deployment::LogicalControlRouteTemplate::control_domain_revision)
+      .def_readonly(
+          "controller_topology_id",
+          &deployment::LogicalControlRouteTemplate::controller_topology_id)
+      .def_readonly(
+          "topology_revision",
+          &deployment::LogicalControlRouteTemplate::topology_revision)
+      .def_readonly(
+          "control_route_id",
+          &deployment::LogicalControlRouteTemplate::control_route_id)
+      .def_readonly(
+          "logical_route_symbol",
+          &deployment::LogicalControlRouteTemplate::logical_route_symbol)
+      .def_property_readonly(
+          "controller_role_ids",
+          [](const deployment::LogicalControlRouteTemplate& value) {
+            return immutable_snapshot(value.controller_role_ids);
+          })
+      .def_property_readonly(
+          "logical_controller_symbols",
+          [](const deployment::LogicalControlRouteTemplate& value) {
+            return immutable_snapshot(value.logical_controller_symbols);
+          })
+      .def_property_readonly(
+          "path_edges",
+          [](const deployment::LogicalControlRouteTemplate& value) {
+            return immutable_snapshot(value.path_edges);
+          })
+      .def_property_readonly(
+          "compatible_activation_set_ids",
+          [](const deployment::LogicalControlRouteTemplate& value) {
+            return immutable_snapshot(value.compatible_activation_set_ids);
+          })
+      .def_property_readonly(
+          "endpoint_templates",
+          [](const deployment::LogicalControlRouteTemplate& value) {
+            return immutable_snapshot(value.endpoint_templates);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::ControlBindingCapabilityOwner>(
+      module, "ControlBindingCapabilityOwner", py::is_final())
+      .def_readonly(
+          "control_binding_id",
+          &deployment::ControlBindingCapabilityOwner::control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &deployment::ControlBindingCapabilityOwner::
+              control_binding_revision)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::CapabilityProviderCapabilityOwner>(
+      module, "CapabilityProviderCapabilityOwner", py::is_final())
+      .def_readonly(
+          "capability_provider_binding_id",
+          &deployment::CapabilityProviderCapabilityOwner::
+              capability_provider_binding_id)
+      .def_readonly(
+          "capability_provider_binding_revision",
+          &deployment::CapabilityProviderCapabilityOwner::
+              capability_provider_binding_revision)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::tuple capability_owner_types{2U};
+  capability_owner_types[0] = module.attr("ControlBindingCapabilityOwner");
+  capability_owner_types[1] =
+      module.attr("CapabilityProviderCapabilityOwner");
+  module.attr("QualifiedCapabilityOwner") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(capability_owner_types);
+
+  py::class_<deployment::LogicalCapabilityTemplate>(
+      module, "LogicalCapabilityTemplate", py::is_final())
+      .def_readonly("owner", &deployment::LogicalCapabilityTemplate::owner)
+      .def_readonly(
+          "capability_id",
+          &deployment::LogicalCapabilityTemplate::capability_id)
+      .def_readonly(
+          "capability_definition_revision",
+          &deployment::LogicalCapabilityTemplate::
+              capability_definition_revision)
+      .def_readonly("scope", &deployment::LogicalCapabilityTemplate::scope)
+      .def_readonly(
+          "provider_binding_kind",
+          &deployment::LogicalCapabilityTemplate::provider_binding_kind)
+      .def_readonly(
+          "provider_instance_id",
+          &deployment::LogicalCapabilityTemplate::provider_instance_id)
+      .def_readonly(
+          "provider_manifest_id",
+          &deployment::LogicalCapabilityTemplate::provider_manifest_id)
+      .def_readonly(
+          "provider_manifest_revision",
+          &deployment::LogicalCapabilityTemplate::
+              provider_manifest_revision)
+      .def_readonly(
+          "logical_capability_symbol",
+          &deployment::LogicalCapabilityTemplate::logical_capability_symbol)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::RuntimeEndpointSourceTemplate>(
+      module, "RuntimeEndpointSourceTemplate", py::is_final())
+      .def_readonly(
+          "runtime_unit_id",
+          &deployment::RuntimeEndpointSourceTemplate::runtime_unit_id)
+      .def_readonly(
+          "runtime_profile_id",
+          &deployment::RuntimeEndpointSourceTemplate::runtime_profile_id)
+      .def_readonly(
+          "runtime_profile_revision",
+          &deployment::RuntimeEndpointSourceTemplate::
+              runtime_profile_revision)
+      .def_readonly(
+          "source_endpoint_role_id",
+          &deployment::RuntimeEndpointSourceTemplate::source_endpoint_role_id)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::ExternalEndpointSourceTemplate>(
+      module, "ExternalEndpointSourceTemplate", py::is_final())
+      .def_readonly(
+          "external_resource_alias",
+          &deployment::ExternalEndpointSourceTemplate::external_resource_alias)
+      .def_readonly(
+          "resource_kind",
+          &deployment::ExternalEndpointSourceTemplate::resource_kind)
+      .def_readonly(
+          "provider_instance_id",
+          &deployment::ExternalEndpointSourceTemplate::provider_instance_id)
+      .def_readonly(
+          "provider_manifest_id",
+          &deployment::ExternalEndpointSourceTemplate::provider_manifest_id)
+      .def_readonly(
+          "provider_manifest_revision",
+          &deployment::ExternalEndpointSourceTemplate::
+              provider_manifest_revision)
+      .def_readonly(
+          "endpoint_role_id",
+          &deployment::ExternalEndpointSourceTemplate::endpoint_role_id)
+      .def_readonly(
+          "site_overlay_value_ref",
+          &deployment::ExternalEndpointSourceTemplate::site_overlay_value_ref)
+      .def_readonly(
+          "selected_site_overlay_id",
+          &deployment::ExternalEndpointSourceTemplate::
+              selected_site_overlay_id)
+      .def_readonly(
+          "selected_site_overlay_revision",
+          &deployment::ExternalEndpointSourceTemplate::
+              selected_site_overlay_revision)
+      .def_readonly(
+          "selected_site_overlay_non_secret_digest",
+          &deployment::ExternalEndpointSourceTemplate::
+              selected_site_overlay_non_secret_digest)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::tuple endpoint_source_types{2U};
+  endpoint_source_types[0] = module.attr("RuntimeEndpointSourceTemplate");
+  endpoint_source_types[1] = module.attr("ExternalEndpointSourceTemplate");
+  module.attr("LogicalEndpointSourceTemplate") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(endpoint_source_types);
+
+  py::class_<deployment::LogicalProviderEndpointTemplate>(
+      module, "LogicalProviderEndpointTemplate", py::is_final())
+      .def_readonly(
+          "capability_provider_binding_id",
+          &deployment::LogicalProviderEndpointTemplate::
+              capability_provider_binding_id)
+      .def_readonly(
+          "capability_provider_binding_revision",
+          &deployment::LogicalProviderEndpointTemplate::
+              capability_provider_binding_revision)
+      .def_readonly(
+          "endpoint_role_id",
+          &deployment::LogicalProviderEndpointTemplate::endpoint_role_id)
+      .def_readonly(
+          "provider_instance_id",
+          &deployment::LogicalProviderEndpointTemplate::provider_instance_id)
+      .def_readonly(
+          "provider_manifest_id",
+          &deployment::LogicalProviderEndpointTemplate::provider_manifest_id)
+      .def_readonly(
+          "provider_manifest_revision",
+          &deployment::LogicalProviderEndpointTemplate::
+              provider_manifest_revision)
+      .def_readonly("source",
+                    &deployment::LogicalProviderEndpointTemplate::source)
+      .def_readonly(
+          "logical_endpoint_symbol",
+          &deployment::LogicalProviderEndpointTemplate::
+              logical_endpoint_symbol)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalExternalResourceTemplate>(
+      module, "LogicalExternalResourceTemplate", py::is_final())
+      .def_readonly(
+          "external_resource_alias",
+          &deployment::LogicalExternalResourceTemplate::
+              external_resource_alias)
+      .def_readonly(
+          "resource_kind",
+          &deployment::LogicalExternalResourceTemplate::resource_kind)
+      .def_readonly(
+          "provider_instance_id",
+          &deployment::LogicalExternalResourceTemplate::provider_instance_id)
+      .def_readonly(
+          "provider_manifest_id",
+          &deployment::LogicalExternalResourceTemplate::provider_manifest_id)
+      .def_readonly(
+          "provider_manifest_revision",
+          &deployment::LogicalExternalResourceTemplate::
+              provider_manifest_revision)
+      .def_readonly(
+          "endpoint_role_id",
+          &deployment::LogicalExternalResourceTemplate::endpoint_role_id)
+      .def_readonly(
+          "site_overlay_value_ref",
+          &deployment::LogicalExternalResourceTemplate::
+              site_overlay_value_ref)
+      .def_readonly(
+          "selected_site_overlay_id",
+          &deployment::LogicalExternalResourceTemplate::
+              selected_site_overlay_id)
+      .def_readonly(
+          "selected_site_overlay_revision",
+          &deployment::LogicalExternalResourceTemplate::
+              selected_site_overlay_revision)
+      .def_readonly(
+          "selected_site_overlay_non_secret_digest",
+          &deployment::LogicalExternalResourceTemplate::
+              selected_site_overlay_non_secret_digest)
+      .def_readonly(
+          "logical_external_resource_symbol",
+          &deployment::LogicalExternalResourceTemplate::
+              logical_external_resource_symbol)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalStopProviderCommandEndpoint>(
+      module, "LogicalStopProviderCommandEndpoint", py::is_final())
+      .def_readonly(
+          "provider_contract_ref",
+          &deployment::LogicalStopProviderCommandEndpoint::
+              provider_contract_ref)
+      .def_readonly(
+          "endpoint_role_id",
+          &deployment::LogicalStopProviderCommandEndpoint::endpoint_role_id)
+      .def_readonly(
+          "logical_endpoint_symbol",
+          &deployment::LogicalStopProviderCommandEndpoint::
+              logical_endpoint_symbol)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalStopProviderEvidenceEndpoint>(
+      module, "LogicalStopProviderEvidenceEndpoint", py::is_final())
+      .def_readonly(
+          "evidence_item_id",
+          &deployment::LogicalStopProviderEvidenceEndpoint::evidence_item_id)
+      .def_readonly(
+          "provider_contract_ref",
+          &deployment::LogicalStopProviderEvidenceEndpoint::
+              provider_contract_ref)
+      .def_readonly(
+          "endpoint_role_id",
+          &deployment::LogicalStopProviderEvidenceEndpoint::endpoint_role_id)
+      .def_readonly(
+          "logical_endpoint_symbol",
+          &deployment::LogicalStopProviderEvidenceEndpoint::
+              logical_endpoint_symbol)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalStopBindingStateAuthoritySource>(
+      module, "LogicalStopBindingStateAuthoritySource", py::is_final())
+      .def_readonly(
+          "evidence_item_id",
+          &deployment::LogicalStopBindingStateAuthoritySource::evidence_item_id)
+      .def_readonly(
+          "state_authority_id",
+          &deployment::LogicalStopBindingStateAuthoritySource::
+              state_authority_id)
+      .def_readonly(
+          "state_authority_class",
+          &deployment::LogicalStopBindingStateAuthoritySource::
+              state_authority_class)
+      .def_readonly(
+          "state_endpoint_role_id",
+          &deployment::LogicalStopBindingStateAuthoritySource::
+              state_endpoint_role_id)
+      .def_readonly(
+          "logical_endpoint_symbol",
+          &deployment::LogicalStopBindingStateAuthoritySource::
+              logical_endpoint_symbol)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalResourceStopScopeTemplate>(
+      module, "LogicalResourceStopScopeTemplate", py::is_final())
+      .def_readonly(
+          "activation_set_id",
+          &deployment::LogicalResourceStopScopeTemplate::activation_set_id)
+      .def_property_readonly(
+          "resource_ids",
+          [](const deployment::LogicalResourceStopScopeTemplate& value) {
+            return immutable_snapshot(value.resource_ids);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalControllerSetStopScopeTemplate>(
+      module, "LogicalControllerSetStopScopeTemplate", py::is_final())
+      .def_readonly(
+          "activation_set_id",
+          &deployment::LogicalControllerSetStopScopeTemplate::
+              activation_set_id)
+      .def_property_readonly(
+          "active_controller_role_ids",
+          [](const deployment::LogicalControllerSetStopScopeTemplate& value) {
+            return immutable_snapshot(value.active_controller_role_ids);
+          })
+      .def_property_readonly(
+          "logical_controller_symbols",
+          [](const deployment::LogicalControllerSetStopScopeTemplate& value) {
+            return immutable_snapshot(value.logical_controller_symbols);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalControlDomainStopScopeTemplate>(
+      module, "LogicalControlDomainStopScopeTemplate", py::is_final())
+      .def_readonly(
+          "activation_set_id",
+          &deployment::LogicalControlDomainStopScopeTemplate::
+              activation_set_id)
+      .def_readonly(
+          "control_domain_id",
+          &deployment::LogicalControlDomainStopScopeTemplate::
+              control_domain_id)
+      .def_readonly(
+          "control_domain_revision",
+          &deployment::LogicalControlDomainStopScopeTemplate::
+              control_domain_revision)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::tuple stop_scope_types{3U};
+  stop_scope_types[0] = module.attr("LogicalResourceStopScopeTemplate");
+  stop_scope_types[1] =
+      module.attr("LogicalControllerSetStopScopeTemplate");
+  stop_scope_types[2] =
+      module.attr("LogicalControlDomainStopScopeTemplate");
+  module.attr("LogicalStopScopeTemplate") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(stop_scope_types);
+
+  py::class_<deployment::LogicalNotStoppableApplicabilityTemplate>(
+      module, "LogicalNotStoppableApplicabilityTemplate", py::is_final())
+      .def_readonly(
+          "control_binding_id",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              control_binding_revision)
+      .def_readonly(
+          "control_route_id",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              control_route_id)
+      .def_readonly(
+          "stop_evidence_policy_id",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              stop_evidence_policy_id)
+      .def_readonly(
+          "stop_evidence_policy_revision",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              stop_evidence_policy_revision)
+      .def_readonly(
+          "control_domain_id",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              control_domain_id)
+      .def_readonly(
+          "control_domain_revision",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              control_domain_revision)
+      .def_readonly(
+          "controller_topology_id",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              controller_topology_id)
+      .def_readonly(
+          "topology_revision",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              topology_revision)
+      .def_readonly(
+          "containment_granularity",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::
+              containment_granularity)
+      .def_readonly(
+          "disposition",
+          &deployment::LogicalNotStoppableApplicabilityTemplate::disposition)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<deployment::LogicalStoppableApplicabilityTemplate>(
+      module, "LogicalStoppableApplicabilityTemplate", py::is_final())
+      .def_readonly(
+          "control_binding_id",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              control_binding_revision)
+      .def_readonly(
+          "control_route_id",
+          &deployment::LogicalStoppableApplicabilityTemplate::control_route_id)
+      .def_readonly(
+          "stop_evidence_policy_id",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              stop_evidence_policy_id)
+      .def_readonly(
+          "stop_evidence_policy_revision",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              stop_evidence_policy_revision)
+      .def_readonly(
+          "control_domain_id",
+          &deployment::LogicalStoppableApplicabilityTemplate::control_domain_id)
+      .def_readonly(
+          "control_domain_revision",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              control_domain_revision)
+      .def_readonly(
+          "controller_topology_id",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              controller_topology_id)
+      .def_readonly(
+          "topology_revision",
+          &deployment::LogicalStoppableApplicabilityTemplate::topology_revision)
+      .def_readonly(
+          "containment_granularity",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              containment_granularity)
+      .def_readonly(
+          "disposition",
+          &deployment::LogicalStoppableApplicabilityTemplate::disposition)
+      .def_readonly(
+          "logical_stop_symbol",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              logical_stop_symbol)
+      .def_readonly(
+          "containment_command",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              containment_command)
+      .def_readonly(
+          "deadline_budget",
+          &deployment::LogicalStoppableApplicabilityTemplate::deadline_budget)
+      .def_readonly(
+          "evidence_conjunction",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              evidence_conjunction)
+      .def_property_readonly(
+          "all_of_evidence_requirements",
+          [](const deployment::LogicalStoppableApplicabilityTemplate& value) {
+            return immutable_snapshot(value.all_of_evidence_requirements);
+          })
+      .def_readonly(
+          "provider_command_endpoint",
+          &deployment::LogicalStoppableApplicabilityTemplate::
+              provider_command_endpoint)
+      .def_property_readonly(
+          "provider_evidence_endpoints",
+          [](const deployment::LogicalStoppableApplicabilityTemplate& value) {
+            return immutable_snapshot(value.provider_evidence_endpoints);
+          })
+      .def_property_readonly(
+          "binding_state_authority_sources",
+          [](const deployment::LogicalStoppableApplicabilityTemplate& value) {
+            return immutable_snapshot(value.binding_state_authority_sources);
+          })
+      .def_property_readonly(
+          "containment_scopes",
+          [](const deployment::LogicalStoppableApplicabilityTemplate& value) {
+            return immutable_snapshot(value.containment_scopes);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::tuple stop_applicability_types{2U};
+  stop_applicability_types[0] =
+      module.attr("LogicalNotStoppableApplicabilityTemplate");
+  stop_applicability_types[1] =
+      module.attr("LogicalStoppableApplicabilityTemplate");
+  module.attr("LogicalStopApplicabilityTemplate") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(stop_applicability_types);
+
+  py::class_<deployment::ApplicabilityQualifiedCellIr>(
+      module, "ApplicabilityQualifiedCellIr", py::is_final())
+      .def_property_readonly(
+          "binding_interfaces",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.binding_interfaces());
+          })
+      .def_property_readonly(
+          "capabilities",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.capabilities());
+          })
+      .def_property_readonly(
+          "capability_definitions",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.capability_definitions());
+          })
+      .def_property_readonly(
+          "composition",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return value.composition();
+          })
+      .def_property_readonly(
+          "control_interface_contracts",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.control_interface_contracts());
+          })
+      .def_property_readonly(
+          "controller_topologies",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.controller_topologies());
+          })
+      .def_property_readonly(
+          "controllers",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.controllers());
+          })
+      .def_property_readonly(
+          "deployment_inputs",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return value.deployment_inputs();
+          })
+      .def_property_readonly(
+          "external_resources",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.external_resources());
+          })
+      .def_property_readonly(
+          "provider_endpoints",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.provider_endpoints());
+          })
+      .def_property_readonly(
+          "provider_manifests",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.provider_manifests());
+          })
+      .def_property_readonly(
+          "routes",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.routes());
+          })
+      .def_property_readonly(
+          "runtime_profiles",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.runtime_profiles());
+          })
+      .def_property_readonly(
+          "selected_site_overlay_ref",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return value.selected_site_overlay_ref();
+          })
+      .def_property_readonly(
+          "stop_applicability",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.stop_applicability());
+          })
+      .def_property_readonly(
+          "stop_evidence_policies",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.stop_evidence_policies());
+          });
+
+  py::class_<deployment::CompilerQualifiedCellIr>(
+      module, "CompilerQualifiedCellIr", py::is_final())
+      .def_property_readonly(
+          "applicability",
+          [](const deployment::CompilerQualifiedCellIr& value) {
+            return value.applicability();
+          })
+      .def_property_readonly(
+          "catalog_record_refs",
+          [](const deployment::CompilerQualifiedCellIr& value) {
+            return immutable_snapshot(value.catalog_record_refs());
           });
 
   module.def(
@@ -1206,7 +2288,7 @@ void register_model_compiler_bindings(py::module_& module) {
              py::call_guard<py::gil_scoped_release>());
 
   module.def(
-      "qualify_cell_structure",
+      "compose_cell_occurrences",
       [](const deployment::GraphRevisionVerifiedCellGraph& graph,
          const py::iterable& model_assets,
          const py::iterable& component_types) {
@@ -1238,7 +2320,7 @@ void register_model_compiler_bindings(py::module_& module) {
                       type.value().component_type_revision.value()};
                 });
         py::gil_scoped_release release;
-        return deployment::qualify_cell_structure(
+        return deployment::compose_cell_occurrences(
             graph,
             std::span<const deployment::SourceVerifiedModelAsset>{
                 bounded_assets},
@@ -1247,6 +2329,78 @@ void register_model_compiler_bindings(py::module_& module) {
       },
       py::arg("graph"), py::arg("model_assets"),
       py::arg("component_types"));
+
+  module.def(
+      "qualify_cell_applicability",
+      [](const deployment::CompositionQualifiedCellIr& composition,
+         const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
+             deployment_inputs,
+         const py::iterable& runtime_profiles,
+         const py::iterable& capability_definitions,
+         const py::iterable& control_interface_contracts,
+         const py::iterable& controller_topologies,
+         const py::iterable& provider_manifests,
+         const py::iterable& stop_evidence_policies,
+         const deployment::QualifiedSelectedSiteOverlay&
+             selected_site_overlay) {
+        auto bounded_runtime_profiles =
+            bounded_qualified_closure_from_python<
+                deployment::QualifiedRuntimeProfile>(
+                runtime_profiles, "runtime_profiles",
+                "QualifiedRuntimeProfile");
+        auto bounded_capability_definitions =
+            bounded_qualified_closure_from_python<
+                deployment::QualifiedCapabilityDefinition>(
+                capability_definitions, "capability_definitions",
+                "QualifiedCapabilityDefinition");
+        auto bounded_control_interface_contracts =
+            bounded_qualified_closure_from_python<
+                deployment::QualifiedControlInterfaceContract>(
+                control_interface_contracts,
+                "control_interface_contracts",
+                "QualifiedControlInterfaceContract");
+        auto bounded_controller_topologies =
+            bounded_qualified_closure_from_python<
+                deployment::QualifiedControllerTopology>(
+                controller_topologies, "controller_topologies",
+                "QualifiedControllerTopology");
+        auto bounded_provider_manifests =
+            bounded_qualified_closure_from_python<
+                deployment::QualifiedProviderManifest>(
+                provider_manifests, "provider_manifests",
+                "QualifiedProviderManifest");
+        auto bounded_stop_evidence_policies =
+            bounded_qualified_closure_from_python<
+                deployment::QualifiedStopEvidencePolicy>(
+                stop_evidence_policies, "stop_evidence_policies",
+                "QualifiedStopEvidencePolicy");
+        py::gil_scoped_release release;
+        return deployment::qualify_cell_applicability(
+            composition, deployment_inputs,
+            std::span<const deployment::QualifiedRuntimeProfile>{
+                bounded_runtime_profiles},
+            std::span<const deployment::QualifiedCapabilityDefinition>{
+                bounded_capability_definitions},
+            std::span<const deployment::QualifiedControlInterfaceContract>{
+                bounded_control_interface_contracts},
+            std::span<const deployment::QualifiedControllerTopology>{
+                bounded_controller_topologies},
+            std::span<const deployment::QualifiedProviderManifest>{
+                bounded_provider_manifests},
+            std::span<const deployment::QualifiedStopEvidencePolicy>{
+                bounded_stop_evidence_policies},
+            selected_site_overlay);
+      },
+      py::arg("composition"), py::arg("deployment_inputs"),
+      py::arg("runtime_profiles"), py::arg("capability_definitions"),
+      py::arg("control_interface_contracts"),
+      py::arg("controller_topologies"), py::arg("provider_manifests"),
+      py::arg("stop_evidence_policies"),
+      py::arg("selected_site_overlay"));
+
+  module.def("compile_cell_ir", &deployment::compile_cell_ir,
+             py::arg("applicability"),
+             py::call_guard<py::gil_scoped_release>());
 
   module.attr("MAX_MODEL_SOURCE_XML_ENTRYPOINT_BYTES") =
       py::int_(deployment::kMaxModelSourceXmlEntrypointBytes);
@@ -1269,6 +2423,27 @@ void register_model_compiler_bindings(py::module_& module) {
   module.attr("MAX_MODEL_SOURCE_EXPANDED_SRDF_SEMANTIC_ROWS") =
       py::int_(
           deployment::kMaxModelSourceExpandedSrdfSemanticRows);
+  module.attr("MAX_COMPOSITION_SYMBOLS") =
+      py::int_(deployment::kMaxCompositionSymbols);
+  module.attr("MAX_COMPOSITION_REFERENCES") =
+      py::int_(deployment::kMaxCompositionReferences);
+  module.attr("MAX_COMPOSITION_PATH_SEGMENTS") =
+      py::int_(deployment::kMaxCompositionPathSegments);
+  module.attr("MAX_COMPOSITION_COORDINATE_PROJECTIONS") =
+      py::int_(deployment::kMaxCompositionCoordinateProjections);
+  module.attr("MAX_COMPOSITION_FRAME_RESOLUTIONS") =
+      py::int_(deployment::kMaxCompositionFrameResolutions);
+  module.attr("MAX_COMPOSITION_TARGET_PROJECTION_ROWS") =
+      py::int_(deployment::kMaxCompositionTargetProjectionRows);
+  module.attr("MAX_COMPOSITION_FLATTENED_XML_BYTES") =
+      py::int_(deployment::kMaxCompositionFlattenedXmlBytes);
+  module.attr("MAX_EXPANDED_CONTROL_INTERFACE_CLAIMS_PER_DIRECTION") =
+      py::int_(deployment::kMaxExpandedControlInterfaceClaimsPerDirection);
+  module.attr("MAX_CELL_EXPANDED_CONTROL_INTERFACE_CLAIMS_PER_DIRECTION") =
+      py::int_(
+          deployment::kMaxCellExpandedControlInterfaceClaimsPerDirection);
+  module.attr("MAX_CELL_LOGICAL_APPLICABILITY_ROWS") =
+      py::int_(deployment::kMaxCellLogicalApplicabilityRows);
 }
 
 }  // namespace manyforge::core::python

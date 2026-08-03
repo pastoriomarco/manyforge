@@ -434,6 +434,12 @@ def test_validation_options_dto():
     v.run_collision_checks = False
     assert v.run_collision_checks is False
 
+    default_speed = manyforge_core_py.ValidationOptionsDTO(
+        tcp_frame="tcp", base_frame="base_link"
+    )
+    assert default_speed.max_tcp_linear_speed_mps == 0.0
+    assert default_speed.run_collision_checks is True
+
 
 def test_fk_request_dto():
     """Test FkRequestDTO creation and attributes."""

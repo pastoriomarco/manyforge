@@ -5,8 +5,8 @@
 
 #include "binding_registrations.hpp"
 
-// Only DTO/enum types are bound — port interfaces and kernel are C++-only.
-// Python interacts with the kernel via NativeKernelClient (manyforge_roboplan_py).
+// ROS-free DTOs and pure compiler operations are bound here. Runtime owner
+// ports and the kernel remain C++-only.
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/execution_result.hpp>
@@ -30,7 +30,7 @@ namespace py = pybind11;
 // ============================================================================
 
 PYBIND11_MODULE(manyforge_core_py, m) {
-    m.doc() = "Python bindings for manyforge_core DTOs and enums";
+    m.doc() = "ROS-free ManyForge DTO and pure deployment-compiler bindings";
 
     manyforge::core::python::register_strong_identity_bindings(m);
     manyforge::core::python::register_catalog_record_bindings(m);
@@ -572,7 +572,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def(py::init<>())
         .def(py::init<double, const std::string&, const std::string&, bool>(),
              py::arg("max_tcp_linear_speed_mps") = 0.0,
-             py::arg("tcp_frame"), py::arg("base_frame"),
+             py::arg("tcp_frame") = "", py::arg("base_frame") = "",
              py::arg("run_collision_checks") = true)
         .def_readwrite("max_tcp_linear_speed_mps", &manyforge::core::ValidationOptionsDTO::max_tcp_linear_speed_mps)
         .def_readwrite("tcp_frame", &manyforge::core::ValidationOptionsDTO::tcp_frame)
@@ -1339,5 +1339,4 @@ PYBIND11_MODULE(manyforge_core_py, m) {
     // ========================================================================
     // Cache Config
     // Port interfaces, kernel, cache, and state machine are C++-only.
-    // Python interacts with the kernel via NativeKernelClient (manyforge_roboplan_py).
 }

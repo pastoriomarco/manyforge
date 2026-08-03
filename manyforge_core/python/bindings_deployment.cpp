@@ -1,6 +1,8 @@
+#include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
@@ -9,11 +11,16 @@
 #include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <manyforge_deployment/controller_topology_codec.hpp>
+#include <manyforge_deployment/deployment_applicability_codec.hpp>
+#include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
+#include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
 #include <algorithm>
+#include <cstddef>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -26,6 +33,82 @@
 namespace py = pybind11;
 
 namespace manyforge::core::python {
+namespace {
+
+template <typename Values>
+[[nodiscard]] py::tuple immutable_snapshot(const Values& values) {
+  py::tuple snapshot{values.size()};
+  for (std::size_t index = 0U; index < values.size(); ++index) {
+    snapshot[index] =
+        py::cast(values[index], py::return_value_policy::copy);
+  }
+  return snapshot;
+}
+
+template <typename Value, typename Error>
+[[nodiscard]] std::vector<Value> bounded_values_from_python(
+    const py::iterable& values, std::size_t maximum,
+    std::string_view argument_name, std::string_view expected_type) {
+  std::vector<Value> bounded;
+  for (const auto& item : values) {
+    if (bounded.size() == maximum) {
+      throw Error(std::string(argument_name) +
+                  " exceeds its public compiler-ingress bound");
+    }
+    if (!py::isinstance<Value>(item)) {
+      throw py::type_error(std::string(argument_name) +
+                           " must contain only " +
+                           std::string(expected_type) + " values");
+    }
+    bounded.push_back(item.cast<const Value&>());
+  }
+  return bounded;
+}
+
+template <typename Projection>
+[[nodiscard]] std::optional<std::string>
+normalized_site_overlay_ref_json(const Projection& projection) {
+  std::optional<std::string> result;
+  {
+    py::gil_scoped_release release;
+    if (projection.normalized_site_overlay_ref().has_value()) {
+      result = deployment::canonical_json(
+          *projection.normalized_site_overlay_ref());
+    }
+  }
+  return result;
+}
+
+[[nodiscard]] CapabilityEndpointSourceIdDTO
+capability_endpoint_source_id_from_python(const py::handle& value) {
+  if (py::isinstance<RuntimeUnitId>(value)) {
+    return value.cast<RuntimeUnitId>();
+  }
+  if (py::isinstance<ExternalResourceAlias>(value)) {
+    return value.cast<ExternalResourceAlias>();
+  }
+  throw py::type_error(
+      "source_id must be RuntimeUnitId or ExternalResourceAlias");
+}
+
+[[nodiscard]] CapabilityProviderTargetDTO
+capability_provider_target_from_python(const py::handle& value) {
+  if (py::isinstance<CellGlobalCapabilityProviderTargetDTO>(value)) {
+    return value.cast<CellGlobalCapabilityProviderTargetDTO>();
+  }
+  if (py::isinstance<TargetBindingCapabilityProviderTargetDTO>(value)) {
+    return value.cast<TargetBindingCapabilityProviderTargetDTO>();
+  }
+  if (py::isinstance<ControlDomainCapabilityProviderTargetDTO>(value)) {
+    return value.cast<ControlDomainCapabilityProviderTargetDTO>();
+  }
+  throw py::type_error(
+      "target must be CellGlobalCapabilityProviderTargetDTO, "
+      "TargetBindingCapabilityProviderTargetDTO, or "
+      "ControlDomainCapabilityProviderTargetDTO");
+}
+
+}  // namespace
 
 void register_deployment_candidate_bindings(py::module_& module) {
   using deployment::IntrinsicallyValidatedCellGraphCandidate;
@@ -57,6 +140,560 @@ void register_deployment_candidate_bindings(py::module_& module) {
       module, "RuntimeProfileCodecError", PyExc_ValueError);
   py::register_exception<deployment::StopEvidencePolicyCodecError>(
       module, "StopEvidencePolicyCodecError", PyExc_ValueError);
+  py::register_exception<deployment::DeploymentApplicabilityCodecError>(
+      module, "DeploymentApplicabilityCodecError", PyExc_ValueError);
+  py::register_exception<deployment::DeploymentArtifactCodecError>(
+      module, "DeploymentArtifactCodecError", PyExc_ValueError);
+  py::register_exception<deployment::SiteOverlayResolutionError>(
+      module, "SiteOverlayResolutionError", PyExc_ValueError);
+
+  py::enum_<CapabilityEndpointSourceKind>(module,
+                                          "CapabilityEndpointSourceKind")
+      .value("kRuntimeUnit", CapabilityEndpointSourceKind::kRuntimeUnit)
+      .value("kExternalResource",
+             CapabilityEndpointSourceKind::kExternalResource);
+  py::enum_<ExternalResourceKind>(module, "ExternalResourceKind")
+      .value("kModelEndpoint", ExternalResourceKind::kModelEndpoint)
+      .value("kContentStore", ExternalResourceKind::kContentStore)
+      .value("kDataSource", ExternalResourceKind::kDataSource)
+      .value("kServiceEndpoint", ExternalResourceKind::kServiceEndpoint);
+  py::enum_<deployment::SiteOverlayRefSourcePresence>(
+      module, "SiteOverlayRefSourcePresence")
+      .value("kAbsent",
+             deployment::SiteOverlayRefSourcePresence::kAbsent)
+      .value("kExplicitNull",
+             deployment::SiteOverlayRefSourcePresence::kExplicitNull)
+      .value("kValue", deployment::SiteOverlayRefSourcePresence::kValue);
+
+  py::class_<DesiredControlBindingRouteDTO>(
+      module, "DesiredControlBindingRouteDTO", py::is_final())
+      .def(py::init([](ControlBindingId control_binding_id,
+                       ControlBindingRevision control_binding_revision,
+                       ControlRouteId control_route_id) {
+             return DesiredControlBindingRouteDTO{
+                 std::move(control_binding_id),
+                 std::move(control_binding_revision),
+                 std::move(control_route_id)};
+           }),
+           py::arg("control_binding_id"),
+           py::arg("control_binding_revision"),
+           py::arg("control_route_id"))
+      .def_readonly("control_binding_id",
+                    &DesiredControlBindingRouteDTO::control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &DesiredControlBindingRouteDTO::control_binding_revision)
+      .def_readonly("control_route_id",
+                    &DesiredControlBindingRouteDTO::control_route_id)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<DesiredControlConfigurationDTO>(
+      module, "DesiredControlConfigurationDTO", py::is_final())
+      .def(py::init([](
+               ControlDomainId control_domain_id,
+               ControlDomainRevision control_domain_revision,
+               ControllerTopologyId controller_topology_id,
+               TopologyRevision topology_revision,
+               ActivationSetId activation_set_id,
+               std::vector<DesiredControlBindingRouteDTO> binding_routes) {
+             return DesiredControlConfigurationDTO{
+                 std::move(control_domain_id),
+                 std::move(control_domain_revision),
+                 std::move(controller_topology_id),
+                 std::move(topology_revision),
+                 std::move(activation_set_id), std::move(binding_routes)};
+           }),
+           py::arg("control_domain_id"),
+           py::arg("control_domain_revision"),
+           py::arg("controller_topology_id"),
+           py::arg("topology_revision"), py::arg("activation_set_id"),
+           py::arg("binding_routes"))
+      .def_readonly("control_domain_id",
+                    &DesiredControlConfigurationDTO::control_domain_id)
+      .def_readonly(
+          "control_domain_revision",
+          &DesiredControlConfigurationDTO::control_domain_revision)
+      .def_readonly(
+          "controller_topology_id",
+          &DesiredControlConfigurationDTO::controller_topology_id)
+      .def_readonly("topology_revision",
+                    &DesiredControlConfigurationDTO::topology_revision)
+      .def_readonly("activation_set_id",
+                    &DesiredControlConfigurationDTO::activation_set_id)
+      .def_readonly("binding_routes",
+                    &DesiredControlConfigurationDTO::binding_routes)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<CellGlobalCapabilityProviderTargetDTO>(
+      module, "CellGlobalCapabilityProviderTargetDTO", py::is_final())
+      .def(py::init<CellId>(), py::arg("cell_id"))
+      .def_readonly("cell_id",
+                    &CellGlobalCapabilityProviderTargetDTO::cell_id)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<TargetBindingCapabilityProviderTargetDTO>(
+      module, "TargetBindingCapabilityProviderTargetDTO", py::is_final())
+      .def(py::init([](
+               ControllableComponentId controllable_component_id,
+               ComponentTypeRevision component_type_revision,
+               CommandTargetId command_target_id,
+               ControlBindingId control_binding_id,
+               ControlBindingRevision control_binding_revision) {
+             return TargetBindingCapabilityProviderTargetDTO{
+                 std::move(controllable_component_id),
+                 std::move(component_type_revision),
+                 std::move(command_target_id),
+                 std::move(control_binding_id),
+                 std::move(control_binding_revision)};
+           }),
+           py::arg("controllable_component_id"),
+           py::arg("component_type_revision"),
+           py::arg("command_target_id"), py::arg("control_binding_id"),
+           py::arg("control_binding_revision"))
+      .def_readonly(
+          "controllable_component_id",
+          &TargetBindingCapabilityProviderTargetDTO::
+              controllable_component_id)
+      .def_readonly(
+          "component_type_revision",
+          &TargetBindingCapabilityProviderTargetDTO::component_type_revision)
+      .def_readonly(
+          "command_target_id",
+          &TargetBindingCapabilityProviderTargetDTO::command_target_id)
+      .def_readonly(
+          "control_binding_id",
+          &TargetBindingCapabilityProviderTargetDTO::control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &TargetBindingCapabilityProviderTargetDTO::
+              control_binding_revision)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<ControlDomainCapabilityProviderTargetDTO>(
+      module, "ControlDomainCapabilityProviderTargetDTO", py::is_final())
+      .def(py::init([](
+               ControlDomainId control_domain_id,
+               ControlDomainRevision control_domain_revision,
+               ControllerTopologyId controller_topology_id,
+               TopologyRevision topology_revision) {
+             return ControlDomainCapabilityProviderTargetDTO{
+                 std::move(control_domain_id),
+                 std::move(control_domain_revision),
+                 std::move(controller_topology_id),
+                 std::move(topology_revision)};
+           }),
+           py::arg("control_domain_id"),
+           py::arg("control_domain_revision"),
+           py::arg("controller_topology_id"),
+           py::arg("topology_revision"))
+      .def_readonly(
+          "control_domain_id",
+          &ControlDomainCapabilityProviderTargetDTO::control_domain_id)
+      .def_readonly(
+          "control_domain_revision",
+          &ControlDomainCapabilityProviderTargetDTO::control_domain_revision)
+      .def_readonly(
+          "controller_topology_id",
+          &ControlDomainCapabilityProviderTargetDTO::controller_topology_id)
+      .def_readonly(
+          "topology_revision",
+          &ControlDomainCapabilityProviderTargetDTO::topology_revision)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::tuple capability_provider_target_types{3U};
+  capability_provider_target_types[0] =
+      module.attr("CellGlobalCapabilityProviderTargetDTO");
+  capability_provider_target_types[1] =
+      module.attr("TargetBindingCapabilityProviderTargetDTO");
+  capability_provider_target_types[2] =
+      module.attr("ControlDomainCapabilityProviderTargetDTO");
+  module.attr("CapabilityProviderTargetDTO") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(capability_provider_target_types);
+
+  py::tuple capability_endpoint_source_id_types{2U};
+  capability_endpoint_source_id_types[0] = module.attr("RuntimeUnitId");
+  capability_endpoint_source_id_types[1] =
+      module.attr("ExternalResourceAlias");
+  module.attr("CapabilityEndpointSourceIdDTO") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(capability_endpoint_source_id_types);
+
+  py::class_<CapabilityProviderEndpointBindingDTO>(
+      module, "CapabilityProviderEndpointBindingDTO", py::is_final())
+      .def(py::init([](
+               EndpointRoleId endpoint_role_id,
+               CapabilityEndpointSourceKind source_kind,
+               const py::object& source_id,
+               EndpointRoleId source_endpoint_role_id) {
+             return CapabilityProviderEndpointBindingDTO{
+                 std::move(endpoint_role_id), source_kind,
+                 capability_endpoint_source_id_from_python(source_id),
+                 std::move(source_endpoint_role_id)};
+           }),
+           py::arg("endpoint_role_id"), py::arg("source_kind"),
+           py::arg("source_id"), py::arg("source_endpoint_role_id"))
+      .def_readonly(
+          "endpoint_role_id",
+          &CapabilityProviderEndpointBindingDTO::endpoint_role_id)
+      .def_readonly("source_kind",
+                    &CapabilityProviderEndpointBindingDTO::source_kind)
+      .def_readonly("source_id",
+                    &CapabilityProviderEndpointBindingDTO::source_id)
+      .def_readonly(
+          "source_endpoint_role_id",
+          &CapabilityProviderEndpointBindingDTO::source_endpoint_role_id)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<CapabilityProviderBindingDTO>(
+      module, "CapabilityProviderBindingDTO", py::is_final())
+      .def(py::init([](
+               CapabilityProviderBindingId capability_provider_binding_id,
+               CapabilityProviderBindingRevision
+                   capability_provider_binding_revision,
+               CapabilityId capability_id,
+               CapabilityDefinitionRevision capability_definition_revision,
+               CapabilityScope scope, const py::object& target,
+               ProviderInstanceId provider_instance_id,
+               ProviderManifestId provider_manifest_id,
+               ProviderManifestRevision provider_manifest_revision,
+               std::vector<CapabilityProviderEndpointBindingDTO>
+                   endpoint_bindings) {
+             return CapabilityProviderBindingDTO{
+                 std::move(capability_provider_binding_id),
+                 std::move(capability_provider_binding_revision),
+                 std::move(capability_id),
+                 std::move(capability_definition_revision), scope,
+                 capability_provider_target_from_python(target),
+                 std::move(provider_instance_id),
+                 std::move(provider_manifest_id),
+                 std::move(provider_manifest_revision),
+                 std::move(endpoint_bindings)};
+           }),
+           py::arg("capability_provider_binding_id"),
+           py::arg("capability_provider_binding_revision"),
+           py::arg("capability_id"),
+           py::arg("capability_definition_revision"), py::arg("scope"),
+           py::arg("target"), py::arg("provider_instance_id"),
+           py::arg("provider_manifest_id"),
+           py::arg("provider_manifest_revision"),
+           py::arg("endpoint_bindings"))
+      .def_readonly(
+          "capability_provider_binding_id",
+          &CapabilityProviderBindingDTO::capability_provider_binding_id)
+      .def_readonly(
+          "capability_provider_binding_revision",
+          &CapabilityProviderBindingDTO::
+              capability_provider_binding_revision)
+      .def_readonly("capability_id",
+                    &CapabilityProviderBindingDTO::capability_id)
+      .def_readonly(
+          "capability_definition_revision",
+          &CapabilityProviderBindingDTO::capability_definition_revision)
+      .def_readonly("scope", &CapabilityProviderBindingDTO::scope)
+      .def_readonly("target", &CapabilityProviderBindingDTO::target)
+      .def_readonly("provider_instance_id",
+                    &CapabilityProviderBindingDTO::provider_instance_id)
+      .def_readonly("provider_manifest_id",
+                    &CapabilityProviderBindingDTO::provider_manifest_id)
+      .def_readonly(
+          "provider_manifest_revision",
+          &CapabilityProviderBindingDTO::provider_manifest_revision)
+      .def_readonly("endpoint_bindings",
+                    &CapabilityProviderBindingDTO::endpoint_bindings)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<SiteOverlayRefDTO>(module, "SiteOverlayRefDTO",
+                                py::is_final())
+      .def(py::init<SiteOverlayId, SiteOverlayRevision, ContentDigest>(),
+           py::arg("site_overlay_id"), py::arg("site_overlay_revision"),
+           py::arg("non_secret_digest"))
+      .def_readonly("site_overlay_id", &SiteOverlayRefDTO::site_overlay_id)
+      .def_readonly("site_overlay_revision",
+                    &SiteOverlayRefDTO::site_overlay_revision)
+      .def_readonly("non_secret_digest",
+                    &SiteOverlayRefDTO::non_secret_digest)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<SiteOverlayExternalResourceKeyDTO>(
+      module, "SiteOverlayExternalResourceKeyDTO", py::is_final())
+      .def(py::init<SiteOverlayValueRef, ExternalResourceKind>(),
+           py::arg("site_overlay_value_ref"), py::arg("resource_kind"))
+      .def_readonly(
+          "site_overlay_value_ref",
+          &SiteOverlayExternalResourceKeyDTO::site_overlay_value_ref)
+      .def_readonly("resource_kind",
+                    &SiteOverlayExternalResourceKeyDTO::resource_kind)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<ExternalResourceDTO>(module, "ExternalResourceDTO",
+                                  py::is_final())
+      .def(py::init([](
+               ExternalResourceAlias external_resource_alias,
+               ExternalResourceKind resource_kind,
+               ProviderInstanceId provider_instance_id,
+               ProviderManifestId provider_manifest_id,
+               ProviderManifestRevision provider_manifest_revision,
+               EndpointRoleId endpoint_role_id,
+               SiteOverlayValueRef site_overlay_value_ref) {
+             return ExternalResourceDTO{
+                 std::move(external_resource_alias), resource_kind,
+                 std::move(provider_instance_id),
+                 std::move(provider_manifest_id),
+                 std::move(provider_manifest_revision),
+                 std::move(endpoint_role_id),
+                 std::move(site_overlay_value_ref)};
+           }),
+           py::arg("external_resource_alias"), py::arg("resource_kind"),
+           py::arg("provider_instance_id"),
+           py::arg("provider_manifest_id"),
+           py::arg("provider_manifest_revision"),
+           py::arg("endpoint_role_id"),
+           py::arg("site_overlay_value_ref"))
+      .def_readonly("external_resource_alias",
+                    &ExternalResourceDTO::external_resource_alias)
+      .def_readonly("resource_kind", &ExternalResourceDTO::resource_kind)
+      .def_readonly("provider_instance_id",
+                    &ExternalResourceDTO::provider_instance_id)
+      .def_readonly("provider_manifest_id",
+                    &ExternalResourceDTO::provider_manifest_id)
+      .def_readonly("provider_manifest_revision",
+                    &ExternalResourceDTO::provider_manifest_revision)
+      .def_readonly("endpoint_role_id",
+                    &ExternalResourceDTO::endpoint_role_id)
+      .def_readonly("site_overlay_value_ref",
+                    &ExternalResourceDTO::site_overlay_value_ref)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<DeploymentApplicabilityInputsDTO>(
+      module, "DeploymentApplicabilityInputsDTO", py::is_final())
+      .def(py::init([](
+               std::optional<SiteOverlayRefDTO> site_overlay_ref,
+               std::vector<DesiredControlConfigurationDTO>
+                   desired_control_configurations,
+               std::vector<CapabilityProviderBindingDTO>
+                   capability_provider_bindings,
+               std::vector<ExternalResourceDTO> external_resources) {
+             return DeploymentApplicabilityInputsDTO{
+                 std::move(site_overlay_ref),
+                 std::move(desired_control_configurations),
+                 std::move(capability_provider_bindings),
+                 std::move(external_resources)};
+           }),
+           py::arg("site_overlay_ref"),
+           py::arg("desired_control_configurations"),
+           py::arg("capability_provider_bindings"),
+           py::arg("external_resources"))
+      .def_readonly("site_overlay_ref",
+                    &DeploymentApplicabilityInputsDTO::site_overlay_ref)
+      .def_readonly(
+          "desired_control_configurations",
+          &DeploymentApplicabilityInputsDTO::desired_control_configurations)
+      .def_readonly(
+          "capability_provider_bindings",
+          &DeploymentApplicabilityInputsDTO::capability_provider_bindings)
+      .def_readonly("external_resources",
+                    &DeploymentApplicabilityInputsDTO::external_resources)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<deployment::TypedDeploymentApplicabilityInputsCandidate>(
+      module, "TypedDeploymentApplicabilityInputsCandidate", py::is_final())
+      .def_property_readonly(
+          "value",
+          [](const deployment::TypedDeploymentApplicabilityInputsCandidate&
+                 candidate) { return candidate.value(); })
+      .def_property_readonly(
+          "normalized_desired_control_configurations_canonical_json",
+          [](const deployment::TypedDeploymentApplicabilityInputsCandidate&
+                 candidate) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(
+                candidate.normalized_desired_control_configurations());
+          })
+      .def_property_readonly(
+          "normalized_capability_provider_bindings_canonical_json",
+          [](const deployment::TypedDeploymentApplicabilityInputsCandidate&
+                 candidate) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(
+                candidate.normalized_capability_provider_bindings());
+          })
+      .def_property_readonly(
+          "normalized_external_resources_canonical_json",
+          [](const deployment::TypedDeploymentApplicabilityInputsCandidate&
+                 candidate) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(
+                candidate.normalized_external_resources());
+          })
+      .def_property_readonly(
+          "site_overlay_ref_presence",
+          &deployment::TypedDeploymentApplicabilityInputsCandidate::
+              site_overlay_ref_presence)
+      .def_property_readonly(
+          "normalized_site_overlay_ref_canonical_json",
+          [](const deployment::TypedDeploymentApplicabilityInputsCandidate&
+                 candidate) {
+            return normalized_site_overlay_ref_json(candidate);
+          })
+      .def_property_readonly(
+          "external_resources_was_present",
+          &deployment::TypedDeploymentApplicabilityInputsCandidate::
+              external_resources_was_present);
+
+  py::class_<deployment::RevisionVerifiedDeploymentApplicabilityInputs>(
+      module, "RevisionVerifiedDeploymentApplicabilityInputs",
+      py::is_final())
+      .def_property_readonly(
+          "value",
+          [](const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
+                 inputs) { return inputs.value(); })
+      .def_property_readonly(
+          "normalized_desired_control_configurations_canonical_json",
+          [](const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
+                 inputs) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(
+                inputs.normalized_desired_control_configurations());
+          })
+      .def_property_readonly(
+          "normalized_capability_provider_bindings_canonical_json",
+          [](const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
+                 inputs) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(
+                inputs.normalized_capability_provider_bindings());
+          })
+      .def_property_readonly(
+          "normalized_external_resources_canonical_json",
+          [](const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
+                 inputs) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(
+                inputs.normalized_external_resources());
+          })
+      .def_property_readonly(
+          "site_overlay_ref_presence",
+          &deployment::RevisionVerifiedDeploymentApplicabilityInputs::
+              site_overlay_ref_presence)
+      .def_property_readonly(
+          "normalized_site_overlay_ref_canonical_json",
+          [](const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
+                 inputs) {
+            return normalized_site_overlay_ref_json(inputs);
+          })
+      .def_property_readonly(
+          "external_resources_was_present",
+          &deployment::RevisionVerifiedDeploymentApplicabilityInputs::
+              external_resources_was_present);
+
+  py::class_<deployment::VerifiedSiteOverlayArtifactProjection>(
+      module, "VerifiedSiteOverlayArtifactProjection", py::is_final())
+      .def_property_readonly(
+          "reference",
+          [](const deployment::VerifiedSiteOverlayArtifactProjection&
+                 projection) { return projection.reference(); })
+      .def_property_readonly(
+          "external_resource_keys",
+          [](const deployment::VerifiedSiteOverlayArtifactProjection&
+                 projection) {
+            return immutable_snapshot(projection.external_resource_keys());
+          });
+
+  py::class_<deployment::QualifiedSelectedSiteOverlay>(
+      module, "QualifiedSelectedSiteOverlay", py::is_final())
+      .def_property_readonly(
+          "has_selection",
+          &deployment::QualifiedSelectedSiteOverlay::has_selection)
+      .def_property_readonly(
+          "reference",
+          [](const deployment::QualifiedSelectedSiteOverlay& selection)
+              -> std::optional<SiteOverlayRefDTO> {
+            const auto* reference = selection.reference();
+            if (reference == nullptr) {
+              return std::nullopt;
+            }
+            return *reference;
+          })
+      .def_property_readonly(
+          "external_resource_keys",
+          [](const deployment::QualifiedSelectedSiteOverlay& selection) {
+            return immutable_snapshot(selection.external_resource_keys());
+          });
+
+  py::class_<deployment::RevisionVerifiedDeploymentArtifact>(
+      module, "RevisionVerifiedDeploymentArtifact", py::is_final())
+      .def_property_readonly(
+          "deployment_artifact_id",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            return artifact.deployment_artifact_id();
+          })
+      .def_property_readonly(
+          "deployment_revision",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            return artifact.deployment_revision();
+          })
+      .def_property_readonly(
+          "cell_id",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            return artifact.cell_id();
+          })
+      .def_property_readonly(
+          "name",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            return artifact.name();
+          })
+      .def_property_readonly(
+          "description",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            return artifact.description();
+          })
+      .def_property_readonly(
+          "catalog_records",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            return immutable_snapshot(artifact.catalog_records());
+          })
+      .def_property_readonly(
+          "graph",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            return artifact.graph();
+          })
+      .def_property_readonly(
+          "applicability_inputs",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            return artifact.applicability_inputs();
+          })
+      .def_property_readonly(
+          "assistant_was_present",
+          &deployment::RevisionVerifiedDeploymentArtifact::
+              assistant_was_present)
+      .def_property_readonly(
+          "normalized_authored_canonical_json",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(
+                artifact.normalized_authored_root());
+          })
+      .def_property_readonly(
+          "normalized_authored_graph_canonical_json",
+          [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(
+                artifact.normalized_authored_graph());
+          });
 
   py::class_<ParsedArtifactCandidate>(module, "ParsedArtifactCandidate", py::is_final())
       .def_property_readonly("canonical_json", [](const ParsedArtifactCandidate& candidate) {
@@ -491,6 +1128,97 @@ void register_deployment_candidate_bindings(py::module_& module) {
              py::arg("stored_bytes"),
              py::call_guard<py::gil_scoped_release>());
   module.def(
+      "decode_deployment_applicability_inputs_candidate",
+      &deployment::decode_deployment_applicability_inputs_candidate,
+      py::arg("parsed_deployment"),
+      py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "compute_capability_provider_binding_revisions",
+      &deployment::compute_capability_provider_binding_revisions,
+      py::arg("candidate"), py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "verify_capability_provider_binding_revisions",
+      &deployment::verify_capability_provider_binding_revisions,
+      py::arg("candidate"), py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "resolve_and_verify_site_overlay_artifact_projection",
+      [](const SiteOverlayRefDTO& expected_reference,
+         const std::string& stored_bytes) {
+        py::gil_scoped_release release;
+        return deployment::resolve_and_verify_site_overlay_artifact_projection(
+            expected_reference, stored_bytes);
+      },
+      py::arg("expected_reference"), py::arg("stored_bytes"));
+  module.def(
+      "select_site_overlay_for_deployment",
+      [](const std::optional<SiteOverlayRefDTO>& deployment_reference,
+         const py::iterable& external_resources,
+         const py::object& selected_projection) {
+        auto bounded_resources =
+            bounded_values_from_python<ExternalResourceDTO,
+                                       deployment::SiteOverlayResolutionError>(
+                external_resources, kMaxDeploymentApplicabilityRows,
+                "external_resources", "ExternalResourceDTO");
+        std::optional<deployment::VerifiedSiteOverlayArtifactProjection>
+            projection;
+        if (!selected_projection.is_none()) {
+          if (!py::isinstance<
+                  deployment::VerifiedSiteOverlayArtifactProjection>(
+                  selected_projection)) {
+            throw py::type_error(
+                "selected_projection must be None or a "
+                "VerifiedSiteOverlayArtifactProjection");
+          }
+          projection.emplace(
+              selected_projection
+                  .cast<const deployment::
+                            VerifiedSiteOverlayArtifactProjection&>());
+        }
+        py::gil_scoped_release release;
+        return deployment::select_site_overlay_for_deployment(
+            deployment_reference,
+            std::span<const ExternalResourceDTO>{bounded_resources},
+            projection.has_value() ? &*projection : nullptr);
+      },
+      py::arg("deployment_reference"), py::arg("external_resources"),
+      py::arg("selected_projection"));
+  module.def(
+      "compute_deployment_artifact_revision",
+      [](const ParsedArtifactCandidate& parsed_deployment,
+         const py::iterable& qualified_runtime_profiles) {
+        auto bounded_profiles =
+            bounded_values_from_python<
+                deployment::QualifiedRuntimeProfile,
+                deployment::DeploymentArtifactCodecError>(
+                qualified_runtime_profiles,
+                deployment::kMaxArtifactNodeCount,
+                "qualified_runtime_profiles", "QualifiedRuntimeProfile");
+        py::gil_scoped_release release;
+        return deployment::compute_deployment_artifact_revision(
+            parsed_deployment,
+            std::span<const deployment::QualifiedRuntimeProfile>{
+                bounded_profiles});
+      },
+      py::arg("parsed_deployment"), py::arg("qualified_runtime_profiles"));
+  module.def(
+      "verify_deployment_artifact_revision",
+      [](const ParsedArtifactCandidate& parsed_deployment,
+         const py::iterable& qualified_runtime_profiles) {
+        auto bounded_profiles =
+            bounded_values_from_python<
+                deployment::QualifiedRuntimeProfile,
+                deployment::DeploymentArtifactCodecError>(
+                qualified_runtime_profiles,
+                deployment::kMaxArtifactNodeCount,
+                "qualified_runtime_profiles", "QualifiedRuntimeProfile");
+        py::gil_scoped_release release;
+        return deployment::verify_deployment_artifact_revision(
+            parsed_deployment,
+            std::span<const deployment::QualifiedRuntimeProfile>{
+                bounded_profiles});
+      },
+      py::arg("parsed_deployment"), py::arg("qualified_runtime_profiles"));
+  module.def(
       "build_qualified_closed_schema_registry",
       []() -> const deployment::BuildQualifiedClosedSchemaRegistry& {
         return deployment::build_qualified_closed_schema_registry();
@@ -500,6 +1228,12 @@ void register_deployment_candidate_bindings(py::module_& module) {
       py::str(deployment::kClosedSchemaApiVersion);
   module.attr("CLOSED_SCHEMA_BOOTSTRAP_CONTRACT_DIGEST") =
       py::str(deployment::kClosedSchemaBootstrapContractDigest);
+  module.attr("MAX_CAPABILITY_PROVIDER_ENDPOINT_BINDINGS") =
+      py::int_(kMaxCapabilityProviderEndpointBindings);
+  module.attr("MAX_DEPLOYMENT_APPLICABILITY_ROWS") =
+      py::int_(kMaxDeploymentApplicabilityRows);
+  module.attr("MAX_SITE_OVERLAY_VALUE_ROWS") =
+      py::int_(kMaxSiteOverlayValueRows);
 }
 
 }  // namespace manyforge::core::python

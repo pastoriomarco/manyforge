@@ -11,7 +11,9 @@ absolute paths in the following variables:
 * ``MANYFORGE_I2_BINDING_GENERATED_ROOT``: the four generated binding outputs
   (used by the generated-API case); and
 * ``MANYFORGE_I2_BINDING_SOURCE_ROOT``: the exact candidate source tree (used
-  by the forbidden-surface case).
+  by the forbidden-surface case); and
+* ``MANYFORGE_I2_BINDING_EXECUTABLE``: the Python executable selected by the
+  packet, including the linked ASan/UBSan host in that sanitizer lane.
 
 No candidate-authored semantic trace is consumed.  Every semantic observation
 is made here from calls to the supplied extension.  Evidence files are created
@@ -40,7 +42,7 @@ import threading
 import time
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, NoReturn
+from typing import Any, Callable, NoReturn, get_args, get_origin
 
 import pytest
 
@@ -50,6 +52,7 @@ _EVIDENCE_ROOT_ENV = "MANYFORGE_I2_BINDING_EVIDENCE_ROOT"
 _STAGED_ROOT_ENV = "MANYFORGE_I2_BINDING_STAGED_ROOT"
 _GENERATED_ROOT_ENV = "MANYFORGE_I2_BINDING_GENERATED_ROOT"
 _SOURCE_ROOT_ENV = "MANYFORGE_I2_BINDING_SOURCE_ROOT"
+_EXECUTABLE_ENV = "MANYFORGE_I2_BINDING_EXECUTABLE"
 _MODULE_NAME = "manyforge_core_py"
 _NODE_PREFIX = "verification/composable_cell_i2/binding_contract_tests.py::test_"
 _MAX_EXTENSION_BYTES = 1024 * 1024 * 1024
@@ -102,8 +105,13 @@ _MODEL_ASSET_SCHEMA_REVISION = (
 )
 
 _TRUSTED_PROJECTIONS = (
+    "RevisionVerifiedDeploymentArtifact",
+    "RevisionVerifiedDeploymentApplicabilityInputs",
     "GraphRevisionVerifiedCellGraph",
-    "VerifiedModelSourceArtifact",
+    "VerifiedSiteOverlayArtifactProjection",
+    "QualifiedSelectedSiteOverlay",
+    "ModelSourceRetrievalPlan",
+    "ModelSourceIr",
     "SourceVerifiedModelAsset",
     "CompositionQualifiedCellIr",
     "ApplicabilityQualifiedCellIr",
@@ -111,13 +119,48 @@ _TRUSTED_PROJECTIONS = (
 )
 _PREDECESSORS = _TRUSTED_PROJECTIONS[:-1]
 _EXPECTED_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "RevisionVerifiedDeploymentArtifact": (
+        "applicability_inputs",
+        "assistant_was_present",
+        "catalog_records",
+        "cell_id",
+        "deployment_artifact_id",
+        "deployment_revision",
+        "description",
+        "graph",
+        "name",
+        "normalized_authored_canonical_json",
+        "normalized_authored_graph_canonical_json",
+    ),
+    "RevisionVerifiedDeploymentApplicabilityInputs": (
+        "external_resources_was_present",
+        "normalized_capability_provider_bindings_canonical_json",
+        "normalized_desired_control_configurations_canonical_json",
+        "normalized_external_resources_canonical_json",
+        "normalized_site_overlay_ref_canonical_json",
+        "site_overlay_ref_presence",
+        "value",
+    ),
     "GraphRevisionVerifiedCellGraph": ("graph", "normalized_canonical_json"),
-    "VerifiedModelSourceArtifact": (
-        "byte_size",
-        "content_digest",
-        "logical_uri",
-        "media_type",
-        "resolved_store_key",
+    "VerifiedSiteOverlayArtifactProjection": (
+        "external_resource_keys",
+        "reference",
+    ),
+    "QualifiedSelectedSiteOverlay": (
+        "external_resource_keys",
+        "has_selection",
+        "reference",
+    ),
+    "ModelSourceRetrievalPlan": (
+        "artifacts",
+        "qualified_asset",
+        "total_bytes",
+    ),
+    "ModelSourceIr": (
+        "artifact_references",
+        "semantic_index",
+        "srdf",
+        "urdf",
     ),
     "SourceVerifiedModelAsset": (
         "qualified_asset",
@@ -167,6 +210,10 @@ _EXPECTED_PROPERTIES: dict[str, tuple[str, ...]] = {
     "CompilerQualifiedCellIr": ("applicability", "catalog_record_refs"),
 }
 _EXPECTED_ENUMS = {
+    "CapabilityEndpointSourceKind": {
+        "kExternalResource": 1,
+        "kRuntimeUnit": 0,
+    },
     "CatalogSchemaQualification": {"kQualified": 1, "kUnqualified": 0},
     "ClosedSchemaPurpose": {"kArtifactDocument": 0, "kValue": 1},
     "ClosedSchemaRootShape": {
@@ -175,6 +222,296 @@ _EXPECTED_ENUMS = {
         "kScalar": 0,
         "kTaggedUnion": 3,
     },
+    "CompositionCoordinateUnit": {
+        "kFloatingMetersRadians": 4,
+        "kMeters": 2,
+        "kNone": 0,
+        "kPlanarMetersRadians": 3,
+        "kRadians": 1,
+    },
+    "ExternalResourceKind": {
+        "kContentStore": 1,
+        "kDataSource": 2,
+        "kModelEndpoint": 0,
+        "kServiceEndpoint": 3,
+    },
+    "ModelSourceArtifactKind": {
+        "kColladaMesh": 3,
+        "kJpegTexture": 5,
+        "kPngTexture": 4,
+        "kSrdfXmlEntrypoint": 1,
+        "kStlMesh": 2,
+        "kUrdfXmlEntrypoint": 0,
+    },
+    "OccurrenceReferenceKind": {
+        "kJointChildLink": 1,
+        "kJointMimic": 2,
+        "kJointParentLink": 0,
+        "kSrdfChainBaseLink": 6,
+        "kSrdfChainTipLink": 7,
+        "kSrdfDisabledCollisionFirstLink": 15,
+        "kSrdfDisabledCollisionSecondLink": 16,
+        "kSrdfEndEffectorGroup": 12,
+        "kSrdfEndEffectorParentGroup": 13,
+        "kSrdfEndEffectorParentLink": 11,
+        "kSrdfGroupJoint": 5,
+        "kSrdfGroupLink": 4,
+        "kSrdfGroupStateGroup": 9,
+        "kSrdfGroupStateJoint": 10,
+        "kSrdfPassiveJoint": 14,
+        "kSrdfSubgroup": 8,
+        "kVisualMaterial": 3,
+    },
+    "OccurrenceSymbolKind": {
+        "kCollision": 6,
+        "kJoint": 4,
+        "kLink": 3,
+        "kMaterial": 2,
+        "kModel": 0,
+        "kRobot": 1,
+        "kSrdfEndEffector": 9,
+        "kSrdfGroup": 7,
+        "kSrdfGroupState": 8,
+        "kVisual": 5,
+    },
+    "SiteOverlayRefSourcePresence": {
+        "kAbsent": 0,
+        "kExplicitNull": 1,
+        "kValue": 2,
+    },
+    "SourceArtifactReferenceKind": {
+        "kMesh": 0,
+        "kTexture": 1,
+    },
+    "SrdfExpansionProvenanceKind": {
+        "kChainJoint": 3,
+        "kChainLink": 2,
+        "kDirectJoint": 1,
+        "kDirectLink": 0,
+        "kSubgroup": 4,
+    },
+    "UrdfCoordinateKind": {
+        "kAngular": 1,
+        "kFloating": 4,
+        "kLinear": 2,
+        "kNone": 0,
+        "kPlanar": 3,
+    },
+    "UrdfJointType": {
+        "kContinuous": 1,
+        "kFixed": 3,
+        "kFloating": 4,
+        "kPlanar": 5,
+        "kPrismatic": 2,
+        "kRevolute": 0,
+    },
+}
+_EXPECTED_CONSTRUCTIBLE_DTO_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "CapabilityProviderBindingDTO": (
+        "capability_definition_revision",
+        "capability_id",
+        "capability_provider_binding_id",
+        "capability_provider_binding_revision",
+        "endpoint_bindings",
+        "provider_instance_id",
+        "provider_manifest_id",
+        "provider_manifest_revision",
+        "scope",
+        "target",
+    ),
+    "CapabilityProviderEndpointBindingDTO": (
+        "endpoint_role_id",
+        "source_endpoint_role_id",
+        "source_id",
+        "source_kind",
+    ),
+    "CellGlobalCapabilityProviderTargetDTO": ("cell_id",),
+    "ControlDomainCapabilityProviderTargetDTO": (
+        "control_domain_id",
+        "control_domain_revision",
+        "controller_topology_id",
+        "topology_revision",
+    ),
+    "DeploymentApplicabilityInputsDTO": (
+        "capability_provider_bindings",
+        "desired_control_configurations",
+        "external_resources",
+        "site_overlay_ref",
+    ),
+    "DesiredControlBindingRouteDTO": (
+        "control_binding_id",
+        "control_binding_revision",
+        "control_route_id",
+    ),
+    "DesiredControlConfigurationDTO": (
+        "activation_set_id",
+        "binding_routes",
+        "control_domain_id",
+        "control_domain_revision",
+        "controller_topology_id",
+        "topology_revision",
+    ),
+    "ExternalResourceDTO": (
+        "endpoint_role_id",
+        "external_resource_alias",
+        "provider_instance_id",
+        "provider_manifest_id",
+        "provider_manifest_revision",
+        "resource_kind",
+        "site_overlay_value_ref",
+    ),
+    "ResolvedModelSourceArtifactCandidate": (
+        "logical_uri",
+        "resolved_store_key",
+        "stored_bytes",
+    ),
+    "SiteOverlayExternalResourceKeyDTO": (
+        "resource_kind",
+        "site_overlay_value_ref",
+    ),
+    "SiteOverlayRefDTO": (
+        "non_secret_digest",
+        "site_overlay_id",
+        "site_overlay_revision",
+    ),
+    "TargetBindingCapabilityProviderTargetDTO": (
+        "command_target_id",
+        "component_type_revision",
+        "control_binding_id",
+        "control_binding_revision",
+        "controllable_component_id",
+    ),
+}
+_EXPECTED_CONSTRUCTOR_PARAMETERS: dict[str, tuple[str, ...]] = {
+    "CapabilityProviderBindingDTO": (
+        "capability_provider_binding_id",
+        "capability_provider_binding_revision",
+        "capability_id",
+        "capability_definition_revision",
+        "scope",
+        "target",
+        "provider_instance_id",
+        "provider_manifest_id",
+        "provider_manifest_revision",
+        "endpoint_bindings",
+    ),
+    "CapabilityProviderEndpointBindingDTO": (
+        "endpoint_role_id",
+        "source_kind",
+        "source_id",
+        "source_endpoint_role_id",
+    ),
+    "CellGlobalCapabilityProviderTargetDTO": ("cell_id",),
+    "ControlDomainCapabilityProviderTargetDTO": (
+        "control_domain_id",
+        "control_domain_revision",
+        "controller_topology_id",
+        "topology_revision",
+    ),
+    "DeploymentApplicabilityInputsDTO": (
+        "site_overlay_ref",
+        "desired_control_configurations",
+        "capability_provider_bindings",
+        "external_resources",
+    ),
+    "DesiredControlBindingRouteDTO": (
+        "control_binding_id",
+        "control_binding_revision",
+        "control_route_id",
+    ),
+    "DesiredControlConfigurationDTO": (
+        "control_domain_id",
+        "control_domain_revision",
+        "controller_topology_id",
+        "topology_revision",
+        "activation_set_id",
+        "binding_routes",
+    ),
+    "ExternalResourceDTO": (
+        "external_resource_alias",
+        "resource_kind",
+        "provider_instance_id",
+        "provider_manifest_id",
+        "provider_manifest_revision",
+        "endpoint_role_id",
+        "site_overlay_value_ref",
+    ),
+    "ResolvedModelSourceArtifactCandidate": (
+        "logical_uri",
+        "resolved_store_key",
+        "stored_bytes",
+    ),
+    "SiteOverlayExternalResourceKeyDTO": (
+        "site_overlay_value_ref",
+        "resource_kind",
+    ),
+    "SiteOverlayRefDTO": (
+        "site_overlay_id",
+        "site_overlay_revision",
+        "non_secret_digest",
+    ),
+    "TargetBindingCapabilityProviderTargetDTO": (
+        "controllable_component_id",
+        "component_type_revision",
+        "command_target_id",
+        "control_binding_id",
+        "control_binding_revision",
+    ),
+}
+_EXPECTED_UNION_ALIASES: dict[str, tuple[str, ...]] = {
+    "CapabilityEndpointSourceIdDTO": (
+        "RuntimeUnitId",
+        "ExternalResourceAlias",
+    ),
+    "CapabilityProviderTargetDTO": (
+        "CellGlobalCapabilityProviderTargetDTO",
+        "TargetBindingCapabilityProviderTargetDTO",
+        "ControlDomainCapabilityProviderTargetDTO",
+    ),
+    "CompositionConnectionSource": (
+        "CompositionDirectModelAnchor",
+        "CompositionDirectComponentAnchor",
+        "CompositionModelMount",
+        "CompositionComponentAttachment",
+    ),
+    "CompositionFramePathSegment": (
+        "CompositionFixedPathSegment",
+        "CompositionModelJointPathSegment",
+    ),
+    "CompositionResolvedFrame": (
+        "CompositionCellFrame",
+        "CompositionComponentModelFrame",
+        "CompositionPassiveModelFrame",
+    ),
+    "LogicalEndpointSourceTemplate": (
+        "RuntimeEndpointSourceTemplate",
+        "ExternalEndpointSourceTemplate",
+    ),
+    "LogicalStopApplicabilityTemplate": (
+        "LogicalNotStoppableApplicabilityTemplate",
+        "LogicalStoppableApplicabilityTemplate",
+    ),
+    "LogicalStopScopeTemplate": (
+        "LogicalResourceStopScopeTemplate",
+        "LogicalControllerSetStopScopeTemplate",
+        "LogicalControlDomainStopScopeTemplate",
+    ),
+    "QualifiedCapabilityOwner": (
+        "ControlBindingCapabilityOwner",
+        "CapabilityProviderCapabilityOwner",
+    ),
+    "SrdfGroupMemberIr": (
+        "SrdfLinkGroupMemberIr",
+        "SrdfJointGroupMemberIr",
+        "SrdfChainGroupMemberIr",
+        "SrdfSubgroupMemberIr",
+    ),
+    "UrdfGeometryIr": (
+        "UrdfBoxGeometryIr",
+        "UrdfCylinderGeometryIr",
+        "UrdfSphereGeometryIr",
+        "UrdfMeshGeometryIr",
+    ),
 }
 _FORBIDDEN_EXPORTS = frozenset(
     {
@@ -279,7 +616,7 @@ _SCAN_CONTRACTS = (
         "trusted_stage_python_constructor",
         "file",
         ("manyforge_core/python",),
-        r"(?s)py::class_<\s*(?:CompositionQualifiedCellIr|ApplicabilityQualifiedCellIr|CompilerQualifiedCellIr)\b(?:(?!py::class_<).)*?\.def\(\s*py::init",
+        r"(?s)py::class_<\s*(?:deployment::)?(?:CompositionQualifiedCellIr|ApplicabilityQualifiedCellIr|CompilerQualifiedCellIr)\b(?:(?!py::class_<).)*?\.def\(\s*py::init",
         ("*.cpp", "*.hpp"),
         ("manyforge_core/python/tests/**",),
     ),
@@ -491,6 +828,134 @@ def _properties(value_type: type[Any]) -> tuple[str, ...]:
     )
 
 
+def _publishes_constructor_signature(value_type: type[Any]) -> bool:
+    return bool(_documented_constructor_contracts(value_type))
+
+
+def _split_signature_parameters(value: str) -> list[str]:
+    result: list[str] = []
+    start = 0
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for index, character in enumerate(value):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in "([{":
+            stack.append(character)
+        elif character in pairs:
+            if stack and stack[-1] == pairs[character]:
+                stack.pop()
+        elif character == "," and not stack:
+            result.append(value[start:index].strip())
+            start = index + 1
+    result.append(value[start:].strip())
+    return [item for item in result if item]
+
+
+def _has_top_level_default(parameter: str) -> bool:
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for character in parameter:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in "([{":
+            stack.append(character)
+        elif character in pairs:
+            if stack and stack[-1] == pairs[character]:
+                stack.pop()
+        elif character == "=" and not stack:
+            return True
+    return False
+
+
+def _documented_constructor_contracts(
+    value_type: type[Any],
+) -> tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]:
+    constructor = vars(value_type).get("__init__")
+    document = getattr(constructor, "__doc__", "") or ""
+    starts = list(re.finditer(r"(?m)(?:^\d+\.\s*)?__init__\(", document))
+    contracts: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    for match in starts:
+        open_index = document.find("(", match.start())
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        close_index: int | None = None
+        for index in range(open_index, len(document)):
+            character = document[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"'}:
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    close_index = index
+                    break
+        if close_index is None:
+            continue
+        names: list[str] = []
+        defaults: list[str] = []
+        valid = True
+        for parameter in _split_signature_parameters(
+            document[open_index + 1 : close_index]
+        ):
+            name = re.split(r"[:=]", parameter, maxsplit=1)[0].strip()
+            if name == "self":
+                continue
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                valid = False
+                break
+            names.append(name)
+            if _has_top_level_default(parameter):
+                defaults.append(name)
+        if valid:
+            contract = (tuple(names), tuple(defaults))
+            if contract not in contracts:
+                contracts.append(contract)
+    return tuple(contracts)
+
+
+def _documented_constructor_contract(
+    value_type: type[Any],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    contracts = _documented_constructor_contracts(value_type)
+    if len(contracts) != 1:
+        _fail(
+            f"expected one detailed constructor signature for {value_type.__name__}: "
+            f"{contracts}"
+        )
+    return contracts[0]
+
+
 def _small_observation(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -602,13 +1067,18 @@ def _canonical_empty_pipeline(module: ModuleType) -> dict[str, Any]:
     compiler = _callable(module, "compile_cell_ir")(applicability)
     values = {
         "deployment": deployment,
+        "deployment_inputs": deployment_inputs,
         "graph": deployment.graph,
+        "selected_overlay": selected_overlay,
         "composition": composition,
         "applicability": applicability,
         "compiler": compiler,
     }
     expected_types = {
+        "deployment": "RevisionVerifiedDeploymentArtifact",
+        "deployment_inputs": "RevisionVerifiedDeploymentApplicabilityInputs",
         "graph": "GraphRevisionVerifiedCellGraph",
+        "selected_overlay": "QualifiedSelectedSiteOverlay",
         "composition": "CompositionQualifiedCellIr",
         "applicability": "ApplicabilityQualifiedCellIr",
         "compiler": "CompilerQualifiedCellIr",
@@ -621,6 +1091,263 @@ def _canonical_empty_pipeline(module: ModuleType) -> dict[str, Any]:
 
 def _sha256_prefixed(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _verified_site_overlay_fixture(module: ModuleType) -> dict[str, Any]:
+    value_ref = "resources.robot.endpoint"
+    identity = {
+        "api_version": "manyforge.site_overlay.v1",
+        "site_overlay_id": "i2_binding_overlay",
+        "values": [
+            {
+                "resource_kind": "service_endpoint",
+                "semantic_kind": "external_resource",
+                "site_overlay_value_ref": value_ref,
+                "value": {
+                    "value": "https://robot.invalid",
+                    "value_kind": "string",
+                },
+            }
+        ],
+    }
+    canonical_identity = json.dumps(
+        identity, sort_keys=True, separators=(",", ":")
+    )
+    revision = _sha256_prefixed(
+        b"manyforge.content-identity.v1\x00"
+        b"site-overlay-revision\x00"
+        b"manyforge.site_overlay.v1\x00"
+        + canonical_identity.encode()
+    )
+    normalized_root = dict(identity)
+    normalized_root["site_overlay_revision"] = revision
+    stored_bytes = json.dumps(
+        normalized_root, sort_keys=True, separators=(",", ":")
+    )
+    reference = module.SiteOverlayRefDTO(
+        site_overlay_id=module.SiteOverlayId("i2_binding_overlay"),
+        site_overlay_revision=module.SiteOverlayRevision(revision),
+        non_secret_digest=module.ContentDigest(
+            _sha256_prefixed(stored_bytes.encode())
+        ),
+    )
+    projection = _callable(
+        module, "resolve_and_verify_site_overlay_artifact_projection"
+    )(reference, stored_bytes)
+    resource = module.ExternalResourceDTO(
+        external_resource_alias=module.ExternalResourceAlias("robot_endpoint"),
+        resource_kind=module.ExternalResourceKind.kServiceEndpoint,
+        provider_instance_id=module.ProviderInstanceId("provider"),
+        provider_manifest_id=module.ProviderManifestId("manifest"),
+        provider_manifest_revision=module.ProviderManifestRevision(_ZERO_DIGEST),
+        endpoint_role_id=module.EndpointRoleId("endpoint"),
+        site_overlay_value_ref=module.SiteOverlayValueRef(value_ref),
+    )
+    selection = _callable(module, "select_site_overlay_for_deployment")(
+        reference, (resource,), projection
+    )
+    if type(projection).__name__ != "VerifiedSiteOverlayArtifactProjection":
+        _fail("ordinary site-overlay verifier returned the wrong type")
+    if type(selection).__name__ != "QualifiedSelectedSiteOverlay":
+        _fail("ordinary site-overlay selector returned the wrong type")
+    return {
+        "projection": projection,
+        "reference": reference,
+        "resource": resource,
+        "selection": selection,
+    }
+
+
+def _constructible_dto_fixture(module: ModuleType) -> dict[str, Any]:
+    route_a_kwargs = {
+        "control_binding_id": module.ControlBindingId("binding_a"),
+        "control_binding_revision": module.ControlBindingRevision(_ZERO_DIGEST),
+        "control_route_id": module.ControlRouteId("route_a"),
+    }
+    route_b_kwargs = {
+        "control_binding_id": module.ControlBindingId("binding_b"),
+        "control_binding_revision": module.ControlBindingRevision(_ZERO_DIGEST),
+        "control_route_id": module.ControlRouteId("route_b"),
+    }
+    route_a = module.DesiredControlBindingRouteDTO(**route_a_kwargs)
+    route_b = module.DesiredControlBindingRouteDTO(**route_b_kwargs)
+
+    configuration_kwargs = {
+        "control_domain_id": module.ControlDomainId("domain"),
+        "control_domain_revision": module.ControlDomainRevision(_ZERO_DIGEST),
+        "controller_topology_id": module.ControllerTopologyId("topology"),
+        "topology_revision": module.TopologyRevision(_ZERO_DIGEST),
+        "activation_set_id": module.ActivationSetId("activation"),
+        "binding_routes": (route_b, route_a),
+    }
+    configuration = module.DesiredControlConfigurationDTO(
+        **configuration_kwargs
+    )
+
+    cell_target_kwargs = {"cell_id": module.CellId("cell")}
+    cell_target = module.CellGlobalCapabilityProviderTargetDTO(
+        **cell_target_kwargs
+    )
+    target_binding_kwargs = {
+        "controllable_component_id": module.ControllableComponentId("component"),
+        "component_type_revision": module.ComponentTypeRevision(_ZERO_DIGEST),
+        "command_target_id": module.CommandTargetId("command_target"),
+        "control_binding_id": module.ControlBindingId("binding_a"),
+        "control_binding_revision": module.ControlBindingRevision(_ZERO_DIGEST),
+    }
+    target_binding = module.TargetBindingCapabilityProviderTargetDTO(
+        **target_binding_kwargs
+    )
+    domain_target_kwargs = {
+        "control_domain_id": module.ControlDomainId("domain"),
+        "control_domain_revision": module.ControlDomainRevision(_ZERO_DIGEST),
+        "controller_topology_id": module.ControllerTopologyId("topology"),
+        "topology_revision": module.TopologyRevision(_ZERO_DIGEST),
+    }
+    domain_target = module.ControlDomainCapabilityProviderTargetDTO(
+        **domain_target_kwargs
+    )
+
+    endpoint_runtime_kwargs = {
+        "endpoint_role_id": module.EndpointRoleId("runtime_endpoint"),
+        "source_kind": module.CapabilityEndpointSourceKind.kRuntimeUnit,
+        "source_id": module.RuntimeUnitId("runtime"),
+        "source_endpoint_role_id": module.EndpointRoleId("runtime_source"),
+    }
+    endpoint_external_kwargs = {
+        "endpoint_role_id": module.EndpointRoleId("external_endpoint"),
+        "source_kind": module.CapabilityEndpointSourceKind.kExternalResource,
+        "source_id": module.ExternalResourceAlias("external_b"),
+        "source_endpoint_role_id": module.EndpointRoleId("external_source"),
+    }
+    endpoint_runtime = module.CapabilityProviderEndpointBindingDTO(
+        **endpoint_runtime_kwargs
+    )
+    endpoint_external = module.CapabilityProviderEndpointBindingDTO(
+        **endpoint_external_kwargs
+    )
+    provider_binding_kwargs = {
+        "capability_provider_binding_id": module.CapabilityProviderBindingId(
+            "provider_binding"
+        ),
+        "capability_provider_binding_revision": (
+            module.CapabilityProviderBindingRevision(_ZERO_DIGEST)
+        ),
+        "capability_id": module.CapabilityId("capability"),
+        "capability_definition_revision": module.CapabilityDefinitionRevision(
+            _ZERO_DIGEST
+        ),
+        "scope": module.CapabilityScope.kCellGlobal,
+        "target": cell_target,
+        "provider_instance_id": module.ProviderInstanceId("provider"),
+        "provider_manifest_id": module.ProviderManifestId("manifest"),
+        "provider_manifest_revision": module.ProviderManifestRevision(_ZERO_DIGEST),
+        "endpoint_bindings": (endpoint_external, endpoint_runtime),
+    }
+    provider_binding = module.CapabilityProviderBindingDTO(
+        **provider_binding_kwargs
+    )
+
+    overlay_reference_kwargs = {
+        "site_overlay_id": module.SiteOverlayId("overlay"),
+        "site_overlay_revision": module.SiteOverlayRevision(_ZERO_DIGEST),
+        "non_secret_digest": module.ContentDigest(_ZERO_DIGEST),
+    }
+    overlay_reference = module.SiteOverlayRefDTO(**overlay_reference_kwargs)
+    overlay_key_kwargs = {
+        "site_overlay_value_ref": module.SiteOverlayValueRef(
+            "resources.robot.endpoint"
+        ),
+        "resource_kind": module.ExternalResourceKind.kServiceEndpoint,
+    }
+    overlay_key = module.SiteOverlayExternalResourceKeyDTO(**overlay_key_kwargs)
+
+    def external_kwargs(alias: str, value_ref: str) -> dict[str, Any]:
+        return {
+            "external_resource_alias": module.ExternalResourceAlias(alias),
+            "resource_kind": module.ExternalResourceKind.kServiceEndpoint,
+            "provider_instance_id": module.ProviderInstanceId("provider"),
+            "provider_manifest_id": module.ProviderManifestId("manifest"),
+            "provider_manifest_revision": module.ProviderManifestRevision(
+                _ZERO_DIGEST
+            ),
+            "endpoint_role_id": module.EndpointRoleId("endpoint"),
+            "site_overlay_value_ref": module.SiteOverlayValueRef(value_ref),
+        }
+
+    external_a_kwargs = external_kwargs(
+        "external_a", "resources.external_a.endpoint"
+    )
+    external_b_kwargs = external_kwargs(
+        "external_b", "resources.external_b.endpoint"
+    )
+    external_a = module.ExternalResourceDTO(**external_a_kwargs)
+    external_b = module.ExternalResourceDTO(**external_b_kwargs)
+    applicability_inputs_kwargs = {
+        "site_overlay_ref": overlay_reference,
+        "desired_control_configurations": (configuration,),
+        "capability_provider_bindings": (provider_binding,),
+        "external_resources": (external_b, external_a),
+    }
+    applicability_inputs = module.DeploymentApplicabilityInputsDTO(
+        **applicability_inputs_kwargs
+    )
+    resolved_candidate_kwargs = {
+        "logical_uri": "asset://i2-constructor/mesh.stl",
+        "resolved_store_key": module.ContentAddressedStoreKey(
+            "sha256/" + hashlib.sha256(b"i2-constructor").hexdigest()
+        ),
+        "stored_bytes": b"\x00i2-constructor\xff",
+    }
+    resolved_candidate = module.ResolvedModelSourceArtifactCandidate(
+        **resolved_candidate_kwargs
+    )
+
+    kwargs_by_type = {
+        "CapabilityProviderBindingDTO": provider_binding_kwargs,
+        "CapabilityProviderEndpointBindingDTO": endpoint_runtime_kwargs,
+        "CellGlobalCapabilityProviderTargetDTO": cell_target_kwargs,
+        "ControlDomainCapabilityProviderTargetDTO": domain_target_kwargs,
+        "DeploymentApplicabilityInputsDTO": applicability_inputs_kwargs,
+        "DesiredControlBindingRouteDTO": route_a_kwargs,
+        "DesiredControlConfigurationDTO": configuration_kwargs,
+        "ExternalResourceDTO": external_a_kwargs,
+        "ResolvedModelSourceArtifactCandidate": resolved_candidate_kwargs,
+        "SiteOverlayExternalResourceKeyDTO": overlay_key_kwargs,
+        "SiteOverlayRefDTO": overlay_reference_kwargs,
+        "TargetBindingCapabilityProviderTargetDTO": target_binding_kwargs,
+    }
+    instances = {
+        "CapabilityProviderBindingDTO": provider_binding,
+        "CapabilityProviderEndpointBindingDTO": endpoint_runtime,
+        "CellGlobalCapabilityProviderTargetDTO": cell_target,
+        "ControlDomainCapabilityProviderTargetDTO": domain_target,
+        "DeploymentApplicabilityInputsDTO": applicability_inputs,
+        "DesiredControlBindingRouteDTO": route_a,
+        "DesiredControlConfigurationDTO": configuration,
+        "ExternalResourceDTO": external_a,
+        "ResolvedModelSourceArtifactCandidate": resolved_candidate,
+        "SiteOverlayExternalResourceKeyDTO": overlay_key,
+        "SiteOverlayRefDTO": overlay_reference,
+        "TargetBindingCapabilityProviderTargetDTO": target_binding,
+    }
+    ordering = {
+        "binding_routes": [
+            row.control_route_id.value for row in configuration.binding_routes
+        ],
+        "endpoint_bindings": [
+            row.endpoint_role_id.value for row in provider_binding.endpoint_bindings
+        ],
+        "external_resources": [
+            row.external_resource_alias.value
+            for row in applicability_inputs.external_resources
+        ],
+    }
+    return {
+        "instances": instances,
+        "kwargs": kwargs_by_type,
+        "ordering": ordering,
+    }
 
 
 def _revisioned_document(
@@ -640,9 +1367,9 @@ def _revisioned_document(
 
 
 def _verified_source_fixture(module: ModuleType) -> Any:
-    urdf_uri = "asset://i2_binding/urdf/model.urdf"
-    srdf_uri = "asset://i2_binding/srdf/model.srdf"
-    mesh_uri = "asset://i2_binding/meshes/base.stl"
+    urdf_uri = "asset://i2_binding_asset/urdf/model.urdf"
+    srdf_uri = "asset://i2_binding_asset/srdf/model.srdf"
+    mesh_uri = "asset://i2_binding_asset/meshes/base.stl"
     urdf = (
         '<robot name="i2_binding"><link name="base_link"><visual><geometry>'
         f'<mesh filename="{mesh_uri}"/></geometry></visual></link>'
@@ -1159,14 +1886,114 @@ def test_cpp_python_field_enum_default_ordering_and_error_parity() -> None:
     enums = _enum_observation(module)
     if enums != _EXPECTED_ENUMS:
         _fail("Python enum names/values differ from the frozen C++ declarations")
+    dto_fixture = _constructible_dto_fixture(module)
+    dto_fields = {
+        name: list(_properties(getattr(module, name)))
+        for name in sorted(_EXPECTED_CONSTRUCTIBLE_DTO_PROPERTIES)
+    }
+    expected_dto_fields = {
+        name: list(fields_)
+        for name, fields_ in sorted(_EXPECTED_CONSTRUCTIBLE_DTO_PROPERTIES.items())
+    }
+    if dto_fields != expected_dto_fields:
+        _fail("constructible DTO fields differ from the frozen C++ declarations")
+    constructor_rejections: dict[str, list[str]] = {}
+    constructor_parameters: dict[str, list[str]] = {}
+    constructor_defaults: dict[str, list[str]] = {}
+    expected_required_constructor_arguments = {
+        name: list(parameters)
+        for name, parameters in sorted(_EXPECTED_CONSTRUCTOR_PARAMETERS.items())
+    }
+    for name, kwargs in sorted(dto_fixture["kwargs"].items()):
+        value_type = getattr(module, name)
+        parameters, defaults = _documented_constructor_contract(value_type)
+        constructor_parameters[name] = list(parameters)
+        constructor_defaults[name] = list(defaults)
+        if parameters != _EXPECTED_CONSTRUCTOR_PARAMETERS[name] or defaults:
+            _fail(
+                f"constructor order/defaults differ from the C++ binding: "
+                f"{name}: parameters={parameters}, defaults={defaults}"
+            )
+        if set(kwargs) != set(parameters):
+            _fail(f"constructor fixture arguments differ from {name}'s signature")
+        instance = value_type(**kwargs)
+        if type(instance).__name__ != name:
+            _fail(f"keyword construction returned the wrong DTO type: {name}")
+        rejected: list[str] = []
+        for omitted in parameters:
+            incomplete = dict(kwargs)
+            del incomplete[omitted]
+            try:
+                value_type(**incomplete)
+            except TypeError:
+                rejected.append(omitted)
+            else:
+                _fail(f"deployment DTO constructor made {name}.{omitted} optional")
+        constructor_rejections[name] = rejected
+    if (
+        constructor_parameters != expected_required_constructor_arguments
+        or constructor_rejections != expected_required_constructor_arguments
+        or any(constructor_defaults.values())
+    ):
+        _fail("deployment DTO required-constructor argument inventory drifted")
+    union_aliases: dict[str, list[str]] = {}
+    expected_union_aliases = {
+        name: list(alternatives)
+        for name, alternatives in sorted(_EXPECTED_UNION_ALIASES.items())
+    }
+    for name in sorted(_EXPECTED_UNION_ALIASES):
+        alias = getattr(module, name, None)
+        alternatives = tuple(
+            getattr(alternative, "__name__", "") for alternative in get_args(alias)
+        )
+        if alternatives != _EXPECTED_UNION_ALIASES[name]:
+            _fail(f"closed Python union alternatives drifted: {name}: {alternatives}")
+        union_aliases[name] = list(alternatives)
+    expected_ordering = {
+        "binding_routes": ["route_b", "route_a"],
+        "endpoint_bindings": ["external_endpoint", "runtime_endpoint"],
+        "external_resources": ["external_b", "external_a"],
+    }
+    if dto_fixture["ordering"] != expected_ordering:
+        _fail("deployment DTO collection ordering differs from C++ input order")
     source = _verified_source_fixture(module)
+    links = {link.name: link for link in source.source_ir.urdf.links}
+    base_visual = links["base_link"].visuals[0]
+    semantic_defaults = {
+        "visual_origin": {
+            "element_authored": base_visual.origin.element_authored,
+            "authored_xyz_m": base_visual.origin.authored_xyz_m,
+            "authored_rpy_rad": base_visual.origin.authored_rpy_rad,
+            "xyz_m": list(base_visual.origin.xyz_m),
+            "rpy_rad": list(base_visual.origin.rpy_rad),
+        },
+        "mesh_scale": {
+            "authored_scale": base_visual.geometry.authored_scale,
+            "scale": list(base_visual.geometry.scale),
+        },
+    }
+    expected_semantic_defaults = {
+        "visual_origin": {
+            "element_authored": False,
+            "authored_xyz_m": None,
+            "authored_rpy_rad": None,
+            "xyz_m": [0.0, 0.0, 0.0],
+            "rpy_rad": [0.0, 0.0, 0.0],
+        },
+        "mesh_scale": {
+            "authored_scale": None,
+            "scale": [1.0, 1.0, 1.0],
+        },
+    }
+    if semantic_defaults != expected_semantic_defaults:
+        _fail("reachable model-source semantic defaults drifted")
     actual_artifact_order = [
         artifact.logical_uri for artifact in source.verified_artifacts
     ]
     expected_artifact_order = [
-        "asset://i2_binding/meshes/base.stl",
-        "asset://i2_binding/srdf/model.srdf",
-        "asset://i2_binding/urdf/model.urdf",
+        "asset://i2_binding_asset/meshes/base.stl",
+        "asset://i2_binding_asset/srdf/model.srdf",
+        "asset://i2_binding_asset/urdf/model.urdf",
     ]
     if actual_artifact_order != expected_artifact_order:
         _fail("Python source-artifact ordering differs from the frozen C++ ordering")
@@ -1185,12 +2012,42 @@ def test_cpp_python_field_enum_default_ordering_and_error_parity() -> None:
     expected_error = {"type": "CellGraphCodecError", "message": "$: missing required field 'graph_revision'", "fields": {}}
     if error_observation != expected_error:
         _fail(f"structured-error parity drifted: {error_observation}")
-    expected_sha = _sha256_value({"projection": expected, "fields": expected_fields, "enums": _EXPECTED_ENUMS, "artifact_order": expected_artifact_order, "error": expected_error})
-    actual_sha = _sha256_value({"projection": actual, "fields": fields, "enums": enums, "artifact_order": actual_artifact_order, "error": error_observation})
+    expected_vector = {
+        "projection": expected,
+        "trusted_fields": expected_fields,
+        "deployment_dto_fields": expected_dto_fields,
+        "constructor_parameters": expected_required_constructor_arguments,
+        "constructor_defaults": {
+            name: [] for name in expected_required_constructor_arguments
+        },
+        "required_constructor_arguments": expected_required_constructor_arguments,
+        "enums": _EXPECTED_ENUMS,
+        "union_aliases": expected_union_aliases,
+        "deployment_collection_order": expected_ordering,
+        "semantic_defaults": expected_semantic_defaults,
+        "artifact_order": expected_artifact_order,
+        "error": expected_error,
+    }
+    actual_vector = {
+        "projection": actual,
+        "trusted_fields": fields,
+        "deployment_dto_fields": dto_fields,
+        "constructor_parameters": constructor_parameters,
+        "constructor_defaults": constructor_defaults,
+        "required_constructor_arguments": constructor_rejections,
+        "enums": enums,
+        "union_aliases": union_aliases,
+        "deployment_collection_order": dto_fixture["ordering"],
+        "semantic_defaults": semantic_defaults,
+        "artifact_order": actual_artifact_order,
+        "error": error_observation,
+    }
+    expected_sha = _sha256_value(expected_vector)
+    actual_sha = _sha256_value(actual_vector)
     _write_case_evidence(
         "cpp_python_field_enum_default_ordering_and_error_parity",
         {"cpp_vector_sha256": expected_sha, "python_vector_sha256": actual_sha, "vectors_equal": expected_sha == actual_sha},
-        {"expected": {"projection": expected, "fields": expected_fields, "enums": _EXPECTED_ENUMS, "artifact_order": expected_artifact_order, "error": expected_error}, "actual": {"projection": actual, "fields": fields, "enums": enums, "artifact_order": actual_artifact_order, "error": error_observation}},
+        {"expected": expected_vector, "actual": actual_vector},
     )
 
 
@@ -1208,9 +2065,17 @@ def test_all_trusted_predecessor_projections_nonconstructible_and_read_only() ->
     module = _load_extension()
     empty = _canonical_empty_pipeline(module)
     source = _verified_source_fixture(module)
+    overlay = _verified_site_overlay_fixture(module)
     instances = {
+        "RevisionVerifiedDeploymentArtifact": empty["deployment"],
+        "RevisionVerifiedDeploymentApplicabilityInputs": empty[
+            "deployment_inputs"
+        ],
         "GraphRevisionVerifiedCellGraph": empty["graph"],
-        "VerifiedModelSourceArtifact": source.verified_artifacts[0],
+        "VerifiedSiteOverlayArtifactProjection": overlay["projection"],
+        "QualifiedSelectedSiteOverlay": overlay["selection"],
+        "ModelSourceRetrievalPlan": source.retrieval_plan,
+        "ModelSourceIr": source.source_ir,
         "SourceVerifiedModelAsset": source,
         "CompositionQualifiedCellIr": empty["composition"],
         "ApplicabilityQualifiedCellIr": empty["applicability"],
@@ -1232,13 +2097,32 @@ def test_detached_predecessor_and_final_value_lifetime() -> None:
     module = _load_extension()
 
     def detached(name: str) -> Any:
-        if name == "VerifiedModelSourceArtifact":
+        if name in {
+            "ModelSourceRetrievalPlan",
+            "ModelSourceIr",
+            "SourceVerifiedModelAsset",
+        }:
             source = _verified_source_fixture(module)
-            return source.verified_artifacts[0]
-        if name == "SourceVerifiedModelAsset":
-            return _verified_source_fixture(module)
+            return {
+                "ModelSourceRetrievalPlan": source.retrieval_plan,
+                "ModelSourceIr": source.source_ir,
+                "SourceVerifiedModelAsset": source,
+            }[name]
+        if name in {
+            "VerifiedSiteOverlayArtifactProjection",
+            "QualifiedSelectedSiteOverlay",
+        }:
+            overlay = _verified_site_overlay_fixture(module)
+            return {
+                "VerifiedSiteOverlayArtifactProjection": overlay["projection"],
+                "QualifiedSelectedSiteOverlay": overlay["selection"],
+            }[name]
         empty = _canonical_empty_pipeline(module)
         return {
+            "RevisionVerifiedDeploymentArtifact": empty["deployment"],
+            "RevisionVerifiedDeploymentApplicabilityInputs": empty[
+                "compiler"
+            ].applicability.deployment_inputs,
             "GraphRevisionVerifiedCellGraph": empty["compiler"].applicability.composition.verified_graph,
             "CompositionQualifiedCellIr": empty["compiler"].applicability.composition,
             "ApplicabilityQualifiedCellIr": empty["compiler"].applicability,
@@ -1398,6 +2282,16 @@ print(json.dumps(observation, sort_keys=True, separators=(",", ":")))
 
 def test_repeated_fresh_interpreter_import_use_and_clean_shutdown() -> None:
     extension = _extension_path()
+    try:
+        expected_executable = _absolute_path(_EXECUTABLE_ENV).resolve(strict=True)
+        active_executable = Path(sys.executable).resolve(strict=True)
+    except OSError as error:
+        _fail(f"active qualification executable is unavailable: {error}")
+    if active_executable != expected_executable:
+        _fail(
+            "fresh-process qualification is not running through the packet-selected "
+            f"Python executable: {active_executable} != {expected_executable}"
+        )
     before_sha = _sha256_file(extension)
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
@@ -1495,6 +2389,18 @@ def test_generated_stub_inventory_and_documentation_parity() -> None:
             mismatches.append(f"{name}:runtime_kind")
         if row["kind"] == "function" and not callable(runtime):
             mismatches.append(f"{name}:runtime_kind")
+        if row["kind"] == "class":
+            runtime_constructible = _publishes_constructor_signature(runtime)
+            stub_constructible = "__init__" in semantic.get("methods", {})
+            if (
+                row["constructible"] is not runtime_constructible
+                or stub_constructible is not runtime_constructible
+            ):
+                mismatches.append(f"{name}:constructibility")
+        if get_origin(runtime) is not None and (
+            row["kind"] != "constant" or semantic["kind"] != "constant"
+        ):
+            mismatches.append(f"{name}:typing_alias_kind")
         if name in _TRUSTED_PROJECTIONS:
             fields = set(_properties(runtime))
             stub_members = set(semantic.get("members", ()))
@@ -1505,7 +2411,7 @@ def test_generated_stub_inventory_and_documentation_parity() -> None:
             if any(field not in section for field in fields):
                 mismatches.append(f"{name}:field_documentation")
         members = getattr(runtime, "__members__", None)
-        if isinstance(members, dict):
+        if isinstance(runtime, type) and isinstance(members, dict):
             stub_members = set(semantic.get("members", ()))
             if set(members) != stub_members or any(member not in section for member in members):
                 mismatches.append(f"{name}:enum_members")

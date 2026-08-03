@@ -19,6 +19,8 @@ CLOSED_SCHEMA_RESOURCES = (
 STRONG_STRING_TYPES = (
     "CellId",
     "GraphRevision",
+    "DeploymentArtifactId",
+    "DeploymentRevision",
     "SchemaId",
     "SchemaRevision",
     "ContentDigest",
@@ -70,8 +72,17 @@ STRONG_STRING_TYPES = (
     "ProviderInstanceId",
     "ProviderManifestId",
     "ProviderManifestRevision",
+    "CapabilityProviderBindingId",
+    "CapabilityProviderBindingRevision",
+    "SiteOverlayId",
+    "SiteOverlayRevision",
+    "ExternalResourceAlias",
+    "SiteOverlayValueRef",
     "ComponentAttachmentId",
     "ComponentAttachmentRevision",
+    "RetainedBundleId",
+    "SceneId",
+    "ProjectionLeaseId",
     "CommandSchemaId",
     "CommandSchemaRevision",
 )
@@ -487,7 +498,12 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
         with pytest.raises(TypeError):
             cls()
 
+    assert len(STRONG_STRING_TYPES) == 68
     assert len({type(value) for value in values}) == len(STRONG_STRING_TYPES)
+    assert len(set(values)) == len(STRONG_STRING_TYPES)
+    for index, left in enumerate(values):
+        for right in values[index + 1 :]:
+            assert left != right
     assert core.CellId("shared") != core.GraphRevision("shared")
     assert len({core.CellId("shared"), core.GraphRevision("shared")}) == 2
 

@@ -150,6 +150,8 @@
         "README.md"
       ],
       "must_add": [
+        "scripts/ci/core-bindings-sanitizer-host.cpp",
+        "scripts/ci/generate-core-bindings-contract.py",
         "scripts/ci/run-core-bindings.sh",
         "scripts/ci/run-core-bindings-sanitizer.sh",
         "scripts/ci/run-core-bindings-contract.sh",
@@ -188,8 +190,13 @@
     "generated_api_contract": {
       "schema_version": "manyforge.composable_cell_i2.binding_api_inventory.v1",
       "required_read_only_nonconstructible_exports": [
+        "RevisionVerifiedDeploymentArtifact",
+        "RevisionVerifiedDeploymentApplicabilityInputs",
         "GraphRevisionVerifiedCellGraph",
-        "VerifiedModelSourceArtifact",
+        "VerifiedSiteOverlayArtifactProjection",
+        "QualifiedSelectedSiteOverlay",
+        "ModelSourceRetrievalPlan",
+        "ModelSourceIr",
         "SourceVerifiedModelAsset",
         "CompositionQualifiedCellIr",
         "ApplicabilityQualifiedCellIr",
@@ -359,7 +366,7 @@
     "native_target_contract_path": "verification/composable_cell_i2/native_target_contract.v1.json",
     "native_target_contract_sha256": "a5161424a62319cea8baa61ca15ceed318ca272b6c0654968f355593d5bffb9d",
     "build_provenance_contract_path": "verification/composable_cell_i2/build_provenance_contract.v1.json",
-    "build_provenance_contract_sha256": "aa087f5cc90f90ce41a3e992c68101483269d1c0cd3865d63f4a0538cf174ad1",
+    "build_provenance_contract_sha256": "fdfc6b37c94e8352ad627fc9132145f8db0e535979f95fdcd4c6374fa03405d2",
     "native_execution_lanes": [
       {
         "lane_id": "core_release",
@@ -908,29 +915,19 @@
         "canonical_empty_admission_digest": "admission_digest"
       }
     },
-    "fixture_ir_outputs": {
-      "c02m_empty_passive_aggregate_attached_internal_and_mixed_vendor": "fixture-ir/c02m_empty_passive_aggregate_attached_internal_and_mixed_vendor.json",
-      "c02m_two_same_type_robot_and_tool_and_independent_attachments": "fixture-ir/c02m_two_same_type_robot_and_tool_and_independent_attachments.json",
-      "c02m_mobile_rail_gantry_floating_prismatic_and_mimic_coordinates": "fixture-ir/c02m_mobile_rail_gantry_floating_prismatic_and_mimic_coordinates.json",
-      "c02m_mf2_rank_digest_collision_rewrite_and_shuffle_determinism": "fixture-ir/c02m_mf2_rank_digest_collision_rewrite_and_shuffle_determinism.json",
-      "c02m_sibling_cross_branch_safe_chain_descendant_and_cycle_mimic_cases": "fixture-ir/c02m_sibling_cross_branch_safe_chain_descendant_and_cycle_mimic_cases.json",
-      "c02m_parser_validity_and_pinocchio_child_order_assumption": "fixture-ir/c02m_parser_validity_and_pinocchio_child_order_assumption.json",
-      "c02n_contract_route_activation_provider_stop_and_external_overlay_matrix": "fixture-ir/c02n_contract_route_activation_provider_stop_and_external_overlay_matrix.json",
-      "c02n_65536_and_1000000_exact_bounds_plus_overflow": "fixture-ir/c02n_65536_and_1000000_exact_bounds_plus_overflow.json",
-      "c02n_site_overlay_presence_digest_values_and_secrets_absence": "fixture-ir/c02n_site_overlay_presence_digest_values_and_secrets_absence.json",
-      "c02o_single_final_operation_empty_nonempty_equality_and_nonforgeability": "fixture-ir/c02o_single_final_operation_empty_nonempty_equality_and_nonforgeability.json"
-    },
     "regression_products": [
       "canonical_empty_product_package/canonical-empty-admission.json",
+      "canonical_empty_product_package/build-manifests/*/*.json",
+      "canonical_empty_product_package/raw-artifacts/sha256/*.blob",
+      "canonical_empty_product_package/retained-bundles/sha256/*.json",
       "lite6_retained_consumer_fixture/manifest.json",
       "lite6_retained_consumer_fixture/retained-model.urdf",
       "lite6_retained_consumer_fixture/retained-model.srdf",
-      "lite6_retained_consumer_fixture/retained-package/**/*",
-      "deployment-build/generated/embedded_build_evidence.hpp",
-      "deployment-build/generated/build_qualified_admission_profile_generated.hpp",
-      "deployment-build/generated/closed_schema/**/*",
-      "fixture-raw/**/*.json",
-      "fixture-ir/*.json"
+      "lite6_retained_consumer_fixture/retained-package/build-manifests/*/*.json",
+      "lite6_retained_consumer_fixture/retained-package/catalog-artifacts/by-key-sha256/*.record",
+      "lite6_retained_consumer_fixture/retained-package/raw-artifacts/sha256/*.blob",
+      "lite6_retained_consumer_fixture/retained-package/retained-bundles/sha256/*.json",
+      "deployment-build/generated/*.hpp"
     ]
   },
   "fixture_matrix": [
@@ -949,7 +946,7 @@
     },
     {
       "id": "c02m_empty_passive_aggregate_attached_internal_and_mixed_vendor",
-      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release"],
       "native_test_witnesses": [
         {"lane_id": "deployment_release", "group_id": "c02m_composition_shapes_required"},
         {"lane_id": "c02_tail_focused_release", "group_id": "c02m_composition_shapes_required"}
@@ -957,12 +954,12 @@
       "binding_case_witnesses": [],
       "python_binding_floor_lanes": [],
       "scan_ids": [],
-      "determinism_artifacts": ["fixture-ir/c02m_empty_passive_aggregate_attached_internal_and_mixed_vendor.json"],
+      "determinism_artifacts": [],
       "generated_output_roles": []
     },
     {
       "id": "c02m_two_same_type_robot_and_tool_and_independent_attachments",
-      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release"],
       "native_test_witnesses": [
         {"lane_id": "deployment_release", "group_id": "c02m_repeated_identity_required"},
         {"lane_id": "c02_tail_focused_release", "group_id": "c02m_repeated_identity_required"}
@@ -970,12 +967,12 @@
       "binding_case_witnesses": [],
       "python_binding_floor_lanes": [],
       "scan_ids": [],
-      "determinism_artifacts": ["fixture-ir/c02m_two_same_type_robot_and_tool_and_independent_attachments.json"],
+      "determinism_artifacts": [],
       "generated_output_roles": []
     },
     {
       "id": "c02m_mobile_rail_gantry_floating_prismatic_and_mimic_coordinates",
-      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release"],
       "native_test_witnesses": [
         {"lane_id": "deployment_release", "group_id": "c02m_coordinate_projection_required"},
         {"lane_id": "c02_tail_focused_release", "group_id": "c02m_coordinate_projection_required"}
@@ -983,24 +980,24 @@
       "binding_case_witnesses": [],
       "python_binding_floor_lanes": [],
       "scan_ids": [],
-      "determinism_artifacts": ["fixture-ir/c02m_mobile_rail_gantry_floating_prismatic_and_mimic_coordinates.json"],
+      "determinism_artifacts": [],
       "generated_output_roles": []
     },
     {
       "id": "c02m_mf2_rank_digest_collision_rewrite_and_shuffle_determinism",
-      "evidence_lanes": ["c02_tail_focused_release", "deterministic_rebuild"],
+      "evidence_lanes": ["c02_tail_focused_release"],
       "native_test_witnesses": [
         {"lane_id": "c02_tail_focused_release", "group_id": "c02m_mf2_determinism_required"}
       ],
       "binding_case_witnesses": [],
       "python_binding_floor_lanes": [],
       "scan_ids": [],
-      "determinism_artifacts": ["fixture-ir/c02m_mf2_rank_digest_collision_rewrite_and_shuffle_determinism.json"],
+      "determinism_artifacts": [],
       "generated_output_roles": []
     },
     {
       "id": "c02m_sibling_cross_branch_safe_chain_descendant_and_cycle_mimic_cases",
-      "evidence_lanes": ["c02_tail_focused_release", "deployment_asan_ubsan", "deterministic_rebuild"],
+      "evidence_lanes": ["c02_tail_focused_release", "deployment_asan_ubsan"],
       "native_test_witnesses": [
         {"lane_id": "c02_tail_focused_release", "group_id": "c02m_mimic_dependency_required"},
         {"lane_id": "deployment_asan_ubsan", "group_id": "c02m_mimic_dependency_required"}
@@ -1008,12 +1005,12 @@
       "binding_case_witnesses": [],
       "python_binding_floor_lanes": [],
       "scan_ids": [],
-      "determinism_artifacts": ["fixture-ir/c02m_sibling_cross_branch_safe_chain_descendant_and_cycle_mimic_cases.json"],
+      "determinism_artifacts": [],
       "generated_output_roles": []
     },
     {
       "id": "c02m_parser_validity_and_pinocchio_child_order_assumption",
-      "evidence_lanes": ["roboplan_release", "roboplan_consumer_focused", "deterministic_rebuild"],
+      "evidence_lanes": ["roboplan_release", "roboplan_consumer_focused"],
       "native_test_witnesses": [
         {"lane_id": "roboplan_release", "group_id": "roboplan_consumer_required"},
         {"lane_id": "roboplan_consumer_focused", "group_id": "roboplan_consumer_required"}
@@ -1021,12 +1018,12 @@
       "binding_case_witnesses": [],
       "python_binding_floor_lanes": [],
       "scan_ids": [],
-      "determinism_artifacts": ["fixture-ir/c02m_parser_validity_and_pinocchio_child_order_assumption.json"],
+      "determinism_artifacts": [],
       "generated_output_roles": []
     },
     {
       "id": "c02n_contract_route_activation_provider_stop_and_external_overlay_matrix",
-      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release"],
       "native_test_witnesses": [
         {"lane_id": "deployment_release", "group_id": "c02n_applicability_matrix_required"},
         {"lane_id": "c02_tail_focused_release", "group_id": "c02n_applicability_matrix_required"}
@@ -1034,12 +1031,12 @@
       "binding_case_witnesses": [],
       "python_binding_floor_lanes": [],
       "scan_ids": [],
-      "determinism_artifacts": ["fixture-ir/c02n_contract_route_activation_provider_stop_and_external_overlay_matrix.json"],
+      "determinism_artifacts": [],
       "generated_output_roles": []
     },
     {
       "id": "c02n_65536_and_1000000_exact_bounds_plus_overflow",
-      "evidence_lanes": ["c02_tail_focused_release", "deployment_asan_ubsan", "deterministic_rebuild"],
+      "evidence_lanes": ["c02_tail_focused_release", "deployment_asan_ubsan"],
       "native_test_witnesses": [
         {"lane_id": "c02_tail_focused_release", "group_id": "c02n_bounds_required"},
         {"lane_id": "deployment_asan_ubsan", "group_id": "c02n_bounds_required"}
@@ -1047,12 +1044,12 @@
       "binding_case_witnesses": [],
       "python_binding_floor_lanes": [],
       "scan_ids": [],
-      "determinism_artifacts": ["fixture-ir/c02n_65536_and_1000000_exact_bounds_plus_overflow.json"],
+      "determinism_artifacts": [],
       "generated_output_roles": []
     },
     {
       "id": "c02n_site_overlay_presence_digest_values_and_secrets_absence",
-      "evidence_lanes": ["deployment_release", "c02_tail_focused_release", "deterministic_rebuild"],
+      "evidence_lanes": ["deployment_release", "c02_tail_focused_release"],
       "native_test_witnesses": [
         {"lane_id": "deployment_release", "group_id": "c02n_site_overlay_required"},
         {"lane_id": "c02_tail_focused_release", "group_id": "c02n_site_overlay_required"}
@@ -1060,7 +1057,7 @@
       "binding_case_witnesses": [],
       "python_binding_floor_lanes": [],
       "scan_ids": [],
-      "determinism_artifacts": ["fixture-ir/c02n_site_overlay_presence_digest_values_and_secrets_absence.json"],
+      "determinism_artifacts": [],
       "generated_output_roles": []
     },
     {
@@ -1083,7 +1080,6 @@
       "python_binding_floor_lanes": [],
       "scan_ids": [],
       "determinism_artifacts": [
-        "fixture-ir/c02o_single_final_operation_empty_nonempty_equality_and_nonforgeability.json",
         "canonical_empty_product_package/canonical-empty-admission.json"
       ],
       "generated_output_roles": []
@@ -1247,7 +1243,7 @@
       "ordinal": 11,
       "id": "core_asan_ubsan",
       "claim": "Complete Core ASan/UBSan suite",
-      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "core_asan_ubsan", "--output-root", "/qualification-output"],
+      "container_command": ["/usr/bin/setarch", "x86_64", "-R", "python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "core_asan_ubsan", "--output-root", "/qualification-output"],
       "skip_policy": "forbid",
       "expected_outputs": ["core-asan/ctest-inventory.json", "core-asan/execution-index.json", "core-asan/native-build-provenance.json"]
     },
@@ -1263,7 +1259,7 @@
       "ordinal": 13,
       "id": "deployment_asan_ubsan",
       "claim": "Complete Deployment ASan/UBSan suite including ordered C0.2 tail",
-      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "deployment_asan_ubsan", "--output-root", "/qualification-output"],
+      "container_command": ["/usr/bin/setarch", "x86_64", "-R", "python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "deployment_asan_ubsan", "--output-root", "/qualification-output"],
       "skip_policy": "forbid",
       "expected_outputs": ["deployment-asan/ctest-inventory.json", "deployment-asan/execution-index.json", "deployment-asan/native-build-provenance.json"]
     },
@@ -1271,7 +1267,7 @@
       "ordinal": 14,
       "id": "roboplan_asan_ubsan",
       "claim": "Patched RoboPlan scene consumer ASan/UBSan regression",
-      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "roboplan_asan_ubsan", "--output-root", "/qualification-output"],
+      "container_command": ["/usr/bin/setarch", "x86_64", "-R", "python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-native-lane", "roboplan_asan_ubsan", "--output-root", "/qualification-output"],
       "skip_policy": "forbid",
       "expected_outputs": ["roboplan-asan/ctest-inventory.json", "roboplan-asan/execution-index.json", "roboplan-asan/native-build-provenance.json"]
     },
@@ -1287,9 +1283,9 @@
       "ordinal": 16,
       "id": "bindings_asan_ubsan",
       "claim": "Binding-specific ASan/UBSan, lifetime and interpreter-shutdown suite",
-      "container_command": ["python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_asan_ubsan", "--output-root", "/qualification-output"],
+      "container_command": ["/usr/bin/setarch", "x86_64", "-R", "python3", "verification/composable_cell_i2/verify_qualification_manifest.py", "--manifest", "verification/composable_cell_i2/qualification_manifest.v1.json", "--execute-binding-lane", "bindings_asan_ubsan", "--output-root", "/qualification-output"],
       "skip_policy": "forbid",
-      "expected_outputs": ["bindings-asan/staged/manyforge_core_py.cpython-312-x86_64-linux-gnu.so", "bindings-asan/collection.txt", "bindings-asan/junit.xml", "bindings-asan/witness.json", "bindings-asan/build-provenance.json"]
+      "expected_outputs": ["build/bindings-asan/sanitizer-host/manyforge-python-asan-ubsan", "bindings-asan/staged/manyforge_core_py.cpython-312-x86_64-linux-gnu.so", "bindings-asan/collection.txt", "bindings-asan/junit.xml", "bindings-asan/witness.json", "bindings-asan/build-provenance.json"]
     },
     {
       "ordinal": 17,
@@ -1502,7 +1498,7 @@
       "id": "trusted_stage_python_constructor",
       "mode": "file_regex",
       "roots": ["manyforge_core/python"],
-      "pattern": "(?s)py::class_<\\s*(?:CompositionQualifiedCellIr|ApplicabilityQualifiedCellIr|CompilerQualifiedCellIr)\\b(?:(?!py::class_<).)*?\\.def\\(\\s*py::init",
+      "pattern": "(?s)py::class_<\\s*(?:deployment::)?(?:CompositionQualifiedCellIr|ApplicabilityQualifiedCellIr|CompilerQualifiedCellIr)\\b(?:(?!py::class_<).)*?\\.def\\(\\s*py::init",
       "globs": ["*.cpp", "*.hpp"],
       "exclude_globs": ["manyforge_core/python/tests/**"],
       "expected_matches": 0
@@ -1618,7 +1614,7 @@
       "binding_junit_summary",
       "log_sha256",
       "generated_output_sha256_and_size",
-      "fixture_ir_manifest_golden_and_product_digests",
+      "fixture_witnesses_and_real_product_digests",
       "identity_rotation_comparison",
       "forbidden_scan_results",
       "final_unchanged_source_identity",

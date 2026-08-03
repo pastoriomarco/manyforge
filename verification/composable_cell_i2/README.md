@@ -123,19 +123,26 @@ recorded by the manifest execute in the resolved AMD64 Docker image. Host-side
 Python is permitted only for validating and dispatching this manifest; it is
 not I2 qualification evidence.
 
-The three TSan lanes prefix the complete in-container executor with
-`/usr/bin/setarch x86_64 -R`; the frozen Docker profile grants only the
-required personality syscall. This covers configure-time GTest discovery and
-binding tests launched by the verifier, not just the final test subprocess.
-Native ordinary-test validation also retains CTest 3.25.1's exact implicit
-working directory and requires canonical command/source paths.
+All seven ASan/UBSan and TSan lanes prefix the complete in-container executor
+with `/usr/bin/setarch x86_64 -R`; the frozen Docker profile allows the
+required personality syscall. This covers
+configure-time GTest discovery and binding tests launched by the verifier, not
+just the final test subprocess. The binding ASan/UBSan lane starts CPython
+through a qualification-only executable linked to ASan, UBSan, libstdc++, and
+the matching libpython. The verifier checks and retains that host's identity
+and dynamic runtime order; it does not use `LD_PRELOAD` or weaken the ASan link
+order check. Native ordinary-test validation also retains CTest 3.25.1's exact
+implicit working directory and requires canonical command/source paths.
 
-Four lane entry points named by the manifest were intentionally absent at the
-historical first-add: `run-core-bindings.sh`,
+Four lane entry points and their two helper sources named by the manifest were
+intentionally absent at the historical first-add: `run-core-bindings.sh`,
 `run-core-bindings-sanitizer.sh`, `run-core-bindings-contract.sh`, and
-`run-composable-cell-i2-determinism.sh`. This is deliberate. They are frozen
-required red gates that I2 must implement; their absence is not evidence that
-the current tree passes or that a lane may be omitted.
+`run-composable-cell-i2-determinism.sh`, plus
+`generate-core-bindings-contract.py` and
+`core-bindings-sanitizer-host.cpp`. That historical red-gate state remains
+lineage evidence. The current candidate implements all six additions; their
+existence does not qualify them, and I2 still requires their exact focused and
+cumulative Docker executions to pass on the final source-frozen state.
 
 ## Freeze and completion rules
 
@@ -152,9 +159,10 @@ the current tree passes or that a lane may be omitted.
    qualification run.
 5. Run the lanes in manifest order. A missing, skipped, disabled, or
    substituted lane is a failure, not an unqualified success.
-6. Preserve command stdout/stderr, exit status, fixture/IR digests, generated
-   stubs/documentation, image identity, and source/API deletion results below
-   the declared output root.
+6. Preserve command stdout/stderr, exit status, named semantic fixture
+   witnesses, generated headers/stubs/documentation, real product/package
+   digests, image identity, and source/API deletion results below the declared
+   output root. Do not invent a qualification-only compiler-IR serializer.
 7. Close I2 only when the complete cumulative matrix passes against the one
    candidate state, the independent review is bound to that result, and the
    evidence bundle verifies. Partial C0.2m, C0.2n, C0.2o, C++, or Python

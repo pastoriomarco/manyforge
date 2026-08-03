@@ -6,7 +6,7 @@
 #   ./scripts/test-all.sh retained # current reduced aggregate
 #   ./scripts/test-all.sh cpp      # retained C++ only
 #   ./scripts/test-all.sh python   # retained Python only
-#   ./scripts/test-all.sh bindings # typed unavailable until I2/E0
+#   ./scripts/test-all.sh bindings # ROS-free I2 compiler bindings
 
 set -euo pipefail
 
@@ -290,8 +290,29 @@ PY
 }
 
 run_pybind_tests() {
-    section "pybind11 bindings tests"
-    manyforge_fail_composable_cell_runtime_unavailable
+    section "ROS-free pybind11 compiler bindings"
+    local stage_root="${MANYFORGE_BINDINGS_STAGE_ROOT:-${BUILD_DIR}-bindings-stage}"
+    local generated_root="${MANYFORGE_BINDINGS_GENERATED_ROOT:-${BUILD_DIR}-bindings-generated}"
+    local prepare_only="${MANYFORGE_BINDINGS_PREPARE_ONLY:-0}"
+    local arguments=(
+        release
+        --build-root "$BUILD_DIR"
+        --stage-root "$stage_root"
+        --generated-output-root "$generated_root"
+    )
+    if [[ "$prepare_only" == "1" ]]; then
+        arguments+=(--prepare-only)
+    elif [[ "$prepare_only" != "0" ]]; then
+        echo -e "${RED}  FAIL: MANYFORGE_BINDINGS_PREPARE_ONLY must be 0 or 1${NC}"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    cd "$WORKSPACE"
+    if "$WORKSPACE/scripts/ci/run-core-bindings.sh" "${arguments[@]}"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
 }
 
 run_python_tests() {

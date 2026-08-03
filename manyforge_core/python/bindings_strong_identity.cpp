@@ -1,6 +1,7 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 
+#include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <string>
 
@@ -95,6 +96,15 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ProviderInstanceId);
   MANYFORGE_BIND_STRONG_STRING(ProviderManifestId);
   MANYFORGE_BIND_STRONG_STRING(ProviderManifestRevision);
+  MANYFORGE_BIND_STRONG_STRING(CapabilityProviderBindingId);
+  MANYFORGE_BIND_STRONG_STRING(CapabilityProviderBindingRevision);
+  MANYFORGE_BIND_STRONG_STRING(SiteOverlayId);
+  MANYFORGE_BIND_STRONG_STRING(SiteOverlayRevision);
+  MANYFORGE_BIND_STRONG_STRING(ExternalResourceAlias);
+  MANYFORGE_BIND_STRONG_STRING(SiteOverlayValueRef);
+
+  MANYFORGE_BIND_STRONG_STRING(DeploymentArtifactId);
+  MANYFORGE_BIND_STRONG_STRING(DeploymentRevision);
 
   MANYFORGE_BIND_STRONG_STRING(ComponentAttachmentId);
   MANYFORGE_BIND_STRONG_STRING(ComponentAttachmentRevision);

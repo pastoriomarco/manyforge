@@ -276,6 +276,53 @@
       "urdf_repository_path": "manyforge_deployment/test/fixtures/structural_model_preparation/source.urdf"
     },
     {
+      "accepted_package_uri_prefix": "package://manyforge_example_models/models/ur10e_robotiq_2f_140/",
+      "cmake_repository_path": "manyforge_deployment/CMakeLists.txt",
+      "exact_output_relative_paths": [
+        "model.srdf",
+        "model.urdf",
+        "preparation-manifest.json"
+      ],
+      "execution_policy": "exact_cmake_execute_process_and_fresh_replay",
+      "interpreter_toolchain_key": "python",
+      "model_asset_id": "ur10e_robotiq_2f_140",
+      "output_root_relative_path": "generated/ur10e_robotiq_2f_140_structural",
+      "owner_project_id": "manyforge_deployment",
+      "required_build_testing": true,
+      "resource_repository_paths": [
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_base_link.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_coupling.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_finger.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_knuckle.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_finger.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_knuckle.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_base_link.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_coupling.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_finger.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_knuckle.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_finger.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_knuckle.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/base.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/forearm.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/shoulder.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/upperarm.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/wrist1.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/wrist2.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/wrist3.stl",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/base.dae",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/forearm.dae",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/shoulder.dae",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/upperarm.dae",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/wrist1.dae",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/wrist2.dae",
+        "manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/wrist3.dae"
+      ],
+      "resource_root_repository_path": "manyforge_example_models/models/ur10e_robotiq_2f_140",
+      "srdf_repository_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.structural.srdf",
+      "tool_repository_path": "manyforge_deployment/tools/prepare_structural_model.py",
+      "urdf_repository_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.structural.urdf"
+    },
+    {
       "accepted_package_uri_prefix": "package://manyforge_example_models/models/lite6_lite_gripper/",
       "cmake_repository_path": "manyforge_roboplan/CMakeLists.txt",
       "exact_output_relative_paths": [
@@ -443,7 +490,7 @@
       "manyforge_core_py.testing_off": {
         "project_id": "manyforge_core_py",
         "build_testing": false,
-        "projection_sha256": "a58158b375091a5cab44cafad827002d1c68ce06721b93df07daf8d3787f9a69",
+        "projection_sha256": "311740258fa6c88efe08d8b313893482312f5386eeb1a0e533726b0a0a3c4d33",
         "local_target_roles": {
           "production": [
             "<owner:manyforge_core/manyforge_content_identity>",

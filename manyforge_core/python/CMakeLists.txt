@@ -76,8 +76,13 @@ set_target_properties(
   INTERFACE_INCLUDE_DIRECTORIES
     "${MANYFORGE_DEPLOYMENT_INCLUDE_DIR}"
 )
+target_link_libraries(
+  manyforge_deployment_verification_core_archive INTERFACE
+  manyforge_content_identity_archive
+)
 target_link_libraries(manyforge_deployment_archive INTERFACE
   manyforge_deployment_verification_core_archive
+  manyforge_content_identity_archive
   OpenSSL::Crypto
   EXPAT::EXPAT
   PkgConfig::LIBYAML
@@ -86,7 +91,7 @@ target_link_libraries(manyforge_deployment_archive INTERFACE
 )
 
 # Python bindings module
-pybind11_add_module(manyforge_core_py
+pybind11_add_module(manyforge_core_py NO_EXTRAS
   bindings.cpp
   bindings_catalog.cpp
   bindings_cell_graph.cpp
@@ -99,7 +104,6 @@ pybind11_add_module(manyforge_core_py
 # Link against the manyforge_core library
 target_link_libraries(manyforge_core_py PRIVATE
   ${MANYFORGE_CORE_DIR}/libmanyforge_core.a
-  manyforge_content_identity_archive
   manyforge_deployment_archive
   pybind11::module
   pybind11::headers

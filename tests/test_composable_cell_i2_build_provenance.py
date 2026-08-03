@@ -461,6 +461,256 @@ def test_git_source_generation_replays_index_bytes_and_untracked_policy(
     assert declared["allowed_untracked_paths"] == ["declared-input.txt"]
 
 
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_git_index_snapshot_is_exactly_validation_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    object_format: str,
+) -> None:
+    repository = tmp_path / "source"
+    output = tmp_path / "qualification-output"
+    repository.mkdir()
+    output.mkdir()
+    _git(repository, "init", "--quiet", f"--object-format={object_format}")
+    _git(repository, "config", "user.name", "I2 Packet Test")
+    _git(repository, "config", "user.email", "i2-packet@example.invalid")
+    first = _write(repository / "first.txt", b"first\n")
+    second = _write(repository / "nested" / "second.txt", b"second\n")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "--quiet", "-m", "fixture")
+
+    original_run_text = provenance._run_text
+    original_run_bytes = provenance._run_bytes
+    original_sha256_file = provenance._sha256_file
+    command_counts = {"object_format": 0, "index": 0, "ninja_deps": 0}
+    physical_sha256_counts: dict[Path, int] = {}
+    qualified_link: Path | None = None
+
+    def read_text(command: list[str], *args: Any, **kwargs: Any) -> str:
+        if command[:2] == ["/usr/bin/ninja", "-C"] and command[-2] == "deps":
+            command_counts["ninja_deps"] += 1
+            dependencies = [first.resolve()]
+            if command[-1] == "symlink.o":
+                assert qualified_link is not None
+                dependencies.append(qualified_link)
+            return (
+                f"{command[-1]}: #deps {len(dependencies)}, "
+                "deps mtime 1 (VALID)\n"
+                + "".join(f"    {dependency}\n" for dependency in dependencies)
+            )
+        if command[-2:] == ["rev-parse", "--show-object-format"]:
+            command_counts["object_format"] += 1
+        return original_run_text(command, *args, **kwargs)
+
+    def read_bytes(command: list[str], *args: Any, **kwargs: Any) -> bytes:
+        if command[-3:] == ["ls-files", "--stage", "-z"]:
+            command_counts["index"] += 1
+        return original_run_bytes(command, *args, **kwargs)
+
+    def sha256_file(path: Path) -> str:
+        physical = Path(path).resolve()
+        physical_sha256_counts[physical] = (
+            physical_sha256_counts.get(physical, 0) + 1
+        )
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(provenance, "_run_text", read_text)
+    monkeypatch.setattr(provenance, "_run_bytes", read_bytes)
+    monkeypatch.setattr(provenance, "_sha256_file", sha256_file)
+
+    roots = provenance._Roots(repository.resolve(), output.resolve())
+    scoped_facts, snapshot = provenance._replay_git_source_generation(repository)
+    roots.remember_git_index_snapshot(snapshot, "test source generation")
+    for path in (first, second, first, second):
+        identity = provenance._git_tracked_file_identity(
+            path,
+            repository,
+            "tracked input",
+            roots=roots,
+        )
+        assert identity["blob"] == _git_blob(path, object_format)
+    assert command_counts == {
+        "object_format": 1,
+        "index": 1,
+        "ninja_deps": 0,
+    }
+
+    build_root = output / "build"
+    build_root.mkdir()
+    ninja_deps = _write(build_root / ".ninja_deps", b"synthetic deps\n")
+    record = provenance._CompileRecord(
+        output=build_root / "object.o",
+        source=first.resolve(),
+        directory=build_root.resolve(),
+        argv=("/usr/bin/c++", "-c", str(first.resolve())),
+        argv_sha256="a" * 64,
+    )
+    build = provenance._Build(
+        lane_id="synthetic_release",
+        project_id="synthetic",
+        root=build_root.resolve(),
+        source_root=repository.resolve(),
+        compiler_path="/usr/bin/c++",
+        archiver_path="/usr/bin/ar",
+        targets={},
+        compile_commands={record.output: record},
+        configure_inputs={},
+        configure_generated_contracts={},
+        qualified_install_inputs={},
+        evidence={},
+    )
+    closure = provenance._compile_dependency_closure(
+        build=build,
+        record=record,
+        commands={},
+        roots=roots,
+        label="synthetic compile closure",
+    )
+    repeated_closure = provenance._compile_dependency_closure(
+        build=build,
+        record=record,
+        commands={},
+        roots=roots,
+        label="repeated synthetic compile closure",
+    )
+    assert repeated_closure is closure
+    assert closure["declared_dependency_count"] == 1
+    assert command_counts == {
+        "object_format": 1,
+        "index": 1,
+        "ninja_deps": 1,
+    }
+    assert physical_sha256_counts[ninja_deps.resolve()] == 1
+    assert physical_sha256_counts[first.resolve()] == 1
+    assert roots.sha256_file(first, "repeated tracked digest") == _sha256(first)
+    assert physical_sha256_counts[first.resolve()] == 1
+
+    installed_a = _write(output / "install/a.hpp", b"installed a\n")
+    installed_b = _write(output / "install/b.hpp", b"installed b\n")
+    qualified_link = output / "install/current.hpp"
+    qualified_link.symlink_to(installed_a.name)
+    symlink_record = dataclasses.replace(
+        record,
+        output=build_root / "symlink.o",
+        argv_sha256="b" * 64,
+    )
+    symlink_build = dataclasses.replace(
+        build,
+        compile_commands={symlink_record.output: symlink_record},
+        qualified_install_inputs={qualified_link: {"owner": "synthetic"}},
+    )
+    provenance._compile_dependency_closure(
+        build=symlink_build,
+        record=symlink_record,
+        commands={},
+        roots=roots,
+        label="symlinked synthetic compile closure",
+    )
+    qualified_link.unlink()
+    qualified_link.symlink_to(installed_b.name)
+    provenance._compile_dependency_closure(
+        build=symlink_build,
+        record=symlink_record,
+        commands={},
+        roots=roots,
+        label="retargeted synthetic compile closure",
+    )
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="symlink resolution changed within one validation scope",
+    ):
+        roots.validate_cached_compile_dependencies()
+    qualified_link.unlink()
+    qualified_link.symlink_to(installed_a.name)
+    roots.validate_cached_compile_dependencies()
+    assert command_counts["ninja_deps"] == 2
+
+    original_ninja_deps = ninja_deps.read_bytes()
+    ninja_deps.write_bytes(b"changed synthetic deps\n")
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="Ninja dependency database changed within one validation scope",
+    ):
+        provenance._compile_dependency_closure(
+            build=build,
+            record=record,
+            commands={},
+            roots=roots,
+            label="mutated synthetic compile closure",
+        )
+    assert command_counts["ninja_deps"] == 2
+    ninja_deps.write_bytes(original_ninja_deps)
+    roots.validate_cached_compile_dependencies()
+
+    original_first = first.read_bytes()
+    first.write_bytes(b"changed compiler dependency\n")
+    provenance._compile_dependency_closure(
+        build=build,
+        record=record,
+        commands={},
+        roots=roots,
+        label="mutated dependency compile closure",
+    )
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="compiler dependency changed within one validation scope",
+    ):
+        roots.validate_cached_compile_dependencies()
+    first.write_bytes(original_first)
+    assert command_counts["ninja_deps"] == 2
+
+    fresh_facts = provenance.replay_git_source_generation(repository)
+    assert json.dumps(scoped_facts, sort_keys=True, separators=(",", ":")) == (
+        json.dumps(fresh_facts, sort_keys=True, separators=(",", ":"))
+    )
+    assert command_counts == {
+        "object_format": 2,
+        "index": 2,
+        "ninja_deps": 2,
+    }
+
+    original_tree = scoped_facts["patched_index_tree"]
+    first.write_bytes(b"staged replacement\n")
+    _git(repository, "add", "first.txt")
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="working bytes/mode differ from tracked Git blob",
+    ):
+        provenance._git_tracked_file_identity(
+            first,
+            repository,
+            "mutated tracked input",
+            roots=roots,
+        )
+    assert command_counts == {
+        "object_format": 2,
+        "index": 2,
+        "ninja_deps": 2,
+    }
+
+    next_roots = provenance._Roots(repository.resolve(), output.resolve())
+    staged_identity = provenance._git_tracked_file_identity(
+        first,
+        repository,
+        "new-scope tracked input",
+        roots=next_roots,
+    )
+    assert staged_identity["blob"] == _git_blob(first, object_format)
+    assert command_counts == {
+        "object_format": 3,
+        "index": 3,
+        "ninja_deps": 2,
+    }
+
+    staged_facts = provenance.replay_git_source_generation(repository)
+    assert staged_facts["patched_index_tree"] != original_tree
+    assert command_counts == {
+        "object_format": 4,
+        "index": 4,
+        "ninja_deps": 2,
+    }
+
+
 def test_tool_environment_is_closed_for_python_replay_and_loader(
     tmp_path: Path,
 ) -> None:
@@ -541,8 +791,42 @@ def _configured_target_graph_fixture(
         *provenance._GRAPHVIZ_LEGEND,
         '    "i2node0" [ label = "manyforge_core_py", shape = tripleoctagon ];',
         f'    "i2node1" [ label = "{owner_path}", shape = septagon ];',
-        '    "i2node0" -> "i2node1"  // '
+        '    "i2node0" -> "i2node1" [ style = dotted ] // '
         f"manyforge_core_py -> {owner_path}",
+        '    "i2node2" [ label = "manyforge_deployment_archive", shape = octagon ];',
+        '    "i2node3" [ label = "EXPAT::EXPAT", shape = septagon ];',
+        '    "i2node2" -> "i2node3" [ style = dashed ] // manyforge_deployment_archive -> EXPAT::EXPAT',
+        '    "i2node4" [ label = "OpenSSL::Crypto", shape = septagon ];',
+        '    "i2node2" -> "i2node4" [ style = dashed ] // manyforge_deployment_archive -> OpenSSL::Crypto',
+        '    "i2node5" [ label = "PkgConfig::LIBYAML", shape = pentagon ];',
+        '    "i2node6" [ label = "/usr/lib/x86_64-linux-gnu/libyaml.so", shape = septagon ];',
+        '    "i2node5" -> "i2node6" [ style = dashed ] // PkgConfig::LIBYAML -> /usr/lib/x86_64-linux-gnu/libyaml.so',
+        '    "i2node2" -> "i2node5" [ style = dashed ] // manyforge_deployment_archive -> PkgConfig::LIBYAML',
+        '    "i2node7" [ label = "PkgConfig::UTF8PROC", shape = pentagon ];',
+        '    "i2node8" [ label = "/usr/lib/x86_64-linux-gnu/libutf8proc.so", shape = septagon ];',
+        '    "i2node7" -> "i2node8" [ style = dashed ] // PkgConfig::UTF8PROC -> /usr/lib/x86_64-linux-gnu/libutf8proc.so',
+        '    "i2node2" -> "i2node7" [ style = dashed ] // manyforge_deployment_archive -> PkgConfig::UTF8PROC',
+        '    "i2node9" [ label = "double-conversion::double-conversion", shape = doubleoctagon ];',
+        '    "i2node2" -> "i2node9" [ style = dashed ] // manyforge_deployment_archive -> double-conversion::double-conversion',
+        '    "i2node10" [ label = "manyforge_content_identity_archive", shape = octagon ];',
+        '    "i2node2" -> "i2node10" [ style = dashed ] // manyforge_deployment_archive -> manyforge_content_identity_archive',
+        '    "i2node11" [ label = "manyforge_deployment_verification_core_archive", shape = octagon ];',
+        '    "i2node11" -> "i2node10" [ style = dashed ] // manyforge_deployment_verification_core_archive -> manyforge_content_identity_archive',
+        '    "i2node2" -> "i2node11" [ style = dashed ] // manyforge_deployment_archive -> manyforge_deployment_verification_core_archive',
+        '    "i2node0" -> "i2node2" [ style = dotted ] // manyforge_core_py -> manyforge_deployment_archive',
+        '    "i2node12" [ label = "pybind11::headers", shape = pentagon ];',
+        '    "i2node13" [ label = "pybind11::pybind11_headers", shape = pentagon ];',
+        '    "i2node12" -> "i2node13" [ style = dashed ] // pybind11::headers -> pybind11::pybind11_headers',
+        '    "i2node0" -> "i2node12" [ style = dotted ] // manyforge_core_py -> pybind11::headers',
+        '    "i2node14" [ label = "pybind11::module", shape = pentagon ];',
+        '    "i2node15" [ label = "pybind11::pybind11", shape = pentagon ];',
+        '    "i2node15" -> "i2node12" [ style = dashed ] // pybind11::pybind11 -> pybind11::headers',
+        '    "i2node16" [ label = "pybind11::python_headers", shape = pentagon ];',
+        '    "i2node15" -> "i2node16" [ style = dashed ] // pybind11::pybind11 -> pybind11::python_headers',
+        '    "i2node14" -> "i2node15" [ style = dashed ] // pybind11::module -> pybind11::pybind11',
+        '    "i2node17" [ label = "pybind11::python_link_helper", shape = pentagon ];',
+        '    "i2node14" -> "i2node17" [ style = dashed ] // pybind11::module -> pybind11::python_link_helper',
+        '    "i2node0" -> "i2node14" [ style = dotted ] // manyforge_core_py -> pybind11::module',
         "}",
     ]
     graph_path = _write(
@@ -554,24 +838,9 @@ def _configured_target_graph_fixture(
         provenance._GRAPHVIZ_OPTIONS,
     )
 
-    alias = "<owner:manyforge_core/manyforge_core>"
-    normalized_projection = {
-        "nodes": [
-            {"name": alias, "label": alias, "shape": "septagon"},
-            {
-                "name": "manyforge_core_py",
-                "label": "manyforge_core_py",
-                "shape": "tripleoctagon",
-            },
-        ],
-        "edges": [
-            {
-                "source": "manyforge_core_py",
-                "target": alias,
-                "style": "solid",
-            }
-        ],
-    }
+    configured_graph_contract = BUILD_PROVENANCE_CONTRACT_VALUE[
+        "configured_target_graph_contract"
+    ]
     contract = {
         "projects": {},
         "configured_target_graph_contract": {
@@ -581,33 +850,13 @@ def _configured_target_graph_fixture(
             "options_sha256": hashlib.sha256(
                 provenance._GRAPHVIZ_OPTIONS
             ).hexdigest(),
-            "project_node_alias_contracts": {
-                "manyforge_core_py": {
-                    "absolute_build_sibling_nodes": [
-                        {
-                            "sibling_build_directory": "core",
-                            "artifact_relative_path": "libmanyforge_core.a",
-                            "alias": alias,
-                            "expected_raw_shape": "septagon",
-                        }
-                    ],
-                    "named_nodes": [],
-                }
-            },
+            "project_node_alias_contracts": configured_graph_contract[
+                "project_node_alias_contracts"
+            ],
             "profiles": {
-                "manyforge_core_py.testing_off": {
-                    "project_id": "manyforge_core_py",
-                    "build_testing": False,
-                    "projection_sha256": provenance._canonical_sha256(
-                        normalized_projection
-                    ),
-                    "local_target_roles": {
-                        "production": [alias, "manyforge_core_py"],
-                        "test_only": [],
-                        "configured_only": [],
-                        "external": [],
-                    },
-                }
+                "manyforge_core_py.testing_off": configured_graph_contract[
+                    "profiles"
+                ]["manyforge_core_py.testing_off"]
             },
         },
     }
@@ -628,16 +877,35 @@ def test_configured_target_graph_replay_normalizes_exact_owner_alias(
         build_contract=contract,
     )
 
-    assert evidence["local_target_roles"]["production"] == [
-        "<owner:manyforge_core/manyforge_core>",
-        "manyforge_core_py",
-    ]
+    profile = BUILD_PROVENANCE_CONTRACT_VALUE[
+        "configured_target_graph_contract"
+    ]["profiles"]["manyforge_core_py.testing_off"]
+    assert evidence["projection_sha256"] == profile["projection_sha256"]
+    assert evidence["local_target_roles"] == profile["local_target_roles"]
     assert evidence["owner_node_aliases"] == [
         {
             "source": "/qualification-output/build/core/libmanyforge_core.a",
             "alias": "<owner:manyforge_core/manyforge_core>",
             "expected_raw_shape": "septagon",
-        }
+        },
+        {
+            "source": "manyforge_content_identity_archive",
+            "alias": "<owner:manyforge_core/manyforge_content_identity>",
+            "expected_raw_shape": "octagon",
+        },
+        {
+            "source": "manyforge_deployment_archive",
+            "alias": "<owner:manyforge_deployment/manyforge_deployment>",
+            "expected_raw_shape": "octagon",
+        },
+        {
+            "source": "manyforge_deployment_verification_core_archive",
+            "alias": (
+                "<owner:manyforge_deployment/"
+                "manyforge_deployment_verification_core>"
+            ),
+            "expected_raw_shape": "octagon",
+        },
     ]
     binding_external = BUILD_PROVENANCE_CONTRACT_VALUE[
         "configured_target_graph_contract"
@@ -683,10 +951,22 @@ def test_focused_selection_does_not_shrink_configured_file_api_targets() -> None
     target_graph = {
         "local_target_roles": {
             "production": ["manyforge_deployment"],
-            "test_only": ["test_focused", "test_unselected"],
+            "test_only": [
+                "test_focused",
+                "test_interface_contract",
+                "test_unselected",
+            ],
             "configured_only": ["configured_helper"],
             "external": ["GTest::gtest"],
-        }
+        },
+        "nodes": [
+            {"name": "GTest::gtest", "shape": "septagon"},
+            {"name": "configured_helper", "shape": "box"},
+            {"name": "manyforge_deployment", "shape": "octagon"},
+            {"name": "test_focused", "shape": "egg"},
+            {"name": "test_interface_contract", "shape": "pentagon"},
+            {"name": "test_unselected", "shape": "egg"},
+        ],
     }
 
     assert provenance._native_configured_file_api_target_names(
@@ -712,6 +992,7 @@ def test_focused_selection_does_not_shrink_configured_file_api_targets() -> None
     )
     for drifted in (
         configured - {"test_unselected"},
+        configured | {"test_interface_contract"},
         configured | {"unexpected"},
     ):
         with pytest.raises(
@@ -890,7 +1171,7 @@ def _configure_executed_replay_fixture(
         "output_root_relative_path": output_relative,
         "exact_output_relative_paths": paths,
         "cmake_repository_path": "project/CMakeLists.txt",
-        "tool_repository_path": "project/tools/prepare.py",
+        "tool_repository_path": "shared/tools/prepare.py",
         "urdf_repository_path": "project/model/source.urdf",
         "srdf_repository_path": "project/model/source.srdf",
         "resource_repository_paths": ["project/model/mesh.stl"],
@@ -910,7 +1191,7 @@ def _configure_executed_replay_fixture(
             "path": path,
             "sha256": hashlib.sha256(path.encode()).hexdigest(),
             "is_generated": False,
-            "is_external": False,
+            "is_external": not path.startswith("/workspace/project/"),
             "is_cmake": False,
             "identity": {"kind": "git_tracked_source"},
         }
@@ -933,7 +1214,7 @@ def _configure_executed_replay_fixture(
         "argv_sha256": "d" * 64,
         "cross_profile_argv_sha256": "e" * 64,
         "cmake": "/workspace/project/CMakeLists.txt",
-        "tool": "/workspace/project/tools/prepare.py",
+        "tool": f"/workspace/{fixture_contract['tool_repository_path']}",
         "interpreter": {
             "path": python_contract["lexical_path"],
             "resolved_path": python_contract["resolved_path"],
@@ -946,8 +1227,10 @@ def _configure_executed_replay_fixture(
     }
     project = {
         "project_id": "project",
+        "source_root": "/workspace/project",
         "build_root": build_root,
         "build_testing": True,
+        "configure_inputs": copy.deepcopy(required_inputs),
         "configure_executed_fixtures": [row],
     }
     build_contract = {
@@ -969,6 +1252,23 @@ def test_host_joins_configure_executed_output_to_fresh_replay(tmp_path: Path) ->
         repository_root=repository_root,
         label="synthetic project",
     )
+
+    row = project["configure_executed_fixtures"][0]
+    external_input = next(
+        item for item in row["required_inputs"] if item["is_external"]
+    )
+    external_input["is_external"] = False
+    row["required_inputs_sha256"] = verifier._canonical_json_sha256(
+        row["required_inputs"]
+    )
+    with pytest.raises(verifier.ManifestError, match="source identity drifted"):
+        verifier._validate_project_configure_fixtures(
+            project,
+            build_contract=build_contract,
+            lane_root=lane_root,
+            repository_root=repository_root,
+            label="synthetic relabelled project input",
+        )
 
 
 def test_host_rejects_self_consistent_but_different_configure_replay(
@@ -2198,7 +2498,8 @@ def _gtest_discovery_fixture(
         discovery.extend(("-D", assignment))
     discovery.extend(("-P", provenance._GTEST_DISCOVERY_MODULE.as_posix()))
     line = (
-        f"/usr/bin/c++ -o {roots.logical(executable)} {roots.logical(object_path)}"
+        f"/usr/bin/c++ -fvisibility=hidden -o {roots.logical(executable)} "
+        f"{roots.logical(object_path)}"
         f" && cd {roots.logical(build_root)} && {' '.join(discovery)}"
     )
     return line, build, roots, executable
@@ -2473,8 +2774,12 @@ def test_ninja_commands_join_gtest_discovery_to_same_link_output(
         reply_path=other_reply,
         reply_sha256=_sha256(other_reply),
     )
-    link_prefix = f"/usr/bin/c++ -o {roots.logical(executable)}"
-    mismatched_prefix = f"/usr/bin/c++ -o {roots.logical(other_executable)}"
+    link_prefix = (
+        f"/usr/bin/c++ -fvisibility=hidden -o {roots.logical(executable)}"
+    )
+    mismatched_prefix = (
+        f"/usr/bin/c++ -fvisibility=hidden -o {roots.logical(other_executable)}"
+    )
     assert link_prefix in line
 
     with pytest.raises(
@@ -2530,6 +2835,7 @@ def test_compile_database_rejects_hidden_tool_or_plugin_controls(
                     "output": str(object_path),
                     "arguments": [
                         "/usr/bin/c++",
+                        "-fvisibility=hidden",
                         *extra_argv,
                         "-o",
                         str(object_path),
@@ -2544,7 +2850,7 @@ def test_compile_database_rejects_hidden_tool_or_plugin_controls(
 
     with pytest.raises(
         provenance.NativeBuildProvenanceError,
-        match="unsupported|forbidden|unqualified",
+        match=re.escape(extra_argv[0]),
     ):
         provenance._load_compile_commands(
             "synthetic",
@@ -3074,8 +3380,10 @@ def _host_target_projection_fixture(
     }
 
 
-def _validate_host_target_projection_fixture(fixture: dict[str, Any]) -> None:
-    verifier._validate_target_proofs_against_projection(
+def _validate_host_target_projection_fixture(
+    fixture: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    return verifier._validate_target_proofs_against_projection(
         fixture["proofs"],
         fixture["projection"],
         expected=fixture["expected"],
@@ -3089,6 +3397,9 @@ def _validate_host_target_projection_fixture(fixture: dict[str, Any]) -> None:
         lane_root=fixture["lane_root"],
         allow_unexpected_proofs=False,
         label="synthetic target proof/parity join",
+        additional_proved_executable_owners=fixture.get(
+            "additional_proved_executable_owners"
+        ),
     )
 
 
@@ -4090,7 +4401,33 @@ def test_host_joins_generated_dependency_to_executable_owner(tmp_path: Path) -> 
     dependency, _, _ = _add_compile_dependency_fixture(fixture)
     _add_executable_generator_fixture(fixture, dependency)
 
+    generator_owner = ("project", "generator")
+    generator_proof = next(
+        row for row in fixture["proofs"] if row["target"] == "generator"
+    )
+    generator_projection = next(
+        row for row in fixture["projection"] if row["target"] == "generator"
+    )
+    producer_fixture = {
+        **fixture,
+        "proofs": [generator_proof],
+        "projection": [generator_projection],
+        "expected": {generator_owner: fixture["expected"][generator_owner]},
+    }
+    proved_generator = _validate_host_target_projection_fixture(producer_fixture)
+    fixture["proofs"] = [
+        row for row in fixture["proofs"] if row["target"] != "generator"
+    ]
+    fixture["projection"] = [
+        row for row in fixture["projection"] if row["target"] != "generator"
+    ]
+    fixture["expected"].pop(generator_owner)
+    fixture["additional_proved_executable_owners"] = proved_generator
     _validate_host_target_projection_fixture(fixture)
+
+    fixture["additional_proved_executable_owners"] = {}
+    with pytest.raises(verifier.ManifestError, match="no proved executable owner"):
+        _validate_host_target_projection_fixture(fixture)
 
 
 def test_host_rejects_reserved_configure_output_as_executable_generated(
@@ -4535,6 +4872,81 @@ def test_host_joins_generated_input_to_direct_consumer_object(
         lane_root=lane_root,
     ) == relationships
 
+    relationship = relationships[0]
+    utility, producer, consumer = targets
+    evidence = {
+        "production_targets": [producer],
+        "test_only_targets": [utility],
+        "targets": [producer, consumer],
+    }
+    output_owner_proofs = verifier._native_target_output_owner_proofs(
+        evidence, "synthetic_native"
+    )
+    assert [target["target"] for target in output_owner_proofs] == [
+        "generator",
+        "generate_output",
+        "generator",
+        "consumer",
+    ]
+    relationship_proofs = verifier._native_utility_relationship_proofs(
+        evidence, "synthetic_native", "project"
+    )
+    assert [target["target"] for target in relationship_proofs] == [
+        "generator",
+        "generate_output",
+        "consumer",
+    ]
+
+    relationship["consumer_relationships"] = [
+        {"target": "consumer", "kind": "target_dependency"}
+    ]
+    utility["consumer_relationships"] = [
+        {
+            "target": "consumer",
+            "kind": "target_dependency",
+            "graph_style": "solid",
+        }
+    ]
+    consumer["required_generated_inputs"] = []
+    consumer["commands"][0]["dependency_closure"]["files"] = []
+    assert verifier._validate_utility_target_relationships(
+        relationships,
+        relationship_proofs,
+        "synthetic partitioned utility owner",
+        lane_root=lane_root,
+    ) == relationships
+
+    utility["output_inventory"]["policy"] = "exact_bounded_tree"
+    utility["commands"][0]["output"] = utility["output_inventory"]["root"]
+    assert verifier._validate_utility_target_relationships(
+        relationships,
+        relationship_proofs,
+        "synthetic bounded-tree utility owner",
+        lane_root=lane_root,
+    ) == relationships
+
+    utility["commands"][0]["output"] += "/wrong"
+    with pytest.raises(
+        verifier.ManifestError, match="no unique generated-output command"
+    ):
+        verifier._validate_utility_target_relationships(
+            relationships,
+            relationship_proofs,
+            "synthetic relabelled tree root",
+            lane_root=lane_root,
+        )
+
+    evidence["targets"] = [producer]
+    with pytest.raises(verifier.ManifestError, match="unproved"):
+        verifier._validate_utility_target_relationships(
+            relationships,
+            verifier._native_utility_relationship_proofs(
+                evidence, "synthetic_native", "project"
+            ),
+            "synthetic omitted consumer",
+            lane_root=lane_root,
+        )
+
 
 def test_host_rejects_generated_input_used_only_by_transitive_compile(
     tmp_path: Path,
@@ -4836,6 +5248,7 @@ def _prove_required_generated_input_fixture(
         profile="none",
         roots=roots,
         responses=provenance._ResponseCollector(roots),
+        utility_contracts={},
     )
     return proof, generated_path, generator_argv_sha256
 
@@ -5299,6 +5712,7 @@ def _utility_virtual_target(
 
 def test_cmake_virtual_source_set_accepts_exact_nested_utility_shape(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     build, roots = _virtual_source_build(tmp_path)
     target_build_base = build.root / "nested"
@@ -5311,6 +5725,29 @@ def test_cmake_virtual_source_set_accepts_exact_nested_utility_shape(
         target_build_base=target_build_base,
         primary=primary,
     )
+    build.targets[target.name] = target
+    build.evidence["configured_target_graph"] = {
+        "edges": [
+            {
+                "source": "generate_consumer",
+                "target": target.name,
+                "style": "solid",
+            }
+        ]
+    }
+    contract = provenance._UtilityTargetContract(
+        project_id="project",
+        target_name=target.name,
+        primary_output=primary.relative_to(build.root),
+        declared_byproducts=(),
+        producer_target="generator",
+        producer_artifact=Path("generator"),
+        generator_output_option="--output",
+        generator_output=primary.relative_to(build.root),
+        housekeeping_policy="make_output_parent",
+        output_inventory_policy="single_file",
+        consumer_relationships=(),
+    )
 
     assert (
         provenance._require_cmake_utility_virtual_sources(
@@ -5320,6 +5757,412 @@ def test_cmake_virtual_source_set_accepts_exact_nested_utility_shape(
         )
         is None
     )
+    phony = target_build_base / target.name
+    dependency = provenance._cmake_utility_order_only_dependency(
+        build=build,
+        current_target="generate_consumer",
+        edge_type="order_only",
+        path=phony,
+        utility_contracts={("project", target.name): contract},
+        roots=roots,
+    )
+    assert dependency == {
+        "type": "order_only",
+        "path": roots.logical(phony),
+        "dependency_kind": "cmake_utility_target",
+        "owner_project_id": "project",
+        "owner_target": target.name,
+        "owner_file_api_target_reply": {
+            "path": roots.logical(target.reply_path),
+            "sha256": target.reply_sha256,
+        },
+        "owner_generated_output": {
+            "path": roots.logical(primary),
+            "sha256": _sha256(primary),
+        },
+    }
+    assert "sha256" not in dependency
+
+    build_root = roots.logical(build.root)
+    current_target = "generate_consumer"
+    current_output = "generated/consumer.json"
+    target_index = {
+        ("project", current_target): {
+            "project_id": "project",
+            "target": current_target,
+            "target_type": "UTILITY",
+            "build_root": build_root,
+            "ninja_query": [
+                {
+                    "node": current_output,
+                    "rule": "CUSTOM_COMMAND",
+                    "edges": [
+                        {"type": "order_only", "path": dependency["path"]}
+                    ],
+                }
+            ],
+            "generator_dependencies": [dependency],
+        },
+        ("project", target.name): {
+            "project_id": "project",
+            "target": target.name,
+            "target_type": "UTILITY",
+            "build_root": build_root,
+            "contract_artifact": primary.relative_to(build.root).as_posix(),
+            "file_api_target_reply": dict(
+                dependency["owner_file_api_target_reply"]
+            ),
+            "artifact": {
+                "path": roots.logical(primary),
+                "sha256": _sha256(primary),
+            },
+            "ninja_query": [],
+            "generator_dependencies": [],
+        },
+    }
+    relationship_index = {
+        ("project", current_target): {
+            "primary_output_relative_path": current_output,
+        },
+        ("project", target.name): {
+            "primary_output_relative_path": primary.relative_to(
+                build.root
+            ).as_posix(),
+            "generated_output_sha256": _sha256(primary),
+        },
+    }
+    assert verifier._validate_cmake_utility_order_only_dependencies(
+        target_index=target_index,
+        relationship_index=relationship_index,
+        lane_root=roots.output,
+        label="synthetic nested utility",
+    ) is None
+    assert provenance._join_cmake_utility_order_only_dependencies(
+        project_id="project",
+        target_name=current_target,
+        utility=target_index[("project", current_target)],
+        proof_index={name: row for (_project, name), row in target_index.items()},
+        project_contracts={target.name: contract},
+    ) is None
+
+    mutations = [
+        (lambda row: row.__setitem__("type", "explicit"), True),
+        (lambda row: row.__setitem__("dependency_kind", "unknown"), True),
+        (lambda row: row.__setitem__("owner_target", current_target), True),
+        (lambda row: row.__setitem__("owner_target", "missing"), True),
+        (
+            lambda row: row.__setitem__("path", f"{build_root}/nested/wrong"),
+            False,
+        ),
+        (
+            lambda row: row["owner_file_api_target_reply"].__setitem__(
+                "sha256", "d" * 64
+            ),
+            True,
+        ),
+        (
+            lambda row: row["owner_generated_output"].__setitem__(
+                "sha256", "e" * 64
+            ),
+            True,
+        ),
+    ]
+    for mutate, packet_rejects in mutations:
+        mutated = copy.deepcopy(target_index)
+        mutate(mutated[("project", current_target)]["generator_dependencies"][0])
+        with pytest.raises(verifier.ManifestError):
+            verifier._validate_cmake_utility_order_only_dependencies(
+                target_index=mutated,
+                relationship_index=relationship_index,
+                lane_root=roots.output,
+                label="synthetic nested utility",
+            )
+        if packet_rejects:
+            with pytest.raises(provenance.NativeBuildProvenanceError):
+                provenance._join_cmake_utility_order_only_dependencies(
+                    project_id="project",
+                    target_name=current_target,
+                    utility=mutated[("project", current_target)],
+                    proof_index={
+                        name: row for (_project, name), row in mutated.items()
+                    },
+                    project_contracts={target.name: contract},
+                )
+    omitted = copy.deepcopy(target_index)
+    omitted[("project", current_target)]["generator_dependencies"].clear()
+    with pytest.raises(verifier.ManifestError, match="dependency set drifted"):
+        verifier._validate_cmake_utility_order_only_dependencies(
+            target_index=omitted,
+            relationship_index=relationship_index,
+            lane_root=roots.output,
+            label="synthetic nested utility",
+        )
+
+    tree_name = "generate_tree"
+    tree_output = build.root / "tree-output"
+    tree_output.mkdir()
+    tree_primary = _write(tree_output / "manifest.json")
+    tree_producer = _write(build.root / "tree-generator", executable=True)
+    tree_owner = dataclasses.replace(
+        target,
+        name=tree_name,
+        build_base=build.root,
+        reply_path=build.root / "target-generate-tree.json",
+    )
+    build.targets[tree_name] = tree_owner
+    tree_contract = provenance._UtilityTargetContract(
+        project_id="project",
+        target_name=tree_name,
+        primary_output=tree_primary.relative_to(build.root),
+        declared_byproducts=(),
+        producer_target="tree_generator",
+        producer_artifact=tree_producer.relative_to(build.root),
+        generator_output_option="--output-root",
+        generator_output=tree_output.relative_to(build.root),
+        housekeeping_policy="replace_output_root",
+        output_inventory_policy="exact_bounded_tree",
+        consumer_relationships=(("material_consumer", "target_dependency"),),
+    )
+    tree_command = provenance._Command(
+        kind="generated",
+        output=tree_output,
+        inputs=(tree_producer,),
+        auxiliary_outputs=(),
+        source=None,
+        directory=build.root,
+        argv=(tree_producer.as_posix(), "--output-root", tree_output.as_posix()),
+        argv_sha256="1" * 64,
+    )
+    second_tree_name = "generate_second_tree"
+    second_tree_output = build.root / "second-tree-output"
+    second_tree_output.mkdir()
+    second_tree_primary = _write(second_tree_output / "manifest.json")
+    second_tree_producer = _write(
+        build.root / "second-tree-generator", executable=True
+    )
+    build.targets[second_tree_name] = dataclasses.replace(
+        target,
+        name=second_tree_name,
+        build_base=build.root,
+        reply_path=build.root / "target-generate-second-tree.json",
+    )
+    second_tree_contract = dataclasses.replace(
+        tree_contract,
+        target_name=second_tree_name,
+        primary_output=second_tree_primary.relative_to(build.root),
+        producer_target="second_tree_generator",
+        producer_artifact=second_tree_producer.relative_to(build.root),
+        generator_output=second_tree_output.relative_to(build.root),
+    )
+    second_tree_command = dataclasses.replace(
+        tree_command,
+        output=second_tree_output,
+        inputs=(second_tree_producer,),
+        argv=(
+            second_tree_producer.as_posix(),
+            "--output-root",
+            second_tree_output.as_posix(),
+        ),
+        argv_sha256="3" * 64,
+    )
+    material_output = _write(build.root / "material-consumer")
+    material_command = provenance._Command(
+        kind="link",
+        output=material_output,
+        inputs=(),
+        auxiliary_outputs=(),
+        source=None,
+        directory=build.root,
+        argv=("/usr/bin/c++", "-o", material_output.as_posix()),
+        argv_sha256="2" * 64,
+    )
+    tree_edge = {
+        "type": "order_only",
+        "path": roots.logical(build.root / tree_name),
+    }
+    second_tree_edge = {
+        "type": "order_only",
+        "path": roots.logical(build.root / second_tree_name),
+    }
+    material_queries = [
+        {
+            "node": "material-consumer",
+            "rule": "link",
+            "edges": [tree_edge, second_tree_edge],
+        }
+    ]
+    material_commands = {
+        tree_output: tree_command,
+        second_tree_output: second_tree_command,
+        material_output: material_command,
+    }
+    utility_contracts = {
+        ("project", tree_name): tree_contract,
+        ("project", second_tree_name): second_tree_contract,
+    }
+    assert provenance._material_target_commands(
+        build=build,
+        target_name="material_consumer",
+        commands=material_commands,
+        query_rows=material_queries,
+        roots=roots,
+        utility_contracts=utility_contracts,
+    ) == {material_output: material_command}
+
+    tree_mutations = [
+        (
+            {
+                second_tree_output: second_tree_command,
+                material_output: material_command,
+            },
+            material_queries,
+            tree_contract,
+        ),
+        (
+            {
+                tree_output: dataclasses.replace(tree_command, kind="link"),
+                second_tree_output: second_tree_command,
+                material_output: material_command,
+            },
+            material_queries,
+            tree_contract,
+        ),
+        (
+            {
+                tree_output: dataclasses.replace(tree_command, inputs=()),
+                second_tree_output: second_tree_command,
+                material_output: material_command,
+            },
+            material_queries,
+            tree_contract,
+        ),
+        (
+            {
+                tree_output: dataclasses.replace(
+                    tree_command, argv=(*tree_command.argv[:-1], "/wrong")
+                ),
+                second_tree_output: second_tree_command,
+                material_output: material_command,
+            },
+            material_queries,
+            tree_contract,
+        ),
+        (
+            material_commands,
+            material_queries,
+            dataclasses.replace(
+                tree_contract,
+                generator_output=Path("wrong-tree-output"),
+            ),
+        ),
+        (material_commands, [], tree_contract),
+        (
+            material_commands,
+            [
+                {
+                    "node": "material-consumer",
+                    "rule": "link",
+                    "edges": [tree_edge, tree_edge, second_tree_edge],
+                }
+            ],
+            tree_contract,
+        ),
+        (
+            material_commands,
+            material_queries,
+            dataclasses.replace(
+                tree_contract,
+                consumer_relationships=(
+                    ("material_consumer", "target_dependency"),
+                    ("material_consumer", "compiled_generated_input"),
+                ),
+            ),
+        ),
+    ]
+    for mutated_commands, mutated_queries, mutated_contract in tree_mutations:
+        with pytest.raises(provenance.NativeBuildProvenanceError):
+            provenance._material_target_commands(
+                build=build,
+                target_name="material_consumer",
+                commands=mutated_commands,
+                query_rows=mutated_queries,
+                roots=roots,
+                utility_contracts={
+                    ("project", tree_name): mutated_contract,
+                    ("project", second_tree_name): second_tree_contract,
+                },
+            )
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="uncontracted directory-output command",
+    ):
+        provenance._material_target_commands(
+            build=build,
+            target_name="material_consumer",
+            commands=material_commands,
+            query_rows=material_queries,
+            roots=roots,
+            utility_contracts={},
+        )
+
+    query_nodes: list[str] = []
+
+    def one_query(
+        _build: provenance._Build,
+        node: str,
+        _roots: provenance._Roots,
+        _label: str,
+    ) -> tuple[dict[str, Any], list[tuple[str, Path]]]:
+        query_nodes.append(node)
+        if node == "nested/generate_profile":
+            return (
+                {"node": node, "rule": "phony", "edges": []},
+                [("explicit", primary)],
+            )
+        assert node == "nested/generated/profile.hpp"
+        return ({"node": node, "rule": "CUSTOM_COMMAND", "edges": []}, [])
+
+    def stop_after_command_target(
+        argv: list[str],
+        cwd: Path,
+        _label: str,
+        **_kwargs: Any,
+    ) -> str:
+        assert cwd == build.root
+        assert argv == [
+            "/usr/bin/ninja",
+            "-C",
+            str(build.root),
+            "-t",
+            "commands",
+            "nested/generate_profile",
+        ]
+        raise RuntimeError("canonical nested utility target observed")
+
+    monkeypatch.setattr(provenance, "_one_query", one_query)
+    monkeypatch.setattr(provenance, "_run_text", stop_after_command_target)
+    spec = provenance._ProductTargetSpec(
+        name=target.name,
+        target_type="UTILITY",
+        artifact=contract.primary_output,
+        required_sources=(),
+        required_generated_sources=(),
+    )
+    with pytest.raises(RuntimeError, match="canonical nested utility target observed"):
+        provenance._prove_utility_target(
+            build=build,
+            spec=spec,
+            contract=contract,
+            role="production_dependency",
+            profile="release",
+            roots=roots,
+            responses=provenance._ResponseCollector(roots),
+            utility_contracts={("project", target.name): contract},
+        )
+    assert query_nodes == [
+        "nested/generate_profile",
+        "nested/generated/profile.hpp",
+    ]
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "reordered"])
@@ -5336,6 +6179,59 @@ def test_cmake_utility_virtual_source_set_rejects_exact_shape_drift(
         target_build_base=build.root,
         primary=primary,
     )
+    if mutation == "missing":
+        build.targets[target.name] = target
+        build.evidence["configured_target_graph"] = {
+            "edges": [
+                {
+                    "source": "generate_consumer",
+                    "target": target.name,
+                    "style": "solid",
+                }
+            ]
+        }
+        contract = provenance._UtilityTargetContract(
+            project_id="project",
+            target_name=target.name,
+            primary_output=primary.relative_to(build.root),
+            declared_byproducts=(),
+            producer_target="generator",
+            producer_artifact=Path("generator"),
+            generator_output_option="--output",
+            generator_output=primary.relative_to(build.root),
+            housekeeping_policy="make_output_parent",
+            output_inventory_policy="single_file",
+            consumer_relationships=(),
+        )
+        contracts = {("project", target.name): contract}
+        phony = target.build_base / target.name
+        assert provenance._cmake_utility_order_only_dependency(
+            build=build,
+            current_target="generate_consumer",
+            edge_type="explicit",
+            path=phony,
+            utility_contracts=contracts,
+            roots=roots,
+        ) is None
+        assert provenance._cmake_utility_order_only_dependency(
+            build=build,
+            current_target="generate_consumer",
+            edge_type="order_only",
+            path=target.build_base / "not_a_target",
+            utility_contracts=contracts,
+            roots=roots,
+        ) is None
+        with pytest.raises(
+            provenance.NativeBuildProvenanceError, match="self-owned"
+        ):
+            provenance._cmake_utility_order_only_dependency(
+                build=build,
+                current_target=target.name,
+                edge_type="order_only",
+                path=phony,
+                utility_contracts=contracts,
+                roots=roots,
+            )
     rows = list(target.virtual_sources)
     if mutation == "missing":
         rows.pop()
@@ -7667,6 +8563,7 @@ def test_binding_consumer_witness_cannot_name_a_different_producer(
             f"{verifier.BINDING_EXTENSION_NAME}"
         ),
         "extension_sha256": _sha256(extension),
+        "sanitizer_host": None,
         "producer_lane_id": "bindings_release",
         "build_provenance_path": build_row["provenance_output"],
         "build_provenance_sha256": _sha256(build_provenance_path),

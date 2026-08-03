@@ -101,7 +101,7 @@ All commands run inside the container (`docker compose run --rm dev bash`).
 # Individual suites
 ./scripts/test-all.sh cpp          # all C++ package tests
 ./scripts/test-all.sh roboplan     # retained-model RoboPlan qualification only
-./scripts/test-all.sh bindings     # explicitly unavailable during I2 cutover
+./scripts/test-all.sh bindings     # ROS-free I2 compiler bindings and API contract
 ./scripts/test-all.sh python       # manyforge_behavior
 ./scripts/test-all.sh integration  # unavailable until native restoration
 ./scripts/test-all.sh composer     # structural Composer tests + frontend build
@@ -112,12 +112,12 @@ The historical no-argument and `all` forms intentionally return
 product matrix and must not silently succeed after that matrix was narrowed.
 Use the named retained or focused selectors above.
 
-The current destructive `dev` checkpoint is not a full-suite qualification:
-the aggregate deployment registry intentionally retains stale identity/golden
-assertions until the I2/I3 surface freezes, and runtime-dependent Python,
-Composer, ROS, and lane suites remain unavailable. Use the focused package
-commands recorded by the active plan rather than interpreting an unavailable
-suite as a product regression.
+The current destructive `dev` checkpoint is not a full-suite qualification.
+The `bindings` selector now builds and tests the real ROS-free
+`manyforge_core_py` compiler surface and its generated API contract; it does
+not start processes or restore any runtime product. I2 still closes only at
+its exact source freeze and cumulative offline qualification. Runtime-dependent
+Python, Composer, ROS, and product-lane suites remain unavailable.
 
 The separate ROS Jazzy image remains a development toolchain for focused
 internal contracts. Such checks do not restore or qualify a ROS product:
@@ -153,7 +153,7 @@ ctest --output-on-failure
 
 ```
 manyforge_core/          C++ library: execution kernel, state machine, DTOs, ports
-  python/                pybind11 bindings exposing the kernel to Python
+  python/                pybind11 DTO and graph/compiler projections; no runtime-owner bindings
 manyforge_content_identity/  Shared ROS-free canonical JSON and content-digest primitives
 manyforge_persistence/   Shared ROS-free mechanical durable-storage safety primitives
 manyforge_scene/         Canonical-empty C++ logical-scene owner foundation only

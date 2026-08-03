@@ -850,9 +850,13 @@ void add_artifact_reference(ParseAccumulator& accumulator,
   require_no_text(node);
   require_allowed_attributes(node, {"name"}, {"name"});
   const auto* name = find_attribute(node, "name");
-  validate_source_symbol(*name, "material name");
   UrdfMaterialIr material;
-  material.name = *name;
+  if (!name->empty()) {
+    validate_source_symbol(*name, "material name");
+    material.name = *name;
+  } else if (top_level) {
+    fail("top-level URDF material name must not be empty");
+  }
   for (const auto& child : node.children) {
     require_no_text(child);
     if (!child.children.empty()) {
@@ -889,12 +893,17 @@ void add_artifact_reference(ParseAccumulator& accumulator,
     if (!material.color.has_value() && !material.texture.has_value()) {
       fail("top-level URDF material must define a color or texture");
     }
-    if (!accumulator.top_level_materials.emplace(*name).second) {
-      fail("URDF contains duplicate top-level material name '" + *name +
+    if (!accumulator.top_level_materials.emplace(*material.name).second) {
+      fail("URDF contains duplicate top-level material name '" +
+           *material.name +
            "'");
     }
   } else if (!material.color.has_value() && !material.texture.has_value()) {
-    accumulator.referenced_materials.emplace(*name);
+    if (!material.name.has_value()) {
+      fail("inline URDF material with an empty name must define a color or "
+           "texture");
+    }
+    accumulator.referenced_materials.emplace(*material.name);
   }
   return material;
 }
@@ -2489,9 +2498,7 @@ void emit_geometry(std::string& output, const UrdfGeometryIr& geometry) {
 
 void emit_material(std::string& output, const UrdfMaterialIr& material) {
   output.append("<material");
-  if (material.name.has_value()) {
-    append_attribute(output, "name", *material.name);
-  }
+  append_attribute(output, "name", material.name.value_or(""));
   if (!material.color.has_value() && !material.texture.has_value()) {
     output.append("/>");
     return;

@@ -377,7 +377,6 @@ def test_ros_runtime_wrappers_share_one_explicit_unavailable_boundary(
 @pytest.mark.parametrize(
     "suite",
     (
-        "bindings",
         "integration",
         "qualification",
         "qualification-all",
@@ -399,6 +398,25 @@ def test_unavailable_test_suites_fail_instead_of_skipping_or_mocking(
     )
     assert completed.returncode == 78, suite
     assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
+
+
+def test_bindings_selector_routes_to_the_real_i2_builder() -> None:
+    source = _TEST_ALL.read_text(encoding="utf-8")
+    body = source.split("run_pybind_tests() {", 1)[1].split(
+        "run_python_tests() {", 1
+    )[0]
+
+    assert "ROS-free pybind11 compiler bindings" in body
+    assert 'MANYFORGE_BINDINGS_PREPARE_ONLY:-0' in body
+    assert 'MANYFORGE_BINDINGS_STAGE_ROOT:-${BUILD_DIR}-bindings-stage' in body
+    assert (
+        'MANYFORGE_BINDINGS_GENERATED_ROOT:-${BUILD_DIR}-bindings-generated'
+        in body
+    )
+    assert '"$WORKSPACE/scripts/ci/run-core-bindings.sh"' in body
+    assert '--build-root "$BUILD_DIR"' in body
+    assert "arguments+=(--prepare-only)" in body
+    assert "manyforge_fail_composable_cell_runtime_unavailable" not in body
 
 
 def test_retained_bridge_suite_qualifies_protocol_without_live_bridge() -> None:

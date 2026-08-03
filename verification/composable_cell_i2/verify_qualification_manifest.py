@@ -51,7 +51,6 @@ RESULT_SCHEMA = "manyforge.composable_cell_i2.qualification_result.v1"
 REVIEW_SCHEMA = "manyforge.composable_cell_i2.adversarial_review.v1"
 CLOSURE_SCHEMA = "manyforge.composable_cell_i2.qualification_closure.v1"
 SOURCE_IDENTITY_SCHEMA = "manyforge.source_identity.v1"
-FIXTURE_IR_WITNESS_SCHEMA = "manyforge.composable_cell_i2.fixture_ir_witness.v1"
 OUTPUT_ROOT = Path(".manyforge-var/qualification/composable-cell-i2")
 GRAPHVIZ_OPTIONS = b"""set(GRAPHVIZ_GRAPH_NAME \"manyforge_i2\")
 set(GRAPHVIZ_GRAPH_HEADER \"node [ fontsize = \\\"12\\\" ];\")
@@ -593,6 +592,10 @@ REQUIRED_BINDING_SCRIPTS = {
     "scripts/ci/run-core-bindings-contract.sh",
     "scripts/ci/run-composable-cell-i2-determinism.sh",
 }
+REQUIRED_BINDING_ADDITIONS = REQUIRED_BINDING_SCRIPTS | {
+    "scripts/ci/core-bindings-sanitizer-host.cpp",
+    "scripts/ci/generate-core-bindings-contract.py",
+}
 REQUIRED_GENERATED_OUTPUTS = {
     "extension": "/qualification-output/generated/manyforge_core_py.cpython-312-x86_64-linux-gnu.so",
     "typed_stub": "/qualification-output/generated/manyforge_core_py.pyi",
@@ -606,8 +609,13 @@ GENERATED_OUTPUT_LANES = {
     "api_documentation": "bindings_generated_api",
 }
 REQUIRED_NONCONSTRUCTIBLE_EXPORTS = {
+    "RevisionVerifiedDeploymentArtifact",
+    "RevisionVerifiedDeploymentApplicabilityInputs",
     "GraphRevisionVerifiedCellGraph",
-    "VerifiedModelSourceArtifact",
+    "VerifiedSiteOverlayArtifactProjection",
+    "QualifiedSelectedSiteOverlay",
+    "ModelSourceRetrievalPlan",
+    "ModelSourceIr",
     "SourceVerifiedModelAsset",
     "CompositionQualifiedCellIr",
     "ApplicabilityQualifiedCellIr",
@@ -678,15 +686,17 @@ REQUIRED_ROTATING_BASELINE = {
 }
 REQUIRED_REGRESSION_PRODUCTS = {
     "canonical_empty_product_package/canonical-empty-admission.json",
+    "canonical_empty_product_package/build-manifests/*/*.json",
+    "canonical_empty_product_package/raw-artifacts/sha256/*.blob",
+    "canonical_empty_product_package/retained-bundles/sha256/*.json",
     "lite6_retained_consumer_fixture/manifest.json",
     "lite6_retained_consumer_fixture/retained-model.urdf",
     "lite6_retained_consumer_fixture/retained-model.srdf",
-    "lite6_retained_consumer_fixture/retained-package/**/*",
-    "deployment-build/generated/embedded_build_evidence.hpp",
-    "deployment-build/generated/build_qualified_admission_profile_generated.hpp",
-    "deployment-build/generated/closed_schema/**/*",
-    "fixture-raw/**/*.json",
-    "fixture-ir/*.json",
+    "lite6_retained_consumer_fixture/retained-package/build-manifests/*/*.json",
+    "lite6_retained_consumer_fixture/retained-package/catalog-artifacts/by-key-sha256/*.record",
+    "lite6_retained_consumer_fixture/retained-package/raw-artifacts/sha256/*.blob",
+    "lite6_retained_consumer_fixture/retained-package/retained-bundles/sha256/*.json",
+    "deployment-build/generated/*.hpp",
 }
 REQUIRED_IDENTITY_ARTIFACT = {
     "path": "canonical_empty_product_package/canonical-empty-admission.json",
@@ -697,11 +707,6 @@ REQUIRED_IDENTITY_ARTIFACT = {
         "canonical_empty_retained_bundle_id": "retained_bundle_id",
         "canonical_empty_admission_digest": "admission_digest",
     },
-}
-REQUIRED_FIXTURE_IR_OUTPUTS = {
-    fixture_id: f"fixture-ir/{fixture_id}.json"
-    for fixture_id in REQUIRED_FIXTURE_IDS
-    if fixture_id.startswith(("c02m_", "c02n_", "c02o_"))
 }
 REQUIRED_DEFERRED = {
     ("ProgramBinding and Program execution bindings", "I6/N"),
@@ -734,7 +739,7 @@ BUILD_PROVENANCE_CONTRACT_PATH = Path(
     "verification/composable_cell_i2/build_provenance_contract.v1.json"
 )
 BUILD_PROVENANCE_CONTRACT_SHA256 = (
-    "aa087f5cc90f90ce41a3e992c68101483269d1c0cd3865d63f4a0538cf174ad1"
+    "fdfc6b37c94e8352ad627fc9132145f8db0e535979f95fdcd4c6374fa03405d2"
 )
 NATIVE_TARGET_GROUP_DIGESTS = {
     "core_release_baseline": "0f84d1494ab118aa0a6862a4845cb49d03ab54ea7275f9e71f452563a8c307f6",
@@ -924,8 +929,37 @@ NATIVE_SANITIZER_ENVIRONMENT = {
         ),
     },
 }
-TSAN_EXECUTION_LANES = {"core_tsan", "roboplan_tsan", "bindings_tsan"}
-TSAN_EXECUTOR_PREFIX = ["/usr/bin/setarch", "x86_64", "-R"]
+BINDING_ASAN_UBSAN_ENVIRONMENT = {
+    # CPython/pybind11 process-global registration objects intentionally live
+    # through interpreter teardown.  LSan cannot attribute those host-owned
+    # allocations precisely, so the binding lane retains ASan/UBSan while the
+    # native C++ lanes above retain leak detection.
+    "ASAN_OPTIONS": "halt_on_error=1:detect_leaks=0:exitcode=66",
+    "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1:exitcode=66",
+}
+BINDING_ASAN_HOST = Path(
+    "/qualification-output/build/bindings-asan/sanitizer-host/"
+    "manyforge-python-asan-ubsan"
+)
+BINDING_ASAN_HOST_OUTPUT = BINDING_ASAN_HOST.relative_to(
+    "/qualification-output"
+).as_posix()
+BINDING_ASAN_HOST_REQUIRED_NEEDED = (
+    "libasan.so.8",
+    "libubsan.so.1",
+    "libstdc++.so.6",
+    "libpython3.12.so.1.0",
+)
+NO_ASLR_EXECUTION_LANES = {
+    "core_asan_ubsan",
+    "core_tsan",
+    "deployment_asan_ubsan",
+    "roboplan_asan_ubsan",
+    "roboplan_tsan",
+    "bindings_asan_ubsan",
+    "bindings_tsan",
+}
+NO_ASLR_EXECUTOR_PREFIX = ["/usr/bin/setarch", "x86_64", "-R"]
 
 
 def _native_process_base_environment(
@@ -1088,9 +1122,9 @@ IMPLEMENTATION_BASES = {
     },
 }
 FROZEN_SECTION_SHA256 = {
-    "qualification_lanes": "66f88b604fc9140ad99494561fe45c11faaa1af8589d479162a8f2ed19921f40",
-    "forbidden_scans": "8ece13c3bc7a54513a149260e8459ce7b8d563dec709bafafa723846b04633d3",
-    "fixture_matrix": "daa18fd82cb0f878772bac43e7d017ae4c427b74489a1657bc8399124457edd7",
+    "qualification_lanes": "ff463d6187f8a2661386738ed81bd8f7d25c943d2074e661860aa8827015e7ec",
+    "forbidden_scans": "cdb8388d0a8d0df1ab3f979507be0c277bfede66a32ba722fd9b2cc56747ae69",
+    "fixture_matrix": "6facac6e5deac2e9aeb34145e378a48fa96897ed52860a20bc56fcfd49dba846",
 }
 REQUIRED_EVIDENCE_FIELDS = {
     "manifest_sha256",
@@ -1111,7 +1145,7 @@ REQUIRED_EVIDENCE_FIELDS = {
     "binding_junit_summary",
     "log_sha256",
     "generated_output_sha256_and_size",
-    "fixture_ir_manifest_golden_and_product_digests",
+    "fixture_witnesses_and_real_product_digests",
     "identity_rotation_comparison",
     "forbidden_scan_results",
     "final_unchanged_source_identity",
@@ -1845,7 +1879,7 @@ def _validate_bindings(binding: dict[str, Any], repository_root: Path) -> None:
                 fail(f"required binding integration input is absent: {relative}")
     if set(integration["must_update"]) != REQUIRED_BINDING_INTEGRATION_UPDATES:
         fail("binding integration-update inventory differs from the frozen set")
-    if set(integration["must_add"]) != REQUIRED_BINDING_SCRIPTS:
+    if set(integration["must_add"]) != REQUIRED_BINDING_ADDITIONS:
         fail("binding script inventory differs from the frozen set")
     outputs = _require_list(binding.get("generated_outputs"), "generated_outputs")
     generated: dict[str, str] = {}
@@ -2180,9 +2214,12 @@ def _validate_lanes(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
         command = _require_list(lane["container_command"], f"lane {lane_id} command")
         if not command or not all(isinstance(value, str) and value for value in command):
             fail(f"lane {lane_id} command must be non-empty argv")
-        if lane_id in TSAN_EXECUTION_LANES:
-            if command[:3] != TSAN_EXECUTOR_PREFIX:
-                fail(f"TSan lane does not use the exact no-ASLR executor: {lane_id}")
+        if lane_id in NO_ASLR_EXECUTION_LANES:
+            if command[:3] != NO_ASLR_EXECUTOR_PREFIX:
+                fail(
+                    "sanitizer lane does not use the exact no-ASLR executor: "
+                    f"{lane_id}"
+                )
         elif command[0] not in {"bash", "python3"}:
             fail(f"lane {lane_id} command has undeclared executable")
         if any("{repository_root}" in value or "{output_root}" in value or "{image_id}" in value for value in command):
@@ -2203,7 +2240,11 @@ def _validate_lanes(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
         )
     for lane_id in NATIVE_EXECUTION_LANES:
         expected = [
-            *(TSAN_EXECUTOR_PREFIX if lane_id in TSAN_EXECUTION_LANES else []),
+            *(
+                NO_ASLR_EXECUTOR_PREFIX
+                if lane_id in NO_ASLR_EXECUTION_LANES
+                else []
+            ),
             "python3",
             "verification/composable_cell_i2/verify_qualification_manifest.py",
             "--manifest",
@@ -2230,7 +2271,11 @@ def _validate_lanes(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
             fail(f"production lane does not use the exact frozen executor: {lane_id}")
     for lane_id in BINDING_RESULT_LANES:
         expected = [
-            *(TSAN_EXECUTOR_PREFIX if lane_id in TSAN_EXECUTION_LANES else []),
+            *(
+                NO_ASLR_EXECUTOR_PREFIX
+                if lane_id in NO_ASLR_EXECUTION_LANES
+                else []
+            ),
             "python3",
             "verification/composable_cell_i2/verify_qualification_manifest.py",
             "--manifest",
@@ -2352,9 +2397,7 @@ def _validate_fixtures(
         row["lane_id"]: row
         for row in manifest["test_inventory_contract"]["binding_result_lanes"]
     }
-    allowed_determinism_artifacts = set(REQUIRED_FIXTURE_IR_OUTPUTS.values()) | {
-        REQUIRED_IDENTITY_ARTIFACT["path"]
-    }
+    allowed_determinism_artifacts = {REQUIRED_IDENTITY_ARTIFACT["path"]}
     lane_ordinals = {lane_id: lane["ordinal"] for lane_id, lane in lanes.items()}
     fixtures = _require_list(manifest["fixture_matrix"], "fixture_matrix")
     seen: set[str] = set()
@@ -2519,7 +2562,6 @@ def _validate_rotating_identities(value: Any) -> None:
             "candidate_expectations",
             "determinism_artifact_roots",
             "identity_artifact",
-            "fixture_ir_outputs",
             "regression_products",
         },
         "rotating_identities",
@@ -2543,8 +2585,6 @@ def _validate_rotating_identities(value: Any) -> None:
         fail("determinism artifact roots drifted")
     if rotating["identity_artifact"] != REQUIRED_IDENTITY_ARTIFACT:
         fail("determinism identity-artifact mapping drifted")
-    if rotating["fixture_ir_outputs"] != REQUIRED_FIXTURE_IR_OUTPUTS:
-        fail("determinism fixture-IR output mapping drifted")
     products = _require_list(
         rotating["regression_products"], "rotating_identities.regression_products"
     )
@@ -3583,6 +3623,10 @@ def _validate_test_inventory_contract(
                 fail(f"binding provenance is not lane-required: {lane_id}")
     if seen != BINDING_RESULT_LANES:
         fail("binding-result lane set differs from the frozen contract")
+    if BINDING_ASAN_HOST_OUTPUT not in lanes["bindings_asan_ubsan"][
+        "expected_outputs"
+    ]:
+        fail("binding ASan/UBSan lane does not retain its linked Python host")
 
     expected_binding_builds = [
         {
@@ -5050,6 +5094,187 @@ def _direct_object_compile_dependency_rows(
     return dependencies
 
 
+def _validate_cmake_utility_order_only_dependencies(
+    *,
+    target_index: dict[tuple[str, str], dict[str, Any]],
+    relationship_index: dict[tuple[str, str], dict[str, Any]],
+    lane_root: Path,
+    label: str,
+) -> None:
+    # The packet-native producer derives the exact File API build-base/name.
+    # Host replay closes omission, relabel, and owner/byte joins without adding
+    # a second File API/Ninja discovery parser.
+    virtual_keys = {
+        "type",
+        "path",
+        "dependency_kind",
+        "owner_project_id",
+        "owner_target",
+        "owner_file_api_target_reply",
+        "owner_generated_output",
+    }
+    for (project_id, target_name), utility in sorted(target_index.items()):
+        if utility.get("target_type") != "UTILITY":
+            continue
+        owner_label = f"{label} {project_id}:{target_name}"
+        dependencies = [
+            _require_object(raw, f"{owner_label}.generator_dependencies[{index}]")
+            for index, raw in enumerate(
+                _require_list(
+                    utility.get("generator_dependencies"),
+                    f"{owner_label}.generator_dependencies",
+                )
+            )
+        ]
+        for dependency in dependencies:
+            kind = dependency.get("dependency_kind")
+            if kind is not None:
+                if kind != "cmake_utility_target":
+                    fail(f"{owner_label} has an unknown dependency kind")
+                continue
+            if (
+                HEX64.fullmatch(
+                    _require_text(
+                        dependency.get("sha256"),
+                        f"{owner_label} physical dependency digest",
+                    )
+                )
+                is None
+            ):
+                fail(f"{owner_label} physical dependency identity drifted")
+            _require_text(
+                dependency.get("path"), f"{owner_label} physical dependency path"
+            )
+        relationship = relationship_index[(project_id, target_name)]
+        primary_relative = relationship["primary_output_relative_path"]
+        primary_queries = [
+            query
+            for raw in _require_list(utility["ninja_query"], f"{owner_label} queries")
+            if (query := _require_object(raw, f"{owner_label} query")).get("node")
+            == primary_relative
+            and query.get("rule") == "CUSTOM_COMMAND"
+        ]
+        special = [row for row in dependencies if row.get("dependency_kind")]
+        nonphysical_order_only: set[str] = set()
+        if len(primary_queries) == 1:
+            for raw_edge in _require_list(
+                primary_queries[0].get("edges"),
+                f"{owner_label} primary-output edges",
+            ):
+                edge = _require_object(raw_edge, f"{owner_label} primary-output edge")
+                path = edge.get("path")
+                if (
+                    edge.get("type") == "order_only"
+                    and isinstance(path, str)
+                    and _logical_path_is_within(path, utility["build_root"])
+                ):
+                    physical = lane_root / Path(path).relative_to(
+                        "/qualification-output"
+                    )
+                    if not physical.exists() and not physical.is_symlink():
+                        nonphysical_order_only.add(path)
+        special_paths = {
+            _require_text(row.get("path"), f"{owner_label} virtual dependency path")
+            for row in special
+        }
+        if nonphysical_order_only != special_paths:
+            fail(f"{owner_label} nonphysical order-only dependency set drifted")
+        if not special:
+            continue
+        if len(primary_queries) != 1:
+            fail(f"{owner_label} lacks one primary-output CUSTOM_COMMAND query")
+        primary_edges = [
+            _require_object(raw, f"{owner_label} primary-output edge")
+            for raw in _require_list(
+                primary_queries[0].get("edges"),
+                f"{owner_label} primary-output edges",
+            )
+        ]
+        seen_paths: set[str] = set()
+        seen_owners: set[tuple[str, str]] = set()
+        for index, dependency in enumerate(special):
+            dependency_label = f"{owner_label} CMake UTILITY dependency[{index}]"
+            _exact_keys(dependency, virtual_keys, dependency_label)
+            path = _require_text(dependency["path"], f"{dependency_label}.path")
+            owner_project = _require_text(
+                dependency["owner_project_id"],
+                f"{dependency_label}.owner_project_id",
+            )
+            owner_target = _require_text(
+                dependency["owner_target"], f"{dependency_label}.owner_target"
+            )
+            owner_key = (owner_project, owner_target)
+            if (
+                dependency["type"] != "order_only"
+                or owner_project != project_id
+                or owner_key == (project_id, target_name)
+                or path in seen_paths
+                or owner_key in seen_owners
+                or posixpath.normpath(path) != path
+                or PurePosixPath(path).name != owner_target
+                or not _logical_path_is_within(path, utility["build_root"])
+                or sum(
+                    edge.get("type") == "order_only" and edge.get("path") == path
+                    for edge in primary_edges
+                )
+                != 1
+            ):
+                fail(f"{dependency_label} identity drifted")
+            seen_paths.add(path)
+            seen_owners.add(owner_key)
+            phony = lane_root / Path(path).relative_to("/qualification-output")
+            if phony.exists() or phony.is_symlink():
+                fail(f"{dependency_label} is not a nonphysical CMake target")
+
+            owner = target_index.get(owner_key)
+            owner_relationship = relationship_index.get(owner_key)
+            if (
+                owner is None
+                or owner_relationship is None
+                or owner.get("target_type") != "UTILITY"
+                or owner.get("build_root") != utility.get("build_root")
+            ):
+                fail(f"{dependency_label} owner is unproved or is not a UTILITY")
+            owner_reply = _require_object(
+                dependency["owner_file_api_target_reply"],
+                f"{dependency_label}.owner_file_api_target_reply",
+            )
+            owner_output = _require_object(
+                dependency["owner_generated_output"],
+                f"{dependency_label}.owner_generated_output",
+            )
+            _exact_keys(
+                owner_reply,
+                {"path", "sha256"},
+                f"{dependency_label}.owner_file_api_target_reply",
+            )
+            _exact_keys(
+                owner_output,
+                {"path", "sha256"},
+                f"{dependency_label}.owner_generated_output",
+            )
+            proved_reply = _require_object(
+                owner.get("file_api_target_reply"),
+                f"{dependency_label} proved owner reply",
+            )
+            proved_output = _require_object(
+                owner.get("artifact"), f"{dependency_label} proved owner output"
+            )
+            expected_output = (
+                PurePosixPath(owner["build_root"])
+                / owner_relationship["primary_output_relative_path"]
+            ).as_posix()
+            if (
+                owner_reply != proved_reply
+                or owner_output.get("path") != proved_output.get("path")
+                or owner_output.get("path") != expected_output
+                or owner_output.get("sha256") != proved_output.get("sha256")
+                or owner_output.get("sha256")
+                != owner_relationship.get("generated_output_sha256")
+            ):
+                fail(f"{dependency_label} owner byte/reply join drifted")
+
+
 def _validate_utility_target_relationships(
     value: Any,
     target_value: Any,
@@ -5259,7 +5484,13 @@ def _validate_utility_target_relationships(
                 )
             ).get("kind")
             == "generated"
-            and command.get("output") == generated_path
+            and command.get("output")
+            == (
+                generated_path
+                if output_policy == "single_file"
+                else output_inventory["root"]
+            )
+            and command.get("output_inventory_sha256") == inventory_digest
         ]
         if len(utility_generator_commands) != 1:
             fail(f"{row_label} has no unique generated-output command")
@@ -5497,6 +5728,12 @@ def _validate_utility_target_relationships(
             f"{label} utility relationship set drifted: "
             f"expected={sorted(expected_keys)}, actual={sorted(relationship_index)}"
         )
+    _validate_cmake_utility_order_only_dependencies(
+        target_index=target_index,
+        relationship_index=relationship_index,
+        lane_root=lane_root,
+        label=label,
+    )
     return sorted(
         normalized, key=lambda row: (row["project_id"], row["target"])
     )
@@ -7380,6 +7617,16 @@ def _validate_project_configure_fixtures(
 ) -> None:
     project_id = project["project_id"]
     build_root = project["build_root"]
+    configure_input_index: dict[str, dict[str, Any]] = {}
+    for input_index, raw_input in enumerate(
+        _require_list(project.get("configure_inputs"), f"{label}.configure_inputs")
+    ):
+        input_label = f"{label}.configure_inputs[{input_index}]"
+        input_row = _require_object(raw_input, input_label)
+        input_path = _require_text(input_row.get("path"), f"{input_label}.path")
+        if input_path in configure_input_index:
+            fail(f"{label}.configure_inputs repeats {input_path}")
+        configure_input_index[input_path] = input_row
     contracted = sorted(
         (
             _require_object(raw, "configure fixture contract")
@@ -7476,12 +7723,13 @@ def _validate_project_configure_fixtures(
             identity = _require_object(item["identity"], f"{input_label}.identity")
             if (
                 item["is_generated"] is not False
-                or item["is_external"] is not False
+                or type(item["is_external"]) is not bool
                 or item["is_cmake"] is not False
                 or identity.get("kind") != "git_tracked_source"
                 or not HEX64.fullmatch(
                     _require_text(item["sha256"], f"{input_label}.sha256")
                 )
+                or configure_input_index.get(path) != item
             ):
                 fail(f"{input_label} source identity drifted")
             input_paths.append(path)
@@ -7871,6 +8119,64 @@ def _validate_project_source_generations(
         fail(f"{label} repository projects use different source generations")
 
 
+def _native_target_output_owner_proofs(
+    evidence: dict[str, Any], lane_id: str
+) -> list[Any]:
+    """Return every native target proof that may own or consume build output."""
+
+    return [
+        *_require_list(
+            evidence["production_targets"],
+            f"{lane_id} native production targets",
+        ),
+        *_require_list(
+            evidence["test_only_targets"],
+            f"{lane_id} native test-only targets",
+        ),
+        *_require_list(evidence["targets"], f"{lane_id} native targets"),
+    ]
+
+
+def _native_utility_relationship_proofs(
+    evidence: dict[str, Any], lane_id: str, primary_project_id: str
+) -> list[Any]:
+    """Match the producer's primary-project utility relationship partition."""
+
+    proofs = [
+        *_require_list(
+            evidence["production_targets"],
+            f"{lane_id} native production relationship targets",
+        ),
+        *_require_list(
+            evidence["test_only_targets"],
+            f"{lane_id} native test-only relationship targets",
+        ),
+    ]
+    proved_primary_targets = {
+        _require_text(
+            _require_object(
+                raw_target, f"{lane_id} native primary relationship target"
+            ).get("target"),
+            f"{lane_id} native primary relationship target name",
+        )
+        for raw_target in proofs
+    }
+    for index, raw_target in enumerate(
+        _require_list(evidence["targets"], f"{lane_id} native targets")
+    ):
+        target = _require_object(raw_target, f"{lane_id} native target[{index}]")
+        if target.get("project_id") != primary_project_id:
+            continue
+        target_name = _require_text(
+            target.get("target"), f"{lane_id} native target[{index}].target"
+        )
+        if target_name in proved_primary_targets:
+            continue
+        proofs.append(target)
+        proved_primary_targets.add(target_name)
+    return proofs
+
+
 def _validate_native_build_provenance_artifact(
     path: Path,
     *,
@@ -7936,21 +8242,6 @@ def _validate_native_build_provenance_artifact(
     ):
         fail(f"{row['lane_id']} native provenance identity drifted")
 
-    _validate_utility_target_relationships(
-        evidence["utility_target_relationships"],
-        [
-            *_require_list(
-                evidence["production_targets"],
-                f"{row['lane_id']} native production targets",
-            ),
-            *_require_list(
-                evidence["test_only_targets"],
-                f"{row['lane_id']} native test-only targets",
-            ),
-        ],
-        f"{row['lane_id']} native utility targets",
-        lane_root=lane_root,
-    )
     package_by_group = {
         "core_release_baseline": "manyforge_core",
         "deployment_release_baseline": "manyforge_deployment",
@@ -7960,6 +8251,17 @@ def _validate_native_build_provenance_artifact(
         "roboplan_scene_sanitizer_required": "manyforge_roboplan",
     }
     package = package_by_group[row["required_group"]]
+    native_target_output_owners = _native_target_output_owner_proofs(
+        evidence, row["lane_id"]
+    )
+    _validate_utility_target_relationships(
+        evidence["utility_target_relationships"],
+        _native_utility_relationship_proofs(
+            evidence, row["lane_id"], package
+        ),
+        f"{row['lane_id']} native utility targets",
+        lane_root=lane_root,
+    )
     expected_projects = {
         package: (
             f"/workspace/{package}",
@@ -8051,19 +8353,6 @@ def _validate_native_build_provenance_artifact(
             evidence["projects"], f"{row['lane_id']} project provenance"
         )
     }
-    native_target_output_owners = [
-        *_require_list(
-            evidence["production_targets"],
-            f"{row['lane_id']} native production command owners",
-        ),
-        *_require_list(
-            evidence["test_only_targets"],
-            f"{row['lane_id']} native test-only command owners",
-        ),
-        *_require_list(
-            evidence["targets"], f"{row['lane_id']} native command owners"
-        ),
-    ]
     for family_name, family_value, family_roles in (
         (
             "production",
@@ -8094,7 +8383,7 @@ def _validate_native_build_provenance_artifact(
                 f"{row['lane_id']} native {family_name} target command evidence"
             ),
         )
-    _validate_target_proofs_against_projection(
+    production_proof_index = _validate_target_proofs_against_projection(
         evidence["production_targets"],
         evidence["production_parity"],
         expected=production_specs,
@@ -8109,7 +8398,7 @@ def _validate_native_build_provenance_artifact(
         allow_unexpected_proofs=False,
         label=f"{row['lane_id']} production parity",
     )
-    _validate_target_proofs_against_projection(
+    test_only_proof_index = _validate_target_proofs_against_projection(
         evidence["test_only_targets"],
         evidence["test_only_parity"],
         expected=test_only_specs,
@@ -8123,8 +8412,13 @@ def _validate_native_build_provenance_artifact(
         lane_root=lane_root,
         allow_unexpected_proofs=False,
         label=f"{row['lane_id']} test-only parity",
+        additional_proved_executable_owners=production_proof_index,
     )
-    _validate_target_proofs_against_projection(
+    previously_proved_executable_owners = {
+        **production_proof_index,
+        **test_only_proof_index,
+    }
+    execution_proof_index = _validate_target_proofs_against_projection(
         evidence["targets"],
         evidence["execution_parity"],
         expected=execution_specs,
@@ -8138,6 +8432,7 @@ def _validate_native_build_provenance_artifact(
         lane_root=lane_root,
         allow_unexpected_proofs=False,
         label=f"{row['lane_id']} execution parity",
+        additional_proved_executable_owners=previously_proved_executable_owners,
     )
     _validate_native_execution_annotations(
         proofs_value=evidence["targets"],
@@ -8164,6 +8459,10 @@ def _validate_native_build_provenance_artifact(
         lane_root=lane_root,
         allow_unexpected_proofs=False,
         label=f"{row['lane_id']} cross-profile parity",
+        additional_proved_executable_owners={
+            **previously_proved_executable_owners,
+            **execution_proof_index,
+        },
     )
 
     file_rows = _authenticate_provenance_files(
@@ -10206,6 +10505,10 @@ def _validate_target_proofs_against_projection(
     lane_root: Path,
     allow_unexpected_proofs: bool,
     label: str,
+    additional_proved_executable_owners: dict[
+        tuple[str, str], dict[str, Any]
+    ]
+    | None = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     normalized_projection = _validate_exact_target_projection(
         projection_value, expected=expected, label=f"{label} projection"
@@ -11265,6 +11568,11 @@ def _validate_target_proofs_against_projection(
             _require_text(producer["target"], f"{producer_label}.target"),
         )
         producer_proof = proofs.get(producer_owner)
+        if (
+            producer_proof is None
+            and additional_proved_executable_owners is not None
+        ):
+            producer_proof = additional_proved_executable_owners.get(producer_owner)
         if producer_proof is None or producer_proof.get("target_type") != "EXECUTABLE":
             fail(f"{producer_label} has no proved executable owner")
         producer_artifact = _require_object(
@@ -11886,7 +12194,8 @@ def _validate_binding_measurements(case_id: str, values: dict[str, Any]) -> None
         == "all_trusted_predecessor_projections_nonconstructible_and_read_only"
     ):
         passed = (
-            values["projection_count"] == 5
+            values["projection_count"]
+            == len(REQUIRED_NONCONSTRUCTIBLE_EXPORTS - {"CompilerQualifiedCellIr"})
             and _positive_int(values["construct_attempts"])
             and values["construct_rejections"] == values["construct_attempts"]
             and _positive_int(values["write_attempts"])
@@ -13225,6 +13534,7 @@ def _validate_binding_results(
                 "child_exit_status",
                 "extension_path",
                 "extension_sha256",
+                "sanitizer_host",
                 "producer_lane_id",
                 "build_provenance_path",
                 "build_provenance_sha256",
@@ -13251,6 +13561,18 @@ def _validate_binding_results(
         expected_extension_path = (
             f"{BINDING_LANE_STAGE_ROOTS[lane_id]}/{BINDING_EXTENSION_NAME}"
         )
+        sanitizer_host_path = _binding_sanitizer_host_artifact_path(
+            artifact_root, lane_id
+        )
+        expected_sanitizer_host = (
+            _inspect_binding_sanitizer_host(
+                sanitizer_host_path,
+                lane_root,
+                rendered_path=str(BINDING_ASAN_HOST),
+            )
+            if sanitizer_host_path is not None
+            else None
+        )
         if (
             witness["schema_version"]
             != "manyforge.composable_cell_i2.binding_witness.v1"
@@ -13265,6 +13587,7 @@ def _validate_binding_results(
             or witness["child_exit_status"] != 0
             or witness["extension_path"] != expected_extension_path
             or witness["extension_sha256"] != _sha256_file(extension_path)
+            or witness["sanitizer_host"] != expected_sanitizer_host
             or witness["producer_lane_id"] != producer_lane_id
             or witness["build_provenance_path"]
             != producer_row["provenance_output"]
@@ -13417,6 +13740,11 @@ def _validate_binding_results(
                 "python_baseline_case_count": baseline_case_count,
                 "required_case_ids": sorted(required),
                 "extension": _file_evidence(extension_path, artifact_root),
+                "sanitizer_host": (
+                    _file_evidence(sanitizer_host_path, artifact_root)
+                    if sanitizer_host_path is not None
+                    else None
+                ),
                 "collection": _file_evidence(collection_path, artifact_root),
                 "junit": _file_evidence(junit_path, artifact_root),
                 "witness": _file_evidence(witness_path, artifact_root),
@@ -13482,7 +13810,6 @@ def _validate_determinism_outputs(
     manifest: dict[str, Any],
     run_root: Path,
     successful_lanes: set[str],
-    expected_manyforge_identity: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     if "deterministic_rebuild" not in successful_lanes:
         return [], None
@@ -13548,107 +13875,6 @@ def _validate_determinism_outputs(
     for relative in first:
         if artifact_inodes[roots[0]][relative] == artifact_inodes[roots[1]][relative]:
             fail(f"two deterministic builds reuse one artifact inode: {relative}")
-    required_fixture_paths = set(rotating["fixture_ir_outputs"].values())
-    actual_fixture_paths = {
-        path for path in first if path.startswith("fixture-ir/")
-    }
-    if actual_fixture_paths != required_fixture_paths:
-        fail("determinism fixture-IR artifact set drifted")
-    fixture_by_id = {
-        fixture["id"]: fixture for fixture in manifest["fixture_matrix"]
-    }
-    for fixture_id, relative in rotating["fixture_ir_outputs"].items():
-        fixture = fixture_by_id[fixture_id]
-        expected_native_groups = sorted(
-            {row["group_id"] for row in fixture["native_test_witnesses"]}
-        )
-        expected_binding_cases = sorted(
-            {
-                case_id
-                for row in fixture["binding_case_witnesses"]
-                for case_id in row["case_ids"]
-            }
-        )
-        for root_value in roots:
-            producer_lane = DETERMINISM_ROOT_LANES[root_value]
-            physical_root = (
-                _lane_artifact_root(run_root, producer_lane) / root_value
-            )
-            path = _require_output_file(
-                physical_root,
-                relative,
-                f"{root_value} fixture-IR witness {fixture_id}",
-            )
-            witness = _read_json_object(
-                path, f"{root_value} fixture-IR witness {fixture_id}"
-            )
-            _exact_keys(
-                witness,
-                {
-                    "schema_version",
-                    "fixture_id",
-                    "producer",
-                    "producer_source_commit",
-                    "producer_source_tree",
-                    "native_witness_groups",
-                    "binding_case_ids",
-                    "raw_artifacts",
-                    "canonical_input_sha256",
-                    "compiler_ir_sha256",
-                    "canonical_projection_sha256",
-                },
-                f"{root_value} fixture-IR witness {fixture_id}",
-            )
-            digest_fields = (
-                "canonical_input_sha256",
-                "compiler_ir_sha256",
-                "canonical_projection_sha256",
-            )
-            if (
-                witness["schema_version"] != FIXTURE_IR_WITNESS_SCHEMA
-                or witness["fixture_id"] != fixture_id
-                or witness["producer"]
-                != "manyforge-i2-packet-determinism-executor"
-                or witness["producer_source_commit"]
-                != expected_manyforge_identity["head_commit"]
-                or witness["producer_source_tree"]
-                != expected_manyforge_identity["head_tree"]
-                or witness["native_witness_groups"] != expected_native_groups
-                or witness["binding_case_ids"] != expected_binding_cases
-                or any(
-                    not _sha256_value(witness[field])
-                    or witness[field].removeprefix("sha256:") == "0" * 64
-                    for field in digest_fields
-                )
-            ):
-                fail(f"{root_value} fixture-IR witness contract drifted: {fixture_id}")
-            raw_artifacts = _require_object(
-                witness["raw_artifacts"],
-                f"{root_value} fixture raw artifact paths {fixture_id}",
-            )
-            expected_raw_paths = _determinism_raw_paths(fixture_id)
-            if raw_artifacts != expected_raw_paths:
-                fail(f"{root_value} fixture raw paths drifted: {fixture_id}")
-            raw_digests: dict[str, str] = {}
-            for role, raw_relative in expected_raw_paths.items():
-                raw_path = _require_output_file(
-                    physical_root,
-                    raw_relative,
-                    f"{root_value} {fixture_id} raw {role}",
-                )
-                _strict_json_file(
-                    raw_path, f"{root_value} {fixture_id} raw {role}"
-                )
-                raw_digests[role] = "sha256:" + _sha256_file(raw_path)
-            if (
-                witness["canonical_input_sha256"]
-                != raw_digests["canonical_input"]
-                or witness["compiler_ir_sha256"] != raw_digests["compiler_ir"]
-                or witness["canonical_projection_sha256"]
-                != raw_digests["canonical_projection"]
-            ):
-                fail(f"{root_value} fixture witness does not hash its raw files")
-
     derived_candidates: list[dict[str, str]] = []
     derived_identity_evidence: list[dict[str, Any]] = []
     for root_value in roots:
@@ -15025,7 +15251,6 @@ def _collect_run_artifacts(
         manifest,
         artifact_root,
         successful_lanes,
-        expected_manyforge_identity,
     )
     scan_results = _validate_scan_output(
         manifest, artifact_root, successful_lanes, repository_root
@@ -15048,7 +15273,7 @@ def _collect_run_artifacts(
         "test_inventory_counts_and_digests": test_inventories,
         "binding_junit_summary": binding_results,
         "generated_output_sha256_and_size": generated,
-        "fixture_ir_manifest_golden_and_product_digests": {
+        "fixture_witnesses_and_real_product_digests": {
             "fixture_witnesses": fixture_witnesses,
             "determinism_products": regression,
         },
@@ -15276,7 +15501,7 @@ def execute_lanes(
             "test_inventory_counts_and_digests": [],
             "binding_junit_summary": [],
             "generated_output_sha256_and_size": [],
-            "fixture_ir_manifest_golden_and_product_digests": {
+            "fixture_witnesses_and_real_product_digests": {
                 "fixture_witnesses": [],
                 "determinism_products": [],
             },
@@ -15801,9 +16026,15 @@ def _binding_pytest_targets(row: dict[str, Any]) -> list[str]:
     return targets
 
 
+def _binding_python_executable(row: dict[str, Any]) -> str:
+    if row["lane_id"] == "bindings_asan_ubsan":
+        return str(BINDING_ASAN_HOST)
+    return "/usr/local/bin/python3"
+
+
 def _binding_collection_argv(row: dict[str, Any]) -> list[str]:
     return [
-        "/usr/local/bin/python3",
+        _binding_python_executable(row),
         "-m",
         "pytest",
         "-p",
@@ -15816,7 +16047,7 @@ def _binding_collection_argv(row: dict[str, Any]) -> list[str]:
 
 def _binding_run_argv(row: dict[str, Any]) -> list[str]:
     return [
-        "/usr/local/bin/python3",
+        _binding_python_executable(row),
         "-m",
         "pytest",
         "-p",
@@ -15838,6 +16069,68 @@ def _binding_extension_host_path(artifact_root: Path, lane_id: str) -> Path:
     else:
         fail(f"binding stage path has no frozen host mapping: {lane_id}")
     return root / relative / BINDING_EXTENSION_NAME
+
+
+def _binding_sanitizer_host_artifact_path(
+    artifact_root: Path, lane_id: str
+) -> Path | None:
+    if lane_id != "bindings_asan_ubsan":
+        return None
+    root = _lane_artifact_root(artifact_root, lane_id)
+    return root / BINDING_ASAN_HOST.relative_to("/qualification-output")
+
+
+def _inspect_binding_sanitizer_host(
+    path: Path, root: Path, *, rendered_path: str
+) -> dict[str, Any]:
+    host = _require_contained_regular_file(
+        path,
+        root,
+        "ASan/UBSan binding Python host",
+        require_single_link=True,
+    )
+    try:
+        metadata = host.stat()
+        with host.open("rb") as stream:
+            magic = stream.read(4)
+    except OSError as error:
+        fail(f"ASan/UBSan binding Python host is unreadable: {error}")
+    if (
+        not metadata.st_mode & 0o111
+        or metadata.st_size <= 0
+        or metadata.st_size > 64 * 1024 * 1024
+        or magic != b"\x7fELF"
+    ):
+        fail("ASan/UBSan binding Python host is not one bounded executable ELF")
+    try:
+        inspected = subprocess.run(
+            ["/usr/bin/readelf", "--wide", "--dynamic", str(host)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        fail(f"ASan/UBSan binding Python host inspection failed: {error}")
+    if inspected.returncode != 0 or inspected.stderr:
+        fail(
+            "ASan/UBSan binding Python host readelf failed: "
+            f"{inspected.stderr}"
+        )
+    needed = re.findall(r"Shared library: \[([^]]+)\]", inspected.stdout)
+    if (
+        not needed
+        or needed[0] != "libasan.so.8"
+        or len(needed) != len(set(needed))
+        or any(library not in needed for library in BINDING_ASAN_HOST_REQUIRED_NEEDED)
+        or any(library.startswith("libtsan") for library in needed)
+    ):
+        fail("ASan/UBSan binding Python host dynamic runtime order drifted")
+    return {
+        "path": rendered_path,
+        "sha256": _sha256_file(host),
+        "needed": needed,
+    }
 
 
 def _ensure_container_output_directory(
@@ -15873,6 +16166,7 @@ def _binding_test_environment(
     stage_root: Path,
     evidence_root: Path,
     generated_root: Path,
+    python_executable: str,
 ) -> dict[str, str]:
     process_home = evidence_root.parent / "process-home"
     process_home.mkdir(parents=False, exist_ok=False)
@@ -15896,11 +16190,11 @@ def _binding_test_environment(
             "MANYFORGE_I2_BINDING_STAGED_ROOT": str(stage_root),
             "MANYFORGE_I2_BINDING_GENERATED_ROOT": str(generated_root),
             "MANYFORGE_I2_BINDING_SOURCE_ROOT": "/workspace",
+            "MANYFORGE_I2_BINDING_EXECUTABLE": python_executable,
         }
     )
     if lane_id == "bindings_asan_ubsan":
-        environment.update(NATIVE_SANITIZER_ENVIRONMENT["address+undefined"])
-        environment["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libasan.so.8"
+        environment.update(BINDING_ASAN_UBSAN_ENVIRONMENT)
     elif lane_id == "bindings_tsan":
         environment.update(NATIVE_SANITIZER_ENVIRONMENT["thread"])
         environment["TSAN_SUPPRESSIONS"] = "/workspace/scripts/ci/tsan.supp"
@@ -15979,6 +16273,15 @@ def execute_binding_lane(
     )
     if staged_files != [extension]:
         fail(f"{lane_id} extension-only stage contains extra files")
+
+    python_executable = _binding_python_executable(row)
+    sanitizer_host_evidence: dict[str, Any] | None = None
+    if lane_id == "bindings_asan_ubsan":
+        sanitizer_host_evidence = _inspect_binding_sanitizer_host(
+            BINDING_ASAN_HOST,
+            output_root,
+            rendered_path=str(BINDING_ASAN_HOST),
+        )
 
     generated_value = BINDING_LANE_GENERATED_ROOTS.get(lane_id)
     if generated_value is None:
@@ -16114,7 +16417,11 @@ def execute_binding_lane(
         must_be_new=True,
     )
     environment = _binding_test_environment(
-        lane_id, stage_root, evidence_root, generated_root
+        lane_id,
+        stage_root,
+        evidence_root,
+        generated_root,
+        python_executable,
     )
 
     collection_argv = _binding_collection_argv(row)
@@ -16147,6 +16454,12 @@ def execute_binding_lane(
     )
     if completed.returncode != 0:
         return completed.returncode
+    if lane_id == "bindings_asan_ubsan" and _inspect_binding_sanitizer_host(
+        BINDING_ASAN_HOST,
+        output_root,
+        rendered_path=str(BINDING_ASAN_HOST),
+    ) != sanitizer_host_evidence:
+        fail("ASan/UBSan binding Python host changed during test execution")
     result_path = _require_output_file(
         output_root, result_relative.as_posix(), f"{lane_id} frozen pytest JUnit"
     )
@@ -16255,6 +16568,7 @@ def execute_binding_lane(
         "junit_sha256": _sha256_file(result_path),
         "extension_path": str(extension),
         "extension_sha256": extension_sha256,
+        "sanitizer_host": sanitizer_host_evidence,
         "producer_lane_id": producer_lane_id,
         "build_provenance_path": build_provenance_relative.as_posix(),
         "build_provenance_sha256": build_provenance_sha256,
@@ -16318,33 +16632,6 @@ def _framed_content_identity(
     if declared != computed:
         fail(f"{label} content identity does not match its exact document")
     return computed
-
-
-def _determinism_raw_paths(fixture_id: str) -> dict[str, str]:
-    prefix = f"fixture-raw/{fixture_id}"
-    return {
-        "canonical_input": f"{prefix}/canonical-input.json",
-        "compiler_ir": f"{prefix}/compiler-ir.json",
-        "canonical_projection": f"{prefix}/canonical-projection.json",
-    }
-
-
-def _determinism_fixture_contract(
-    manifest: dict[str, Any], fixture_id: str
-) -> tuple[list[str], list[str]]:
-    fixtures = {fixture["id"]: fixture for fixture in manifest["fixture_matrix"]}
-    fixture = fixtures[fixture_id]
-    native_groups = sorted(
-        {row["group_id"] for row in fixture["native_test_witnesses"]}
-    )
-    binding_cases = sorted(
-        {
-            case_id
-            for row in fixture["binding_case_witnesses"]
-            for case_id in row["case_ids"]
-        }
-    )
-    return native_groups, binding_cases
 
 
 def _validate_and_index_determinism_products(
@@ -16438,46 +16725,6 @@ def execute_determinism_build(
 
     source_commit = _git_head(repository_root)
     source_tree = _git_tree(repository_root, source_commit)
-    fixture_root = root / "fixture-ir"
-    try:
-        fixture_root.mkdir(parents=True, exist_ok=False)
-    except OSError as error:
-        fail(f"{lane_id} candidate precreated or blocked fixture witnesses: {error}")
-    for fixture_id, witness_relative in manifest["rotating_identities"][
-        "fixture_ir_outputs"
-    ].items():
-        raw_paths = _determinism_raw_paths(fixture_id)
-        digests: dict[str, str] = {}
-        for role, relative in raw_paths.items():
-            path = _require_contained_regular_file(
-                root / relative,
-                root,
-                f"{lane_id} {fixture_id} {role}",
-                require_single_link=True,
-            )
-            _strict_json_file(path, f"{lane_id} {fixture_id} {role}")
-            digests[role] = "sha256:" + _sha256_file(path)
-        native_groups, binding_cases = _determinism_fixture_contract(
-            manifest, fixture_id
-        )
-        witness = {
-            "schema_version": FIXTURE_IR_WITNESS_SCHEMA,
-            "fixture_id": fixture_id,
-            "producer": "manyforge-i2-packet-determinism-executor",
-            "producer_source_commit": source_commit,
-            "producer_source_tree": source_tree,
-            "native_witness_groups": native_groups,
-            "binding_case_ids": binding_cases,
-            "raw_artifacts": raw_paths,
-            "canonical_input_sha256": digests["canonical_input"],
-            "compiler_ir_sha256": digests["compiler_ir"],
-            "canonical_projection_sha256": digests["canonical_projection"],
-        }
-        expected_relative = Path(witness_relative)
-        if expected_relative.parent != Path("fixture-ir"):
-            fail("fixture witness output escaped its frozen directory")
-        _write_exclusive_json(fixture_root, expected_relative.name, witness)
-
     products = _validate_and_index_determinism_products(
         root,
         manifest["rotating_identities"]["regression_products"],

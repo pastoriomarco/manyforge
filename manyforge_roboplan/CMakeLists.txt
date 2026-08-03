@@ -12,6 +12,11 @@ find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 option(BUILD_TESTING "Build unit tests" ON)
 
+get_filename_component(
+  _MANYFORGE_REPOSITORY_SOURCE_ROOT
+  "${CMAKE_CURRENT_SOURCE_DIR}/.."
+  REALPATH)
+
 # The wall clock and scheduler are factory-neutral implementations of Core's
 # time ports.  Build Core without its package-local tests so this bounded
 # support library remains compiled in ordinary builds without restoring a
@@ -22,7 +27,7 @@ if(NOT TARGET manyforge_core)
   cmake_policy(SET CMP0077 NEW)
   set(BUILD_TESTING OFF)
   add_subdirectory(
-    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core"
+    "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core"
     "${CMAKE_CURRENT_BINARY_DIR}/manyforge_core"
     EXCLUDE_FROM_ALL)
   cmake_policy(POP)
@@ -190,7 +195,7 @@ if(BUILD_TESTING)
       cmake_policy(SET CMP0077 NEW)
       set(BUILD_TESTING OFF)
       add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment"
         "${CMAKE_CURRENT_BINARY_DIR}/manyforge_deployment")
       cmake_policy(POP)
       set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
@@ -238,11 +243,11 @@ if(BUILD_TESTING)
         "I3 independent retained-model qualification requires urdfdom check_urdf")
     endif()
     set(_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT
-      "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_example_models/models/lite6_lite_gripper")
     set(_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/lite6_structural_consumer_fixture")
     set(_MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL
-      "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/tools/prepare_structural_model.py")
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/tools/prepare_structural_model.py")
     get_filename_component(
       _MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL
       "${_MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL}"
@@ -287,15 +292,15 @@ if(BUILD_TESTING)
     # exact retained bytes and compiler maps, without importing any RoboPlan,
     # collision-engine, Composer, or Pinocchio consumer API.
     add_executable(generate_lite6_retained_consumer_fixture
-      ../manyforge_deployment/test/generate_lite6_retained_consumer_fixture.cpp)
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test/generate_lite6_retained_consumer_fixture.cpp")
     target_compile_definitions(
       generate_lite6_retained_consumer_fixture PRIVATE
       MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}"
       MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}")
     target_include_directories(
       generate_lite6_retained_consumer_fixture PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/src"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/test")
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src"
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
     target_link_libraries(
       generate_lite6_retained_consumer_fixture PRIVATE
       manyforge_deployment)
@@ -343,8 +348,8 @@ if(BUILD_TESTING)
       MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}"
       MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT="${_MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT}")
     target_include_directories(test_retained_product_consumer PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/src"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/test")
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src"
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
     target_link_libraries(test_retained_product_consumer PRIVATE
       manyforge_roboplan_retained_consumer
       manyforge_deployment

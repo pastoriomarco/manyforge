@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -25,6 +28,22 @@
 #include <vector>
 
 #include "proof_root_transfer_test.hpp"
+
+#ifndef MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT
+#error "MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT is required"
+#endif
+
+#ifndef MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT
+#error "MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT is required"
+#endif
+
+#ifndef MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT
+#error "MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT is required"
+#endif
+
+#ifndef MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT
+#error "MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT is required"
+#endif
 
 namespace manyforge::deployment {
 namespace {
@@ -328,6 +347,141 @@ struct QualifiedSource final {
   return qualify_source_impl(input, std::move(urdf), std::move(srdf));
 }
 
+[[nodiscard]] std::string
+read_real_vendor_fixture_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot read real-vendor compiler fixture: " +
+                             path.string());
+  }
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
+void expect_ur_structural_sources_are_exact_supported_projections() {
+  const auto source_root = std::filesystem::path{
+      MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT};
+  auto historical_urdf = read_real_vendor_fixture_file(
+      source_root / "ur10e_robotiq_2f_140.urdf");
+  const auto structural_urdf = read_real_vendor_fixture_file(
+      source_root / "ur10e_robotiq_2f_140.structural.urdf");
+  constexpr std::string_view kNonStandardCollisionMaterial = R"urdf(
+      <material name="">
+        <color rgba="0.9 0.0 0.0 1"/>
+      </material>)urdf";
+  const auto remove_pad_collision_material =
+      [&historical_urdf,
+       kNonStandardCollisionMaterial](std::string_view link_name) {
+    const auto link = historical_urdf.find(
+        "<link name=\"" + std::string(link_name) + "\">");
+    ASSERT_NE(link, std::string::npos);
+    const auto link_end = historical_urdf.find("</link>", link);
+    ASSERT_NE(link_end, std::string::npos);
+    const auto collision = historical_urdf.find("<collision>", link);
+    ASSERT_NE(collision, std::string::npos);
+    ASSERT_LT(collision, link_end);
+    const auto collision_end = historical_urdf.find("</collision>", collision);
+    ASSERT_NE(collision_end, std::string::npos);
+    ASSERT_LT(collision_end, link_end);
+    const auto material = historical_urdf.find(
+        kNonStandardCollisionMaterial, collision);
+    ASSERT_NE(material, std::string::npos);
+    ASSERT_LT(material, collision_end);
+    const auto repeated = historical_urdf.find(
+        kNonStandardCollisionMaterial,
+        material + kNonStandardCollisionMaterial.size());
+    EXPECT_TRUE(repeated == std::string::npos || repeated > collision_end);
+    historical_urdf.erase(material, kNonStandardCollisionMaterial.size());
+  };
+  remove_pad_collision_material("left_inner_finger_pad");
+  remove_pad_collision_material("right_inner_finger_pad");
+  EXPECT_EQ(structural_urdf, historical_urdf);
+
+  auto historical_srdf = read_real_vendor_fixture_file(
+      source_root / "ur10e_robotiq_2f_140.srdf");
+  const auto structural_srdf = read_real_vendor_fixture_file(
+      source_root / "ur10e_robotiq_2f_140.structural.srdf");
+  constexpr std::string_view kHppGripperExtension = R"srdf(
+  <gripper name="gripper" clearance="0.03">
+    <position>0 0 0 0 0 0 1</position>
+    <link name="grasp_frame"/>
+  </gripper>
+)srdf";
+
+  const auto extension = historical_srdf.find(kHppGripperExtension);
+  ASSERT_NE(extension, std::string::npos);
+  EXPECT_EQ(historical_srdf.find(kHppGripperExtension,
+                                 extension + kHppGripperExtension.size()),
+            std::string::npos);
+  historical_srdf.erase(extension, kHppGripperExtension.size());
+  EXPECT_EQ(structural_srdf, historical_srdf);
+}
+
+[[nodiscard]] std::vector<SourceArtifactSpec>
+load_real_vendor_dependency_artifacts(
+    const std::filesystem::path& prepared_root,
+    const std::filesystem::path& source_root) {
+  const auto manifest = parse_strict_json_model_yaml(
+      read_real_vendor_fixture_file(
+          prepared_root / "preparation-manifest.json"));
+  const auto* rewrites_value =
+      manifest.root().find_object_member("resource_rewrites");
+  const auto* rewrites =
+      rewrites_value == nullptr
+          ? nullptr
+          : std::get_if<CanonicalValue::Array>(
+                &rewrites_value->storage());
+  if (rewrites == nullptr) {
+    throw std::runtime_error(
+        "real-vendor preparation manifest has no resource rewrites");
+  }
+  std::vector<SourceArtifactSpec> artifacts;
+  artifacts.reserve(rewrites->size());
+  for (const auto& rewrite : *rewrites) {
+    const auto* relative_value =
+        rewrite.find_object_member("relative_path");
+    const auto* media_type_value =
+        rewrite.find_object_member("media_type");
+    const auto* relative =
+        relative_value == nullptr
+            ? nullptr
+            : std::get_if<std::string>(&relative_value->storage());
+    const auto* media_type =
+        media_type_value == nullptr
+            ? nullptr
+            : std::get_if<std::string>(&media_type_value->storage());
+    if (relative == nullptr || media_type == nullptr) {
+      throw std::runtime_error(
+          "real-vendor preparation manifest has an invalid resource rewrite");
+    }
+    artifacts.push_back({
+        *relative,
+        *media_type,
+        read_real_vendor_fixture_file(source_root / *relative),
+    });
+  }
+  return artifacts;
+}
+
+[[nodiscard]] QualifiedSource
+qualify_real_vendor_source(AssetSpec spec,
+                           const std::filesystem::path& prepared_root,
+                           const std::filesystem::path& source_root) {
+  spec.source_artifacts = load_real_vendor_dependency_artifacts(
+      prepared_root, source_root);
+  return qualify_source_with_documents(
+      spec, read_real_vendor_fixture_file(prepared_root / "model.urdf"),
+      read_real_vendor_fixture_file(prepared_root / "model.srdf"));
+}
+
+struct CommandTargetSpec final {
+  std::string id;
+  std::string group_source;
+  std::string resource_source;
+  std::string frame_source;
+  std::string body_source;
+};
+
 struct TypeSpec final {
   std::string id;
   std::vector<std::string> tags;
@@ -340,6 +494,7 @@ struct TypeSpec final {
   std::string target_resource_source{"arm_joints"};
   std::string target_frame_source{"tcp"};
   std::string target_body_source{"arm_collision"};
+  std::vector<CommandTargetSpec> command_targets{};
   bool with_interface = false;
   std::string interface_id{"flange"};
   std::string interface_model_role{"body"};
@@ -410,71 +565,102 @@ struct QualifiedType final {
 
   CanonicalValue::Array targets;
   std::vector<QualifiedCapabilityDefinition> capabilities;
-  if (spec.with_target) {
+  if (spec.with_target && !spec.command_targets.empty()) {
+    throw std::logic_error(
+        "test component type cannot mix default and explicit command targets");
+  }
+  if (!spec.command_targets.empty() &&
+      (!target_resource_roles.empty() ||
+       !component_local_resource_roles.empty())) {
+    throw std::logic_error(
+        "explicit command targets own their resource-role declarations");
+  }
+  if (spec.with_target || !spec.command_targets.empty()) {
     auto capability = observed_state_capability();
     const auto revision =
         capability.value().capability_definition_revision.value();
-    CanonicalValue::Array target_resources;
-    const auto resource_roles =
-        target_resource_roles.empty() &&
-                component_local_resource_roles.empty()
-            ? std::vector<std::pair<std::string, std::string>>{
-                  {"joints", spec.target_resource_source}}
-            : std::move(target_resource_roles);
-    for (const auto& [alias, source] : resource_roles) {
-      target_resources.emplace_back(CanonicalValue::Object{
-          {"resource_role_id", CanonicalValue(alias)},
-          {"source_kind", CanonicalValue("model_role")},
-          {"model_role_id", CanonicalValue(spec.target_model_role)},
-          {"asset_resource_role_id", CanonicalValue(source)},
-      });
+    const auto append_target =
+        [&](std::string_view target_id, std::string_view group_source,
+            std::string_view frame_source, std::string_view body_source,
+            const std::vector<std::pair<std::string, std::string>>&
+                resource_roles,
+            const std::vector<std::string>& component_local_resources) {
+          CanonicalValue::Array target_resources;
+          for (const auto& [alias, source] : resource_roles) {
+            target_resources.emplace_back(CanonicalValue::Object{
+                {"resource_role_id", CanonicalValue(alias)},
+                {"source_kind", CanonicalValue("model_role")},
+                {"model_role_id", CanonicalValue(spec.target_model_role)},
+                {"asset_resource_role_id", CanonicalValue(source)},
+            });
+          }
+          for (const auto& role : component_local_resources) {
+            target_resources.emplace_back(CanonicalValue::Object{
+                {"resource_role_id", CanonicalValue(role)},
+                {"source_kind", CanonicalValue("component_local")},
+            });
+          }
+          targets.emplace_back(CanonicalValue::Object{
+              {"command_target_id",
+               CanonicalValue(std::string(target_id))},
+              {"model_group_roles",
+               CanonicalValue(CanonicalValue::Array{
+                   CanonicalValue(CanonicalValue::Object{
+                       {"model_group_role_id",
+                        CanonicalValue("planning_group")},
+                       {"model_role_id",
+                        CanonicalValue(spec.target_model_role)},
+                       {"asset_model_group_role_id",
+                        CanonicalValue(std::string(group_source))},
+                   })})},
+              {"resource_roles",
+               CanonicalValue(std::move(target_resources))},
+              {"frame_roles",
+               CanonicalValue(CanonicalValue::Array{
+                   CanonicalValue(CanonicalValue::Object{
+                       {"frame_role_id", CanonicalValue("tcp")},
+                       {"model_role_id",
+                        CanonicalValue(spec.target_model_role)},
+                       {"asset_frame_role_id",
+                        CanonicalValue(std::string(frame_source))},
+                   })})},
+              {"collision_body_roles",
+               CanonicalValue(CanonicalValue::Array{
+                   CanonicalValue(CanonicalValue::Object{
+                       {"collision_body_role_id",
+                        CanonicalValue("collision")},
+                       {"model_role_id",
+                        CanonicalValue(spec.target_model_role)},
+                       {"asset_collision_body_role_id",
+                        CanonicalValue(std::string(body_source))},
+                   })})},
+              {"capabilities",
+               CanonicalValue(CanonicalValue::Array{
+                   CanonicalValue(CanonicalValue::Object{
+                       {"capability_id",
+                        CanonicalValue("state.observed.current")},
+                       {"capability_definition_revision",
+                        CanonicalValue(revision)},
+                   })})},
+          });
+        };
+    if (spec.with_target) {
+      const auto resource_roles =
+          target_resource_roles.empty() &&
+                  component_local_resource_roles.empty()
+              ? std::vector<std::pair<std::string, std::string>>{
+                    {"joints", spec.target_resource_source}}
+              : std::move(target_resource_roles);
+      append_target("command", spec.target_group_source,
+                    spec.target_frame_source, spec.target_body_source,
+                    resource_roles, component_local_resource_roles);
+    } else {
+      for (const auto& target : spec.command_targets) {
+        append_target(
+            target.id, target.group_source, target.frame_source,
+            target.body_source, {{"joints", target.resource_source}}, {});
+      }
     }
-    for (const auto& role : component_local_resource_roles) {
-      target_resources.emplace_back(CanonicalValue::Object{
-          {"resource_role_id", CanonicalValue(role)},
-          {"source_kind", CanonicalValue("component_local")},
-      });
-    }
-    targets.emplace_back(CanonicalValue::Object{
-        {"command_target_id", CanonicalValue("command")},
-        {"model_group_roles",
-         CanonicalValue(CanonicalValue::Array{
-             CanonicalValue(CanonicalValue::Object{
-                 {"model_group_role_id", CanonicalValue("planning_group")},
-                 {"model_role_id",
-                  CanonicalValue(spec.target_model_role)},
-                 {"asset_model_group_role_id",
-                  CanonicalValue(spec.target_group_source)},
-             })})},
-        {"resource_roles", CanonicalValue(std::move(target_resources))},
-        {"frame_roles",
-         CanonicalValue(CanonicalValue::Array{
-             CanonicalValue(CanonicalValue::Object{
-                 {"frame_role_id", CanonicalValue("tcp")},
-                 {"model_role_id",
-                  CanonicalValue(spec.target_model_role)},
-                 {"asset_frame_role_id",
-                  CanonicalValue(spec.target_frame_source)},
-             })})},
-        {"collision_body_roles",
-         CanonicalValue(CanonicalValue::Array{
-             CanonicalValue(CanonicalValue::Object{
-                 {"collision_body_role_id",
-                  CanonicalValue("collision")},
-                 {"model_role_id",
-                  CanonicalValue(spec.target_model_role)},
-                 {"asset_collision_body_role_id",
-                  CanonicalValue(spec.target_body_source)},
-             })})},
-        {"capabilities",
-         CanonicalValue(CanonicalValue::Array{
-             CanonicalValue(CanonicalValue::Object{
-                 {"capability_id",
-                  CanonicalValue("state.observed.current")},
-                 {"capability_definition_revision",
-                  CanonicalValue(revision)},
-             })})},
-    });
     capabilities.push_back(std::move(capability));
   }
 
@@ -802,6 +988,471 @@ struct BindingSpec final {
     result.push_back(type->value);
   }
   return result;
+}
+
+using ExpectedVendorCoordinate =
+    std::tuple<std::string_view, UrdfCoordinateKind, bool, double, double>;
+
+struct VisualMaterialSummary final {
+  std::size_t total = 0U;
+  std::size_t anonymous = 0U;
+  std::size_t named = 0U;
+  std::size_t colored = 0U;
+};
+
+[[nodiscard]] VisualMaterialSummary summarize_visual_materials(
+    const UrdfDocumentIr& urdf) {
+  VisualMaterialSummary result;
+  for (const auto& link : urdf.links) {
+    for (const auto& visual : link.visuals) {
+      if (!visual.material.has_value()) {
+        continue;
+      }
+      ++result.total;
+      if (visual.material->name.has_value()) {
+        ++result.named;
+      } else {
+        ++result.anonymous;
+      }
+      result.colored += visual.material->color.has_value() ? 1U : 0U;
+    }
+  }
+  return result;
+}
+
+void expect_real_vendor_coordinates(
+    const CompositionResourceCoordinateRow& resource,
+    std::string_view model_instance_id,
+    std::span<const ExpectedVendorCoordinate> expected) {
+  ASSERT_EQ(resource.coordinates.size(), expected.size());
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    const auto& [source_joint_name, coordinate_kind, derived_mimic,
+                 mimic_multiplier, mimic_offset] = expected[index];
+    const auto& coordinate = resource.coordinates[index];
+    EXPECT_EQ(coordinate.model_instance_id.value(), model_instance_id);
+    EXPECT_EQ(coordinate.source_joint_name, source_joint_name);
+    EXPECT_EQ(coordinate.coordinate_kind, coordinate_kind);
+    EXPECT_EQ(coordinate.unit, coordinate_kind == UrdfCoordinateKind::kLinear
+                                   ? CompositionCoordinateUnit::kMeters
+                                   : CompositionCoordinateUnit::kRadians);
+    EXPECT_EQ(coordinate.derived_mimic, derived_mimic);
+    EXPECT_DOUBLE_EQ(coordinate.multiplier, mimic_multiplier);
+    EXPECT_DOUBLE_EQ(coordinate.offset, mimic_offset);
+    EXPECT_FALSE(coordinate.compiled_joint_name.empty());
+  }
+}
+
+void expect_real_vendor_direct_resource_projection(
+    const CompositionControlBindingCoordinateMap& map,
+    std::string_view resource_role_id, std::string_view model_instance_id,
+    std::span<const std::string_view> resource_ids,
+    std::span<const ExpectedVendorCoordinate> expected) {
+  ASSERT_EQ(resource_ids.size(), expected.size());
+  ASSERT_EQ(map.resources.size(), expected.size());
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    const auto& resource = map.resources[index];
+    EXPECT_EQ(resource.resource_role_id.value(), resource_role_id);
+    EXPECT_EQ(resource.resource_id.value(), resource_ids[index]);
+    const std::array<ExpectedVendorCoordinate, 1U> coordinate{
+        expected[index]};
+    expect_real_vendor_coordinates(resource, model_instance_id, coordinate);
+  }
+}
+
+void expect_real_vendor_mimic_resource_projection(
+    const CompositionControlBindingCoordinateMap& map,
+    std::string_view resource_role_id, std::string_view resource_id,
+    std::string_view model_instance_id,
+    std::span<const ExpectedVendorCoordinate> expected) {
+  ASSERT_EQ(map.resources.size(), 1U);
+  const auto& resource = map.resources.front();
+  EXPECT_EQ(resource.resource_role_id.value(), resource_role_id);
+  EXPECT_EQ(resource.resource_id.value(), resource_id);
+  expect_real_vendor_coordinates(resource, model_instance_id, expected);
+}
+
+[[nodiscard]] const std::string& require_real_vendor_compiled_symbol(
+    const CompositionQualifiedCellIr& composition,
+    std::string_view model_instance_id, OccurrenceSymbolKind kind,
+    std::string_view source_name) {
+  const auto found = std::find_if(
+      composition.symbol_rewrites().begin(),
+      composition.symbol_rewrites().end(),
+      [model_instance_id, kind, source_name](
+          const OccurrenceSymbolRewrite& candidate) {
+        return candidate.source.model_instance_id.value() ==
+                   model_instance_id &&
+               candidate.source.kind == kind &&
+               candidate.source.scope_name.empty() &&
+               candidate.source.source_name == source_name;
+      });
+  if (found == composition.symbol_rewrites().end()) {
+    throw std::runtime_error(
+        "real-vendor target witness lost an expected compiled symbol");
+  }
+  return found->compiled_name;
+}
+
+[[nodiscard]] std::vector<std::string>
+require_real_vendor_compiled_symbols(
+    const CompositionQualifiedCellIr& composition,
+    std::string_view model_instance_id, OccurrenceSymbolKind kind,
+    std::span<const std::string_view> source_names) {
+  std::vector<std::string> result;
+  result.reserve(source_names.size());
+  for (const auto source_name : source_names) {
+    result.push_back(require_real_vendor_compiled_symbol(
+        composition, model_instance_id, kind, source_name));
+  }
+  return result;
+}
+
+void expect_real_vendor_target_resolution(
+    const CompositionQualifiedCellIr& composition,
+    const QualifiedSource& source, std::string_view component_id,
+    std::string_view target_id, std::string_view model_instance_id,
+    std::string_view source_group_name,
+    std::string_view asset_frame_role_id,
+    std::string_view source_frame_link,
+    std::span<const std::string_view> source_collision_links) {
+  const auto target = std::find_if(
+      composition.targets().begin(), composition.targets().end(),
+      [component_id, target_id](
+          const CompositionTargetResolution& candidate) {
+        return candidate.controllable_component_id.value() == component_id &&
+               candidate.command_target_id.value() == target_id;
+      });
+  ASSERT_NE(target, composition.targets().end());
+
+  ASSERT_EQ(target->model_groups.size(), 1U);
+  const auto& group = target->model_groups.front();
+  EXPECT_EQ(group.model_group_role_id.value(), "planning_group");
+  EXPECT_EQ(group.model_instance_id.value(), model_instance_id);
+  EXPECT_EQ(group.compiled_group_name,
+            require_real_vendor_compiled_symbol(
+                composition, model_instance_id,
+                OccurrenceSymbolKind::kSrdfGroup, source_group_name));
+
+  const auto& expanded_groups =
+      source.value.source_ir().semantic_index().expanded_groups;
+  const auto expanded = std::find_if(
+      expanded_groups.begin(), expanded_groups.end(),
+      [source_group_name](const ExpandedSrdfGroupIr& candidate) {
+        return candidate.group_name == source_group_name;
+      });
+  ASSERT_NE(expanded, expanded_groups.end());
+  std::vector<std::string_view> source_group_links;
+  source_group_links.reserve(expanded->links.size());
+  for (const auto& link : expanded->links) {
+    source_group_links.push_back(link.name);
+  }
+  std::vector<std::string_view> source_group_joints;
+  source_group_joints.reserve(expanded->joints.size());
+  for (const auto& joint : expanded->joints) {
+    source_group_joints.push_back(joint.name);
+  }
+  EXPECT_EQ(group.expanded_compiled_link_names,
+            require_real_vendor_compiled_symbols(
+                composition, model_instance_id,
+                OccurrenceSymbolKind::kLink, source_group_links));
+  EXPECT_EQ(group.expanded_compiled_joint_names,
+            require_real_vendor_compiled_symbols(
+                composition, model_instance_id,
+                OccurrenceSymbolKind::kJoint, source_group_joints));
+
+  ASSERT_EQ(target->frames.size(), 1U);
+  EXPECT_EQ(target->frames.front().frame_role_id.value(), "tcp");
+  const auto* frame = std::get_if<CompositionComponentModelFrame>(
+      &target->frames.front().frame);
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(frame->controllable_component_id.value(), component_id);
+  EXPECT_EQ(frame->model_instance_id.value(), model_instance_id);
+  EXPECT_EQ(frame->frame_role_id.value(), asset_frame_role_id);
+  EXPECT_EQ(frame->compiled_frame_name,
+            require_real_vendor_compiled_symbol(
+                composition, model_instance_id,
+                OccurrenceSymbolKind::kLink, source_frame_link));
+
+  ASSERT_EQ(target->collision_bodies.size(), 1U);
+  const auto& collision = target->collision_bodies.front();
+  EXPECT_EQ(collision.collision_body_role_id.value(), "collision");
+  EXPECT_EQ(collision.model_instance_id.value(), model_instance_id);
+  std::vector<std::string_view> canonical_collision_links(
+      source_collision_links.begin(), source_collision_links.end());
+  std::sort(canonical_collision_links.begin(),
+            canonical_collision_links.end());
+  EXPECT_EQ(collision.compiled_link_names,
+            require_real_vendor_compiled_symbols(
+                composition, model_instance_id,
+                OccurrenceSymbolKind::kLink,
+                canonical_collision_links));
+}
+
+void expect_checked_in_lite6_and_ur_mixed_composition_matrix() {
+  expect_ur_structural_sources_are_exact_supported_projections();
+
+  AssetSpec lite6_spec;
+  lite6_spec.id = "lite6_lite_gripper";
+  lite6_spec.with_srdf = true;
+  lite6_spec.frames = {{"base", "world"},
+                       {"gripper_tcp", "link_tcp"},
+                       {"tcp", "link_tcp"}};
+  lite6_spec.groups = {{"arm", "lite6"}, {"gripper", "lite_gripper"}};
+  lite6_spec.resources = {
+      {"arm_joints",
+       {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"}},
+      {"gripper_joint", {"right_finger_joint"}},
+  };
+  lite6_spec.bodies = {
+      {"arm_collision",
+       {"link_base", "link1", "link2", "link3", "link4", "link5", "link6"}},
+      {"gripper_collision",
+       {"lite_gripper_base_link", "lite_gripper_left_finger",
+        "lite_gripper_right_finger"}},
+  };
+  auto lite6_source = qualify_real_vendor_source(
+      std::move(lite6_spec),
+      std::filesystem::path{MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT},
+      std::filesystem::path{MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT});
+
+  AssetSpec ur_spec;
+  ur_spec.id = "ur10e_robotiq_2f_140";
+  ur_spec.with_srdf = true;
+  ur_spec.frames = {{"base", "base_link"},
+                    {"gripper_tcp", "grasp_frame"},
+                    {"tcp", "tool0"}};
+  ur_spec.groups = {{"arm", "arm"}, {"gripper", "gripper"}};
+  ur_spec.resources = {
+      {"arm_joints",
+       {"shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+        "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"}},
+      {"gripper_joint", {"finger_joint"}},
+  };
+  ur_spec.bodies = {
+      {"arm_collision",
+       {"base_link_inertia", "shoulder_link", "upper_arm_link",
+        "forearm_link", "wrist_1_link", "wrist_2_link", "wrist_3_link"}},
+      {"gripper_collision",
+       {"robotiq_base_link", "left_outer_knuckle", "left_outer_finger",
+        "left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle",
+        "right_outer_knuckle", "right_outer_finger", "right_inner_finger",
+        "right_inner_finger_pad", "right_inner_knuckle"}},
+  };
+  auto ur_source = qualify_real_vendor_source(
+      std::move(ur_spec),
+      std::filesystem::path{MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT},
+      std::filesystem::path{MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT});
+  const auto ur_materials =
+      summarize_visual_materials(ur_source.value.source_ir().urdf());
+  EXPECT_EQ(ur_materials.total, 18U);
+  EXPECT_EQ(ur_materials.anonymous, 11U);
+  EXPECT_EQ(ur_materials.named, 7U);
+  EXPECT_EQ(ur_materials.colored, 18U);
+  for (const auto& link : ur_source.value.source_ir().urdf().links) {
+    for (const auto& visual : link.visuals) {
+      if (visual.material.has_value() &&
+          visual.material->name.has_value()) {
+        EXPECT_EQ(*visual.material->name, "LightGrey");
+      }
+    }
+  }
+
+  TypeSpec lite6_type_spec;
+  lite6_type_spec.id = "opaque_lite6_lite_gripper";
+  lite6_type_spec.tags = {"articulated-arm", "opaque-aggregate"};
+  lite6_type_spec.command_targets = {
+      {"arm", "arm", "arm_joints", "tcp", "arm_collision"},
+      {"gripper", "gripper", "gripper_joint", "gripper_tcp",
+       "gripper_collision"},
+  };
+  auto lite6_type = qualify_type(lite6_type_spec);
+
+  TypeSpec ur_type_spec;
+  ur_type_spec.id = "opaque_ur10e_robotiq";
+  ur_type_spec.tags = {"articulated-arm", "opaque-aggregate"};
+  ur_type_spec.command_targets = {
+      {"arm", "arm", "arm_joints", "tcp", "arm_collision"},
+      {"gripper", "gripper", "gripper_joint", "gripper_tcp",
+       "gripper_collision"},
+  };
+  auto ur_type = qualify_type(ur_type_spec);
+
+  const auto mixed_graph = graph_for(
+      {{"lite6_model", &lite6_source, false},
+       {"ur10e_model", &ur_source, false}},
+      {{"lite6", &lite6_type, {{"body", "lite6_model"}}, true},
+       {"ur10e", &ur_type, {{"body", "ur10e_model"}}, true}},
+      {},
+      {{"lite6_arm_binding",
+        "lite6",
+        "arm",
+        {{"joints", "lite6_joint_1"},
+         {"joints", "lite6_joint_2"},
+         {"joints", "lite6_joint_3"},
+         {"joints", "lite6_joint_4"},
+         {"joints", "lite6_joint_5"},
+         {"joints", "lite6_joint_6"}}},
+       {"lite6_gripper_binding",
+        "lite6",
+        "gripper",
+        {{"joints", "lite6_gripper"}}},
+       {"ur10e_arm_binding",
+        "ur10e",
+        "arm",
+        {{"joints", "ur10e_joint_1"},
+         {"joints", "ur10e_joint_2"},
+         {"joints", "ur10e_joint_3"},
+         {"joints", "ur10e_joint_4"},
+         {"joints", "ur10e_joint_5"},
+         {"joints", "ur10e_joint_6"}}},
+       {"ur10e_gripper_binding",
+        "ur10e",
+        "gripper",
+        {{"joints", "ur10e_gripper"}}}});
+  const auto mixed = compose_cell_occurrences(
+      mixed_graph, source_values({&ur_source, &lite6_source}),
+      type_values({&ur_type, &lite6_type}));
+
+  const auto lite6_materials =
+      summarize_visual_materials(lite6_source.value.source_ir().urdf());
+  const auto flattened_materials =
+      summarize_visual_materials(mixed.flattened_urdf());
+  EXPECT_EQ(flattened_materials.total,
+            lite6_materials.total + ur_materials.total);
+  EXPECT_EQ(flattened_materials.anonymous,
+            lite6_materials.anonymous + ur_materials.anonymous);
+  EXPECT_EQ(flattened_materials.named,
+            lite6_materials.named + ur_materials.named);
+  EXPECT_EQ(flattened_materials.colored,
+            lite6_materials.colored + ur_materials.colored);
+
+  ASSERT_EQ(mixed.model_occurrences().size(), 2U);
+  ASSERT_EQ(mixed.graph().controllable_components.size(), 2U);
+  ASSERT_EQ(mixed.targets().size(), 4U);
+  std::map<std::string, std::string, std::less<>> assets_by_instance;
+  for (const auto& occurrence : mixed.model_occurrences()) {
+    EXPECT_TRUE(assets_by_instance
+                    .emplace(occurrence.model_instance_id.value(),
+                             occurrence.model_asset_id.value())
+                    .second);
+  }
+  EXPECT_EQ(assets_by_instance.at("lite6_model"), "lite6_lite_gripper");
+  EXPECT_EQ(assets_by_instance.at("ur10e_model"), "ur10e_robotiq_2f_140");
+
+  constexpr std::array<std::string_view, 7U> kLite6ArmCollisionLinks{{
+      "link_base", "link1", "link2", "link3", "link4", "link5", "link6",
+  }};
+  constexpr std::array<std::string_view, 3U> kLite6GripperCollisionLinks{{
+      "lite_gripper_base_link", "lite_gripper_left_finger",
+      "lite_gripper_right_finger",
+  }};
+  constexpr std::array<std::string_view, 7U> kUrArmCollisionLinks{{
+      "base_link_inertia", "shoulder_link", "upper_arm_link",
+      "forearm_link", "wrist_1_link", "wrist_2_link", "wrist_3_link",
+  }};
+  constexpr std::array<std::string_view, 11U> kUrGripperCollisionLinks{{
+      "robotiq_base_link", "left_outer_knuckle", "left_outer_finger",
+      "left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle",
+      "right_outer_knuckle", "right_outer_finger", "right_inner_finger",
+      "right_inner_finger_pad", "right_inner_knuckle",
+  }};
+  expect_real_vendor_target_resolution(
+      mixed, lite6_source, "lite6", "arm", "lite6_model", "lite6", "tcp",
+      "link_tcp", kLite6ArmCollisionLinks);
+  expect_real_vendor_target_resolution(
+      mixed, lite6_source, "lite6", "gripper", "lite6_model",
+      "lite_gripper", "gripper_tcp", "link_tcp",
+      kLite6GripperCollisionLinks);
+  expect_real_vendor_target_resolution(
+      mixed, ur_source, "ur10e", "arm", "ur10e_model", "arm", "tcp",
+      "tool0", kUrArmCollisionLinks);
+  expect_real_vendor_target_resolution(
+      mixed, ur_source, "ur10e", "gripper", "ur10e_model", "gripper",
+      "gripper_tcp", "grasp_frame", kUrGripperCollisionLinks);
+
+  const auto coordinate_map_for = [&mixed](std::string_view binding_id)
+      -> const CompositionControlBindingCoordinateMap* {
+    const auto found = std::find_if(
+        mixed.control_binding_coordinate_maps().begin(),
+        mixed.control_binding_coordinate_maps().end(),
+        [binding_id](
+            const CompositionControlBindingCoordinateMap& candidate) {
+          return candidate.control_binding_id.value() == binding_id;
+        });
+    return found == mixed.control_binding_coordinate_maps().end() ? nullptr
+                                                                  : &*found;
+  };
+  ASSERT_EQ(mixed.control_binding_coordinate_maps().size(), 4U);
+  const auto* lite6_arm_map = coordinate_map_for("lite6_arm_binding");
+  const auto* lite6_gripper_map =
+      coordinate_map_for("lite6_gripper_binding");
+  const auto* ur_arm_map = coordinate_map_for("ur10e_arm_binding");
+  const auto* ur_gripper_map = coordinate_map_for("ur10e_gripper_binding");
+  ASSERT_NE(lite6_arm_map, nullptr);
+  ASSERT_NE(lite6_gripper_map, nullptr);
+  ASSERT_NE(ur_arm_map, nullptr);
+  ASSERT_NE(ur_gripper_map, nullptr);
+  EXPECT_EQ(lite6_arm_map->controllable_component_id.value(), "lite6");
+  EXPECT_EQ(lite6_arm_map->command_target_id.value(), "arm");
+  EXPECT_EQ(lite6_gripper_map->controllable_component_id.value(), "lite6");
+  EXPECT_EQ(lite6_gripper_map->command_target_id.value(), "gripper");
+  EXPECT_EQ(ur_arm_map->controllable_component_id.value(), "ur10e");
+  EXPECT_EQ(ur_arm_map->command_target_id.value(), "arm");
+  EXPECT_EQ(ur_gripper_map->controllable_component_id.value(), "ur10e");
+  EXPECT_EQ(ur_gripper_map->command_target_id.value(), "gripper");
+
+  constexpr std::array<ExpectedVendorCoordinate, 6U> kLite6Arm{{
+      {"joint1", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"joint2", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"joint3", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"joint4", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"joint5", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"joint6", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+  }};
+  constexpr std::array<ExpectedVendorCoordinate, 2U> kLite6Gripper{{
+      {"right_finger_joint", UrdfCoordinateKind::kLinear, false, 1.0, 0.0},
+      {"left_finger_joint", UrdfCoordinateKind::kLinear, true, 1.0, 0.0},
+  }};
+  constexpr std::array<ExpectedVendorCoordinate, 6U> kUrArm{{
+      {"shoulder_pan_joint", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"shoulder_lift_joint", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"elbow_joint", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"wrist_1_joint", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"wrist_2_joint", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"wrist_3_joint", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+  }};
+  constexpr std::array<ExpectedVendorCoordinate, 6U> kUrGripper{{
+      {"finger_joint", UrdfCoordinateKind::kAngular, false, 1.0, 0.0},
+      {"left_inner_finger_joint", UrdfCoordinateKind::kAngular, true, 1.0,
+       0.0},
+      {"left_inner_knuckle_joint", UrdfCoordinateKind::kAngular, true, -1.0,
+       0.0},
+      {"right_inner_finger_joint", UrdfCoordinateKind::kAngular, true, 1.0,
+       0.0},
+      {"right_inner_knuckle_joint", UrdfCoordinateKind::kAngular, true, -1.0,
+       0.0},
+      {"right_outer_knuckle_joint", UrdfCoordinateKind::kAngular, true, -1.0,
+       0.0},
+  }};
+  constexpr std::array<std::string_view, 6U> kLite6ArmResourceIds{{
+      "lite6_joint_1", "lite6_joint_2", "lite6_joint_3", "lite6_joint_4",
+      "lite6_joint_5", "lite6_joint_6",
+  }};
+  constexpr std::array<std::string_view, 6U> kUrArmResourceIds{{
+      "ur10e_joint_1", "ur10e_joint_2", "ur10e_joint_3", "ur10e_joint_4",
+      "ur10e_joint_5", "ur10e_joint_6",
+  }};
+  expect_real_vendor_direct_resource_projection(
+      *lite6_arm_map, "joints", "lite6_model", kLite6ArmResourceIds,
+      kLite6Arm);
+  expect_real_vendor_mimic_resource_projection(
+      *lite6_gripper_map, "joints", "lite6_gripper", "lite6_model",
+      kLite6Gripper);
+  expect_real_vendor_direct_resource_projection(
+      *ur_arm_map, "joints", "ur10e_model", kUrArmResourceIds, kUrArm);
+  expect_real_vendor_mimic_resource_projection(
+      *ur_gripper_map, "joints", "ur10e_gripper", "ur10e_model",
+      kUrGripper);
 }
 
 TEST(CellStructure, QualifiesTheEmptyGraphWithExactEmptyClosures) {
@@ -1579,6 +2230,10 @@ TEST(CellComposition,
   for (const auto& joint : composed.flattened_urdf().joints) {
     EXPECT_TRUE(represented_joints.contains(joint.name));
   }
+
+  // Bind this frozen C0.2m aggregate/mixed-vendor witness to the actual
+  // checked-in Lite6/Lite-gripper and UR10e/Robotiq source closures.
+  expect_checked_in_lite6_and_ur_mixed_composition_matrix();
 }
 
 TEST(CellComposition,

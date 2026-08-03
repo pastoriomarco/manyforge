@@ -89,7 +89,8 @@ def _source_fixture(
             '<geometry><cylinder radius="0.5" length="2"/></geometry>'
             '</collision></link>'
             '<link name="aux2"><visual><geometry>'
-            '<sphere radius="0.75"/></geometry></visual></link>'
+            '<sphere radius="0.75"/></geometry><material name="">'
+            '<color rgba="0.2 0.4 0.6 1"/></material></visual></link>'
             '<link name="aux3"/><link name="aux4"/><link name="aux5"/>'
             '<joint name="joint1" type="revolute">'
             '<origin xyz="0.1 0.2 0.3" rpy="0.4 0.5 0.6"/>'
@@ -304,48 +305,80 @@ def _qualified_component_type():
     )
 
 
-def _verified_graph(source, component_type):
-    graph = {
-        "api_version": "manyforge.cell_graph.v1",
-        "graph_revision": ZERO_DIGEST,
+def _verified_deployment(source, component_type):
+    deployment = {
+        "api_version": "manyforge.deployment.v1",
+        "deployment_artifact_id": "python_compiler",
+        "deployment_revision": ZERO_DIGEST,
         "cell_id": "python_structure",
-        "runtime_units": [],
-        "model_instances": [
-            {
-                "model_instance_id": "arm_model",
-                "model_asset_id": source.value.model_asset_id.value,
-                "model_revision": source.value.model_revision.value,
-            }
-        ],
-        "controllable_components": [
-            {
-                "controllable_component_id": "arm",
-                "component_type_id": component_type.value.component_type_id.value,
-                "component_type_revision": (
-                    component_type.value.component_type_revision.value
-                ),
-                "model_role_bindings": [
-                    {
-                        "model_role_id": "body",
-                        "model_instance_id": "arm_model",
-                    }
-                ],
-                "runtime_unit_ids": [],
-                "root_pose_in_cell": {
-                    "position_m": [0, 0, 0],
-                    "orientation_xyzw": [0, 0, 0, 1],
-                },
-            }
-        ],
-        "control_domains": [],
-        "control_bindings": [],
-        "component_attachments": [],
+        "name": "Python compiler fixture",
+        "catalogs": {"records": []},
+        "graph": {
+            "runtime_units": [],
+            "model_instances": [
+                {
+                    "model_instance_id": "arm_model",
+                    "model_asset_id": source.value.model_asset_id.value,
+                    "model_revision": source.value.model_revision.value,
+                }
+            ],
+            "controllable_components": [
+                {
+                    "controllable_component_id": "arm",
+                    "component_type_id": (
+                        component_type.value.component_type_id.value
+                    ),
+                    "component_type_revision": (
+                        component_type.value.component_type_revision.value
+                    ),
+                    "model_role_bindings": [
+                        {
+                            "model_role_id": "body",
+                            "model_instance_id": "arm_model",
+                        }
+                    ],
+                    "runtime_unit_ids": [],
+                    "root_pose_in_cell": {
+                        "position_m": [0, 0, 0],
+                        "orientation_xyzw": [0, 0, 0, 1],
+                    },
+                }
+            ],
+            "control_domains": [],
+            "control_bindings": [],
+            "component_attachments": [],
+        },
+        "desired_control_configurations": [],
+        "capability_provider_bindings": [],
     }
-    parsed = core.parse_strict_json_model_yaml(_canonical(graph))
-    typed = core.decode_cell_graph_candidate(parsed)
-    intrinsic = core.validate_intrinsic_cell_graph_candidate(typed)
-    identity_ready = core.prepare_cell_graph_identity(intrinsic, [])
-    return core.compute_graph_revision(identity_ready)
+    parsed = core.parse_strict_json_model_yaml(_canonical(deployment))
+    return core.compute_deployment_artifact_revision(parsed, [])
+
+
+def _final_pipeline(source, component_type):
+    deployment = _verified_deployment(source, component_type)
+    composition = core.compose_cell_occurrences(
+        deployment.graph, [source], [component_type]
+    )
+    deployment_inputs = deployment.applicability_inputs
+    selected_overlay = core.select_site_overlay_for_deployment(
+        deployment_inputs.value.site_overlay_ref,
+        deployment_inputs.value.external_resources,
+        None,
+    )
+    applicability = core.qualify_cell_applicability(
+        composition,
+        deployment_inputs,
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        selected_overlay,
+    )
+    compiled = core.compile_cell_ir(applicability)
+    return deployment, composition, selected_overlay, applicability, compiled
 
 
 def test_resolved_candidate_requires_and_preserves_python_bytes():
@@ -596,9 +629,17 @@ def test_complete_model_source_values_have_python_semantic_parity():
     assert isinstance(cylinder.geometry, core.UrdfCylinderGeometryIr)
     assert cylinder.geometry.radius_m == pytest.approx(0.5)
     assert cylinder.geometry.length_m == pytest.approx(2)
-    sphere = links["aux2"].visuals[0].geometry
-    assert isinstance(sphere, core.UrdfSphereGeometryIr)
-    assert sphere.radius_m == pytest.approx(0.75)
+    sphere_visual = links["aux2"].visuals[0]
+    assert isinstance(sphere_visual.geometry, core.UrdfSphereGeometryIr)
+    assert sphere_visual.geometry.radius_m == pytest.approx(0.75)
+    assert sphere_visual.material.name is None
+    assert sphere_visual.material.color.rgba == pytest.approx(
+        (0.2, 0.4, 0.6, 1.0)
+    )
+    assert (
+        '<material name=""><color rgba="0.2 0.4 0.6 1"/></material>'
+        in core.emit_canonical_urdf(source)
+    )
 
     joints = {joint.name: joint for joint in source.urdf.joints}
     assert {
@@ -804,55 +845,174 @@ def test_source_declaration_limits_reject_before_iterable_consumption():
 def test_structure_qualification_exposes_read_only_resolutions():
     source = _verified_source()
     component_type = _qualified_component_type()
-    graph = _verified_graph(source, component_type)
-
-    qualified = core.qualify_cell_structure(
-        graph, [source], [component_type]
+    deployment, composition, selected_overlay, applicability, compiled = (
+        _final_pipeline(source, component_type)
     )
 
-    assert qualified.graph == graph.graph
-    assert qualified.verified_graph.graph == graph.graph
-    assert isinstance(qualified.model_assets, tuple)
-    assert isinstance(qualified.component_types, tuple)
-    assert len(qualified.model_instances) == 1
-    model = qualified.model_instances[0]
-    assert model.model_instance_id == core.ModelInstanceId("arm_model")
-    assert model.owner_component_id == core.ControllableComponentId("arm")
-    assert model.owner_model_role_id == core.ModelRoleId("body")
-    assert (
-        model.placement_source
-        == core.StructuralPlacementSource.kDirectComponentPoseInCell
+    assert isinstance(deployment, core.RevisionVerifiedDeploymentArtifact)
+    assert isinstance(deployment.graph, core.GraphRevisionVerifiedCellGraph)
+    assert isinstance(composition, core.CompositionQualifiedCellIr)
+    assert isinstance(selected_overlay, core.QualifiedSelectedSiteOverlay)
+    assert isinstance(applicability, core.ApplicabilityQualifiedCellIr)
+    assert isinstance(compiled, core.CompilerQualifiedCellIr)
+    assert composition.graph == deployment.graph.graph
+    assert composition.verified_graph.graph == deployment.graph.graph
+
+    collection_names = (
+        "model_assets",
+        "component_types",
+        "model_occurrences",
+        "symbol_rewrites",
+        "reverse_symbol_rewrites",
+        "reference_rewrites",
+        "planning_resource_rewrites",
+        "frames",
+        "fixed_connections",
+        "frame_paths",
+        "coordinates",
+        "control_binding_coordinate_maps",
+        "targets",
     )
-    component = qualified.components[0]
-    assert component.component_tags == ("articulated-arm",)
-    assert component.model_roles[0].model_instance_id == core.ModelInstanceId(
+    for name in collection_names:
+        assert isinstance(getattr(composition, name), tuple)
+
+    assert len(composition.model_assets) == 1
+    assert composition.model_assets[0].value.model_asset_id == core.ModelAssetId(
+        "python_arm"
+    )
+    assert len(composition.component_types) == 1
+    retained_type = composition.component_types[0].value
+    assert retained_type.component_type_id == core.ComponentTypeId(
+        "python_arm_type"
+    )
+    assert tuple(retained_type.tags) == ("articulated-arm",)
+    assert retained_type.model_roles[0].model_role_id == core.ModelRoleId("body")
+
+    assert len(composition.model_occurrences) == 1
+    occurrence = composition.model_occurrences[0]
+    assert isinstance(occurrence, core.CompositionModelOccurrence)
+    assert occurrence.model_instance_id == core.ModelInstanceId("arm_model")
+    assert occurrence.model_asset_id == core.ModelAssetId("python_arm")
+    assert occurrence.model_revision == source.value.model_revision
+    assert occurrence.owner_component_id == core.ControllableComponentId("arm")
+    assert occurrence.owner_model_role_id == core.ModelRoleId("body")
+    assert occurrence.compiled_model_name
+    assert occurrence.compiled_robot_name
+    assert occurrence.compiled_root_link_name
+
+    assert composition.cell_frame.cell_id == core.CellId("python_structure")
+    assert composition.cell_frame.compiled_frame_name
+    assert isinstance(composition.flattened_urdf, core.UrdfDocumentIr)
+    assert isinstance(composition.flattened_srdf, core.SrdfDocumentIr)
+    assert isinstance(composition.flattened_urdf.materials, tuple)
+    assert isinstance(composition.flattened_urdf.links, tuple)
+    assert isinstance(composition.flattened_urdf.joints, tuple)
+    assert isinstance(composition.flattened_srdf.groups, tuple)
+    assert occurrence.compiled_root_link_name in {
+        link.name for link in composition.flattened_urdf.links
+    }
+
+    root_frames = [
+        row
+        for row in composition.frames
+        if isinstance(row.frame, core.CompositionComponentModelFrame)
+        and row.frame.frame_role_id == core.FrameRoleId("base")
+    ]
+    assert len(root_frames) == 1
+    root_frame = root_frames[0]
+    assert root_frame.frame.controllable_component_id == (
+        core.ControllableComponentId("arm")
+    )
+    assert root_frame.frame.model_instance_id == core.ModelInstanceId("arm_model")
+    assert root_frame.source_link_name == "base_link"
+    assert root_frame.frame.compiled_frame_name == occurrence.compiled_root_link_name
+
+    assert len(composition.fixed_connections) == 1
+    connection = composition.fixed_connections[0]
+    assert isinstance(connection.source, core.CompositionDirectComponentAnchor)
+    assert connection.source.controllable_component_id == (
+        core.ControllableComponentId("arm")
+    )
+    assert connection.source.root_model_instance_id == core.ModelInstanceId(
         "arm_model"
     )
-    assert component.component_root.source_link_name == "base_link"
-    assert component.command_targets == ()
-    assert qualified.attachments == ()
+    assert connection.compiled_child_link_name == occurrence.compiled_root_link_name
+    assert composition.graph.component_attachments == []
+    assert composition.control_binding_coordinate_maps == ()
+    assert composition.targets == ()
+
+    assert applicability.composition.graph == composition.graph
+    assert applicability.deployment_inputs.value == (
+        deployment.applicability_inputs.value
+    )
+    assert applicability.selected_site_overlay_ref is None
+    for name in (
+        "runtime_profiles",
+        "capability_definitions",
+        "control_interface_contracts",
+        "controller_topologies",
+        "provider_manifests",
+        "stop_evidence_policies",
+        "binding_interfaces",
+        "controllers",
+        "routes",
+        "capabilities",
+        "provider_endpoints",
+        "external_resources",
+        "stop_applicability",
+    ):
+        assert getattr(applicability, name) == ()
+
+    assert compiled.applicability.composition.graph == composition.graph
+    assert isinstance(compiled.catalog_record_refs, tuple)
+    assert tuple(type(value) for value in compiled.catalog_record_refs) == (
+        core.ComponentTypeCatalogRecordRefDTO,
+        core.ModelAssetCatalogRecordRefDTO,
+    )
+    assert tuple(value.record_id.value for value in compiled.catalog_record_refs) == (
+        "python_arm_type",
+        "python_arm",
+    )
 
     for type_name in (
-        "StructuralModelInstanceResolution",
-        "StructuralModelOccurrence",
-        "StructuralFrameResolution",
-        "StructuralComponentResolution",
-        "StructurallyQualifiedCellGraph",
+        "GraphRevisionVerifiedCellGraph",
+        "RevisionVerifiedDeploymentArtifact",
+        "RevisionVerifiedDeploymentApplicabilityInputs",
+        "QualifiedSelectedSiteOverlay",
+        "CompositionQualifiedCellIr",
+        "CompositionModelOccurrence",
+        "CompositionComponentModelFrame",
+        "CompositionFrameResolution",
+        "CompositionDirectComponentAnchor",
+        "CompositionFixedConnection",
+        "ApplicabilityQualifiedCellIr",
+        "CompilerQualifiedCellIr",
     ):
         with pytest.raises(TypeError):
             getattr(core, type_name)()
     with pytest.raises(AttributeError):
-        model.placement_source = (
-            core.StructuralPlacementSource.kDirectModelPoseInCell
-        )
+        occurrence.owner_component_id = core.ControllableComponentId("other")
+    with pytest.raises(TypeError):
+        composition.model_occurrences[0] = occurrence
     with pytest.raises(AttributeError):
-        qualified.components = ()
+        composition.model_occurrences = ()
+    with pytest.raises(AttributeError):
+        compiled.catalog_record_refs = ()
+    for value in (composition, applicability, compiled, occurrence, root_frame):
+        with pytest.raises(AttributeError):
+            value.qualification_only_field = True
+
+    assert not hasattr(core, "qualify_cell_structure")
+    assert not hasattr(core, "CellStructureError")
+    assert not any(
+        name.startswith(("Structural", "Structurally")) for name in dir(core)
+    )
 
 
 def test_structure_iterables_stop_at_selected_exact_closure_bounds():
     source = _verified_source()
     component_type = _qualified_component_type()
-    graph = _verified_graph(source, component_type)
+    graph = _verified_deployment(source, component_type).graph
 
     source_items_consumed = 0
 
@@ -864,8 +1024,8 @@ def test_structure_iterables_stop_at_selected_exact_closure_bounds():
         yield source
         raise AssertionError("source closure consumed past one extra")
 
-    with pytest.raises(core.CellStructureError, match="more values"):
-        core.qualify_cell_structure(
+    with pytest.raises(core.CellCompositionError, match="more values"):
+        core.compose_cell_occurrences(
             graph, too_many_sources(), [component_type]
         )
     assert source_items_consumed == 2
@@ -880,14 +1040,18 @@ def test_structure_iterables_stop_at_selected_exact_closure_bounds():
         yield component_type
         raise AssertionError("type closure consumed past one extra")
 
-    with pytest.raises(core.CellStructureError, match="more values"):
-        core.qualify_cell_structure(graph, [source], too_many_types())
+    with pytest.raises(core.CellCompositionError, match="more values"):
+        core.compose_cell_occurrences(graph, [source], too_many_types())
     assert type_items_consumed == 2
 
     with pytest.raises(TypeError, match="SourceVerifiedModelAsset"):
-        core.qualify_cell_structure(graph, [component_type], [component_type])
-    with pytest.raises(core.CellStructureError):
-        core.qualify_cell_structure(graph, [], [component_type])
+        core.compose_cell_occurrences(graph, [component_type], [component_type])
+    with pytest.raises(core.CellCompositionError, match="missing selected asset"):
+        core.compose_cell_occurrences(graph, [], [component_type])
+
+    _, _, _, _, compiled = _final_pipeline(source, component_type)
+    assert len(compiled.applicability.composition.model_occurrences) == 1
+    assert len(compiled.catalog_record_refs) == 2
 
 
 def test_source_limits_are_exported_from_the_compiler_contract():

@@ -5,6 +5,9 @@ on:
     paths:
       - "Dockerfile"
       - "docker-entrypoint.sh"
+      - "manyforge_content_identity/**"
+      - "manyforge_core/**"
+      - "manyforge_deployment/**"
       - "manyforge_behavior/**"
       - "manyforge_composer/**"
       - "manyforge_supervision/**"
@@ -17,6 +20,13 @@ on:
       - "manyforge_medkit_adapter/manyforge_medkit_adapter/forwarder.py"
       - "manyforge_medkit_adapter/tests/test_forwarder.py"
       - "scripts/test-all.sh"
+      - "scripts/ci/generate-core-bindings-contract.py"
+      - "scripts/ci/core-bindings-sanitizer-host.cpp"
+      - "scripts/ci/run-composable-cell-i2-determinism.sh"
+      - "scripts/ci/run-core-bindings.sh"
+      - "scripts/ci/run-core-bindings-contract.sh"
+      - "scripts/ci/run-core-bindings-sanitizer.sh"
+      - "verification/composable_cell_i2/**"
       - "scripts/setup-docker.sh"
       - ".github/workflows/python-tests.yml"
   push:
@@ -24,6 +34,9 @@ on:
     paths:
       - "Dockerfile"
       - "docker-entrypoint.sh"
+      - "manyforge_content_identity/**"
+      - "manyforge_core/**"
+      - "manyforge_deployment/**"
       - "manyforge_behavior/**"
       - "manyforge_composer/**"
       - "manyforge_supervision/**"
@@ -36,19 +49,26 @@ on:
       - "manyforge_medkit_adapter/manyforge_medkit_adapter/forwarder.py"
       - "manyforge_medkit_adapter/tests/test_forwarder.py"
       - "scripts/test-all.sh"
+      - "scripts/ci/generate-core-bindings-contract.py"
+      - "scripts/ci/core-bindings-sanitizer-host.cpp"
+      - "scripts/ci/run-composable-cell-i2-determinism.sh"
+      - "scripts/ci/run-core-bindings.sh"
+      - "scripts/ci/run-core-bindings-contract.sh"
+      - "scripts/ci/run-core-bindings-sanitizer.sh"
+      - "verification/composable_cell_i2/**"
       - "scripts/setup-docker.sh"
       - ".github/workflows/python-tests.yml"
   workflow_dispatch:
 
 # Qualification is container-only. The job builds the repository development
 # image, resolves that tag to an immutable image ID, and runs the retained
-# Behavior/observation assertions, assistant protocol/supervisor clients, and
-# structural Composer shell inside that image. Deleted bindings and live
-# runtime products remain unavailable and are not represented by skips or
-# mock lanes.
+# ROS-free I2 compiler bindings, retained Behavior/observation assertions,
+# assistant protocol/supervisor clients, and structural Composer shell inside
+# that image. Live runtime products remain unavailable and are not represented
+# by skips or mock lanes.
 jobs:
   python-tests:
-    name: Retained Python and structural Composer (AMD64 Docker)
+    name: I2 bindings, retained Python, and Composer (AMD64 Docker)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -72,7 +92,7 @@ jobs:
           echo "id=${image_id}" >> "${GITHUB_OUTPUT}"
           echo "Qualified image: ${image_id}"
 
-      - name: Run retained Python and structural Composer qualification
+      - name: Run I2 bindings, retained Python, and Composer qualification
         shell: bash
         env:
           IMAGE_ID: ${{ steps.image.outputs.id }}
@@ -84,4 +104,4 @@ jobs:
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${IMAGE_ID}" \
-            bash -lc 'set -euo pipefail; ./scripts/test-all.sh python; ./scripts/test-all.sh bridge; cd manyforge_composer/frontend; npm ci --ignore-scripts; cd /workspace; ./scripts/test-all.sh composer'
+            bash -lc 'set -euo pipefail; ./scripts/test-all.sh bindings; ./scripts/test-all.sh python; ./scripts/test-all.sh bridge; cd manyforge_composer/frontend; npm ci --ignore-scripts; cd /workspace; ./scripts/test-all.sh composer'
