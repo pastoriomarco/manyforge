@@ -5974,12 +5974,10 @@ def _validate_auxiliary_install_projects(
             manifest_text = raw_manifest.decode("utf-8")
         except UnicodeDecodeError as error:
             fail(f"{project_label} manifest is not UTF-8: {error}")
-        lines = manifest_text.splitlines()
-        if (
-            not raw_manifest.endswith(b"\n")
-            or not lines
-            or any(not line or "\r" in line for line in lines)
-        ):
+        lines = manifest_text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        if not lines or any(not line or "\r" in line for line in lines):
             fail(f"{project_label} manifest line format drifted")
         relative_rows: list[str] = []
         install_root_pure = PurePosixPath(install_root)

@@ -10472,12 +10472,10 @@ def _auxiliary_install_states(
             manifest_text = raw_manifest.decode("utf-8")
         except UnicodeDecodeError as error:
             _fail(f"{project_id} install manifest is not UTF-8: {error}")
-        lines = manifest_text.splitlines()
-        if (
-            not raw_manifest.endswith(b"\n")
-            or not lines
-            or any(not line or "\r" in line for line in lines)
-        ):
+        lines = manifest_text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        if not lines or any(not line or "\r" in line for line in lines):
             _fail(f"{project_id} install manifest line format drifted")
         relative_rows: list[str] = []
         files_by_relative: dict[Path, Path] = {}

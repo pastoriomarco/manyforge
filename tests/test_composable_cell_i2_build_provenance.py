@@ -1684,7 +1684,9 @@ def _bounded_tree_inventory(lane_root: Path, logical_root: str) -> dict[str, Any
     }
 
 
-def _synthetic_auxiliary_install_fixture(tmp_path: Path) -> dict[str, Any]:
+def _synthetic_auxiliary_install_fixture(
+    tmp_path: Path, *, manifest_terminal_newline: bool = False
+) -> dict[str, Any]:
     lane_root = tmp_path / "lane"
     repository_root = tmp_path / "repository"
     repository_root.mkdir()
@@ -1789,9 +1791,14 @@ def _synthetic_auxiliary_install_fixture(tmp_path: Path) -> dict[str, Any]:
             library_install_relative,
         ]
         manifest_path = f"{build_root}/install_manifest.txt"
+        manifest_text = "\n".join(
+            f"{install_root}/{path}" for path in manifest_rows
+        )
+        if manifest_terminal_newline:
+            manifest_text += "\n"
         physical_manifest = _write(
             lane_root / Path(manifest_path).relative_to("/qualification-output"),
-            "".join(f"{install_root}/{path}\n" for path in manifest_rows).encode(),
+            manifest_text.encode(),
         )
         repeated_rows = [{"path": library_install_relative, "count": 2}]
         manifest_contract = {
@@ -2056,12 +2063,34 @@ def _validate_synthetic_auxiliary_install_fixture(fixture: dict[str, Any]) -> No
     )
 
 
+@pytest.mark.parametrize("manifest_terminal_newline", [False, True])
 def test_host_joins_auxiliary_manifest_tree_sources_exports_and_library_copies(
-    tmp_path: Path,
+    tmp_path: Path, manifest_terminal_newline: bool
 ) -> None:
     _validate_synthetic_auxiliary_install_fixture(
-        _synthetic_auxiliary_install_fixture(tmp_path)
+        _synthetic_auxiliary_install_fixture(
+            tmp_path,
+            manifest_terminal_newline=manifest_terminal_newline,
+        )
     )
+
+
+@pytest.mark.parametrize("invalid_separator", [b"\n\n", b"\r\n"])
+def test_host_rejects_auxiliary_manifest_invalid_line_format(
+    tmp_path: Path, invalid_separator: bytes
+) -> None:
+    fixture = _synthetic_auxiliary_install_fixture(tmp_path)
+    manifest = fixture["installed_copies"][0]["install_manifest"]
+    physical = fixture["lane_root"] / Path(manifest["path"]).relative_to(
+        "/qualification-output"
+    )
+    physical.write_bytes(
+        physical.read_bytes().replace(b"\n", invalid_separator, 1)
+    )
+    manifest["sha256"] = _sha256(physical)
+
+    with pytest.raises(verifier.ManifestError, match="line format drifted"):
+        _validate_synthetic_auxiliary_install_fixture(fixture)
 
 
 def test_host_rejects_auxiliary_generated_export_target_drift(
