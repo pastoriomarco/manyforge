@@ -75,6 +75,7 @@ constexpr std::string_view kCompositionGeneratedNamePrefixes =
 constexpr std::string_view kMf2JointNameTokenFormat =
     "mf2_joint_<parent-local-rank:zero-padded-decimal-6>_"
     "<semantic-identity-sha256:lowerhex-64>";
+constexpr std::size_t kMf2JointParentLocalRankDecimalBase = 10U;
 constexpr std::string_view kMf2JointSourceTieBreak =
     "utf8-bytewise-source-joint-name";
 constexpr std::string_view kMf2JointMimicProjectionPolicy =
@@ -96,6 +97,14 @@ constexpr std::string_view kMf2SourceJointHashFields =
     "kind,scope,source";
 constexpr std::string_view kMf2FixedConnectionHashFields =
     "cell_id,model_instance_id,kind,parent_link,child_link";
+constexpr std::string_view kOccurrenceSymbolRewriteKeyFields =
+    "model_instance_id,kind,scope_name,source_name";
+constexpr std::string_view kCellFramePolicy =
+    "one-compiler-owned-cell-frame";
+constexpr std::string_view kRewritePolicy =
+    "total-forward-reverse-reference-rewrite";
+constexpr std::string_view kFramePathPolicy =
+    "cell-rooted-portable-frame-paths";
 [[noreturn]] void fail(std::string_view message) {
   throw BuildManifestError(std::string(message));
 }
@@ -769,6 +778,9 @@ struct IdentityContractRow final {
            {"joint_parent_local_rank_decimal_width",
             CanonicalValue(
                 static_cast<double>(detail::kMf2JointLocalRankWidth))},
+           {"joint_parent_local_rank_decimal_base",
+            CanonicalValue(static_cast<double>(
+                kMf2JointParentLocalRankDecimalBase))},
            {"joint_parent_local_rank_capacity",
             CanonicalValue(static_cast<double>(
                 detail::kMf2JointMaximumLocalRank + 1U))},
@@ -792,12 +804,15 @@ struct IdentityContractRow final {
             CanonicalValue(std::string(kMf2SourceJointHashFields))},
            {"fixed_connection_hash_fields",
             CanonicalValue(std::string(kMf2FixedConnectionHashFields))},
+           {"occurrence_symbol_rewrite_key_fields",
+            CanonicalValue(
+                std::string(kOccurrenceSymbolRewriteKeyFields))},
            {"cell_frame_policy",
-            CanonicalValue("one-compiler-owned-cell-frame")},
+            CanonicalValue(std::string(kCellFramePolicy))},
            {"rewrite_policy",
-            CanonicalValue("total-forward-reverse-reference-rewrite")},
+            CanonicalValue(std::string(kRewritePolicy))},
            {"frame_path_policy",
-            CanonicalValue("cell-rooted-portable-frame-paths")},
+            CanonicalValue(std::string(kFramePathPolicy))},
        })},
       {"accepted_deployment_subset",
        CanonicalValue(CanonicalValue::Object{
@@ -1487,12 +1502,14 @@ void require_compiler_contract_nested_shapes(
       {"naming_scheme", "name_preimage_prefix", "generated_name_prefix",
        "joint_name_token_format",
        "joint_parent_local_rank_decimal_width",
+       "joint_parent_local_rank_decimal_base",
        "joint_parent_local_rank_capacity", "joint_source_tie_break",
        "joint_mimic_projection_policy",
        "joint_sibling_ordering_policy",
        "fixed_connection_ordering_policy",
        "joint_hash_preimage_domain", "joint_hash_field_encoding",
        "source_joint_hash_fields", "fixed_connection_hash_fields",
+       "occurrence_symbol_rewrite_key_fields",
        "cell_frame_policy",
        "rewrite_policy", "frame_path_policy"},
       composition_field);
@@ -1530,6 +1547,13 @@ void require_compiler_contract_nested_shapes(
                                  kMf2SourceJointHashFields);
   require_exact_composition_text("fixed_connection_hash_fields",
                                  kMf2FixedConnectionHashFields);
+  require_exact_composition_text("occurrence_symbol_rewrite_key_fields",
+                                 kOccurrenceSymbolRewriteKeyFields);
+  require_exact_composition_text("cell_frame_policy",
+                                 kCellFramePolicy);
+  require_exact_composition_text("rewrite_policy", kRewritePolicy);
+  require_exact_composition_text("frame_path_policy",
+                                 kFramePathPolicy);
   if (require_safe_integer(
           require_member(composition,
                          "joint_parent_local_rank_decimal_width",
@@ -1542,6 +1566,16 @@ void require_compiler_contract_nested_shapes(
   }
   if (require_safe_integer(
           require_member(composition,
+                         "joint_parent_local_rank_decimal_base",
+                         composition_field),
+          composition_field +
+              ".joint_parent_local_rank_decimal_base") !=
+      kMf2JointParentLocalRankDecimalBase) {
+    fail(composition_field +
+         ".joint_parent_local_rank_decimal_base is not decimal");
+  }
+  if (require_safe_integer(
+          require_member(composition,
                          "joint_parent_local_rank_capacity",
                          composition_field),
           composition_field + ".joint_parent_local_rank_capacity") !=
@@ -1549,13 +1583,6 @@ void require_compiler_contract_nested_shapes(
     fail(composition_field +
          ".joint_parent_local_rank_capacity is not the mf2 capacity");
   }
-  for (const std::string_view name :
-       {"cell_frame_policy", "rewrite_policy", "frame_path_policy"}) {
-    (void)require_text(
-        require_member(composition, name, composition_field),
-        composition_field + "." + std::string(name));
-  }
-
   const auto& accepted = require_object(
       require_member(root, "accepted_deployment_subset",
                      "compiler_contract_manifest"),

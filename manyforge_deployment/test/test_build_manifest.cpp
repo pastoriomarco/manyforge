@@ -116,11 +116,11 @@ constexpr std::string_view kZeroDigest =
 constexpr std::string_view kExpectedNodeEnvironmentDigest =
     "sha256:c1a6f5fcdcabc18c30ade4761a64ff7fd10dfbeb473514ccde3a69e3bd11dd6a";
 constexpr std::string_view kExpectedCompilerContractDigest =
-    "sha256:2197422750ff536028772ff44c555c4cc0725859fd6763236fe5ef14ba641fb5";
+    "sha256:6709d1bf0e663bee96d3a4f6ca44b0891f2f59cd9dd1d8cb28ccee1d3a822ad5";
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:1a0004374353968bc4b0b1fb50229ab95c48790ddb4b58c35f5f5f39862c3d72";
+    "sha256:4689361cbec73efdb3ef56b0a90dd40a4a6094609992243739bf4c6e00a76872";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:58bbf96c6990ca84bae1d1d5986323984704f0842334acd898d6cddb41f61858";
+    "sha256:019857513cab8b499d5488796e72e99c7bda8be15e8a874676704957f31f4898";
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);
 static_assert(!std::is_aggregate_v<BuildQualifiedManifest>);
@@ -593,6 +593,10 @@ TEST(BuildManifestAuthority,
             6.0);
   EXPECT_EQ(number_member(
                 composition,
+                "joint_parent_local_rank_decimal_base"),
+            10.0);
+  EXPECT_EQ(number_member(
+                composition,
                 "joint_parent_local_rank_capacity"),
             1000000.0);
   EXPECT_EQ(text_member(composition, "joint_source_tie_break"),
@@ -624,6 +628,16 @@ TEST(BuildManifestAuthority,
   EXPECT_EQ(
       text_member(composition, "fixed_connection_hash_fields"),
       "cell_id,model_instance_id,kind,parent_link,child_link");
+  EXPECT_EQ(
+      text_member(composition,
+                  "occurrence_symbol_rewrite_key_fields"),
+      "model_instance_id,kind,scope_name,source_name");
+  EXPECT_EQ(text_member(composition, "cell_frame_policy"),
+            "one-compiler-owned-cell-frame");
+  EXPECT_EQ(text_member(composition, "rewrite_policy"),
+            "total-forward-reverse-reference-rewrite");
+  EXPECT_EQ(text_member(composition, "frame_path_policy"),
+            "cell-rooted-portable-frame-paths");
 
   for (const std::string_view field : {
            "naming_scheme",
@@ -638,6 +652,10 @@ TEST(BuildManifestAuthority,
            "joint_hash_field_encoding",
            "source_joint_hash_fields",
            "fixed_connection_hash_fields",
+           "occurrence_symbol_rewrite_key_fields",
+           "cell_frame_policy",
+           "rewrite_policy",
+           "frame_path_policy",
        }) {
     const auto changed_composition =
         replace_member(composition, field,
@@ -657,6 +675,7 @@ TEST(BuildManifestAuthority,
   for (const auto& [field, invalid] :
        std::vector<std::pair<std::string_view, double>>{
            {"joint_parent_local_rank_decimal_width", 5.0},
+           {"joint_parent_local_rank_decimal_base", 16.0},
            {"joint_parent_local_rank_capacity", 999999.0},
        }) {
     const auto changed_composition =

@@ -22,12 +22,14 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(UTF8PROC REQUIRED IMPORTED_TARGET libutf8proc)
 pkg_check_modules(LIBYAML REQUIRED IMPORTED_TARGET yaml-0.1)
 
+get_filename_component(
+  _MANYFORGE_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." REALPATH)
 set(
   MANYFORGE_NODE_ENVIRONMENT_MANIFEST
-  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_environment_manifest.yaml")
+  "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior/resources/node_environment_manifest.yaml")
 set(
   MANYFORGE_NODE_ENVIRONMENT_CHECK
-  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/scripts/generate_node_environment_manifest.py")
+  "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior/scripts/generate_node_environment_manifest.py")
 set(
   MANYFORGE_STRUCTURAL_PREPARATION_TOOL
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_structural_model.py")
@@ -41,9 +43,9 @@ endif()
 execute_process(
   COMMAND
     "${CMAKE_COMMAND}" -E env
-    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior"
+    "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior"
     "${Python3_EXECUTABLE}" "${MANYFORGE_NODE_ENVIRONMENT_CHECK}" --check
-  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+  WORKING_DIRECTORY "${_MANYFORGE_WORKSPACE_ROOT}"
   RESULT_VARIABLE MANYFORGE_NODE_ENVIRONMENT_CHECK_RESULT
   OUTPUT_VARIABLE MANYFORGE_NODE_ENVIRONMENT_CHECK_OUTPUT
   ERROR_VARIABLE MANYFORGE_NODE_ENVIRONMENT_CHECK_ERROR)

@@ -2609,14 +2609,12 @@ TEST(CellComposition, PinsMixedMf1Mf2DomainFieldEncodingAndBoundaryVectors) {
       composed.flattened_urdf().robot_name,
       "mf1_robot_cb4af488b4df85807d66e188803e78f2fab669bd5c3193178c9c5b5aae867a84");
   auto compiled_symbol =
-      [&](OccurrenceSymbolKind kind,
-          std::string_view source_name) -> std::string {
+      [&](const OccurrenceSymbolKey& source) -> std::string {
     const auto found = std::find_if(
         composed.symbol_rewrites().begin(),
         composed.symbol_rewrites().end(),
         [&](const OccurrenceSymbolRewrite& row) {
-          return row.source.kind == kind &&
-                 row.source.source_name == source_name;
+          return row.source == source;
         });
     if (found == composed.symbol_rewrites().end()) {
       throw std::runtime_error("golden symbol is absent");
@@ -2624,10 +2622,14 @@ TEST(CellComposition, PinsMixedMf1Mf2DomainFieldEncodingAndBoundaryVectors) {
     return found->compiled_name;
   };
   EXPECT_EQ(
-      compiled_symbol(OccurrenceSymbolKind::kLink, "base:link=1"),
+      compiled_symbol(
+          {core::ModelInstanceId("golden_model"),
+           OccurrenceSymbolKind::kLink, "", "base:link=1"}),
       "mf1_link_f27ab8448bae2e59bec5afe8cd1dd898aa542dd1cb60504580725b9a5f2ba391");
   EXPECT_EQ(
-      compiled_symbol(OccurrenceSymbolKind::kLink, "base:link=11"),
+      compiled_symbol(
+          {core::ModelInstanceId("golden_model"),
+           OccurrenceSymbolKind::kLink, "", "base:link=11"}),
       "mf1_link_e78a3238d8cadd7dae93f697301dc8b96dc07fa46472ab925c977bab9c771261");
   ASSERT_EQ(composed.fixed_connections().size(), 1U);
   EXPECT_EQ(
@@ -2635,7 +2637,9 @@ TEST(CellComposition, PinsMixedMf1Mf2DomainFieldEncodingAndBoundaryVectors) {
       "mf2_joint_000000_"
       "da38214c7b450c16ba1270cb7126cc6a436853852c7520a067210746bbe7d92c");
   EXPECT_EQ(
-      compiled_symbol(OccurrenceSymbolKind::kJoint, "joint=1:two"),
+      compiled_symbol(
+          {core::ModelInstanceId("golden_model"),
+           OccurrenceSymbolKind::kJoint, "", "joint=1:two"}),
       "mf2_joint_000000_"
       "e12e1daaec8e24d2a5f32b029f60b479c6fae5038b19e106646b6ab21600f18e");
 }
