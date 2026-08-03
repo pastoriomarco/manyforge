@@ -99,8 +99,6 @@ if(BUILD_TESTING)
       test/test_native_runtime_support.cpp)
     target_link_libraries(test_native_runtime_support PRIVATE
       manyforge_roboplan_native_runtime_support GTest::gtest_main)
-    gtest_discover_tests(test_native_runtime_support
-      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
     # Bounded qualification-only evidence capture. It is deliberately not a
     # production target and supplies no planner, factory, scene, execution, or
@@ -147,8 +145,6 @@ if(BUILD_TESTING)
       test/test_roboplan_planning_qualification.cpp)
     target_link_libraries(test_roboplan_planning_qualification PRIVATE
       manyforge_roboplan_planning_evidence GTest::gtest_main)
-    gtest_discover_tests(test_roboplan_planning_qualification
-      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
     add_executable(test_roboplan_planner_options
       test/test_roboplan_planner_options.cpp)
@@ -171,8 +167,6 @@ if(BUILD_TESTING)
       test/test_retained_planning_model_stage.cpp)
     target_link_libraries(test_retained_planning_model_stage PRIVATE
       manyforge_roboplan_retained_consumer GTest::gtest_main)
-    gtest_discover_tests(test_retained_planning_model_stage
-      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
     add_executable(test_roboplan_scene_generation
       test/test_roboplan_scene_generation.cpp)
@@ -377,49 +371,62 @@ if(BUILD_TESTING)
       endif()
     endforeach()
 
+    get_filename_component(
+      _MANYFORGE_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." REALPATH)
+
+    # The qualification runner removes its ambient loader environment before
+    # CTest execution. Register every RoboPlan GTest with the exact library
+    # closure derived above instead of relying on inherited process state.
+    gtest_discover_tests(test_native_runtime_support
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_roboplan_planning_qualification
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_retained_planning_model_stage
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_retained_product_consumer
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
-        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
-      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_roboplan_scene_generation
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
-        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
-      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_roboplan_planner_options
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
-        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
-      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_cartesian_planning_contract
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
-        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
-      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_joint_cap_contract
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
-        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
-      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     add_test(
       NAME retained_compiled_visual_fk_composer_consumer
       COMMAND
         "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_composer/tests/qualify_retained_compiled_visual_fk.py"
+        "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_composer/tests/qualify_retained_compiled_visual_fk.py"
         --fixture-root
         "${_MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT}")
     set_tests_properties(
       retained_compiled_visual_fk_composer_consumer
       PROPERTIES
         ENVIRONMENT
-          "PYTHONOPTIMIZE=1;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/..;LD_LIBRARY_PATH=${_LIB_PATHS}"
+          "PYTHONOPTIMIZE=1;PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     add_test(
       NAME retained_compiled_model_independent_standard_parser
       COMMAND
         "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/test/qualify_retained_model_standard_parsers.py"
+        "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_deployment/test/qualify_retained_model_standard_parsers.py"
         --fixture-root
         "${_MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT}"
         --urdfdom-checker
@@ -428,7 +435,7 @@ if(BUILD_TESTING)
       retained_compiled_model_independent_standard_parser
       PROPERTIES
         ENVIRONMENT
-          "PYTHONOPTIMIZE=1;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/..;LD_LIBRARY_PATH=${_LIB_PATHS}"
+          "PYTHONOPTIMIZE=1;PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   endif()

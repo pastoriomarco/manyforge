@@ -49,8 +49,7 @@ if(TARGET GTest::gtest_main)
     set(MANYFORGE_GTEST_TIMEOUT_SECONDS 60)
   endif()
   gtest_discover_tests(test_collision_engine_integration
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
-    DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 else()
   message(STATUS
     "GTest is unavailable; owner-neutral collision integration tests are not "
