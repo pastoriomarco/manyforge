@@ -51,13 +51,13 @@ def loaded_build_contract() -> dict[str, object]:
     return verifier.load_manifest(BUILD_CONTRACT_PATH)
 
 
-def test_manifest_is_strict_complete_and_preimplementation() -> None:
+def test_manifest_is_strict_and_declares_the_active_qualification_contract() -> None:
     manifest = loaded_manifest()
 
     lanes = verifier.validate_manifest(manifest, REPOSITORY_ROOT)
 
     assert manifest["schema_version"] == verifier.SCHEMA
-    assert manifest["status"] == verifier.PACKET_STATUS
+    assert manifest["status"] == verifier.QUALIFICATION_STATUS
     assert set(lanes) == verifier.REQUIRED_LANES
     assert [lane["ordinal"] for lane in lanes.values()] == list(
         range(1, len(lanes) + 1)
@@ -1159,24 +1159,84 @@ def test_host_native_provenance_rejects_self_hash_drift(tmp_path: Path) -> None:
         )
 
 
-def test_packet_is_pending_or_frozen_under_one_atomic_first_add_commit() -> None:
+def test_historical_packet_lineage_is_exact_and_non_qualifying() -> None:
     manifest = loaded_manifest()
 
-    packet = verifier._validate_packet_freeze_contract(
-        manifest,
-        REPOSITORY_ROOT,
-        require_committed=False,
-        require_external_anchor=False,
+    lineage = verifier._validate_historical_packet_lineage(
+        manifest, REPOSITORY_ROOT
     )
 
-    assert {row["path"] for row in packet["files"]} == verifier.REQUIRED_PACKET_PATHS
-    if packet["status"] == "pending_initial_commit":
-        assert packet["freeze_commit"] is None
-        assert all(row["git_blob"] is None for row in packet["files"])
-    else:
-        assert packet["status"] == "frozen"
-        assert packet["freeze_commit"] is not None
-        assert all(row["git_blob"] is not None for row in packet["files"])
+    assert lineage["disposition"] == "historical_non_qualifying"
+    assert lineage["initial_packet_commit"] == verifier.HISTORICAL_PACKET_COMMIT
+    assert lineage["initial_packet_tree"] == verifier.HISTORICAL_PACKET_TREE
+    assert lineage["initial_packet_parent_commit"] == verifier.IMPLEMENTATION_BASES[
+        "manyforge"
+    ]["head_commit"]
+    assert {row["path"] for row in lineage["files"]} == (
+        verifier.HISTORICAL_NEW_PACKET_PATHS | verifier.HISTORICAL_SUPPORT_PATHS
+    )
+    assert sum(row["origin"] == "initial_new" for row in lineage["files"]) == 17
+    assert all(row["initial_git_blob"] for row in lineage["files"])
+    assert verifier._git_head(REPOSITORY_ROOT) != lineage["initial_packet_commit"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("disposition", "qualified"),
+        ("initial_packet_commit", "0" * 40),
+        ("initial_packet_tree", "0" * 40),
+        ("initial_packet_parent_commit", "0" * 40),
+    ],
+)
+def test_historical_packet_lineage_identity_is_closed(
+    field: str, value: str
+) -> None:
+    manifest = loaded_manifest()
+    manifest["historical_packet_lineage"][field] = value
+
+    with pytest.raises(
+        verifier.ManifestError, match="historical packet lineage identity drifted"
+    ):
+        verifier._validate_historical_packet_lineage(
+            manifest, REPOSITORY_ROOT
+        )
+
+
+@pytest.mark.parametrize(
+    "obsolete_field",
+    [
+        "freeze_commit_directly_follows_implementation_base",
+        "blob_and_mode_immutable_after_freeze",
+        "external_anchor_path",
+    ],
+)
+def test_historical_packet_lineage_rejects_obsolete_process_rules(
+    obsolete_field: str,
+) -> None:
+    manifest = loaded_manifest()
+    manifest["historical_packet_lineage"][obsolete_field] = True
+
+    with pytest.raises(verifier.ManifestError, match="keys differ"):
+        verifier._validate_historical_packet_lineage(manifest, REPOSITORY_ROOT)
+
+
+def test_candidate_must_descend_from_implementation_base() -> None:
+    base = verifier.IMPLEMENTATION_BASES["manyforge"]["head_commit"]
+    verifier._require_commit_descends_from(
+        REPOSITORY_ROOT,
+        candidate=verifier._git_head(REPOSITORY_ROOT),
+        base=base,
+        label="ManyForge",
+    )
+
+    with pytest.raises(verifier.ManifestError, match="does not descend"):
+        verifier._require_commit_descends_from(
+            REPOSITORY_ROOT,
+            candidate="08222188293df8e12f90dc72e204c21f22f92ea1",
+            base=base,
+            label="ManyForge",
+        )
 
 
 def test_binding_measurement_counts_reject_json_booleans() -> None:

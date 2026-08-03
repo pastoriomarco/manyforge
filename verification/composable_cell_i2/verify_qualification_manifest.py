@@ -347,7 +347,7 @@ TOP_LEVEL_KEYS = {
     "schema_version",
     "status",
     "implementation_base",
-    "packet_freeze_contract",
+    "historical_packet_lineage",
     "candidate_identity",
     "qualification_environment",
     "binding_contract",
@@ -362,13 +362,10 @@ TOP_LEVEL_KEYS = {
     "historical_non_satisfying_inputs",
     "evidence_contract",
 }
-PACKET_STATUS = "preimplementation_freeze_packet"
-PACKET_ANCHOR_PENDING = "PENDING_INITIAL_COMMIT"
-PACKET_ANCHOR_PREFIX = "I2 qualification packet freeze commit:"
-PACKET_ANCHOR_PATH = Path(
-    "../manyforge_specs/docs/plans/COMPOSABLE_CELL_RUNTIME_IMPLEMENTATION_PLAN.md"
-)
-REQUIRED_NEW_PACKET_PATHS = {
+QUALIFICATION_STATUS = "active_i2_qualification_contract"
+HISTORICAL_PACKET_COMMIT = "c860246d377f63e1937922ab7611ec77aa18331e"
+HISTORICAL_PACKET_TREE = "3af67641352edec310c6f2aea8b0784c5b269993"
+HISTORICAL_NEW_PACKET_PATHS = {
     "scripts/ci/run-composable-cell-i2-core-asan.sh",
     "scripts/ci/run-composable-cell-i2-core-tsan.sh",
     "scripts/ci/run-composable-cell-i2-deployment-asan.sh",
@@ -387,11 +384,10 @@ REQUIRED_NEW_PACKET_PATHS = {
     "verification/composable_cell_i2/native_target_contract.v1.json",
     "verification/composable_cell_i2/verify_qualification_manifest.py",
 }
-REQUIRED_EXISTING_PACKET_PATHS = {
+HISTORICAL_SUPPORT_PATHS = {
     "scripts/ci/tsan.supp",
     "scripts/qualification/source_identity.py",
 }
-REQUIRED_PACKET_PATHS = REQUIRED_NEW_PACKET_PATHS | REQUIRED_EXISTING_PACKET_PATHS
 REQUIRED_LANES = {
     "preflight",
     "core_release",
@@ -1099,7 +1095,7 @@ FROZEN_SECTION_SHA256 = {
 REQUIRED_EVIDENCE_FIELDS = {
     "manifest_sha256",
     "verifier_sha256",
-    "qualification_packet_freeze",
+    "historical_packet_lineage",
     "candidate_manyforge_source_identity",
     "candidate_specs_source_identity",
     "candidate_source_snapshot",
@@ -1122,7 +1118,7 @@ REQUIRED_EVIDENCE_FIELDS = {
     "independent_adversarial_review",
 }
 REQUIRED_REVIEW_CHECKS = [
-    "candidate_diff_and_packet_freeze",
+    "candidate_diff_and_historical_packet_lineage",
     "manifest_verifier_and_exact_lane_commands",
     "all_native_test_artifacts_and_raw_logs",
     "native_production_and_binding_build_provenance_closure",
@@ -1137,7 +1133,7 @@ REQUIRED_REVIEW_CHECKS = [
 
 
 class ManifestError(RuntimeError):
-    """The frozen qualification contract is malformed or cannot be verified."""
+    """The I2 qualification contract is malformed or cannot be verified."""
 
 
 def fail(message: str) -> NoReturn:
@@ -1342,6 +1338,38 @@ def _git_head(repository: Path) -> str:
     ).stdout.strip()
 
 
+def _require_commit_descends_from(
+    repository: Path,
+    *,
+    candidate: str,
+    base: str,
+    label: str,
+) -> None:
+    if not HEX40.fullmatch(candidate) or not HEX40.fullmatch(base):
+        fail(f"{label} ancestry identity is malformed")
+    completed = subprocess.run(
+        [
+            "git",
+            "--no-optional-locks",
+            "-C",
+            str(repository),
+            "merge-base",
+            "--is-ancestor",
+            base,
+            candidate,
+        ],
+        cwd=repository,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode == 1:
+        fail(f"{label} candidate does not descend from its implementation base")
+    if completed.returncode != 0:
+        fail(f"cannot verify {label} candidate ancestry: {completed.stderr.strip()}")
+
+
 def _git_tree_entry(repository: Path, commit: str, relative: str) -> tuple[str, str]:
     output = _run_checked(
         [
@@ -1458,181 +1486,60 @@ def _validate_base(manifest: dict[str, Any], repository_root: Path) -> None:
             fail(f"implementation base identity drifted for {name}")
 
 
-def _packet_anchor_value(anchor_path: Path) -> str | None:
-    if not anchor_path.is_file():
-        return None
-    try:
-        matches = [
-            line.removeprefix(PACKET_ANCHOR_PREFIX).strip()
-            for line in anchor_path.read_text(encoding="utf-8").splitlines()
-            if line.startswith(PACKET_ANCHOR_PREFIX)
-        ]
-    except (OSError, UnicodeError) as error:
-        fail(f"cannot read external packet anchor: {error}")
-    if len(matches) != 1 or not matches[0]:
-        fail("Specs plan must contain one exact I2 packet-freeze anchor line")
-    return matches[0]
-
-
-def _validate_packet_freeze_contract(
+def _validate_historical_packet_lineage(
     manifest: dict[str, Any],
     repository_root: Path,
-    *,
-    require_committed: bool,
-    require_external_anchor: bool,
 ) -> dict[str, Any]:
     contract = _require_object(
-        manifest["packet_freeze_contract"], "packet_freeze_contract"
+        manifest["historical_packet_lineage"], "historical_packet_lineage"
     )
     _exact_keys(
         contract,
         {
-            "implementation_base_commit",
-            "new_packet_paths",
-            "existing_packet_paths",
-            "packet_paths",
-            "one_shared_first_add_commit",
-            "freeze_commit_directly_follows_implementation_base",
-            "freeze_commit_contains_only_packet_changes",
-            "existing_paths_bound_to_base_and_freeze",
-            "blob_and_mode_immutable_after_freeze",
-            "external_anchor_path",
-            "external_anchor_prefix",
+            "disposition",
+            "initial_packet_commit",
+            "initial_packet_tree",
+            "initial_packet_parent_commit",
+            "initial_new_paths",
+            "initial_support_paths",
         },
-        "packet_freeze_contract",
+        "historical_packet_lineage",
     )
     base_commit = IMPLEMENTATION_BASES["manyforge"]["head_commit"]
     if (
-        contract["implementation_base_commit"] != base_commit
-        or contract["one_shared_first_add_commit"] is not True
-        or contract["freeze_commit_directly_follows_implementation_base"] is not True
-        or contract["freeze_commit_contains_only_packet_changes"] is not True
-        or contract["existing_paths_bound_to_base_and_freeze"] is not True
-        or contract["blob_and_mode_immutable_after_freeze"] is not True
-        or contract["external_anchor_path"] != PACKET_ANCHOR_PATH.as_posix()
-        or contract["external_anchor_prefix"] != PACKET_ANCHOR_PREFIX
+        contract["disposition"] != "historical_non_qualifying"
+        or contract["initial_packet_commit"] != HISTORICAL_PACKET_COMMIT
+        or contract["initial_packet_tree"] != HISTORICAL_PACKET_TREE
+        or contract["initial_packet_parent_commit"] != base_commit
     ):
-        fail("packet-freeze rule drifted")
+        fail("historical packet lineage identity drifted")
     new_paths = _require_list(
-        contract["new_packet_paths"], "packet_freeze_contract.new_packet_paths"
+        contract["initial_new_paths"],
+        "historical_packet_lineage.initial_new_paths",
     )
-    existing_paths = _require_list(
-        contract["existing_packet_paths"],
-        "packet_freeze_contract.existing_packet_paths",
-    )
-    paths = _require_list(
-        contract["packet_paths"], "packet_freeze_contract.packet_paths"
+    support_paths = _require_list(
+        contract["initial_support_paths"],
+        "historical_packet_lineage.initial_support_paths",
     )
     if (
-        new_paths != sorted(REQUIRED_NEW_PACKET_PATHS)
-        or existing_paths != sorted(REQUIRED_EXISTING_PACKET_PATHS)
-        or paths != sorted(REQUIRED_PACKET_PATHS)
-        or len(paths) != len(set(paths))
-        or set(new_paths).intersection(existing_paths)
-        or set(new_paths).union(existing_paths) != set(paths)
+        new_paths != sorted(HISTORICAL_NEW_PACKET_PATHS)
+        or support_paths != sorted(HISTORICAL_SUPPORT_PATHS)
+        or set(new_paths).intersection(support_paths)
     ):
-        fail("packet-freeze path inventory drifted")
-    current_files: list[tuple[str, Path]] = []
-    tracked: dict[str, bool] = {}
-    for value in paths:
-        relative = _safe_relative_path(value, "packet-freeze path")
-        current = _require_contained_regular_file(
-            repository_root / relative,
-            repository_root,
-            f"qualification packet file {relative}",
-            require_single_link=True,
-        )
-        current_files.append((relative.as_posix(), current))
-        tracked[relative.as_posix()] = subprocess.run(
-            [
-                "git",
-                "--no-optional-locks",
-                "-C",
-                str(repository_root),
-                "ls-files",
-                "--error-unmatch",
-                "--",
-                value,
-            ],
-            cwd=repository_root,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode == 0
-    if not all(tracked[path] for path in existing_paths):
-        fail("an existing qualification packet path is not tracked")
-    new_tracked = [tracked[path] for path in new_paths]
-    if any(new_tracked) and not all(new_tracked):
-        fail("new qualification packet paths are only partially tracked")
-    head = _git_head(repository_root)
-    anchor_path = (repository_root / PACKET_ANCHOR_PATH).resolve()
-    anchor_value = _packet_anchor_value(anchor_path)
+        fail("historical packet lineage path inventory drifted")
+    paths = [*new_paths, *support_paths]
     base_entries: dict[str, tuple[str, str] | None] = {
         relative: _git_tree_entry_optional(repository_root, base_commit, relative)
         for relative in paths
     }
     if any(base_entries[path] is not None for path in new_paths):
         fail("a new qualification packet path already exists at the implementation base")
-    if any(base_entries[path] is None for path in existing_paths):
-        fail("an existing qualification packet path is absent at the implementation base")
+    if any(base_entries[path] is None for path in support_paths):
+        fail("a historical support path is absent at the implementation base")
 
-    if not any(new_tracked):
-        if head != base_commit:
-            fail("untracked qualification packet no longer directly follows its base")
-        if require_committed:
-            fail("qualification packet must be committed before lane execution")
-        if anchor_value not in {None, PACKET_ANCHOR_PENDING}:
-            fail("uncommitted qualification packet has a premature external anchor")
-        files: list[dict[str, Any]] = []
-        for relative, path in current_files:
-            base_entry = base_entries[relative]
-            working_mode = "100755" if path.stat().st_mode & 0o111 else "100644"
-            files.append(
-                {
-                    "path": relative,
-                    "origin": "new" if relative in REQUIRED_NEW_PACKET_PATHS else "existing",
-                    "sha256": _sha256_file(path),
-                    "size": path.stat().st_size,
-                    "git_mode": working_mode,
-                    "git_blob": None,
-                    "base_git_mode": base_entry[0] if base_entry is not None else None,
-                    "base_git_blob": base_entry[1] if base_entry is not None else None,
-                }
-            )
-        return {
-            "status": "pending_initial_commit",
-            "implementation_base_commit": base_commit,
-            "freeze_commit": None,
-            "freeze_tree": None,
-            "external_anchor_verified": anchor_value == PACKET_ANCHOR_PENDING,
-            "files": files,
-        }
-
-    add_commits: set[str] = set()
-    for relative in new_paths:
-        output = _run_checked(
-            [
-                "git",
-                "--no-optional-locks",
-                "-C",
-                str(repository_root),
-                "log",
-                "--reverse",
-                "--format=%H",
-                "--diff-filter=A",
-                f"{base_commit}..{head}",
-                "--",
-                relative,
-            ],
-            cwd=repository_root,
-            label=f"packet first-add lookup for {relative}",
-        ).stdout.splitlines()
-        if len(output) != 1 or not HEX40.fullmatch(output[0]):
-            fail(f"packet path does not have one first-add commit: {relative}")
-        add_commits.add(output[0])
-    if len(add_commits) != 1:
-        fail("qualification packet files were not frozen in one commit")
-    freeze_commit = next(iter(add_commits))
+    initial_commit = HISTORICAL_PACKET_COMMIT
+    if _git_tree(repository_root, initial_commit) != HISTORICAL_PACKET_TREE:
+        fail("historical packet tree drifted")
     parents = _run_checked(
         [
             "git",
@@ -1643,30 +1550,13 @@ def _validate_packet_freeze_contract(
             "--parents",
             "-n",
             "1",
-            freeze_commit,
+            initial_commit,
         ],
         cwd=repository_root,
-        label="packet freeze parent lookup",
+        label="packet first-add parent lookup",
     ).stdout.split()
-    if parents != [freeze_commit, base_commit]:
-        fail("qualification packet freeze commit must directly follow the implementation base")
-    if subprocess.run(
-        [
-            "git",
-            "--no-optional-locks",
-            "-C",
-            str(repository_root),
-            "merge-base",
-            "--is-ancestor",
-            freeze_commit,
-            head,
-        ],
-        cwd=repository_root,
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode != 0:
-        fail("qualification packet freeze commit is not an ancestor of HEAD")
+    if parents != [initial_commit, base_commit]:
+        fail("historical packet commit does not directly follow its implementation base")
     changed_paths = set(
         _run_checked(
             [
@@ -1678,81 +1568,32 @@ def _validate_packet_freeze_contract(
                 "--no-commit-id",
                 "--name-only",
                 "-r",
-                freeze_commit,
+                initial_commit,
             ],
             cwd=repository_root,
-            label="packet freeze changed-path lookup",
+            label="packet first-add changed-path lookup",
         ).stdout.splitlines()
     )
-    if not set(new_paths).issubset(changed_paths):
-        fail("packet freeze commit does not add every new packet path")
-    if not changed_paths.issubset(REQUIRED_PACKET_PATHS):
-        fail("packet freeze commit contains non-packet changes")
-    later_packet_commits = _run_checked(
-        [
-            "git",
-            "--no-optional-locks",
-            "-C",
-            str(repository_root),
-            "log",
-            "--format=%H",
-            f"{freeze_commit}..{head}",
-            "--",
-            *paths,
-        ],
-        cwd=repository_root,
-        label="post-freeze packet history lookup",
-    ).stdout.splitlines()
-    if later_packet_commits:
-        fail("qualification packet was changed after its freeze commit")
-    for argv, label in (
-        (
-            ["git", "--no-optional-locks", "diff", "--quiet", "HEAD", "--", *paths],
-            "worktree packet drift",
-        ),
-        (
-            [
-                "git",
-                "--no-optional-locks",
-                "diff",
-                "--cached",
-                "--quiet",
-                "HEAD",
-                "--",
-                *paths,
-            ],
-            "index packet drift",
-        ),
+    if changed_paths != set(new_paths):
+        fail("packet first-add commit path inventory drifted")
+    if any(
+        _git_tree_entry(repository_root, initial_commit, path)
+        != base_entries[path]
+        for path in support_paths
     ):
-        completed = subprocess.run(
-            argv,
-            cwd=repository_root,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if completed.returncode != 0:
-            fail(f"{label}: {completed.stderr.strip()}")
+        fail("a support path changed in the historical packet commit")
     files: list[dict[str, Any]] = []
-    for relative, path in current_files:
-        mode, blob = _git_tree_entry(repository_root, freeze_commit, relative)
-        if _git_tree_entry(repository_root, head, relative) != (mode, blob):
-            fail(f"qualification packet Git entry drifted: {relative}")
-        content = _git_blob(repository_root, freeze_commit, relative)
-        if hashlib.sha256(content).hexdigest() != _sha256_file(path):
-            fail(f"qualification packet working bytes drifted: {relative}")
-        executable = bool(path.stat().st_mode & 0o111)
-        if executable != (mode == "100755"):
-            fail(f"qualification packet working mode drifted: {relative}")
+    for relative in paths:
+        mode, blob = _git_tree_entry(repository_root, initial_commit, relative)
+        content = _git_blob(repository_root, initial_commit, relative)
         files.append(
             {
                 "path": relative,
-                "origin": "new" if relative in REQUIRED_NEW_PACKET_PATHS else "existing",
+                "origin": "initial_new" if relative in new_paths else "support",
                 "sha256": hashlib.sha256(content).hexdigest(),
                 "size": len(content),
-                "git_mode": mode,
-                "git_blob": blob,
+                "initial_git_mode": mode,
+                "initial_git_blob": blob,
                 "base_git_mode": (
                     base_entries[relative][0]
                     if base_entries[relative] is not None
@@ -1765,15 +1606,11 @@ def _validate_packet_freeze_contract(
                 ),
             }
         )
-    anchor_verified = anchor_value == freeze_commit
-    if require_external_anchor and not anchor_verified:
-        fail("Specs plan does not anchor the exact qualification packet freeze commit")
     return {
-        "status": "frozen",
-        "implementation_base_commit": base_commit,
-        "freeze_commit": freeze_commit,
-        "freeze_tree": _git_tree(repository_root, freeze_commit),
-        "external_anchor_verified": anchor_verified,
+        "disposition": "historical_non_qualifying",
+        "initial_packet_commit": initial_commit,
+        "initial_packet_tree": HISTORICAL_PACKET_TREE,
+        "initial_packet_parent_commit": base_commit,
         "files": files,
     }
 
@@ -4076,15 +3913,10 @@ def validate_manifest(manifest: dict[str, Any], repository_root: Path) -> dict[s
     _exact_keys(manifest, TOP_LEVEL_KEYS, "manifest")
     if manifest["schema_version"] != SCHEMA:
         fail(f"manifest schema must be {SCHEMA}")
-    if manifest["status"] != PACKET_STATUS:
-        fail("manifest status is not the pre-implementation freeze packet")
+    if manifest["status"] != QUALIFICATION_STATUS:
+        fail("manifest status is not the I2 qualification contract")
     _validate_base(manifest, repository_root)
-    _validate_packet_freeze_contract(
-        manifest,
-        repository_root,
-        require_committed=False,
-        require_external_anchor=False,
-    )
+    _validate_historical_packet_lineage(manifest, repository_root)
     _validate_candidate_identity(manifest["candidate_identity"], repository_root)
     _validate_environment(
         _require_object(manifest["qualification_environment"], "qualification_environment")
@@ -15111,12 +14943,7 @@ def execute_lanes(
 ) -> int:
     if requested != "all" and requested not in lanes:
         fail(f"unknown qualification lane: {requested}")
-    packet_freeze = _validate_packet_freeze_contract(
-        manifest,
-        repository_root,
-        require_committed=True,
-        require_external_anchor=True,
-    )
+    packet_lineage = _validate_historical_packet_lineage(manifest, repository_root)
     selected = list(lanes.values()) if requested == "all" else [lanes[requested]]
     identifier = run_id or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     if not RUN_ID.fullmatch(identifier):
@@ -15137,6 +14964,18 @@ def execute_lanes(
     specs_before = capture_source_identity(identity_tool, specs_root)
     if source_before.get("dirty") or specs_before.get("dirty"):
         fail("qualification execution requires clean committed ManyForge and Specs trees")
+    _require_commit_descends_from(
+        repository_root,
+        candidate=source_before["head_commit"],
+        base=IMPLEMENTATION_BASES["manyforge"]["head_commit"],
+        label="ManyForge",
+    )
+    _require_commit_descends_from(
+        specs_root,
+        candidate=specs_before["head_commit"],
+        base=IMPLEMENTATION_BASES["manyforge_specs"]["head_commit"],
+        label="Specs",
+    )
     try:
         run_root.mkdir(parents=True, exist_ok=False)
         artifact_root = run_root / "artifacts"
@@ -15346,7 +15185,7 @@ def execute_lanes(
             / "verification/composable_cell_i2/qualification_manifest.v1.json"
         ),
         "verifier_sha256": _sha256_file(Path(__file__).resolve()),
-        "qualification_packet_freeze": packet_freeze,
+        "historical_packet_lineage": packet_lineage,
         "candidate_manyforge_source_identity": source_before,
         "candidate_specs_source_identity": specs_before,
         "candidate_source_snapshot": snapshot_evidence,
@@ -15603,24 +15442,31 @@ def verify_and_close_result(
         or result["independent_adversarial_review"] is not None
     ):
         fail("qualification result is not an exact automatically passing pre-review result")
-    packet_freeze = _validate_packet_freeze_contract(
-        manifest,
-        repository_root,
-        require_committed=True,
-        require_external_anchor=True,
-    )
-    if result["qualification_packet_freeze"] != packet_freeze:
-        fail("qualification result is not bound to the frozen packet blobs")
-    _validate_source_identity(
+    packet_lineage = _validate_historical_packet_lineage(manifest, repository_root)
+    if result["historical_packet_lineage"] != packet_lineage:
+        fail("qualification result historical packet lineage drifted")
+    manyforge_identity = _validate_source_identity(
         result["candidate_manyforge_source_identity"],
         repository=repository_root,
         label="qualification result ManyForge source",
     )
     specs_root = (repository_root / "../manyforge_specs").resolve()
-    _validate_source_identity(
+    specs_identity = _validate_source_identity(
         result["candidate_specs_source_identity"],
         repository=specs_root,
         label="qualification result Specs source",
+    )
+    _require_commit_descends_from(
+        repository_root,
+        candidate=manyforge_identity["head_commit"],
+        base=IMPLEMENTATION_BASES["manyforge"]["head_commit"],
+        label="ManyForge",
+    )
+    _require_commit_descends_from(
+        specs_root,
+        candidate=specs_identity["head_commit"],
+        base=IMPLEMENTATION_BASES["manyforge_specs"]["head_commit"],
+        label="Specs",
     )
     identity_tool = _require_contained_regular_file(
         repository_root / manifest["candidate_identity"]["capture_tool"],
@@ -15773,7 +15619,7 @@ def verify_and_close_result(
         "schema_version": CLOSURE_SCHEMA,
         "manifest_sha256": manifest_sha256,
         "verifier_sha256": verifier_sha256,
-        "qualification_packet_freeze": packet_freeze,
+        "historical_packet_lineage": packet_lineage,
         "qualification_result": _file_evidence(result_path, run_root),
         "independent_adversarial_review": _file_evidence(review_path, run_root),
         "candidate_manyforge_source_identity": result[

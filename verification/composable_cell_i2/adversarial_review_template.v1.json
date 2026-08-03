@@ -25,7 +25,7 @@
   },
   "scope": {
     "checks": [
-      "candidate_diff_and_packet_freeze",
+      "candidate_diff_and_historical_packet_lineage",
       "manifest_verifier_and_exact_lane_commands",
       "all_native_test_artifacts_and_raw_logs",
       "native_production_and_binding_build_provenance_closure",
@@ -81,13 +81,13 @@
       "fixture_ir_manifest_golden_and_product_digests",
       "forbidden_scan_results",
       "generated_output_sha256_and_size",
+      "historical_packet_lineage",
       "identity_rotation_comparison",
       "lane_artifact_seals",
       "lane_exit_statuses",
       "log_sha256",
       "manifest_sha256",
       "pinned_container_replay",
-      "qualification_packet_freeze",
       "resolved_image_inspection",
       "source_identity_file_evidence",
       "test_inventory_counts_and_digests",

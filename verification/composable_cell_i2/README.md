@@ -1,13 +1,17 @@
 # Composable Cell I2 Qualification
 
-Status: pre-implementation qualification contract. Its current pending/frozen
-state is machine-enforced by `packet_freeze_contract` and the external plan
-anchor rather than recorded in this immutable packet file.
+Status: executable I2 qualification contract under development. Its historical
+first-add lineage is recorded separately as non-qualifying evidence under
+`historical_packet_lineage`. Formal evidence instead binds the complete current
+ManyForge and Specs trees through clean source identities, a detached source
+snapshot, manifest/verifier digests, final identity rechecks, and review.
 
-This directory contains the candidate executable qualification contract for I2
-of the Composable Cell Runtime Implementation Plan. Once independently accepted
-and committed as one packet, it freezes the implementation
-base, the qualification-time candidate identity rule, the resolved AMD64
+This directory contains the executable qualification contract for I2 of the
+Composable Cell Runtime Implementation Plan. Its historical atomic first-add
+froze the implementation base and initial contract inventory. Bounded packet
+defects discovered during execution may be corrected in ordinary follow-up
+commits. A formal run binds the resulting current contract, the
+qualification-time candidate identity rule, the resolved AMD64
 development image and toolchain, the sole production Python module, every
 binding registration unit and generated output, the retained file-only
 RoboPlan/Pinocchio regression, exact native/production/binding build closure,
@@ -53,12 +57,13 @@ names. The base contains no parameterized or typed-test registrations. The
 three focused groups are exact name/filter subsets of those frozen full-suite
 registries; group overlap is intentional.
 
-The candidate manifest is a gate, not evidence that I2 already passes. In particular,
-the candidate commit and tree do not exist when this packet is frozen. Final
-evidence must resolve them from one clean committed tree and must bind every
-lane result to that same identity. The recorded implementation base remains
-immutable and must never be rewritten to make a later candidate appear to be
-the pre-implementation state.
+The manifest is a gate, not evidence that I2 already passes. Development
+snapshots may be dirty, but no formal lane may start that way. Final evidence
+must resolve the contract and implementation from clean committed ManyForge
+and Specs trees and bind every lane result to those same identities. The
+recorded implementation base and historical first-add commit remain lineage
+evidence; neither substitutes for the current candidate identity or the final
+result-bound review and closure.
 
 The contract intentionally qualifies only the pure ROS-free compiler and the
 `manyforge_core_py` pybind11 projection. It does not retain a product, start a
@@ -125,8 +130,8 @@ binding tests launched by the verifier, not just the final test subprocess.
 Native ordinary-test validation also retains CTest 3.25.1's exact implicit
 working directory and requires canonical command/source paths.
 
-Four lane entry points named by the manifest do not exist at the
-pre-implementation freeze: `run-core-bindings.sh`,
+Four lane entry points named by the manifest were intentionally absent at the
+historical first-add: `run-core-bindings.sh`,
 `run-core-bindings-sanitizer.sh`, `run-core-bindings-contract.sh`, and
 `run-composable-cell-i2-determinism.sh`. This is deliberate. They are frozen
 required red gates that I2 must implement; their absence is not evidence that
@@ -134,24 +139,26 @@ the current tree passes or that a lane may be omitted.
 
 ## Freeze and completion rules
 
-1. Complete the packet source/fixture review and every correction before
-   changing compiler or binding production source. This review accepts the
-   pre-implementation gate; it is distinct from the result-bound adversarial
-   review performed after the cumulative lanes pass.
-2. Atomically first-add the packet in one ManyForge commit, then record that
-   exact commit in the external Specs plan anchor in a separate coordinated
-   Specs commit. The packet is not frozen while the anchor remains
-   `PENDING_INITIAL_COMMIT`.
-3. Keep the implementation-base commit/tree and historical inputs unchanged.
-4. Resolve one clean candidate commit/tree at qualification time.
+1. Preserve the historical atomic first-add and implementation-base lineage;
+   packet corrections may use ordinary follow-up commits and do not need to
+   reconstruct that old commit topology.
+2. During development, run the smallest affected diagnostics and record each
+   material failure once. A dirty development snapshot is never qualification
+   evidence.
+3. Before any formal lane, commit the exact ManyForge and Specs candidates and
+   require both repositories to be clean descendants of their recorded
+   implementation bases.
+4. Resolve and retain those exact ManyForge and Specs identities for the whole
+   qualification run.
 5. Run the lanes in manifest order. A missing, skipped, disabled, or
    substituted lane is a failure, not an unqualified success.
 6. Preserve command stdout/stderr, exit status, fixture/IR digests, generated
    stubs/documentation, image identity, and source/API deletion results below
    the declared output root.
 7. Close I2 only when the complete cumulative matrix passes against the one
-   candidate tree and the evidence bundle verifies. Partial C0.2m, C0.2n,
-   C0.2o, C++, or Python success is not an I2 completion claim.
+   candidate state, the independent review is bound to that result, and the
+   evidence bundle verifies. Partial C0.2m, C0.2n, C0.2o, C++, or Python
+   success is not an I2 completion claim.
 
 An automatic all-lane run always writes `complete: false`. After an independent
 adversarial review has produced a hash-bound

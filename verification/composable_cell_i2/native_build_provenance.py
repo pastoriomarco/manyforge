@@ -850,11 +850,61 @@ def _cache_value(cache: Mapping[str, tuple[str, str]], key: str, label: str) -> 
 
 
 @dataclass(frozen=True)
+class _VirtualSourceReply:
+    path: Path
+    kind: str
+    owner: Path
+
+
+def _classify_cmake_virtual_source(
+    *,
+    target_name: str,
+    target_type: str,
+    build_root: Path,
+    target_build_base: Path,
+    path: Path,
+    generated: bool,
+    compile_group_present: bool,
+    source_group: str | None,
+) -> _VirtualSourceReply | None:
+    """Recognize only the virtual source rows emitted by pinned CMake/Ninja."""
+
+    utility_stamp = target_build_base / "CMakeFiles" / target_name
+    if target_type == "UTILITY" and path == utility_stamp:
+        if not generated or source_group != "" or compile_group_present:
+            _fail(f"target {target_name} has malformed CMake utility stamp source")
+        return _VirtualSourceReply(
+            path=path,
+            kind="cmake_utility_stamp",
+            owner=path,
+        )
+
+    is_rule_node = path.suffix == ".rule"
+    if source_group == "CMake Rules" or is_rule_node:
+        if (
+            source_group != "CMake Rules"
+            or not is_rule_node
+            or not generated
+            or compile_group_present
+            or not _is_within(path, build_root)
+        ):
+            _fail(f"target {target_name} has malformed CMake virtual rule source")
+        return _VirtualSourceReply(
+            path=path,
+            kind="cmake_rule",
+            owner=Path(path.as_posix()[: -len(".rule")]),
+        )
+    return None
+
+
+@dataclass(frozen=True)
 class _TargetReply:
     name: str
     target_type: str
     artifacts: tuple[Path, ...]
     sources: tuple[Path, ...]
+    virtual_sources: tuple[_VirtualSourceReply, ...]
+    build_base: Path
     reply_path: Path
     reply_sha256: str
 
@@ -2492,6 +2542,167 @@ def _cross_profile_command_contract(
     return selected, frozenset(known_tokens)
 
 
+def _file_api_target_sources(
+    *,
+    project_id: str,
+    target_name: str,
+    target_type: str,
+    target_value: Mapping[str, Any],
+    model_source: Path,
+    target_build_base: Path,
+    allowed_source_roots: Sequence[Path],
+    build_root: Path,
+    roots: _Roots,
+) -> tuple[tuple[Path, ...], tuple[_VirtualSourceReply, ...]]:
+    """Decode physical sources and the exact pinned CMake virtual exceptions."""
+
+    raw_sources = _list(
+        target_value.get("sources", []), f"{project_id} target {target_name} sources"
+    )
+    raw_source_groups = _list(
+        target_value.get("sourceGroups", []),
+        f"{project_id} target {target_name} source groups",
+    )
+    sources: list[Path] = []
+    generated_sources: set[Path] = set()
+    virtual_sources: list[_VirtualSourceReply] = []
+
+    for source_index, raw_source in enumerate(raw_sources):
+        label = f"{project_id} target {target_name} source[{source_index}]"
+        source = _object(raw_source, label)
+        generated = source.get("isGenerated", False)
+        if not isinstance(generated, bool):
+            _fail(f"{project_id} target {target_name} source has malformed isGenerated")
+
+        source_group_index: int | None = None
+        source_group: str | None = None
+        if "sourceGroupIndex" in source:
+            raw_group_index = source.get("sourceGroupIndex")
+            if (
+                not isinstance(raw_group_index, int)
+                or isinstance(raw_group_index, bool)
+                or raw_group_index < 0
+                or raw_group_index >= len(raw_source_groups)
+            ):
+                _fail(
+                    f"{project_id} target {target_name} source group index is malformed"
+                )
+            source_group_index = raw_group_index
+            group = _object(
+                raw_source_groups[source_group_index],
+                f"{project_id} target {target_name} source group[{source_group_index}]",
+            )
+            group_name = group.get("name")
+            if not isinstance(group_name, str) or "\x00" in group_name:
+                _fail(
+                    f"{project_id} target {target_name} source group has malformed name"
+                )
+            source_group = group_name
+
+        path = _resolve_declared_path(
+            source.get("path"),
+            build_root if generated else model_source,
+            roots,
+            f"{project_id} target {target_name} source",
+        )
+        if not (
+            any(_is_within(path, source_root) for source_root in allowed_source_roots)
+            or _is_within(path, build_root)
+        ):
+            _fail(f"{project_id} target {target_name} source escapes source/build roots")
+
+        virtual_source = _classify_cmake_virtual_source(
+            target_name=target_name,
+            target_type=target_type,
+            build_root=build_root,
+            target_build_base=target_build_base,
+            path=path,
+            generated=generated,
+            compile_group_present="compileGroupIndex" in source,
+            source_group=source_group,
+        )
+        if virtual_source is not None:
+            memberships: list[int] = []
+            for group_index, raw_group in enumerate(raw_source_groups):
+                group = _object(
+                    raw_group,
+                    f"{project_id} target {target_name} source group[{group_index}]",
+                )
+                raw_indexes = _list(
+                    group.get("sourceIndexes"),
+                    f"{project_id} target {target_name} source group[{group_index}] indexes",
+                )
+                indexes: list[int] = []
+                for raw_index in raw_indexes:
+                    if (
+                        not isinstance(raw_index, int)
+                        or isinstance(raw_index, bool)
+                        or raw_index < 0
+                        or raw_index >= len(raw_sources)
+                    ):
+                        _fail(
+                            f"{project_id} target {target_name} source group membership is malformed"
+                        )
+                    indexes.append(raw_index)
+                if len(indexes) != len(set(indexes)):
+                    _fail(
+                        f"{project_id} target {target_name} source group membership is duplicated"
+                    )
+                if source_index in indexes:
+                    memberships.append(group_index)
+            if source_group_index is None or memberships != [source_group_index]:
+                _fail(
+                    f"{project_id} target {target_name} CMake virtual source group membership drifted"
+                )
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                _fail(
+                    f"{project_id} target {target_name} cannot inspect CMake virtual source: {error}"
+                )
+            else:
+                _fail(
+                    f"{project_id} target {target_name} CMake virtual source exists physically"
+                )
+            virtual_sources.append(virtual_source)
+            continue
+
+        compile_group = source.get("compileGroupIndex")
+        if path.suffix in _CODE_SOURCE_SUFFIXES and (
+            not isinstance(compile_group, int)
+            or isinstance(compile_group, bool)
+            or compile_group < 0
+        ):
+            _fail(f"{project_id} target {target_name} code source has no compile group")
+        sources.append(path)
+        if generated:
+            generated_sources.add(path)
+
+    virtual_paths = [source.path for source in virtual_sources]
+    if (
+        len(sources) != len(set(sources))
+        or len(virtual_paths) != len(set(virtual_paths))
+        or set(sources).intersection(virtual_paths)
+    ):
+        _fail(f"{project_id} target {target_name} repeats a source")
+    if target_type in _MATERIAL_TARGET_TYPES:
+        for virtual_source in virtual_sources:
+            if (
+                virtual_source.kind != "cmake_rule"
+                or virtual_source.owner not in generated_sources
+            ):
+                _fail(
+                    f"{project_id} target {target_name} has an orphan CMake virtual source"
+                )
+    elif target_type != "UTILITY" and virtual_sources:
+        _fail(
+            f"{project_id} target {target_name} has unsupported CMake virtual sources"
+        )
+    return tuple(sources), tuple(virtual_sources)
+
+
 def _load_build(
     *,
     lane_id: str,
@@ -2783,39 +2994,26 @@ def _load_build(
             if not _is_within(path, build_root):
                 _fail(f"{project_id} target {name} artifact escapes its build")
             artifacts.append(path)
-        sources: list[Path] = []
-        for source_index, raw_source in enumerate(target_value.get("sources", [])):
-            source = _object(raw_source, f"{project_id} target {name} source[{source_index}]")
-            generated = source.get("isGenerated", False)
-            if not isinstance(generated, bool):
-                _fail(f"{project_id} target {name} source has malformed isGenerated")
-            path = _resolve_declared_path(
-                source.get("path"),
-                model_build if generated else model_source,
-                roots,
-                f"{project_id} target {name} source",
-            )
-            if not (
-                any(_is_within(path, source_root) for source_root in allowed_source_roots)
-                or _is_within(path, build_root)
-            ):
-                _fail(f"{project_id} target {name} source escapes source/build roots")
-            if path.suffix in _CODE_SOURCE_SUFFIXES:
-                compile_group = source.get("compileGroupIndex")
-                if (
-                    not isinstance(compile_group, int)
-                    or isinstance(compile_group, bool)
-                    or compile_group < 0
-                ):
-                    _fail(f"{project_id} target {name} code source has no compile group")
-            sources.append(path)
-        if len(artifacts) != len(set(artifacts)) or len(sources) != len(set(sources)):
-            _fail(f"{project_id} target {name} repeats an artifact or source")
+        sources, virtual_sources = _file_api_target_sources(
+            project_id=project_id,
+            target_name=name,
+            target_type=target_type,
+            target_value=target_value,
+            model_source=model_source,
+            target_build_base=target_build_base,
+            allowed_source_roots=allowed_source_roots,
+            build_root=build_root,
+            roots=roots,
+        )
+        if len(artifacts) != len(set(artifacts)):
+            _fail(f"{project_id} target {name} repeats an artifact")
         targets[name] = _TargetReply(
             name=name,
             target_type=target_type,
             artifacts=tuple(artifacts),
-            sources=tuple(sources),
+            sources=sources,
+            virtual_sources=virtual_sources,
+            build_base=target_build_base,
             reply_path=reply_root / reply_name,
             reply_sha256=documents[reply_name][1],
         )
@@ -7662,6 +7860,43 @@ def _utility_housekeeping_evidence(
     ]
 
 
+def _require_cmake_utility_virtual_sources(
+    target: _TargetReply,
+    *,
+    build: _Build,
+    primary_output: Path,
+) -> None:
+    """Bind pinned CMake metadata rows to one contracted UTILITY output."""
+
+    if (
+        not _is_within(target.build_base, build.root)
+        or not _is_within(primary_output, build.root)
+    ):
+        _fail(f"{build.project_id} utility {target.name} path escapes its build")
+    utility_stamp = target.build_base / "CMakeFiles" / target.name
+    expected = (
+        _VirtualSourceReply(
+            path=utility_stamp,
+            kind="cmake_utility_stamp",
+            owner=utility_stamp,
+        ),
+        _VirtualSourceReply(
+            path=Path(f"{utility_stamp}.rule"),
+            kind="cmake_rule",
+            owner=utility_stamp,
+        ),
+        _VirtualSourceReply(
+            path=Path(f"{primary_output}.rule"),
+            kind="cmake_rule",
+            owner=primary_output,
+        ),
+    )
+    if target.sources or target.virtual_sources != expected:
+        _fail(
+            f"{build.project_id} utility {target.name} CMake virtual source set drifted"
+        )
+
+
 def _prove_utility_target(
     *,
     build: _Build,
@@ -7687,21 +7922,12 @@ def _prove_utility_target(
             f"{build.project_id} target {spec.name} is not an artifact-free "
             "File API UTILITY target"
         )
-    for source in target.sources:
-        if _is_within(source, build.root):
-            source_owner = build.root
-        elif _is_within(source, build.source_root):
-            source_owner = build.source_root
-        elif _is_within(source, roots.repository):
-            source_owner = roots.repository
-        else:
-            _fail(f"{build.project_id} target {spec.name} source has no owner")
-        _regular_file(
-            source,
-            f"{build.project_id} target {spec.name} source",
-            contained_by=source_owner,
-        )
     primary_output = Path(os.path.normpath(build.root / contract.primary_output))
+    _require_cmake_utility_virtual_sources(
+        target,
+        build=build,
+        primary_output=primary_output,
+    )
     primary_file = _regular_file(
         primary_output,
         f"{build.project_id} target {spec.name} generated artifact",

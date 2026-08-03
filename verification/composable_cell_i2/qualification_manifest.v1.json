@@ -1,6 +1,6 @@
 {
   "schema_version": "manyforge.composable_cell_i2.qualification_manifest.v1",
-  "status": "preimplementation_freeze_packet",
+  "status": "active_i2_qualification_contract",
   "implementation_base": {
     "manyforge": {
       "repository_path": ".",
@@ -25,9 +25,12 @@
       }
     }
   },
-  "packet_freeze_contract": {
-    "implementation_base_commit": "9252769feb7e57a054bb2e7b6067325758d0d09a",
-    "new_packet_paths": [
+  "historical_packet_lineage": {
+    "disposition": "historical_non_qualifying",
+    "initial_packet_commit": "c860246d377f63e1937922ab7611ec77aa18331e",
+    "initial_packet_tree": "3af67641352edec310c6f2aea8b0784c5b269993",
+    "initial_packet_parent_commit": "9252769feb7e57a054bb2e7b6067325758d0d09a",
+    "initial_new_paths": [
       "scripts/ci/run-composable-cell-i2-core-asan.sh",
       "scripts/ci/run-composable-cell-i2-core-tsan.sh",
       "scripts/ci/run-composable-cell-i2-deployment-asan.sh",
@@ -46,38 +49,10 @@
       "verification/composable_cell_i2/qualification_manifest.v1.json",
       "verification/composable_cell_i2/verify_qualification_manifest.py"
     ],
-    "existing_packet_paths": [
+    "initial_support_paths": [
       "scripts/ci/tsan.supp",
       "scripts/qualification/source_identity.py"
-    ],
-    "packet_paths": [
-      "scripts/ci/run-composable-cell-i2-core-asan.sh",
-      "scripts/ci/run-composable-cell-i2-core-tsan.sh",
-      "scripts/ci/run-composable-cell-i2-deployment-asan.sh",
-      "scripts/ci/run-composable-cell-i2-native-evidence.py",
-      "scripts/ci/run-composable-cell-i2-qualification.sh",
-      "scripts/ci/run-composable-cell-i2-roboplan-scene-sanitizer.sh",
-      "scripts/ci/tsan.supp",
-      "scripts/qualification/source_identity.py",
-      "tests/test_composable_cell_i2_build_provenance.py",
-      "tests/test_composable_cell_i2_qualification_manifest.py",
-      "verification/composable_cell_i2/README.md",
-      "verification/composable_cell_i2/adversarial_review_template.v1.json",
-      "verification/composable_cell_i2/baseline_test_inventory.v1.json",
-      "verification/composable_cell_i2/binding_contract_tests.py",
-      "verification/composable_cell_i2/build_provenance_contract.v1.json",
-      "verification/composable_cell_i2/native_build_provenance.py",
-      "verification/composable_cell_i2/native_target_contract.v1.json",
-      "verification/composable_cell_i2/qualification_manifest.v1.json",
-      "verification/composable_cell_i2/verify_qualification_manifest.py"
-    ],
-    "one_shared_first_add_commit": true,
-    "freeze_commit_directly_follows_implementation_base": true,
-    "freeze_commit_contains_only_packet_changes": true,
-    "existing_paths_bound_to_base_and_freeze": true,
-    "blob_and_mode_immutable_after_freeze": true,
-    "external_anchor_path": "../manyforge_specs/docs/plans/COMPOSABLE_CELL_RUNTIME_IMPLEMENTATION_PLAN.md",
-    "external_anchor_prefix": "I2 qualification packet freeze commit:"
+    ]
   },
   "candidate_identity": {
     "capture_tool": "scripts/qualification/source_identity.py",
@@ -1627,7 +1602,7 @@
     "required_fields": [
       "manifest_sha256",
       "verifier_sha256",
-      "qualification_packet_freeze",
+      "historical_packet_lineage",
       "candidate_manyforge_source_identity",
       "candidate_specs_source_identity",
       "candidate_source_snapshot",

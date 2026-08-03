@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import subprocess
@@ -2059,6 +2060,8 @@ def _gtest_discovery_fixture(
                 target_type="EXECUTABLE",
                 artifacts=(executable,),
                 sources=(),
+                virtual_sources=(),
+                build_base=build_root,
                 reply_path=reply,
                 reply_sha256=_sha256(reply),
             )
@@ -2364,6 +2367,8 @@ def test_ninja_commands_join_gtest_discovery_to_same_link_output(
         target_type="EXECUTABLE",
         artifacts=(other_executable,),
         sources=(),
+        virtual_sources=(),
+        build_base=build.root,
         reply_path=other_reply,
         reply_sha256=_sha256(other_reply),
     )
@@ -4560,6 +4565,519 @@ def test_utility_target_contract_is_semantically_joined_to_target_specs(
         )
 
 
+def _virtual_source_build(
+    tmp_path: Path,
+) -> tuple[provenance._Build, provenance._Roots]:
+    repository, output, roots = _roots(tmp_path)
+    source_root = repository / "project"
+    source_root.mkdir()
+    build_root = output / "build"
+    build_root.mkdir()
+    return (
+        provenance._Build(
+            lane_id="synthetic",
+            project_id="project",
+            root=build_root,
+            source_root=source_root,
+            compiler_path="/usr/bin/c++",
+            archiver_path="/usr/bin/ar",
+            targets={},
+            compile_commands={},
+            configure_inputs={},
+            configure_generated_contracts={},
+            qualified_install_inputs={},
+            evidence={},
+        ),
+        roots,
+    )
+
+
+def _parse_target_sources(
+    *,
+    build: provenance._Build,
+    roots: provenance._Roots,
+    target_name: str,
+    target_type: str,
+    target_value: dict[str, Any],
+    target_build_base: Path | None = None,
+) -> tuple[tuple[Path, ...], tuple[provenance._VirtualSourceReply, ...]]:
+    return provenance._file_api_target_sources(
+        project_id=build.project_id,
+        target_name=target_name,
+        target_type=target_type,
+        target_value=target_value,
+        model_source=build.source_root,
+        target_build_base=target_build_base or build.root,
+        allowed_source_roots=(build.source_root,),
+        build_root=build.root,
+        roots=roots,
+    )
+
+
+def test_file_api_sources_keep_optional_groups_and_physical_generated_rows(
+    tmp_path: Path,
+) -> None:
+    build, roots = _virtual_source_build(tmp_path)
+    source = _write(build.source_root / "source.cpp")
+    header = _write(build.root / "generated/profile.hpp")
+
+    physical, virtual = _parse_target_sources(
+        build=build,
+        roots=roots,
+        target_name="admission",
+        target_type="STATIC_LIBRARY",
+        target_value={
+            "sources": [
+                {
+                    "path": roots.logical(source),
+                    "compileGroupIndex": 0,
+                },
+                {
+                    "path": roots.logical(header),
+                    "isGenerated": True,
+                },
+            ]
+        },
+    )
+
+    assert physical == (source, header)
+    assert virtual == ()
+
+
+@pytest.mark.parametrize(
+    ("relative", "target_type", "source_group", "kind", "owner_relative"),
+    [
+        (
+            "CMakeFiles/generate_profile",
+            "UTILITY",
+            "",
+            "cmake_utility_stamp",
+            "CMakeFiles/generate_profile",
+        ),
+        (
+            "CMakeFiles/generate_profile.rule",
+            "UTILITY",
+            "CMake Rules",
+            "cmake_rule",
+            "CMakeFiles/generate_profile",
+        ),
+        (
+            "generated/profile.hpp.rule",
+            "STATIC_LIBRARY",
+            "CMake Rules",
+            "cmake_rule",
+            "generated/profile.hpp",
+        ),
+    ],
+    ids=["utility-stamp", "utility-rule", "generated-header-rule"],
+)
+def test_cmake_virtual_source_classifier_accepts_only_pinned_families(
+    tmp_path: Path,
+    relative: str,
+    target_type: str,
+    source_group: str,
+    kind: str,
+    owner_relative: str,
+) -> None:
+    build, _roots_value = _virtual_source_build(tmp_path)
+    path = build.root / relative
+
+    assert provenance._classify_cmake_virtual_source(
+        target_name="generate_profile",
+        target_type=target_type,
+        build_root=build.root,
+        target_build_base=build.root,
+        path=path,
+        generated=True,
+        compile_group_present=False,
+        source_group=source_group,
+    ) == provenance._VirtualSourceReply(
+        path=path,
+        kind=kind,
+        owner=build.root / owner_relative,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("rule-not-generated", "malformed CMake virtual rule source"),
+        ("rule-wrong-group", "malformed CMake virtual rule source"),
+        ("rule-missing-group", "malformed CMake virtual rule source"),
+        ("rule-compile-bearing", "malformed CMake virtual rule source"),
+        ("rule-outside-build", "malformed CMake virtual rule source"),
+        ("group-without-rule-suffix", "malformed CMake virtual rule source"),
+        ("stamp-not-generated", "malformed CMake utility stamp source"),
+        ("stamp-wrong-group", "malformed CMake utility stamp source"),
+        ("stamp-compile-bearing", "malformed CMake utility stamp source"),
+    ],
+)
+def test_cmake_virtual_source_classifier_rejects_one_field_mutations(
+    tmp_path: Path,
+    case: str,
+    message: str,
+) -> None:
+    build, _roots_value = _virtual_source_build(tmp_path)
+    stamp = build.root / "CMakeFiles/generate_profile"
+    kwargs: dict[str, Any] = {
+        "target_name": "generate_profile",
+        "target_type": "UTILITY",
+        "build_root": build.root,
+        "target_build_base": build.root,
+        "path": Path(f"{stamp}.rule"),
+        "generated": True,
+        "compile_group_present": False,
+        "source_group": "CMake Rules",
+    }
+    if case == "rule-not-generated":
+        kwargs["generated"] = False
+    elif case == "rule-wrong-group":
+        kwargs["source_group"] = ""
+    elif case == "rule-missing-group":
+        kwargs["source_group"] = None
+    elif case == "rule-compile-bearing":
+        kwargs["compile_group_present"] = True
+    elif case == "rule-outside-build":
+        kwargs["path"] = build.root.parent / "escaped.rule"
+    elif case == "group-without-rule-suffix":
+        kwargs["path"] = build.root / "generated/profile.hpp"
+    else:
+        kwargs["path"] = stamp
+        kwargs["source_group"] = ""
+        if case == "stamp-not-generated":
+            kwargs["generated"] = False
+        elif case == "stamp-wrong-group":
+            kwargs["source_group"] = "CMake Rules"
+        elif case == "stamp-compile-bearing":
+            kwargs["compile_group_present"] = True
+
+    with pytest.raises(provenance.NativeBuildProvenanceError, match=message):
+        provenance._classify_cmake_virtual_source(**kwargs)
+
+
+def _utility_virtual_target(
+    *,
+    build: provenance._Build,
+    roots: provenance._Roots,
+    target_name: str,
+    target_build_base: Path,
+    primary: Path,
+) -> provenance._TargetReply:
+    stamp = target_build_base / "CMakeFiles" / target_name
+    sources, virtual_sources = _parse_target_sources(
+        build=build,
+        roots=roots,
+        target_name=target_name,
+        target_type="UTILITY",
+        target_build_base=target_build_base,
+        target_value={
+            "sourceGroups": [
+                {"name": "", "sourceIndexes": [0]},
+                {"name": "CMake Rules", "sourceIndexes": [1, 2]},
+            ],
+            "sources": [
+                {
+                    "path": roots.logical(stamp),
+                    "isGenerated": True,
+                    "sourceGroupIndex": 0,
+                },
+                {
+                    "path": roots.logical(Path(f"{stamp}.rule")),
+                    "isGenerated": True,
+                    "sourceGroupIndex": 1,
+                },
+                {
+                    "path": roots.logical(Path(f"{primary}.rule")),
+                    "isGenerated": True,
+                    "sourceGroupIndex": 1,
+                },
+            ],
+        },
+    )
+    return provenance._TargetReply(
+        name=target_name,
+        target_type="UTILITY",
+        artifacts=(),
+        sources=sources,
+        virtual_sources=virtual_sources,
+        build_base=target_build_base,
+        reply_path=build.root / "target-generate-profile.json",
+        reply_sha256="0" * 64,
+    )
+
+
+def test_cmake_virtual_source_set_accepts_exact_nested_utility_shape(
+    tmp_path: Path,
+) -> None:
+    build, roots = _virtual_source_build(tmp_path)
+    target_build_base = build.root / "nested"
+    target_build_base.mkdir()
+    primary = _write(target_build_base / "generated/profile.hpp")
+    target = _utility_virtual_target(
+        build=build,
+        roots=roots,
+        target_name="generate_profile",
+        target_build_base=target_build_base,
+        primary=primary,
+    )
+
+    assert (
+        provenance._require_cmake_utility_virtual_sources(
+            target,
+            build=build,
+            primary_output=primary,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "reordered"])
+def test_cmake_utility_virtual_source_set_rejects_exact_shape_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    build, roots = _virtual_source_build(tmp_path)
+    primary = _write(build.root / "generated/profile.hpp")
+    target = _utility_virtual_target(
+        build=build,
+        roots=roots,
+        target_name="generate_profile",
+        target_build_base=build.root,
+        primary=primary,
+    )
+    rows = list(target.virtual_sources)
+    if mutation == "missing":
+        rows.pop()
+    elif mutation == "extra":
+        extra = build.root / "generated/extra.hpp"
+        rows.append(
+            provenance._VirtualSourceReply(
+                path=Path(f"{extra}.rule"),
+                kind="cmake_rule",
+                owner=extra,
+            )
+        )
+    else:
+        rows[0], rows[1] = rows[1], rows[0]
+    target = dataclasses.replace(target, virtual_sources=tuple(rows))
+
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="CMake virtual source set drifted",
+    ):
+        provenance._require_cmake_utility_virtual_sources(
+            target,
+            build=build,
+            primary_output=primary,
+        )
+
+
+def _material_virtual_target(
+    *,
+    build: provenance._Build,
+    roots: provenance._Roots,
+    header_exists: bool = True,
+) -> tuple[provenance._TargetReply, Path, Path]:
+    target_build_base = build.root / "nested"
+    target_build_base.mkdir()
+    source = _write(build.source_root / "admission.cpp")
+    header = build.root / "shared/generated/profile.hpp"
+    if header_exists:
+        _write(header)
+    artifact = _write(target_build_base / "libadmission.a", b"!<arch>\n")
+    sources, virtual_sources = _parse_target_sources(
+        build=build,
+        roots=roots,
+        target_name="admission",
+        target_type="STATIC_LIBRARY",
+        target_build_base=target_build_base,
+        target_value={
+            "sourceGroups": [
+                {"name": "Source Files", "sourceIndexes": [0]},
+                {"name": "Header Files", "sourceIndexes": [1]},
+                {"name": "CMake Rules", "sourceIndexes": [2]},
+            ],
+            "sources": [
+                {
+                    "path": roots.logical(source),
+                    "compileGroupIndex": 0,
+                    "sourceGroupIndex": 0,
+                },
+                {
+                    "path": roots.logical(header),
+                    "isGenerated": True,
+                    "sourceGroupIndex": 1,
+                },
+                {
+                    "path": roots.logical(Path(f"{header}.rule")),
+                    "isGenerated": True,
+                    "sourceGroupIndex": 2,
+                },
+            ],
+        },
+    )
+    return (
+        provenance._TargetReply(
+            name="admission",
+            target_type="STATIC_LIBRARY",
+            artifacts=(artifact,),
+            sources=sources,
+            virtual_sources=virtual_sources,
+            build_base=target_build_base,
+            reply_path=build.root / "target-admission.json",
+            reply_sha256="0" * 64,
+        ),
+        source,
+        artifact,
+    )
+
+
+def test_material_virtual_rule_accepts_generated_source_outside_target_base(
+    tmp_path: Path,
+) -> None:
+    build, roots = _virtual_source_build(tmp_path)
+    target, source, artifact = _material_virtual_target(build=build, roots=roots)
+    build.targets[target.name] = target
+
+    assert (
+        provenance._target_reply(
+            build,
+            target.name,
+            artifact,
+            {source},
+            roots,
+            "production",
+        )
+        is target
+    )
+
+
+def test_cmake_virtual_source_group_membership_is_exact(
+    tmp_path: Path,
+) -> None:
+    build, roots = _virtual_source_build(tmp_path)
+    header = _write(build.root / "generated/profile.hpp")
+
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="virtual source group membership drifted",
+    ):
+        _parse_target_sources(
+            build=build,
+            roots=roots,
+            target_name="admission",
+            target_type="STATIC_LIBRARY",
+            target_value={
+                "sourceGroups": [
+                    {"name": "Header Files", "sourceIndexes": [0]},
+                    {"name": "CMake Rules", "sourceIndexes": []},
+                ],
+                "sources": [
+                    {
+                        "path": roots.logical(header),
+                        "isGenerated": True,
+                        "sourceGroupIndex": 0,
+                    },
+                    {
+                        "path": roots.logical(Path(f"{header}.rule")),
+                        "isGenerated": True,
+                        "sourceGroupIndex": 1,
+                    },
+                ],
+            },
+        )
+
+
+def test_cmake_virtual_source_rejects_orphan_material_rule(
+    tmp_path: Path,
+) -> None:
+    build, roots = _virtual_source_build(tmp_path)
+    header = _write(build.root / "generated/profile.hpp")
+
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="orphan CMake virtual source",
+    ):
+        _parse_target_sources(
+            build=build,
+            roots=roots,
+            target_name="admission",
+            target_type="STATIC_LIBRARY",
+            target_value={
+                "sourceGroups": [
+                    {"name": "CMake Rules", "sourceIndexes": [0]}
+                ],
+                "sources": [
+                    {
+                        "path": roots.logical(Path(f"{header}.rule")),
+                        "isGenerated": True,
+                        "sourceGroupIndex": 0,
+                    }
+                ],
+            },
+        )
+
+
+def test_cmake_virtual_source_rejects_physical_spoof(tmp_path: Path) -> None:
+    build, roots = _virtual_source_build(tmp_path)
+    header = _write(build.root / "generated/profile.hpp")
+    rule = _write(Path(f"{header}.rule"))
+
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="CMake virtual source exists physically",
+    ):
+        _parse_target_sources(
+            build=build,
+            roots=roots,
+            target_name="admission",
+            target_type="STATIC_LIBRARY",
+            target_value={
+                "sourceGroups": [
+                    {"name": "Header Files", "sourceIndexes": [0]},
+                    {"name": "CMake Rules", "sourceIndexes": [1]},
+                ],
+                "sources": [
+                    {
+                        "path": roots.logical(header),
+                        "isGenerated": True,
+                        "sourceGroupIndex": 0,
+                    },
+                    {
+                        "path": roots.logical(rule),
+                        "isGenerated": True,
+                        "sourceGroupIndex": 1,
+                    },
+                ],
+            },
+        )
+
+
+def test_material_target_still_rejects_absent_generated_source(
+    tmp_path: Path,
+) -> None:
+    build, roots = _virtual_source_build(tmp_path)
+    target, source, artifact = _material_virtual_target(
+        build=build,
+        roots=roots,
+        header_exists=False,
+    )
+    build.targets[target.name] = target
+
+    with pytest.raises(
+        provenance.NativeBuildProvenanceError,
+        match="target admission source is absent",
+    ):
+        provenance._target_reply(
+            build,
+            target.name,
+            artifact,
+            {source},
+            roots,
+            "production",
+        )
+
+
 def test_native_lane_partition_is_role_exact_and_rejects_substitution() -> None:
     contract = provenance._ProductContract(
         project_id="project",
@@ -4612,6 +5130,8 @@ def test_production_target_rejects_one_extra_generated_code_source(
         target_type="STATIC_LIBRARY",
         artifacts=(artifact,),
         sources=(expected, extra),
+        virtual_sources=(),
+        build_base=build_root,
         reply_path=build_root / "target-project.json",
         reply_sha256="0" * 64,
     )
@@ -5165,6 +5685,8 @@ def _run_binding_until_copy_validation(
                 target_type="MODULE_LIBRARY",
                 artifacts=(built,),
                 sources=contract.registration_sources,
+                virtual_sources=(),
+                build_base=root,
                 reply_path=root / "target.json",
                 reply_sha256="0" * 64,
             )
@@ -5193,6 +5715,8 @@ def _run_binding_until_copy_validation(
                     target_type=spec.target_type,
                     artifacts=(artifact,),
                     sources=(),
+                    virtual_sources=(),
+                    build_base=root,
                     reply_path=root / f"target-{target_name}.json",
                     reply_sha256="0" * 64,
                 )
@@ -5398,6 +5922,8 @@ def test_binding_module_file_api_artifact_cannot_be_relabelled(
         target_type="MODULE_LIBRARY",
         artifacts=(relabelled,),
         sources=(source,),
+        virtual_sources=(),
+        build_base=build_root,
         reply_path=build_root / "target.json",
         reply_sha256="0" * 64,
     )
