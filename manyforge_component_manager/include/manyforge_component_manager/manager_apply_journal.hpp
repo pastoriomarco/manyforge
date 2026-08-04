@@ -15,53 +15,54 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.i4.v1";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 1;
+    "manyforge.internal.component-manager.apply-journal.i4.v2";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 2;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
 inline constexpr std::size_t kMaximumManagerApplyFenceAttempts =
     kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyAffectedScopes =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyFenceComponents = 256U;
 inline constexpr std::size_t kMaximumManagerApplyFenceDomains = 64U;
 inline constexpr std::size_t kMaximumManagerApplyFenceBindings = 256U;
 inline constexpr std::size_t kMaximumManagerApplyFenceResources = 1024U;
-inline constexpr std::size_t kMaximumManagerApplyJournalIdentifierBytes =
-    256U;
+inline constexpr std::size_t kMaximumManagerApplyJournalIdentifierBytes = 256U;
 inline constexpr std::size_t kMaximumManagerApplySourceLabelBytes = 256U;
 inline constexpr std::size_t kMaximumManagerApplyCorrelationIdBytes = 1024U;
 inline constexpr std::size_t kMaximumManagerApplyFenceReasonBytes = 1024U;
-inline constexpr std::int64_t kMaximumManagerApplyJournalDatabasePageImageBytes =
-    64LL * 1024LL * 1024LL;
+inline constexpr std::int64_t
+    kMaximumManagerApplyJournalDatabasePageImageBytes = 64LL * 1024LL * 1024LL;
 
 class ManagerApplyJournalError : public std::runtime_error {
- public:
+public:
   using std::runtime_error::runtime_error;
 };
 
-class ManagerApplyJournalConflictError final
-    : public ManagerApplyJournalError {
- public:
+class ManagerApplyJournalConflictError final : public ManagerApplyJournalError {
+public:
   using ManagerApplyJournalError::ManagerApplyJournalError;
 };
 
 class ManagerApplyJournalLimitError final : public ManagerApplyJournalError {
- public:
+public:
   using ManagerApplyJournalError::ManagerApplyJournalError;
 };
 
 class ManagerApplyJournalBusyError final : public ManagerApplyJournalError {
- public:
+public:
   using ManagerApplyJournalError::ManagerApplyJournalError;
 };
 
 class ManagerApplyJournalIntegrityError final
     : public ManagerApplyJournalError {
- public:
+public:
   using ManagerApplyJournalError::ManagerApplyJournalError;
 };
 
 class ManagerApplyJournalClosedError final : public ManagerApplyJournalError {
- public:
+public:
   using ManagerApplyJournalError::ManagerApplyJournalError;
 };
 
@@ -81,25 +82,22 @@ struct ManagerApplyIntentDTO final {
   manyforge::core::ApplyId apply_id;
   manyforge::core::ApplyGeneration apply_generation;
   manyforge::core::CellId cell_id;
-  manyforge::core::ProjectionRevisionDTO
-      expected_active_projection_revision;
+  manyforge::core::ProjectionRevisionDTO expected_active_projection_revision;
   manyforge::core::RetainedBundleId candidate_retained_bundle_id;
   manyforge::core::GraphRevision candidate_graph_revision;
 
   [[nodiscard]] bool valid() const noexcept;
 
-  friend bool operator==(
-      const ManagerApplyIntentDTO&,
-      const ManagerApplyIntentDTO&) = default;
+  friend bool operator==(const ManagerApplyIntentDTO &,
+                         const ManagerApplyIntentDTO &) = default;
 };
 
 struct PersistedManagerApplyIntent final {
   ManagerApplyIntentDTO intent;
   manyforge::core::ContentDigest intent_digest;
 
-  friend bool operator==(
-      const PersistedManagerApplyIntent&,
-      const PersistedManagerApplyIntent&) = default;
+  friend bool operator==(const PersistedManagerApplyIntent &,
+                         const PersistedManagerApplyIntent &) = default;
 };
 
 struct ManagerApplyIntentWriteResult final {
@@ -107,10 +105,41 @@ struct ManagerApplyIntentWriteResult final {
   bool inserted;
 };
 
+/// Immutable whole-Apply admission scope derived from sealed bundles.
+struct ManagerApplyAffectedScopeDTO final {
+  manyforge::core::ApplyId apply_id;
+  manyforge::core::ApplyGeneration apply_generation;
+  manyforge::core::ConfigurationFenceScopeDTO scope;
+  manyforge::core::ApplyFenceBusyDispositionDTO busy_disposition;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !apply_id.empty() && apply_generation.nonzero() && scope.valid() &&
+           manyforge::core::IsKnownApplyFenceBusyDisposition(busy_disposition);
+  }
+
+  friend bool operator==(const ManagerApplyAffectedScopeDTO &,
+                         const ManagerApplyAffectedScopeDTO &) = default;
+};
+
+struct PersistedManagerApplyAffectedScope final {
+  ManagerApplyAffectedScopeDTO affected_scope;
+  manyforge::core::ContentDigest intent_digest;
+  manyforge::core::ContentDigest affected_scope_digest;
+
+  friend bool operator==(const PersistedManagerApplyAffectedScope &,
+                         const PersistedManagerApplyAffectedScope &) = default;
+};
+
+struct ManagerApplyAffectedScopeWriteResult final {
+  PersistedManagerApplyAffectedScope record;
+  bool inserted;
+};
+
 /// Exact immutable Kernel-fence request durably bound to one Apply intent.
 struct PersistedManagerApplyFenceAttempt final {
   manyforge::core::ApplyConfigurationFenceIntentDTO fence_intent;
   manyforge::core::ContentDigest intent_digest;
+  manyforge::core::ContentDigest affected_scope_digest;
   manyforge::core::ContentDigest fence_attempt_digest;
 };
 
@@ -141,6 +170,7 @@ struct ManagerApplyJournalIntegrityReport final {
   std::int64_t apply_intent_count;
   std::int64_t distinct_apply_id_count;
   std::int64_t distinct_request_identity_count;
+  std::int64_t affected_scope_count;
   std::int64_t fence_attempt_count;
   std::int64_t fence_acceptance_count;
 };
@@ -150,9 +180,10 @@ struct ManagerApplyJournalIntegrityReport final {
 /// Exact duplicate writes replay the original record. One public
 /// `(request_owner_epoch, request_id)` identifies exactly one immutable Apply
 /// intent. Reusing an Apply ID requires the next contiguous generation.
-/// Each Apply generation may then append one exact configuration-fence
-/// attempt, digest-bound to its intent, followed by one complete successful
-/// acceptance, digest-bound to the attempt. Conflicts, gaps, corruption,
+/// Each Apply generation may then append one derived affected-scope record,
+/// digest-bound to its intent, one exact configuration-fence attempt bound to
+/// both records, and one complete successful acceptance bound to the attempt.
+/// Conflicts, gaps, corruption,
 /// foreign-cell databases, and resource-limit exhaustion fail before another
 /// journal write.
 ///
@@ -160,57 +191,58 @@ struct ManagerApplyJournalIntegrityReport final {
 /// process, native projection, scene mutation, active publication, or robot
 /// semantic.
 class SqliteManagerApplyJournal final {
- public:
-  SqliteManagerApplyJournal(
-      std::filesystem::path database_path,
-      manyforge::core::CellId cell_id);
+public:
+  SqliteManagerApplyJournal(std::filesystem::path database_path,
+                            manyforge::core::CellId cell_id);
   ~SqliteManagerApplyJournal();
 
-  SqliteManagerApplyJournal(SqliteManagerApplyJournal&&) noexcept;
-  SqliteManagerApplyJournal& operator=(
-      SqliteManagerApplyJournal&&) noexcept;
-  SqliteManagerApplyJournal(const SqliteManagerApplyJournal&) = delete;
-  SqliteManagerApplyJournal& operator=(
-      const SqliteManagerApplyJournal&) = delete;
+  SqliteManagerApplyJournal(SqliteManagerApplyJournal &&) noexcept;
+  SqliteManagerApplyJournal &operator=(SqliteManagerApplyJournal &&) noexcept;
+  SqliteManagerApplyJournal(const SqliteManagerApplyJournal &) = delete;
+  SqliteManagerApplyJournal &
+  operator=(const SqliteManagerApplyJournal &) = delete;
 
-  [[nodiscard]] const std::filesystem::path& database_path() const noexcept;
-  [[nodiscard]] const manyforge::core::CellId& cell_id() const noexcept;
+  [[nodiscard]] const std::filesystem::path &database_path() const noexcept;
+  [[nodiscard]] const manyforge::core::CellId &cell_id() const noexcept;
 
-  [[nodiscard]] ManagerApplyIntentWriteResult EnsureIntent(
-      const ManagerApplyIntentDTO& intent);
-  [[nodiscard]] std::optional<PersistedManagerApplyIntent> ReadIntent(
-      const manyforge::core::ApplyId& apply_id,
-      manyforge::core::ApplyGeneration apply_generation) const;
-  [[nodiscard]] std::optional<PersistedManagerApplyIntent> ReadRequest(
-      const manyforge::core::RequestOwnerEpoch& request_owner_epoch,
-      const manyforge::core::RequestId& request_id) const;
+  [[nodiscard]] ManagerApplyIntentWriteResult
+  EnsureIntent(const ManagerApplyIntentDTO &intent);
+  [[nodiscard]] std::optional<PersistedManagerApplyIntent>
+  ReadIntent(const manyforge::core::ApplyId &apply_id,
+             manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] std::optional<PersistedManagerApplyIntent>
+  ReadRequest(const manyforge::core::RequestOwnerEpoch &request_owner_epoch,
+              const manyforge::core::RequestId &request_id) const;
   [[nodiscard]] std::optional<manyforge::core::ApplyGeneration>
-  ReadApplyGenerationHighWater(
-      const manyforge::core::ApplyId& apply_id) const;
+  ReadApplyGenerationHighWater(const manyforge::core::ApplyId &apply_id) const;
+  [[nodiscard]] ManagerApplyAffectedScopeWriteResult
+  EnsureAffectedScope(const manyforge::core::ContentDigest &intent_digest,
+                      const ManagerApplyAffectedScopeDTO &affected_scope);
+  [[nodiscard]] std::optional<PersistedManagerApplyAffectedScope>
+  ReadAffectedScope(const manyforge::core::ApplyId &apply_id,
+                    manyforge::core::ApplyGeneration apply_generation) const;
   [[nodiscard]] ManagerApplyFenceAttemptWriteResult EnsureFenceAttempt(
-      const manyforge::core::ContentDigest& intent_digest,
-      const manyforge::core::ApplyConfigurationFenceIntentDTO& fence_intent);
+      const manyforge::core::ContentDigest &intent_digest,
+      const manyforge::core::ContentDigest &affected_scope_digest,
+      const manyforge::core::ApplyConfigurationFenceIntentDTO &fence_intent);
   [[nodiscard]] std::optional<PersistedManagerApplyFenceAttempt>
-  ReadFenceAttempt(
-      const manyforge::core::ApplyId& apply_id,
-      manyforge::core::ApplyGeneration apply_generation) const;
-  [[nodiscard]] ManagerApplyFenceAcceptanceWriteResult
-  EnsureFenceAcceptance(
-      const manyforge::core::ApplyId& apply_id,
+  ReadFenceAttempt(const manyforge::core::ApplyId &apply_id,
+                   manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyFenceAcceptanceWriteResult EnsureFenceAcceptance(
+      const manyforge::core::ApplyId &apply_id,
       manyforge::core::ApplyGeneration apply_generation,
-      const manyforge::core::ContentDigest& fence_attempt_digest,
-      const manyforge::core::ConfigurationFenceAcceptedDTO& accepted_fence);
+      const manyforge::core::ContentDigest &fence_attempt_digest,
+      const manyforge::core::ConfigurationFenceAcceptedDTO &accepted_fence);
   [[nodiscard]] std::optional<PersistedManagerApplyFenceAcceptance>
-  ReadFenceAcceptance(
-      const manyforge::core::ApplyId& apply_id,
-      manyforge::core::ApplyGeneration apply_generation) const;
+  ReadFenceAcceptance(const manyforge::core::ApplyId &apply_id,
+                      manyforge::core::ApplyGeneration apply_generation) const;
   [[nodiscard]] ManagerApplyJournalIntegrityReport VerifyIntegrity() const;
 
   void Close();
 
- private:
+private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace manyforge::component_manager
+} // namespace manyforge::component_manager

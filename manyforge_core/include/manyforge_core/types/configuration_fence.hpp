@@ -4,14 +4,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/retained_product.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <manyforge_core/types/error_code.hpp>
-#include <manyforge_core/types/retained_product.hpp>
-#include <manyforge_core/types/strong_id.hpp>
 
 namespace manyforge::core {
 
@@ -23,8 +22,7 @@ struct PublicRequestContextDTO final {
   std::string source_label;
   std::optional<std::string> correlation_id;
 
-  friend bool operator==(const PublicRequestContextDTO&,
-                         const PublicRequestContextDTO&) = default;
+  friend bool operator==(const PublicRequestContextDTO&, const PublicRequestContextDTO&) = default;
 };
 
 enum class RequestReplayStatusDTO {
@@ -36,8 +34,7 @@ enum class RequestReplayStatusDTO {
   kStaleRequestOwnerEpoch,
 };
 
-[[nodiscard]] constexpr std::string_view
-to_string(RequestReplayStatusDTO status) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(RequestReplayStatusDTO status) noexcept {
   switch (status) {
     case RequestReplayStatusDTO::kAcceptedNew:
       return "accepted_new";
@@ -55,8 +52,7 @@ to_string(RequestReplayStatusDTO status) noexcept {
   return {};
 }
 
-[[nodiscard]] constexpr bool IsKnownRequestReplayStatus(
-    RequestReplayStatusDTO status) noexcept {
+[[nodiscard]] constexpr bool IsKnownRequestReplayStatus(RequestReplayStatusDTO status) noexcept {
   switch (status) {
     case RequestReplayStatusDTO::kAcceptedNew:
     case RequestReplayStatusDTO::kReplayedExact:
@@ -69,8 +65,7 @@ to_string(RequestReplayStatusDTO status) noexcept {
   return false;
 }
 
-[[nodiscard]] constexpr bool IsAcceptedRequestReplayStatus(
-    RequestReplayStatusDTO status) noexcept {
+[[nodiscard]] constexpr bool IsAcceptedRequestReplayStatus(RequestReplayStatusDTO status) noexcept {
   switch (status) {
     case RequestReplayStatusDTO::kAcceptedNew:
     case RequestReplayStatusDTO::kReplayedExact:
@@ -92,13 +87,23 @@ struct ApplyFenceOwnerDTO final {
     return !apply_id.empty() && apply_generation.nonzero();
   }
 
-  friend bool operator==(const ApplyFenceOwnerDTO&,
-                         const ApplyFenceOwnerDTO&) = default;
+  friend bool operator==(const ApplyFenceOwnerDTO&, const ApplyFenceOwnerDTO&) = default;
 };
 
 struct ConfigurationFenceDomainScopeDTO final {
   ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
+  std::optional<ControlDomainRevision> predecessor_control_domain_revision;
+  std::optional<ControlDomainRevision> candidate_control_domain_revision;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !control_domain_id.empty() &&
+           (predecessor_control_domain_revision.has_value() ||
+            candidate_control_domain_revision.has_value()) &&
+           (!predecessor_control_domain_revision.has_value() ||
+            !predecessor_control_domain_revision->empty()) &&
+           (!candidate_control_domain_revision.has_value() ||
+            !candidate_control_domain_revision->empty());
+  }
 
   friend bool operator==(const ConfigurationFenceDomainScopeDTO&,
                          const ConfigurationFenceDomainScopeDTO&) = default;
@@ -106,75 +111,94 @@ struct ConfigurationFenceDomainScopeDTO final {
 
 struct ConfigurationFenceBindingScopeDTO final {
   ControlBindingId control_binding_id;
-  ControlBindingRevision control_binding_revision;
+  std::optional<ControlBindingRevision> predecessor_control_binding_revision;
+  std::optional<ControlBindingRevision> candidate_control_binding_revision;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !control_binding_id.empty() &&
+           (predecessor_control_binding_revision.has_value() ||
+            candidate_control_binding_revision.has_value()) &&
+           (!predecessor_control_binding_revision.has_value() ||
+            !predecessor_control_binding_revision->empty()) &&
+           (!candidate_control_binding_revision.has_value() ||
+            !candidate_control_binding_revision->empty());
+  }
 
   friend bool operator==(const ConfigurationFenceBindingScopeDTO&,
                          const ConfigurationFenceBindingScopeDTO&) = default;
 };
 
-/// Scope arrays are canonical, sorted, unique, and bounded by the qualified
-/// deployment. The DTO does not infer domains or resources from a component.
+/// One flat whole-Apply admission scope.
+///
+/// The collections are canonical, sorted, unique, and bounded by the
+/// qualified deployment. They are deliberately not partitioned by component:
+/// one domain or resource may span components and must be fenced atomically.
+/// Either every collection is empty or every collection is nonempty. The
+/// deployment-owned pure derivation proves the binding/resource overlap
+/// closure; this value layer validates only the closed canonical shape.
 struct ConfigurationFenceScopeDTO final {
-  ControllableComponentId controllable_component_id;
+  std::vector<ControllableComponentId> controllable_component_ids;
   std::vector<ConfigurationFenceDomainScopeDTO> domains;
   std::vector<ConfigurationFenceBindingScopeDTO> bindings;
   std::vector<ResourceId> resources;
 
   [[nodiscard]] bool valid() const noexcept {
-    if (controllable_component_id.empty() || resources.empty()) {
+    const bool all_empty = controllable_component_ids.empty() && domains.empty() &&
+                           bindings.empty() && resources.empty();
+    if (all_empty) {
+      return true;
+    }
+    if (controllable_component_ids.empty() || domains.empty() || bindings.empty() ||
+        resources.empty()) {
       return false;
     }
 
-    const auto domain_less =
-        [](const ConfigurationFenceDomainScopeDTO& lhs,
-           const ConfigurationFenceDomainScopeDTO& rhs) noexcept {
-          if (lhs.control_domain_id != rhs.control_domain_id) {
-            return lhs.control_domain_id < rhs.control_domain_id;
-          }
-          return lhs.control_domain_revision <
-                 rhs.control_domain_revision;
-        };
+    if (!std::is_sorted(controllable_component_ids.begin(), controllable_component_ids.end()) ||
+        std::adjacent_find(controllable_component_ids.begin(), controllable_component_ids.end()) !=
+            controllable_component_ids.end()) {
+      return false;
+    }
+    for (const auto& component_id : controllable_component_ids) {
+      if (component_id.empty()) {
+        return false;
+      }
+    }
+
+    const auto domain_less = [](const ConfigurationFenceDomainScopeDTO& lhs,
+                                const ConfigurationFenceDomainScopeDTO& rhs) noexcept {
+      return lhs.control_domain_id < rhs.control_domain_id;
+    };
     if (!std::is_sorted(domains.begin(), domains.end(), domain_less) ||
-        std::adjacent_find(
-            domains.begin(), domains.end(),
-            [](const ConfigurationFenceDomainScopeDTO& lhs,
-               const ConfigurationFenceDomainScopeDTO& rhs) noexcept {
-              return lhs.control_domain_id == rhs.control_domain_id;
-            }) != domains.end()) {
+        std::adjacent_find(domains.begin(), domains.end(),
+                           [](const ConfigurationFenceDomainScopeDTO& lhs,
+                              const ConfigurationFenceDomainScopeDTO& rhs) noexcept {
+                             return lhs.control_domain_id == rhs.control_domain_id;
+                           }) != domains.end()) {
       return false;
     }
 
-    const auto binding_less =
-        [](const ConfigurationFenceBindingScopeDTO& lhs,
-           const ConfigurationFenceBindingScopeDTO& rhs) noexcept {
-          if (lhs.control_binding_id != rhs.control_binding_id) {
-            return lhs.control_binding_id < rhs.control_binding_id;
-          }
-          return lhs.control_binding_revision <
-                 rhs.control_binding_revision;
-        };
+    const auto binding_less = [](const ConfigurationFenceBindingScopeDTO& lhs,
+                                 const ConfigurationFenceBindingScopeDTO& rhs) noexcept {
+      return lhs.control_binding_id < rhs.control_binding_id;
+    };
     if (!std::is_sorted(bindings.begin(), bindings.end(), binding_less) ||
-        std::adjacent_find(
-            bindings.begin(), bindings.end(),
-            [](const ConfigurationFenceBindingScopeDTO& lhs,
-               const ConfigurationFenceBindingScopeDTO& rhs) noexcept {
-              return lhs.control_binding_id == rhs.control_binding_id;
-            }) != bindings.end() ||
+        std::adjacent_find(bindings.begin(), bindings.end(),
+                           [](const ConfigurationFenceBindingScopeDTO& lhs,
+                              const ConfigurationFenceBindingScopeDTO& rhs) noexcept {
+                             return lhs.control_binding_id == rhs.control_binding_id;
+                           }) != bindings.end() ||
         !std::is_sorted(resources.begin(), resources.end()) ||
-        std::adjacent_find(resources.begin(), resources.end()) !=
-            resources.end()) {
+        std::adjacent_find(resources.begin(), resources.end()) != resources.end()) {
       return false;
     }
 
     for (const auto& domain : domains) {
-      if (domain.control_domain_id.empty() ||
-          domain.control_domain_revision.empty()) {
+      if (!domain.valid()) {
         return false;
       }
     }
     for (const auto& binding : bindings) {
-      if (binding.control_binding_id.empty() ||
-          binding.control_binding_revision.empty()) {
+      if (!binding.valid()) {
         return false;
       }
     }
@@ -190,15 +214,31 @@ struct ConfigurationFenceScopeDTO final {
                          const ConfigurationFenceScopeDTO&) = default;
 };
 
+enum class ApplyFenceBusyDispositionDTO {
+  kRejectIfAffectedBusy,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    ApplyFenceBusyDispositionDTO disposition) noexcept {
+  switch (disposition) {
+    case ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy:
+      return "reject_if_affected_busy";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr bool IsKnownApplyFenceBusyDisposition(
+    ApplyFenceBusyDispositionDTO disposition) noexcept {
+  return disposition == ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy;
+}
+
 struct DomainActiveControlConfigurationDTO final {
   ControlDomainId control_domain_id;
   ActiveControlConfigurationId active_control_configuration_id;
-  ActiveControlConfigurationGeneration
-      active_control_configuration_generation;
+  ActiveControlConfigurationGeneration active_control_configuration_generation;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !control_domain_id.empty() &&
-           !active_control_configuration_id.empty() &&
+    return !control_domain_id.empty() && !active_control_configuration_id.empty() &&
            active_control_configuration_generation.nonzero();
   }
 
@@ -215,51 +255,51 @@ struct ApplyConfigurationFenceIntentDTO final {
   PublicRequestContextDTO owner_request_context;
   ApplyFenceOwnerDTO owner_transaction;
   ConfigurationFenceScopeDTO scope;
+  ApplyFenceBusyDispositionDTO busy_disposition;
   RetainedBundleId expected_retained_bundle_id;
   GraphRevision expected_graph_revision;
   std::uint64_t expected_operation_resource_generation;
   ConfigurationFenceGeneration expected_fence_generation;
-  std::vector<DomainActiveControlConfigurationDTO>
-      expected_active_control_configurations;
+  std::vector<DomainActiveControlConfigurationDTO> expected_active_control_configurations;
   std::string reason;
 
   [[nodiscard]] bool valid() const noexcept {
     if (owner_request_context.request_id.empty() ||
         owner_request_context.request_owner_epoch.empty() ||
-        owner_request_context.source_label.empty() ||
-        !owner_transaction.valid() || !scope.valid() ||
-        expected_retained_bundle_id.empty() ||
-        expected_graph_revision.empty() || reason.empty() ||
+        owner_request_context.source_label.empty() || !owner_transaction.valid() ||
+        !scope.valid() || !IsKnownApplyFenceBusyDisposition(busy_disposition) ||
+        expected_retained_bundle_id.empty() || expected_graph_revision.empty() || reason.empty() ||
         expected_active_control_configurations.size() !=
-            scope.domains.size()) {
+            static_cast<std::size_t>(
+                std::count_if(scope.domains.begin(), scope.domains.end(),
+                              [](const ConfigurationFenceDomainScopeDTO& domain) {
+                                return domain.predecessor_control_domain_revision.has_value();
+                              }))) {
       return false;
     }
 
-    const auto configuration_less =
-        [](const DomainActiveControlConfigurationDTO& lhs,
-           const DomainActiveControlConfigurationDTO& rhs) noexcept {
-          return lhs.control_domain_id < rhs.control_domain_id;
-        };
+    const auto configuration_less = [](const DomainActiveControlConfigurationDTO& lhs,
+                                       const DomainActiveControlConfigurationDTO& rhs) noexcept {
+      return lhs.control_domain_id < rhs.control_domain_id;
+    };
     if (!std::is_sorted(expected_active_control_configurations.begin(),
-                        expected_active_control_configurations.end(),
-                        configuration_less) ||
-        std::adjacent_find(
-            expected_active_control_configurations.begin(),
-            expected_active_control_configurations.end(),
-            [](const DomainActiveControlConfigurationDTO& lhs,
-               const DomainActiveControlConfigurationDTO& rhs) noexcept {
-              return lhs.control_domain_id == rhs.control_domain_id;
-            }) != expected_active_control_configurations.end()) {
+                        expected_active_control_configurations.end(), configuration_less) ||
+        std::adjacent_find(expected_active_control_configurations.begin(),
+                           expected_active_control_configurations.end(),
+                           [](const DomainActiveControlConfigurationDTO& lhs,
+                              const DomainActiveControlConfigurationDTO& rhs) noexcept {
+                             return lhs.control_domain_id == rhs.control_domain_id;
+                           }) != expected_active_control_configurations.end()) {
       return false;
     }
 
-    for (std::size_t index = 0;
-         index < expected_active_control_configurations.size(); ++index) {
-      const auto& configuration =
-          expected_active_control_configurations[index];
-      if (!configuration.valid() ||
-          configuration.control_domain_id !=
-              scope.domains[index].control_domain_id) {
+    std::size_t configuration_index = 0U;
+    for (const auto& domain : scope.domains) {
+      if (!domain.predecessor_control_domain_revision.has_value()) {
+        continue;
+      }
+      const auto& configuration = expected_active_control_configurations[configuration_index++];
+      if (!configuration.valid() || configuration.control_domain_id != domain.control_domain_id) {
         return false;
       }
     }
@@ -278,8 +318,7 @@ struct ConfigurationFenceAcceptedDTO final {
   RequestReplayStatusDTO replay_status;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !configuration_fence_id.empty() &&
-           configuration_fence_generation.nonzero() &&
+    return !configuration_fence_id.empty() && configuration_fence_generation.nonzero() &&
            captured_scope.valid() && accepted_at_ns >= 0 &&
            IsAcceptedRequestReplayStatus(replay_status);
   }
@@ -289,8 +328,7 @@ struct ConfigurationFenceAcceptedDTO final {
   /// `expected_fence_generation` is a compare-and-swap predecessor. A new
   /// acceptance is its immediate successor; exact request replay returns that
   /// same accepted identity and therefore satisfies the same relation.
-  [[nodiscard]] bool matches(
-      const ApplyConfigurationFenceIntentDTO& intent) const noexcept {
+  [[nodiscard]] bool matches(const ApplyConfigurationFenceIntentDTO& intent) const noexcept {
     const auto predecessor = intent.expected_fence_generation.value();
     return valid() && intent.valid() && captured_scope == intent.scope &&
            predecessor < std::numeric_limits<std::uint64_t>::max() &&
@@ -307,8 +345,7 @@ enum class ConfigurationFenceState {
   kReleased,
 };
 
-[[nodiscard]] constexpr std::string_view
-to_string(ConfigurationFenceState state) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(ConfigurationFenceState state) noexcept {
   switch (state) {
     case ConfigurationFenceState::kHeld:
       return "held";
@@ -329,14 +366,11 @@ struct ExecutionHostEpochDTO final {
   ActiveBundlePublicationGeneration publication_generation;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !runtime_unit_id.empty() && !runtime_epoch.empty() &&
-           !request_owner_epoch.empty() &&
-           !durable_stop_fence_ledger_digest.empty() &&
-           publication_generation.nonzero();
+    return !runtime_unit_id.empty() && !runtime_epoch.empty() && !request_owner_epoch.empty() &&
+           !durable_stop_fence_ledger_digest.empty() && publication_generation.nonzero();
   }
 
-  friend bool operator==(const ExecutionHostEpochDTO&,
-                         const ExecutionHostEpochDTO&) = default;
+  friend bool operator==(const ExecutionHostEpochDTO&, const ExecutionHostEpochDTO&) = default;
 };
 
 /// Exact durable Manager attempt used only to reconcile a lost Acquire
@@ -398,8 +432,7 @@ struct ApplyFenceAcquireAttemptReconcileResultDTO final {
   std::optional<ErrorDTO> error;
 
   [[nodiscard]] bool presence_valid() const noexcept {
-    if (!execution_host_epoch.valid() || !echoed_query.valid() ||
-        result_digest.empty()) {
+    if (!execution_host_epoch.valid() || !echoed_query.valid() || result_digest.empty()) {
       return false;
     }
     const bool has_error = error.has_value();
@@ -410,9 +443,8 @@ struct ApplyFenceAcquireAttemptReconcileResultDTO final {
     switch (state) {
       case ApplyFenceAcquireAttemptReconcileState::kAcceptedExact:
         return accepted_fence.has_value() &&
-               accepted_fence->matches(echoed_query.persisted_intent) &&
-               admission_fenced && !has_error &&
-               required_compensation_or_operator_direction.empty();
+               accepted_fence->matches(echoed_query.persisted_intent) && admission_fenced &&
+               !has_error && required_compensation_or_operator_direction.empty();
       case ApplyFenceAcquireAttemptReconcileState::kNotSeen:
         return !accepted_fence.has_value() && !has_error &&
                required_compensation_or_operator_direction.empty();
@@ -424,8 +456,7 @@ struct ApplyFenceAcquireAttemptReconcileResultDTO final {
     return false;
   }
 
-  [[nodiscard]] bool matches(
-      const ApplyFenceAcquireAttemptQueryDTO& query) const noexcept {
+  [[nodiscard]] bool matches(const ApplyFenceAcquireAttemptQueryDTO& query) const noexcept {
     return presence_valid() && query.valid() && echoed_query == query;
   }
 };
@@ -447,17 +478,13 @@ struct ApplyFenceRehydrateDTO final {
   RuntimeEpoch manager_runtime_epoch;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero() &&
-           !request_id.empty() && !request_owner_epoch.empty() &&
-           !intent_digest.empty() &&
-           !expected_old_retained_bundle_id.empty() &&
-           !expected_old_graph_revision.empty() &&
-           !expected_new_retained_bundle_id.empty() &&
-           !expected_new_graph_revision.empty() &&
+    return !apply_id.empty() && apply_generation.nonzero() && !request_id.empty() &&
+           !request_owner_epoch.empty() && !intent_digest.empty() &&
+           !expected_old_retained_bundle_id.empty() && !expected_old_graph_revision.empty() &&
+           !expected_new_retained_bundle_id.empty() && !expected_new_graph_revision.empty() &&
            !persisted_configuration_fence_id.empty() &&
-           persisted_configuration_fence_generation.nonzero() &&
-           persisted_scope.valid() && !last_durable_phase.empty() &&
-           !manager_runtime_epoch.empty();
+           persisted_configuration_fence_generation.nonzero() && persisted_scope.valid() &&
+           !last_durable_phase.empty() && !manager_runtime_epoch.empty();
   }
 };
 
@@ -468,8 +495,7 @@ enum class ApplyFenceReconcileState {
   kConflicting,
 };
 
-[[nodiscard]] constexpr std::string_view
-to_string(ApplyFenceReconcileState state) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(ApplyFenceReconcileState state) noexcept {
   switch (state) {
     case ApplyFenceReconcileState::kMatched:
       return "matched";
@@ -488,16 +514,13 @@ struct ApplyFenceReconcileEntryDTO final {
   ConfigurationFenceGeneration persisted_configuration_fence_generation;
   ApplyFenceReconcileState state;
   std::optional<ConfigurationFenceId> reconciled_configuration_fence_id;
-  std::optional<ConfigurationFenceGeneration>
-      reconciled_configuration_fence_generation;
+  std::optional<ConfigurationFenceGeneration> reconciled_configuration_fence_generation;
 
   [[nodiscard]] bool presence_valid() const noexcept {
     const bool has_id = reconciled_configuration_fence_id.has_value();
-    const bool has_generation =
-        reconciled_configuration_fence_generation.has_value();
+    const bool has_generation = reconciled_configuration_fence_generation.has_value();
     if (persisted_configuration_fence_id.empty() ||
-        !persisted_configuration_fence_generation.nonzero() ||
-        has_id != has_generation) {
+        !persisted_configuration_fence_generation.nonzero() || has_id != has_generation) {
       return false;
     }
 
@@ -513,11 +536,9 @@ struct ApplyFenceReconcileEntryDTO final {
     return false;
   }
 
-  [[nodiscard]] bool matches(
-      const ApplyFenceRehydrateDTO& request) const noexcept {
+  [[nodiscard]] bool matches(const ApplyFenceRehydrateDTO& request) const noexcept {
     return presence_valid() && request.valid() &&
-           persisted_configuration_fence_id ==
-               request.persisted_configuration_fence_id &&
+           persisted_configuration_fence_id == request.persisted_configuration_fence_id &&
            persisted_configuration_fence_generation ==
                request.persisted_configuration_fence_generation;
   }
@@ -532,8 +553,7 @@ struct ApplyFenceReconcileResultDTO final {
   std::optional<ErrorDTO> error;
 
   [[nodiscard]] bool presence_valid() const noexcept {
-    if (!execution_host_epoch.valid() || fence_results.empty() ||
-        result_digest.empty()) {
+    if (!execution_host_epoch.valid() || fence_results.empty() || result_digest.empty()) {
       return false;
     }
 
@@ -543,16 +563,12 @@ struct ApplyFenceReconcileResultDTO final {
       if (!result.presence_valid()) {
         return false;
       }
-      if (index != 0U &&
-          !(fence_results[index - 1U]
-                .persisted_configuration_fence_id <
-            result.persisted_configuration_fence_id)) {
+      if (index != 0U && !(fence_results[index - 1U].persisted_configuration_fence_id <
+                           result.persisted_configuration_fence_id)) {
         return false;
       }
-      all_reconciled =
-          all_reconciled &&
-          (result.state == ApplyFenceReconcileState::kMatched ||
-           result.state == ApplyFenceReconcileState::kRecreated);
+      all_reconciled = all_reconciled && (result.state == ApplyFenceReconcileState::kMatched ||
+                                          result.state == ApplyFenceReconcileState::kRecreated);
     }
 
     const bool has_error = error.has_value();
@@ -561,24 +577,18 @@ struct ApplyFenceReconcileResultDTO final {
     }
 
     if (!admission_fenced) {
-      return all_reconciled && !has_error &&
-             required_compensation_or_operator_direction.empty();
+      return all_reconciled && !has_error && required_compensation_or_operator_direction.empty();
     }
 
     if (!all_reconciled || has_error) {
-      return has_error &&
-             !required_compensation_or_operator_direction.empty();
+      return has_error && !required_compensation_or_operator_direction.empty();
     }
 
     return !required_compensation_or_operator_direction.empty();
   }
 
-  [[nodiscard]] bool matches(
-      const ApplyFenceRehydrateDTO& request) const noexcept {
-    return presence_valid() && request.valid() &&
-           execution_host_epoch.request_owner_epoch ==
-               request.request_owner_epoch &&
-           fence_results.size() == 1U &&
+  [[nodiscard]] bool matches(const ApplyFenceRehydrateDTO& request) const noexcept {
+    return presence_valid() && request.valid() && fence_results.size() == 1U &&
            fence_results.front().matches(request);
   }
 };

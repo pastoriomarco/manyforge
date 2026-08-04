@@ -487,6 +487,7 @@ set(MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES
 # This private substrate is deliberately free of compiler, materializer,
 # repository-writer, package-generator, and admission-selection effects.
 add_library(manyforge_deployment_verification_core
+  src/apply_affected_scope.cpp
   src/artifact_codec.cpp
   src/composed_model_symbol_role_map_verifier.cpp
   src/control_domain_control_verifier.cpp
@@ -506,6 +507,9 @@ add_library(manyforge_deployment_verification_core
   src/verified_retained_bundle.cpp
   src/verified_retained_bundle_store.cpp
 )
+add_library(
+  manyforge::deployment_verification_core ALIAS
+  manyforge_deployment_verification_core)
 target_include_directories(manyforge_deployment_verification_core PUBLIC
   ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
 target_include_directories(manyforge_deployment_verification_core PRIVATE
@@ -1093,6 +1097,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_retained_bundle PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_retained_bundle
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_apply_affected_scope
+    test/test_apply_affected_scope.cpp)
+  target_include_directories(test_apply_affected_scope PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_apply_affected_scope PRIVATE
+    manyforge_deployment_verification_core GTest::gtest_main)
+  gtest_discover_tests(test_apply_affected_scope
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_retained_bundle_store

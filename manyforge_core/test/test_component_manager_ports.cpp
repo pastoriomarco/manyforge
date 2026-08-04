@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <limits>
+#include <manyforge_core/ports/iactive_bundle_publication_store.hpp>
+#include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
+#include <manyforge_core/ports/imanager_scene_projection.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -10,10 +13,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <manyforge_core/ports/iactive_bundle_publication_store.hpp>
-#include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
-#include <manyforge_core/ports/imanager_scene_projection.hpp>
 
 namespace manyforge::core {
 namespace {
@@ -27,157 +26,105 @@ constexpr const char* kSceneIdDigest =
 
 static_assert(!std::is_same_v<ApplyId, BootstrapId>);
 static_assert(!std::is_same_v<ApplyGeneration, BootstrapGeneration>);
-static_assert(
-    !std::is_same_v<ProjectionStageGeneration,
-                    ActiveBundlePublicationGeneration>);
+static_assert(!std::is_same_v<ProjectionStageGeneration, ActiveBundlePublicationGeneration>);
 static_assert(!std::is_constructible_v<ApplyGeneration, BootstrapGeneration>);
 static_assert(!std::is_convertible_v<std::uint64_t, ApplyGeneration>);
-static_assert(std::variant_size_v<
-                  ActiveBundlePublicationTransactionRefDTO> == 2U);
-static_assert(std::is_same_v<
-              decltype(std::declval<ApplyConfigurationFenceIntentDTO>()
-                           .owner_transaction),
-              ApplyFenceOwnerDTO>);
+static_assert(std::variant_size_v<ActiveBundlePublicationTransactionRefDTO> == 2U);
 static_assert(
-    !std::is_default_constructible_v<LogicalSceneSnapshotRoot>);
-static_assert(std::is_constructible_v<
-              LogicalSceneSnapshotRoot,
-              std::shared_ptr<const LogicalSceneSnapshotDTO>>);
-static_assert(std::is_same_v<
-              decltype(std::declval<
-                           NativeProjectionBootstrapRebuildResultDTO>()
-                           .planning_collision_model),
-              RetainedProductDTO>);
-static_assert(std::is_same_v<
-              decltype(std::declval<
-                           NativeProjectionBootstrapRebuildResultDTO>()
-                           .initialized_logical_scene),
-              LogicalSceneSnapshotRoot>);
+    std::is_same_v<decltype(std::declval<ApplyConfigurationFenceIntentDTO>().owner_transaction),
+                   ApplyFenceOwnerDTO>);
+static_assert(!std::is_default_constructible_v<LogicalSceneSnapshotRoot>);
+static_assert(std::is_constructible_v<LogicalSceneSnapshotRoot,
+                                      std::shared_ptr<const LogicalSceneSnapshotDTO>>);
+static_assert(std::is_same_v<decltype(std::declval<NativeProjectionBootstrapRebuildResultDTO>()
+                                          .planning_collision_model),
+                             RetainedProductDTO>);
+static_assert(std::is_same_v<decltype(std::declval<NativeProjectionBootstrapRebuildResultDTO>()
+                                          .initialized_logical_scene),
+                             LogicalSceneSnapshotRoot>);
 
-using PublishSignature =
-    ActiveBundlePublicationReceiptDTO (IActiveBundlePublicationStore::*)(
-        const ActiveBundlePublicationRequestDTO&);
-using ReadPublicationSignature =
-    Result<ActiveBundlePublicationReceiptDTO> (
-        IActiveBundlePublicationReader::*)(
-        ActiveBundlePublicationGeneration) const;
-static_assert(std::is_same_v<decltype(
-                                 &IActiveBundlePublicationStore::
-                                     PublishActiveBundle),
+using PublishSignature = ActiveBundlePublicationReceiptDTO (IActiveBundlePublicationStore::*)(
+    const ActiveBundlePublicationRequestDTO&);
+using ReadPublicationSignature = Result<ActiveBundlePublicationReceiptDTO> (
+    IActiveBundlePublicationReader::*)(ActiveBundlePublicationGeneration) const;
+static_assert(std::is_same_v<decltype(&IActiveBundlePublicationStore::PublishActiveBundle),
                              PublishSignature>);
-static_assert(std::is_same_v<decltype(
-                                 &IActiveBundlePublicationReader::
-                                     ReadActiveBundlePublication),
+static_assert(std::is_same_v<decltype(&IActiveBundlePublicationReader::ReadActiveBundlePublication),
                              ReadPublicationSignature>);
-static_assert(
-    std::is_base_of_v<IActiveBundlePublicationReader,
-                      IActiveBundlePublicationStore>);
+static_assert(std::is_base_of_v<IActiveBundlePublicationReader, IActiveBundlePublicationStore>);
 
 template <typename T>
-concept ExposesPublish = requires(
-    T& value, const ActiveBundlePublicationRequestDTO& request) {
+concept ExposesPublish = requires(T& value, const ActiveBundlePublicationRequestDTO& request) {
   value.PublishActiveBundle(request);
 };
 
 static_assert(!ExposesPublish<IActiveBundlePublicationReader>);
 static_assert(ExposesPublish<IActiveBundlePublicationStore>);
 
-using StageSignature = ProjectionApplyStageResultDTO (
-    IManagerSceneProjectionHandoffPort::*)(const ProjectionApplyStageDTO&);
+using StageSignature = ProjectionApplyStageResultDTO (IManagerSceneProjectionHandoffPort::*)(
+    const ProjectionApplyStageDTO&);
 using ActivateSignature = ProjectionApplyActivationResultDTO (
-    IManagerSceneProjectionHandoffPort::*)(
-    const ProjectionApplyActivationDTO&);
-using DiscardSignature = ProjectionApplyDiscardResultDTO (
-    IManagerSceneProjectionHandoffPort::*)(
+    IManagerSceneProjectionHandoffPort::*)(const ProjectionApplyActivationDTO&);
+using DiscardSignature = ProjectionApplyDiscardResultDTO (IManagerSceneProjectionHandoffPort::*)(
     const ProjectionApplyDiscardDTO&);
-using FinalizeSignature = ProjectionApplyFinalizeResultDTO (
-    IManagerSceneProjectionHandoffPort::*)(
+using FinalizeSignature = ProjectionApplyFinalizeResultDTO (IManagerSceneProjectionHandoffPort::*)(
     const ProjectionApplyFinalizeDTO&);
-using ApplyStatusSignature = ProjectionApplyStatusDTO (
-    IManagerSceneProjectionHandoffPort::*)(
+using ApplyStatusSignature = ProjectionApplyStatusDTO (IManagerSceneProjectionHandoffPort::*)(
     const ProjectionApplyStatusQueryDTO&) const;
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionHandoffPort::
-                           StageCandidateProjection),
-              StageSignature>);
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionHandoffPort::
-                           ActivateStagedProjection),
-              ActivateSignature>);
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionHandoffPort::
-                           DiscardStagedProjection),
-              DiscardSignature>);
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionHandoffPort::
-                           FinalizeProjectionTransition),
-              FinalizeSignature>);
-static_assert(std::is_same_v<
-              decltype(
-                  &IManagerSceneProjectionHandoffPort::ProjectionApplyStatus),
-              ApplyStatusSignature>);
+static_assert(
+    std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::StageCandidateProjection),
+                   StageSignature>);
+static_assert(
+    std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::ActivateStagedProjection),
+                   ActivateSignature>);
+static_assert(std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::DiscardStagedProjection),
+                             DiscardSignature>);
+static_assert(
+    std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::FinalizeProjectionTransition),
+                   FinalizeSignature>);
+static_assert(std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::ProjectionApplyStatus),
+                             ApplyStatusSignature>);
 
 using BeginBootstrapSignature = ProjectionBootstrapAcceptedDTO (
-    IManagerSceneProjectionBootstrapPort::*)(
-    const ProjectionBootstrapIntentDTO&);
-using ObserveBootstrapPrerequisitesSignature =
-    ProjectionBootstrapPrerequisiteStatusDTO (
-        IManagerSceneProjectionBootstrapPort::*)(
-        const ProjectionBootstrapPrerequisiteQueryDTO&) const;
+    IManagerSceneProjectionBootstrapPort::*)(const ProjectionBootstrapIntentDTO&);
+using ObserveBootstrapPrerequisitesSignature = ProjectionBootstrapPrerequisiteStatusDTO (
+    IManagerSceneProjectionBootstrapPort::*)(const ProjectionBootstrapPrerequisiteQueryDTO&) const;
 using RebuildBootstrapSignature = ProjectionBootstrapRebuildResultDTO (
-    IManagerSceneProjectionBootstrapPort::*)(
-    const ProjectionBootstrapRebuildRequestDTO&);
+    IManagerSceneProjectionBootstrapPort::*)(const ProjectionBootstrapRebuildRequestDTO&);
 using BootstrapStatusSignature = ProjectionBootstrapStatusDTO (
-    IManagerSceneProjectionBootstrapPort::*)(
-    const ProjectionBootstrapStatusQueryDTO&) const;
+    IManagerSceneProjectionBootstrapPort::*)(const ProjectionBootstrapStatusQueryDTO&) const;
 using FinalizeBootstrapSignature = ProjectionBootstrapFinalizeResultDTO (
-    IManagerSceneProjectionBootstrapPort::*)(
-    const ProjectionBootstrapFinalizeDTO&);
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionBootstrapPort::
-                           ObserveProjectionBootstrapPrerequisites),
-              ObserveBootstrapPrerequisitesSignature>);
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionBootstrapPort::
-                           BeginProjectionBootstrap),
-              BeginBootstrapSignature>);
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionBootstrapPort::
-                           RebuildProjectionBootstrap),
-              RebuildBootstrapSignature>);
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionBootstrapPort::
-                           ProjectionBootstrapStatus),
-              BootstrapStatusSignature>);
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionBootstrapPort::
-                           FinalizeProjectionBootstrap),
-              FinalizeBootstrapSignature>);
-
-using AcquireFenceSignature = ConfigurationFenceAcceptedDTO (
-    IManagerKernelApplyFenceAcquireRehydratePort::*)(
-        const ApplyConfigurationFenceIntentDTO&);
-using ReconcileFenceAttemptSignature =
-    ApplyFenceAcquireAttemptReconcileResultDTO (
-        IManagerKernelApplyFenceAcquireRehydratePort::*)(
-            const ApplyFenceAcquireAttemptQueryDTO&) const;
-using RehydrateFenceSignature = ApplyFenceReconcileResultDTO (
-    IManagerKernelApplyFenceAcquireRehydratePort::*)(
-        const ApplyFenceRehydrateDTO&);
-static_assert(std::is_same_v<
-              decltype(
-                  &IManagerKernelApplyFenceAcquireRehydratePort::Acquire),
-              AcquireFenceSignature>);
-static_assert(std::is_same_v<
-              decltype(&IManagerKernelApplyFenceAcquireRehydratePort::
-                           ReconcileAcquireAttempt),
-              ReconcileFenceAttemptSignature>);
+    IManagerSceneProjectionBootstrapPort::*)(const ProjectionBootstrapFinalizeDTO&);
 static_assert(
     std::is_same_v<
-                   decltype(
-                       &IManagerKernelApplyFenceAcquireRehydratePort::
-                           Rehydrate),
-                   RehydrateFenceSignature>);
+        decltype(&IManagerSceneProjectionBootstrapPort::ObserveProjectionBootstrapPrerequisites),
+        ObserveBootstrapPrerequisitesSignature>);
+static_assert(
+    std::is_same_v<decltype(&IManagerSceneProjectionBootstrapPort::BeginProjectionBootstrap),
+                   BeginBootstrapSignature>);
+static_assert(
+    std::is_same_v<decltype(&IManagerSceneProjectionBootstrapPort::RebuildProjectionBootstrap),
+                   RebuildBootstrapSignature>);
+static_assert(
+    std::is_same_v<decltype(&IManagerSceneProjectionBootstrapPort::ProjectionBootstrapStatus),
+                   BootstrapStatusSignature>);
+static_assert(
+    std::is_same_v<decltype(&IManagerSceneProjectionBootstrapPort::FinalizeProjectionBootstrap),
+                   FinalizeBootstrapSignature>);
+
+using AcquireFenceSignature = ConfigurationFenceAcceptedDTO (
+    IManagerKernelApplyFenceAcquireRehydratePort::*)(const ApplyConfigurationFenceIntentDTO&);
+using ReconcileFenceAttemptSignature = ApplyFenceAcquireAttemptReconcileResultDTO (
+    IManagerKernelApplyFenceAcquireRehydratePort::*)(const ApplyFenceAcquireAttemptQueryDTO&) const;
+using RehydrateFenceSignature = ApplyFenceReconcileResultDTO (
+    IManagerKernelApplyFenceAcquireRehydratePort::*)(const ApplyFenceRehydrateDTO&);
+static_assert(std::is_same_v<decltype(&IManagerKernelApplyFenceAcquireRehydratePort::Acquire),
+                             AcquireFenceSignature>);
+static_assert(
+    std::is_same_v<decltype(&IManagerKernelApplyFenceAcquireRehydratePort::ReconcileAcquireAttempt),
+                   ReconcileFenceAttemptSignature>);
+static_assert(std::is_same_v<decltype(&IManagerKernelApplyFenceAcquireRehydratePort::Rehydrate),
+                             RehydrateFenceSignature>);
 
 template <typename T>
 concept ExposesFenceStatus = requires { &T::Status; };
@@ -186,26 +133,19 @@ template <typename T>
 concept ExposesFenceRelease = requires { &T::CasRelease; };
 
 template <typename T>
-concept ExposesGenericStop = requires(T& value) {
-  value.Stop();
-};
+concept ExposesGenericStop = requires(T& value) { value.Stop(); };
 
-static_assert(
-    !ExposesFenceStatus<IManagerKernelApplyFenceAcquireRehydratePort>);
-static_assert(
-    !ExposesFenceRelease<IManagerKernelApplyFenceAcquireRehydratePort>);
-static_assert(
-    !ExposesGenericStop<IManagerKernelApplyFenceAcquireRehydratePort>);
+static_assert(!ExposesFenceStatus<IManagerKernelApplyFenceAcquireRehydratePort>);
+static_assert(!ExposesFenceRelease<IManagerKernelApplyFenceAcquireRehydratePort>);
+static_assert(!ExposesGenericStop<IManagerKernelApplyFenceAcquireRehydratePort>);
 
-[[nodiscard]] ProjectionRevisionDTO Projection(
-    const char* bundle_digest = kDigest,
-    const char* graph_digest = kDigest,
-    std::uint64_t scene_revision = 1U) {
+[[nodiscard]] ProjectionRevisionDTO Projection(const char* bundle_digest = kDigest,
+                                               const char* graph_digest = kDigest,
+                                               std::uint64_t scene_revision = 1U) {
   return ProjectionRevisionDTO{
       RetainedBundleId{bundle_digest},
       GraphRevision{graph_digest},
-      SceneRevision{SceneId{kSceneIdDigest}, scene_revision,
-                    ContentDigest{kDigest}},
+      SceneRevision{SceneId{kSceneIdDigest}, scene_revision, ContentDigest{kDigest}},
   };
 }
 
@@ -224,20 +164,13 @@ static_assert(
     const ProjectionRevisionDTO& projection,
     ProjectionNativeRuntimeBindingDTO binding = NativeBinding()) {
   return ProjectionHealthDTO{
-      std::move(binding),
-      1U,
-      ProjectionHealthState::kHealthy,
-      projection,
-      std::nullopt,
-      1U,
-      ContentDigest{kDigest},
-      std::nullopt,
+      std::move(binding), 1U, ProjectionHealthState::kHealthy, projection,
+      std::nullopt,       1U, ContentDigest{kDigest},          std::nullopt,
   };
 }
 
 [[nodiscard]] ProjectionTransitionEvidenceDTO TransitionEvidence(
-    ProjectionTransitionEvidenceState state =
-        ProjectionTransitionEvidenceState::kStaged) {
+    ProjectionTransitionEvidenceState state = ProjectionTransitionEvidenceState::kStaged) {
   const auto predecessor = Projection();
   const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
   return ProjectionTransitionEvidenceDTO{
@@ -249,16 +182,13 @@ static_assert(
       state,
       {},
       state == ProjectionTransitionEvidenceState::kUncertain
-          ? std::optional<ErrorDTO>{
-                ErrorDTO{"projection_failed", "test uncertainty", {}}}
+          ? std::optional<ErrorDTO>{ErrorDTO{"projection_failed", "test uncertainty", {}}}
           : std::nullopt,
   };
 }
 
-[[nodiscard]] ProjectionTransitionEvidenceDTO
-FinalizedTransitionEvidence() {
-  auto evidence =
-      TransitionEvidence(ProjectionTransitionEvidenceState::kFinalized);
+[[nodiscard]] ProjectionTransitionEvidenceDTO FinalizedTransitionEvidence() {
+  auto evidence = TransitionEvidence(ProjectionTransitionEvidenceState::kFinalized);
   const auto predecessor = evidence.predecessor_projection_revision;
   const auto candidate = evidence.candidate_projection_revision;
   evidence.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
@@ -270,8 +200,7 @@ FinalizedTransitionEvidence() {
       ProjectionTransitionRowEvidenceState::kCandidateActive,
       candidate,
       candidate,
-      HealthyProjection(
-          candidate, NativeBinding("provider-binding.a", "runtime.a")),
+      HealthyProjection(candidate, NativeBinding("provider-binding.a", "runtime.a")),
       std::nullopt,
   });
   evidence.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
@@ -283,8 +212,7 @@ FinalizedTransitionEvidence() {
       ProjectionTransitionRowEvidenceState::kCandidateActive,
       candidate,
       candidate,
-      HealthyProjection(
-          candidate, NativeBinding("provider-binding.b", "runtime.b")),
+      HealthyProjection(candidate, NativeBinding("provider-binding.b", "runtime.b")),
       std::nullopt,
   });
   evidence.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
@@ -322,17 +250,14 @@ FinalizedTransitionEvidence() {
       },
       ProjectionHealthState::kHealthy,
       {
-          HealthyProjection(
-              candidate, NativeBinding("provider-binding.a", "runtime.a")),
-          HealthyProjection(
-              candidate, NativeBinding("provider-binding.b", "runtime.b")),
+          HealthyProjection(candidate, NativeBinding("provider-binding.a", "runtime.a")),
+          HealthyProjection(candidate, NativeBinding("provider-binding.b", "runtime.b")),
       },
       std::nullopt,
   };
 }
 
-[[nodiscard]] RetainedBundleDTO RetainedBundle(
-    const ProjectionRevisionDTO& projection) {
+[[nodiscard]] RetainedBundleDTO RetainedBundle(const ProjectionRevisionDTO& projection) {
   return RetainedBundleDTO{
       std::string{kRetainedBundleApiVersion},
       projection.retained_bundle_id,
@@ -490,19 +415,17 @@ FinalizedTransitionEvidence() {
 
 [[nodiscard]] ProjectionBootstrapEvidenceDTO BootstrapEvidence() {
   return ProjectionBootstrapEvidenceDTO{
-      BootstrapId{"bootstrap-1"},
-      BootstrapGeneration{1U},
-      Projection(),
-      {},
+      BootstrapId{"bootstrap-1"}, BootstrapGeneration{1U}, Projection(), {},
       BootstrapAggregateHealth(),
   };
 }
 
 [[nodiscard]] ConfigurationFenceScopeDTO FenceScope() {
   return ConfigurationFenceScopeDTO{
-      ControllableComponentId{"component.arm-a"},
-      {{ControlDomainId{"domain.arm-a"}, ControlDomainRevision{kDigest}}},
-      {{ControlBindingId{"binding.arm-a"},
+      {ControllableComponentId{"component.arm-a"}},
+      {{ControlDomainId{"domain.arm-a"}, ControlDomainRevision{kDigest},
+        ControlDomainRevision{kDigest}}},
+      {{ControlBindingId{"binding.arm-a"}, ControlBindingRevision{kDigest},
         ControlBindingRevision{kDigest}}},
       {ResourceId{"arm-a-joint-1"}},
   };
@@ -518,12 +441,12 @@ FinalizedTransitionEvidence() {
       },
       ApplyFenceOwnerDTO{ApplyId{"apply-1"}, ApplyGeneration{1U}},
       FenceScope(),
+      ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       RetainedBundleId{kDigest},
       GraphRevision{kOtherDigest},
       7U,
       ConfigurationFenceGeneration{0U},
-      {{ControlDomainId{"domain.arm-a"},
-        ActiveControlConfigurationId{"active.arm-a"},
+      {{ControlDomainId{"domain.arm-a"}, ActiveControlConfigurationId{"active.arm-a"},
         ActiveControlConfigurationGeneration{9U}}},
       "candidate structure transition",
   };
@@ -558,21 +481,17 @@ FinalizedTransitionEvidence() {
 
 [[nodiscard]] ExecutionHostEpochDTO ExecutionHostEpoch() {
   return ExecutionHostEpochDTO{
-      RuntimeUnitId{"runtime.kernel"},
-      RuntimeEpoch{"kernel-runtime-2"},
-      RequestOwnerEpoch{"kernel-epoch-1"},
-      ContentDigest{kDigest},
+      RuntimeUnitId{"runtime.kernel"},       RuntimeEpoch{"kernel-runtime-2"},
+      RequestOwnerEpoch{"kernel-epoch-1"},   ContentDigest{kDigest},
       ActiveBundlePublicationGeneration{4U},
   };
 }
 
-class RecordingPublicationStore final
-    : public IActiveBundlePublicationStore {
+class RecordingPublicationStore final : public IActiveBundlePublicationStore {
  public:
   RecordingPublicationStore() = default;
 
-  explicit RecordingPublicationStore(
-      ActiveBundlePublicationGeneration current_generation)
+  explicit RecordingPublicationStore(ActiveBundlePublicationGeneration current_generation)
       : current_generation_(current_generation) {}
 
   ActiveBundlePublicationReceiptDTO PublishActiveBundle(
@@ -585,32 +504,28 @@ class RecordingPublicationStore final
         return receipt;
       }
     }
-    if (request.expected_previous_publication_generation !=
-        current_generation_) {
+    if (request.expected_previous_publication_generation != current_generation_) {
       throw std::logic_error("compare-and-swap conflict");
     }
     const auto next_generation =
         current_generation_.has_value()
-            ? ActiveBundlePublicationGeneration{
-                  current_generation_->value() + 1U}
+            ? ActiveBundlePublicationGeneration{current_generation_->value() + 1U}
             : ActiveBundlePublicationGeneration{1U};
-    receipts_.push_back(ActiveBundlePublicationReceiptDTO{
-        request, next_generation, ContentDigest{kDigest}});
+    receipts_.push_back(
+        ActiveBundlePublicationReceiptDTO{request, next_generation, ContentDigest{kDigest}});
     current_generation_ = next_generation;
     return receipts_.back();
   }
 
   Result<ActiveBundlePublicationReceiptDTO> ReadActiveBundlePublication(
-      ActiveBundlePublicationGeneration publication_generation)
-      const override {
+      ActiveBundlePublicationGeneration publication_generation) const override {
     for (const auto& receipt : receipts_) {
       if (receipt.publication_generation == publication_generation) {
         return Result<ActiveBundlePublicationReceiptDTO>::Ok(receipt);
       }
     }
     return Result<ActiveBundlePublicationReceiptDTO>::Err(
-        ErrorDTO{"missing_reference",
-                 "publication generation is not present", {}});
+        ErrorDTO{"missing_reference", "publication generation is not present", {}});
   }
 
  private:
@@ -618,8 +533,7 @@ class RecordingPublicationStore final
   std::vector<ActiveBundlePublicationReceiptDTO> receipts_;
 };
 
-TEST(ComponentManagerPortContracts,
-     CompositeProjectionRevisionRejectsPartialIdentity) {
+TEST(ComponentManagerPortContracts, CompositeProjectionRevisionRejectsPartialIdentity) {
   const auto valid = Projection();
   EXPECT_TRUE(valid.valid());
   EXPECT_TRUE(valid.scene_revision.valid());
@@ -632,8 +546,7 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(invalid.valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     PublicationRejectsEmptyAndZeroTransactionIdentities) {
+TEST(ComponentManagerPortContracts, PublicationRejectsEmptyAndZeroTransactionIdentities) {
   auto named = NamedPublicationRequest();
   ASSERT_TRUE(named.valid());
 
@@ -645,26 +558,23 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(named.valid());
 
   named = NamedPublicationRequest();
-  named.expected_previous_publication_generation =
-      ActiveBundlePublicationGeneration{0U};
+  named.expected_previous_publication_generation = ActiveBundlePublicationGeneration{0U};
   EXPECT_FALSE(named.valid());
 
   auto bootstrap = BootstrapPublicationRequest();
   ASSERT_TRUE(bootstrap.valid());
-  bootstrap.transaction_ref = BootstrapPublicationTransactionDTO{
-      BootstrapId{""}, BootstrapGeneration{0U}};
+  bootstrap.transaction_ref =
+      BootstrapPublicationTransactionDTO{BootstrapId{""}, BootstrapGeneration{0U}};
   EXPECT_FALSE(bootstrap.valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     PublicationPresenceAndCompareAndSwapAreTransactionExact) {
+TEST(ComponentManagerPortContracts, PublicationPresenceAndCompareAndSwapAreTransactionExact) {
   auto named = NamedPublicationRequest();
   named.expected_previous_publication_generation.reset();
   EXPECT_FALSE(named.valid());
 
   auto bootstrap = BootstrapPublicationRequest();
-  bootstrap.expected_previous_publication_generation =
-      ActiveBundlePublicationGeneration{3U};
+  bootstrap.expected_previous_publication_generation = ActiveBundlePublicationGeneration{3U};
   EXPECT_FALSE(bootstrap.valid());
 
   RecordingPublicationStore store{ActiveBundlePublicationGeneration{3U}};
@@ -678,18 +588,15 @@ TEST(ComponentManagerPortContracts,
       ApplyGeneration{1U},
       ProjectionStageGeneration{1U},
   };
-  stale.expected_previous_publication_generation =
-      ActiveBundlePublicationGeneration{2U};
+  stale.expected_previous_publication_generation = ActiveBundlePublicationGeneration{2U};
   EXPECT_THROW(store.PublishActiveBundle(stale), std::logic_error);
 
-  const auto exact =
-      store.ReadActiveBundlePublication(first.publication_generation);
+  const auto exact = store.ReadActiveBundlePublication(first.publication_generation);
   ASSERT_TRUE(exact.ok());
   EXPECT_EQ(exact.value(), first);
 }
 
-TEST(ComponentManagerPortContracts,
-     StagePresenceValidatorRejectsPartialPostCaptureTuple) {
+TEST(ComponentManagerPortContracts, StagePresenceValidatorRejectsPartialPostCaptureTuple) {
   const auto projection = Projection();
   const ErrorDTO error{"projection_failed", "test failure", {}};
 
@@ -718,25 +625,20 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(partial_capture.presence_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     ApplyResultEvidencePhaseMustMatchClaimedPhase) {
+TEST(ComponentManagerPortContracts, ApplyResultEvidencePhaseMustMatchClaimedPhase) {
   const auto predecessor = Projection();
   const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
 
   ProjectionApplyActivationResultDTO activation{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      predecessor,
-      ProjectionStageGeneration{1U},
-      candidate,
-      ProjectionApplyActivationResultState::kActivated,
-      candidate,
-      TransitionEvidence(),
+      ApplyId{"apply-1"}, ApplyGeneration{1U},
+      predecessor,        ProjectionStageGeneration{1U},
+      candidate,          ProjectionApplyActivationResultState::kActivated,
+      candidate,          TransitionEvidence(),
       std::nullopt,
   };
   EXPECT_FALSE(activation.presence_valid());
-  activation.transition_evidence = TransitionEvidence(
-      ProjectionTransitionEvidenceState::kActivatedAndRetired);
+  activation.transition_evidence =
+      TransitionEvidence(ProjectionTransitionEvidenceState::kActivatedAndRetired);
   EXPECT_TRUE(activation.presence_valid());
 
   ProjectionApplyDiscardResultDTO discard{
@@ -750,52 +652,39 @@ TEST(ComponentManagerPortContracts,
       std::nullopt,
   };
   EXPECT_FALSE(discard.presence_valid());
-  discard.transition_evidence =
-      TransitionEvidence(ProjectionTransitionEvidenceState::kAborted);
+  discard.transition_evidence = TransitionEvidence(ProjectionTransitionEvidenceState::kAborted);
   EXPECT_TRUE(discard.presence_valid());
 
   ProjectionApplyFinalizeResultDTO finalize{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      ProjectionStageGeneration{1U},
-      candidate,
-      NamedPublicationReceipt(),
-      ProjectionApplyFinalizeResultState::kFinalized,
-      candidate,
-      TransitionEvidence(),
-      NamedAggregateHealth(),
+      ApplyId{"apply-1"}, ApplyGeneration{1U},       ProjectionStageGeneration{1U},
+      candidate,          NamedPublicationReceipt(), ProjectionApplyFinalizeResultState::kFinalized,
+      candidate,          TransitionEvidence(),      NamedAggregateHealth(),
       std::nullopt,
   };
   EXPECT_FALSE(finalize.presence_valid());
-  finalize.transition_evidence =
-      FinalizedTransitionEvidence();
+  finalize.transition_evidence = FinalizedTransitionEvidence();
   EXPECT_TRUE(finalize.presence_valid());
 
   finalize.candidate_aggregate_health.native_projection_health.pop_back();
   EXPECT_FALSE(finalize.presence_valid());
   finalize.candidate_aggregate_health = NamedAggregateHealth();
   finalize.candidate_aggregate_health.native_projection_health.push_back(
-      HealthyProjection(
-          candidate, NativeBinding("provider-binding.z", "runtime.z")));
+      HealthyProjection(candidate, NativeBinding("provider-binding.z", "runtime.z")));
   EXPECT_FALSE(finalize.presence_valid());
   finalize.candidate_aggregate_health = NamedAggregateHealth();
-  finalize.candidate_aggregate_health.native_projection_health.front()
-      .native_runtime_binding =
-          NativeBinding("provider-binding.aa", "runtime.aa");
+  finalize.candidate_aggregate_health.native_projection_health.front().native_runtime_binding =
+      NativeBinding("provider-binding.aa", "runtime.aa");
   ASSERT_TRUE(finalize.candidate_aggregate_health.valid());
   EXPECT_FALSE(finalize.presence_valid());
   finalize.candidate_aggregate_health = NamedAggregateHealth();
 
-  finalize.transition_evidence.state =
-      static_cast<ProjectionTransitionEvidenceState>(999);
+  finalize.transition_evidence.state = static_cast<ProjectionTransitionEvidenceState>(999);
   EXPECT_FALSE(finalize.presence_valid());
-  finalize.state =
-      static_cast<ProjectionApplyFinalizeResultState>(999);
+  finalize.state = static_cast<ProjectionApplyFinalizeResultState>(999);
   EXPECT_FALSE(finalize.presence_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     TransitionEvidenceRowsCannotContradictLocalPhase) {
+TEST(ComponentManagerPortContracts, TransitionEvidenceRowsCannotContradictLocalPhase) {
   const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
   auto evidence = TransitionEvidence();
   auto staged_health = HealthyProjection(candidate);
@@ -819,26 +708,19 @@ TEST(ComponentManagerPortContracts,
       std::nullopt,
   });
 
-  EXPECT_FALSE(evidence.phase_consistent(
-      ProjectionTransitionEvidenceState::kStaged));
+  EXPECT_FALSE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
   auto& staged_row = evidence.transition_rows.front();
-  staged_row.state =
-      ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect;
-  EXPECT_TRUE(evidence.phase_consistent(
-      ProjectionTransitionEvidenceState::kStaged));
+  staged_row.state = ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect;
+  EXPECT_TRUE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
 
   staged_row.resulting_health.active_projection_revision = candidate;
-  EXPECT_FALSE(evidence.phase_consistent(
-      ProjectionTransitionEvidenceState::kStaged));
+  EXPECT_FALSE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
   staged_row.resulting_health.active_projection_revision.reset();
-  staged_row.resulting_health.state =
-      ProjectionHealthState::kUnavailable;
-  EXPECT_FALSE(evidence.phase_consistent(
-      ProjectionTransitionEvidenceState::kStaged));
+  staged_row.resulting_health.state = ProjectionHealthState::kUnavailable;
+  EXPECT_FALSE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
 
   const auto predecessor = Projection();
-  auto aborted = TransitionEvidence(
-      ProjectionTransitionEvidenceState::kAborted);
+  auto aborted = TransitionEvidence(ProjectionTransitionEvidenceState::kAborted);
   aborted.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
       ProjectionTransitionRowDTO{
           NativeBinding(),
@@ -851,33 +733,27 @@ TEST(ComponentManagerPortContracts,
       HealthyProjection(predecessor),
       std::nullopt,
   });
-  EXPECT_FALSE(aborted.phase_consistent(
-      ProjectionTransitionEvidenceState::kAborted));
-  aborted.transition_rows.front()
-      .acknowledged_staged_candidate_revision.reset();
-  EXPECT_TRUE(aborted.phase_consistent(
-      ProjectionTransitionEvidenceState::kAborted));
+  EXPECT_FALSE(aborted.phase_consistent(ProjectionTransitionEvidenceState::kAborted));
+  aborted.transition_rows.front().acknowledged_staged_candidate_revision.reset();
+  EXPECT_TRUE(aborted.phase_consistent(ProjectionTransitionEvidenceState::kAborted));
 
-  auto uncertain = TransitionEvidence(
-      ProjectionTransitionEvidenceState::kUncertain);
+  auto uncertain = TransitionEvidence(ProjectionTransitionEvidenceState::kUncertain);
   ASSERT_TRUE(uncertain.valid());
   uncertain.error.reset();
   EXPECT_FALSE(uncertain.valid());
 
   auto finalized = FinalizedTransitionEvidence();
   ASSERT_TRUE(finalized.valid());
-  finalized.transition_rows.back().resulting_health.staged_candidate =
-      ProjectionStagedCandidateDTO{
-          finalized.apply_id,
-          finalized.apply_generation,
-          finalized.projection_stage_generation,
-          finalized.candidate_projection_revision,
-      };
+  finalized.transition_rows.back().resulting_health.staged_candidate = ProjectionStagedCandidateDTO{
+      finalized.apply_id,
+      finalized.apply_generation,
+      finalized.projection_stage_generation,
+      finalized.candidate_projection_revision,
+  };
   EXPECT_FALSE(finalized.valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     TransitionInputAndEvidenceRowsRequireCanonicalUniqueBindings) {
+TEST(ComponentManagerPortContracts, TransitionInputAndEvidenceRowsRequireCanonicalUniqueBindings) {
   const ProjectionTransitionRowDTO first{
       NativeBinding("provider-binding.a", "runtime.a"),
       ProjectionTransitionDisposition::kAdded,
@@ -902,27 +778,26 @@ TEST(ComponentManagerPortContracts,
       evidence.projection_stage_generation,
       evidence.candidate_projection_revision,
   };
-  const auto evidence_row =
-      [&evidence, &staged_candidate](
-          const ProjectionTransitionRowDTO& transition_row) {
-        return ProjectionTransitionRowEvidenceDTO{
-            transition_row,
-            ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect,
-            evidence.candidate_projection_revision,
+  const auto evidence_row = [&evidence,
+                             &staged_candidate](const ProjectionTransitionRowDTO& transition_row) {
+    return ProjectionTransitionRowEvidenceDTO{
+        transition_row,
+        ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect,
+        evidence.candidate_projection_revision,
+        transition_row.expected_local_active,
+        ProjectionHealthDTO{
+            transition_row.native_runtime_binding,
+            1U,
+            ProjectionHealthState::kUninitialized,
             transition_row.expected_local_active,
-            ProjectionHealthDTO{
-                transition_row.native_runtime_binding,
-                1U,
-                ProjectionHealthState::kUninitialized,
-                transition_row.expected_local_active,
-                staged_candidate,
-                std::nullopt,
-                std::nullopt,
-                std::nullopt,
-            },
+            staged_candidate,
             std::nullopt,
-        };
-      };
+            std::nullopt,
+            std::nullopt,
+        },
+        std::nullopt,
+    };
+  };
   evidence.transition_rows = {
       evidence_row(first),
       evidence_row(second),
@@ -937,8 +812,7 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(evidence.valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     TransitionDispositionRequiresTheExactPredecessor) {
+TEST(ComponentManagerPortContracts, TransitionDispositionRequiresTheExactPredecessor) {
   const auto predecessor = Projection();
   const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
   const auto binding = NativeBinding();
@@ -1007,13 +881,11 @@ TEST(ComponentManagerPortContracts,
       std::nullopt,
   });
   EXPECT_TRUE(evidence.valid());
-  evidence.transition_rows.front()
-      .transition_row.expected_local_active = candidate;
+  evidence.transition_rows.front().transition_row.expected_local_active = candidate;
   EXPECT_FALSE(evidence.structurally_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     AggregateHealthForTargetRejectsContradictionsAndBadOrder) {
+TEST(ComponentManagerPortContracts, AggregateHealthForTargetRejectsContradictionsAndBadOrder) {
   const auto target = Projection(kOtherDigest, kOtherDigest, 2U);
   auto aggregate = NamedAggregateHealth();
   ASSERT_TRUE(aggregate.healthy_for_target(target));
@@ -1022,46 +894,38 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(aggregate.healthy_for_target(target));
 
   aggregate = NamedAggregateHealth();
-  aggregate.error =
-      ErrorDTO{"projection_failed", "aggregate error", {}};
+  aggregate.error = ErrorDTO{"projection_failed", "aggregate error", {}};
   EXPECT_FALSE(aggregate.healthy_for_target(target));
 
   aggregate = NamedAggregateHealth();
-  aggregate.native_projection_health.front().state =
-      ProjectionHealthState::kUnavailable;
+  aggregate.native_projection_health.front().state = ProjectionHealthState::kUnavailable;
   EXPECT_FALSE(aggregate.healthy_for_target(target));
 
   aggregate = NamedAggregateHealth();
-  aggregate.native_projection_health.front().error =
-      ErrorDTO{"projection_failed", "row error", {}};
+  aggregate.native_projection_health.front().error = ErrorDTO{"projection_failed", "row error", {}};
   EXPECT_FALSE(aggregate.healthy_for_target(target));
 
   aggregate = NamedAggregateHealth();
-  aggregate.native_projection_health.front().active_projection_revision =
-      Projection();
+  aggregate.native_projection_health.front().active_projection_revision = Projection();
   EXPECT_FALSE(aggregate.healthy_for_target(target));
 
   aggregate = NamedAggregateHealth();
-  aggregate.native_projection_health.front().staged_candidate =
-      ProjectionStagedCandidateDTO{
-          ApplyId{"apply-1"},
-          ApplyGeneration{1U},
-          ProjectionStageGeneration{1U},
-          target,
-      };
+  aggregate.native_projection_health.front().staged_candidate = ProjectionStagedCandidateDTO{
+      ApplyId{"apply-1"},
+      ApplyGeneration{1U},
+      ProjectionStageGeneration{1U},
+      target,
+  };
   EXPECT_FALSE(aggregate.healthy_for_target(target));
 
   aggregate = NamedAggregateHealth();
-  aggregate.native_projection_health.push_back(
-      aggregate.native_projection_health.front());
+  aggregate.native_projection_health.push_back(aggregate.native_projection_health.front());
   EXPECT_FALSE(aggregate.valid());
 
   aggregate = NamedAggregateHealth();
   aggregate.native_projection_health = {
-      HealthyProjection(
-          target, NativeBinding("provider-binding.z", "runtime.z")),
-      HealthyProjection(
-          target, NativeBinding("provider-binding.a", "runtime.a")),
+      HealthyProjection(target, NativeBinding("provider-binding.z", "runtime.z")),
+      HealthyProjection(target, NativeBinding("provider-binding.a", "runtime.a")),
   };
   EXPECT_FALSE(aggregate.valid());
 
@@ -1069,41 +933,33 @@ TEST(ComponentManagerPortContracts,
   aggregate.state = static_cast<ProjectionHealthState>(999);
   EXPECT_FALSE(aggregate.valid());
   aggregate = NamedAggregateHealth();
-  aggregate.native_projection_health.front().state =
-      static_cast<ProjectionHealthState>(999);
+  aggregate.native_projection_health.front().state = static_cast<ProjectionHealthState>(999);
   EXPECT_FALSE(aggregate.valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     AggregateBindingEqualityRejectsOmissionExtraAndSubstitution) {
+TEST(ComponentManagerPortContracts, AggregateBindingEqualityRejectsOmissionExtraAndSubstitution) {
   const auto target = Projection(kOtherDigest, kOtherDigest, 2U);
   const auto expected = NamedAggregateHealth();
   auto observed = expected;
   observed.native_projection_health.front().source_sequence = 99U;
-  EXPECT_TRUE(
-      EqualCanonicalProjectionHealthBindings(expected, observed));
+  EXPECT_TRUE(EqualCanonicalProjectionHealthBindings(expected, observed));
 
   observed.native_projection_health.pop_back();
-  EXPECT_FALSE(
-      EqualCanonicalProjectionHealthBindings(expected, observed));
+  EXPECT_FALSE(EqualCanonicalProjectionHealthBindings(expected, observed));
 
   observed = expected;
   observed.native_projection_health.push_back(
-      HealthyProjection(
-          target, NativeBinding("provider-binding.z", "runtime.z")));
-  EXPECT_FALSE(
-      EqualCanonicalProjectionHealthBindings(expected, observed));
+      HealthyProjection(target, NativeBinding("provider-binding.z", "runtime.z")));
+  EXPECT_FALSE(EqualCanonicalProjectionHealthBindings(expected, observed));
 
   observed = expected;
   observed.native_projection_health.front().native_runtime_binding =
       NativeBinding("provider-binding.aa", "runtime.aa");
   ASSERT_TRUE(observed.valid());
-  EXPECT_FALSE(
-      EqualCanonicalProjectionHealthBindings(expected, observed));
+  EXPECT_FALSE(EqualCanonicalProjectionHealthBindings(expected, observed));
 }
 
-TEST(ComponentManagerPortContracts,
-     ApplyStatusPresenceIsClosedForPublishedFinalizedAndDiscarded) {
+TEST(ComponentManagerPortContracts, ApplyStatusPresenceIsClosedForPublishedFinalizedAndDiscarded) {
   const auto predecessor = Projection();
   const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
   const auto receipt = NamedPublicationReceipt();
@@ -1124,22 +980,20 @@ TEST(ComponentManagerPortContracts,
 
   status.publication_receipt = receipt;
   EXPECT_FALSE(status.presence_valid());
-  status.transition_evidence = TransitionEvidence(
-      ProjectionTransitionEvidenceState::kActivatedAndRetired);
+  status.transition_evidence =
+      TransitionEvidence(ProjectionTransitionEvidenceState::kActivatedAndRetired);
   EXPECT_TRUE(status.presence_valid());
 
   status.state = ProjectionApplyStatusState::kFinalized;
   EXPECT_FALSE(status.presence_valid());
-  status.transition_evidence =
-      FinalizedTransitionEvidence();
+  status.transition_evidence = FinalizedTransitionEvidence();
   EXPECT_FALSE(status.presence_valid());
   status.candidate_aggregate_health = NamedAggregateHealth();
   EXPECT_TRUE(status.presence_valid());
   status.candidate_aggregate_health->native_projection_health.pop_back();
   EXPECT_FALSE(status.presence_valid());
   status.candidate_aggregate_health = NamedAggregateHealth();
-  status.candidate_aggregate_health->state =
-      ProjectionHealthState::kUnavailable;
+  status.candidate_aggregate_health->state = ProjectionHealthState::kUnavailable;
   EXPECT_FALSE(status.presence_valid());
 
   status.state = ProjectionApplyStatusState::kStaged;
@@ -1162,26 +1016,19 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(status.presence_valid());
 
   status = ProjectionApplyStatusDTO{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      predecessor,
-      ProjectionStageGeneration{1U},
-      std::nullopt,
-      ProjectionApplyStatusState::kDiscarded,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
+      ApplyId{"apply-1"}, ApplyGeneration{1U},
+      predecessor,        ProjectionStageGeneration{1U},
+      std::nullopt,       ProjectionApplyStatusState::kDiscarded,
+      std::nullopt,       std::nullopt,
+      std::nullopt,       std::nullopt,
   };
   EXPECT_FALSE(status.presence_valid());
   status.candidate_projection_revision = candidate;
-  status.transition_evidence =
-      TransitionEvidence(ProjectionTransitionEvidenceState::kAborted);
+  status.transition_evidence = TransitionEvidence(ProjectionTransitionEvidenceState::kAborted);
   EXPECT_TRUE(status.presence_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     ResultPresenceRejectsFabricatedSuccessEvidence) {
+TEST(ComponentManagerPortContracts, ResultPresenceRejectsFabricatedSuccessEvidence) {
   const auto predecessor = Projection();
   const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
   const ErrorDTO error{"projection_failed", "test failure", {}};
@@ -1194,8 +1041,7 @@ TEST(ComponentManagerPortContracts,
       candidate,
       ProjectionApplyActivationResultState::kActivated,
       candidate,
-      TransitionEvidence(
-          ProjectionTransitionEvidenceState::kActivatedAndRetired),
+      TransitionEvidence(ProjectionTransitionEvidenceState::kActivatedAndRetired),
       std::nullopt,
   };
   EXPECT_TRUE(activation.presence_valid());
@@ -1212,17 +1058,15 @@ TEST(ComponentManagerPortContracts,
       std::nullopt,
   };
   EXPECT_TRUE(rebuild.presence_valid());
-  rebuild.bootstrap_evidence->candidate_aggregate_health
-      .native_projection_health.push_back(
-          HealthyProjection(Projection()));
+  rebuild.bootstrap_evidence->candidate_aggregate_health.native_projection_health.push_back(
+      HealthyProjection(Projection()));
   EXPECT_FALSE(rebuild.presence_valid());
   rebuild.bootstrap_evidence = BootstrapEvidence();
   rebuild.bootstrap_evidence->candidate_aggregate_health.state =
       ProjectionHealthState::kUnavailable;
   EXPECT_FALSE(rebuild.presence_valid());
   rebuild.bootstrap_evidence = BootstrapEvidence();
-  rebuild.state =
-      ProjectionBootstrapRebuildResultState::kFailedProjectionUncertain;
+  rebuild.state = ProjectionBootstrapRebuildResultState::kFailedProjectionUncertain;
   rebuild.error = error;
   EXPECT_FALSE(rebuild.presence_valid());
 
@@ -1238,13 +1082,10 @@ TEST(ComponentManagerPortContracts,
   };
   EXPECT_TRUE(finalize.presence_valid());
   finalize.candidate_aggregate_health->native_projection_health.push_back(
-      HealthyProjection(
-          Projection(),
-          NativeBinding("provider-binding.z", "runtime.z")));
+      HealthyProjection(Projection(), NativeBinding("provider-binding.z", "runtime.z")));
   EXPECT_FALSE(finalize.presence_valid());
   finalize.candidate_aggregate_health = BootstrapAggregateHealth();
-  finalize.candidate_aggregate_health->state =
-      ProjectionHealthState::kUnavailable;
+  finalize.candidate_aggregate_health->state = ProjectionHealthState::kUnavailable;
   EXPECT_FALSE(finalize.presence_valid());
   finalize.candidate_aggregate_health = BootstrapAggregateHealth();
   finalize.state = ProjectionBootstrapFinalizeResultState::kStale;
@@ -1252,16 +1093,12 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(finalize.presence_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     LogicalSceneRootRejectsNull) {
-  EXPECT_THROW(
-      LogicalSceneSnapshotRoot{
-          std::shared_ptr<const LogicalSceneSnapshotDTO>{}},
-      std::invalid_argument);
+TEST(ComponentManagerPortContracts, LogicalSceneRootRejectsNull) {
+  EXPECT_THROW(LogicalSceneSnapshotRoot{std::shared_ptr<const LogicalSceneSnapshotDTO>{}},
+               std::invalid_argument);
 }
 
-TEST(ComponentManagerPortContracts,
-     BootstrapPrerequisiteQueryRequiresEveryAdmissionIdentity) {
+TEST(ComponentManagerPortContracts, BootstrapPrerequisiteQueryRequiresEveryAdmissionIdentity) {
   ProjectionBootstrapPrerequisiteQueryDTO query{
       CellId{"cell-a"},
       RetainedBundleId{kDigest},
@@ -1291,11 +1128,9 @@ TEST(ComponentManagerPortContracts,
       "test prerequisite failure",
       {},
   };
-  for (const auto state :
-       {ProjectionBootstrapPrerequisiteState::kReadyCommandFenced,
-        ProjectionBootstrapPrerequisiteState::kUnavailable,
-        ProjectionBootstrapPrerequisiteState::
-            kConflictingActiveProjection}) {
+  for (const auto state : {ProjectionBootstrapPrerequisiteState::kReadyCommandFenced,
+                           ProjectionBootstrapPrerequisiteState::kUnavailable,
+                           ProjectionBootstrapPrerequisiteState::kConflictingActiveProjection}) {
     for (const bool scene_writes_closed : {false, true}) {
       for (const bool projection_leases_closed : {false, true}) {
         for (const bool has_active_projection : {false, true}) {
@@ -1310,34 +1145,28 @@ TEST(ComponentManagerPortContracts,
                 state,
                 scene_writes_closed,
                 projection_leases_closed,
-                has_active_projection
-                    ? std::optional<ProjectionRevisionDTO>{Projection()}
-                    : std::nullopt,
+                has_active_projection ? std::optional<ProjectionRevisionDTO>{Projection()}
+                                      : std::nullopt,
                 has_error ? std::optional<ErrorDTO>{error} : std::nullopt,
             };
 
             bool expected = false;
             switch (state) {
-              case ProjectionBootstrapPrerequisiteState::
-                  kReadyCommandFenced:
-                expected = scene_writes_closed &&
-                           projection_leases_closed &&
+              case ProjectionBootstrapPrerequisiteState::kReadyCommandFenced:
+                expected = scene_writes_closed && projection_leases_closed &&
                            !has_active_projection && !has_error;
                 break;
               case ProjectionBootstrapPrerequisiteState::kUnavailable:
                 expected = !has_active_projection && has_error;
                 break;
-              case ProjectionBootstrapPrerequisiteState::
-                  kConflictingActiveProjection:
+              case ProjectionBootstrapPrerequisiteState::kConflictingActiveProjection:
                 expected = has_active_projection && has_error;
                 break;
             }
             EXPECT_EQ(status.presence_valid(), expected);
-            EXPECT_EQ(status.ready_for(query),
-                      expected &&
-                          state ==
-                              ProjectionBootstrapPrerequisiteState::
-                                  kReadyCommandFenced);
+            EXPECT_EQ(
+                status.ready_for(query),
+                expected && state == ProjectionBootstrapPrerequisiteState::kReadyCommandFenced);
           }
         }
       }
@@ -1345,20 +1174,16 @@ TEST(ComponentManagerPortContracts,
   }
 }
 
-TEST(ComponentManagerPortContracts,
-     BootstrapPrerequisiteReadyForRequiresAnExactEchoAndKnownState) {
+TEST(ComponentManagerPortContracts, BootstrapPrerequisiteReadyForRequiresAnExactEchoAndKnownState) {
   const ProjectionBootstrapPrerequisiteQueryDTO query{
       CellId{"cell-a"},
       RetainedBundleId{kDigest},
       GraphRevision{kOtherDigest},
   };
   ProjectionBootstrapPrerequisiteStatusDTO status{
-      query,
-      ProjectionBootstrapPrerequisiteState::kReadyCommandFenced,
-      true,
-      true,
-      std::nullopt,
-      std::nullopt,
+      query,        ProjectionBootstrapPrerequisiteState::kReadyCommandFenced,
+      true,         true,
+      std::nullopt, std::nullopt,
   };
   ASSERT_TRUE(status.presence_valid());
   EXPECT_TRUE(status.ready_for(query));
@@ -1367,8 +1192,7 @@ TEST(ComponentManagerPortContracts,
   mismatch.cell_id = CellId{"cell-b"};
   EXPECT_FALSE(status.ready_for(mismatch));
   mismatch = query;
-  mismatch.canonical_empty_retained_bundle_id =
-      RetainedBundleId{kOtherDigest};
+  mismatch.canonical_empty_retained_bundle_id = RetainedBundleId{kOtherDigest};
   EXPECT_FALSE(status.ready_for(mismatch));
   mismatch = query;
   mismatch.canonical_empty_graph_revision = GraphRevision{kDigest};
@@ -1380,37 +1204,30 @@ TEST(ComponentManagerPortContracts,
   status.query = query;
 
   status.active_projection = Projection();
-  status.state =
-      ProjectionBootstrapPrerequisiteState::kConflictingActiveProjection;
-  status.error =
-      ErrorDTO{"bootstrap_projection_conflict", "test conflict", {}};
+  status.state = ProjectionBootstrapPrerequisiteState::kConflictingActiveProjection;
+  status.error = ErrorDTO{"bootstrap_projection_conflict", "test conflict", {}};
   ASSERT_TRUE(status.presence_valid());
   status.active_projection->retained_bundle_id = RetainedBundleId{""};
   EXPECT_FALSE(status.presence_valid());
 
   status.active_projection.reset();
-  status.state =
-      static_cast<ProjectionBootstrapPrerequisiteState>(999);
+  status.state = static_cast<ProjectionBootstrapPrerequisiteState>(999);
   EXPECT_FALSE(status.presence_valid());
   EXPECT_FALSE(status.ready_for(query));
 }
 
 TEST(ComponentManagerPortContracts,
      BootstrapStatusCarriesPartialObservationsWithoutCompleteEvidence) {
-  auto absent_observation =
-      BootstrapNativeStatus(NativeProjectionBootstrapStatusState::kAbsent);
+  auto absent_observation = BootstrapNativeStatus(NativeProjectionBootstrapStatusState::kAbsent);
   ASSERT_TRUE(absent_observation.presence_valid());
-  absent_observation.resulting_health.state =
-      ProjectionHealthState::kHealthy;
-  absent_observation.resulting_health.active_projection_revision =
-      Projection();
+  absent_observation.resulting_health.state = ProjectionHealthState::kHealthy;
+  absent_observation.resulting_health.active_projection_revision = Projection();
   EXPECT_FALSE(absent_observation.presence_valid());
 
-  auto rebuilding_observation = BootstrapNativeStatus(
-      NativeProjectionBootstrapStatusState::kRebuilding);
+  auto rebuilding_observation =
+      BootstrapNativeStatus(NativeProjectionBootstrapStatusState::kRebuilding);
   ASSERT_TRUE(rebuilding_observation.presence_valid());
-  rebuilding_observation.resulting_health.active_projection_revision =
-      Projection();
+  rebuilding_observation.resulting_health.active_projection_revision = Projection();
   EXPECT_FALSE(rebuilding_observation.presence_valid());
 
   ProjectionBootstrapStatusDTO rebuilding{
@@ -1418,8 +1235,7 @@ TEST(ComponentManagerPortContracts,
       BootstrapGeneration{1U},
       ProjectionBootstrapStatusState::kRebuilding,
       Projection(),
-      {BootstrapNativeStatus(
-          NativeProjectionBootstrapStatusState::kRebuilding)},
+      {BootstrapNativeStatus(NativeProjectionBootstrapStatusState::kRebuilding)},
       std::nullopt,
       std::nullopt,
       std::nullopt,
@@ -1427,18 +1243,15 @@ TEST(ComponentManagerPortContracts,
   };
   EXPECT_TRUE(rebuilding.presence_valid());
 
-  rebuilding.state =
-      ProjectionBootstrapStatusState::kFailedProjectionUncertain;
-  rebuilding.error =
-      ErrorDTO{"projection_failed", "bootstrap uncertain", {}};
+  rebuilding.state = ProjectionBootstrapStatusState::kFailedProjectionUncertain;
+  rebuilding.error = ErrorDTO{"projection_failed", "bootstrap uncertain", {}};
   EXPECT_TRUE(rebuilding.presence_valid());
 
   rebuilding.bootstrap_evidence = BootstrapEvidence();
   EXPECT_FALSE(rebuilding.presence_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     BootstrapStatusPresenceIsClosedByPhase) {
+TEST(ComponentManagerPortContracts, BootstrapStatusPresenceIsClosedByPhase) {
   const ProjectionBootstrapStatusDTO absent{
       BootstrapId{"bootstrap-1"},
       BootstrapGeneration{1U},
@@ -1494,20 +1307,16 @@ TEST(ComponentManagerPortContracts,
   };
   EXPECT_TRUE(finalized.presence_valid());
   finalized.finalized_aggregate_health->native_projection_health.push_back(
-      HealthyProjection(
-          Projection(),
-          NativeBinding("provider-binding.z", "runtime.z")));
+      HealthyProjection(Projection(), NativeBinding("provider-binding.z", "runtime.z")));
   EXPECT_FALSE(finalized.presence_valid());
   finalized.finalized_aggregate_health = BootstrapAggregateHealth();
-  finalized.finalized_aggregate_health->state =
-      ProjectionHealthState::kUnavailable;
+  finalized.finalized_aggregate_health->state = ProjectionHealthState::kUnavailable;
   EXPECT_FALSE(finalized.presence_valid());
   finalized.state = static_cast<ProjectionBootstrapStatusState>(999);
   EXPECT_FALSE(finalized.presence_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     FenceScopeOwnerAndBundleGraphKeyRemainExplicitAndTyped) {
+TEST(ComponentManagerPortContracts, FenceScopeOwnerAndBundleGraphKeyRemainExplicitAndTyped) {
   auto intent = FenceIntent();
 
   EXPECT_TRUE(intent.valid());
@@ -1523,8 +1332,9 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(intent.valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     FenceScopeAndActiveConfigurationsAreCanonicalAndExact) {
+TEST(ComponentManagerPortContracts, FenceScopeAndActiveConfigurationsAreCanonicalAndExact) {
+  EXPECT_TRUE(ConfigurationFenceScopeDTO{}.valid());
+
   auto scope = FenceScope();
   scope.resources = {
       ResourceId{"arm-a-joint-2"},
@@ -1533,13 +1343,22 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(scope.valid());
 
   scope = FenceScope();
+  scope.controllable_component_ids.clear();
+  EXPECT_FALSE(scope.valid());
+
+  scope = FenceScope();
+  scope.domains.front().predecessor_control_domain_revision.reset();
+  scope.domains.front().candidate_control_domain_revision.reset();
+  EXPECT_FALSE(scope.valid());
+
+  scope = FenceScope();
   scope.domains.push_back(scope.domains.front());
   EXPECT_FALSE(scope.valid());
 
   scope = FenceScope();
   scope.domains = {
-      {ControlDomainId{"domain.z"}, ControlDomainRevision{kDigest}},
-      {ControlDomainId{"domain.a"}, ControlDomainRevision{kDigest}},
+      {ControlDomainId{"domain.z"}, ControlDomainRevision{kDigest}, ControlDomainRevision{kDigest}},
+      {ControlDomainId{"domain.a"}, ControlDomainRevision{kDigest}, ControlDomainRevision{kDigest}},
   };
   EXPECT_FALSE(scope.valid());
 
@@ -1549,22 +1368,36 @@ TEST(ComponentManagerPortContracts,
 
   scope = FenceScope();
   scope.bindings = {
-      {ControlBindingId{"binding.z"}, ControlBindingRevision{kDigest}},
-      {ControlBindingId{"binding.a"}, ControlBindingRevision{kDigest}},
+      {ControlBindingId{"binding.z"}, ControlBindingRevision{kDigest},
+       ControlBindingRevision{kDigest}},
+      {ControlBindingId{"binding.a"}, ControlBindingRevision{kDigest},
+       ControlBindingRevision{kDigest}},
   };
   EXPECT_FALSE(scope.valid());
 
   auto intent = FenceIntent();
   ASSERT_TRUE(intent.valid());
-  intent.expected_active_control_configurations.front()
-      .active_control_configuration_generation =
-          ActiveControlConfigurationGeneration{0U};
+  intent.expected_active_control_configurations.front().active_control_configuration_generation =
+      ActiveControlConfigurationGeneration{0U};
   EXPECT_FALSE(intent.valid());
 
   intent = FenceIntent();
-  intent.expected_active_control_configurations.front()
-      .active_control_configuration_id =
-          ActiveControlConfigurationId{""};
+  intent.busy_disposition = static_cast<ApplyFenceBusyDispositionDTO>(999);
+  EXPECT_FALSE(intent.valid());
+
+  intent = FenceIntent();
+  intent.scope.domains.front().predecessor_control_domain_revision.reset();
+  intent.scope.bindings.front().predecessor_control_binding_revision.reset();
+  intent.expected_active_control_configurations.clear();
+  EXPECT_TRUE(intent.valid());
+  intent.expected_active_control_configurations.push_back(
+      {ControlDomainId{"domain.arm-a"}, ActiveControlConfigurationId{"active.arm-a"},
+       ActiveControlConfigurationGeneration{9U}});
+  EXPECT_FALSE(intent.valid());
+
+  intent = FenceIntent();
+  intent.expected_active_control_configurations.front().active_control_configuration_id =
+      ActiveControlConfigurationId{""};
   EXPECT_FALSE(intent.valid());
 
   intent = FenceIntent();
@@ -1578,84 +1411,66 @@ TEST(ComponentManagerPortContracts,
 
   intent = FenceIntent();
   intent.scope.domains = {
-      {ControlDomainId{"domain.arm-a"}, ControlDomainRevision{kDigest}},
-      {ControlDomainId{"domain.arm-b"}, ControlDomainRevision{kDigest}},
+      {ControlDomainId{"domain.arm-a"}, ControlDomainRevision{kDigest},
+       ControlDomainRevision{kDigest}},
+      {ControlDomainId{"domain.arm-b"}, ControlDomainRevision{kDigest},
+       ControlDomainRevision{kDigest}},
   };
   intent.expected_active_control_configurations = {
-      {ControlDomainId{"domain.arm-b"},
-       ActiveControlConfigurationId{"active.arm-b"},
+      {ControlDomainId{"domain.arm-b"}, ActiveControlConfigurationId{"active.arm-b"},
        ActiveControlConfigurationGeneration{10U}},
-      {ControlDomainId{"domain.arm-a"},
-       ActiveControlConfigurationId{"active.arm-a"},
+      {ControlDomainId{"domain.arm-a"}, ActiveControlConfigurationId{"active.arm-a"},
        ActiveControlConfigurationGeneration{9U}},
   };
   EXPECT_FALSE(intent.valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     FenceAcceptedAllowsOnlyAcceptedOrExactReplayStatus) {
+TEST(ComponentManagerPortContracts, FenceAcceptedAllowsOnlyAcceptedOrExactReplayStatus) {
   ConfigurationFenceAcceptedDTO accepted{
-      ConfigurationFenceId{"fence-1"},
-      ConfigurationFenceGeneration{1U},
-      FenceScope(),
-      1,
+      ConfigurationFenceId{"fence-1"},      ConfigurationFenceGeneration{1U}, FenceScope(), 1,
       RequestReplayStatusDTO::kAcceptedNew,
   };
   EXPECT_TRUE(accepted.valid());
   accepted.replay_status = RequestReplayStatusDTO::kReplayedExact;
   EXPECT_TRUE(accepted.valid());
-  accepted.replay_status =
-      RequestReplayStatusDTO::kRequestResultExpired;
+  accepted.replay_status = RequestReplayStatusDTO::kRequestResultExpired;
   EXPECT_FALSE(accepted.valid());
   accepted.replay_status = RequestReplayStatusDTO::kRequestIdConflict;
   EXPECT_FALSE(accepted.valid());
   accepted.replay_status = RequestReplayStatusDTO::kRequestLedgerFull;
   EXPECT_FALSE(accepted.valid());
-  accepted.replay_status =
-      RequestReplayStatusDTO::kStaleRequestOwnerEpoch;
+  accepted.replay_status = RequestReplayStatusDTO::kStaleRequestOwnerEpoch;
   EXPECT_FALSE(accepted.valid());
   accepted.replay_status = static_cast<RequestReplayStatusDTO>(999);
   EXPECT_FALSE(accepted.valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     FenceAcceptanceMatchesExactScopeAndSuccessorGeneration) {
+TEST(ComponentManagerPortContracts, FenceAcceptanceMatchesExactScopeAndSuccessorGeneration) {
   auto intent = FenceIntent();
   ConfigurationFenceAcceptedDTO accepted{
-      ConfigurationFenceId{"fence-1"},
-      ConfigurationFenceGeneration{1U},
-      FenceScope(),
-      1,
+      ConfigurationFenceId{"fence-1"},      ConfigurationFenceGeneration{1U}, FenceScope(), 1,
       RequestReplayStatusDTO::kAcceptedNew,
   };
   EXPECT_TRUE(accepted.matches(intent));
 
-  accepted.configuration_fence_generation =
-      ConfigurationFenceGeneration{2U};
+  accepted.configuration_fence_generation = ConfigurationFenceGeneration{2U};
   EXPECT_FALSE(accepted.matches(intent));
-  accepted.configuration_fence_generation =
-      ConfigurationFenceGeneration{1U};
+  accepted.configuration_fence_generation = ConfigurationFenceGeneration{1U};
   accepted.captured_scope.resources = {ResourceId{"different-resource"}};
   EXPECT_FALSE(accepted.matches(intent));
 
-  intent.expected_fence_generation = ConfigurationFenceGeneration{
-      std::numeric_limits<std::uint64_t>::max()};
+  intent.expected_fence_generation =
+      ConfigurationFenceGeneration{std::numeric_limits<std::uint64_t>::max()};
   accepted.configuration_fence_generation = ConfigurationFenceGeneration{0U};
   EXPECT_FALSE(accepted.matches(intent));
 }
 
-TEST(ComponentManagerPortContracts,
-     FenceAttemptReconciliationHasOneRetryableNoResultState) {
+TEST(ComponentManagerPortContracts, FenceAttemptReconciliationHasOneRetryableNoResultState) {
   const auto query = FenceAttemptQuery();
   ApplyFenceAcquireAttemptReconcileResultDTO result{
-      ExecutionHostEpoch(),
-      query,
-      ApplyFenceAcquireAttemptReconcileState::kNotSeen,
-      std::nullopt,
-      false,
-      "",
-      ContentDigest{kDigest},
-      std::nullopt,
+      ExecutionHostEpoch(),   query,        ApplyFenceAcquireAttemptReconcileState::kNotSeen,
+      std::nullopt,           false,        "",
+      ContentDigest{kDigest}, std::nullopt,
   };
   EXPECT_TRUE(result.presence_valid());
   EXPECT_TRUE(result.matches(query));
@@ -1663,10 +1478,7 @@ TEST(ComponentManagerPortContracts,
   result.state = ApplyFenceAcquireAttemptReconcileState::kAcceptedExact;
   EXPECT_FALSE(result.presence_valid());
   result.accepted_fence = ConfigurationFenceAcceptedDTO{
-      ConfigurationFenceId{"fence-1"},
-      ConfigurationFenceGeneration{1U},
-      FenceScope(),
-      1,
+      ConfigurationFenceId{"fence-1"},      ConfigurationFenceGeneration{1U}, FenceScope(), 1,
       RequestReplayStatusDTO::kAcceptedNew,
   };
   result.admission_fenced = true;
@@ -1690,8 +1502,7 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(result.presence_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     FenceRehydrateNewIdentityIsPresentOnlyWhenRecreated) {
+TEST(ComponentManagerPortContracts, FenceRehydrateNewIdentityIsPresentOnlyWhenRecreated) {
   ApplyFenceReconcileEntryDTO entry{
       ConfigurationFenceId{"fence-1"},
       ConfigurationFenceGeneration{1U},
@@ -1703,10 +1514,8 @@ TEST(ComponentManagerPortContracts,
 
   entry.state = ApplyFenceReconcileState::kRecreated;
   EXPECT_FALSE(entry.presence_valid());
-  entry.reconciled_configuration_fence_id =
-      ConfigurationFenceId{"fence-2"};
-  entry.reconciled_configuration_fence_generation =
-      ConfigurationFenceGeneration{2U};
+  entry.reconciled_configuration_fence_id = ConfigurationFenceId{"fence-2"};
+  entry.reconciled_configuration_fence_generation = ConfigurationFenceGeneration{2U};
   EXPECT_TRUE(entry.presence_valid());
 
   entry.state = ApplyFenceReconcileState::kConflicting;
@@ -1719,8 +1528,7 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(entry.presence_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     FenceReconciliationCannotOpenOnMissingConflictOrError) {
+TEST(ComponentManagerPortContracts, FenceReconciliationCannotOpenOnMissingConflictOrError) {
   const auto request = FenceRehydrateRequest();
   const ApplyFenceReconcileEntryDTO matched{
       ConfigurationFenceId{"fence-1"},
@@ -1730,37 +1538,32 @@ TEST(ComponentManagerPortContracts,
       std::nullopt,
   };
   ApplyFenceReconcileResultDTO result{
-      ExecutionHostEpoch(),
-      {matched},
-      false,
-      "",
-      ContentDigest{kDigest},
-      std::nullopt,
+      ExecutionHostEpoch(), {matched}, false, "", ContentDigest{kDigest}, std::nullopt,
   };
   EXPECT_TRUE(result.presence_valid());
+  EXPECT_TRUE(result.matches(request));
+
+  result.execution_host_epoch.request_owner_epoch =
+      RequestOwnerEpoch{"different-kernel-owner-epoch"};
   EXPECT_TRUE(result.matches(request));
 
   result.fence_results.clear();
   EXPECT_FALSE(result.presence_valid());
 
   result.fence_results = {matched};
-  result.error =
-      ErrorDTO{"fence_reconcile_failed", "test error", {}};
+  result.error = ErrorDTO{"fence_reconcile_failed", "test error", {}};
   EXPECT_FALSE(result.presence_valid());
 
-  result.fence_results.front().state =
-      ApplyFenceReconcileState::kMissing;
+  result.fence_results.front().state = ApplyFenceReconcileState::kMissing;
   result.admission_fenced = false;
-  result.required_compensation_or_operator_direction =
-      "recreate or inspect the missing fence";
+  result.required_compensation_or_operator_direction = "recreate or inspect the missing fence";
   EXPECT_FALSE(result.presence_valid());
 
   result.admission_fenced = true;
   EXPECT_TRUE(result.presence_valid());
   EXPECT_TRUE(result.matches(request));
 
-  result.fence_results.front().state =
-      ApplyFenceReconcileState::kConflicting;
+  result.fence_results.front().state = ApplyFenceReconcileState::kConflicting;
   EXPECT_TRUE(result.presence_valid());
   result.error->code.clear();
   EXPECT_FALSE(result.presence_valid());
@@ -1768,8 +1571,7 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(result.presence_valid());
 }
 
-TEST(ComponentManagerPortContracts,
-     FenceReconcileOrderingAndSingletonRequestMatchAreExplicit) {
+TEST(ComponentManagerPortContracts, FenceReconcileOrderingAndSingletonRequestMatchAreExplicit) {
   const auto request = FenceRehydrateRequest();
   const ApplyFenceReconcileEntryDTO first{
       ConfigurationFenceId{"fence-1"},
@@ -1786,12 +1588,7 @@ TEST(ComponentManagerPortContracts,
       std::nullopt,
   };
   ApplyFenceReconcileResultDTO result{
-      ExecutionHostEpoch(),
-      {second, first},
-      false,
-      "",
-      ContentDigest{kDigest},
-      std::nullopt,
+      ExecutionHostEpoch(), {second, first}, false, "", ContentDigest{kDigest}, std::nullopt,
   };
   EXPECT_FALSE(result.presence_valid());
 

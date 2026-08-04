@@ -187,6 +187,7 @@ target_link_libraries(manyforge_component_manager PRIVATE
   OpenSSL::Crypto
   SQLite::SQLite3
   manyforge::deployment_admission
+  manyforge::deployment_verification_core
   manyforge::persistence
 )
 get_target_property(
@@ -197,6 +198,12 @@ if(NOT "manyforge::deployment_admission" IN_LIST
        MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS)
   message(FATAL_ERROR
     "manyforge_component_manager lost its focused admission dependency")
+endif()
+if(NOT "manyforge::deployment_verification_core" IN_LIST
+       MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS)
+  message(FATAL_ERROR
+    "manyforge_component_manager lost its read-neutral Apply-scope "
+    "derivation dependency")
 endif()
 if(NOT "manyforge::persistence" IN_LIST
        MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS)
@@ -324,8 +331,12 @@ if(BUILD_TESTING)
 
   add_executable(test_manager_apply_fence_coordinator
     test/test_manager_apply_fence_coordinator.cpp)
+  target_include_directories(test_manager_apply_fence_coordinator PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
   target_link_libraries(test_manager_apply_fence_coordinator PRIVATE
     manyforge_component_manager
+    manyforge::deployment
     GTest::gtest_main)
   gtest_discover_tests(test_manager_apply_fence_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

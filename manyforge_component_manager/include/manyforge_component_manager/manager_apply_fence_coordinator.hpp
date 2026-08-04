@@ -7,11 +7,12 @@
 
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 
 namespace manyforge::component_manager {
 
 class ManagerApplyFenceCoordinatorError : public std::runtime_error {
- public:
+public:
   using std::runtime_error::runtime_error;
 };
 
@@ -21,6 +22,8 @@ enum class ManagerApplyFenceUncertaintyPhase {
   kAcquireCall,
   kAcquireResponse,
   kAcceptancePersistence,
+  kRehydrateCall,
+  kRehydrateResponse,
 };
 
 /// Programmatically distinct fail-closed result for an Acquire that may
@@ -32,38 +35,42 @@ enum class ManagerApplyFenceUncertaintyPhase {
 /// code does not have to infer what happened from an exception string.
 class ManagerApplyFenceEffectUncertainError final
     : public ManagerApplyFenceCoordinatorError {
- public:
+public:
   ManagerApplyFenceEffectUncertainError(
-      std::string detail,
-      ManagerApplyFenceUncertaintyPhase phase,
+      std::string detail, ManagerApplyFenceUncertaintyPhase phase,
       bool acquire_invoked_in_this_call,
       manyforge::core::ApplyFenceAcquireAttemptQueryDTO recovery_query,
       std::optional<manyforge::core::ConfigurationFenceAcceptedDTO>
           observed_acceptance = std::nullopt,
-      std::optional<
-          manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO>
-          observed_reconciliation = std::nullopt);
+      std::optional<manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO>
+          observed_reconciliation = std::nullopt,
+      std::optional<manyforge::core::ApplyFenceReconcileResultDTO>
+          observed_rehydration = std::nullopt);
 
   [[nodiscard]] ManagerApplyFenceUncertaintyPhase phase() const noexcept;
   [[nodiscard]] bool acquire_invoked_in_this_call() const noexcept;
-  [[nodiscard]] const manyforge::core::ApplyFenceAcquireAttemptQueryDTO&
+  [[nodiscard]] const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &
   recovery_query() const noexcept;
   [[nodiscard]] const std::optional<
-      manyforge::core::ConfigurationFenceAcceptedDTO>&
+      manyforge::core::ConfigurationFenceAcceptedDTO> &
   observed_acceptance() const noexcept;
   [[nodiscard]] const std::optional<
-      manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO>&
+      manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO> &
   observed_reconciliation() const noexcept;
+  [[nodiscard]] const std::optional<
+      manyforge::core::ApplyFenceReconcileResultDTO> &
+  observed_rehydration() const noexcept;
 
- private:
+private:
   ManagerApplyFenceUncertaintyPhase phase_;
   bool acquire_invoked_in_this_call_;
   manyforge::core::ApplyFenceAcquireAttemptQueryDTO recovery_query_;
   std::optional<manyforge::core::ConfigurationFenceAcceptedDTO>
       observed_acceptance_;
-  std::optional<
-      manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO>
+  std::optional<manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO>
       observed_reconciliation_;
+  std::optional<manyforge::core::ApplyFenceReconcileResultDTO>
+      observed_rehydration_;
 };
 
 enum class ManagerApplyFenceAcquirePath {
@@ -75,48 +82,62 @@ enum class ManagerApplyFenceAcquirePath {
 
 struct ManagerApplyFenceAcquireResult final {
   ManagerApplyIntentWriteResult durable_intent;
+  ManagerApplyAffectedScopeWriteResult durable_affected_scope;
   ManagerApplyFenceAttemptWriteResult durable_attempt;
   ManagerApplyFenceAcceptanceWriteResult durable_acceptance;
+  manyforge::core::ApplyFenceRehydrateDTO rehydrate_request;
+  manyforge::core::ApplyFenceReconcileResultDTO rehydration;
   ManagerApplyFenceAcquirePath path;
+};
+
+/// Manager-owned exact Kernel generation/configuration observation used to
+/// construct the fixed fence request. It deliberately contains no scope,
+/// disposition, request identity, graph, or bundle input.
+struct ManagerApplyFenceExpectationDTO final {
+  std::uint64_t expected_operation_resource_generation;
+  manyforge::core::ConfigurationFenceGeneration expected_fence_generation;
+  std::vector<manyforge::core::DomainActiveControlConfigurationDTO>
+      expected_active_control_configurations;
 };
 
 /// Bounded durable pre-effect coordinator for one named Apply fence.
 ///
-/// Every invocation verifies one coherent Apply/fence input, commits the
-/// immutable Apply intent and exact fence attempt, and returns only after the
-/// complete accepted fence is durable. An existing accepted record is an
-/// effect-free replay. An attempt-only restart first performs the read-only
-/// Kernel reconciliation query; only authoritative `not_seen` permits an
-/// exact Acquire retry, while `accepted_exact` is durably appended directly.
+/// Every invocation verifies the exact sealed predecessor/candidate bundles,
+/// derives and commits one immutable whole-Apply scope with the fixed busy
+/// disposition, commits the exact fence attempt, and returns only after the
+/// complete accepted fence is durable and rehydrated. An existing accepted
+/// record never repeats Acquire. An attempt-only restart first performs the
+/// read-only Kernel reconciliation query; only authoritative `not_seen` permits
+/// an exact Acquire retry, while `accepted_exact` is durably appended directly.
 /// Conflict, uncertainty, malformed evidence, or journal failure after a
 /// possible effect remains explicitly effect-uncertain.
 ///
-/// This coordinator owns commit-before-each-Acquire it invokes. It does not
-/// claim global first-effect ownership, calculate affected scope, implement
-/// reject-if-busy, converge processes, stage/activate a projection, publish a
-/// bundle, release or rehydrate an accepted fence, or perform later Apply
-/// phases.
+/// This coordinator owns the complete pre-effect admission boundary through
+/// rehydration. It does not converge processes, stage/activate a projection,
+/// publish a bundle, release a fence, or perform later Apply phases.
 class ManagerApplyFenceCoordinator final {
- public:
+public:
   ManagerApplyFenceCoordinator(
-      SqliteManagerApplyJournal& apply_journal,
-      manyforge::core::IManagerKernelApplyFenceAcquireRehydratePort&
-          kernel_fence,
+      SqliteManagerApplyJournal &apply_journal,
+      manyforge::core::IManagerKernelApplyFenceAcquireRehydratePort
+          &kernel_fence,
       manyforge::core::RuntimeEpoch manager_runtime_epoch);
 
   [[nodiscard]] ManagerApplyFenceAcquireResult AcquireOrRecoverFence(
-      const ManagerApplyIntentDTO& apply_intent,
-      const manyforge::core::ApplyConfigurationFenceIntentDTO& fence_intent);
+      const ManagerApplyIntentDTO &apply_intent,
+      const manyforge::deployment::RetainedBundle &predecessor,
+      const manyforge::deployment::RetainedBundle &candidate,
+      const ManagerApplyFenceExpectationDTO &expectation);
 
-  ManagerApplyFenceCoordinator(const ManagerApplyFenceCoordinator&) = delete;
-  ManagerApplyFenceCoordinator& operator=(
-      const ManagerApplyFenceCoordinator&) = delete;
+  ManagerApplyFenceCoordinator(const ManagerApplyFenceCoordinator &) = delete;
+  ManagerApplyFenceCoordinator &
+  operator=(const ManagerApplyFenceCoordinator &) = delete;
 
- private:
-  SqliteManagerApplyJournal& apply_journal_;
-  manyforge::core::IManagerKernelApplyFenceAcquireRehydratePort& kernel_fence_;
+private:
+  SqliteManagerApplyJournal &apply_journal_;
+  manyforge::core::IManagerKernelApplyFenceAcquireRehydratePort &kernel_fence_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   std::mutex operation_mutex_;
 };
 
-}  // namespace manyforge::component_manager
+} // namespace manyforge::component_manager
