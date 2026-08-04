@@ -1052,8 +1052,9 @@ This convention also applies retrospectively to scene/Core/RoboPlan and other
 relocation work already present in the pinned cumulative range. Those rows are
 derived from exact Git objects and the active demolition/evidence records, not
 reconstructed from recollection. The completed retrospective check and current
-Composer disposition are retained permanently in
-`manyforge_specs/docs/implementation/composable-cell-relocation-responsibility-disposition-record-2026-07-31.md`;
-their cumulative dynamic closure is retained in the 2026-08-01 relocation
-reconciliation qualification evidence. The temporary relocation handoff is
-not a continuing authority or retained fallback.
+Composer disposition are retained permanently in the companion
+`composable-cell-relocation-responsibility-disposition-record-2026-07-31.md`
+in the implementation-specification repository; their cumulative dynamic
+closure is retained in the 2026-08-01 relocation-reconciliation qualification
+evidence. The temporary relocation handoff is not a continuing authority or
+retained fallback.
