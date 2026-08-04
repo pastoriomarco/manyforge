@@ -14,53 +14,55 @@
 
 namespace manyforge::deployment {
 class CanonicalEmptyRetainedBundleAdmission;
-}
+class IVerifiedRetainedBundleSource;
+} // namespace manyforge::deployment
 
 namespace manyforge::scene {
 
 inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
-    "manyforge.internal.logical-scene.canonical-empty.i4.v1";
-inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 1;
+    "manyforge.internal.logical-scene.i4.v2";
+inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
 inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
-    1296454467;  // "MFSC"
+    1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;
 inline constexpr std::int64_t kMaximumSceneStoreDatabasePageImageBytes =
     64LL * 1024LL * 1024LL;
 inline constexpr std::int64_t kMaximumSceneStoreWalBytes =
     16LL * 1024LL * 1024LL;
+inline constexpr std::size_t kMaximumNamedApplySceneStages = 256U;
 
 class CanonicalEmptySceneOwnerError : public std::runtime_error {
- public:
+public:
   using std::runtime_error::runtime_error;
 };
 
 class CanonicalEmptySceneOwnerConflictError final
     : public CanonicalEmptySceneOwnerError {
- public:
+public:
   using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
 };
 
 class CanonicalEmptySceneOwnerIntegrityError final
     : public CanonicalEmptySceneOwnerError {
- public:
+public:
   using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
 };
 
 class CanonicalEmptySceneOwnerLimitError final
     : public CanonicalEmptySceneOwnerError {
- public:
+public:
   using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
 };
 
 class CanonicalEmptySceneOwnerBusyError final
     : public CanonicalEmptySceneOwnerError {
- public:
+public:
   using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
 };
 
 class CanonicalEmptySceneOwnerClosedError final
     : public CanonicalEmptySceneOwnerError {
- public:
+public:
   using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
 };
 
@@ -69,10 +71,14 @@ enum class CanonicalEmptySceneBootstrapPhase {
   kAccepted,
   kReadyToPublish,
   kFinalized,
+  kNamedApplyStaged,
+  kNamedApplyActivated,
+  kNamedApplyDiscarded,
+  kNamedApplyFinalized,
 };
 
-[[nodiscard]] std::string_view ToString(
-    CanonicalEmptySceneBootstrapPhase phase) noexcept;
+[[nodiscard]] std::string_view
+ToString(CanonicalEmptySceneBootstrapPhase phase) noexcept;
 
 /// Read-only evidence for the scene-write and projection-lease gates owned by
 /// this logical-scene database.
@@ -97,10 +103,14 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
   std::int64_t acceptance_row_count;
   std::int64_t rebuild_row_count;
   std::int64_t finalization_row_count;
+  std::int64_t named_apply_stage_count;
+  std::int64_t named_apply_activation_count;
+  std::int64_t named_apply_discard_count;
+  std::int64_t named_apply_finalization_count;
   CanonicalEmptySceneAccessStatus access;
 };
 
-/// Production owner for the exact zero-native canonical-empty I4 bootstrap.
+/// Production owner for the exact zero-native I4 logical-scene lineage.
 ///
 /// Construction accepts only the deployment-owned sealed canonical-empty
 /// admission, derives its fixed cell/bundle/graph prerequisite query, and opens
@@ -122,65 +132,89 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
 /// its corresponding transition. During initial bootstrap no successor can be
 /// admitted before this Finalize completes.
 ///
-/// This deliberately implements no nonzero native materializer, named Apply,
-/// public scene edit, compatibility wrapper, ROS adapter, robot command, or
+/// With an independently verified retained-bundle source, the same owner also
+/// admits the first zero-native named-Apply stage, atomically closes writes and
+/// leases, captures the current immutable scene revision, and durably returns
+/// one replayable staged candidate. Nonzero native materialization remains
+/// unavailable until its exact adapter boundary is installed. This implements
+/// no public scene edit, compatibility wrapper, ROS adapter, robot command, or
 /// legacy SceneAuthority fallback.
 class CanonicalEmptySceneOwner final
-    : public manyforge::core::IManagerSceneProjectionBootstrapPort {
- public:
+    : public manyforge::core::IManagerSceneProjectionBootstrapPort,
+      public manyforge::core::IManagerSceneProjectionHandoffPort {
+public:
   CanonicalEmptySceneOwner(
       std::filesystem::path database_path,
-      const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission&
-          admission,
-      const manyforge::core::IActiveBundlePublicationReader&
-          publication_reader);
+      const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
+          &admission,
+      const manyforge::core::IActiveBundlePublicationReader
+          &publication_reader);
+  CanonicalEmptySceneOwner(
+      std::filesystem::path database_path,
+      const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
+          &admission,
+      const manyforge::core::IActiveBundlePublicationReader &publication_reader,
+      const manyforge::deployment::IVerifiedRetainedBundleSource
+          &retained_bundle_source);
   ~CanonicalEmptySceneOwner() override;
 
-  CanonicalEmptySceneOwner(CanonicalEmptySceneOwner&&) noexcept;
-  CanonicalEmptySceneOwner& operator=(
-      CanonicalEmptySceneOwner&&) noexcept;
-  CanonicalEmptySceneOwner(const CanonicalEmptySceneOwner&) = delete;
-  CanonicalEmptySceneOwner& operator=(
-      const CanonicalEmptySceneOwner&) = delete;
+  CanonicalEmptySceneOwner(CanonicalEmptySceneOwner &&) noexcept;
+  CanonicalEmptySceneOwner &operator=(CanonicalEmptySceneOwner &&) noexcept;
+  CanonicalEmptySceneOwner(const CanonicalEmptySceneOwner &) = delete;
+  CanonicalEmptySceneOwner &
+  operator=(const CanonicalEmptySceneOwner &) = delete;
 
-  [[nodiscard]] const std::filesystem::path& database_path() const noexcept;
-  [[nodiscard]] const
-      manyforge::core::ProjectionBootstrapPrerequisiteQueryDTO&
-      fixed_query() const noexcept;
+  [[nodiscard]] const std::filesystem::path &database_path() const noexcept;
+  [[nodiscard]] const manyforge::core::ProjectionBootstrapPrerequisiteQueryDTO &
+  fixed_query() const noexcept;
 
   [[nodiscard]] manyforge::core::ProjectionBootstrapPrerequisiteStatusDTO
   ObserveProjectionBootstrapPrerequisites(
-      const manyforge::core::ProjectionBootstrapPrerequisiteQueryDTO& query)
+      const manyforge::core::ProjectionBootstrapPrerequisiteQueryDTO &query)
       const override;
 
   [[nodiscard]] manyforge::core::ProjectionBootstrapAcceptedDTO
   BeginProjectionBootstrap(
-      const manyforge::core::ProjectionBootstrapIntentDTO& intent) override;
+      const manyforge::core::ProjectionBootstrapIntentDTO &intent) override;
 
   [[nodiscard]] manyforge::core::ProjectionBootstrapRebuildResultDTO
   RebuildProjectionBootstrap(
-      const manyforge::core::ProjectionBootstrapRebuildRequestDTO& request)
+      const manyforge::core::ProjectionBootstrapRebuildRequestDTO &request)
       override;
 
   [[nodiscard]] manyforge::core::ProjectionBootstrapStatusDTO
   ProjectionBootstrapStatus(
-      const manyforge::core::ProjectionBootstrapStatusQueryDTO& query)
+      const manyforge::core::ProjectionBootstrapStatusQueryDTO &query)
       const override;
 
   [[nodiscard]] manyforge::core::ProjectionBootstrapFinalizeResultDTO
   FinalizeProjectionBootstrap(
-      const manyforge::core::ProjectionBootstrapFinalizeDTO& request)
-      override;
+      const manyforge::core::ProjectionBootstrapFinalizeDTO &request) override;
+
+  [[nodiscard]] manyforge::core::ProjectionApplyStageResultDTO
+  StageCandidateProjection(
+      const manyforge::core::ProjectionApplyStageDTO &request) override;
+  [[nodiscard]] manyforge::core::ProjectionApplyActivationResultDTO
+  ActivateStagedProjection(
+      const manyforge::core::ProjectionApplyActivationDTO &request) override;
+  [[nodiscard]] manyforge::core::ProjectionApplyDiscardResultDTO
+  DiscardStagedProjection(
+      const manyforge::core::ProjectionApplyDiscardDTO &request) override;
+  [[nodiscard]] manyforge::core::ProjectionApplyFinalizeResultDTO
+  FinalizeProjectionTransition(
+      const manyforge::core::ProjectionApplyFinalizeDTO &request) override;
+  [[nodiscard]] manyforge::core::ProjectionApplyStatusDTO ProjectionApplyStatus(
+      const manyforge::core::ProjectionApplyStatusQueryDTO &query)
+      const override;
 
   [[nodiscard]] CanonicalEmptySceneAccessStatus ReadAccessStatus() const;
-  [[nodiscard]] CanonicalEmptySceneStoreIntegrityReport VerifyIntegrity()
-      const;
+  [[nodiscard]] CanonicalEmptySceneStoreIntegrityReport VerifyIntegrity() const;
 
   void Close();
 
- private:
+private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace manyforge::scene
+} // namespace manyforge::scene

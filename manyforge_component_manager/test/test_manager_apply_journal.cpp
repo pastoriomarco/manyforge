@@ -26,10 +26,10 @@
 namespace manyforge::component_manager {
 namespace {
 
+using core::ActiveBundlePublicationGeneration;
 using core::ApplyConfigurationFenceIntentDTO;
 using core::ApplyGeneration;
 using core::ApplyId;
-using core::ActiveBundlePublicationGeneration;
 using core::CellId;
 using core::ConfigurationFenceAcceptedDTO;
 using core::ConfigurationFenceGeneration;
@@ -46,7 +46,20 @@ using core::GraphRevision;
 using core::ProductContractId;
 using core::ProductContractRevision;
 using core::ProductId;
+using core::ProjectionApplyStageResultDTO;
+using core::ProjectionApplyStageResultState;
+using core::ProjectionHealthDTO;
+using core::ProjectionHealthState;
+using core::ProjectionNativeRuntimeBindingDTO;
 using core::ProjectionRevisionDTO;
+using core::ProjectionStagedCandidateDTO;
+using core::ProjectionStageGeneration;
+using core::ProjectionTransitionDisposition;
+using core::ProjectionTransitionEvidenceDTO;
+using core::ProjectionTransitionEvidenceState;
+using core::ProjectionTransitionRowDTO;
+using core::ProjectionTransitionRowEvidenceDTO;
+using core::ProjectionTransitionRowEvidenceState;
 using core::PublicRequestContextDTO;
 using core::RequestId;
 using core::RequestOwnerEpoch;
@@ -211,8 +224,9 @@ RuntimeUnitConvergencePlanRowDTO RuntimePlanRow() {
   };
 }
 
-ManagerApplyRuntimeConvergenceIntentDTO RuntimeIntent(
-    const ContentDigest &acceptance_digest, const bool empty = false) {
+ManagerApplyRuntimeConvergenceIntentDTO
+RuntimeIntent(const ContentDigest &acceptance_digest,
+              const bool empty = false) {
   return {
       ApplyId("apply-1"),
       ApplyGeneration(1U),
@@ -226,9 +240,9 @@ ManagerApplyRuntimeConvergenceIntentDTO RuntimeIntent(
   };
 }
 
-ManagerApplyRuntimeStagedReadyDTO RuntimeStagedReady(
-    const ContentDigest &convergence_digest, const std::uint64_t generation,
-    const bool empty = false) {
+ManagerApplyRuntimeStagedReadyDTO
+RuntimeStagedReady(const ContentDigest &convergence_digest,
+                   const std::uint64_t generation, const bool empty = false) {
   std::vector<RuntimeUnitStagedReadyEvidenceDTO> runtime_units;
   if (!empty) {
     runtime_units.push_back({
@@ -264,6 +278,179 @@ ManagerApplyRuntimeStagedReadyDTO RuntimeStagedReady(
   };
 }
 
+ProjectionRevisionDTO CandidateProjection() {
+  return {
+      RetainedBundleId("candidate-bundle-1"),
+      GraphRevision("candidate-graph"),
+      SceneRevision{
+          SceneId(std::string(kSceneIdTwo)),
+          8U,
+          ContentDigest(std::string(kDigestTwo)),
+      },
+  };
+}
+
+std::vector<ProjectionTransitionRowDTO> SceneTransitionRows() {
+  const auto predecessor = Intent().expected_active_projection_revision;
+  return {
+      {
+          ProjectionNativeRuntimeBindingDTO{
+              core::CapabilityProviderBindingId("provider-a"),
+              core::CapabilityProviderBindingRevision("provider-r1"),
+              RuntimeUnitId("runtime-1"),
+              RuntimeEpoch("runtime-epoch-1"),
+          },
+          ProjectionTransitionDisposition::kAdded,
+          std::nullopt,
+      },
+      {
+          ProjectionNativeRuntimeBindingDTO{
+              core::CapabilityProviderBindingId("provider-b"),
+              core::CapabilityProviderBindingRevision("provider-r1"),
+              RuntimeUnitId("runtime-1"),
+              RuntimeEpoch("runtime-epoch-1"),
+          },
+          ProjectionTransitionDisposition::kRetained,
+          predecessor,
+      },
+      {
+          ProjectionNativeRuntimeBindingDTO{
+              core::CapabilityProviderBindingId("provider-c"),
+              core::CapabilityProviderBindingRevision("provider-r1"),
+              RuntimeUnitId("runtime-1"),
+              RuntimeEpoch("runtime-epoch-1"),
+          },
+          ProjectionTransitionDisposition::kRemoved,
+          predecessor,
+      },
+  };
+}
+
+ManagerApplySceneStageIntentDTO
+SceneStageIntent(const ContentDigest &runtime_staged_ready_digest,
+                 const bool empty = false) {
+  return {
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      runtime_staged_ready_digest,
+      ActiveBundlePublicationGeneration(3U),
+      ContentDigest(std::string(kDigestOne)),
+      Intent().expected_active_projection_revision,
+      RetainedBundleId("candidate-bundle-1"),
+      GraphRevision("candidate-graph"),
+      empty ? std::vector<ProjectionTransitionRowDTO>{} : SceneTransitionRows(),
+  };
+}
+
+ManagerApplySceneStagedDTO
+SceneStaged(const ContentDigest &scene_stage_intent_digest,
+            const bool empty = false) {
+  const auto predecessor = Intent().expected_active_projection_revision;
+  const auto candidate = CandidateProjection();
+  const auto transition_rows =
+      empty ? std::vector<ProjectionTransitionRowDTO>{} : SceneTransitionRows();
+  std::vector<ProjectionTransitionRowEvidenceDTO> row_evidence;
+  row_evidence.reserve(transition_rows.size());
+  for (const auto &row : transition_rows) {
+    const bool removed =
+        row.disposition == ProjectionTransitionDisposition::kRemoved;
+    const auto observed = row.expected_local_active;
+    row_evidence.push_back({
+        row,
+        removed ? ProjectionTransitionRowEvidenceState::kPredecessorUnchanged
+                : ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect,
+        removed ? std::optional<ProjectionRevisionDTO>{}
+                : std::optional<ProjectionRevisionDTO>{candidate},
+        observed,
+        ProjectionHealthDTO{
+            row.native_runtime_binding,
+            17U,
+            observed.has_value() ? ProjectionHealthState::kHealthy
+                                 : ProjectionHealthState::kUninitialized,
+            observed,
+            removed
+                ? std::optional<ProjectionStagedCandidateDTO>{}
+                : std::optional<
+                      ProjectionStagedCandidateDTO>{ProjectionStagedCandidateDTO{
+                      ApplyId("apply-1"),
+                      ApplyGeneration(1U),
+                      ProjectionStageGeneration(9U),
+                      candidate,
+                  }},
+            23U,
+            ContentDigest(std::string(kDigestTwo)),
+            std::nullopt,
+        },
+        std::nullopt,
+    });
+  }
+  ProjectionTransitionEvidenceDTO evidence{
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      ProjectionStageGeneration(9U),
+      predecessor,
+      candidate,
+      ProjectionTransitionEvidenceState::kStaged,
+      std::move(row_evidence),
+      std::nullopt,
+  };
+  return {
+      scene_stage_intent_digest,
+      ProjectionApplyStageResultDTO{
+          ApplyId("apply-1"),
+          ApplyGeneration(1U),
+          predecessor,
+          candidate,
+          ProjectionStageGeneration(9U),
+          std::move(evidence),
+          ProjectionApplyStageResultState::kStaged,
+          std::nullopt,
+      },
+  };
+}
+
+ManagerApplyActivationSelectionDTO
+ActivationSelection(const PersistedManagerApplySceneStaged &staged) {
+  const auto &result = staged.scene_staged.staged_result;
+  return {
+      staged.scene_staged_digest,
+      result.apply_id,
+      result.apply_generation,
+      result.expected_active_projection_revision,
+      *result.projection_stage_generation,
+      *result.candidate_projection_revision,
+  };
+}
+
+ManagerApplySceneActivatedDTO
+SceneActivated(const PersistedManagerApplyActivationSelection &selection) {
+  const auto &selected = selection.activation_selection;
+  ProjectionTransitionEvidenceDTO evidence{
+      selected.apply_id,
+      selected.apply_generation,
+      selected.projection_stage_generation,
+      selected.predecessor_projection_revision,
+      selected.candidate_projection_revision,
+      ProjectionTransitionEvidenceState::kActivatedAndRetired,
+      {},
+      std::nullopt,
+  };
+  return {
+      selection.activation_selection_digest,
+      core::ProjectionApplyActivationResultDTO{
+          selected.apply_id,
+          selected.apply_generation,
+          selected.predecessor_projection_revision,
+          selected.projection_stage_generation,
+          selected.candidate_projection_revision,
+          core::ProjectionApplyActivationResultState::kActivated,
+          selected.candidate_projection_revision,
+          std::move(evidence),
+          std::nullopt,
+      },
+  };
+}
+
 struct AcceptedApplyRecords final {
   PersistedManagerApplyIntent intent;
   PersistedManagerApplyFenceAcceptance acceptance;
@@ -276,6 +463,22 @@ AcceptedApplyRecords EnsureAcceptedApply(SqliteManagerApplyJournal &journal) {
       ApplyId("apply-1"), ApplyGeneration(1U), attempt.fence_attempt_digest,
       AcceptedFence());
   return {intent, acceptance.record};
+}
+
+struct SceneParentRecords final {
+  PersistedManagerApplyRuntimeStagedReady staged_ready;
+};
+
+SceneParentRecords EnsureSceneParents(SqliteManagerApplyJournal &journal,
+                                      const bool empty_runtime = false) {
+  const auto accepted = EnsureAcceptedApply(journal);
+  const auto runtime_intent = journal.EnsureRuntimeConvergenceIntent(
+      accepted.intent.intent_digest,
+      RuntimeIntent(accepted.acceptance.acceptance_digest, empty_runtime));
+  const auto staged_ready = journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+      runtime_intent.record.runtime_convergence_intent_digest, 1U,
+      empty_runtime));
+  return {staged_ready.record};
 }
 
 bool SameFenceIntent(const ApplyConfigurationFenceIntentDTO &lhs,
@@ -1403,8 +1606,8 @@ TEST(ManagerApplyRuntimeJournal,
         runtime_intent.record.runtime_convergence_intent_digest, 1U));
     EXPECT_TRUE(staged.inserted);
     EXPECT_TRUE(staged.record.staged_ready.valid());
-    const auto staged_replay = journal.EnsureRuntimeStagedReady(
-        RuntimeStagedReady(
+    const auto staged_replay =
+        journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
             runtime_intent.record.runtime_convergence_intent_digest, 1U));
     EXPECT_FALSE(staged_replay.inserted);
     EXPECT_EQ(staged_replay.record, staged.record);
@@ -1412,11 +1615,11 @@ TEST(ManagerApplyRuntimeJournal,
   }
 
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
-  EXPECT_EQ(reopened.ReadRuntimeConvergenceIntent(
-                ApplyId("apply-1"), ApplyGeneration(1U)),
+  EXPECT_EQ(reopened.ReadRuntimeConvergenceIntent(ApplyId("apply-1"),
+                                                  ApplyGeneration(1U)),
             expected_intent);
-  EXPECT_EQ(reopened.ReadLatestRuntimeStagedReady(
-                ApplyId("apply-1"), ApplyGeneration(1U)),
+  EXPECT_EQ(reopened.ReadLatestRuntimeStagedReady(ApplyId("apply-1"),
+                                                  ApplyGeneration(1U)),
             expected_staged);
   const auto report = reopened.VerifyIntegrity();
   EXPECT_EQ(report.runtime_convergence_intent_count, 1);
@@ -1429,19 +1632,17 @@ TEST(ManagerApplyRuntimeJournal,
   SqliteManagerApplyJournal journal(directory.path() / "runtime.sqlite3",
                                     CellId("cell-1"));
   const auto parent = journal.EnsureIntent(Intent()).record;
-  EXPECT_THROW(
-      journal.EnsureRuntimeConvergenceIntent(
-          parent.intent_digest,
-          RuntimeIntent(ContentDigest(std::string(kDigestOne)))),
-      ManagerApplyJournalConflictError);
+  EXPECT_THROW(journal.EnsureRuntimeConvergenceIntent(
+                   parent.intent_digest,
+                   RuntimeIntent(ContentDigest(std::string(kDigestOne)))),
+               ManagerApplyJournalConflictError);
 
   const auto attempt = EnsureAttempt(journal, parent.intent_digest).record;
   const auto acceptance = journal.EnsureFenceAcceptance(
       ApplyId("apply-1"), ApplyGeneration(1U), attempt.fence_attempt_digest,
       AcceptedFence());
   const auto runtime_intent = journal.EnsureRuntimeConvergenceIntent(
-      parent.intent_digest,
-      RuntimeIntent(acceptance.record.acceptance_digest));
+      parent.intent_digest, RuntimeIntent(acceptance.record.acceptance_digest));
 
   auto conflicting_intent = RuntimeIntent(acceptance.record.acceptance_digest);
   conflicting_intent.runtime_units.front().product_identity =
@@ -1450,10 +1651,9 @@ TEST(ManagerApplyRuntimeJournal,
                                                       conflicting_intent),
                ManagerApplyJournalConflictError);
 
-  EXPECT_THROW(
-      journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
-          ContentDigest(std::string(kDigestTwo)), 1U)),
-      ManagerApplyJournalConflictError);
+  EXPECT_THROW(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+                   ContentDigest(std::string(kDigestTwo)), 1U)),
+               ManagerApplyJournalConflictError);
   EXPECT_THROW(
       journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
           runtime_intent.record.runtime_convergence_intent_digest, 2U)),
@@ -1477,8 +1677,8 @@ TEST(ManagerApplyRuntimeJournal,
   const auto runtime_intent = journal.EnsureRuntimeConvergenceIntent(
       accepted.intent.intent_digest,
       RuntimeIntent(accepted.acceptance.acceptance_digest, true));
-  ASSERT_TRUE(runtime_intent.record.runtime_convergence_intent.runtime_units
-                  .empty());
+  ASSERT_TRUE(
+      runtime_intent.record.runtime_convergence_intent.runtime_units.empty());
 
   for (std::uint64_t generation = 1U;
        generation <= kMaximumRuntimeStagedReadySetsPerApply; ++generation) {
@@ -1488,14 +1688,12 @@ TEST(ManagerApplyRuntimeJournal,
                         generation, true))
                     .inserted);
   }
-  EXPECT_THROW(
-      journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
-          runtime_intent.record.runtime_convergence_intent_digest,
-          kMaximumRuntimeStagedReadySetsPerApply + 1U, true)),
-      ManagerApplyJournalConflictError);
+  EXPECT_THROW(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+                   runtime_intent.record.runtime_convergence_intent_digest,
+                   kMaximumRuntimeStagedReadySetsPerApply + 1U, true)),
+               ManagerApplyJournalConflictError);
   EXPECT_EQ(journal.VerifyIntegrity().runtime_staged_ready_count,
-            static_cast<std::int64_t>(
-                kMaximumRuntimeStagedReadySetsPerApply));
+            static_cast<std::int64_t>(kMaximumRuntimeStagedReadySetsPerApply));
 }
 
 TEST(ManagerApplyRuntimeJournal,
@@ -1509,15 +1707,14 @@ TEST(ManagerApplyRuntimeJournal,
         accepted.intent.intent_digest,
         RuntimeIntent(accepted.acceptance.acceptance_digest)));
   }
-  ExecSql(
-      intent_path,
-      "DROP TRIGGER manager_apply_runtime_convergence_intents_no_update;"
-      "UPDATE manager_apply_runtime_convergence_intents "
-      "SET runtime_units_encoding='0;';"
-      "CREATE TRIGGER manager_apply_runtime_convergence_intents_no_update "
-      "BEFORE UPDATE ON manager_apply_runtime_convergence_intents BEGIN "
-      "SELECT RAISE(ABORT, 'manager_apply_runtime_convergence_intents is "
-      "immutable'); END;");
+  ExecSql(intent_path,
+          "DROP TRIGGER manager_apply_runtime_convergence_intents_no_update;"
+          "UPDATE manager_apply_runtime_convergence_intents "
+          "SET runtime_units_encoding='0;';"
+          "CREATE TRIGGER manager_apply_runtime_convergence_intents_no_update "
+          "BEFORE UPDATE ON manager_apply_runtime_convergence_intents BEGIN "
+          "SELECT RAISE(ABORT, 'manager_apply_runtime_convergence_intents is "
+          "immutable'); END;");
   EXPECT_THROW(SqliteManagerApplyJournal(intent_path, CellId("cell-1")),
                ManagerApplyJournalIntegrityError);
 
@@ -1531,15 +1728,260 @@ TEST(ManagerApplyRuntimeJournal,
     static_cast<void>(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
         runtime_intent.record.runtime_convergence_intent_digest, 1U)));
   }
+  ExecSql(staged_path,
+          "DROP TRIGGER manager_apply_runtime_staged_ready_sets_no_update;"
+          "UPDATE manager_apply_runtime_staged_ready_sets "
+          "SET runtime_evidence_encoding='0;';"
+          "CREATE TRIGGER manager_apply_runtime_staged_ready_sets_no_update "
+          "BEFORE UPDATE ON manager_apply_runtime_staged_ready_sets BEGIN "
+          "SELECT RAISE(ABORT, 'manager_apply_runtime_staged_ready_sets is "
+          "immutable'); END;");
+  EXPECT_THROW(SqliteManagerApplyJournal(staged_path, CellId("cell-1")),
+               ManagerApplyJournalIntegrityError);
+}
+
+TEST(ManagerApplySceneJournal,
+     PersistsStageIntentAndCompleteStagedEvidenceAcrossRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "scene-stage.sqlite3";
+  std::optional<PersistedManagerApplySceneStageIntent> expected_intent;
+  std::optional<PersistedManagerApplySceneStaged> expected_staged;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto parents = EnsureSceneParents(journal);
+    const auto intent = journal.EnsureSceneStageIntent(
+        SceneStageIntent(parents.staged_ready.staged_ready_digest));
+    EXPECT_TRUE(intent.inserted);
+    EXPECT_TRUE(intent.record.scene_stage_intent.valid());
+    const auto intent_replay = journal.EnsureSceneStageIntent(
+        SceneStageIntent(parents.staged_ready.staged_ready_digest));
+    EXPECT_FALSE(intent_replay.inserted);
+    EXPECT_EQ(intent_replay.record, intent.record);
+    expected_intent = intent.record;
+
+    const auto staged = journal.EnsureSceneStaged(
+        SceneStaged(intent.record.scene_stage_intent_digest));
+    EXPECT_TRUE(staged.inserted);
+    EXPECT_TRUE(staged.record.scene_staged.valid());
+    const auto staged_replay = journal.EnsureSceneStaged(
+        SceneStaged(intent.record.scene_stage_intent_digest));
+    EXPECT_FALSE(staged_replay.inserted);
+    EXPECT_TRUE(SameManagerApplySceneStaged(staged_replay.record.scene_staged,
+                                            staged.record.scene_staged));
+    EXPECT_EQ(staged_replay.record.scene_staged_digest,
+              staged.record.scene_staged_digest);
+    expected_staged = staged.record;
+  }
+
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  ASSERT_TRUE(expected_intent.has_value());
+  EXPECT_EQ(
+      reopened.ReadSceneStageIntent(ApplyId("apply-1"), ApplyGeneration(1U)),
+      *expected_intent);
+  const auto staged =
+      reopened.ReadSceneStaged(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(staged.has_value());
+  ASSERT_TRUE(expected_staged.has_value());
+  EXPECT_TRUE(SameManagerApplySceneStaged(staged->scene_staged,
+                                          expected_staged->scene_staged));
+  EXPECT_EQ(staged->scene_staged_digest, expected_staged->scene_staged_digest);
+  const auto report = reopened.VerifyIntegrity();
+  EXPECT_EQ(report.scene_stage_intent_count, 1);
+  EXPECT_EQ(report.scene_staged_count, 1);
+}
+
+TEST(ManagerApplySceneJournal,
+     FreezesLatestRuntimeEvidenceAndRejectsMismatchedStageResults) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "scene-stage.sqlite3",
+                                    CellId("cell-1"));
+  const auto parents = EnsureSceneParents(journal);
+
+  EXPECT_THROW(journal.EnsureSceneStageIntent(
+                   SceneStageIntent(ContentDigest(std::string(kDigestTwo)))),
+               ManagerApplyJournalConflictError);
+  const auto intent = journal.EnsureSceneStageIntent(
+      SceneStageIntent(parents.staged_ready.staged_ready_digest));
+
+  const auto runtime_intent = journal.ReadRuntimeConvergenceIntent(
+      ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(runtime_intent.has_value());
+  EXPECT_THROW(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+                   runtime_intent->runtime_convergence_intent_digest, 2U)),
+               ManagerApplyJournalConflictError);
+
+  auto wrong_parent = SceneStaged(ContentDigest(std::string(kDigestTwo)));
+  EXPECT_THROW(journal.EnsureSceneStaged(wrong_parent),
+               ManagerApplyJournalConflictError);
+
+  auto wrong_candidate = SceneStaged(intent.record.scene_stage_intent_digest);
+  wrong_candidate.staged_result.candidate_projection_revision->graph_revision =
+      GraphRevision("candidate-graph-other");
+  wrong_candidate.staged_result.transition_evidence
+      ->candidate_projection_revision.graph_revision =
+      GraphRevision("candidate-graph-other");
+  for (auto &row :
+       wrong_candidate.staged_result.transition_evidence->transition_rows) {
+    if (row.acknowledged_staged_candidate_revision.has_value()) {
+      row.acknowledged_staged_candidate_revision->graph_revision =
+          GraphRevision("candidate-graph-other");
+    }
+    if (row.resulting_health.staged_candidate.has_value()) {
+      row.resulting_health.staged_candidate->candidate_projection_revision
+          .graph_revision = GraphRevision("candidate-graph-other");
+    }
+  }
+  EXPECT_TRUE(wrong_candidate.valid());
+  EXPECT_THROW(journal.EnsureSceneStaged(wrong_candidate),
+               ManagerApplyJournalConflictError);
+
+  auto missing_rows =
+      SceneStaged(intent.record.scene_stage_intent_digest, true);
+  EXPECT_TRUE(missing_rows.valid());
+  EXPECT_THROW(journal.EnsureSceneStaged(missing_rows),
+               ManagerApplyJournalConflictError);
+  EXPECT_EQ(journal.VerifyIntegrity().scene_staged_count, 0);
+}
+
+TEST(ManagerApplySceneJournal,
+     SupportsExplicitZeroNativeTransitionAndBoundsRows) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "scene-empty.sqlite3",
+                                    CellId("cell-1"));
+  const auto parents = EnsureSceneParents(journal, true);
+  const auto intent = journal.EnsureSceneStageIntent(
+      SceneStageIntent(parents.staged_ready.staged_ready_digest, true));
+  const auto staged = journal.EnsureSceneStaged(
+      SceneStaged(intent.record.scene_stage_intent_digest, true));
+  EXPECT_TRUE(staged.record.scene_staged.valid());
+  EXPECT_TRUE(staged.record.scene_staged.staged_result.transition_evidence
+                  ->transition_rows.empty());
+
+  auto oversized =
+      SceneStageIntent(parents.staged_ready.staged_ready_digest, true);
+  oversized.native_transition_rows.reserve(
+      kMaximumManagerApplySceneTransitionRows + 1U);
+  for (std::size_t index = 0U; index <= kMaximumManagerApplySceneTransitionRows;
+       ++index) {
+    oversized.native_transition_rows.push_back({
+        ProjectionNativeRuntimeBindingDTO{
+            core::CapabilityProviderBindingId("provider-" +
+                                              std::to_string(1000U + index)),
+            core::CapabilityProviderBindingRevision("provider-r1"),
+            RuntimeUnitId("runtime-1"),
+            RuntimeEpoch("runtime-epoch-1"),
+        },
+        ProjectionTransitionDisposition::kAdded,
+        std::nullopt,
+    });
+  }
+  EXPECT_THROW(journal.EnsureSceneStageIntent(oversized),
+               std::invalid_argument);
+}
+
+TEST(ManagerApplySceneJournal,
+     PersistsIrreversibleSelectionAndActivationAcrossRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "scene-activation.sqlite3";
+  std::optional<PersistedManagerApplyActivationSelection> expected_selection;
+  std::optional<PersistedManagerApplySceneActivated> expected_activated;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto parents = EnsureSceneParents(journal, true);
+    const auto stage_intent = journal.EnsureSceneStageIntent(
+        SceneStageIntent(parents.staged_ready.staged_ready_digest, true));
+    const auto staged = journal.EnsureSceneStaged(
+        SceneStaged(stage_intent.record.scene_stage_intent_digest, true));
+
+    const auto selection =
+        journal.EnsureActivationSelection(ActivationSelection(staged.record));
+    EXPECT_TRUE(selection.inserted);
+    EXPECT_TRUE(selection.record.activation_selection.valid());
+    const auto selection_replay =
+        journal.EnsureActivationSelection(ActivationSelection(staged.record));
+    EXPECT_FALSE(selection_replay.inserted);
+    EXPECT_EQ(selection_replay.record, selection.record);
+    expected_selection = selection.record;
+
+    const auto activated =
+        journal.EnsureSceneActivated(SceneActivated(selection.record));
+    EXPECT_TRUE(activated.inserted);
+    EXPECT_TRUE(activated.record.scene_activated.valid());
+    const auto activated_replay =
+        journal.EnsureSceneActivated(SceneActivated(selection.record));
+    EXPECT_FALSE(activated_replay.inserted);
+    EXPECT_TRUE(
+        SameManagerApplySceneActivated(activated_replay.record.scene_activated,
+                                       activated.record.scene_activated));
+    EXPECT_EQ(activated_replay.record.scene_activated_digest,
+              activated.record.scene_activated_digest);
+    expected_activated = activated.record;
+
+    auto conflicting = ActivationSelection(staged.record);
+    conflicting.candidate_projection_revision.graph_revision =
+        GraphRevision("different-candidate-graph");
+    EXPECT_THROW(journal.EnsureActivationSelection(conflicting),
+                 ManagerApplyJournalConflictError);
+    const auto report = journal.VerifyIntegrity();
+    EXPECT_EQ(report.activation_selection_count, 1);
+    EXPECT_EQ(report.scene_activated_count, 1);
+  }
+
+  ASSERT_TRUE(expected_selection.has_value());
+  ASSERT_TRUE(expected_activated.has_value());
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  EXPECT_EQ(
+      reopened.ReadActivationSelection(ApplyId("apply-1"), ApplyGeneration(1U)),
+      expected_selection);
+  const auto activated =
+      reopened.ReadSceneActivated(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(activated.has_value());
+  EXPECT_TRUE(SameManagerApplySceneActivated(
+      activated->scene_activated, expected_activated->scene_activated));
+  EXPECT_EQ(activated->scene_activated_digest,
+            expected_activated->scene_activated_digest);
+}
+
+TEST(ManagerApplySceneJournal,
+     DetectsStageIntentAndStagedEvidenceCorruptionOnRestart) {
+  TemporaryDirectory directory;
+  const auto intent_path = directory.path() / "scene-intent.sqlite3";
+  {
+    SqliteManagerApplyJournal journal(intent_path, CellId("cell-1"));
+    const auto parents = EnsureSceneParents(journal);
+    static_cast<void>(journal.EnsureSceneStageIntent(
+        SceneStageIntent(parents.staged_ready.staged_ready_digest)));
+  }
+  ExecSql(
+      intent_path,
+      "DROP TRIGGER manager_apply_scene_stage_intents_no_update;"
+      "UPDATE manager_apply_scene_stage_intents "
+      "SET native_transition_rows_encoding='0;';"
+      "CREATE TRIGGER manager_apply_scene_stage_intents_no_update "
+      "BEFORE UPDATE ON manager_apply_scene_stage_intents BEGIN "
+      "SELECT RAISE(ABORT, 'manager_apply_scene_stage_intents is immutable'); "
+      "END;");
+  EXPECT_THROW(SqliteManagerApplyJournal(intent_path, CellId("cell-1")),
+               ManagerApplyJournalIntegrityError);
+
+  const auto staged_path = directory.path() / "scene-staged.sqlite3";
+  {
+    SqliteManagerApplyJournal journal(staged_path, CellId("cell-1"));
+    const auto parents = EnsureSceneParents(journal);
+    const auto intent = journal.EnsureSceneStageIntent(
+        SceneStageIntent(parents.staged_ready.staged_ready_digest));
+    static_cast<void>(journal.EnsureSceneStaged(
+        SceneStaged(intent.record.scene_stage_intent_digest)));
+  }
   ExecSql(
       staged_path,
-      "DROP TRIGGER manager_apply_runtime_staged_ready_sets_no_update;"
-      "UPDATE manager_apply_runtime_staged_ready_sets "
-      "SET runtime_evidence_encoding='0;';"
-      "CREATE TRIGGER manager_apply_runtime_staged_ready_sets_no_update "
-      "BEFORE UPDATE ON manager_apply_runtime_staged_ready_sets BEGIN "
-      "SELECT RAISE(ABORT, 'manager_apply_runtime_staged_ready_sets is "
-      "immutable'); END;");
+      "DROP TRIGGER manager_apply_scene_staged_records_no_update;"
+      "UPDATE manager_apply_scene_staged_records "
+      "SET transition_evidence_encoding='0;';"
+      "CREATE TRIGGER manager_apply_scene_staged_records_no_update "
+      "BEFORE UPDATE ON manager_apply_scene_staged_records BEGIN "
+      "SELECT RAISE(ABORT, 'manager_apply_scene_staged_records is immutable'); "
+      "END;");
   EXPECT_THROW(SqliteManagerApplyJournal(staged_path, CellId("cell-1")),
                ManagerApplyJournalIntegrityError);
 }

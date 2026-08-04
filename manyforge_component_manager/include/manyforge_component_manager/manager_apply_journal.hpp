@@ -9,21 +9,30 @@
 #include <string>
 #include <string_view>
 
+#include <manyforge_component_manager/runtime_convergence.hpp>
+#include <manyforge_component_manager/scene_staging.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/projection_common.hpp>
-#include <manyforge_component_manager/runtime_convergence.hpp>
 
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.i4.v3";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 3;
+    "manyforge.internal.component-manager.apply-journal.i4.v5";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 5;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
 inline constexpr std::size_t kMaximumManagerApplyFenceAttempts =
     kMaximumManagerApplyIntents;
 inline constexpr std::size_t kMaximumManagerApplyAffectedScopes =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplySceneStageIntents =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplySceneStagedRecords =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyActivationSelections =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplySceneActivatedRecords =
     kMaximumManagerApplyIntents;
 inline constexpr std::size_t kMaximumManagerApplyFenceComponents = 256U;
 inline constexpr std::size_t kMaximumManagerApplyFenceDomains = 64U;
@@ -168,9 +177,9 @@ struct PersistedManagerApplyRuntimeConvergenceIntent final {
   manyforge::core::ContentDigest intent_digest;
   manyforge::core::ContentDigest runtime_convergence_intent_digest;
 
-  friend bool operator==(
-      const PersistedManagerApplyRuntimeConvergenceIntent &,
-      const PersistedManagerApplyRuntimeConvergenceIntent &) = default;
+  friend bool
+  operator==(const PersistedManagerApplyRuntimeConvergenceIntent &,
+             const PersistedManagerApplyRuntimeConvergenceIntent &) = default;
 };
 
 struct ManagerApplyRuntimeConvergenceIntentWriteResult final {
@@ -182,13 +191,61 @@ struct PersistedManagerApplyRuntimeStagedReady final {
   ManagerApplyRuntimeStagedReadyDTO staged_ready;
   manyforge::core::ContentDigest staged_ready_digest;
 
-  friend bool operator==(const PersistedManagerApplyRuntimeStagedReady &,
-                         const PersistedManagerApplyRuntimeStagedReady &) =
-      default;
+  friend bool
+  operator==(const PersistedManagerApplyRuntimeStagedReady &,
+             const PersistedManagerApplyRuntimeStagedReady &) = default;
 };
 
 struct ManagerApplyRuntimeStagedReadyWriteResult final {
   PersistedManagerApplyRuntimeStagedReady record;
+  bool inserted;
+};
+
+struct PersistedManagerApplySceneStageIntent final {
+  ManagerApplySceneStageIntentDTO scene_stage_intent;
+  manyforge::core::ContentDigest scene_stage_intent_digest;
+
+  friend bool
+  operator==(const PersistedManagerApplySceneStageIntent &,
+             const PersistedManagerApplySceneStageIntent &) = default;
+};
+
+struct ManagerApplySceneStageIntentWriteResult final {
+  PersistedManagerApplySceneStageIntent record;
+  bool inserted;
+};
+
+struct PersistedManagerApplySceneStaged final {
+  ManagerApplySceneStagedDTO scene_staged;
+  manyforge::core::ContentDigest scene_staged_digest;
+};
+
+struct ManagerApplySceneStagedWriteResult final {
+  PersistedManagerApplySceneStaged record;
+  bool inserted;
+};
+
+struct PersistedManagerApplyActivationSelection final {
+  ManagerApplyActivationSelectionDTO activation_selection;
+  manyforge::core::ContentDigest activation_selection_digest;
+
+  friend bool
+  operator==(const PersistedManagerApplyActivationSelection &,
+             const PersistedManagerApplyActivationSelection &) = default;
+};
+
+struct ManagerApplyActivationSelectionWriteResult final {
+  PersistedManagerApplyActivationSelection record;
+  bool inserted;
+};
+
+struct PersistedManagerApplySceneActivated final {
+  ManagerApplySceneActivatedDTO scene_activated;
+  manyforge::core::ContentDigest scene_activated_digest;
+};
+
+struct ManagerApplySceneActivatedWriteResult final {
+  PersistedManagerApplySceneActivated record;
   bool inserted;
 };
 
@@ -205,6 +262,10 @@ struct ManagerApplyJournalIntegrityReport final {
   std::int64_t fence_acceptance_count;
   std::int64_t runtime_convergence_intent_count;
   std::int64_t runtime_staged_ready_count;
+  std::int64_t scene_stage_intent_count;
+  std::int64_t scene_staged_count;
+  std::int64_t activation_selection_count;
+  std::int64_t scene_activated_count;
 };
 
 /// Durable append-only owner of bounded named-Apply fence ordering evidence.
@@ -283,6 +344,28 @@ public:
   ReadLatestRuntimeStagedReady(
       const manyforge::core::ApplyId &apply_id,
       manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplySceneStageIntentWriteResult EnsureSceneStageIntent(
+      const ManagerApplySceneStageIntentDTO &scene_stage_intent);
+  [[nodiscard]] std::optional<PersistedManagerApplySceneStageIntent>
+  ReadSceneStageIntent(const manyforge::core::ApplyId &apply_id,
+                       manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplySceneStagedWriteResult
+  EnsureSceneStaged(const ManagerApplySceneStagedDTO &scene_staged);
+  [[nodiscard]] std::optional<PersistedManagerApplySceneStaged>
+  ReadSceneStaged(const manyforge::core::ApplyId &apply_id,
+                  manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyActivationSelectionWriteResult
+  EnsureActivationSelection(
+      const ManagerApplyActivationSelectionDTO &activation_selection);
+  [[nodiscard]] std::optional<PersistedManagerApplyActivationSelection>
+  ReadActivationSelection(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplySceneActivatedWriteResult
+  EnsureSceneActivated(const ManagerApplySceneActivatedDTO &scene_activated);
+  [[nodiscard]] std::optional<PersistedManagerApplySceneActivated>
+  ReadSceneActivated(const manyforge::core::ApplyId &apply_id,
+                     manyforge::core::ApplyGeneration apply_generation) const;
   [[nodiscard]] ManagerApplyJournalIntegrityReport VerifyIntegrity() const;
 
   void Close();

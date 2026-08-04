@@ -170,11 +170,14 @@ add_library(manyforge_component_manager
   src/manager_apply_fence_coordinator.cpp
   src/manager_apply_journal.cpp
   src/manager_runtime_convergence_coordinator.cpp
+  src/manager_scene_activation_coordinator.cpp
+  src/manager_scene_stage_coordinator.cpp
   src/manager_bootstrap_journal.cpp
   src/reference_runtime_unit_admission.cpp
   src/retained_posix_runtime_unit_adapter.cpp
   src/runtime_convergence.cpp
   src/runtime_observation.cpp
+  src/scene_staging.cpp
   src/sqlite_store_startup_internal.cpp
 )
 add_library(

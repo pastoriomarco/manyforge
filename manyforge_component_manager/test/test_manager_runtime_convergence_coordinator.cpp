@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "manyforge_component_manager/manager_runtime_convergence_coordinator.hpp"
+#include "manyforge_component_manager/manager_scene_activation_coordinator.hpp"
+#include "manyforge_component_manager/manager_scene_stage_coordinator.hpp"
 #include "manyforge_component_manager/reference_runtime_unit_admission.hpp"
 #include "manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp"
 #include "runtime_only_retention_fixture.hpp"
@@ -307,6 +309,221 @@ private:
   std::string process_incarnation_{"process-epoch-1"};
 };
 
+class ScriptedSceneOwner final : public IManagerSceneProjectionHandoffPort {
+public:
+  explicit ScriptedSceneOwner(SqliteManagerApplyJournal &independent_reader)
+      : independent_reader_(independent_reader) {}
+
+  [[nodiscard]] ProjectionApplyStageResultDTO
+  StageCandidateProjection(const ProjectionApplyStageDTO &request) override {
+    ++stage_calls;
+    last_stage_request = request;
+    const auto durable = independent_reader_.ReadSceneStageIntent(
+        request.apply_id, request.apply_generation);
+    saw_durable_intent_before_stage =
+        durable.has_value() &&
+        durable->scene_stage_intent.native_transition_rows ==
+            request.native_transition_rows &&
+        durable->scene_stage_intent.expected_active_projection_revision ==
+            request.expected_active_projection_revision;
+    if (!request.valid() || !request.native_transition_rows.empty()) {
+      throw std::runtime_error("scene fixture received an invalid request");
+    }
+    const ProjectionRevisionDTO candidate{
+        request.candidate_retained_bundle.retained_bundle_id,
+        request.candidate_retained_bundle.cell_graph.graph_revision,
+        SceneRevision{
+            request.expected_active_projection_revision.scene_revision.scene_id,
+            request.expected_active_projection_revision.scene_revision
+                    .revision_id +
+                1U,
+            ContentDigest(std::string(kDigestTwo)),
+        },
+    };
+    const ProjectionStageGeneration stage_generation(9U);
+    ProjectionTransitionEvidenceDTO evidence{
+        request.apply_id,
+        request.apply_generation,
+        stage_generation,
+        request.expected_active_projection_revision,
+        candidate,
+        ProjectionTransitionEvidenceState::kStaged,
+        {},
+        std::nullopt,
+    };
+    staged_result_ = ProjectionApplyStageResultDTO{
+        request.apply_id,
+        request.apply_generation,
+        request.expected_active_projection_revision,
+        candidate,
+        stage_generation,
+        std::move(evidence),
+        ProjectionApplyStageResultState::kStaged,
+        std::nullopt,
+    };
+    if (throw_after_stage_effect) {
+      throw std::runtime_error("simulated lost scene Stage response");
+    }
+    return *staged_result_;
+  }
+
+  [[nodiscard]] ProjectionApplyActivationResultDTO ActivateStagedProjection(
+      const ProjectionApplyActivationDTO &request) override {
+    ++activation_calls;
+    last_activation_request = request;
+    const auto durable = independent_reader_.ReadActivationSelection(
+        request.apply_id, request.apply_generation);
+    saw_durable_selection_before_activation =
+        durable.has_value() &&
+        durable->activation_selection.apply_id == request.apply_id &&
+        durable->activation_selection.apply_generation ==
+            request.apply_generation &&
+        durable->activation_selection.projection_stage_generation ==
+            request.projection_stage_generation &&
+        durable->activation_selection.candidate_projection_revision ==
+            request.candidate_projection_revision;
+    if (!staged_result_.has_value() || !request.valid() ||
+        staged_result_->apply_id != request.apply_id ||
+        staged_result_->apply_generation != request.apply_generation ||
+        staged_result_->expected_active_projection_revision !=
+            request.expected_active_projection_revision ||
+        staged_result_->projection_stage_generation !=
+            std::optional<ProjectionStageGeneration>{
+                request.projection_stage_generation} ||
+        staged_result_->candidate_projection_revision !=
+            std::optional<ProjectionRevisionDTO>{
+                request.candidate_projection_revision} ||
+        !staged_result_->transition_evidence->transition_rows.empty()) {
+      throw std::runtime_error(
+          "activation fixture received a foreign or nonempty stage");
+    }
+    auto evidence = *staged_result_->transition_evidence;
+    evidence.state = ProjectionTransitionEvidenceState::kActivatedAndRetired;
+    activation_result_ = ProjectionApplyActivationResultDTO{
+        request.apply_id,
+        request.apply_generation,
+        request.expected_active_projection_revision,
+        request.projection_stage_generation,
+        request.candidate_projection_revision,
+        ProjectionApplyActivationResultState::kActivated,
+        request.candidate_projection_revision,
+        std::move(evidence),
+        std::nullopt,
+    };
+    if (throw_after_activation_effect) {
+      throw std::runtime_error("simulated lost activation response");
+    }
+    return *activation_result_;
+  }
+
+  [[nodiscard]] ProjectionApplyDiscardResultDTO
+  DiscardStagedProjection(const ProjectionApplyDiscardDTO &) override {
+    throw std::runtime_error("discard is outside the scene-stage fixture");
+  }
+
+  [[nodiscard]] ProjectionApplyFinalizeResultDTO
+  FinalizeProjectionTransition(const ProjectionApplyFinalizeDTO &) override {
+    throw std::runtime_error("finalize is outside the scene-stage fixture");
+  }
+
+  [[nodiscard]] ProjectionApplyStatusDTO ProjectionApplyStatus(
+      const ProjectionApplyStatusQueryDTO &query) const override {
+    ++status_calls;
+    if (throw_status) {
+      throw std::runtime_error("simulated scene status transport failure");
+    }
+    if (foreign_status) {
+      return {
+          ApplyId("foreign-apply"),
+          query.apply_generation,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          ProjectionApplyStatusState::kAbsent,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      };
+    }
+    if (activation_result_.has_value()) {
+      const auto &result = *activation_result_;
+      return {
+          result.apply_id,
+          result.apply_generation,
+          result.expected_active_projection_revision,
+          result.projection_stage_generation,
+          result.candidate_projection_revision,
+          ProjectionApplyStatusState::kActivated,
+          result.transition_evidence,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      };
+    }
+    if (staged_result_.has_value()) {
+      const auto &result = *staged_result_;
+      return {
+          result.apply_id,
+          result.apply_generation,
+          result.expected_active_projection_revision,
+          result.projection_stage_generation,
+          result.candidate_projection_revision,
+          ProjectionApplyStatusState::kStaged,
+          result.transition_evidence,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      };
+    }
+    if (quiescing) {
+      const auto durable = independent_reader_.ReadSceneStageIntent(
+          query.apply_id, query.apply_generation);
+      if (!durable.has_value()) {
+        throw std::runtime_error(
+            "quiescing fixture requires an expected predecessor");
+      }
+      return {
+          query.apply_id,
+          query.apply_generation,
+          durable->scene_stage_intent.expected_active_projection_revision,
+          ProjectionStageGeneration(9U),
+          std::nullopt,
+          ProjectionApplyStatusState::kQuiescing,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      };
+    }
+    return {
+        query.apply_id, query.apply_generation,
+        std::nullopt,   std::nullopt,
+        std::nullopt,   ProjectionApplyStatusState::kAbsent,
+        std::nullopt,   std::nullopt,
+        std::nullopt,   std::nullopt,
+    };
+  }
+
+  bool throw_after_stage_effect{false};
+  bool throw_after_activation_effect{false};
+  bool throw_status{false};
+  bool foreign_status{false};
+  bool quiescing{false};
+  bool saw_durable_intent_before_stage{false};
+  bool saw_durable_selection_before_activation{false};
+  int stage_calls{0};
+  int activation_calls{0};
+  mutable int status_calls{0};
+  std::optional<ProjectionApplyStageDTO> last_stage_request;
+  std::optional<ProjectionApplyActivationDTO> last_activation_request;
+
+private:
+  SqliteManagerApplyJournal &independent_reader_;
+  std::optional<ProjectionApplyStageResultDTO> staged_result_;
+  std::optional<ProjectionApplyActivationResultDTO> activation_result_;
+};
+
 struct CoordinatorFixture final {
   explicit CoordinatorFixture(const std::filesystem::path &root)
       : package(MaterializeRuntimePackage(root)),
@@ -521,6 +738,220 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
       second.durable_staged_ready->record.staged_ready.staged_ready_generation,
       2U);
   EXPECT_EQ(kernel.acquire_calls, 1);
+}
+
+TEST(ManagerSceneStageCoordinator,
+     PersistsBeforeStageAndReplaysWithoutAnotherOwnerCall) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  ASSERT_EQ(fixture.Run().state,
+            ManagerRuntimeConvergenceResultState::kStagedReady);
+  ScriptedSceneOwner scene_owner(fixture.independent_reader);
+  ManagerSceneStageCoordinator coordinator(fixture.journal,
+                                           *fixture.package.bundle_source,
+                                           fixture.publication, scene_owner);
+
+  const auto staged =
+      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(staged.path, ManagerSceneStagePath::kStagedFromNewCall);
+  EXPECT_TRUE(staged.durable_scene_stage_intent.inserted);
+  EXPECT_TRUE(staged.durable_scene_staged.inserted);
+  EXPECT_TRUE(scene_owner.saw_durable_intent_before_stage);
+  EXPECT_EQ(scene_owner.status_calls, 1);
+  EXPECT_EQ(scene_owner.stage_calls, 1);
+  EXPECT_TRUE(staged.durable_scene_stage_intent.record.scene_stage_intent
+                  .native_transition_rows.empty());
+
+  const auto replay =
+      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(replay.path, ManagerSceneStagePath::kDurableStagedReplay);
+  EXPECT_FALSE(replay.durable_scene_stage_intent.inserted);
+  EXPECT_FALSE(replay.durable_scene_staged.inserted);
+  EXPECT_EQ(replay.durable_scene_staged.record.scene_staged_digest,
+            staged.durable_scene_staged.record.scene_staged_digest);
+  EXPECT_EQ(scene_owner.status_calls, 1);
+  EXPECT_EQ(scene_owner.stage_calls, 1);
+  const auto report = fixture.journal.VerifyIntegrity();
+  EXPECT_EQ(report.scene_stage_intent_count, 1);
+  EXPECT_EQ(report.scene_staged_count, 1);
+}
+
+TEST(ManagerSceneStageCoordinator,
+     LostStageResponseRecoversFromOwnerStatusWithoutDuplicateStage) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  ASSERT_EQ(fixture.Run().state,
+            ManagerRuntimeConvergenceResultState::kStagedReady);
+  ScriptedSceneOwner scene_owner(fixture.independent_reader);
+  scene_owner.throw_after_stage_effect = true;
+  ManagerSceneStageCoordinator coordinator(fixture.journal,
+                                           *fixture.package.bundle_source,
+                                           fixture.publication, scene_owner);
+
+  try {
+    static_cast<void>(
+        coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
+    FAIL() << "expected a lost Stage response";
+  } catch (const ManagerSceneStageEffectUncertainError &error) {
+    EXPECT_TRUE(error.recovery_query().valid());
+    EXPECT_EQ(error.recovery_query().apply_id, ApplyId("apply-1"));
+  }
+  EXPECT_TRUE(fixture.journal
+                  .ReadSceneStageIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+                  .has_value());
+  EXPECT_FALSE(
+      fixture.journal.ReadSceneStaged(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
+  EXPECT_EQ(scene_owner.stage_calls, 1);
+
+  scene_owner.throw_after_stage_effect = false;
+  const auto recovered =
+      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(recovered.path, ManagerSceneStagePath::kRecoveredOwnerStatus);
+  EXPECT_TRUE(recovered.durable_scene_staged.inserted);
+  EXPECT_EQ(scene_owner.stage_calls, 1);
+  EXPECT_EQ(scene_owner.status_calls, 2);
+}
+
+TEST(ManagerSceneStageCoordinator,
+     QuiescingAndMalformedStatusRemainExplicitlyRecoverable) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  ASSERT_EQ(fixture.Run().state,
+            ManagerRuntimeConvergenceResultState::kStagedReady);
+  ScriptedSceneOwner scene_owner(fixture.independent_reader);
+  scene_owner.quiescing = true;
+  ManagerSceneStageCoordinator coordinator(fixture.journal,
+                                           *fixture.package.bundle_source,
+                                           fixture.publication, scene_owner);
+
+  try {
+    static_cast<void>(
+        coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
+    FAIL() << "expected quiescing recovery context";
+  } catch (const ManagerSceneStageEffectUncertainError &error) {
+    ASSERT_TRUE(error.observed_status().has_value());
+    EXPECT_EQ(error.observed_status()->state,
+              ProjectionApplyStatusState::kQuiescing);
+  }
+  EXPECT_EQ(scene_owner.stage_calls, 0);
+
+  scene_owner.quiescing = false;
+  scene_owner.foreign_status = true;
+  EXPECT_THROW(static_cast<void>(coordinator.StageOrRecover(
+                   ApplyId("apply-1"), ApplyGeneration(1U))),
+               ManagerSceneStageEffectUncertainError);
+  EXPECT_EQ(scene_owner.stage_calls, 0);
+
+  scene_owner.foreign_status = false;
+  const auto recovered =
+      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(recovered.path, ManagerSceneStagePath::kStagedFromNewCall);
+  EXPECT_EQ(scene_owner.stage_calls, 1);
+}
+
+TEST(ManagerSceneStageCoordinator,
+     PublicationDriftStopsBeforeOwnerObservationOrStage) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  ASSERT_EQ(fixture.Run().state,
+            ManagerRuntimeConvergenceResultState::kStagedReady);
+  ScriptedSceneOwner scene_owner(fixture.independent_reader);
+  ManagerSceneStageCoordinator coordinator(fixture.journal,
+                                           *fixture.package.bundle_source,
+                                           fixture.publication, scene_owner);
+  fixture.publication.fail_on_call = fixture.publication.read_calls + 1;
+
+  EXPECT_THROW(static_cast<void>(coordinator.StageOrRecover(
+                   ApplyId("apply-1"), ApplyGeneration(1U))),
+               ManagerSceneStageCoordinatorError);
+  EXPECT_EQ(scene_owner.status_calls, 0);
+  EXPECT_EQ(scene_owner.stage_calls, 0);
+  EXPECT_TRUE(fixture.journal
+                  .ReadSceneStageIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+                  .has_value());
+  EXPECT_FALSE(
+      fixture.journal.ReadSceneStaged(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
+}
+
+TEST(ManagerSceneActivationCoordinator,
+     PersistsSelectionBeforeActivationAndReplaysWithoutAnotherOwnerCall) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  ASSERT_EQ(fixture.Run().state,
+            ManagerRuntimeConvergenceResultState::kStagedReady);
+  ScriptedSceneOwner scene_owner(fixture.independent_reader);
+  ManagerSceneStageCoordinator stage_coordinator(
+      fixture.journal, *fixture.package.bundle_source, fixture.publication,
+      scene_owner);
+  ASSERT_EQ(
+      stage_coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
+          .path,
+      ManagerSceneStagePath::kStagedFromNewCall);
+  ManagerSceneActivationCoordinator activation_coordinator(fixture.journal,
+                                                           scene_owner);
+
+  const auto activated = activation_coordinator.ActivateOrRecover(
+      ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(activated.path, ManagerSceneActivationPath::kActivatedFromNewCall);
+  EXPECT_TRUE(activated.durable_selection.inserted);
+  EXPECT_TRUE(activated.durable_scene_activated.inserted);
+  EXPECT_TRUE(scene_owner.saw_durable_selection_before_activation);
+  EXPECT_EQ(scene_owner.activation_calls, 1);
+
+  const auto replay = activation_coordinator.ActivateOrRecover(
+      ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(replay.path, ManagerSceneActivationPath::kDurableActivatedReplay);
+  EXPECT_FALSE(replay.durable_selection.inserted);
+  EXPECT_FALSE(replay.durable_scene_activated.inserted);
+  EXPECT_EQ(replay.durable_scene_activated.record.scene_activated_digest,
+            activated.durable_scene_activated.record.scene_activated_digest);
+  EXPECT_EQ(scene_owner.activation_calls, 1);
+  const auto report = fixture.journal.VerifyIntegrity();
+  EXPECT_EQ(report.activation_selection_count, 1);
+  EXPECT_EQ(report.scene_activated_count, 1);
+}
+
+TEST(ManagerSceneActivationCoordinator,
+     LostActivationResponseRecoversFromOwnerStatusWithoutDuplicateEffect) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  ASSERT_EQ(fixture.Run().state,
+            ManagerRuntimeConvergenceResultState::kStagedReady);
+  ScriptedSceneOwner scene_owner(fixture.independent_reader);
+  ManagerSceneStageCoordinator stage_coordinator(
+      fixture.journal, *fixture.package.bundle_source, fixture.publication,
+      scene_owner);
+  static_cast<void>(stage_coordinator.StageOrRecover(ApplyId("apply-1"),
+                                                     ApplyGeneration(1U)));
+  scene_owner.throw_after_activation_effect = true;
+  ManagerSceneActivationCoordinator activation_coordinator(fixture.journal,
+                                                           scene_owner);
+
+  try {
+    static_cast<void>(activation_coordinator.ActivateOrRecover(
+        ApplyId("apply-1"), ApplyGeneration(1U)));
+    FAIL() << "expected a lost activation response";
+  } catch (const ManagerSceneActivationEffectUncertainError &error) {
+    EXPECT_TRUE(error.recovery_query().valid());
+    EXPECT_EQ(error.recovery_query().apply_id, ApplyId("apply-1"));
+  }
+  EXPECT_TRUE(
+      fixture.journal
+          .ReadActivationSelection(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
+  EXPECT_FALSE(fixture.journal
+                   .ReadSceneActivated(ApplyId("apply-1"), ApplyGeneration(1U))
+                   .has_value());
+  EXPECT_EQ(scene_owner.activation_calls, 1);
+
+  scene_owner.throw_after_activation_effect = false;
+  const auto recovered = activation_coordinator.ActivateOrRecover(
+      ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(recovered.path, ManagerSceneActivationPath::kRecoveredOwnerStatus);
+  EXPECT_TRUE(recovered.durable_scene_activated.inserted);
+  EXPECT_EQ(scene_owner.activation_calls, 1);
 }
 
 } // namespace

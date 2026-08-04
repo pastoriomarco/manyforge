@@ -1,16 +1,17 @@
--- ManyForge I4 canonical-empty logical-scene owner store, version 1.
+-- ManyForge I4 logical-scene owner store, version 2.
 --
--- This is a one-lineage, append-only bootstrap store. It intentionally has no
--- Manager Apply/process rows, generic event journal, native adapter payload,
--- public scene-edit request, mutable gate flag, or legacy SceneAuthority row.
+-- This is a one-lineage, append-only bootstrap plus named-Apply stage store.
+-- It intentionally has no Manager process rows, generic event journal, native
+-- adapter payload, public scene-edit request, mutable gate flag, or legacy
+-- SceneAuthority row.
 
 PRAGMA application_id = 1296454467;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 CREATE TABLE IF NOT EXISTS logical_scene_store_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
     schema_artifact_digest TEXT NOT NULL CHECK (
         length(schema_artifact_digest) = 71
         AND substr(schema_artifact_digest, 1, 7) = 'sha256:'
@@ -38,6 +39,9 @@ CREATE TABLE IF NOT EXISTS logical_scene_store_metadata (
     ),
     maximum_wal_bytes INTEGER NOT NULL CHECK (
         maximum_wal_bytes = 16777216
+    ),
+    maximum_named_apply_stages INTEGER NOT NULL CHECK (
+        maximum_named_apply_stages = 256
     )
 ) STRICT;
 
@@ -169,6 +173,119 @@ CREATE TABLE IF NOT EXISTS canonical_empty_scene_finalization (
         )
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS logical_scene_named_apply_stages (
+    lineage_generation INTEGER NOT NULL UNIQUE CHECK (
+        lineage_generation > 0 AND lineage_generation <= 256
+    ),
+    apply_id TEXT NOT NULL CHECK (
+        length(apply_id) > 0 AND length(apply_id) <= 256
+    ),
+    apply_generation INTEGER NOT NULL CHECK (
+        apply_generation > 0
+        AND apply_generation <= 9007199254740991
+    ),
+    projection_stage_generation INTEGER NOT NULL CHECK (
+        projection_stage_generation > 0
+        AND projection_stage_generation <= 9007199254740991
+    ),
+    predecessor_retained_bundle_id TEXT NOT NULL,
+    predecessor_graph_revision TEXT NOT NULL,
+    predecessor_scene_id TEXT NOT NULL,
+    predecessor_scene_revision_id INTEGER NOT NULL CHECK (
+        predecessor_scene_revision_id > 0
+        AND predecessor_scene_revision_id <= 9007199254740991
+    ),
+    predecessor_scene_content_hash TEXT NOT NULL,
+    candidate_retained_bundle_id TEXT NOT NULL,
+    candidate_graph_revision TEXT NOT NULL,
+    candidate_scene_id TEXT NOT NULL,
+    candidate_scene_revision_id INTEGER NOT NULL CHECK (
+        candidate_scene_revision_id > 0
+        AND candidate_scene_revision_id <= 9007199254740991
+    ),
+    candidate_scene_content_hash TEXT NOT NULL,
+    transition_row_count INTEGER NOT NULL CHECK (transition_row_count = 0),
+    transition_evidence_state TEXT NOT NULL CHECK (
+        transition_evidence_state = 'staged'
+    ),
+    PRIMARY KEY (apply_id, apply_generation),
+    UNIQUE (apply_id, apply_generation, projection_stage_generation)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS logical_scene_named_apply_activations (
+    apply_id TEXT NOT NULL,
+    apply_generation INTEGER NOT NULL CHECK (
+        apply_generation > 0
+        AND apply_generation <= 9007199254740991
+    ),
+    projection_stage_generation INTEGER NOT NULL CHECK (
+        projection_stage_generation > 0
+        AND projection_stage_generation <= 9007199254740991
+    ),
+    transition_row_count INTEGER NOT NULL CHECK (transition_row_count = 0),
+    transition_evidence_state TEXT NOT NULL CHECK (
+        transition_evidence_state = 'activated_and_retired'
+    ),
+    PRIMARY KEY (
+        apply_id, apply_generation, projection_stage_generation
+    )
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS logical_scene_named_apply_discards (
+    apply_id TEXT NOT NULL,
+    apply_generation INTEGER NOT NULL CHECK (
+        apply_generation > 0
+        AND apply_generation <= 9007199254740991
+    ),
+    projection_stage_generation INTEGER NOT NULL CHECK (
+        projection_stage_generation > 0
+        AND projection_stage_generation <= 9007199254740991
+    ),
+    transition_row_count INTEGER NOT NULL CHECK (transition_row_count = 0),
+    transition_evidence_state TEXT NOT NULL CHECK (
+        transition_evidence_state = 'aborted'
+    ),
+    PRIMARY KEY (
+        apply_id, apply_generation, projection_stage_generation
+    )
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS logical_scene_named_apply_finalizations (
+    apply_id TEXT NOT NULL,
+    apply_generation INTEGER NOT NULL CHECK (
+        apply_generation > 0
+        AND apply_generation <= 9007199254740991
+    ),
+    projection_stage_generation INTEGER NOT NULL CHECK (
+        projection_stage_generation > 0
+        AND projection_stage_generation <= 9007199254740991
+    ),
+    expected_previous_publication_generation INTEGER NOT NULL CHECK (
+        expected_previous_publication_generation > 0
+        AND expected_previous_publication_generation <= 9007199254740991
+    ),
+    publication_generation INTEGER NOT NULL CHECK (
+        publication_generation > 0
+        AND publication_generation <= 9007199254740991
+    ),
+    private_materialization_content_digest TEXT NOT NULL,
+    obsolete_command_surfaces_retired_evidence_digest TEXT NOT NULL,
+    durable_public_pointer_content_digest TEXT NOT NULL,
+    transition_row_count INTEGER NOT NULL CHECK (transition_row_count = 0),
+    transition_evidence_state TEXT NOT NULL CHECK (
+        transition_evidence_state = 'finalized'
+    ),
+    candidate_health_row_count INTEGER NOT NULL CHECK (
+        candidate_health_row_count = 0
+    ),
+    candidate_health_state TEXT NOT NULL CHECK (
+        candidate_health_state = 'healthy'
+    ),
+    PRIMARY KEY (
+        apply_id, apply_generation, projection_stage_generation
+    )
+) WITHOUT ROWID, STRICT;
+
 CREATE TRIGGER IF NOT EXISTS logical_scene_store_metadata_no_update
 BEFORE UPDATE ON logical_scene_store_metadata
 BEGIN
@@ -215,4 +332,52 @@ CREATE TRIGGER IF NOT EXISTS canonical_empty_scene_finalization_no_delete
 BEFORE DELETE ON canonical_empty_scene_finalization
 BEGIN
     SELECT RAISE(ABORT, 'canonical_empty_scene_finalization is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_scene_named_apply_stages_no_update
+BEFORE UPDATE ON logical_scene_named_apply_stages
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_named_apply_stages is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_scene_named_apply_stages_no_delete
+BEFORE DELETE ON logical_scene_named_apply_stages
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_named_apply_stages is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_scene_named_apply_activations_no_update
+BEFORE UPDATE ON logical_scene_named_apply_activations
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_named_apply_activations is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_scene_named_apply_activations_no_delete
+BEFORE DELETE ON logical_scene_named_apply_activations
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_named_apply_activations is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_scene_named_apply_discards_no_update
+BEFORE UPDATE ON logical_scene_named_apply_discards
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_named_apply_discards is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_scene_named_apply_discards_no_delete
+BEFORE DELETE ON logical_scene_named_apply_discards
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_named_apply_discards is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_scene_named_apply_finalizations_no_update
+BEFORE UPDATE ON logical_scene_named_apply_finalizations
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_named_apply_finalizations is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logical_scene_named_apply_finalizations_no_delete
+BEFORE DELETE ON logical_scene_named_apply_finalizations
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_named_apply_finalizations is immutable');
 END;

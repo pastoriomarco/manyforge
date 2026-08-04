@@ -1,18 +1,20 @@
--- ManyForge I4 typed initial named-Apply journal, version 3.
+-- ManyForge I4 typed initial named-Apply journal, version 5.
 --
 -- This schema stores immutable named-Apply intents, their exact generation-
 -- bound whole-Apply affected scopes, configuration-fence attempts, and
 -- successful fence acceptances, complete runtime convergence intents, and
--- immutable candidate staged-ready sets.
+-- immutable candidate staged-ready sets, scene-stage intents, and complete
+-- successful scene-stage evidence, irreversible activation selection, and
+-- successful activation/retirement evidence.
 -- It is deliberately not a mutable phase/event journal.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 3;
+PRAGMA user_version = 5;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 3),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 5),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL
@@ -50,6 +52,31 @@ CREATE TABLE IF NOT EXISTS apply_journal_metadata (
         CHECK (
             maximum_runtime_staged_ready_sets > 0
             AND maximum_runtime_staged_ready_sets <= 4096
+        ),
+    maximum_scene_stage_intents INTEGER NOT NULL
+        CHECK (
+            maximum_scene_stage_intents > 0
+            AND maximum_scene_stage_intents <= 256
+        ),
+    maximum_scene_staged_records INTEGER NOT NULL
+        CHECK (
+            maximum_scene_staged_records > 0
+            AND maximum_scene_staged_records <= 256
+        ),
+    maximum_activation_selections INTEGER NOT NULL
+        CHECK (
+            maximum_activation_selections > 0
+            AND maximum_activation_selections <= 256
+        ),
+    maximum_scene_activated_records INTEGER NOT NULL
+        CHECK (
+            maximum_scene_activated_records > 0
+            AND maximum_scene_activated_records <= 256
+        ),
+    maximum_scene_transition_rows INTEGER NOT NULL
+        CHECK (
+            maximum_scene_transition_rows > 0
+            AND maximum_scene_transition_rows <= 256
         ),
     maximum_main_database_page_image_bytes INTEGER NOT NULL
         CHECK (
@@ -222,6 +249,117 @@ CREATE TABLE IF NOT EXISTS manager_apply_runtime_staged_ready_sets (
     )
 ) WITHOUT ROWID, STRICT;
 
+CREATE TABLE IF NOT EXISTS manager_apply_scene_stage_intents (
+    apply_id TEXT NOT NULL,
+    apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
+    runtime_staged_ready_digest TEXT NOT NULL,
+    predecessor_publication_generation INTEGER NOT NULL
+        CHECK (predecessor_publication_generation > 0),
+    predecessor_public_pointer_digest TEXT NOT NULL,
+    predecessor_retained_bundle_id TEXT NOT NULL,
+    predecessor_graph_revision TEXT NOT NULL,
+    predecessor_scene_id TEXT NOT NULL,
+    predecessor_scene_revision_id INTEGER NOT NULL
+        CHECK (predecessor_scene_revision_id > 0),
+    predecessor_scene_content_hash TEXT NOT NULL,
+    candidate_retained_bundle_id TEXT NOT NULL,
+    candidate_graph_revision TEXT NOT NULL,
+    native_transition_rows_encoding TEXT NOT NULL,
+    scene_stage_intent_digest TEXT NOT NULL,
+    PRIMARY KEY (apply_id, apply_generation),
+    UNIQUE (apply_id, apply_generation, scene_stage_intent_digest),
+    FOREIGN KEY (apply_id, apply_generation, runtime_staged_ready_digest)
+        REFERENCES manager_apply_runtime_staged_ready_sets (
+            apply_id, apply_generation, staged_ready_digest
+        )
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS manager_apply_scene_staged_records (
+    apply_id TEXT NOT NULL,
+    apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
+    scene_stage_intent_digest TEXT NOT NULL,
+    predecessor_retained_bundle_id TEXT NOT NULL,
+    predecessor_graph_revision TEXT NOT NULL,
+    predecessor_scene_id TEXT NOT NULL,
+    predecessor_scene_revision_id INTEGER NOT NULL
+        CHECK (predecessor_scene_revision_id > 0),
+    predecessor_scene_content_hash TEXT NOT NULL,
+    projection_stage_generation INTEGER NOT NULL
+        CHECK (projection_stage_generation > 0),
+    candidate_retained_bundle_id TEXT NOT NULL,
+    candidate_graph_revision TEXT NOT NULL,
+    candidate_scene_id TEXT NOT NULL,
+    candidate_scene_revision_id INTEGER NOT NULL
+        CHECK (candidate_scene_revision_id > 0),
+    candidate_scene_content_hash TEXT NOT NULL,
+    result_state TEXT NOT NULL CHECK (result_state = 'staged'),
+    transition_evidence_encoding TEXT NOT NULL,
+    scene_staged_digest TEXT NOT NULL,
+    PRIMARY KEY (apply_id, apply_generation),
+    UNIQUE (apply_id, apply_generation, scene_staged_digest),
+    UNIQUE (apply_id, apply_generation, projection_stage_generation),
+    FOREIGN KEY (apply_id, apply_generation, scene_stage_intent_digest)
+        REFERENCES manager_apply_scene_stage_intents (
+            apply_id, apply_generation, scene_stage_intent_digest
+        )
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS manager_apply_activation_selections (
+    apply_id TEXT NOT NULL,
+    apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
+    scene_staged_digest TEXT NOT NULL,
+    predecessor_retained_bundle_id TEXT NOT NULL,
+    predecessor_graph_revision TEXT NOT NULL,
+    predecessor_scene_id TEXT NOT NULL,
+    predecessor_scene_revision_id INTEGER NOT NULL
+        CHECK (predecessor_scene_revision_id > 0),
+    predecessor_scene_content_hash TEXT NOT NULL,
+    projection_stage_generation INTEGER NOT NULL
+        CHECK (projection_stage_generation > 0),
+    candidate_retained_bundle_id TEXT NOT NULL,
+    candidate_graph_revision TEXT NOT NULL,
+    candidate_scene_id TEXT NOT NULL,
+    candidate_scene_revision_id INTEGER NOT NULL
+        CHECK (candidate_scene_revision_id > 0),
+    candidate_scene_content_hash TEXT NOT NULL,
+    activation_selection_digest TEXT NOT NULL,
+    PRIMARY KEY (apply_id, apply_generation),
+    UNIQUE (apply_id, apply_generation, activation_selection_digest),
+    FOREIGN KEY (apply_id, apply_generation, scene_staged_digest)
+        REFERENCES manager_apply_scene_staged_records (
+            apply_id, apply_generation, scene_staged_digest
+        )
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS manager_apply_scene_activated_records (
+    apply_id TEXT NOT NULL,
+    apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
+    activation_selection_digest TEXT NOT NULL,
+    predecessor_retained_bundle_id TEXT NOT NULL,
+    predecessor_graph_revision TEXT NOT NULL,
+    predecessor_scene_id TEXT NOT NULL,
+    predecessor_scene_revision_id INTEGER NOT NULL
+        CHECK (predecessor_scene_revision_id > 0),
+    predecessor_scene_content_hash TEXT NOT NULL,
+    projection_stage_generation INTEGER NOT NULL
+        CHECK (projection_stage_generation > 0),
+    candidate_retained_bundle_id TEXT NOT NULL,
+    candidate_graph_revision TEXT NOT NULL,
+    candidate_scene_id TEXT NOT NULL,
+    candidate_scene_revision_id INTEGER NOT NULL
+        CHECK (candidate_scene_revision_id > 0),
+    candidate_scene_content_hash TEXT NOT NULL,
+    result_state TEXT NOT NULL CHECK (result_state = 'activated'),
+    transition_evidence_encoding TEXT NOT NULL,
+    scene_activated_digest TEXT NOT NULL,
+    PRIMARY KEY (apply_id, apply_generation),
+    UNIQUE (apply_id, apply_generation, scene_activated_digest),
+    FOREIGN KEY (apply_id, apply_generation, activation_selection_digest)
+        REFERENCES manager_apply_activation_selections (
+            apply_id, apply_generation, activation_selection_digest
+        )
+) WITHOUT ROWID, STRICT;
+
 CREATE TRIGGER IF NOT EXISTS apply_journal_metadata_no_update
 BEFORE UPDATE ON apply_journal_metadata
 BEGIN
@@ -304,4 +442,52 @@ CREATE TRIGGER IF NOT EXISTS manager_apply_runtime_staged_ready_sets_no_delete
 BEFORE DELETE ON manager_apply_runtime_staged_ready_sets
 BEGIN
     SELECT RAISE(ABORT, 'manager_apply_runtime_staged_ready_sets is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_scene_stage_intents_no_update
+BEFORE UPDATE ON manager_apply_scene_stage_intents
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_scene_stage_intents is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_scene_stage_intents_no_delete
+BEFORE DELETE ON manager_apply_scene_stage_intents
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_scene_stage_intents is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_scene_staged_records_no_update
+BEFORE UPDATE ON manager_apply_scene_staged_records
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_scene_staged_records is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_scene_staged_records_no_delete
+BEFORE DELETE ON manager_apply_scene_staged_records
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_scene_staged_records is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_activation_selections_no_update
+BEFORE UPDATE ON manager_apply_activation_selections
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_activation_selections is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_activation_selections_no_delete
+BEFORE DELETE ON manager_apply_activation_selections
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_activation_selections is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_scene_activated_records_no_update
+BEFORE UPDATE ON manager_apply_scene_activated_records
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_scene_activated_records is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_scene_activated_records_no_delete
+BEFORE DELETE ON manager_apply_scene_activated_records
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_scene_activated_records is immutable');
 END;
