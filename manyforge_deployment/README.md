@@ -56,8 +56,11 @@ deployment blocks and unqualified catalog families fail before raw storage.
 
 Current limits are explicit:
 
-- the production Python compiler binding still awaits the separately approved
-  atomic binding cutover, so I2 is not complete;
+- I2's pure C++ compiler and atomic `manyforge_core_py` projection cutover are
+  qualified. Python remains a read-only projection over C++-owned values;
+  before any I3 Python product-authoring path exposes the three raw
+  applicability DTO convenience constructors, their iterable inputs must use
+  bounded ingestion with exact- and over-limit tests;
 - C1.0 build-qualified retention authority is implemented: the closed v2
   node-environment, compiler-contract, and non-circular compiler-build
   manifests are produced by one non-caller-constructible authority, and the
@@ -93,10 +96,13 @@ Current limits are explicit:
   planning/collision `Scene`, including the semantic cell frame, zero
   coordinates, zero geometry/pairs, collision-query behavior, and
   deterministic reopen;
-- this does not complete I3 or the complete C1 exit: no build-owned public
-  runtime selection or active alias exists, and remaining products, consumer
-  equivalence outside canonical-empty planning/collision, and runtime-shadow
-  behavior remain later I3 work; and
+- this does not complete I3 or the complete C1 exit. Current source covers the
+  planning/collision and composed-model symbol/role-map products, including
+  non-empty Lite6 cross-consumer regressions; viewer, control-domain, and
+  runtime-unit products, runtime manifests, extended provenance, remaining
+  cross-consumer equivalence, projection staging/runtime-shadow behavior, and
+  final cumulative I3 qualification remain open. Runtime selection and active
+  publication belong to I4; and
 - Apply, active publication, process ownership, runtime convergence,
   simulation, controllers, execution, and lane restoration belong to later
   packages and plan checkpoints.
