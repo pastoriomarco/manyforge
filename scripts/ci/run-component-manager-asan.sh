@@ -7,6 +7,22 @@ BUILD_DIR="${COMPONENT_MANAGER_BUILD_DIR:-${REPO_ROOT}/build/asan-component-mana
 PARALLEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 GTEST_TIMEOUT_SECONDS="${MANYFORGE_ASAN_GTEST_TIMEOUT_SECONDS:-300}"
 
+# ASan and LeakSanitizer can recurse in their signal handler during CMake's
+# short post-link GoogleTest discovery when PIE mappings collide with ASLR.
+# The binding sanitizer already fixes the address layout this way; keep the
+# native retained-product lane deterministic for the same reason.
+expected_personality="00040000"
+current_personality="$(cat /proc/self/personality)"
+if [[ "${current_personality}" != "${expected_personality}" ]]; then
+  if [[ "${MANYFORGE_NATIVE_ASAN_SETARCH_REEXEC:-0}" == "1" ]]; then
+    echo "native ASan/UBSan ADDR_NO_RANDOMIZE re-exec did not take effect" >&2
+    exit 2
+  fi
+  export MANYFORGE_NATIVE_ASAN_SETARCH_REEXEC=1
+  exec /usr/bin/setarch x86_64 -R "$0" "$@"
+fi
+unset MANYFORGE_NATIVE_ASAN_SETARCH_REEXEC
+
 ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=1:detect_leaks=1}"
 if [[ "${ASAN_OPTIONS}" != *"exitcode="* ]]; then
   ASAN_OPTIONS="${ASAN_OPTIONS}:exitcode=66"
