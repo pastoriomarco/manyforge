@@ -570,14 +570,14 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
   EXPECT_TRUE(bundle.catalogs.schema_artifacts.empty());
   EXPECT_TRUE(bundle.desired_control_configurations.empty());
   EXPECT_TRUE(bundle.capability_provider_bindings.empty());
-  EXPECT_FALSE(bundle.compiled_products.viewer_model.has_value());
+  ASSERT_TRUE(bundle.compiled_products.viewer_model.has_value());
   EXPECT_TRUE(
       bundle.compiled_products.control_domain_products.empty());
   EXPECT_TRUE(bundle.compiled_products.symbol_role_maps.empty());
   EXPECT_TRUE(bundle.compiled_products.runtime_unit_products.empty());
   EXPECT_TRUE(bundle.provenance.source_records.empty());
   EXPECT_TRUE(bundle.provenance.generator_records.empty());
-  ASSERT_EQ(bundle.provenance.output_records.size(), 1U);
+  ASSERT_EQ(bundle.provenance.output_records.size(), 2U);
 
   const auto& planning =
       bundle.compiled_products.planning_collision_model;
@@ -589,6 +589,14 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
             "planning_resource_map");
   EXPECT_EQ(planning.artifact_refs[1].artifact_role_id.value(), "srdf");
   EXPECT_EQ(planning.artifact_refs[2].artifact_role_id.value(), "urdf");
+
+  const auto& viewer = *bundle.compiled_products.viewer_model;
+  EXPECT_EQ(viewer.product_id.value(), "cell_viewer_model");
+  EXPECT_EQ(viewer.product_kind,
+            core::RetainedProductKind::kViewerModel);
+  ASSERT_EQ(viewer.artifact_refs.size(), 2U);
+  EXPECT_EQ(viewer.artifact_refs[0], planning.artifact_refs[0]);
+  EXPECT_EQ(viewer.artifact_refs[1], planning.artifact_refs[2]);
 }
 
 TEST_F(CanonicalEmptyAdmissionPackageTest,

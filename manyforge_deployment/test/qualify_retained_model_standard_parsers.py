@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 from yourdfpy import URDF
 
 
-_MANIFEST_API_VERSION = "manyforge.i3.retained-consumer-fixture.v1"
+_MANIFEST_API_VERSION = "manyforge.i3.retained-consumer-fixture.v2"
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 
 
@@ -83,7 +83,8 @@ def _parse_manifest(data: bytes) -> dict[str, Any]:
             "api_version",
             "model_instance_id",
             "retained_bundle_id",
-            "product_id",
+            "planning_product_id",
+            "viewer_product_id",
             "symbol_role_map_product_id",
             "urdf_sha256",
             "srdf_sha256",
@@ -100,7 +101,8 @@ def _parse_manifest(data: bytes) -> dict[str, Any]:
     )
     _required_text(decoded["model_instance_id"], "model_instance_id")
     _required_text(decoded["retained_bundle_id"], "retained_bundle_id")
-    _required_text(decoded["product_id"], "product_id")
+    _required_text(decoded["planning_product_id"], "planning_product_id")
+    _required_text(decoded["viewer_product_id"], "viewer_product_id")
     _required_text(
         decoded["symbol_role_map_product_id"],
         "symbol_role_map_product_id",

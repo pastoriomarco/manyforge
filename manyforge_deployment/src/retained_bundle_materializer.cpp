@@ -58,6 +58,22 @@ require_flattened_model_contract() {
 }
 
 [[nodiscard]] const BuildQualifiedProductContract&
+require_viewer_model_contract() {
+  const auto* contract = build_qualified_product_contract_registry().find(
+      core::ProductContractId(
+          std::string(detail::viewer_model_product_contract_id())),
+      detail::viewer_model_product_contract_revision());
+  if (contract == nullptr ||
+      contract->product_kind() != core::RetainedProductKind::kViewerModel ||
+      contract->placement() != ProductPlacement::kCellViewerModel) {
+    throw std::logic_error(
+        "build-qualified viewer-model product contract is absent or "
+        "incoherent");
+  }
+  return *contract;
+}
+
+[[nodiscard]] const BuildQualifiedProductContract&
 require_composed_model_symbol_role_map_contract() {
   const auto* contract = build_qualified_product_contract_registry().find(
       core::ProductContractId(std::string(
@@ -137,6 +153,7 @@ require_composed_model_symbol_role_map_contract() {
 
 [[nodiscard]] CanonicalValue compiled_products_projection(
     const core::RetainedProductDTO& planning_collision_model,
+    const core::RetainedProductDTO& viewer_model,
     std::span<const core::RetainedProductDTO> symbol_role_maps) {
   CanonicalValue::Array symbol_products;
   symbol_products.reserve(symbol_role_maps.size());
@@ -146,7 +163,7 @@ require_composed_model_symbol_role_map_contract() {
   return CanonicalValue(CanonicalValue::Object{
       {"planning_collision_model",
        detail::retained_product_projection(planning_collision_model)},
-      {"viewer_model", CanonicalValue(nullptr)},
+      {"viewer_model", detail::retained_product_projection(viewer_model)},
       {"control_domain_products", CanonicalValue(CanonicalValue::Array{})},
       {"symbol_role_maps", CanonicalValue(std::move(symbol_products))},
       {"runtime_unit_products", CanonicalValue(CanonicalValue::Array{})},
@@ -197,9 +214,10 @@ require_composed_model_symbol_role_map_contract() {
     std::span<const core::RetainedSourceRecordDTO> source_records,
     std::span<const core::RetainedGeneratorRecordDTO> generator_records,
     const core::RetainedProductDTO& planning_collision_model,
+    const core::RetainedProductDTO& viewer_model,
     std::span<const core::RetainedProductDTO> symbol_role_maps) {
   std::vector<const core::RetainedProductDTO*> products{
-      &planning_collision_model};
+      &planning_collision_model, &viewer_model};
   for (const auto& product : symbol_role_maps) {
     products.push_back(&product);
   }
@@ -239,6 +257,7 @@ require_composed_model_symbol_role_map_contract() {
     std::vector<core::RetainedSourceRecordDTO> source_records,
     std::vector<core::RetainedGeneratorRecordDTO> generator_records,
     const core::RetainedProductDTO& planning_collision_model,
+    const core::RetainedProductDTO& viewer_model,
     std::vector<core::RetainedProductDTO> symbol_role_maps) {
   const auto& deployment = qualified.deployment();
   const auto& registry = build_qualified_closed_schema_registry();
@@ -265,7 +284,7 @@ require_composed_model_symbol_role_map_contract() {
           .capability_provider_bindings,
       core::RetainedCompiledProductsDTO{
           planning_collision_model,
-          std::nullopt,
+          viewer_model,
           {},
           symbol_role_maps,
           {},
@@ -277,12 +296,16 @@ require_composed_model_symbol_role_map_contract() {
           std::move(generator_records),
           [&]() {
             std::vector<core::RetainedOutputRecordDTO> outputs;
-            outputs.reserve(1U + symbol_role_maps.size());
+            outputs.reserve(2U + symbol_role_maps.size());
             outputs.push_back(core::RetainedOutputRecordDTO{
                 planning_collision_model.product_id,
                 planning_collision_model.product_kind,
                 detail::retained_product_output_digest(
                     planning_collision_model)});
+            outputs.push_back(core::RetainedOutputRecordDTO{
+                viewer_model.product_id,
+                viewer_model.product_kind,
+                detail::retained_product_output_digest(viewer_model)});
             for (const auto& product : symbol_role_maps) {
               outputs.push_back(core::RetainedOutputRecordDTO{
                   product.product_id, product.product_kind,
@@ -307,6 +330,7 @@ require_composed_model_symbol_role_map_contract() {
     std::span<const core::RetainedSourceRecordDTO> source_records,
     std::span<const core::RetainedGeneratorRecordDTO> generator_records,
     const core::RetainedProductDTO& planning_collision_model,
+    const core::RetainedProductDTO& viewer_model,
     std::span<const core::RetainedProductDTO> symbol_role_maps) {
   const auto& deployment = qualified.deployment();
   return CanonicalValue(CanonicalValue::Object{
@@ -331,10 +355,12 @@ require_composed_model_symbol_role_map_contract() {
            .normalized_capability_provider_bindings()},
       {"compiled_products",
        compiled_products_projection(planning_collision_model,
+                                    viewer_model,
                                     symbol_role_maps)},
       {"provenance",
        provenance_projection(context, source_records, generator_records,
-                             planning_collision_model, symbol_role_maps)},
+                             planning_collision_model, viewer_model,
+                             symbol_role_maps)},
   });
 }
 
@@ -360,6 +386,7 @@ struct PreparedPlanningCollisionProduct final {
   std::string srdf;
   std::string planning_resource_map;
   const BuildQualifiedProductContract* contract;
+  const BuildQualifiedProductContract* viewer_contract;
   std::optional<std::string> symbol_role_map;
   const BuildQualifiedProductContract* symbol_role_map_contract;
   std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts;
@@ -983,6 +1010,20 @@ prepare_planning_collision_product_before_store(
       ProductPlacement::kCellPlanningCollisionModel,
       contract.product_contract_id(),
       contract.product_contract_revision(), product_inputs);
+  const auto& viewer_contract = require_viewer_model_contract();
+  const std::array<detail::RetainedArtifactInput, 2U> viewer_inputs{{
+      {core::ArtifactRoleId(
+           std::string(detail::kPlanningResourceMapArtifactRole)),
+       std::string(detail::kPlanningResourceMapMediaType),
+       planning_resource_map},
+      {core::ArtifactRoleId("urdf"), "application/xml", urdf},
+  }};
+  detail::preflight_retained_product(
+      core::ProductId("cell_viewer_model"),
+      core::RetainedProductKind::kViewerModel,
+      ProductPlacement::kCellViewerModel,
+      viewer_contract.product_contract_id(),
+      viewer_contract.product_contract_revision(), viewer_inputs);
   std::optional<std::string> symbol_role_map;
   const BuildQualifiedProductContract* symbol_role_map_contract = nullptr;
   if (!composition.model_occurrences().empty()) {
@@ -1039,6 +1080,7 @@ prepare_planning_collision_product_before_store(
       std::move(srdf),
       std::move(planning_resource_map),
       &contract,
+      &viewer_contract,
       std::move(symbol_role_map),
       symbol_role_map_contract,
       std::move(schema_artifacts),
@@ -1360,6 +1402,7 @@ detail::RetainedBundleMaterializer::materialize_prepared(
     std::string_view urdf, std::string_view srdf,
     std::string_view planning_resource_map,
     const BuildQualifiedProductContract& contract,
+    const BuildQualifiedProductContract& viewer_contract,
     std::optional<std::string_view> symbol_role_map,
     const BuildQualifiedProductContract* symbol_role_map_contract,
     std::span<const core::RetainedSchemaArtifactRefDTO> schema_artifacts,
@@ -1382,6 +1425,21 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           contract.product_contract_id(),
           contract.product_contract_revision(), artifacts,
           artifact_store);
+
+  const std::array<detail::RetainedArtifactInput, 2U> viewer_artifacts{{
+      {core::ArtifactRoleId(
+           std::string(detail::kPlanningResourceMapArtifactRole)),
+       std::string(detail::kPlanningResourceMapMediaType),
+       std::string(planning_resource_map)},
+      {core::ArtifactRoleId("urdf"), "application/xml", std::string(urdf)},
+  }};
+  const core::RetainedProductDTO viewer = detail::build_and_retain_product(
+      core::ProductId("cell_viewer_model"),
+      core::RetainedProductKind::kViewerModel,
+      ProductPlacement::kCellViewerModel,
+      viewer_contract.product_contract_id(),
+      viewer_contract.product_contract_revision(), viewer_artifacts,
+      artifact_store);
 
   std::vector<core::RetainedProductDTO> symbol_role_maps;
   if (symbol_role_map.has_value() != (symbol_role_map_contract != nullptr)) {
@@ -1420,7 +1478,8 @@ detail::RetainedBundleMaterializer::materialize_prepared(
 
   const CanonicalValue placeholder = retained_bundle_projection(
       kZeroDigest, qualified, context, schema_artifacts,
-      source_records, generator_records, planning, symbol_role_maps);
+      source_records, generator_records, planning, viewer,
+      symbol_role_maps);
   const std::string retained_bundle_id = detail::compute_content_identity(
       placeholder,
       detail::ContentIdentitySpec{
@@ -1430,7 +1489,8 @@ detail::RetainedBundleMaterializer::materialize_prepared(
   });
   CanonicalValue root = retained_bundle_projection(
       retained_bundle_id, qualified, context, schema_artifacts,
-      source_records, generator_records, planning, symbol_role_maps);
+      source_records, generator_records, planning, viewer,
+      symbol_role_maps);
   std::string bytes = canonical_json(root);
   core::RetainedBundleDTO value = retained_bundle_value(
       retained_bundle_id, qualified, context,
@@ -1440,7 +1500,7 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           source_records.begin(), source_records.end()),
       std::vector<core::RetainedGeneratorRecordDTO>(
           generator_records.begin(), generator_records.end()),
-      planning, symbol_role_maps);
+      planning, viewer, symbol_role_maps);
   auto bundle = detail::RetainedBundleConstructionAuthority::construct(
       core::RetainedBundleId(retained_bundle_id), std::move(value),
       std::move(root), std::move(bytes));
@@ -1475,6 +1535,7 @@ detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
       qualified, context, prepared.urdf, prepared.srdf,
       prepared.planning_resource_map,
       *prepared.contract,
+      *prepared.viewer_contract,
       prepared.symbol_role_map.has_value()
           ? std::optional<std::string_view>(*prepared.symbol_role_map)
           : std::nullopt,
@@ -1518,6 +1579,7 @@ detail::RetainedBundleMaterializer::materialize(
       qualified, context, prepared.urdf, prepared.srdf,
       prepared.planning_resource_map,
       *prepared.contract,
+      *prepared.viewer_contract,
       prepared.symbol_role_map.has_value()
           ? std::optional<std::string_view>(*prepared.symbol_role_map)
           : std::nullopt,

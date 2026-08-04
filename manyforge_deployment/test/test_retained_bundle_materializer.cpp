@@ -21,6 +21,7 @@
 
 #include "retained_bundle_internal.hpp"
 #include "composed_model_symbol_role_map_internal.hpp"
+#include "content_identity_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_structural_retention_fixture.hpp"
 #include "planning_resource_map_internal.hpp"
@@ -214,6 +215,21 @@ static_assert(!std::is_constructible_v<
       root, array_name, CanonicalValue(std::move(rows)));
 }
 
+[[nodiscard]] CanonicalValue reidentify_retained_bundle(
+    CanonicalValue root) {
+  root = replace_root_member(
+      root, "retained_bundle_id", CanonicalValue(std::string(kZeroDigest)));
+  const std::string identity = detail::compute_content_identity(
+      root,
+      detail::ContentIdentitySpec{
+          .identity_domain = "retained-bundle-id",
+          .api_version = std::string(core::kRetainedBundleApiVersion),
+          .own_field = "retained_bundle_id",
+      });
+  return replace_root_member(
+      root, "retained_bundle_id", CanonicalValue(identity));
+}
+
 class CountingRawArtifactStore final : public IRawArtifactStore {
  public:
   [[nodiscard]] StoredRawArtifact put_if_absent(
@@ -285,9 +301,9 @@ TEST(RetainedBundleMaterializer,
             qualified.compiler_ir().applicability().composition().graph());
   EXPECT_TRUE(bundle->value().catalogs.records.empty());
   EXPECT_TRUE(bundle->value().catalogs.schema_artifacts.empty());
-  EXPECT_FALSE(bundle->value().compiled_products.viewer_model.has_value());
+  ASSERT_TRUE(bundle->value().compiled_products.viewer_model.has_value());
   EXPECT_TRUE(bundle->value().compiled_products.symbol_role_maps.empty());
-  EXPECT_EQ(bundle->value().provenance.output_records.size(), 1U);
+  EXPECT_EQ(bundle->value().provenance.output_records.size(), 2U);
 
   const CanonicalValue& catalogs = member(root, "catalogs");
   EXPECT_TRUE(array_member(catalogs, "records").empty());
@@ -308,6 +324,23 @@ TEST(RetainedBundleMaterializer,
 
   const std::string expected_resource_map =
       detail::emit_planning_resource_map({});
+  const auto& viewer =
+      *bundle->value().compiled_products.viewer_model;
+  EXPECT_EQ(viewer.product_id.value(), "cell_viewer_model");
+  EXPECT_EQ(viewer.product_kind, core::RetainedProductKind::kViewerModel);
+  EXPECT_EQ(viewer.product_contract_id.value(),
+            "manyforge.viewer_model");
+  ASSERT_EQ(viewer.artifact_refs.size(), 2U);
+  EXPECT_EQ(viewer.artifact_refs[0].artifact_role_id.value(),
+            detail::kPlanningResourceMapArtifactRole);
+  EXPECT_EQ(viewer.artifact_refs[1].artifact_role_id.value(), "urdf");
+  EXPECT_EQ(
+      require_product_artifact_bytes(
+          viewer, detail::kPlanningResourceMapArtifactRole, store),
+      expected_resource_map);
+  EXPECT_EQ(require_product_artifact_bytes(viewer, "urdf", store),
+            expected_urdf);
+
   const std::string resource_map_digest =
       sha256_digest(expected_resource_map);
   const std::string srdf_digest = sha256_digest(expected_srdf);
@@ -333,7 +366,54 @@ TEST(RetainedBundleMaterializer,
   const CanonicalValue& provenance = member(root, "provenance");
   EXPECT_TRUE(array_member(provenance, "source_records").empty());
   EXPECT_TRUE(array_member(provenance, "generator_records").empty());
-  EXPECT_EQ(array_member(provenance, "output_records").size(), 1U);
+  EXPECT_EQ(array_member(provenance, "output_records").size(), 2U);
+}
+
+TEST(RetainedBundleMaterializer,
+     RehashedViewerCannotDivergeFromAuthoritativePlanningUrdf) {
+  test::InMemoryRawArtifactStoreFixture store;
+  const auto bundle = materialize_empty("i3_viewer_splice_cell", store);
+  const auto& products = bundle->value().compiled_products;
+  ASSERT_TRUE(products.viewer_model.has_value());
+  ASSERT_EQ(products.planning_collision_model.artifact_refs.size(), 3U);
+
+  core::RetainedProductDTO changed_viewer = *products.viewer_model;
+  changed_viewer.artifact_refs[1] =
+      products.planning_collision_model.artifact_refs[1];
+  changed_viewer.artifact_refs[1].artifact_role_id =
+      core::ArtifactRoleId("urdf");
+  ASSERT_NO_THROW(
+      detail::require_current_retained_product_conformance(changed_viewer));
+
+  CanonicalValue root = bundle->normalized_root();
+  CanonicalValue compiled_products = member(root, "compiled_products");
+  compiled_products = replace_object_member(
+      compiled_products, "viewer_model",
+      detail::retained_product_projection(changed_viewer));
+  root = replace_root_member(
+      root, "compiled_products", std::move(compiled_products));
+
+  CanonicalValue provenance = member(root, "provenance");
+  CanonicalValue::Array outputs =
+      array_member(provenance, "output_records");
+  const auto viewer_output = std::find_if(
+      outputs.begin(), outputs.end(), [](const CanonicalValue& output) {
+        return string_member(output, "product_id") == "cell_viewer_model";
+      });
+  ASSERT_NE(viewer_output, outputs.end());
+  *viewer_output = replace_object_member(
+      *viewer_output, "content_digest",
+      CanonicalValue(
+          detail::retained_product_output_digest(changed_viewer).value()));
+  provenance = replace_object_member(
+      provenance, "output_records", CanonicalValue(std::move(outputs)));
+  root = replace_root_member(root, "provenance", std::move(provenance));
+  root = reidentify_retained_bundle(std::move(root));
+
+  EXPECT_THROW(
+      static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+          canonical_json(root))),
+      RetainedBundleError);
 }
 
 TEST(RetainedBundleMaterializer,
@@ -424,6 +504,22 @@ TEST(RetainedBundleMaterializer,
             .has_value());
   }
 
+  ASSERT_TRUE(bundle->value().compiled_products.viewer_model.has_value());
+  const auto& viewer =
+      *bundle->value().compiled_products.viewer_model;
+  ASSERT_EQ(viewer.artifact_refs.size(), 2U);
+  EXPECT_EQ(
+      require_product_artifact_bytes(viewer, "urdf", raw_store),
+      require_product_artifact_bytes(
+          bundle->value().compiled_products.planning_collision_model,
+          "urdf", raw_store));
+  EXPECT_EQ(
+      require_product_artifact_bytes(
+          viewer, detail::kPlanningResourceMapArtifactRole, raw_store),
+      require_product_artifact_bytes(
+          bundle->value().compiled_products.planning_collision_model,
+          detail::kPlanningResourceMapArtifactRole, raw_store));
+
   ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
   const auto& symbol_product =
       bundle->value().compiled_products.symbol_role_maps.front();
@@ -508,6 +604,14 @@ TEST(RetainedBundleMaterializer,
       bundle->value().compiled_products.control_domain_products.empty());
   EXPECT_TRUE(
       bundle->value().compiled_products.runtime_unit_products.empty());
+  ASSERT_TRUE(bundle->value().compiled_products.viewer_model.has_value());
+  EXPECT_EQ(
+      require_product_artifact_bytes(
+          *bundle->value().compiled_products.viewer_model, "urdf",
+          raw_store),
+      require_product_artifact_bytes(
+          bundle->value().compiled_products.planning_collision_model,
+          "urdf", raw_store));
 
   ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
   const std::string symbol_map = require_product_artifact_bytes(

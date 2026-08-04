@@ -175,6 +175,7 @@ class RetainedBundleMaterializer final {
       std::string_view urdf, std::string_view srdf,
       std::string_view planning_resource_map,
       const BuildQualifiedProductContract& contract,
+      const BuildQualifiedProductContract& viewer_contract,
       std::optional<std::string_view> symbol_role_map,
       const BuildQualifiedProductContract* symbol_role_map_contract,
       std::span<const core::RetainedSchemaArtifactRefDTO> schema_artifacts,

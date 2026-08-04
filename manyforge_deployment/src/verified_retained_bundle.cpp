@@ -35,6 +35,9 @@ constexpr std::string_view kFlattenedModelContractId =
     "manyforge.flattened_model";
 constexpr std::string_view kFlattenedModelPlacement =
     "cell_planning_collision_model";
+constexpr std::string_view kViewerModelContractId =
+    "manyforge.viewer_model";
+constexpr std::string_view kViewerModelPlacement = "cell_viewer_model";
 constexpr std::string_view kSymbolRoleMapPlacement = "symbol_role_map";
 constexpr std::string_view kContentIdentityPrefix =
     "manyforge.content-identity.v1";
@@ -51,6 +54,12 @@ constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 3U>
         {detail::kPlanningResourceMapArtifactRole,
          detail::kPlanningResourceMapMediaType, true},
         {"srdf", "application/xml", true},
+        {"urdf", "application/xml", true},
+    }};
+constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
+    kViewerModelArtifactRoles{{
+        {detail::kPlanningResourceMapArtifactRole,
+         detail::kPlanningResourceMapMediaType, true},
         {"urdf", "application/xml", true},
     }};
 constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 1U>
@@ -155,12 +164,6 @@ void require_empty_array(const CanonicalValue& value,
   }
 }
 
-void require_null(const CanonicalValue& value, std::string_view field) {
-  if (!std::holds_alternative<std::nullptr_t>(value.storage())) {
-    detail::fail_retained_bundle(std::string(field) + " must be null");
-  }
-}
-
 [[nodiscard]] std::uint64_t require_i_json_size(
     const CanonicalValue& value, std::string_view field) {
   const auto* number = std::get_if<double>(&value.storage());
@@ -249,6 +252,14 @@ qualified_product_contract_state(
       placement == kFlattenedModelPlacement &&
       artifact_roles.data() == kFlattenedModelArtifactRoles.data() &&
       artifact_roles.size() == kFlattenedModelArtifactRoles.size()) {
+    static const QualifiedProductContractState state = build_state();
+    return state;
+  }
+  if (contract_id == kViewerModelContractId &&
+      product_kind == core::RetainedProductKind::kViewerModel &&
+      placement == kViewerModelPlacement &&
+      artifact_roles.data() == kViewerModelArtifactRoles.data() &&
+      artifact_roles.size() == kViewerModelArtifactRoles.size()) {
     static const QualifiedProductContractState state = build_state();
     return state;
   }
@@ -961,9 +972,21 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
                      "retained_bundle.compiled_products"),
       "retained_bundle.compiled_products.planning_collision_model",
       core::RetainedProductKind::kPlanningCollisionModel);
-  require_null(require_member(products, "viewer_model",
-                              "retained_bundle.compiled_products"),
-               "retained_bundle.compiled_products.viewer_model");
+  const core::RetainedProductDTO viewer = parse_retained_product(
+      require_member(products, "viewer_model",
+                     "retained_bundle.compiled_products"),
+      "retained_bundle.compiled_products.viewer_model",
+      core::RetainedProductKind::kViewerModel);
+  if (viewer.product_id.value() != "cell_viewer_model") {
+    detail::fail_retained_bundle(
+        "viewer model has the wrong stable product ID");
+  }
+  if (viewer.artifact_refs[0] != planning.artifact_refs[0] ||
+      viewer.artifact_refs[1] != planning.artifact_refs[2]) {
+    detail::fail_retained_bundle(
+        "viewer model does not reuse the exact planning resource map and "
+        "compiled URDF");
+  }
   require_empty_array(
       require_member(products, "control_domain_products",
                      "retained_bundle.compiled_products"),
@@ -1041,7 +1064,8 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       require_array(require_member(provenance, "output_records",
                                    "retained_bundle.provenance"),
                     "retained_bundle.provenance.output_records");
-  std::vector<const core::RetainedProductDTO*> expected_outputs{&planning};
+  std::vector<const core::RetainedProductDTO*> expected_outputs{
+      &planning, &viewer};
   for (const auto& product : symbol_role_maps) {
     expected_outputs.push_back(&product);
   }
@@ -1113,7 +1137,7 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       applicability.value().capability_provider_bindings,
       core::RetainedCompiledProductsDTO{
           planning,
-          std::nullopt,
+          viewer,
           {},
           symbol_role_maps,
           {},
@@ -1155,6 +1179,32 @@ const CanonicalValue& flattened_model_product_contract_descriptor() {
              kFlattenedModelContractId,
              core::RetainedProductKind::kPlanningCollisionModel,
              kFlattenedModelPlacement, kFlattenedModelArtifactRoles)
+      .descriptor;
+}
+
+std::string_view viewer_model_product_contract_id() noexcept {
+  return kViewerModelContractId;
+}
+
+const core::ProductContractRevision&
+viewer_model_product_contract_revision() {
+  return qualified_product_contract_state(
+             kViewerModelContractId,
+             core::RetainedProductKind::kViewerModel,
+             kViewerModelPlacement, kViewerModelArtifactRoles)
+      .revision;
+}
+
+std::span<const QualifiedRetainedProductArtifactRole>
+viewer_model_product_artifact_roles() noexcept {
+  return kViewerModelArtifactRoles;
+}
+
+const CanonicalValue& viewer_model_product_contract_descriptor() {
+  return qualified_product_contract_state(
+             kViewerModelContractId,
+             core::RetainedProductKind::kViewerModel,
+             kViewerModelPlacement, kViewerModelArtifactRoles)
       .descriptor;
 }
 
@@ -1256,6 +1306,12 @@ void require_current_retained_product_conformance(
       product.product_kind ==
           core::RetainedProductKind::kPlanningCollisionModel) {
     artifact_roles = kFlattenedModelArtifactRoles;
+  } else if (
+      product.product_contract_id.value() == kViewerModelContractId &&
+      product.product_contract_revision ==
+          viewer_model_product_contract_revision() &&
+      product.product_kind == core::RetainedProductKind::kViewerModel) {
+    artifact_roles = kViewerModelArtifactRoles;
   } else if (
       product.product_contract_id.value() ==
           kComposedModelSymbolRoleMapContractId &&

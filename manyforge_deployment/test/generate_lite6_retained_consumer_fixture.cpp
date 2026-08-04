@@ -13,6 +13,7 @@
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include "lite6_retained_consumer_fixture.hpp"
+#include "planning_resource_map_internal.hpp"
 
 namespace {
 
@@ -299,6 +300,12 @@ int main(int argc, char** argv) {
     const auto& planning =
         materialized.bundle->value()
             .compiled_products.planning_collision_model;
+    const auto& viewer =
+        materialized.bundle->value().compiled_products.viewer_model;
+    if (!viewer.has_value()) {
+      throw std::runtime_error(
+          "generated retained Lite6 bundle has no viewer product");
+    }
     const manyforge::deployment::RetainedPlanningModelQuery query{
         materialized.bundle->retained_bundle_id(), planning.product_id};
     const manyforge::deployment::
@@ -309,9 +316,44 @@ int main(int argc, char** argv) {
           "generated retained Lite6 planning model is absent");
     }
 
+    const manyforge::deployment::
+        FilesystemVerifiedRetainedProductArtifactSource artifact_source(
+            package_root);
+    const auto require_artifact =
+        [&](const manyforge::core::RetainedProductDTO& product,
+            std::string_view role) {
+          auto artifact = artifact_source.get_verified(
+              manyforge::deployment::RetainedProductArtifactQuery{
+                  materialized.bundle->retained_bundle_id(),
+                  product.product_id, product.product_kind,
+                  manyforge::core::ArtifactRoleId(std::string(role))});
+          if (!artifact.has_value()) {
+            throw std::runtime_error(
+                "generated retained Lite6 product artifact is absent: " +
+                product.product_id.value() + "/" + std::string(role));
+          }
+          return *std::move(artifact);
+        };
+    const auto planning_resource_map = require_artifact(
+        planning,
+        manyforge::deployment::detail::kPlanningResourceMapArtifactRole);
+    const auto viewer_resource_map = require_artifact(
+        *viewer,
+        manyforge::deployment::detail::kPlanningResourceMapArtifactRole);
+    const auto viewer_urdf = require_artifact(*viewer, "urdf");
+    if (viewer_urdf.bytes() != model->urdf_bytes() ||
+        viewer_urdf.artifact_ref() != planning.artifact_refs.back() ||
+        viewer_resource_map.bytes() != planning_resource_map.bytes() ||
+        viewer_resource_map.artifact_ref() !=
+            planning_resource_map.artifact_ref()) {
+      throw std::runtime_error(
+          "generated retained Lite6 viewer product differs from the "
+          "authoritative planning model inputs");
+    }
+
     const auto urdf_path = output_root / "retained-model.urdf";
     const auto srdf_path = output_root / "retained-model.srdf";
-    write_exact_file(urdf_path, model->urdf_bytes());
+    write_exact_file(urdf_path, viewer_urdf.bytes());
     write_exact_file(srdf_path, model->srdf_bytes());
 
     const auto& symbol_products =
@@ -350,13 +392,16 @@ int main(int argc, char** argv) {
     const CanonicalValue manifest(CanonicalValue::Object{
         {"api_version",
          CanonicalValue(
-             "manyforge.i3.retained-consumer-fixture.v1")},
+             "manyforge.i3.retained-consumer-fixture.v2")},
         {"model_instance_id",
          CanonicalValue("lite6_fixture_instance")},
         {"retained_bundle_id",
          CanonicalValue(
              materialized.bundle->retained_bundle_id().value())},
-        {"product_id", CanonicalValue(planning.product_id.value())},
+        {"planning_product_id",
+         CanonicalValue(planning.product_id.value())},
+        {"viewer_product_id",
+         CanonicalValue(viewer->product_id.value())},
         {"symbol_role_map_product_id",
          CanonicalValue(symbol_product.product_id.value())},
         {"urdf_sha256",

@@ -93,6 +93,20 @@ TEST(RetainedBundlePublicSurfaceTest,
   return *match;
 }
 
+[[nodiscard]] const BuildQualifiedProductContract &viewer_contract() {
+  const auto contracts =
+      build_qualified_product_contract_registry().contracts();
+  const auto match = std::find_if(
+      contracts.begin(), contracts.end(), [](const auto &contract) {
+        return contract.product_contract_id().value() ==
+               "manyforge.viewer_model";
+      });
+  if (match == contracts.end()) {
+    throw std::logic_error("viewer-model contract is absent");
+  }
+  return *match;
+}
+
 [[nodiscard]] std::vector<detail::RetainedArtifactInput>
 product_contract_fixture_artifacts() {
   return {
@@ -194,10 +208,10 @@ void expect_no_thread_failures(
 } // namespace
 
 TEST(ProductContractRegistryTest,
-     QualifiesExactFlattenedModelAndComposedSymbolMapContracts) {
+     QualifiesExactFlattenedViewerAndComposedSymbolMapContracts) {
   const auto &registry = build_qualified_product_contract_registry();
   const auto contracts = registry.contracts();
-  ASSERT_EQ(contracts.size(), 2U);
+  ASSERT_EQ(contracts.size(), 3U);
   const auto &contract = flattened_contract();
 
   EXPECT_EQ(contract.product_contract_id().value(),
@@ -268,6 +282,31 @@ TEST(ProductContractRegistryTest,
   EXPECT_EQ(registry.find(symbol_map->product_contract_id(),
                           symbol_map->product_contract_revision()),
             &*symbol_map);
+
+  const auto &viewer = viewer_contract();
+  EXPECT_EQ(viewer.product_kind(),
+            core::RetainedProductKind::kViewerModel);
+  EXPECT_EQ(viewer.placement(), ProductPlacement::kCellViewerModel);
+  ASSERT_EQ(viewer.artifact_roles().size(), 2U);
+  EXPECT_EQ(viewer.artifact_roles()[0].artifact_role_id.value(),
+            detail::kPlanningResourceMapArtifactRole);
+  EXPECT_EQ(viewer.artifact_roles()[0].media_type,
+            detail::kPlanningResourceMapMediaType);
+  EXPECT_EQ(viewer.artifact_roles()[1].artifact_role_id.value(), "urdf");
+  EXPECT_EQ(viewer.artifact_roles()[1].media_type, "application/xml");
+  for (const auto &role : viewer.artifact_roles()) {
+    EXPECT_EQ(role.cardinality,
+              ProductArtifactCardinality::kRequiredExactlyOne);
+  }
+  const auto *viewer_declared_revision =
+      viewer.normalized_descriptor().find_object_member(
+          "product_contract_revision");
+  ASSERT_NE(viewer_declared_revision, nullptr);
+  EXPECT_EQ(std::get<std::string>(viewer_declared_revision->storage()),
+            viewer.product_contract_revision().value());
+  EXPECT_EQ(registry.find(viewer.product_contract_id(),
+                          viewer.product_contract_revision()),
+            &viewer);
 }
 
 TEST(RawArtifactStoreTest, UsesImmutableDigestKeysAndReverifiesReads) {

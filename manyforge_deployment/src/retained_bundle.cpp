@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -14,26 +15,10 @@ namespace manyforge::deployment {
 namespace {
 
 [[nodiscard]] std::vector<ProductContractArtifactRole>
-flattened_model_artifact_roles() {
+public_artifact_roles(
+    std::span<const detail::QualifiedRetainedProductArtifactRole>
+        qualified) {
   std::vector<ProductContractArtifactRole> roles;
-  const auto qualified = detail::flattened_model_product_artifact_roles();
-  roles.reserve(qualified.size());
-  for (const auto& role : qualified) {
-    roles.push_back(ProductContractArtifactRole{
-        core::ArtifactRoleId(std::string(role.artifact_role_id)),
-        std::string(role.media_type),
-        role.required ? ProductArtifactCardinality::kRequiredExactlyOne
-                      : ProductArtifactCardinality::kOptionalAtMostOne,
-    });
-  }
-  return roles;
-}
-
-[[nodiscard]] std::vector<ProductContractArtifactRole>
-composed_model_symbol_role_map_artifact_roles() {
-  std::vector<ProductContractArtifactRole> roles;
-  const auto qualified =
-      detail::composed_model_symbol_role_map_product_artifact_roles();
   roles.reserve(qualified.size());
   for (const auto& role : qualified) {
     roles.push_back(ProductContractArtifactRole{
@@ -69,15 +54,25 @@ BuildQualifiedProductContractRegistry::
       detail::flattened_model_product_contract_revision(),
       core::RetainedProductKind::kPlanningCollisionModel,
       ProductPlacement::kCellPlanningCollisionModel,
-      flattened_model_artifact_roles(),
+      public_artifact_roles(
+          detail::flattened_model_product_artifact_roles()),
       detail::flattened_model_product_contract_descriptor()));
+  contracts_.push_back(BuildQualifiedProductContract(
+      core::ProductContractId(
+          std::string(detail::viewer_model_product_contract_id())),
+      detail::viewer_model_product_contract_revision(),
+      core::RetainedProductKind::kViewerModel,
+      ProductPlacement::kCellViewerModel,
+      public_artifact_roles(detail::viewer_model_product_artifact_roles()),
+      detail::viewer_model_product_contract_descriptor()));
   contracts_.push_back(BuildQualifiedProductContract(
       core::ProductContractId(std::string(
           detail::composed_model_symbol_role_map_product_contract_id())),
       detail::composed_model_symbol_role_map_product_contract_revision(),
       core::RetainedProductKind::kSymbolRoleMap,
       ProductPlacement::kSymbolRoleMap,
-      composed_model_symbol_role_map_artifact_roles(),
+      public_artifact_roles(
+          detail::composed_model_symbol_role_map_product_artifact_roles()),
       detail::composed_model_symbol_role_map_product_contract_descriptor()));
 }
 

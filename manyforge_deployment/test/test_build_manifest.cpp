@@ -116,11 +116,11 @@ constexpr std::string_view kZeroDigest =
 constexpr std::string_view kExpectedNodeEnvironmentDigest =
     "sha256:c1a6f5fcdcabc18c30ade4761a64ff7fd10dfbeb473514ccde3a69e3bd11dd6a";
 constexpr std::string_view kExpectedCompilerContractDigest =
-    "sha256:6709d1bf0e663bee96d3a4f6ca44b0891f2f59cd9dd1d8cb28ccee1d3a822ad5";
+    "sha256:7c6ccfb7ad848298c3c76747aaabad93128a65091ed365291e137c78e53fa117";
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:f03e507e8587e08b67de5e81d5a1014720c2cca6bf6286b66325e310391bf055";
+    "sha256:5489afd1de5cf19351bb7f2aa101a572b1e81a085de109b155d3fc944a10ebb3";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:83cc5a07f5cc6c78d33f3e63b420a213d06b24cd267ac48f4fe5f61aff4167ab";
+    "sha256:3cb3c9cbe8485b941fc7c8c55d1fcbe2fe885ae314edafc5a8257f8f592fd022";
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);
 static_assert(!std::is_aggregate_v<BuildQualifiedManifest>);
@@ -1733,8 +1733,8 @@ TEST(BuildManifestAuthority,
   EXPECT_EQ(manifest_repository.put_calls(), 3U);
   EXPECT_EQ(manifest_repository.get_calls(), 3U);
   EXPECT_EQ(manifest_repository.size(), 3U);
-  EXPECT_EQ(raw_store.put_calls(), 3U);
-  EXPECT_EQ(raw_store.get_calls(), 6U);
+  EXPECT_EQ(raw_store.put_calls(), 5U);
+  EXPECT_EQ(raw_store.get_calls(), 10U);
 
   EXPECT_EQ(bundle_repository.size(), 1U);
   const auto reloaded =

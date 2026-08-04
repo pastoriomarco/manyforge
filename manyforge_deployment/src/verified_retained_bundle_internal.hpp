@@ -29,6 +29,14 @@ flattened_model_product_artifact_roles() noexcept;
 [[nodiscard]] const CanonicalValue&
 flattened_model_product_contract_descriptor();
 
+[[nodiscard]] std::string_view viewer_model_product_contract_id() noexcept;
+[[nodiscard]] const core::ProductContractRevision&
+viewer_model_product_contract_revision();
+[[nodiscard]] std::span<const QualifiedRetainedProductArtifactRole>
+viewer_model_product_artifact_roles() noexcept;
+[[nodiscard]] const CanonicalValue&
+viewer_model_product_contract_descriptor();
+
 [[nodiscard]] std::string_view
 composed_model_symbol_role_map_product_contract_id() noexcept;
 [[nodiscard]] const core::ProductContractRevision&
