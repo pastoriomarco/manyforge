@@ -14,14 +14,18 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <Eigen/Core>
+#include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
+#include <roboplan/core/geometry_wrappers.hpp>
 #include <roboplan/core/scene.hpp>
 
 #include "lite6_retained_consumer_fixture.hpp"
@@ -31,6 +35,7 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
+using collision::ManyForgeCollisionEngine;
 constexpr std::string_view kCanonicalCellFrame =
     "mf1_cell_e228ede37638a8d03080644d418a75c681930a4b5b3f6b0bbde2603974dab681";
 
@@ -819,6 +824,192 @@ TEST(RetainedProductRoboPlanConsumer,
   }
   EXPECT_FALSE(std::filesystem::exists(incomplete_stage_root));
   EXPECT_TRUE(std::filesystem::is_empty(staging_parent));
+}
+
+TEST(RetainedProductCrossConsumer, DurableLite6ModelPreservesAuthoritativeCollisionDecisions) {
+  ScopedTemporaryRoot temporary;
+  const std::filesystem::path package_root = temporary.path() / "retained-package";
+  const std::filesystem::path staging_parent = temporary.path() / "private-stages";
+  const std::filesystem::path empty_ambient_root = temporary.path() / "empty-ambient";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
+  ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
+
+  const auto materialized =
+      deployment::test::materialize_lite6_retained_consumer_fixture(package_root);
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto& products = materialized.bundle->value().compiled_products;
+  const deployment::RetainedPlanningModelQuery planning_query{
+      materialized.bundle->retained_bundle_id(), products.planning_collision_model.product_id};
+  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
+  const deployment::RetainedModelMapQuery map_query{materialized.bundle->retained_bundle_id(),
+                                                    products.symbol_role_maps.front().product_id};
+  const auto retained = load_lite6_planning_model(package_root, planning_query);
+  const auto model_map = load_lite6_model_map(package_root, map_query);
+  model_map.require_same_bundle_as(retained);
+
+  const core::ControllableComponentId component_id(
+      std::string(deployment::test::kLite6ControllableComponentId));
+  const core::CommandTargetId command_target_id(std::string(deployment::test::kLite6ArmTargetId));
+  const auto* arm_binding = model_map.find_binding(component_id, command_target_id);
+  const auto* arm_target = model_map.find_target(component_id, command_target_id);
+  ASSERT_NE(arm_binding, nullptr);
+  ASSERT_NE(arm_target, nullptr);
+  const auto arm_group =
+      std::find_if(arm_target->model_groups.begin(), arm_target->model_groups.end(),
+                   [](const deployment::CompositionTargetGroupResolution& group) {
+                     return group.model_group_role_id.value() == "planning_group";
+                   });
+  ASSERT_NE(arm_group, arm_target->model_groups.end());
+  const auto tcp_frame =
+      std::find_if(arm_target->frames.begin(), arm_target->frames.end(),
+                   [](const deployment::CompositionTargetFrameResolution& frame) {
+                     return frame.frame_role_id.value() == "tcp";
+                   });
+  ASSERT_NE(tcp_frame, arm_target->frames.end());
+  const auto* component_tcp =
+      std::get_if<deployment::CompositionComponentModelFrame>(&tcp_frame->frame);
+  ASSERT_NE(component_tcp, nullptr);
+  const std::string motion_link = component_tcp->compiled_frame_name;
+
+  std::vector<std::string> arm_joint_names;
+  for (const auto& resource : arm_binding->resources) {
+    ASSERT_EQ(resource.coordinates.size(), 1U);
+    EXPECT_FALSE(resource.coordinates.front().derived_mimic);
+    arm_joint_names.push_back(resource.coordinates.front().compiled_joint_name);
+  }
+  ASSERT_EQ(arm_joint_names.size(), 6U);
+
+  auto stage = RetainedPlanningModelStage::create_verified(retained, staging_parent);
+  ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
+  roboplan::Scene planning_scene("retained_lite6_cross_consumer",
+                                 std::string(stage.loader_urdf_bytes()),
+                                 std::string(stage.srdf_bytes()), stage.package_paths());
+  ManyForgeCollisionEngine collision_engine("retained_lite6_cross_consumer",
+                                            stage.loader_urdf_path(), stage.srdf_path(),
+                                            stage.package_paths(), arm_group->compiled_group_name);
+
+  const std::string robot_body_id = "robot/lite6/link/" + motion_link + "/collision/0";
+  const std::string fixture_body_id = "fixture/retained-model-obstacle/shape/0";
+  const auto make_box_geometry = [](const core::CollisionBodyId& body_id,
+                                    const core::CollisionOwnerKind owner_kind,
+                                    const double extent_m) {
+    core::CollisionGeometryDescriptor geometry;
+    geometry.body_id = body_id;
+    geometry.owner_kind = owner_kind;
+    geometry.geometry_kind = core::CollisionGeometryKind::kBox;
+    geometry.local_pose = core::Pose3DTO{{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+    geometry.box_dimensions_m = core::Vector3DTO{extent_m, extent_m, extent_m};
+    return geometry;
+  };
+  const auto make_snapshot = [&](const std::uint64_t revision_id, const double fixture_x_m,
+                                 const double fixture_extent_m) {
+    core::CollisionWorldBody robot_body;
+    robot_body.body_id = robot_body_id;
+    robot_body.owner_kind = core::CollisionOwnerKind::kRobotLink;
+    robot_body.frame_id = motion_link;
+    robot_body.pose = core::Pose3DTO{{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+    robot_body.geometries.push_back(
+        make_box_geometry(robot_body.body_id, robot_body.owner_kind, 0.05));
+
+    core::CollisionWorldBody fixture_body;
+    fixture_body.body_id = fixture_body_id;
+    fixture_body.owner_kind = core::CollisionOwnerKind::kFixture;
+    fixture_body.frame_id = "universe";
+    fixture_body.pose = core::Pose3DTO{{fixture_x_m, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+    fixture_body.geometries.push_back(
+        make_box_geometry(fixture_body.body_id, fixture_body.owner_kind, fixture_extent_m));
+
+    auto built = core::CollisionWorldSnapshotBuilder()
+                     .set_publisher_id("retained-lite6-cross-consumer")
+                     .set_revision_id(revision_id)
+                     .add_body(std::move(robot_body))
+                     .add_body(std::move(fixture_body))
+                     .build();
+    if (!built.ok()) {
+      throw std::logic_error("cannot construct retained-model parity snapshot: " +
+                             built.error().message);
+    }
+    return built.value();
+  };
+
+  std::set<std::string> retained_collision_frames;
+  for (const auto& geometry : planning_scene.getCollisionModel().geometryObjects) {
+    ASSERT_LT(geometry.parentFrame, planning_scene.getModel().frames.size());
+    retained_collision_frames.insert(planning_scene.getModel().frames[geometry.parentFrame].name);
+  }
+  const Eigen::Matrix4d identity = Eigen::Matrix4d::Identity();
+  const Eigen::Vector4d color(0.2, 0.4, 0.8, 1.0);
+  const std::string robot_proxy_name = "retained_model_robot_proxy";
+  const std::string fixture_name = "retained_model_world_fixture";
+  const auto added_proxy = planning_scene.addBoxGeometry(
+      robot_proxy_name, motion_link, roboplan::Box(0.05, 0.05, 0.05), identity, color);
+  ASSERT_TRUE(added_proxy.has_value()) << added_proxy.error();
+  for (const auto& retained_frame : retained_collision_frames) {
+    const auto disabled = planning_scene.setCollisions(retained_frame, robot_proxy_name, false);
+    ASSERT_TRUE(disabled.has_value()) << disabled.error();
+  }
+  const auto add_world_fixture = [&](const double x_m, const double extent_m) {
+    Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+    pose(0, 3) = x_m;
+    const auto added = planning_scene.addBoxGeometry(
+        fixture_name, "universe", roboplan::Box(extent_m, extent_m, extent_m), pose, color);
+    ASSERT_TRUE(added.has_value()) << added.error();
+    for (const auto& retained_frame : retained_collision_frames) {
+      const auto disabled = planning_scene.setCollisions(retained_frame, fixture_name, false);
+      ASSERT_TRUE(disabled.has_value()) << disabled.error();
+    }
+  };
+  add_world_fixture(10.0, 0.2);
+  auto snapshot = make_snapshot(1U, 10.0, 0.2);
+
+  const auto compare_configuration =
+      [&](std::string query_id, const std::vector<std::string>& names,
+          const std::vector<double>& values, const bool expected_collision) {
+        ASSERT_EQ(names.size(), values.size());
+        Eigen::VectorXd planning_positions = Eigen::VectorXd::Zero(planning_scene.getModel().nq);
+        for (std::size_t index = 0U; index < names.size(); ++index) {
+          const auto joint_id = planning_scene.getModel().getJointId(names[index]);
+          ASSERT_LT(joint_id, planning_scene.getModel().idx_qs.size());
+          planning_positions[planning_scene.getModel().idx_qs[joint_id]] = values[index];
+        }
+        const bool planning_collision = planning_scene.hasCollisions(planning_positions);
+
+        core::CollisionQuery query;
+        query.query_id = std::move(query_id);
+        query.collision_world_revision = snapshot.revision;
+        query.robot_state.joint_names = names;
+        query.robot_state.positions_rad = values;
+        const auto result = collision_engine.check(snapshot, query, core::CollisionPolicySnapshot{},
+                                                   core::CollisionCancellationToken{});
+        EXPECT_EQ(result.engine_status, core::CollisionEngineStatus::kOk);
+        EXPECT_EQ(result.in_collision, planning_collision);
+        EXPECT_EQ(result.decision, planning_collision ? core::CollisionDecisionResult::kFail
+                                                      : core::CollisionDecisionResult::kPass);
+        EXPECT_EQ(planning_collision, expected_collision);
+        if (expected_collision) {
+          ASSERT_EQ(result.normalized_pairs.size(), 1U);
+          EXPECT_EQ(result.normalized_pairs.front().body_a, fixture_body_id);
+          EXPECT_EQ(result.normalized_pairs.front().body_b, robot_body_id);
+        } else {
+          EXPECT_TRUE(result.normalized_pairs.empty());
+        }
+      };
+
+  const std::vector<double> home(arm_joint_names.size(), 0.0);
+  const std::vector<double> historical_rest{0.0, -0.785, 0.785, 0.0, 1.57, 0.0};
+  compare_configuration("lite6-home", arm_joint_names, home, false);
+  compare_configuration("lite6-historical-rest", arm_joint_names, historical_rest, false);
+
+  const std::string gripper_master =
+      compiled_symbol(model_map, deployment::OccurrenceSymbolKind::kJoint, "right_finger_joint");
+  compare_configuration("lite6-open-gripper", {gripper_master}, {0.004}, false);
+
+  const auto removed = planning_scene.removeGeometry(fixture_name);
+  ASSERT_TRUE(removed.has_value()) << removed.error();
+  add_world_fixture(0.0, 4.0);
+  snapshot = make_snapshot(2U, 0.0, 4.0);
+  compare_configuration("lite6-positive-collision", arm_joint_names, home, true);
 }
 
 }  // namespace

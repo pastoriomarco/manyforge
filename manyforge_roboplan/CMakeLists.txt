@@ -97,6 +97,28 @@ if(BUILD_TESTING)
     find_package(roboplan_simple_ik REQUIRED)
     find_package(roboplan_example_models REQUIRED)
 
+    # The I3 cross-consumer fixture proves that the authoritative collision
+    # engine imports the same retained model generation as RoboPlan. Keep this
+    # dependency test-only: neither production package may acquire the other
+    # consumer as a semantic owner.
+    if(NOT TARGET manyforge_collision)
+      set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
+      cmake_policy(PUSH)
+      cmake_policy(SET CMP0077 NEW)
+      set(BUILD_TESTING OFF)
+      add_subdirectory(
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_collision"
+        "${CMAKE_CURRENT_BINARY_DIR}/manyforge_collision")
+      cmake_policy(POP)
+      set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
+      unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
+    endif()
+    if(NOT TARGET manyforge_collision)
+      message(FATAL_ERROR
+        "I3 retained-model parity requires the authoritative collision "
+        "consumer target")
+    endif()
+
     set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
         "Per-test timeout for manyforge_roboplan gtest cases")
 
@@ -352,6 +374,7 @@ if(BUILD_TESTING)
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
     target_link_libraries(test_retained_product_consumer PRIVATE
       manyforge_roboplan_retained_consumer
+      manyforge_collision
       manyforge_deployment
       manyforge_deployment_admission
       roboplan::roboplan
