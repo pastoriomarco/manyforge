@@ -1,10 +1,17 @@
 # Composable Cell I2 Qualification
 
-Status: executable I2 qualification contract under development. Its historical
-first-add lineage is recorded separately as non-qualifying evidence under
-`historical_packet_lineage`. Formal evidence instead binds the complete current
-ManyForge and Specs trees through clean source identities, a detached source
-snapshot, manifest/verifier digests, final identity rechecks, and review.
+Status: **I2 qualification closed for the exact executable freeze.** Run
+`I2-FINAL-MATRIX-0EE506A-2E581C9-20260804T002627Z` passed all 30 lanes on
+ManyForge `0ee506a0d1c05006d2d0f5356cc93db17dca0b98` / tree
+`22de99ef24350e533616d899534914478cb53cee` and Specs
+`2e581c93bbb3d1dabd0d433959fa16f3aca70363` / tree
+`79ecf17d37dceb8dfc0e534a1fc4d5eba3778c95`. The final result, independent
+review, and `complete: true` closure SHA-256 values are respectively
+`15e5268f3205fd4dfc9db174f894db87e615c68e7468f2be9e72ec71063e0f7d`,
+`e4f9b99abd934f0dfb706dac651cd3d69718de313ab669dff63e797b18bd9b5d`,
+and `09a32b064dd42700919494fd22e3703abcab74b69d313aa7341a1e79eae47714`.
+Historical first-add lineage remains separately recorded as non-qualifying
+evidence under `historical_packet_lineage`.
 
 This directory contains the executable qualification contract for I2 of the
 Composable Cell Runtime Implementation Plan. Its historical atomic first-add
@@ -57,13 +64,12 @@ names. The base contains no parameterized or typed-test registrations. The
 three focused groups are exact name/filter subsets of those frozen full-suite
 registries; group overlap is intentional.
 
-The manifest is a gate, not evidence that I2 already passes. Development
-snapshots may be dirty, but no formal lane may start that way. Final evidence
-must resolve the contract and implementation from clean committed ManyForge
-and Specs trees and bind every lane result to those same identities. The
-recorded implementation base and historical first-add commit remain lineage
-evidence; neither substitutes for the current candidate identity or the final
-result-bound review and closure.
+The manifest alone is a gate, not qualification evidence. The closed I2 claim
+comes from the exact clean source identities, complete result, result-bound
+independent review, and closure receipt above. Future development snapshots
+may be dirty, but no formal replay may start that way. The recorded
+implementation base and historical first-add commit remain lineage evidence;
+neither substitutes for an exact candidate identity or result-bound closure.
 
 The contract intentionally qualifies only the pure ROS-free compiler and the
 `manyforge_core_py` pybind11 projection. It does not retain a product, start a
@@ -171,14 +177,22 @@ cumulative Docker executions to pass on the final source-frozen state.
 An automatic all-lane run always writes `complete: false`. After an independent
 adversarial review has produced a hash-bound
 `manyforge.composable_cell_i2.adversarial_review.v1` JSON record in the same
-run directory, verify and close that exact result with:
+run directory, verify and close that exact result with absolute paths because
+the verifier resolves evidence beneath the guarded qualification output root:
 
 ```bash
+run_dir="$(pwd)/.manyforge-var/qualification/composable-cell-i2/RUN"
 ./scripts/ci/run-composable-cell-i2-qualification.sh \
-  --verify-result .manyforge-var/qualification/composable-cell-i2/RUN/qualification-result.json \
-  --review .manyforge-var/qualification/composable-cell-i2/RUN/adversarial-review.json
+  --verify-result "${run_dir}/qualification-result.json" \
+  --review "${run_dir}/adversarial-review.json"
 ```
 
 Only the resulting `qualification-closure.json` may carry `complete: true`.
-Permanent Specs evidence records its digest and claim boundary; raw build/test
-artifacts remain ignored by repository policy.
+The final run's exact comparison command emitted no stdout; after closure
+correctly rejected its zero-byte host log, that ignored log received one
+explicit post-run annotation and only its result hash/size changed. The
+independent reviewer reconstructed the prior result byte-for-byte, rechecked
+all 30 logs, and rebound the review. No source, command, outcome, sealed
+artifact, or qualification claim changed. Permanent Specs evidence records
+the final digests and claim boundary; raw build/test artifacts remain ignored
+by repository policy.

@@ -6,13 +6,15 @@ product, assistant, and real-robot lanes described by historical material are
 not currently available on `dev`.
 
 > **`dev` migration status:** the composable-cell destructive implementation
-> window is active. The v2 node catalog and retained node-environment identity
-> are inspectable, but Composer program execution and all three product lanes
-> are intentionally unavailable while the old factory/runtime owner is
-> removed. Headless resolution returns at I5/H0, native execution at I6/N,
-> and Isaac/real operation at I9/I10. The launch recipes below describe the
-> last qualified baseline; they are not valid bring-up instructions for the
-> current `dev` branch.
+> window is active. I2's pure ROS-free compiler and `manyforge_core_py`
+> compiler/DTO projection are qualified at executable commit `0ee506a...`.
+> The v2 node catalog and retained node-environment identity are inspectable,
+> but Composer program execution and all three product lanes are intentionally
+> unavailable while the old factory/runtime owner is removed. Headless
+> resolution returns at I5/H0, native execution at I6/N, and Isaac/real
+> operation at I9/I10. The launch recipes below describe the last qualified
+> baseline; they are not valid bring-up instructions for the current `dev`
+> branch.
 
 > **For LLMs** (Claude, ChatGPT, agentic IDEs): read
 > [`AGENTS.md`](AGENTS.md) before making any change. It tells you what
@@ -112,12 +114,14 @@ The historical no-argument and `all` forms intentionally return
 product matrix and must not silently succeed after that matrix was narrowed.
 Use the named retained or focused selectors above.
 
-The current destructive `dev` checkpoint is not a full-suite qualification.
-The `bindings` selector now builds and tests the real ROS-free
-`manyforge_core_py` compiler surface and its generated API contract; it does
-not start processes or restore any runtime product. I2 still closes only at
-its exact source freeze and cumulative offline qualification. Runtime-dependent
-Python, Composer, ROS, and product-lane suites remain unavailable.
+The current destructive `dev` checkpoint is not a product-suite
+qualification. The `bindings` selector builds and tests the qualified ROS-free
+`manyforge_core_py` compiler surface and generated API contract. I2 closed on
+the exact executable commit `0ee506a0d1c05006d2d0f5356cc93db17dca0b98`,
+tree `22de99ef24350e533616d899534914478cb53cee`, after its complete cumulative
+offline matrix and independent closure review. That boundary does not start
+processes or restore any runtime product; runtime-dependent Python, Composer,
+ROS, and product-lane suites remain unavailable.
 
 The separate ROS Jazzy image remains a development toolchain for focused
 internal contracts. Such checks do not restore or qualify a ROS product:

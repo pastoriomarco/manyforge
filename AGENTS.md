@@ -6,9 +6,12 @@
 > where to find the canonical reference docs. Read referenced docs
 > before editing code or running scripts.
 
-> **Current `dev` cutover status:** only the retained ROS-free C++ package
-> qualifications, build-owned v2 node-environment inspection, and Composer's
-> structural catalog/files/URDF shell are available. Program execution,
+> **Current `dev` cutover status:** I2's pure ROS-free compiler and
+> `manyforge_core_py` compiler/DTO projection are qualified at executable
+> commit `0ee506a0d1c05006d2d0f5356cc93db17dca0b98`. The retained ROS-free C++
+> package qualifications, build-owned v2 node-environment inspection, and
+> Composer's structural catalog/files/URDF shell are also available. I2 does
+> not retain or run a product. Program execution,
 > assistant/MCP operation, live scene editing/viewing, native planning,
 > Isaac/ROS product launch, and real-robot operation are explicitly
 > unavailable. Do not run the historical recipes below or recreate their
@@ -83,6 +86,13 @@ docker compose run --rm dev bash # enter the dev container
 Hard requirements: Docker (with BuildKit), git, and ~10 GB disk for the Docker
 image. Host Python or build commands are not qualification evidence, and
 effectful product scripts must remain behind their typed cutover gates.
+
+The exact I2 compiler boundary closed on ManyForge commit
+`0ee506a0d1c05006d2d0f5356cc93db17dca0b98`, tree
+`22de99ef24350e533616d899534914478cb53cee`, through its complete 30-lane
+AMD64 qualification and result-bound independent review. The `bindings`
+selector is therefore a qualified compiler-only surface; it does not make any
+runtime or product lane available.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
