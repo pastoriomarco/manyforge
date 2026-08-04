@@ -12,6 +12,7 @@
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
+#include "control_domain_control_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
 #include "planning_resource_map_internal.hpp"
 
@@ -341,6 +342,19 @@ int main(int argc, char** argv) {
         *viewer,
         manyforge::deployment::detail::kPlanningResourceMapArtifactRole);
     const auto viewer_urdf = require_artifact(*viewer, "urdf");
+    const auto &control_groups =
+        materialized.bundle->value().compiled_products.control_domain_products;
+    if (control_groups.size() != 1U ||
+        control_groups.front().products.size() != 1U) {
+      throw std::runtime_error(
+          "generated retained Lite6 bundle has no exact control-domain "
+          "product");
+    }
+    const auto &control_group = control_groups.front();
+    const auto &control_product = control_group.products.front();
+    const auto control_artifact = require_artifact(
+        control_product,
+        manyforge::deployment::detail::kControlDomainControlArtifactRole);
     if (viewer_urdf.bytes() != model->urdf_bytes() ||
         viewer_urdf.artifact_ref() != planning.artifact_refs.back() ||
         viewer_resource_map.bytes() != planning_resource_map.bytes() ||
@@ -353,8 +367,10 @@ int main(int argc, char** argv) {
 
     const auto urdf_path = output_root / "retained-model.urdf";
     const auto srdf_path = output_root / "retained-model.srdf";
+    const auto control_path = output_root / "retained-control.json";
     write_exact_file(urdf_path, viewer_urdf.bytes());
     write_exact_file(srdf_path, model->srdf_bytes());
+    write_exact_file(control_path, control_artifact.bytes());
 
     const auto& symbol_products =
         materialized.bundle->value().compiled_products.symbol_role_maps;
@@ -391,25 +407,24 @@ int main(int argc, char** argv) {
 
     const CanonicalValue manifest(CanonicalValue::Object{
         {"api_version",
-         CanonicalValue(
-             "manyforge.i3.retained-consumer-fixture.v2")},
-        {"model_instance_id",
-         CanonicalValue("lite6_fixture_instance")},
+         CanonicalValue("manyforge.i3.retained-consumer-fixture.v3")},
+        {"model_instance_id", CanonicalValue("lite6_fixture_instance")},
         {"retained_bundle_id",
-         CanonicalValue(
-             materialized.bundle->retained_bundle_id().value())},
-        {"planning_product_id",
-         CanonicalValue(planning.product_id.value())},
-        {"viewer_product_id",
-         CanonicalValue(viewer->product_id.value())},
+         CanonicalValue(materialized.bundle->retained_bundle_id().value())},
+        {"planning_product_id", CanonicalValue(planning.product_id.value())},
+        {"viewer_product_id", CanonicalValue(viewer->product_id.value())},
         {"symbol_role_map_product_id",
          CanonicalValue(symbol_product.product_id.value())},
-        {"urdf_sha256",
-         CanonicalValue(manyforge::deployment::sha256_digest(
-             model->urdf_bytes()))},
-        {"srdf_sha256",
-         CanonicalValue(manyforge::deployment::sha256_digest(
-             model->srdf_bytes()))},
+        {"control_domain_id",
+         CanonicalValue(control_group.control_domain_id.value())},
+        {"control_product_id",
+         CanonicalValue(control_product.product_id.value())},
+        {"urdf_sha256", CanonicalValue(manyforge::deployment::sha256_digest(
+                            model->urdf_bytes()))},
+        {"srdf_sha256", CanonicalValue(manyforge::deployment::sha256_digest(
+                            model->srdf_bytes()))},
+        {"control_sha256", CanonicalValue(manyforge::deployment::sha256_digest(
+                               control_artifact.bytes()))},
         {"symbol_rewrites", project_symbols(*model_map)},
         {"coordinates", project_coordinates(*model_map)},
         {"control_binding_coordinate_maps",

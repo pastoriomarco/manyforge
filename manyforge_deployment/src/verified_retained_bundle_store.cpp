@@ -19,6 +19,7 @@
 #include <variant>
 #include <vector>
 
+#include "control_domain_control_internal.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/model_asset_codec.hpp"
@@ -812,14 +813,14 @@ void require_symbol_role_map_matches_retained_graph(
 }
 
 void require_verified_product_artifacts(
-    const std::filesystem::path& raw_data,
-    const core::RetainedProductDTO& product,
-    const core::CellGraphDTO& graph) {
-  for (const auto& artifact : product.artifact_refs) {
+    const std::filesystem::path &raw_data,
+    const core::RetainedProductDTO &product,
+    const core::RetainedBundleDTO &bundle,
+    const core::ControlDomainId *control_domain_subject = nullptr) {
+  for (const auto &artifact : product.artifact_refs) {
     const std::string bytes = read_verified_raw_reference(
-        raw_data, artifact.content_addressed_store_key,
-        artifact.content_digest, artifact.byte_size,
-        "retained product artifact reference");
+        raw_data, artifact.content_addressed_store_key, artifact.content_digest,
+        artifact.byte_size, "retained product artifact reference");
     if (product.product_kind == core::RetainedProductKind::kSymbolRoleMap) {
       if (artifact.artifact_role_id.value() !=
               detail::kComposedModelSymbolRoleMapArtifactRole ||
@@ -829,7 +830,21 @@ void require_verified_product_artifacts(
       }
       const CanonicalValue map =
           detail::parse_and_verify_composed_model_symbol_role_map(bytes);
-      require_symbol_role_map_matches_retained_graph(map, graph);
+      require_symbol_role_map_matches_retained_graph(map, bundle.cell_graph);
+    } else if (product.product_kind ==
+               core::RetainedProductKind::kControlDomainControl) {
+      if (artifact.artifact_role_id.value() !=
+              detail::kControlDomainControlArtifactRole ||
+          artifact.media_type != detail::kControlDomainControlMediaType) {
+        detail::fail_retained_bundle(
+            "control-domain product has an unexpected artifact role");
+      }
+      if (control_domain_subject == nullptr) {
+        detail::fail_retained_bundle(
+            "control-domain product is missing its envelope subject");
+      }
+      detail::require_control_domain_control_matches_retained_bundle(
+          bytes, bundle, *control_domain_subject);
     }
   }
 }
@@ -860,26 +875,23 @@ void require_verified_bundle_references(
   }
 
   const auto& products = value.compiled_products;
-  require_verified_product_artifacts(
-      raw_data, products.planning_collision_model, value.cell_graph);
+  require_verified_product_artifacts(raw_data,
+                                     products.planning_collision_model, value);
   if (products.viewer_model.has_value()) {
-    require_verified_product_artifacts(
-        raw_data, *products.viewer_model, value.cell_graph);
+    require_verified_product_artifacts(raw_data, *products.viewer_model, value);
   }
-  for (const auto& group : products.control_domain_products) {
-    for (const auto& product : group.products) {
-      require_verified_product_artifacts(raw_data, product,
-                                         value.cell_graph);
+  for (const auto &group : products.control_domain_products) {
+    for (const auto &product : group.products) {
+      require_verified_product_artifacts(raw_data, product, value,
+                                         &group.control_domain_id);
     }
   }
-  for (const auto& product : products.symbol_role_maps) {
-    require_verified_product_artifacts(raw_data, product,
-                                       value.cell_graph);
+  for (const auto &product : products.symbol_role_maps) {
+    require_verified_product_artifacts(raw_data, product, value);
   }
-  for (const auto& group : products.runtime_unit_products) {
-    for (const auto& product : group.products) {
-      require_verified_product_artifacts(raw_data, product,
-                                         value.cell_graph);
+  for (const auto &group : products.runtime_unit_products) {
+    for (const auto &product : group.products) {
+      require_verified_product_artifacts(raw_data, product, value);
     }
   }
 }
@@ -1353,13 +1365,36 @@ FilesystemVerifiedRetainedProductArtifactSource::get_verified(
     }
     const CanonicalValue map =
         detail::parse_and_verify_composed_model_symbol_role_map(bytes);
-    require_symbol_role_map_matches_retained_graph(
-        map, bundle->value().cell_graph);
+    require_symbol_role_map_matches_retained_graph(map,
+                                                   bundle->value().cell_graph);
+  } else if (product->product_kind ==
+             core::RetainedProductKind::kControlDomainControl) {
+    if (artifact->artifact_role_id.value() !=
+            detail::kControlDomainControlArtifactRole ||
+        artifact->media_type != detail::kControlDomainControlMediaType) {
+      detail::fail_retained_bundle(
+          "selected control-domain artifact has an incoherent contract");
+    }
+    const core::ControlDomainId *subject = nullptr;
+    for (const auto &group :
+         bundle->value().compiled_products.control_domain_products) {
+      if (std::any_of(
+              group.products.begin(), group.products.end(),
+              [&](const auto &candidate) { return &candidate == product; })) {
+        subject = &group.control_domain_id;
+        break;
+      }
+    }
+    if (subject == nullptr) {
+      detail::fail_retained_bundle(
+          "selected control-domain artifact lost its envelope subject");
+    }
+    detail::require_control_domain_control_matches_retained_bundle(
+        bytes, bundle->value(), *subject);
   }
-  return VerifiedRetainedProductArtifact(
-      query, product->product_contract_id,
-      product->product_contract_revision, *artifact,
-      std::move(bytes));
+  return VerifiedRetainedProductArtifact(query, product->product_contract_id,
+                                         product->product_contract_revision,
+                                         *artifact, std::move(bytes));
 }
 
 FilesystemVerifiedRetainedModelMapSource::

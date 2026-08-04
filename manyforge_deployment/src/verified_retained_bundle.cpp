@@ -15,6 +15,7 @@
 
 #include "compiler_semantic_limits_internal.hpp"
 #include "content_identity_internal.hpp"
+#include "control_domain_control_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/cell_graph_codec.hpp"
@@ -38,6 +39,7 @@ constexpr std::string_view kFlattenedModelPlacement =
 constexpr std::string_view kViewerModelContractId =
     "manyforge.viewer_model";
 constexpr std::string_view kViewerModelPlacement = "cell_viewer_model";
+constexpr std::string_view kControlDomainControlPlacement = "control_domain";
 constexpr std::string_view kSymbolRoleMapPlacement = "symbol_role_map";
 constexpr std::string_view kContentIdentityPrefix =
     "manyforge.content-identity.v1";
@@ -61,6 +63,11 @@ constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
         {detail::kPlanningResourceMapArtifactRole,
          detail::kPlanningResourceMapMediaType, true},
         {"urdf", "application/xml", true},
+    }};
+constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 1U>
+    kControlDomainControlArtifactRoles{{
+        {detail::kControlDomainControlArtifactRole,
+         detail::kControlDomainControlMediaType, true},
     }};
 constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 1U>
     kComposedModelSymbolRoleMapArtifactRoles{{
@@ -260,6 +267,14 @@ qualified_product_contract_state(
       placement == kViewerModelPlacement &&
       artifact_roles.data() == kViewerModelArtifactRoles.data() &&
       artifact_roles.size() == kViewerModelArtifactRoles.size()) {
+    static const QualifiedProductContractState state = build_state();
+    return state;
+  }
+  if (contract_id == detail::kControlDomainControlContractId &&
+      product_kind == core::RetainedProductKind::kControlDomainControl &&
+      placement == kControlDomainControlPlacement &&
+      artifact_roles.data() == kControlDomainControlArtifactRoles.data() &&
+      artifact_roles.size() == kControlDomainControlArtifactRoles.size()) {
     static const QualifiedProductContractState state = build_state();
     return state;
   }
@@ -987,10 +1002,56 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
         "viewer model does not reuse the exact planning resource map and "
         "compiled URDF");
   }
-  require_empty_array(
+  const auto &control_group_values = require_array(
       require_member(products, "control_domain_products",
                      "retained_bundle.compiled_products"),
       "retained_bundle.compiled_products.control_domain_products");
+  if (control_group_values.size() !=
+      verified_graph.graph().control_domains.size()) {
+    detail::fail_retained_bundle(
+        "retained control-domain product subjects do not equal the graph "
+        "control-domain set");
+  }
+  std::vector<core::RetainedControlDomainProductsDTO> control_domain_products;
+  control_domain_products.reserve(control_group_values.size());
+  for (std::size_t index = 0U; index < control_group_values.size(); ++index) {
+    const std::string path =
+        "retained_bundle.compiled_products.control_domain_products[" +
+        std::to_string(index) + "]";
+    const auto &group = require_object(control_group_values[index], path);
+    require_exact_fields(group, {"control_domain_id", "products"}, path);
+    const std::string &control_domain_id =
+        require_string(require_member(group, "control_domain_id", path),
+                       path + ".control_domain_id");
+    detail::require_retained_portable_identity(control_domain_id,
+                                               path + ".control_domain_id");
+    if (control_domain_id != verified_graph.graph()
+                                 .control_domains[index]
+                                 .control_domain_id.value()) {
+      detail::fail_retained_bundle(
+          "retained control-domain product groups are not the exact "
+          "canonical graph-domain table");
+    }
+    const auto &group_products = require_array(
+        require_member(group, "products", path), path + ".products");
+    if (group_products.size() != 1U) {
+      detail::fail_retained_bundle(
+          "each qualified control domain requires exactly one control "
+          "product");
+    }
+    core::RetainedProductDTO product = parse_retained_product(
+        group_products.front(), path + ".products[0]",
+        core::RetainedProductKind::kControlDomainControl);
+    if (product.product_id.value() !=
+        detail::control_domain_control_product_id(
+            core::ControlDomainId(control_domain_id))) {
+      detail::fail_retained_bundle(
+          "control-domain product has the wrong stable product ID");
+    }
+    control_domain_products.push_back(core::RetainedControlDomainProductsDTO{
+        core::ControlDomainId(control_domain_id),
+        std::vector<core::RetainedProductDTO>{std::move(product)}});
+  }
   const auto& symbol_role_map_values = require_array(
       require_member(products, "symbol_role_maps",
                      "retained_bundle.compiled_products"),
@@ -1064,9 +1125,14 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       require_array(require_member(provenance, "output_records",
                                    "retained_bundle.provenance"),
                     "retained_bundle.provenance.output_records");
-  std::vector<const core::RetainedProductDTO*> expected_outputs{
-      &planning, &viewer};
-  for (const auto& product : symbol_role_maps) {
+  std::vector<const core::RetainedProductDTO *> expected_outputs{&planning,
+                                                                 &viewer};
+  for (const auto &group : control_domain_products) {
+    for (const auto &product : group.products) {
+      expected_outputs.push_back(&product);
+    }
+  }
+  for (const auto &product : symbol_role_maps) {
     expected_outputs.push_back(&product);
   }
   std::sort(expected_outputs.begin(), expected_outputs.end(),
@@ -1138,7 +1204,7 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       core::RetainedCompiledProductsDTO{
           planning,
           viewer,
-          {},
+          control_domain_products,
           symbol_role_maps,
           {},
       },
@@ -1205,6 +1271,32 @@ const CanonicalValue& viewer_model_product_contract_descriptor() {
              kViewerModelContractId,
              core::RetainedProductKind::kViewerModel,
              kViewerModelPlacement, kViewerModelArtifactRoles)
+      .descriptor;
+}
+
+std::string_view control_domain_control_product_contract_id() noexcept {
+  return kControlDomainControlContractId;
+}
+
+const core::ProductContractRevision &
+control_domain_control_product_contract_revision() {
+  return qualified_product_contract_state(
+             kControlDomainControlContractId,
+             core::RetainedProductKind::kControlDomainControl,
+             kControlDomainControlPlacement, kControlDomainControlArtifactRoles)
+      .revision;
+}
+
+std::span<const QualifiedRetainedProductArtifactRole>
+control_domain_control_product_artifact_roles() noexcept {
+  return kControlDomainControlArtifactRoles;
+}
+
+const CanonicalValue &control_domain_control_product_contract_descriptor() {
+  return qualified_product_contract_state(
+             kControlDomainControlContractId,
+             core::RetainedProductKind::kControlDomainControl,
+             kControlDomainControlPlacement, kControlDomainControlArtifactRoles)
       .descriptor;
 }
 
@@ -1306,22 +1398,27 @@ void require_current_retained_product_conformance(
       product.product_kind ==
           core::RetainedProductKind::kPlanningCollisionModel) {
     artifact_roles = kFlattenedModelArtifactRoles;
-  } else if (
-      product.product_contract_id.value() == kViewerModelContractId &&
-      product.product_contract_revision ==
-          viewer_model_product_contract_revision() &&
-      product.product_kind == core::RetainedProductKind::kViewerModel) {
+  } else if (product.product_contract_id.value() == kViewerModelContractId &&
+             product.product_contract_revision ==
+                 viewer_model_product_contract_revision() &&
+             product.product_kind == core::RetainedProductKind::kViewerModel) {
     artifact_roles = kViewerModelArtifactRoles;
-  } else if (
-      product.product_contract_id.value() ==
-          kComposedModelSymbolRoleMapContractId &&
-      product.product_contract_revision ==
-          composed_model_symbol_role_map_product_contract_revision() &&
-      product.product_kind == core::RetainedProductKind::kSymbolRoleMap) {
+  } else if (product.product_contract_id.value() ==
+                 kControlDomainControlContractId &&
+             product.product_contract_revision ==
+                 control_domain_control_product_contract_revision() &&
+             product.product_kind ==
+                 core::RetainedProductKind::kControlDomainControl) {
+    artifact_roles = kControlDomainControlArtifactRoles;
+  } else if (product.product_contract_id.value() ==
+                 kComposedModelSymbolRoleMapContractId &&
+             product.product_contract_revision ==
+                 composed_model_symbol_role_map_product_contract_revision() &&
+             product.product_kind ==
+                 core::RetainedProductKind::kSymbolRoleMap) {
     artifact_roles = kComposedModelSymbolRoleMapArtifactRoles;
   } else {
-    fail_retained_bundle(
-        "retained product references an unqualified contract");
+    fail_retained_bundle("retained product references an unqualified contract");
   }
   if (product.artifact_refs.size() > artifact_roles.size()) {
     fail_retained_bundle(

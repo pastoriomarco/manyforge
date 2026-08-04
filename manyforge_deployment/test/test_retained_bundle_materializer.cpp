@@ -22,6 +22,7 @@
 #include "retained_bundle_internal.hpp"
 #include "composed_model_symbol_role_map_internal.hpp"
 #include "content_identity_internal.hpp"
+#include "control_domain_control_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_structural_retention_fixture.hpp"
 #include "planning_resource_map_internal.hpp"
@@ -199,6 +200,45 @@ static_assert(!std::is_constructible_v<
   }
   found->second = std::move(replacement);
   return CanonicalValue(std::move(object));
+}
+
+[[nodiscard]] CanonicalValue
+recompute_controller_configuration_digest(CanonicalValue controller) {
+  const std::string digest = detail::compute_content_identity(
+      controller,
+      detail::ContentIdentitySpec{
+          .identity_domain = "control-controller-configuration-digest",
+          .api_version = std::string(detail::kControlDomainControlApiVersion) +
+                         "#controller",
+          .own_field = "configuration_digest",
+          .root_shape = detail::ContentIdentityRootShape::kNestedRecord,
+      });
+  return replace_object_member(controller, "configuration_digest",
+                               CanonicalValue(digest));
+}
+
+[[nodiscard]] CanonicalValue
+recompute_control_source_conformance(CanonicalValue control) {
+  CanonicalValue preimage(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue("manyforge.control_source_conformance.v1")},
+      {"source_conformance_digest", CanonicalValue(std::string(kZeroDigest))},
+      {"bindings", member(control, "bindings")},
+      {"controllers", member(control, "controllers")},
+  });
+  const std::string digest = detail::compute_content_identity(
+      preimage, detail::ContentIdentitySpec{
+                    .identity_domain = "control-source-conformance-digest",
+                    .api_version = "manyforge.control_source_conformance.v1",
+                    .own_field = "source_conformance_digest",
+                });
+  CanonicalValue evidence(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue("manyforge.control_source_conformance.v1")},
+      {"source_conformance_digest", CanonicalValue(digest)},
+  });
+  return replace_object_member(control, "source_conformance",
+                               std::move(evidence));
 }
 
 [[nodiscard]] CanonicalValue replace_first_array_object_member(
@@ -600,8 +640,56 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(catalog_store.size(), 7U);
   ASSERT_EQ(bundle->value().desired_control_configurations.size(), 1U);
   EXPECT_TRUE(bundle->value().capability_provider_bindings.empty());
-  EXPECT_TRUE(
-      bundle->value().compiled_products.control_domain_products.empty());
+  ASSERT_EQ(bundle->value().compiled_products.control_domain_products.size(),
+            1U);
+  const auto &control_group =
+      bundle->value().compiled_products.control_domain_products.front();
+  EXPECT_EQ(control_group.control_domain_id.value(), test::kLite6ArmDomainId);
+  ASSERT_EQ(control_group.products.size(), 1U);
+  EXPECT_EQ(control_group.products.front().product_kind,
+            core::RetainedProductKind::kControlDomainControl);
+  EXPECT_EQ(control_group.products.front().product_contract_id.value(),
+            "manyforge.control_domain_control");
+  ASSERT_EQ(control_group.products.front().artifact_refs.size(), 1U);
+  EXPECT_EQ(control_group.products.front()
+                .artifact_refs.front()
+                .artifact_role_id.value(),
+            "control_domain_control");
+  const std::string control_bytes = require_product_artifact_bytes(
+      control_group.products.front(), detail::kControlDomainControlArtifactRole,
+      raw_store);
+  const CanonicalValue control =
+      detail::parse_and_verify_control_domain_control(control_bytes);
+  EXPECT_NO_THROW(detail::require_control_domain_control_matches(
+      control_bytes, fixture.qualified.compiler_ir(),
+      core::ControlDomainId(std::string(test::kLite6ArmDomainId))));
+  const auto chained_fixture =
+      test::make_lite6_chained_controllable_retention_fixture();
+  const std::string chained_bytes = detail::emit_control_domain_control(
+      chained_fixture.qualified.compiler_ir(),
+      core::ControlDomainId(std::string(test::kLite6ArmDomainId)));
+  EXPECT_THROW(detail::require_control_domain_control_matches(
+                   chained_bytes, fixture.qualified.compiler_ir(),
+                   core::ControlDomainId(std::string(test::kLite6ArmDomainId))),
+               RetainedBundleError);
+  EXPECT_THROW(
+      detail::require_control_domain_control_matches_retained_bundle(
+          chained_bytes, bundle->value(), control_group.control_domain_id),
+      RetainedBundleError);
+  ASSERT_EQ(array_member(control, "bindings").size(), 1U);
+  EXPECT_EQ(
+      array_member(array_member(control, "bindings").front(), "command_claims")
+          .size(),
+      6U);
+  EXPECT_EQ(
+      array_member(array_member(control, "bindings").front(), "state_claims")
+          .size(),
+      6U);
+  ASSERT_EQ(array_member(control, "controllers").size(), 1U);
+  EXPECT_EQ(string_member(member(array_member(control, "controllers").front(),
+                                 "implementation"),
+                          "implementation_id"),
+            "manyforge.ros2_control.joint_trajectory_controller.direct");
   EXPECT_TRUE(
       bundle->value().compiled_products.runtime_unit_products.empty());
   ASSERT_TRUE(bundle->value().compiled_products.viewer_model.has_value());
@@ -651,6 +739,117 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(array_member(targets.front(), "model_groups").size(), 1U);
   EXPECT_EQ(array_member(targets.front(), "frames").size(), 1U);
   EXPECT_EQ(array_member(targets.front(), "collision_bodies").size(), 1U);
+}
+
+TEST(ControlDomainControlVerifier,
+     SelfConsistentImplementationRelabelStillRejects) {
+  const auto direct = test::make_lite6_controllable_retention_fixture();
+  const auto chained =
+      test::make_lite6_chained_controllable_retention_fixture();
+  const core::ControlDomainId domain_id(std::string(test::kLite6ArmDomainId));
+  CanonicalValue direct_control =
+      detail::parse_and_verify_control_domain_control(
+          detail::emit_control_domain_control(direct.qualified.compiler_ir(),
+                                              domain_id));
+  const CanonicalValue chained_control =
+      detail::parse_and_verify_control_domain_control(
+          detail::emit_control_domain_control(chained.qualified.compiler_ir(),
+                                              domain_id));
+
+  CanonicalValue::Array direct_controllers =
+      array_member(direct_control, "controllers");
+  ASSERT_EQ(direct_controllers.size(), 1U);
+  const auto &chained_controllers =
+      array_member(chained_control, "controllers");
+  ASSERT_EQ(chained_controllers.size(), 2U);
+  ASSERT_EQ(string_member(chained_controllers[1], "controller_role_id"),
+            "trajectory");
+  direct_controllers.front() = recompute_controller_configuration_digest(
+      replace_object_member(direct_controllers.front(), "implementation",
+                            member(chained_controllers[1], "implementation")));
+  direct_control =
+      replace_object_member(std::move(direct_control), "controllers",
+                            CanonicalValue(std::move(direct_controllers)));
+  direct_control =
+      recompute_control_source_conformance(std::move(direct_control));
+
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_control_domain_control(
+          canonical_json(direct_control))),
+      RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
+     ChainedLite6RetainsOrderedJtcAdmittanceControllerProduct) {
+  const auto fixture =
+      test::make_lite6_chained_controllable_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  ASSERT_EQ(bundle->value().compiled_products.control_domain_products.size(),
+            1U);
+  const auto &product = bundle->value()
+                            .compiled_products.control_domain_products.front()
+                            .products.front();
+  const std::string bytes = require_product_artifact_bytes(
+      product, detail::kControlDomainControlArtifactRole, raw_store);
+  const CanonicalValue control =
+      detail::parse_and_verify_control_domain_control(bytes);
+  EXPECT_NO_THROW(detail::require_control_domain_control_matches(
+      bytes, fixture.qualified.compiler_ir(),
+      core::ControlDomainId(std::string(test::kLite6ArmDomainId))));
+
+  const auto &controllers = array_member(control, "controllers");
+  ASSERT_EQ(controllers.size(), 2U);
+  EXPECT_EQ(string_member(controllers[0], "controller_role_id"), "admittance");
+  EXPECT_EQ(string_member(member(controllers[0], "implementation"),
+                          "implementation_id"),
+            "manyforge.ros2_control.admittance_controller");
+  EXPECT_EQ(string_member(controllers[1], "controller_role_id"), "trajectory");
+  EXPECT_EQ(string_member(member(controllers[1], "implementation"),
+                          "implementation_id"),
+            "manyforge.ros2_control.joint_trajectory_controller.chainable");
+
+  const auto &routes = array_member(control, "routes");
+  ASSERT_EQ(routes.size(), 1U);
+  const auto &ordered_roles =
+      array_member(routes.front(), "controller_role_ids");
+  ASSERT_EQ(ordered_roles.size(), 2U);
+  EXPECT_EQ(std::get<std::string>(ordered_roles[0].storage()), "trajectory");
+  EXPECT_EQ(std::get<std::string>(ordered_roles[1].storage()), "admittance");
+  const auto &path_edges = array_member(routes.front(), "path_edges");
+  ASSERT_EQ(path_edges.size(), 1U);
+  EXPECT_EQ(array_member(path_edges.front(), "reference_interfaces").size(),
+            6U);
+  EXPECT_EQ(array_member(path_edges.front(), "state_interfaces").size(), 6U);
+  EXPECT_EQ(string_member(member(control, "desired_configuration"),
+                          "activation_set_id"),
+            "arm_chain");
+
+  test::InMemoryCatalogArtifactStoreFixture second_catalog_store;
+  test::InMemoryRawArtifactStoreFixture second_raw_store;
+  const auto regenerated = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), second_catalog_store,
+      second_raw_store);
+  ASSERT_NE(regenerated, nullptr);
+  EXPECT_EQ(regenerated->retained_bundle_id(), bundle->retained_bundle_id());
+  EXPECT_EQ(regenerated->canonical_bytes(), bundle->canonical_bytes());
+  EXPECT_EQ(require_product_artifact_bytes(
+                regenerated->value()
+                    .compiled_products.control_domain_products.front()
+                    .products.front(),
+                detail::kControlDomainControlArtifactRole, second_raw_store),
+            bytes);
 }
 
 TEST(RetainedBundleMaterializer,

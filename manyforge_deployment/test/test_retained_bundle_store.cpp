@@ -40,6 +40,7 @@
 
 #include "catalog_artifact_store_internal.hpp"
 #include "composed_model_symbol_role_map_internal.hpp"
+#include "control_domain_control_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_structural_retention_fixture.hpp"
 #include "planning_resource_map_internal.hpp"
@@ -1154,8 +1155,26 @@ TEST(FilesystemVerifiedRetainedModelMapSourceTest,
   ASSERT_EQ(reloaded->value().desired_control_configurations.size(), 1U);
   EXPECT_EQ(reloaded->value().catalogs.records.size(), 7U);
   EXPECT_EQ(reloaded->value().provenance.source_records.size(), 7U);
-  EXPECT_TRUE(
-      reloaded->value().compiled_products.control_domain_products.empty());
+  ASSERT_EQ(reloaded->value().compiled_products.control_domain_products.size(),
+            1U);
+  const auto &control_group =
+      reloaded->value().compiled_products.control_domain_products.front();
+  EXPECT_EQ(control_group.control_domain_id.value(), test::kLite6ArmDomainId);
+  ASSERT_EQ(control_group.products.size(), 1U);
+  const auto &control_product = control_group.products.front();
+  ASSERT_EQ(control_product.artifact_refs.size(), 1U);
+  const RetainedProductArtifactQuery control_query{
+      reloaded->retained_bundle_id(), control_product.product_id,
+      control_product.product_kind,
+      control_product.artifact_refs.front().artifact_role_id};
+  const FilesystemVerifiedRetainedProductArtifactSource artifact_source(
+      root.path());
+  const auto control_artifact = artifact_source.get_verified(control_query);
+  ASSERT_TRUE(control_artifact.has_value());
+  EXPECT_NO_THROW(
+      detail::require_control_domain_control_matches_retained_bundle(
+          control_artifact->bytes(), reloaded->value(),
+          control_group.control_domain_id));
   EXPECT_TRUE(
       reloaded->value().compiled_products.runtime_unit_products.empty());
 

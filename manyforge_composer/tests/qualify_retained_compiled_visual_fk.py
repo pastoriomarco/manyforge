@@ -71,7 +71,7 @@ def qualify(fixture_root: Path) -> None:
     urdf_bytes = urdf_path.read_bytes()
     srdf_bytes = (fixture_root / "retained-model.srdf").read_bytes()
     _require(
-        manifest["api_version"] == "manyforge.i3.retained-consumer-fixture.v2",
+        manifest["api_version"] == "manyforge.i3.retained-consumer-fixture.v3",
         "retained consumer fixture API version is not qualified",
     )
     _require(

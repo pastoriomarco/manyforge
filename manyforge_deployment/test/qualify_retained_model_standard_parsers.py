@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 from yourdfpy import URDF
 
 
-_MANIFEST_API_VERSION = "manyforge.i3.retained-consumer-fixture.v2"
+_MANIFEST_API_VERSION = "manyforge.i3.retained-consumer-fixture.v3"
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 
 
@@ -86,8 +86,11 @@ def _parse_manifest(data: bytes) -> dict[str, Any]:
             "planning_product_id",
             "viewer_product_id",
             "symbol_role_map_product_id",
+            "control_domain_id",
+            "control_product_id",
             "urdf_sha256",
             "srdf_sha256",
+            "control_sha256",
             "symbol_rewrites",
             "coordinates",
             "control_binding_coordinate_maps",
@@ -107,8 +110,11 @@ def _parse_manifest(data: bytes) -> dict[str, Any]:
         decoded["symbol_role_map_product_id"],
         "symbol_role_map_product_id",
     )
+    _required_text(decoded["control_domain_id"], "control_domain_id")
+    _required_text(decoded["control_product_id"], "control_product_id")
     _required_text(decoded["urdf_sha256"], "urdf_sha256")
     _required_text(decoded["srdf_sha256"], "srdf_sha256")
+    _required_text(decoded["control_sha256"], "control_sha256")
     _require(isinstance(decoded["symbol_rewrites"], list), "symbol_rewrites must be an array")
     _require(isinstance(decoded["coordinates"], list), "coordinates must be an array")
     _require(
@@ -122,6 +128,167 @@ def _parse_manifest(data: bytes) -> dict[str, Any]:
         "target_role_maps must contain the selected logical target",
     )
     return decoded
+
+
+def _parse_control_product(data: bytes, manifest: dict[str, Any]) -> dict[str, Any]:
+    try:
+        control = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise QualificationError(f"control product is invalid JSON: {error}") from error
+    _require(isinstance(control, dict), "control product root must be an object")
+    _exact_keys(
+        control,
+        {
+            "api_version",
+            "control_domain_id",
+            "control_domain_revision",
+            "controller_topology_id",
+            "topology_revision",
+            "control_coordinator_endpoint_role",
+            "containment_granularity",
+            "implementation_profile",
+            "desired_configuration",
+            "bindings",
+            "controllers",
+            "activation_sets",
+            "routes",
+            "source_conformance",
+        },
+        "control product",
+    )
+    _require(
+        control["api_version"] == "manyforge.control_domain_control.v1",
+        "control product API version differs",
+    )
+    _require(
+        control["control_domain_id"] == manifest["control_domain_id"],
+        "control product belongs to another retained domain",
+    )
+    for field in (
+        "control_domain_revision",
+        "controller_topology_id",
+        "topology_revision",
+        "control_coordinator_endpoint_role",
+        "containment_granularity",
+    ):
+        _required_text(control[field], f"control.{field}")
+
+    profile = control["implementation_profile"]
+    _require(isinstance(profile, dict), "control implementation profile must be an object")
+    _exact_keys(
+        profile,
+        {
+            "implementation_profile_id",
+            "implementation_profile_revision",
+            "generated_controller_manager_name",
+        },
+        "control implementation profile",
+    )
+    _require(
+        profile["implementation_profile_id"] == "manyforge.reference_ros2_control",
+        "control product selects another implementation profile",
+    )
+
+    manifest_binding = manifest["control_binding_coordinate_maps"][0]
+    expected_resources = {
+        (resource["resource_role_id"], resource["resource_id"])
+        for resource in manifest_binding["resources"]
+    }
+    bindings = control["bindings"]
+    _require(isinstance(bindings, list) and len(bindings) == 1, "control product must contain one binding")
+    binding = bindings[0]
+    _require(isinstance(binding, dict), "control binding must be an object")
+    _require(
+        binding["control_binding_id"] == manifest_binding["control_binding_id"],
+        "control product binding differs from the retained coordinate map",
+    )
+    for side in ("command_claims", "state_claims"):
+        claims = binding[side]
+        _require(isinstance(claims, list) and bool(claims), f"control binding {side} must be non-empty")
+        observed_resources: set[tuple[str, str]] = set()
+        observed_symbols: set[str] = set()
+        for index, claim in enumerate(claims):
+            _require(isinstance(claim, dict), f"{side}[{index}] must be an object")
+            _exact_keys(
+                claim,
+                {"resource_role_id", "resource_id", "interface_name", "logical_interface_symbol"},
+                f"{side}[{index}]",
+            )
+            observed_resources.add(
+                (
+                    _required_text(claim["resource_role_id"], f"{side}[{index}].resource_role_id"),
+                    _required_text(claim["resource_id"], f"{side}[{index}].resource_id"),
+                )
+            )
+            _require(claim["interface_name"] == "position", f"{side}[{index}] is not a position interface")
+            symbol = _required_text(claim["logical_interface_symbol"], f"{side}[{index}].logical_interface_symbol")
+            _require(symbol not in observed_symbols, f"{side} repeats logical symbol {symbol}")
+            observed_symbols.add(symbol)
+        _require(
+            observed_resources == expected_resources,
+            f"control binding {side} resources differ from the retained coordinate map",
+        )
+
+    controllers = control["controllers"]
+    _require(isinstance(controllers, list) and len(controllers) == 1, "direct control fixture must contain one controller")
+    controller = controllers[0]
+    _require(controller["controller_role_id"] == "hardware", "direct controller role differs")
+    implementation = controller["implementation"]
+    _require(isinstance(implementation, dict), "controller implementation must be an object")
+    _exact_keys(
+        implementation,
+        {"implementation_id", "implementation_revision", "implementation_type"},
+        "controller implementation",
+    )
+    _require(
+        implementation["implementation_id"]
+        == "manyforge.ros2_control.joint_trajectory_controller.direct",
+        "direct fixture selected the wrong controller implementation",
+    )
+    _require(
+        implementation["implementation_type"]
+        == "joint_trajectory_controller/JointTrajectoryController",
+        "direct fixture selected the wrong controller plugin type",
+    )
+
+    routes = control["routes"]
+    _require(isinstance(routes, list) and len(routes) == 1, "direct control fixture must contain one route")
+    route = routes[0]
+    _require(route["controller_role_ids"] == ["hardware"], "direct route changed controller order")
+    _require(route["path_edges"] == [], "direct route unexpectedly contains a chain edge")
+    endpoint_modes = {
+        endpoint["endpoint_role_id"]: (
+            endpoint["is_command_endpoint"],
+            endpoint["is_state_endpoint"],
+        )
+        for endpoint in route["endpoints"]
+    }
+    _require(
+        endpoint_modes == {"command": (True, False), "state": (False, True)},
+        "control route endpoint roles differ from the retained binding",
+    )
+    desired = control["desired_configuration"]
+    _require(desired["activation_set_id"] == "arm_direct", "direct desired activation differs")
+    _require(
+        desired["binding_routes"]
+        == [
+            {
+                "control_binding_id": binding["control_binding_id"],
+                "control_binding_revision": binding["control_binding_revision"],
+                "control_route_id": route["control_route_id"],
+            }
+        ],
+        "control desired route differs from its retained binding product",
+    )
+    conformance = control["source_conformance"]
+    _require(isinstance(conformance, dict), "control source conformance must be an object")
+    _exact_keys(conformance, {"api_version", "source_conformance_digest"}, "control source conformance")
+    _require(
+        conformance["api_version"] == "manyforge.control_source_conformance.v1",
+        "control source-conformance API differs",
+    )
+    _required_text(conformance["source_conformance_digest"], "control source-conformance digest")
+    return control
 
 
 @dataclass(frozen=True)
@@ -582,11 +749,18 @@ def main() -> int:
     manifest_bytes = _read_bounded_regular_file(root / "manifest.json", "fixture manifest")
     urdf_path = root / "retained-model.urdf"
     srdf_path = root / "retained-model.srdf"
+    control_path = root / "retained-control.json"
     urdf_bytes = _read_bounded_regular_file(urdf_path, "retained URDF")
     srdf_bytes = _read_bounded_regular_file(srdf_path, "retained SRDF")
+    control_bytes = _read_bounded_regular_file(control_path, "retained control product")
     manifest = _parse_manifest(manifest_bytes)
     _require(_sha256(urdf_bytes) == manifest["urdf_sha256"], "retained URDF digest differs from fixture manifest")
     _require(_sha256(srdf_bytes) == manifest["srdf_sha256"], "retained SRDF digest differs from fixture manifest")
+    _require(
+        _sha256(control_bytes) == manifest["control_sha256"],
+        "retained control-product digest differs from fixture manifest",
+    )
+    control = _parse_control_product(control_bytes, manifest)
 
     urdf = _parse_urdf_with_yourdfpy(urdf_bytes)
     _run_urdfdom(args.urdfdom_checker.resolve(strict=True), urdf_path, urdf.robot_name)
@@ -603,7 +777,8 @@ def main() -> int:
         "retained Lite6 ordinary-model qualification passed: "
         f"links={len(urdf.links)} joints={len(urdf.joints)} "
         f"groups={groups} states={states} end_effectors={end_effectors} "
-        f"disabled_pairs={disabled_pairs}"
+        f"disabled_pairs={disabled_pairs} "
+        f"controllers={len(control['controllers'])}"
     )
     return 0
 

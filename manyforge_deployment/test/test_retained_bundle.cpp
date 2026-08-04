@@ -208,10 +208,10 @@ void expect_no_thread_failures(
 } // namespace
 
 TEST(ProductContractRegistryTest,
-     QualifiesExactFlattenedViewerAndComposedSymbolMapContracts) {
+     QualifiesExactFlattenedViewerControlAndComposedSymbolMapContracts) {
   const auto &registry = build_qualified_product_contract_registry();
   const auto contracts = registry.contracts();
-  ASSERT_EQ(contracts.size(), 3U);
+  ASSERT_EQ(contracts.size(), 4U);
   const auto &contract = flattened_contract();
 
   EXPECT_EQ(contract.product_contract_id().value(),
@@ -307,6 +307,23 @@ TEST(ProductContractRegistryTest,
   EXPECT_EQ(registry.find(viewer.product_contract_id(),
                           viewer.product_contract_revision()),
             &viewer);
+
+  const auto control = std::find_if(
+      contracts.begin(), contracts.end(), [](const auto &candidate) {
+        return candidate.product_contract_id().value() ==
+               "manyforge.control_domain_control";
+      });
+  ASSERT_NE(control, contracts.end());
+  EXPECT_EQ(control->product_kind(),
+            core::RetainedProductKind::kControlDomainControl);
+  EXPECT_EQ(control->placement(), ProductPlacement::kControlDomain);
+  ASSERT_EQ(control->artifact_roles().size(), 1U);
+  EXPECT_EQ(control->artifact_roles().front().artifact_role_id.value(),
+            "control_domain_control");
+  EXPECT_EQ(control->artifact_roles().front().media_type,
+            "application/vnd.manyforge.control-domain-control+json");
+  EXPECT_EQ(control->artifact_roles().front().cardinality,
+            ProductArtifactCardinality::kRequiredExactlyOne);
 }
 
 TEST(RawArtifactStoreTest, UsesImmutableDigestKeysAndReverifiesReads) {

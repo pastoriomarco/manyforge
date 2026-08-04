@@ -66,6 +66,15 @@ BuildQualifiedProductContractRegistry::
       public_artifact_roles(detail::viewer_model_product_artifact_roles()),
       detail::viewer_model_product_contract_descriptor()));
   contracts_.push_back(BuildQualifiedProductContract(
+      core::ProductContractId(
+          std::string(detail::control_domain_control_product_contract_id())),
+      detail::control_domain_control_product_contract_revision(),
+      core::RetainedProductKind::kControlDomainControl,
+      ProductPlacement::kControlDomain,
+      public_artifact_roles(
+          detail::control_domain_control_product_artifact_roles()),
+      detail::control_domain_control_product_contract_descriptor()));
+  contracts_.push_back(BuildQualifiedProductContract(
       core::ProductContractId(std::string(
           detail::composed_model_symbol_role_map_product_contract_id())),
       detail::composed_model_symbol_role_map_product_contract_revision(),

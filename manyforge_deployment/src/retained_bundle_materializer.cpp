@@ -19,6 +19,7 @@
 #include "build_manifest_internal.hpp"
 #include "composed_model_symbol_role_map_internal.hpp"
 #include "content_identity_internal.hpp"
+#include "control_domain_control_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
 #include "manyforge_deployment/capability_definition_codec.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
@@ -89,6 +90,23 @@ require_composed_model_symbol_role_map_contract() {
   return *contract;
 }
 
+[[nodiscard]] const BuildQualifiedProductContract &
+require_control_domain_control_contract() {
+  const auto *contract = build_qualified_product_contract_registry().find(
+      core::ProductContractId(
+          std::string(detail::control_domain_control_product_contract_id())),
+      detail::control_domain_control_product_contract_revision());
+  if (contract == nullptr ||
+      contract->product_kind() !=
+          core::RetainedProductKind::kControlDomainControl ||
+      contract->placement() != ProductPlacement::kControlDomain) {
+    throw std::logic_error(
+        "build-qualified control-domain product contract is absent or "
+        "incoherent");
+  }
+  return *contract;
+}
+
 [[nodiscard]] CanonicalValue node_environment_projection(
     const core::RetainedNodeEnvironmentDTO& environment) {
   return CanonicalValue(CanonicalValue::Object{
@@ -154,7 +172,22 @@ require_composed_model_symbol_role_map_contract() {
 [[nodiscard]] CanonicalValue compiled_products_projection(
     const core::RetainedProductDTO& planning_collision_model,
     const core::RetainedProductDTO& viewer_model,
+    std::span<const core::RetainedControlDomainProductsDTO>
+        control_domain_products,
     std::span<const core::RetainedProductDTO> symbol_role_maps) {
+  CanonicalValue::Array control_products;
+  control_products.reserve(control_domain_products.size());
+  for (const auto &group : control_domain_products) {
+    CanonicalValue::Array products;
+    products.reserve(group.products.size());
+    for (const auto &product : group.products) {
+      products.push_back(detail::retained_product_projection(product));
+    }
+    control_products.emplace_back(CanonicalValue::Object{
+        {"control_domain_id", CanonicalValue(group.control_domain_id.value())},
+        {"products", CanonicalValue(std::move(products))},
+    });
+  }
   CanonicalValue::Array symbol_products;
   symbol_products.reserve(symbol_role_maps.size());
   for (const auto& product : symbol_role_maps) {
@@ -164,7 +197,7 @@ require_composed_model_symbol_role_map_contract() {
       {"planning_collision_model",
        detail::retained_product_projection(planning_collision_model)},
       {"viewer_model", detail::retained_product_projection(viewer_model)},
-      {"control_domain_products", CanonicalValue(CanonicalValue::Array{})},
+      {"control_domain_products", CanonicalValue(std::move(control_products))},
       {"symbol_role_maps", CanonicalValue(std::move(symbol_products))},
       {"runtime_unit_products", CanonicalValue(CanonicalValue::Array{})},
   });
@@ -210,15 +243,22 @@ require_composed_model_symbol_role_map_contract() {
 }
 
 [[nodiscard]] CanonicalValue provenance_projection(
-    const detail::BuildQualifiedRetentionContext& context,
+    const detail::BuildQualifiedRetentionContext &context,
     std::span<const core::RetainedSourceRecordDTO> source_records,
     std::span<const core::RetainedGeneratorRecordDTO> generator_records,
-    const core::RetainedProductDTO& planning_collision_model,
-    const core::RetainedProductDTO& viewer_model,
+    const core::RetainedProductDTO &planning_collision_model,
+    const core::RetainedProductDTO &viewer_model,
+    std::span<const core::RetainedControlDomainProductsDTO>
+        control_domain_products,
     std::span<const core::RetainedProductDTO> symbol_role_maps) {
-  std::vector<const core::RetainedProductDTO*> products{
+  std::vector<const core::RetainedProductDTO *> products{
       &planning_collision_model, &viewer_model};
-  for (const auto& product : symbol_role_maps) {
+  for (const auto &group : control_domain_products) {
+    for (const auto &product : group.products) {
+      products.push_back(&product);
+    }
+  }
+  for (const auto &product : symbol_role_maps) {
     products.push_back(&product);
   }
   std::sort(products.begin(), products.end(),
@@ -256,11 +296,12 @@ require_composed_model_symbol_role_map_contract() {
     std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts,
     std::vector<core::RetainedSourceRecordDTO> source_records,
     std::vector<core::RetainedGeneratorRecordDTO> generator_records,
-    const core::RetainedProductDTO& planning_collision_model,
-    const core::RetainedProductDTO& viewer_model,
+    const core::RetainedProductDTO &planning_collision_model,
+    const core::RetainedProductDTO &viewer_model,
+    std::vector<core::RetainedControlDomainProductsDTO> control_domain_products,
     std::vector<core::RetainedProductDTO> symbol_role_maps) {
-  const auto& deployment = qualified.deployment();
-  const auto& registry = build_qualified_closed_schema_registry();
+  const auto &deployment = qualified.deployment();
+  const auto &registry = build_qualified_closed_schema_registry();
   return core::RetainedBundleDTO{
       std::string(core::kRetainedBundleApiVersion),
       core::RetainedBundleId(std::string(retained_bundle_id)),
@@ -285,7 +326,7 @@ require_composed_model_symbol_role_map_contract() {
       core::RetainedCompiledProductsDTO{
           planning_collision_model,
           viewer_model,
-          {},
+          control_domain_products,
           symbol_role_maps,
           {},
       },
@@ -296,17 +337,28 @@ require_composed_model_symbol_role_map_contract() {
           std::move(generator_records),
           [&]() {
             std::vector<core::RetainedOutputRecordDTO> outputs;
-            outputs.reserve(2U + symbol_role_maps.size());
+            std::size_t control_product_count = 0U;
+            for (const auto &group : control_domain_products) {
+              control_product_count += group.products.size();
+            }
+            outputs.reserve(2U + control_product_count +
+                            symbol_role_maps.size());
             outputs.push_back(core::RetainedOutputRecordDTO{
                 planning_collision_model.product_id,
                 planning_collision_model.product_kind,
                 detail::retained_product_output_digest(
                     planning_collision_model)});
             outputs.push_back(core::RetainedOutputRecordDTO{
-                viewer_model.product_id,
-                viewer_model.product_kind,
+                viewer_model.product_id, viewer_model.product_kind,
                 detail::retained_product_output_digest(viewer_model)});
-            for (const auto& product : symbol_role_maps) {
+            for (const auto &group : control_domain_products) {
+              for (const auto &product : group.products) {
+                outputs.push_back(core::RetainedOutputRecordDTO{
+                    product.product_id, product.product_kind,
+                    detail::retained_product_output_digest(product)});
+              }
+            }
+            for (const auto &product : symbol_role_maps) {
               outputs.push_back(core::RetainedOutputRecordDTO{
                   product.product_id, product.product_kind,
                   detail::retained_product_output_digest(product)});
@@ -329,10 +381,12 @@ require_composed_model_symbol_role_map_contract() {
     std::span<const core::RetainedSchemaArtifactRefDTO> schema_artifacts,
     std::span<const core::RetainedSourceRecordDTO> source_records,
     std::span<const core::RetainedGeneratorRecordDTO> generator_records,
-    const core::RetainedProductDTO& planning_collision_model,
-    const core::RetainedProductDTO& viewer_model,
+    const core::RetainedProductDTO &planning_collision_model,
+    const core::RetainedProductDTO &viewer_model,
+    std::span<const core::RetainedControlDomainProductsDTO>
+        control_domain_products,
     std::span<const core::RetainedProductDTO> symbol_role_maps) {
-  const auto& deployment = qualified.deployment();
+  const auto &deployment = qualified.deployment();
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(core::kRetainedBundleApiVersion))},
@@ -356,11 +410,11 @@ require_composed_model_symbol_role_map_contract() {
       {"compiled_products",
        compiled_products_projection(planning_collision_model,
                                     viewer_model,
-                                    symbol_role_maps)},
+                                    control_domain_products, symbol_role_maps)},
       {"provenance",
        provenance_projection(context, source_records, generator_records,
                              planning_collision_model, viewer_model,
-                             symbol_role_maps)},
+                             control_domain_products, symbol_role_maps)},
   });
 }
 
@@ -389,6 +443,8 @@ struct PreparedPlanningCollisionProduct final {
   const BuildQualifiedProductContract* viewer_contract;
   std::optional<std::string> symbol_role_map;
   const BuildQualifiedProductContract* symbol_role_map_contract;
+  std::vector<detail::PreparedControlDomainArtifact> control_domain_artifacts;
+  const BuildQualifiedProductContract *control_domain_contract;
   std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts;
   std::vector<core::CatalogRecordKind> schema_artifact_kinds;
   std::vector<core::RetainedSourceRecordDTO> source_records;
@@ -569,6 +625,7 @@ void require_qualified_structural_subset_before_store(
     const auto& domain = graph.control_domains.front();
     const auto& binding = graph.control_bindings.front();
     const auto& desired = inputs.desired_control_configurations.front();
+    const std::size_t controller_count = applicability.controllers().size();
     if (composition.component_types().size() != 1U ||
         composition.control_binding_coordinate_maps().size() != 1U ||
         composition.targets().size() != 1U) {
@@ -620,7 +677,7 @@ void require_qualified_structural_subset_before_store(
         applicability.provider_manifests().size() != 1U ||
         applicability.stop_evidence_policies().size() != 1U ||
         applicability.binding_interfaces().size() != 1U ||
-        applicability.controllers().size() != 1U ||
+        (controller_count != 1U && controller_count != 2U) ||
         applicability.routes().size() != 1U ||
         applicability.capabilities().size() != 1U ||
         applicability.stop_applicability().size() != 1U ||
@@ -1048,12 +1105,39 @@ prepare_planning_collision_product_before_store(
         symbol_inputs);
     symbol_role_map_contract = &qualified_symbol_contract;
   }
-  // This bounded I3 slice retains the complete logical control selection and
-  // its generic symbol/role maps, but deliberately has no runtime unit from
-  // which a runtime/controller product could be qualified. The empty control
-  // and runtime product tables in the envelope are therefore an exact
-  // no-runtime condition, not a compatibility fallback or an implementation
-  // claim deferred behind this materializer.
+  std::vector<detail::PreparedControlDomainArtifact> control_domain_artifacts;
+  const BuildQualifiedProductContract *control_domain_contract = nullptr;
+  if (!composition.graph().control_domains.empty()) {
+    const auto &qualified_control_contract =
+        require_control_domain_control_contract();
+    control_domain_artifacts.reserve(
+        composition.graph().control_domains.size());
+    for (const auto &domain : composition.graph().control_domains) {
+      std::string control_bytes = detail::emit_control_domain_control(
+          qualified.compiler_ir(), domain.control_domain_id);
+      detail::require_control_domain_control_matches(
+          control_bytes, qualified.compiler_ir(), domain.control_domain_id);
+      const std::array<detail::RetainedArtifactInput, 1U> control_inputs{{
+          {core::ArtifactRoleId(
+               std::string(detail::kControlDomainControlArtifactRole)),
+           std::string(detail::kControlDomainControlMediaType), control_bytes},
+      }};
+      detail::preflight_retained_product(
+          core::ProductId(detail::control_domain_control_product_id(
+              domain.control_domain_id)),
+          core::RetainedProductKind::kControlDomainControl,
+          ProductPlacement::kControlDomain,
+          qualified_control_contract.product_contract_id(),
+          qualified_control_contract.product_contract_revision(),
+          control_inputs);
+      control_domain_artifacts.push_back(detail::PreparedControlDomainArtifact{
+          domain.control_domain_id, std::move(control_bytes)});
+    }
+    control_domain_contract = &qualified_control_contract;
+  }
+  // Runtime-unit products remain empty here because the currently qualified
+  // structural/control fixture has no RuntimeUnit. This is an exact graph
+  // condition, not a compatibility fallback or a runtime availability claim.
   std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts;
   std::vector<core::CatalogRecordKind> schema_artifact_kinds;
   schema_artifacts.reserve(schemas.size());
@@ -1083,6 +1167,8 @@ prepare_planning_collision_product_before_store(
       &viewer_contract,
       std::move(symbol_role_map),
       symbol_role_map_contract,
+      std::move(control_domain_artifacts),
+      control_domain_contract,
       std::move(schema_artifacts),
       std::move(schema_artifact_kinds),
       std::move(source_records),
@@ -1272,17 +1358,42 @@ void require_verified_current_bundle_artifacts(
     }
   }
 
-  const auto& products = value.compiled_products;
-  require_verified_product_artifact_readback(
-      products.planning_collision_model, artifact_store);
+  const auto &products = value.compiled_products;
+  require_verified_product_artifact_readback(products.planning_collision_model,
+                                             artifact_store);
   if (products.viewer_model.has_value()) {
-    require_verified_product_artifact_readback(
-        *products.viewer_model, artifact_store);
+    require_verified_product_artifact_readback(*products.viewer_model,
+                                               artifact_store);
   }
-  for (const auto& group : products.control_domain_products) {
-    for (const auto& product : group.products) {
-      require_verified_product_artifact_readback(product, artifact_store);
+  if (products.control_domain_products.size() !=
+      prepared.control_domain_artifacts.size()) {
+    throw std::logic_error(
+        "reloaded bundle changed control-domain product presence");
+  }
+  for (std::size_t index = 0U; index < products.control_domain_products.size();
+       ++index) {
+    const auto &group = products.control_domain_products[index];
+    const auto &expected = prepared.control_domain_artifacts[index];
+    if (group.control_domain_id != expected.control_domain_id ||
+        group.products.size() != 1U ||
+        group.products.front().artifact_refs.size() != 1U ||
+        group.products.front().artifact_refs.front().artifact_role_id.value() !=
+            detail::kControlDomainControlArtifactRole) {
+      throw std::logic_error(
+          "reloaded control-domain product has an incoherent subject or "
+          "artifact set");
     }
+    const auto &product = group.products.front();
+    require_verified_product_artifact_readback(product, artifact_store);
+    const auto &artifact = product.artifact_refs.front();
+    const auto bytes = artifact_store.get_verified(
+        artifact.content_addressed_store_key, artifact.content_digest,
+        artifact.byte_size);
+    if (!bytes.has_value() || *bytes != expected.bytes) {
+      throw std::runtime_error(
+          "reloaded control-domain product differs from its prepared bytes");
+    }
+    static_cast<void>(detail::parse_and_verify_control_domain_control(*bytes));
   }
   for (const auto& product : products.symbol_role_maps) {
     require_verified_product_artifact_readback(product, artifact_store);
@@ -1405,6 +1516,9 @@ detail::RetainedBundleMaterializer::materialize_prepared(
     const BuildQualifiedProductContract& viewer_contract,
     std::optional<std::string_view> symbol_role_map,
     const BuildQualifiedProductContract* symbol_role_map_contract,
+    std::span<const detail::PreparedControlDomainArtifact>
+        control_domain_artifacts,
+    const BuildQualifiedProductContract *control_domain_contract,
     std::span<const core::RetainedSchemaArtifactRefDTO> schema_artifacts,
     std::span<const core::RetainedSourceRecordDTO> source_records,
     std::span<const core::RetainedGeneratorRecordDTO> generator_records,
@@ -1476,9 +1590,48 @@ detail::RetainedBundleMaterializer::materialize_prepared(
         *readback, qualified.compiler_ir());
   }
 
+  if (control_domain_artifacts.empty() !=
+      (control_domain_contract == nullptr)) {
+    throw std::logic_error(
+        "control-domain artifact bytes and qualified contract must be "
+        "present together");
+  }
+  std::vector<core::RetainedControlDomainProductsDTO> control_domain_products;
+  control_domain_products.reserve(control_domain_artifacts.size());
+  for (const auto &input : control_domain_artifacts) {
+    detail::require_control_domain_control_matches(
+        input.bytes, qualified.compiler_ir(), input.control_domain_id);
+    const std::array<detail::RetainedArtifactInput, 1U> artifacts{{
+        {core::ArtifactRoleId(
+             std::string(detail::kControlDomainControlArtifactRole)),
+         std::string(detail::kControlDomainControlMediaType), input.bytes},
+    }};
+    core::RetainedProductDTO product = detail::build_and_retain_product(
+        core::ProductId(
+            detail::control_domain_control_product_id(input.control_domain_id)),
+        core::RetainedProductKind::kControlDomainControl,
+        ProductPlacement::kControlDomain,
+        control_domain_contract->product_contract_id(),
+        control_domain_contract->product_contract_revision(), artifacts,
+        artifact_store);
+    const auto readback = artifact_store.get_verified(
+        product.artifact_refs.front().content_addressed_store_key,
+        product.artifact_refs.front().content_digest,
+        product.artifact_refs.front().byte_size);
+    if (!readback.has_value()) {
+      throw std::runtime_error(
+          "control-domain raw artifact vanished after verified retention");
+    }
+    detail::require_control_domain_control_matches(
+        *readback, qualified.compiler_ir(), input.control_domain_id);
+    control_domain_products.push_back(core::RetainedControlDomainProductsDTO{
+        input.control_domain_id,
+        std::vector<core::RetainedProductDTO>{std::move(product)}});
+  }
+
   const CanonicalValue placeholder = retained_bundle_projection(
-      kZeroDigest, qualified, context, schema_artifacts,
-      source_records, generator_records, planning, viewer,
+      kZeroDigest, qualified, context, schema_artifacts, source_records,
+      generator_records, planning, viewer, control_domain_products,
       symbol_role_maps);
   const std::string retained_bundle_id = detail::compute_content_identity(
       placeholder,
@@ -1486,10 +1639,10 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           .identity_domain = "retained-bundle-id",
           .api_version = std::string(core::kRetainedBundleApiVersion),
           .own_field = "retained_bundle_id",
-  });
+      });
   CanonicalValue root = retained_bundle_projection(
-      retained_bundle_id, qualified, context, schema_artifacts,
-      source_records, generator_records, planning, viewer,
+      retained_bundle_id, qualified, context, schema_artifacts, source_records,
+      generator_records, planning, viewer, control_domain_products,
       symbol_role_maps);
   std::string bytes = canonical_json(root);
   core::RetainedBundleDTO value = retained_bundle_value(
@@ -1500,7 +1653,7 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           source_records.begin(), source_records.end()),
       std::vector<core::RetainedGeneratorRecordDTO>(
           generator_records.begin(), generator_records.end()),
-      planning, viewer, symbol_role_maps);
+      planning, viewer, control_domain_products, symbol_role_maps);
   auto bundle = detail::RetainedBundleConstructionAuthority::construct(
       core::RetainedBundleId(retained_bundle_id), std::move(value),
       std::move(root), std::move(bytes));
@@ -1539,7 +1692,8 @@ detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
       prepared.symbol_role_map.has_value()
           ? std::optional<std::string_view>(*prepared.symbol_role_map)
           : std::nullopt,
-      prepared.symbol_role_map_contract, prepared.schema_artifacts,
+      prepared.symbol_role_map_contract, prepared.control_domain_artifacts,
+      prepared.control_domain_contract, prepared.schema_artifacts,
       prepared.source_records, prepared.generator_records,
       artifact_store);
   (void)bundle_repository.put_if_absent(bundle);
@@ -1583,7 +1737,8 @@ detail::RetainedBundleMaterializer::materialize(
       prepared.symbol_role_map.has_value()
           ? std::optional<std::string_view>(*prepared.symbol_role_map)
           : std::nullopt,
-      prepared.symbol_role_map_contract, prepared.schema_artifacts,
+      prepared.symbol_role_map_contract, prepared.control_domain_artifacts,
+      prepared.control_domain_contract, prepared.schema_artifacts,
       prepared.source_records, prepared.generator_records,
       artifact_store);
 }

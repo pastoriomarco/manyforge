@@ -38,6 +38,15 @@ viewer_model_product_artifact_roles() noexcept;
 viewer_model_product_contract_descriptor();
 
 [[nodiscard]] std::string_view
+control_domain_control_product_contract_id() noexcept;
+[[nodiscard]] const core::ProductContractRevision &
+control_domain_control_product_contract_revision();
+[[nodiscard]] std::span<const QualifiedRetainedProductArtifactRole>
+control_domain_control_product_artifact_roles() noexcept;
+[[nodiscard]] const CanonicalValue &
+control_domain_control_product_contract_descriptor();
+
+[[nodiscard]] std::string_view
 composed_model_symbol_role_map_product_contract_id() noexcept;
 [[nodiscard]] const core::ProductContractRevision&
 composed_model_symbol_role_map_product_contract_revision();

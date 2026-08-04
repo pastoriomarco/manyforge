@@ -839,8 +839,7 @@ struct IdentityContractRow final {
            {"policies", CanonicalValue("reject-if-present")},
            {"compatibility", CanonicalValue("reject-if-present")},
            {"i3_retention_subset",
-            CanonicalValue(
-                "passive-model-only-with-composed-symbol-role-map")},
+            CanonicalValue("passive-or-one-bounded-controllable-component")},
        })},
       {"retained_projection_contract",
        CanonicalValue(CanonicalValue::Object{
@@ -858,15 +857,18 @@ struct IdentityContractRow final {
             CanonicalValue(sorted_text_values({
                 "manyforge.flattened_model",
                 "manyforge.composed_model_symbol_role_map",
+                "manyforge.control_domain_control",
+                "manyforge.viewer_model",
             }))},
-           {"qualified_product_placements",
-            CanonicalValue(sorted_text_values({
-                "cell_planning_collision_model",
-                "symbol_role_map",
-            }))},
+           {"qualified_product_placements", CanonicalValue(sorted_text_values({
+                                                "cell_planning_collision_model",
+                                                "cell_viewer_model",
+                                                "control_domain",
+                                                "symbol_role_map",
+                                            }))},
            {"canonical_empty_artifact_roles",
-            CanonicalValue(sorted_text_values(
-                {"planning_resource_map", "srdf", "urdf"}))},
+            CanonicalValue(
+                sorted_text_values({"planning_resource_map", "srdf", "urdf"}))},
            {"active_alias_owner", CanonicalValue("none")},
        })},
   });

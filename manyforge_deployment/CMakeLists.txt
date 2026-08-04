@@ -489,6 +489,7 @@ set(MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES
 add_library(manyforge_deployment_verification_core
   src/artifact_codec.cpp
   src/composed_model_symbol_role_map_verifier.cpp
+  src/control_domain_control_verifier.cpp
   src/cell_graph_codec.cpp
   src/closed_schema.cpp
   src/content_identity.cpp
@@ -527,6 +528,7 @@ add_library(manyforge_deployment
   src/cell_structure.cpp
   src/component_type_codec.cpp
   src/composed_model_symbol_role_map_internal.cpp
+  src/control_domain_control_internal.cpp
   src/control_interface_contract_codec.cpp
   src/controller_topology_codec.cpp
   src/mf2_joint_name_internal.cpp

@@ -155,7 +155,8 @@ struct QualifiedControlCatalog final {
   std::vector<Lite6InputArtifact> artifacts;
 };
 
-[[nodiscard]] inline QualifiedControlCatalog qualify_control_catalog() {
+[[nodiscard]] inline QualifiedControlCatalog
+qualify_control_catalog(bool chained) {
   const auto* descriptor =
       core::find_builtin_capability_definition("state.observed.current");
   if (descriptor == nullptr) {
@@ -342,50 +343,104 @@ struct QualifiedControlCatalog final {
            CanonicalValue(contract.value().control_interface_revision.value())},
           {"claimed_directions", text_array({"command", "state"})},
       });
+  const CanonicalValue topology_interface_claim(CanonicalValue::Object{
+      {"resource_role_id", CanonicalValue("joints")},
+      {"interface_name", CanonicalValue("position")},
+  });
+  const std::string topology_id = chained ? "lite6_arm_jtc_admittance_topology"
+                                          : "lite6_arm_direct_topology";
+  CanonicalValue::Array controllers;
+  CanonicalValue::Array chain_edges;
+  CanonicalValue::Array activation_sets;
+  CanonicalValue::Array legal_routes;
+  if (chained) {
+    controllers = CanonicalValue::Array{
+        CanonicalValue(CanonicalValue::Object{
+            {"controller_role_id", CanonicalValue("admittance")},
+            {"control_interface_claims",
+             CanonicalValue(CanonicalValue::Array{topology_contract_claim})},
+            {"exported_reference_interfaces",
+             CanonicalValue(CanonicalValue::Array{topology_interface_claim})},
+            {"exported_state_interfaces",
+             CanonicalValue(CanonicalValue::Array{topology_interface_claim})},
+        }),
+        CanonicalValue(CanonicalValue::Object{
+            {"controller_role_id", CanonicalValue("trajectory")},
+            {"control_interface_claims",
+             CanonicalValue(CanonicalValue::Array{})},
+            {"exported_reference_interfaces",
+             CanonicalValue(CanonicalValue::Array{})},
+            {"exported_state_interfaces",
+             CanonicalValue(CanonicalValue::Array{})},
+        }),
+    };
+    chain_edges = CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+        {"upstream_controller_role_id", CanonicalValue("trajectory")},
+        {"downstream_controller_role_id", CanonicalValue("admittance")},
+        {"reference_interfaces",
+         CanonicalValue(CanonicalValue::Array{topology_interface_claim})},
+        {"state_interfaces",
+         CanonicalValue(CanonicalValue::Array{topology_interface_claim})},
+    })};
+    activation_sets =
+        CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"activation_set_id", CanonicalValue("arm_chain")},
+            {"active_controller_role_ids",
+             text_array({"admittance", "trajectory"})},
+            {"active_chain_edges", CanonicalValue(CanonicalValue::Array{
+                                       CanonicalValue(CanonicalValue::Object{
+                                           {"upstream_controller_role_id",
+                                            CanonicalValue("trajectory")},
+                                           {"downstream_controller_role_id",
+                                            CanonicalValue("admittance")},
+                                       })})},
+        })};
+    legal_routes = CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+        {"control_route_id", CanonicalValue("arm_position")},
+        {"control_interface_contract_id",
+         CanonicalValue(
+             contract.value().control_interface_contract_id.value())},
+        {"control_interface_revision",
+         CanonicalValue(contract.value().control_interface_revision.value())},
+        {"ordered_controller_role_ids",
+         text_array({"trajectory", "admittance"})},
+        {"compatible_activation_set_ids", text_array({"arm_chain"})},
+    })};
+  } else {
+    controllers = CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+        {"controller_role_id", CanonicalValue("hardware")},
+        {"control_interface_claims",
+         CanonicalValue(CanonicalValue::Array{topology_contract_claim})},
+        {"exported_reference_interfaces",
+         CanonicalValue(CanonicalValue::Array{})},
+        {"exported_state_interfaces", CanonicalValue(CanonicalValue::Array{})},
+    })};
+    activation_sets =
+        CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"activation_set_id", CanonicalValue("arm_direct")},
+            {"active_controller_role_ids", text_array({"hardware"})},
+            {"active_chain_edges", CanonicalValue(CanonicalValue::Array{})},
+        })};
+    legal_routes = CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+        {"control_route_id", CanonicalValue("arm_position")},
+        {"control_interface_contract_id",
+         CanonicalValue(
+             contract.value().control_interface_contract_id.value())},
+        {"control_interface_revision",
+         CanonicalValue(contract.value().control_interface_revision.value())},
+        {"ordered_controller_role_ids", text_array({"hardware"})},
+        {"compatible_activation_set_ids", text_array({"arm_direct"})},
+    })};
+  }
   const std::string topology_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
           {"api_version",
            CanonicalValue(std::string(core::kControllerTopologyApiVersion))},
-          {"controller_topology_id",
-           CanonicalValue("lite6_arm_direct_topology")},
-          {"controllers",
-           CanonicalValue(CanonicalValue::Array{CanonicalValue(
-               CanonicalValue::Object{
-                   {"controller_role_id", CanonicalValue("hardware")},
-                   {"control_interface_claims",
-                    CanonicalValue(CanonicalValue::Array{
-                        topology_contract_claim})},
-                   {"exported_reference_interfaces",
-                    CanonicalValue(CanonicalValue::Array{})},
-                   {"exported_state_interfaces",
-                    CanonicalValue(CanonicalValue::Array{})},
-               })})},
-          {"chain_edges", CanonicalValue(CanonicalValue::Array{})},
-          {"activation_sets",
-           CanonicalValue(CanonicalValue::Array{CanonicalValue(
-               CanonicalValue::Object{
-                   {"activation_set_id", CanonicalValue("arm_direct")},
-                   {"active_controller_role_ids",
-                    text_array({"hardware"})},
-                   {"active_chain_edges",
-                    CanonicalValue(CanonicalValue::Array{})},
-               })})},
-          {"legal_routes",
-           CanonicalValue(CanonicalValue::Array{CanonicalValue(
-               CanonicalValue::Object{
-                   {"control_route_id", CanonicalValue("arm_position")},
-                   {"control_interface_contract_id",
-                    CanonicalValue(
-                        contract.value()
-                            .control_interface_contract_id.value())},
-                   {"control_interface_revision",
-                    CanonicalValue(
-                        contract.value().control_interface_revision.value())},
-                   {"ordered_controller_role_ids",
-                    text_array({"hardware"})},
-                   {"compatible_activation_set_ids",
-                    text_array({"arm_direct"})},
-               })})},
+          {"controller_topology_id", CanonicalValue(topology_id)},
+          {"controllers", CanonicalValue(std::move(controllers))},
+          {"chain_edges", CanonicalValue(std::move(chain_edges))},
+          {"activation_sets", CanonicalValue(std::move(activation_sets))},
+          {"legal_routes", CanonicalValue(std::move(legal_routes))},
       }),
       "catalog-record-revision/controller_topology",
       core::kControllerTopologyApiVersion, "topology_revision");
@@ -393,7 +448,7 @@ struct QualifiedControlCatalog final {
   const core::ContentAddressedStoreKey topology_key(
       catalog_key("topology", topology_digest.value()));
   const core::ControllerTopologyCatalogRecordRefDTO topology_ref{
-      core::ControllerTopologyId("lite6_arm_direct_topology"),
+      core::ControllerTopologyId(topology_id),
       core::TopologyRevision(
           revision_from_document(topology_bytes, "topology_revision")),
       core::SchemaId(std::string(core::kControllerTopologyApiVersion)),
@@ -472,21 +527,21 @@ struct QualifiedControlCatalog final {
 
   std::vector<Lite6InputArtifact> artifacts;
   artifacts.reserve(6U);
-  artifacts.push_back(catalog_artifact(
-      "catalog://capability/state.observed.current", capability_bytes,
-      capability));
-  artifacts.push_back(catalog_artifact(
-      "catalog://component_type/lite6_arm_component", component_bytes,
-      component_type));
-  artifacts.push_back(catalog_artifact(
-      "catalog://control_interface/lite6_arm_position", contract_bytes,
-      contract));
-  artifacts.push_back(catalog_artifact(
-      "catalog://controller_topology/lite6_arm_direct_topology",
-      topology_bytes, topology));
-  artifacts.push_back(catalog_artifact(
-      "catalog://provider_manifest/lite6_arm_provider", provider_bytes,
-      provider));
+  artifacts.push_back(
+      catalog_artifact("catalog://capability/state.observed.current",
+                       capability_bytes, capability));
+  artifacts.push_back(
+      catalog_artifact("catalog://component_type/lite6_arm_component",
+                       component_bytes, component_type));
+  artifacts.push_back(
+      catalog_artifact("catalog://control_interface/lite6_arm_position",
+                       contract_bytes, contract));
+  artifacts.push_back(
+      catalog_artifact("catalog://controller_topology/" + topology_id,
+                       topology_bytes, topology));
+  artifacts.push_back(
+      catalog_artifact("catalog://provider_manifest/lite6_arm_provider",
+                       provider_bytes, provider));
   artifacts.push_back(catalog_artifact(
       "catalog://stop_policy/lite6_not_stoppable", stop_bytes, stop));
 
@@ -657,7 +712,13 @@ make_applicability_inputs(const GraphRevisionVerifiedCellGraph& graph) {
                 CanonicalValue(domain.controller_topology_id.value())},
                {"topology_revision",
                 CanonicalValue(domain.topology_revision.value())},
-               {"activation_set_id", CanonicalValue("arm_direct")},
+               {"activation_set_id",
+                CanonicalValue(graph.graph()
+                                           .control_domains.front()
+                                           .controller_topology_id.value() ==
+                                       "lite6_arm_direct_topology"
+                                   ? "arm_direct"
+                                   : "arm_chain")},
                {"binding_routes",
                 CanonicalValue(CanonicalValue::Array{CanonicalValue(
                     CanonicalValue::Object{
@@ -681,10 +742,10 @@ make_applicability_inputs(const GraphRevisionVerifiedCellGraph& graph) {
 }  // namespace lite6_controllable_fixture_detail
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
-make_lite6_controllable_retention_fixture() {
+make_lite6_controllable_retention_fixture(bool chained = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   auto structural = make_lite6_structural_retention_fixture();
-  auto catalog = fixture_detail::qualify_control_catalog();
+  auto catalog = fixture_detail::qualify_control_catalog(chained);
   const auto graph = fixture_detail::make_graph(structural, catalog);
   const auto inputs = fixture_detail::make_applicability_inputs(graph);
 
@@ -711,11 +772,13 @@ make_lite6_controllable_retention_fixture() {
   const CanonicalValue deployment_value(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"deployment_artifact_id",
-       CanonicalValue("i3_lite6_controllable_fixture")},
+       CanonicalValue(chained ? "i3_lite6_chained_controllable_fixture"
+                              : "i3_lite6_controllable_fixture")},
       {"deployment_revision",
        CanonicalValue(std::string(fixture_detail::kZeroDigest))},
       {"cell_id", CanonicalValue(graph.graph().cell_id.value())},
-      {"name", CanonicalValue("I3 Lite6 controllable fixture")},
+      {"name", CanonicalValue(chained ? "I3 Lite6 chained controllable fixture"
+                                      : "I3 Lite6 controllable fixture")},
       {"catalogs", detail::encode_deployment_catalogs(catalog_records)},
       {"graph", CanonicalValue(std::move(deployment_graph))},
       {"desired_control_configurations",
@@ -764,6 +827,11 @@ make_lite6_controllable_retention_fixture() {
       std::move(catalog.artifacts),
       std::move(qualified),
   };
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_chained_controllable_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(true);
 }
 
 class Lite6ControllableCompilerInputArtifactSource final
