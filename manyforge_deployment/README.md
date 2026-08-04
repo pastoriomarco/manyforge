@@ -57,10 +57,10 @@ deployment blocks and unqualified catalog families fail before raw storage.
 Current limits are explicit:
 
 - I2's pure C++ compiler and atomic `manyforge_core_py` projection cutover are
-  qualified. Python remains a read-only projection over C++-owned values;
-  before any I3 Python product-authoring path exposes the three raw
-  applicability DTO convenience constructors, their iterable inputs must use
-  bounded ingestion with exact- and over-limit tests;
+  qualified. Python remains a read-only projection over C++-owned values; the
+  three raw applicability DTO convenience constructors now ingest iterables
+  incrementally and reject at the exact C++ limits, with exact- and over-limit
+  coverage;
 - C1.0 build-qualified retention authority is implemented: the closed v2
   node-environment, compiler-contract, and non-circular compiler-build
   manifests are produced by one non-caller-constructible authority, and the
@@ -96,13 +96,15 @@ Current limits are explicit:
   planning/collision `Scene`, including the semantic cell frame, zero
   coordinates, zero geometry/pairs, collision-query behavior, and
   deterministic reopen;
-- this does not complete I3 or the complete C1 exit. Current source covers the
-  planning/collision and composed-model symbol/role-map products, including
-  non-empty Lite6 cross-consumer regressions; viewer, control-domain, and
-  runtime-unit products, runtime manifests, extended provenance, remaining
-  cross-consumer equivalence, projection staging/runtime-shadow behavior, and
-  final cumulative I3 qualification remain open. Runtime selection and active
-  publication belong to I4; and
+- I3 and the current C1 exit are qualified at implementation freeze
+  `62df57ca76b55991c8ac01d3a316dfc8a3b450aa`. The closed current subset covers
+  planning/collision and composed-model maps, a distinct viewer projection,
+  per-domain control products, one reference manager-managed runtime-unit
+  manifest/artifact pair, complete retained provenance, cross-consumer
+  equivalence, and a sealed logical-snapshot projection input. Optional
+  assistant, policy, command-schema, contact, tool, and gripper semantics stay
+  rejected until their named owner slices extend both compiler and envelope.
+  Runtime selection and active publication belong to I4; and
 - Apply, active publication, process ownership, runtime convergence,
   simulation, controllers, execution, and lane restoration belong to later
   packages and plan checkpoints.

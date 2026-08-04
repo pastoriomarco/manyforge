@@ -8,10 +8,14 @@
 
 > **Current `dev` cutover status:** I2's pure ROS-free compiler and
 > `manyforge_core_py` compiler/DTO projection are qualified at executable
-> commit `0ee506a0d1c05006d2d0f5356cc93db17dca0b98`. The retained ROS-free C++
-> package qualifications, build-owned v2 node-environment inspection, and
-> Composer's structural catalog/files/URDF shell are also available. I2 does
-> not retain or run a product. Program execution,
+> commit `0ee506a0d1c05006d2d0f5356cc93db17dca0b98`. I3's ROS-free retained
+> deployment compiler is qualified at implementation freeze
+> `62df57ca76b55991c8ac01d3a316dfc8a3b450aa`: its immutable
+> planning/collision, viewer, control-domain, reference runtime-unit, and
+> projection-input products are deterministic, reloadable, and testable
+> offline. I3 does not Apply, select an active bundle, start a process, or run
+> a product. Composer's structural catalog/files/URDF shell is also available.
+> Program execution,
 > assistant/MCP operation, live scene editing/viewing, native planning,
 > Isaac/ROS product launch, and real-robot operation are explicitly
 > unavailable. Do not run the historical recipes below or recreate their
@@ -93,6 +97,14 @@ The exact I2 compiler boundary closed on ManyForge commit
 AMD64 qualification and result-bound independent review. The `bindings`
 selector is therefore a qualified compiler-only surface; it does not make any
 runtime or product lane available.
+
+The exact I3 implementation/identity freeze is ManyForge commit
+`62df57ca76b55991c8ac01d3a316dfc8a3b450aa`, tree
+`968422a59dd1216a0db07ec398c9f49b1a9ff7cc`. Its cumulative AMD64 Release,
+sanitizer, deterministic-regeneration, static-boundary, and adversarial checks
+passed. Later qualification-runner and documentation-only descendants do not
+change the retained products. I4 remains the first owner of operational Apply,
+active publication, and process convergence; no runtime lane is available.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
@@ -282,7 +294,7 @@ What lives where in this repo, and what it's for:
 | [`manyforge_content_identity/`](manyforge_content_identity/)             | Shared ROS-free RFC 8785 serialization and domain-separated content-digest primitives                                      |
 | [`manyforge_persistence/`](manyforge_persistence/)                       | Shared ROS-free mechanical durable-storage safety primitives; no semantic state ownership                                  |
 | [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free canonical-empty logical-scene owner foundation; no live scene surface                                               |
-| [`manyforge_deployment/`](manyforge_deployment/)                         | ROS-free composable-cell artifact decoding, identity, validation, and compiler substrate                                    |
+| [`manyforge_deployment/`](manyforge_deployment/)                         | Qualified ROS-free composable-cell compiler and immutable offline retained-product boundary                                 |
 | [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ Component Manager foundation; no operational Apply process                                                      |
 | [`manyforge_behavior/`](manyforge_behavior/)                             | Build-owned node catalog/environment inspection plus explicit runtime-unavailable boundaries                                |
 | [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
