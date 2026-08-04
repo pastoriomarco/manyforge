@@ -165,19 +165,23 @@ configure_file(
 
 add_library(manyforge_component_manager
   src/active_bundle_publication_store.cpp
+  src/apply_completion.cpp
   src/canonical_empty_bootstrap_coordinator.cpp
   src/durable_store_set.cpp
   src/manager_apply_fence_coordinator.cpp
+  src/manager_apply_fence_release_coordinator.cpp
   src/manager_apply_journal.cpp
   src/manager_runtime_convergence_coordinator.cpp
   src/manager_scene_activation_coordinator.cpp
   src/manager_scene_stage_coordinator.cpp
+  src/manager_selected_bundle_transition_coordinator.cpp
   src/manager_bootstrap_journal.cpp
   src/reference_runtime_unit_admission.cpp
   src/retained_posix_runtime_unit_adapter.cpp
   src/runtime_convergence.cpp
   src/runtime_observation.cpp
   src/scene_staging.cpp
+  src/selected_bundle_transition.cpp
   src/sqlite_store_startup_internal.cpp
 )
 add_library(

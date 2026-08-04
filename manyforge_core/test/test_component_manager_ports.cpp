@@ -112,32 +112,30 @@ static_assert(
     std::is_same_v<decltype(&IManagerSceneProjectionBootstrapPort::FinalizeProjectionBootstrap),
                    FinalizeBootstrapSignature>);
 
-using AcquireFenceSignature = ConfigurationFenceAcceptedDTO (
-    IManagerKernelApplyFenceAcquireRehydratePort::*)(const ApplyConfigurationFenceIntentDTO&);
+using AcquireFenceSignature = ConfigurationFenceAcceptedDTO (IManagerKernelApplyFencePort::*)(const ApplyConfigurationFenceIntentDTO&);
 using ReconcileFenceAttemptSignature = ApplyFenceAcquireAttemptReconcileResultDTO (
-    IManagerKernelApplyFenceAcquireRehydratePort::*)(const ApplyFenceAcquireAttemptQueryDTO&) const;
-using RehydrateFenceSignature = ApplyFenceReconcileResultDTO (
-    IManagerKernelApplyFenceAcquireRehydratePort::*)(const ApplyFenceRehydrateDTO&);
-static_assert(std::is_same_v<decltype(&IManagerKernelApplyFenceAcquireRehydratePort::Acquire),
+    IManagerKernelApplyFencePort::*)(const ApplyFenceAcquireAttemptQueryDTO&) const;
+using RehydrateFenceSignature = ApplyFenceReconcileResultDTO (IManagerKernelApplyFencePort::*)(const ApplyFenceRehydrateDTO&);
+using QueryFenceStatusSignature = ConfigurationFenceStatusDTO (IManagerKernelApplyFencePort::*)(
+    const ConfigurationFenceStatusQueryDTO&) const;
+using ReleaseFenceSignature = ConfigurationFenceReleasedDTO (IManagerKernelApplyFencePort::*)(
+    const ConfigurationFenceReleaseDTO&);
+static_assert(std::is_same_v<decltype(&IManagerKernelApplyFencePort::Acquire),
                              AcquireFenceSignature>);
 static_assert(
-    std::is_same_v<decltype(&IManagerKernelApplyFenceAcquireRehydratePort::ReconcileAcquireAttempt),
+    std::is_same_v<decltype(&IManagerKernelApplyFencePort::ReconcileAcquireAttempt),
                    ReconcileFenceAttemptSignature>);
-static_assert(std::is_same_v<decltype(&IManagerKernelApplyFenceAcquireRehydratePort::Rehydrate),
+static_assert(std::is_same_v<decltype(&IManagerKernelApplyFencePort::Rehydrate),
                              RehydrateFenceSignature>);
-
-template <typename T>
-concept ExposesFenceStatus = requires { &T::Status; };
-
-template <typename T>
-concept ExposesFenceRelease = requires { &T::CasRelease; };
+static_assert(std::is_same_v <decltype(&IManagerKernelApplyFencePort::QueryStatus),
+                             QueryFenceStatusSignature>);
+static_assert(
+    std::is_same_v<decltype( &IManagerKernelApplyFencePort::Release), ReleaseFenceSignature>);
 
 template <typename T>
 concept ExposesGenericStop = requires(T& value) { value.Stop(); };
 
-static_assert(!ExposesFenceStatus<IManagerKernelApplyFenceAcquireRehydratePort>);
-static_assert(!ExposesFenceRelease<IManagerKernelApplyFenceAcquireRehydratePort>);
-static_assert(!ExposesGenericStop<IManagerKernelApplyFenceAcquireRehydratePort>);
+static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
 
 [[nodiscard]] ProjectionRevisionDTO Projection(const char* bundle_digest = kDigest,
                                                const char* graph_digest = kDigest,
@@ -484,6 +482,44 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFenceAcquireRehydratePort>)
       RuntimeUnitId{"runtime.kernel"},       RuntimeEpoch{"kernel-runtime-2"},
       RequestOwnerEpoch{"kernel-epoch-1"},   ContentDigest{kDigest},
       ActiveBundlePublicationGeneration{4U},
+  };
+}
+
+[[nodiscard]] ConfigurationFenceReconciliationEvidenceDTO FenceReleaseEvidence() {
+  return ConfigurationFenceReconciliationEvidenceDTO{
+      ExecutionHostEpoch(),
+      ApplyFenceOwnerDTO{ApplyId{"apply-1"}, ApplyGeneration{1U}},
+      ConfigurationFenceId{"fence-1"},
+      ConfigurationFenceGeneration{1U},
+      FenceScope(),
+      8U,
+      GraphRevision{kOtherDigest},
+      Projection(kOtherDigest, kOtherDigest, 2U),
+      ActiveBundlePublicationGeneration{4U},
+      ContentDigest{kOtherDigest},
+      {{ControlDomainId{"domain.arm-a"}, ActiveControlConfigurationId{"active.arm-a-v2"},
+        ActiveControlConfigurationGeneration{10U}}},
+      0U,
+      0U,
+      ContentDigest{kDigest},
+  };
+}
+
+[[nodiscard]] ConfigurationFenceReleaseDTO FenceReleaseRequest() {
+  return {
+      FenceReleaseEvidence(),
+      RuntimeEpoch{"manager-epoch-2"},
+  };
+}
+
+[[nodiscard]] ConfigurationFenceStatusQueryDTO FenceStatusQuery() {
+  const auto evidence = FenceReleaseEvidence();
+  return {
+      evidence.owner_transaction,
+      evidence.configuration_fence_id,
+      evidence.configuration_fence_generation,
+      evidence.reconciled_scope,
+      RuntimeEpoch{"manager-epoch-2"},
   };
 }
 
@@ -1463,6 +1499,80 @@ TEST(ComponentManagerPortContracts, FenceAcceptanceMatchesExactScopeAndSuccessor
       ConfigurationFenceGeneration{std::numeric_limits<std::uint64_t>::max()};
   accepted.configuration_fence_generation = ConfigurationFenceGeneration{0U};
   EXPECT_FALSE(accepted.matches(intent));
+}
+
+TEST(ComponentManagerPortContracts, FenceReleaseRequiresExactReconciledIdleCandidateState) {
+  auto evidence = FenceReleaseEvidence();
+  EXPECT_TRUE(evidence.valid());
+  auto release = FenceReleaseRequest();
+  EXPECT_TRUE(release.valid());
+
+  evidence.active_graph_revision = GraphRevision{kDigest};
+  EXPECT_FALSE(evidence.valid());
+  evidence = FenceReleaseEvidence();
+  evidence.execution_host_epoch.publication_generation = ActiveBundlePublicationGeneration{3U};
+  EXPECT_FALSE(evidence.valid());
+  evidence = FenceReleaseEvidence();
+  evidence.active_control_configurations.clear();
+  EXPECT_FALSE(evidence.valid());
+  evidence = FenceReleaseEvidence();
+  evidence.affected_active_operation_count = 1U;
+  EXPECT_TRUE(evidence.valid());
+  release.reconciliation_evidence = evidence;
+  EXPECT_FALSE(release.valid());
+}
+
+TEST(ComponentManagerPortContracts, FenceStatusSeparatesHeldPendingAndExactReleasedEvidence) {
+  const auto query = FenceStatusQuery();
+  ConfigurationFenceStatusDTO status{
+      query,
+      FenceReleaseEvidence(),
+      ConfigurationFenceState::kHeld,
+      true,
+      std::nullopt,
+      "",
+      ContentDigest{kDigest},
+      std::nullopt,
+  };
+  EXPECT_TRUE(status.matches(query));
+
+  status.state = ConfigurationFenceState::kReleasePending;
+  EXPECT_FALSE(status.presence_valid());
+  status.required_compensation_or_operator_direction =
+      "keep admission fenced and reconcile the release ledger";
+  status.error = ErrorDTO{"fence_release_pending", "release uncertain", {}};
+  EXPECT_TRUE(status.presence_valid());
+
+  status.state = ConfigurationFenceState::kReleased;
+  status.admission_fenced = false;
+  status.required_compensation_or_operator_direction.clear();
+  status.error.reset();
+  status.release_receipt = ConfigurationFenceReleasedDTO{
+      FenceReleaseRequest(),       ExecutionHostEpoch(), 42, RequestReplayStatusDTO::kAcceptedNew,
+      ContentDigest{kOtherDigest},
+  };
+  EXPECT_TRUE(status.presence_valid());
+  status.release_receipt->request.manager_runtime_epoch = RuntimeEpoch{"foreign-manager"};
+  EXPECT_TRUE(status.presence_valid());
+  status.release_receipt->request.reconciliation_evidence.owner_transaction =
+      ApplyFenceOwnerDTO{ApplyId{"foreign"}, ApplyGeneration{1U}};
+  EXPECT_FALSE(status.presence_valid());
+  status.release_receipt = ConfigurationFenceReleasedDTO{
+      FenceReleaseRequest(),       ExecutionHostEpoch(), 42, RequestReplayStatusDTO::kAcceptedNew,
+      ContentDigest{kOtherDigest},
+  };
+  status.release_receipt->request.reconciliation_evidence.active_public_pointer_digest =
+      ContentDigest{kSceneIdDigest};
+  EXPECT_TRUE(status.release_receipt->valid());
+  EXPECT_FALSE(status.presence_valid());
+  status.release_receipt = ConfigurationFenceReleasedDTO{
+      FenceReleaseRequest(),       ExecutionHostEpoch(), 42, RequestReplayStatusDTO::kAcceptedNew,
+      ContentDigest{kOtherDigest},
+  };
+  status.release_receipt->request.reconciliation_evidence.reconciled_scope.resources = {
+      ResourceId{"different-resource"}};
+  EXPECT_TRUE(status.release_receipt->valid());
+  EXPECT_FALSE(status.presence_valid());
 }
 
 TEST(ComponentManagerPortContracts, FenceAttemptReconciliationHasOneRetryableNoResultState) {

@@ -139,6 +139,16 @@ void VerifyApplyInputs(const ManagerApplyIntentDTO& apply_intent, const Retained
       VerifyRuntimeProducts(predecessor, artifact_source, operating_system, shell_contract);
   auto candidate_plans =
       VerifyRuntimeProducts(candidate, artifact_source, operating_system, shell_contract);
+  for (const auto& [runtime_id, predecessor_row] : predecessor_plans) {
+    const auto candidate_row = candidate_plans.find(runtime_id);
+    if (candidate_row == candidate_plans.end()) {
+      Fail(
+          "runtime-unit removal is not qualified by the current I4 "
+          "command-surface retirement boundary: " +
+          runtime_id);
+    }
+    static_cast<void>(predecessor_row);
+  }
   std::vector<RuntimeUnitConvergencePlanRowDTO> result;
   result.reserve(candidate_plans.size());
   for (auto& [runtime_id, candidate_row] : candidate_plans) {

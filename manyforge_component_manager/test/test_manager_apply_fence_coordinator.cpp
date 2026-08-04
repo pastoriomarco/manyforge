@@ -1,4 +1,4 @@
-#include "manyforge_component_manager/manager_apply_fence_coordinator.hpp"
+
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -19,6 +19,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "manyforge_component_manager/manager_apply_fence_coordinator.hpp"
 
 #include "runtime_only_retention_fixture.hpp"
 
@@ -219,7 +221,7 @@ enum class ReconcileScript {
 };
 
 class ScriptedFencePort final
-    : public IManagerKernelApplyFenceAcquireRehydratePort {
+    : public IManagerKernelApplyFencePort {
 public:
   ScriptedFencePort(SqliteManagerApplyJournal &independent_reader,
                     ManagerApplyIntentDTO expected_intent)
@@ -353,6 +355,16 @@ public:
                                  : ContentDigest(std::string(kEvidenceDigest)),
         std::nullopt,
     };
+  }
+
+  [[nodiscard]] ConfigurationFenceStatusDTO QueryStatus(
+      const ConfigurationFenceStatusQueryDTO&) const override {
+    throw std::runtime_error("release status is outside this fixture");
+  }
+
+  [[nodiscard]] ConfigurationFenceReleasedDTO Release(
+      const ConfigurationFenceReleaseDTO&) override {
+    throw std::runtime_error("release is outside this fixture");
   }
 
   [[nodiscard]] std::optional<ApplyConfigurationFenceIntentDTO>

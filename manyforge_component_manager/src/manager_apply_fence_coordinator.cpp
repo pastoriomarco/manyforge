@@ -154,7 +154,7 @@ RecoveryQuery(const PersistedManagerApplyFenceAttempt &attempt,
 
 [[nodiscard]] ManagerApplyFenceAcceptanceWriteResult AcquireAndPersist(
     SqliteManagerApplyJournal &journal,
-    core::IManagerKernelApplyFenceAcquireRehydratePort &kernel_fence,
+    core::IManagerKernelApplyFencePort &kernel_fence,
     const PersistedManagerApplyFenceAttempt &attempt,
     const core::ApplyFenceAcquireAttemptQueryDTO &query,
     const std::optional<core::ApplyFenceAcquireAttemptReconcileResultDTO>
@@ -187,7 +187,7 @@ RecoveryQuery(const PersistedManagerApplyFenceAttempt &attempt,
 }
 
 [[nodiscard]] ManagerApplyFenceAcquireResult RehydrateAndFinish(
-    core::IManagerKernelApplyFenceAcquireRehydratePort &kernel_fence,
+    core::IManagerKernelApplyFencePort &kernel_fence,
     const core::RuntimeEpoch &manager_runtime_epoch,
     ManagerApplyIntentWriteResult durable_intent,
     ManagerApplyAffectedScopeWriteResult durable_affected_scope,
@@ -322,7 +322,7 @@ ManagerApplyFenceEffectUncertainError::observed_rehydration() const noexcept {
 
 ManagerApplyFenceCoordinator::ManagerApplyFenceCoordinator(
     SqliteManagerApplyJournal &apply_journal,
-    core::IManagerKernelApplyFenceAcquireRehydratePort &kernel_fence,
+    core::IManagerKernelApplyFencePort &kernel_fence,
     core::RuntimeEpoch manager_runtime_epoch)
     : apply_journal_(apply_journal), kernel_fence_(kernel_fence),
       manager_runtime_epoch_(std::move(manager_runtime_epoch)) {

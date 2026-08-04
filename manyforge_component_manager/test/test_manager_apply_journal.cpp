@@ -1,4 +1,4 @@
-#include "manyforge_component_manager/manager_apply_journal.hpp"
+
 
 #include <gtest/gtest.h>
 #include <sqlite3.h>
@@ -22,6 +22,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include "manyforge_component_manager/manager_apply_journal.hpp"
 
 namespace manyforge::component_manager {
 namespace {
@@ -451,6 +453,181 @@ SceneActivated(const PersistedManagerApplyActivationSelection &selection) {
   };
 }
 
+ManagerApplyPrivateMaterializationDTO PrivateMaterialization(
+    const PersistedManagerApplySceneActivated& activated) {
+  const auto& result = activated.scene_activated.activation_result;
+  return {
+      activated.scene_activated_digest,
+      result.apply_id,
+      result.apply_generation,
+      result.projection_stage_generation,
+      result.candidate_projection_revision,
+      ContentDigest(std::string(kDigestTwo)),
+      512U,
+  };
+}
+
+ManagerApplyObsoleteCommandSurfacesRetiredDTO RetiredCommandSurfaces(
+    const PersistedManagerApplyPrivateMaterialization& materialization) {
+  const auto& record = materialization.private_materialization;
+  return {
+      materialization.private_materialization_content_digest,
+      record.apply_id,
+      record.apply_generation,
+      {},
+  };
+}
+
+ManagerApplyPublicationReceiptDTO PublicationReceipt(
+    const PersistedManagerApplyPrivateMaterialization& materialization,
+    const PersistedManagerApplyObsoleteCommandSurfacesRetired& retired) {
+  const auto& record = materialization.private_materialization;
+  core::ActiveBundlePublicationRequestDTO request{
+      core::NamedApplyPublicationTransactionDTO{
+          record.apply_id,
+          record.apply_generation,
+          record.projection_stage_generation,
+      },
+      record.candidate_projection_revision,
+      record.candidate_projection_revision.retained_bundle_id,
+      record.candidate_projection_revision.graph_revision,
+      ActiveBundlePublicationGeneration(3U),
+      materialization.private_materialization_content_digest,
+      retired.obsolete_managed_command_surfaces_retired_evidence_digest,
+  };
+  return {
+      retired.obsolete_managed_command_surfaces_retired_evidence_digest,
+      core::ActiveBundlePublicationReceiptDTO{
+          std::move(request),
+          ActiveBundlePublicationGeneration(4U),
+          ContentDigest(std::string(kDigestOne)),
+      },
+  };
+}
+
+ManagerApplySceneFinalizedDTO SceneFinalized(
+    const PersistedManagerApplySceneActivated& activated,
+    const PersistedManagerApplyPublicationReceipt& publication) {
+  const auto& active = activated.scene_activated.activation_result;
+  auto transition = active.transition_evidence;
+  transition.state = ProjectionTransitionEvidenceState::kFinalized;
+  return {
+      publication.publication_receipt_digest,
+      core::ProjectionApplyFinalizeResultDTO{
+          active.apply_id,
+          active.apply_generation,
+          active.projection_stage_generation,
+          active.candidate_projection_revision,
+          publication.publication.publication_receipt,
+          core::ProjectionApplyFinalizeResultState::kFinalized,
+          active.candidate_projection_revision,
+          std::move(transition),
+          core::ProjectionAggregateHealthDTO{
+              core::NamedApplyProjectionSetSourceDTO{
+                  active.apply_id,
+                  active.apply_generation,
+                  active.projection_stage_generation,
+                  active.candidate_projection_revision,
+              },
+              ProjectionHealthState::kHealthy,
+              {},
+              std::nullopt,
+          },
+          std::nullopt,
+      },
+  };
+}
+
+struct SelectedBundleTransitionRecords final {
+  PersistedManagerApplySceneActivated activated;
+  PersistedManagerApplyPrivateMaterialization materialization;
+  PersistedManagerApplyObsoleteCommandSurfacesRetired retired;
+  PersistedManagerApplyPublicationReceipt publication;
+  PersistedManagerApplySceneFinalized finalized;
+};
+
+ManagerApplyFenceReleaseIntentDTO FenceReleaseIntent(
+    const SelectedBundleTransitionRecords& records,
+    const PersistedManagerApplyFenceAcceptance& acceptance) {
+  const auto& candidate =
+      records.finalized.scene_finalized.finalized_result.candidate_projection_revision;
+  core::ConfigurationFenceReconciliationEvidenceDTO evidence{
+      core::ExecutionHostEpochDTO{
+          RuntimeUnitId("kernel-runtime"),
+          RuntimeEpoch("kernel-epoch-1"),
+          RequestOwnerEpoch("kernel-owner-epoch-1"),
+          ContentDigest(std::string(kDigestTwo)),
+          ActiveBundlePublicationGeneration(4U),
+      },
+      core::ApplyFenceOwnerDTO{ApplyId("apply-1"), ApplyGeneration(1U)},
+      acceptance.accepted_fence.configuration_fence_id,
+      acceptance.accepted_fence.configuration_fence_generation,
+      acceptance.accepted_fence.captured_scope,
+      12U,
+      candidate.graph_revision,
+      candidate,
+      records.publication.publication.publication_receipt.publication_generation,
+      records.publication.publication.publication_receipt.durable_public_pointer_content_digest,
+      {{ControlDomainId("arm"), core::ActiveControlConfigurationId("trajectory-mode-v2"),
+        core::ActiveControlConfigurationGeneration(4U)}},
+      0U,
+      0U,
+      ContentDigest(std::string(kDigestOne)),
+  };
+  return {
+      records.finalized.scene_finalized_digest,
+      acceptance.acceptance_digest,
+      core::ConfigurationFenceReleaseDTO{std::move(evidence), RuntimeEpoch("manager-epoch-1")},
+  };
+}
+
+ManagerApplyFenceReleasedDTO FenceReleased(const PersistedManagerApplyFenceReleaseIntent& intent) {
+  const auto& request = intent.fence_release_intent.release_request;
+  return {
+      intent.fence_release_intent_digest,
+      core::ConfigurationFenceReleasedDTO{
+          request,
+          request.reconciliation_evidence.execution_host_epoch,
+          987654321LL,
+          core::RequestReplayStatusDTO::kAcceptedNew,
+          ContentDigest(std::string(kDigestTwo)),
+      },
+  };
+}
+
+ManagerApplyTerminalOutcomeDTO TerminalOutcome(const SelectedBundleTransitionRecords& records,
+                                               const PersistedManagerApplyFenceReleased& released) {
+  const auto& result = records.finalized.scene_finalized.finalized_result;
+  return {
+      result.apply_id,
+      result.apply_generation,
+      result.candidate_projection_revision,
+      records.publication.publication_receipt_digest,
+      records.finalized.scene_finalized_digest,
+      released.fence_released_digest,
+      ManagerApplyTerminalOutcomeState::kSucceeded,
+  };
+}
+
+struct ApplyCompletionRecords final {
+  PersistedManagerApplyFenceReleaseIntent release_intent;
+  PersistedManagerApplyFenceReleased released;
+  PersistedManagerApplyTerminalOutcome terminal;
+};
+
+ApplyCompletionRecords EnsureApplyCompletion(SqliteManagerApplyJournal& journal,
+                                             const SelectedBundleTransitionRecords& records) {
+  const auto acceptance = journal.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U));
+  if (!acceptance.has_value()) {
+    throw std::runtime_error("test fixture lacks fence acceptance");
+  }
+  const auto release_intent =
+      journal.EnsureFenceReleaseIntent(FenceReleaseIntent(records, *acceptance));
+  const auto released = journal.EnsureFenceReleased(FenceReleased(release_intent.record));
+  const auto terminal = journal.EnsureTerminalOutcome(TerminalOutcome(records, released.record));
+  return {release_intent.record, released.record, terminal.record};
+}
+
 struct AcceptedApplyRecords final {
   PersistedManagerApplyIntent intent;
   PersistedManagerApplyFenceAcceptance acceptance;
@@ -479,6 +656,27 @@ SceneParentRecords EnsureSceneParents(SqliteManagerApplyJournal &journal,
       runtime_intent.record.runtime_convergence_intent_digest, 1U,
       empty_runtime));
   return {staged_ready.record};
+}
+
+SelectedBundleTransitionRecords EnsureSelectedBundleTransition(SqliteManagerApplyJournal& journal) {
+  const auto parents = EnsureSceneParents(journal, true);
+  const auto stage_intent = journal.EnsureSceneStageIntent(
+      SceneStageIntent(parents.staged_ready.staged_ready_digest, true));
+  const auto staged =
+      journal.EnsureSceneStaged(SceneStaged(stage_intent.record.scene_stage_intent_digest, true));
+  const auto selection = journal.EnsureActivationSelection(ActivationSelection(staged.record));
+  const auto activated = journal.EnsureSceneActivated(SceneActivated(selection.record));
+  const auto materialization =
+      journal.EnsurePrivateMaterialization(PrivateMaterialization(activated.record));
+  const auto retired =
+      journal.EnsureObsoleteCommandSurfacesRetired(RetiredCommandSurfaces(materialization.record));
+  const auto publication =
+      journal.EnsurePublicationReceipt(PublicationReceipt(materialization.record, retired.record));
+  const auto finalized =
+      journal.EnsureSceneFinalized(SceneFinalized(activated.record, publication.record));
+  return {
+      activated.record,   materialization.record, retired.record,
+      publication.record, finalized.record,};
 }
 
 bool SameFenceIntent(const ApplyConfigurationFenceIntentDTO &lhs,
@@ -1940,6 +2138,209 @@ TEST(ManagerApplySceneJournal,
       activated->scene_activated, expected_activated->scene_activated));
   EXPECT_EQ(activated->scene_activated_digest,
             expected_activated->scene_activated_digest);
+}
+
+TEST(ManagerApplySelectedBundleJournal, PersistsCompleteForwardChainAndExactReplayAcrossRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "selected-bundle.sqlite3";
+  std::optional<SelectedBundleTransitionRecords> expected;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    expected = EnsureSelectedBundleTransition(journal);
+
+    const auto materialization =
+        journal.EnsurePrivateMaterialization(PrivateMaterialization(expected->activated));
+    EXPECT_FALSE(materialization.inserted);
+    EXPECT_EQ(materialization.record, expected->materialization);
+    const auto retired = journal.EnsureObsoleteCommandSurfacesRetired(
+        RetiredCommandSurfaces(expected->materialization));
+    EXPECT_FALSE(retired.inserted);
+    EXPECT_EQ(retired.record, expected->retired);
+    const auto publication = journal.EnsurePublicationReceipt(
+        PublicationReceipt(expected->materialization, expected->retired));
+    EXPECT_FALSE(publication.inserted);
+    EXPECT_EQ(publication.record, expected->publication);
+    const auto finalized =
+        journal.EnsureSceneFinalized(SceneFinalized(expected->activated, expected->publication));
+    EXPECT_FALSE(finalized.inserted);
+    EXPECT_TRUE(SameManagerApplySceneFinalized(finalized.record.scene_finalized,
+                                               expected->finalized.scene_finalized));
+    EXPECT_EQ(finalized.record.scene_finalized_digest, expected->finalized.scene_finalized_digest);
+
+    const auto report = journal.VerifyIntegrity();
+    EXPECT_EQ(report.private_materialization_count, 1);
+    EXPECT_EQ(report.retired_command_surfaces_count, 1);
+    EXPECT_EQ(report.publication_receipt_count, 1);
+    EXPECT_EQ(report.scene_finalized_count, 1);
+  }
+
+  ASSERT_TRUE(expected.has_value());
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  EXPECT_EQ(reopened.ReadPrivateMaterialization(ApplyId("apply-1"), ApplyGeneration(1U)),
+            expected->materialization);
+  EXPECT_EQ(reopened.ReadObsoleteCommandSurfacesRetired(ApplyId("apply-1"), ApplyGeneration(1U)),
+            expected->retired);
+  EXPECT_EQ(reopened.ReadPublicationReceipt(ApplyId("apply-1"), ApplyGeneration(1U)),
+            expected->publication);
+  const auto finalized = reopened.ReadSceneFinalized(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(finalized.has_value());
+  EXPECT_TRUE(SameManagerApplySceneFinalized(finalized->scene_finalized,
+                                             expected->finalized.scene_finalized));
+  EXPECT_EQ(finalized->scene_finalized_digest, expected->finalized.scene_finalized_digest);
+}
+
+TEST(ManagerApplySelectedBundleJournal, RejectsConflictingReplayAtEveryForwardBoundary) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "selected-bundle-conflict.sqlite3",
+                                    CellId("cell-1"));
+  const auto records = EnsureSelectedBundleTransition(journal);
+
+  auto materialization = PrivateMaterialization(records.activated);
+  materialization.retained_bundle_canonical_byte_size += 1U;
+  EXPECT_THROW(journal.EnsurePrivateMaterialization(materialization),
+               ManagerApplyJournalConflictError);
+
+  auto retired = RetiredCommandSurfaces(records.materialization);
+  retired.command_surfaces.push_back({
+      RuntimeUnitId("obsolete-runtime"),
+      RuntimeEpoch("obsolete-epoch"),
+      ContentDigest(std::string(kDigestOne)),
+      ContentDigest(std::string(kDigestTwo)),
+      1U,
+      ObsoleteManagedCommandSurfaceDisposition::kRetired,
+  });
+  EXPECT_THROW(journal.EnsureObsoleteCommandSurfacesRetired(retired),
+               ManagerApplyJournalConflictError);
+
+  auto publication = PublicationReceipt(records.materialization, records.retired);
+  publication.publication_receipt.durable_public_pointer_content_digest =
+      ContentDigest(std::string(kDigestTwo));
+  EXPECT_THROW(journal.EnsurePublicationReceipt(publication), ManagerApplyJournalConflictError);
+
+  auto finalized = SceneFinalized(records.activated, records.publication);
+  finalized.finalized_result.publication_receipt.durable_public_pointer_content_digest =
+      ContentDigest(std::string(kDigestTwo));
+  EXPECT_TRUE(finalized.valid());
+  EXPECT_THROW(journal.EnsureSceneFinalized(finalized), ManagerApplyJournalConflictError);
+}
+
+TEST(ManagerApplySelectedBundleJournal, DetectsForwardChainPayloadCorruptionOnRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "selected-bundle-corrupt.sqlite3";
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    static_cast<void>(EnsureSelectedBundleTransition(journal));
+  }
+  ExecSql(path,
+          "DROP TRIGGER manager_apply_private_materializations_no_update;"
+          "UPDATE manager_apply_private_materializations "
+          "SET retained_bundle_canonical_byte_size=513;"
+          "CREATE TRIGGER manager_apply_private_materializations_no_update "
+          "BEFORE UPDATE ON manager_apply_private_materializations BEGIN "
+          "SELECT RAISE(ABORT, 'manager_apply_private_materializations is "
+          "immutable'); END;");
+  EXPECT_THROW(SqliteManagerApplyJournal(path, CellId("cell-1")),
+               ManagerApplyJournalIntegrityError);
+}
+
+TEST(ManagerApplyCompletionJournal, PersistsReleaseAndTerminalChainWithExactRestartReplay) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "apply-completion.sqlite3";
+  std::optional<SelectedBundleTransitionRecords> transition;
+  std::optional<ApplyCompletionRecords> expected;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    transition = EnsureSelectedBundleTransition(journal);
+    expected = EnsureApplyCompletion(journal, *transition);
+
+    const auto acceptance = journal.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U));
+    ASSERT_TRUE(acceptance.has_value());
+    const auto release_intent =
+        journal.EnsureFenceReleaseIntent(FenceReleaseIntent(*transition, *acceptance));
+    EXPECT_FALSE(release_intent.inserted);
+    EXPECT_EQ(release_intent.record, expected->release_intent);
+    const auto released = journal.EnsureFenceReleased(FenceReleased(expected->release_intent));
+    EXPECT_FALSE(released.inserted);
+    EXPECT_EQ(released.record, expected->released);
+    const auto terminal =
+        journal.EnsureTerminalOutcome(TerminalOutcome(*transition, expected->released));
+    EXPECT_FALSE(terminal.inserted);
+    EXPECT_EQ(terminal.record, expected->terminal);
+
+    const auto report = journal.VerifyIntegrity();
+    EXPECT_EQ(report.fence_release_intent_count, 1);
+    EXPECT_EQ(report.fence_released_count, 1);
+    EXPECT_EQ(report.terminal_outcome_count, 1);
+  }
+
+  ASSERT_TRUE(expected.has_value());
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  EXPECT_EQ(reopened.ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U)),
+            expected->release_intent);
+  EXPECT_EQ(reopened.ReadFenceReleased(ApplyId("apply-1"), ApplyGeneration(1U)),
+            expected->released);
+  EXPECT_EQ(reopened.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U)),
+            expected->terminal);
+}
+
+TEST(ManagerApplyCompletionJournal, RejectsPrematureTerminalAndConflictingCompletionRecords) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "apply-completion-conflict.sqlite3",
+                                    CellId("cell-1"));
+  const auto transition = EnsureSelectedBundleTransition(journal);
+  const auto acceptance = journal.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(acceptance.has_value());
+  const auto release_intent =
+      journal.EnsureFenceReleaseIntent(FenceReleaseIntent(transition, *acceptance));
+  EXPECT_FALSE(journal.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U)).has_value());
+
+  auto impossible_terminal = ManagerApplyTerminalOutcomeDTO{
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      transition.finalized.scene_finalized.finalized_result.candidate_projection_revision,
+      transition.publication.publication_receipt_digest,
+      transition.finalized.scene_finalized_digest,
+      ContentDigest(std::string(kDigestOne)),
+      ManagerApplyTerminalOutcomeState::kSucceeded,
+  };
+  EXPECT_THROW(journal.EnsureTerminalOutcome(impossible_terminal),
+               ManagerApplyJournalConflictError);
+
+  auto conflicting_intent = FenceReleaseIntent(transition, *acceptance);
+  conflicting_intent.release_request.manager_runtime_epoch = RuntimeEpoch("manager-epoch-2");
+  EXPECT_THROW(journal.EnsureFenceReleaseIntent(conflicting_intent),
+               ManagerApplyJournalConflictError);
+
+  const auto released = journal.EnsureFenceReleased(FenceReleased(release_intent.record));
+  auto conflicting_release = FenceReleased(release_intent.record);
+  conflicting_release.released_fence.released_at_ns += 1;
+  EXPECT_THROW(journal.EnsureFenceReleased(conflicting_release), ManagerApplyJournalConflictError);
+
+  static_cast<void>(journal.EnsureTerminalOutcome(TerminalOutcome(transition, released.record)));
+  auto conflicting_terminal = TerminalOutcome(transition, released.record);
+  conflicting_terminal.publication_receipt_digest = ContentDigest(std::string(kDigestTwo));
+  EXPECT_THROW(journal.EnsureTerminalOutcome(conflicting_terminal),
+               ManagerApplyJournalConflictError);
+}
+
+TEST(ManagerApplyCompletionJournal, DetectsReleaseRequestPayloadCorruptionOnRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "apply-completion-corrupt.sqlite3";
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto transition = EnsureSelectedBundleTransition(journal);
+    static_cast<void>(EnsureApplyCompletion(journal, transition));
+  }
+  ExecSql(path,
+          "DROP TRIGGER manager_apply_fence_release_intents_no_update;"
+          "UPDATE manager_apply_fence_release_intents "
+          "SET release_request_encoding='0;';"
+          "CREATE TRIGGER manager_apply_fence_release_intents_no_update "
+          "BEFORE UPDATE ON manager_apply_fence_release_intents BEGIN "
+          "SELECT RAISE(ABORT, 'manager_apply_fence_release_intents is "
+          "immutable'); END;");
+  EXPECT_THROW(SqliteManagerApplyJournal(path, CellId("cell-1")),
+               ManagerApplyJournalIntegrityError);
 }
 
 TEST(ManagerApplySceneJournal,

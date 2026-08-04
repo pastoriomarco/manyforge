@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
@@ -371,6 +372,150 @@ struct ExecutionHostEpochDTO final {
   }
 
   friend bool operator==(const ExecutionHostEpochDTO&, const ExecutionHostEpochDTO&) = default;
+};
+
+/// Kernel-owned observation used to compare-and-swap an exact fence release.
+///
+/// It binds the fence identity and whole-Apply scope to the current Kernel
+/// incarnation, active projection/publication, candidate-domain control
+/// configurations, affected-operation counts, and an owner-computed digest.
+struct ConfigurationFenceReconciliationEvidenceDTO final {
+  ExecutionHostEpochDTO execution_host_epoch;
+  ApplyFenceOwnerDTO owner_transaction;
+  ConfigurationFenceId configuration_fence_id;
+  ConfigurationFenceGeneration configuration_fence_generation;
+  ConfigurationFenceScopeDTO reconciled_scope;
+  std::uint64_t operation_resource_generation;
+  GraphRevision active_graph_revision;
+  ProjectionRevisionDTO active_projection_revision;
+  ActiveBundlePublicationGeneration active_publication_generation;
+  ContentDigest active_public_pointer_digest;
+  std::vector<DomainActiveControlConfigurationDTO> active_control_configurations;
+  std::uint64_t affected_queued_operation_count;
+  std::uint64_t affected_active_operation_count;
+  ContentDigest evidence_digest;
+
+  [[nodiscard]] bool valid() const noexcept {
+    if (!execution_host_epoch.valid() || !owner_transaction.valid() ||
+        configuration_fence_id.empty() || !configuration_fence_generation.nonzero() ||
+        !reconciled_scope.valid() || active_graph_revision.empty() ||
+        !active_projection_revision.valid() ||
+        active_projection_revision.graph_revision != active_graph_revision ||
+        !active_publication_generation.nonzero() || active_public_pointer_digest.empty() ||
+        evidence_digest.empty() ||
+        execution_host_epoch.publication_generation != active_publication_generation) {
+      return false;
+    }
+
+    std::size_t configuration_index = 0U;
+    for (const auto& domain : reconciled_scope.domains) {
+      if (!domain.candidate_control_domain_revision.has_value()) {
+        continue;
+      }
+      if (configuration_index >= active_control_configurations.size()) {
+        return false;
+      }
+      const auto& configuration = active_control_configurations[configuration_index++];
+      if (!configuration.valid() || configuration.control_domain_id != domain.control_domain_id) {
+        return false;
+      }
+    }
+    return configuration_index == active_control_configurations.size();
+  }
+
+  friend bool operator==(const ConfigurationFenceReconciliationEvidenceDTO&,
+                         const ConfigurationFenceReconciliationEvidenceDTO&) = default;
+};
+
+/// Exact compare-and-swap release request. The evidence is obtained only from
+/// the Kernel status capability after scene Finalize is durable.
+struct ConfigurationFenceReleaseDTO final {
+  ConfigurationFenceReconciliationEvidenceDTO reconciliation_evidence;
+  RuntimeEpoch manager_runtime_epoch;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return reconciliation_evidence.valid() && !manager_runtime_epoch.empty() &&
+           reconciliation_evidence.affected_queued_operation_count == 0U &&
+           reconciliation_evidence.affected_active_operation_count == 0U;
+  }
+
+  friend bool operator==(const ConfigurationFenceReleaseDTO&,
+                         const ConfigurationFenceReleaseDTO&) = default;
+};
+
+struct ConfigurationFenceReleasedDTO final {
+  ConfigurationFenceReleaseDTO request;
+  ExecutionHostEpochDTO execution_host_epoch;
+  std::int64_t released_at_ns;
+  RequestReplayStatusDTO replay_status;
+  ContentDigest release_receipt_digest;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return request.valid() && execution_host_epoch.valid() &&
+           execution_host_epoch == request.reconciliation_evidence.execution_host_epoch &&
+           released_at_ns >= 0 && IsAcceptedRequestReplayStatus(replay_status) &&
+           !release_receipt_digest.empty();
+  }
+
+  friend bool operator==(const ConfigurationFenceReleasedDTO&,
+                         const ConfigurationFenceReleasedDTO&) = default;
+};
+
+struct ConfigurationFenceStatusQueryDTO final {
+  ApplyFenceOwnerDTO owner_transaction;
+  ConfigurationFenceId configuration_fence_id;
+  ConfigurationFenceGeneration configuration_fence_generation;
+  ConfigurationFenceScopeDTO expected_scope;
+  RuntimeEpoch manager_runtime_epoch;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return owner_transaction.valid() && !configuration_fence_id.empty() &&
+           configuration_fence_generation.nonzero() && expected_scope.valid() &&
+           !manager_runtime_epoch.empty();
+  }
+
+  friend bool operator==(const ConfigurationFenceStatusQueryDTO&,
+                         const ConfigurationFenceStatusQueryDTO&) = default;
+};
+
+struct ConfigurationFenceStatusDTO final {
+  ConfigurationFenceStatusQueryDTO echoed_query;
+  ConfigurationFenceReconciliationEvidenceDTO reconciliation_evidence;
+  ConfigurationFenceState state;
+  bool admission_fenced;
+  std::optional<ConfigurationFenceReleasedDTO> release_receipt;
+  std::string required_compensation_or_operator_direction;
+  ContentDigest result_digest;
+  std::optional<ErrorDTO> error;
+
+  [[nodiscard]] bool presence_valid() const noexcept {
+    if (!echoed_query.valid() || !reconciliation_evidence.valid() || result_digest.empty() ||
+        reconciliation_evidence.owner_transaction != echoed_query.owner_transaction ||
+        reconciliation_evidence.configuration_fence_id != echoed_query.configuration_fence_id ||
+        reconciliation_evidence.configuration_fence_generation !=
+            echoed_query.configuration_fence_generation ||
+        reconciliation_evidence.reconciled_scope != echoed_query.expected_scope ||
+        (error.has_value() && error->code.empty())) {
+      return false;
+    }
+    switch (state) {
+      case ConfigurationFenceState::kHeld:
+        return admission_fenced && !release_receipt.has_value() &&
+               required_compensation_or_operator_direction.empty() && !error.has_value();
+      case ConfigurationFenceState::kReleasePending:
+        return admission_fenced && !release_receipt.has_value() &&
+               !required_compensation_or_operator_direction.empty() && error.has_value();
+      case ConfigurationFenceState::kReleased:
+        return !admission_fenced && release_receipt.has_value() && release_receipt->valid() &&
+               release_receipt->request.reconciliation_evidence == reconciliation_evidence &&
+               required_compensation_or_operator_direction.empty() && !error.has_value();
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool matches(const ConfigurationFenceStatusQueryDTO& query) const noexcept {
+    return presence_valid() && query.valid() && echoed_query == query;
+  }
 };
 
 /// Exact durable Manager attempt used only to reconcile a lost Acquire

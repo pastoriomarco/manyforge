@@ -1,13 +1,12 @@
 #pragma once
 
+#include <manyforge_component_manager/manager_apply_journal.hpp>
+#include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
-
-#include <manyforge_component_manager/manager_apply_journal.hpp>
-#include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
-#include <manyforge_deployment/verified_retained_bundle.hpp>
 
 namespace manyforge::component_manager {
 
@@ -119,7 +118,7 @@ class ManagerApplyFenceCoordinator final {
 public:
   ManagerApplyFenceCoordinator(
       SqliteManagerApplyJournal &apply_journal,
-      manyforge::core::IManagerKernelApplyFenceAcquireRehydratePort
+      manyforge::core::IManagerKernelApplyFencePort
           &kernel_fence,
       manyforge::core::RuntimeEpoch manager_runtime_epoch);
 
@@ -135,7 +134,7 @@ public:
 
 private:
   SqliteManagerApplyJournal &apply_journal_;
-  manyforge::core::IManagerKernelApplyFenceAcquireRehydratePort &kernel_fence_;
+  manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   std::mutex operation_mutex_;
 };

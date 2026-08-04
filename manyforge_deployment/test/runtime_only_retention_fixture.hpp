@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include <manyforge_core/types/runtime_profile.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
@@ -11,8 +13,6 @@
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
-
-#include <cstdint>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -142,7 +142,8 @@ class RuntimeOnlyCompilerInputArtifactSource final
          "\",\"content_addressed_store_key\":\"" + store_key + "\"}]}";
 }
 
-[[nodiscard]] inline std::string runtime_only_provider_binding() {
+[[nodiscard]] inline std::string runtime_only_provider_binding(
+    std::string_view cell_id = "runtime_only_cell") {
   return "{\"capability_provider_binding_id\":\"runtime_only_provider\","
          "\"capability_provider_binding_revision\":\"" +
          std::string(kRuntimeOnlyZeroDigest) +
@@ -150,7 +151,9 @@ class RuntimeOnlyCompilerInputArtifactSource final
          "\"capability_definition_revision\":\"" +
          std::string(kRuntimeOnlyZeroDigest) +
          "\",\"scope\":\"cell_global\","
-         "\"target\":{\"cell_id\":\"runtime_only_cell\"},"
+         "\"target\":{\"cell_id\":\"" +
+         std::string(cell_id) +
+         "\"},"
          "\"provider_instance_id\":\"runtime_only_provider\","
          "\"provider_manifest_id\":\"runtime_only_manifest\","
          "\"provider_manifest_revision\":\"" +
@@ -162,7 +165,8 @@ class RuntimeOnlyCompilerInputArtifactSource final
     const QualifiedRuntimeProfile& profile,
     std::string graph = {},
     std::string catalogs = {},
-    std::string capability_provider_bindings = "[]") {
+    std::string capability_provider_bindings = "[]",
+    std::string_view cell_id = "runtime_only_cell") {
   if (graph.empty()) {
     graph = runtime_only_graph(profile);
   }
@@ -172,8 +176,8 @@ class RuntimeOnlyCompilerInputArtifactSource final
   return "{\"api_version\":\"manyforge.deployment.v1\","
          "\"deployment_artifact_id\":\"runtime_only_deployment\","
          "\"deployment_revision\":\"" +
-         std::string(kRuntimeOnlyZeroDigest) +
-         "\",\"cell_id\":\"runtime_only_cell\","
+         std::string(kRuntimeOnlyZeroDigest) + "\",\"cell_id\":\"" + std::string(cell_id) +
+         "\","
          "\"name\":\"Runtime-only retention fixture\","
          "\"catalogs\":" + std::move(catalogs) +
          ",\"graph\":" + std::move(graph) +
@@ -187,11 +191,12 @@ produce_runtime_only_deployment(
     const QualifiedRuntimeProfile& profile,
     std::string graph = {},
     std::string catalogs = {},
-    std::string capability_provider_bindings = "[]") {
+    std::string capability_provider_bindings = "[]",
+    std::string_view cell_id = "runtime_only_cell") {
   return compute_deployment_artifact_revision(
       parse_strict_json_model_yaml(runtime_only_deployment_document(
           profile, std::move(graph), std::move(catalogs),
-          std::move(capability_provider_bindings))),
+          std::move(capability_provider_bindings), cell_id)),
       std::span<const QualifiedRuntimeProfile>(&profile, 1U));
 }
 
@@ -212,9 +217,10 @@ produce_runtime_only_deployment(
 }
 
 [[nodiscard]] inline RuntimeOnlyRetentionFixture
-make_runtime_only_retention_fixture() {
+make_runtime_only_retention_fixture(
+    std::string_view cell_id = "runtime_only_cell") {
   auto profile = qualify_runtime_only_profile();
-  auto deployment = produce_runtime_only_deployment(profile);
+  auto deployment = produce_runtime_only_deployment(profile, {}, {}, "[]", cell_id);
   auto compiler = compile_runtime_only_deployment(deployment, profile);
   auto qualified =
       qualify_deployment_for_retention(deployment, compiler);

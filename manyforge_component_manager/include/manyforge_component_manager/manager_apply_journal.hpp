@@ -3,22 +3,23 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <manyforge_component_manager/apply_completion.hpp>
+#include <manyforge_component_manager/runtime_convergence.hpp>
+#include <manyforge_component_manager/scene_staging.hpp>
+#include <manyforge_component_manager/selected_bundle_transition.hpp>
+#include <manyforge_core/types/configuration_fence.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
-#include <manyforge_component_manager/runtime_convergence.hpp>
-#include <manyforge_component_manager/scene_staging.hpp>
-#include <manyforge_core/types/configuration_fence.hpp>
-#include <manyforge_core/types/projection_common.hpp>
-
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.i4.v5";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 5;
+    "manyforge.internal.component-manager.apply-journal.i4.v7";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 7;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -33,6 +34,17 @@ inline constexpr std::size_t kMaximumManagerApplySceneStagedRecords =
 inline constexpr std::size_t kMaximumManagerApplyActivationSelections =
     kMaximumManagerApplyIntents;
 inline constexpr std::size_t kMaximumManagerApplySceneActivatedRecords =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyPrivateMaterializations =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyRetiredCommandSurfaceRecords =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyPublicationReceipts = kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplySceneFinalizedRecords =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyFenceReleaseIntents = kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyFenceReleasedRecords = kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyTerminalOutcomes =
     kMaximumManagerApplyIntents;
 inline constexpr std::size_t kMaximumManagerApplyFenceComponents = 256U;
 inline constexpr std::size_t kMaximumManagerApplyFenceDomains = 64U;
@@ -249,6 +261,94 @@ struct ManagerApplySceneActivatedWriteResult final {
   bool inserted;
 };
 
+struct PersistedManagerApplyPrivateMaterialization final {
+  ManagerApplyPrivateMaterializationDTO private_materialization;
+  manyforge::core::ContentDigest private_materialization_content_digest;
+
+  friend bool operator==(const PersistedManagerApplyPrivateMaterialization&,
+                         const PersistedManagerApplyPrivateMaterialization&) = default;
+};
+
+struct ManagerApplyPrivateMaterializationWriteResult final {
+  PersistedManagerApplyPrivateMaterialization record;
+  bool inserted;
+};
+
+struct PersistedManagerApplyObsoleteCommandSurfacesRetired final {
+  ManagerApplyObsoleteCommandSurfacesRetiredDTO retired_command_surfaces;
+  manyforge::core::ContentDigest obsolete_managed_command_surfaces_retired_evidence_digest;
+
+  friend bool operator==(const PersistedManagerApplyObsoleteCommandSurfacesRetired&,
+                         const PersistedManagerApplyObsoleteCommandSurfacesRetired&) = default;
+};
+
+struct ManagerApplyObsoleteCommandSurfacesRetiredWriteResult final {
+  PersistedManagerApplyObsoleteCommandSurfacesRetired record;
+  bool inserted;
+};
+
+struct PersistedManagerApplyPublicationReceipt final {
+  ManagerApplyPublicationReceiptDTO publication;
+  manyforge::core::ContentDigest publication_receipt_digest;
+
+  friend bool operator==(const PersistedManagerApplyPublicationReceipt&,
+                         const PersistedManagerApplyPublicationReceipt&) = default;
+};
+
+struct ManagerApplyPublicationReceiptWriteResult final {
+  PersistedManagerApplyPublicationReceipt record;
+  bool inserted;
+};
+
+struct PersistedManagerApplySceneFinalized final {
+  ManagerApplySceneFinalizedDTO scene_finalized;
+  manyforge::core::ContentDigest scene_finalized_digest;
+};
+
+struct ManagerApplySceneFinalizedWriteResult final {
+  PersistedManagerApplySceneFinalized record;
+  bool inserted;
+};
+
+struct PersistedManagerApplyFenceReleaseIntent final {
+  ManagerApplyFenceReleaseIntentDTO fence_release_intent;
+  manyforge::core::ContentDigest fence_release_intent_digest;
+
+  friend bool operator==(const PersistedManagerApplyFenceReleaseIntent&,
+                         const PersistedManagerApplyFenceReleaseIntent&) = default;
+};
+
+struct ManagerApplyFenceReleaseIntentWriteResult final {
+  PersistedManagerApplyFenceReleaseIntent record;
+  bool inserted;
+};
+
+struct PersistedManagerApplyFenceReleased final {
+  ManagerApplyFenceReleasedDTO fence_released;
+  manyforge::core::ContentDigest fence_released_digest;
+
+  friend bool operator==(const PersistedManagerApplyFenceReleased&,
+                         const PersistedManagerApplyFenceReleased&) = default;
+};
+
+struct ManagerApplyFenceReleasedWriteResult final {
+  PersistedManagerApplyFenceReleased record;
+  bool inserted;
+};
+
+struct PersistedManagerApplyTerminalOutcome final {
+  ManagerApplyTerminalOutcomeDTO terminal_outcome;
+  manyforge::core::ContentDigest terminal_outcome_digest;
+
+  friend bool operator==(const PersistedManagerApplyTerminalOutcome&,
+                         const PersistedManagerApplyTerminalOutcome&) = default;
+};
+
+struct ManagerApplyTerminalOutcomeWriteResult final {
+  PersistedManagerApplyTerminalOutcome record;
+  bool inserted;
+};
+
 struct ManagerApplyJournalIntegrityReport final {
   manyforge::core::CellId cell_id;
   std::string schema_id;
@@ -266,23 +366,29 @@ struct ManagerApplyJournalIntegrityReport final {
   std::int64_t scene_staged_count;
   std::int64_t activation_selection_count;
   std::int64_t scene_activated_count;
+  std::int64_t private_materialization_count;
+  std::int64_t retired_command_surfaces_count;
+  std::int64_t publication_receipt_count;
+  std::int64_t scene_finalized_count;
+  std::int64_t fence_release_intent_count;
+  std::int64_t fence_released_count;
+  std::int64_t terminal_outcome_count;
 };
 
-/// Durable append-only owner of bounded named-Apply fence ordering evidence.
+/// Durable append-only owner of bounded named-Apply ordering evidence.
 ///
 /// Exact duplicate writes replay the original record. One public
 /// `(request_owner_epoch, request_id)` identifies exactly one immutable Apply
 /// intent. Reusing an Apply ID requires the next contiguous generation.
-/// Each Apply generation may then append one derived affected-scope record,
-/// digest-bound to its intent, one exact configuration-fence attempt bound to
-/// both records, and one complete successful acceptance bound to the attempt.
-/// Conflicts, gaps, corruption,
-/// foreign-cell databases, and resource-limit exhaustion fail before another
-/// journal write.
+/// Each Apply generation may append only the exact parent-linked records for
+/// affected scope, fence admission, runtime staged readiness, scene stage and
+/// activation, selected-bundle publication and Finalize, fence release, and
+/// terminal success. Conflicts, gaps, corruption, foreign-cell databases, and
+/// resource-limit exhaustion fail before another journal write.
 ///
-/// This focused journal owns no mutable Apply phase, external Kernel effect,
-/// process, native projection, scene mutation, active publication, or robot
-/// semantic.
+/// This journal owns no mutable phase row and performs no external Kernel,
+/// process, scene, publication, or robot effect. Those semantic owners return
+/// the exact evidence recorded here.
 class SqliteManagerApplyJournal final {
 public:
   SqliteManagerApplyJournal(std::filesystem::path database_path,
@@ -366,6 +472,43 @@ public:
   [[nodiscard]] std::optional<PersistedManagerApplySceneActivated>
   ReadSceneActivated(const manyforge::core::ApplyId &apply_id,
                      manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyPrivateMaterializationWriteResult EnsurePrivateMaterialization(
+      const ManagerApplyPrivateMaterializationDTO& private_materialization);
+  [[nodiscard]] std::optional<PersistedManagerApplyPrivateMaterialization>
+  ReadPrivateMaterialization(const manyforge::core::ApplyId& apply_id,
+                             manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyObsoleteCommandSurfacesRetiredWriteResult
+  EnsureObsoleteCommandSurfacesRetired(
+      const ManagerApplyObsoleteCommandSurfacesRetiredDTO& retired_command_surfaces);
+  [[nodiscard]]
+  std::optional<PersistedManagerApplyObsoleteCommandSurfacesRetired>
+  ReadObsoleteCommandSurfacesRetired(const manyforge::core::ApplyId& apply_id,
+                                     manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyPublicationReceiptWriteResult EnsurePublicationReceipt(
+      const ManagerApplyPublicationReceiptDTO& publication);
+  [[nodiscard]] std::optional<PersistedManagerApplyPublicationReceipt> ReadPublicationReceipt(
+      const manyforge::core::ApplyId& apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplySceneFinalizedWriteResult EnsureSceneFinalized(
+      const ManagerApplySceneFinalizedDTO& scene_finalized);
+  [[nodiscard]] std::optional<PersistedManagerApplySceneFinalized> ReadSceneFinalized(
+      const manyforge::core::ApplyId& apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyFenceReleaseIntentWriteResult EnsureFenceReleaseIntent(
+      const ManagerApplyFenceReleaseIntentDTO& fence_release_intent);
+  [[nodiscard]] std::optional<PersistedManagerApplyFenceReleaseIntent> ReadFenceReleaseIntent(
+      const manyforge::core::ApplyId& apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyFenceReleasedWriteResult EnsureFenceReleased(
+      const ManagerApplyFenceReleasedDTO& fence_released);
+  [[nodiscard]] std::optional<PersistedManagerApplyFenceReleased> ReadFenceReleased(
+      const manyforge::core::ApplyId& apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyTerminalOutcomeWriteResult EnsureTerminalOutcome(
+      const ManagerApplyTerminalOutcomeDTO& terminal_outcome);
+  [[nodiscard]] std::optional<PersistedManagerApplyTerminalOutcome> ReadTerminalOutcome(
+      const manyforge::core::ApplyId& apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
   [[nodiscard]] ManagerApplyJournalIntegrityReport VerifyIntegrity() const;
 
   void Close();
