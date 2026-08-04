@@ -3871,6 +3871,8 @@ def _validate_scans(manifest: dict[str, Any], repository_root: Path) -> None:
                 re.compile(pattern)
             except re.error as error:
                 fail(f"scan {scan_id} file regex is invalid: {error}")
+        else:
+            _compile_line_rg_pattern(pattern, f"scan {scan_id} line regex")
     if seen != REQUIRED_SCAN_IDS:
         fail("forbidden scan inventory differs from the frozen v1 contract")
 
@@ -4195,23 +4197,45 @@ def _evaluate_file_regex_scan(
     }
 
 
+def _compile_line_rg_pattern(pattern: str, label: str) -> re.Pattern[str]:
+    # ``line_rg`` is the frozen v1 evidence-mode name.  Evaluate its currently
+    # qualified ripgrep-compatible subset inside the verifier so the pinned
+    # qualification image does not depend on an undeclared host-style tool.
+    translated = pattern.replace("[[:space:]]", r"\s")
+    unsupported_posix_classes = sorted(
+        set(re.findall(r"\[\[:[A-Za-z]+:\]\]", translated))
+    )
+    if unsupported_posix_classes:
+        fail(
+            f"{label} uses unsupported POSIX classes: "
+            f"{unsupported_posix_classes}"
+        )
+    try:
+        return re.compile(translated)
+    except re.error as error:
+        fail(f"{label} is invalid: {error}")
+
+
 def _evaluate_line_rg_scan(
     scan: dict[str, Any], repository_root: Path
 ) -> dict[str, Any]:
     paths = _scan_candidate_files(scan, repository_root)
     relatives = [path.relative_to(repository_root).as_posix() for path in paths]
-    argv = ["rg", "-n", "--no-heading", "--hidden", "--no-ignore"]
-    argv.extend(["--", scan["pattern"], *relatives])
-    completed = subprocess.run(
-        argv,
-        cwd=repository_root,
-        check=False,
-        capture_output=True,
-        text=True,
+    expression = _compile_line_rg_pattern(
+        scan["pattern"], f"scan {scan['id']} line regex"
     )
-    if completed.returncode not in (0, 1):
-        fail(f"forbidden scan {scan['id']} failed to execute: {completed.stderr.strip()}")
-    lines = completed.stdout.splitlines()
+    argv = ["verifier-line-regex-v1", "-n"]
+    argv.extend(["--", scan["pattern"], *relatives])
+    lines: list[str] = []
+    for path, relative in zip(paths, relatives, strict=True):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            fail(f"scan {scan['id']} cannot read {relative}: {error}")
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            if expression.search(line) is not None:
+                lines.append(f"{relative}:{line_number}:{line}")
+    rendered = "".join(f"{line}\n" for line in lines)
     return {
         "id": scan["id"],
         "mode": scan["mode"],
@@ -4220,7 +4244,7 @@ def _evaluate_line_rg_scan(
         "matches": len(lines),
         "expected_matches": scan["expected_matches"],
         "passed": len(lines) == scan["expected_matches"],
-        "matches_sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
+        "matches_sha256": hashlib.sha256(rendered.encode()).hexdigest(),
         "details": lines,
     }
 

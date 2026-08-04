@@ -500,6 +500,37 @@ py::class_<
     assert result["details"][0]["path"] == "manyforge_core/python/bindings.cpp"
 
 
+def test_line_rg_scan_is_bounded_and_verifier_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "manyforge_core/python"
+    source_root.mkdir(parents=True)
+    (source_root / "bindings.cpp").write_text(
+        '#include   <rclcpp/rclcpp.hpp>\n#include "safe/header.hpp"\n',
+        encoding="utf-8",
+    )
+    manifest = loaded_manifest()
+    scan = next(
+        row
+        for row in manifest["forbidden_scans"]
+        if row["id"] == "ros_or_backend_header_in_core_binding"
+    )
+
+    def unexpected_subprocess(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("line scan must not invoke an external executable")
+
+    monkeypatch.setattr(verifier.subprocess, "run", unexpected_subprocess)
+    result = verifier.evaluate_scan(scan, tmp_path)
+
+    assert result["matches"] == 1
+    assert result["passed"] is False
+    assert result["argv"][0] == "verifier-line-regex-v1"
+    assert result["details"] == [
+        "manyforge_core/python/bindings.cpp:1:#include   <rclcpp/rclcpp.hpp>"
+    ]
+
+
 @pytest.mark.parametrize(
     ("scan_id", "relative_path", "content"),
     [
