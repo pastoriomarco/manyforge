@@ -1654,7 +1654,7 @@ TEST(BuildManifestAuthority,
 }
 
 TEST(BuildManifestAuthority,
-     UnsupportedDeploymentRejectsBeforeAuthorityRepositoryOrRawCasEffects) {
+     MissingReferenceRuntimeProfileRejectsBeforeAuthorityOrRawCasEffects) {
   const auto fixture = test::make_runtime_only_retention_fixture();
   CountingManifestRepository manifest_repository;
   CountingRawArtifactStore raw_store;

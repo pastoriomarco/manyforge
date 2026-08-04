@@ -500,6 +500,8 @@ add_library(manyforge_deployment_verification_core
   src/model_source.cpp
   src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp
+  src/reference_runtime_unit_verifier.cpp
+  src/runtime_profile_codec.cpp
   src/verified_retained_bundle.cpp
   src/verified_retained_bundle_store.cpp
 )
@@ -534,11 +536,11 @@ add_library(manyforge_deployment
   src/mf2_joint_name_internal.cpp
   src/posix_durability_internal.cpp
   src/provider_manifest_codec.cpp
+  src/reference_runtime_unit_internal.cpp
   src/retained_bundle.cpp
   src/retained_bundle_materializer.cpp
   src/retained_bundle_store.cpp
   src/retention_qualified_deployment.cpp
-  src/runtime_profile_codec.cpp
   src/site_overlay_resolution.cpp
   src/stop_evidence_policy_codec.cpp
   src/structural_model_preparation.cpp
@@ -1141,6 +1143,8 @@ if(BUILD_TESTING)
 
   add_executable(test_retention_qualified_deployment
     test/test_retention_qualified_deployment.cpp)
+  target_include_directories(test_retention_qualified_deployment PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_retention_qualified_deployment PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_retention_qualified_deployment

@@ -28,6 +28,7 @@
 #include "composed_model_symbol_role_map_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "posix_durability_internal.hpp"
+#include "reference_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
@@ -816,7 +817,10 @@ void require_verified_product_artifacts(
     const std::filesystem::path &raw_data,
     const core::RetainedProductDTO &product,
     const core::RetainedBundleDTO &bundle,
-    const core::ControlDomainId *control_domain_subject = nullptr) {
+    const core::ControlDomainId *control_domain_subject = nullptr,
+    const core::RuntimeUnitId* runtime_unit_subject = nullptr) {
+  std::optional<std::string> runtime_manifest;
+  std::optional<std::string> runtime_launchable;
   for (const auto &artifact : product.artifact_refs) {
     const std::string bytes = read_verified_raw_reference(
         raw_data, artifact.content_addressed_store_key, artifact.content_digest,
@@ -845,7 +849,40 @@ void require_verified_product_artifacts(
       }
       detail::require_control_domain_control_matches_retained_bundle(
           bytes, bundle, *control_domain_subject);
+    } else if (product.product_kind ==
+               core::RetainedProductKind::kRuntimeUnitConfiguration) {
+      if (runtime_unit_subject == nullptr) {
+        detail::fail_retained_bundle("runtime-unit product is missing its envelope subject");
+      }
+      if (artifact.artifact_role_id.value() ==
+          detail::kReferenceRuntimeManifestArtifactRole) {
+        if (artifact.media_type != detail::kReferenceRuntimeManifestMediaType ||
+            runtime_manifest.has_value()) {
+          detail::fail_retained_bundle(
+              "runtime-unit product has an incoherent manifest artifact");
+        }
+        runtime_manifest = bytes;
+      } else if (artifact.artifact_role_id.value() ==
+                 detail::kReferenceRuntimeLaunchableArtifactRole) {
+        if (artifact.media_type != detail::kReferenceRuntimeLaunchableMediaType ||
+            runtime_launchable.has_value()) {
+          detail::fail_retained_bundle(
+              "runtime-unit product has an incoherent launchable artifact");
+        }
+        runtime_launchable = bytes;
+      } else {
+        detail::fail_retained_bundle("runtime-unit product has an unexpected artifact role");
+      }
     }
+  }
+  if (product.product_kind ==
+      core::RetainedProductKind::kRuntimeUnitConfiguration) {
+    if (!runtime_manifest.has_value() || !runtime_launchable.has_value()) {
+      detail::fail_retained_bundle(
+          "runtime-unit product omits its manifest or launchable artifact");
+    }
+    detail::require_reference_runtime_product_matches_retained_bundle(
+        *runtime_manifest, *runtime_launchable, bundle, *runtime_unit_subject);
   }
 }
 
@@ -891,7 +928,8 @@ void require_verified_bundle_references(
   }
   for (const auto &group : products.runtime_unit_products) {
     for (const auto &product : group.products) {
-      require_verified_product_artifacts(raw_data, product, value);
+      require_verified_product_artifacts(
+          raw_data, product, value, nullptr, &group.runtime_unit_id);
     }
   }
 }
@@ -1391,10 +1429,92 @@ FilesystemVerifiedRetainedProductArtifactSource::get_verified(
     }
     detail::require_control_domain_control_matches_retained_bundle(
         bytes, bundle->value(), *subject);
+  } else if (product->product_kind ==
+             core::RetainedProductKind::kRuntimeUnitConfiguration) {
+    const core::RuntimeUnitId* subject = nullptr;
+    for (const auto& group :
+         bundle->value().compiled_products.runtime_unit_products) {
+      if (std::any_of(group.products.begin(), group.products.end(),
+                      [&](const auto& candidate) { return &candidate == product; })) {
+        subject = &group.runtime_unit_id;
+        break;
+      }
+    }
+    if (subject == nullptr) {
+      detail::fail_retained_bundle(
+          "selected runtime-unit artifact lost its envelope subject");
+    }
+    require_verified_product_artifacts(
+        paths.raw_data, *product, bundle->value(), nullptr, subject);
   }
   return VerifiedRetainedProductArtifact(query, product->product_contract_id,
                                          product->product_contract_revision,
                                          *artifact, std::move(bytes));
+}
+
+std::optional<VerifiedRetainedRuntimeUnitProduct>
+verify_reference_runtime_unit_product(
+    const RetainedBundle& bundle, const core::RuntimeUnitId& runtime_unit_id,
+    const IVerifiedRetainedProductArtifactSource& artifact_source) {
+  if (!verify_retained_bundle_identity(bundle)) {
+    detail::fail_retained_bundle(
+        "runtime-unit verification requires one sealed valid bundle");
+  }
+  const auto& groups = bundle.value().compiled_products.runtime_unit_products;
+  const auto group = std::find_if(
+      groups.begin(), groups.end(), [&](const auto& candidate) {
+        return candidate.runtime_unit_id == runtime_unit_id;
+      });
+  if (group == groups.end()) {
+    return std::nullopt;
+  }
+  if (group->products.size() != 1U) {
+    detail::fail_retained_bundle(
+        "runtime-unit verification found an incoherent product group");
+  }
+  const auto& product = group->products.front();
+  const RetainedProductArtifactQuery manifest_query{
+      bundle.retained_bundle_id(),
+      product.product_id,
+      core::RetainedProductKind::kRuntimeUnitConfiguration,
+      core::ArtifactRoleId(
+          std::string(detail::kReferenceRuntimeManifestArtifactRole)),
+  };
+  const RetainedProductArtifactQuery launchable_query{
+      bundle.retained_bundle_id(),
+      product.product_id,
+      core::RetainedProductKind::kRuntimeUnitConfiguration,
+      core::ArtifactRoleId(
+          std::string(detail::kReferenceRuntimeLaunchableArtifactRole)),
+  };
+  const auto manifest = artifact_source.get_verified(manifest_query);
+  const auto launchable = artifact_source.get_verified(launchable_query);
+  if (!manifest.has_value() || !launchable.has_value() ||
+      manifest->query() != manifest_query ||
+      launchable->query() != launchable_query ||
+      manifest->product_contract_id() != product.product_contract_id ||
+      launchable->product_contract_id() != product.product_contract_id ||
+      manifest->product_contract_revision() != product.product_contract_revision ||
+      launchable->product_contract_revision() != product.product_contract_revision) {
+    detail::fail_retained_bundle(
+        "runtime-unit artifact source did not return the exact product pair");
+  }
+  detail::require_reference_runtime_product_matches_retained_bundle(
+      manifest->bytes(), launchable->bytes(), bundle.value(), runtime_unit_id);
+  return VerifiedRetainedRuntimeUnitProduct(
+      bundle.retained_bundle_id(), runtime_unit_id, product.product_id,
+      detail::retained_product_output_digest(product),
+      manifest->artifact_ref().content_digest, product.product_contract_id,
+      product.product_contract_revision, launchable->artifact_ref(),
+      std::string(launchable->bytes()),
+      std::string(detail::kReferenceRuntimeOperatingSystem),
+      std::string(detail::kReferenceRuntimeShellContract),
+      std::string(detail::kReferenceRuntimeRoleId),
+      std::string(detail::kReferenceRuntimeStatusEndpointRoleId),
+      std::string(detail::kReferenceRuntimeProcessAdapterContractId),
+      detail::reference_runtime_process_adapter_revision(),
+      std::string(detail::kReferenceRuntimeRetrievalContractId),
+      detail::reference_runtime_retrieval_contract_revision());
 }
 
 FilesystemVerifiedRetainedModelMapSource::

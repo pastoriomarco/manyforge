@@ -12,6 +12,8 @@
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
+#include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -19,14 +21,15 @@
 #include <utility>
 #include <variant>
 
+#include "reference_runtime_unit_internal.hpp"
+#include "retained_bundle_internal.hpp"
+
 namespace manyforge::deployment::test {
 
 inline constexpr std::string_view kRuntimeOnlyZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 inline constexpr std::string_view kRuntimeOnlyProfileSchemaRevision =
     "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7";
-inline constexpr std::string_view kRuntimeOnlyConfigurationSchemaRevision =
-    "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785";
 
 struct RuntimeOnlyRetentionFixture final {
   QualifiedRuntimeProfile runtime_profile;
@@ -36,46 +39,7 @@ struct RuntimeOnlyRetentionFixture final {
 };
 
 [[nodiscard]] inline std::string runtime_only_profile_document() {
-  CanonicalValue identity(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue(std::string(core::kRuntimeProfileApiVersion))},
-      {"runtime_profile_id", CanonicalValue("runtime_only_profile")},
-      {"configuration_schema_ref",
-       CanonicalValue(CanonicalValue::Object{
-           {"schema_id",
-            CanonicalValue("manyforge.value_schema.runtime.empty.v1")},
-           {"schema_revision",
-            CanonicalValue(
-                std::string(kRuntimeOnlyConfigurationSchemaRevision))},
-       })},
-      {"process_contract",
-       CanonicalValue(CanonicalValue::Object{
-           {"lifecycle_control", CanonicalValue("manager_managed")},
-       })},
-      {"supervision_contract",
-       CanonicalValue(CanonicalValue::Object{
-           {"status_endpoint_role_id", CanonicalValue("runtime_status")},
-       })},
-      {"offered_runtime_role_ids",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue("planner")})},
-      {"source_endpoint_role_ids",
-       CanonicalValue(CanonicalValue::Array{
-           CanonicalValue("plan_runtime"),
-           CanonicalValue("runtime_status"),
-       })},
-  });
-
-  std::string preimage{"manyforge.content-identity.v1"};
-  preimage.push_back('\0');
-  preimage.append("catalog-record-revision/runtime_profile");
-  preimage.push_back('\0');
-  preimage.append(core::kRuntimeProfileApiVersion);
-  preimage.push_back('\0');
-  preimage.append(canonical_json(identity));
-  auto root = identity.as_object();
-  root.emplace_back("runtime_profile_revision",
-                    CanonicalValue(sha256_digest(preimage)));
-  return canonical_json(CanonicalValue(std::move(root)));
+  return detail::reference_runtime_profile_document();
 }
 
 [[nodiscard]] inline std::string runtime_only_revision_from_document(
@@ -102,7 +66,8 @@ qualify_runtime_only_profile() {
       "sha256/runtime-only-profile");
   return resolve_and_qualify_runtime_profile(
       {
-          core::RuntimeProfileId("runtime_only_profile"),
+          core::RuntimeProfileId(
+              std::string(detail::kReferenceRuntimeProfileId)),
           core::RuntimeProfileRevision(
               runtime_only_revision_from_document(document)),
           core::SchemaId(std::string(core::kRuntimeProfileApiVersion)),
@@ -116,7 +81,7 @@ qualify_runtime_only_profile() {
 
 [[nodiscard]] inline std::string runtime_only_graph(
     const QualifiedRuntimeProfile& profile,
-    std::string_view runtime_unit_id = "runtime_only") {
+    std::string_view runtime_unit_id = detail::kReferenceRuntimeUnitId) {
   return "{\"runtime_units\":[{\"runtime_unit_id\":\"" +
          std::string(runtime_unit_id) +
          "\",\"runtime_profile_id\":\"" +
@@ -128,6 +93,34 @@ qualify_runtime_only_profile() {
          "\"control_domains\":[],\"control_bindings\":[],"
          "\"component_attachments\":[]}";
 }
+
+/// Exact build-owned source bytes for the one qualified runtime profile.
+class RuntimeOnlyCompilerInputArtifactSource final
+    : public detail::ICompilerInputArtifactSource {
+ public:
+  explicit RuntimeOnlyCompilerInputArtifactSource(
+      const QualifiedRuntimeProfile& profile)
+      : key_(profile.reference().content_addressed_store_key),
+        digest_(profile.reference().content_digest),
+        bytes_(runtime_only_profile_document()) {}
+
+  [[nodiscard]] std::optional<std::string> get_verified(
+      const core::ContentAddressedStoreKey& key,
+      const core::ContentDigest& expected_digest,
+      std::optional<std::uint64_t> expected_size) const override {
+    if (key != key_ || expected_digest != digest_ ||
+        (expected_size.has_value() && *expected_size != bytes_.size()) ||
+        sha256_digest(bytes_) != digest_.value()) {
+      return std::nullopt;
+    }
+    return bytes_;
+  }
+
+ private:
+  core::ContentAddressedStoreKey key_;
+  core::ContentDigest digest_;
+  std::string bytes_;
+};
 
 [[nodiscard]] inline std::string runtime_only_catalogs(
     const QualifiedRuntimeProfile& profile,

@@ -92,6 +92,19 @@ static_assert(!std::is_constructible_v<
   return std::get<std::string>(member(value, name).storage());
 }
 
+[[nodiscard]] std::string replace_once(std::string value,
+                                       std::string_view from,
+                                       std::string_view to) {
+  const std::size_t position = value.find(from);
+  if (position == std::string::npos ||
+      value.find(from, position + from.size()) != std::string::npos) {
+    throw std::logic_error(
+        "test replacement requires exactly one source occurrence");
+  }
+  value.replace(position, from.size(), to);
+  return value;
+}
+
 [[nodiscard]] std::string empty_graph() {
   return "{\"runtime_units\":[],\"model_instances\":[],"
          "\"controllable_components\":[],\"control_domains\":[],"
@@ -457,7 +470,7 @@ TEST(RetainedBundleMaterializer,
 }
 
 TEST(RetainedBundleMaterializer,
-     ValidButUnsupportedNonEmptyDeploymentRejectsBeforeAnyStoreEffect) {
+     MissingReferenceRuntimeProfileRejectsBeforeAnyStoreEffect) {
   const auto fixture = test::make_runtime_only_retention_fixture();
   ASSERT_EQ(fixture.qualified.deployment().graph().graph().runtime_units.size(),
             1U);
@@ -474,6 +487,174 @@ TEST(RetainedBundleMaterializer,
       RetainedBundleError);
   EXPECT_EQ(store.put_calls(), 0U);
   EXPECT_EQ(store.get_calls(), 0U);
+}
+
+TEST(RetainedBundleMaterializer,
+     UnqualifiedRuntimeRowRejectsBeforeAnyStoreEffect) {
+  const auto fixture = test::make_runtime_only_retention_fixture();
+  auto deployment = test::produce_runtime_only_deployment(
+      fixture.runtime_profile,
+      test::runtime_only_graph(fixture.runtime_profile,
+                               "unqualified_runtime"));
+  auto compiler = test::compile_runtime_only_deployment(
+      deployment, fixture.runtime_profile);
+  auto qualified = qualify_deployment_for_retention(
+      deployment, compiler);
+  const test::RuntimeOnlyCompilerInputArtifactSource input_source(
+      fixture.runtime_profile);
+  CountingRawArtifactStore store;
+  detail::RejectingCatalogArtifactStore catalog_store;
+
+  EXPECT_THROW(
+      static_cast<void>(detail::RetainedBundleMaterializer::materialize(
+          qualified,
+          detail::RetentionMaterializerTestAccess::make_context(),
+          input_source, {}, catalog_store, store)),
+      RetainedBundleError);
+  EXPECT_EQ(store.put_calls(), 0U);
+  EXPECT_EQ(store.get_calls(), 0U);
+}
+
+TEST(RetainedBundleMaterializer,
+     ReferenceRuntimeProductIsExactDeterministicAndClosed) {
+  const auto fixture = test::make_runtime_only_retention_fixture();
+  const test::RuntimeOnlyCompilerInputArtifactSource input_source(
+      fixture.runtime_profile);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      {}, catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(),
+            1U);
+  const auto& group =
+      bundle->value().compiled_products.runtime_unit_products.front();
+  EXPECT_EQ(group.runtime_unit_id.value(), detail::kReferenceRuntimeUnitId);
+  ASSERT_EQ(group.products.size(), 1U);
+  const auto& product = group.products.front();
+  EXPECT_EQ(product.product_kind,
+            core::RetainedProductKind::kRuntimeUnitConfiguration);
+  EXPECT_EQ(product.product_contract_id.value(),
+            detail::kReferenceRuntimeProductContractId);
+  EXPECT_EQ(product.product_contract_revision,
+            detail::reference_runtime_product_contract_revision());
+  ASSERT_EQ(product.artifact_refs.size(), 2U);
+
+  const std::string manifest = require_product_artifact_bytes(
+      product, detail::kReferenceRuntimeManifestArtifactRole, raw_store);
+  const std::string launchable = require_product_artifact_bytes(
+      product, detail::kReferenceRuntimeLaunchableArtifactRole, raw_store);
+  EXPECT_EQ(launchable, detail::reference_runtime_launchable_script());
+  EXPECT_NO_THROW(static_cast<void>(
+      detail::parse_and_verify_reference_runtime_manifest(manifest)));
+  EXPECT_NO_THROW(
+      detail::require_reference_runtime_product_matches_retained_bundle(
+          manifest, launchable, bundle->value(), group.runtime_unit_id));
+  EXPECT_EQ(catalog_store.size(), 1U);
+
+  test::InMemoryCatalogArtifactStoreFixture second_catalog_store;
+  test::InMemoryRawArtifactStoreFixture second_raw_store;
+  const auto regenerated = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      {}, second_catalog_store, second_raw_store);
+  ASSERT_NE(regenerated, nullptr);
+  EXPECT_EQ(regenerated->retained_bundle_id(), bundle->retained_bundle_id());
+  EXPECT_EQ(regenerated->canonical_bytes(), bundle->canonical_bytes());
+
+  const std::string changed_manifest = replace_once(
+      manifest, "posix.1-2017", "posix.1-2018");
+  EXPECT_THROW(static_cast<void>(
+                   detail::parse_and_verify_reference_runtime_manifest(
+                       changed_manifest)),
+               RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
+     ReferenceRuntimeManifestRejectsEveryMutableExecutionSeam) {
+  const auto fixture = test::make_runtime_only_retention_fixture();
+  const test::RuntimeOnlyCompilerInputArtifactSource input_source(
+      fixture.runtime_profile);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      {}, catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  const auto& group =
+      bundle->value().compiled_products.runtime_unit_products.front();
+  const auto& product = group.products.front();
+  const std::string manifest = require_product_artifact_bytes(
+      product, detail::kReferenceRuntimeManifestArtifactRole, raw_store);
+  const std::string launchable = require_product_artifact_bytes(
+      product, detail::kReferenceRuntimeLaunchableArtifactRole, raw_store);
+
+  struct Mutation final {
+    std::string_view name;
+    std::string from;
+    std::string to;
+  };
+  const std::array<Mutation, 9U> mutations{{
+      {"artifact role", "launchable_script", "launchable_binary"},
+      {"artifact media", "application/x-sh", "application/octet-stream"},
+      {"artifact digest",
+       sha256_digest(detail::reference_runtime_launchable_script()),
+       std::string(kZeroDigest)},
+      {"retriever", "manyforge.retained_raw_artifact",
+       "manyforge.mutable_local_artifact"},
+      {"adapter", "manyforge.posix_sh.retained_script",
+       "manyforge.arbitrary_command"},
+      {"lifecycle", "manager_managed", "externally_managed"},
+      {"runtime role", "manager_fixture", "arbitrary_runtime_role"},
+      {"endpoint role", "runtime_status", "arbitrary_status"},
+      {"endpoint contract", "manyforge.reference_runtime.status_stdout",
+       "manyforge.reference_runtime.status_socket"},
+  }};
+  for (const auto& mutation : mutations) {
+    SCOPED_TRACE(mutation.name);
+    const std::string changed = replace_once(
+        manifest, mutation.from, mutation.to);
+    EXPECT_THROW(static_cast<void>(
+                     detail::parse_and_verify_reference_runtime_manifest(
+                         changed)),
+                 RetainedBundleError);
+  }
+
+  CanonicalValue::Object injected =
+      parse_strict_json_model_yaml(manifest).root().as_object();
+  injected.emplace_back(
+      "command",
+      CanonicalValue(CanonicalValue::Array{CanonicalValue("/bin/other")}));
+  injected.emplace_back(
+      "environment",
+      CanonicalValue(CanonicalValue::Object{
+          {"UNQUALIFIED", CanonicalValue("injected")},
+      }));
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_reference_runtime_manifest(
+          canonical_json(CanonicalValue(std::move(injected))))),
+      RetainedBundleError);
+
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_reference_runtime_manifest(
+          std::string(detail::kMaxReferenceRuntimeManifestBytes + 1U, 'x'))),
+      RetainedBundleError);
+  EXPECT_THROW(
+      detail::require_reference_runtime_product_matches_retained_bundle(
+          manifest,
+          std::string(detail::kMaxReferenceRuntimeLaunchableBytes + 1U, 'x'),
+          bundle->value(), group.runtime_unit_id),
+      RetainedBundleError);
+  EXPECT_NO_THROW(
+      detail::require_reference_runtime_product_matches_retained_bundle(
+          manifest, launchable, bundle->value(), group.runtime_unit_id));
 }
 
 TEST(RetainedBundleMaterializer,

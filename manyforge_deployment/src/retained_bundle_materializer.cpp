@@ -29,8 +29,10 @@
 #include "manyforge_deployment/controller_topology_codec.hpp"
 #include "manyforge_deployment/model_source.hpp"
 #include "manyforge_deployment/provider_manifest_codec.hpp"
+#include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
 #include "planning_resource_map_internal.hpp"
+#include "reference_runtime_unit_internal.hpp"
 #include "retained_bundle_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -107,6 +109,20 @@ require_control_domain_control_contract() {
   return *contract;
 }
 
+[[nodiscard]] const BuildQualifiedProductContract& require_reference_runtime_contract() {
+  const auto* contract = build_qualified_product_contract_registry().find(
+      core::ProductContractId(std::string(detail::reference_runtime_product_contract_id())),
+      detail::reference_runtime_product_contract_revision());
+  if (contract == nullptr ||
+      contract->product_kind() != core::RetainedProductKind::kRuntimeUnitConfiguration ||
+      contract->placement() != ProductPlacement::kRuntimeUnit) {
+    throw std::logic_error(
+        "build-qualified reference runtime product contract is absent or "
+        "incoherent");
+  }
+  return *contract;
+}
+
 [[nodiscard]] CanonicalValue node_environment_projection(
     const core::RetainedNodeEnvironmentDTO& environment) {
   return CanonicalValue(CanonicalValue::Object{
@@ -174,7 +190,8 @@ require_control_domain_control_contract() {
     const core::RetainedProductDTO& viewer_model,
     std::span<const core::RetainedControlDomainProductsDTO>
         control_domain_products,
-    std::span<const core::RetainedProductDTO> symbol_role_maps) {
+    std::span<const core::RetainedProductDTO> symbol_role_maps,
+    std::span<const core::RetainedRuntimeUnitProductsDTO> runtime_unit_products) {
   CanonicalValue::Array control_products;
   control_products.reserve(control_domain_products.size());
   for (const auto &group : control_domain_products) {
@@ -193,13 +210,26 @@ require_control_domain_control_contract() {
   for (const auto& product : symbol_role_maps) {
     symbol_products.push_back(detail::retained_product_projection(product));
   }
+  CanonicalValue::Array runtime_products;
+  runtime_products.reserve(runtime_unit_products.size());
+  for (const auto& group : runtime_unit_products) {
+    CanonicalValue::Array products;
+    products.reserve(group.products.size());
+    for (const auto& product : group.products) {
+      products.push_back(detail::retained_product_projection(product));
+    }
+    runtime_products.emplace_back(CanonicalValue::Object{
+        {"runtime_unit_id", CanonicalValue(group.runtime_unit_id.value())},
+        {"products", CanonicalValue(std::move(products))},
+    });
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"planning_collision_model",
        detail::retained_product_projection(planning_collision_model)},
       {"viewer_model", detail::retained_product_projection(viewer_model)},
       {"control_domain_products", CanonicalValue(std::move(control_products))},
       {"symbol_role_maps", CanonicalValue(std::move(symbol_products))},
-      {"runtime_unit_products", CanonicalValue(CanonicalValue::Array{})},
+      {"runtime_unit_products", CanonicalValue(std::move(runtime_products))},
   });
 }
 
@@ -250,7 +280,8 @@ require_control_domain_control_contract() {
     const core::RetainedProductDTO &viewer_model,
     std::span<const core::RetainedControlDomainProductsDTO>
         control_domain_products,
-    std::span<const core::RetainedProductDTO> symbol_role_maps) {
+    std::span<const core::RetainedProductDTO> symbol_role_maps,
+    std::span<const core::RetainedRuntimeUnitProductsDTO> runtime_unit_products) {
   std::vector<const core::RetainedProductDTO *> products{
       &planning_collision_model, &viewer_model};
   for (const auto &group : control_domain_products) {
@@ -260,6 +291,11 @@ require_control_domain_control_contract() {
   }
   for (const auto &product : symbol_role_maps) {
     products.push_back(&product);
+  }
+  for (const auto& group : runtime_unit_products) {
+    for (const auto& product : group.products) {
+      products.push_back(&product);
+    }
   }
   std::sort(products.begin(), products.end(),
             [](const auto* left, const auto* right) {
@@ -299,7 +335,8 @@ require_control_domain_control_contract() {
     const core::RetainedProductDTO &planning_collision_model,
     const core::RetainedProductDTO &viewer_model,
     std::vector<core::RetainedControlDomainProductsDTO> control_domain_products,
-    std::vector<core::RetainedProductDTO> symbol_role_maps) {
+    std::vector<core::RetainedProductDTO> symbol_role_maps,
+    std::vector<core::RetainedRuntimeUnitProductsDTO> runtime_unit_products) {
   const auto &deployment = qualified.deployment();
   const auto &registry = build_qualified_closed_schema_registry();
   return core::RetainedBundleDTO{
@@ -328,7 +365,7 @@ require_control_domain_control_contract() {
           viewer_model,
           control_domain_products,
           symbol_role_maps,
-          {},
+          runtime_unit_products,
       },
       core::RetainedBundleProvenanceDTO{
           context.compiler_contract_digest(),
@@ -342,7 +379,8 @@ require_control_domain_control_contract() {
               control_product_count += group.products.size();
             }
             outputs.reserve(2U + control_product_count +
-                            symbol_role_maps.size());
+                            symbol_role_maps.size() +
+                            runtime_unit_products.size());
             outputs.push_back(core::RetainedOutputRecordDTO{
                 planning_collision_model.product_id,
                 planning_collision_model.product_kind,
@@ -362,6 +400,13 @@ require_control_domain_control_contract() {
               outputs.push_back(core::RetainedOutputRecordDTO{
                   product.product_id, product.product_kind,
                   detail::retained_product_output_digest(product)});
+            }
+            for (const auto& group : runtime_unit_products) {
+              for (const auto& product : group.products) {
+                outputs.push_back(
+                    core::RetainedOutputRecordDTO{product.product_id, product.product_kind,
+                                                  detail::retained_product_output_digest(product)});
+              }
             }
             std::sort(outputs.begin(), outputs.end(),
                       [](const auto& left, const auto& right) {
@@ -385,7 +430,8 @@ require_control_domain_control_contract() {
     const core::RetainedProductDTO &viewer_model,
     std::span<const core::RetainedControlDomainProductsDTO>
         control_domain_products,
-    std::span<const core::RetainedProductDTO> symbol_role_maps) {
+    std::span<const core::RetainedProductDTO> symbol_role_maps,
+    std::span<const core::RetainedRuntimeUnitProductsDTO> runtime_unit_products) {
   const auto &deployment = qualified.deployment();
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
@@ -410,11 +456,13 @@ require_control_domain_control_contract() {
       {"compiled_products",
        compiled_products_projection(planning_collision_model,
                                     viewer_model,
-                                    control_domain_products, symbol_role_maps)},
+                                    control_domain_products, symbol_role_maps,
+                                    runtime_unit_products)},
       {"provenance",
        provenance_projection(context, source_records, generator_records,
                              planning_collision_model, viewer_model,
-                             control_domain_products, symbol_role_maps)},
+                             control_domain_products, symbol_role_maps,
+                             runtime_unit_products)},
   });
 }
 
@@ -445,6 +493,8 @@ struct PreparedPlanningCollisionProduct final {
   const BuildQualifiedProductContract* symbol_role_map_contract;
   std::vector<detail::PreparedControlDomainArtifact> control_domain_artifacts;
   const BuildQualifiedProductContract *control_domain_contract;
+  std::vector<detail::PreparedRuntimeUnitArtifact> runtime_unit_artifacts;
+  const BuildQualifiedProductContract* runtime_unit_contract;
   std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts;
   std::vector<core::CatalogRecordKind> schema_artifact_kinds;
   std::vector<core::RetainedSourceRecordDTO> source_records;
@@ -560,40 +610,45 @@ void require_qualified_structural_subset_before_store(
   const auto& inputs = deployment.applicability_inputs().value();
   const auto& compiler = qualified.compiler_ir();
 
-  if (!graph.runtime_units.empty() ||
+  if (graph.runtime_units.size() > 1U ||
       !graph.component_attachments.empty() ||
       !inputs.capability_provider_bindings.empty() ||
       !inputs.external_resources.empty() ||
       inputs.site_overlay_ref.has_value()) {
     detail::fail_retained_bundle(
-        "structural retained-bundle materialization excludes runtime units, "
+        "retained-bundle materialization excludes multiple runtime units, "
         "attachments, provider bindings, and site resources");
   }
 
   const auto& applicability = compiler.applicability();
   const auto& composition = applicability.composition();
-  if (!applicability.runtime_profiles().empty() ||
+  if (applicability.runtime_profiles().size() != graph.runtime_units.size() ||
       !applicability.provider_endpoints().empty() ||
       !applicability.external_resources().empty()) {
     detail::fail_retained_bundle(
-        "structural compiler IR contains an unexpected runtime or external "
+        "compiler IR contains an incoherent runtime-profile or external "
         "provider semantic input");
   }
 
-  const bool passive_subset =
-      graph.controllable_components.empty() &&
+  const bool passive_subset = graph.runtime_units.empty() &&
+                              graph.controllable_components.empty() &&
       graph.control_domains.empty() && graph.control_bindings.empty() &&
       inputs.desired_control_configurations.empty();
   const bool one_component_control_subset =
-      graph.model_instances.size() == 1U &&
+      graph.runtime_units.empty() && graph.model_instances.size() == 1U &&
       graph.controllable_components.size() == 1U &&
       graph.control_domains.size() == 1U &&
       graph.control_bindings.size() == 1U &&
       inputs.desired_control_configurations.size() == 1U;
-  if (!passive_subset && !one_component_control_subset) {
+  const bool reference_runtime_subset =
+      graph.runtime_units.size() == 1U && graph.model_instances.empty() &&
+      graph.controllable_components.empty() && graph.control_domains.empty() &&
+      graph.control_bindings.empty() && inputs.desired_control_configurations.empty();
+  if (!passive_subset && !one_component_control_subset &&
+      !reference_runtime_subset) {
     detail::fail_retained_bundle(
-        "structural retention accepts either passive models or exactly one "
-        "bounded controllable component");
+        "retention accepts passive models, exactly one bounded controllable "
+        "component, or the exact reference runtime unit");
   }
 
   if (passive_subset) {
@@ -619,7 +674,7 @@ void require_qualified_structural_subset_before_store(
           "passive structural retention contains component/control "
           "semantics or an unplaced model");
     }
-  } else {
+  } else if (one_component_control_subset) {
     const auto& model = graph.model_instances.front();
     const auto& component = graph.controllable_components.front();
     const auto& domain = graph.control_domains.front();
@@ -687,6 +742,32 @@ void require_qualified_structural_subset_before_store(
           "one-component structural control retention is outside its exact "
           "qualified target/binding subset");
     }
+  } else {
+    const auto& unit = graph.runtime_units.front();
+    if (unit.runtime_unit_id.value() != detail::kReferenceRuntimeUnitId ||
+        unit.runtime_profile_id.value() != detail::kReferenceRuntimeProfileId ||
+        unit.runtime_profile_revision.value() !=
+            detail::reference_runtime_profile_revision() ||
+        !unit.dependency_runtime_unit_ids.empty() ||
+        !unit.configuration.empty() ||
+        applicability.runtime_profiles().size() != 1U ||
+        !composition.component_types().empty() ||
+        !composition.control_binding_coordinate_maps().empty() ||
+        !composition.targets().empty() ||
+        !applicability.capability_definitions().empty() ||
+        !applicability.control_interface_contracts().empty() ||
+        !applicability.controller_topologies().empty() ||
+        !applicability.provider_manifests().empty() ||
+        !applicability.stop_evidence_policies().empty() ||
+        !applicability.binding_interfaces().empty() ||
+        !applicability.controllers().empty() ||
+        !applicability.routes().empty() ||
+        !applicability.capabilities().empty() ||
+        !applicability.stop_applicability().empty()) {
+      detail::fail_retained_bundle("runtime retention is outside the exact reference process row");
+    }
+    static_cast<void>(
+        detail::emit_reference_runtime_manifest(qualified.compiler_ir(), unit.runtime_unit_id));
   }
 
   const auto& cell_frame = composition.cell_frame();
@@ -900,7 +981,14 @@ prepare_planning_collision_product_before_store(
             }
           } else if constexpr (std::is_same_v<
                                    Record,
-                                   core::CapabilityDefinitionCatalogRecordRefDTO>) {
+                                   core::RuntimeProfileCatalogRecordRefDTO>) {
+            const auto requalified = resolve_and_qualify_runtime_profile(
+                typed_reference, typed_reference.content_addressed_store_key, catalog_bytes);
+            require_exact_requalified_catalog_record(
+                requalified, qualified.compiler_ir().applicability().runtime_profiles(),
+                "runtime profile");
+          } else if constexpr (std::is_same_v<Record,
+                                              core::CapabilityDefinitionCatalogRecordRefDTO>) {
             const auto requalified =
                 resolve_and_qualify_capability_definition(
                     typed_reference,
@@ -1135,9 +1223,34 @@ prepare_planning_collision_product_before_store(
     }
     control_domain_contract = &qualified_control_contract;
   }
-  // Runtime-unit products remain empty here because the currently qualified
-  // structural/control fixture has no RuntimeUnit. This is an exact graph
-  // condition, not a compatibility fallback or a runtime availability claim.
+  std::vector<detail::PreparedRuntimeUnitArtifact> runtime_unit_artifacts;
+  const BuildQualifiedProductContract* runtime_unit_contract = nullptr;
+  if (!composition.graph().runtime_units.empty()) {
+    const auto& qualified_runtime_contract = require_reference_runtime_contract();
+    const auto& unit = composition.graph().runtime_units.front();
+    std::string manifest =
+        detail::emit_reference_runtime_manifest(qualified.compiler_ir(), unit.runtime_unit_id);
+    detail::require_reference_runtime_manifest_matches(manifest, qualified.compiler_ir(),
+                                                       unit.runtime_unit_id);
+    std::string launchable(detail::reference_runtime_launchable_script());
+    if (launchable.empty() || launchable.size() > detail::kMaxReferenceRuntimeLaunchableBytes) {
+      throw std::logic_error("build-owned reference runtime launchable exceeds its bound");
+    }
+    const std::array<detail::RetainedArtifactInput, 2U> runtime_inputs{{
+        {core::ArtifactRoleId(std::string(detail::kReferenceRuntimeLaunchableArtifactRole)),
+         std::string(detail::kReferenceRuntimeLaunchableMediaType), launchable},
+        {core::ArtifactRoleId(std::string(detail::kReferenceRuntimeManifestArtifactRole)),
+         std::string(detail::kReferenceRuntimeManifestMediaType), manifest},
+    }};
+    detail::preflight_retained_product(
+        core::ProductId(detail::reference_runtime_product_id(unit.runtime_unit_id)),
+        core::RetainedProductKind::kRuntimeUnitConfiguration, ProductPlacement::kRuntimeUnit,
+        qualified_runtime_contract.product_contract_id(),
+        qualified_runtime_contract.product_contract_revision(), runtime_inputs);
+    runtime_unit_artifacts.push_back(detail::PreparedRuntimeUnitArtifact{
+        unit.runtime_unit_id, std::move(manifest), std::move(launchable)});
+    runtime_unit_contract = &qualified_runtime_contract;
+  }
   std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts;
   std::vector<core::CatalogRecordKind> schema_artifact_kinds;
   schema_artifacts.reserve(schemas.size());
@@ -1169,6 +1282,8 @@ prepare_planning_collision_product_before_store(
       symbol_role_map_contract,
       std::move(control_domain_artifacts),
       control_domain_contract,
+      std::move(runtime_unit_artifacts),
+      runtime_unit_contract,
       std::move(schema_artifacts),
       std::move(schema_artifact_kinds),
       std::move(source_records),
@@ -1419,10 +1534,45 @@ void require_verified_current_bundle_artifacts(
     throw std::logic_error(
         "reloaded bundle changed symbol/role-map product presence");
   }
-  for (const auto& group : products.runtime_unit_products) {
-    for (const auto& product : group.products) {
-      require_verified_product_artifact_readback(product, artifact_store);
+  if (products.runtime_unit_products.size() !=
+      prepared.runtime_unit_artifacts.size()) {
+    throw std::logic_error("reloaded bundle changed runtime-unit product presence");
+  }
+  for (std::size_t index = 0U; index < products.runtime_unit_products.size(); ++index) {
+    const auto& group = products.runtime_unit_products[index];
+    const auto& expected = prepared.runtime_unit_artifacts[index];
+    if (group.runtime_unit_id != expected.runtime_unit_id ||
+        group.products.size() != 1U ||
+        group.products.front().artifact_refs.size() != 2U) {
+      throw std::logic_error(
+          "reloaded runtime-unit product has an incoherent subject or "
+          "artifact set");
     }
+    const auto& product = group.products.front();
+    require_verified_product_artifact_readback(product, artifact_store);
+    std::optional<std::string> manifest;
+    std::optional<std::string> launchable;
+    for (const auto& artifact : product.artifact_refs) {
+      const auto bytes = artifact_store.get_verified(
+          artifact.content_addressed_store_key, artifact.content_digest,
+          artifact.byte_size);
+      if (!bytes.has_value()) {
+        throw std::runtime_error("reloaded runtime-unit artifact failed exact read-back");
+      }
+      if (artifact.artifact_role_id.value() == detail::kReferenceRuntimeManifestArtifactRole) {
+        manifest = *bytes;
+      } else if (artifact.artifact_role_id.value() ==
+                 detail::kReferenceRuntimeLaunchableArtifactRole) {
+        launchable = *bytes;
+      }
+    }
+    if (!manifest.has_value() || !launchable.has_value() ||
+        *manifest != expected.manifest_bytes ||
+        *launchable != expected.launchable_bytes) {
+      throw std::runtime_error("reloaded runtime-unit product differs from its prepared bytes");
+    }
+    detail::require_reference_runtime_product_matches_retained_bundle(
+        *manifest, *launchable, value, group.runtime_unit_id);
   }
 }
 
@@ -1519,6 +1669,8 @@ detail::RetainedBundleMaterializer::materialize_prepared(
     std::span<const detail::PreparedControlDomainArtifact>
         control_domain_artifacts,
     const BuildQualifiedProductContract *control_domain_contract,
+    std::span<const detail::PreparedRuntimeUnitArtifact> runtime_unit_artifacts,
+    const BuildQualifiedProductContract* runtime_unit_contract,
     std::span<const core::RetainedSchemaArtifactRefDTO> schema_artifacts,
     std::span<const core::RetainedSourceRecordDTO> source_records,
     std::span<const core::RetainedGeneratorRecordDTO> generator_records,
@@ -1629,10 +1781,62 @@ detail::RetainedBundleMaterializer::materialize_prepared(
         std::vector<core::RetainedProductDTO>{std::move(product)}});
   }
 
+  if (runtime_unit_artifacts.empty() != (runtime_unit_contract == nullptr)) {
+    throw std::logic_error(
+        "runtime-unit artifact bytes and qualified contract must be present "
+        "together");
+  }
+  std::vector<core::RetainedRuntimeUnitProductsDTO> runtime_unit_products;
+  runtime_unit_products.reserve(runtime_unit_artifacts.size());
+  for (const auto& input : runtime_unit_artifacts) {
+    detail::require_reference_runtime_manifest_matches(
+        input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
+    if (input.launchable_bytes !=
+        detail::reference_runtime_launchable_script()) {
+      throw std::logic_error(
+          "prepared reference runtime launchable changed before retention");
+    }
+    const std::array<detail::RetainedArtifactInput, 2U> runtime_artifacts{{
+        {core::ArtifactRoleId(std::string(detail::kReferenceRuntimeLaunchableArtifactRole)),
+         std::string(detail::kReferenceRuntimeLaunchableMediaType), input.launchable_bytes},
+        {core::ArtifactRoleId(std::string(detail::kReferenceRuntimeManifestArtifactRole)),
+         std::string(detail::kReferenceRuntimeManifestMediaType), input.manifest_bytes},
+    }};
+    core::RetainedProductDTO product = detail::build_and_retain_product(
+        core::ProductId(detail::reference_runtime_product_id(input.runtime_unit_id)),
+        core::RetainedProductKind::kRuntimeUnitConfiguration, ProductPlacement::kRuntimeUnit,
+        runtime_unit_contract->product_contract_id(),
+        runtime_unit_contract->product_contract_revision(), runtime_artifacts,
+        artifact_store);
+    std::optional<std::string> retained_manifest;
+    std::optional<std::string> retained_launchable;
+    for (const auto& artifact : product.artifact_refs) {
+      const auto readback = artifact_store.get_verified(
+          artifact.content_addressed_store_key, artifact.content_digest,
+          artifact.byte_size);
+      if (!readback.has_value()) {
+        throw std::runtime_error("reference runtime artifact vanished after verified retention");
+      }
+      if (artifact.artifact_role_id.value() == detail::kReferenceRuntimeManifestArtifactRole) {
+        retained_manifest = *readback;
+      } else if (artifact.artifact_role_id.value() ==
+                 detail::kReferenceRuntimeLaunchableArtifactRole) {
+        retained_launchable = *readback;
+      }
+    }
+    if (!retained_manifest.has_value() || !retained_launchable.has_value() ||
+        *retained_manifest != input.manifest_bytes ||
+        *retained_launchable != input.launchable_bytes) {
+      throw std::runtime_error("reference runtime product failed exact artifact read-back");
+    }
+    runtime_unit_products.push_back(core::RetainedRuntimeUnitProductsDTO{
+        input.runtime_unit_id, std::vector<core::RetainedProductDTO>{std::move(product)}});
+  }
+
   const CanonicalValue placeholder = retained_bundle_projection(
       kZeroDigest, qualified, context, schema_artifacts, source_records,
       generator_records, planning, viewer, control_domain_products,
-      symbol_role_maps);
+      symbol_role_maps, runtime_unit_products);
   const std::string retained_bundle_id = detail::compute_content_identity(
       placeholder,
       detail::ContentIdentitySpec{
@@ -1643,7 +1847,7 @@ detail::RetainedBundleMaterializer::materialize_prepared(
   CanonicalValue root = retained_bundle_projection(
       retained_bundle_id, qualified, context, schema_artifacts, source_records,
       generator_records, planning, viewer, control_domain_products,
-      symbol_role_maps);
+      symbol_role_maps, runtime_unit_products);
   std::string bytes = canonical_json(root);
   core::RetainedBundleDTO value = retained_bundle_value(
       retained_bundle_id, qualified, context,
@@ -1653,7 +1857,8 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           source_records.begin(), source_records.end()),
       std::vector<core::RetainedGeneratorRecordDTO>(
           generator_records.begin(), generator_records.end()),
-      planning, viewer, control_domain_products, symbol_role_maps);
+      planning, viewer, control_domain_products, symbol_role_maps,
+      runtime_unit_products);
   auto bundle = detail::RetainedBundleConstructionAuthority::construct(
       core::RetainedBundleId(retained_bundle_id), std::move(value),
       std::move(root), std::move(bytes));
@@ -1693,7 +1898,8 @@ detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
           ? std::optional<std::string_view>(*prepared.symbol_role_map)
           : std::nullopt,
       prepared.symbol_role_map_contract, prepared.control_domain_artifacts,
-      prepared.control_domain_contract, prepared.schema_artifacts,
+      prepared.control_domain_contract, prepared.runtime_unit_artifacts,
+      prepared.runtime_unit_contract, prepared.schema_artifacts,
       prepared.source_records, prepared.generator_records,
       artifact_store);
   (void)bundle_repository.put_if_absent(bundle);
@@ -1738,7 +1944,8 @@ detail::RetainedBundleMaterializer::materialize(
           ? std::optional<std::string_view>(*prepared.symbol_role_map)
           : std::nullopt,
       prepared.symbol_role_map_contract, prepared.control_domain_artifacts,
-      prepared.control_domain_contract, prepared.schema_artifacts,
+      prepared.control_domain_contract, prepared.runtime_unit_artifacts,
+      prepared.runtime_unit_contract, prepared.schema_artifacts,
       prepared.source_records, prepared.generator_records,
       artifact_store);
 }

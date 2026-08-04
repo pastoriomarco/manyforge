@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <manyforge_core/types/retained_product.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
 #include <memory>
@@ -164,6 +165,155 @@ class IVerifiedRetainedProductArtifactSource {
   [[nodiscard]] virtual std::optional<VerifiedRetainedProductArtifact>
   get_verified(const RetainedProductArtifactQuery& query) const = 0;
 };
+
+/// Sealed verification result for the one build-qualified reference runtime
+/// row.
+///
+/// This value exists only after the semantic bundle and both runtime product
+/// artifacts have been independently re-read and checked as one exact pair.
+/// It exposes the immutable bytes and identities needed by the Component
+/// Manager's adapter admission without exposing compiler IR or a generic
+/// executable tuple.
+class VerifiedRetainedRuntimeUnitProduct final {
+ public:
+  VerifiedRetainedRuntimeUnitProduct(
+      const VerifiedRetainedRuntimeUnitProduct&) = default;
+  VerifiedRetainedRuntimeUnitProduct& operator=(
+      const VerifiedRetainedRuntimeUnitProduct&) = default;
+  VerifiedRetainedRuntimeUnitProduct(
+      VerifiedRetainedRuntimeUnitProduct&&) noexcept = default;
+  VerifiedRetainedRuntimeUnitProduct& operator=(
+      VerifiedRetainedRuntimeUnitProduct&&) noexcept = default;
+  ~VerifiedRetainedRuntimeUnitProduct() = default;
+
+  [[nodiscard]] const core::RetainedBundleId&
+  retained_bundle_id() const noexcept {
+    return retained_bundle_id_;
+  }
+  [[nodiscard]] const core::RuntimeUnitId& runtime_unit_id() const noexcept {
+    return runtime_unit_id_;
+  }
+  [[nodiscard]] const core::ProductId& product_id() const noexcept {
+    return product_id_;
+  }
+  [[nodiscard]] const core::ContentDigest& product_identity() const noexcept {
+    return product_identity_;
+  }
+  [[nodiscard]] const core::ContentDigest&
+  configuration_identity() const noexcept {
+    return configuration_identity_;
+  }
+  [[nodiscard]] const core::ProductContractId&
+  product_contract_id() const noexcept {
+    return product_contract_id_;
+  }
+  [[nodiscard]] const core::ProductContractRevision&
+  product_contract_revision() const noexcept {
+    return product_contract_revision_;
+  }
+  [[nodiscard]] const core::RetainedArtifactRefDTO&
+  launchable_artifact_ref() const noexcept {
+    return launchable_artifact_ref_;
+  }
+  [[nodiscard]] std::string_view launchable_bytes() const noexcept {
+    return launchable_bytes_;
+  }
+  [[nodiscard]] std::string_view operating_system() const noexcept {
+    return operating_system_;
+  }
+  [[nodiscard]] std::string_view shell_contract() const noexcept {
+    return shell_contract_;
+  }
+  [[nodiscard]] std::string_view runtime_role_id() const noexcept {
+    return runtime_role_id_;
+  }
+  [[nodiscard]] std::string_view status_endpoint_role_id() const noexcept {
+    return status_endpoint_role_id_;
+  }
+  [[nodiscard]] std::string_view
+  process_adapter_contract_id() const noexcept {
+    return process_adapter_contract_id_;
+  }
+  [[nodiscard]] std::string_view
+  process_adapter_contract_revision() const noexcept {
+    return process_adapter_contract_revision_;
+  }
+  [[nodiscard]] std::string_view retrieval_contract_id() const noexcept {
+    return retrieval_contract_id_;
+  }
+  [[nodiscard]] std::string_view
+  retrieval_contract_revision() const noexcept {
+    return retrieval_contract_revision_;
+  }
+
+ private:
+  VerifiedRetainedRuntimeUnitProduct(
+      core::RetainedBundleId retained_bundle_id,
+      core::RuntimeUnitId runtime_unit_id, core::ProductId product_id,
+      core::ContentDigest product_identity,
+      core::ContentDigest configuration_identity,
+      core::ProductContractId product_contract_id,
+      core::ProductContractRevision product_contract_revision,
+      core::RetainedArtifactRefDTO launchable_artifact_ref,
+      std::string launchable_bytes, std::string operating_system,
+      std::string shell_contract, std::string runtime_role_id,
+      std::string status_endpoint_role_id,
+      std::string process_adapter_contract_id,
+      std::string process_adapter_contract_revision,
+      std::string retrieval_contract_id,
+      std::string retrieval_contract_revision)
+      : retained_bundle_id_(std::move(retained_bundle_id)),
+        runtime_unit_id_(std::move(runtime_unit_id)),
+        product_id_(std::move(product_id)),
+        product_identity_(std::move(product_identity)),
+        configuration_identity_(std::move(configuration_identity)),
+        product_contract_id_(std::move(product_contract_id)),
+        product_contract_revision_(std::move(product_contract_revision)),
+        launchable_artifact_ref_(std::move(launchable_artifact_ref)),
+        launchable_bytes_(std::move(launchable_bytes)),
+        operating_system_(std::move(operating_system)),
+        shell_contract_(std::move(shell_contract)),
+        runtime_role_id_(std::move(runtime_role_id)),
+        status_endpoint_role_id_(std::move(status_endpoint_role_id)),
+        process_adapter_contract_id_(std::move(process_adapter_contract_id)),
+        process_adapter_contract_revision_(
+            std::move(process_adapter_contract_revision)),
+        retrieval_contract_id_(std::move(retrieval_contract_id)),
+        retrieval_contract_revision_(std::move(retrieval_contract_revision)) {}
+
+  core::RetainedBundleId retained_bundle_id_;
+  core::RuntimeUnitId runtime_unit_id_;
+  core::ProductId product_id_;
+  core::ContentDigest product_identity_;
+  core::ContentDigest configuration_identity_;
+  core::ProductContractId product_contract_id_;
+  core::ProductContractRevision product_contract_revision_;
+  core::RetainedArtifactRefDTO launchable_artifact_ref_;
+  std::string launchable_bytes_;
+  std::string operating_system_;
+  std::string shell_contract_;
+  std::string runtime_role_id_;
+  std::string status_endpoint_role_id_;
+  std::string process_adapter_contract_id_;
+  std::string process_adapter_contract_revision_;
+  std::string retrieval_contract_id_;
+  std::string retrieval_contract_revision_;
+
+  friend std::optional<VerifiedRetainedRuntimeUnitProduct>
+  verify_reference_runtime_unit_product(
+      const RetainedBundle&, const core::RuntimeUnitId&,
+      const IVerifiedRetainedProductArtifactSource&);
+};
+
+/// Verify one exact reference runtime product for an I4 consumer.
+///
+/// Missing runtime-unit coordinates return no value. A present bundle,
+/// product, manifest, or launchable artifact that fails any exact contract,
+/// subject, provenance, or cross-artifact check fails closed.
+[[nodiscard]] std::optional<VerifiedRetainedRuntimeUnitProduct>
+verify_reference_runtime_unit_product(
+    const RetainedBundle& bundle, const core::RuntimeUnitId& runtime_unit_id,
+    const IVerifiedRetainedProductArtifactSource& artifact_source);
 
 /// Exact coordinates for the generic composed-model map retained beside one
 /// planning model. Product kind and artifact role are fixed by this typed

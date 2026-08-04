@@ -1,0 +1,52 @@
+#include "manyforge_component_manager/reference_runtime_unit_admission.hpp"
+
+#include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace manyforge::component_manager {
+
+std::optional<ReferenceRuntimeUnitAdmission> VerifyReferenceRuntimeUnitForHost(
+    const deployment::RetainedBundle& bundle, const core::RuntimeUnitId& runtime_unit_id,
+    const deployment::IVerifiedRetainedProductArtifactSource& artifact_source,
+    std::string_view operating_system, std::string_view shell_contract) {
+  const auto product =
+      deployment::verify_reference_runtime_unit_product(bundle, runtime_unit_id, artifact_source);
+  if (!product.has_value()) {
+    return std::nullopt;
+  }
+  if (operating_system != product->operating_system() ||
+      shell_contract != product->shell_contract()) {
+    throw ReferenceRuntimeUnitAdmissionError(
+        "reference runtime product is incompatible with the selected host");
+  }
+  if (product->process_adapter_contract_id() != "manyforge.posix_sh.retained_script" ||
+      product->retrieval_contract_id() != "manyforge.retained_raw_artifact" ||
+      product->runtime_role_id() != "manager_fixture" ||
+      product->status_endpoint_role_id() != "runtime_status") {
+    throw ReferenceRuntimeUnitAdmissionError(
+        "reference runtime product does not select the I4 adapter contract");
+  }
+
+  const std::string runtime_id = product->runtime_unit_id().value();
+  const std::string product_identity = product->product_identity().value();
+  std::vector<std::string> fixed_arguments{
+      "--runtime-unit-id",
+      runtime_id,
+      "--product-identity",
+      product_identity,
+  };
+  return ReferenceRuntimeUnitAdmission(
+      runtime_id, product_identity, product->configuration_identity().value(),
+      product->launchable_artifact_ref().content_digest.value(),
+      std::string(product->launchable_bytes()), std::move(fixed_arguments),
+      "runtime-ready " + runtime_id + " " + product_identity, "shutdown\n",
+      std::string(product->runtime_role_id()), std::string(product->status_endpoint_role_id()),
+      std::string(product->process_adapter_contract_id()),
+      std::string(product->process_adapter_contract_revision()),
+      std::string(product->retrieval_contract_id()),
+      std::string(product->retrieval_contract_revision()));
+}
+
+}  // namespace manyforge::component_manager

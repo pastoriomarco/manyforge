@@ -154,6 +154,8 @@ static_assert(!std::is_base_of_v<
 static_assert(!std::is_default_constructible_v<
               VerifiedRetainedProductArtifact>);
 static_assert(!std::is_default_constructible_v<
+              VerifiedRetainedRuntimeUnitProduct>);
+static_assert(!std::is_default_constructible_v<
               VerifiedRetainedModelMap>);
 static_assert(!std::is_default_constructible_v<
               VerifiedRetainedPlanningResource>);
@@ -2141,28 +2143,74 @@ TEST(FilesystemRetainedBundleRepositoryTest,
 }
 
 TEST(FilesystemRetentionStoreTest,
-     UnsupportedCurrentSubsetRejectsBeforeAnyDurableContentEffect) {
+     ReferenceRuntimeProductDurablyReloadsAndPointReadsAsOneExactPair) {
   const auto fixture = test::make_runtime_only_retention_fixture();
   ScopedTrustedRoot root;
   FilesystemBuildManifestRepository manifest_repository(
       root.path());
+  FilesystemCatalogArtifactStore catalog_store(root.path());
   FilesystemRawArtifactStore raw_store(root.path());
   FilesystemRetainedBundleRepository bundle_repository(root.path());
-  const detail::RejectingCompilerInputArtifactSource input_source;
-  detail::RejectingCatalogArtifactStore catalog_store;
+  const test::RuntimeOnlyCompilerInputArtifactSource input_source(
+      fixture.runtime_profile);
 
-  EXPECT_THROW(
-      static_cast<void>(
-          detail::RetainedBundleMaterializer::
-              materialize_store_and_reload_production(
-                  fixture.qualified, manifest_repository, input_source,
-                  {}, catalog_store, raw_store, bundle_repository)),
-      RetainedBundleError);
-  EXPECT_EQ(manifest_repository.size(), 0U);
-  EXPECT_EQ(raw_store.size(), 0U);
-  EXPECT_EQ(raw_store.retained_bytes(), 0U);
-  EXPECT_EQ(bundle_repository.size(), 0U);
-  EXPECT_EQ(bundle_repository.retained_bytes(), 0U);
+  const auto bundle =
+      detail::RetainedBundleMaterializer::
+          materialize_store_and_reload_production(
+              fixture.qualified, manifest_repository, input_source, {},
+              catalog_store, raw_store, bundle_repository);
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_EQ(manifest_repository.size(), 3U);
+  EXPECT_EQ(catalog_store.size(), 1U);
+  EXPECT_EQ(bundle_repository.size(), 1U);
+  ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(),
+            1U);
+  const auto& group =
+      bundle->value().compiled_products.runtime_unit_products.front();
+  ASSERT_EQ(group.products.size(), 1U);
+  const auto& product = group.products.front();
+
+  FilesystemVerifiedRetainedBundleSource bundle_source(root.path());
+  const auto reloaded =
+      bundle_source.get_verified(bundle->retained_bundle_id());
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_EQ(reloaded->canonical_bytes(), bundle->canonical_bytes());
+
+  FilesystemVerifiedRetainedProductArtifactSource artifact_source(
+      root.path());
+  const auto manifest = artifact_source.get_verified({
+      bundle->retained_bundle_id(), product.product_id,
+      core::RetainedProductKind::kRuntimeUnitConfiguration,
+      core::ArtifactRoleId(std::string(
+          detail::kReferenceRuntimeManifestArtifactRole)),
+  });
+  const auto launchable = artifact_source.get_verified({
+      bundle->retained_bundle_id(), product.product_id,
+      core::RetainedProductKind::kRuntimeUnitConfiguration,
+      core::ArtifactRoleId(std::string(
+          detail::kReferenceRuntimeLaunchableArtifactRole)),
+  });
+  ASSERT_TRUE(manifest.has_value());
+  ASSERT_TRUE(launchable.has_value());
+  EXPECT_EQ(launchable->bytes(), detail::reference_runtime_launchable_script());
+  EXPECT_NO_THROW(
+      detail::require_reference_runtime_product_matches_retained_bundle(
+          manifest->bytes(), launchable->bytes(), reloaded->value(),
+          group.runtime_unit_id));
+  const auto verified_runtime = verify_reference_runtime_unit_product(
+      *reloaded, group.runtime_unit_id, artifact_source);
+  ASSERT_TRUE(verified_runtime.has_value());
+  EXPECT_EQ(verified_runtime->retained_bundle_id(),
+            bundle->retained_bundle_id());
+  EXPECT_EQ(verified_runtime->runtime_unit_id(), group.runtime_unit_id);
+  EXPECT_EQ(verified_runtime->product_id(), product.product_id);
+  EXPECT_EQ(verified_runtime->configuration_identity(),
+            manifest->artifact_ref().content_digest);
+  EXPECT_EQ(verified_runtime->launchable_bytes(), launchable->bytes());
+  EXPECT_EQ(verified_runtime->operating_system(), "linux");
+  EXPECT_EQ(verified_runtime->shell_contract(), "posix.1-2017");
+  EXPECT_EQ(verified_runtime->runtime_role_id(), "manager_fixture");
+  EXPECT_EQ(verified_runtime->status_endpoint_role_id(), "runtime_status");
 }
 
 }  // namespace manyforge::deployment

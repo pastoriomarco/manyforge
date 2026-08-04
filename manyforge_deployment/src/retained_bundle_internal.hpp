@@ -25,6 +25,12 @@ struct PreparedControlDomainArtifact final {
   std::string bytes;
 };
 
+struct PreparedRuntimeUnitArtifact final {
+  core::RuntimeUnitId runtime_unit_id;
+  std::string manifest_bytes;
+  std::string launchable_bytes;
+};
+
 /// Exact read-only input-artifact source used before I3 creates any retained
 /// output.
 ///
@@ -185,6 +191,8 @@ class RetainedBundleMaterializer final {
       const BuildQualifiedProductContract* symbol_role_map_contract,
       std::span<const PreparedControlDomainArtifact> control_domain_artifacts,
       const BuildQualifiedProductContract *control_domain_contract,
+      std::span<const PreparedRuntimeUnitArtifact> runtime_unit_artifacts,
+      const BuildQualifiedProductContract* runtime_unit_contract,
       std::span<const core::RetainedSchemaArtifactRefDTO> schema_artifacts,
       std::span<const core::RetainedSourceRecordDTO> source_records,
       std::span<const core::RetainedGeneratorRecordDTO> generator_records,

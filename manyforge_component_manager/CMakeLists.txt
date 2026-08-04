@@ -170,6 +170,7 @@ add_library(manyforge_component_manager
   src/manager_apply_fence_coordinator.cpp
   src/manager_apply_journal.cpp
   src/manager_bootstrap_journal.cpp
+  src/reference_runtime_unit_admission.cpp
   src/runtime_observation.cpp
   src/sqlite_store_startup_internal.cpp
 )
@@ -250,6 +251,21 @@ if(BUILD_TESTING)
   target_link_libraries(test_runtime_observation PRIVATE
     manyforge_component_manager GTest::gtest_main)
   gtest_discover_tests(test_runtime_observation
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  # Test-only join: generate one real retained runtime product through the
+  # offline compiler, then admit it through the production focused reader.
+  # The Component Manager library itself remains free of the full compiler.
+  add_executable(test_reference_runtime_unit_admission
+    test/test_reference_runtime_unit_admission.cpp)
+  target_include_directories(test_reference_runtime_unit_admission PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
+  target_link_libraries(test_reference_runtime_unit_admission PRIVATE
+    manyforge_component_manager
+    manyforge::deployment
+    GTest::gtest_main)
+  gtest_discover_tests(test_reference_runtime_unit_admission
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_sqlite_store_startup_internal
