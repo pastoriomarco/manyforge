@@ -1,0 +1,65 @@
+#pragma once
+
+#include <filesystem>
+#include <manyforge_component_manager/runtime_convergence.hpp>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+namespace manyforge::deployment {
+class IVerifiedRetainedBundleSource;
+class IVerifiedRetainedProductArtifactSource;
+} // namespace manyforge::deployment
+
+namespace manyforge::component_manager {
+
+class RetainedPosixRuntimeUnitAdapterError final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+/// Concrete closed adapter for the one I3-qualified retained POSIX reference
+/// runtime product.
+///
+/// The constructor accepts one trusted, existing Manager-private runtime root
+/// and read-only verified retained-product sources. Runtime calls accept only
+/// the exact durable convergence query: no executable, path, arguments,
+/// environment, working directory, or status payload is caller-selectable.
+///
+/// The implementation is Linux/POSIX-specific. It atomically materializes the
+/// independently verified script, persists boot/PID/start-time/epoch evidence
+/// before releasing a pre-exec gate, observes before start, and produces a
+/// progress result only from a newly received complete source status record.
+class RetainedPosixRuntimeUnitAdapter final : public IRuntimeUnitProcessPort,
+                                              public IRuntimeUnitProgressPort {
+public:
+  RetainedPosixRuntimeUnitAdapter(
+      std::filesystem::path trusted_runtime_root,
+      const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
+      const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+          &artifact_source,
+      std::string operating_system, std::string shell_contract);
+  ~RetainedPosixRuntimeUnitAdapter() override;
+
+  RetainedPosixRuntimeUnitAdapter(const RetainedPosixRuntimeUnitAdapter &) =
+      delete;
+  RetainedPosixRuntimeUnitAdapter &
+  operator=(const RetainedPosixRuntimeUnitAdapter &) = delete;
+  RetainedPosixRuntimeUnitAdapter(RetainedPosixRuntimeUnitAdapter &&) = delete;
+  RetainedPosixRuntimeUnitAdapter &
+  operator=(RetainedPosixRuntimeUnitAdapter &&) = delete;
+
+  [[nodiscard]] ProcessPresenceObservation
+  ObserveProcess(const RuntimeUnitConvergenceQueryDTO &query) override;
+  [[nodiscard]] ProcessPresenceObservation
+  EnsureRunning(const RuntimeUnitConvergenceQueryDTO &query) override;
+  [[nodiscard]] std::optional<RuntimeUnitSourceReport>
+  ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
+                  const manyforge::core::RuntimeEpoch &runtime_epoch) override;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace manyforge::component_manager
