@@ -23,6 +23,8 @@ using PlanningModel =
     manyforge::deployment::VerifiedRetainedPlanningModel;
 using PlanningResource =
     manyforge::deployment::VerifiedRetainedPlanningResource;
+using ProjectionInput =
+    manyforge::deployment::VerifiedRetainedProjectionInput;
 
 static_assert(std::is_final_v<Bundle>);
 static_assert(!std::is_default_constructible_v<Bundle>);
@@ -42,6 +44,10 @@ static_assert(!std::is_default_constructible_v<PlanningModel>);
 static_assert(!std::is_default_constructible_v<PlanningResource>);
 static_assert(std::is_copy_constructible_v<PlanningModel>);
 static_assert(std::is_move_constructible_v<PlanningModel>);
+static_assert(!std::is_default_constructible_v<ProjectionInput>);
+static_assert(!std::is_aggregate_v<ProjectionInput>);
+static_assert(std::is_copy_constructible_v<ProjectionInput>);
+static_assert(std::is_move_constructible_v<ProjectionInput>);
 static_assert(std::is_constructible_v<
               FilesystemBundleSource, std::filesystem::path>);
 static_assert(std::is_constructible_v<

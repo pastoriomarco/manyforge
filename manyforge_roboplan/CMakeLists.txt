@@ -376,6 +376,7 @@ if(BUILD_TESTING)
     target_link_libraries(test_retained_product_consumer PRIVATE
       manyforge_roboplan_retained_consumer
       manyforge_collision
+      manyforge_core
       manyforge_deployment
       manyforge_deployment_admission
       roboplan::roboplan

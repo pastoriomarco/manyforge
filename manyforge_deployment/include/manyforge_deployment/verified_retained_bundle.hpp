@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <manyforge_core/types/projection_bootstrap.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
@@ -32,6 +33,11 @@ inline constexpr std::uint64_t kMaxDurableRetainedBundleBytes =
     512ULL * 1024ULL * 1024ULL;
 
 class RetainedBundleError : public std::invalid_argument {
+ public:
+  using std::invalid_argument::invalid_argument;
+};
+
+class RetainedProjectionInputError : public std::invalid_argument {
  public:
   using std::invalid_argument::invalid_argument;
 };
@@ -582,6 +588,70 @@ class IVerifiedRetainedPlanningModelSource {
   [[nodiscard]] virtual std::optional<VerifiedRetainedPlanningModel>
   get_verified(const RetainedPlanningModelQuery& query) const = 0;
 };
+
+/// Sealed, effect-free input for one exact native projection revision.
+///
+/// This value binds the independently verified retained planning/collision
+/// product to one scene-owner-issued immutable logical snapshot and the
+/// indivisible retained-bundle/graph/scene revision derived from those exact
+/// inputs. It grants no stage, activate, Apply, active-selection, process, or
+/// scene-mutation authority.
+class VerifiedRetainedProjectionInput final {
+ public:
+  VerifiedRetainedProjectionInput(
+      const VerifiedRetainedProjectionInput&) = default;
+  VerifiedRetainedProjectionInput& operator=(
+      const VerifiedRetainedProjectionInput&) = default;
+  VerifiedRetainedProjectionInput(
+      VerifiedRetainedProjectionInput&&) noexcept = default;
+  VerifiedRetainedProjectionInput& operator=(
+      VerifiedRetainedProjectionInput&&) noexcept = default;
+  ~VerifiedRetainedProjectionInput() = default;
+
+  [[nodiscard]] const core::ProjectionRevisionDTO&
+  projection_revision() const noexcept {
+    return projection_revision_;
+  }
+  [[nodiscard]] const core::LogicalSceneSnapshotRoot&
+  logical_scene() const noexcept {
+    return logical_scene_;
+  }
+  [[nodiscard]] const VerifiedRetainedPlanningModel&
+  planning_model() const noexcept {
+    return planning_model_;
+  }
+
+ private:
+  VerifiedRetainedProjectionInput(
+      core::ProjectionRevisionDTO projection_revision,
+      core::LogicalSceneSnapshotRoot logical_scene,
+      VerifiedRetainedPlanningModel planning_model)
+      : projection_revision_(std::move(projection_revision)),
+        logical_scene_(std::move(logical_scene)),
+        planning_model_(std::move(planning_model)) {}
+
+  core::ProjectionRevisionDTO projection_revision_;
+  core::LogicalSceneSnapshotRoot logical_scene_;
+  VerifiedRetainedPlanningModel planning_model_;
+
+  friend VerifiedRetainedProjectionInput verify_retained_projection_input(
+      const RetainedBundle&, core::LogicalSceneSnapshotRoot,
+      const IVerifiedRetainedPlanningModelSource&);
+};
+
+/// Verifies and freezes one exact retained-product/logical-scene input pair.
+///
+/// The logical-scene owner remains solely responsible for minting and
+/// content-sealing the supplied snapshot. This boundary checks its local
+/// shape and exact cell binding but deliberately does not recompute or mint
+/// scene identity. The planning product is selected from `bundle`, never from
+/// caller-provided product coordinates, and is re-read through the exact
+/// verified point-read capability before return.
+[[nodiscard]] VerifiedRetainedProjectionInput
+verify_retained_projection_input(
+    const RetainedBundle& bundle,
+    core::LogicalSceneSnapshotRoot logical_scene,
+    const IVerifiedRetainedPlanningModelSource& planning_model_source);
 
 /// Narrow lower-level verified-bundle lookup capability.
 ///

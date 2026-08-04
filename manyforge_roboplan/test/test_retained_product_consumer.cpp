@@ -20,6 +20,7 @@
 #include <Eigen/Core>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
+#include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
@@ -38,6 +39,8 @@ namespace {
 using collision::ManyForgeCollisionEngine;
 constexpr std::string_view kCanonicalCellFrame =
     "mf1_cell_e228ede37638a8d03080644d418a75c681930a4b5b3f6b0bbde2603974dab681";
+constexpr std::string_view kZeroDigest =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 static_assert(!std::is_default_constructible_v<
               deployment::VerifiedRetainedProductArtifact>);
@@ -47,6 +50,43 @@ static_assert(!std::is_default_constructible_v<
               deployment::VerifiedRetainedModelMap>);
 static_assert(!std::is_aggregate_v<
               deployment::VerifiedRetainedModelMap>);
+static_assert(!std::is_default_constructible_v<
+              deployment::VerifiedRetainedProjectionInput>);
+static_assert(!std::is_aggregate_v<
+              deployment::VerifiedRetainedProjectionInput>);
+
+[[nodiscard]] core::LogicalSceneSnapshotRoot
+make_projection_runtime_shadow_snapshot(const core::CellId& cell_id) {
+  core::CollisionPolicySnapshot policy;
+  policy.revision = {
+      1U, std::string(core::kCanonicalEmptyCollisionPolicyDigest)};
+  auto snapshot = std::make_shared<core::LogicalSceneSnapshotDTO>(
+      core::LogicalSceneSnapshotDTO{
+          core::SceneRevision{
+              core::logical_scene_identity::MintSceneId({
+                  cell_id,
+                  core::BootstrapId("i3_projection_runtime_shadow"),
+                  core::BootstrapGeneration(1U),
+              }),
+              1U,
+              core::ContentDigest(std::string(kZeroDigest))},
+          cell_id,
+          0U,
+          0U,
+          0U,
+          std::move(policy),
+          {},
+          {},
+      });
+  snapshot->revision.content_hash =
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(
+          *snapshot);
+  if (!snapshot->locally_valid()) {
+    throw std::logic_error(
+        "test-only projection runtime-shadow snapshot is invalid");
+  }
+  return core::LogicalSceneSnapshotRoot(std::move(snapshot));
+}
 
 class ScopedTemporaryRoot final {
  public:
@@ -671,8 +711,21 @@ TEST(RetainedProductRoboPlanConsumer,
   const deployment::RetainedModelMapQuery model_map_query{
       materialized.bundle->retained_bundle_id(), symbol_product.product_id};
 
-  const auto first =
-      load_lite6_planning_model(package_root, query);
+  const deployment::FilesystemVerifiedRetainedPlanningModelSource
+      projection_source(package_root);
+  const auto first_projection =
+      deployment::verify_retained_projection_input(
+          *materialized.bundle,
+          make_projection_runtime_shadow_snapshot(
+              materialized.bundle->value().cell_graph.cell_id),
+          projection_source);
+  const auto& first = first_projection.planning_model();
+  EXPECT_EQ(
+      first_projection.projection_revision(),
+      (core::ProjectionRevisionDTO{
+          materialized.bundle->retained_bundle_id(),
+          materialized.bundle->value().cell_graph.graph_revision,
+          first_projection.logical_scene().shared()->revision}));
   const auto model_map =
       load_lite6_model_map(package_root, model_map_query);
   expect_total_retained_model_map_semantics(model_map);
@@ -716,8 +769,25 @@ TEST(RetainedProductRoboPlanConsumer,
     EXPECT_NE(resource.bytes(), "unreferenced ambient retained bytes");
   }
 
-  const auto reopened =
-      load_lite6_planning_model(package_root, query);
+  const auto reopened_projection =
+      deployment::verify_retained_projection_input(
+          *materialized.bundle,
+          make_projection_runtime_shadow_snapshot(
+              materialized.bundle->value().cell_graph.cell_id),
+          projection_source);
+  const auto& reopened = reopened_projection.planning_model();
+  EXPECT_EQ(reopened_projection.projection_revision(),
+            first_projection.projection_revision());
+  EXPECT_EQ(reopened_projection.logical_scene().shared()->identity(),
+            first_projection.logical_scene().shared()->identity());
+  EXPECT_TRUE(core::IsCanonicalEmptyCollisionPolicy(
+      reopened_projection.logical_scene()
+          .shared()
+          ->configured_collision_policy));
+  EXPECT_TRUE(reopened_projection.logical_scene().shared()->objects.empty());
+  EXPECT_TRUE(reopened_projection.logical_scene()
+                  .shared()
+                  ->carried_object_attachments.empty());
   expect_exact_planning_reopen(first, reopened);
 
   std::filesystem::path first_stage_root;

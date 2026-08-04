@@ -119,6 +119,68 @@ using namespace std::string_view_literals;
 
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+constexpr std::string_view kProjectionSceneId =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+constexpr std::string_view kProjectionSceneContent =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+[[nodiscard]] std::shared_ptr<core::LogicalSceneSnapshotDTO>
+make_projection_snapshot(const core::CellId& cell_id) {
+  core::CollisionPolicySnapshot policy;
+  policy.revision = {
+      1U, std::string(core::kCanonicalEmptyCollisionPolicyDigest)};
+  return std::make_shared<core::LogicalSceneSnapshotDTO>(
+      core::LogicalSceneSnapshotDTO{
+          core::SceneRevision{
+              core::SceneId(std::string(kProjectionSceneId)), 7U,
+              core::ContentDigest(std::string(kProjectionSceneContent))},
+          cell_id,
+          11U,
+          3U,
+          5U,
+          std::move(policy),
+          {},
+          {},
+      });
+}
+
+class AbsentPlanningModelSource final
+    : public IVerifiedRetainedPlanningModelSource {
+ public:
+  [[nodiscard]] std::optional<VerifiedRetainedPlanningModel>
+  get_verified(const RetainedPlanningModelQuery&) const override {
+    ++call_count_;
+    return std::nullopt;
+  }
+
+  [[nodiscard]] std::size_t call_count() const noexcept {
+    return call_count_;
+  }
+
+ private:
+  mutable std::size_t call_count_ = 0U;
+};
+
+class FixedPlanningModelSource final
+    : public IVerifiedRetainedPlanningModelSource {
+ public:
+  explicit FixedPlanningModelSource(VerifiedRetainedPlanningModel model)
+      : model_(std::move(model)) {}
+
+  [[nodiscard]] std::optional<VerifiedRetainedPlanningModel>
+  get_verified(const RetainedPlanningModelQuery&) const override {
+    ++call_count_;
+    return model_;
+  }
+
+  [[nodiscard]] std::size_t call_count() const noexcept {
+    return call_count_;
+  }
+
+ private:
+  VerifiedRetainedPlanningModel model_;
+  mutable std::size_t call_count_ = 0U;
+};
 
 template <typename Source>
 concept HasBundleInsertion =
@@ -1786,6 +1848,109 @@ TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
   EXPECT_THROW(
       static_cast<void>(source.get_verified(query)),
       RetainedBundleError);
+}
+
+TEST(VerifiedRetainedProjectionInputTest,
+     ExactPlanningProductAndOwnerSnapshotYieldCompositeRevision) {
+  ScopedTrustedRoot root;
+  const auto bundle = materialize_durable_bundle(
+      root.path(), "retained_projection_exact");
+  const auto snapshot =
+      make_projection_snapshot(bundle->value().cell_graph.cell_id);
+  const core::SceneRevision scene_revision = snapshot->revision;
+  const FilesystemVerifiedRetainedPlanningModelSource source(root.path());
+
+  const auto verified = verify_retained_projection_input(
+      *bundle, core::LogicalSceneSnapshotRoot(snapshot), source);
+
+  EXPECT_EQ(
+      verified.projection_revision(),
+      (core::ProjectionRevisionDTO{
+          bundle->retained_bundle_id(),
+          bundle->value().cell_graph.graph_revision,
+          scene_revision}));
+  EXPECT_EQ(verified.logical_scene().shared(), snapshot);
+  EXPECT_EQ(verified.planning_model().query(),
+            (RetainedPlanningModelQuery{
+                bundle->retained_bundle_id(),
+                bundle->value()
+                    .compiled_products.planning_collision_model.product_id}));
+
+  VerifiedRetainedProjectionInput copied = verified;
+  VerifiedRetainedProjectionInput moved = std::move(copied);
+  EXPECT_EQ(moved.projection_revision(), verified.projection_revision());
+  EXPECT_EQ(moved.logical_scene().shared(), snapshot);
+  EXPECT_EQ(moved.planning_model().query(),
+            verified.planning_model().query());
+}
+
+TEST(VerifiedRetainedProjectionInputTest,
+     CrossCellOrMutatedInvalidSnapshotRejectsBeforeProductRead) {
+  ScopedTrustedRoot root;
+  const auto bundle = materialize_durable_bundle(
+      root.path(), "retained_projection_reject_snapshot");
+
+  {
+    const auto snapshot = make_projection_snapshot(
+        core::CellId("different_projection_cell"));
+    AbsentPlanningModelSource source;
+    EXPECT_THROW(
+        static_cast<void>(verify_retained_projection_input(
+            *bundle, core::LogicalSceneSnapshotRoot(snapshot), source)),
+        RetainedProjectionInputError);
+    EXPECT_EQ(source.call_count(), 0U);
+  }
+
+  {
+    const auto snapshot =
+        make_projection_snapshot(bundle->value().cell_graph.cell_id);
+    core::LogicalSceneSnapshotRoot immutable_root(snapshot);
+    snapshot->revision.revision_id = 0U;
+    AbsentPlanningModelSource source;
+    EXPECT_THROW(
+        static_cast<void>(verify_retained_projection_input(
+            *bundle, std::move(immutable_root), source)),
+        RetainedProjectionInputError);
+    EXPECT_EQ(source.call_count(), 0U);
+  }
+}
+
+TEST(VerifiedRetainedProjectionInputTest,
+     MissingOrCrossBundlePlanningReadFailsClosed) {
+  ScopedTrustedRoot root;
+  const auto first = materialize_durable_bundle(
+      root.path(), "retained_projection_first");
+  const auto second = materialize_durable_bundle(
+      root.path(), "retained_projection_second");
+
+  {
+    AbsentPlanningModelSource source;
+    EXPECT_THROW(
+        static_cast<void>(verify_retained_projection_input(
+            *second,
+            core::LogicalSceneSnapshotRoot(make_projection_snapshot(
+                second->value().cell_graph.cell_id)),
+            source)),
+        RetainedProjectionInputError);
+    EXPECT_EQ(source.call_count(), 1U);
+  }
+
+  const auto& first_product =
+      first->value().compiled_products.planning_collision_model;
+  const FilesystemVerifiedRetainedPlanningModelSource durable_source(
+      root.path());
+  auto first_model = durable_source.get_verified({
+      first->retained_bundle_id(), first_product.product_id});
+  ASSERT_TRUE(first_model.has_value());
+  FixedPlanningModelSource mismatched_source(std::move(*first_model));
+  EXPECT_THROW(
+      static_cast<void>(verify_retained_projection_input(
+          *second,
+          core::LogicalSceneSnapshotRoot(make_projection_snapshot(
+              second->value().cell_graph.cell_id)),
+          mismatched_source)),
+      RetainedProjectionInputError);
+  EXPECT_EQ(mismatched_source.call_count(), 1U);
 }
 
 TEST(FilesystemRetainedBundleRepositoryTest,
