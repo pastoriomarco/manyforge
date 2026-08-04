@@ -11,12 +11,13 @@
 
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/projection_common.hpp>
+#include <manyforge_component_manager/runtime_convergence.hpp>
 
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.i4.v2";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 2;
+    "manyforge.internal.component-manager.apply-journal.i4.v3";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 3;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -162,6 +163,35 @@ struct ManagerApplyFenceAcceptanceWriteResult final {
   bool inserted;
 };
 
+struct PersistedManagerApplyRuntimeConvergenceIntent final {
+  ManagerApplyRuntimeConvergenceIntentDTO runtime_convergence_intent;
+  manyforge::core::ContentDigest intent_digest;
+  manyforge::core::ContentDigest runtime_convergence_intent_digest;
+
+  friend bool operator==(
+      const PersistedManagerApplyRuntimeConvergenceIntent &,
+      const PersistedManagerApplyRuntimeConvergenceIntent &) = default;
+};
+
+struct ManagerApplyRuntimeConvergenceIntentWriteResult final {
+  PersistedManagerApplyRuntimeConvergenceIntent record;
+  bool inserted;
+};
+
+struct PersistedManagerApplyRuntimeStagedReady final {
+  ManagerApplyRuntimeStagedReadyDTO staged_ready;
+  manyforge::core::ContentDigest staged_ready_digest;
+
+  friend bool operator==(const PersistedManagerApplyRuntimeStagedReady &,
+                         const PersistedManagerApplyRuntimeStagedReady &) =
+      default;
+};
+
+struct ManagerApplyRuntimeStagedReadyWriteResult final {
+  PersistedManagerApplyRuntimeStagedReady record;
+  bool inserted;
+};
+
 struct ManagerApplyJournalIntegrityReport final {
   manyforge::core::CellId cell_id;
   std::string schema_id;
@@ -173,6 +203,8 @@ struct ManagerApplyJournalIntegrityReport final {
   std::int64_t affected_scope_count;
   std::int64_t fence_attempt_count;
   std::int64_t fence_acceptance_count;
+  std::int64_t runtime_convergence_intent_count;
+  std::int64_t runtime_staged_ready_count;
 };
 
 /// Durable append-only owner of bounded named-Apply fence ordering evidence.
@@ -236,6 +268,21 @@ public:
   [[nodiscard]] std::optional<PersistedManagerApplyFenceAcceptance>
   ReadFenceAcceptance(const manyforge::core::ApplyId &apply_id,
                       manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyRuntimeConvergenceIntentWriteResult
+  EnsureRuntimeConvergenceIntent(
+      const manyforge::core::ContentDigest &intent_digest,
+      const ManagerApplyRuntimeConvergenceIntentDTO &runtime_intent);
+  [[nodiscard]] std::optional<PersistedManagerApplyRuntimeConvergenceIntent>
+  ReadRuntimeConvergenceIntent(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyRuntimeStagedReadyWriteResult
+  EnsureRuntimeStagedReady(
+      const ManagerApplyRuntimeStagedReadyDTO &staged_ready);
+  [[nodiscard]] std::optional<PersistedManagerApplyRuntimeStagedReady>
+  ReadLatestRuntimeStagedReady(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
   [[nodiscard]] ManagerApplyJournalIntegrityReport VerifyIntegrity() const;
 
   void Close();

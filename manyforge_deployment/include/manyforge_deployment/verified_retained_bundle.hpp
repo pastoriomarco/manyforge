@@ -237,6 +237,17 @@ class VerifiedRetainedRuntimeUnitProduct final {
     return status_endpoint_role_id_;
   }
   [[nodiscard]] std::string_view
+  status_endpoint_contract_id() const noexcept {
+    return status_endpoint_contract_id_;
+  }
+  [[nodiscard]] std::string_view
+  status_endpoint_contract_revision() const noexcept {
+    return status_endpoint_contract_revision_;
+  }
+  [[nodiscard]] std::string_view status_transport() const noexcept {
+    return status_transport_;
+  }
+  [[nodiscard]] std::string_view
   process_adapter_contract_id() const noexcept {
     return process_adapter_contract_id_;
   }
@@ -264,6 +275,9 @@ class VerifiedRetainedRuntimeUnitProduct final {
       std::string launchable_bytes, std::string operating_system,
       std::string shell_contract, std::string runtime_role_id,
       std::string status_endpoint_role_id,
+      std::string status_endpoint_contract_id,
+      std::string status_endpoint_contract_revision,
+      std::string status_transport,
       std::string process_adapter_contract_id,
       std::string process_adapter_contract_revision,
       std::string retrieval_contract_id,
@@ -281,6 +295,11 @@ class VerifiedRetainedRuntimeUnitProduct final {
         shell_contract_(std::move(shell_contract)),
         runtime_role_id_(std::move(runtime_role_id)),
         status_endpoint_role_id_(std::move(status_endpoint_role_id)),
+        status_endpoint_contract_id_(
+            std::move(status_endpoint_contract_id)),
+        status_endpoint_contract_revision_(
+            std::move(status_endpoint_contract_revision)),
+        status_transport_(std::move(status_transport)),
         process_adapter_contract_id_(std::move(process_adapter_contract_id)),
         process_adapter_contract_revision_(
             std::move(process_adapter_contract_revision)),
@@ -300,6 +319,9 @@ class VerifiedRetainedRuntimeUnitProduct final {
   std::string shell_contract_;
   std::string runtime_role_id_;
   std::string status_endpoint_role_id_;
+  std::string status_endpoint_contract_id_;
+  std::string status_endpoint_contract_revision_;
+  std::string status_transport_;
   std::string process_adapter_contract_id_;
   std::string process_adapter_contract_revision_;
   std::string retrieval_contract_id_;

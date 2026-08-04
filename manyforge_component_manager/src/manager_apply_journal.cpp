@@ -53,12 +53,20 @@ using core::ControlDomainRevision;
 using core::ControllableComponentId;
 using core::DomainActiveControlConfigurationDTO;
 using core::GraphRevision;
+using core::ProductContractId;
+using core::ProductContractRevision;
+using core::ProductId;
 using core::ProjectionRevisionDTO;
 using core::PublicRequestContextDTO;
 using core::RequestId;
 using core::RequestOwnerEpoch;
 using core::ResourceId;
 using core::RetainedBundleId;
+using core::RuntimeProfileId;
+using core::RuntimeProfileRevision;
+using core::RuntimeRoleId;
+using core::RuntimeUnitId;
+using core::RuntimeEpoch;
 using core::SceneId;
 using core::SceneRevision;
 
@@ -70,9 +78,13 @@ constexpr std::string_view kFenceAttemptDigestDomain =
     "manyforge.component-manager-apply-fence-attempt.v2";
 constexpr std::string_view kFenceAcceptanceDigestDomain =
     "manyforge.component-manager-apply-fence-acceptance.v2";
+constexpr std::string_view kRuntimeConvergenceIntentDigestDomain =
+    "manyforge.component-manager-runtime-convergence-intent.v1";
+constexpr std::string_view kRuntimeStagedReadyDigestDomain =
+    "manyforge.component-manager-runtime-staged-ready.v1";
 constexpr int kBusyTimeoutMilliseconds = 10000;
 constexpr std::int64_t kWalCheckpointTargetBytes = 16LL * 1024LL * 1024LL;
-constexpr std::int64_t kExpectedSchemaObjectCardinality = 15;
+constexpr std::int64_t kExpectedSchemaObjectCardinality = 21;
 
 [[noreturn]] void ThrowSqlite(sqlite3 *database, const int result,
                               const std::string_view context) {
@@ -1025,6 +1037,390 @@ EncodeFenceAcceptance(const ApplyId &apply_id,
   return encoded;
 }
 
+std::string EncodeRuntimeUnitIds(
+    const std::vector<RuntimeUnitId> &runtime_unit_ids) {
+  std::vector<std::string> tokens;
+  tokens.reserve(runtime_unit_ids.size());
+  for (const auto &runtime_unit_id : runtime_unit_ids) {
+    ValidateBoundedIdentity(runtime_unit_id.value(), "runtime_unit_id");
+    tokens.push_back(runtime_unit_id.value());
+  }
+  return EncodeTokens(tokens);
+}
+
+std::string
+EncodeRuntimeRoleIds(const std::vector<RuntimeRoleId> &runtime_role_ids) {
+  std::vector<std::string> tokens;
+  tokens.reserve(runtime_role_ids.size());
+  for (const auto &runtime_role_id : runtime_role_ids) {
+    ValidateBoundedIdentity(runtime_role_id.value(), "runtime_role_id");
+    tokens.push_back(runtime_role_id.value());
+  }
+  return EncodeTokens(tokens);
+}
+
+std::string EncodeRuntimePlanRows(
+    const std::vector<RuntimeUnitConvergencePlanRowDTO> &runtime_units) {
+  std::vector<std::string> tokens;
+  tokens.reserve(runtime_units.size() * 25U);
+  for (const auto &row : runtime_units) {
+    if (!row.valid()) {
+      throw std::invalid_argument("runtime convergence plan row is invalid");
+    }
+    tokens.push_back(row.runtime_unit_id.value());
+    tokens.push_back(row.runtime_profile_id.value());
+    tokens.push_back(row.runtime_profile_revision.value());
+    tokens.emplace_back(core::to_string(row.lifecycle_control));
+    tokens.emplace_back(ToString(row.candidate_disposition));
+    tokens.push_back(row.product_id.value());
+    tokens.push_back(row.product_contract_id.value());
+    tokens.push_back(row.product_contract_revision.value());
+    tokens.push_back(row.product_identity.value());
+    tokens.push_back(row.configuration_identity.value());
+    tokens.push_back(EncodeRuntimeUnitIds(row.dependency_runtime_unit_ids));
+    tokens.push_back(EncodeRuntimeRoleIds(row.required_runtime_role_ids));
+    tokens.push_back(row.status_endpoint_role_id.value());
+    tokens.push_back(row.status_endpoint_contract_id);
+    tokens.push_back(row.status_endpoint_contract_revision);
+    tokens.push_back(row.status_transport);
+    tokens.push_back(row.process_adapter_contract_id);
+    tokens.push_back(row.process_adapter_contract_revision);
+    tokens.push_back(row.retrieval_contract_id);
+    tokens.push_back(row.retrieval_contract_revision);
+    tokens.emplace_back(row.launchable_content_digest.has_value() ? "1" : "0");
+    tokens.push_back(row.launchable_content_digest.has_value()
+                         ? row.launchable_content_digest->value()
+                         : std::string{});
+    tokens.push_back(std::to_string(row.launchable_byte_size));
+    tokens.push_back(row.operating_system);
+    tokens.push_back(row.shell_contract);
+  }
+  return EncodeTokens(tokens);
+}
+
+core::RuntimeLifecycleControl
+DecodeRuntimeLifecycleControl(const std::string_view value) {
+  if (value == "manager_managed") {
+    return core::RuntimeLifecycleControl::kManagerManaged;
+  }
+  if (value == "externally_managed") {
+    return core::RuntimeLifecycleControl::kExternallyManaged;
+  }
+  throw ManagerApplyJournalIntegrityError(
+      "stored runtime lifecycle control is invalid");
+}
+
+RuntimeUnitCandidateDisposition
+DecodeRuntimeCandidateDisposition(const std::string_view value) {
+  if (value == "added") {
+    return RuntimeUnitCandidateDisposition::kAdded;
+  }
+  if (value == "retained_exact") {
+    return RuntimeUnitCandidateDisposition::kRetainedExact;
+  }
+  throw ManagerApplyJournalIntegrityError(
+      "stored runtime candidate disposition is invalid");
+}
+
+std::vector<RuntimeUnitConvergencePlanRowDTO>
+DecodeRuntimePlanRows(const std::string &encoding) {
+  constexpr std::size_t kFieldsPerRow = 25U;
+  const auto tokens = DecodeTokens(
+      encoding, kMaximumRuntimeUnits * kFieldsPerRow,
+      "runtime convergence plan");
+  if (tokens.size() % kFieldsPerRow != 0U) {
+    throw ManagerApplyJournalIntegrityError(
+        "stored runtime convergence plan tuple cardinality is invalid");
+  }
+  std::vector<RuntimeUnitConvergencePlanRowDTO> result;
+  result.reserve(tokens.size() / kFieldsPerRow);
+  for (std::size_t index = 0U; index < tokens.size();
+       index += kFieldsPerRow) {
+    const auto dependency_tokens = DecodeTokens(
+        tokens[index + 10U], kMaximumDependencies,
+        "runtime convergence dependencies");
+    const auto role_tokens =
+        DecodeTokens(tokens[index + 11U], kMaximumRuntimeRoles,
+                     "runtime convergence roles");
+    std::vector<RuntimeUnitId> dependencies;
+    std::vector<RuntimeRoleId> roles;
+    for (const auto &dependency : dependency_tokens) {
+      dependencies.emplace_back(dependency);
+    }
+    for (const auto &role : role_tokens) {
+      roles.emplace_back(role);
+    }
+    std::optional<ContentDigest> launchable_digest;
+    if (tokens[index + 20U] == "1") {
+      if (tokens[index + 21U].empty()) {
+        throw ManagerApplyJournalIntegrityError(
+            "stored runtime launchable digest is absent");
+      }
+      launchable_digest.emplace(tokens[index + 21U]);
+    } else if (tokens[index + 20U] != "0" ||
+               !tokens[index + 21U].empty()) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored runtime launchable presence is invalid");
+    }
+    RuntimeUnitConvergencePlanRowDTO row{
+        RuntimeUnitId(tokens[index]),
+        RuntimeProfileId(tokens[index + 1U]),
+        RuntimeProfileRevision(tokens[index + 2U]),
+        DecodeRuntimeLifecycleControl(tokens[index + 3U]),
+        DecodeRuntimeCandidateDisposition(tokens[index + 4U]),
+        ProductId(tokens[index + 5U]),
+        ProductContractId(tokens[index + 6U]),
+        ProductContractRevision(tokens[index + 7U]),
+        ContentDigest(tokens[index + 8U]),
+        ContentDigest(tokens[index + 9U]),
+        std::move(dependencies),
+        std::move(roles),
+        core::EndpointRoleId(tokens[index + 12U]),
+        tokens[index + 13U],
+        tokens[index + 14U],
+        tokens[index + 15U],
+        tokens[index + 16U],
+        tokens[index + 17U],
+        tokens[index + 18U],
+        tokens[index + 19U],
+        std::move(launchable_digest),
+        ParseCanonicalUnsigned(tokens[index + 22U],
+                               "runtime launchable byte size"),
+        tokens[index + 23U],
+        tokens[index + 24U],
+    };
+    if (!row.valid()) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored runtime convergence plan row is invalid");
+    }
+    result.push_back(std::move(row));
+  }
+  return result;
+}
+
+std::string EncodeDependencyEpochs(
+    const std::vector<RuntimeUnitDependencyEpochDTO> &dependencies) {
+  std::vector<std::string> tokens;
+  tokens.reserve(dependencies.size() * 2U);
+  for (const auto &dependency : dependencies) {
+    if (!dependency.valid()) {
+      throw std::invalid_argument("runtime dependency epoch is invalid");
+    }
+    tokens.push_back(dependency.runtime_unit_id.value());
+    tokens.push_back(dependency.runtime_epoch.value());
+  }
+  return EncodeTokens(tokens);
+}
+
+std::string EncodeRuntimeStagedReadyRows(
+    const std::vector<RuntimeUnitStagedReadyEvidenceDTO> &runtime_units) {
+  std::vector<std::string> tokens;
+  tokens.reserve(runtime_units.size() * 18U);
+  for (const auto &row : runtime_units) {
+    if (!row.valid()) {
+      throw std::invalid_argument("runtime staged-ready row is invalid");
+    }
+    tokens.push_back(row.runtime_unit_id.value());
+    tokens.emplace_back(core::to_string(row.lifecycle_control));
+    tokens.emplace_back(ToString(row.candidate_disposition));
+    tokens.push_back(row.runtime_epoch.value());
+    tokens.push_back(row.process_observer_instance_id);
+    tokens.push_back(std::to_string(row.process_observation_sequence));
+    tokens.push_back(std::to_string(row.source_report_sequence));
+    tokens.push_back(std::to_string(row.critical_progress_sequence));
+    tokens.push_back(row.observed_product_identity.value());
+    tokens.push_back(row.observed_configuration_identity.value());
+    tokens.emplace_back(ToString(row.source_phase));
+    tokens.emplace_back(ToString(row.source_health));
+    tokens.push_back(EncodeRuntimeRoleIds(row.ready_runtime_role_ids));
+    tokens.emplace_back(ToString(row.command_surface_state));
+    tokens.push_back(EncodeDependencyEpochs(row.dependency_runtime_epochs));
+    tokens.push_back(std::to_string(row.presence_age_ns));
+    tokens.push_back(std::to_string(row.report_age_ns));
+    tokens.push_back(std::to_string(row.progress_age_ns));
+  }
+  return EncodeTokens(tokens);
+}
+
+RuntimeSourcePhase DecodeRuntimeSourcePhase(const std::string_view value) {
+  if (value == "serving") {
+    return RuntimeSourcePhase::kServing;
+  }
+  throw ManagerApplyJournalIntegrityError(
+      "stored staged-ready source phase is invalid");
+}
+
+RuntimeSourceHealth DecodeRuntimeSourceHealth(const std::string_view value) {
+  if (value == "healthy") {
+    return RuntimeSourceHealth::kHealthy;
+  }
+  throw ManagerApplyJournalIntegrityError(
+      "stored staged-ready source health is invalid");
+}
+
+ManagedCommandSurfaceState
+DecodeRuntimeCommandSurface(const std::string_view value) {
+  if (value == "closed_no_active_effect") {
+    return ManagedCommandSurfaceState::kClosedNoActiveEffect;
+  }
+  throw ManagerApplyJournalIntegrityError(
+      "stored staged-ready command surface is invalid");
+}
+
+std::vector<RuntimeUnitStagedReadyEvidenceDTO>
+DecodeRuntimeStagedReadyRows(const std::string &encoding) {
+  constexpr std::size_t kFieldsPerRow = 18U;
+  const auto tokens = DecodeTokens(
+      encoding, kMaximumRuntimeUnits * kFieldsPerRow,
+      "runtime staged-ready evidence");
+  if (tokens.size() % kFieldsPerRow != 0U) {
+    throw ManagerApplyJournalIntegrityError(
+        "stored runtime staged-ready tuple cardinality is invalid");
+  }
+  std::vector<RuntimeUnitStagedReadyEvidenceDTO> result;
+  result.reserve(tokens.size() / kFieldsPerRow);
+  for (std::size_t index = 0U; index < tokens.size();
+       index += kFieldsPerRow) {
+    const auto role_tokens =
+        DecodeTokens(tokens[index + 12U], kMaximumRuntimeRoles,
+                     "runtime staged-ready roles");
+    const auto dependency_tokens = DecodeTokens(
+        tokens[index + 14U], kMaximumDependencies * 2U,
+        "runtime staged-ready dependency epochs");
+    if (dependency_tokens.size() % 2U != 0U) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored runtime dependency-epoch tuple cardinality is invalid");
+    }
+    std::vector<RuntimeRoleId> roles;
+    std::vector<RuntimeUnitDependencyEpochDTO> dependencies;
+    for (const auto &role : role_tokens) {
+      roles.emplace_back(role);
+    }
+    for (std::size_t dependency = 0U;
+         dependency < dependency_tokens.size(); dependency += 2U) {
+      dependencies.push_back({RuntimeUnitId(dependency_tokens[dependency]),
+                              RuntimeEpoch(
+                                  dependency_tokens[dependency + 1U])});
+    }
+    RuntimeUnitStagedReadyEvidenceDTO row{
+        RuntimeUnitId(tokens[index]),
+        DecodeRuntimeLifecycleControl(tokens[index + 1U]),
+        DecodeRuntimeCandidateDisposition(tokens[index + 2U]),
+        RuntimeEpoch(tokens[index + 3U]),
+        tokens[index + 4U],
+        ParseCanonicalUnsigned(tokens[index + 5U],
+                               "process observation sequence"),
+        ParseCanonicalUnsigned(tokens[index + 6U],
+                               "source report sequence"),
+        ParseCanonicalUnsigned(tokens[index + 7U],
+                               "critical progress sequence"),
+        ContentDigest(tokens[index + 8U]),
+        ContentDigest(tokens[index + 9U]),
+        DecodeRuntimeSourcePhase(tokens[index + 10U]),
+        DecodeRuntimeSourceHealth(tokens[index + 11U]),
+        std::move(roles),
+        DecodeRuntimeCommandSurface(tokens[index + 13U]),
+        std::move(dependencies),
+        ParseCanonicalUnsigned(tokens[index + 15U], "presence age"),
+        ParseCanonicalUnsigned(tokens[index + 16U], "report age"),
+        ParseCanonicalUnsigned(tokens[index + 17U], "progress age"),
+    };
+    if (!row.valid()) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored runtime staged-ready row is invalid");
+    }
+    result.push_back(std::move(row));
+  }
+  return result;
+}
+
+struct EncodedRuntimeConvergenceIntent final {
+  std::int64_t apply_generation;
+  std::int64_t predecessor_publication_generation;
+  std::string runtime_units;
+  std::string digest;
+};
+
+EncodedRuntimeConvergenceIntent EncodeRuntimeConvergenceIntent(
+    const ContentDigest &intent_digest,
+    const ManagerApplyRuntimeConvergenceIntentDTO &intent) {
+  if (!intent.valid()) {
+    throw std::invalid_argument("runtime convergence intent is invalid");
+  }
+  ValidateDigest(intent_digest.value(), "intent_digest");
+  EncodedRuntimeConvergenceIntent encoded{
+      CheckedSigned(intent.apply_generation.value(), "apply_generation"),
+      CheckedSigned(intent.predecessor_publication_generation.value(),
+                    "predecessor_publication_generation"),
+      EncodeRuntimePlanRows(intent.runtime_units),
+      {},
+  };
+  std::string record;
+  AppendField(record, "domain", kRuntimeConvergenceIntentDigestDomain);
+  AppendField(record, "intent_digest", intent_digest.value());
+  AppendField(record, "apply_id", intent.apply_id.value());
+  AppendField(record, "apply_generation",
+              std::to_string(encoded.apply_generation));
+  AppendField(record, "candidate_retained_bundle_id",
+              intent.candidate_retained_bundle_id.value());
+  AppendField(record, "candidate_graph_revision",
+              intent.candidate_graph_revision.value());
+  AppendField(record, "fence_acceptance_digest",
+              intent.fence_acceptance_digest.value());
+  AppendField(record, "predecessor_publication_generation",
+              std::to_string(encoded.predecessor_publication_generation));
+  AppendField(record, "predecessor_public_pointer_digest",
+              intent.predecessor_public_pointer_digest.value());
+  AppendField(record, "runtime_units_encoding", encoded.runtime_units);
+  encoded.digest = RawDigest(record);
+  return encoded;
+}
+
+struct EncodedRuntimeStagedReady final {
+  std::int64_t apply_generation;
+  std::int64_t staged_ready_generation;
+  std::int64_t predecessor_publication_generation;
+  std::int64_t evaluated_at_ns;
+  std::string runtime_evidence;
+  std::string digest;
+};
+
+EncodedRuntimeStagedReady EncodeRuntimeStagedReady(
+    const ManagerApplyRuntimeStagedReadyDTO &staged_ready) {
+  if (!staged_ready.valid()) {
+    throw std::invalid_argument("runtime staged-ready set is invalid");
+  }
+  EncodedRuntimeStagedReady encoded{
+      CheckedSigned(staged_ready.apply_generation.value(),
+                    "apply_generation"),
+      CheckedSigned(staged_ready.staged_ready_generation,
+                    "staged_ready_generation"),
+      CheckedSigned(staged_ready.predecessor_publication_generation.value(),
+                    "predecessor_publication_generation"),
+      CheckedSigned(staged_ready.evaluated_at_ns, "evaluated_at_ns"),
+      EncodeRuntimeStagedReadyRows(staged_ready.runtime_units),
+      {},
+  };
+  std::string record;
+  AppendField(record, "domain", kRuntimeStagedReadyDigestDomain);
+  AppendField(record, "runtime_convergence_intent_digest",
+              staged_ready.runtime_convergence_intent_digest.value());
+  AppendField(record, "apply_id", staged_ready.apply_id.value());
+  AppendField(record, "apply_generation",
+              std::to_string(encoded.apply_generation));
+  AppendField(record, "staged_ready_generation",
+              std::to_string(encoded.staged_ready_generation));
+  AppendField(record, "predecessor_publication_generation",
+              std::to_string(encoded.predecessor_publication_generation));
+  AppendField(record, "predecessor_public_pointer_digest",
+              staged_ready.predecessor_public_pointer_digest.value());
+  AppendField(record, "evaluated_at_ns",
+              std::to_string(encoded.evaluated_at_ns));
+  AppendField(record, "runtime_evidence_encoding", encoded.runtime_evidence);
+  encoded.digest = RawDigest(record);
+  return encoded;
+}
+
 std::filesystem::path ValidateDatabasePath(std::filesystem::path path) {
   if (path.empty()) {
     throw std::invalid_argument(
@@ -1091,7 +1487,11 @@ void ValidateApplyJournalMetadata(sqlite3 *database, const CellId &cell_id) {
           static_cast<std::int64_t>(kMaximumManagerApplyFenceBindings) ||
       row.Integer(11) !=
           static_cast<std::int64_t>(kMaximumManagerApplyFenceResources) ||
-      row.Integer(12) != kMaximumManagerApplyJournalDatabasePageImageBytes) {
+      row.Integer(12) !=
+          static_cast<std::int64_t>(kMaximumManagerApplyIntents) ||
+      row.Integer(13) !=
+          static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets) ||
+      row.Integer(14) != kMaximumManagerApplyJournalDatabasePageImageBytes) {
     throw ManagerApplyJournalIntegrityError(
         "Apply-journal resource-limit metadata mismatch");
   }
@@ -1341,8 +1741,10 @@ public:
           "maximum_apply_intents,maximum_fence_attempts,"
           "maximum_affected_scopes,maximum_fence_components,"
           "maximum_fence_domains,maximum_fence_bindings,"
-          "maximum_fence_resources,maximum_main_database_page_image_bytes"
-          ") VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?)");
+          "maximum_fence_resources,maximum_runtime_convergence_intents,"
+          "maximum_runtime_staged_ready_sets,"
+          "maximum_main_database_page_image_bytes"
+          ") VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
       metadata.Bind(1, kManagerApplyJournalSchemaId);
       metadata.Bind(2, kManagerApplyJournalSchemaVersion);
       metadata.Bind(3, RawDigest(detail::kEmbeddedManagerApplyJournalSchema));
@@ -1360,7 +1762,11 @@ public:
           10, static_cast<std::int64_t>(kMaximumManagerApplyFenceBindings));
       metadata.Bind(
           11, static_cast<std::int64_t>(kMaximumManagerApplyFenceResources));
-      metadata.Bind(12, kMaximumManagerApplyJournalDatabasePageImageBytes);
+      metadata.Bind(12,
+                    static_cast<std::int64_t>(kMaximumManagerApplyIntents));
+      metadata.Bind(
+          13, static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets));
+      metadata.Bind(14, kMaximumManagerApplyJournalDatabasePageImageBytes);
       static_cast<void>(metadata.Step());
     } else if (!existing.contains({"table", "apply_journal_metadata"})) {
       throw ManagerApplyJournalIntegrityError(
@@ -1740,6 +2146,198 @@ public:
     }
   }
 
+  std::optional<PersistedManagerApplyRuntimeConvergenceIntent>
+  RuntimeConvergenceIntentLocked(
+      const ApplyId &apply_id,
+      const std::int64_t apply_generation) const {
+    Statement row(
+        database_,
+        "SELECT intent_digest,candidate_retained_bundle_id,"
+        "candidate_graph_revision,fence_acceptance_digest,"
+        "predecessor_publication_generation,"
+        "predecessor_public_pointer_digest,runtime_units_encoding,"
+        "runtime_convergence_intent_digest "
+        "FROM manager_apply_runtime_convergence_intents "
+        "WHERE apply_id=? AND apply_generation=?");
+    row.Bind(1, apply_id.value());
+    row.Bind(2, apply_generation);
+    if (!row.Step()) {
+      return std::nullopt;
+    }
+    const auto intent_digest = row.Text(0);
+    const auto candidate_bundle = row.Text(1);
+    const auto candidate_graph = row.Text(2);
+    const auto acceptance_digest = row.Text(3);
+    const auto publication_generation = row.Integer(4);
+    const auto public_pointer_digest = row.Text(5);
+    const auto runtime_units = row.Text(6);
+    const auto stored_digest = row.Text(7);
+    if (row.Step() || publication_generation <= 0) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored runtime convergence intent is structurally invalid");
+    }
+    try {
+      ManagerApplyRuntimeConvergenceIntentDTO intent{
+          apply_id,
+          ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
+          RetainedBundleId(candidate_bundle),
+          GraphRevision(candidate_graph),
+          ContentDigest(acceptance_digest),
+          core::ActiveBundlePublicationGeneration(
+              static_cast<std::uint64_t>(publication_generation)),
+          ContentDigest(public_pointer_digest),
+          DecodeRuntimePlanRows(runtime_units),
+      };
+      const ContentDigest parent_digest(intent_digest);
+      const auto encoded =
+          EncodeRuntimeConvergenceIntent(parent_digest, intent);
+      const auto parent = IntentLocked(apply_id, apply_generation);
+      const auto acceptance =
+          FenceAcceptanceLocked(apply_id, apply_generation);
+      if (encoded.digest != stored_digest || !parent.has_value() ||
+          parent->intent_digest != parent_digest ||
+          parent->intent.candidate_retained_bundle_id !=
+              intent.candidate_retained_bundle_id ||
+          parent->intent.candidate_graph_revision !=
+              intent.candidate_graph_revision ||
+          !acceptance.has_value() ||
+          acceptance->acceptance_digest != intent.fence_acceptance_digest) {
+        throw ManagerApplyJournalIntegrityError(
+            "stored runtime convergence intent is not bound to its exact "
+            "Apply/fence records");
+      }
+      return PersistedManagerApplyRuntimeConvergenceIntent{
+          std::move(intent), parent_digest, ContentDigest(stored_digest)};
+    } catch (const ManagerApplyJournalIntegrityError &) {
+      throw;
+    } catch (const std::exception &) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored runtime convergence intent contains an invalid value");
+    }
+  }
+
+  std::optional<PersistedManagerApplyRuntimeStagedReady>
+  RuntimeStagedReadyLocked(
+      const ApplyId &apply_id, const std::int64_t apply_generation,
+      const std::int64_t staged_ready_generation) const {
+    Statement row(
+        database_,
+        "SELECT runtime_convergence_intent_digest,"
+        "predecessor_publication_generation,"
+        "predecessor_public_pointer_digest,evaluated_at_ns,"
+        "runtime_evidence_encoding,staged_ready_digest "
+        "FROM manager_apply_runtime_staged_ready_sets "
+        "WHERE apply_id=? AND apply_generation=? "
+        "AND staged_ready_generation=?");
+    row.Bind(1, apply_id.value());
+    row.Bind(2, apply_generation);
+    row.Bind(3, staged_ready_generation);
+    if (!row.Step()) {
+      return std::nullopt;
+    }
+    const auto convergence_digest = row.Text(0);
+    const auto publication_generation = row.Integer(1);
+    const auto public_pointer_digest = row.Text(2);
+    const auto evaluated_at_ns = row.Integer(3);
+    const auto runtime_evidence = row.Text(4);
+    const auto stored_digest = row.Text(5);
+    if (row.Step() || staged_ready_generation <= 0 ||
+        publication_generation <= 0 || evaluated_at_ns <= 0) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored runtime staged-ready set is structurally invalid");
+    }
+    try {
+      ManagerApplyRuntimeStagedReadyDTO staged_ready{
+          apply_id,
+          ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
+          static_cast<std::uint64_t>(staged_ready_generation),
+          ContentDigest(convergence_digest),
+          core::ActiveBundlePublicationGeneration(
+              static_cast<std::uint64_t>(publication_generation)),
+          ContentDigest(public_pointer_digest),
+          static_cast<std::uint64_t>(evaluated_at_ns),
+          DecodeRuntimeStagedReadyRows(runtime_evidence),
+      };
+      const auto encoded = EncodeRuntimeStagedReady(staged_ready);
+      const auto intent =
+          RuntimeConvergenceIntentLocked(apply_id, apply_generation);
+      if (encoded.digest != stored_digest || !intent.has_value() ||
+          intent->runtime_convergence_intent_digest !=
+              staged_ready.runtime_convergence_intent_digest ||
+          intent->runtime_convergence_intent
+                  .predecessor_publication_generation !=
+              staged_ready.predecessor_publication_generation ||
+          intent->runtime_convergence_intent
+                  .predecessor_public_pointer_digest !=
+              staged_ready.predecessor_public_pointer_digest ||
+          intent->runtime_convergence_intent.runtime_units.size() !=
+              staged_ready.runtime_units.size()) {
+        throw ManagerApplyJournalIntegrityError(
+            "stored runtime staged-ready set is not bound to its exact "
+            "convergence intent");
+      }
+      for (std::size_t index = 0U;
+           index < staged_ready.runtime_units.size(); ++index) {
+        const auto &plan =
+            intent->runtime_convergence_intent.runtime_units[index];
+        const auto &evidence = staged_ready.runtime_units[index];
+        if (evidence.runtime_unit_id != plan.runtime_unit_id ||
+            evidence.lifecycle_control != plan.lifecycle_control ||
+            evidence.candidate_disposition != plan.candidate_disposition ||
+            evidence.observed_product_identity != plan.product_identity ||
+            evidence.observed_configuration_identity !=
+                plan.configuration_identity ||
+            evidence.ready_runtime_role_ids !=
+                plan.required_runtime_role_ids ||
+            evidence.dependency_runtime_epochs.size() !=
+                plan.dependency_runtime_unit_ids.size()) {
+          throw ManagerApplyJournalIntegrityError(
+              "stored runtime staged-ready row differs from its plan");
+        }
+        for (std::size_t dependency = 0U;
+             dependency < evidence.dependency_runtime_epochs.size();
+             ++dependency) {
+          if (evidence.dependency_runtime_epochs[dependency].runtime_unit_id !=
+              plan.dependency_runtime_unit_ids[dependency]) {
+            throw ManagerApplyJournalIntegrityError(
+                "stored runtime staged-ready dependency differs from its "
+                "plan");
+          }
+        }
+      }
+      return PersistedManagerApplyRuntimeStagedReady{
+          std::move(staged_ready), ContentDigest(stored_digest)};
+    } catch (const ManagerApplyJournalIntegrityError &) {
+      throw;
+    } catch (const std::exception &) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored runtime staged-ready set contains an invalid value");
+    }
+  }
+
+  std::optional<PersistedManagerApplyRuntimeStagedReady>
+  LatestRuntimeStagedReadyLocked(
+      const ApplyId &apply_id,
+      const std::int64_t apply_generation) const {
+    Statement row(
+        database_,
+        "SELECT staged_ready_generation "
+        "FROM manager_apply_runtime_staged_ready_sets "
+        "WHERE apply_id=? AND apply_generation=? "
+        "ORDER BY staged_ready_generation DESC LIMIT 1");
+    row.Bind(1, apply_id.value());
+    row.Bind(2, apply_generation);
+    if (!row.Step()) {
+      return std::nullopt;
+    }
+    const auto generation = row.Integer(0);
+    if (generation <= 0 || row.Step()) {
+      throw ManagerApplyJournalIntegrityError(
+          "runtime staged-ready high-water row is invalid");
+    }
+    return RuntimeStagedReadyLocked(apply_id, apply_generation, generation);
+  }
+
   ManagerApplyJournalIntegrityReport VerifyIntegrityLocked() const {
     Statement integrity(database_, "PRAGMA integrity_check");
     if (!integrity.Step() || integrity.Text(0) != "ok" || integrity.Step()) {
@@ -1825,12 +2423,24 @@ public:
         database_, "SELECT COUNT(*) FROM manager_apply_fence_attempts");
     const auto acceptance_count = ScalarInteger(
         database_, "SELECT COUNT(*) FROM manager_apply_fence_acceptances");
+    const auto runtime_intent_count = ScalarInteger(
+        database_,
+        "SELECT COUNT(*) FROM manager_apply_runtime_convergence_intents");
+    const auto runtime_staged_ready_count = ScalarInteger(
+        database_,
+        "SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets");
     if (affected_scope_count < 0 || attempt_count < 0 || acceptance_count < 0 ||
+        runtime_intent_count < 0 || runtime_staged_ready_count < 0 ||
         affected_scope_count >
             static_cast<std::int64_t>(kMaximumManagerApplyAffectedScopes) ||
         attempt_count >
             static_cast<std::int64_t>(kMaximumManagerApplyFenceAttempts) ||
         acceptance_count > attempt_count ||
+        runtime_intent_count > acceptance_count ||
+        runtime_intent_count >
+            static_cast<std::int64_t>(kMaximumManagerApplyIntents) ||
+        runtime_staged_ready_count >
+            static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets) ||
         attempt_count > affected_scope_count ||
         affected_scope_count > intent_count) {
       throw ManagerApplyJournalIntegrityError(
@@ -1895,6 +2505,62 @@ public:
       throw ManagerApplyJournalIntegrityError(
           "stored Apply-fence inventory count is inconsistent");
     }
+    Statement runtime_intents(
+        database_,
+        "SELECT apply_id,apply_generation "
+        "FROM manager_apply_runtime_convergence_intents "
+        "ORDER BY apply_id,apply_generation LIMIT ?");
+    runtime_intents.Bind(
+        1, static_cast<std::int64_t>(kMaximumManagerApplyIntents + 1U));
+    std::int64_t observed_runtime_intents = 0;
+    while (runtime_intents.Step()) {
+      ++observed_runtime_intents;
+      if (observed_runtime_intents >
+              static_cast<std::int64_t>(kMaximumManagerApplyIntents) ||
+          !RuntimeConvergenceIntentLocked(
+               ApplyId(runtime_intents.Text(0)), runtime_intents.Integer(1))
+               .has_value()) {
+        throw ManagerApplyJournalIntegrityError(
+            "stored runtime convergence-intent inventory is inconsistent");
+      }
+    }
+    Statement staged_ready_sets(
+        database_,
+        "SELECT apply_id,apply_generation,staged_ready_generation "
+        "FROM manager_apply_runtime_staged_ready_sets "
+        "ORDER BY apply_id,apply_generation,staged_ready_generation "
+        "LIMIT ?");
+    staged_ready_sets.Bind(
+        1, static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets + 1U));
+    std::int64_t observed_staged_ready = 0;
+    std::map<std::pair<ApplyId, std::int64_t>, std::int64_t>
+        expected_staged_ready_generations;
+    while (staged_ready_sets.Step()) {
+      ++observed_staged_ready;
+      const auto apply = ApplyId(staged_ready_sets.Text(0));
+      const auto apply_generation = staged_ready_sets.Integer(1);
+      const auto staged_generation = staged_ready_sets.Integer(2);
+      auto [expected, inserted] = expected_staged_ready_generations.emplace(
+          std::make_pair(apply, apply_generation), 1);
+      if (observed_staged_ready >
+              static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets) ||
+          staged_generation != expected->second ||
+          staged_generation > static_cast<std::int64_t>(
+                                  kMaximumRuntimeStagedReadySetsPerApply) ||
+          !RuntimeStagedReadyLocked(apply, apply_generation,
+                                   staged_generation)
+               .has_value()) {
+        throw ManagerApplyJournalIntegrityError(
+            "stored runtime staged-ready inventory is inconsistent");
+      }
+      ++expected->second;
+      static_cast<void>(inserted);
+    }
+    if (observed_runtime_intents != runtime_intent_count ||
+        observed_staged_ready != runtime_staged_ready_count) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored runtime convergence inventory count is inconsistent");
+    }
     return {
         cell_id_,
         std::string(kManagerApplyJournalSchemaId),
@@ -1906,6 +2572,8 @@ public:
         affected_scope_count,
         attempt_count,
         acceptance_count,
+        runtime_intent_count,
+        runtime_staged_ready_count,
     };
   }
 
@@ -2357,6 +3025,196 @@ SqliteManagerApplyJournal::ReadFenceAcceptance(
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN");
   const auto result = impl_->FenceAcceptanceLocked(apply_id, generation);
+  transaction.Commit();
+  return result;
+}
+
+ManagerApplyRuntimeConvergenceIntentWriteResult
+SqliteManagerApplyJournal::EnsureRuntimeConvergenceIntent(
+    const ContentDigest &intent_digest,
+    const ManagerApplyRuntimeConvergenceIntentDTO &runtime_intent) {
+  const auto encoded =
+      EncodeRuntimeConvergenceIntent(intent_digest, runtime_intent);
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
+  static_cast<void>(impl_->VerifyIntegrityLocked());
+  const auto parent = impl_->IntentLocked(runtime_intent.apply_id,
+                                          encoded.apply_generation);
+  const auto acceptance = impl_->FenceAcceptanceLocked(
+      runtime_intent.apply_id, encoded.apply_generation);
+  if (!parent.has_value() || parent->intent_digest != intent_digest ||
+      !acceptance.has_value() ||
+      acceptance->acceptance_digest != runtime_intent.fence_acceptance_digest) {
+    throw ManagerApplyJournalConflictError(
+        "runtime convergence intent does not name its exact durable "
+        "Apply/fence acceptance");
+  }
+  if (const auto existing = impl_->RuntimeConvergenceIntentLocked(
+          runtime_intent.apply_id, encoded.apply_generation);
+      existing.has_value()) {
+    if (existing->intent_digest != intent_digest ||
+        existing->runtime_convergence_intent != runtime_intent ||
+        existing->runtime_convergence_intent_digest.value() !=
+            encoded.digest) {
+      throw ManagerApplyJournalConflictError(
+          "Apply generation already has a different runtime convergence "
+          "intent");
+    }
+    transaction.Commit();
+    return {*existing, false};
+  }
+  const auto count = ScalarInteger(
+      impl_->database_,
+      "SELECT COUNT(*) FROM manager_apply_runtime_convergence_intents");
+  if (count >= static_cast<std::int64_t>(kMaximumManagerApplyIntents)) {
+    throw ManagerApplyJournalLimitError(
+        "runtime convergence-intent inventory reached its fixed limit");
+  }
+  Statement insert(
+      impl_->database_,
+      "INSERT INTO manager_apply_runtime_convergence_intents ("
+      "apply_id,apply_generation,intent_digest,"
+      "candidate_retained_bundle_id,candidate_graph_revision,"
+      "fence_acceptance_digest,predecessor_publication_generation,"
+      "predecessor_public_pointer_digest,runtime_units_encoding,"
+      "runtime_convergence_intent_digest) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?)");
+  insert.Bind(1, runtime_intent.apply_id.value());
+  insert.Bind(2, encoded.apply_generation);
+  insert.Bind(3, intent_digest.value());
+  insert.Bind(4, runtime_intent.candidate_retained_bundle_id.value());
+  insert.Bind(5, runtime_intent.candidate_graph_revision.value());
+  insert.Bind(6, runtime_intent.fence_acceptance_digest.value());
+  insert.Bind(7, encoded.predecessor_publication_generation);
+  insert.Bind(8, runtime_intent.predecessor_public_pointer_digest.value());
+  insert.Bind(9, encoded.runtime_units);
+  insert.Bind(10, encoded.digest);
+  static_cast<void>(insert.Step());
+  const auto stored = impl_->RuntimeConvergenceIntentLocked(
+      runtime_intent.apply_id, encoded.apply_generation);
+  if (!stored.has_value() ||
+      stored->runtime_convergence_intent != runtime_intent ||
+      stored->runtime_convergence_intent_digest.value() != encoded.digest) {
+    throw ManagerApplyJournalIntegrityError(
+        "inserted runtime convergence intent cannot be verified");
+  }
+  static_cast<void>(impl_->VerifyIntegrityLocked());
+  transaction.Commit();
+  return {*stored, true};
+}
+
+std::optional<PersistedManagerApplyRuntimeConvergenceIntent>
+SqliteManagerApplyJournal::ReadRuntimeConvergenceIntent(
+    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
+  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  const auto generation =
+      CheckedSigned(apply_generation.value(), "apply_generation");
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  Transaction transaction(impl_->database_, "BEGIN");
+  const auto result =
+      impl_->RuntimeConvergenceIntentLocked(apply_id, generation);
+  transaction.Commit();
+  return result;
+}
+
+ManagerApplyRuntimeStagedReadyWriteResult
+SqliteManagerApplyJournal::EnsureRuntimeStagedReady(
+    const ManagerApplyRuntimeStagedReadyDTO &staged_ready) {
+  const auto encoded = EncodeRuntimeStagedReady(staged_ready);
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
+  static_cast<void>(impl_->VerifyIntegrityLocked());
+  const auto intent = impl_->RuntimeConvergenceIntentLocked(
+      staged_ready.apply_id, encoded.apply_generation);
+  if (!intent.has_value() ||
+      intent->runtime_convergence_intent_digest !=
+          staged_ready.runtime_convergence_intent_digest ||
+      intent->runtime_convergence_intent.predecessor_publication_generation !=
+          staged_ready.predecessor_publication_generation ||
+      intent->runtime_convergence_intent
+              .predecessor_public_pointer_digest !=
+          staged_ready.predecessor_public_pointer_digest) {
+    throw ManagerApplyJournalConflictError(
+        "runtime staged-ready set does not name its exact convergence "
+        "intent/publication");
+  }
+  if (const auto existing = impl_->RuntimeStagedReadyLocked(
+          staged_ready.apply_id, encoded.apply_generation,
+          encoded.staged_ready_generation);
+      existing.has_value()) {
+    if (existing->staged_ready != staged_ready ||
+        existing->staged_ready_digest.value() != encoded.digest) {
+      throw ManagerApplyJournalConflictError(
+          "staged-ready generation already has different evidence");
+    }
+    transaction.Commit();
+    return {*existing, false};
+  }
+  const auto latest = impl_->LatestRuntimeStagedReadyLocked(
+      staged_ready.apply_id, encoded.apply_generation);
+  const auto expected_generation =
+      latest.has_value()
+          ? latest->staged_ready.staged_ready_generation + 1U
+          : 1U;
+  if (staged_ready.staged_ready_generation != expected_generation ||
+      staged_ready.staged_ready_generation >
+          kMaximumRuntimeStagedReadySetsPerApply) {
+    throw ManagerApplyJournalConflictError(
+        "runtime staged-ready generations must be contiguous and bounded");
+  }
+  const auto count = ScalarInteger(
+      impl_->database_,
+      "SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets");
+  if (count >= static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets)) {
+    throw ManagerApplyJournalLimitError(
+        "runtime staged-ready inventory reached its fixed limit");
+  }
+  Statement insert(
+      impl_->database_,
+      "INSERT INTO manager_apply_runtime_staged_ready_sets ("
+      "apply_id,apply_generation,staged_ready_generation,"
+      "runtime_convergence_intent_digest,"
+      "predecessor_publication_generation,"
+      "predecessor_public_pointer_digest,evaluated_at_ns,"
+      "runtime_evidence_encoding,staged_ready_digest) "
+      "VALUES (?,?,?,?,?,?,?,?,?)");
+  insert.Bind(1, staged_ready.apply_id.value());
+  insert.Bind(2, encoded.apply_generation);
+  insert.Bind(3, encoded.staged_ready_generation);
+  insert.Bind(4, staged_ready.runtime_convergence_intent_digest.value());
+  insert.Bind(5, encoded.predecessor_publication_generation);
+  insert.Bind(6, staged_ready.predecessor_public_pointer_digest.value());
+  insert.Bind(7, encoded.evaluated_at_ns);
+  insert.Bind(8, encoded.runtime_evidence);
+  insert.Bind(9, encoded.digest);
+  static_cast<void>(insert.Step());
+  const auto stored = impl_->RuntimeStagedReadyLocked(
+      staged_ready.apply_id, encoded.apply_generation,
+      encoded.staged_ready_generation);
+  if (!stored.has_value() || stored->staged_ready != staged_ready ||
+      stored->staged_ready_digest.value() != encoded.digest) {
+    throw ManagerApplyJournalIntegrityError(
+        "inserted runtime staged-ready set cannot be verified");
+  }
+  static_cast<void>(impl_->VerifyIntegrityLocked());
+  transaction.Commit();
+  return {*stored, true};
+}
+
+std::optional<PersistedManagerApplyRuntimeStagedReady>
+SqliteManagerApplyJournal::ReadLatestRuntimeStagedReady(
+    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
+  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  const auto generation =
+      CheckedSigned(apply_generation.value(), "apply_generation");
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  Transaction transaction(impl_->database_, "BEGIN");
+  const auto result =
+      impl_->LatestRuntimeStagedReadyLocked(apply_id, generation);
   transaction.Commit();
   return result;
 }

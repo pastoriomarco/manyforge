@@ -38,12 +38,17 @@ std::optional<ReferenceRuntimeUnitAdmission> VerifyReferenceRuntimeUnitForHost(
       product_identity,
   };
   return ReferenceRuntimeUnitAdmission(
-      runtime_id, product_identity, product->configuration_identity().value(),
+      runtime_id, product->retained_bundle_id(), product->product_id(),
+      product->product_contract_id(), product->product_contract_revision(), product_identity,
+      product->configuration_identity().value(),
       product->launchable_artifact_ref().content_digest.value(),
       std::string(product->launchable_bytes()), std::move(fixed_arguments),
       "runtime-ready " + runtime_id + " " + product_identity, "shutdown\n",
       std::string(product->runtime_role_id()), std::string(product->status_endpoint_role_id()),
-      std::string(product->process_adapter_contract_id()),
+      std::string(product->status_endpoint_contract_id()),
+      std::string(product->status_endpoint_contract_revision()),
+      std::string(product->status_transport()), std::string(product->operating_system()),
+      std::string(product->shell_contract()), std::string(product->process_adapter_contract_id()),
       std::string(product->process_adapter_contract_revision()),
       std::string(product->retrieval_contract_id()),
       std::string(product->retrieval_contract_revision()));

@@ -29,6 +29,7 @@ namespace {
 using core::ApplyConfigurationFenceIntentDTO;
 using core::ApplyGeneration;
 using core::ApplyId;
+using core::ActiveBundlePublicationGeneration;
 using core::CellId;
 using core::ConfigurationFenceAcceptedDTO;
 using core::ConfigurationFenceGeneration;
@@ -40,13 +41,22 @@ using core::ControlBindingRevision;
 using core::ControlDomainId;
 using core::ControlDomainRevision;
 using core::ControllableComponentId;
+using core::EndpointRoleId;
 using core::GraphRevision;
+using core::ProductContractId;
+using core::ProductContractRevision;
+using core::ProductId;
 using core::ProjectionRevisionDTO;
 using core::PublicRequestContextDTO;
 using core::RequestId;
 using core::RequestOwnerEpoch;
 using core::ResourceId;
 using core::RetainedBundleId;
+using core::RuntimeEpoch;
+using core::RuntimeProfileId;
+using core::RuntimeProfileRevision;
+using core::RuntimeRoleId;
+using core::RuntimeUnitId;
 using core::SceneId;
 using core::SceneRevision;
 
@@ -170,6 +180,102 @@ AcceptedFence(core::RequestReplayStatusDTO replay_status =
       123456789LL,
       replay_status,
   };
+}
+
+RuntimeUnitConvergencePlanRowDTO RuntimePlanRow() {
+  return {
+      RuntimeUnitId("runtime-1"),
+      RuntimeProfileId("profile-1"),
+      RuntimeProfileRevision("profile-r1"),
+      core::RuntimeLifecycleControl::kManagerManaged,
+      RuntimeUnitCandidateDisposition::kAdded,
+      ProductId("runtime-product-1"),
+      ProductContractId("manyforge.reference-runtime-product.v1"),
+      ProductContractRevision("1"),
+      ContentDigest(std::string(kDigestOne)),
+      ContentDigest(std::string(kDigestTwo)),
+      {},
+      {RuntimeRoleId("runtime.role.reference")},
+      EndpointRoleId("runtime.status"),
+      "manyforge.reference-runtime-status.v1",
+      "1",
+      "stdout_line",
+      "manyforge.process-adapter.posix-shell.v1",
+      "1",
+      "manyforge.retained-artifact-retrieval.v1",
+      "1",
+      ContentDigest(std::string(kDigestOne)),
+      128U,
+      "linux",
+      "posix-sh",
+  };
+}
+
+ManagerApplyRuntimeConvergenceIntentDTO RuntimeIntent(
+    const ContentDigest &acceptance_digest, const bool empty = false) {
+  return {
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      RetainedBundleId("candidate-bundle-1"),
+      GraphRevision("candidate-graph"),
+      acceptance_digest,
+      ActiveBundlePublicationGeneration(3U),
+      ContentDigest(std::string(kDigestOne)),
+      empty ? std::vector<RuntimeUnitConvergencePlanRowDTO>{}
+            : std::vector<RuntimeUnitConvergencePlanRowDTO>{RuntimePlanRow()},
+  };
+}
+
+ManagerApplyRuntimeStagedReadyDTO RuntimeStagedReady(
+    const ContentDigest &convergence_digest, const std::uint64_t generation,
+    const bool empty = false) {
+  std::vector<RuntimeUnitStagedReadyEvidenceDTO> runtime_units;
+  if (!empty) {
+    runtime_units.push_back({
+        RuntimeUnitId("runtime-1"),
+        core::RuntimeLifecycleControl::kManagerManaged,
+        RuntimeUnitCandidateDisposition::kAdded,
+        RuntimeEpoch("runtime-epoch-1"),
+        "observer-1",
+        generation,
+        generation,
+        generation,
+        ContentDigest(std::string(kDigestOne)),
+        ContentDigest(std::string(kDigestTwo)),
+        RuntimeSourcePhase::kServing,
+        RuntimeSourceHealth::kHealthy,
+        {RuntimeRoleId("runtime.role.reference")},
+        ManagedCommandSurfaceState::kClosedNoActiveEffect,
+        {},
+        generation,
+        generation + 1U,
+        generation + 2U,
+    });
+  }
+  return {
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      generation,
+      convergence_digest,
+      ActiveBundlePublicationGeneration(3U),
+      ContentDigest(std::string(kDigestOne)),
+      100U + generation,
+      std::move(runtime_units),
+  };
+}
+
+struct AcceptedApplyRecords final {
+  PersistedManagerApplyIntent intent;
+  PersistedManagerApplyFenceAcceptance acceptance;
+};
+
+AcceptedApplyRecords EnsureAcceptedApply(SqliteManagerApplyJournal &journal) {
+  const auto intent = journal.EnsureIntent(Intent()).record;
+  const auto attempt = EnsureAttempt(journal, intent.intent_digest).record;
+  const auto acceptance = journal.EnsureFenceAcceptance(
+      ApplyId("apply-1"), ApplyGeneration(1U), attempt.fence_attempt_digest,
+      AcceptedFence());
+  return {intent, acceptance.record};
 }
 
 bool SameFenceIntent(const ApplyConfigurationFenceIntentDTO &lhs,
@@ -1262,6 +1368,179 @@ TEST(ManagerApplyFenceJournal,
       "SELECT RAISE(ABORT, 'manager_apply_fence_acceptances is immutable'); "
       "END;");
   EXPECT_THROW(SqliteManagerApplyJournal(acceptance_path, CellId("cell-1")),
+               ManagerApplyJournalIntegrityError);
+}
+
+TEST(ManagerApplyRuntimeJournal,
+     PersistsIntentAndStagedReadyExactlyAcrossRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "runtime.sqlite3";
+  PersistedManagerApplyRuntimeConvergenceIntent expected_intent{
+      RuntimeIntent(ContentDigest(std::string(kDigestOne))),
+      ContentDigest(std::string(kDigestOne)),
+      ContentDigest(std::string(kDigestOne)),
+  };
+  PersistedManagerApplyRuntimeStagedReady expected_staged{
+      RuntimeStagedReady(ContentDigest(std::string(kDigestOne)), 1U),
+      ContentDigest(std::string(kDigestOne)),
+  };
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto accepted = EnsureAcceptedApply(journal);
+    const auto runtime_intent = journal.EnsureRuntimeConvergenceIntent(
+        accepted.intent.intent_digest,
+        RuntimeIntent(accepted.acceptance.acceptance_digest));
+    EXPECT_TRUE(runtime_intent.inserted);
+    EXPECT_TRUE(runtime_intent.record.runtime_convergence_intent.valid());
+    const auto runtime_replay = journal.EnsureRuntimeConvergenceIntent(
+        accepted.intent.intent_digest,
+        RuntimeIntent(accepted.acceptance.acceptance_digest));
+    EXPECT_FALSE(runtime_replay.inserted);
+    EXPECT_EQ(runtime_replay.record, runtime_intent.record);
+    expected_intent = runtime_intent.record;
+
+    const auto staged = journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+        runtime_intent.record.runtime_convergence_intent_digest, 1U));
+    EXPECT_TRUE(staged.inserted);
+    EXPECT_TRUE(staged.record.staged_ready.valid());
+    const auto staged_replay = journal.EnsureRuntimeStagedReady(
+        RuntimeStagedReady(
+            runtime_intent.record.runtime_convergence_intent_digest, 1U));
+    EXPECT_FALSE(staged_replay.inserted);
+    EXPECT_EQ(staged_replay.record, staged.record);
+    expected_staged = staged.record;
+  }
+
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  EXPECT_EQ(reopened.ReadRuntimeConvergenceIntent(
+                ApplyId("apply-1"), ApplyGeneration(1U)),
+            expected_intent);
+  EXPECT_EQ(reopened.ReadLatestRuntimeStagedReady(
+                ApplyId("apply-1"), ApplyGeneration(1U)),
+            expected_staged);
+  const auto report = reopened.VerifyIntegrity();
+  EXPECT_EQ(report.runtime_convergence_intent_count, 1);
+  EXPECT_EQ(report.runtime_staged_ready_count, 1);
+}
+
+TEST(ManagerApplyRuntimeJournal,
+     RequiresAcceptedParentAndRejectsConflictingReplay) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "runtime.sqlite3",
+                                    CellId("cell-1"));
+  const auto parent = journal.EnsureIntent(Intent()).record;
+  EXPECT_THROW(
+      journal.EnsureRuntimeConvergenceIntent(
+          parent.intent_digest,
+          RuntimeIntent(ContentDigest(std::string(kDigestOne)))),
+      ManagerApplyJournalConflictError);
+
+  const auto attempt = EnsureAttempt(journal, parent.intent_digest).record;
+  const auto acceptance = journal.EnsureFenceAcceptance(
+      ApplyId("apply-1"), ApplyGeneration(1U), attempt.fence_attempt_digest,
+      AcceptedFence());
+  const auto runtime_intent = journal.EnsureRuntimeConvergenceIntent(
+      parent.intent_digest,
+      RuntimeIntent(acceptance.record.acceptance_digest));
+
+  auto conflicting_intent = RuntimeIntent(acceptance.record.acceptance_digest);
+  conflicting_intent.runtime_units.front().product_identity =
+      ContentDigest(std::string(kDigestTwo));
+  EXPECT_THROW(journal.EnsureRuntimeConvergenceIntent(parent.intent_digest,
+                                                      conflicting_intent),
+               ManagerApplyJournalConflictError);
+
+  EXPECT_THROW(
+      journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+          ContentDigest(std::string(kDigestTwo)), 1U)),
+      ManagerApplyJournalConflictError);
+  EXPECT_THROW(
+      journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+          runtime_intent.record.runtime_convergence_intent_digest, 2U)),
+      ManagerApplyJournalConflictError);
+
+  const auto first = journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+      runtime_intent.record.runtime_convergence_intent_digest, 1U));
+  auto conflicting_staged = first.record.staged_ready;
+  conflicting_staged.runtime_units.front().process_observation_sequence = 2U;
+  EXPECT_THROW(journal.EnsureRuntimeStagedReady(conflicting_staged),
+               ManagerApplyJournalConflictError);
+  EXPECT_EQ(journal.VerifyIntegrity().runtime_staged_ready_count, 1);
+}
+
+TEST(ManagerApplyRuntimeJournal,
+     EmptyRuntimeSetIsExplicitAndStagedGenerationsAreBounded) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "runtime.sqlite3",
+                                    CellId("cell-1"));
+  const auto accepted = EnsureAcceptedApply(journal);
+  const auto runtime_intent = journal.EnsureRuntimeConvergenceIntent(
+      accepted.intent.intent_digest,
+      RuntimeIntent(accepted.acceptance.acceptance_digest, true));
+  ASSERT_TRUE(runtime_intent.record.runtime_convergence_intent.runtime_units
+                  .empty());
+
+  for (std::uint64_t generation = 1U;
+       generation <= kMaximumRuntimeStagedReadySetsPerApply; ++generation) {
+    EXPECT_TRUE(journal
+                    .EnsureRuntimeStagedReady(RuntimeStagedReady(
+                        runtime_intent.record.runtime_convergence_intent_digest,
+                        generation, true))
+                    .inserted);
+  }
+  EXPECT_THROW(
+      journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+          runtime_intent.record.runtime_convergence_intent_digest,
+          kMaximumRuntimeStagedReadySetsPerApply + 1U, true)),
+      ManagerApplyJournalConflictError);
+  EXPECT_EQ(journal.VerifyIntegrity().runtime_staged_ready_count,
+            static_cast<std::int64_t>(
+                kMaximumRuntimeStagedReadySetsPerApply));
+}
+
+TEST(ManagerApplyRuntimeJournal,
+     DetectsConvergenceAndStagedReadyPayloadCorruptionOnRestart) {
+  TemporaryDirectory directory;
+  const auto intent_path = directory.path() / "runtime-intent.sqlite3";
+  {
+    SqliteManagerApplyJournal journal(intent_path, CellId("cell-1"));
+    const auto accepted = EnsureAcceptedApply(journal);
+    static_cast<void>(journal.EnsureRuntimeConvergenceIntent(
+        accepted.intent.intent_digest,
+        RuntimeIntent(accepted.acceptance.acceptance_digest)));
+  }
+  ExecSql(
+      intent_path,
+      "DROP TRIGGER manager_apply_runtime_convergence_intents_no_update;"
+      "UPDATE manager_apply_runtime_convergence_intents "
+      "SET runtime_units_encoding='0;';"
+      "CREATE TRIGGER manager_apply_runtime_convergence_intents_no_update "
+      "BEFORE UPDATE ON manager_apply_runtime_convergence_intents BEGIN "
+      "SELECT RAISE(ABORT, 'manager_apply_runtime_convergence_intents is "
+      "immutable'); END;");
+  EXPECT_THROW(SqliteManagerApplyJournal(intent_path, CellId("cell-1")),
+               ManagerApplyJournalIntegrityError);
+
+  const auto staged_path = directory.path() / "runtime-staged.sqlite3";
+  {
+    SqliteManagerApplyJournal journal(staged_path, CellId("cell-1"));
+    const auto accepted = EnsureAcceptedApply(journal);
+    const auto runtime_intent = journal.EnsureRuntimeConvergenceIntent(
+        accepted.intent.intent_digest,
+        RuntimeIntent(accepted.acceptance.acceptance_digest));
+    static_cast<void>(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
+        runtime_intent.record.runtime_convergence_intent_digest, 1U)));
+  }
+  ExecSql(
+      staged_path,
+      "DROP TRIGGER manager_apply_runtime_staged_ready_sets_no_update;"
+      "UPDATE manager_apply_runtime_staged_ready_sets "
+      "SET runtime_evidence_encoding='0;';"
+      "CREATE TRIGGER manager_apply_runtime_staged_ready_sets_no_update "
+      "BEFORE UPDATE ON manager_apply_runtime_staged_ready_sets BEGIN "
+      "SELECT RAISE(ABORT, 'manager_apply_runtime_staged_ready_sets is "
+      "immutable'); END;");
+  EXPECT_THROW(SqliteManagerApplyJournal(staged_path, CellId("cell-1")),
                ManagerApplyJournalIntegrityError);
 }
 

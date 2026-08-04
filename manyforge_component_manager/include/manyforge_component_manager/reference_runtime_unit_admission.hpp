@@ -1,6 +1,6 @@
 #pragma once
 
-#include <manyforge_core/types/strong_id.hpp>
+#include <manyforge_core/types/retained_product.hpp>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -35,6 +35,16 @@ class ReferenceRuntimeUnitAdmission final {
   ~ReferenceRuntimeUnitAdmission() = default;
 
   [[nodiscard]] const std::string& runtime_unit_id() const noexcept { return runtime_unit_id_; }
+  [[nodiscard]] const core::RetainedBundleId& retained_bundle_id() const noexcept {
+    return retained_bundle_id_;
+  }
+  [[nodiscard]] const core::ProductId& product_id() const noexcept { return product_id_; }
+  [[nodiscard]] const core::ProductContractId& product_contract_id() const noexcept {
+    return product_contract_id_;
+  }
+  [[nodiscard]] const core::ProductContractRevision& product_contract_revision() const noexcept {
+    return product_contract_revision_;
+  }
   [[nodiscard]] const std::string& product_identity() const noexcept { return product_identity_; }
   [[nodiscard]] const std::string& configuration_identity() const noexcept {
     return configuration_identity_;
@@ -54,6 +64,15 @@ class ReferenceRuntimeUnitAdmission final {
   [[nodiscard]] const std::string& status_endpoint_role_id() const noexcept {
     return status_endpoint_role_id_;
   }
+  [[nodiscard]] const std::string& status_endpoint_contract_id() const noexcept {
+    return status_endpoint_contract_id_;
+  }
+  [[nodiscard]] const std::string& status_endpoint_contract_revision() const noexcept {
+    return status_endpoint_contract_revision_;
+  }
+  [[nodiscard]] const std::string& status_transport() const noexcept { return status_transport_; }
+  [[nodiscard]] const std::string& operating_system() const noexcept { return operating_system_; }
+  [[nodiscard]] const std::string& shell_contract() const noexcept { return shell_contract_; }
   [[nodiscard]] const std::string& process_adapter_contract_id() const noexcept {
     return process_adapter_contract_id_;
   }
@@ -68,17 +87,23 @@ class ReferenceRuntimeUnitAdmission final {
   }
 
  private:
-  ReferenceRuntimeUnitAdmission(std::string runtime_unit_id, std::string product_identity,
-                                std::string configuration_identity,
-                                std::string launchable_content_digest, std::string launchable_bytes,
-                                std::vector<std::string> fixed_arguments,
-                                std::string expected_ready_line, std::string shutdown_command,
-                                std::string runtime_role_id, std::string status_endpoint_role_id,
-                                std::string process_adapter_contract_id,
-                                std::string process_adapter_contract_revision,
-                                std::string retrieval_contract_id,
-                                std::string retrieval_contract_revision)
+  ReferenceRuntimeUnitAdmission(
+      std::string runtime_unit_id, core::RetainedBundleId retained_bundle_id,
+      core::ProductId product_id, core::ProductContractId product_contract_id,
+      core::ProductContractRevision product_contract_revision, std::string product_identity,
+      std::string configuration_identity, std::string launchable_content_digest,
+      std::string launchable_bytes, std::vector<std::string> fixed_arguments,
+      std::string expected_ready_line, std::string shutdown_command, std::string runtime_role_id,
+      std::string status_endpoint_role_id, std::string status_endpoint_contract_id,
+      std::string status_endpoint_contract_revision, std::string status_transport,
+      std::string operating_system, std::string shell_contract,
+      std::string process_adapter_contract_id, std::string process_adapter_contract_revision,
+      std::string retrieval_contract_id, std::string retrieval_contract_revision)
       : runtime_unit_id_(std::move(runtime_unit_id)),
+        retained_bundle_id_(std::move(retained_bundle_id)),
+        product_id_(std::move(product_id)),
+        product_contract_id_(std::move(product_contract_id)),
+        product_contract_revision_(std::move(product_contract_revision)),
         product_identity_(std::move(product_identity)),
         configuration_identity_(std::move(configuration_identity)),
         launchable_content_digest_(std::move(launchable_content_digest)),
@@ -88,12 +113,21 @@ class ReferenceRuntimeUnitAdmission final {
         shutdown_command_(std::move(shutdown_command)),
         runtime_role_id_(std::move(runtime_role_id)),
         status_endpoint_role_id_(std::move(status_endpoint_role_id)),
+        status_endpoint_contract_id_(std::move(status_endpoint_contract_id)),
+        status_endpoint_contract_revision_(std::move(status_endpoint_contract_revision)),
+        status_transport_(std::move(status_transport)),
+        operating_system_(std::move(operating_system)),
+        shell_contract_(std::move(shell_contract)),
         process_adapter_contract_id_(std::move(process_adapter_contract_id)),
         process_adapter_contract_revision_(std::move(process_adapter_contract_revision)),
         retrieval_contract_id_(std::move(retrieval_contract_id)),
         retrieval_contract_revision_(std::move(retrieval_contract_revision)) {}
 
   std::string runtime_unit_id_;
+  core::RetainedBundleId retained_bundle_id_;
+  core::ProductId product_id_;
+  core::ProductContractId product_contract_id_;
+  core::ProductContractRevision product_contract_revision_;
   std::string product_identity_;
   std::string configuration_identity_;
   std::string launchable_content_digest_;
@@ -103,6 +137,11 @@ class ReferenceRuntimeUnitAdmission final {
   std::string shutdown_command_;
   std::string runtime_role_id_;
   std::string status_endpoint_role_id_;
+  std::string status_endpoint_contract_id_;
+  std::string status_endpoint_contract_revision_;
+  std::string status_transport_;
+  std::string operating_system_;
+  std::string shell_contract_;
   std::string process_adapter_contract_id_;
   std::string process_adapter_contract_revision_;
   std::string retrieval_contract_id_;

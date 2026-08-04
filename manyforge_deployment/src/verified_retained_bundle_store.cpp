@@ -1511,6 +1511,8 @@ verify_reference_runtime_unit_product(
       std::string(detail::kReferenceRuntimeShellContract),
       std::string(detail::kReferenceRuntimeRoleId),
       std::string(detail::kReferenceRuntimeStatusEndpointRoleId),
+      std::string(detail::kReferenceRuntimeStatusEndpointContractId),
+      detail::reference_runtime_status_endpoint_revision(), "stdout_line",
       std::string(detail::kReferenceRuntimeProcessAdapterContractId),
       detail::reference_runtime_process_adapter_revision(),
       std::string(detail::kReferenceRuntimeRetrievalContractId),

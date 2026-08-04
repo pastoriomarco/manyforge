@@ -169,8 +169,10 @@ add_library(manyforge_component_manager
   src/durable_store_set.cpp
   src/manager_apply_fence_coordinator.cpp
   src/manager_apply_journal.cpp
+  src/manager_runtime_convergence_coordinator.cpp
   src/manager_bootstrap_journal.cpp
   src/reference_runtime_unit_admission.cpp
+  src/runtime_convergence.cpp
   src/runtime_observation.cpp
   src/sqlite_store_startup_internal.cpp
 )
@@ -339,6 +341,19 @@ if(BUILD_TESTING)
     manyforge::deployment
     GTest::gtest_main)
   gtest_discover_tests(test_manager_apply_fence_coordinator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_manager_runtime_convergence_coordinator
+    test/test_manager_runtime_convergence_coordinator.cpp)
+  target_include_directories(
+    test_manager_runtime_convergence_coordinator PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
+  target_link_libraries(test_manager_runtime_convergence_coordinator PRIVATE
+    manyforge_component_manager
+    manyforge::deployment
+    GTest::gtest_main)
+  gtest_discover_tests(test_manager_runtime_convergence_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_canonical_empty_bootstrap_coordinator
