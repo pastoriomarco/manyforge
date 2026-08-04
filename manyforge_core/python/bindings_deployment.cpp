@@ -196,13 +196,18 @@ void register_deployment_candidate_bindings(py::module_& module) {
                ControllerTopologyId controller_topology_id,
                TopologyRevision topology_revision,
                ActivationSetId activation_set_id,
-               std::vector<DesiredControlBindingRouteDTO> binding_routes) {
+               const py::iterable& binding_routes) {
+             auto bounded_routes = bounded_values_from_python<
+                 DesiredControlBindingRouteDTO,
+                 deployment::DeploymentApplicabilityCodecError>(
+                 binding_routes, kMaxDeploymentApplicabilityRows,
+                 "binding_routes", "DesiredControlBindingRouteDTO");
              return DesiredControlConfigurationDTO{
                  std::move(control_domain_id),
                  std::move(control_domain_revision),
                  std::move(controller_topology_id),
                  std::move(topology_revision),
-                 std::move(activation_set_id), std::move(binding_routes)};
+                 std::move(activation_set_id), std::move(bounded_routes)};
            }),
            py::arg("control_domain_id"),
            py::arg("control_domain_revision"),
@@ -365,8 +370,13 @@ void register_deployment_candidate_bindings(py::module_& module) {
                ProviderInstanceId provider_instance_id,
                ProviderManifestId provider_manifest_id,
                ProviderManifestRevision provider_manifest_revision,
-               std::vector<CapabilityProviderEndpointBindingDTO>
-                   endpoint_bindings) {
+               const py::iterable& endpoint_bindings) {
+             auto bounded_endpoints = bounded_values_from_python<
+                 CapabilityProviderEndpointBindingDTO,
+                 deployment::DeploymentApplicabilityCodecError>(
+                 endpoint_bindings, kMaxCapabilityProviderEndpointBindings,
+                 "endpoint_bindings",
+                 "CapabilityProviderEndpointBindingDTO");
              return CapabilityProviderBindingDTO{
                  std::move(capability_provider_binding_id),
                  std::move(capability_provider_binding_revision),
@@ -376,7 +386,7 @@ void register_deployment_candidate_bindings(py::module_& module) {
                  std::move(provider_instance_id),
                  std::move(provider_manifest_id),
                  std::move(provider_manifest_revision),
-                 std::move(endpoint_bindings)};
+                 std::move(bounded_endpoints)};
            }),
            py::arg("capability_provider_binding_id"),
            py::arg("capability_provider_binding_revision"),
@@ -481,16 +491,33 @@ void register_deployment_candidate_bindings(py::module_& module) {
       module, "DeploymentApplicabilityInputsDTO", py::is_final())
       .def(py::init([](
                std::optional<SiteOverlayRefDTO> site_overlay_ref,
-               std::vector<DesiredControlConfigurationDTO>
-                   desired_control_configurations,
-               std::vector<CapabilityProviderBindingDTO>
-                   capability_provider_bindings,
-               std::vector<ExternalResourceDTO> external_resources) {
+               const py::iterable& desired_control_configurations,
+               const py::iterable& capability_provider_bindings,
+               const py::iterable& external_resources) {
+             auto bounded_configurations = bounded_values_from_python<
+                 DesiredControlConfigurationDTO,
+                 deployment::DeploymentApplicabilityCodecError>(
+                 desired_control_configurations,
+                 kMaxDeploymentApplicabilityRows,
+                 "desired_control_configurations",
+                 "DesiredControlConfigurationDTO");
+             auto bounded_providers = bounded_values_from_python<
+                 CapabilityProviderBindingDTO,
+                 deployment::DeploymentApplicabilityCodecError>(
+                 capability_provider_bindings,
+                 kMaxDeploymentApplicabilityRows,
+                 "capability_provider_bindings",
+                 "CapabilityProviderBindingDTO");
+             auto bounded_resources = bounded_values_from_python<
+                 ExternalResourceDTO,
+                 deployment::DeploymentApplicabilityCodecError>(
+                 external_resources, kMaxDeploymentApplicabilityRows,
+                 "external_resources", "ExternalResourceDTO");
              return DeploymentApplicabilityInputsDTO{
                  std::move(site_overlay_ref),
-                 std::move(desired_control_configurations),
-                 std::move(capability_provider_bindings),
-                 std::move(external_resources)};
+                 std::move(bounded_configurations),
+                 std::move(bounded_providers),
+                 std::move(bounded_resources)};
            }),
            py::arg("site_overlay_ref"),
            py::arg("desired_control_configurations"),

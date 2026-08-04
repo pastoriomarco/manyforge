@@ -480,6 +480,170 @@ def _cell_graph():
     }
 
 
+class _GuardedOverBoundIterable:
+    def __init__(self, value, maximum: int):
+        self._value = value
+        self._maximum = maximum
+        self.items_requested = 0
+
+    def __iter__(self):
+        while self.items_requested <= self._maximum:
+            self.items_requested += 1
+            yield self._value
+        raise AssertionError("binding consumed beyond the first over-bound item")
+
+
+def _applicability_constructor_fixture():
+    route = core.DesiredControlBindingRouteDTO(
+        control_binding_id=core.ControlBindingId("binding"),
+        control_binding_revision=core.ControlBindingRevision(ZERO_DIGEST),
+        control_route_id=core.ControlRouteId("route"),
+    )
+    configuration_kwargs = {
+        "control_domain_id": core.ControlDomainId("domain"),
+        "control_domain_revision": core.ControlDomainRevision(ZERO_DIGEST),
+        "controller_topology_id": core.ControllerTopologyId("topology"),
+        "topology_revision": core.TopologyRevision(ZERO_DIGEST),
+        "activation_set_id": core.ActivationSetId("activation"),
+        "binding_routes": (route,),
+    }
+    configuration = core.DesiredControlConfigurationDTO(**configuration_kwargs)
+
+    endpoint = core.CapabilityProviderEndpointBindingDTO(
+        endpoint_role_id=core.EndpointRoleId("endpoint"),
+        source_kind=core.CapabilityEndpointSourceKind.kRuntimeUnit,
+        source_id=core.RuntimeUnitId("runtime"),
+        source_endpoint_role_id=core.EndpointRoleId("source_endpoint"),
+    )
+    provider_kwargs = {
+        "capability_provider_binding_id": core.CapabilityProviderBindingId(
+            "provider_binding"
+        ),
+        "capability_provider_binding_revision": (
+            core.CapabilityProviderBindingRevision(ZERO_DIGEST)
+        ),
+        "capability_id": core.CapabilityId("capability"),
+        "capability_definition_revision": core.CapabilityDefinitionRevision(
+            ZERO_DIGEST
+        ),
+        "scope": core.CapabilityScope.kCellGlobal,
+        "target": core.CellGlobalCapabilityProviderTargetDTO(
+            cell_id=core.CellId("cell")
+        ),
+        "provider_instance_id": core.ProviderInstanceId("provider"),
+        "provider_manifest_id": core.ProviderManifestId("manifest"),
+        "provider_manifest_revision": core.ProviderManifestRevision(ZERO_DIGEST),
+        "endpoint_bindings": (endpoint,),
+    }
+    provider = core.CapabilityProviderBindingDTO(**provider_kwargs)
+
+    external = core.ExternalResourceDTO(
+        external_resource_alias=core.ExternalResourceAlias("external"),
+        resource_kind=core.ExternalResourceKind.kServiceEndpoint,
+        provider_instance_id=core.ProviderInstanceId("provider"),
+        provider_manifest_id=core.ProviderManifestId("manifest"),
+        provider_manifest_revision=core.ProviderManifestRevision(ZERO_DIGEST),
+        endpoint_role_id=core.EndpointRoleId("endpoint"),
+        site_overlay_value_ref=core.SiteOverlayValueRef(
+            "resources.external.endpoint"
+        ),
+    )
+    applicability_kwargs = {
+        "site_overlay_ref": None,
+        "desired_control_configurations": (configuration,),
+        "capability_provider_bindings": (provider,),
+        "external_resources": (external,),
+    }
+    return {
+        "binding_routes": (
+            core.DesiredControlConfigurationDTO,
+            configuration_kwargs,
+            route,
+        ),
+        "endpoint_bindings": (
+            core.CapabilityProviderBindingDTO,
+            provider_kwargs,
+            endpoint,
+        ),
+        "desired_control_configurations": (
+            core.DeploymentApplicabilityInputsDTO,
+            applicability_kwargs,
+            configuration,
+        ),
+        "capability_provider_bindings": (
+            core.DeploymentApplicabilityInputsDTO,
+            applicability_kwargs,
+            provider,
+        ),
+        "external_resources": (
+            core.DeploymentApplicabilityInputsDTO,
+            applicability_kwargs,
+            external,
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "maximum"),
+    (
+        ("binding_routes", core.MAX_DEPLOYMENT_APPLICABILITY_ROWS),
+        ("endpoint_bindings", core.MAX_CAPABILITY_PROVIDER_ENDPOINT_BINDINGS),
+        (
+            "desired_control_configurations",
+            core.MAX_DEPLOYMENT_APPLICABILITY_ROWS,
+        ),
+        (
+            "capability_provider_bindings",
+            core.MAX_DEPLOYMENT_APPLICABILITY_ROWS,
+        ),
+        ("external_resources", core.MAX_DEPLOYMENT_APPLICABILITY_ROWS),
+    ),
+)
+def test_applicability_constructors_accept_their_exact_iterable_bound(
+    field, maximum
+):
+    constructor, base_kwargs, value = _applicability_constructor_fixture()[field]
+    kwargs = dict(base_kwargs)
+    kwargs[field] = (value for _ in range(maximum))
+
+    constructed = constructor(**kwargs)
+
+    assert len(getattr(constructed, field)) == maximum
+
+
+@pytest.mark.parametrize(
+    ("field", "maximum"),
+    (
+        ("binding_routes", core.MAX_DEPLOYMENT_APPLICABILITY_ROWS),
+        ("endpoint_bindings", core.MAX_CAPABILITY_PROVIDER_ENDPOINT_BINDINGS),
+        (
+            "desired_control_configurations",
+            core.MAX_DEPLOYMENT_APPLICABILITY_ROWS,
+        ),
+        (
+            "capability_provider_bindings",
+            core.MAX_DEPLOYMENT_APPLICABILITY_ROWS,
+        ),
+        ("external_resources", core.MAX_DEPLOYMENT_APPLICABILITY_ROWS),
+    ),
+)
+def test_applicability_constructors_stop_at_the_first_over_bound_item(
+    field, maximum
+):
+    constructor, base_kwargs, value = _applicability_constructor_fixture()[field]
+    guarded = _GuardedOverBoundIterable(value, maximum)
+    kwargs = dict(base_kwargs)
+    kwargs[field] = guarded
+
+    with pytest.raises(
+        core.DeploymentApplicabilityCodecError,
+        match=rf"{field} exceeds its public compiler-ingress bound",
+    ):
+        constructor(**kwargs)
+
+    assert guarded.items_requested == maximum + 1
+
+
 def test_every_core_strong_string_has_distinct_immutable_python_type():
     values = []
     for type_name in STRONG_STRING_TYPES:
