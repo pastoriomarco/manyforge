@@ -195,14 +195,20 @@ one trusted Manager-private runtime root. It uses one product-subject/product/
 configuration slot, a bounded cross-process lock, an atomically materialized
 0500 script, and a durable boot/controller-PID/runtime-PID/Linux-start-time/
 socket/adapter-epoch record. A forked runtime cannot exec before that record is
-durable. Exact surviving state is reconciled before a start, fixed crash-
-temporary names are recoverable, and PID reuse or a previous boot cannot
-match. A private controller owns the fixed stdin/stdout `status`/`shutdown`
-channel after release. Manager disappearance leaves that controller, runtime,
-and epoch unchanged; a replacement validates the durable identities,
-reconnects, and returns only a newly received exact status record. Explicit
-`EnsureStopped` alone submits the verified fixed shutdown request and succeeds
-only after both controller and runtime are absent.
+durable. The controller and gated child inherit the slot-lock open-file
+description. If Manager loss occurs before release, no Manager destructor can
+unlock it, so a replacement cannot report absence or start another pair until
+both unreleased processes have exited. Exact surviving state is reconciled
+before a start, fixed crash-temporary names are recoverable, and PID reuse or a
+previous boot cannot match. A private controller owns the fixed stdin/stdout
+`status`/`shutdown` channel after release. Manager disappearance leaves that
+controller, runtime, and epoch unchanged; a replacement validates the durable
+identities, reconnects, and returns only a newly received exact status record.
+Explicit `EnsureStopped` alone submits the verified fixed shutdown request and
+succeeds only after both controller and runtime are absent.
+The private-control boundary assumes a stable trusted root and an exclusive
+trusted Manager service UID; the same-UID peer check is not isolation from a
+hostile process deliberately sharing that UID.
 
 `DurableManagerActiveRuntimePlanSource` reconstructs the desired runtime plan
 only from the authoritative current publication and byte-equivalent durable

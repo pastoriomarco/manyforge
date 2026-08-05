@@ -28,10 +28,13 @@ public:
 ///
 /// The implementation is Linux/POSIX-specific. It atomically materializes the
 /// independently verified script, persists the private controller and runtime
-/// process identities before releasing a pre-exec gate, observes before start,
-/// reconnects to the surviving controller after Manager replacement, and
-/// produces a progress result only from a newly received complete source
-/// status record. Only the exact fixed shutdown protocol can stop the process.
+/// process identities before releasing a pre-exec gate. If Manager death
+/// prevents that release, the controller and gated child retain the inherited
+/// cross-process slot-lock description until the unreleased pair exits. It
+/// observes before start, reconnects to the surviving controller after Manager
+/// replacement, and produces a progress result only from a newly received
+/// complete source status record. Only the exact fixed shutdown protocol can
+/// stop the process.
 class RetainedPosixRuntimeUnitAdapter final : public IRuntimeUnitProcessPort,
                                               public IRuntimeUnitProgressPort {
 public:

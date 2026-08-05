@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <signal.h>
+#include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -9,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <manyforge_component_manager/reference_runtime_unit_admission.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
@@ -154,6 +157,27 @@ FindMaterializedLaunchable(const std::filesystem::path &runtime_root) {
   throw std::runtime_error("retained POSIX adapter materialized no launchable");
 }
 
+[[nodiscard]] std::filesystem::path
+FindProcessState(const std::filesystem::path &runtime_root) {
+  for (const auto &entry :
+       std::filesystem::recursive_directory_iterator(runtime_root)) {
+    if (entry.path().filename() == "process.state") {
+      return entry.path();
+    }
+  }
+  throw std::runtime_error("retained POSIX adapter produced no process state");
+}
+
+[[nodiscard]] std::string ReadFile(const std::filesystem::path &path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream.good()) {
+    throw std::runtime_error("retained POSIX adapter fixture could not read " +
+                             path.string());
+  }
+  return std::string((std::istreambuf_iterator<char>(stream)),
+                     std::istreambuf_iterator<char>());
+}
+
 [[nodiscard]] std::string ReadAllFromFd(const int fd) {
   std::string result;
   char byte = 0;
@@ -168,6 +192,59 @@ FindMaterializedLaunchable(const std::filesystem::path &runtime_root) {
     result.push_back(byte);
   }
   return result;
+}
+
+[[nodiscard]] pid_t WaitForTracedFork(const pid_t tracee) {
+  for (;;) {
+    int status = 0;
+    if (::waitpid(tracee, &status, __WALL) != tracee) {
+      throw std::runtime_error("retained POSIX adapter trace wait failed");
+    }
+    if (!WIFSTOPPED(status)) {
+      throw std::runtime_error(
+          "retained POSIX adapter tracee exited before fork");
+    }
+    const auto event = static_cast<unsigned int>(status) >> 16U;
+    if (event == PTRACE_EVENT_FORK) {
+      unsigned long child = 0UL;
+      if (::ptrace(PTRACE_GETEVENTMSG, tracee, nullptr, &child) != 0 ||
+          child == 0UL ||
+          child >
+              static_cast<unsigned long>(std::numeric_limits<pid_t>::max())) {
+        throw std::runtime_error(
+            "retained POSIX adapter trace returned an invalid child");
+      }
+      const auto child_pid = static_cast<pid_t>(child);
+      int child_status = 0;
+      if (::waitpid(child_pid, &child_status, __WALL) != child_pid ||
+          !WIFSTOPPED(child_status)) {
+        throw std::runtime_error(
+            "retained POSIX adapter traced child was not stopped");
+      }
+      return child_pid;
+    }
+    if (::ptrace(PTRACE_CONT, tracee, nullptr, nullptr) != 0) {
+      throw std::runtime_error(
+          "retained POSIX adapter trace could not continue to fork");
+    }
+  }
+}
+
+void SetTraceForkAndContinue(const pid_t tracee) {
+  const auto options =
+      reinterpret_cast<void *>(static_cast<std::uintptr_t>(PTRACE_O_TRACEFORK));
+  if (::ptrace(PTRACE_SETOPTIONS, tracee, nullptr, options) != 0 ||
+      ::ptrace(PTRACE_CONT, tracee, nullptr, nullptr) != 0) {
+    throw std::runtime_error(
+        "retained POSIX adapter could not arm fork tracing");
+  }
+}
+
+void DetachTracedProcess(const pid_t tracee) {
+  if (::ptrace(PTRACE_DETACH, tracee, nullptr, nullptr) != 0) {
+    throw std::runtime_error(
+        "retained POSIX adapter could not detach traced process");
+  }
 }
 
 TEST(RetainedPosixRuntimeUnitAdapter,
@@ -291,6 +368,8 @@ TEST(RetainedPosixRuntimeUnitAdapter,
   ASSERT_TRUE(WIFEXITED(manager_status));
   ASSERT_EQ(WEXITSTATUS(manager_status), 0);
   ASSERT_FALSE(old_epoch.empty());
+  const auto durable_state_before_replacement =
+      ReadFile(FindProcessState(runtime_root.path()));
 
   RetainedPosixRuntimeUnitAdapter replacement(
       runtime_root.path(), *package.bundle_source, *package.artifact_source,
@@ -300,6 +379,8 @@ TEST(RetainedPosixRuntimeUnitAdapter,
   EXPECT_EQ(observed.process_incarnation(), old_epoch);
   const auto reconciled = replacement.EnsureRunning(query);
   EXPECT_EQ(reconciled.process_incarnation(), old_epoch);
+  EXPECT_EQ(ReadFile(FindProcessState(runtime_root.path())),
+            durable_state_before_replacement);
   const auto fresh = replacement.ObserveProgress(
       query, RuntimeEpoch(reconciled.process_incarnation()));
   ASSERT_TRUE(fresh.has_value());
@@ -316,6 +397,71 @@ TEST(RetainedPosixRuntimeUnitAdapter,
       query, RuntimeEpoch(restarted.process_incarnation()));
   ASSERT_TRUE(restarted_report.has_value());
   EXPECT_EQ(restarted_report->source_report_sequence(), 1U);
+  EXPECT_EQ(replacement.EnsureStopped(query).state(),
+            ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedPosixRuntimeUnitAdapter,
+     ManagerDeathBeforeDurableStateKeepsBootstrapPairLockedUntilAbsent) {
+  ScopedRoot package_root("manyforge-retained-posix-bootstrap-crash-package");
+  ScopedRoot runtime_root("manyforge-retained-posix-bootstrap-crash-runtime");
+  const auto package = MaterializeRuntimePackage(package_root.path());
+  const auto query = Query(package);
+
+  const pid_t manager = ::fork();
+  ASSERT_GE(manager, 0);
+  if (manager == 0) {
+    if (::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) != 0 ||
+        ::raise(SIGSTOP) != 0) {
+      ::_exit(74);
+    }
+    try {
+      deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+          package_root.path());
+      deployment::FilesystemVerifiedRetainedProductArtifactSource
+          artifact_source(package_root.path());
+      RetainedPosixRuntimeUnitAdapter adapter(runtime_root.path(),
+                                              bundle_source, artifact_source,
+                                              "linux", "posix.1-2017");
+      static_cast<void>(adapter.EnsureRunning(query));
+      ::_exit(75);
+    } catch (...) {
+      ::_exit(76);
+    }
+  }
+
+  int manager_status = 0;
+  ASSERT_EQ(::waitpid(manager, &manager_status, __WALL), manager);
+  ASSERT_TRUE(WIFSTOPPED(manager_status));
+  SetTraceForkAndContinue(manager);
+  const pid_t controller = WaitForTracedFork(manager);
+
+  ASSERT_EQ(::kill(manager, SIGKILL), 0);
+  ASSERT_EQ(::waitpid(manager, &manager_status, __WALL), manager);
+  ASSERT_TRUE(WIFSIGNALED(manager_status));
+  ASSERT_EQ(WTERMSIG(manager_status), SIGKILL);
+
+  SetTraceForkAndContinue(controller);
+  const pid_t gated_runtime = WaitForTracedFork(controller);
+
+  RetainedPosixRuntimeUnitAdapter replacement(
+      runtime_root.path(), *package.bundle_source, *package.artifact_source,
+      "linux", "posix.1-2017");
+  bool rejected_while_bootstrap_pair_existed = false;
+  try {
+    static_cast<void>(replacement.EnsureStopped(query));
+  } catch (const RetainedPosixRuntimeUnitAdapterError &error) {
+    rejected_while_bootstrap_pair_existed = true;
+    EXPECT_EQ(std::string(error.what()), "runtime adapter slot lock timed out");
+  }
+
+  DetachTracedProcess(gated_runtime);
+  DetachTracedProcess(controller);
+  EXPECT_TRUE(rejected_while_bootstrap_pair_existed)
+      << "replacement reported absence while the abandoned bootstrap pair "
+         "was stopped";
+  EXPECT_EQ(replacement.EnsureStopped(query).state(),
+            ProcessPresenceState::kAbsent);
   EXPECT_EQ(replacement.EnsureStopped(query).state(),
             ProcessPresenceState::kAbsent);
 }

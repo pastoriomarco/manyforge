@@ -1063,6 +1063,7 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
 }
 
 [[noreturn]] void RunController(const int listener_fd, const int bootstrap_fd,
+                                const int bootstrap_lock_fd,
                                 const std::filesystem::path &launch_path,
                                 std::vector<std::string> arguments,
                                 const std::string status_command,
@@ -1070,6 +1071,11 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
   try {
     UniqueFd listener(listener_fd);
     UniqueFd bootstrap(bootstrap_fd);
+    // This is the inherited slot-lock open-file description. Keep the
+    // descriptor in both controller and gated child so that, if Manager death
+    // prevents its normal explicit unlock, a replacement cannot observe a
+    // state-less slot while either unreleased process still exists.
+    UniqueFd bootstrap_lock(bootstrap_lock_fd);
     auto standard_input = MakePipe();
     auto standard_output = MakePipe();
     auto gate = MakeSocketPair();
@@ -1116,6 +1122,7 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
       standard_input[0].Reset();
       standard_output[1].Reset();
       gate[0].Reset();
+      bootstrap_lock.Reset();
       const int result =
           ::execve(launch_path.c_str(), argv.data(), environment.data());
       (void)result;
@@ -1141,6 +1148,7 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
     SendAllNoSignal(gate[1].get(), "R");
     gate[1].Reset();
     bootstrap.Reset();
+    bootstrap_lock.Reset();
 
     RuntimeChannel channel{
         std::move(standard_input[1]), std::move(standard_output[0]), {}, true};
@@ -1214,26 +1222,27 @@ void ReapOwnedChildIfExited(const pid_t child) noexcept {
   }
 }
 
-[[noreturn]] void
-EnterControllerProcess(const int listener_fd, const int bootstrap_fd,
-                       const std::filesystem::path &launch_path,
-                       std::vector<std::string> arguments,
-                       std::string status_command,
-                       std::string shutdown_command) {
+[[noreturn]] void EnterControllerProcess(
+    const int listener_fd, const int bootstrap_fd, const int bootstrap_lock_fd,
+    const std::filesystem::path &launch_path,
+    std::vector<std::string> arguments, std::string status_command,
+    std::string shutdown_command) {
   const int listener_copy = ::fcntl(listener_fd, F_DUPFD_CLOEXEC, 10);
   const int bootstrap_copy = ::fcntl(bootstrap_fd, F_DUPFD_CLOEXEC, 10);
-  if (listener_copy < 0 || bootstrap_copy < 0) {
+  const int bootstrap_lock_copy =
+      ::fcntl(bootstrap_lock_fd, F_DUPFD_CLOEXEC, 10);
+  if (listener_copy < 0 || bootstrap_copy < 0 || bootstrap_lock_copy < 0) {
     ::_exit(125);
   }
   const int null_io = ::open("/dev/null", O_RDWR | O_CLOEXEC);
   if (null_io < 0 || ::dup2(null_io, STDIN_FILENO) < 0 ||
       ::dup2(null_io, STDOUT_FILENO) < 0 ||
       ::dup2(null_io, STDERR_FILENO) < 0 || ::dup2(listener_copy, 3) < 0 ||
-      ::dup2(bootstrap_copy, 4) < 0) {
+      ::dup2(bootstrap_copy, 4) < 0 || ::dup2(bootstrap_lock_copy, 5) < 0) {
     ::_exit(125);
   }
 #ifdef SYS_close_range
-  const long close_range_result = ::syscall(SYS_close_range, 5U, UINT_MAX, 0U);
+  const long close_range_result = ::syscall(SYS_close_range, 6U, UINT_MAX, 0U);
   if (close_range_result != 0 && errno != ENOSYS) {
     ::_exit(125);
   }
@@ -1242,13 +1251,13 @@ EnterControllerProcess(const int listener_fd, const int bootstrap_fd,
     const long maximum = ::sysconf(_SC_OPEN_MAX);
     const int upper =
         maximum > 0 && maximum < INT_MAX ? static_cast<int>(maximum) : 65536;
-    for (int descriptor = 5; descriptor < upper; ++descriptor) {
+    for (int descriptor = 6; descriptor < upper; ++descriptor) {
       static_cast<void>(::close(descriptor));
     }
 #ifdef SYS_close_range
   }
 #endif
-  RunController(3, 4, launch_path, std::move(arguments),
+  RunController(3, 4, 5, launch_path, std::move(arguments),
                 std::move(status_command), std::move(shutdown_command));
 }
 
@@ -1459,8 +1468,8 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
                        fork_error));
     }
     if (controller == 0) {
-      EnterControllerProcess(listener.fd.get(), bootstrap[0].get(), launch_path,
-                             std::move(arguments),
+      EnterControllerProcess(listener.fd.get(), bootstrap[0].get(),
+                             slot.lock_fd(), launch_path, std::move(arguments),
                              std::string(admission.status_command()),
                              std::string(admission.shutdown_command()));
     }
