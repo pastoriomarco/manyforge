@@ -27,9 +27,11 @@ public:
 /// environment, working directory, or status payload is caller-selectable.
 ///
 /// The implementation is Linux/POSIX-specific. It atomically materializes the
-/// independently verified script, persists boot/PID/start-time/epoch evidence
-/// before releasing a pre-exec gate, observes before start, and produces a
-/// progress result only from a newly received complete source status record.
+/// independently verified script, persists the private controller and runtime
+/// process identities before releasing a pre-exec gate, observes before start,
+/// reconnects to the surviving controller after Manager replacement, and
+/// produces a progress result only from a newly received complete source
+/// status record. Only the exact fixed shutdown protocol can stop the process.
 class RetainedPosixRuntimeUnitAdapter final : public IRuntimeUnitProcessPort,
                                               public IRuntimeUnitProgressPort {
 public:
@@ -53,6 +55,8 @@ public:
   ObserveProcess(const RuntimeUnitConvergenceQueryDTO &query) override;
   [[nodiscard]] ProcessPresenceObservation
   EnsureRunning(const RuntimeUnitConvergenceQueryDTO &query) override;
+  [[nodiscard]] ProcessPresenceObservation
+  EnsureStopped(const RuntimeUnitConvergenceQueryDTO &query) override;
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
                   const manyforge::core::RuntimeEpoch &runtime_epoch) override;

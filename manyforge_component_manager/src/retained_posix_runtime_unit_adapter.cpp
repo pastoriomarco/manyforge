@@ -7,7 +7,9 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -15,6 +17,8 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -37,12 +41,16 @@ namespace {
 using manyforge::core::RuntimeEpoch;
 using manyforge::deployment::RetainedBundle;
 
-constexpr std::string_view kStateFormat = "manyforge.retained-posix-process.v1";
+constexpr std::string_view kStateFormat = "manyforge.retained-posix-process.v2";
+constexpr std::string_view kControlSocketName = "control.sock";
 constexpr std::size_t kMaximumStateBytes = 4096U;
 constexpr std::size_t kMaximumStatusLineBytes = 2048U;
+constexpr std::size_t kMaximumControlPacketBytes = 4096U;
 constexpr auto kSlotLockTimeout = std::chrono::seconds(2);
 constexpr auto kStatusWait = std::chrono::milliseconds(500);
-constexpr auto kChildExitWait = std::chrono::milliseconds(500);
+constexpr auto kBootstrapWait = std::chrono::seconds(2);
+constexpr auto kRuntimeStopWait = std::chrono::seconds(2);
+constexpr auto kRelayPollInterval = std::chrono::milliseconds(50);
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw RetainedPosixRuntimeUnitAdapterError(detail);
@@ -108,6 +116,16 @@ void SetNonBlocking(const int fd) {
   return {UniqueFd(descriptors[0]), UniqueFd(descriptors[1])};
 }
 
+[[nodiscard]] std::array<UniqueFd, 2U> MakeSeqPacketPair() {
+  int descriptors[2]{-1, -1};
+  if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, descriptors) !=
+      0) {
+    Fail(ErrnoDetail("could not create runtime adapter packet socket pair",
+                     errno));
+  }
+  return {UniqueFd(descriptors[0]), UniqueFd(descriptors[1])};
+}
+
 void WriteAll(const int fd, const std::string_view bytes) {
   std::size_t offset = 0U;
   while (offset < bytes.size()) {
@@ -142,6 +160,53 @@ void SendAllNoSignal(const int fd, const std::string_view bytes) {
     }
     offset += static_cast<std::size_t>(written);
   }
+}
+
+void SendPacketNoSignal(const int fd, const std::string_view bytes) {
+  for (;;) {
+    const auto written = ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written < 0) {
+      Fail(ErrnoDetail("runtime adapter packet write failed", errno));
+    }
+    if (static_cast<std::size_t>(written) != bytes.size()) {
+      Fail("runtime adapter packet write was incomplete");
+    }
+    return;
+  }
+}
+
+[[nodiscard]] std::optional<std::string>
+ReceivePacket(const int fd, const std::size_t maximum_bytes,
+              const std::chrono::milliseconds timeout) {
+  pollfd descriptor{fd, POLLIN | POLLHUP, 0};
+  int poll_result = 0;
+  do {
+    poll_result = ::poll(&descriptor, 1U, static_cast<int>(timeout.count()));
+  } while (poll_result < 0 && errno == EINTR);
+  if (poll_result < 0) {
+    Fail(ErrnoDetail("runtime adapter packet poll failed", errno));
+  }
+  if (poll_result == 0) {
+    return std::nullopt;
+  }
+  std::vector<char> bytes(maximum_bytes + 1U);
+  ssize_t received = -1;
+  do {
+    received = ::recv(fd, bytes.data(), bytes.size(), MSG_TRUNC);
+  } while (received < 0 && errno == EINTR);
+  if (received < 0) {
+    Fail(ErrnoDetail("runtime adapter packet read failed", errno));
+  }
+  if (received == 0) {
+    Fail("runtime adapter packet peer closed without a record");
+  }
+  if (static_cast<std::size_t>(received) > maximum_bytes) {
+    Fail("runtime adapter packet exceeds its byte bound");
+  }
+  return std::string(bytes.data(), static_cast<std::size_t>(received));
 }
 
 [[nodiscard]] std::string RandomHex() {
@@ -273,8 +338,12 @@ struct ProcessState final {
   std::string configuration_identity;
   std::string process_adapter_revision;
   std::string boot_id;
+  pid_t controller_pid{};
+  std::uint64_t controller_start_ticks{};
   pid_t pid{};
   std::uint64_t start_ticks{};
+  std::uint64_t control_socket_device{};
+  std::uint64_t control_socket_inode{};
   RuntimeEpoch runtime_epoch;
 };
 
@@ -285,9 +354,15 @@ struct ProcessState final {
          "configuration_identity=" + state.configuration_identity + "\n" +
          "process_adapter_revision=" + state.process_adapter_revision + "\n" +
          "boot_id=" + state.boot_id + "\n" +
+         "controller_pid=" + std::to_string(state.controller_pid) + "\n" +
+         "controller_start_ticks=" +
+         std::to_string(state.controller_start_ticks) + "\n" +
          "pid=" + std::to_string(state.pid) + "\n" +
          "start_ticks=" + std::to_string(state.start_ticks) + "\n" +
-         "runtime_epoch=" + state.runtime_epoch.value() + "\n";
+         "control_socket_device=" +
+         std::to_string(state.control_socket_device) + "\n" +
+         "control_socket_inode=" + std::to_string(state.control_socket_inode) +
+         "\n" + "runtime_epoch=" + state.runtime_epoch.value() + "\n";
 }
 
 [[nodiscard]] std::vector<std::string> SplitLines(const std::string &bytes) {
@@ -325,18 +400,32 @@ struct ProcessState final {
 
 [[nodiscard]] ProcessState DecodeState(const std::string &bytes) {
   const auto lines = SplitLines(bytes);
-  if (lines.size() != 9U ||
+  if (lines.size() != 13U ||
       lines.front() != "format=" + std::string(kStateFormat)) {
     Fail("runtime process state has the wrong closed schema");
   }
-  const auto pid_text = StateValue(lines[6], "pid=");
+  const auto controller_pid_text = StateValue(lines[6], "controller_pid=");
+  const auto controller_pid_value =
+      ParseCanonicalUnsigned(controller_pid_text, "runtime controller pid");
+  if (controller_pid_value == 0U ||
+      controller_pid_value >
+          static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    Fail("runtime controller pid is out of range");
+  }
+  const auto controller_start_ticks =
+      ParseCanonicalUnsigned(StateValue(lines[7], "controller_start_ticks="),
+                             "runtime controller start time");
+  if (controller_start_ticks == 0U) {
+    Fail("runtime controller start time is zero");
+  }
+  const auto pid_text = StateValue(lines[8], "pid=");
   const auto pid_value =
       ParseCanonicalUnsigned(pid_text, "runtime process pid");
   if (pid_value == 0U || pid_value > static_cast<std::uint64_t>(
                                          std::numeric_limits<pid_t>::max())) {
     Fail("runtime process pid is out of range");
   }
-  const auto start_ticks_text = StateValue(lines[7], "start_ticks=");
+  const auto start_ticks_text = StateValue(lines[9], "start_ticks=");
   const auto start_ticks =
       ParseCanonicalUnsigned(start_ticks_text, "runtime process start time");
   if (start_ticks == 0U) {
@@ -348,10 +437,19 @@ struct ProcessState final {
       StateValue(lines[3], "configuration_identity="),
       StateValue(lines[4], "process_adapter_revision="),
       StateValue(lines[5], "boot_id="),
+      static_cast<pid_t>(controller_pid_value),
+      controller_start_ticks,
       static_cast<pid_t>(pid_value),
       start_ticks,
-      RuntimeEpoch(StateValue(lines[8], "runtime_epoch=")),
+      ParseCanonicalUnsigned(StateValue(lines[10], "control_socket_device="),
+                             "runtime control socket device"),
+      ParseCanonicalUnsigned(StateValue(lines[11], "control_socket_inode="),
+                             "runtime control socket inode"),
+      RuntimeEpoch(StateValue(lines[12], "runtime_epoch=")),
   };
+  if (result.control_socket_inode == 0U) {
+    Fail("runtime control socket inode is zero");
+  }
   return result;
 }
 
@@ -414,14 +512,23 @@ ReadProcObservation(const pid_t pid) {
       tokens.front().front()};
 }
 
-[[nodiscard]] bool ProcessIsLive(const ProcessState &state,
-                                 const std::string_view boot_id) {
-  if (state.boot_id != boot_id) {
-    return false;
-  }
-  const auto observed = ReadProcObservation(state.pid);
-  return observed.has_value() && observed->start_ticks == state.start_ticks &&
+[[nodiscard]] bool ProcessIsLive(const pid_t pid,
+                                 const std::uint64_t start_ticks) {
+  const auto observed = ReadProcObservation(pid);
+  return observed.has_value() && observed->start_ticks == start_ticks &&
          observed->state != 'Z' && observed->state != 'X';
+}
+
+[[nodiscard]] bool RuntimeProcessIsLive(const ProcessState &state,
+                                        const std::string_view boot_id) {
+  return state.boot_id == boot_id &&
+         ProcessIsLive(state.pid, state.start_ticks);
+}
+
+[[nodiscard]] bool ControllerProcessIsLive(const ProcessState &state,
+                                           const std::string_view boot_id) {
+  return state.boot_id == boot_id &&
+         ProcessIsLive(state.controller_pid, state.controller_start_ticks);
 }
 
 void VerifyStateMatchesQuery(const ProcessState &state,
@@ -453,6 +560,7 @@ public:
   SlotLock &operator=(SlotLock &&) noexcept = default;
 
   [[nodiscard]] int directory_fd() const noexcept { return directory_.get(); }
+  [[nodiscard]] int lock_fd() const noexcept { return lock_.get(); }
 
 private:
   UniqueFd directory_;
@@ -639,15 +747,123 @@ void RemoveState(const int directory_fd) {
   SyncDirectory(directory_fd);
 }
 
-void WaitForChildExit(const pid_t pid) noexcept {
-  const auto deadline = std::chrono::steady_clock::now() + kChildExitWait;
-  for (;;) {
-    int status = 0;
-    const pid_t result = ::waitpid(pid, &status, WNOHANG);
-    if (result == pid || (result < 0 && errno == ECHILD)) {
-      return;
+[[nodiscard]] std::string ControlSocketPath(const int directory_fd) {
+  return "/proc/self/fd/" + std::to_string(directory_fd) + "/" +
+         std::string(kControlSocketName);
+}
+
+[[nodiscard]] sockaddr_un ControlSocketAddress(const int directory_fd,
+                                               socklen_t &length) {
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  const auto path = ControlSocketPath(directory_fd);
+  if (path.size() >= sizeof(address.sun_path)) {
+    Fail("runtime control socket path exceeds the Linux AF_UNIX bound");
+  }
+  std::memcpy(address.sun_path, path.c_str(), path.size() + 1U);
+  length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                  path.size() + 1U);
+  return address;
+}
+
+struct ControlSocketIdentity final {
+  std::uint64_t device{};
+  std::uint64_t inode{};
+};
+
+[[nodiscard]] std::optional<ControlSocketIdentity>
+ReadControlSocketIdentity(const int directory_fd) {
+  struct stat status {};
+  if (::fstatat(directory_fd, std::string(kControlSocketName).c_str(), &status,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
     }
-    if (result < 0 && errno != EINTR) {
+    Fail(ErrnoDetail("could not inspect runtime control socket", errno));
+  }
+  if (!S_ISSOCK(status.st_mode) || status.st_uid != ::geteuid() ||
+      (status.st_mode & 0777) != 0600 || status.st_nlink != 1) {
+    Fail("runtime control socket has invalid type, owner, or permissions");
+  }
+  return ControlSocketIdentity{static_cast<std::uint64_t>(status.st_dev),
+                               static_cast<std::uint64_t>(status.st_ino)};
+}
+
+void RemoveControlSocket(const int directory_fd) {
+  const auto identity = ReadControlSocketIdentity(directory_fd);
+  if (!identity.has_value()) {
+    return;
+  }
+  if (::unlinkat(directory_fd, std::string(kControlSocketName).c_str(), 0) !=
+      0) {
+    Fail(ErrnoDetail("could not remove stale runtime control socket", errno));
+  }
+  SyncDirectory(directory_fd);
+}
+
+struct ControlListener final {
+  UniqueFd fd;
+  ControlSocketIdentity identity;
+};
+
+[[nodiscard]] ControlListener CreateControlListener(const int directory_fd) {
+  RemoveControlSocket(directory_fd);
+  UniqueFd listener(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+  if (!listener) {
+    Fail(ErrnoDetail("could not create runtime control socket", errno));
+  }
+  socklen_t address_length = 0;
+  const auto address = ControlSocketAddress(directory_fd, address_length);
+  if (::bind(listener.get(), reinterpret_cast<const sockaddr *>(&address),
+             address_length) != 0) {
+    Fail(ErrnoDetail("could not bind runtime control socket", errno));
+  }
+  if (::fchmodat(directory_fd, std::string(kControlSocketName).c_str(), 0600,
+                 0) != 0) {
+    Fail(ErrnoDetail("could not restrict runtime control socket", errno));
+  }
+  if (::listen(listener.get(), 4) != 0) {
+    Fail(ErrnoDetail("could not listen on runtime control socket", errno));
+  }
+  const auto identity = ReadControlSocketIdentity(directory_fd);
+  if (!identity.has_value()) {
+    Fail("runtime control socket disappeared after bind");
+  }
+  return ControlListener{std::move(listener), *identity};
+}
+
+[[nodiscard]] bool ControlSocketMatches(const int directory_fd,
+                                        const ProcessState &state) {
+  const auto identity = ReadControlSocketIdentity(directory_fd);
+  return identity.has_value() &&
+         identity->device == state.control_socket_device &&
+         identity->inode == state.control_socket_inode;
+}
+
+[[nodiscard]] UniqueFd ConnectControlSocket(const int directory_fd,
+                                            const ProcessState &state) {
+  if (!ControlSocketMatches(directory_fd, state)) {
+    Fail("runtime control socket identity conflicts with durable state");
+  }
+  UniqueFd connection(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+  if (!connection) {
+    Fail(ErrnoDetail("could not create runtime control connection", errno));
+  }
+  socklen_t address_length = 0;
+  const auto address = ControlSocketAddress(directory_fd, address_length);
+  if (::connect(connection.get(), reinterpret_cast<const sockaddr *>(&address),
+                address_length) != 0) {
+    Fail(ErrnoDetail("could not connect to runtime controller", errno));
+  }
+  return connection;
+}
+
+void WaitForProcessExit(const pid_t pid,
+                        const std::chrono::steady_clock::time_point deadline) {
+  for (;;) {
+    const auto observed = ReadProcObservation(pid);
+    if (!observed.has_value() || observed->state == 'Z' ||
+        observed->state == 'X') {
       return;
     }
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -721,18 +937,15 @@ void VerifyAdmissionMatchesQuery(const ReferenceRuntimeUnitAdmission &admission,
   }
 }
 
-struct Channel final {
-  pid_t pid{};
-  std::uint64_t start_ticks{};
-  RuntimeEpoch runtime_epoch;
+struct RuntimeChannel final {
   UniqueFd standard_input;
   UniqueFd standard_output;
   std::string output_buffer;
-  std::uint64_t next_source_sequence{1U};
   bool status_request_outstanding{true};
 };
 
-[[nodiscard]] std::optional<std::string> ReadStatusLine(Channel &channel) {
+[[nodiscard]] std::optional<std::string>
+ReadStatusLine(RuntimeChannel &channel) {
   auto take_line = [&]() -> std::optional<std::string> {
     const auto newline = channel.output_buffer.find('\n');
     if (newline == std::string::npos) {
@@ -788,6 +1001,279 @@ struct Channel final {
   return take_line();
 }
 
+[[nodiscard]] std::string EncodeControllerBootstrap(const pid_t pid,
+                                                    const std::uint64_t ticks) {
+  return std::to_string(pid) + ":" + std::to_string(ticks);
+}
+
+[[nodiscard]] std::pair<pid_t, std::uint64_t>
+DecodeControllerBootstrap(const std::string_view record) {
+  const auto separator = record.find(':');
+  if (separator == std::string_view::npos ||
+      record.find(':', separator + 1U) != std::string_view::npos) {
+    Fail("runtime controller bootstrap record is malformed");
+  }
+  const auto pid_value = ParseCanonicalUnsigned(record.substr(0U, separator),
+                                                "runtime controller child pid");
+  const auto ticks = ParseCanonicalUnsigned(
+      record.substr(separator + 1U), "runtime controller child start time");
+  if (pid_value == 0U ||
+      pid_value >
+          static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max()) ||
+      ticks == 0U) {
+    Fail("runtime controller bootstrap identity is out of range");
+  }
+  return {static_cast<pid_t>(pid_value), ticks};
+}
+
+void VerifyControlPeer(const int connection) {
+  struct ucred credentials {};
+  socklen_t size = sizeof(credentials);
+  if (::getsockopt(connection, SOL_SOCKET, SO_PEERCRED, &credentials, &size) !=
+          0 ||
+      size != sizeof(credentials) || credentials.uid != ::geteuid()) {
+    Fail("runtime control peer does not have the Manager uid");
+  }
+}
+
+[[nodiscard]] bool ReapChildIfExited(const pid_t child, int &status) {
+  for (;;) {
+    const pid_t result = ::waitpid(child, &status, WNOHANG);
+    if (result == child) {
+      return true;
+    }
+    if (result == 0) {
+      return false;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    return result < 0 && errno == ECHILD;
+  }
+}
+
+void ReapOwnedChildIfExited(const pid_t child) noexcept {
+  int status = 0;
+  for (;;) {
+    const pid_t result = ::waitpid(child, &status, WNOHANG);
+    if (result >= 0 || errno != EINTR) {
+      return;
+    }
+  }
+}
+
+[[noreturn]] void RunController(const int listener_fd, const int bootstrap_fd,
+                                const std::filesystem::path &launch_path,
+                                std::vector<std::string> arguments,
+                                const std::string status_command,
+                                const std::string shutdown_command) {
+  try {
+    UniqueFd listener(listener_fd);
+    UniqueFd bootstrap(bootstrap_fd);
+    auto standard_input = MakePipe();
+    auto standard_output = MakePipe();
+    auto gate = MakeSocketPair();
+    SetNonBlocking(standard_output[0].get());
+    const UniqueFd null_error(::open("/dev/null", O_WRONLY | O_CLOEXEC));
+    if (!null_error) {
+      Fail(ErrnoDetail("could not open fixed runtime stderr sink", errno));
+    }
+
+    std::vector<char *> argv;
+    argv.reserve(arguments.size() + 1U);
+    for (auto &argument : arguments) {
+      argv.push_back(argument.data());
+    }
+    argv.push_back(nullptr);
+    std::array<char, 19U> path_environment{"PATH=/usr/bin:/bin"};
+    std::array<char, 7U> lang_environment{"LANG=C"};
+    std::array<char, 9U> locale_environment{"LC_ALL=C"};
+    std::array<char *, 4U> environment{path_environment.data(),
+                                       lang_environment.data(),
+                                       locale_environment.data(), nullptr};
+
+    const pid_t child = ::fork();
+    if (child < 0) {
+      Fail(ErrnoDetail("could not fork retained runtime", errno));
+    }
+    if (child == 0) {
+      listener.Reset();
+      bootstrap.Reset();
+      standard_input[1].Reset();
+      standard_output[0].Reset();
+      gate[1].Reset();
+      char release = 0;
+      ssize_t received = -1;
+      do {
+        received = ::read(gate[0].get(), &release, 1U);
+      } while (received < 0 && errno == EINTR);
+      if (received != 1 || release != 'R' ||
+          ::dup2(standard_input[0].get(), STDIN_FILENO) < 0 ||
+          ::dup2(standard_output[1].get(), STDOUT_FILENO) < 0 ||
+          ::dup2(null_error.get(), STDERR_FILENO) < 0) {
+        ::_exit(126);
+      }
+      standard_input[0].Reset();
+      standard_output[1].Reset();
+      gate[0].Reset();
+      const int result =
+          ::execve(launch_path.c_str(), argv.data(), environment.data());
+      (void)result;
+      ::_exit(127);
+    }
+
+    standard_input[0].Reset();
+    standard_output[1].Reset();
+    gate[0].Reset();
+    const auto observed = ReadProcObservation(child);
+    if (!observed.has_value() || observed->state == 'Z' ||
+        observed->state == 'X' || observed->start_ticks == 0U) {
+      Fail("forked runtime disappeared before controller bootstrap");
+    }
+    SendPacketNoSignal(bootstrap.get(),
+                       EncodeControllerBootstrap(child, observed->start_ticks));
+    const auto release = ReceivePacket(
+        bootstrap.get(), 16U,
+        std::chrono::duration_cast<std::chrono::milliseconds>(kBootstrapWait));
+    if (!release.has_value() || *release != "release") {
+      Fail("runtime controller was not durably released by Manager");
+    }
+    SendAllNoSignal(gate[1].get(), "R");
+    gate[1].Reset();
+    bootstrap.Reset();
+
+    RuntimeChannel channel{
+        std::move(standard_input[1]), std::move(standard_output[0]), {}, true};
+    bool shutdown_requested = false;
+    for (;;) {
+      int child_status = 0;
+      if (ReapChildIfExited(child, child_status)) {
+        const bool clean =
+            WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0;
+        ::_exit(clean ? 0 : 124);
+      }
+
+      pollfd descriptor{listener.get(), POLLIN, 0};
+      int poll_result = 0;
+      do {
+        poll_result = ::poll(&descriptor, 1U,
+                             static_cast<int>(kRelayPollInterval.count()));
+      } while (poll_result < 0 && errno == EINTR);
+      if (poll_result < 0) {
+        Fail(ErrnoDetail("runtime controller accept poll failed", errno));
+      }
+      if (poll_result == 0 || shutdown_requested) {
+        continue;
+      }
+
+      UniqueFd connection(
+          ::accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC));
+      if (!connection) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;
+        }
+        Fail(ErrnoDetail("runtime controller accept failed", errno));
+      }
+      try {
+        VerifyControlPeer(connection.get());
+        const auto command = ReceivePacket(
+            connection.get(), 64U,
+            std::chrono::duration_cast<std::chrono::milliseconds>(kStatusWait));
+        if (!command.has_value()) {
+          SendPacketNoSignal(connection.get(), "pending");
+          continue;
+        }
+        if (*command == "status") {
+          if (!channel.status_request_outstanding) {
+            WriteAll(channel.standard_input.get(), status_command);
+            channel.status_request_outstanding = true;
+          }
+          const auto line = ReadStatusLine(channel);
+          if (!line.has_value()) {
+            SendPacketNoSignal(connection.get(), "pending");
+            continue;
+          }
+          channel.status_request_outstanding = false;
+          SendPacketNoSignal(connection.get(), *line);
+          continue;
+        }
+        if (*command == "shutdown") {
+          WriteAll(channel.standard_input.get(), shutdown_command);
+          shutdown_requested = true;
+          SendPacketNoSignal(connection.get(), "shutdown-accepted");
+          continue;
+        }
+        SendPacketNoSignal(connection.get(), "invalid-command");
+      } catch (const std::exception &) {
+        // A disappearing Manager client loses only its response. The
+        // controller and runtime stay alive for exact reconnect/recovery.
+      }
+    }
+  } catch (...) {
+    ::_exit(125);
+  }
+}
+
+[[noreturn]] void
+EnterControllerProcess(const int listener_fd, const int bootstrap_fd,
+                       const std::filesystem::path &launch_path,
+                       std::vector<std::string> arguments,
+                       std::string status_command,
+                       std::string shutdown_command) {
+  const int listener_copy = ::fcntl(listener_fd, F_DUPFD_CLOEXEC, 10);
+  const int bootstrap_copy = ::fcntl(bootstrap_fd, F_DUPFD_CLOEXEC, 10);
+  if (listener_copy < 0 || bootstrap_copy < 0) {
+    ::_exit(125);
+  }
+  const int null_io = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+  if (null_io < 0 || ::dup2(null_io, STDIN_FILENO) < 0 ||
+      ::dup2(null_io, STDOUT_FILENO) < 0 ||
+      ::dup2(null_io, STDERR_FILENO) < 0 || ::dup2(listener_copy, 3) < 0 ||
+      ::dup2(bootstrap_copy, 4) < 0) {
+    ::_exit(125);
+  }
+#ifdef SYS_close_range
+  const long close_range_result = ::syscall(SYS_close_range, 5U, UINT_MAX, 0U);
+  if (close_range_result != 0 && errno != ENOSYS) {
+    ::_exit(125);
+  }
+  if (close_range_result != 0) {
+#endif
+    const long maximum = ::sysconf(_SC_OPEN_MAX);
+    const int upper =
+        maximum > 0 && maximum < INT_MAX ? static_cast<int>(maximum) : 65536;
+    for (int descriptor = 5; descriptor < upper; ++descriptor) {
+      static_cast<void>(::close(descriptor));
+    }
+#ifdef SYS_close_range
+  }
+#endif
+  RunController(3, 4, launch_path, std::move(arguments),
+                std::move(status_command), std::move(shutdown_command));
+}
+
+[[nodiscard]] std::uint64_t
+SourceSequenceFromStatusLine(const std::string &line,
+                             const ReferenceRuntimeUnitAdmission &admission,
+                             const RuntimeEpoch &runtime_epoch) {
+  std::istringstream stream(line);
+  std::vector<std::string> fields;
+  std::string field;
+  while (stream >> field) {
+    fields.push_back(std::move(field));
+  }
+  if (fields.size() != 11U) {
+    Fail("retained runtime emitted a malformed status field count");
+  }
+  const auto sequence =
+      ParseCanonicalUnsigned(fields[3], "runtime source-report sequence");
+  if (sequence == 0U ||
+      line != admission.expected_status_line(runtime_epoch, sequence)) {
+    Fail("retained runtime emitted a malformed or foreign status record");
+  }
+  return sequence;
+}
+
 } // namespace
 
 struct RetainedPosixRuntimeUnitAdapter::Impl final {
@@ -819,22 +1305,7 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     }
   }
 
-  ~Impl() {
-    std::vector<pid_t> children;
-    {
-      std::lock_guard lock(mutex);
-      children.reserve(channels.size());
-      for (auto &[unused, channel] : channels) {
-        (void)unused;
-        children.push_back(channel.pid);
-        channel.standard_input.Reset();
-      }
-      channels.clear();
-    }
-    for (const auto child : children) {
-      WaitForChildExit(child);
-    }
-  }
+  ~Impl() = default;
 
   [[nodiscard]] std::pair<std::shared_ptr<const RetainedBundle>,
                           ReferenceRuntimeUnitAdmission>
@@ -884,32 +1355,35 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     return state;
   }
 
-  void DropLocalChannel(const std::string &slot_name,
-                        const std::optional<ProcessState> &state) {
-    const auto found = channels.find(slot_name);
-    if (found == channels.end()) {
-      return;
+  [[nodiscard]] ProcessPresenceState
+  DurablePresence(const ProcessState &state, const int directory_fd) const {
+    if (state.boot_id != boot_id) {
+      return ProcessPresenceState::kAbsent;
     }
-    if (!state.has_value() || found->second.pid != state->pid ||
-        found->second.start_ticks != state->start_ticks ||
-        found->second.runtime_epoch != state->runtime_epoch) {
-      const pid_t child = found->second.pid;
-      channels.erase(found);
-      WaitForChildExit(child);
+    const bool runtime_live = RuntimeProcessIsLive(state, boot_id);
+    const bool controller_live = ControllerProcessIsLive(state, boot_id);
+    if (!runtime_live && !controller_live) {
+      return ProcessPresenceState::kAbsent;
     }
+    if (runtime_live && controller_live &&
+        ControlSocketMatches(directory_fd, state)) {
+      return ProcessPresenceState::kPresent;
+    }
+    return ProcessPresenceState::kUnknown;
   }
 
   [[nodiscard]] ProcessPresenceObservation
   ObserveLocked(const RuntimeUnitConvergenceQueryDTO &query,
-                const std::string &slot_name, const int directory_fd) {
+                const int directory_fd) {
     const auto state = CurrentState(directory_fd, query);
-    if (!state.has_value() || !ProcessIsLive(*state, boot_id)) {
-      DropLocalChannel(slot_name, std::nullopt);
+    if (!state.has_value()) {
       return Presence(query, ProcessPresenceState::kAbsent);
     }
-    DropLocalChannel(slot_name, state);
-    return Presence(query, ProcessPresenceState::kPresent,
-                    state->runtime_epoch.value());
+    const auto presence = DurablePresence(*state, directory_fd);
+    return Presence(query, presence,
+                    presence == ProcessPresenceState::kPresent
+                        ? state->runtime_epoch.value()
+                        : std::string_view{});
   }
 
   [[nodiscard]] ProcessPresenceObservation
@@ -938,7 +1412,7 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     probe_lock.Reset();
     probe_fd.Reset();
     auto slot = AcquireSlot(root_fd.get(), slot_name, false);
-    return ObserveLocked(query, slot_name, slot.directory_fd());
+    return ObserveLocked(query, slot.directory_fd());
   }
 
   [[nodiscard]] ProcessPresenceObservation
@@ -948,17 +1422,22 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     const std::string slot_name = SlotName(query);
     std::lock_guard lock(mutex);
     auto slot = AcquireSlot(root_fd.get(), slot_name, true);
+    RemoveStaleTemporaryAt(slot.directory_fd(), ".process.state.tmp");
+    MaterializeLaunchable(slot.directory_fd(), admission);
     auto current = CurrentState(slot.directory_fd(), query);
-    if (current.has_value() && ProcessIsLive(*current, boot_id)) {
-      DropLocalChannel(slot_name, current);
-      return Presence(query, ProcessPresenceState::kPresent,
-                      current->runtime_epoch.value());
-    }
-    DropLocalChannel(slot_name, std::nullopt);
     if (current.has_value()) {
+      const auto presence = DurablePresence(*current, slot.directory_fd());
+      if (presence == ProcessPresenceState::kPresent) {
+        return Presence(query, ProcessPresenceState::kPresent,
+                        current->runtime_epoch.value());
+      }
+      if (presence == ProcessPresenceState::kUnknown) {
+        Fail("runtime controller/process state is not safely absent");
+      }
+      ReapOwnedChildIfExited(current->controller_pid);
       RemoveState(slot.directory_fd());
     }
-    MaterializeLaunchable(slot.directory_fd(), admission);
+    RemoveControlSocket(slot.directory_fd());
 
     const RuntimeEpoch runtime_epoch("runtime-" + RandomHex());
     const auto launch_arguments = admission.launch_arguments(runtime_epoch);
@@ -969,65 +1448,45 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     arguments.push_back(launch_path.string());
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
-    std::vector<char *> argv;
-    argv.reserve(arguments.size() + 1U);
-    for (auto &argument : arguments) {
-      argv.push_back(argument.data());
+    auto listener = CreateControlListener(slot.directory_fd());
+    auto bootstrap = MakeSeqPacketPair();
+    const pid_t controller = ::fork();
+    if (controller < 0) {
+      const int fork_error = errno;
+      listener.fd.Reset();
+      RemoveControlSocket(slot.directory_fd());
+      Fail(ErrnoDetail("could not fork retained runtime controller",
+                       fork_error));
     }
-    argv.push_back(nullptr);
-    std::array<char, 19U> path_environment{"PATH=/usr/bin:/bin"};
-    std::array<char, 7U> lang_environment{"LANG=C"};
-    std::array<char, 9U> locale_environment{"LC_ALL=C"};
-    std::array<char *, 4U> environment{path_environment.data(),
-                                       lang_environment.data(),
-                                       locale_environment.data(), nullptr};
-
-    auto standard_input = MakeSocketPair();
-    auto standard_output = MakePipe();
-    auto gate = MakeSocketPair();
-    SetNonBlocking(standard_output[0].get());
-    const UniqueFd null_error(::open("/dev/null", O_WRONLY | O_CLOEXEC));
-    if (!null_error) {
-      Fail(ErrnoDetail("could not open fixed runtime stderr sink", errno));
+    if (controller == 0) {
+      EnterControllerProcess(listener.fd.get(), bootstrap[0].get(), launch_path,
+                             std::move(arguments),
+                             std::string(admission.status_command()),
+                             std::string(admission.shutdown_command()));
     }
 
-    const pid_t child = ::fork();
-    if (child < 0) {
-      Fail(ErrnoDetail("could not fork retained runtime", errno));
-    }
-    if (child == 0) {
-      standard_input[1].Reset();
-      standard_output[0].Reset();
-      gate[1].Reset();
-      char release = 0;
-      ssize_t received = -1;
-      do {
-        received = ::read(gate[0].get(), &release, 1U);
-      } while (received < 0 && errno == EINTR);
-      if (received != 1 || release != 'R' ||
-          ::dup2(standard_input[0].get(), STDIN_FILENO) < 0 ||
-          ::dup2(standard_output[1].get(), STDOUT_FILENO) < 0 ||
-          ::dup2(null_error.get(), STDERR_FILENO) < 0) {
-        ::_exit(126);
-      }
-      standard_input[0].Reset();
-      standard_output[1].Reset();
-      gate[0].Reset();
-      const int result =
-          ::execve(launch_path.c_str(), argv.data(), environment.data());
-      (void)result;
-      ::_exit(127);
-    }
-
-    standard_input[0].Reset();
-    standard_output[1].Reset();
-    gate[0].Reset();
+    bootstrap[0].Reset();
+    listener.fd.Reset();
     bool released = false;
     bool state_written = false;
     try {
-      const auto observed = ReadProcObservation(child);
-      if (!observed.has_value() || observed->state == 'Z' ||
-          observed->state == 'X' || observed->start_ticks == 0U) {
+      const auto controller_observed = ReadProcObservation(controller);
+      if (!controller_observed.has_value() ||
+          controller_observed->state == 'Z' ||
+          controller_observed->state == 'X' ||
+          controller_observed->start_ticks == 0U) {
+        Fail("runtime controller disappeared before durable admission");
+      }
+      const auto bootstrap_record =
+          ReceivePacket(bootstrap[1].get(), 128U,
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            kBootstrapWait));
+      if (!bootstrap_record.has_value()) {
+        Fail("runtime controller bootstrap timed out");
+      }
+      const auto [child, child_start_ticks] =
+          DecodeControllerBootstrap(*bootstrap_record);
+      if (!ProcessIsLive(child, child_start_ticks)) {
         Fail("forked runtime disappeared before durable process admission");
       }
       ProcessState state{
@@ -1036,39 +1495,105 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
           query.plan.configuration_identity.value(),
           query.plan.process_adapter_contract_revision,
           boot_id,
+          controller,
+          controller_observed->start_ticks,
           child,
-          observed->start_ticks,
+          child_start_ticks,
+          listener.identity.device,
+          listener.identity.inode,
           runtime_epoch,
       };
       AtomicWriteAt(slot.directory_fd(), "process.state", EncodeState(state),
                     0600);
       state_written = true;
-      Channel channel{child,
-                      observed->start_ticks,
-                      runtime_epoch,
-                      std::move(standard_input[1]),
-                      std::move(standard_output[0]),
-                      {},
-                      1U,
-                      true};
-      channels.insert_or_assign(slot_name, std::move(channel));
-      SendAllNoSignal(gate[1].get(), "R");
+      SendPacketNoSignal(bootstrap[1].get(), "release");
       released = true;
-      gate[1].Reset();
+      bootstrap[1].Reset();
       return Presence(query, ProcessPresenceState::kPresent,
                       runtime_epoch.value());
     } catch (...) {
-      gate[1].Reset();
-      channels.erase(slot_name);
-      WaitForChildExit(child);
+      bootstrap[1].Reset();
+      WaitForProcessExit(controller,
+                         std::chrono::steady_clock::now() + kRuntimeStopWait);
+      ReapOwnedChildIfExited(controller);
       if (state_written && !released) {
         try {
           RemoveState(slot.directory_fd());
         } catch (...) {
         }
       }
+      if (!released) {
+        try {
+          RemoveControlSocket(slot.directory_fd());
+        } catch (...) {
+        }
+      }
       throw;
     }
+  }
+
+  [[nodiscard]] ProcessPresenceObservation
+  EnsureStopped(const RuntimeUnitConvergenceQueryDTO &query) {
+    static_cast<void>(Admission(query));
+    const std::string slot_name = SlotName(query);
+    std::lock_guard lock(mutex);
+    const int probe = ::openat(root_fd.get(), slot_name.c_str(),
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (probe < 0) {
+      if (errno == ENOENT) {
+        return Presence(query, ProcessPresenceState::kAbsent);
+      }
+      Fail(ErrnoDetail("could not inspect runtime stop slot", errno));
+    }
+    UniqueFd probe_fd(probe);
+    probe_fd.Reset();
+    auto slot = AcquireSlot(root_fd.get(), slot_name, false);
+    const auto state = CurrentState(slot.directory_fd(), query);
+    if (!state.has_value()) {
+      RemoveControlSocket(slot.directory_fd());
+      return Presence(query, ProcessPresenceState::kAbsent);
+    }
+
+    auto runtime_live = RuntimeProcessIsLive(*state, boot_id);
+    auto controller_live = ControllerProcessIsLive(*state, boot_id);
+    if (runtime_live && controller_live &&
+        ControlSocketMatches(slot.directory_fd(), *state)) {
+      bool request_uncertain = false;
+      try {
+        auto connection = ConnectControlSocket(slot.directory_fd(), *state);
+        SendPacketNoSignal(connection.get(), "shutdown");
+        const auto acknowledgement = ReceivePacket(
+            connection.get(), 64U,
+            std::chrono::duration_cast<std::chrono::milliseconds>(kStatusWait));
+        request_uncertain = !acknowledgement.has_value() ||
+                            *acknowledgement != "shutdown-accepted";
+      } catch (const std::exception &) {
+        request_uncertain = true;
+      }
+
+      const auto deadline = std::chrono::steady_clock::now() + kRuntimeStopWait;
+      do {
+        runtime_live = RuntimeProcessIsLive(*state, boot_id);
+        controller_live = ControllerProcessIsLive(*state, boot_id);
+        if (!runtime_live && !controller_live) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      } while (std::chrono::steady_clock::now() < deadline);
+      if ((runtime_live || controller_live) && request_uncertain) {
+        Fail("runtime shutdown outcome is uncertain");
+      }
+    }
+
+    runtime_live = RuntimeProcessIsLive(*state, boot_id);
+    controller_live = ControllerProcessIsLive(*state, boot_id);
+    if (runtime_live || controller_live) {
+      Fail("runtime controller/process is not safely stopped");
+    }
+    ReapOwnedChildIfExited(state->controller_pid);
+    RemoveState(slot.directory_fd());
+    RemoveControlSocket(slot.directory_fd());
+    return Presence(query, ProcessPresenceState::kAbsent);
   }
 
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
@@ -1094,43 +1619,20 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
     auto slot = AcquireSlot(root_fd.get(), slot_name, false);
     const auto state = CurrentState(slot.directory_fd(), query);
     if (!state.has_value() || state->runtime_epoch != runtime_epoch ||
-        !ProcessIsLive(*state, boot_id)) {
-      DropLocalChannel(slot_name, std::nullopt);
+        DurablePresence(*state, slot.directory_fd()) !=
+            ProcessPresenceState::kPresent) {
       return std::nullopt;
     }
-    const auto found = channels.find(slot_name);
-    if (found == channels.end() || found->second.pid != state->pid ||
-        found->second.start_ticks != state->start_ticks ||
-        found->second.runtime_epoch != state->runtime_epoch) {
+    auto connection = ConnectControlSocket(slot.directory_fd(), *state);
+    SendPacketNoSignal(connection.get(), "status");
+    const auto line = ReceivePacket(
+        connection.get(), kMaximumControlPacketBytes,
+        std::chrono::duration_cast<std::chrono::milliseconds>(kStatusWait));
+    if (!line.has_value() || *line == "pending") {
       return std::nullopt;
     }
-    Channel &channel = found->second;
-    if (!channel.standard_input || !channel.standard_output) {
-      return std::nullopt;
-    }
-    if (!channel.status_request_outstanding) {
-      try {
-        SendAllNoSignal(channel.standard_input.get(),
-                        admission.status_command());
-        channel.status_request_outstanding = true;
-      } catch (const RetainedPosixRuntimeUnitAdapterError &) {
-        channel.standard_input.Reset();
-        return std::nullopt;
-      }
-    }
-    const auto line = ReadStatusLine(channel);
-    if (!line.has_value()) {
-      return std::nullopt;
-    }
-    const auto sequence = channel.next_source_sequence;
-    if (*line != admission.expected_status_line(runtime_epoch, sequence)) {
-      Fail("retained runtime emitted a malformed or foreign status record");
-    }
-    if (sequence == std::numeric_limits<std::uint64_t>::max()) {
-      Fail("retained runtime source-report sequence is exhausted");
-    }
-    ++channel.next_source_sequence;
-    channel.status_request_outstanding = false;
+    const auto sequence =
+        SourceSequenceFromStatusLine(*line, admission, runtime_epoch);
     return RuntimeUnitSourceReport(
         query.plan.runtime_unit_id.value(), runtime_epoch.value(), sequence, 1U,
         RuntimeSourcePhase::kServing, RuntimeSourceHealth::kHealthy,
@@ -1151,7 +1653,6 @@ struct RetainedPosixRuntimeUnitAdapter::Impl final {
   UniqueFd root_fd;
   std::mutex mutex;
   std::uint64_t observation_sequence{};
-  std::map<std::string, Channel> channels;
 };
 
 RetainedPosixRuntimeUnitAdapter::RetainedPosixRuntimeUnitAdapter(
@@ -1174,6 +1675,11 @@ ProcessPresenceObservation RetainedPosixRuntimeUnitAdapter::ObserveProcess(
 ProcessPresenceObservation RetainedPosixRuntimeUnitAdapter::EnsureRunning(
     const RuntimeUnitConvergenceQueryDTO &query) {
   return impl_->EnsureRunning(query);
+}
+
+ProcessPresenceObservation RetainedPosixRuntimeUnitAdapter::EnsureStopped(
+    const RuntimeUnitConvergenceQueryDTO &query) {
+  return impl_->EnsureStopped(query);
 }
 
 std::optional<RuntimeUnitSourceReport>

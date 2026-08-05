@@ -54,8 +54,8 @@ struct RuntimeUnitConvergencePlanRowDTO final {
 
   [[nodiscard]] bool valid() const noexcept;
 
-  friend bool operator==(const RuntimeUnitConvergencePlanRowDTO&,
-                         const RuntimeUnitConvergencePlanRowDTO&) = default;
+  friend bool operator==(const RuntimeUnitConvergencePlanRowDTO &,
+                         const RuntimeUnitConvergencePlanRowDTO &) = default;
 };
 
 /// Complete immutable candidate-runtime convergence intent.
@@ -68,14 +68,16 @@ struct ManagerApplyRuntimeConvergenceIntentDTO final {
   manyforge::core::RetainedBundleId candidate_retained_bundle_id;
   manyforge::core::GraphRevision candidate_graph_revision;
   manyforge::core::ContentDigest fence_acceptance_digest;
-  manyforge::core::ActiveBundlePublicationGeneration predecessor_publication_generation;
+  manyforge::core::ActiveBundlePublicationGeneration
+      predecessor_publication_generation;
   manyforge::core::ContentDigest predecessor_public_pointer_digest;
   std::vector<RuntimeUnitConvergencePlanRowDTO> runtime_units;
 
   [[nodiscard]] bool valid() const noexcept;
 
-  friend bool operator==(const ManagerApplyRuntimeConvergenceIntentDTO&,
-                         const ManagerApplyRuntimeConvergenceIntentDTO&) = default;
+  friend bool
+  operator==(const ManagerApplyRuntimeConvergenceIntentDTO &,
+             const ManagerApplyRuntimeConvergenceIntentDTO &) = default;
 };
 
 /// Exact adapter query bound to one durable convergence intent and plan row.
@@ -89,23 +91,26 @@ struct RuntimeUnitConvergenceQueryDTO final {
 
   [[nodiscard]] bool valid() const noexcept;
 
-  friend bool operator==(const RuntimeUnitConvergenceQueryDTO&,
-                         const RuntimeUnitConvergenceQueryDTO&) = default;
+  friend bool operator==(const RuntimeUnitConvergenceQueryDTO &,
+                         const RuntimeUnitConvergenceQueryDTO &) = default;
 };
 
 /// Process presence/lifecycle adapter used only by the Manager owner.
 ///
-/// Every implementation observes first. `EnsureRunning` is idempotent for the
-/// exact query, may perform an effect only for `manager_managed`, and must
-/// reconcile a surviving exact process rather than start a duplicate.
+/// Every implementation observes first. `EnsureRunning` and `EnsureStopped`
+/// are idempotent for the exact query, may perform an effect only for
+/// `manager_managed`, and must reconcile a surviving exact process or an
+/// already-absent process rather than duplicate an effect.
 class IRuntimeUnitProcessPort {
- public:
+public:
   virtual ~IRuntimeUnitProcessPort() = default;
 
-  [[nodiscard]] virtual ProcessPresenceObservation ObserveProcess(
-      const RuntimeUnitConvergenceQueryDTO& query) = 0;
-  [[nodiscard]] virtual ProcessPresenceObservation EnsureRunning(
-      const RuntimeUnitConvergenceQueryDTO& query) = 0;
+  [[nodiscard]] virtual ProcessPresenceObservation
+  ObserveProcess(const RuntimeUnitConvergenceQueryDTO &query) = 0;
+  [[nodiscard]] virtual ProcessPresenceObservation
+  EnsureRunning(const RuntimeUnitConvergenceQueryDTO &query) = 0;
+  [[nodiscard]] virtual ProcessPresenceObservation
+  EnsureStopped(const RuntimeUnitConvergenceQueryDTO &query) = 0;
 };
 
 /// Direct source-attested runtime progress adapter.
@@ -115,12 +120,12 @@ class IRuntimeUnitProcessPort {
 /// must return a newly received direct report for this observation or absence;
 /// replaying cached bytes as a fresh receipt is forbidden.
 class IRuntimeUnitProgressPort {
- public:
+public:
   virtual ~IRuntimeUnitProgressPort() = default;
 
-  [[nodiscard]] virtual std::optional<RuntimeUnitSourceReport> ObserveProgress(
-      const RuntimeUnitConvergenceQueryDTO& query,
-      const manyforge::core::RuntimeEpoch& runtime_epoch) = 0;
+  [[nodiscard]] virtual std::optional<RuntimeUnitSourceReport>
+  ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
+                  const manyforge::core::RuntimeEpoch &runtime_epoch) = 0;
 };
 
 struct RuntimeUnitDependencyEpochDTO final {
@@ -131,8 +136,8 @@ struct RuntimeUnitDependencyEpochDTO final {
     return !runtime_unit_id.empty() && !runtime_epoch.empty();
   }
 
-  friend bool operator==(const RuntimeUnitDependencyEpochDTO&,
-                         const RuntimeUnitDependencyEpochDTO&) = default;
+  friend bool operator==(const RuntimeUnitDependencyEpochDTO &,
+                         const RuntimeUnitDependencyEpochDTO &) = default;
 };
 
 /// Complete Manager-derived staged-ready evidence for one runtime unit.
@@ -158,8 +163,8 @@ struct RuntimeUnitStagedReadyEvidenceDTO final {
 
   [[nodiscard]] bool valid() const noexcept;
 
-  friend bool operator==(const RuntimeUnitStagedReadyEvidenceDTO&,
-                         const RuntimeUnitStagedReadyEvidenceDTO&) = default;
+  friend bool operator==(const RuntimeUnitStagedReadyEvidenceDTO &,
+                         const RuntimeUnitStagedReadyEvidenceDTO &) = default;
 };
 
 /// One complete point-in-time candidate staged-ready set.
@@ -168,17 +173,18 @@ struct ManagerApplyRuntimeStagedReadyDTO final {
   manyforge::core::ApplyGeneration apply_generation;
   std::uint64_t staged_ready_generation;
   manyforge::core::ContentDigest runtime_convergence_intent_digest;
-  manyforge::core::ActiveBundlePublicationGeneration predecessor_publication_generation;
+  manyforge::core::ActiveBundlePublicationGeneration
+      predecessor_publication_generation;
   manyforge::core::ContentDigest predecessor_public_pointer_digest;
   std::uint64_t evaluated_at_ns;
   std::vector<RuntimeUnitStagedReadyEvidenceDTO> runtime_units;
 
   [[nodiscard]] bool valid() const noexcept;
 
-  friend bool operator==(const ManagerApplyRuntimeStagedReadyDTO&,
-                         const ManagerApplyRuntimeStagedReadyDTO&) = default;
+  friend bool operator==(const ManagerApplyRuntimeStagedReadyDTO &,
+                         const ManagerApplyRuntimeStagedReadyDTO &) = default;
 };
 
 [[nodiscard]] std::string_view ToString(RuntimeUnitCandidateDisposition value);
 
-}  // namespace manyforge::component_manager
+} // namespace manyforge::component_manager

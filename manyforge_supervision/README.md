@@ -1,6 +1,8 @@
 # Historical Python supervision disposition
 
-Status: **source-reconciled and unqualified**.
+Status: **the Python owners are deleted and relocation-qualified. The C++ I4
+successor owns and qualifies the migrated M0 runtime fixture; public headless
+client projection remains I5/H0 work.**
 
 `manyforge_supervision` no longer ships a production Python package. The C++
 `manyforge_component_manager` package is the selected I4 semantic owner for
@@ -16,7 +18,11 @@ client or process/status adapter over owner-issued facts. It must not restore
 the reducers, v1 heartbeat/policy wire, execution pin, or two-container
 teardown state machine recorded below.
 
-No build or test has qualified this source reconciliation yet.
+The 2026-08-01 relocation evidence qualifies the deletion and exact historical
+transfer ledger. Final I4 evidence binds the reconnectable retained-POSIX
+adapter, active-runtime coordinator, external-process M0 proof, and cumulative
+executable results; this ledger remains the historical behavior map rather
+than a second qualification authority.
 
 ## Exact historical sources
 
@@ -35,8 +41,13 @@ and acceptance inputs; they are not runnable fallbacks.
 The retained owner/reference evidence is:
 
 - `manyforge_component_manager/{include,src}/.../runtime_observation.*`;
+- `manyforge_component_manager/{include,src}/.../manager_active_runtime_coordinator.*`;
+- `manyforge_component_manager/{include,src}/.../retained_posix_runtime_unit_adapter.*`;
 - `manyforge_component_manager/test/test_runtime_observation.cpp` and
   `testdata/runtime_observation_parity_v1.txt`;
+- `manyforge_component_manager/test/test_manager_active_runtime_coordinator.cpp`,
+  `test_retained_posix_runtime_unit_adapter.cpp`, and
+  `manyforge_scene/test/test_component_manager_m0_process.cpp`;
 - `verification/composable_cell_i4/{runtime_observation_fixture.py,process_fixture.py}`;
 - `tests/composable_cell_i4/{test_runtime_observation.py,test_process_fixture.py}`.
 
@@ -53,18 +64,18 @@ Source: `manyforge_composer/tests/test_cell_supervisor.py`, blob
 `8295eefcd305e63c50efd368547244a2339ab054`, case digest
 `dfeb5f3e0f3d15c7972286ef1c590c2f7a7270bde6401ec5cd1b66662956942d`.
 
-| Historical case | Future owner/gate and evidence use |
+| Historical case | Successor owner/gate and evidence use |
 | --- | --- |
-| `test_supervisor_starts_fenced_and_arms_only_complete_domain` | I4 Manager staged readiness, dependency convergence, and command fencing; current process fixture proves only owner/effect separation. |
-| `test_unexpected_composer_exit_tears_down_owner_without_restart` | I4 desired/observed convergence and external-bootstrap policy. Re-evaluate the old blanket teardown/no-restart outcome against explicit runtime-unit ownership. |
-| `test_reduced_domain_health_loss_tears_down_complete_domain` | I4 source observation and process convergence. Do not preserve the old aggregate Composer-health authority. |
-| `test_docker_process_control_observes_domain_in_one_bounded_call` | Future thin I4 process adapter: bounded observation, independent handles, and no robot/lifecycle authority. |
+| `test_supervisor_starts_fenced_and_arms_only_complete_domain` | I4 durable staged readiness, dependency convergence, and `closed_no_active_effect` evidence are carried by the runtime-convergence and M0 tests. Manager never arms a robot domain. |
+| `test_unexpected_composer_exit_tears_down_owner_without_restart` | The teardown outcome is intentionally superseded: spec 100 §5.8 makes Composer/browser loss inert, while Manager loss leaves the exact runtime/epoch unchanged. Adapter and M0 process-loss tests carry the successor behavior. |
+| `test_reduced_domain_health_loss_tears_down_complete_domain` | I4 observes source loss and exposes nonconvergence without restoring Composer-owned aggregate health or containment. H0/I5 later projects that owner-issued fact. |
+| `test_docker_process_control_observes_domain_in_one_bounded_call` | The closed retained-POSIX adapter supplies bounded exact process observation and fixed lifecycle effects without robot/lifecycle authority; fixed Docker-domain policy is not restored. |
 | `test_composer_probe_requires_progress_and_pins_epoch` | H0/I5 status source plus I4 receiver-local freshness/incarnation evidence; current C++/fixture observation tests carry the invariant. |
 | `test_composer_probe_requires_persistent_reduced_unhealthy_state` | H0/I5 source facts and I4 convergence policy; the old Composer-reduced health endpoint is not restored as authority. |
-| `test_explicit_shutdown_is_dependency_ordered` | I4 dependency-ordered process convergence and external-bootstrap teardown evidence. |
-| `test_force_remove_is_recorded_as_unclean_not_physical_stop` | I4 effect reconciliation plus P5/I8 proof that process teardown never substitutes for Kernel Stop. |
-| `test_runner_persists_one_terminal_epoch_and_restores_signals` | Future external-bootstrap/thin process adapter at I4; terminal process evidence remains separate from robot truth. |
-| `test_runner_contains_domain_if_health_adapter_raises` | I4 fail-closed adapter/reconciliation evidence; no Python-owned containment state machine. |
+| `test_explicit_shutdown_is_dependency_ordered` | I4 active-runtime tests prove reverse-dependency explicit shutdown, exact absence, idempotency, and fresh epochs after restart. |
+| `test_force_remove_is_recorded_as_unclean_not_physical_stop` | I4 intentionally exposes no force-remove or signal choice: uncertain fixed shutdown remains unavailable until observed. P5/I8 still proves that process teardown never substitutes for Kernel Stop. |
+| `test_runner_persists_one_terminal_epoch_and_restores_signals` | The reconnectable controller and durable process identity carry bounded Manager-loss/replacement and terminal process evidence; public bootstrap/client signal handling remains H0/I5. |
+| `test_runner_contains_domain_if_health_adapter_raises` | I4 fails closed on adapter/reconciliation errors and never restores the Python containment state machine. |
 
 ### v1 component-health and manifest cohort — 9 cases
 
@@ -72,12 +83,12 @@ Source: `manyforge_composer/tests/test_component_supervision.py`, blob
 `9ba5cf1ec6dd0dfe7b3b868f9ad79e3aa31f3a79`, case digest
 `2acc35f3e3d56897b1af69803b12ae294a2e5f093acee1eb1ece06378feeb8e0`.
 
-| Historical case | Future owner/gate and evidence use |
+| Historical case | Successor owner/gate and evidence use |
 | --- | --- |
 | `test_policy_rejects_unknown_dependency_and_cycle` | C++ I4 expectation-graph validation; carried by current C++ and fixture tests. |
 | `test_manifest_parser_rejects_unknown_top_and_component_keys` | Strict negative parsing for final I2/I3 retained products and I4 adapter inputs; never restore the v1 policy schema. |
 | `test_manifest_parser_accepts_runtime_supervision_metadata` | Port only metadata that exists in the final I2/I3 runtime-unit/product contracts. The old role vocabulary is not authoritative. |
-| `test_external_heartbeat_reader_is_strict_and_identity_bound` | Future thin I4 status adapter over explicit runtime-unit/source/incarnation identities. |
+| `test_external_heartbeat_reader_is_strict_and_identity_bound` | The retained-POSIX status adapter now validates exact runtime-unit/source/incarnation/product/configuration identities. A later external product still requires its own observation-only adapter. |
 | `test_missing_duplicate_regressed_and_conflicting_samples_fail_closed` | C++ I4 observation ingestion; carried by current C++ and fixture duplicate/conflict/regression tests. |
 | `test_same_epoch_heartbeat_does_not_fake_critical_progress` | C++ I4 receiver-local progress freshness; carried by current C++ and fixture tests. |
 | `test_dependency_epoch_mismatch_propagates_to_dependants` | C++ I4 causal dependency rejoin; carried by current C++ and fixture tests. |
@@ -141,7 +152,9 @@ retained `runtime_observation_parity_v1.txt` vector. It no longer executes a
 second production Python reducer.
 
 Together these four cohorts account for all **43** deleted historical test
-definitions. Passing the retained tests later will qualify only their named
-ROS-free observation/process-fixture claims; operational Apply, process
-convergence, H0 status APIs, Program/lifecycle admission, and any product lane
-remain unavailable until their respective plan gates pass.
+definitions. The relocation evidence already qualifies their exact retention
+and routing. Final I4 evidence must additionally bind the C++ observation,
+process convergence, Apply recovery, active reconciliation, and M0 successor
+tests before the ownership cutover closes. H0 status APIs, Program/lifecycle
+admission, external products, and every product lane remain unavailable until
+their later plan gates pass.

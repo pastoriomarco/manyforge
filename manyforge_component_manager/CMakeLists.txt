@@ -171,6 +171,7 @@ add_library(manyforge_component_manager
   src/manager_apply_fence_coordinator.cpp
   src/manager_apply_fence_release_coordinator.cpp
   src/manager_apply_journal.cpp
+  src/manager_active_runtime_coordinator.cpp
   src/manager_runtime_convergence_coordinator.cpp
   src/manager_scene_activation_coordinator.cpp
   src/manager_scene_stage_coordinator.cpp
@@ -362,6 +363,14 @@ if(BUILD_TESTING)
     manyforge::deployment
     GTest::gtest_main)
   gtest_discover_tests(test_manager_runtime_convergence_coordinator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_manager_active_runtime_coordinator
+    test/test_manager_active_runtime_coordinator.cpp)
+  target_link_libraries(test_manager_active_runtime_coordinator PRIVATE
+    manyforge_component_manager
+    GTest::gtest_main)
+  gtest_discover_tests(test_manager_active_runtime_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_retained_posix_runtime_unit_adapter

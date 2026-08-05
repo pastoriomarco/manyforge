@@ -14,10 +14,14 @@ branch/commit workflow).
 
 > **Current `dev` outage:** the composable-cell destructive migration has
 > removed the legacy node factory and runtime resolver. Catalog inspection is
-> available; Composer program execution and the native, Isaac, and real-robot
-> product lanes are not. H0 restores headless resolution, N restores native
-> execution, and I/R restore Isaac/real operation. Operator runbooks below
-> remain baseline/reference material until their owning restoration gate.
+> available. I4's internal C++ M0 proof now owns durable Apply and retained
+> reference-runtime convergence across Manager loss, crash/restart, and
+> explicit shutdown, but it exposes no public operator client and restores no
+> product lane. Composer program execution and the native, Isaac, and
+> real-robot product lanes are not available. H0 restores headless resolution,
+> N restores native execution, and I/R restore Isaac/real operation. Operator
+> runbooks below remain baseline/reference material until their owning
+> restoration gate.
 
 ## Choose A Path
 

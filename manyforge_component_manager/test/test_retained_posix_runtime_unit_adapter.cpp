@@ -227,11 +227,18 @@ TEST(RetainedPosixRuntimeUnitAdapter,
   EXPECT_EQ(observed.process_incarnation(), epoch.value());
   const auto reconciled = observer.EnsureRunning(query);
   EXPECT_EQ(reconciled.process_incarnation(), epoch.value());
-  EXPECT_FALSE(observer.ObserveProgress(query, epoch).has_value());
+  const auto reconnected = observer.ObserveProgress(query, epoch);
+  ASSERT_TRUE(reconnected.has_value());
+  EXPECT_EQ(reconnected->source_report_sequence(), 3U);
+
+  EXPECT_EQ(observer.EnsureStopped(query).state(),
+            ProcessPresenceState::kAbsent);
+  EXPECT_EQ(observer.EnsureStopped(query).state(),
+            ProcessPresenceState::kAbsent);
 }
 
 TEST(RetainedPosixRuntimeUnitAdapter,
-     ManagerProcessExitIsObservedBeforeAReplacementEpochStarts) {
+     ManagerProcessExitLeavesRuntimeAndStatusChannelReconnectable) {
   ScopedRoot package_root("manyforge-retained-posix-crash-package");
   ScopedRoot runtime_root("manyforge-retained-posix-crash-runtime");
   const auto package = MaterializeRuntimePackage(package_root.path());
@@ -288,23 +295,29 @@ TEST(RetainedPosixRuntimeUnitAdapter,
   RetainedPosixRuntimeUnitAdapter replacement(
       runtime_root.path(), *package.bundle_source, *package.artifact_source,
       "linux", "posix.1-2017");
-  ProcessPresenceObservation observed = replacement.ObserveProcess(query);
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  while (observed.state() == ProcessPresenceState::kPresent &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    observed = replacement.ObserveProcess(query);
-  }
-  ASSERT_EQ(observed.state(), ProcessPresenceState::kAbsent);
+  const auto observed = replacement.ObserveProcess(query);
+  ASSERT_EQ(observed.state(), ProcessPresenceState::kPresent);
+  EXPECT_EQ(observed.process_incarnation(), old_epoch);
+  const auto reconciled = replacement.EnsureRunning(query);
+  EXPECT_EQ(reconciled.process_incarnation(), old_epoch);
+  const auto fresh = replacement.ObserveProgress(
+      query, RuntimeEpoch(reconciled.process_incarnation()));
+  ASSERT_TRUE(fresh.has_value());
+  EXPECT_EQ(fresh->source_report_sequence(), 2U);
 
+  EXPECT_EQ(replacement.EnsureStopped(query).state(),
+            ProcessPresenceState::kAbsent);
+  EXPECT_EQ(replacement.EnsureStopped(query).state(),
+            ProcessPresenceState::kAbsent);
   const auto restarted = replacement.EnsureRunning(query);
   ASSERT_EQ(restarted.state(), ProcessPresenceState::kPresent);
   EXPECT_NE(restarted.process_incarnation(), old_epoch);
-  const auto fresh = replacement.ObserveProgress(
+  const auto restarted_report = replacement.ObserveProgress(
       query, RuntimeEpoch(restarted.process_incarnation()));
-  ASSERT_TRUE(fresh.has_value());
-  EXPECT_EQ(fresh->source_report_sequence(), 1U);
+  ASSERT_TRUE(restarted_report.has_value());
+  EXPECT_EQ(restarted_report->source_report_sequence(), 1U);
+  EXPECT_EQ(replacement.EnsureStopped(query).state(),
+            ProcessPresenceState::kAbsent);
 }
 
 TEST(RetainedPosixRuntimeUnitAdapter,
@@ -336,6 +349,8 @@ TEST(RetainedPosixRuntimeUnitAdapter,
         "linux", "posix.1-2017");
     ASSERT_EQ(adapter.EnsureRunning(query).state(),
               ProcessPresenceState::kPresent);
+    ASSERT_EQ(adapter.EnsureStopped(query).state(),
+              ProcessPresenceState::kAbsent);
   }
 
   const auto launchable = FindMaterializedLaunchable(runtime_root.path());
@@ -354,21 +369,25 @@ TEST(RetainedPosixRuntimeUnitAdapter,
       "linux", "posix.1-2017");
   EXPECT_THROW(static_cast<void>(replacement.EnsureRunning(query)),
                RetainedPosixRuntimeUnitAdapterError);
+  EXPECT_EQ(replacement.EnsureStopped(query).state(),
+            ProcessPresenceState::kAbsent);
 }
 
 TEST(RetainedPosixRuntimeUnitAdapter,
-     CrashLeftFixedTemporaryIsRecoveredWithoutStrandingTheSlot) {
+     CrashLeftFixedTemporaryIsRemovedWhileSurvivingEpochIsReconciled) {
   ScopedRoot package_root("manyforge-retained-posix-temp-package");
   ScopedRoot runtime_root("manyforge-retained-posix-temp-runtime");
   const auto package = MaterializeRuntimePackage(package_root.path());
   const auto query = Query(package);
   std::filesystem::path slot;
+  std::string old_epoch;
   {
     RetainedPosixRuntimeUnitAdapter adapter(
         runtime_root.path(), *package.bundle_source, *package.artifact_source,
         "linux", "posix.1-2017");
-    ASSERT_EQ(adapter.EnsureRunning(query).state(),
-              ProcessPresenceState::kPresent);
+    const auto started = adapter.EnsureRunning(query);
+    ASSERT_EQ(started.state(), ProcessPresenceState::kPresent);
+    old_epoch = started.process_incarnation();
     slot = FindMaterializedLaunchable(runtime_root.path()).parent_path();
   }
 
@@ -384,11 +403,14 @@ TEST(RetainedPosixRuntimeUnitAdapter,
       "linux", "posix.1-2017");
   const auto restarted = replacement.EnsureRunning(query);
   ASSERT_EQ(restarted.state(), ProcessPresenceState::kPresent);
+  EXPECT_EQ(restarted.process_incarnation(), old_epoch);
   EXPECT_FALSE(std::filesystem::exists(stale_temporary));
   EXPECT_TRUE(
       replacement
           .ObserveProgress(query, RuntimeEpoch(restarted.process_incarnation()))
           .has_value());
+  EXPECT_EQ(replacement.EnsureStopped(query).state(),
+            ProcessPresenceState::kAbsent);
 }
 
 } // namespace

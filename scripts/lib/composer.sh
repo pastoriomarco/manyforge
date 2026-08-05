@@ -15,8 +15,9 @@
 #       -> compiler-retained assistant settings at I5, not v0 YAML inference.
 #
 # No fixed Composer URL, old route, HTTP client, Docker log probe, YAML loader,
-# process wait remains. Exact launcher cleanup is available through launch.sh
-# stop and does not source this library.
+# process wait remains. Historical launcher cleanup is unavailable because its
+# PID/container names cannot authenticate ownership; future cleanup consumes
+# Manager-issued identities through the I5/H0 client surface.
 
 if [[ -n "${_MANYFORGE_LIB_COMPOSER:-}" ]]; then
     return 0

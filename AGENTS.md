@@ -13,8 +13,13 @@
 > `62df57ca76b55991c8ac01d3a316dfc8a3b450aa`: its immutable
 > planning/collision, viewer, control-domain, reference runtime-unit, and
 > projection-input products are deterministic, reloadable, and testable
-> offline. I3 does not Apply, select an active bundle, start a process, or run
-> a product. Composer's structural catalog/files/URDF shell is also available.
+> offline. I4 now owns the bounded canonical-empty-to-reference-runtime M0
+> path: durable Apply recovery, active publication, retained-process
+> convergence across Manager replacement, active-plan reconciliation, and
+> explicit shutdown are qualified without a robot port. This is an internal
+> C++ owner/process proof, not a public Manager daemon, CLI/HTTP surface, or
+> restored product lane. Composer's structural catalog/files/URDF shell is
+> also available.
 > Program execution,
 > assistant/MCP operation, live scene editing/viewing, native planning,
 > Isaac/ROS product launch, and real-robot operation are explicitly
@@ -103,8 +108,12 @@ The exact I3 implementation/identity freeze is ManyForge commit
 `968422a59dd1216a0db07ec398c9f49b1a9ff7cc`. Its cumulative AMD64 Release,
 sanitizer, deterministic-regeneration, static-boundary, and adversarial checks
 passed. Later qualification-runner and documentation-only descendants do not
-change the retained products. I4 remains the first owner of operational Apply,
-active publication, and process convergence; no runtime lane is available.
+change the retained products. I4 now owns operational Apply, active
+publication, and process convergence for the bounded M0 reference fixture.
+Its external-process proof covers Manager loss/replacement, runtime
+crash/restart, and explicit shutdown without a robot, controller, motion, or
+Stop port. Public Manager clients remain I5/H0 work, and no runtime product
+lane is available.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
@@ -293,9 +302,9 @@ What lives where in this repo, and what it's for:
 | [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                                                      |
 | [`manyforge_content_identity/`](manyforge_content_identity/)             | Shared ROS-free RFC 8785 serialization and domain-separated content-digest primitives                                      |
 | [`manyforge_persistence/`](manyforge_persistence/)                       | Shared ROS-free mechanical durable-storage safety primitives; no semantic state ownership                                  |
-| [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free canonical-empty logical-scene owner foundation; no live scene surface                                               |
+| [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free canonical-empty and bounded runtime-only Apply logical-scene owner; no live scene surface                           |
 | [`manyforge_deployment/`](manyforge_deployment/)                         | Qualified ROS-free composable-cell compiler and immutable offline retained-product boundary                                 |
-| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ Component Manager foundation; no operational Apply process                                                      |
+| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ I4 owner for the bounded M0 Apply/runtime fixture; public daemon and product lanes unavailable                   |
 | [`manyforge_behavior/`](manyforge_behavior/)                             | Build-owned node catalog/environment inspection plus explicit runtime-unavailable boundaries                                |
 | [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
 | [`manyforge_roboplan/`](manyforge_roboplan/)                             | Retained planning-model staging and offline RoboPlan import qualification; runtime adapters are intentionally unavailable   |

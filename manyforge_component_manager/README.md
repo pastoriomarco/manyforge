@@ -1,6 +1,6 @@
-# ManyForge Component Manager C++ foundation
+# ManyForge Component Manager C++ owner
 
-This ROS-free C++ package is the selected semantic-owner foundation for the
+This ROS-free C++ package is the selected semantic owner for the
 Composable Cell Component Manager. It currently owns these bounded mechanisms:
 
 - receiver-local runtime-unit observation and convergence reduction;
@@ -8,15 +8,19 @@ Composable Cell Component Manager. It currently owns these bounded mechanisms:
   scene-owner-accepted target;
 - the separate durable `IActiveBundlePublicationStore` public-pointer owner;
 - a typed durable journal for immutable named-Apply intent, affected scope,
-  Kernel-fence recovery, runtime-convergence intent, and complete staged-ready
-  evidence;
+  Kernel-fence recovery, runtime-convergence intent, complete staged-ready
+  evidence, scene stage/activation, selected-bundle publication, Finalize,
+  fence release, and terminal success;
 - the canonical-empty prerequisite/Begin coordinator that consumes the sealed
   I3 admission, durably records the scene-owner-accepted target, and advances
   that exact zero-native target through Rebuild, publication, and Finalize;
-- the whole-Apply affected-scope/fence coordinator and observe-first runtime
-  convergence coordinator; and
+- the whole-Apply affected-scope/fence coordinator, observe-first runtime
+  convergence coordinator, scene stage/activation and selected-bundle
+  completion coordinators;
 - one closed concrete Linux/POSIX adapter for the exact I3-qualified retained
-  reference runtime product.
+  reference runtime product; and
+- active-plan reconstruction plus dependency-ordered steady-state
+  reconciliation and explicit reverse-order shutdown.
 
 The adjacent ROS-free contracts in `manyforge_core` additionally define the
 bounded owner-to-owner substrate that this package will consume:
@@ -27,8 +31,8 @@ bounded owner-to-owner substrate that this package will consume:
   including the read-only pre-Begin prerequisite observation;
 - separate active-bundle publish and read-only receipt-verification
   capabilities; and
-- an Apply-only Kernel fence acquire/rehydrate capability that exposes neither
-  generic Stop nor an unfrozen release operation.
+- an Apply-only Kernel fence acquire/rehydrate/status/release capability that
+  exposes no generic Stop or robot/controller lifecycle operation.
 
 Those DTOs reject contradictory phase evidence, non-canonical transition
 rows, mismatched predecessor/candidate expectations, inconsistent native
@@ -58,10 +62,10 @@ invalidating the root's validate-existing-peers-before-creating-missing-peers
 order. Cooperating multi-process root startup/classification is additionally
 serialized through the stable-state-directory lock. Already-open processes
 coordinate ordinary database operations through SQLite/WAL. Overlap between
-one process's root teardown and another process's root startup is not qualified
-by this foundation; it requires the future operational process-lifecycle owner
-and forked shutdown/replacement coverage. Each owner has a distinct embedded
-schema artifact, uses WAL with `synchronous=FULL`, and enforces fixed
+one process's root teardown and another process's root startup is outside the
+bounded store contract; external bootstrap must serialize that handoff rather
+than asking Manager to own its own process lifetime. Each owner has a distinct
+embedded schema artifact, uses WAL with `synchronous=FULL`, and enforces fixed
 cardinality and database page-image ceilings. Before any read-write open or
 persistent PRAGMA, each owner performs an exact read-only identity, schema,
 metadata, resource-limit, and cell preflight. Clean at-rest WAL databases use
@@ -133,10 +137,13 @@ attempts, 64 canonical native-runtime bindings per attempt, 256
 printable-ASCII bytes per identity, and a 64 MiB main database page image.
 
 The Apply journal stores the exact immutable named transaction and predecessor
-projection, the canonical affected scope, the complete exact Kernel-fence
-attempt, the accepted fence bound to that attempt, the immutable aggregate
-runtime-convergence intent, and bounded complete staged-ready generations. The
-focused `ManagerApplyFenceCoordinator`
+projection, canonical affected scope, complete Kernel-fence attempt and
+acceptance, aggregate runtime-convergence intent, bounded staged-ready
+generations, scene stage and activation records, selected private bundle and
+obsolete-surface disposition, publication and Finalize evidence, fence-release
+intent/receipt, and terminal success. Each record family is immutable,
+parent-linked, bounded, and replay-checked. The focused
+`ManagerApplyFenceCoordinator`
 commits the intent and attempt before each Acquire it invokes and never returns
 the fence until the acceptance is durable. A durable acceptance replays without
 another Kernel call. An attempt-only restart first uses the read-only Kernel
@@ -144,16 +151,15 @@ reconciliation query: `accepted_exact` is appended, only authoritative
 `not_seen` permits an exact persisted-request retry, and conflicting,
 uncertain, malformed, or mismatched evidence fails closed. Acquire uncertainty
 is a distinct typed error retaining the exact recovery query and every observed
-Kernel result. This ordering applies only to Acquire calls made through this
-coordinator; it does not claim global first-effect ownership. One
+Kernel result. One
 `(request_owner_epoch, request_id)` maps to exactly one intent; an exact
 duplicate replays the original digest, and another payload fails without
 another journal write. Reusing one `ApplyId` requires its next contiguous
 generation. The runtime records are parent-bound to the accepted fence and
 predecessor public pointer; exact replay cannot change their plan or reuse
-foreign evidence. The journal intentionally stops before scene-stage input and
-evidence, activation selection, named-Apply publication/finalize, fence release,
-or terminal outcome. Its resource envelope is at most 256 intents/fence
+foreign evidence. Later records can only advance the same transaction forward
+through the selected candidate and exact public receipt. Its resource envelope
+is at most 256 intents/fence
 attempts, 64 domains, 256 bindings, and 1,024 resources per attempt, with at
 most 4,096 staged-ready sets globally and 16 per Apply, bounded text fields,
 and a 64 MiB main database page image.
@@ -171,20 +177,43 @@ coordinator admits only the build-qualified retained POSIX reference product;
 unsupported external or replacement products fail before fence or process
 effects.
 
+`ManagerSceneStageCoordinator` and `ManagerSceneActivationCoordinator` bind
+the complete durable staged-ready set to the production scene owner's frozen
+revision, persist the irreversible selection decision before activation, and
+recover only from exact owner status. `ManagerSelectedBundleTransitionCoordinator`
+then verifies and privately binds the selected bundle, records the complete
+obsolete-command-surface disposition, compare-and-swap publishes the public
+pointer, and invokes Finalize only after an independent current-head reread.
+`ManagerApplyFenceReleaseCoordinator` persists the exact idle release request
+and Kernel receipt before terminal success. Lost responses replay from byte-
+equivalent owner evidence and a terminal replay performs no external effect.
+
 `RetainedPosixRuntimeUnitAdapter` is the first concrete process/progress port,
 not a generic subprocess API. It independently reloads and verifies the exact
 retained bundle, manifest, artifact, query, and host contract before mutating
 one trusted Manager-private runtime root. It uses one product-subject/product/
 configuration slot, a bounded cross-process lock, an atomically materialized
-0500 script, and a durable boot/PID/Linux-start-time/adapter-epoch record. A
-forked child cannot exec before that record is durable. Exact surviving state
-is reconciled before a start, fixed crash-temporary names are recoverable, and
-PID reuse or a previous boot cannot match. Private fixed stdin/stdout channels
-accept only the qualified `status`/`shutdown` protocol; a progress observation
-is returned only from a newly received exact status record. Manager
-disappearance closes stdin, so a replacement first observes the old
-incarnation disappear and then starts a fresh epoch rather than fabricating a
-replacement status channel.
+0500 script, and a durable boot/controller-PID/runtime-PID/Linux-start-time/
+socket/adapter-epoch record. A forked runtime cannot exec before that record is
+durable. Exact surviving state is reconciled before a start, fixed crash-
+temporary names are recoverable, and PID reuse or a previous boot cannot
+match. A private controller owns the fixed stdin/stdout `status`/`shutdown`
+channel after release. Manager disappearance leaves that controller, runtime,
+and epoch unchanged; a replacement validates the durable identities,
+reconnects, and returns only a newly received exact status record. Explicit
+`EnsureStopped` alone submits the verified fixed shutdown request and succeeds
+only after both controller and runtime are absent.
+
+`DurableManagerActiveRuntimePlanSource` reconstructs the desired runtime plan
+only from the authoritative current publication and byte-equivalent durable
+Apply records. `ManagerActiveRuntimeCoordinator` observes every unit first,
+starts only missing `manager_managed` units in dependency order, never mutates
+an `externally_managed` process, derives convergence through the sole runtime-
+observation reducer, retains its replay/freshness history while the exact plan
+is unchanged, and rereads the current plan before returning. Explicit
+shutdown proceeds in reverse dependency order through the fixed adapter
+operation; destroying the Manager or adapter has no process effect. Lost start
+or stop responses retain the exact observe-first recovery query.
 
 The active-bundle publication owner is deliberately separate from the
 bootstrap journal. It stores one immutable, generation-contiguous receipt
@@ -246,14 +275,18 @@ or premature publication fails closed.
 
 ## Deliberate non-claims
 
-These checkpoints have no ROS types or callbacks. The only concrete process
-effect is the closed retained-POSIX reference product above; it exposes no
-caller-selected command, path, arguments, environment, working directory, or
-active command surface. There is still no operational Component Manager
-process, production named-Apply scene transition, external-runtime adapter,
-obsolete-runtime retirement, controller/robot lifecycle, motion effect, or
-restored lane wiring. The scene owner used for the focused bootstrap proof is
-test-only.
+These owners have no ROS types or callbacks. The only concrete process effect
+is the closed retained-POSIX reference product above; it exposes no caller-
+selected command, path, arguments, environment, working directory, or active
+command surface. The first runtime-only named Apply is operational inside the
+bounded M0 composition through the production logical-scene owner and durable
+public pointer. Its external-process proof covers bootstrap, Manager
+loss/replacement, Apply recovery, runtime crash/restart, and explicit shutdown.
+I4 intentionally does not add the public Manager daemon/CLI/HTTP projection
+assigned to I5/H0. It also does not
+qualify an external-runtime adapter, nonempty native projection transition,
+nonempty obsolete-command-surface retirement, controller/robot lifecycle,
+motion effect, or restored product lane.
 The lower-level journal still treats bundle and graph identities as opaque;
 only the external store composition root and coordinator require the sealed,
 verified I3 admission. The coordinator does not retain the scene owner's
@@ -261,14 +294,12 @@ logical-scene value, implement native projection adapters, or directly open
 scene writes and leases. Those openings remain the scene owner's responsibility
 inside a successful Finalize after its independent receipt and health checks.
 
-The focused Apply journal itself has no effect surface. Its fence/runtime
-coordinators acquire or recover the configuration fence and converge only the
-closed reference runtime; they do not make a named Apply operational. The
-focused publication store implements only publication persistence and
-current-head reread. These slices do not implement a production scene owner,
-complete Apply coordinator, private native materialization,
-obsolete-command-surface retirement, fence release, terminal outcome, or M0
-behavior. Opening the external store set creates no bootstrap intent and
+The journal itself has no effect surface; effects remain behind focused owner
+ports and observe-first coordinators. The qualified M0 fixture is the
+canonical-empty-to-one-runtime-only transition, so its native-transition and
+obsolete-command-surface sets are exactly empty and independently verified as
+such. This is not evidence for silently treating a future nonempty set as
+empty. Opening the external store set still creates no bootstrap intent and
 publishes nothing.
 
 The old generic raw persistence fixture and its `FoundationHead` compare-and-

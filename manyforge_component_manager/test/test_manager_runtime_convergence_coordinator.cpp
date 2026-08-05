@@ -179,25 +179,31 @@ private:
 };
 
 class ScriptedPublicationStore final : public IActiveBundlePublicationStore {
- public:
-  explicit ScriptedPublicationStore(ActiveBundlePublicationReceiptDTO predecessor,
-                                    SqliteManagerApplyJournal* independent_reader = nullptr)
-      : current_(std::move(predecessor)), independent_reader_(independent_reader) {}
+public:
+  explicit ScriptedPublicationStore(
+      ActiveBundlePublicationReceiptDTO predecessor,
+      SqliteManagerApplyJournal *independent_reader = nullptr)
+      : current_(std::move(predecessor)),
+        independent_reader_(independent_reader) {}
 
   [[nodiscard]] ActiveBundlePublicationReceiptDTO PublishActiveBundle(
-      const ActiveBundlePublicationRequestDTO& request) override {
+      const ActiveBundlePublicationRequestDTO &request) override {
     ++publish_calls;
     if (!request.valid() ||
         request.expected_previous_publication_generation !=
-            std::optional<ActiveBundlePublicationGeneration>{current_.publication_generation}) {
+            std::optional<ActiveBundlePublicationGeneration>{
+                current_.publication_generation}) {
       throw std::runtime_error("publication fixture rejected stale request");
     }
-    const auto* named = std::get_if<NamedApplyPublicationTransactionDTO>(&request.transaction_ref);
+    const auto *named = std::get_if<NamedApplyPublicationTransactionDTO>(
+        &request.transaction_ref);
     if (independent_reader_ != nullptr && named != nullptr) {
       const auto materialization =
-          independent_reader_->ReadPrivateMaterialization(named->apply_id, named->apply_generation);
-      const auto retired = independent_reader_->ReadObsoleteCommandSurfacesRetired(
-          named->apply_id, named->apply_generation);
+          independent_reader_->ReadPrivateMaterialization(
+              named->apply_id, named->apply_generation);
+      const auto retired =
+          independent_reader_->ReadObsoleteCommandSurfacesRetired(
+              named->apply_id, named->apply_generation);
       saw_prerequisites_before_publish =
           materialization.has_value() && retired.has_value() &&
           materialization->private_materialization_content_digest ==
@@ -207,7 +213,8 @@ class ScriptedPublicationStore final : public IActiveBundlePublicationStore {
     }
     current_ = {
         request,
-        ActiveBundlePublicationGeneration(current_.publication_generation.value() + 1U),
+        ActiveBundlePublicationGeneration(
+            current_.publication_generation.value() + 1U),
         ContentDigest(std::string(kDigestOne)),
     };
     if (throw_after_publish_effect) {
@@ -217,7 +224,8 @@ class ScriptedPublicationStore final : public IActiveBundlePublicationStore {
     return current_;
   }
 
-  [[nodiscard]] Result<ActiveBundlePublicationReceiptDTO> ReadActiveBundlePublication(
+  [[nodiscard]] Result<ActiveBundlePublicationReceiptDTO>
+  ReadActiveBundlePublication(
       const ActiveBundlePublicationGeneration generation) const override {
     ++read_calls;
     if (fail_next_read) {
@@ -229,8 +237,8 @@ class ScriptedPublicationStore final : public IActiveBundlePublicationStore {
       });
     }
     if (generation != current_.publication_generation) {
-      return Result<ActiveBundlePublicationReceiptDTO>::Err(
-          ErrorDTO{"publication_not_current", "publication is not current", {}});
+      return Result<ActiveBundlePublicationReceiptDTO>::Err(ErrorDTO{
+          "publication_not_current", "publication is not current", {}});
     }
     return Result<ActiveBundlePublicationReceiptDTO>::Ok(current_);
   }
@@ -241,13 +249,12 @@ class ScriptedPublicationStore final : public IActiveBundlePublicationStore {
   int publish_calls{0};
   mutable int read_calls{0};
 
- private:
+private:
   ActiveBundlePublicationReceiptDTO current_;
-  SqliteManagerApplyJournal* independent_reader_;
+  SqliteManagerApplyJournal *independent_reader_;
 };
 
-class ExactFencePort final
-    : public IManagerKernelApplyFencePort {
+class ExactFencePort final : public IManagerKernelApplyFencePort {
 public:
   [[nodiscard]] ConfigurationFenceAcceptedDTO
   Acquire(const ApplyConfigurationFenceIntentDTO &intent) override {
@@ -297,13 +304,13 @@ public:
     };
   }
 
-  [[nodiscard]] ConfigurationFenceStatusDTO QueryStatus(
-      const ConfigurationFenceStatusQueryDTO&) const override {
+  [[nodiscard]] ConfigurationFenceStatusDTO
+  QueryStatus(const ConfigurationFenceStatusQueryDTO &) const override {
     throw std::runtime_error("release status is outside this fixture");
   }
 
-  [[nodiscard]] ConfigurationFenceReleasedDTO Release(
-      const ConfigurationFenceReleaseDTO&) override {
+  [[nodiscard]] ConfigurationFenceReleasedDTO
+  Release(const ConfigurationFenceReleaseDTO &) override {
     throw std::runtime_error("release is outside this fixture");
   }
 
@@ -313,37 +320,43 @@ public:
 };
 
 class ScriptedFenceReleasePort final : public IManagerKernelApplyFencePort {
- public:
-  explicit ScriptedFenceReleasePort(SqliteManagerApplyJournal& independent_reader)
+public:
+  explicit ScriptedFenceReleasePort(
+      SqliteManagerApplyJournal &independent_reader)
       : independent_reader_(independent_reader) {}
 
-  [[nodiscard]] ConfigurationFenceAcceptedDTO Acquire(
-      const ApplyConfigurationFenceIntentDTO&) override {
+  [[nodiscard]] ConfigurationFenceAcceptedDTO
+  Acquire(const ApplyConfigurationFenceIntentDTO &) override {
     throw std::runtime_error("Acquire is outside the release fixture");
   }
 
-  [[nodiscard]] ApplyFenceAcquireAttemptReconcileResultDTO ReconcileAcquireAttempt(
-      const ApplyFenceAcquireAttemptQueryDTO&) const override {
-    throw std::runtime_error("Acquire reconciliation is outside the release fixture");
+  [[nodiscard]] ApplyFenceAcquireAttemptReconcileResultDTO
+  ReconcileAcquireAttempt(
+      const ApplyFenceAcquireAttemptQueryDTO &) const override {
+    throw std::runtime_error(
+        "Acquire reconciliation is outside the release fixture");
   }
 
-  [[nodiscard]] ApplyFenceReconcileResultDTO Rehydrate(const ApplyFenceRehydrateDTO&) override {
+  [[nodiscard]] ApplyFenceReconcileResultDTO
+  Rehydrate(const ApplyFenceRehydrateDTO &) override {
     throw std::runtime_error("rehydration is outside the release fixture");
   }
 
-  [[nodiscard]] ConfigurationFenceStatusDTO QueryStatus(
-      const ConfigurationFenceStatusQueryDTO& query) const override {
+  [[nodiscard]] ConfigurationFenceStatusDTO
+  QueryStatus(const ConfigurationFenceStatusQueryDTO &query) const override {
     ++status_calls;
     const auto finalized = independent_reader_.ReadSceneFinalized(
-        query.owner_transaction.apply_id, query.owner_transaction.apply_generation);
+        query.owner_transaction.apply_id,
+        query.owner_transaction.apply_generation);
     const auto publication = independent_reader_.ReadPublicationReceipt(
-        query.owner_transaction.apply_id, query.owner_transaction.apply_generation);
+        query.owner_transaction.apply_id,
+        query.owner_transaction.apply_generation);
     if (!finalized.has_value() || !publication.has_value()) {
       throw std::runtime_error("release fixture lacks finalized publication");
     }
-    const auto& candidate =
-        finalized->scene_finalized.finalized_result.candidate_projection_revision;
-    const auto& receipt = publication->publication.publication_receipt;
+    const auto &candidate = finalized->scene_finalized.finalized_result
+                                .candidate_projection_revision;
+    const auto &receipt = publication->publication.publication_receipt;
     ConfigurationFenceReconciliationEvidenceDTO evidence{
         ExecutionHostEpochDTO{
             RuntimeUnitId("runtime.kernel"),
@@ -390,14 +403,15 @@ class ScriptedFenceReleasePort final : public IManagerKernelApplyFencePort {
     };
   }
 
-  [[nodiscard]] ConfigurationFenceReleasedDTO Release(
-      const ConfigurationFenceReleaseDTO& request) override {
+  [[nodiscard]] ConfigurationFenceReleasedDTO
+  Release(const ConfigurationFenceReleaseDTO &request) override {
     ++release_calls;
-    const auto& owner = request.reconciliation_evidence.owner_transaction;
-    const auto intent =
-        independent_reader_.ReadFenceReleaseIntent(owner.apply_id, owner.apply_generation);
+    const auto &owner = request.reconciliation_evidence.owner_transaction;
+    const auto intent = independent_reader_.ReadFenceReleaseIntent(
+        owner.apply_id, owner.apply_generation);
     saw_durable_intent_before_release =
-        intent.has_value() && intent->fence_release_intent.release_request == request;
+        intent.has_value() &&
+        intent->fence_release_intent.release_request == request;
     released_ = ConfigurationFenceReleasedDTO{
         request,
         request.reconciliation_evidence.execution_host_epoch,
@@ -419,8 +433,8 @@ class ScriptedFenceReleasePort final : public IManagerKernelApplyFencePort {
   mutable int status_calls{0};
   int release_calls{0};
 
- private:
-  SqliteManagerApplyJournal& independent_reader_;
+private:
+  SqliteManagerApplyJournal &independent_reader_;
   std::optional<ConfigurationFenceReleasedDTO> released_;
 };
 
@@ -453,6 +467,13 @@ public:
     if (throw_after_ensure_effect) {
       throw std::runtime_error("simulated lost process-start response");
     }
+    return Presence(query);
+  }
+
+  [[nodiscard]] ProcessPresenceObservation
+  EnsureStopped(const RuntimeUnitConvergenceQueryDTO &query) override {
+    state_ = ProcessPresenceState::kAbsent;
+    ++observation_sequence_;
     return Presence(query);
   }
 
@@ -613,22 +634,23 @@ public:
     throw std::runtime_error("discard is outside the scene-stage fixture");
   }
 
-  [[nodiscard]] ProjectionApplyFinalizeResultDTO
-  FinalizeProjectionTransition(const ProjectionApplyFinalizeDTO & request) override {
+  [[nodiscard]] ProjectionApplyFinalizeResultDTO FinalizeProjectionTransition(
+      const ProjectionApplyFinalizeDTO &request) override {
     ++finalize_calls;
     last_finalize_request = request;
-    const auto durable =
-        independent_reader_.ReadPublicationReceipt(request.apply_id, request.apply_generation);
+    const auto durable = independent_reader_.ReadPublicationReceipt(
+        request.apply_id, request.apply_generation);
     saw_durable_publication_before_finalize =
         durable.has_value() &&
         durable->publication.publication_receipt == request.publication_receipt;
     if (!activation_result_.has_value() || !request.valid() ||
         request.apply_id != activation_result_->apply_id ||
         request.apply_generation != activation_result_->apply_generation ||
-        request.projection_stage_generation != activation_result_->projection_stage_generation ||
+        request.projection_stage_generation !=
+            activation_result_->projection_stage_generation ||
         request.candidate_projection_revision !=
             activation_result_->candidate_projection_revision) {
-    throw std::runtime_error("finalize fixture received a foreign request");
+      throw std::runtime_error("finalize fixture received a foreign request");
     }
     auto evidence = activation_result_->transition_evidence;
     evidence.state = ProjectionTransitionEvidenceState::kFinalized;
@@ -682,7 +704,7 @@ public:
       };
     }
     if (finalization_result_.has_value()) {
-      const auto& result = *finalization_result_;
+      const auto &result = *finalization_result_;
       return {
           result.apply_id,
           result.apply_generation,
@@ -816,26 +838,40 @@ struct CoordinatorFixture final {
   ManagerApplyRuntimeConvergenceCoordinator coordinator;
 };
 
-void ReachDurableSceneActivation(CoordinatorFixture& fixture, ScriptedSceneOwner& scene_owner) {
-  ASSERT_EQ(fixture.Run().state, ManagerRuntimeConvergenceResultState::kStagedReady);
-  ManagerSceneStageCoordinator stage_coordinator(fixture.journal, *fixture.package.bundle_source,
-                                                 fixture.publication, scene_owner);
-  ASSERT_EQ(stage_coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)).path,
-            ManagerSceneStagePath::kStagedFromNewCall);
-  ManagerSceneActivationCoordinator activation_coordinator(fixture.journal, scene_owner);
-  ASSERT_EQ(activation_coordinator.ActivateOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)).path,
+void ReachDurableSceneActivation(CoordinatorFixture &fixture,
+                                 ScriptedSceneOwner &scene_owner) {
+  ASSERT_EQ(fixture.Run().state,
+            ManagerRuntimeConvergenceResultState::kStagedReady);
+  ManagerSceneStageCoordinator stage_coordinator(
+      fixture.journal, *fixture.package.bundle_source, fixture.publication,
+      scene_owner);
+  ASSERT_EQ(
+      stage_coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
+          .path,
+      ManagerSceneStagePath::kStagedFromNewCall);
+  ManagerSceneActivationCoordinator activation_coordinator(fixture.journal,
+                                                           scene_owner);
+  ASSERT_EQ(activation_coordinator
+                .ActivateOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
+                .path,
             ManagerSceneActivationPath::kActivatedFromNewCall);
 }
 
-void ReachDurableSceneFinalize(CoordinatorFixture& fixture, ScriptedSceneOwner& scene_owner,
-                               ScriptedPublicationStore& publication_store) {
+void ReachDurableSceneFinalize(CoordinatorFixture &fixture,
+                               ScriptedSceneOwner &scene_owner,
+                               ScriptedPublicationStore &publication_store) {
   ReachDurableSceneActivation(fixture, scene_owner);
   ManagerSelectedBundleTransitionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, publication_store, scene_owner);
-  ASSERT_EQ(coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)).path,
-            ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
-  ASSERT_EQ(coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)).path,
-            ManagerSelectedBundleTransitionPath::kFinalizedFromNewCall);
+      fixture.journal, *fixture.package.bundle_source, publication_store,
+      scene_owner);
+  ASSERT_EQ(
+      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
+          .path,
+      ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
+  ASSERT_EQ(
+      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
+          .path,
+      ManagerSelectedBundleTransitionPath::kFinalizedFromNewCall);
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
@@ -1015,6 +1051,17 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
       second.durable_staged_ready->record.staged_ready.staged_ready_generation,
       2U);
   EXPECT_EQ(kernel.acquire_calls, 1);
+  const auto &durable_runtime = second.durable_runtime_intent.record;
+  const RuntimeUnitConvergenceQueryDTO cleanup_query{
+      apply_intent.apply_id,
+      apply_intent.apply_generation,
+      package.bundle->retained_bundle_id(),
+      package.bundle->value().cell_graph.graph_revision,
+      durable_runtime.runtime_convergence_intent_digest,
+      durable_runtime.runtime_convergence_intent.runtime_units.front(),
+  };
+  EXPECT_EQ(runtime_adapter.EnsureStopped(cleanup_query).state(),
+            ProcessPresenceState::kAbsent);
 }
 
 TEST(ManagerSceneStageCoordinator,
@@ -1237,13 +1284,17 @@ TEST(ManagerSelectedBundleTransitionCoordinator,
   CoordinatorFixture fixture(root.path());
   ScriptedSceneOwner scene_owner(fixture.independent_reader);
   ReachDurableSceneActivation(fixture, scene_owner);
-  ScriptedPublicationStore publication_store(PredecessorPublication(fixture.apply_intent),
-                                             &fixture.independent_reader);
+  ScriptedPublicationStore publication_store(
+      PredecessorPublication(fixture.apply_intent),
+      &fixture.independent_reader);
   ManagerSelectedBundleTransitionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, publication_store, scene_owner);
+      fixture.journal, *fixture.package.bundle_source, publication_store,
+      scene_owner);
 
-  const auto published = coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(published.path, ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
+  const auto published =
+      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(published.path,
+            ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
   EXPECT_TRUE(published.durable_materialization.inserted);
   EXPECT_TRUE(published.durable_retired_command_surfaces.inserted);
   EXPECT_TRUE(published.durable_publication.inserted);
@@ -1252,16 +1303,20 @@ TEST(ManagerSelectedBundleTransitionCoordinator,
   EXPECT_TRUE(publication_store.saw_prerequisites_before_publish);
   EXPECT_EQ(scene_owner.finalize_calls, 0);
 
-  const auto finalized = coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(finalized.path, ManagerSelectedBundleTransitionPath::kFinalizedFromNewCall);
+  const auto finalized =
+      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(finalized.path,
+            ManagerSelectedBundleTransitionPath::kFinalizedFromNewCall);
   ASSERT_TRUE(finalized.durable_finalized.has_value());
   EXPECT_TRUE(finalized.durable_finalized->inserted);
   EXPECT_TRUE(scene_owner.saw_durable_publication_before_finalize);
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(scene_owner.finalize_calls, 1);
 
-  const auto replay = coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(replay.path, ManagerSelectedBundleTransitionPath::kDurableFinalizedReplay);
+  const auto replay =
+      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(replay.path,
+            ManagerSelectedBundleTransitionPath::kDurableFinalizedReplay);
   ASSERT_TRUE(replay.durable_finalized.has_value());
   EXPECT_FALSE(replay.durable_finalized->inserted);
   EXPECT_EQ(publication_store.publish_calls, 1);
@@ -1279,25 +1334,32 @@ TEST(ManagerSelectedBundleTransitionCoordinator,
   CoordinatorFixture fixture(root.path());
   ScriptedSceneOwner scene_owner(fixture.independent_reader);
   ReachDurableSceneActivation(fixture, scene_owner);
-  ScriptedPublicationStore publication_store(PredecessorPublication(fixture.apply_intent),
-                                             &fixture.independent_reader);
+  ScriptedPublicationStore publication_store(
+      PredecessorPublication(fixture.apply_intent),
+      &fixture.independent_reader);
   publication_store.throw_after_publish_effect = true;
   ManagerSelectedBundleTransitionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, publication_store, scene_owner);
+      fixture.journal, *fixture.package.bundle_source, publication_store,
+      scene_owner);
 
   try {
-    static_cast<void>(coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
+    static_cast<void>(
+        coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
     FAIL() << "expected uncertain lost publication response";
-  } catch (const ManagerSelectedBundleTransitionEffectUncertainError& error) {
+  } catch (const ManagerSelectedBundleTransitionEffectUncertainError &error) {
     EXPECT_TRUE(error.publication_request().valid());
     EXPECT_EQ(error.scene_status_query().apply_id, ApplyId("apply-1"));
   }
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_FALSE(
-      fixture.journal.ReadPublicationReceipt(ApplyId("apply-1"), ApplyGeneration(1U)).has_value());
+      fixture.journal
+          .ReadPublicationReceipt(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
 
-  const auto recovered = coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(recovered.path, ManagerSelectedBundleTransitionPath::kRecoveredPublicationHead);
+  const auto recovered =
+      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(recovered.path,
+            ManagerSelectedBundleTransitionPath::kRecoveredPublicationHead);
   EXPECT_TRUE(recovered.durable_publication.inserted);
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(scene_owner.finalize_calls, 0);
@@ -1309,23 +1371,31 @@ TEST(ManagerSelectedBundleTransitionCoordinator,
   CoordinatorFixture fixture(root.path());
   ScriptedSceneOwner scene_owner(fixture.independent_reader);
   ReachDurableSceneActivation(fixture, scene_owner);
-  ScriptedPublicationStore publication_store(PredecessorPublication(fixture.apply_intent),
-                                             &fixture.independent_reader);
+  ScriptedPublicationStore publication_store(
+      PredecessorPublication(fixture.apply_intent),
+      &fixture.independent_reader);
   ManagerSelectedBundleTransitionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, publication_store, scene_owner);
-  ASSERT_EQ(coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)).path,
-            ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
+      fixture.journal, *fixture.package.bundle_source, publication_store,
+      scene_owner);
+  ASSERT_EQ(
+      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
+          .path,
+      ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
 
   scene_owner.throw_after_finalize_effect = true;
-  EXPECT_THROW(
-      static_cast<void>(coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))),
-      ManagerSelectedBundleTransitionEffectUncertainError);
+  EXPECT_THROW(static_cast<void>(coordinator.AdvanceOrRecover(
+                   ApplyId("apply-1"), ApplyGeneration(1U))),
+               ManagerSelectedBundleTransitionEffectUncertainError);
   EXPECT_EQ(scene_owner.finalize_calls, 1);
-  EXPECT_FALSE(
-      fixture.journal.ReadSceneFinalized(ApplyId("apply-1"), ApplyGeneration(1U)).has_value());
+  EXPECT_FALSE(fixture.journal
+                   .ReadSceneFinalized(ApplyId("apply-1"), ApplyGeneration(1U))
+                   .has_value());
 
-  const auto recovered = coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(recovered.path, ManagerSelectedBundleTransitionPath::kRecoveredFinalizedOwnerStatus);
+  const auto recovered =
+      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(
+      recovered.path,
+      ManagerSelectedBundleTransitionPath::kRecoveredFinalizedOwnerStatus);
   ASSERT_TRUE(recovered.durable_finalized.has_value());
   EXPECT_TRUE(recovered.durable_finalized->inserted);
   EXPECT_EQ(scene_owner.finalize_calls, 1);
@@ -1337,14 +1407,16 @@ TEST(ManagerApplyFenceReleaseCoordinator,
   ScopedPackageRoot root;
   CoordinatorFixture fixture(root.path());
   ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ScriptedPublicationStore publication_store(PredecessorPublication(fixture.apply_intent),
-                                             &fixture.independent_reader);
+  ScriptedPublicationStore publication_store(
+      PredecessorPublication(fixture.apply_intent),
+      &fixture.independent_reader);
   ReachDurableSceneFinalize(fixture, scene_owner, publication_store);
   ScriptedFenceReleasePort release_port(fixture.independent_reader);
-  ManagerApplyFenceReleaseCoordinator coordinator(fixture.journal, release_port,
-                                                  RuntimeEpoch("manager-runtime-1"));
+  ManagerApplyFenceReleaseCoordinator coordinator(
+      fixture.journal, release_port, RuntimeEpoch("manager-runtime-1"));
 
-  const auto released = coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  const auto released =
+      coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
   EXPECT_EQ(released.path, ManagerApplyFenceReleasePath::kReleasedFromNewCall);
   EXPECT_TRUE(released.durable_release_intent.inserted);
   EXPECT_TRUE(released.durable_release.inserted);
@@ -1353,7 +1425,8 @@ TEST(ManagerApplyFenceReleaseCoordinator,
   EXPECT_EQ(release_port.status_calls, 1);
   EXPECT_EQ(release_port.release_calls, 1);
 
-  const auto replay = coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  const auto replay =
+      coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
   EXPECT_EQ(replay.path, ManagerApplyFenceReleasePath::kDurableTerminalReplay);
   EXPECT_FALSE(replay.durable_release_intent.inserted);
   EXPECT_FALSE(replay.durable_release.inserted);
@@ -1371,33 +1444,41 @@ TEST(ManagerApplyFenceReleaseCoordinator,
   ScopedPackageRoot root;
   CoordinatorFixture fixture(root.path());
   ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ScriptedPublicationStore publication_store(PredecessorPublication(fixture.apply_intent),
-                                             &fixture.independent_reader);
+  ScriptedPublicationStore publication_store(
+      PredecessorPublication(fixture.apply_intent),
+      &fixture.independent_reader);
   ReachDurableSceneFinalize(fixture, scene_owner, publication_store);
   ScriptedFenceReleasePort release_port(fixture.independent_reader);
   release_port.throw_after_release_effect = true;
-  ManagerApplyFenceReleaseCoordinator coordinator(fixture.journal, release_port,
-                                                  RuntimeEpoch("manager-runtime-1"));
+  ManagerApplyFenceReleaseCoordinator coordinator(
+      fixture.journal, release_port, RuntimeEpoch("manager-runtime-1"));
 
   try {
-    static_cast<void>(coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
+    static_cast<void>(
+        coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
     FAIL() << "expected a lost Kernel Release response";
-  } catch (const ManagerApplyFenceReleaseEffectUncertainError& error) {
+  } catch (const ManagerApplyFenceReleaseEffectUncertainError &error) {
     EXPECT_TRUE(error.release_invoked_in_this_call());
     EXPECT_TRUE(error.status_query().valid());
     EXPECT_TRUE(error.durable_release_request().has_value());
   }
   EXPECT_TRUE(
-      fixture.journal.ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U)).has_value());
+      fixture.journal
+          .ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
   EXPECT_FALSE(
-      fixture.journal.ReadFenceReleased(ApplyId("apply-1"), ApplyGeneration(1U)).has_value());
-  EXPECT_FALSE(
-      fixture.journal.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U)).has_value());
+      fixture.journal.ReadFenceReleased(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
+  EXPECT_FALSE(fixture.journal
+                   .ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U))
+                   .has_value());
   EXPECT_EQ(release_port.release_calls, 1);
 
   release_port.throw_after_release_effect = false;
-  const auto recovered = coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(recovered.path, ManagerApplyFenceReleasePath::kRecoveredReleasedStatus);
+  const auto recovered =
+      coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(recovered.path,
+            ManagerApplyFenceReleasePath::kRecoveredReleasedStatus);
   EXPECT_TRUE(recovered.durable_release.inserted);
   EXPECT_TRUE(recovered.durable_terminal_outcome.inserted);
   EXPECT_EQ(release_port.status_calls, 2);
@@ -1409,30 +1490,35 @@ TEST(ManagerApplyFenceReleaseCoordinator,
   ScopedPackageRoot root;
   CoordinatorFixture fixture(root.path());
   ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ScriptedPublicationStore publication_store(PredecessorPublication(fixture.apply_intent),
-                                             &fixture.independent_reader);
+  ScriptedPublicationStore publication_store(
+      PredecessorPublication(fixture.apply_intent),
+      &fixture.independent_reader);
   ReachDurableSceneFinalize(fixture, scene_owner, publication_store);
   ScriptedFenceReleasePort release_port(fixture.independent_reader);
   release_port.state = ConfigurationFenceState::kReleasePending;
-  ManagerApplyFenceReleaseCoordinator coordinator(fixture.journal, release_port,
-                                                  RuntimeEpoch("manager-runtime-1"));
+  ManagerApplyFenceReleaseCoordinator coordinator(
+      fixture.journal, release_port, RuntimeEpoch("manager-runtime-1"));
 
-  EXPECT_THROW(
-      static_cast<void>(coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))),
-      ManagerApplyFenceReleaseEffectUncertainError);
+  EXPECT_THROW(static_cast<void>(coordinator.ReleaseOrRecover(
+                   ApplyId("apply-1"), ApplyGeneration(1U))),
+               ManagerApplyFenceReleaseEffectUncertainError);
   EXPECT_EQ(release_port.release_calls, 0);
   EXPECT_FALSE(
-      fixture.journal.ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U)).has_value());
+      fixture.journal
+          .ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
 
   release_port.state = ConfigurationFenceState::kHeld;
   release_port.foreign_public_pointer = true;
-  EXPECT_THROW(
-      static_cast<void>(coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))),
-      ManagerApplyFenceReleaseEffectUncertainError);
+  EXPECT_THROW(static_cast<void>(coordinator.ReleaseOrRecover(
+                   ApplyId("apply-1"), ApplyGeneration(1U))),
+               ManagerApplyFenceReleaseEffectUncertainError);
   EXPECT_EQ(release_port.release_calls, 0);
   EXPECT_FALSE(
-      fixture.journal.ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U)).has_value());
+      fixture.journal
+          .ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
 
 } // namespace
-}  // namespace
-}  // namespace manyforge::component_manager
+} // namespace
+} // namespace manyforge::component_manager

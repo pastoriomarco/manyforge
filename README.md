@@ -11,9 +11,12 @@ not currently available on `dev`.
 > I3's retained deployment compiler is qualified at implementation freeze
 > `62df57c...`: deterministic planning/collision, viewer, control-domain,
 > reference runtime-unit, and projection-input products can be generated,
-> durably reloaded, and verified offline. They cannot be Applied, selected as
-> active, or executed yet. Composer program execution and all three product
-> lanes remain intentionally unavailable. Headless
+> durably reloaded, and verified offline. I4 now owns the bounded internal M0
+> path that Applies canonical empty to the retained reference runtime, retains
+> it across Manager replacement, reconciles crash/restart, and shuts it down
+> explicitly. This does not expose a public Manager client or restore a product
+> lane. Composer program execution and all three product lanes remain
+> intentionally unavailable. Headless
 > resolution returns at I5/H0, native execution at I6/N, and Isaac/real
 > operation at I9/I10. The launch recipes below describe the last qualified
 > baseline; they are not valid bring-up instructions for the current `dev`
@@ -167,9 +170,9 @@ manyforge_core/          C++ library: execution kernel, state machine, DTOs, por
   python/                pybind11 DTO and graph/compiler projections; no runtime-owner bindings
 manyforge_content_identity/  Shared ROS-free canonical JSON and content-digest primitives
 manyforge_persistence/   Shared ROS-free mechanical durable-storage safety primitives
-manyforge_scene/         Canonical-empty C++ logical-scene owner foundation only
+manyforge_scene/         Canonical-empty and bounded runtime-only Apply logical-scene owner
 manyforge_deployment/    ROS-free composable-cell codec, qualification, final C++ trust boundary, and retention substrate
-manyforge_component_manager/  ROS-free Manager foundation; no operational Apply process
+manyforge_component_manager/  ROS-free I4 owner for the bounded M0 Apply/runtime fixture
 manyforge_collision/     C++ planner-neutral collision query implementation
 manyforge_roboplan/      Retained planning-model staging and offline RoboPlan import qualification
 manyforge_ros2_control_execution/  Retained C++ ROS execution/admission library; no current product lane

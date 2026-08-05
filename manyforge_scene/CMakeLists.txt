@@ -236,4 +236,23 @@ if(BUILD_TESTING)
     GTest::gtest_main)
   gtest_discover_tests(test_canonical_empty_scene_manager_integration
     PROPERTIES TIMEOUT ${MANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_component_manager_m0_process
+    test/test_component_manager_m0_process.cpp)
+  add_dependencies(
+    test_component_manager_m0_process
+    manyforge_scene_test_canonical_empty_package)
+  target_compile_definitions(
+    test_component_manager_m0_process PRIVATE
+    MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
+  target_include_directories(test_component_manager_m0_process PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
+  target_link_libraries(test_component_manager_m0_process PRIVATE
+    manyforge_scene
+    manyforge::component_manager
+    manyforge::deployment
+    GTest::gtest_main)
+  gtest_discover_tests(test_component_manager_m0_process
+    PROPERTIES TIMEOUT ${MANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS})
 endif()
