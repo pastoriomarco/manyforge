@@ -5,11 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "manyforge_assistant_bridge"
 version = "0.1.0"
-description = "Retained ManyForge assistant protocol and supervisor port targets; live provider bridge unavailable during the composable-cell cutover"
+description = "Bounded ManyForge assistant H0 observation client and gated provider bridge"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "manyforge_headless_api>=0.1.0,<0.2.0",
+]
 
 [tool.setuptools]
 # Flat layout — the directory containing this pyproject.toml IS the package.

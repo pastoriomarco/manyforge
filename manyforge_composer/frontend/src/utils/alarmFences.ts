@@ -5,15 +5,21 @@ export interface AlarmAcknowledgementMember {
 }
 
 export interface AlarmAcknowledgementFence {
+  ownerEpoch: string;
   generation: number;
   members: AlarmAcknowledgementMember[];
 }
 
 export function acknowledgementFence(
+  ownerEpoch: string,
   generation: number,
   members: AlarmAcknowledgementMember[],
 ): AlarmAcknowledgementFence {
-  return { generation, members: members.map((member) => ({ ...member })) };
+  return {
+    ownerEpoch,
+    generation,
+    members: members.map((member) => ({ ...member })),
+  };
 }
 
 function memberKey(member: AlarmAcknowledgementMember): string {
@@ -23,10 +29,15 @@ function memberKey(member: AlarmAcknowledgementMember): string {
 /** Confirmation remains bound to exact observed membership and generation. */
 export function acknowledgementFenceMatches(
   fence: AlarmAcknowledgementFence,
+  ownerEpoch: string,
   generation: number,
   members: AlarmAcknowledgementMember[],
 ): boolean {
-  if (fence.generation !== generation || fence.members.length !== members.length) {
+  if (
+    fence.ownerEpoch !== ownerEpoch
+    || fence.generation !== generation
+    || fence.members.length !== members.length
+  ) {
     return false;
   }
   const expected = fence.members.map(memberKey).sort();

@@ -8,9 +8,10 @@ export interface RuntimeAvailability {
 
 export interface HealthResponse {
   status: string;
-  mode: 'structural_only';
+  mode: 'structural_only' | 'headless_client';
   components: Record<string, string>;
-  runtimeAvailability: RuntimeAvailability;
+  runtimeAvailability: RuntimeAvailability | null;
+  headless: Record<string, unknown> | null;
   timestamp: number;
 }
 

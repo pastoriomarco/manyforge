@@ -14,10 +14,11 @@ not currently available on `dev`.
 > durably reloaded, and verified offline. I4 now owns the bounded internal M0
 > path that Applies canonical empty to the retained reference runtime, retains
 > it across Manager replacement, reconciles crash/restart, and shuts it down
-> explicitly. This does not expose a public Manager client or restore a product
-> lane. Composer program execution and all three product lanes remain
-> intentionally unavailable. Headless
-> resolution returns at I5/H0, native execution at I6/N, and Isaac/real
+> explicitly. I5/H0 now exposes the independent Manager/headless API, CLI,
+> alarms/history, verified NodeEnvironment projection, and thin Composer read
+> clients without restoring a product lane. Composer program execution and all
+> three product lanes remain intentionally unavailable. Native execution
+> returns at I6/N, and Isaac/real
 > operation at I9/I10. The launch recipes below describe the last qualified
 > baseline; they are not valid bring-up instructions for the current `dev`
 > branch.
@@ -229,15 +230,22 @@ The former workflow was:
 The command now fails before effects. Use its workflow only as historical
 reimplementation input; the demo shim and native viewer are removed.
 
-## Historical LLM interaction surfaces — unavailable
+## Current inspection APIs and historical LLM interactions
 
-Only the structural REST surface is current. Former MCP and assistant
-interactions are retained as historical design inputs:
+The structural Composer REST surface and the independent I5/H0 headless
+projection are current. Provider-backed assistant conversations and a public
+MCP server remain unavailable; their former interactions are retained as
+historical design inputs:
 
 - **REST API** — FastAPI backend at `http://localhost:9000/api/`. Operator-
   facing reference: [`docs/reference/REST_API.md`](docs/reference/REST_API.md).
   The live OpenAPI schema is also available at `http://localhost:9000/docs`
   and `http://localhost:9000/openapi.json` once Composer is running.
+- **Headless REST/CLI** — the independent Manager, runtime, scene, alarm,
+  history, and health projection defaults to `http://127.0.0.1:9010` when
+  started with `python -m manyforge_headless_api serve`. Contract:
+  [`docs/reference/HEADLESS_REST_API.md`](docs/reference/HEADLESS_REST_API.md).
+  It reports robot readiness and operational Apply as unavailable until I6/N.
 - **MCP Server (historical)** — former Model Context Protocol interface.
   Reference-only tool contract:
   [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md).

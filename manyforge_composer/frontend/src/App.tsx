@@ -3,6 +3,7 @@ import { ArtifactBrowser } from './components/ArtifactBrowser';
 import { CatalogPanel } from './components/CatalogPanel';
 import { StructuralViewer } from './components/StructuralViewer';
 import { UnavailableBanner } from './components/UnavailableBanner';
+import { HeadlessRuntimeSurfaces } from './components/HeadlessRuntimeSurfaces';
 import { useStructuralResource } from './state/structuralResource';
 
 function isNotFound(error: unknown): boolean {
@@ -21,6 +22,8 @@ export default function App() {
     absentMessage: 'No complete URDF is available for the authored deployment.',
     failureMessage: 'Could not read the authored-neutral URDF manifest.',
   });
+  const headlessEnabled = health.status === 'ready'
+    && health.data.mode === 'headless_client';
 
   return (
     <main className="app-shell">
@@ -37,6 +40,8 @@ export default function App() {
       </header>
 
       <UnavailableBanner health={health} onRetry={retryHealth} />
+
+      <HeadlessRuntimeSurfaces enabled={headlessEnabled} />
 
       <StructuralViewer manifest={manifest} onRetry={retryManifest} />
 

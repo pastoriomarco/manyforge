@@ -3,8 +3,8 @@
 Pure data-in/data-out: consumes ManyForge execution diagnostic snapshots and
 yields AUTOSAR-DEM-style fault reports
 (FAILED on fault latch, PASSED on clear) keyed by the externally published
-``MANYFORGE_*`` fault code. The ROS service transport lives in
-the future H0 adapter; this module never imports rclpy or medkit types so its
+``MANYFORGE_*`` fault code. The ROS service transport returns at I6/N; this
+module never imports rclpy or medkit types so its
 contract tests run hermetically in any lane.
 
 ManyForge core stays medkit-free: this package depends one-way on
@@ -40,7 +40,7 @@ SEVERITY_TO_MEDKIT = {
     "CRITICAL": 3,
 }
 
-# Retained reducer-state bounds, not a future H0 transport declaration.
+# Retained reducer-state bounds, not a future N transport declaration.
 MAX_TRACKED_FAULTS: Final = 64
 MAX_REPORT_ROWS: Final = 64
 MAX_HEALING_PASSES: Final = 64

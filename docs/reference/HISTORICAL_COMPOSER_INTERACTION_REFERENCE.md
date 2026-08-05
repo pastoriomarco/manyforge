@@ -87,7 +87,7 @@ be activated.
 | Gate | Same-language interaction behavior to retain or port | Contract/ownership that must not return |
 | --- | --- | --- |
 | Current structural shell | Read-only catalog browsing, sandboxed artifact browsing, local camera/orbit controls, visual/collision geometry and authored-neutral model inspection | Live scene state, WebSocket pose truth, scene edits, inferred robot state or runtime readiness |
-| H0 / I5 | Runtime-status presentation, alarm lifecycle/history UI, execution-history presentation, node-environment diagnostics and assistant client mediation | Composer-owned runtime/scene/alarm truth, old scene initialization owner and direct endpoint-state reduction |
+| H0 / I5 | Runtime-status presentation, alarm lifecycle/history UI, event-history presentation, node-environment diagnostics, and closed read-only assistant/MCP adapters | Composer-owned runtime/scene/alarm truth, old scene initialization owner, provider/authoring effects, and direct endpoint-state reduction |
 | N / I6 | Behavior-tree/program/deployment authoring, validation, layout/draft mechanics, addressed component/target selection and manual scene-client workflows | Singleton robot/group assumptions, v1 factory/loading, old scene DTOs, path-derived runtime names and client-side capability unions |
 | L0 / I7 | Lifecycle/controller request forms, status explanations and recovery guidance | Caller leases/sessions, browser-owned command authority, vendor policy or lifecycle truth in the UI |
 | P5 / I8 | Execution/Stop controls, recovery choices and Kernel error presentation as thin requests | CycleManager/backend Stop settlement, browser-selected Stop fallback profiles and client-minted terminal truth |
@@ -113,15 +113,15 @@ commit and must be consulted at the named gate.
 | Historical path at `082221...` | Current checkpoint state | Why the former executable body is not current | Required destination/evidence |
 | --- | --- | --- | --- |
 | `manyforge_ros/manyforge_ros/ros2_control_kernel_factory.py` and its test | The factory and its exclusive test are absent | Python constructed the deleted RoboPlan/Kernel runtime and materialized the superseded Stop profile | I3 retained control/runtime products, I6/N runtime adapter construction, and I8/P5 Kernel-owned Stop evidence |
-| `tests/test_integration.py`, `tests/test_pick_and_place.py`, and `tests/fixtures/pick_and_place.program.yaml` | The two executable tests are absent; the YAML fixture remains in-tree as legacy source material, not current acceptance evidence | The tests directly instantiate the v1 runner, mock Kernel client, singleton robot/group addressing, and old scene-edit DTOs | I5/H0 scene-client cases, I6/N addressed program/native acceptance, and I8/P5 execution/Stop recovery cases |
-| `manyforge_behavior/manyforge_behavior/nodes/scene.py`, `nodes/pick_planning.py`, `nodes/selection.py`, and their exclusive tests | The named nodes and their exclusive tests are absent | These nodes bind directly to the deleted scene/factory and singleton target contracts | I5 headless scene client, I6 component/target-addressed node implementations, and N/P5 acceptance |
-| `manyforge_composer/backend/state.py` | The path contains a structural-only catalog/deployment replacement | The former body also owned runtime clients, scene state, discovery, Runner/CycleManager construction, and robot control | H0/I5/I6 restore those clients against headless owners; the structural catalog/deployment role remains available without reviving Composer authority |
-| `manyforge_composer/backend/routes_scene.py` | The path is absent | Its routes exposed the removed Composer-owned scene contract | I5 restores scene access as a client of headless scene truth; the old Composer scene owner does not return |
+| `tests/test_integration.py`, `tests/test_pick_and_place.py`, and `tests/fixtures/pick_and_place.program.yaml` | The two executable tests are absent; the YAML fixture remains in-tree as legacy source material, not current acceptance evidence | The tests directly instantiate the v1 runner, mock Kernel client, singleton robot/group addressing, and old scene-edit DTOs | I5/H0 now carries independent scene-client cases; I6/N must carry addressed program/native acceptance and I8/P5 execution/Stop recovery cases |
+| `manyforge_behavior/manyforge_behavior/nodes/scene.py`, `nodes/pick_planning.py`, `nodes/selection.py`, and their exclusive tests | The named nodes and their exclusive tests are absent | These nodes bind directly to the deleted scene/factory and singleton target contracts | I5/H0 now supplies the read-only scene client; I6 must supply component/target-addressed node implementations and N/P5 acceptance |
+| `manyforge_composer/backend/state.py` | The path contains a structural catalog/deployment shell; H0 reads live in separate bounded headless clients | The former body also owned runtime clients, scene state, discovery, Runner/CycleManager construction, and robot control | I5/H0 now restores owner-issued runtime, scene, alarm, history, and node-environment reads without putting them back in `state.py`; I6 restores addressed authoring/execution clients |
+| `manyforge_composer/backend/routes_scene.py` | The path remains absent; `routes_headless.py` exposes the H0 read projection | Its routes exposed the removed Composer-owned scene contract | I5/H0 now supplies scene access as a client of headless scene truth; I6/N must add addressed scene intent, and the old Composer scene owner does not return |
 | `manyforge_composer/backend/viewer_data_plane.py` | The path contains payload-neutral demand, lease, and bounded-fanout primitives only | The former body also defined the Composer viewer schema, encoder, runtime sampler, and live route contract | I9 binds the retained transport mechanics to an observer-owned viewer/point-cloud contract; the old WebSocket protocol does not return |
 | `manyforge_composer/backend/viewer_worker.py` | The path contains bounded envelope helpers and a typed-unavailable I9 construction fence | The former visual snapshot builder, versioned worker protocol, and process supervisor depended on Composer-owned runtime/scene state | I9 supplies an observer-owned snapshot adapter and restores qualified worker construction without restoring the old owner |
 | `manyforge_composer/frontend/src/components/{ProgramPanel,PropertyPanel,DeploymentPanel}.tsx` and their stores/tests | The named v1 panels are absent; dependency-independent authoring validators and reducers are retained separately | Their interaction intent remains required, but their compiled types and stores are coupled to v1 program/deployment/runtime identities | I6/N TypeScript authoring clients on explicit component/target identities, reusing the historical UX and validation cases |
 | `manyforge_composer/frontend/src/components/{RobotControlPanel,TransportControls,KernelErrorPanel}.tsx` and related stores/tests | `RobotControlPanel` and `TransportControls` are absent; `KernelErrorPanel` now exists as a generic diagnostic presentation shell | The former bodies called old command/session/Stop and terminal-settlement contracts; the replacement error shell owns no policy or command authority | I7/L0 request clients and I8/P5 execution/Stop projection and presentation; no browser command authority or fallback selection |
-| `manyforge_assistant_bridge/bridge.py` and its live HTTP tests | `bridge.py` contains a typed-unavailable, effect-free entrypoint; the old live HTTP tests are absent, while split protocol/supervisor tests remain | The former provider loop is coupled to removed Composer callback/tool contracts | I5/H0 assistant client mediation after the retained protocol/supervisor logic is rebound to a real headless owner, with Program tools following at I6 |
+| `manyforge_assistant_bridge/bridge.py` and its live HTTP tests | `bridge.py` remains a typed-unavailable, effect-free provider entrypoint; `headless.py` is the separate bounded H0 read client, and split protocol/supervisor tests remain | The former provider loop is coupled to removed Composer callback/tool contracts | I5/H0 now supplies read-only owner observation; I6/N must restore bounded provider mediation and Program tools against the new contracts |
 
 This table is a source-and-acceptance map, not permission to treat every file
 in the same directory alike. Dependency-independent utilities, reducers,
@@ -168,17 +168,17 @@ currently runnable qualification.
 - `assistant_provider.py`: lines 1–132 (`_partition_runtime_noise`,
   `AssistantProviderError`, `AssistantProviderContext`, and
   `AssistantProviderResult`) preserve bounded warning/error/result-envelope
-  intent for a Python H0 assistant client. The warning classifier is now
+  intent for a future Python N provider client. The warning classifier is now
   retained, owner-neutrally, as
   `assistant_client_primitives.partition_runtime_warnings`; the old context
   and result fields must still be replaced by owner-issued facts. Lines
   133–381 (`AssistantProvider`,
   `MockAssistantProvider`, and `DeterministicSceneAuthoringProvider`) are old
   in-process/mock and scene-proposal contracts: their deterministic review
-  behavior is acceptance input at H0/N, while the old provider and scene DTOs
+  behavior is acceptance input at N/I9, while the old provider and scene DTOs
   stay deleted. Lines 382–819 (`NemoClawAssistantProvider`,
   `_validate_lane_entry`, and `HermesAssistantProvider`) contain bounded HTTP
-  request/cancel/response handling to re-extract at H0; the old endpoint,
+  request/cancel/response handling to re-extract at N; the old endpoint,
   lane-registry, callback, and catalog shapes do not return. Lines 820–995
   (`build_assistant_provider`, `_error_from_response_json`, and
   `assistant_provider_catalog`) supply selection/error/catalog UX cases, but
@@ -192,15 +192,16 @@ currently runnable qualification.
   1259–1290 contain scalar/list context readers that may be re-extracted with
   the new context type. Acceptance comes from the pinned
   `test_assistant_provider_http_fixture.py`,
-  `test_assistant_lane_catalog.py`, and `test_assistant_routes.py`; H0 owns
-  provider mediation and N owns Program/scene proposal effects.
+  `test_assistant_lane_catalog.py`, and `test_assistant_routes.py`; H0 owns only
+  the closed read adapter, while N owns provider mediation and Program/scene
+  proposal effects.
 
 - `assistant_tool_schemas.py`: lines 1–140 contain defensive schema copying,
   description-independent hashing, and field-policy narrowing.
   `schema_projection.strip_schema_descriptions` now retains the
   owner-neutral copy/description behavior; the historical hash and
   orientation-field narrowing remain unqualified contract input for
-  owner-issued H0/N schemas. The generic description/property helpers from
+  owner-issued N schemas. The generic description/property helpers from
   lines 141 and 443–470 are likewise retained in `schema_projection` as
   `with_description`, `with_replaced_description`, `property_schema`, and
   `projected_property_or_fallback`. Lines 141–428
@@ -214,7 +215,7 @@ currently runnable qualification.
   their tool intents are requirements input, not a public contract. Lines
   1967–2067 (`assistant_tool_input_schema` and both
   `enrich_assistant_tool_descriptor*` functions) contain defensive descriptor
-  enrichment to re-extract at H0/N after the headless owners publish the exact
+  enrichment to re-extract at N after the headless owners publish the exact
   schemas and identities. The old tool IDs, accepted aliases, and schema hash
   are not assumed compatible. Acceptance comes from the pinned
   `test_assistant_catalog_schema_projection.py`, `test_assistant_routes.py`,
@@ -226,7 +227,7 @@ currently runnable qualification.
   (`inspect_isaac_scene_report`) are an I9 read-client requirement; the
   dynamic import of the old ROS inspector is not restored. Lines 183–310
   (`propose_scene_object_resources` and `propose_scene_object_nodes`) preserve
-  deterministic, review-before-mutation proposal behavior for H0/N/I9, but
+  deterministic, review-before-mutation proposal behavior for N/I9, but
   their old scene/tree outputs do not. Lines 311–592 contain that dynamic
   importer plus shape, pose, finite-number, required-string, ID sanitization,
   uniqueness, and proposal conversion helpers. The owner-neutral numeric and
@@ -249,7 +250,7 @@ currently runnable qualification.
 
 - `mcp_server.py`: lines 1–91 contain dispatch-outcome/audit classification,
   trigger-reason, and live-scene mutation-message helpers. Re-extract generic
-  result/error classification at H0, but do not reuse caller-minted principal
+  result/error classification at N, but do not reuse caller-minted principal
   context or old trigger/scene enums. Within `create_mcp_server` (lines
   92–1332), lines 116–173 are the audited wrapper to recreate with
   server-derived identity; lines 174–199 are the scene-read intent; lines
@@ -257,7 +258,8 @@ currently runnable qualification.
   capability/skill reads; lines 676–1001 are intervention/runtime-override
   commands; and lines 1002–1332 are execution/debug/catalog/snapshot/file/
   deployment/Kernel/session reads and commands. Recreate the still-required
-  reads as authenticated thin H0/N/P5/I9 clients and the still-required
+  closed H0 read subset through `mcp_client_primitives` and recreate the
+  remaining reads as authenticated thin N/P5/I9 clients and the still-required
   commands as bounded intent at their owner gate. The in-process
   `ComposerState`, old tool names/signatures, direct mutation, CycleManager
   settlement, runtime override, and session authority stay deleted. Lines
@@ -271,7 +273,8 @@ currently runnable qualification.
 - `routes_mcp.py`: lines 1–35 define the old transport/session constants.
   Lines 36–207 (`create_mcp_router`, JSON-RPC POST, and SSE GET) preserve
   bounded HTTP/SSE transport, lazy construction, eviction, and disconnect
-  behavior to re-extract at H0. Lines 208–246 (`_McpSession`) preserve bounded
+  behavior to re-extract at N if a public MCP transport returns. Lines 208–246
+  (`_McpSession`) preserve bounded
   queue/touch/disconnect mechanics, and lines 247–369 (`_handle_jsonrpc`)
   preserve JSON-RPC validation/error behavior. The in-process MCP server,
   fallback tool registry, unbounded old session identity, and principal
@@ -283,24 +286,24 @@ currently runnable qualification.
 
 - `routes_assistant.py`: lines 1–335 contain environment bounds, catalog/read
   dedupe, hashes, fingerprints, and compaction. Re-extract the bounded-cache
-  and repeated-read behavior at H0 after result DTOs are frozen; old scene and
+  and repeated-read behavior at N after provider result DTOs are frozen; old scene and
   catalog fingerprints are not wire commitments. Within
   `create_assistant_router`, lines 336–707 are chat, tool/mode/provider/status,
-  cancellation, and request-terminalization client behavior for H0; the
+  cancellation, and request-terminalization client behavior for N; the
   Composer-owned request ledger/provider factory stays deleted. Lines 708–736
   are caller principal-binding endpoints and stay deleted outright. Lines
   737–1173 are the old bridge callback dispatcher: authenticated catalog
   binding, schema checking, timeouts, and bounded execution remain acceptance
   requirements, but direct `ComposerState` mutation and the callback wire do
   not. Lines 1174–1331 cover Isaac inspection and proposal stage/list/discard/
-  materialize interactions; restore those review workflows at H0/N/I9 as
+  materialize interactions; restore those review workflows at N/I9 as
   clients of real owners, never as Composer scene authority.
 
 - In the same `routes_assistant.py` blob, lines 1332–1731 contain catalog
   hashing, field-policy normalization/intersection, schema enforcement,
   catalog/skill/deployment/request payload projection, provider error mapping,
   and bridge context resolution. Re-extract their pure validation and
-  presentation intent at H0/N against new identities. Lines 1732–2302 contain
+  presentation intent at N against new identities. Lines 1732–2302 contain
   read-tool dispatch, Program snapshot projection, schema selection/hash/diff,
   and argument normalization; preserve fail-closed schema validation and read
   result behavior, but replace every in-process state read and old tool schema.
@@ -320,9 +323,9 @@ currently runnable qualification.
   and direct state writes stay deleted. Lines 4612–4885 contain Program
   parameter and blackboard draft transforms; carry atomic authoring behavior
   into N's Program-Binding client, not the v1 blackboard schema. Lines
-  4886–5121 contain provider context/resolution helpers to adapt at H0. Lines
+  4886–5121 contain provider context/resolution helpers to adapt at N. Lines
   5122–5225 contain proposal validation/materialization and capability lookup;
-  retain review/materialization intent at H0/N, with I9 supplying Isaac facts,
+  retain review/materialization intent at N, with I9 supplying Isaac facts,
   but remove Composer-owned proposal/scene effects. Pinned
   `test_assistant_arg_normalizer.py`,
   `test_assistant_catalog_schema_projection.py`, `test_assistant_routes.py`,
@@ -358,17 +361,19 @@ currently runnable qualification.
   and robot-control-candidate cases.
 
 - `routes_execution.py`: lines 1–136 (`_iter_tree_names`, execution-history,
-  channel, and alarm payload builders) contain read/presentation behavior to
-  adapt to H0/N/P5 owner snapshots. Lines 137–187 contain alarm error and query
+  channel, and alarm payload builders) contain read/presentation behavior. H0
+  now carries the alarm/event subset; execution-specific projections remain
+  N/P5 work. Lines 137–187 contain alarm error and query
   parsers. Their substantive wall-time/filter behavior is retained in
   `event_recorder.HistoryQuery` and `parse_wall_timestamp_ns`; only the future
   thin route's CSV/HTTP-error adaptation remains. Lines 188–508 build
   blackboard and execution digests from many in-process owners; their stable
   operator summaries remain requirements, while the cross-owner join and v1
-  blackboard/runtime truth stay deleted. Lines 509–628 are alarm snapshot and
-  exact-revision acknowledgement clients for H0, with alarm truth remaining
-  headless. Lines 629–721 are run/history/channel/digest/blackboard/latency read
-  routes for H0/N/P5. Pinned `test_execution_observability.py`,
+  blackboard/runtime truth stay deleted. The behavior in lines 509–628 is now
+  carried by the bounded H0 alarm snapshot and exact-revision acknowledgement
+  clients, with alarm truth remaining headless. Of lines 629–721, H0 carries
+  event history; run/channel/digest/blackboard/latency reads remain N/P5 work.
+  Pinned `test_execution_observability.py`,
   `test_observability_routes.py`, alarm tests, and the frontend alarm ledger
   below carry filtering, pagination, race, and presentation cases.
 
@@ -385,22 +390,25 @@ currently runnable qualification.
   execution-profile, and native-viewer helpers) preserve component/status
   presentation ideas, but their file/env/singleton truth sources do not.
   Lines 226–506 (`build_runtime_status_payload`) are the old composite
-  Composer runtime owner and stay deleted; H0 must provide owner-issued status
-  and can reuse only formatting behavior. In lines 507–527, the GET status
-  interaction returns as a thin H0 route; the POST external-provider update
+  Composer runtime owner and stay deleted; H0 now provides owner-issued status
+  through `routes_headless.py` and reuses only presentation behavior. The GET
+  interaction in lines 507–527 has returned as a thin H0 route; the POST
+  external-provider update
   endpoint does not return because callers cannot write runtime truth. Pinned
   `test_model_serving_status.py`, `test_observability_routes.py`, and runtime
   frontend cases carry the acceptance behavior.
 
 - `routes_infra.py`: lines 1–57 contain the bounded OpenAI-compatible model
   probe and endpoint-capability formatter. They are focused Python adapter
-  behavior to re-extract at H0 if still required, not runtime truth. Lines
+  behavior to re-extract at N if still required, not runtime truth. Lines
   58–127 synthesize safety and route-executor heartbeat state in Composer and
   stay deleted. Lines 128–475 build old composite infrastructure status and
   heartbeat payloads; operator detail and freshness behavior are acceptance
-  inputs, but H0 Manager/headless owners must issue the facts. Lines 476–529
-  are thin status/heartbeat/model-endpoint routes to recreate only after those
-  projections exist. Pinned model-serving and observability route tests carry
+  inputs. H0 Manager/headless owners now issue their bounded runtime, scene,
+  alarm, and historian facts; later provider-specific facts must come from N.
+  Lines 476–529 are thin status/heartbeat/model-endpoint interaction sources,
+  not permission to restore their composite payload. Pinned model-serving and
+  observability route tests carry
   probe, timeout, stale, and failure cases.
 
 - `routes_debug.py`: lines 1–229 build scene trace, export, Medkit, and
@@ -509,8 +517,9 @@ Git history:
   timeout, and response-normalization methods; `routes_mcp._McpSession`,
   `_handle_jsonrpc`, and the transport/session-eviction portion of
   `create_mcp_router`; and the catalog/read dedupe helpers at
-  `routes_assistant.py:139-334`. The H0 entrypoints remain fenced before
-  network or state effects, but the bounded mechanics are not semantic
+  `routes_assistant.py:139-334`. Those provider/session entrypoints remain
+  fenced before network or state effects until N; H0 implements only a
+  separate closed read adapter, and the bounded mechanics are not semantic
   owners; and
 - authoring algorithms awaiting a wire-neutral document type are
   `routes_assistant.{_find_tree_node_ref,_collect_tree_node_names,
@@ -614,17 +623,18 @@ new contract; merely retaining this ledger is not acceptance.
   `139 shows only individual acknowledgement for one attention alarm`;
   `168 shows bulk acknowledgement for two attention alarms`;
   `196 shows the newest three attention panels and a separate standing alarm`.
-  Port the presentation stack and exact-record confirmation controls at H0;
-  the headless alarm owner supplies ordering, lifecycle, and acknowledgement
-  facts. Focused H0 React and alarm-client tests must carry all four cases.
+  I5/H0 now ports the presentation stack and exact-record confirmation
+  controls; the headless alarm owner supplies ordering, lifecycle, and
+  acknowledgement facts. Focused React and alarm-client tests carry all four
+  cases.
 
 - `NodeDiscoveryDiagnostics.test.tsx`, `discovery_presentation`, line 38; 1
   record; digest
   `1352cbd785cc88d7117478c3d7eb1525282b81eb77ed3baa885d4c0cbd0fb391`:
-  `38 renders active provenance and structured rejection details`. Port the
-  diagnostic presentation at H0 against the immutable v2 environment and a
-  real implementation-availability projection; the old dynamic-loader/source
-  report stays deleted.
+  `38 renders active provenance and structured rejection details`. I5/H0 now
+  projects the independently verified immutable v2 environment, resolved
+  implementation identity, and dynamic runtime availability; the old
+  dynamic-loader/source report stays deleted.
 
 - `ProgramPanel.binding.test.ts`, `binding_candidates`, lines 47, 55, and 64;
   3 records; digest
@@ -662,10 +672,10 @@ new contract; merely retaining this ledger is not acceptance.
   `7da8ea54c998799b1c325f0267a5f413723aa288cc07d3de7bf690f3878dec3e`:
   `6 disables motion whenever runtime admission is explicitly closed`;
   `10 fails closed until an authoritative runtime exists`;
-  `14 allows motion after runtime admission opens`. Translate the decision to
-  H0/N/P5 owner-issued admission and retain only disabled-state/reason
-  presentation in TypeScript. The browser-side `runtimeAllowsMotion` owner
-  does not return.
+  `14 allows motion after runtime admission opens`. H0 explicitly reports that
+  robot readiness is unavailable; N/P5 must supply owner-issued admission.
+  TypeScript retains only disabled-state/reason presentation, and the
+  browser-side `runtimeAllowsMotion` owner does not return.
 
 #### Store and utility test cohorts
 
@@ -680,8 +690,9 @@ new contract; merely retaining this ledger is not acceptance.
 
 - The same file, `reason_presentation`, line 71; 1 record; digest
   `2b13a9b65a55b059cd269fd5b84154360c76daa3a3a0abc5386feb6e35aa760f`:
-  `71 uses user-facing reason labels for scene readiness failures`. Port the
-  label/presentation behavior at H0/N using typed owner reason codes.
+  `71 uses user-facing reason labels for scene readiness failures`. H0 now
+  carries generic typed-unavailable presentation; N adds addressed scene
+  readiness reasons without moving policy into the browser.
 
 - `store/cycleState.test.ts`, `boundary_parse`, lines 5 and 13; 2 records;
   digest
@@ -703,15 +714,16 @@ new contract; merely retaining this ledger is not acceptance.
   `b03d34c19fa7358dca5251d5a399a588c21e7f0da3abcc497fce182f0ed92932`:
   `152 reannunciates only a genuinely new activation, not repeated samples`;
   `162 detects membership, recurrence, revision, and generation changes in a bulk fence`.
-  These client-local comparison behaviors are already split into
-  `utils/alarmFences.ts`; focused H0 tests must retain exact activation and
+  These client-local comparison behaviors are split into
+  `utils/alarmFences.ts`; focused H0 tests retain exact activation and
   bulk-membership semantics.
 
 - The same file, `motion_ui_fence`, line 177; 1 record; digest
   `547a3281bee0e2dd3790a1b523555557a931b0d80b4de57437e61308cb6296a7`:
-  `177 fails closed only for motion-producing controls`. At H0, retain scoped
-  disabled-state presentation while translating actual motion admission to
-  the headless owner; non-motion inspection remains usable.
+  `177 fails closed only for motion-producing controls`. H0 retains scoped
+  disabled-state presentation and explicitly leaves robot readiness
+  unavailable; non-motion inspection remains usable. N/P5 supplies actual
+  motion admission.
 
 - The same file, `projection_ack_races`, lines 187, 208, 232, 254, 273, and
   303; 6 records; digest
@@ -721,10 +733,10 @@ new contract; merely retaining this ledger is not acceptance.
   `232 binds acknowledge-all to the confirmation-time membership and generation`;
   `254 accepts a later observation from a restarted process with a reset generation`;
   `273 does not let a delayed acknowledgement overwrite a newer poll`;
-  `303 refreshes state after a stale bulk acknowledgement`. Port these as an
-  H0 alarm projection/command client with exact revisions and latest-wins
-  response ordering; the browser does not own alarm lifecycle or motion
-  admission.
+  `303 refreshes state after a stale bulk acknowledgement`. I5/H0 now carries
+  these through the alarm projection/intent client with exact revisions and
+  latest-wins response ordering; the browser does not own alarm lifecycle or
+  motion admission.
 
 - `store/pointCloudStore.test.ts`, `mfpc_decoder`, line 59; 1 record; digest
   `74b112be79266f3e83c0153b7ad690959da4ba7085cfcf9228da0d6f11f17818`:
@@ -946,19 +958,19 @@ treated as a future TypeScript authority.
 
 | Historical frontend path at `082221...` | Current disposition and restoration gate | Retained/extracted TypeScript responsibility |
 | --- | --- | --- |
-| `src/components/AssistantOverlay.tsx` | The assistant interaction remains required. Reconnect at I5/H0 after the exact retained assistant projection and request client exist; do not restore the old deployment flag/callback contract. | `src/components/assistantRequestRecovery.ts` and its test retain bounded authoritative-request reconciliation without an old assistant DTO. |
+| `src/components/AssistantOverlay.tsx` | Read-only assistant observation is available through the I5/H0 headless client. The interactive provider/conversation overlay returns at I6/N; do not restore the old deployment flag/callback contract. | `src/components/assistantRequestRecovery.ts` and its test retain bounded authoritative-request reconciliation without an old assistant DTO. |
 | `src/components/DeploymentPanel.tsx`; `src/components/DeploymentPanel.robotControlLimits.test.ts` | Deployment authoring returns at I6/N on explicit component/target artifacts. The singleton `robot_config`, adapter capability union, and old mutation endpoint do not return. | `src/utils/deploymentCapabilities.ts`, `src/utils/parameterAuthoring.ts`, `src/components/property/parameterCapValidation.test.ts`, and the v2 catalog/schema helpers retain capability filtering, optional omission, and cap behavior. |
 | `src/components/FileBrowserDialog.tsx` | Read navigation is available now. Mutation-aware open/save selection reconnects at I6; the old save endpoint shape is not retained. | `src/components/ArtifactBrowser.tsx`, `src/api/client.ts`, and their parser/client tests retain sandbox-root navigation and explicit selection. |
-| `src/components/HeaderBar.tsx`; `src/components/HeaderBar.operatorAlarms.test.ts` | The structural header is available now. Alarm, status, lifecycle, history, and command integrations reconnect through I5/I7/I8 projections; the old all-stores monolith does not return. | `src/App.tsx`, `src/components/OperatorAlarmPanel.tsx`, `RuntimeStatusOverlay.tsx`, `RobotLifecycleCard.tsx`, `ExecutionHistoryPanel.tsx`, and `src/utils/alarmFences.ts` retain presentation, exact-record confirmation fencing, and reannunciation behavior. |
+| `src/components/HeaderBar.tsx`; `src/components/HeaderBar.operatorAlarms.test.ts` | The structural header plus H0 alarm, status, and history presentation are available now. Lifecycle and command integrations return through I7/I8 projections; the old all-stores monolith does not return. | `src/App.tsx`, `src/components/OperatorAlarmPanel.tsx`, `RuntimeStatusOverlay.tsx`, `RobotLifecycleCard.tsx`, `ExecutionHistoryPanel.tsx`, and `src/utils/alarmFences.ts` retain presentation, exact-record confirmation fencing, and reannunciation behavior. |
 | `src/components/Layout.tsx` | The current structural layout is available. The authoring dock composition returns at I6/N; the old store-coupled root component is not copied. | `src/App.tsx`, `src/components/CollapsedRail.tsx`, and `src/index.css` retain the shell, collapse affordance, and semantic styling. |
-| `src/components/NodeDiscoveryDiagnostics.tsx`; `src/components/NodeDiscoveryDiagnostics.test.tsx` | Permanently superseded as a v1 dynamic-loader/source report. I5/H0 must provide a fresh retained-environment implementation-availability view rather than recreating this payload. | The active immutable-v2 `CatalogPanel`, catalog identity/digests, and typed-unavailable boundary cover only the currently qualified structural facts. |
+| `src/components/NodeDiscoveryDiagnostics.tsx`; `src/components/NodeDiscoveryDiagnostics.test.tsx` | Permanently superseded as a v1 dynamic-loader/source report. I5/H0 now provides a verified retained-environment identity and runtime-availability view rather than recreating this payload; execution remains explicitly unavailable until I6/N. | `useHeadlessState.ts`, `HeadlessRuntimeSurfaces.tsx`, the immutable-v2 `CatalogPanel`, and strict parsers present only owner-issued facts. |
 | `src/components/ObjectEditPanel.tsx` | Object editing/discard interaction remains required at I6/N. Direct mutation of Composer Scene Authority does not return. | `src/components/common/DraftInputs.tsx`, `src/utils/poseTransforms.ts`, `moveTo.ts`, `gizmoAuthoring.ts`, and `src/hooks/usePersistentDraft.ts` retain draft/pose interaction without an effectful endpoint. |
 | `src/components/ProgramPanel.tsx`; `src/components/ProgramPanel.binding.test.ts` | Program and Program-Binding authoring return at I6/N. V1 blackboard DTOs, singleton robot/group fields, and Pick-Plan artifact shapes do not return. | V2 `catalogSchema.ts`, `catalogParameterValidation.ts`, `parameterAuthoring.ts`, and the graph/draft extractions below retain schema-driven authoring mechanics. |
 | `src/components/PropertyPanel.tsx` | The property surface remains required at I6/N after exact Program-Binding and command-schema types exist. | `src/components/common/DraftInputs.tsx`, `src/components/property/utils.ts`, catalog schema/parameter validation, and cap tests retain dependency-independent editing behavior. |
 | `src/components/RobotControlPanel.tsx`; `src/components/RobotControlPanel.test.tsx` | Manual control/preview interaction returns at I6/N on addressed, unit-tagged commands. The old candidate endpoint, group ID, angular-only gripper payload, and browser command gate do not return. | `src/utils/{poseTransforms,moveTo,gizmoAuthoring,gripperAuthoring,gripperGhost,gripperSemantics,jointAuthoring,robotModelAuthority}.ts`, their focused tests, and `src/hooks/usePersistentDraft.ts` retain the target-safe algorithms. |
 | `src/components/SceneControls.tsx` | Viewer authoring controls reconnect at I6/N to the qualified Program presentation projection. Live scene state is not a second persistence owner. | `src/state/viewerPresentationDraft.ts`, `src/utils/viewerCamera.ts`, and `viewerPerformance.ts` retain local view preferences, camera pins, renderer selection, and render metrics. |
 | `src/components/ScenePanel.tsx`; `src/components/ScenePanel.supportContactEvidence.test.ts` | Ordinary addressed scene authoring returns at I6/N. The former inline support-contact payload is deliberately not copied: exact `contact_policy` qualification belongs to I8/P5 and tool/contact fixtures are requalified at I11/T. | Generic draft, schema, pose, and graph utilities remain. The historical support-contact test at `082221...` is explicit reimplementation evidence, not an active schema contract. |
-| `src/components/SceneViewer.tsx` | Authored-neutral structural viewing is available now. Live objects/state reconnect through I5/I6; Isaac point cloud, ghost, snapshot, and simulator interaction pass I9/I. The viewer-v1 data plane does not return. | `src/components/StructuralViewer.tsx`, `SnapshotResponder.tsx`, `src/utils/{structuralTransforms,viewerCamera,viewerPerformance,snapshotCapture}.ts`, and `src/state/latestFrameSlot.ts` retain renderer, camera, capture, and protocol-independent newest-frame behavior. |
+| `src/components/SceneViewer.tsx` | Authored-neutral structural viewing and H0 scene/initialization facts are available now. Addressed object authoring returns at I6/N; Isaac point cloud, ghost, snapshot, and simulator interaction pass I9/I. The viewer-v1 data plane does not return. | `src/components/StructuralViewer.tsx`, `SnapshotResponder.tsx`, `src/utils/{structuralTransforms,viewerCamera,viewerPerformance,snapshotCapture}.ts`, and `src/state/latestFrameSlot.ts` retain renderer, camera, capture, and protocol-independent newest-frame behavior. |
 | `src/components/Sidebar.tsx` | Catalog/palette and authoring tabs remain target behavior. The read-only catalog is available now; Program/scene/deployment tabs reconnect at I6/N. | `src/components/CatalogPanel.tsx`, `NodePaletteItem.tsx`, the v2 catalog client, and profile/capability filters retain catalog browsing and drag identity. |
 | `src/components/TransportControls.tsx`; `src/components/TransportControls.runtimeGate.test.ts` | Stop/Pause/Resume/Reset interaction returns on the final resource-addressed public contract at I6/N and is requalified against the one Kernel Stop envelope at I8/P5. Old cycle endpoints and browser-side runtime gates never return. | `src/components/RecoveryActionControls.tsx`, `KernelErrorPanel.tsx`, and generic request reconciliation retain presentation, exact-offer confirmation binding, and readable failure behavior without command authority. |
 | `src/components/TreeCanvas.tsx` | The interactive graph adapter returns at I6/N after exact Program node/binding types exist. The former React-Flow/store wiring is not a compatibility surface. | `src/utils/authoringGraph.ts` and tests retain tree validation, single-parent/cycle/cardinality checks, ordering, and deterministic layout; `BtNode.tsx`, `StatusEdge.tsx`, `CanvasViewControls.tsx`, and pure `store/composerStore.ts` retain graph presentation state. |
@@ -974,13 +986,13 @@ treated as a future TypeScript authority.
 | `src/store/commandAuthority.ts`; `src/store/commandAuthority.test.ts` | Permanently deleted browser command-admission semantic owner. | I7/L0 and I8/P5 server/Kernel owners prove authority. The focused historical negative cases remain at the pinned commit for new contract tests. |
 | `src/store/cycleState.ts`; `src/store/cycleState.test.ts`; `src/store/cycleStore.ts` | The old cycle enum, WebSocket reduction, and unknown-to-`running` compatibility coercion do not return. | I6/N supplies resource-addressed execution projection and I8/P5 the final envelope. Recovery/status/history presentation shells are retained without inferring runtime truth. |
 | `src/store/deploymentStore.ts` | Singleton deployment artifact/store and mutation API do not return. | I6/N supplies the component-instance deployment client; catalog capability filtering and authoring controls are retained independently. |
-| `src/store/operatorAlarmStore.ts`; `src/store/operatorAlarmStore.test.ts` | Old polling endpoint/store shape remains absent pending I5/H0. Browser motion admission from alarm state is not restored. | `src/utils/alarmFences.ts`, `OperatorAlarmPanel.tsx`, `ExecutionHistoryPanel.tsx`, and focused tests retain exact-activation fencing, reannunciation, and presentation. |
+| `src/store/operatorAlarmStore.ts`; `src/store/operatorAlarmStore.test.ts` | Old polling endpoint/store shape is permanently superseded. Browser motion admission from alarm state is not restored. | I5/H0 now uses `useHeadlessState.ts`, the bounded owner-issued WebSocket projection, `HeadlessRuntimeSurfaces.tsx`, `alarmFences.ts`, `OperatorAlarmPanel.tsx`, and `ExecutionHistoryPanel.tsx`; the C++ owner retains lifecycle and complete membership truth. |
 | `src/store/pointCloudStore.ts`; `src/store/pointCloudStore.test.ts` | The MFPC/v1 socket decoder and connection owner do not return by assumption. | I9/I owns the exact future point-cloud client. `src/state/latestFrameSlot.ts` retains epoch/sequence ordering, newest-only materialization, clear, invalidation, and stale-connection rejection without a wire schema. |
 | `src/store/programStore.ts`; `src/store/programStore.test.ts` | The v1 Program serializer, singleton identities, Pick-Plan macro payload, scene/store joins, and mutation endpoints do not return. | I6/N implements the exact Program-Binding store. `authoringGraph.ts`, pure `composerStore.ts`, catalog/schema/parameter helpers, viewer-presentation reducer, and focused tests retain independent graph/draft behavior. |
 | `src/store/robotControlCandidateStore.ts`; `src/store/robotControlCandidateStore.test.ts` | The old candidate DTO/endpoint, shared Approve owner, and singleton move groups do not return. | I6/N binds addressed local drafts to the qualified command schema. Pose/gizmo/move/joint/gripper/ghost/persistent-draft utilities retain authoring and fail-closed behavior. |
 | `src/store/robotLifecycleStore.ts` | The former endpoint/poll/command store remains absent until I7/L0 freezes resource-addressed lifecycle requests and observed status. | `RobotLifecycleCard.tsx` retains observation-only presentation. I7 must reconnect enable/disable/recovery/reconcile confirmations without browser lifecycle authority. |
 | `src/store/sceneStateStore.ts`; `src/store/sceneStateStore.viewer.test.ts` | Composer Scene Authority, old scene WebSocket reduction, live placement truth, and viewer-v1 joins do not return. | I5/H0 supplies headless scene truth and I6/N addressed scene/manual clients. Structural viewing, pose transforms, view drafts, and latest-frame mechanics remain. |
-| `src/store/statusStore.ts` | The old runtime-status endpoint/poll store remains absent until I5/H0 exact projection. | `RuntimeStatusOverlay.tsx` is retained as a prop-driven observation view and cannot infer readiness or gate commands. |
+| `src/store/statusStore.ts` | The old runtime-status endpoint/poll store is permanently superseded by the I5/H0 owner-issued projection. | `useHeadlessState.ts` and `HeadlessRuntimeSurfaces.tsx` feed `RuntimeStatusOverlay.tsx` as a prop-driven observation view; none may infer robot readiness or gate commands. |
 | `src/store/stopProfile.ts`; `src/store/stopProfile.test.ts` | Permanently superseded browser Stop fallback/profile table. | I8/P5 owns one Kernel Stop envelope; historical cases translate into Kernel/transport acceptance, not another client policy. |
 | `src/store/viewerFrameStore.ts`; `src/store/viewerFrameStore.test.ts` | Viewer-v1 manifest/frame state and live wire owner do not return. | I5/I9 own exact projections; `latestFrameSlot.ts`, structural transforms, camera, performance, and snapshot clients retain protocol-independent mechanics. |
 | `src/store/viewerSelectionStore.ts` | The mixed Zustand store remains absent. Its camera, collision, view-draft, move/gizmo, and selection concerns are split rather than discarded. | Camera parsing is in `viewerCamera.ts`; collision is local to `StructuralViewer`; presentation drafts are in `viewerPresentationDraft.ts`; addressed move/gizmo drafts reconnect at I6/N. |

@@ -2,8 +2,9 @@
 
 > **Cutover status:** retained as a restoration and behavior reference. The
 > command recipes below are not qualified on the current `dev` branch and
-> must not be executed until I5/H0 and every selected execution lane's gate
-> pass. Present-tense install/run descriptions below record the captured
+> must not be executed until the required I6-I11 execution, provider,
+> simulation/robot, and tool gates pass. I5/H0 supplies observation only.
+> Present-tense install/run descriptions below record the captured
 > platform baseline, not a currently operable ManyForge stack.
 
 **This was the entry point for bringing up the entire ManyForge + NemoClaw +

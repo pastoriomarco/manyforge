@@ -1,10 +1,10 @@
-"""Fail-before-state tests for the I5/H0 scene-initialization gate."""
+"""Fail-before-state tests for the permanent Composer-owner fence."""
 
 import pytest
 
 from manyforge_composer.backend import scene_initialization
 from manyforge_composer.backend.scene_initialization import (
-    SCENE_INITIALIZATION_RESTORATION_GATES,
+    SCENE_INITIALIZATION_REPLACEMENT_GATE,
     SceneInitializationClient,
     SceneInitializationClientUnavailableError,
     require_scene_initialization_client,
@@ -30,7 +30,7 @@ def test_gate_fails_before_token_or_observation_access() -> None:
     with pytest.raises(SceneInitializationClientUnavailableError):
         require_scene_initialization_client(poison, token=poison)
 
-    assert SCENE_INITIALIZATION_RESTORATION_GATES == ("I5", "H0")
+    assert SCENE_INITIALIZATION_REPLACEMENT_GATE == "I5/H0"
 
 
 def test_composer_barrier_and_v1_replay_dto_are_absent() -> None:

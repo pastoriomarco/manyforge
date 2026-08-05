@@ -7,9 +7,10 @@
 #
 # Historical runtime/E2E recipe:
 # manyforge@08222188293df8e12f90dc72e204c21f22f92ea1, blob
-# a84828d749fc2a63f409965cb8e1319773b1ef1c. Its Program load/tree and cycle
-# control interactions return as thin clients at H0/I5 and N/I6; live runtime
-# state and Stop bind only to their new headless owners at N/I6 and P5/I8.
+# a84828d749fc2a63f409965cb8e1319773b1ef1c. H0/I5 supplies read-only runtime
+# observation. Program load/tree and cycle control return as thin clients at
+# N/I6; live execution state and Stop bind only to their new owners at N/I6
+# and P5/I8.
 #
 # Usage:
 #   ./scripts/compose-dev.sh              # Start API (9000) + Vite HMR (3000)

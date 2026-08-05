@@ -3,7 +3,7 @@
 import pytest
 
 from manyforge_composer.backend.operator_alarm_adapters import (
-    OPERATOR_ALARM_ADAPTERS_RESTORATION_GATES,
+    OPERATOR_ALARM_ADAPTERS_REPLACEMENT_GATE,
     OperatorAlarmAdapters,
     OperatorAlarmAdaptersUnavailableError,
 )
@@ -25,4 +25,4 @@ def test_adapters_fail_before_manager_or_collaborator_access() -> None:
             monotonic_clock=poison,
         )
 
-    assert OPERATOR_ALARM_ADAPTERS_RESTORATION_GATES == ("I5", "H0")
+    assert OPERATOR_ALARM_ADAPTERS_REPLACEMENT_GATE == "I5/H0"

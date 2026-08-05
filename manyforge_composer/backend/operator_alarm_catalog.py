@@ -1,4 +1,4 @@
-"""Typed I5/H0 gate for the relocated operator-alarm catalog.
+"""Permanent compatibility fence for the relocated operator-alarm catalog.
 
 The removed Composer loader implemented ``manyforge.operator_alarm_catalog.v1``
 and identified its YAML by raw file bytes.  The approved catalog contract uses
@@ -15,7 +15,7 @@ from typing import Final, NoReturn
 OPERATOR_ALARM_CATALOG_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_operator_alarm_catalog_unavailable"
 )
-OPERATOR_ALARM_CATALOG_RESTORATION_GATES: Final = ("I5", "H0")
+OPERATOR_ALARM_CATALOG_REPLACEMENT_GATE: Final = "I5/H0"
 
 
 class OperatorAlarmCatalogUnavailableError(RuntimeError):
@@ -23,8 +23,8 @@ class OperatorAlarmCatalogUnavailableError(RuntimeError):
 
 
 def load_operator_alarm_catalog(_source: object = None) -> NoReturn:
-    """Fail closed until the headless JCS catalog owner is available."""
+    """Reject the obsolete Composer loader before inspecting its source."""
     raise OperatorAlarmCatalogUnavailableError(
-        f"{OPERATOR_ALARM_CATALOG_UNAVAILABLE_REASON_CODE}: the approved "
-        "canonical operator-alarm catalog loader returns at I5/H0"
+        f"{OPERATOR_ALARM_CATALOG_UNAVAILABLE_REASON_CODE}: the Composer "
+        "loader was replaced at I5/H0 by the manyforge_headless JCS catalog"
     )

@@ -2,8 +2,9 @@
 
 > **Cutover status:** retained as a restoration and behavior reference. The
 > command recipes below are not qualified on the current `dev` branch and
-> must not be executed until I5/H0 restores the assistant/headless boundary
-> and every workflow-dependent execution gate has passed. Unless explicitly
+> must not be executed until I6/N restores the provider/Program-operation
+> boundary and every workflow-dependent execution gate has passed. I5/H0
+> supplies read-only headless observation, not these workflows. Unless explicitly
 > marked as retained offline logic, present-tense wording below describes the
 > captured baseline, not a live service.
 
@@ -23,7 +24,8 @@ matrix.
 At the captured baseline, NemoClaw-Thor owned model serving while ManyForge
 owned the assistant-provider contract, mode catalog, bridge service, Composer
 callbacks, and this cookbook. Those ManyForge runtime owners are not current
-services; future ownership must follow the H0 boundary.
+services; their replacements must consume H0 owner-issued facts and follow the
+I6/N operation boundary.
 
 ## How Recipes Evolve
 

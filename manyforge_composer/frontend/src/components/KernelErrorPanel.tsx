@@ -102,6 +102,7 @@ interface KernelErrorPanelProps {
   presentation?: KernelErrorPresentation;
   presentationKey?: string;
   onDismiss?: () => void;
+  eyebrow?: string;
 }
 
 /**
@@ -114,6 +115,7 @@ export function KernelErrorPanel({
   presentation,
   presentationKey,
   onDismiss,
+  eyebrow = 'Kernel diagnostic',
 }: KernelErrorPanelProps) {
   const rows = detailRows(error.details);
   const headline = presentation?.headline || readableErrorCode(error.code);
@@ -127,7 +129,7 @@ export function KernelErrorPanel({
     >
       <header>
         <div>
-          <p className="eyebrow">Kernel diagnostic</p>
+          <p className="eyebrow">{eyebrow}</p>
           <h2>{headline}</h2>
         </div>
         {onDismiss && (

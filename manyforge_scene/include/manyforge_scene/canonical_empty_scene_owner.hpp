@@ -208,6 +208,13 @@ public:
       const override;
 
   [[nodiscard]] CanonicalEmptySceneAccessStatus ReadAccessStatus() const;
+  /// Returns the current immutable logical-scene snapshot after bootstrap has
+  /// established a real active projection. During a named Apply transition
+  /// this remains the frozen predecessor snapshot until Finalize selects the
+  /// candidate projection. Before bootstrap Finalize there is no public
+  /// logical-scene truth and the result is empty.
+  [[nodiscard]] std::optional<manyforge::core::LogicalSceneSnapshotRoot>
+  ReadActiveSnapshot() const;
   [[nodiscard]] CanonicalEmptySceneStoreIntegrityReport VerifyIntegrity() const;
 
   void Close();

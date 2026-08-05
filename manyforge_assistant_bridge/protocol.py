@@ -20,10 +20,11 @@ def compute_catalog_hash(catalog: dict[str, list[str]], mode: str) -> str:
     recomputing it only from an untrusted envelope proves nothing about which
     tools were authorized.
 
-    The input is an already-resolved set of visible identifiers. H0 must bind
-    it to independently trusted owner state; callers must never derive both
-    the catalog and the value used to authenticate that catalog from the same
-    untrusted request.
+    The input is an already-resolved set of visible identifiers. The H0 read
+    client obtains owner-issued state independently; a future N provider must
+    bind this hash to separately trusted catalog state. Callers must never
+    derive both the catalog and the value used to authenticate that catalog
+    from the same untrusted request.
     """
     normalized_mode = _bounded_identifier(mode, label="mode")
     if type(catalog) is not dict:

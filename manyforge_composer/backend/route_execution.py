@@ -2,7 +2,7 @@
 
 Executor separation is reusable client infrastructure; it does not own
 runtime, lifecycle, execution, or Stop semantics.  The former direct Kernel
-Stop backstop and CycleManager-named wrappers were removed.  Future H0/L0/P5
+Stop backstop and CycleManager-named wrappers were removed.  Future N/L0/P5
 routes may submit one already-typed synchronous client request through
 ``run_route_role`` and translate ``RouteExecutorBusyError`` at the transport
 boundary.

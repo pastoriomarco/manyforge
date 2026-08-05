@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, api, resolveStructuralAssetUrl } from './client';
+import type { OperatorAlarmRecord } from '../types/headless';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -73,5 +74,88 @@ describe('resolveStructuralAssetUrl', () => {
       'https://assets.example/model.glb',
     );
     expect(resolveStructuralAssetUrl('/api/model.glb')).toMatch(/\/api\/model\.glb$/);
+  });
+});
+
+describe('headless intent client', () => {
+  it('requests a bounded attention-newest alarm page', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({}));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.alarms.list()).rejects.toThrow('Invalid response');
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/execution/alarms?limit=32&ordering=attention_newest',
+    );
+  });
+
+  it('submits one exact alarm activation without a caller-supplied principal', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({ acknowledged: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    const alarm: OperatorAlarmRecord = {
+      conditionId: 'condition/one',
+      activationId: 'activation-2',
+      recordRevision: 7,
+      definitionId: 'manyforge.test.condition',
+      lifecycleState: 'active_unacknowledged',
+      active: true,
+      acknowledged: false,
+      priority: 'high',
+      alarmClass: 'runtime_health',
+      title: 'Test alarm',
+      message: 'Attention required.',
+      consequence: 'State is incomplete.',
+      operatorResponse: 'Inspect the source.',
+      occurrenceCount: 1,
+      activatedAtNs: 100,
+      requiresMotionAttention: false,
+      subject: { subjectKind: 'cell', subjectId: 'cell-1', resourceIds: [] },
+      details: {},
+    };
+
+    await api.alarms.acknowledge(
+      alarm,
+      'owner-epoch-3',
+      'request-4',
+    );
+
+    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('/api/execution/alarms/condition%2Fone/acknowledge');
+    expect(options.method).toBe('POST');
+    expect(JSON.parse(String(options.body))).toEqual({
+      request_id: 'request-4',
+      request_owner_epoch: 'owner-epoch-3',
+      source_label: 'composer_ui',
+      correlation_id: null,
+      activation_id: 'activation-2',
+      expected_record_revision: 7,
+      reason: null,
+      confirmed: true,
+    });
+    expect(String(options.body)).not.toContain('principal');
+  });
+
+  it('submits the exact common epoch, generation, and membership for bulk acknowledgement', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({ acknowledged: true }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.alarms.acknowledgeAll(
+      'owner-epoch-5',
+      9,
+      [{ conditionId: 'condition-a', activationId: 'activation-a', recordRevision: 3 }],
+      'request-6',
+    );
+
+    const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(options.body))).toMatchObject({
+      request_owner_epoch: 'owner-epoch-5',
+      expected_generation: 9,
+      members: [{
+        condition_id: 'condition-a',
+        activation_id: 'activation-a',
+        record_revision: 3,
+      }],
+      confirmed: true,
+    });
   });
 });

@@ -3,7 +3,7 @@
 The pure mapping remains usable during the composable-cell cutover.  The
 former effectful bridge polled Composer-owned runtime endpoints and is not
 retained as a hidden fallback; the module entrypoint stays unavailable until
-the headless diagnostic projection exists.
+I6/N supplies addressed runtime diagnostics over the headless substrate.
 
 The mapping produces one ``DiagnosticStatus`` per active backend
 fault (level/values mapped from the backend fault taxonomy) and an OK
@@ -41,7 +41,7 @@ LEVEL_ERROR = 2
 LEVEL_STALE = 3
 
 # Defensive bounds for this retained projection seam. They are not a
-# declaration of the future H0 wire contract.
+# declaration of the future N wire contract.
 MAX_ID_CHARS: Final = 256
 MAX_DETAIL_CHARS: Final = 2048
 MAX_DETAIL_ROWS: Final = 64
@@ -52,10 +52,10 @@ _MAX_JSON_DEPTH: Final = 8
 _MAX_JSON_NODES: Final = 256
 
 UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
-RESTORATION_GATE = "I5/H0"
+RESTORATION_GATE = "I6/N"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: ROS diagnostics publication requires the "
-    f"{RESTORATION_GATE} headless diagnostic projection"
+    f"{RESTORATION_GATE} addressed runtime diagnostic projection"
 )
 
 _SEVERITY_TO_LEVEL = {
@@ -222,7 +222,7 @@ def _validated_digest_fault(digest: object):
     """Validate the retained snapshot input before using its classifier.
 
     This bounds the historical JSON-shaped projection only; it does not
-    define or anticipate the future H0 transport contract.
+    define or anticipate the future N transport contract.
     """
 
     if type(digest) is not dict:

@@ -1,8 +1,8 @@
-"""Typed cutover gate for headless scene initialization.
+"""Permanent compatibility fence for headless scene initialization.
 
 The deleted Composer barrier and ``manyforge.scene_initialization.v1`` mapping
-were a mutable scene/runtime owner, not a client helper.  I5/H0 restores this
-responsibility in the C++ logical-scene/runtime owner.  Its focused evidence
+were a mutable scene/runtime owner, not a client helper.  I5/H0 replaces this
+responsibility with the C++ logical-scene/runtime owner.  Its focused evidence
 must cover generation-bound tokens, reset/seed/replay/open ordering,
 supersession and retirement, stale completion rejection, explicit capacities,
 latest eligible observation per source/object, failed-replay recovery, and no
@@ -19,7 +19,7 @@ from typing import Final, NoReturn
 SCENE_INITIALIZATION_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_scene_initialization_client_unavailable"
 )
-SCENE_INITIALIZATION_RESTORATION_GATES: Final = ("I5", "H0")
+SCENE_INITIALIZATION_REPLACEMENT_GATE: Final = "I5/H0"
 
 
 class SceneInitializationClientUnavailableError(RuntimeError):
@@ -28,8 +28,9 @@ class SceneInitializationClientUnavailableError(RuntimeError):
 
 def _raise_scene_initialization_unavailable() -> NoReturn:
     raise SceneInitializationClientUnavailableError(
-        f"{SCENE_INITIALIZATION_UNAVAILABLE_REASON_CODE}: the generation-fenced "
-        "headless scene owner returns at I5/H0"
+        f"{SCENE_INITIALIZATION_UNAVAILABLE_REASON_CODE}: the Composer-local "
+        "barrier was replaced at I5/H0 by the generation-fenced headless scene "
+        "owner; use its headless projection"
     )
 
 
@@ -50,7 +51,7 @@ def require_scene_initialization_client(
 
 
 __all__ = [
-    "SCENE_INITIALIZATION_RESTORATION_GATES",
+    "SCENE_INITIALIZATION_REPLACEMENT_GATE",
     "SCENE_INITIALIZATION_UNAVAILABLE_REASON_CODE",
     "SceneInitializationClient",
     "SceneInitializationClientUnavailableError",

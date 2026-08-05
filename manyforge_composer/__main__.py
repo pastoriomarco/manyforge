@@ -1,4 +1,4 @@
-"""Run the structural-only Composer cutover shell."""
+"""Run Composer as a structural shell and optional headless-runtime client."""
 
 from __future__ import annotations
 
@@ -77,12 +77,14 @@ def main() -> None:
         raise ComposerRuntimeUnavailableError()
 
     parser = argparse.ArgumentParser(
-        description="ManyForge Composer structural cutover shell"
+        description="ManyForge Composer structural and headless-client shell"
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--deployment-path")
     parser.add_argument("--static-dir")
+    parser.add_argument("--headless-api-url")
+    parser.add_argument("--headless-api-timeout-s", type=float, default=2.0)
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -98,20 +100,33 @@ def main() -> None:
         "::1",
     }:
         logger.warning(
-            "No MANYFORGE_API_TOKEN set — structural API is unauthenticated on %s:%d",
+            "No MANYFORGE_API_TOKEN set — Composer API is unauthenticated on %s:%d",
             args.host,
             args.port,
         )
-    state = ComposerState.from_deployment_path(
-        args.deployment_path,
-        allowed_fs_roots=security.allowed_fs_roots,
-    )
-    app = create_app(
-        state,
-        static_dir=args.static_dir,
-        security=security,
-    )
-    uvicorn.run(app, host=args.host, port=args.port)
+    headless_client = None
+    if args.headless_api_url is not None:
+        from manyforge_headless_api.client import HeadlessHttpClient
+
+        headless_client = HeadlessHttpClient(
+            args.headless_api_url,
+            timeout_seconds=args.headless_api_timeout_s,
+        )
+    try:
+        state = ComposerState.from_deployment_path(
+            args.deployment_path,
+            allowed_fs_roots=security.allowed_fs_roots,
+            headless_client=headless_client,
+        )
+        app = create_app(
+            state,
+            static_dir=args.static_dir,
+            security=security,
+        )
+        uvicorn.run(app, host=args.host, port=args.port)
+    finally:
+        if headless_client is not None:
+            headless_client.close()
 
 
 if __name__ == "__main__":

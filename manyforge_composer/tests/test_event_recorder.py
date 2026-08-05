@@ -41,7 +41,7 @@ import pytest
 
 from manyforge_composer.backend import event_recorder
 from manyforge_composer.backend.event_recorder import (
-    HISTORIAN_RESTORATION_GATES,
+    HISTORIAN_REPLACEMENT_GATE,
     HISTORY_SOURCE_REQUALIFICATION_GATES,
     EventPageBoundsError,
     EventRecorder,
@@ -99,7 +99,7 @@ def test_recorder_gate_fails_before_state_storage_or_event_access() -> None:
     with pytest.raises(HistorianClientUnavailableError):
         require_historian_client(poison, storage=poison)
 
-    assert HISTORIAN_RESTORATION_GATES == ("I5", "H0")
+    assert HISTORIAN_REPLACEMENT_GATE == "I5/H0"
     assert HISTORY_SOURCE_REQUALIFICATION_GATES == (
         "I6",
         "N",

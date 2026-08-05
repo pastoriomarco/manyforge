@@ -1,8 +1,9 @@
 # Historical Python supervision disposition
 
 Status: **the Python owners are deleted and relocation-qualified. The C++ I4
-successor owns and qualifies the migrated M0 runtime fixture; public headless
-client projection remains I5/H0 work.**
+successor owns and qualifies the migrated M0 runtime fixture, and the C++
+I5/H0 daemon/API candidate supplies the public owner-issued projection without
+reviving this package.**
 
 `manyforge_supervision` no longer ships a production Python package. The C++
 `manyforge_component_manager` package is the selected I4 semantic owner for
@@ -13,10 +14,11 @@ second owner and an undeclared fallback.
 The current Python sources under `verification/composable_cell_i4/` are
 deliberately test-only, product-effect-free reference fixtures. They are retained
 to state ownership and failure invariants; production code must not import
-them. A future Python surface may return here only as a thin NRT Manager
-client or process/status adapter over owner-issued facts. It must not restore
-the reducers, v1 heartbeat/policy wire, execution pin, or two-container
-teardown state machine recorded below.
+them. The thin Python surface now lives in `manyforge_headless_api`, over
+owner-issued facts. This historical package must not return as a Manager,
+process/status, or health owner, and no client may restore the reducers, v1
+heartbeat/policy wire, execution pin, or two-container teardown state machine
+recorded below.
 
 The 2026-08-01 relocation evidence qualifies the deletion and exact historical
 transfer ledger. Final I4 evidence binds the reconnectable retained-POSIX
@@ -68,13 +70,13 @@ Source: `manyforge_composer/tests/test_cell_supervisor.py`, blob
 | --- | --- |
 | `test_supervisor_starts_fenced_and_arms_only_complete_domain` | I4 durable staged readiness, dependency convergence, and `closed_no_active_effect` evidence are carried by the runtime-convergence and M0 tests. Manager never arms a robot domain. |
 | `test_unexpected_composer_exit_tears_down_owner_without_restart` | The teardown outcome is intentionally superseded: spec 100 §5.8 makes Composer/browser loss inert, while Manager loss leaves the exact runtime/epoch unchanged. Adapter and M0 process-loss tests carry the successor behavior. |
-| `test_reduced_domain_health_loss_tears_down_complete_domain` | I4 observes source loss and exposes nonconvergence without restoring Composer-owned aggregate health or containment. H0/I5 later projects that owner-issued fact. |
+| `test_reduced_domain_health_loss_tears_down_complete_domain` | I4 observes source loss and exposes nonconvergence without restoring Composer-owned aggregate health or containment. I5/H0 projects that owner-issued fact. |
 | `test_docker_process_control_observes_domain_in_one_bounded_call` | The closed retained-POSIX adapter supplies bounded exact process observation and fixed lifecycle effects without robot/lifecycle authority; fixed Docker-domain policy is not restored. |
-| `test_composer_probe_requires_progress_and_pins_epoch` | H0/I5 status source plus I4 receiver-local freshness/incarnation evidence; current C++/fixture observation tests carry the invariant. |
-| `test_composer_probe_requires_persistent_reduced_unhealthy_state` | H0/I5 source facts and I4 convergence policy; the old Composer-reduced health endpoint is not restored as authority. |
+| `test_composer_probe_requires_progress_and_pins_epoch` | I5/H0 status projection plus I4 receiver-local freshness/incarnation evidence; current C++/fixture observation tests carry the invariant. |
+| `test_composer_probe_requires_persistent_reduced_unhealthy_state` | I5/H0 source facts and I4 convergence policy; the old Composer-reduced health endpoint is not restored as authority. |
 | `test_explicit_shutdown_is_dependency_ordered` | I4 active-runtime tests prove reverse-dependency explicit shutdown, exact absence, idempotency, and fresh epochs after restart. |
 | `test_force_remove_is_recorded_as_unclean_not_physical_stop` | I4 intentionally exposes no force-remove or signal choice: uncertain fixed shutdown remains unavailable until observed. P5/I8 still proves that process teardown never substitutes for Kernel Stop. |
-| `test_runner_persists_one_terminal_epoch_and_restores_signals` | The reconnectable controller and durable process identity carry bounded Manager-loss/replacement and terminal process evidence; public bootstrap/client signal handling remains H0/I5. |
+| `test_runner_persists_one_terminal_epoch_and_restores_signals` | The reconnectable controller and durable process identity carry bounded Manager-loss/replacement and terminal process evidence; I5/H0 supplies public bootstrap and thin-client process handling. |
 | `test_runner_contains_domain_if_health_adapter_raises` | I4 fails closed on adapter/reconciliation errors and never restores the Python containment state machine. |
 
 ### v1 component-health and manifest cohort — 9 cases
@@ -92,7 +94,7 @@ Source: `manyforge_composer/tests/test_component_supervision.py`, blob
 | `test_missing_duplicate_regressed_and_conflicting_samples_fail_closed` | C++ I4 observation ingestion; carried by current C++ and fixture duplicate/conflict/regression tests. |
 | `test_same_epoch_heartbeat_does_not_fake_critical_progress` | C++ I4 receiver-local progress freshness; carried by current C++ and fixture tests. |
 | `test_dependency_epoch_mismatch_propagates_to_dependants` | C++ I4 causal dependency rejoin; carried by current C++ and fixture tests. |
-| `test_generation_changes_only_for_semantics_not_freshness` | H0/I5 owner-issued projection generation and I4 snapshot semantics; still future, not evidence supplied by the deleted Python generation counter. |
+| `test_generation_changes_only_for_semantics_not_freshness` | I5/H0 owner-issued projection generation and I4 snapshot semantics; the H0 implementation replaces rather than revives the deleted Python generation counter. |
 | `test_execution_pin_rejects_replacement_and_never_auto_repairs` | C++ Program Binding/Kernel/lifecycle admission at N/I6 and L0/I7, consuming I4 runtime epochs. The Python execution pin is not restored. |
 
 ### Python runtime-observation owner cohort — 23 cases

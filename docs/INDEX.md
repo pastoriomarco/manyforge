@@ -16,10 +16,12 @@ branch/commit workflow).
 > removed the legacy node factory and runtime resolver. Catalog inspection is
 > available. I4's internal C++ M0 proof now owns durable Apply and retained
 > reference-runtime convergence across Manager loss, crash/restart, and
-> explicit shutdown, but it exposes no public operator client and restores no
+> explicit shutdown. I5/H0 now exposes independent Manager, runtime, scene,
+> alarm, history, health, and retained-NodeEnvironment projections through a
+> bounded API/CLI and thin Composer clients, but it restores no execution
 > product lane. Composer program execution and the native, Isaac, and
-> real-robot product lanes are not available. H0 restores headless resolution,
-> N restores native execution, and I/R restore Isaac/real operation. Operator
+> real-robot product lanes are not available. N restores native execution, and
+> I/R restore Isaac/real operation. Operator
 > runbooks below remain baseline/reference material until their owning
 > restoration gate.
 
@@ -35,6 +37,7 @@ branch/commit workflow).
 | Study historical physical-Lite6 qualification | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md); unavailable until R/I10                        |
 | Understand ownership and data flow          | [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)                                                                            |
 | Integrate the current structural API        | Generated [`reference/REST_API.md`](reference/REST_API.md); former clients use the historical interaction index                       |
+| Integrate the current headless API          | Generated [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md); robot readiness/execution remain unavailable             |
 
 ## Historical operator runbooks (`docs/operations/`)
 
@@ -165,19 +168,24 @@ commands must not be run or cited as current lane evidence.
     support-contact handling, and temporary backend workarounds are
     restoration inputs rather than a live adapter claim.
 
-### Current generated public contract
+### Current generated public contracts
 
 These files are generated from owning code/models and must not be edited by
-hand. Regenerate the retained surface with
-`scripts/regen-public-contracts.py structural-rest`; CI guards freshness with
-`scripts/ci/check-public-contracts-fresh.sh structural-rest`. The historical
-no-argument aggregate forms are typed unavailable rather than silently
-checking only this reduced projection.
+hand. Regenerate one retained surface with
+`scripts/regen-public-contracts.py {structural-rest|headless-rest}`; CI guards
+freshness with the matching
+`scripts/ci/check-public-contracts-fresh.sh {structural-rest|headless-rest}`
+selector. The historical no-argument aggregate forms are typed unavailable
+rather than silently checking only a reduced projection.
 
 - [`reference/REST_API.md`](reference/REST_API.md)
 
   - Composer REST surface generated from FastAPI/OpenAPI. The live schema is
     also at `:9000/openapi.json` while Composer is running.
+- [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md)
+
+  - Independent I5/H0 owner-issued projection, generated from the headless
+    FastAPI application. The default live schema is at `:9010/openapi.json`.
 
 ### Historical Composer/client interaction references
 

@@ -11,7 +11,7 @@ responsibilities in one Composer process:
 * filtering and projecting already-recorded events for clients.
 
 Only the last, value-level responsibility still belongs in this Python
-package.  The headless C++ Historian returns at I5/H0 and owns asynchronous
+package.  The headless C++ Historian replaces the old recorder at I5/H0 and owns asynchronous
 durable raw/lifecycle records.  Source owners emit their own facts, and I8/P5
 owns Stop causality and terminality.  This module therefore contains no
 filesystem, thread, queue, clock, runtime, scene, CycleManager, Kernel,
@@ -32,7 +32,7 @@ from typing import Any, Final, Iterable, Mapping, NoReturn, Sequence
 HISTORIAN_CLIENT_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_historian_client_unavailable"
 )
-HISTORIAN_RESTORATION_GATES: Final = ("I5", "H0")
+HISTORIAN_REPLACEMENT_GATE: Final = "I5/H0"
 HISTORY_SOURCE_REQUALIFICATION_GATES: Final = (
     "I6",
     "N",
@@ -81,8 +81,9 @@ class EventPageBoundsError(ValueError):
 
 def _raise_historian_unavailable() -> NoReturn:
     raise HistorianClientUnavailableError(
-        f"{HISTORIAN_CLIENT_UNAVAILABLE_REASON_CODE}: the asynchronous "
-        "headless Historian and its thin query client return at I5/H0"
+        f"{HISTORIAN_CLIENT_UNAVAILABLE_REASON_CODE}: the Composer-local "
+        "recorder was replaced at I5/H0 by the asynchronous headless Historian; "
+        "use the manyforge_headless_api history projection"
     )
 
 
@@ -643,7 +644,7 @@ __all__ = [
     "EventPageBoundsError",
     "EventRecorder",
     "HISTORIAN_CLIENT_UNAVAILABLE_REASON_CODE",
-    "HISTORIAN_RESTORATION_GATES",
+    "HISTORIAN_REPLACEMENT_GATE",
     "HISTORY_SOURCE_REQUALIFICATION_GATES",
     "HistorianClientUnavailableError",
     "HistoryQuery",

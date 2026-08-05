@@ -1,4 +1,4 @@
-"""Typed, source-neutral diagnostic presentation for future clients.
+"""Typed, source-neutral diagnostic presentation for thin clients.
 
 The former helper reconciled CycleManager fields with a second Kernel snapshot
 and therefore selected runtime truth inside Composer.  The replacement accepts
@@ -31,7 +31,7 @@ def _dict_or_none(value: Any) -> dict[str, Any] | None:
 
 @dataclass(frozen=True, slots=True)
 class HeadlessDiagnosticSnapshot:
-    """One immutable client value produced by the future headless owner."""
+    """One immutable client value produced by a headless semantic owner."""
 
     state: Any
     error_code: str | None = None

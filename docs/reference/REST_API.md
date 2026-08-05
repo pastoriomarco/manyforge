@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-01 09:47:25 UTC
+  Last regenerated: 2026-08-05 15:47:17 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -11,9 +11,9 @@
 
 This is the structural-only Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, and health remain available. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
 
-The live schema is available at `/openapi.json` and `/docs` while Composer is running.
+The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
-OpenAPI version: `3.1.0`. Title: `ManyForge Composer (structural cutover shell)`.
+OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 
 ## Routes
 

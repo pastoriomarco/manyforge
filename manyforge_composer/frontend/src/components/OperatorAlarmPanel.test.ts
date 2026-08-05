@@ -37,5 +37,7 @@ describe('operator alarm presentation', () => {
     );
     expect(html).toContain('record revision');
     expect(html).toContain('does not clear the condition or resume motion');
+    expect(html).toContain('<details>');
+    expect(html).not.toContain('<details open="">');
   });
 });

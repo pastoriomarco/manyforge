@@ -307,6 +307,9 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
           {},
           {},
       },
+      std::nullopt,
+      {},
+      std::nullopt,
   };
 }
 

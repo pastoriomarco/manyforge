@@ -3,8 +3,9 @@
 > **Temporarily unavailable on `dev`:** the composable-cell destructive
 > migration has removed the legacy behavior-node factory/runtime path before
 > its replacement. This launcher guide records the last qualified baseline;
-> it must not be used to claim a working product lane until H0/N and the
-> lane-specific I/R restoration gates pass.
+> it must not be used to claim a working product lane until N and the
+> lane-specific I/R restoration gates pass. The H0 source candidate supplies
+> observation only; it does not restore launch or execution.
 > Unless explicitly identified as a retained parser or typed-unavailable
 > boundary, every present-tense command, process, endpoint, scenario, and
 > readiness claim below describes that baseline rather than current behavior.
@@ -13,8 +14,9 @@
 > `scripts/lib/vllm-status-watch.sh` (blob
 > `0d3f6a6d4a32fad8ea1ec6fa2086ad38f80d8cf2`) are intentionally absent from
 > the current tree: their port/PID/container and model-status ownership moves
-> to I4/H0 and the lane gates. Bounded presentation, prompt, wait, and frontend
-> build helpers remain only as owner-neutral restoration inputs.
+> to I4, the H0 observation surface, and the lane gates. Bounded presentation,
+> prompt, wait, and frontend build helpers remain only as owner-neutral
+> restoration inputs.
 
 This was the operator's recipe for bringing up the ManyForge stack with
 the unified launcher (`scripts/launch.sh`). Two flows are covered:

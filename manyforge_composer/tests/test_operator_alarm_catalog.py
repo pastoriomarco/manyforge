@@ -3,7 +3,7 @@
 import pytest
 
 from manyforge_composer.backend.operator_alarm_catalog import (
-    OPERATOR_ALARM_CATALOG_RESTORATION_GATES,
+    OPERATOR_ALARM_CATALOG_REPLACEMENT_GATE,
     OperatorAlarmCatalogUnavailableError,
     load_operator_alarm_catalog,
 )
@@ -20,4 +20,4 @@ def test_catalog_loader_fails_before_source_access() -> None:
     ):
         load_operator_alarm_catalog(PoisonSource())
 
-    assert OPERATOR_ALARM_CATALOG_RESTORATION_GATES == ("I5", "H0")
+    assert OPERATOR_ALARM_CATALOG_REPLACEMENT_GATE == "I5/H0"

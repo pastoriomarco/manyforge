@@ -53,6 +53,7 @@ check "manyforge_persistence CMakeLists.txt" "$(extract_cmake_version "${REPO_RO
 check "manyforge_scene CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_scene/CMakeLists.txt")"
 check "manyforge_component_manager CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_component_manager/CMakeLists.txt")"
 check "manyforge_deployment CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_deployment/CMakeLists.txt")"
+check "manyforge_headless CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_headless/CMakeLists.txt")"
 check "manyforge_roboplan CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_roboplan/CMakeLists.txt")"
 
 # Python packages — pyproject.toml `version = "X.Y.Z"`
@@ -62,7 +63,12 @@ extract_pyproject_version() {
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
 
-for pkg in manyforge_behavior manyforge_ros manyforge_composer manyforge_assistant_bridge; do
+for pkg in \
+    manyforge_behavior \
+    manyforge_ros \
+    manyforge_composer \
+    manyforge_assistant_bridge \
+    manyforge_headless_api; do
     file="${REPO_ROOT}/${pkg}/pyproject.toml"
     if [[ ! -f "${file}" ]]; then
         printf '  ✗ %-50s pyproject.toml missing\n' "${pkg}"

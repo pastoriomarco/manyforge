@@ -3,10 +3,10 @@
 The former module selected arbitrary Python provider factories from raw
 ``runtime_resources`` mappings, opened handles, owned rollback/close state, and
 served alias-based resources to behavior nodes.  That is runtime binding and
-lifecycle authority, not portable authoring logic.  Dynamic implementation
-availability returns through the headless resolver at I5/H0; native
-resource-addressed behavior binding returns at I6/N.  The raw v0 registry is
-never restored.
+lifecycle authority, not portable authoring logic.  I5/H0 now projects the
+verified retained implementation identity and runtime availability without
+constructing it; native resource-addressed behavior binding returns at I6/N.
+The raw v0 registry is never restored.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Final, NoReturn
 RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_runtime_resource_binding_unavailable"
 )
-RUNTIME_RESOURCE_BINDING_RESTORATION_GATES: Final = ("I5", "H0", "I6", "N")
+RUNTIME_RESOURCE_BINDING_RESTORATION_GATES: Final = ("I6", "N")
 
 
 class RuntimeResourceBindingUnavailableError(RuntimeError):
@@ -26,9 +26,9 @@ class RuntimeResourceBindingUnavailableError(RuntimeError):
 
 def _raise_runtime_resource_binding_unavailable() -> NoReturn:
     raise RuntimeResourceBindingUnavailableError(
-        f"{RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE}: dynamic "
-        "implementation availability returns at I5/H0 and resource-addressed "
-        "native behavior binding returns at I6/N"
+        f"{RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE}: H0 provides "
+        "read-only implementation availability; resource-addressed native "
+        "behavior binding returns at I6/N"
     )
 
 

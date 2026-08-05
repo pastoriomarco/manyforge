@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Regenerate the retained structural Composer REST reference.
+"""Regenerate code-owned structural Composer or headless H0 REST references.
 
-The composable-cell cutover intentionally removes the former MCP, assistant,
-viewer, scene, execution, lifecycle, and runtime contract owners. This script
-therefore has exactly one source and one output:
+The composable-cell cutover still removes the former aggregate MCP, assistant,
+viewer, execution, and lifecycle contract owners. The explicit generators are:
 
   - ``docs/reference/REST_API.md`` from
     ``create_app(ComposerState()).openapi()``.
+  - ``docs/reference/HEADLESS_REST_API.md`` from the independent H0 FastAPI
+    route owner.
 
 Do not add unavailable product surfaces or synthetic compatibility contracts
 to this generator. A restored public surface must first regain a real code
@@ -15,6 +16,7 @@ owner and complete its plan qualification gate.
 Usage:
     cd $REPO_ROOT
     python3 scripts/regen-public-contracts.py structural-rest
+    python3 scripts/regen-public-contracts.py headless-rest
 
 The script imports the retained Composer modules; run it from the standard
 Composer dev container. It fails closed if the application cannot be imported
@@ -28,9 +30,8 @@ import sys
 _UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
 _LEGACY_AGGREGATE_UNAVAILABLE_MESSAGE = (
     f"{_UNAVAILABLE_REASON_CODE}: aggregate public-contract generation is "
-    "unavailable while its former runtime contract owners are removed; use "
-    "the explicit structural-rest selector for the retained Composer REST "
-    "projection."
+    "unavailable while later runtime contract owners are removed; use one "
+    "explicit structural-rest or headless-rest selector."
 )
 
 
@@ -61,6 +62,7 @@ from typing import Callable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REF_DIR = REPO_ROOT / "docs" / "reference"
 REST_REFERENCE_PATH = REF_DIR / "REST_API.md"
+HEADLESS_REST_REFERENCE_PATH = REF_DIR / "HEADLESS_REST_API.md"
 
 # Composer is importable from the repository root, while manyforge_behavior
 # uses a nested package root. Keep direct invocation deterministic instead of
@@ -76,17 +78,18 @@ HEADER_TEMPLATE = (
     "  THIS FILE IS GENERATED — do not hand-edit. Source of truth: code.\n"
     "  Regenerate with:\n"
     "    cd <repository-root>\n"
-    "    python3 scripts/regen-public-contracts.py structural-rest\n"
+    "    python3 scripts/regen-public-contracts.py {selector}\n"
     "  Last regenerated: {timestamp}\n"
     "  Generator source: scripts/regen-public-contracts.py:{generator_name}\n"
     "-->\n\n"
 )
 
 
-def _stamp(generator_name: str) -> str:
+def _stamp(generator_name: str, selector: str) -> str:
     return HEADER_TEMPLATE.format(
         timestamp=time.strftime("%Y-%m-%d %H:%M:%S %Z"),
         generator_name=generator_name,
+        selector=selector,
     )
 
 
@@ -106,23 +109,10 @@ def _markdown_cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ").strip()
 
 
-def gen_rest_api() -> str:
-    """Render the retained Composer REST surface from FastAPI OpenAPI."""
-    from manyforge_composer.backend.app import create_app
-    from manyforge_composer.backend.state import ComposerState
-
-    spec = create_app(ComposerState()).openapi()
-    body: list[str] = [_stamp("gen_rest_api"), "# Composer REST API\n\n"]
-    body.append(
-        "This is the structural-only Composer surface retained during the "
-        "composable-cell runtime cutover. Catalog reads, sandboxed artifact "
-        "browsing, structural URDF assets, and health remain available. The "
-        "catch-all `/api/{unavailable_path}` operations return the typed "
-        "runtime-unavailable response for former product routes.\n\n"
-    )
+def _append_openapi_routes(body: list[str], spec: dict) -> None:
     body.append(
         "The live schema is available at `/openapi.json` and `/docs` while "
-        "Composer is running.\n\n"
+        "the API process is running.\n\n"
     )
     body.append(
         f"OpenAPI version: `{spec.get('openapi', '?')}`. "
@@ -144,6 +134,54 @@ def gen_rest_api() -> str:
                 f"| `{method.upper()}` | `{_markdown_cell(path)}` | "
                 f"{_markdown_cell(tag)} | {_markdown_cell(summary)} |\n"
             )
+
+
+def gen_rest_api() -> str:
+    """Render the retained Composer REST surface from FastAPI OpenAPI."""
+    from manyforge_composer.backend.app import create_app
+    from manyforge_composer.backend.state import ComposerState
+
+    spec = create_app(ComposerState()).openapi()
+    body: list[str] = [
+        _stamp("gen_rest_api", "structural-rest"),
+        "# Composer REST API\n\n",
+    ]
+    body.append(
+        "This is the structural-only Composer surface retained during the "
+        "composable-cell runtime cutover. Catalog reads, sandboxed artifact "
+        "browsing, structural URDF assets, and health remain available. The "
+        "catch-all `/api/{unavailable_path}` operations return the typed "
+        "runtime-unavailable response for former product routes.\n\n"
+    )
+    _append_openapi_routes(body, spec)
+    return "".join(body)
+
+
+def gen_headless_rest_api() -> str:
+    """Render the independent H0 REST surface from its FastAPI owner."""
+    from manyforge_headless_api.app import create_app
+
+    # Route construction is service-neutral. The schema-only sentinel is never
+    # started and no endpoint callback is invoked during OpenAPI generation.
+    spec = create_app(service=object()).openapi()
+    body: list[str] = [
+        _stamp("gen_headless_rest_api", "headless-rest"),
+        "# Headless Runtime REST API\n\n",
+    ]
+    body.append(
+        "This is the independent I5/H0 projection over Manager, logical-scene, "
+        "scene-runtime, Alarm Lifecycle, and Historian owners. Reads return "
+        "owner-issued facts. Alarm acknowledgement and Manager Apply are "
+        "attributed intents; Apply remains a typed `kernel_owner_unavailable` "
+        "operation until I6/N supplies the execution-host owner. No condition "
+        "mutation endpoint exists. `/api/health` reports only "
+        "`headless_projection_ready`; robot readiness has no H0 owner and is "
+        "explicitly unavailable. The alarm page defaults to 32 records and is "
+        "bounded at 128, history defaults to and is bounded at 32 records, "
+        "request bodies are bounded at 1 MiB, and native/HTTP responses are "
+        "bounded at 64 MiB.\n\n"
+    )
+    _append_openapi_routes(body, spec)
     return "".join(body)
 
 
@@ -163,11 +201,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Exit 1 if regeneration would change REST_API.md.",
     )
+    headless_rest = subparsers.add_parser(
+        "headless-rest",
+        help="Regenerate only the independent I5/H0 REST reference.",
+    )
+    headless_rest.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit 1 if regeneration would change HEADLESS_REST_API.md.",
+    )
     args = parser.parse_args(arguments)
 
-    targets: dict[Path, Callable[[], str]] = {
-        REST_REFERENCE_PATH: gen_rest_api,
-    }
+    targets: dict[Path, Callable[[], str]] = (
+        {REST_REFERENCE_PATH: gen_rest_api}
+        if args.selector == "structural-rest"
+        else {HEADLESS_REST_REFERENCE_PATH: gen_headless_rest_api}
+    )
     drift: list[str] = []
     for path, generator in targets.items():
         new_content = generator()
@@ -188,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     if drift:
         print("ERROR: regen would change: " + ", ".join(drift), file=sys.stderr)
         print(
-            "Run scripts/regen-public-contracts.py structural-rest to update.",
+            f"Run scripts/regen-public-contracts.py {args.selector} to update.",
             file=sys.stderr,
         )
         return 1

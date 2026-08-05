@@ -2,8 +2,9 @@
 
 > **Cutover status:** retained as a restoration and behavior reference. The
 > command recipes below are not qualified on the current `dev` branch and
-> must not be executed until I5/H0 restores the assistant/headless boundary
-> and every selected execution lane's gate passes. Present-tense descriptions
+> must not be executed until I6/N restores the provider/Program-operation
+> boundary and every selected execution lane's gate passes. I5/H0 supplies
+> read-only headless observation, not these provider-backed workflows. Present-tense descriptions
 > below are historical unless a section explicitly says it is retained and
 > offline.
 

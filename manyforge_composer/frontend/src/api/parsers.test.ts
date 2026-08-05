@@ -2,8 +2,90 @@ import { describe, expect, it } from 'vitest';
 import {
   StructuralContractError,
   parseCatalogResponse,
+  parseHealthResponse,
+  parseHeadlessRuntimeSnapshot,
+  parseHistorianPage,
+  parseOperatorAlarmSnapshot,
   parseSceneUrdfManifest,
 } from './parsers';
+
+function sourceSectionFixture(): Record<string, unknown> {
+  return {
+    available: true,
+    freshness: 'fresh',
+    known_gaps: [],
+    payload: { schema_version: 'fixture.v1' },
+    source_generation: 1,
+    source_owner_epoch: 'source-epoch-1',
+    source_owner_id: 'source-owner',
+    receiver_age_ns: 100,
+  };
+}
+
+function runtimeSnapshotFixture(): Record<string, unknown> {
+  return {
+    schema_version: 'manyforge.headless_runtime_snapshot.v1',
+    complete: true,
+    projection_generation: 4,
+    projection_owner_epoch: 'projection-epoch-1',
+    projection_owner_id: 'headless-api',
+    reasons: [],
+    unavailable_sections: [],
+    sections: {
+      manager: sourceSectionFixture(),
+      logical_scene: sourceSectionFixture(),
+      scene_runtime: sourceSectionFixture(),
+    },
+  };
+}
+
+function alarmSnapshotFixture(): Record<string, unknown> {
+  const alarm = {
+    condition_id: 'condition-1',
+    activation_id: 'activation-1',
+    record_revision: 3,
+    activated_at_ns: 100,
+    definition_id: 'manyforge.test.condition',
+    lifecycle_state: 'active_unacknowledged',
+    active: true,
+    acknowledged: false,
+    priority: 'high',
+    alarm_class: 'runtime_health',
+    title: 'Test alarm',
+    message: 'A condition requires attention.',
+    consequence: 'Runtime state may be incomplete.',
+    operator_response: 'Inspect the source.',
+    occurrence_count: 2,
+    requires_motion_attention: false,
+    subject: {
+      subject_kind: 'cell',
+      subject_id: 'cell-1',
+      resource_ids: [],
+    },
+    details: { source: 'fixture' },
+  };
+  return {
+    schema_version: 'manyforge.operator_alarm_snapshot.v2',
+    owner_id: 'alarm-owner',
+    owner_epoch: 'alarm-epoch-1',
+    generation: 2,
+    state_revision: 3,
+    reconciled: true,
+    health: { state: 'available', details: {} },
+    live_count: 1,
+    unacknowledged_count: 1,
+    active_count: 1,
+    active_acknowledged_count: 0,
+    motion_attention_count: 0,
+    unacknowledged_membership: [{
+      condition_id: 'condition-1',
+      activation_id: 'activation-1',
+      record_revision: 3,
+    }],
+    alarms: [alarm],
+    truncated: false,
+  };
+}
 
 function structuralManifestFixture(): Record<string, unknown> {
   return {
@@ -123,5 +205,84 @@ describe('parseCatalogResponse', () => {
     expect(() => parseCatalogResponse({ apiVersion: 'v1' })).toThrow(
       'catalog.apiVersion must be the literal "manyforge.node_catalog.v2"',
     );
+  });
+});
+
+describe('headless projection parsers', () => {
+  it('accepts structural and headless Composer health without inventing state', () => {
+    const structural = parseHealthResponse({
+      status: 'degraded',
+      mode: 'structural_only',
+      components: { runtime: 'unavailable' },
+      runtimeAvailability: {
+        code: 'composable_cell_runtime_unavailable',
+        message: 'Runtime is unavailable.',
+        restorationGates: ['N', 'L0', 'P5', 'I', 'R', 'T'],
+      },
+      timestamp: 1,
+    });
+    const headless = parseHealthResponse({
+      status: 'degraded',
+      mode: 'headless_client',
+      components: { runtime: 'degraded' },
+      runtimeAvailability: null,
+      headless: { schema_version: 'manyforge.headless_health.v1' },
+      timestamp: 2,
+    });
+
+    expect(structural.runtimeAvailability?.restorationGates).toEqual([
+      'N', 'L0', 'P5', 'I', 'R', 'T',
+    ]);
+    expect(structural.headless).toBeNull();
+    expect(headless.mode).toBe('headless_client');
+    expect(headless.runtimeAvailability).toBeNull();
+  });
+
+  it('accepts exact runtime and four-state alarm snapshots', () => {
+    const runtime = parseHeadlessRuntimeSnapshot(runtimeSnapshotFixture());
+    const alarms = parseOperatorAlarmSnapshot(alarmSnapshotFixture());
+
+    expect(runtime.sections.logicalScene.sourceOwnerEpoch).toBe('source-epoch-1');
+    expect(alarms.alarms[0]?.lifecycleState).toBe('active_unacknowledged');
+    expect(alarms.unacknowledgedMembership[0]?.recordRevision).toBe(3);
+  });
+
+  it('rejects unsafe fence numbers and unknown alarm lifecycle values', () => {
+    const runtime = runtimeSnapshotFixture();
+    runtime.projection_generation = Number.MAX_SAFE_INTEGER + 1;
+    expect(() => parseHeadlessRuntimeSnapshot(runtime)).toThrow(
+      'runtime.projection_generation must be a non-negative safe integer',
+    );
+
+    const alarms = alarmSnapshotFixture();
+    const [record] = alarms.alarms as Record<string, unknown>[];
+    record.lifecycle_state = 'cleared';
+    expect(() => parseOperatorAlarmSnapshot(alarms)).toThrow(
+      'a supported four-state alarm lifecycle value',
+    );
+  });
+
+  it('accepts the bounded historian page and validates event schema identity', () => {
+    const page = parseHistorianPage({
+      schema_version: 'manyforge.historian_page.v1',
+      events: [{
+        sequence: 7,
+        event: {
+          schema_version: 'manyforge.historian_event.v1',
+          event_id: 'event-1',
+          component: 'manyforge.alarm',
+          event_type: 'operator_alarm_activated',
+          severity: 'INFO',
+          occurred_at_ns: 123,
+          occurred_at_wall: '2026-08-05T12:00:00Z',
+          payload: { condition_id: 'condition-1' },
+        },
+      }],
+      next_before_sequence: null,
+      truncated: false,
+    });
+
+    expect(page.events[0]?.event.eventType).toBe('operator_alarm_activated');
+    expect(page.events[0]?.sequence).toBe(7);
   });
 });

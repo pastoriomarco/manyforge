@@ -9,7 +9,7 @@
     "reason_code": "composable_cell_runtime_unavailable",
     "historical_source": "manyforge@08222188293df8e12f90dc72e204c21f22f92ea1",
     "historical_blob": "e4097f2777ea45bcb3e9f09700aa357bcf378ad7",
-    "restoration_gates": ["H0/I5", "N/I6"],
+    "restoration_gates": ["N/I6"],
     "required_behavior": [
       "inject only a qualified public MCP client",
       "resolve owner-issued endpoints instead of a fixed Composer address",

@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace manyforge::component_manager {
 
@@ -39,11 +40,14 @@ inline constexpr std::size_t kMaximumManagerApplyPrivateMaterializations =
     kMaximumManagerApplyIntents;
 inline constexpr std::size_t kMaximumManagerApplyRetiredCommandSurfaceRecords =
     kMaximumManagerApplyIntents;
-inline constexpr std::size_t kMaximumManagerApplyPublicationReceipts = kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyPublicationReceipts =
+    kMaximumManagerApplyIntents;
 inline constexpr std::size_t kMaximumManagerApplySceneFinalizedRecords =
     kMaximumManagerApplyIntents;
-inline constexpr std::size_t kMaximumManagerApplyFenceReleaseIntents = kMaximumManagerApplyIntents;
-inline constexpr std::size_t kMaximumManagerApplyFenceReleasedRecords = kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyFenceReleaseIntents =
+    kMaximumManagerApplyIntents;
+inline constexpr std::size_t kMaximumManagerApplyFenceReleasedRecords =
+    kMaximumManagerApplyIntents;
 inline constexpr std::size_t kMaximumManagerApplyTerminalOutcomes =
     kMaximumManagerApplyIntents;
 inline constexpr std::size_t kMaximumManagerApplyFenceComponents = 256U;
@@ -265,8 +269,9 @@ struct PersistedManagerApplyPrivateMaterialization final {
   ManagerApplyPrivateMaterializationDTO private_materialization;
   manyforge::core::ContentDigest private_materialization_content_digest;
 
-  friend bool operator==(const PersistedManagerApplyPrivateMaterialization&,
-                         const PersistedManagerApplyPrivateMaterialization&) = default;
+  friend bool
+  operator==(const PersistedManagerApplyPrivateMaterialization &,
+             const PersistedManagerApplyPrivateMaterialization &) = default;
 };
 
 struct ManagerApplyPrivateMaterializationWriteResult final {
@@ -276,10 +281,12 @@ struct ManagerApplyPrivateMaterializationWriteResult final {
 
 struct PersistedManagerApplyObsoleteCommandSurfacesRetired final {
   ManagerApplyObsoleteCommandSurfacesRetiredDTO retired_command_surfaces;
-  manyforge::core::ContentDigest obsolete_managed_command_surfaces_retired_evidence_digest;
+  manyforge::core::ContentDigest
+      obsolete_managed_command_surfaces_retired_evidence_digest;
 
-  friend bool operator==(const PersistedManagerApplyObsoleteCommandSurfacesRetired&,
-                         const PersistedManagerApplyObsoleteCommandSurfacesRetired&) = default;
+  friend bool operator==(
+      const PersistedManagerApplyObsoleteCommandSurfacesRetired &,
+      const PersistedManagerApplyObsoleteCommandSurfacesRetired &) = default;
 };
 
 struct ManagerApplyObsoleteCommandSurfacesRetiredWriteResult final {
@@ -291,8 +298,9 @@ struct PersistedManagerApplyPublicationReceipt final {
   ManagerApplyPublicationReceiptDTO publication;
   manyforge::core::ContentDigest publication_receipt_digest;
 
-  friend bool operator==(const PersistedManagerApplyPublicationReceipt&,
-                         const PersistedManagerApplyPublicationReceipt&) = default;
+  friend bool
+  operator==(const PersistedManagerApplyPublicationReceipt &,
+             const PersistedManagerApplyPublicationReceipt &) = default;
 };
 
 struct ManagerApplyPublicationReceiptWriteResult final {
@@ -314,8 +322,9 @@ struct PersistedManagerApplyFenceReleaseIntent final {
   ManagerApplyFenceReleaseIntentDTO fence_release_intent;
   manyforge::core::ContentDigest fence_release_intent_digest;
 
-  friend bool operator==(const PersistedManagerApplyFenceReleaseIntent&,
-                         const PersistedManagerApplyFenceReleaseIntent&) = default;
+  friend bool
+  operator==(const PersistedManagerApplyFenceReleaseIntent &,
+             const PersistedManagerApplyFenceReleaseIntent &) = default;
 };
 
 struct ManagerApplyFenceReleaseIntentWriteResult final {
@@ -327,8 +336,8 @@ struct PersistedManagerApplyFenceReleased final {
   ManagerApplyFenceReleasedDTO fence_released;
   manyforge::core::ContentDigest fence_released_digest;
 
-  friend bool operator==(const PersistedManagerApplyFenceReleased&,
-                         const PersistedManagerApplyFenceReleased&) = default;
+  friend bool operator==(const PersistedManagerApplyFenceReleased &,
+                         const PersistedManagerApplyFenceReleased &) = default;
 };
 
 struct ManagerApplyFenceReleasedWriteResult final {
@@ -340,13 +349,42 @@ struct PersistedManagerApplyTerminalOutcome final {
   ManagerApplyTerminalOutcomeDTO terminal_outcome;
   manyforge::core::ContentDigest terminal_outcome_digest;
 
-  friend bool operator==(const PersistedManagerApplyTerminalOutcome&,
-                         const PersistedManagerApplyTerminalOutcome&) = default;
+  friend bool
+  operator==(const PersistedManagerApplyTerminalOutcome &,
+             const PersistedManagerApplyTerminalOutcome &) = default;
 };
 
 struct ManagerApplyTerminalOutcomeWriteResult final {
   PersistedManagerApplyTerminalOutcome record;
   bool inserted;
+};
+
+/// One transactionally consistent, immutable view of every durable record for
+/// one Apply generation. Missing members mean that the corresponding phase
+/// has not been durably reached; no mutable phase label is stored or inferred
+/// by the journal.
+struct PersistedManagerApplyStatus final {
+  PersistedManagerApplyIntent intent;
+  std::optional<PersistedManagerApplyAffectedScope> affected_scope;
+  std::optional<PersistedManagerApplyFenceAttempt> fence_attempt;
+  std::optional<PersistedManagerApplyFenceAcceptance> fence_acceptance;
+  std::optional<PersistedManagerApplyRuntimeConvergenceIntent>
+      runtime_convergence_intent;
+  std::optional<PersistedManagerApplyRuntimeStagedReady>
+      latest_runtime_staged_ready;
+  std::optional<PersistedManagerApplySceneStageIntent> scene_stage_intent;
+  std::optional<PersistedManagerApplySceneStaged> scene_staged;
+  std::optional<PersistedManagerApplyActivationSelection> activation_selection;
+  std::optional<PersistedManagerApplySceneActivated> scene_activated;
+  std::optional<PersistedManagerApplyPrivateMaterialization>
+      private_materialization;
+  std::optional<PersistedManagerApplyObsoleteCommandSurfacesRetired>
+      retired_command_surfaces;
+  std::optional<PersistedManagerApplyPublicationReceipt> publication_receipt;
+  std::optional<PersistedManagerApplySceneFinalized> scene_finalized;
+  std::optional<PersistedManagerApplyFenceReleaseIntent> fence_release_intent;
+  std::optional<PersistedManagerApplyFenceReleased> fence_released;
+  std::optional<PersistedManagerApplyTerminalOutcome> terminal_outcome;
 };
 
 struct ManagerApplyJournalIntegrityReport final {
@@ -409,6 +447,8 @@ public:
   [[nodiscard]] std::optional<PersistedManagerApplyIntent>
   ReadIntent(const manyforge::core::ApplyId &apply_id,
              manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] std::vector<PersistedManagerApplyStatus>
+  ReadStatusInventory() const;
   [[nodiscard]] std::optional<PersistedManagerApplyIntent>
   ReadRequest(const manyforge::core::RequestOwnerEpoch &request_owner_epoch,
               const manyforge::core::RequestId &request_id) const;
@@ -472,43 +512,51 @@ public:
   [[nodiscard]] std::optional<PersistedManagerApplySceneActivated>
   ReadSceneActivated(const manyforge::core::ApplyId &apply_id,
                      manyforge::core::ApplyGeneration apply_generation) const;
-  [[nodiscard]] ManagerApplyPrivateMaterializationWriteResult EnsurePrivateMaterialization(
-      const ManagerApplyPrivateMaterializationDTO& private_materialization);
+  [[nodiscard]] ManagerApplyPrivateMaterializationWriteResult
+  EnsurePrivateMaterialization(
+      const ManagerApplyPrivateMaterializationDTO &private_materialization);
   [[nodiscard]] std::optional<PersistedManagerApplyPrivateMaterialization>
-  ReadPrivateMaterialization(const manyforge::core::ApplyId& apply_id,
-                             manyforge::core::ApplyGeneration apply_generation) const;
+  ReadPrivateMaterialization(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
   [[nodiscard]] ManagerApplyObsoleteCommandSurfacesRetiredWriteResult
   EnsureObsoleteCommandSurfacesRetired(
-      const ManagerApplyObsoleteCommandSurfacesRetiredDTO& retired_command_surfaces);
+      const ManagerApplyObsoleteCommandSurfacesRetiredDTO
+          &retired_command_surfaces);
   [[nodiscard]]
   std::optional<PersistedManagerApplyObsoleteCommandSurfacesRetired>
-  ReadObsoleteCommandSurfacesRetired(const manyforge::core::ApplyId& apply_id,
-                                     manyforge::core::ApplyGeneration apply_generation) const;
-  [[nodiscard]] ManagerApplyPublicationReceiptWriteResult EnsurePublicationReceipt(
-      const ManagerApplyPublicationReceiptDTO& publication);
-  [[nodiscard]] std::optional<PersistedManagerApplyPublicationReceipt> ReadPublicationReceipt(
-      const manyforge::core::ApplyId& apply_id,
+  ReadObsoleteCommandSurfacesRetired(
+      const manyforge::core::ApplyId &apply_id,
       manyforge::core::ApplyGeneration apply_generation) const;
-  [[nodiscard]] ManagerApplySceneFinalizedWriteResult EnsureSceneFinalized(
-      const ManagerApplySceneFinalizedDTO& scene_finalized);
-  [[nodiscard]] std::optional<PersistedManagerApplySceneFinalized> ReadSceneFinalized(
-      const manyforge::core::ApplyId& apply_id,
+  [[nodiscard]] ManagerApplyPublicationReceiptWriteResult
+  EnsurePublicationReceipt(
+      const ManagerApplyPublicationReceiptDTO &publication);
+  [[nodiscard]] std::optional<PersistedManagerApplyPublicationReceipt>
+  ReadPublicationReceipt(
+      const manyforge::core::ApplyId &apply_id,
       manyforge::core::ApplyGeneration apply_generation) const;
-  [[nodiscard]] ManagerApplyFenceReleaseIntentWriteResult EnsureFenceReleaseIntent(
-      const ManagerApplyFenceReleaseIntentDTO& fence_release_intent);
-  [[nodiscard]] std::optional<PersistedManagerApplyFenceReleaseIntent> ReadFenceReleaseIntent(
-      const manyforge::core::ApplyId& apply_id,
+  [[nodiscard]] ManagerApplySceneFinalizedWriteResult
+  EnsureSceneFinalized(const ManagerApplySceneFinalizedDTO &scene_finalized);
+  [[nodiscard]] std::optional<PersistedManagerApplySceneFinalized>
+  ReadSceneFinalized(const manyforge::core::ApplyId &apply_id,
+                     manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyFenceReleaseIntentWriteResult
+  EnsureFenceReleaseIntent(
+      const ManagerApplyFenceReleaseIntentDTO &fence_release_intent);
+  [[nodiscard]] std::optional<PersistedManagerApplyFenceReleaseIntent>
+  ReadFenceReleaseIntent(
+      const manyforge::core::ApplyId &apply_id,
       manyforge::core::ApplyGeneration apply_generation) const;
-  [[nodiscard]] ManagerApplyFenceReleasedWriteResult EnsureFenceReleased(
-      const ManagerApplyFenceReleasedDTO& fence_released);
-  [[nodiscard]] std::optional<PersistedManagerApplyFenceReleased> ReadFenceReleased(
-      const manyforge::core::ApplyId& apply_id,
-      manyforge::core::ApplyGeneration apply_generation) const;
-  [[nodiscard]] ManagerApplyTerminalOutcomeWriteResult EnsureTerminalOutcome(
-      const ManagerApplyTerminalOutcomeDTO& terminal_outcome);
-  [[nodiscard]] std::optional<PersistedManagerApplyTerminalOutcome> ReadTerminalOutcome(
-      const manyforge::core::ApplyId& apply_id,
-      manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyFenceReleasedWriteResult
+  EnsureFenceReleased(const ManagerApplyFenceReleasedDTO &fence_released);
+  [[nodiscard]] std::optional<PersistedManagerApplyFenceReleased>
+  ReadFenceReleased(const manyforge::core::ApplyId &apply_id,
+                    manyforge::core::ApplyGeneration apply_generation) const;
+  [[nodiscard]] ManagerApplyTerminalOutcomeWriteResult
+  EnsureTerminalOutcome(const ManagerApplyTerminalOutcomeDTO &terminal_outcome);
+  [[nodiscard]] std::optional<PersistedManagerApplyTerminalOutcome>
+  ReadTerminalOutcome(const manyforge::core::ApplyId &apply_id,
+                      manyforge::core::ApplyGeneration apply_generation) const;
   [[nodiscard]] ManagerApplyJournalIntegrityReport VerifyIntegrity() const;
 
   void Close();

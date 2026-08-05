@@ -122,6 +122,32 @@ def test_explicit_structural_rest_generator_routes_write_and_check(
     assert calls == ["structural-rest"] * 3
 
 
+def test_explicit_headless_rest_generator_routes_write_and_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_generator_module()
+    reference = tmp_path / "HEADLESS_REST_API.md"
+    calls: list[str] = []
+
+    def generate() -> str:
+        calls.append("headless-rest")
+        return "generated headless REST\n"
+
+    monkeypatch.setattr(module, "HEADLESS_REST_REFERENCE_PATH", reference)
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(module, "gen_headless_rest_api", generate)
+
+    assert module.main(["headless-rest"]) == 0
+    assert reference.read_text(encoding="utf-8") == "generated headless REST\n"
+    assert module.main(["headless-rest", "--check"]) == 0
+
+    reference.write_text("stale headless REST\n", encoding="utf-8")
+    assert module.main(["headless-rest", "--check"]) == 1
+    assert reference.read_text(encoding="utf-8") == "stale headless REST\n"
+    assert calls == ["headless-rest"] * 3
+
+
 def _write_recording_command(path: Path) -> None:
     path.write_text(
         "#!/usr/bin/env bash\n"
@@ -159,23 +185,11 @@ def test_historical_freshness_wrapper_cannot_reach_python_or_docker(
     assert not calls.exists()
 
 
-@pytest.mark.parametrize(
-    ("inside_container", "expected"),
-    (
-        (
-            True,
-            "scripts/regen-public-contracts.py structural-rest --check",
-        ),
-        (
-            False,
-            "compose run --rm -e INSIDE_MANYFORGE_DEV_CONTAINER=1 dev "
-            "python3 scripts/regen-public-contracts.py structural-rest --check",
-        ),
-    ),
-)
+@pytest.mark.parametrize("selector", ("structural-rest", "headless-rest"))
+@pytest.mark.parametrize("inside_container", (True, False))
 def test_explicit_freshness_selector_routes_to_the_bounded_generator(
     inside_container: bool,
-    expected: str,
+    selector: str,
     tmp_path: Path,
 ) -> None:
     fake_bin = tmp_path / "bin"
@@ -193,7 +207,7 @@ def test_explicit_freshness_selector_routes_to_the_bounded_generator(
         environment["INSIDE_MANYFORGE_DEV_CONTAINER"] = "1"
 
     completed = subprocess.run(
-        ["bash", str(_FRESHNESS_WRAPPER), "structural-rest"],
+        ["bash", str(_FRESHNESS_WRAPPER), selector],
         cwd=_REPO_ROOT,
         env=environment,
         capture_output=True,
@@ -202,6 +216,12 @@ def test_explicit_freshness_selector_routes_to_the_bounded_generator(
     )
 
     assert completed.returncode == 0, completed.stderr
+    expected = (
+        f"scripts/regen-public-contracts.py {selector} --check"
+        if inside_container
+        else "compose run --rm -e INSIDE_MANYFORGE_DEV_CONTAINER=1 dev "
+        f"python3 scripts/regen-public-contracts.py {selector} --check"
+    )
     assert calls.read_text(encoding="utf-8").splitlines() == [expected]
 
 

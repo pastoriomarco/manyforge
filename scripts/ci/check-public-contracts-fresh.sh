@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# check-public-contracts-fresh.sh — guard that the generated structural
-# Composer REST reference is up-to-date with the retained FastAPI app.
+# check-public-contracts-fresh.sh — guard one explicitly selected generated
+# Composer or headless REST reference.
 #
 # `docs/reference/REST_API.md` is produced by
 # `scripts/regen-public-contracts.py` from
-# `create_app(ComposerState()).openapi()`. MCP, assistant, viewer, scene,
-# execution, lifecycle, and runtime contracts are intentionally not generated
-# while those product owners are unavailable during the composable-cell
-# cutover.
+# `create_app(ComposerState()).openapi()`; `docs/reference/HEADLESS_REST_API.md`
+# comes from the independent H0 FastAPI route owner. Removed aggregate MCP,
+# assistant-provider, viewer, execution, and lifecycle contracts are not
+# generated.
 #
 # The historical no-argument form represented the removed aggregate contract
 # check and is unavailable.  The retained REST-only check requires the
-# explicit `structural-rest` selector and exits 1 on drift.
+# explicit `structural-rest` or `headless-rest` selector and exits 1 on drift.
 #
 # It MUST run inside the manyforge dev container — the regen script
 # imports the retained Composer app and structural state, which require the
@@ -26,15 +26,15 @@
 set -euo pipefail
 
 readonly UNAVAILABLE_REASON_CODE="composable_cell_runtime_unavailable"
-readonly LEGACY_AGGREGATE_UNAVAILABLE_MESSAGE="${UNAVAILABLE_REASON_CODE}: aggregate public-contract freshness is unavailable while its former runtime contract owners are removed; use the explicit structural-rest selector for the retained Composer REST projection."
+readonly LEGACY_AGGREGATE_UNAVAILABLE_MESSAGE="${UNAVAILABLE_REASON_CODE}: aggregate public-contract freshness is unavailable while later runtime owners are removed; use one explicit structural-rest or headless-rest selector."
 
 if (( $# == 0 )); then
   builtin printf '%s\n' "${LEGACY_AGGREGATE_UNAVAILABLE_MESSAGE}" >&2
   exit 78
 fi
 
-if (( $# != 1 )) || [[ "$1" != "structural-rest" ]]; then
-  builtin printf 'Usage: %s structural-rest\n' "$0" >&2
+if (( $# != 1 )) || { [[ "$1" != "structural-rest" ]] && [[ "$1" != "headless-rest" ]]; }; then
+  builtin printf 'Usage: %s {structural-rest|headless-rest}\n' "$0" >&2
   exit 64
 fi
 
@@ -43,7 +43,7 @@ cd "${REPO_ROOT}"
 
 if [[ -n "${INSIDE_MANYFORGE_DEV_CONTAINER:-}" ]]; then
   # Already inside the dev image — run the check directly.
-  exec python3 scripts/regen-public-contracts.py structural-rest --check
+  exec python3 scripts/regen-public-contracts.py "$1" --check
 fi
 
 # Host invocation: shell out to docker compose. The `dev` service mounts
@@ -57,4 +57,4 @@ fi
 exec docker compose run --rm \
   -e INSIDE_MANYFORGE_DEV_CONTAINER=1 \
   dev \
-  python3 scripts/regen-public-contracts.py structural-rest --check
+  python3 scripts/regen-public-contracts.py "$1" --check

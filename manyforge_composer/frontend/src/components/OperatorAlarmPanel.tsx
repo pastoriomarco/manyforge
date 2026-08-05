@@ -24,7 +24,8 @@ interface OperatorAlarmPanelProps {
 
 /**
  * Alarm presentation and exact-record callback binding retained for I5. The
- * adapter owns lifecycle interpretation, freshness, and acknowledgement API.
+ * headless owner supplies lifecycle and freshness; this component only maps
+ * those facts and submits acknowledgement intent through its callback.
  */
 export function OperatorAlarmPanel({
   alarm,
@@ -32,26 +33,37 @@ export function OperatorAlarmPanel({
   onAcknowledge,
   onMinimize,
 }: OperatorAlarmPanelProps) {
+  const occurrenceCount = alarm.details.occurrence_count;
+  const countLabel = typeof occurrenceCount === 'number'
+    ? ` · ${occurrenceCount} occurrence${occurrenceCount === 1 ? '' : 's'}`
+    : '';
   return (
     <div className="operator-alarm-panel">
-      <KernelErrorPanel
-        error={{
-          code: alarm.definitionId,
-          message: alarm.message,
-          details: {
-            ...alarm.details,
-            condition_id: alarm.conditionId,
-            activation_id: alarm.activationId,
-            record_revision: alarm.recordRevision,
-          },
-        }}
-        presentation={{
-          headline: `${alarm.lifecycleLabel} · ${alarm.priorityLabel} · ${alarm.title}`,
-          hint: alarm.operatorResponse,
-          severity: alarm.severity,
-        }}
-        presentationKey={`${alarm.conditionId}:${alarm.activationId}`}
-      />
+      <details>
+        <summary>
+          {alarm.lifecycleLabel} · {alarm.priorityLabel} · {alarm.title}
+          {countLabel}
+        </summary>
+        <KernelErrorPanel
+          error={{
+            code: alarm.definitionId,
+            message: alarm.message,
+            details: {
+              ...alarm.details,
+              condition_id: alarm.conditionId,
+              activation_id: alarm.activationId,
+              record_revision: alarm.recordRevision,
+            },
+          }}
+          presentation={{
+            headline: `${alarm.lifecycleLabel} · ${alarm.priorityLabel} · ${alarm.title}`,
+            hint: alarm.operatorResponse,
+            severity: alarm.severity,
+          }}
+          presentationKey={`${alarm.conditionId}:${alarm.activationId}`}
+          eyebrow="Operator alarm"
+        />
+      </details>
       <div className="operator-alarm-actions">
         <button type="button" onClick={onMinimize}>Minimize</button>
         <button

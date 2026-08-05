@@ -2973,6 +2973,26 @@ CanonicalEmptySceneOwner::ReadAccessStatus() const {
   return status;
 }
 
+std::optional<LogicalSceneSnapshotRoot>
+CanonicalEmptySceneOwner::ReadActiveSnapshot() const {
+  std::lock_guard lock(impl_->mutex_);
+  const auto state = impl_->ReadStateTransaction();
+  if (!state.active_projection.has_value()) {
+    return std::nullopt;
+  }
+  if (!state.accepted.has_value() ||
+      state.accepted->snapshot.revision !=
+          state.active_projection->scene_revision ||
+      state.accepted->snapshot.cell_id != impl_->fixed_query_.cell_id) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "active projection does not identify the durable logical-scene "
+        "snapshot");
+  }
+  return LogicalSceneSnapshotRoot(
+      std::make_shared<const LogicalSceneSnapshotDTO>(
+          state.accepted->snapshot));
+}
+
 CanonicalEmptySceneStoreIntegrityReport
 CanonicalEmptySceneOwner::VerifyIntegrity() const {
   std::lock_guard lock(impl_->mutex_);

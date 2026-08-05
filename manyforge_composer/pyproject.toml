@@ -24,6 +24,9 @@ dependencies = [
 visual = [
     "pin==3.9.0",
 ]
+headless = [
+    "manyforge_headless_api>=0.1.0,<0.2.0",
+]
 
 [tool.setuptools]
 # Flat layout — the directory containing this pyproject.toml IS the package.

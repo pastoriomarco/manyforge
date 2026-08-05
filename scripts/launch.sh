@@ -11,8 +11,10 @@
 #       -> thin operator client over Manager/headless facts at I4/I5;
 #   native program/deployment launch and smoke orchestration
 #       -> addressed native client at N/I6;
-#   assistant selection, setup, bridge, and status orchestration
-#       -> qualified headless assistant client at H0/I5 and N/I6;
+#   assistant status observation
+#       -> qualified read-only headless client at H0/I5;
+#   assistant selection, setup, bridge, and provider operation
+#       -> addressed assistant client at N/I6;
 #   Isaac and real-robot lane orchestration
 #       -> I/I9 and R/I10 respectively; and
 #   stop/cleanup of PID files, named containers, Compose services, and the

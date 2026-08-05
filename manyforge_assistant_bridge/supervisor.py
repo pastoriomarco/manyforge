@@ -1,11 +1,12 @@
-"""Pure assistant observation reducer plus the fenced H0 supervisor boundary.
+"""Pure assistant observation reducer plus the fenced product supervisor.
 
 The complete effectful supervisor is pinned at source blob
 ``8c0ecee5ad79b553063c0f171740a3ccf617e8d7`` (sha256
 ``febb08a34f5b13491cbc7675656a51135b0f360dca71c8c97be47d95eab40978``).
 Its HTTP probes (lines 77-142), Composer-v0 status envelope (164-230), status
 POST (232-256), polling/signal loop, and shutdown post (264-304) are H0
-reimplementation and acceptance inputs, not a callable fallback.
+and I6/N acceptance inputs, not a callable fallback. H0 supplies the separate
+owner-neutral read client; it does not restore assistant-product publication.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ MAX_COMPONENTS: Final = 16
 SUPERVISOR_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_assistant_supervisor_unavailable"
 )
-SUPERVISOR_RESTORATION_GATE: Final = "H0"
+SUPERVISOR_RESTORATION_GATE: Final = "I6/N"
 
 
 class AssistantSupervisorUnavailableError(RuntimeError):
@@ -203,7 +204,7 @@ def post_status(
     del config, payload
     raise AssistantSupervisorUnavailableError(
         f"{SUPERVISOR_UNAVAILABLE_REASON_CODE}: status publication requires "
-        "the qualified H0 headless status endpoint"
+        "the I6/N assistant-product status owner; H0 provides reads only"
     )
 
 
@@ -211,7 +212,7 @@ def main() -> int:
     """Fail before configuration, network probes, publication, or looping."""
 
     logger.error(
-        "%s: assistant supervision requires the H0 status endpoint",
+        "%s: assistant supervision requires the I6/N assistant-product owner",
         SUPERVISOR_UNAVAILABLE_REASON_CODE,
     )
     return 78

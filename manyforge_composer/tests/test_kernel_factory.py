@@ -83,6 +83,9 @@ def test_structural_options_are_not_classified_as_removed_runtime_options() -> N
             "--deployment-path",
             "deployment.yaml",
             "--static-dir=dist",
+            "--headless-api-url",
+            "http://127.0.0.1:9010",
+            "--headless-api-timeout-s=2.0",
             "--log-level",
             "INFO",
         )

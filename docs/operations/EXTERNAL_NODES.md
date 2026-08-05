@@ -3,8 +3,11 @@
 > **Current status:** trusted extension nodes are intentionally unavailable.
 > ManyForge does not scan node folders, import a caller-selected Python file,
 > merge a runtime catalog, or instantiate an extension implementation. The
-> headless implementation/availability resolver returns at **I5/H0** and
-> component/target-addressed execution returns at **I6/N**.
+> **I5/H0** headless projection now independently verifies the immutable
+> built-in NodeEnvironment selected by Manager and reports its implementation
+> identity and runtime availability. It explicitly reports execution as
+> unavailable; component/target-addressed execution returns at **I6/N**, and
+> no installable extension-package contract is claimed yet.
 
 This runbook records the supported authoring boundary and the work required to
 restore trusted extensions without restoring the deleted v1 architecture. It
@@ -43,8 +46,9 @@ from executable identity:
    package identities, and source identities.
 5. Component Manager retains that environment with the selected deployment
    bundle.
-6. At I5/H0, the headless owner will project dynamic availability without
-   changing catalog meaning.
+6. At I5/H0, the headless projection independently verifies this retained
+   environment and adds runtime availability without changing catalog meaning
+   or constructing an implementation.
 7. At I6/N, the program runner will resolve the retained implementation and
    invoke resource-addressed semantic owners.
 
@@ -150,9 +154,9 @@ Acceptance moves in dependency order:
 
 | Historical cases | Disposition |
 | --- | --- |
-| Descriptor shape, schema preservation, duplicate IDs, compatible versions, source containment, immutable captured source, and CLI validation | Recreate against the closed v2 extension-package compiler and retained environment. Never restore `manyforge.external_node.v0` or path import. |
-| `test_descriptor_*`, `test_non_strict_discovery_*`, `test_strict_discovery_*`, `test_external_import_*`, constructor checks, module-cache checks, and generated-node CLI checks | Compiler/package acceptance before H0, using content/package identities rather than folders and Python symbols. |
-| Registry execution, normal tree outcomes, contained tick/terminate exceptions, structured diagnostics, and captured-environment behavior | I5/H0 implementation resolution and dynamic availability, then I6/N addressed execution. |
+| Descriptor shape, schema preservation, duplicate IDs, compatible versions, source containment, immutable captured source, and CLI validation | Recreate against a future closed v2 extension-package compiler and retained environment before extension enablement. Never restore `manyforge.external_node.v0` or path import. |
+| `test_descriptor_*`, `test_non_strict_discovery_*`, `test_strict_discovery_*`, `test_external_import_*`, constructor checks, module-cache checks, and generated-node CLI checks | Future extension-package acceptance using content/package identities rather than folders and Python symbols; H0 qualifies only the retained built-in environment projection. |
+| Registry execution, normal tree outcomes, contained tick/terminate exceptions, structured diagnostics, and captured-environment behavior | I5/H0 now verifies and projects the selected built-in implementation identity and runtime availability; I6/N must supply addressed execution. |
 | Runtime-resource setup, alias admission, provider construction, rollback, close, and enablement tests | Replace with retained deployment/Program-Binding resolution at I6/N. The Python `runtime_resources` registry and deployment `external_nodes` fields never return. |
 | PLC example `test_success`, `test_provider_failure`, `test_timeout_cancels`, and `test_stop_cancels_in_flight_operation` | Dependency-neutral attempt decisions remain tested in the example. Actual command/result/cancellation behavior returns through `kernel.command_target` at I6/N; Stop remains Kernel-owned and is requalified at I8/P5. |
 

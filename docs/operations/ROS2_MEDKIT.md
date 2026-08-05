@@ -3,8 +3,9 @@
 > **Cutover status (2026-07-31):** there is no runnable ManyForge Medkit or
 > generic diagnostics process on the current composable-cell branch. The
 > pure fault reducer, diagnostic mapping, and ROS message translation remain;
-> both effectful entrypoints exit 78 before network or ROS effects. I5/H0 must
-> restore them as thin clients of owner-issued headless diagnostics, not by
+> both effectful entrypoints exit 78 before network or ROS effects. I6/N must
+> restore them as thin clients of addressed owner-issued diagnostics over the
+> H0 substrate, not by
 > reviving Composer runtime authority. The recipes and operational behavior
 > below describe the implementation at
 > `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`; they are acceptance
@@ -17,9 +18,9 @@ boundary may couple to medkit.
 
 | Historical surface | Preserved requirement | Current disposition |
 | --- | --- | --- |
-| `manyforge_ros.diagnostics_bridge` | Taxonomy-mapped statuses plus an OK heartbeat on `/diagnostics`. | Pure mapping and ROS translation retained; process awaits H0 source/API. |
-| `manyforge_medkit_adapter` | FAILED on latch, PASSED healing, archive reference, severity, and discovery mapping. | Pure reducer retained; ROS service process awaits H0 source/API. |
-| `GET /api/debug/export/ros2-medkit` | Normalized, served trace export rather than an implicit push owner. | Historical API requirement; future owner/API assigned at H0. |
+| `manyforge_ros.diagnostics_bridge` | Taxonomy-mapped statuses plus an OK heartbeat on `/diagnostics`. | Pure mapping and ROS translation retained; process awaits the I6/N addressed runtime-diagnostics source. |
+| `manyforge_medkit_adapter` | FAILED on latch, PASSED healing, archive reference, severity, and discovery mapping. | Pure reducer retained; ROS service process awaits the I6/N addressed runtime-diagnostics source. |
+| `GET /api/debug/export/ros2-medkit` | Normalized, served trace export rather than an implicit push owner. | Historical API requirement; the replacement addressed export remains an I6/N responsibility. |
 
 Fault codes are `MANYFORGE_<REASON_CODE>` (UPPER_SNAKE, ≤64 chars, from the
 Phase 6A taxonomy in `manyforge_behavior.cycle_manager.

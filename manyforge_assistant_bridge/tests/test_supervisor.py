@@ -3,8 +3,9 @@
 The effectful historical cohorts remain pinned in source blob
 8c0ecee5ad79b553063c0f171740a3ccf617e8d7: HTTP probes at lines 77-142,
 Composer-v0 reduction/publication at 164-256, and polling/shutdown at 264-304.
-H0 acceptance must recover endpoint failure, model-identity mismatch, optional
-proxy selection, readiness transitions, bounded polling, and shutdown truth.
+I6/N acceptance must recover endpoint failure, model-identity mismatch,
+optional proxy selection, readiness transitions, bounded polling, and shutdown
+truth. H0 qualifies only the separate closed read client.
 """
 
 from __future__ import annotations
@@ -105,8 +106,8 @@ def test_old_status_transport_is_fenced_before_network() -> None:
         )
 
 
-def test_historical_effectful_supervisor_cohorts_remain_assigned_to_h0() -> None:
-    assert supervisor.SUPERVISOR_RESTORATION_GATE == "H0"
+def test_historical_effectful_supervisor_cohorts_remain_assigned_after_h0_reads() -> None:
+    assert supervisor.SUPERVISOR_RESTORATION_GATE == "I6/N"
     source = inspect.getsource(supervisor)
     assert "8c0ecee5ad79b553063c0f171740a3ccf617e8d7" in source
     assert "lines 77-142" in source

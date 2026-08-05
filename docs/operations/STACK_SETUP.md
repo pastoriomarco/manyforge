@@ -4,8 +4,9 @@
 
 > **Temporarily unavailable on `dev`:** the composable-cell destructive
 > migration has intentionally taken product-lane startup offline. This runbook
-> records the last qualified baseline until H0/N and the lane-specific I/R
-> restoration gates pass.
+> records the last qualified baseline until N and the lane-specific I/R
+> restoration gates pass. The H0 source candidate supplies observation only;
+> it does not restore product-lane startup.
 > Unless explicitly identified as current structural/offline tooling,
 > present-tense commands, services, and availability claims below describe
 > that baseline rather than the current branch.

@@ -18,6 +18,20 @@ import type {
   SceneUrdfVisual,
   Vector3Tuple,
 } from '../types/api';
+import type {
+  AlarmLifecycleState,
+  AlarmMembership,
+  AlarmPriority,
+  AlarmSubject,
+  ComposerHeadlessState,
+  HeadlessRuntimeSnapshot,
+  HeadlessSourceSection,
+  HistorianEvent,
+  HistorianPage,
+  OperatorAlarmRecord,
+  OperatorAlarmSnapshot,
+  SourceFreshness,
+} from '../types/headless';
 
 type JsonObject = Record<string, unknown>;
 
@@ -72,6 +86,14 @@ function numberAt(value: unknown, path: string): number {
     return fail(path, 'a finite number');
   }
   return value;
+}
+
+function integerAt(value: unknown, path: string): number {
+  const number = numberAt(value, path);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    return fail(path, 'a non-negative safe integer');
+  }
+  return number;
 }
 
 function nullableNumberAt(value: unknown, path: string): number | null {
@@ -255,29 +277,36 @@ function parseCatalogEntry(value: unknown, path: string): CatalogEntry {
 
 export function parseHealthResponse(value: unknown): HealthResponse {
   const record = objectAt(value, 'health');
-  const availability = objectAt(
-    record.runtimeAvailability,
-    'health.runtimeAvailability',
-  );
   const mode = stringAt(record.mode, 'health.mode');
-  if (mode !== 'structural_only') {
-    return fail('health.mode', 'the literal "structural_only"');
+  if (mode !== 'structural_only' && mode !== 'headless_client') {
+    return fail('health.mode', '"structural_only" or "headless_client"');
+  }
+  const availability = record.runtimeAvailability === null
+    ? null
+    : objectAt(record.runtimeAvailability, 'health.runtimeAvailability');
+  if (mode === 'structural_only' && availability === null) {
+    return fail('health.runtimeAvailability', 'an unavailable-runtime object');
   }
   return {
     status: stringAt(record.status, 'health.status'),
     mode,
     components: stringRecordAt(record.components, 'health.components'),
-    runtimeAvailability: {
-      code: stringAt(availability.code, 'health.runtimeAvailability.code'),
-      message: stringAt(
-        availability.message,
-        'health.runtimeAvailability.message',
-      ),
-      restorationGates: stringArrayAt(
-        availability.restorationGates,
-        'health.runtimeAvailability.restorationGates',
-      ),
-    },
+    runtimeAvailability: availability === null
+      ? null
+      : {
+          code: stringAt(availability.code, 'health.runtimeAvailability.code'),
+          message: stringAt(
+            availability.message,
+            'health.runtimeAvailability.message',
+          ),
+          restorationGates: stringArrayAt(
+            availability.restorationGates,
+            'health.runtimeAvailability.restorationGates',
+          ),
+        },
+    headless: record.headless === undefined
+      ? null
+      : objectAt(record.headless, 'health.headless'),
     timestamp: numberAt(record.timestamp, 'health.timestamp'),
   };
 }
@@ -567,5 +596,293 @@ export function parseSceneUrdfManifest(value: unknown): SceneUrdfManifest {
     joints: arrayAt(record.joints, 'manifest.joints').map((joint, index) =>
       parseJoint(joint, `manifest.joints[${index}]`),
     ),
+  };
+}
+
+function sourceFreshnessAt(value: unknown, path: string): SourceFreshness {
+  const freshness = stringAt(value, path);
+  if (!['fresh', 'stale', 'unavailable'].includes(freshness)) {
+    return fail(path, 'fresh, stale, or unavailable');
+  }
+  return freshness as SourceFreshness;
+}
+
+function parseHeadlessSourceSection(
+  value: unknown,
+  path: string,
+): HeadlessSourceSection {
+  const record = objectAt(value, path);
+  return {
+    available: booleanAt(record.available, `${path}.available`),
+    freshness: sourceFreshnessAt(record.freshness, `${path}.freshness`),
+    knownGaps: stringArrayAt(record.known_gaps, `${path}.known_gaps`),
+    payload: record.payload === null
+      ? null
+      : objectAt(record.payload, `${path}.payload`),
+    sourceGeneration: nullableNumberAt(
+      record.source_generation,
+      `${path}.source_generation`,
+    ),
+    sourceOwnerEpoch: nullableStringAt(
+      record.source_owner_epoch,
+      `${path}.source_owner_epoch`,
+    ),
+    sourceOwnerId: nullableStringAt(
+      record.source_owner_id,
+      `${path}.source_owner_id`,
+    ),
+    receiverAgeNs: nullableNumberAt(
+      record.receiver_age_ns,
+      `${path}.receiver_age_ns`,
+    ),
+  };
+}
+
+export function parseHeadlessRuntimeSnapshot(
+  value: unknown,
+): HeadlessRuntimeSnapshot {
+  const record = objectAt(value, 'runtime');
+  const schemaVersion = stringAt(record.schema_version, 'runtime.schema_version');
+  if (schemaVersion !== 'manyforge.headless_runtime_snapshot.v1') {
+    return fail(
+      'runtime.schema_version',
+      'manyforge.headless_runtime_snapshot.v1',
+    );
+  }
+  const sections = objectAt(record.sections, 'runtime.sections');
+  return {
+    schemaVersion,
+    complete: booleanAt(record.complete, 'runtime.complete'),
+    projectionGeneration: integerAt(
+      record.projection_generation,
+      'runtime.projection_generation',
+    ),
+    projectionOwnerEpoch: stringAt(
+      record.projection_owner_epoch,
+      'runtime.projection_owner_epoch',
+    ),
+    projectionOwnerId: stringAt(
+      record.projection_owner_id,
+      'runtime.projection_owner_id',
+    ),
+    reasons: stringArrayAt(record.reasons, 'runtime.reasons'),
+    unavailableSections: stringArrayAt(
+      record.unavailable_sections,
+      'runtime.unavailable_sections',
+    ),
+    sections: {
+      manager: parseHeadlessSourceSection(
+        sections.manager,
+        'runtime.sections.manager',
+      ),
+      logicalScene: parseHeadlessSourceSection(
+        sections.logical_scene,
+        'runtime.sections.logical_scene',
+      ),
+      sceneRuntime: parseHeadlessSourceSection(
+        sections.scene_runtime,
+        'runtime.sections.scene_runtime',
+      ),
+    },
+  };
+}
+
+function alarmLifecycleStateAt(
+  value: unknown,
+  path: string,
+): AlarmLifecycleState {
+  const state = stringAt(value, path);
+  if (![
+    'active_unacknowledged',
+    'active_acknowledged',
+    'returned_unacknowledged',
+    'returned_acknowledged',
+  ].includes(state)) {
+    return fail(path, 'a supported four-state alarm lifecycle value');
+  }
+  return state as AlarmLifecycleState;
+}
+
+function alarmPriorityAt(value: unknown, path: string): AlarmPriority {
+  const priority = stringAt(value, path);
+  if (!['critical', 'high', 'medium', 'low'].includes(priority)) {
+    return fail(path, 'critical, high, medium, or low');
+  }
+  return priority as AlarmPriority;
+}
+
+function parseAlarmSubject(value: unknown, path: string): AlarmSubject {
+  const record = objectAt(value, path);
+  return {
+    subjectKind: stringAt(record.subject_kind, `${path}.subject_kind`),
+    subjectId: stringAt(record.subject_id, `${path}.subject_id`),
+    resourceIds: stringArrayAt(record.resource_ids, `${path}.resource_ids`),
+  };
+}
+
+function parseAlarmMembership(value: unknown, path: string): AlarmMembership {
+  const record = objectAt(value, path);
+  return {
+    conditionId: stringAt(record.condition_id, `${path}.condition_id`),
+    activationId: stringAt(record.activation_id, `${path}.activation_id`),
+    recordRevision: integerAt(record.record_revision, `${path}.record_revision`),
+  };
+}
+
+function parseOperatorAlarmRecord(
+  value: unknown,
+  path: string,
+): OperatorAlarmRecord {
+  const record = objectAt(value, path);
+  return {
+    ...parseAlarmMembership(record, path),
+    activatedAtNs: integerAt(record.activated_at_ns, `${path}.activated_at_ns`),
+    definitionId: stringAt(record.definition_id, `${path}.definition_id`),
+    lifecycleState: alarmLifecycleStateAt(
+      record.lifecycle_state,
+      `${path}.lifecycle_state`,
+    ),
+    active: booleanAt(record.active, `${path}.active`),
+    acknowledged: booleanAt(record.acknowledged, `${path}.acknowledged`),
+    priority: alarmPriorityAt(record.priority, `${path}.priority`),
+    alarmClass: stringAt(record.alarm_class, `${path}.alarm_class`),
+    title: stringAt(record.title, `${path}.title`),
+    message: stringAt(record.message, `${path}.message`),
+    consequence: stringAt(record.consequence, `${path}.consequence`),
+    operatorResponse: stringAt(
+      record.operator_response,
+      `${path}.operator_response`,
+    ),
+    occurrenceCount: integerAt(
+      record.occurrence_count,
+      `${path}.occurrence_count`,
+    ),
+    requiresMotionAttention: booleanAt(
+      record.requires_motion_attention,
+      `${path}.requires_motion_attention`,
+    ),
+    subject: parseAlarmSubject(record.subject, `${path}.subject`),
+    details: objectAt(record.details, `${path}.details`),
+  };
+}
+
+export function parseOperatorAlarmSnapshot(
+  value: unknown,
+): OperatorAlarmSnapshot {
+  const record = objectAt(value, 'alarms');
+  const schemaVersion = stringAt(record.schema_version, 'alarms.schema_version');
+  if (schemaVersion !== 'manyforge.operator_alarm_snapshot.v2') {
+    return fail(
+      'alarms.schema_version',
+      'manyforge.operator_alarm_snapshot.v2',
+    );
+  }
+  const health = objectAt(record.health, 'alarms.health');
+  return {
+    schemaVersion,
+    ownerId: stringAt(record.owner_id, 'alarms.owner_id'),
+    ownerEpoch: stringAt(record.owner_epoch, 'alarms.owner_epoch'),
+    generation: integerAt(record.generation, 'alarms.generation'),
+    stateRevision: integerAt(record.state_revision, 'alarms.state_revision'),
+    reconciled: booleanAt(record.reconciled, 'alarms.reconciled'),
+    healthState: stringAt(health.state, 'alarms.health.state'),
+    liveCount: integerAt(record.live_count, 'alarms.live_count'),
+    unacknowledgedCount: integerAt(
+      record.unacknowledged_count,
+      'alarms.unacknowledged_count',
+    ),
+    activeCount: integerAt(record.active_count, 'alarms.active_count'),
+    activeAcknowledgedCount: integerAt(
+      record.active_acknowledged_count,
+      'alarms.active_acknowledged_count',
+    ),
+    motionAttentionCount: integerAt(
+      record.motion_attention_count,
+      'alarms.motion_attention_count',
+    ),
+    unacknowledgedMembership: arrayAt(
+      record.unacknowledged_membership,
+      'alarms.unacknowledged_membership',
+    ).map((item, index) => parseAlarmMembership(
+      item,
+      `alarms.unacknowledged_membership[${index}]`,
+    )),
+    alarms: arrayAt(record.alarms, 'alarms.alarms').map((item, index) =>
+      parseOperatorAlarmRecord(item, `alarms.alarms[${index}]`)),
+    truncated: booleanAt(record.truncated, 'alarms.truncated'),
+  };
+}
+
+export function parseComposerHeadlessState(
+  value: unknown,
+): ComposerHeadlessState {
+  const record = objectAt(value, 'headlessState');
+  const schemaVersion = stringAt(
+    record.schema_version,
+    'headlessState.schema_version',
+  );
+  if (schemaVersion !== 'manyforge.composer_headless_state.v1') {
+    return fail(
+      'headlessState.schema_version',
+      'manyforge.composer_headless_state.v1',
+    );
+  }
+  return {
+    schemaVersion,
+    runtime: parseHeadlessRuntimeSnapshot(record.runtime),
+    alarms: parseOperatorAlarmSnapshot(record.alarms),
+  };
+}
+
+export function parseObjectResponse(value: unknown): Record<string, unknown> {
+  return objectAt(value, 'response');
+}
+
+function parseHistorianEvent(value: unknown, path: string): HistorianEvent {
+  const record = objectAt(value, path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.historian_event.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.historian_event.v1');
+  }
+  return {
+    schemaVersion,
+    eventId: stringAt(record.event_id, `${path}.event_id`),
+    component: stringAt(record.component, `${path}.component`),
+    eventType: stringAt(record.event_type, `${path}.event_type`),
+    severity: stringAt(record.severity, `${path}.severity`),
+    occurredAtNs: integerAt(record.occurred_at_ns, `${path}.occurred_at_ns`),
+    occurredAtWall: stringAt(
+      record.occurred_at_wall,
+      `${path}.occurred_at_wall`,
+    ),
+    payload: objectAt(record.payload, `${path}.payload`),
+  };
+}
+
+export function parseHistorianPage(value: unknown): HistorianPage {
+  const record = objectAt(value, 'history');
+  const schemaVersion = stringAt(record.schema_version, 'history.schema_version');
+  if (schemaVersion !== 'manyforge.historian_page.v1') {
+    return fail('history.schema_version', 'manyforge.historian_page.v1');
+  }
+  return {
+    schemaVersion,
+    events: arrayAt(record.events, 'history.events').map((value, index) => {
+      const stored = objectAt(value, `history.events[${index}]`);
+      return {
+        sequence: integerAt(
+          stored.sequence,
+          `history.events[${index}].sequence`,
+        ),
+        event: parseHistorianEvent(
+          stored.event,
+          `history.events[${index}].event`,
+        ),
+      };
+    }),
+    nextBeforeSequence: record.next_before_sequence === null
+      ? null
+      : integerAt(record.next_before_sequence, 'history.next_before_sequence'),
+    truncated: booleanAt(record.truncated, 'history.truncated'),
   };
 }

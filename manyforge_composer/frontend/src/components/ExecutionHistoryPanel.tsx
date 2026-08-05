@@ -129,7 +129,7 @@ export function ExecutionHistoryPanel({
       <header>
         <div>
           <p className="eyebrow">Authoritative event projection</p>
-          <h2 id="history-title">Execution history</h2>
+          <h2 id="history-title">Runtime history</h2>
         </div>
         <button type="button" onClick={onClose}>Close</button>
       </header>

@@ -3,7 +3,7 @@
 import pytest
 
 from manyforge_composer.backend.runtime_requirements import (
-    RUNTIME_REQUIREMENTS_RESTORATION_GATES,
+    RUNTIME_REQUIREMENTS_REPLACEMENT_GATES,
     RuntimeRequirementsClient,
     RuntimeRequirementsClientUnavailableError,
     assess_runtime_requirements,
@@ -32,4 +32,4 @@ def test_assessment_fails_before_legacy_inference() -> None:
     ):
         assess_runtime_requirements(poison, lane=poison)
 
-    assert RUNTIME_REQUIREMENTS_RESTORATION_GATES == ("I5", "H0", "I6", "N")
+    assert RUNTIME_REQUIREMENTS_REPLACEMENT_GATES == ("I5/H0", "I6/N")

@@ -1,9 +1,9 @@
-"""Wire-neutral recovery guidance for future assistant clients.
+"""Wire-neutral recovery guidance for assistant clients.
 
 This module deliberately knows nothing about the former Composer tool IDs,
 node-catalog wire, or free-form backend error strings.  It contains only pure
-presentation mechanics that a future H0/N assistant client may bind to its
-typed operation and error contracts.
+presentation mechanics that the H0 read client and future N operation client
+may bind to typed owner-issued error contracts.
 """
 
 from __future__ import annotations

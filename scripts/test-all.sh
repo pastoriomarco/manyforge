@@ -5,6 +5,7 @@
 # Usage (from /workspace):
 #   ./scripts/test-all.sh retained # current reduced aggregate
 #   ./scripts/test-all.sh cpp      # retained C++ only
+#   ./scripts/test-all.sh headless # qualified I5/H0 owner and client surfaces
 #   ./scripts/test-all.sh python   # retained Python only
 #   ./scripts/test-all.sh bindings # ROS-free I2 compiler bindings
 
@@ -159,6 +160,22 @@ build_manyforge_component_manager() {
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
 
+build_manyforge_headless() {
+    local build="$1"
+    local pybind11_cmake_dir
+    pybind11_cmake_dir="$(
+        python3 -c 'import pybind11; print(pybind11.get_cmake_dir())'
+    )"
+    mkdir -p "$build"
+    cd "$build"
+    cmake "$WORKSPACE/manyforge_headless" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=ON \
+        -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
+        -Dpybind11_DIR="$pybind11_cmake_dir" \
+        -DMANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+}
+
 run_cpp_tests() {
     section "C++ manyforge_content_identity tests"
     local identity_build="$BUILD_DIR/content-identity"
@@ -289,6 +306,49 @@ PY
 
 }
 
+run_headless_cpp_tests() {
+    section "C++ I5/H0 headless owner tests"
+    local build="$BUILD_DIR/headless"
+    build_manyforge_headless "$build"
+    cd "$build"
+    if ! require_ctest_tests "manyforge_headless"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_headless_python_tests() {
+    section "Python I5/H0 API, CLI, and process-boundary tests"
+    local build="$BUILD_DIR/headless"
+    cd "$WORKSPACE"
+    setup_pythonpath
+    export PYTHONPATH="$build:$PYTHONPATH"
+    if ! python_has_modules fastapi httpx pydantic uvicorn manyforge_headless_py; then
+        echo -e "${RED}  FAIL: missing I5/H0 Python or native binding dependencies${NC}"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    if MANYFORGE_MANAGER_DAEMON="$build/manyforge_manager_daemon" \
+        MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
+        pytest \
+            manyforge_headless_api/tests/ \
+            manyforge_headless_api/process_tests/ \
+            -p no:cacheprovider \
+            -v; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_headless_tests() {
+    run_headless_cpp_tests
+    run_headless_python_tests
+}
+
 run_pybind_tests() {
     section "ROS-free pybind11 compiler bindings"
     local stage_root="${MANYFORGE_BINDINGS_STAGE_ROOT:-${BUILD_DIR}-bindings-stage}"
@@ -356,7 +416,7 @@ run_integration_tests() {
 }
 
 run_bridge_tests() {
-    section "Retained assistant protocol and supervisor tests"
+    section "Assistant H0 read client and retained protocol tests"
     cd "$WORKSPACE"
     setup_pythonpath
     if ! python_has_modules fastapi httpx; then
@@ -452,6 +512,10 @@ run_ros_tests() {
 case "$FILTER" in
     cpp)
         run_cpp_tests
+        run_headless_cpp_tests
+        ;;
+    headless)
+        run_headless_tests
         ;;
     roboplan)
         run_roboplan_tests
@@ -495,6 +559,7 @@ case "$FILTER" in
         # This name is deliberately narrower than the historical `all`: it
         # covers only the currently retained structural/offline surfaces.
         run_cpp_tests
+        run_headless_tests
         run_roboplan_tests
         run_python_tests
         run_observability_client_tests
@@ -504,7 +569,7 @@ case "$FILTER" in
         run_composer_frontend_tests
         ;;
     *)
-        echo "Usage: $0 [retained|cpp|roboplan|bindings|python|composer|bridge|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
+        echo "Usage: $0 [retained|cpp|headless|roboplan|bindings|python|composer|bridge|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
         exit 1
         ;;
 esac

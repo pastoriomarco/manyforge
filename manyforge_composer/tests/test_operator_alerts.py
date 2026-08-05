@@ -1,4 +1,4 @@
-"""Bounded immutable alarm-history coverage and the I5/H0 owner gate."""
+"""Bounded immutable alarm-history coverage and the legacy-owner fence."""
 
 from collections.abc import Iterator, Mapping
 from typing import Any
@@ -7,7 +7,7 @@ import pytest
 
 from manyforge_composer.backend import operator_alarms
 from manyforge_composer.backend.operator_alarms import (
-    OPERATOR_ALARM_OWNER_RESTORATION_GATES,
+    OPERATOR_ALARM_OWNER_REPLACEMENT_GATE,
     AlarmLifecycleFact,
     OperatorAlarmManager,
     OperatorAlarmOwnerUnavailableError,
@@ -173,4 +173,4 @@ def test_manager_fails_before_catalog_or_collaborator_access() -> None:
     ):
         OperatorAlarmManager(poison, history_sink=poison)
 
-    assert OPERATOR_ALARM_OWNER_RESTORATION_GATES == ("I5", "H0")
+    assert OPERATOR_ALARM_OWNER_REPLACEMENT_GATE == "I5/H0"

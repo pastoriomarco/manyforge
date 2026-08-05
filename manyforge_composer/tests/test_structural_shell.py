@@ -40,6 +40,14 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert health.json()["runtimeAvailability"]["code"] == (
         "composable_cell_runtime_unavailable"
     )
+    assert health.json()["runtimeAvailability"]["restorationGates"] == [
+        "N",
+        "L0",
+        "P5",
+        "I",
+        "R",
+        "T",
+    ]
 
     catalog = client.get("/api/catalog")
     assert catalog.status_code == 200

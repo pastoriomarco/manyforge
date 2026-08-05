@@ -15,7 +15,7 @@ from typing import Final
 RUNTIME_REQUIREMENTS_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_runtime_requirements_client_unavailable"
 )
-RUNTIME_REQUIREMENTS_RESTORATION_GATES: Final = ("I5", "H0", "I6", "N")
+RUNTIME_REQUIREMENTS_REPLACEMENT_GATES: Final = ("I5/H0", "I6/N")
 
 
 class RuntimeRequirementsClientUnavailableError(RuntimeError):
@@ -24,8 +24,10 @@ class RuntimeRequirementsClientUnavailableError(RuntimeError):
 
 def _raise_runtime_requirements_unavailable() -> None:
     raise RuntimeRequirementsClientUnavailableError(
-        f"{RUNTIME_REQUIREMENTS_UNAVAILABLE_REASON_CODE}: v2 retained-unit and "
-        "provider availability projection returns at I5/H0 and I6/N"
+        f"{RUNTIME_REQUIREMENTS_UNAVAILABLE_REASON_CODE}: H0 replaced the "
+        "environment-availability portion with manyforge_headless_api; the "
+        "selected Program Binding completes the replacement at I6/N, and this "
+        "legacy inference helper does not return"
     )
 
 

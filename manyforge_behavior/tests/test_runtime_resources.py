@@ -57,14 +57,12 @@ def test_runtime_resource_entrypoints_gate_before_input_or_effects(
 
     message = str(raised.value)
     assert RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE in message
-    assert "I5/H0" in message
+    assert "H0 provides read-only implementation availability" in message
     assert "I6/N" in message
 
 
 def test_runtime_resource_gate_names_exact_restoration_order() -> None:
     assert RUNTIME_RESOURCE_BINDING_RESTORATION_GATES == (
-        "I5",
-        "H0",
         "I6",
         "N",
     )

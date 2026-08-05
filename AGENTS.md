@@ -16,12 +16,15 @@
 > offline. I4 now owns the bounded canonical-empty-to-reference-runtime M0
 > path: durable Apply recovery, active publication, retained-process
 > convergence across Manager replacement, active-plan reconciliation, and
-> explicit shutdown are qualified without a robot port. This is an internal
-> C++ owner/process proof, not a public Manager daemon, CLI/HTTP surface, or
-> restored product lane. Composer's structural catalog/files/URDF shell is
-> also available.
+> explicit shutdown are qualified without a robot port. I5/H0 now hosts that
+> owner in a sole-process Manager daemon and adds independent runtime/scene
+> aggregation, scene-initialization lifetime, alarm lifecycle, historian,
+> retained-NodeEnvironment verification, bounded API/CLI, and thin Composer,
+> assistant, and MCP read clients. Composer's structural catalog/files/URDF
+> shell remains available. H0 is an observation and attributed-intent surface,
+> not a restored execution product lane.
 > Program execution,
-> assistant/MCP operation, live scene editing/viewing, native planning,
+> provider-backed assistant/public-MCP operation, live scene editing, native planning,
 > Isaac/ROS product launch, and real-robot operation are explicitly
 > unavailable. Do not run the historical recipes below or recreate their
 > superseded Python semantic owners. Retain or port same-role Python/TypeScript
@@ -46,7 +49,7 @@ authority map is:
 
 | Question                                                          | Authoritative repo          | Notes                                                                                                                             |
 | ----------------------------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| **How do I install / deploy / run ManyForge?**                    | this repo (`manyforge`)     | deployment-side authority; current `dev` exposes only the structural/offline cutover subset, not a runnable non-AI product lane   |
+| **How do I install / deploy / run ManyForge?**                    | this repo (`manyforge`)     | deployment-side authority; current `dev` exposes structural/offline plus H0 headless observation, not a runnable non-AI product lane |
 | **How do I run the LLM assistant on Jetson Thor?**                | `NemoClaw-Thor`             | platform glue: vLLM serving, sandbox provisioner, OpenClaw bridge launcher. Required only when using the `openclaw` lane on Thor. |
 | **What is the spec / contract / ADR — what should this code do?** | `manyforge_specs` (private) | dev-only; **not required at runtime**. Specs/ADRs/plans live there for maintainer use.                                            |
 
@@ -112,8 +115,9 @@ change the retained products. I4 now owns operational Apply, active
 publication, and process convergence for the bounded M0 reference fixture.
 Its external-process proof covers Manager loss/replacement, runtime
 crash/restart, and explicit shutdown without a robot, controller, motion, or
-Stop port. Public Manager clients remain I5/H0 work, and no runtime product
-lane is available.
+Stop port. I5/H0 now exposes the bounded public Manager/headless read and
+attributed-intent surfaces while keeping robot readiness and operational Apply
+explicitly unavailable. No runtime product lane is available.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
@@ -304,7 +308,9 @@ What lives where in this repo, and what it's for:
 | [`manyforge_persistence/`](manyforge_persistence/)                       | Shared ROS-free mechanical durable-storage safety primitives; no semantic state ownership                                  |
 | [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free canonical-empty and bounded runtime-only Apply logical-scene owner; no live scene surface                           |
 | [`manyforge_deployment/`](manyforge_deployment/)                         | Qualified ROS-free composable-cell compiler and immutable offline retained-product boundary                                 |
-| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ I4 owner for the bounded M0 Apply/runtime fixture; public daemon and product lanes unavailable                   |
+| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ I4 Apply/runtime-convergence owner hosted by the sole-process I5 Manager daemon; product execution unavailable   |
+| [`manyforge_headless/`](manyforge_headless/)                             | C++ H0 runtime/scene aggregation, scene lifetime, alarm owner, historian, NodeEnvironment projection, and Manager daemon      |
+| [`manyforge_headless_api/`](manyforge_headless_api/)                     | Bounded FastAPI/CLI and native binding over H0 owners; no robot-readiness or execution authority                              |
 | [`manyforge_behavior/`](manyforge_behavior/)                             | Build-owned node catalog/environment inspection plus explicit runtime-unavailable boundaries                                |
 | [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
 | [`manyforge_roboplan/`](manyforge_roboplan/)                             | Retained planning-model staging and offline RoboPlan import qualification; runtime adapters are intentionally unavailable   |
@@ -313,8 +319,8 @@ What lives where in this repo, and what it's for:
 | [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                                           |
 | [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model/binding/observation inputs; no current real-robot lane                                               |
 | [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle adapter; provider wiring unavailable until I10/R                                                 |
-| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell; runtime, MCP, viewer and assistant ownership unavailable                                    |
-| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Retained protocol hashing and pure supervisor reduction; live provider bridge unavailable pending H0+                         |
+| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0 status/alarm/history clients; runtime and command ownership unavailable          |
+| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | H0 read client plus retained protocol/supervisor logic; live provider bridge unavailable until I6/N                          |
 | [`manyforge_ros/`](manyforge_ros/)                                       | Retained pure mappings/contracts plus explicit unavailable runtime entry points                                              |
 | [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Non-activatable historical assistant interaction references                                                                 |
 | [`examples/`](examples/)                                                 | Reference `*.program.yaml` + `*.deployment.yaml`                                                                            |

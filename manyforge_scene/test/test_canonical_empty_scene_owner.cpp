@@ -553,6 +553,7 @@ TEST(CanonicalEmptySceneOwner, SealedAdmissionMintsGoldenAndHoldsGatesClosed) {
   EXPECT_FALSE(access.scene_writes_open);
   EXPECT_FALSE(access.projection_leases_open);
   EXPECT_FALSE(access.active_projection.has_value());
+  EXPECT_FALSE(owner.ReadActiveSnapshot().has_value());
   const auto integrity = owner.VerifyIntegrity();
   EXPECT_EQ(integrity.acceptance_row_count, 1);
   EXPECT_EQ(integrity.rebuild_row_count, 0);
@@ -725,6 +726,12 @@ TEST(CanonicalEmptySceneOwner,
     Require(access.active_projection.has_value(),
             "finalized access has no active projection");
     EXPECT_EQ(*access.active_projection, accepted.canonical_empty_target);
+    const auto snapshot = owner.ReadActiveSnapshot();
+    Require(snapshot.has_value(), "finalized owner has no active snapshot");
+    EXPECT_EQ(snapshot->shared()->identity(),
+              accepted.initialized_logical_scene.shared()->identity());
+    EXPECT_TRUE(snapshot->canonical_empty_for(
+        accepted.initialized_logical_scene.shared()->identity()));
     EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 1);
 
     const auto observed =
@@ -748,6 +755,10 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(status.publication_receipt, exact_receipt);
   EXPECT_TRUE(reopened.ReadAccessStatus().scene_writes_open);
   EXPECT_TRUE(reopened.ReadAccessStatus().projection_leases_open);
+  const auto reopened_snapshot = reopened.ReadActiveSnapshot();
+  ASSERT_TRUE(reopened_snapshot.has_value());
+  EXPECT_EQ(reopened_snapshot->shared()->revision,
+            exact_receipt.request.candidate_projection_revision.scene_revision);
   ASSERT_TRUE(status.canonical_empty_target.has_value());
   const auto replay = reopened.FinalizeProjectionBootstrap({
       BootstrapId("bootstrap-alpha"),
@@ -938,6 +949,10 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
     EXPECT_EQ(owner.ReadAccessStatus().phase,
               CanonicalEmptySceneBootstrapPhase::kNamedApplyActivated);
+    const auto frozen_predecessor = owner.ReadActiveSnapshot();
+    ASSERT_TRUE(frozen_predecessor.has_value());
+    EXPECT_EQ(frozen_predecessor->shared()->revision,
+              predecessor.scene_revision);
 
     const auto activation_replay =
         owner.ActivateStagedProjection(activation_request);
@@ -974,6 +989,10 @@ TEST(CanonicalEmptySceneOwner,
               CanonicalEmptySceneBootstrapPhase::kNamedApplyFinalized);
     ASSERT_TRUE(access.active_projection.has_value());
     EXPECT_EQ(*access.active_projection, *staged.candidate_projection_revision);
+    const auto selected_snapshot = owner.ReadActiveSnapshot();
+    ASSERT_TRUE(selected_snapshot.has_value());
+    EXPECT_EQ(selected_snapshot->shared()->revision,
+              staged.candidate_projection_revision->scene_revision);
     const auto integrity = owner.VerifyIntegrity();
     EXPECT_EQ(integrity.named_apply_stage_count, 1);
     EXPECT_EQ(integrity.named_apply_activation_count, 1);

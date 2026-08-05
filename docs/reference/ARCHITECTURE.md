@@ -4,8 +4,11 @@
 > three-lane runtime baseline. The composable-cell destructive cutover has
 > removed the legacy scene owner and RoboPlan native/ROS factories; program
 > execution and all three lanes are intentionally unavailable. The new Core,
-> retained-product, canonical-empty scene-owner, and Manager foundations are
-> not yet a restored end-to-end runtime.
+> retained-product, canonical-empty scene-owner, and Manager foundations now
+> include the I5/H0 Manager daemon, independent headless runtime/scene/alarm/
+> historian owners, public API/CLI, and thin Composer/assistant read clients.
+> Robot readiness, provider/authoring effects, and end-to-end execution remain
+> unavailable until their later gates.
 > Unless a section explicitly identifies a retained foundation or target
 > design, present-tense ownership and flow descriptions below refer to the
 > captured three-lane baseline.
@@ -53,12 +56,15 @@ ______________________________________________________________________
 | ----------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `manyforge_core`                          | C++20                 | Execution kernel: lifecycle state machine, terminal authority, stop/pause/reset semantics, collision-validation policy, runtime collision monitoring, execution snapshots and events. **ROS-free.** |
 | `manyforge_deployment`                    | C++20                 | ROS-free, non-real-time composable-cell artifact decoding, qualified schema normalization, staged graph content identity, and compiler substrate. It is not a Kernel dependency.                    |
+| `manyforge_component_manager`             | C++20                 | Durable Apply, active retained-graph reconciliation, runtime-unit convergence, and explicit shutdown. The I5 daemon is its sole process owner and publishes immutable snapshots.                    |
+| `manyforge_headless`                      | C++20 + pybind11      | I5/H0 runtime/scene source aggregation, scene-initialization lifetime, Alarm Lifecycle Owner, asynchronous historian, verified NodeEnvironment projection, and Manager/scene publication adapters. |
+| `manyforge_headless_api`                  | Python/FastAPI        | Bounded public HTTP/CLI projection and attributed alarm/Manager intents over the C++ owners. It does not own runtime, scene, alarm conditions, or robot readiness.                                   |
 | `manyforge_core/python`                   | pybind11              | Bindings exposing the kernel to Python (poll-based; no C++→Python callbacks).                                                                                                                       |
 | `manyforge_collision`                     | C++20                 | Planner-neutral collision-world/query implementation behind ManyForge collision ports.                                                                                                              |
 | `manyforge_roboplan`                      | C++ + pybind11        | Primary planning/projection adapter (RRT + TOPP-RA), native execution, and native kernel composition.                                                                                               |
 | `manyforge_ros2_control_execution`        | C++20/ROS 2           | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, isolated ROS scene projection, and optional exact controller/lifecycle dispatch admission.                |
 | `manyforge_behavior`                      | Python                | Behavior-tree runner, node catalog, program/deployment loader, cycle orchestration, one versioned recovery offer, and Robot Model Authority.                                                        |
-| `manyforge_composer`                      | FastAPI + React + MCP | Authoring/operator surface, condition-backed alarm manager, scene-initialization barrier, bounded native viewer, REST, and MCP.                                                                     |
+| `manyforge_composer`                      | FastAPI + React       | Current structural authoring/operator shell plus thin H0 runtime/alarm/history clients. Historical Composer-owned alarm, scene, runtime, provider, and MCP authorities remain removed.              |
 | `manyforge_ros` / `manyforge_ros_bringup` | C++/Python            | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                        |
 | `manyforge_assistant_bridge`              | Python                | Retained protocol/supervisor client logic and historical direct-lane reference; live HTTP provider unavailable during the cutover.                                                                  |
 
@@ -584,10 +590,12 @@ ______________________________________________________________________
 
 ## Reference contracts
 
-The only current generated contract is:
+The current generated contracts are:
 
 - [`REST_API.md`](REST_API.md) — the retained structural Composer REST surface,
   generated from the current FastAPI application.
+- [`HEADLESS_REST_API.md`](HEADLESS_REST_API.md) — the independent I5/H0
+  Manager, runtime, scene, alarm, history, and health projection.
 
 The following files are pinned historical reimplementation inputs. Their
 product surfaces are unavailable on the current cutover branch; they are not

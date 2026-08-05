@@ -1,4 +1,4 @@
-"""Typed I5/H0 gate for source-owned operator-alarm producers.
+"""Permanent compatibility fence for source-owned alarm producers.
 
 Scene, pose, collision, provider, lifecycle, and runtime-health conditions are
 owned by their new headless producers.  The former Composer adapter aggregate
@@ -14,7 +14,7 @@ from typing import Final
 OPERATOR_ALARM_ADAPTERS_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_operator_alarm_adapters_unavailable"
 )
-OPERATOR_ALARM_ADAPTERS_RESTORATION_GATES: Final = ("I5", "H0")
+OPERATOR_ALARM_ADAPTERS_REPLACEMENT_GATE: Final = "I5/H0"
 
 
 class OperatorAlarmAdaptersUnavailableError(RuntimeError):
@@ -26,6 +26,7 @@ class OperatorAlarmAdapters:
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise OperatorAlarmAdaptersUnavailableError(
-            f"{OPERATOR_ALARM_ADAPTERS_UNAVAILABLE_REASON_CODE}: source-owned "
-            "condition producers return with the headless alarm owner at I5/H0"
+            f"{OPERATOR_ALARM_ADAPTERS_UNAVAILABLE_REASON_CODE}: the Composer "
+            "adapter aggregate was replaced at I5/H0 by source-owned headless "
+            "adapters; later domains arrive only at their named plan gates"
         )

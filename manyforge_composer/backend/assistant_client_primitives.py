@@ -3,7 +3,8 @@
 These functions preserve bounded input and response handling from the former
 Composer provider/tool modules.  They perform no provider discovery, network
 access, tool dispatch, document mutation, or runtime-state interpretation.
-Assistant availability remains gated at H0/I5 and Program authoring at N/I6.
+H0/I5 read-only assistant observations use the separate headless client;
+provider operation and Program authoring remain gated at N/I6.
 """
 
 from __future__ import annotations

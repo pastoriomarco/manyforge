@@ -78,6 +78,7 @@ def test_reduced_aggregate_has_an_explicit_retained_selector() -> None:
     assert "./scripts/test-all.sh retained # current reduced aggregate" in source
     assert "    all)" not in source
     assert "run_cpp_tests" in retained_body
+    assert "run_headless_tests" in retained_body
     assert "run_roboplan_tests" in retained_body
     assert "run_python_tests" in retained_body
     assert "run_observability_client_tests" in retained_body
@@ -85,6 +86,8 @@ def test_reduced_aggregate_has_an_explicit_retained_selector() -> None:
     assert "run_composer_backend_tests" in retained_body
     assert "run_composer_frontend_build" in retained_body
     assert "run_composer_frontend_tests" in retained_body
+    assert "manyforge_headless_api/process_tests/" in source
+    assert "-p no:cacheprovider" in source
     assert "tests/test_public_contract_entrypoint_reconciliation.py" in source
     assert "tests/test_qualification_wrapper_entrypoints.py" in source
 

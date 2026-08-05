@@ -1,24 +1,31 @@
 # manyforge_assistant_bridge
 
-The live assistant bridge is intentionally unavailable during the composable-
-cell runtime cutover. Running `python -m manyforge_assistant_bridge.bridge`
-fails before starting a server and returns exit status 78.
+The provider-backed assistant conversation and Program-authoring bridge remains
+intentionally unavailable during the composable-cell runtime cutover. Running
+`python -m manyforge_assistant_bridge.bridge` fails before starting a server
+and returns exit status 78.
 
 What remains current:
 
 - `protocol.py`: deterministic catalog identity only. A hash is not proof of
   authenticity unless it is compared with an independently trusted value.
+- `headless.py`: the closed H0 read client over independently owned health,
+  runtime, Manager, scene, alarm, and historian projections. It has no
+  mutation, callback, provider, conversation, or Program operation.
 - `supervisor.py`: a transport-neutral availability reducer over
   already-observed facts. Endpoint probes, publication, polling, and shutdown
-  effects were removed; publishing status is fenced until H0.
-- `bridge.py`: the stable H0/I5/I6 unavailable entrypoint.
+  effects were removed; assistant-product publication remains fenced until
+  I6/N.
+- `bridge.py`: the stable fail-before-effects provider/authoring entrypoint.
+  It does not hide or replace the separately available H0 read client.
 
 What must be rebuilt rather than revived:
 
-- H0/I5: bounded conversation/session history, hard memory and turn/time
-  limits, cancellation, argument/schema sanitation, stuck-loop handling,
-  proposal-only/nonmutation enforcement, bounded audit, and the headless
-  callback client.
+- A later assistant-product gate: bounded conversation/session history, hard
+  memory and turn/time limits, cancellation, argument/schema sanitation,
+  stuck-loop handling, proposal-only/nonmutation enforcement, and bounded
+  provider audit. H0 restores only the independently useful read client; it
+  does not invent a provider contract merely to close I5.
 - I6: Program/tree authoring context and tools on the new native addressing
   contract.
 

@@ -7,6 +7,10 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 from .models import CatalogEntryResponse, CatalogResponse
+from .node_environment_client import (
+    ActiveNodeEnvironmentProjectionError,
+    read_active_node_environment,
+)
 from .state import ComposerState
 
 
@@ -102,6 +106,18 @@ def _entry_response(entry: Any, *, catalog: Any) -> dict[str, Any]:
 def create_catalog_router(state: ComposerState) -> APIRouter:
     router = APIRouter()
 
+    def active_catalog() -> tuple[Any, str]:
+        if state.headless_client is None:
+            return state.node_environment.catalog, state.node_environment.environment_digest
+        try:
+            projection = read_active_node_environment(state)
+        except ActiveNodeEnvironmentProjectionError as error:
+            raise HTTPException(
+                status_code=error.status_code,
+                detail={"code": error.code, "message": str(error)},
+            ) from error
+        return projection.catalog, projection.manifest.environment_digest
+
     @router.get(
         "",
         response_model=CatalogResponse,
@@ -109,8 +125,7 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
         response_model_exclude_unset=True,
     )
     def get_catalog() -> dict[str, Any]:
-        environment = state.node_environment
-        catalog = environment.catalog
+        catalog, environment_digest = active_catalog()
         return {
             "apiVersion": catalog.api_version,
             "contentVersion": catalog.content_version,
@@ -120,7 +135,7 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
                 for entry in catalog.entries
             ],
             "catalogDigest": catalog.catalog_digest,
-            "environmentDigest": environment.environment_digest,
+            "environmentDigest": environment_digest,
         }
 
     @router.get(
@@ -130,7 +145,7 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
         response_model_exclude_unset=True,
     )
     def get_catalog_entry(entry_id: str) -> dict[str, Any]:
-        catalog = state.node_environment.catalog
+        catalog, _environment_digest = active_catalog()
         try:
             entry = catalog.get(entry_id)
         except KeyError as exc:

@@ -2,6 +2,10 @@ import {
   parseCatalogResponse,
   parseFileBrowserResponse,
   parseHealthResponse,
+  parseHeadlessRuntimeSnapshot,
+  parseHistorianPage,
+  parseObjectResponse,
+  parseOperatorAlarmSnapshot,
   parseSceneUrdfManifest,
 } from './parsers';
 import type {
@@ -11,6 +15,13 @@ import type {
   HealthResponse,
   SceneUrdfManifest,
 } from '../types/api';
+import type {
+  AlarmMembership,
+  HeadlessRuntimeSnapshot,
+  HistorianPage,
+  OperatorAlarmRecord,
+  OperatorAlarmSnapshot,
+} from '../types/headless';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -67,10 +78,15 @@ async function requestJson<T>(
   path: string,
   parser: (value: unknown) => T,
   signal?: AbortSignal,
+  init: RequestInit = {},
 ): Promise<T> {
+  const headers = new Headers(init.headers);
+  headers.set('Accept', 'application/json');
+  if (init.body !== undefined) headers.set('Content-Type', 'application/json');
   const response = await fetch(resolveStructuralAssetUrl(path), {
-    method: 'GET',
-    headers: { Accept: 'application/json' },
+    method: init.method ?? 'GET',
+    headers,
+    body: init.body,
     signal,
   });
   let payload: unknown;
@@ -135,6 +151,77 @@ export const api = {
       requestJson(
         '/api/scene/urdf/manifest',
         parseSceneUrdfManifest,
+        signal,
+      ),
+  },
+  runtime: {
+    get: (signal?: AbortSignal): Promise<HeadlessRuntimeSnapshot> =>
+      requestJson('/api/runtime', parseHeadlessRuntimeSnapshot, signal),
+  },
+  alarms: {
+    list: (signal?: AbortSignal): Promise<OperatorAlarmSnapshot> =>
+      requestJson(
+        '/api/execution/alarms?limit=32&ordering=attention_newest',
+        parseOperatorAlarmSnapshot,
+        signal,
+      ),
+    acknowledge: (
+      alarm: OperatorAlarmRecord,
+      ownerEpoch: string,
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      `/api/execution/alarms/${encodeURIComponent(alarm.conditionId)}/acknowledge`,
+      parseObjectResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          request_id: requestId,
+          request_owner_epoch: ownerEpoch,
+          source_label: 'composer_ui',
+          correlation_id: null,
+          activation_id: alarm.activationId,
+          expected_record_revision: alarm.recordRevision,
+          reason: null,
+          confirmed: true,
+        }),
+      },
+    ),
+    acknowledgeAll: (
+      ownerEpoch: string,
+      generation: number,
+      members: AlarmMembership[],
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      '/api/execution/alarms/acknowledge-all',
+      parseObjectResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          request_id: requestId,
+          request_owner_epoch: ownerEpoch,
+          source_label: 'composer_ui',
+          correlation_id: null,
+          members: members.map((member) => ({
+            condition_id: member.conditionId,
+            activation_id: member.activationId,
+            record_revision: member.recordRevision,
+          })),
+          expected_generation: generation,
+          reason: null,
+          confirmed: true,
+        }),
+      },
+    ),
+  },
+  history: {
+    list: (limit = 32, signal?: AbortSignal): Promise<HistorianPage> =>
+      requestJson(
+        `/api/execution/history?limit=${encodeURIComponent(String(limit))}`,
+        parseHistorianPage,
         signal,
       ),
   },

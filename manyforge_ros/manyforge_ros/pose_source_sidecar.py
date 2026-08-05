@@ -3,9 +3,9 @@
 This module deliberately does **not** own pose-source identity, freshness,
 latest-state caching, scene-apply policy, status reduction, or a Composer wire
 payload.  It only normalizes bounded ROS/simulator observations and offers a
-depth-one callback adapter.  The I5/H0 headless owner must supply retained
-provider identities, receiver-local ordering/freshness, and scene policy; I9/I
-restores the concrete Isaac/ROS product wiring.
+depth-one callback adapter.  The I5/H0 headless owner now supplies the retained
+pose-source lifetime/state boundary; concrete producer identity,
+receiver-local ordering/freshness, and Isaac/ROS wiring remain I9/I work.
 
 Relocation traceability
 -----------------------
@@ -17,8 +17,9 @@ capture mapping, and bounded ROS subscription mechanics from those sources.
 The old ``PoseSourceLatestState`` family, status constants, deployment-v0
 ``apply_policy`` bindings, duck-typed deployment constructors, polling loop,
 frame relabeling, and Composer-shaped ``to_dict`` payload are intentionally
-absent.  The historical cases remain acceptance input at H0 and I; they are
-not a runnable legacy fallback.
+absent.  The H0 lifetime cases are carried by the current C++ owner; the
+historical producer/adapter cases remain acceptance input at I and are not a
+runnable legacy fallback.
 """
 
 from __future__ import annotations

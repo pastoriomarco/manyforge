@@ -1,17 +1,17 @@
-"""Immutable alarm-history values and the typed I5/H0 owner gate.
+"""Immutable alarm-history values and the fenced legacy owner name.
 
 The four-state reducer is itself alarm-lifecycle semantics, even when written
 as a pure function.  It therefore does not remain in Composer beside the one
-future headless owner.  Its exact historical implementation is pinned at
+headless owner.  Its exact historical implementation is pinned at
 ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` in source blob
 ``268fb082d9098da53b92a764b6002dd1076d5130`` (the full reducers start at
 lines 798 and 990); transition-table acceptance input is in historical test
 blob ``085187dd6464001d635ac216b387cf97d8c962bd`` at lines 226 and 266.
 
-Only bounded, immutable history-value mechanics remain here.  Their current
-field names are porting input, not a declaration of the future H0 wire: the
-final owner-issued DTO must use the approved owner epoch and snapshot
-generation contract.  Composer retains no catalog, reduction, identity,
+Only bounded, immutable history-value mechanics remain here.  Their field
+names are retained presentation input, while the current H0 projection uses
+the approved owner epoch and snapshot-generation contract. Composer retains
+no catalog, reduction, identity,
 acknowledgement, reconciliation, interlock, persistence, or producer owner.
 """
 
@@ -27,7 +27,7 @@ from typing import Any, Final, Mapping
 OPERATOR_ALARM_OWNER_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_operator_alarm_owner_unavailable"
 )
-OPERATOR_ALARM_OWNER_RESTORATION_GATES: Final = ("I5", "H0")
+OPERATOR_ALARM_OWNER_REPLACEMENT_GATE: Final = "I5/H0"
 _MAX_JSON_DEPTH: Final = 8
 _MAX_JSON_NODES: Final = 4_096
 _MAX_MAPPING_ITEMS: Final = 64
@@ -374,6 +374,7 @@ class OperatorAlarmManager:
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise OperatorAlarmOwnerUnavailableError(
-            f"{OPERATOR_ALARM_OWNER_UNAVAILABLE_REASON_CODE}: the single "
-            "headless alarm owner returns at I5/H0"
+            f"{OPERATOR_ALARM_OWNER_UNAVAILABLE_REASON_CODE}: the legacy "
+            "Composer owner was replaced at I5/H0 by manyforge_headless; use "
+            "the manyforge_headless_api projection"
         )

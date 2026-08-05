@@ -17,7 +17,7 @@ _WS_MAX_PAYLOAD_BYTES: Final = 2 * 1024 * 1024
 STATE_PROJECTION_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_state_projection_unavailable"
 )
-STATE_PROJECTION_RESTORATION_GATE: Final = "H0"
+STATE_PROJECTION_REPLACEMENT_GATE: Final = "I5/H0"
 
 
 class StateProjectionUnavailableError(RuntimeError):
@@ -28,8 +28,8 @@ class StateHub:
     """Event-loop-owned transport for already-built payloads only.
 
     It does not poll Composer state, assemble runtime truth, drain events, or
-    start a background task. Those old semantic-owner responsibilities return
-    only through the H0 headless snapshot client.
+    start a background task. Those old semantic-owner responsibilities were
+    replaced by the I5/H0 headless snapshot client.
     """
 
     def __init__(self) -> None:
@@ -76,8 +76,9 @@ class StateHub:
     def start(self, _state: "ComposerState") -> None:
         """Fail before reading state or creating any polling task."""
         raise StateProjectionUnavailableError(
-            f"{STATE_PROJECTION_UNAVAILABLE_REASON_CODE}: runtime state "
-            "projection returns from the H0 headless snapshot owner"
+            f"{STATE_PROJECTION_UNAVAILABLE_REASON_CODE}: Composer-local "
+            "polling was replaced at I5/H0; use backend.headless_ws with the "
+            "headless snapshot client"
         )
 
     def stop(self) -> None:

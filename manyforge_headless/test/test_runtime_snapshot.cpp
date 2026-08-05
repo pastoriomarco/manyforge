@@ -1,0 +1,393 @@
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+
+#include <manyforge_content_identity/canonical_value.hpp>
+
+#include "manyforge_headless/runtime_snapshot.hpp"
+#include "manyforge_headless/scene_runtime_state_owner.hpp"
+#include "manyforge_headless/source_contract.hpp"
+#include "manyforge_headless/source_snapshot.hpp"
+
+namespace manyforge::headless {
+namespace {
+
+using content_identity::CanonicalValue;
+
+constexpr std::int64_t kFreshnessBudgetNs = 10'000'000'000LL;
+
+class TemporaryDirectory final {
+public:
+  TemporaryDirectory() {
+    auto pattern = (std::filesystem::temp_directory_path() /
+                    "manyforge-headless-runtime-snapshot-XXXXXX")
+                       .string();
+    buffer_.assign(pattern.begin(), pattern.end());
+    buffer_.push_back('\0');
+    const auto *created = ::mkdtemp(buffer_.data());
+    if (created == nullptr) {
+      throw std::runtime_error("runtime snapshot test mkdtemp failed");
+    }
+    path_ = created;
+  }
+
+  ~TemporaryDirectory() {
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+
+  [[nodiscard]] const std::filesystem::path &path() const noexcept {
+    return path_;
+  }
+
+private:
+  std::vector<char> buffer_;
+  std::filesystem::path path_;
+};
+
+CanonicalValue ManagerPayload(const std::string &cell_id,
+                              const std::string &graph_revision) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"active",
+       CanonicalValue(CanonicalValue::Object{
+           {"cell_graph",
+            CanonicalValue(CanonicalValue::Object{
+                {"api_version", CanonicalValue("manyforge.cell_graph.v1")},
+                {"cell_id", CanonicalValue(cell_id)},
+            })},
+           {"graph_revision", CanonicalValue(graph_revision)},
+           {"publication", CanonicalValue(CanonicalValue::Object{})},
+           {"retained_bundle_id", CanonicalValue("bundle-1")},
+       })},
+      {"api_version",
+       CanonicalValue(std::string(kManagerSourcePayloadApiVersion))},
+      {"apply", CanonicalValue(CanonicalValue::Object{})},
+      {"cell_id", CanonicalValue(cell_id)},
+      {"manager_ready", CanonicalValue(true)},
+      {"runtime", CanonicalValue(CanonicalValue::Object{
+                      {"converged", CanonicalValue(true)},
+                  })},
+  });
+}
+
+CanonicalValue LogicalScenePayload(const std::string &cell_id) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"access", CanonicalValue(CanonicalValue::Object{})},
+      {"api_version",
+       CanonicalValue(std::string(kLogicalSceneSourcePayloadApiVersion))},
+      {"snapshot", CanonicalValue(CanonicalValue::Object{
+                       {"cell_id", CanonicalValue(cell_id)},
+                       {"objects", CanonicalValue(CanonicalValue::Array{})},
+                   })},
+  });
+}
+
+CanonicalValue SceneRuntimePayload(const std::string &cell_id) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kSceneRuntimeSourcePayloadApiVersion))},
+      {"cell_id", CanonicalValue(cell_id)},
+      {"state", SceneRuntimeStateValue(SceneRuntimeStateSnapshot{
+                    1U,
+                    std::nullopt,
+                    SceneInitializationState::kOpen,
+                    false,
+                    SceneRuntimeIdentity{"bundle-1", "graph-1", 1U, 0U, 1U},
+                    "bootstrap",
+                    std::nullopt,
+                    0,
+                    0,
+                    std::nullopt,
+                    {},
+                    {},
+                })},
+  });
+}
+
+bool RequiredBool(const CanonicalValue &root, const std::string_view name) {
+  const auto *member = root.find_object_member(name);
+  if (member == nullptr) {
+    throw std::runtime_error("missing test field " + std::string(name));
+  }
+  const auto *value = std::get_if<bool>(&member->storage());
+  if (value == nullptr) {
+    throw std::runtime_error("non-boolean test field " + std::string(name));
+  }
+  return *value;
+}
+
+const CanonicalValue &RequiredMember(const CanonicalValue &root,
+                                     const std::string_view name) {
+  const auto *member = root.find_object_member(name);
+  if (member == nullptr) {
+    throw std::runtime_error("missing test field " + std::string(name));
+  }
+  return *member;
+}
+
+const CanonicalValue &Section(const HeadlessRuntimeSnapshot &snapshot,
+                              const std::string_view name) {
+  return RequiredMember(RequiredMember(snapshot.root, "sections"), name);
+}
+
+TEST(RuntimeSnapshotAggregator,
+     GenerationTracksSemanticAndFreshnessTransitionsButNotClockTicks) {
+  TemporaryDirectory directory;
+  AtomicSourceSnapshotChannel manager(directory.path(), "manager-source.json");
+  AtomicSourceSnapshotChannel scene(directory.path(),
+                                    "logical-scene-source.json");
+  AtomicSourceSnapshotChannel scene_runtime(directory.path(),
+                                            "scene-runtime-source.json");
+  const std::string cell_id = "cell-a";
+  static_cast<void>(manager.Publish(
+      "component_manager", "component-manager." + cell_id, "manager-epoch-1",
+      10, ManagerPayload(cell_id, "graph-1")));
+  static_cast<void>(scene.Publish("logical_scene", "logical-scene." + cell_id,
+                                  "scene-epoch-1", 20,
+                                  LogicalScenePayload(cell_id)));
+  static_cast<void>(scene_runtime.Publish(
+      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 30,
+      SceneRuntimePayload(cell_id)));
+  const auto manager_observation = manager.ReadObserved();
+  const auto scene_observation = scene.ReadObserved();
+  const auto scene_runtime_observation = scene_runtime.ReadObserved();
+  ASSERT_TRUE(manager_observation.has_value());
+  ASSERT_TRUE(scene_observation.has_value());
+  ASSERT_TRUE(scene_runtime_observation.has_value());
+
+  const auto publication_time =
+      std::max({manager_observation->file_modified_at_unix_ns,
+                scene_observation->file_modified_at_unix_ns,
+                scene_runtime_observation->file_modified_at_unix_ns});
+  std::int64_t wall_now = publication_time + 10;
+  std::int64_t projection_now = 100;
+  RuntimeSnapshotAggregator aggregator(
+      directory.path(), cell_id, "headless-api.cell-a", "api-epoch-1",
+      RuntimeSnapshotFreshnessPolicy{kFreshnessBudgetNs, kFreshnessBudgetNs,
+                                     kFreshnessBudgetNs},
+      [&] { return wall_now; }, [&] { return projection_now; });
+
+  const auto first = aggregator.Evaluate();
+  EXPECT_EQ(first.projection_generation, 1U);
+  EXPECT_TRUE(RequiredBool(first.root, "complete"));
+
+  wall_now = publication_time + 20;
+  projection_now = 200;
+  const auto clock_only = aggregator.Evaluate();
+  EXPECT_EQ(clock_only.projection_generation, 1U);
+  EXPECT_EQ(clock_only.semantic_content_digest, first.semantic_content_digest);
+  EXPECT_NE(clock_only.root, first.root);
+
+  wall_now = publication_time + kFreshnessBudgetNs + 1;
+  projection_now = 300;
+  const auto stale = aggregator.Evaluate();
+  EXPECT_EQ(stale.projection_generation, 2U);
+  EXPECT_FALSE(RequiredBool(stale.root, "complete"));
+  EXPECT_NE(stale.semantic_content_digest, first.semantic_content_digest);
+  EXPECT_NE(
+      content_identity::canonical_json(stale.root).find("manager_source_stale"),
+      std::string::npos);
+
+  const auto refreshed_manager = manager.Publish(
+      "component_manager", "component-manager." + cell_id, "manager-epoch-1",
+      30, ManagerPayload(cell_id, "graph-1"));
+  const auto refreshed_scene =
+      scene.Publish("logical_scene", "logical-scene." + cell_id,
+                    "scene-epoch-1", 40, LogicalScenePayload(cell_id));
+  const auto refreshed_scene_runtime = scene_runtime.Publish(
+      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 50,
+      SceneRuntimePayload(cell_id));
+  EXPECT_EQ(refreshed_manager.source_generation, 1U);
+  EXPECT_EQ(refreshed_scene.source_generation, 1U);
+  EXPECT_EQ(refreshed_scene_runtime.source_generation, 1U);
+  const auto refreshed_manager_observation = manager.ReadObserved();
+  const auto refreshed_scene_observation = scene.ReadObserved();
+  const auto refreshed_scene_runtime_observation = scene_runtime.ReadObserved();
+  ASSERT_TRUE(refreshed_manager_observation.has_value());
+  ASSERT_TRUE(refreshed_scene_observation.has_value());
+  ASSERT_TRUE(refreshed_scene_runtime_observation.has_value());
+  wall_now =
+      std::max(
+          {refreshed_manager_observation->file_modified_at_unix_ns,
+           refreshed_scene_observation->file_modified_at_unix_ns,
+           refreshed_scene_runtime_observation->file_modified_at_unix_ns}) +
+      10;
+  projection_now = 400;
+  const auto fresh_again = aggregator.Evaluate();
+  EXPECT_EQ(fresh_again.projection_generation, 3U);
+  EXPECT_TRUE(RequiredBool(fresh_again.root, "complete"));
+
+  const auto changed_manager = manager.Publish(
+      "component_manager", "component-manager." + cell_id, "manager-epoch-1",
+      50, ManagerPayload(cell_id, "graph-2"));
+  EXPECT_EQ(changed_manager.source_generation, 2U);
+  const auto changed_observation = manager.ReadObserved();
+  ASSERT_TRUE(changed_observation.has_value());
+  wall_now =
+      std::max(
+          {changed_observation->file_modified_at_unix_ns,
+           refreshed_scene_observation->file_modified_at_unix_ns,
+           refreshed_scene_runtime_observation->file_modified_at_unix_ns}) +
+      10;
+  projection_now = 500;
+  const auto changed = aggregator.Evaluate();
+  EXPECT_EQ(changed.projection_generation, 4U);
+  EXPECT_TRUE(RequiredBool(changed.root, "complete"));
+  EXPECT_NE(changed.semantic_content_digest,
+            fresh_again.semantic_content_digest);
+}
+
+TEST(RuntimeSnapshotAggregator,
+     FreshnessUsesAWallClockSampleTakenAfterEachAtomicRead) {
+  TemporaryDirectory directory;
+  AtomicSourceSnapshotChannel manager(directory.path(), "manager-source.json");
+  AtomicSourceSnapshotChannel scene(directory.path(),
+                                    "logical-scene-source.json");
+  AtomicSourceSnapshotChannel scene_runtime(directory.path(),
+                                            "scene-runtime-source.json");
+  const std::string cell_id = "cell-a";
+  static_cast<void>(manager.Publish(
+      "component_manager", "component-manager." + cell_id, "manager-epoch-1",
+      10, ManagerPayload(cell_id, "graph-1")));
+  static_cast<void>(scene.Publish("logical_scene", "logical-scene." + cell_id,
+                                  "scene-epoch-1", 20,
+                                  LogicalScenePayload(cell_id)));
+  static_cast<void>(scene_runtime.Publish(
+      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 30,
+      SceneRuntimePayload(cell_id)));
+  const auto manager_observation = manager.ReadObserved();
+  const auto scene_observation = scene.ReadObserved();
+  const auto scene_runtime_observation = scene_runtime.ReadObserved();
+  ASSERT_TRUE(manager_observation.has_value());
+  ASSERT_TRUE(scene_observation.has_value());
+  ASSERT_TRUE(scene_runtime_observation.has_value());
+  const auto publication_time =
+      std::max({manager_observation->file_modified_at_unix_ns,
+                scene_observation->file_modified_at_unix_ns,
+                scene_runtime_observation->file_modified_at_unix_ns});
+
+  std::size_t wall_samples = 0U;
+  RuntimeSnapshotAggregator aggregator(
+      directory.path(), cell_id, "headless-api.cell-a", "api-epoch-1",
+      RuntimeSnapshotFreshnessPolicy{kFreshnessBudgetNs, kFreshnessBudgetNs,
+                                     kFreshnessBudgetNs},
+      [&] {
+        ++wall_samples;
+        return wall_samples == 1U ? publication_time - 1 : publication_time + 1;
+      },
+      [] { return 100; });
+
+  const auto snapshot = aggregator.Evaluate();
+  EXPECT_TRUE(RequiredBool(snapshot.root, "complete"));
+  EXPECT_GE(wall_samples, 4U);
+  EXPECT_EQ(content_identity::canonical_json(snapshot.root)
+                .find("publication_time_in_future"),
+            std::string::npos);
+}
+
+TEST(RuntimeSnapshotAggregator,
+     RestartMeasuresPersistedAgeAndLossRetainsLastIdentifiedGeneration) {
+  TemporaryDirectory directory;
+  AtomicSourceSnapshotChannel manager(directory.path(), "manager-source.json");
+  AtomicSourceSnapshotChannel scene(directory.path(),
+                                    "logical-scene-source.json");
+  AtomicSourceSnapshotChannel scene_runtime(directory.path(),
+                                            "scene-runtime-source.json");
+  const std::string cell_id = "cell-a";
+  static_cast<void>(manager.Publish(
+      "component_manager", "component-manager." + cell_id, "manager-epoch-1",
+      10, ManagerPayload(cell_id, "graph-1")));
+  static_cast<void>(scene.Publish("logical_scene", "logical-scene." + cell_id,
+                                  "scene-epoch-1", 20,
+                                  LogicalScenePayload(cell_id)));
+  static_cast<void>(scene_runtime.Publish(
+      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 30,
+      SceneRuntimePayload(cell_id)));
+  const auto manager_observation = manager.ReadObserved();
+  const auto scene_observation = scene.ReadObserved();
+  const auto scene_runtime_observation = scene_runtime.ReadObserved();
+  ASSERT_TRUE(manager_observation.has_value());
+  ASSERT_TRUE(scene_observation.has_value());
+  ASSERT_TRUE(scene_runtime_observation.has_value());
+  const auto publication_time =
+      std::max({manager_observation->file_modified_at_unix_ns,
+                scene_observation->file_modified_at_unix_ns,
+                scene_runtime_observation->file_modified_at_unix_ns});
+
+  std::int64_t wall_now = publication_time + kFreshnessBudgetNs + 1;
+  std::int64_t projection_now = 100;
+  RuntimeSnapshotAggregator restarted(
+      directory.path(), cell_id, "headless-api.cell-a", "api-epoch-2",
+      RuntimeSnapshotFreshnessPolicy{kFreshnessBudgetNs, kFreshnessBudgetNs,
+                                     kFreshnessBudgetNs},
+      [&] { return wall_now; }, [&] { return projection_now; });
+  const auto first_after_restart = restarted.Evaluate();
+  EXPECT_EQ(first_after_restart.projection_generation, 1U);
+  EXPECT_FALSE(RequiredBool(first_after_restart.root, "complete"));
+  EXPECT_NE(content_identity::canonical_json(first_after_restart.root)
+                .find("manager_source_stale"),
+            std::string::npos);
+
+  wall_now = publication_time + 10;
+  projection_now = 200;
+  const auto known = restarted.Evaluate();
+  EXPECT_TRUE(RequiredBool(known.root, "complete"));
+  const auto &known_manager = Section(known, "manager");
+
+  ASSERT_TRUE(
+      std::filesystem::remove(directory.path() / "manager-source.json"));
+  projection_now = 300;
+  const auto absent = restarted.Evaluate();
+  EXPECT_FALSE(RequiredBool(absent.root, "complete"));
+  const auto &absent_manager = Section(absent, "manager");
+  EXPECT_EQ(RequiredMember(absent_manager, "source_content_digest"),
+            RequiredMember(known_manager, "source_content_digest"));
+  EXPECT_EQ(RequiredMember(absent_manager, "source_generation"),
+            RequiredMember(known_manager, "source_generation"));
+  EXPECT_NE(content_identity::canonical_json(absent.root)
+                .find("manager_source_absent"),
+            std::string::npos);
+
+  {
+    std::ofstream corrupt(directory.path() / "manager-source.json");
+    corrupt << "not-json";
+  }
+  projection_now = 400;
+  const auto invalid = restarted.Evaluate();
+  EXPECT_FALSE(RequiredBool(invalid.root, "complete"));
+  EXPECT_EQ(
+      RequiredMember(Section(invalid, "manager"), "source_content_digest"),
+      RequiredMember(known_manager, "source_content_digest"));
+  EXPECT_NE(content_identity::canonical_json(invalid.root)
+                .find("manager_source_invalid"),
+            std::string::npos);
+}
+
+TEST(RuntimeSnapshotAggregator, RejectsInvalidConfigurationAndForeignSources) {
+  TemporaryDirectory directory;
+  EXPECT_THROW(RuntimeSnapshotAggregator(
+                   directory.path(), "cell-a", "api.cell-a", "epoch", {0, 1, 1},
+                   [] { return 1; }, [] { return 1; }),
+               RuntimeSnapshotError);
+
+  AtomicSourceSnapshotChannel manager(directory.path(), "manager-source.json");
+  static_cast<void>(manager.Publish("component_manager",
+                                    "component-manager.cell-b", "manager-epoch",
+                                    10, ManagerPayload("cell-b", "graph-1")));
+  RuntimeSnapshotAggregator aggregator(
+      directory.path(), "cell-a", "api.cell-a", "epoch", {100, 100, 100},
+      [] { return 1'000'000'000'000'000LL; }, [] { return 1; });
+  const auto snapshot = aggregator.Evaluate();
+  EXPECT_FALSE(RequiredBool(snapshot.root, "complete"));
+  EXPECT_NE(content_identity::canonical_json(snapshot.root)
+                .find("manager_source_identity_mismatch"),
+            std::string::npos);
+}
+
+} // namespace
+} // namespace manyforge::headless

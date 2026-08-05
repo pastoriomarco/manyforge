@@ -1,4 +1,4 @@
-"""Structural-only FastAPI application for the Composer cutover window."""
+"""Composer structural shell plus optional thin headless-runtime projection."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from .routes_catalog import create_catalog_router
 from .routes_filesystem import create_filesystem_router
 from .routes_nodes import create_nodes_router
 from .routes_urdf import create_urdf_router
-from .security import BearerAuthMiddleware, SecurityConfig
+from .security import BearerAuthMiddleware, SecurityConfig, check_ws_bearer_token
 from .state import (
     ComposerState,
     RUNTIME_UNAVAILABLE_MESSAGE,
@@ -35,7 +35,7 @@ _UNAVAILABLE_PAYLOAD = UnavailableResponse(
     detail=UnavailableDetail(
         code=RUNTIME_UNAVAILABLE_REASON_CODE,
         message=RUNTIME_UNAVAILABLE_MESSAGE,
-        restoration_gates=["H0", "N", "I", "R"],
+        restoration_gates=["N", "L0", "P5", "I", "R", "T"],
     )
 ).detail.model_dump(by_alias=True)
 
@@ -45,18 +45,19 @@ def create_app(
     static_dir: str | None = None,
     security: SecurityConfig | None = None,
 ) -> FastAPI:
-    """Create the non-runtime Composer shell.
+    """Create the structural Composer and optional headless client routes.
 
     Only immutable catalog reads, sandboxed artifact browsing, and structural
-    URDF assets are served. Every former runtime/scene/command route is caught
-    by the typed unavailable boundary before it can create a process or mutate
-    robot state.
+    URDF assets are owned locally. When configured, runtime routes proxy the
+    independent headless API; every later-lane route remains caught by the
+    typed unavailable boundary before it can create a process or mutate robot
+    state.
     """
 
     security = security or SecurityConfig()
     state.allowed_fs_roots = list(security.allowed_fs_roots)
 
-    app = FastAPI(title="ManyForge Composer (structural cutover shell)")
+    app = FastAPI(title="ManyForge Composer (replaceable client)")
     if security.api_token:
         app.add_middleware(BearerAuthMiddleware, token=security.api_token)
     app.add_middleware(
@@ -138,6 +139,61 @@ def create_app(
 
     @app.get("/api/health")
     def health() -> dict:
+        if state.headless_client is not None:
+            from manyforge_headless_api.client import HeadlessClientError
+
+            try:
+                headless = state.headless_client.health()
+                return {
+                    "status": headless.get("status", "degraded"),
+                    "mode": "headless_client",
+                    "components": {
+                        "backend": "structural_client",
+                        "catalog": "available",
+                        "deployment": (
+                            "authored" if state.deployment is not None else "none"
+                        ),
+                        "headless_projection": (
+                            "ready"
+                            if headless.get("headless_projection_ready")
+                            else "degraded"
+                        ),
+                    },
+                    "headless": headless,
+                    "runtimeAvailability": None,
+                    "timestamp": time.time(),
+                }
+            except HeadlessClientError as error:
+                return {
+                    "status": "degraded",
+                    "mode": "headless_client",
+                    "components": {
+                        "backend": "structural_client",
+                        "catalog": "available",
+                        "deployment": (
+                            "authored" if state.deployment is not None else "none"
+                        ),
+                        "headless_projection": "unavailable",
+                    },
+                    "headless": {
+                        "status_scope": "headless_projection",
+                        "status": "unavailable",
+                        "headless_projection_ready": False,
+                        "robot_readiness": {
+                            "available": False,
+                            "state": None,
+                            "source_owner_id": None,
+                            "reason_code": "robot_readiness_owner_unavailable",
+                        },
+                        "error": {"code": error.code, "message": str(error)},
+                    },
+                    "runtimeAvailability": {
+                        "code": error.code,
+                        "message": str(error),
+                        "restorationGates": [],
+                    },
+                    "timestamp": time.time(),
+                }
         return {
             "status": "degraded",
             "mode": "structural_only",
@@ -173,6 +229,25 @@ def create_app(
         prefix="/api/scene/urdf",
         tags=["structural-urdf"],
     )
+
+    if state.headless_client is not None:
+        from .headless_ws import serve_headless_state
+        from .routes_headless import create_headless_router
+
+        app.include_router(
+            create_headless_router(state.headless_client),
+            tags=["headless-runtime-client"],
+        )
+
+        @app.websocket("/ws/state")
+        async def headless_state_websocket(websocket: WebSocket) -> None:
+            if security.api_token and not check_ws_bearer_token(
+                websocket,
+                security.api_token,
+            ):
+                await websocket.close(code=1008, reason="Unauthorized")
+                return
+            await serve_headless_state(websocket, state.headless_client)
 
     async def unavailable_api(
         unavailable_path: str,
