@@ -68,7 +68,11 @@ class RevisionVerifiedDeploymentArtifact final {
     return data_->applicability_inputs;
   }
   [[nodiscard]] bool assistant_was_present() const noexcept {
-    return data_->assistant_was_present;
+    return data_->applicability_inputs.assistant_settings().source_was_present();
+  }
+  [[nodiscard]] const TypedAssistantSettingsCandidate& assistant_settings()
+      const noexcept {
+    return data_->applicability_inputs.assistant_settings();
   }
 
   /// Exact accepted deployment source after schema-owned collection
@@ -95,7 +99,6 @@ class RevisionVerifiedDeploymentArtifact final {
         const GraphRevisionVerifiedCellGraph& graph_in,
         const RevisionVerifiedDeploymentApplicabilityInputs&
             applicability_inputs_in,
-        bool assistant_was_present_in,
         CanonicalValue normalized_authored_root_in)
         : deployment_artifact_id(std::move(deployment_artifact_id_in)),
           deployment_revision(std::move(deployment_revision_in)),
@@ -105,7 +108,6 @@ class RevisionVerifiedDeploymentArtifact final {
           catalog_records(std::move(catalog_records_in)),
           graph(graph_in),
           applicability_inputs(applicability_inputs_in),
-          assistant_was_present(assistant_was_present_in),
           normalized_authored_root(
               std::move(normalized_authored_root_in)) {}
 
@@ -117,7 +119,6 @@ class RevisionVerifiedDeploymentArtifact final {
     std::vector<core::CatalogRecordRefDTO> catalog_records;
     GraphRevisionVerifiedCellGraph graph;
     RevisionVerifiedDeploymentApplicabilityInputs applicability_inputs;
-    bool assistant_was_present{false};
     CanonicalValue normalized_authored_root;
   };
 
@@ -129,13 +130,13 @@ class RevisionVerifiedDeploymentArtifact final {
       const GraphRevisionVerifiedCellGraph& graph,
       const RevisionVerifiedDeploymentApplicabilityInputs&
           applicability_inputs,
-      bool assistant_was_present, CanonicalValue normalized_authored_root)
+      CanonicalValue normalized_authored_root)
       : data_(std::make_shared<const Data>(
             std::move(deployment_artifact_id),
             std::move(deployment_revision), std::move(cell_id),
             std::move(name), std::move(description),
             std::move(catalog_records), graph, applicability_inputs,
-            assistant_was_present, std::move(normalized_authored_root))) {}
+            std::move(normalized_authored_root))) {}
 
   std::shared_ptr<const Data> data_;
 

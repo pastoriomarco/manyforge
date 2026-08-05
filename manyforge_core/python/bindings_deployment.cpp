@@ -142,6 +142,8 @@ void register_deployment_candidate_bindings(py::module_& module) {
       module, "StopEvidencePolicyCodecError", PyExc_ValueError);
   py::register_exception<deployment::DeploymentApplicabilityCodecError>(
       module, "DeploymentApplicabilityCodecError", PyExc_ValueError);
+  py::register_exception<deployment::AssistantSettingsCodecError>(
+      module, "AssistantSettingsCodecError", PyExc_ValueError);
   py::register_exception<deployment::DeploymentArtifactCodecError>(
       module, "DeploymentArtifactCodecError", PyExc_ValueError);
   py::register_exception<deployment::SiteOverlayResolutionError>(
@@ -164,6 +166,56 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .value("kExplicitNull",
              deployment::SiteOverlayRefSourcePresence::kExplicitNull)
       .value("kValue", deployment::SiteOverlayRefSourcePresence::kValue);
+
+  py::class_<deployment::TypedAssistantSettingsCandidate>(
+      module, "TypedAssistantSettingsCandidate", py::is_final())
+      .def_property_readonly(
+          "source_was_present",
+          &deployment::TypedAssistantSettingsCandidate::source_was_present)
+      .def_property_readonly(
+          "enabled", &deployment::TypedAssistantSettingsCandidate::enabled)
+      .def_property_readonly(
+          "normalized_source_canonical_json",
+          [](const deployment::TypedAssistantSettingsCandidate& candidate) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(candidate.normalized_source());
+          });
+
+  py::class_<deployment::BuildQualifiedAssistantInstrumentRegistry>(
+      module, "BuildQualifiedAssistantInstrumentRegistry", py::is_final())
+      .def_property_readonly(
+          "registry_digest",
+          [](const deployment::BuildQualifiedAssistantInstrumentRegistry&
+                 registry) { return registry.value().registry_digest; })
+      .def_property_readonly(
+          "normalized_projection_canonical_json",
+          [](const deployment::BuildQualifiedAssistantInstrumentRegistry&
+                 registry) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(registry.normalized_root());
+          });
+
+  py::class_<deployment::QualifiedAssistantSettings>(
+      module, "QualifiedAssistantSettings", py::is_final())
+      .def_property_readonly(
+          "enabled", &deployment::QualifiedAssistantSettings::enabled)
+      .def_property_readonly(
+          "projection_digest",
+          [](const deployment::QualifiedAssistantSettings& settings) {
+            return settings.projection_digest();
+          })
+      .def_property_readonly(
+          "instrument_registry_digest",
+          [](const deployment::QualifiedAssistantSettings& settings) {
+            return settings.instruments().registry_digest;
+          })
+      .def_property_readonly(
+          "normalized_projection_canonical_json",
+          [](const deployment::QualifiedAssistantSettings& settings) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(
+                settings.normalized_projection());
+          });
 
   py::class_<DesiredControlBindingRouteDTO>(
       module, "DesiredControlBindingRouteDTO", py::is_final())
@@ -579,7 +631,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def_property_readonly(
           "external_resources_was_present",
           &deployment::TypedDeploymentApplicabilityInputsCandidate::
-              external_resources_was_present);
+              external_resources_was_present)
+      .def_property_readonly(
+          "assistant_settings",
+          [](const deployment::TypedDeploymentApplicabilityInputsCandidate&
+                 candidate) { return candidate.assistant_settings(); });
 
   py::class_<deployment::RevisionVerifiedDeploymentApplicabilityInputs>(
       module, "RevisionVerifiedDeploymentApplicabilityInputs",
@@ -625,7 +681,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def_property_readonly(
           "external_resources_was_present",
           &deployment::RevisionVerifiedDeploymentApplicabilityInputs::
-              external_resources_was_present);
+              external_resources_was_present)
+      .def_property_readonly(
+          "assistant_settings",
+          [](const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
+                 inputs) { return inputs.assistant_settings(); });
 
   py::class_<deployment::VerifiedSiteOverlayArtifactProjection>(
       module, "VerifiedSiteOverlayArtifactProjection", py::is_final())
@@ -721,6 +781,27 @@ void register_deployment_candidate_bindings(py::module_& module) {
             return deployment::canonical_json(
                 artifact.normalized_authored_graph());
           });
+
+  module.def(
+      "build_qualified_assistant_instrument_registry",
+      &deployment::build_qualified_assistant_instrument_registry,
+      py::return_value_policy::reference);
+
+  module.def(
+      "qualify_assistant_settings",
+      [](const deployment::TypedAssistantSettingsCandidate& candidate,
+         const py::iterable& external_resources) {
+        auto bounded_resources = bounded_values_from_python<
+            ExternalResourceDTO,
+            deployment::AssistantSettingsCodecError>(
+            external_resources, kMaxDeploymentApplicabilityRows,
+            "external_resources", "ExternalResourceDTO");
+        py::gil_scoped_release release;
+        return deployment::qualify_assistant_settings(
+            candidate,
+            std::span<const ExternalResourceDTO>{bounded_resources});
+      },
+      py::arg("candidate"), py::arg("external_resources"));
 
   py::class_<ParsedArtifactCandidate>(module, "ParsedArtifactCandidate", py::is_final())
       .def_property_readonly("canonical_json", [](const ParsedArtifactCandidate& candidate) {

@@ -1650,3 +1650,134 @@ def test_graph_revision_trust_surface_is_staged_narrow_and_immutable():
 
     for forbidden_name in ("TrustedCellGraph", "TrustedCellGraphCandidate"):
         assert not hasattr(core, forbidden_name)
+
+
+def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
+    assistant = {
+        "model_endpoint_aliases": {
+            "primary_model": {
+                "external_resource_alias": "assistant_model",
+                "model_id": "i5-python-test-model",
+            }
+        },
+        "modes": {
+            "query": {
+                "catalog": {
+                    "nodes": [],
+                    "skills": [],
+                    "tools": ["scene_inspect", "status_read"],
+                },
+                "description": "Read-only H0 query",
+                "enabled": True,
+                "grant_policy": {
+                    "approval_mode": None,
+                    "review_policy": "not_required",
+                    "session_kind": None,
+                },
+                "model_endpoint_alias": "primary_model",
+                "provider_alias": "direct_local",
+            }
+        },
+        "provider_aliases": {
+            "direct_local": {
+                "bridge_external_resource_alias": "assistant_bridge",
+                "provider_kind": "direct",
+            }
+        },
+    }
+    external_resources = [
+        {
+            "endpoint_role_id": "state",
+            "external_resource_alias": "assistant_bridge",
+            "provider_instance_id": "assistant_provider_instance",
+            "provider_manifest_id": "assistant_provider_manifest",
+            "provider_manifest_revision": ZERO_DIGEST,
+            "resource_kind": "service_endpoint",
+            "site_overlay_value_ref": "resources.assistant_bridge",
+        },
+        {
+            "endpoint_role_id": "state",
+            "external_resource_alias": "assistant_model",
+            "provider_instance_id": "assistant_provider_instance",
+            "provider_manifest_id": "assistant_provider_manifest",
+            "provider_manifest_revision": ZERO_DIGEST,
+            "resource_kind": "model_endpoint",
+            "site_overlay_value_ref": "resources.assistant_model",
+        },
+    ]
+    document = {
+        "api_version": "manyforge.deployment.v1",
+        "assistant": assistant,
+        "desired_control_configurations": [],
+        "capability_provider_bindings": [],
+        "external_resources": external_resources,
+    }
+    candidate = core.decode_deployment_applicability_inputs_candidate(
+        core.parse_strict_json_model_yaml(
+            json.dumps(document, sort_keys=True, separators=(",", ":"))
+        )
+    )
+
+    assistant_candidate = candidate.assistant_settings
+    assert assistant_candidate.source_was_present
+    assert assistant_candidate.enabled
+    assert json.loads(assistant_candidate.normalized_source_canonical_json) == assistant
+
+    qualified = core.qualify_assistant_settings(
+        assistant_candidate, candidate.value.external_resources
+    )
+    projection = json.loads(qualified.normalized_projection_canonical_json)
+    registry = core.build_qualified_assistant_instrument_registry()
+    registry_projection = json.loads(registry.normalized_projection_canonical_json)
+
+    assert qualified.enabled
+    assert qualified.projection_digest.value == projection["projection_digest"]
+    assert qualified.instrument_registry_digest == registry.registry_digest
+    assert projection["instruments"] == registry_projection
+    assert [mode["mode_id"] for mode in projection["modes"]] == ["query"]
+    assert [tool["tool_id"] for tool in projection["instruments"]["tools"]] == [
+        "alarms_read",
+        "catalog_read",
+        "deployment_capabilities_read",
+        "history_read",
+        "program_read",
+        "scene_inspect",
+        "skills_read",
+        "status_read",
+    ]
+
+    for value, field in (
+        (assistant_candidate, "enabled"),
+        (qualified, "projection_digest"),
+        (registry, "registry_digest"),
+    ):
+        with pytest.raises(AttributeError):
+            setattr(value, field, getattr(value, field))
+        with pytest.raises(AttributeError):
+            value.extra = "not allowed"
+
+    for value_type in (
+        core.TypedAssistantSettingsCandidate,
+        core.QualifiedAssistantSettings,
+        core.BuildQualifiedAssistantInstrumentRegistry,
+    ):
+        with pytest.raises(TypeError):
+            value_type()
+
+    wrong_resources = list(candidate.value.external_resources)
+    wrong_resources[0] = core.ExternalResourceDTO(
+        external_resource_alias=core.ExternalResourceAlias("assistant_bridge"),
+        resource_kind=core.ExternalResourceKind.kModelEndpoint,
+        provider_instance_id=core.ProviderInstanceId("assistant_provider_instance"),
+        provider_manifest_id=core.ProviderManifestId("assistant_provider_manifest"),
+        provider_manifest_revision=core.ProviderManifestRevision(ZERO_DIGEST),
+        endpoint_role_id=core.EndpointRoleId("state"),
+        site_overlay_value_ref=core.SiteOverlayValueRef(
+            "resources.assistant_bridge"
+        ),
+    )
+    with pytest.raises(
+        core.AssistantSettingsCodecError,
+        match="bridge external resource is not a service_endpoint",
+    ):
+        core.qualify_assistant_settings(assistant_candidate, wrong_resources)

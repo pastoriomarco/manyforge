@@ -358,6 +358,10 @@ class ApplicabilityQualifiedCellIr final {
   selected_site_overlay_ref() const noexcept {
     return data_->selected_site_overlay_ref;
   }
+  [[nodiscard]] const QualifiedAssistantSettings& assistant_settings()
+      const noexcept {
+    return data_->assistant_settings;
+  }
   [[nodiscard]] const std::vector<QualifiedRuntimeProfile>& runtime_profiles()
       const noexcept {
     return data_->runtime_profiles;
@@ -419,6 +423,7 @@ class ApplicabilityQualifiedCellIr final {
         const RevisionVerifiedDeploymentApplicabilityInputs&
             deployment_inputs_in,
         std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref_in,
+        const QualifiedAssistantSettings& assistant_settings_in,
         std::vector<QualifiedRuntimeProfile> runtime_profiles_in,
         std::vector<QualifiedCapabilityDefinition>
             capability_definitions_in,
@@ -442,6 +447,7 @@ class ApplicabilityQualifiedCellIr final {
           deployment_inputs(deployment_inputs_in),
           selected_site_overlay_ref(
               std::move(selected_site_overlay_ref_in)),
+          assistant_settings(assistant_settings_in),
           runtime_profiles(std::move(runtime_profiles_in)),
           capability_definitions(std::move(capability_definitions_in)),
           control_interface_contracts(
@@ -460,6 +466,7 @@ class ApplicabilityQualifiedCellIr final {
     CompositionQualifiedCellIr composition;
     RevisionVerifiedDeploymentApplicabilityInputs deployment_inputs;
     std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref;
+    QualifiedAssistantSettings assistant_settings;
     std::vector<QualifiedRuntimeProfile> runtime_profiles;
     std::vector<QualifiedCapabilityDefinition> capability_definitions;
     std::vector<QualifiedControlInterfaceContract>
@@ -480,6 +487,7 @@ class ApplicabilityQualifiedCellIr final {
       const CompositionQualifiedCellIr& composition,
       const RevisionVerifiedDeploymentApplicabilityInputs& deployment_inputs,
       std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref,
+      const QualifiedAssistantSettings& assistant_settings,
       std::vector<QualifiedRuntimeProfile> runtime_profiles,
       std::vector<QualifiedCapabilityDefinition> capability_definitions,
       std::vector<QualifiedControlInterfaceContract>
@@ -497,6 +505,7 @@ class ApplicabilityQualifiedCellIr final {
       : data_(std::make_shared<const Data>(
             composition, deployment_inputs,
             std::move(selected_site_overlay_ref),
+            assistant_settings,
             std::move(runtime_profiles),
             std::move(capability_definitions),
             std::move(control_interface_contracts),

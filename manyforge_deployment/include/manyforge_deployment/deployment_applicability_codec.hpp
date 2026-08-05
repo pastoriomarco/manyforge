@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "manyforge_deployment/artifact_codec.hpp"
+#include "manyforge_deployment/assistant_settings_codec.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
 
 namespace manyforge::deployment {
@@ -73,6 +74,10 @@ class TypedDeploymentApplicabilityInputsCandidate final {
   [[nodiscard]] bool external_resources_was_present() const noexcept {
     return data_->external_resources_was_present;
   }
+  [[nodiscard]] const TypedAssistantSettingsCandidate& assistant_settings()
+      const noexcept {
+    return data_->assistant_settings;
+  }
 
  private:
   struct Data final {
@@ -82,7 +87,8 @@ class TypedDeploymentApplicabilityInputsCandidate final {
          CanonicalValue normalized_external_resources_in,
          SiteOverlayRefSourcePresence site_overlay_ref_presence_in,
          std::optional<CanonicalValue> normalized_site_overlay_ref_in,
-         bool external_resources_was_present_in)
+         bool external_resources_was_present_in,
+         const TypedAssistantSettingsCandidate& assistant_settings_in)
         : value(std::move(value_in)),
           normalized_desired_control_configurations(
               std::move(normalized_desired_control_configurations_in)),
@@ -93,7 +99,8 @@ class TypedDeploymentApplicabilityInputsCandidate final {
           site_overlay_ref_presence(site_overlay_ref_presence_in),
           normalized_site_overlay_ref(
               std::move(normalized_site_overlay_ref_in)),
-          external_resources_was_present(external_resources_was_present_in) {}
+          external_resources_was_present(external_resources_was_present_in),
+          assistant_settings(assistant_settings_in) {}
 
     core::DeploymentApplicabilityInputsDTO value;
     CanonicalValue normalized_desired_control_configurations;
@@ -103,6 +110,7 @@ class TypedDeploymentApplicabilityInputsCandidate final {
         SiteOverlayRefSourcePresence::kAbsent};
     std::optional<CanonicalValue> normalized_site_overlay_ref;
     bool external_resources_was_present{false};
+    TypedAssistantSettingsCandidate assistant_settings;
   };
 
   TypedDeploymentApplicabilityInputsCandidate(
@@ -112,7 +120,8 @@ class TypedDeploymentApplicabilityInputsCandidate final {
       CanonicalValue normalized_external_resources,
       SiteOverlayRefSourcePresence site_overlay_ref_presence,
       std::optional<CanonicalValue> normalized_site_overlay_ref,
-      bool external_resources_was_present)
+      bool external_resources_was_present,
+      const TypedAssistantSettingsCandidate& assistant_settings)
       : data_(std::make_shared<const Data>(
             std::move(value),
             std::move(normalized_desired_control_configurations),
@@ -120,7 +129,7 @@ class TypedDeploymentApplicabilityInputsCandidate final {
             std::move(normalized_external_resources),
             site_overlay_ref_presence,
             std::move(normalized_site_overlay_ref),
-            external_resources_was_present)) {}
+            external_resources_was_present, assistant_settings)) {}
 
   std::shared_ptr<const Data> data_;
 
@@ -181,6 +190,10 @@ class RevisionVerifiedDeploymentApplicabilityInputs final {
   }
   [[nodiscard]] bool external_resources_was_present() const noexcept {
     return data_->candidate.external_resources_was_present();
+  }
+  [[nodiscard]] const TypedAssistantSettingsCandidate& assistant_settings()
+      const noexcept {
+    return data_->candidate.assistant_settings();
   }
 
  private:

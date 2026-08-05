@@ -2517,6 +2517,10 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
     std::span<const QualifiedProviderManifest> provider_manifests,
     std::span<const QualifiedStopEvidencePolicy> stop_evidence_policies,
     const QualifiedSelectedSiteOverlay& selected_site_overlay) {
+  const QualifiedAssistantSettings assistant_settings =
+      qualify_assistant_settings(
+          deployment_inputs.assistant_settings(),
+          deployment_inputs.value().external_resources);
   const auto indexes = build_qualified_indexes(
       composition, deployment_inputs, runtime_profiles,
       capability_definitions, control_interface_contracts,
@@ -2580,6 +2584,7 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
 
   return ApplicabilityQualifiedCellIr(
       composition, deployment_inputs, selected_overlay,
+      assistant_settings,
       copy_closure_in_key_order<QualifiedRuntimeProfile>(
           indexes.runtime_profiles, indexes.required_runtime_profiles),
       copy_closure_in_key_order<QualifiedCapabilityDefinition>(

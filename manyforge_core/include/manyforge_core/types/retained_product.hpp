@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/types/assistant.hpp>
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
@@ -274,6 +275,9 @@ struct RetainedBundleDTO final {
   std::vector<CapabilityProviderBindingDTO> capability_provider_bindings;
   RetainedCompiledProductsDTO compiled_products;
   RetainedBundleProvenanceDTO provenance;
+  std::optional<SiteOverlayRefDTO> selected_site_overlay_ref;
+  std::vector<ExternalResourceDTO> external_resources;
+  std::optional<RetainedAssistantProjectionDTO> assistant;
 
   friend bool operator==(const RetainedBundleDTO&,
                          const RetainedBundleDTO&) = default;

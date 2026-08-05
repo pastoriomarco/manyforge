@@ -6,6 +6,7 @@
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <manyforge_deployment/controller_topology_codec.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
+#include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
 
 #include <algorithm>
@@ -154,6 +155,118 @@ struct QualifiedControlCatalog final {
   QualifiedStopEvidencePolicy stop;
   std::vector<Lite6InputArtifact> artifacts;
 };
+
+struct AssistantOverlayFixture final {
+  core::SiteOverlayRefDTO reference;
+  std::string bytes;
+};
+
+[[nodiscard]] inline CanonicalValue assistant_external_resource(
+    std::string_view alias, std::string_view resource_kind,
+    std::string_view overlay_ref, const QualifiedProviderManifest& provider) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"endpoint_role_id", CanonicalValue("state")},
+      {"external_resource_alias", CanonicalValue(std::string(alias))},
+      {"provider_instance_id",
+       CanonicalValue("assistant_provider_instance")},
+      {"provider_manifest_id",
+       CanonicalValue(provider.value().provider_manifest_id.value())},
+      {"provider_manifest_revision",
+       CanonicalValue(provider.value().provider_manifest_revision.value())},
+      {"resource_kind", CanonicalValue(std::string(resource_kind))},
+      {"site_overlay_value_ref", CanonicalValue(std::string(overlay_ref))},
+  });
+}
+
+[[nodiscard]] inline AssistantOverlayFixture make_assistant_overlay() {
+  CanonicalValue::Array values{
+      CanonicalValue(CanonicalValue::Object{
+          {"resource_kind", CanonicalValue("service_endpoint")},
+          {"semantic_kind", CanonicalValue("external_resource")},
+          {"site_overlay_value_ref",
+           CanonicalValue("resources.assistant_bridge")},
+          {"value",
+           CanonicalValue(CanonicalValue::Object{
+               {"value", CanonicalValue("http://assistant.invalid")},
+               {"value_kind", CanonicalValue("string")},
+           })},
+      }),
+      CanonicalValue(CanonicalValue::Object{
+          {"resource_kind", CanonicalValue("model_endpoint")},
+          {"semantic_kind", CanonicalValue("external_resource")},
+          {"site_overlay_value_ref",
+           CanonicalValue("resources.assistant_model")},
+          {"value",
+           CanonicalValue(CanonicalValue::Object{
+               {"value", CanonicalValue("http://model.invalid")},
+               {"value_kind", CanonicalValue("string")},
+           })},
+      }),
+  };
+  const std::string bytes = revisioned_document(
+      CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue("manyforge.site_overlay.v1")},
+          {"site_overlay_id", CanonicalValue("i5_assistant_site")},
+          {"values", CanonicalValue(std::move(values))},
+      }),
+      "site-overlay-revision", "manyforge.site_overlay.v1",
+      "site_overlay_revision");
+  return {
+      core::SiteOverlayRefDTO{
+          core::SiteOverlayId("i5_assistant_site"),
+          core::SiteOverlayRevision(
+              revision_from_document(bytes, "site_overlay_revision")),
+          core::ContentDigest(sha256_digest(bytes)),
+      },
+      bytes,
+  };
+}
+
+[[nodiscard]] inline CanonicalValue assistant_source() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"model_endpoint_aliases",
+       CanonicalValue(CanonicalValue::Object{
+           {"primary_model",
+            CanonicalValue(CanonicalValue::Object{
+                {"external_resource_alias",
+                 CanonicalValue("assistant_model")},
+                {"model_id", CanonicalValue("i5-test-model")},
+            })},
+       })},
+      {"modes",
+       CanonicalValue(CanonicalValue::Object{
+           {"query",
+            CanonicalValue(CanonicalValue::Object{
+                {"catalog",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"nodes", CanonicalValue(CanonicalValue::Array{})},
+                     {"skills", CanonicalValue(CanonicalValue::Array{})},
+                     {"tools",
+                      text_array({"scene_inspect", "status_read"})},
+                 })},
+                {"description", CanonicalValue("Read-only H0 query")},
+                {"enabled", CanonicalValue(true)},
+                {"grant_policy",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"approval_mode", CanonicalValue(nullptr)},
+                     {"review_policy", CanonicalValue("not_required")},
+                     {"session_kind", CanonicalValue(nullptr)},
+                 })},
+                {"model_endpoint_alias", CanonicalValue("primary_model")},
+                {"provider_alias", CanonicalValue("direct_local")},
+            })},
+       })},
+      {"provider_aliases",
+       CanonicalValue(CanonicalValue::Object{
+           {"direct_local",
+            CanonicalValue(CanonicalValue::Object{
+                {"bridge_external_resource_alias",
+                 CanonicalValue("assistant_bridge")},
+                {"provider_kind", CanonicalValue("direct")},
+            })},
+       })},
+  });
+}
 
 [[nodiscard]] inline QualifiedControlCatalog
 qualify_control_catalog(bool chained) {
@@ -696,10 +809,12 @@ qualify_control_catalog(bool chained) {
 }
 
 [[nodiscard]] inline RevisionVerifiedDeploymentApplicabilityInputs
-make_applicability_inputs(const GraphRevisionVerifiedCellGraph& graph) {
+make_applicability_inputs(const GraphRevisionVerifiedCellGraph& graph,
+                          const QualifiedProviderManifest& provider,
+                          const AssistantOverlayFixture* assistant_overlay) {
   const auto& domain = graph.graph().control_domains.front();
   const auto& binding = graph.graph().control_bindings.front();
-  const CanonicalValue root(CanonicalValue::Object{
+  CanonicalValue::Object root_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"desired_control_configurations",
        CanonicalValue(CanonicalValue::Array{CanonicalValue(
@@ -733,7 +848,34 @@ make_applicability_inputs(const GraphRevisionVerifiedCellGraph& graph) {
            })})},
       {"capability_provider_bindings",
        CanonicalValue(CanonicalValue::Array{})},
-  });
+  };
+  if (assistant_overlay != nullptr) {
+    root_members.emplace_back("assistant", assistant_source());
+    root_members.emplace_back(
+        "external_resources",
+        CanonicalValue(CanonicalValue::Array{
+            assistant_external_resource(
+                "assistant_bridge", "service_endpoint",
+                "resources.assistant_bridge", provider),
+            assistant_external_resource(
+                "assistant_model", "model_endpoint",
+                "resources.assistant_model", provider),
+        }));
+    root_members.emplace_back(
+        "site_overlay_ref",
+        CanonicalValue(CanonicalValue::Object{
+            {"non_secret_digest",
+             CanonicalValue(
+                 assistant_overlay->reference.non_secret_digest.value())},
+            {"site_overlay_id",
+             CanonicalValue(
+                 assistant_overlay->reference.site_overlay_id.value())},
+            {"site_overlay_revision",
+             CanonicalValue(
+                 assistant_overlay->reference.site_overlay_revision.value())},
+        }));
+  }
+  const CanonicalValue root(std::move(root_members));
   return compute_capability_provider_binding_revisions(
       decode_deployment_applicability_inputs_candidate(
           parse_strict_json_model_yaml(canonical_json(root))));
@@ -742,12 +884,21 @@ make_applicability_inputs(const GraphRevisionVerifiedCellGraph& graph) {
 }  // namespace lite6_controllable_fixture_detail
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
-make_lite6_controllable_retention_fixture(bool chained = false) {
+make_lite6_controllable_retention_fixture(bool chained = false,
+                                          bool assistant_enabled = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   auto structural = make_lite6_structural_retention_fixture();
   auto catalog = fixture_detail::qualify_control_catalog(chained);
   const auto graph = fixture_detail::make_graph(structural, catalog);
-  const auto inputs = fixture_detail::make_applicability_inputs(graph);
+  const std::optional<fixture_detail::AssistantOverlayFixture>
+      assistant_overlay = assistant_enabled
+                              ? std::optional<
+                                    fixture_detail::AssistantOverlayFixture>(
+                                    fixture_detail::make_assistant_overlay())
+                              : std::nullopt;
+  const auto inputs = fixture_detail::make_applicability_inputs(
+      graph, catalog.provider,
+      assistant_overlay.has_value() ? &*assistant_overlay : nullptr);
 
   std::vector<core::CatalogRecordRefDTO> catalog_records{
       structural.catalog_reference,
@@ -769,7 +920,7 @@ make_lite6_controllable_retention_fixture(bool chained = false) {
                    member.first == "cell_id";
           }),
       deployment_graph.end());
-  const CanonicalValue deployment_value(CanonicalValue::Object{
+  CanonicalValue::Object deployment_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"deployment_artifact_id",
        CanonicalValue(chained ? "i3_lite6_chained_controllable_fixture"
@@ -785,7 +936,16 @@ make_lite6_controllable_retention_fixture(bool chained = false) {
        inputs.normalized_desired_control_configurations()},
       {"capability_provider_bindings",
        inputs.normalized_capability_provider_bindings()},
-  });
+  };
+  if (assistant_enabled) {
+    deployment_members.emplace_back(
+        "assistant", inputs.assistant_settings().normalized_source());
+    deployment_members.emplace_back(
+        "external_resources", inputs.normalized_external_resources());
+    deployment_members.emplace_back(
+        "site_overlay_ref", *inputs.normalized_site_overlay_ref());
+  }
+  const CanonicalValue deployment_value(std::move(deployment_members));
   const auto deployment = compute_deployment_artifact_revision(
       parse_strict_json_model_yaml(canonical_json(deployment_value)),
       std::span<const QualifiedRuntimeProfile>{});
@@ -796,10 +956,19 @@ make_lite6_controllable_retention_fixture(bool chained = false) {
       catalog.component_type};
   const auto composition = compose_cell_occurrences(
       deployment.graph(), assets, component_types);
+  const std::optional<VerifiedSiteOverlayArtifactProjection>
+      verified_assistant_overlay =
+          assistant_overlay.has_value()
+              ? std::optional<VerifiedSiteOverlayArtifactProjection>(
+                    resolve_and_verify_site_overlay_artifact_projection(
+                        assistant_overlay->reference,
+                        assistant_overlay->bytes))
+              : std::nullopt;
   const auto overlay = select_site_overlay_for_deployment(
       deployment.applicability_inputs().value().site_overlay_ref,
       deployment.applicability_inputs().value().external_resources,
-      nullptr);
+      verified_assistant_overlay.has_value() ? &*verified_assistant_overlay
+                                             : nullptr);
   const std::array<QualifiedCapabilityDefinition, 1U> capabilities{
       catalog.capability};
   const std::array<QualifiedControlInterfaceContract, 1U> contracts{
@@ -832,6 +1001,11 @@ make_lite6_controllable_retention_fixture(bool chained = false) {
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_chained_controllable_retention_fixture() {
   return make_lite6_controllable_retention_fixture(true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_assistant_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(false, true);
 }
 
 class Lite6ControllableCompilerInputArtifactSource final

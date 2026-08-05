@@ -946,6 +946,14 @@ def test_structure_qualification_exposes_read_only_resolutions():
         deployment.applicability_inputs.value
     )
     assert applicability.selected_site_overlay_ref is None
+    assert not applicability.assistant_settings.enabled
+    assert (
+        applicability.assistant_settings.normalized_projection_canonical_json
+        == "{}"
+    )
+    assert applicability.assistant_settings.projection_digest == core.ContentDigest(
+        ZERO_DIGEST
+    )
     for name in (
         "runtime_profiles",
         "capability_definitions",

@@ -217,7 +217,6 @@ struct DecodedDeployment final {
   GraphIdentityReadyCellGraphCandidate graph_candidate;
   CanonicalValue normalized_authored_graph;
   TypedDeploymentApplicabilityInputsCandidate applicability_candidate;
-  bool assistant_was_present{false};
 };
 
 [[nodiscard]] DecodedDeployment decode_deployment(
@@ -241,17 +240,6 @@ struct DecodedDeployment final {
     fail("$.compatibility",
          "compatibility admission is not qualified by the current compiler "
          "subset");
-  }
-
-  bool assistant_was_present = false;
-  if (const CanonicalValue* assistant = find_member(root, "assistant");
-      assistant != nullptr) {
-    assistant_was_present = true;
-    if (!require_object(*assistant, "$.assistant").empty()) {
-      fail("$.assistant",
-           "only the exact empty assistant object is qualified by the "
-           "current compiler subset");
-    }
   }
 
   std::optional<std::string> description;
@@ -334,7 +322,6 @@ struct DecodedDeployment final {
       identity_ready_graph,
       normalized_authored_graph,
       applicability_candidate,
-      assistant_was_present,
   };
 }
 
@@ -378,10 +365,9 @@ struct DecodedDeployment final {
     root.emplace_back("external_resources",
                       applicability.normalized_external_resources());
   }
-  if (decoded.assistant_was_present) {
-    root.emplace_back(
-        "assistant",
-        CanonicalValue(CanonicalValue::Object{}));
+  if (applicability.assistant_settings().source_was_present()) {
+    root.emplace_back("assistant",
+                      applicability.assistant_settings().normalized_source());
   }
   return CanonicalValue(std::move(root));
 }
@@ -493,8 +479,7 @@ RevisionVerifiedDeploymentArtifact compute_deployment_artifact_revision(
       std::move(parts.decoded.cell_id), std::move(parts.decoded.name),
       std::move(parts.decoded.description),
       std::move(parts.decoded.catalog_records), parts.graph,
-      parts.applicability, parts.decoded.assistant_was_present,
-      std::move(parts.normalized_root));
+      parts.applicability, std::move(parts.normalized_root));
 }
 
 RevisionVerifiedDeploymentArtifact verify_deployment_artifact_revision(
@@ -509,8 +494,7 @@ RevisionVerifiedDeploymentArtifact verify_deployment_artifact_revision(
       std::move(parts.decoded.cell_id), std::move(parts.decoded.name),
       std::move(parts.decoded.description),
       std::move(parts.decoded.catalog_records), parts.graph,
-      parts.applicability, parts.decoded.assistant_was_present,
-      std::move(parts.normalized_root));
+      parts.applicability, std::move(parts.normalized_root));
 }
 
 }  // namespace manyforge::deployment

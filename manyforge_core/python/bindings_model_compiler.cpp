@@ -2228,6 +2228,11 @@ void register_model_compiler_bindings(py::module_& module) {
           "stop_evidence_policies",
           [](const deployment::ApplicabilityQualifiedCellIr& value) {
             return immutable_snapshot(value.stop_evidence_policies());
+          })
+      .def_property_readonly(
+          "assistant_settings",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return value.assistant_settings();
           });
 
   py::class_<deployment::CompilerQualifiedCellIr>(

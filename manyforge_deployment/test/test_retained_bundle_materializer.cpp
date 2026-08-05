@@ -922,6 +922,94 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(array_member(targets.front(), "collision_bodies").size(), 1U);
 }
 
+TEST(RetainedBundleMaterializer,
+     AssistantSettingsRetainReloadAndRequalifyExactly) {
+  const auto fixture = test::make_lite6_assistant_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  ASSERT_TRUE(bundle->value().selected_site_overlay_ref.has_value());
+  EXPECT_EQ(bundle->value().selected_site_overlay_ref,
+            fixture.qualified.compiler_ir()
+                .applicability()
+                .selected_site_overlay_ref());
+  ASSERT_EQ(bundle->value().external_resources.size(), 2U);
+  ASSERT_TRUE(bundle->value().assistant.has_value());
+
+  const auto& qualified_assistant =
+      fixture.qualified.compiler_ir().applicability().assistant_settings();
+  ASSERT_TRUE(qualified_assistant.enabled());
+  EXPECT_EQ(*bundle->value().assistant,
+            qualified_assistant.retained_projection());
+  EXPECT_EQ(member(bundle->normalized_root(), "assistant"),
+            qualified_assistant.normalized_projection());
+  EXPECT_EQ(canonical_json(member(bundle->normalized_root(), "assistant")),
+            bundle->value().assistant->canonical_json);
+  EXPECT_EQ(array_member(bundle->normalized_root(), "external_resources")
+                .size(),
+            2U);
+
+  const auto reloaded = detail::RetainedBundleReloadAuthority::reload(
+      bundle->canonical_bytes());
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_EQ(reloaded->retained_bundle_id(), bundle->retained_bundle_id());
+  EXPECT_EQ(reloaded->value(), bundle->value());
+  EXPECT_EQ(reloaded->canonical_bytes(), bundle->canonical_bytes());
+
+  test::InMemoryCatalogArtifactStoreFixture second_catalog_store;
+  test::InMemoryRawArtifactStoreFixture second_raw_store;
+  const auto regenerated = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), second_catalog_store,
+      second_raw_store);
+  ASSERT_NE(regenerated, nullptr);
+  EXPECT_EQ(regenerated->retained_bundle_id(), bundle->retained_bundle_id());
+  EXPECT_EQ(regenerated->canonical_bytes(), bundle->canonical_bytes());
+
+  CanonicalValue changed_assistant =
+      member(bundle->normalized_root(), "assistant");
+  CanonicalValue::Array modes = array_member(changed_assistant, "modes");
+  ASSERT_EQ(modes.size(), 1U);
+  modes.front() = replace_object_member(
+      modes.front(), "description", CanonicalValue("changed description"));
+  changed_assistant = replace_object_member(
+      changed_assistant, "modes", CanonicalValue(std::move(modes)));
+  CanonicalValue changed_root = replace_root_member(
+      bundle->normalized_root(), "assistant", std::move(changed_assistant));
+  changed_root = reidentify_retained_bundle(std::move(changed_root));
+  EXPECT_THROW(
+      static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+          canonical_json(changed_root))),
+      RetainedBundleError);
+
+  CanonicalValue::Array resources =
+      array_member(bundle->normalized_root(), "external_resources");
+  ASSERT_EQ(resources.size(), 2U);
+  ASSERT_EQ(string_member(resources.front(), "external_resource_alias"),
+            "assistant_bridge");
+  resources.front() = replace_object_member(
+      resources.front(), "resource_kind", CanonicalValue("model_endpoint"));
+  CanonicalValue changed_resources_root = replace_root_member(
+      bundle->normalized_root(), "external_resources",
+      CanonicalValue(std::move(resources)));
+  changed_resources_root =
+      reidentify_retained_bundle(std::move(changed_resources_root));
+  EXPECT_THROW(
+      static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+          canonical_json(changed_resources_root))),
+      RetainedBundleError);
+}
+
 TEST(ControlDomainControlVerifier,
      SelfConsistentImplementationRelabelStillRejects) {
   const auto direct = test::make_lite6_controllable_retention_fixture();

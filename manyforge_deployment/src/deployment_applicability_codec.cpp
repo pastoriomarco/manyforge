@@ -902,11 +902,13 @@ decode_deployment_applicability_inputs_candidate(
       encode_provider_bindings(value.capability_provider_bindings);
   CanonicalValue normalized_external =
       encode_external_resources(value.external_resources);
+  const TypedAssistantSettingsCandidate assistant_settings =
+      decode_assistant_settings_candidate(parsed_deployment);
   return TypedDeploymentApplicabilityInputsCandidate(
       std::move(value), std::move(normalized_desired),
       std::move(normalized_providers), std::move(normalized_external),
       site_overlay_ref_presence, std::move(normalized_site_overlay_ref),
-      external_resources_was_present);
+      external_resources_was_present, assistant_settings);
 }
 
 RevisionVerifiedDeploymentApplicabilityInputs
@@ -933,7 +935,8 @@ compute_capability_provider_binding_revisions(
           candidate.normalized_external_resources(),
           candidate.site_overlay_ref_presence(),
           candidate.normalized_site_overlay_ref(),
-          candidate.external_resources_was_present()));
+          candidate.external_resources_was_present(),
+          candidate.assistant_settings()));
 }
 
 RevisionVerifiedDeploymentApplicabilityInputs

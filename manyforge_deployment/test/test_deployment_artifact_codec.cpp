@@ -472,7 +472,7 @@ TEST(DeploymentArtifactCodec,
   expect_compute_error(
       document(empty_graph(), "[]", "{\"records\":[]}",
                ",\"assistant\":{\"enabled\":false}"),
-      "only the exact empty assistant object");
+      "$.assistant: unknown field 'enabled'");
   expect_compute_error(
       document(empty_graph(), "[]", "{\"records\":[]}",
                ",\"policies\":{}"),

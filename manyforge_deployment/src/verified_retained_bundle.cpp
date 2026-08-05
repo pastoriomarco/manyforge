@@ -5,6 +5,7 @@
 #include <cmath>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -18,6 +19,7 @@
 #include "control_domain_control_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
+#include "manyforge_deployment/assistant_settings_codec.hpp"
 #include "manyforge_deployment/cell_graph_codec.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -168,6 +170,24 @@ void require_exact_fields(
     }
   }
   for (const std::string_view name : expected) {
+    (void)require_member(object, name, field);
+  }
+}
+
+void require_required_and_optional_fields(
+    const CanonicalValue::Object& object,
+    std::initializer_list<std::string_view> required,
+    std::initializer_list<std::string_view> optional,
+    std::string_view field) {
+  for (const auto& [name, unused] : object) {
+    (void)unused;
+    if (std::find(required.begin(), required.end(), name) == required.end() &&
+        std::find(optional.begin(), optional.end(), name) == optional.end()) {
+      detail::fail_retained_bundle(std::string(field) +
+                                   " contains unknown member " + name);
+    }
+  }
+  for (const std::string_view name : required) {
     (void)require_member(object, name, field);
   }
 }
@@ -849,23 +869,57 @@ void verify_node_environment_projection(const CanonicalValue& value) {
 verify_structural_applicability_projection(
     const CanonicalValue& desired_value,
     const CanonicalValue& provider_value,
+    const CanonicalValue* site_overlay_ref_value,
+    const CanonicalValue* external_resources_value,
     const core::CellGraphDTO& graph) {
   require_empty_array(
       provider_value,
       "retained_bundle.capability_provider_bindings");
-  const CanonicalValue root(CanonicalValue::Object{
+  CanonicalValue::Object root_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"desired_control_configurations", desired_value},
       {"capability_provider_bindings", provider_value},
-  });
+  };
+  if (site_overlay_ref_value != nullptr) {
+    root_members.emplace_back("site_overlay_ref", *site_overlay_ref_value);
+  }
+  if (external_resources_value != nullptr) {
+    root_members.emplace_back("external_resources", *external_resources_value);
+  }
+  const CanonicalValue root(std::move(root_members));
   RevisionVerifiedDeploymentApplicabilityInputs verified =
       compute_capability_provider_binding_revisions(
           decode_deployment_applicability_inputs_candidate(
               parse_strict_json_model_yaml(canonical_json(root))));
+  if (site_overlay_ref_value != nullptr &&
+      !verified.value().site_overlay_ref.has_value()) {
+    detail::fail_retained_bundle(
+        "retained site_overlay_ref must be a non-null selected reference");
+  }
+  if (external_resources_value != nullptr &&
+      verified.value().external_resources.empty()) {
+    detail::fail_retained_bundle(
+        "retained external_resources must be omitted when empty");
+  }
+  if (!verified.value().external_resources.empty() &&
+      !verified.value().site_overlay_ref.has_value()) {
+    detail::fail_retained_bundle(
+        "retained external resources require a selected site overlay");
+  }
   if (verified.normalized_desired_control_configurations() !=
           desired_value ||
       verified.normalized_capability_provider_bindings() !=
-          provider_value) {
+          provider_value ||
+      (external_resources_value != nullptr &&
+       verified.normalized_external_resources() !=
+           *external_resources_value) ||
+      (external_resources_value == nullptr &&
+       !verified.value().external_resources.empty()) ||
+      (site_overlay_ref_value != nullptr &&
+       verified.normalized_site_overlay_ref() !=
+           std::optional<CanonicalValue>(*site_overlay_ref_value)) ||
+      (site_overlay_ref_value == nullptr &&
+       verified.value().site_overlay_ref.has_value())) {
     detail::fail_retained_bundle(
         "retained applicability differs from its exact revision-verified "
         "projection");
@@ -909,12 +963,13 @@ verify_structural_applicability_projection(
 [[nodiscard]] core::RetainedBundleDTO
 verify_current_retained_bundle_projection(const CanonicalValue& root) {
   const auto& object = require_object(root, "retained_bundle");
-  require_exact_fields(
+  require_required_and_optional_fields(
       object,
       {"api_version", "retained_bundle_id", "deployment_artifact_id",
        "deployment_revision", "cell_graph", "catalogs",
        "desired_control_configurations", "capability_provider_bindings",
        "compiled_products", "provenance"},
+      {"site_overlay_ref", "external_resources", "assistant"},
       "retained_bundle");
   if (require_string(require_member(object, "api_version", "retained_bundle"),
                      "retained_bundle.api_version") !=
@@ -1011,7 +1066,25 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
                      "retained_bundle"),
       require_member(object, "capability_provider_bindings",
                      "retained_bundle"),
+      root.find_object_member("site_overlay_ref"),
+      root.find_object_member("external_resources"),
       verified_graph.graph());
+  std::optional<core::RetainedAssistantProjectionDTO> assistant;
+  if (const CanonicalValue* retained_assistant =
+          root.find_object_member("assistant");
+      retained_assistant != nullptr) {
+    try {
+      const QualifiedAssistantSettings qualified_assistant =
+          verify_retained_assistant_projection(
+              *retained_assistant,
+              applicability.value().external_resources);
+      assistant = qualified_assistant.retained_projection();
+    } catch (const AssistantSettingsCodecError& error) {
+      detail::fail_retained_bundle(
+          std::string("retained assistant projection is invalid: ") +
+          error.what());
+    }
+  }
 
   const auto& products = require_object(
       require_member(object, "compiled_products", "retained_bundle"),
@@ -1310,6 +1383,9 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
           generator_records,
           output_records,
       },
+      applicability.value().site_overlay_ref,
+      applicability.value().external_resources,
+      std::move(assistant),
   };
 }
 

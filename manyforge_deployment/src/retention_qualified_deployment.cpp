@@ -42,6 +42,14 @@ void require_exact_applicability_projection(
       compiled.external_resources_was_present()) {
     fail("external_resources source presence");
   }
+  if (deployment.assistant_settings().source_was_present() !=
+          compiled.assistant_settings().source_was_present() ||
+      deployment.assistant_settings().value() !=
+          compiled.assistant_settings().value() ||
+      deployment.assistant_settings().normalized_source() !=
+          compiled.assistant_settings().normalized_source()) {
+    fail("assistant source projection");
+  }
 }
 
 }  // namespace
@@ -71,6 +79,11 @@ RetentionQualifiedDeployment qualify_deployment_for_retention(
       deployment.applicability_inputs().value().site_overlay_ref;
   if (selected_ref != authored_ref) {
     fail("selected site_overlay_ref");
+  }
+
+  if (applicability.assistant_settings().value() !=
+      deployment.assistant_settings().value()) {
+    fail("qualified assistant settings");
   }
 
   if (deployment.catalog_records() != compiler_ir.catalog_record_refs()) {

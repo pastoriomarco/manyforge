@@ -135,6 +135,17 @@ require_control_domain_control_contract() {
   });
 }
 
+[[nodiscard]] CanonicalValue site_overlay_ref_projection(
+    const core::SiteOverlayRefDTO& reference) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"non_secret_digest",
+       CanonicalValue(reference.non_secret_digest.value())},
+      {"site_overlay_id", CanonicalValue(reference.site_overlay_id.value())},
+      {"site_overlay_revision",
+       CanonicalValue(reference.site_overlay_revision.value())},
+  });
+}
+
 [[nodiscard]] CanonicalValue records_projection(
     std::span<const core::CatalogRecordRefDTO> records) {
   const CanonicalValue catalogs =
@@ -416,6 +427,15 @@ require_control_domain_control_contract() {
             return outputs;
           }(),
       },
+      qualified.compiler_ir().applicability().selected_site_overlay_ref(),
+      deployment.applicability_inputs().value().external_resources,
+      qualified.compiler_ir().applicability().assistant_settings().enabled()
+          ? std::optional<core::RetainedAssistantProjectionDTO>(
+                qualified.compiler_ir()
+                    .applicability()
+                    .assistant_settings()
+                    .retained_projection())
+          : std::nullopt,
   };
 }
 
@@ -433,7 +453,7 @@ require_control_domain_control_contract() {
     std::span<const core::RetainedProductDTO> symbol_role_maps,
     std::span<const core::RetainedRuntimeUnitProductsDTO> runtime_unit_products) {
   const auto &deployment = qualified.deployment();
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object root{
       {"api_version",
        CanonicalValue(std::string(core::kRetainedBundleApiVersion))},
       {"retained_bundle_id",
@@ -463,7 +483,30 @@ require_control_domain_control_contract() {
                              planning_collision_model, viewer_model,
                              control_domain_products, symbol_role_maps,
                              runtime_unit_products)},
-  });
+  };
+  const auto& applicability = qualified.compiler_ir().applicability();
+  if (applicability.selected_site_overlay_ref().has_value()) {
+    root.emplace_back(
+        "site_overlay_ref",
+        site_overlay_ref_projection(
+            *applicability.selected_site_overlay_ref()));
+  }
+  if (!qualified.deployment()
+           .applicability_inputs()
+           .value()
+           .external_resources.empty()) {
+    root.emplace_back(
+        "external_resources",
+        qualified.deployment()
+            .applicability_inputs()
+            .normalized_external_resources());
+  }
+  if (applicability.assistant_settings().enabled()) {
+    root.emplace_back(
+        "assistant",
+        applicability.assistant_settings().normalized_projection());
+  }
+  return CanonicalValue(std::move(root));
 }
 
 struct PreparedCatalogArtifact final {
@@ -612,19 +655,18 @@ void require_qualified_structural_subset_before_store(
 
   if (graph.runtime_units.size() > 1U ||
       !graph.component_attachments.empty() ||
-      !inputs.capability_provider_bindings.empty() ||
-      !inputs.external_resources.empty() ||
-      inputs.site_overlay_ref.has_value()) {
+      !inputs.capability_provider_bindings.empty()) {
     detail::fail_retained_bundle(
         "retained-bundle materialization excludes multiple runtime units, "
-        "attachments, provider bindings, and site resources");
+        "attachments, and provider bindings");
   }
 
   const auto& applicability = compiler.applicability();
   const auto& composition = applicability.composition();
   if (applicability.runtime_profiles().size() != graph.runtime_units.size() ||
       !applicability.provider_endpoints().empty() ||
-      !applicability.external_resources().empty()) {
+      applicability.external_resources().size() !=
+          inputs.external_resources.size()) {
     detail::fail_retained_bundle(
         "compiler IR contains an incoherent runtime-profile or external "
         "provider semantic input");

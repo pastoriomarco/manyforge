@@ -487,6 +487,7 @@ set(MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES
 # This private substrate is deliberately free of compiler, materializer,
 # repository-writer, package-generator, and admission-selection effects.
 add_library(manyforge_deployment_verification_core
+  src/assistant_settings_codec.cpp
   src/apply_affected_scope.cpp
   src/artifact_codec.cpp
   src/composed_model_symbol_role_map_verifier.cpp
@@ -695,6 +696,15 @@ if(BUILD_TESTING)
   endif()
 
   manyforge_try_public_header(
+    MANYFORGE_ASSISTANT_SETTINGS_PUBLIC_HEADER_COMPILES
+    assistant_settings_public_header_compiles.cpp)
+  if(NOT MANYFORGE_ASSISTANT_SETTINGS_PUBLIC_HEADER_COMPILES)
+    message(FATAL_ERROR
+      "The assistant-settings public-header compile control failed:\n"
+      "${MANYFORGE_ASSISTANT_SETTINGS_PUBLIC_HEADER_COMPILES_OUTPUT}")
+  endif()
+
+  manyforge_try_public_header(
     MANYFORGE_VERIFIED_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES
     verified_retained_bundle_public_header_compiles.cpp)
   if(NOT MANYFORGE_VERIFIED_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES)
@@ -791,6 +801,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_artifact_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_artifact_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_assistant_settings_codec
+    test/test_assistant_settings_codec.cpp)
+  target_link_libraries(test_assistant_settings_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_assistant_settings_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_content_identity test/test_content_identity.cpp)
