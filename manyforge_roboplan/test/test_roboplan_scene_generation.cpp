@@ -4,42 +4,37 @@
 #include <filesystem>
 #include <memory>
 #include <thread>
-#include <type_traits>
 #include <vector>
 
 #include <Eigen/Core>
-#include <roboplan/core/collision_context.hpp>
 #include <roboplan/core/geometry_wrappers.hpp>
 #include <roboplan/core/scene.hpp>
 #include <roboplan_example_models/resources.hpp>
 
 namespace {
 
-static_assert(std::is_copy_constructible_v<roboplan::Scene>);
-static_assert(!std::is_copy_assignable_v<roboplan::Scene>);
-static_assert(!std::is_move_constructible_v<roboplan::Scene>);
-static_assert(!std::is_move_assignable_v<roboplan::Scene>);
-
-std::shared_ptr<roboplan::Scene> make_scene() {
+std::shared_ptr<roboplan::Scene> make_scene(const std::string& name) {
   const auto models = roboplan::example_models::get_package_models_dir();
   const auto package_share =
       roboplan::example_models::get_package_share_dir();
   return std::make_shared<roboplan::Scene>(
-      "ur5_gripper", models / "ur_robot_model/ur5_gripper.urdf",
+      name, models / "ur_robot_model/ur5_gripper.urdf",
       models / "ur_robot_model/ur5_gripper.srdf",
       std::vector<std::filesystem::path>{package_share});
 }
 
 TEST(RoboPlanSceneGenerationTest,
-     CloneOwnsIndependentGeometryStateAndCollisionScratch) {
-  auto source = make_scene();
+     FreshReconstructionOwnsIndependentGeometryStateAndCollisionScratch) {
+  auto source = make_scene("source");
+  auto retained = make_scene("retained");
   ASSERT_TRUE(source);
-  auto clone = source->clone();
-  ASSERT_TRUE(clone);
-  const auto clone_geometry_count =
-      clone->getCollisionModel().geometryObjects.size();
-  const Eigen::VectorXd clone_positions = clone->getCurrentJointPositions();
-  const bool clone_collision_before = clone->hasCollisions(clone_positions);
+  ASSERT_TRUE(retained);
+  const auto retained_geometry_count =
+      retained->getCollisionModel().geometryObjects.size();
+  const Eigen::VectorXd retained_positions =
+      retained->getCurrentJointPositions();
+  const bool retained_collision_before =
+      retained->hasCollisions(retained_positions);
 
   Eigen::Matrix4d far_pose = Eigen::Matrix4d::Identity();
   far_pose(0, 3) = 100.0;
@@ -49,51 +44,44 @@ TEST(RoboPlanSceneGenerationTest,
   ASSERT_TRUE(added.has_value()) << added.error();
   source->setJointPositions(source->randomPositions());
 
-  EXPECT_EQ(clone->getCollisionModel().geometryObjects.size(),
-            clone_geometry_count);
-  EXPECT_TRUE(clone->getCurrentJointPositions().isApprox(clone_positions));
-  EXPECT_EQ(clone->hasCollisions(clone_positions), clone_collision_before);
+  EXPECT_EQ(retained->getCollisionModel().geometryObjects.size(),
+            retained_geometry_count);
+  EXPECT_TRUE(
+      retained->getCurrentJointPositions().isApprox(retained_positions));
+  EXPECT_EQ(retained->hasCollisions(retained_positions),
+            retained_collision_before);
   EXPECT_GT(source->getCollisionModel().geometryObjects.size(),
-            clone_geometry_count);
+            retained_geometry_count);
 }
 
 TEST(RoboPlanSceneGenerationTest,
-     OwnedCollisionContextRetainsExactGenerationAfterSourceDestruction) {
-  std::unique_ptr<roboplan::CollisionContext> context;
-  std::weak_ptr<const roboplan::Scene> generation_lifetime;
-  Eigen::VectorXd query;
-  bool expected_collision = false;
+     RequestPrivateSceneKeepsNativeScratchInsideItsExactGeneration) {
+  auto generation = make_scene("owned_generation");
+  ASSERT_TRUE(generation);
+  const Eigen::VectorXd query = generation->getCurrentJointPositions();
+  const bool expected_collision = generation->hasCollisions(query);
 
-  {
-    auto source = make_scene();
-    ASSERT_TRUE(source);
-    auto generation = source->clone();
-    ASSERT_TRUE(generation);
-    query = generation->getCurrentJointPositions();
-    expected_collision = generation->hasCollisions(query);
-    generation_lifetime = generation;
-    context = std::make_unique<roboplan::CollisionContext>(generation);
+  // Scene owns its model, geometry, and private collision scratch. Repeated
+  // queries remain valid without exporting a borrowed CollisionContext.
+  EXPECT_EQ(generation->hasCollisions(query), expected_collision);
+  generation.reset();
 
-    generation.reset();
-    source.reset();
-  }
-
-  ASSERT_FALSE(generation_lifetime.expired());
-  EXPECT_EQ(context->hasCollisions(query), expected_collision);
-  context.reset();
-  EXPECT_TRUE(generation_lifetime.expired());
+  auto replacement = make_scene("replacement_generation");
+  ASSERT_TRUE(replacement);
+  EXPECT_EQ(replacement->hasCollisions(
+                replacement->getCurrentJointPositions()),
+            expected_collision);
 }
 
 TEST(RoboPlanSceneGenerationTest,
-     ExplicitReplacementKeepsLiveIdentityAndRetainedGenerationIsolation) {
-  auto live_scene = make_scene();
+     ReplacementChangesNativeIdentityAndRetainsPriorGenerationIsolation) {
+  auto live_scene = make_scene("live_generation");
   ASSERT_TRUE(live_scene);
-  auto retained_generation = live_scene->clone();
-  auto replacement = live_scene->clone();
-  ASSERT_TRUE(retained_generation);
+  const auto retained_generation = live_scene;
+  auto replacement = make_scene("replacement_generation");
   ASSERT_TRUE(replacement);
 
-  const auto* const live_identity = live_scene.get();
+  const auto* const old_identity = live_scene.get();
   const auto retained_geometry_count =
       retained_generation->getCollisionModel().geometryObjects.size();
   Eigen::Matrix4d far_pose = Eigen::Matrix4d::Identity();
@@ -103,62 +91,58 @@ TEST(RoboPlanSceneGenerationTest,
       far_pose, Eigen::Vector4d(0.8, 0.4, 0.2, 1.0));
   ASSERT_TRUE(added.has_value()) << added.error();
 
-  live_scene->replaceWithIsolatedCopy(*replacement);
+  live_scene = replacement;
 
-  EXPECT_EQ(live_scene.get(), live_identity);
+  EXPECT_NE(live_scene.get(), old_identity);
   EXPECT_GT(live_scene->getCollisionModel().geometryObjects.size(),
             retained_geometry_count);
   EXPECT_EQ(retained_generation->getCollisionModel().geometryObjects.size(),
             retained_geometry_count);
-  EXPECT_NO_THROW(
-      (void)live_scene->hasCollisions(live_scene->getCurrentJointPositions()));
-
-  const auto removed = replacement->removeGeometry("replacement_only_sphere");
-  ASSERT_TRUE(removed.has_value()) << removed.error();
-  EXPECT_GT(live_scene->getCollisionModel().geometryObjects.size(),
-            replacement->getCollisionModel().geometryObjects.size());
+  EXPECT_NO_THROW((void)live_scene->hasCollisions(
+      live_scene->getCurrentJointPositions()));
 }
 
 TEST(RoboPlanSceneGenerationTest,
-     CloneRetainsIndependentCollisionPairPolicyAfterSourceMutation) {
-  auto source = make_scene();
+     FreshGenerationRetainsIndependentCollisionPairPolicyAfterMutation) {
+  auto source = make_scene("source_policy");
+  auto retained = make_scene("retained_policy");
   ASSERT_TRUE(source);
+  ASSERT_TRUE(retained);
   Eigen::Matrix4d far_pose = Eigen::Matrix4d::Identity();
   far_pose(0, 3) = 100.0;
-  const auto added = source->addSphereGeometry(
-      "source_policy_sphere", "universe", roboplan::Sphere(0.05), far_pose,
-      Eigen::Vector4d(0.2, 0.8, 0.4, 1.0));
-  ASSERT_TRUE(added.has_value()) << added.error();
+  for (auto* scene : {source.get(), retained.get()}) {
+    const auto added = scene->addSphereGeometry(
+        "policy_sphere", "universe", roboplan::Sphere(0.05), far_pose,
+        Eigen::Vector4d(0.2, 0.8, 0.4, 1.0));
+    ASSERT_TRUE(added.has_value()) << added.error();
+  }
+  const auto retained_pair_count =
+      retained->getCollisionModel().collisionPairs.size();
+  ASSERT_EQ(source->getCollisionModel().collisionPairs.size(),
+            retained_pair_count);
 
-  auto clone = source->clone();
-  ASSERT_TRUE(clone);
-  const auto clone_pair_count =
-      clone->getCollisionModel().collisionPairs.size();
-  const auto source_pair_count =
-      source->getCollisionModel().collisionPairs.size();
-  ASSERT_EQ(clone_pair_count, source_pair_count);
-
-  const auto disabled = source->setCollisions(
-      "forearm_link", "source_policy_sphere", false);
+  const auto disabled =
+      source->setCollisions("forearm_link", "policy_sphere", false);
   ASSERT_TRUE(disabled.has_value()) << disabled.error();
 
   EXPECT_LT(source->getCollisionModel().collisionPairs.size(),
-            source_pair_count);
-  EXPECT_EQ(clone->getCollisionModel().collisionPairs.size(),
-            clone_pair_count);
-  EXPECT_NO_THROW(
-      (void)clone->hasCollisions(clone->getCurrentJointPositions()));
+            retained_pair_count);
+  EXPECT_EQ(retained->getCollisionModel().collisionPairs.size(),
+            retained_pair_count);
+  EXPECT_NO_THROW((void)retained->hasCollisions(
+      retained->getCurrentJointPositions()));
 }
 
 TEST(RoboPlanSceneGenerationTest,
-     SourceMutationAndQueriesDoNotRaceOrAffectCloneQueries) {
-  auto source = make_scene();
+     IndependentSourceMutationAndRetainedQueriesDoNotInterfere) {
+  auto source = make_scene("concurrent_source");
+  auto retained = make_scene("concurrent_retained");
   ASSERT_TRUE(source);
-  auto clone = source->clone();
-  ASSERT_TRUE(clone);
-  auto context = std::make_unique<roboplan::CollisionContext>(clone);
-  const Eigen::VectorXd clone_query = clone->getCurrentJointPositions();
-  const bool expected_collision = context->hasCollisions(clone_query);
+  ASSERT_TRUE(retained);
+  const Eigen::VectorXd retained_query =
+      retained->getCurrentJointPositions();
+  const bool expected_collision =
+      retained->hasCollisions(retained_query);
 
   std::atomic<bool> start{false};
   std::atomic<bool> failed{false};
@@ -172,12 +156,12 @@ TEST(RoboPlanSceneGenerationTest,
       (void)source->hasCollisions(positions);
     }
   });
-  std::jthread clone_worker([&](std::stop_token) {
+  std::jthread retained_worker([&](std::stop_token) {
     while (!start.load(std::memory_order_acquire)) {
       std::this_thread::yield();
     }
     for (int iteration = 0; iteration < 128; ++iteration) {
-      if (context->hasCollisions(clone_query) != expected_collision) {
+      if (retained->hasCollisions(retained_query) != expected_collision) {
         failed.store(true, std::memory_order_release);
         return;
       }
@@ -186,9 +170,10 @@ TEST(RoboPlanSceneGenerationTest,
 
   start.store(true, std::memory_order_release);
   source_worker.join();
-  clone_worker.join();
+  retained_worker.join();
   EXPECT_FALSE(failed.load(std::memory_order_acquire));
-  EXPECT_TRUE(clone->getCurrentJointPositions().isApprox(clone_query));
+  EXPECT_TRUE(
+      retained->getCurrentJointPositions().isApprox(retained_query));
 }
 
 }  // namespace

@@ -1,0 +1,36 @@
+diff --git a/roboplan_rrt/src/constraints.cpp b/roboplan_rrt/src/constraints.cpp
+index 5720afc..3efba4d 100644
+--- a/roboplan_rrt/src/constraints.cpp
++++ b/roboplan_rrt/src/constraints.cpp
+@@ -17,7 +17,8 @@ PoseConstraint::PoseConstraint(const std::shared_ptr<Scene> scene, const std::st
+     : scene_{scene}, group_name_{group_name}, frame_name_{frame_name},
+       reference_frame_{reference_frame}, region_tform_{pinocchio::SE3(tform)},
+       lower_bounds_{lower_bounds}, upper_bounds_{upper_bounds},
+-      position_tolerance_{position_tolerance}, orientation_tolerance_{orientation_tolerance} {
++      position_tolerance_{position_tolerance}, orientation_tolerance_{orientation_tolerance},
++      data_{scene->getModel()} {
+ 
+   // Validate the joint group.
+   const auto maybe_joint_group_info = scene_->getJointGroupInfo(group_name);
+@@ -53,7 +54,6 @@ PoseConstraint::PoseConstraint(const std::shared_ptr<Scene> scene, const std::st
+ 
+   // Initialize private kinematics data, matrices, and vectors.
+   const auto& model = scene_->getModel();
+-  data_ = pinocchio::Data(model);
+   displacement_ = TaskSpaceVector::Zero();
+   displacement_jacobian_ = Eigen::MatrixXd::Zero(6, joint_group_info_.v_indices.size());
+   world_jacobian_ = Eigen::MatrixXd::Zero(6, model.nv);
+diff --git a/roboplan_simple_ik/src/simple_ik.cpp b/roboplan_simple_ik/src/simple_ik.cpp
+index d21a049..6f36809 100644
+--- a/roboplan_simple_ik/src/simple_ik.cpp
++++ b/roboplan_simple_ik/src/simple_ik.cpp
+@@ -9,8 +9,7 @@
+ namespace roboplan {
+ 
+ SimpleIk::SimpleIk(const std::shared_ptr<Scene> scene, const SimpleIkOptions& options)
+-    : scene_{scene}, options_{options} {
+-  data_ = pinocchio::Data(scene_->getModel());
++    : scene_{scene}, options_{options}, data_{scene->getModel()} {
+ 
+   // Validate the joint group.
+   const auto maybe_joint_group_info = scene_->getJointGroupInfo(options.group_name);

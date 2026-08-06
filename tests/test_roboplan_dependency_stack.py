@@ -103,6 +103,33 @@ def test_linkage_rejects_unresolved_library(
         )
 
 
+def test_linkage_rejects_roboplan_library_outside_selected_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cmeel_prefix = tmp_path / "site-packages/cmeel.prefix"
+    cmeel_prefix.mkdir(parents=True)
+    selected = tmp_path / "site-packages/lib"
+    selected.mkdir(parents=True)
+    competing = tmp_path / "usr/local/lib/libroboplan.so"
+    competing.parent.mkdir(parents=True)
+    competing.touch()
+    monkeypatch.setattr(
+        _MODULE.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout=f"libroboplan.so => {competing} (0x0)\n"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="resolved outside"):
+        _MODULE._check_linkage(  # noqa: SLF001
+            tmp_path / "extension.so",
+            cmeel_prefix,
+            selected,
+        )
+
+
 def test_cmeel_prefix_requires_exactly_one_active_generation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

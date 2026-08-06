@@ -1,0 +1,33 @@
+diff --git a/roboplan_rrt/include/dynotree/StateSpace.h b/roboplan_rrt/include/dynotree/StateSpace.h
+index 71845593ecbb7d250aa955cc965d8c042c2d2732..7f32846c1a2aa394a2c972b7cb29fcfc64d215df 100644
+--- a/roboplan_rrt/include/dynotree/StateSpace.h
++++ b/roboplan_rrt/include/dynotree/StateSpace.h
+@@ -348,8 +348,8 @@ template <typename Scalar> struct SO2Squared {
+   using cref_t = const Eigen::Ref<const Eigen::Matrix<Scalar, 1, 1>> &;
+   using ref_t = Eigen::Ref<Eigen::Matrix<Scalar, 1, 1>>;
+ 
+-  Eigen::Matrix<Scalar, 1, 1> lb;
+-  Eigen::Matrix<Scalar, 1, 1> ub;
++  Eigen::Matrix<Scalar, 1, 1> lb = Eigen::Matrix<Scalar, 1, 1>::Zero();
++  Eigen::Matrix<Scalar, 1, 1> ub = Eigen::Matrix<Scalar, 1, 1>::Zero();
+ 
+   SO2<Scalar> so2;
+ 
+@@ -407,9 +407,14 @@ template <typename Scalar, int Dimensions = -1> struct RnSquared {
+   using ref_t = Eigen::Ref<Eigen::Matrix<Scalar, Dimensions, 1>>;
+   using vec_t = Eigen::Matrix<Scalar, Dimensions, 1>;
+ 
+-  Eigen::Matrix<Scalar, Dimensions, 1> lb;
+-  Eigen::Matrix<Scalar, Dimensions, 1> ub;
+-  vec_t weights;
++  Eigen::Matrix<Scalar, Dimensions, 1> lb =
++      Eigen::Matrix<Scalar, Dimensions, 1>::Zero(
++          Dimensions == Eigen::Dynamic ? 0 : Dimensions);
++  Eigen::Matrix<Scalar, Dimensions, 1> ub =
++      Eigen::Matrix<Scalar, Dimensions, 1>::Zero(
++          Dimensions == Eigen::Dynamic ? 0 : Dimensions);
++  vec_t weights =
++      vec_t::Ones(Dimensions == Eigen::Dynamic ? 0 : Dimensions);
+   bool use_weights = false;
+ 
+   void print(std::ostream &out) {

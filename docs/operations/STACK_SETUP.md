@@ -276,7 +276,9 @@ manually; they are documented here for traceability.
 | Base dev image                                                                       | `python:3.12-slim-bookworm`                                        | Docker Hub                                                       | Dockerfile L31; ROS-free dev environment                                                                                                                                                                                                                                                                                   |
 | Frontend builder                                                                     | `node:22-slim`                                                     | Docker Hub                                                       | Dockerfile L23; React/Vite build stage                                                                                                                                                                                                                                                                                     |
 | ROS image                                                                            | `ros:jazzy-ros-base-noble`                                         | Docker Hub                                                       | Dockerfile.ros-jazzy L11; Ubuntu Noble + ROS Jazzy                                                                                                                                                                                                                                                                         |
-| RoboPlan                                                                             | reviewed `0.5.1` commit `e06d1a2f1b749c38742aee9e401bbe97fa967f7b` | `https://github.com/open-planning/roboplan.git`                  | Pinned in `scripts/setup-docker.sh` as `ROBOPLAN_PINNED_REF`. The upstream tag is lightweight and unsigned; the exact commit and every checked patch/removal criterion are recorded in `third_party/roboplan/README.md`. The Dockerfiles install RoboPlan's modular C++ and Python packages, including Cartesian planning. |
+| RoboPlan                                                                             | reviewed `0.6.0` commit `d2e5162eda2f51f5599ecd60375b65346d0b2944` | `https://github.com/open-planning/roboplan.git`                  | Sole selected baseline, pinned in `scripts/setup-docker.sh` as `ROBOPLAN_PINNED_REF`. Exact source identity and every checked patch/removal criterion are recorded in `third_party/roboplan/README.md`; the former 0.5.1 series remains historical evidence, not a selectable build.                                                               |
+| ProxSuite                                                                            | reviewed `v0.7.3` commit `b93d7778ffc3299d84b5cb0851022a29bf24a596` | `https://github.com/Simple-Robotics/proxsuite.git`               | Source-built from the exact commit with only its frozen `cmake-module` gitlink populated; Docker configuration is disconnected from network fallback.                                                                                                                                                                                               |
+| TOPPRA                                                                               | reviewed `0.6.8` commit `cbbc89d46208fddfaa3e1aab52ab44553751b510` | `https://github.com/hungpham2511/toppra.git`                     | Source-built from the exact commit for RoboPlan 0.6; Docker configuration is disconnected from network fallback.                                                                                                                                                                                                                                     |
 | Pinocchio (kinematics / dynamics)                                                    | `pin==4.1.0`, `libpinocchio==4.1.0`                                | PyPI                                                             | Both wrapper and C++ library wheels are pinned; the compatible aarch64 graph uses `coal==3.0.3` and `libcoal==3.0.3`.                                                                                                                                                                                                      |
 | `pybind11`                                                                           | `3.0.3`                                                            | PyPI                                                             | Dockerfile L58                                                                                                                                                                                                                                                                                                             |
 | `nanobind`                                                                           | `2.12.0`                                                           | PyPI                                                             | Dockerfile L63                                                                                                                                                                                                                                                                                                             |
@@ -303,8 +305,8 @@ carry the same string as the tag they forked from), so
 on the host:
 
 ```bash
-cat .docker/.manyforge-roboplan-ref   # the ref passed to git fetch
-cat .docker/.manyforge-roboplan-sha   # the resolved commit SHA
+cat .docker/roboplan.manyforge-ref   # the ref passed to git fetch
+cat .docker/roboplan.manyforge-sha   # the resolved commit SHA
 ```
 
 The disposable checkout retains shallow Git metadata. Every setup run verifies
@@ -319,12 +321,17 @@ rm -rf .docker/roboplan/
 ROBOPLAN_REF=<branch|tag|sha> ./scripts/setup-docker.sh
 ```
 
-With no `ROBOPLAN_REF`, the script uses the reviewed RoboPlan 0.5.1 commit pinned at
-`scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`). Maintainers move that pin
-forward only after the dependency, adapter, sanitizer, ROS/Isaac, and
-performance gates in `third_party/roboplan/README.md` pass. An explicit
-`ROBOPLAN_REF` is a development override and cannot produce release evidence
-for the pinned build.
+With no `ROBOPLAN_REF`, the script uses the reviewed RoboPlan 0.6.0 commit
+pinned in `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`) together with the
+exact ProxSuite and TOPPRA source closure. Maintainers move any pin only after
+the affected dependency, adapter, sanitizer, platform, and performance gates
+in `third_party/roboplan/README.md` pass. An explicit `ROBOPLAN_REF` changes
+only RoboPlan for a development experiment and cannot produce release evidence
+for the selected build. The setup script marks that image build
+`development_override`; exact pinned-source verification is disabled visibly,
+the source-stack builder reports non-qualification mode, the exact dependency
+closure remains enforced, and the checked patch manifest must still apply.
+Canonical builds default to fail-closed `qualified` mode.
 
 ## Primary Scripts
 

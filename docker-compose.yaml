@@ -11,6 +11,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
     logging: *default-logging
     security_opt:
       # ThreadSanitizer needs personality(ADDR_NO_RANDOMIZE), which Docker's
@@ -32,6 +34,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
     logging: *default-logging
     restart: unless-stopped
     ports:
@@ -59,6 +63,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
     logging: *default-logging
     ports:
       - "9000:9000"
@@ -118,6 +124,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ros-jazzy-full
+      args:
+        ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
     logging: *default-logging
     network_mode: host
     ipc: host

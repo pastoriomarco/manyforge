@@ -1,37 +1,33 @@
 #!/usr/bin/env bash
-# One-time setup for the ManyForge Docker dev environment.
-#
-# What it does:
-#   1. Pre-clones RoboPlan (recursive submodule clone fails inside Docker)
-#   2. Verifies the exact clean RoboPlan source revision
-#   3. Builds the Docker image via docker compose
+# Materialize the exact RoboPlan 0.6 source closure and build ManyForge images.
 #
 # Usage:
 #   ./scripts/setup-docker.sh
 #   ./scripts/setup-docker.sh --prepare-only
 #
-#   # Optional: clone a different RoboPlan ref instead of the pinned SHA.
-#   ROBOPLAN_REF=main ./scripts/setup-docker.sh
-#   ROBOPLAN_REF=0.5.1 ./scripts/setup-docker.sh
-#
-# After setup:
-#   docker compose run --rm dev bash
+# ROBOPLAN_REF may select another RoboPlan revision for development experiments.
+# ProxSuite and TOPPRA remain exact even in that mode, and the resulting image
+# is explicitly non-qualifying.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ROBOPLAN_DIR="$REPO_DIR/.docker/roboplan"
-# Pinned to the reviewed commit referenced by RoboPlan's lightweight 0.5.1
-# tag. Use the exact SHA for reproducible Docker builds while still allowing
-# explicit ROBOPLAN_REF overrides for development experiments.
-# Checked source patches are applied by the Dockerfiles after hash validation;
-# .docker/roboplan remains an exact, disposable checkout of this commit.
-# See docs/reference/ROBOPLAN_ADAPTER_NOTES.md for the source-level dependency.
-ROBOPLAN_PINNED_REF="e06d1a2f1b749c38742aee9e401bbe97fa967f7b"
+SOURCE_ROOT="$REPO_DIR/.docker"
+ROBOPLAN_DIR="$SOURCE_ROOT/roboplan"
+PROXSUITE_DIR="$SOURCE_ROOT/proxsuite"
+TOPPRA_DIR="$SOURCE_ROOT/toppra"
+
+ROBOPLAN_URL="https://github.com/open-planning/roboplan.git"
+ROBOPLAN_PINNED_REF="d2e5162eda2f51f5599ecd60375b65346d0b2944"
 ROBOPLAN_REF="${ROBOPLAN_REF:-$ROBOPLAN_PINNED_REF}"
-ROBOPLAN_REF_MARKER="$REPO_DIR/.docker/.manyforge-roboplan-ref"
-ROBOPLAN_SHA_MARKER="$REPO_DIR/.docker/.manyforge-roboplan-sha"
+PROXSUITE_URL="https://github.com/Simple-Robotics/proxsuite.git"
+PROXSUITE_PINNED_REF="b93d7778ffc3299d84b5cb0851022a29bf24a596"
+TOPPRA_URL="https://github.com/hungpham2511/toppra.git"
+TOPPRA_PINNED_REF="cbbc89d46208fddfaa3e1aab52ab44553751b510"
+
+ROBOPLAN_SOURCE_LEDGER="$REPO_DIR/verification/composable_cell_e1/external_delta_ledger.v1.json"
+ROBOPLAN_SOURCE_VERIFIER="$REPO_DIR/scripts/ci/verify-external-source-closure.py"
 
 info() { echo -e "\033[0;32m>>>\033[0m $1"; }
 warn() { echo -e "\033[1;33m>>>\033[0m $1"; }
@@ -47,73 +43,107 @@ case "${1:-}" in
     *) fail "Usage: $0 [--prepare-only]" ;;
 esac
 
-# 1. Pre-clone RoboPlan
-current_roboplan_ref=""
-if [ -f "$ROBOPLAN_REF_MARKER" ]; then
-    current_roboplan_ref=$(cat "$ROBOPLAN_REF_MARKER" || true)
-fi
+materialize_source() {
+    local label="$1"
+    local url="$2"
+    local ref="$3"
+    local target="$4"
+    local initialized_submodule="${5:-}"
+    local ref_marker="${target}.manyforge-ref"
+    local sha_marker="${target}.manyforge-sha"
+    local recorded_ref=""
+    local reusable=false
 
-reuse_roboplan_checkout=false
-if [ -d "$ROBOPLAN_DIR/.git" ] && [ "$current_roboplan_ref" = "$ROBOPLAN_REF" ] \
-    && [ -f "$ROBOPLAN_SHA_MARKER" ]; then
-    expected_roboplan_sha=$(cat "$ROBOPLAN_SHA_MARKER" || true)
-    if actual_roboplan_sha=$(git -C "$ROBOPLAN_DIR" rev-parse HEAD 2>/dev/null) \
-        && roboplan_status=$(git -C "$ROBOPLAN_DIR" status --porcelain=v1 \
-            --untracked-files=all --ignore-submodules=none 2>/dev/null) \
-        && roboplan_submodules=$(git -C "$ROBOPLAN_DIR" submodule status \
-            --recursive 2>/dev/null) \
-        && [ "$actual_roboplan_sha" = "$expected_roboplan_sha" ] \
-        && [ -z "$roboplan_status" ] \
-        && ! printf '%s\n' "$roboplan_submodules" | grep -Eq '^[+-U]'; then
-        reuse_roboplan_checkout=true
-    else
-        warn "RoboPlan checkout is not the recorded clean source; recreating it."
+    if [ -f "$ref_marker" ]; then
+        recorded_ref=$(<"$ref_marker")
     fi
-fi
+    if [ -d "$target/.git" ] && [ "$recorded_ref" = "$ref" ] \
+        && [ -f "$sha_marker" ]; then
+        local expected_sha actual_sha source_status
+        expected_sha=$(<"$sha_marker")
+        if actual_sha=$(git -C "$target" rev-parse HEAD 2>/dev/null) \
+            && source_status=$(git -C "$target" status --porcelain=v1 \
+                --untracked-files=all --ignore-submodules=none 2>/dev/null) \
+            && [ "$actual_sha" = "$expected_sha" ] \
+            && [ -z "$source_status" ]; then
+            reusable=true
+        fi
+    fi
 
-if [ "$reuse_roboplan_checkout" = true ]; then
-    info "RoboPlan ref '$ROBOPLAN_REF' is present and source-clean at .docker/roboplan/."
-    info "Resolved SHA: $(cat "$ROBOPLAN_SHA_MARKER")"
+    if [ "$reusable" = true ]; then
+        info "$label source is clean at $target ($(git -C "$target" rev-parse HEAD))."
+        return
+    fi
+
+    if [ -e "$target" ]; then
+        warn "$label source is absent, stale, or modified; recreating $target."
+        rm -rf "$target"
+    fi
+    mkdir -p "$SOURCE_ROOT"
+    git init -q "$target"
+    git -C "$target" remote add origin "$url"
+    git -C "$target" fetch --depth 1 origin "$ref"
+    git -C "$target" checkout -q --detach FETCH_HEAD
+    if [ -n "$initialized_submodule" ]; then
+        git -C "$target" submodule update --init --depth 1 "$initialized_submodule"
+    fi
+    local resolved_sha
+    resolved_sha=$(git -C "$target" rev-parse HEAD)
+    printf '%s\n' "$ref" > "$ref_marker"
+    printf '%s\n' "$resolved_sha" > "$sha_marker"
+    info "$label source ready at $resolved_sha."
+}
+
+materialize_source RoboPlan "$ROBOPLAN_URL" "$ROBOPLAN_REF" "$ROBOPLAN_DIR"
+materialize_source ProxSuite "$PROXSUITE_URL" "$PROXSUITE_PINNED_REF" \
+    "$PROXSUITE_DIR" cmake-module
+materialize_source TOPPRA "$TOPPRA_URL" "$TOPPRA_PINNED_REF" "$TOPPRA_DIR"
+
+python3 "$ROBOPLAN_SOURCE_VERIFIER" \
+    --ledger "$ROBOPLAN_SOURCE_LEDGER" \
+    --source-id proxsuite_0_7_3_candidate_dependency \
+    --root "$PROXSUITE_DIR" --content-kind source \
+    || fail "ProxSuite source identity/license preflight failed."
+python3 "$ROBOPLAN_SOURCE_VERIFIER" \
+    --ledger "$ROBOPLAN_SOURCE_LEDGER" \
+    --source-id proxsuite_cmake_module_candidate_dependency \
+    --root "$PROXSUITE_DIR/cmake-module" --content-kind source \
+    || fail "ProxSuite CMake-module identity/license preflight failed."
+python3 "$ROBOPLAN_SOURCE_VERIFIER" \
+    --ledger "$ROBOPLAN_SOURCE_LEDGER" \
+    --source-id toppra_0_6_8_candidate_dependency \
+    --root "$TOPPRA_DIR" --content-kind source \
+    || fail "TOPPRA source identity/license preflight failed."
+
+ROBOPLAN_SOURCE_MODE=qualified
+if [ "$ROBOPLAN_REF" = "$ROBOPLAN_PINNED_REF" ]; then
+    python3 "$ROBOPLAN_SOURCE_VERIFIER" \
+        --ledger "$ROBOPLAN_SOURCE_LEDGER" \
+        --source-id roboplan_0_6_0_candidate \
+        --root "$ROBOPLAN_DIR" --content-kind source \
+        || fail "RoboPlan source identity/license preflight failed."
 else
-    info "Cloning RoboPlan ref '$ROBOPLAN_REF' (this takes a minute)..."
-    rm -rf "$ROBOPLAN_DIR"
-    mkdir -p "$REPO_DIR/.docker"
-    git init "$ROBOPLAN_DIR"
-    cd "$ROBOPLAN_DIR"
-    git remote add origin https://github.com/open-planning/roboplan.git
-    git fetch --depth 1 origin "$ROBOPLAN_REF"
-    git checkout --detach FETCH_HEAD
-    resolved_roboplan_sha=$(git rev-parse HEAD)
-    git submodule update --init --recursive --depth 1
-    cd "$REPO_DIR"
-
-    printf '%s\n' "$ROBOPLAN_REF" > "$ROBOPLAN_REF_MARKER"
-    printf '%s\n' "$resolved_roboplan_sha" > "$ROBOPLAN_SHA_MARKER"
-
-    info "RoboPlan ready ($(du -sh "$ROBOPLAN_DIR" | cut -f1)); SHA $resolved_roboplan_sha."
+    ROBOPLAN_SOURCE_MODE=development_override
+    warn "ROBOPLAN_REF override selected: this image cannot qualify a release."
 fi
 
 if [ "$prepare_only" = true ]; then
-    info "Pinned RoboPlan Docker build context is ready."
+    if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then
+        info "Exact RoboPlan 0.6 source closure is ready."
+    else
+        info "Exact dependencies and experimental RoboPlan source are ready."
+    fi
     exit 0
 fi
 
-# 2. Build Docker image
-info "Building Docker image (this takes several minutes on first run)..."
+info "Building Docker images from the prepared source closure."
 cd "$REPO_DIR"
-docker compose build
+ROBOPLAN_SOURCE_MODE="$ROBOPLAN_SOURCE_MODE" docker compose build
 
-info "Setup complete!"
+info "Setup complete."
 echo ""
 echo "  Start the dev environment:"
 echo "    docker compose run --rm dev bash"
 echo ""
-echo "  Build and test C++ core:"
-echo "    cd manyforge_core && mkdir -p build && cd build"
-echo "    cmake .. && make -j\$(nproc) && ctest --output-on-failure"
-echo ""
-echo "  Run Python tests:"
-echo "    pytest manyforge_behavior/tests/"
-echo ""
-echo "  Run retained tests:"
+echo "  Run retained tests in the container:"
 echo "    ./scripts/test-all.sh retained"

@@ -2586,6 +2586,9 @@ def collect_inventory(repo_root: Path) -> dict[str, Any]:
     capabilities, workarounds = _version_inventory(
         repo_root, roboplan_version
     )
+    # This branch reconstructs the historical 0.5 transition evidence only.
+    # The selected 0.6 baseline deliberately does not inherit those patch
+    # fields or reinterpret the current production manifest as 0.5 evidence.
     patch_manifest = (
         _checked_patch_manifest(repo_root)
         if roboplan_version == ROBOPLAN_05_VERSION

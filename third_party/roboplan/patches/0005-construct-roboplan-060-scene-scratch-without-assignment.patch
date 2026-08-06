@@ -1,8 +1,8 @@
 diff --git a/roboplan/include/roboplan/core/scene.hpp b/roboplan/include/roboplan/core/scene.hpp
-index 1e8aa88..b8221a0 100644
+index 8298e4d..2558092 100644
 --- a/roboplan/include/roboplan/core/scene.hpp
 +++ b/roboplan/include/roboplan/core/scene.hpp
-@@ -96,7 +96,7 @@ public:
+@@ -71,7 +71,7 @@ public:
  
    /// @brief Gets the scene's internal Pinocchio data (read-only).
    /// @return The Pinocchio data.
@@ -11,7 +11,7 @@ index 1e8aa88..b8221a0 100644
  
    /// @brief Gets the scene's internal Pinocchio collision model.
    /// @return The Pinocchio collision (geometry) model.
-@@ -106,7 +106,7 @@ public:
+@@ -81,7 +81,7 @@ public:
    /// @details The data is shared with the scene; computations such as
    /// hasCollisions() and computeCollisionDistances() write into this data.
    /// @return The Pinocchio collision (geometry) data.
@@ -20,12 +20,12 @@ index 1e8aa88..b8221a0 100644
  
    /// @brief Updates geometry placements and computes distance results for all
    /// active collision pairs at the specified joint configuration.
-@@ -405,14 +405,14 @@ private:
+@@ -386,14 +386,14 @@ private:
  
    /// @brief The default data structure for the underlying Pinocchio model.
    /// @details This won't be thread-safe unless each thread uses its own data.
 -  mutable pinocchio::Data model_data_;
-+  mutable std::unique_ptr<pinocchio::Data> model_data_;
++  mutable std::optional<pinocchio::Data> model_data_;
  
    /// @brief The Pinocchio collision model representing the robot and its environment.
    pinocchio::GeometryModel collision_model_;
@@ -33,58 +33,43 @@ index 1e8aa88..b8221a0 100644
    /// @brief The default data structure for the underlying Pinocchio collision model.
    /// @details This won't be thread-safe unless each thread uses its own data.
 -  mutable pinocchio::GeometryData collision_model_data_;
-+  mutable std::unique_ptr<pinocchio::GeometryData> collision_model_data_;
++  mutable std::optional<pinocchio::GeometryData> collision_model_data_;
  
    /// @brief Broadphase collision manager type, using a dynamic AABB tree to cull non-overlapping
    /// geometry pairs before narrow-phase collision checking.
 diff --git a/roboplan/src/core/scene.cpp b/roboplan/src/core/scene.cpp
-index 29ddef7..94aa53b 100644
+index 0c988f8..f056892 100644
 --- a/roboplan/src/core/scene.cpp
 +++ b/roboplan/src/core/scene.cpp
-@@ -181,8 +181,9 @@ Scene::Scene(const std::string& name, const std::string& urdf, const std::string
+@@ -182,8 +182,8 @@ Scene::Scene(const std::string& name, const std::string& urdf, const std::string
    frame_map_ = createFrameMap(model_);
    joint_group_info_map_ = createJointGroupInfo(model_, srdf);
  
 -  model_data_ = pinocchio::Data(model_);
 -  collision_model_data_ = pinocchio::GeometryData(collision_model_);
-+  model_data_ = std::make_unique<pinocchio::Data>(model_);
-+  collision_model_data_ =
-+      std::make_unique<pinocchio::GeometryData>(collision_model_);
++  model_data_.emplace(model_);
++  collision_model_data_.emplace(collision_model_);
    rebuildBroadphaseManager();
  
    // Initialize the current state of the scene.
-@@ -193,8 +194,11 @@ Scene::Scene(const std::string& name, const std::string& urdf, const std::string
- }
- 
- Scene::Scene(const Scene& other)
--    : name_(other.name_), model_(other.model_), model_data_(model_),
--      collision_model_(other.collision_model_), collision_model_data_(collision_model_),
-+    : name_(other.name_), model_(other.model_),
-+      model_data_(std::make_unique<pinocchio::Data>(model_)),
-+      collision_model_(other.collision_model_),
-+      collision_model_data_(
-+          std::make_unique<pinocchio::GeometryData>(collision_model_)),
-       joint_names_(other.joint_names_), actuated_joint_names_(other.actuated_joint_names_),
-       joint_info_map_(other.joint_info_map_), joint_group_info_map_(other.joint_group_info_map_),
-       rng_gen_(other.rng_gen_), cur_state_(other.cur_state_), frame_map_(other.frame_map_),
-@@ -332,12 +336,14 @@ std::optional<Eigen::VectorXd> Scene::randomCollisionFreePositions(size_t max_sa
+@@ -278,13 +278,13 @@ std::optional<Eigen::VectorXd> Scene::randomCollisionFreePositions(size_t max_sa
  void Scene::rebuildBroadphaseManager() {
    // The manager caches AABB-tree state and pointers into collision_model_/collision_model_data_,
    // so it is rebuilt from scratch whenever the collision data is (re)assigned.
 -  broadphase_manager_.emplace(&model_, &collision_model_, &collision_model_data_);
-+  broadphase_manager_.emplace(&model_, &collision_model_,
-+                              collision_model_data_.get());
++  broadphase_manager_.emplace(&model_, &collision_model_, &*collision_model_data_);
  
    // Initialize geometry world placements before the first AABB-tree refit. Without this the world
    // transforms are uninitialized, which makes the underlying coal manager throw on degenerate
    // bounding volumes. The per-query path overwrites these placements on every call.
 -  pinocchio::updateGeometryPlacements(model_, model_data_, collision_model_, collision_model_data_,
+-                                      pinocchio::neutral(model_));
 +  pinocchio::updateGeometryPlacements(model_, *model_data_, collision_model_,
-+                                      *collision_model_data_,
-                                       pinocchio::neutral(model_));
++                                      *collision_model_data_, pinocchio::neutral(model_));
    broadphase_manager_->update(/*compute_local_aabb=*/true);
  }
-@@ -346,22 +352,23 @@ bool Scene::hasCollisions(const Eigen::VectorXd& q, const bool debug) const {
+ 
+@@ -292,22 +292,23 @@ bool Scene::hasCollisions(const Eigen::VectorXd& q, const bool debug) const {
    if (!debug) {
      // Fast path: broadphase AABB-tree culling, stopping at the first collision. The one-shot
      // overload runs forward kinematics, updates geometry placements + the AABB tree, then collides.
@@ -113,17 +98,16 @@ index 29ddef7..94aa53b 100644
      if (cr.isCollision()) {
        const auto& body1 = collision_model_.geometryObjects.at(cp.first).name;
        const auto& body2 = collision_model_.geometryObjects.at(cp.second).name;
-@@ -373,7 +380,8 @@ bool Scene::hasCollisions(const Eigen::VectorXd& q, const bool debug) const {
+@@ -319,7 +320,7 @@ bool Scene::hasCollisions(const Eigen::VectorXd& q, const bool debug) const {
  }
  
  void Scene::computeCollisionDistances(const Eigen::VectorXd& q) const {
 -  pinocchio::computeDistances(model_, model_data_, collision_model_, collision_model_data_, q);
-+  pinocchio::computeDistances(model_, *model_data_, collision_model_,
-+                              *collision_model_data_, q);
++  pinocchio::computeDistances(model_, *model_data_, collision_model_, *collision_model_data_, q);
  }
  
  bool Scene::isValidConfiguration(const Eigen::VectorXd& q) const {
-@@ -527,12 +535,12 @@ Eigen::Matrix4d Scene::forwardKinematics(const Eigen::VectorXd& q, const std::st
+@@ -478,12 +479,12 @@ Eigen::Matrix4d Scene::forwardKinematics(const Eigen::VectorXd& q, const std::st
    }
    const auto frame_id = maybe_frame_id.value();
  
@@ -139,7 +123,7 @@ index 29ddef7..94aa53b 100644
    }
  
    // Otherwise compute the incremental fk from the base_frame
-@@ -542,14 +550,16 @@ Eigen::Matrix4d Scene::forwardKinematics(const Eigen::VectorXd& q, const std::st
+@@ -493,14 +494,15 @@ Eigen::Matrix4d Scene::forwardKinematics(const Eigen::VectorXd& q, const std::st
    }
    const auto base_id = maybe_base_id.value();
  
@@ -154,12 +138,11 @@ index 29ddef7..94aa53b 100644
                                   pinocchio::ReferenceFrame reference_frame,
                                   Eigen::Ref<Eigen::MatrixXd> jacobian) const {
 -  pinocchio::computeFrameJacobian(model_, model_data_, q, frame_id, reference_frame, jacobian);
-+  pinocchio::computeFrameJacobian(model_, *model_data_, q, frame_id,
-+                                  reference_frame, jacobian);
++  pinocchio::computeFrameJacobian(model_, *model_data_, q, frame_id, reference_frame, jacobian);
  }
  
  void Scene::computeRelativeFrameJacobian(const Eigen::VectorXd& q, pinocchio::FrameIndex frame_id,
-@@ -566,14 +576,14 @@ void Scene::computeRelativeFrameJacobian(const Eigen::VectorXd& q, pinocchio::Fr
+@@ -517,14 +519,14 @@ void Scene::computeRelativeFrameJacobian(const Eigen::VectorXd& q, pinocchio::Fr
    // This avoids toActionMatrix() convention issues between Pinocchio versions.
    Eigen::MatrixXd J_ee_lwa = Eigen::MatrixXd::Zero(6, model_.nv);
    Eigen::MatrixXd J_base_lwa = Eigen::MatrixXd::Zero(6, model_.nv);
@@ -180,7 +163,7 @@ index 29ddef7..94aa53b 100644
  
    // World-frame relative Jacobian (at EE origin, world orientation).
    //
-@@ -628,7 +638,7 @@ void Scene::computeRelativeFrameJacobian(const Eigen::VectorXd& q, pinocchio::Fr
+@@ -579,7 +581,7 @@ void Scene::computeRelativeFrameJacobian(const Eigen::VectorXd& q, pinocchio::Fr
  }
  
  void Scene::computeJointJacobians(const Eigen::VectorXd& q) const {
@@ -189,33 +172,33 @@ index 29ddef7..94aa53b 100644
  }
  
  tl::expected<pinocchio::FrameIndex, std::string> Scene::getFrameId(const std::string& name) const {
-@@ -939,7 +949,8 @@ tl::expected<void, std::string> Scene::addGeometry(const pinocchio::GeometryObje
+@@ -890,7 +892,8 @@ tl::expected<void, std::string> Scene::addGeometry(const pinocchio::GeometryObje
      collision_model_.addCollisionPair(pinocchio::CollisionPair(idx, collision_geom_idx));
    }
  
 -  collision_model_data_ = pinocchio::GeometryData(collision_model_);
-+  collision_model_data_ =
-+      std::make_unique<pinocchio::GeometryData>(collision_model_);
++  broadphase_manager_.reset();
++  collision_model_data_.emplace(collision_model_);
    rebuildBroadphaseManager();
    return {};
  }
-@@ -983,7 +994,8 @@ tl::expected<void, std::string> Scene::removeGeometry(const std::string& name) {
+@@ -934,7 +937,8 @@ tl::expected<void, std::string> Scene::removeGeometry(const std::string& name) {
  
    collision_model_.removeGeometryObject(name);
    collision_geometry_map_.erase(name);
 -  collision_model_data_ = pinocchio::GeometryData(collision_model_);
-+  collision_model_data_ =
-+      std::make_unique<pinocchio::GeometryData>(collision_model_);
++  broadphase_manager_.reset();
++  collision_model_data_.emplace(collision_model_);
    rebuildBroadphaseManager();
    return {};
  }
-@@ -1040,7 +1052,8 @@ tl::expected<void, std::string> Scene::setCollisions(const std::string& body1,
+@@ -991,7 +995,8 @@ tl::expected<void, std::string> Scene::setCollisions(const std::string& body1,
        }
      }
    }
 -  collision_model_data_ = pinocchio::GeometryData(collision_model_);
-+  collision_model_data_ =
-+      std::make_unique<pinocchio::GeometryData>(collision_model_);
++  broadphase_manager_.reset();
++  collision_model_data_.emplace(collision_model_);
    rebuildBroadphaseManager();
    return {};
  }

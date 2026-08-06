@@ -30,6 +30,7 @@ RUN npm run build
 # --- Stage 2: Python/C++ runtime ---
 FROM python:3.12-slim-bookworm
 
+ARG ROBOPLAN_SOURCE_MODE=qualified
 ENV DEBIAN_FRONTEND=noninteractive
 # Pinocchio (cmeel package) installs shared libs under a Python-managed prefix.
 # The cmeel lib dir is added to the dynamic linker cache below; keep LD_LIBRARY_PATH
@@ -102,51 +103,82 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
     && CMEEL_LIB=$(python3 -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix/lib \
     && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/cmeel.conf && ldconfig; fi
 
-# RoboPlan: C++ planning library with Python bindings (nanobind)
-# Pre-cloned on host — see scripts/setup-docker.sh
+# Exact RoboPlan 0.6 source closure with source-built ProxSuite and TOPPRA.
+# Prepared on the host by scripts/setup-docker.sh.
 COPY .docker/roboplan/ /tmp/roboplan/
+COPY .docker/proxsuite/ /tmp/proxsuite/
+COPY .docker/toppra/ /tmp/toppra/
 COPY third_party/roboplan/ /tmp/roboplan-manifest/
+COPY scripts/ci/build-roboplan-source-stack.sh /tmp/build-roboplan-source-stack.sh
+COPY scripts/ci/build-roboplan-source-closure.sh /tmp/build-roboplan-source-closure.sh
+COPY scripts/ci/verify-external-source-closure.py /tmp/verify-external-source-closure.py
+COPY verification/composable_cell_e1/external_delta_ledger.v1.json /tmp/external-delta-ledger.v1.json
 COPY scripts/ci/check-roboplan-dependency-stack.py /tmp/check-roboplan-dependency-stack.py
 RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1) \
     && PINOCCHIO_PREFIX=$(dirname $(dirname $(dirname $PINOCCHIO_CMAKE_DIR))) \
     && echo "Pinocchio prefix: ${PINOCCHIO_PREFIX}" \
+    && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then \
+         python3 /tmp/verify-external-source-closure.py \
+           --ledger /tmp/external-delta-ledger.v1.json \
+           --source-id roboplan_0_6_0_candidate --root /tmp/roboplan \
+           --content-kind source --allow-stripped-git; \
+       elif [ "$ROBOPLAN_SOURCE_MODE" = development_override ]; then \
+         echo "RoboPlan development override: exact-source qualification disabled" >&2; \
+       else \
+         echo "Invalid ROBOPLAN_SOURCE_MODE: $ROBOPLAN_SOURCE_MODE" >&2; exit 2; \
+       fi \
     && cd /tmp/roboplan-manifest \
     && sha256sum -c patches.sha256 \
+    && umask 0002 \
     && while read -r digest patch; do \
          case "$patch" in patches/*.patch) ;; *) echo "Invalid RoboPlan patch path: $patch" >&2; exit 1;; esac; \
          git -C /tmp/roboplan apply --check "/tmp/roboplan-manifest/$patch"; \
          git -C /tmp/roboplan apply "/tmp/roboplan-manifest/$patch"; \
        done < patches.sha256 \
-    && cd /tmp/roboplan \
-    && export CMAKE_PREFIX_PATH="${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH}" \
+    && umask 0022 \
+    && export CMAKE_PREFIX_PATH="${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
     && export LD_LIBRARY_PATH="${PINOCCHIO_PREFIX}/lib:${LD_LIBRARY_PATH}" \
-    && ROBOPLAN_CMAKE_ARGS=-DBUILD_TESTING=OFF ./scripts/build_cmake.bash \
-    && ROBOPLAN_INSTALL=/tmp/roboplan/install \
-    && mkdir -p /usr/local/lib/cmake /usr/local/include /usr/local/share \
-    && for pkg in roboplan roboplan_rrt roboplan_simple_ik roboplan_toppra roboplan_oink roboplan_cartesian_planning roboplan_example_models toppra; do \
-         if [ -d "${ROBOPLAN_INSTALL}/${pkg}/lib" ]; then \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/*.so* /usr/local/lib/ 2>/dev/null || true; \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/*.a /usr/local/lib/ 2>/dev/null || true; \
-         fi; \
-         if [ -d "${ROBOPLAN_INSTALL}/${pkg}/include" ]; then \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/include/* /usr/local/include/; \
-         fi; \
-         if [ -d "${ROBOPLAN_INSTALL}/${pkg}/lib/cmake" ]; then \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/cmake/* /usr/local/lib/cmake/; \
-         fi; \
-         if [ -d "${ROBOPLAN_INSTALL}/${pkg}/share" ]; then \
-           cp -a ${ROBOPLAN_INSTALL}/${pkg}/share/* /usr/local/share/; \
-         fi; \
+    && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then DEVELOPMENT_SOURCE=0; else DEVELOPMENT_SOURCE=1; fi \
+    && ROBOPLAN_SOURCE_LEDGER=/tmp/external-delta-ledger.v1.json \
+       ROBOPLAN_SOURCE_VERIFIER=/tmp/verify-external-source-closure.py \
+       ROBOPLAN_SOURCE_ID=roboplan_0_6_0_candidate \
+       ROBOPLAN_ALLOW_STRIPPED_GIT=1 \
+       ROBOPLAN_ALLOW_DEVELOPMENT_SOURCE="$DEVELOPMENT_SOURCE" \
+       bash /tmp/build-roboplan-source-closure.sh \
+         /tmp/proxsuite /tmp/toppra /tmp/roboplan \
+         -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+         -DBUILD_PYTHON_BINDINGS=OFF \
+    && CLOSURE_INSTALL=/tmp/roboplan-install-closure \
+    && for prefix in \
+         "${CLOSURE_INSTALL}/proxsuite" \
+         "${CLOSURE_INSTALL}/toppra"; do \
+         test -d "$prefix" || { echo "Missing exact install prefix: $prefix" >&2; exit 1; }; \
+         cp -a "$prefix/." /usr/local/; \
        done \
     && ldconfig \
-    && export CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH}" \
+    && ROBOPLAN_SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])") \
+    && export CMAKE_PREFIX_PATH="${ROBOPLAN_SITE_PACKAGES}:/usr/local:${PINOCCHIO_PREFIX}" \
+    && export LD_LIBRARY_PATH="${ROBOPLAN_SITE_PACKAGES}/lib:/usr/local/lib:${PINOCCHIO_PREFIX}/lib" \
+    && export CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON" \
     && for py_pkg in roboplan roboplan_example_models roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning; do \
          cd "/tmp/roboplan/${py_pkg}"; \
          pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
        done \
+    && printf '%s\n' "${ROBOPLAN_SITE_PACKAGES}/lib" > /etc/ld.so.conf.d/manyforge-roboplan.conf \
+    && ldconfig \
     && pip check \
     && python3 /tmp/check-roboplan-dependency-stack.py \
-    && rm -rf /tmp/roboplan /tmp/check-roboplan-dependency-stack.py
+    && rm -rf /tmp/roboplan /tmp/proxsuite /tmp/toppra /tmp/roboplan-manifest \
+         /tmp/roboplan-build-closure /tmp/roboplan-install-closure \
+         /tmp/build-roboplan-source-stack.sh /tmp/build-roboplan-source-closure.sh \
+         /tmp/verify-external-source-closure.py /tmp/external-delta-ledger.v1.json \
+         /tmp/check-roboplan-dependency-stack.py
+
+# The installed Python distributions are the sole RoboPlan runtime/CMake
+# prefix. The disconnected C++ closure above is qualification/build input and
+# is removed in the same layer; it does not leave a second ABI generation.
+ENV CMAKE_PREFIX_PATH=/usr/local/lib/python3.12/site-packages:/usr/local/lib/python3.12/site-packages/cmeel.prefix:/usr/local
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/lib:/usr/local/lib
 
 WORKDIR /workspace
 

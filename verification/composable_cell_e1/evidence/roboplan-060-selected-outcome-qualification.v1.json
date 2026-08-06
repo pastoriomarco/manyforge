@@ -1,0 +1,184 @@
+{
+  "schema": "manyforge.composable_cell.e1.selected_outcome_qualification.v1",
+  "status": "passed",
+  "date": "2026-08-06",
+  "decision": "adopt_roboplan_0_6_0",
+  "selected_source_id": "roboplan_0_6_0_candidate",
+  "source_closure": {
+    "roboplan_commit": "d2e5162eda2f51f5599ecd60375b65346d0b2944",
+    "roboplan_tree": "60b5791cd34288fc19eea2777a2fc6867c3af0b2",
+    "roboplan_build_content_sha256": "f022073b2bcedb55634ff7937caac63f034062fe7e29b79b52f07b585b4faded",
+    "closure_identity_sha256": "f46cd93eafada18a5850fb34d49ccac7b0d9f56a3824ca3dbb00f16d5ea9a5a1",
+    "proxsuite_commit": "b93d7778ffc3299d84b5cb0851022a29bf24a596",
+    "proxsuite_cmake_module_commit": "30795190916d0297092e37bc1f7b50f5d76fc09c",
+    "toppra_commit": "cbbc89d46208fddfaa3e1aab52ab44553751b510",
+    "build_time_ledger_sha256": "fe780d18364c948f4ddfe4241eb59e5be6a70e9af6f46f15097a6789b5004cd1",
+    "build_inputs": {
+      "Dockerfile": "e1bdf1b37b4725fcfd3f3415ee7067f58be08d3ed012e7207da2c51eb17e2299",
+      "Dockerfile.ros-jazzy-full": "3be3bd1a3045ff8dbe25522f8a2fcbf181149875922f12179e86f0c2cbf1c1c2",
+      "scripts/ci/build-roboplan-source-closure.sh": "35bcf668a23159b55e599b12da3afa41a877c1430e8e57e773104bfa642a745f",
+      "scripts/ci/build-roboplan-source-stack.sh": "4f92187bc90b50b977e3a1a044e642b98ca247019442d2270f0d325b4691741c",
+      "scripts/ci/check-roboplan-dependency-stack.py": "1ff98c45cb24cb813121dbe0ede78fe8cacd1eaf795829807ce7444465b14cdb",
+      "scripts/ci/verify-external-source-closure.py": "ba48a758dc5076ba055c4f156e66f695b56c7dfaab674a4a3bf7c100b0999e78",
+      "third_party/roboplan/patches.sha256": "826fa8b5e5d68f95a08213c310882d3d8ae31948f418aff1e775e1482733ea0d"
+    }
+  },
+  "patches": [
+    {
+      "path": "third_party/roboplan/patches/0005-construct-roboplan-060-scene-scratch-without-assignment.patch",
+      "sha256": "00ca95fea84dcf1180d80f8abd2782897a3911fef80ae639131d75f834250184"
+    },
+    {
+      "path": "third_party/roboplan/patches/0006-bound-roboplan-060-toppra-output-samples.patch",
+      "sha256": "ba886434bdca4eafb6f59ce630b1b4a4957a2c7ffb0c7e3c140a1bab5c5fac6a"
+    },
+    {
+      "path": "third_party/roboplan/patches/0008-initialize-roboplan-060-dynotree-variant-state.patch",
+      "sha256": "e705472bfa05feecc8cf0b669018968966687a5a911047307be01f421ac2cbdd"
+    },
+    {
+      "path": "third_party/roboplan/patches/0009-direct-initialize-roboplan-060-pinocchio-scratch.patch",
+      "sha256": "af8526dad047c046c6cd5a33a0513a3c94fca321da22c658d54e0efa33a5f858"
+    }
+  ],
+  "lanes": [
+    {
+      "id": "native_amd64",
+      "platform": "linux/amd64",
+      "runner": "native AMD64",
+      "build_history_ref": "773yplx77xl27tpgt9m7keszm",
+      "image": {
+        "tag": "manyforge-e1-roboplan-060-native-amd64-singleabi",
+        "descriptor_digest": "sha256:22f1c63f3be0810b708a91081a4577742fc6cbceabdc435d3190f28fb8c62b27",
+        "manifest_digest": "sha256:075e71d629274bcc7c818011dd96cdc71f7e42b45684d45c807822a5ca0f456e",
+        "config_digest": "sha256:5996750533b869e132fec04326c98aadba5e2eec9d735be41a9890fbe4b4326a",
+        "provenance_digest": "sha256:1aa956b4d13cca8cc08e7626cbddeb1ab2e29e9441a64520addc1f813626a86b",
+        "size_bytes": 643160657
+      },
+      "checks": [
+        "image_build",
+        "pip_check",
+        "dependency_stack",
+        "single_recorded_planner_abi"
+      ]
+    },
+    {
+      "id": "native_aarch64",
+      "platform": "linux/arm64",
+      "runner": "QEMU-on-AMD64 contingency",
+      "build_history_ref": "i2wonlcp5pooqcp1ilvxpcyax",
+      "image": {
+        "tag": "manyforge-e1-roboplan-060-native-arm64-singleabi",
+        "descriptor_digest": "sha256:de4756e30048354c062ea6c3772394a087caecc7f368c2ef706ba1048df028c0",
+        "manifest_digest": "sha256:6d534b0821a1f6251bad4ba297793c72f71eb86c23a41069dcd9fd434424dd7b",
+        "config_digest": "sha256:140c004fc031939e21d269ab9d06f0990529a3c58472ef8da92ec1aed498a733",
+        "provenance_digest": "sha256:177976b2cb39b734dd3732e56d2d0c0ee732c3494d57c6ca756405142163daa7",
+        "size_bytes": 616370786
+      },
+      "checks": [
+        "image_build",
+        "pip_check",
+        "dependency_stack",
+        "single_recorded_planner_abi",
+        "external_current_checker"
+      ]
+    },
+    {
+      "id": "ros_isaac_amd64",
+      "platform": "linux/amd64",
+      "runner": "native AMD64",
+      "build_history_ref": "l5uqbjxa3syngtxv1otajl6u5",
+      "image": {
+        "tag": "manyforge-e1-roboplan-060-ros-amd64-singleabi",
+        "descriptor_digest": "sha256:5bc1b53ada16b446b0d28368b6c4291ee11c330b914b4fea7b12ae3e9c57028f",
+        "manifest_digest": "sha256:3608c149874251de22642955427341e0fe242daea0af07ecda9c3faace890f57",
+        "config_digest": "sha256:1b231bf687336d2d64548f41d0330826b075a77a5e68c9a914427329892105d8",
+        "provenance_digest": "sha256:a189a419f0bbd88e6d2e15d57cabc2f7a35d9b3815a196d65ea417386439a3a2",
+        "size_bytes": 963735399
+      },
+      "checks": [
+        "image_build",
+        "pip_check",
+        "dependency_stack",
+        "single_recorded_planner_abi"
+      ]
+    },
+    {
+      "id": "ros_isaac_aarch64",
+      "platform": "linux/arm64",
+      "runner": "native Jetson AGX Orin",
+      "build_history_ref": "vqkv7b75sz07v3ywabqocdmnj",
+      "image": {
+        "tag": "manyforge-e1-roboplan-060-ros-arm64-singleabi",
+        "descriptor_digest": "sha256:b569c093b8c4abca588ea4bd7263b676ed848d61af72efdb74df657a6969b549",
+        "manifest_digest": "sha256:3a740f81cc56f11c302d1c8eca44b12dc56c533663805fb0615f568f2ce55c69",
+        "config_digest": "sha256:5c71d84afd391195bc6da183df0b391d477e7605b71bf762e0f212a4610fd1f9",
+        "provenance_digest": "sha256:a0b578e918a55934088904ace518bdc6ceb9ac11a5b1341ba75ac1c3894ed02a",
+        "size_bytes": 910118875
+      },
+      "checks": [
+        "image_build",
+        "pip_check",
+        "dependency_stack",
+        "single_recorded_planner_abi",
+        "external_current_checker"
+      ]
+    }
+  ],
+  "selected_source_checks": {
+    "corrected_cpp_cumulative": {
+      "passed": 239,
+      "total": 239
+    },
+    "source_installed_python": {
+      "passed": 47,
+      "total": 47
+    },
+    "retained_manyforge_planner_consumers": {
+      "passed": 57,
+      "total": 57
+    },
+    "worker_containment_after_pid1_correction": {
+      "passed": 22,
+      "total": 22
+    },
+    "planner_portability_contracts": {
+      "passed": 14,
+      "total": 14,
+      "live_evidence_rows": 23
+    },
+    "final_e1_contract_replay": {
+      "passed": 156,
+      "skipped": 1,
+      "skip_reason": "Optional local frozen RoboPlan 0.5 raw evidence was not installed; exact historical identities and selected 0.6 evidence remain covered."
+    },
+    "sanitizers": {
+      "rrt_asan_ubsan": "17/17 passed",
+      "simple_ik_asan_ubsan": "4/4 passed",
+      "tsan": "runtime unavailable before main: unexpected memory mapping; no green claim",
+      "leak_sanitizer": "runtime unavailable in uninstrumented Pinocchio/Coal teardown; no green claim"
+    }
+  },
+  "performance": {
+    "comparison_path": "verification/composable_cell_e1/evidence/roboplan-060-comparable-performance.v1.json",
+    "comparison_sha256": "38b9193731775d8cf66ec537fe6da7a6d8d5f5adae44e35045c5af44613a5539",
+    "patch_0007_ab_path": "verification/composable_cell_e1/evidence/roboplan-051-patch0007-collision-reuse-ab.v1.json",
+    "patch_0007_ab_sha256": "ad086267ba5396c51fc4e6d2a50726ebb87dc8dd62a2e652150a679d4e6c8b30",
+    "accepted_tradeoff": "The exact E1 joint-RRT fixture is about 12-13% slower, roughly 1.4-1.8 ms, while remaining inside fixed bounds; Cartesian planning is about 56% faster and other measured workloads, memory, cancellation, replacement, and recovery are comparable or better."
+  },
+  "qualification_notes": [
+    "The selected image builds consumed the source-identity ledger at SHA-256 fe780d18364c948f4ddfe4241eb59e5be6a70e9af6f46f15097a6789b5004cd1. Final ledger status, result binding, and current local-path hashes are intentionally refreshed after image completion; no selected source, dependency, patch, Dockerfile, build script, or checker input changed.",
+    "The local QEMU ROS ARM64 duplicate was intentionally canceled only after the exact native Jetson AGX Orin image completed and passed both its in-image and external checks; that canceled duplicate is not a failed qualification lane.",
+    "Raw build and test logs are disposable and are not retained in Git."
+  ],
+  "raw_logs_committed": false,
+  "nonclaims": [
+    "E1 does not restore a planner, runtime, simulator, controller, robot, or product lane.",
+    "The ROS/Isaac image rows qualify the dependency environment and ABI closure, not an Isaac runtime workflow.",
+    "No TSan-clean or LeakSanitizer-clean result is claimed where the runtime could not initialize or report reliably.",
+    "The current source-installed component distributions are not claimed as standalone end-user wheels or a completed Pixi installation.",
+    "Optional constrained planning remains the separately recorded post-I12 F1 feature and is not advertised by E1.",
+    "No physical motion or attended hardware qualification was performed.",
+    "xarm_ros2 and ManyMove deltas are inventoried and routed to I9-I12; E1 does not implement those future gates."
+  ]
+}

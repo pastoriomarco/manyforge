@@ -1,0 +1,201 @@
+diff --git a/roboplan_toppra/bindings/python/roboplan/toppra/_toppra_ext.pyi b/roboplan_toppra/bindings/python/roboplan/toppra/_toppra_ext.pyi
+index c11611c..d587a3a 100644
+--- a/roboplan_toppra/bindings/python/roboplan/toppra/_toppra_ext.pyi
++++ b/roboplan_toppra/bindings/python/roboplan/toppra/_toppra_ext.pyi
+@@ -22,7 +22,7 @@ class TOPPRAOptions:
+     def __init__(self) -> None: ...
+ 
+     @overload
+-    def __init__(self, dt: float = 0.01, mode: SplineFittingMode = SplineFittingMode.Hermite, velocity_scale: float = 1.0, acceleration_scale: float = 1.0, max_adaptive_iterations: int = 10, max_adaptive_step_size: float = 0.05, max_blend_deviation: float = 0.01) -> None: ...
++    def __init__(self, dt: float = 0.01, mode: SplineFittingMode = SplineFittingMode.Hermite, velocity_scale: float = 1.0, acceleration_scale: float = 1.0, max_adaptive_iterations: int = 10, max_adaptive_step_size: float = 0.05, max_blend_deviation: float = 0.01, max_output_samples: int = 1000000) -> None: ...
+ 
+     @property
+     def dt(self) -> float: ...
+@@ -66,6 +66,12 @@ class TOPPRAOptions:
+     @max_blend_deviation.setter
+     def max_blend_deviation(self, arg: float, /) -> None: ...
+ 
++    @property
++    def max_output_samples(self) -> int: ...
++
++    @max_output_samples.setter
++    def max_output_samples(self, arg: int, /) -> None: ...
++
+ class PathParameterizerTOPPRA:
+     """Trajectory time parameterizer using the TOPP-RA algorithm."""
+ 
+diff --git a/roboplan_toppra/bindings/src/toppra.cpp b/roboplan_toppra/bindings/src/toppra.cpp
+index 9fe3986..18cd255 100644
+--- a/roboplan_toppra/bindings/src/toppra.cpp
++++ b/roboplan_toppra/bindings/src/toppra.cpp
+@@ -27,25 +27,28 @@ void init_toppra(nanobind::module_& m) {
+           "__init__",
+           [](TOPPRAOptions* self, double dt, SplineFittingMode mode, double velocity_scale,
+              double acceleration_scale, int max_adaptive_iterations, double max_adaptive_step_size,
+-             double max_blend_deviation) {
++             double max_blend_deviation, size_t max_output_samples) {
+             new (self) TOPPRAOptions{dt,
+                                      mode,
+                                      velocity_scale,
+                                      acceleration_scale,
+                                      max_adaptive_iterations,
+                                      max_adaptive_step_size,
+-                                     max_blend_deviation};
++                                     max_blend_deviation,
++                                     max_output_samples};
+           },
+           "dt"_a = 0.01, "mode"_a = SplineFittingMode::Hermite, "velocity_scale"_a = 1.0,
+           "acceleration_scale"_a = 1.0, "max_adaptive_iterations"_a = 10,
+-          "max_adaptive_step_size"_a = 0.05, "max_blend_deviation"_a = 0.01)
++          "max_adaptive_step_size"_a = 0.05, "max_blend_deviation"_a = 0.01,
++          "max_output_samples"_a = 1'000'000)
+       .def_rw("dt", &TOPPRAOptions::dt)
+       .def_rw("mode", &TOPPRAOptions::mode)
+       .def_rw("velocity_scale", &TOPPRAOptions::velocity_scale)
+       .def_rw("acceleration_scale", &TOPPRAOptions::acceleration_scale)
+       .def_rw("max_adaptive_iterations", &TOPPRAOptions::max_adaptive_iterations)
+       .def_rw("max_adaptive_step_size", &TOPPRAOptions::max_adaptive_step_size)
+-      .def_rw("max_blend_deviation", &TOPPRAOptions::max_blend_deviation);
++      .def_rw("max_blend_deviation", &TOPPRAOptions::max_blend_deviation)
++      .def_rw("max_output_samples", &TOPPRAOptions::max_output_samples);
+ 
+   nanobind::class_<PathParameterizerTOPPRA>(
+       m, "PathParameterizerTOPPRA", "Trajectory time parameterizer using the TOPP-RA algorithm.")
+diff --git a/roboplan_toppra/include/roboplan_toppra/toppra.hpp b/roboplan_toppra/include/roboplan_toppra/toppra.hpp
+index 84ff566..c3098cf 100644
+--- a/roboplan_toppra/include/roboplan_toppra/toppra.hpp
++++ b/roboplan_toppra/include/roboplan_toppra/toppra.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <cstddef>
+ #include <string>
+ #include <vector>
+ 
+@@ -64,6 +65,11 @@ struct TOPPRAOptions {
+   /// corners more (faster, but the path strays further from the waypoints); values <= 0 disable
+   /// blending (a pure polyline that stops at each corner).
+   double max_blend_deviation = 0.01;
++
++  /// @brief Maximum number of samples in the returned trajectory.
++  /// @details The bound is checked before converting the solver-derived duration to an integer
++  /// sample count or reserving output storage. Must be strictly positive.
++  size_t max_output_samples = 1'000'000;
+ };
+ 
+ /// @brief Trajectory time parameterizer using the TOPP-RA algorithm.
+diff --git a/roboplan_toppra/src/toppra.cpp b/roboplan_toppra/src/toppra.cpp
+index c619cc0..6abdf91 100644
+--- a/roboplan_toppra/src/toppra.cpp
++++ b/roboplan_toppra/src/toppra.cpp
+@@ -1,4 +1,5 @@
+ #include <chrono>
++#include <cmath>
+ #include <numbers>
+ #include <stdexcept>
+ 
+@@ -174,17 +175,22 @@ PathParameterizerTOPPRA::generate(const JointPath& path, const TOPPRAOptions& op
+       !std::equal(joint_names_.begin(), joint_names_.end(), path.joint_names.begin())) {
+     return tl::make_unexpected("Path joint names do not match the scene joint names.");
+   }
+-  if (options.dt <= 0.0) {
++  if (!std::isfinite(options.dt) || options.dt <= 0.0) {
+     return tl::make_unexpected("dt must be strictly positive.");
+   }
+-  if ((options.velocity_scale <= 0.0) || (options.velocity_scale > 1.0)) {
++  if (!std::isfinite(options.velocity_scale) || (options.velocity_scale <= 0.0) ||
++      (options.velocity_scale > 1.0)) {
+     return tl::make_unexpected(
+         "Velocity scale must be greater than 0.0 and less than or equal to 1.0.");
+   }
+-  if ((options.acceleration_scale <= 0.0) || (options.acceleration_scale > 1.0)) {
++  if (!std::isfinite(options.acceleration_scale) || (options.acceleration_scale <= 0.0) ||
++      (options.acceleration_scale > 1.0)) {
+     return tl::make_unexpected(
+         "Acceleration scale must be greater than 0.0 and less than or equal to 1.0.");
+   }
++  if (options.max_output_samples == 0) {
++    return tl::make_unexpected("max_output_samples must be strictly positive.");
++  }
+ 
+   // Create scaled velocity and acceleration constraints.
+   toppra::LinearConstraintPtr vel_constraint, acc_constraint;
+@@ -323,7 +329,16 @@ PathParameterizerTOPPRA::generate(const JointPath& path, const TOPPRAOptions& op
+   traj.joint_names = path.joint_names;
+ 
+   const auto t_final = const_acc->pathInterval()[1];
+-  const auto num_traj_pts = static_cast<size_t>(std::ceil(t_final / options.dt)) + 1;
++  if (!std::isfinite(t_final) || t_final < 0.0) {
++    return tl::make_unexpected("TOPPRA produced an invalid trajectory duration.");
++  }
++  const long double num_intervals =
++      std::ceil(static_cast<long double>(t_final) / static_cast<long double>(options.dt));
++  if (!std::isfinite(num_intervals) || num_intervals < 0.0L ||
++      num_intervals > static_cast<long double>(options.max_output_samples - 1)) {
++    return tl::make_unexpected("Trajectory exceeds max_output_samples.");
++  }
++  const auto num_traj_pts = static_cast<size_t>(num_intervals) + 1;
+   traj.times.reserve(num_traj_pts);
+   traj.positions.reserve(num_traj_pts);
+   traj.velocities.reserve(num_traj_pts);
+diff --git a/roboplan_toppra/test/test_toppra.cpp b/roboplan_toppra/test/test_toppra.cpp
+index 41a7a56..44a01cb 100644
+--- a/roboplan_toppra/test/test_toppra.cpp
++++ b/roboplan_toppra/test/test_toppra.cpp
+@@ -1,6 +1,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <gtest/gtest.h>
++#include <limits>
+ #include <memory>
+ #include <stdexcept>
+ #include <vector>
+@@ -189,6 +190,48 @@ TEST_F(RoboPlanToppraTest, NegativeDt) {
+   ASSERT_EQ(result.error(), "dt must be strictly positive.");
+ }
+ 
++TEST_F(RoboPlanToppraTest, NonFiniteSamplingOptionsAreRejected) {
++  const auto path = createTestPathShort();
++  auto toppra = PathParameterizerTOPPRA(scene, "arm");
++
++  for (const auto dt :
++       {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
++    const auto result = toppra.generate(path, {dt});
++    ASSERT_FALSE(result.has_value());
++    EXPECT_EQ(result.error(), "dt must be strictly positive.");
++  }
++
++  TOPPRAOptions options;
++  options.velocity_scale = std::numeric_limits<double>::quiet_NaN();
++  auto result = toppra.generate(path, options);
++  ASSERT_FALSE(result.has_value());
++  EXPECT_EQ(result.error(),
++            "Velocity scale must be greater than 0.0 and less than or equal to 1.0.");
++
++  options.velocity_scale = 1.0;
++  options.acceleration_scale = std::numeric_limits<double>::infinity();
++  result = toppra.generate(path, options);
++  ASSERT_FALSE(result.has_value());
++  EXPECT_EQ(result.error(),
++            "Acceleration scale must be greater than 0.0 and less than or equal to 1.0.");
++}
++
++TEST_F(RoboPlanToppraTest, OutputSampleBudgetIsCheckedBeforeAllocation) {
++  const auto path = createTestPathShort();
++  auto toppra = PathParameterizerTOPPRA(scene, "arm");
++
++  TOPPRAOptions options;
++  options.max_output_samples = 0;
++  auto result = toppra.generate(path, options);
++  ASSERT_FALSE(result.has_value());
++  EXPECT_EQ(result.error(), "max_output_samples must be strictly positive.");
++
++  options.max_output_samples = 1;
++  result = toppra.generate(path, options);
++  ASSERT_FALSE(result.has_value());
++  EXPECT_EQ(result.error(), "Trajectory exceeds max_output_samples.");
++}
++
+ TEST_F(RoboPlanToppraTest, BadVelocityAccelerationScales) {
+   auto path = createTestPathShort();
+   double dt = 0.01;

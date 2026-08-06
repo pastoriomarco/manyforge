@@ -256,23 +256,28 @@ Current gaps to keep visible:
 
 ## Source Locations
 
-- `manyforge_roboplan/src/roboplan_projection_backend.cpp`
+- historical `manyforge_roboplan/src/roboplan_projection_backend.cpp` at
+  `c4b075fa6dfb69e463c61f3efa8cfce8de681e8a` (blob
+  `013f8218298f6ee22f740d1639bae424ae65413e`)
   - `scene_placement_from_tracked_locked`
   - `parent_joint_from_frame_matrix_locked`
   - `apply_static_collision_policy_for_object_locked`
   - `erase_static_collision_policy_for_object_locked`
   - `recompute_support_contact_policy_locked`
   - `set_support_contact_pairs_for_validation_locked`
-  - mesh objects are added through RoboPlan's `Scene::addMeshGeometry` API,
-    available in the reviewed RoboPlan 0.5.1 commit used by
-    `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`); the exact source and
-    checked patch manifest is `third_party/roboplan/README.md`
-- `manyforge_roboplan/include/manyforge_roboplan/roboplan_projection_backend.hpp`
+  - the historical implementation used RoboPlan 0.5.1's
+    `Scene::addMeshGeometry` API; E1 selected exact RoboPlan 0.6.0 for the I6
+    restoration, whose source and checked patch manifest are recorded in
+    `third_party/roboplan/README.md`
+- historical
+  `manyforge_roboplan/include/manyforge_roboplan/roboplan_projection_backend.hpp`
+  at the same commit
   - `disabled_static_collision_pairs_`
   - `disabled_support_contact_pairs_`
-- `manyforge_roboplan/test/test_native_backends.cpp`
+- historical `manyforge_roboplan/test/test_native_backends.cpp` at the same
+  commit
   - `DetachedStaticObjectOverlapDoesNotBlockRobotState`
-- `manyforge_roboplan/test/test_native_e2e.py`
+- historical `manyforge_roboplan/test/test_native_e2e.py` at the same commit
   - `test_attached_object_collision_pose_uses_named_frame_not_parent_joint`
   - `test_attached_object_still_collides_with_world_obstacles_at_carried_pose`
   - `test_declared_support_contact_reaches_validation_and_requires_release`

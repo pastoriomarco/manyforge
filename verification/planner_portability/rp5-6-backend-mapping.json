@@ -1,6 +1,6 @@
 {
   "schema_version": "manyforge.planner_portability.v1",
-  "contract_revision": "2026-07-31",
+  "contract_revision": "2026-08-06",
   "runtime_availability": {
     "status": "temporarily_unavailable_composable_cell_rebuild",
     "available_surface": "retained_planning_product_consumer_qualification_only",
@@ -11,7 +11,7 @@
     "planning.motion.pose_goal",
     "planning.motion.cartesian_path",
     "planning.ik.single_shot",
-    "planning.cancellation.cooperative",
+    "planning.cancellation.bounded",
     "planning.trajectory.time_parameterized",
     "scene.projection.revision_bound",
     "planning.failure.structured"
@@ -39,18 +39,18 @@
       "conformance_target": "test_planner_backend_conformance",
       "capability_disposition": "supported_and_explicit_rejection_variants"
     },
-    "roboplan_0_5_1": {
+    "roboplan_0_6_0": {
       "status": "temporarily_unavailable_composable_cell_rebuild",
       "package": "manyforge_roboplan",
       "available_surface": "retained_planning_product_consumer_qualification_only",
       "restoration_gate": "non-empty retained planning product plus target-scene adapter qualification",
-      "source_identity": "RoboPlan 0.5.1 e06d1a2f1b749c38742aee9e401bbe97fa967f7b",
+      "source_identity": "RoboPlan 0.6.0 d2e5162eda2f51f5599ecd60375b65346d0b2944 plus the exact E1 four-patch manifest",
       "capability_disposition": {
         "planning.motion.joint_goal": "temporarily_unavailable",
         "planning.motion.pose_goal": "temporarily_unavailable",
         "planning.motion.cartesian_path": "temporarily_unavailable",
         "planning.ik.single_shot": "temporarily_unavailable",
-        "planning.cancellation.cooperative": "temporarily_unavailable",
+        "planning.cancellation.bounded": "temporarily_unavailable",
         "planning.trajectory.time_parameterized": "temporarily_unavailable",
         "scene.projection.revision_bound": "temporarily_unavailable",
         "planning.failure.structured": "temporarily_unavailable"
@@ -114,9 +114,9 @@
           "status": "optional_mapping_complete",
           "implementation_gate": "Use a request-local RobotState setFromIK-style solve with caller timeout and canonical result mapping, or reject planning.ik.single_shot explicitly"
         },
-        "planning.cancellation.cooperative": {
+        "planning.cancellation.bounded": {
           "status": "mandatory_mapping_complete",
-          "implementation_gate": "IPlannerBackend.request_cancel invokes the selected PlanningPipeline/planner-context termination surface without blocking; any plugin that cannot meet the qualified bound is rejected at deployment admission"
+          "implementation_gate": "Use a qualified nonblocking PlanningPipeline/planner-context termination surface when available; otherwise contain the opaque phase in a bounded generation-private worker that can be terminated and replaced without publishing late results"
         },
         "planning.trajectory.time_parameterized": {
           "status": "mandatory_mapping_complete",
@@ -152,7 +152,7 @@
         },
         {
           "id": "moveit_plugin_cancellation_qualification",
-          "resolution": "qualify each selectable planning plugin and reject non-cancellable configurations"
+          "resolution": "qualify cooperative cancellation where available and the bounded worker-containment path for every remaining selectable planning plugin"
         },
         {
           "id": "moveit_profile_configuration",

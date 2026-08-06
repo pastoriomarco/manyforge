@@ -22,8 +22,9 @@ inline roboplan::RRTOptions production_rrt_options(
   options.group_name = group_name;
   options.max_planning_time = max_planning_time_s;
   options.max_nodes = 5000;
-  // Preserve the qualified RoboPlan 0.4 search policy. RoboPlan 0.5 adds
-  // budget-spending and optimal variants, but they remain opt-in capabilities.
+  // Preserve ManyForge's qualified first-feasible policy inherited from the
+  // 0.4 baseline. Later RoboPlan releases add budget-spending and optimal
+  // variants, but they remain opt-in capabilities.
   options.rrt_star = false;
   options.fast_return = true;
   return options;
@@ -60,8 +61,8 @@ inline roboplan::PathShortcuttingOptions production_shortcutting_options(
   options.max_step_size = 0.05;
   options.max_iters = 100;
   // RoboPlan 0.4 always spent the configured 100-iteration budget. Keep that
-  // compatibility behavior; 0.5 convergence-shortcutting is benchmarked as a
-  // separate opt-in row before it can become a production policy change.
+  // compatibility behavior; convergence-shortcutting remains a separate
+  // opt-in row until its owning milestone qualifies a production policy change.
   options.max_convergence_iters = 0;
   options.seed = deterministic_seed.has_value()
                      ? static_cast<int>(

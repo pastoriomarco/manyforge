@@ -40,7 +40,7 @@ _LIVE = importlib.util.module_from_spec(_LIVE_SPEC)
 _LIVE_SPEC.loader.exec_module(_LIVE)
 
 
-def test_roboplan_05_inventory_binds_capabilities_workarounds_and_patches() -> None:
+def test_roboplan_05_inventory_retains_historical_patch_identity() -> None:
     capabilities, workarounds = _MODULE._version_inventory(  # noqa: SLF001
         _REPO_ROOT, _MODULE.ROBOPLAN_05_VERSION
     )
@@ -63,9 +63,15 @@ def test_roboplan_05_inventory_binds_capabilities_workarounds_and_patches() -> N
         "status"
     ] == "retired"
 
-    patch_manifest = _MODULE._checked_patch_manifest(_REPO_ROOT)  # noqa: SLF001
-    assert len(patch_manifest["patches"]) == 7
-    assert all(len(item["sha256"]) == 64 for item in patch_manifest["patches"])
+    # The 0.5 series is an exact historical acceptance input after E1, not the
+    # selected production manifest. Keep its frozen identity without reading
+    # third_party/roboplan, which now contains only the selected 0.6 patches.
+    assert len(_MODULE.ROBOPLAN_05_PATCH_DIGESTS) == 7
+    assert len(_MODULE.ROBOPLAN_05_PATCH_MANIFEST_SHA256) == 64
+    assert all(
+        len(digest) == 64
+        for digest in _MODULE.ROBOPLAN_05_PATCH_DIGESTS.values()
+    )
 
 
 def test_patch_manifest_rejects_unlisted_patch(tmp_path: Path) -> None:
