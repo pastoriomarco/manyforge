@@ -116,7 +116,7 @@ constexpr std::string_view kZeroDigest =
 constexpr std::string_view kExpectedNodeEnvironmentDigest =
     "sha256:54427004956356b47efe790df8ef3fc1c5570694678bbd59e72d8d96fdd31969";
 constexpr std::string_view kExpectedCompilerContractDigest =
-    "sha256:8d0ab521153cbbb2e7b2cb9a406d8ffb1d2f65ec2d9abca43e947d90736c982f";
+    "sha256:13880762c8bf41ce8b6148e17b56e67ca46339cfb34e5d0a6fd7abfc9d013b64";
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
     "sha256:288d8897cd3a72938bd1c285fe3f9f2d885db7294385af9cd1ba192041a300d7";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
@@ -255,7 +255,7 @@ static_assert(!std::is_default_constructible_v<
       deployment.applicability_inputs().value().external_resources, nullptr);
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
-      {}, selected_overlay);
+      {}, {}, selected_overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
 }

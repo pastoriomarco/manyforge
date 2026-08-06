@@ -36,6 +36,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
     manyforge::core::python::register_catalog_record_bindings(m);
     manyforge::core::python::register_cell_graph_bindings(m);
     manyforge::core::python::register_component_type_bindings(m);
+    manyforge::core::python::register_coordinate_state_bindings(m);
+    manyforge::core::python::register_command_schema_bindings(m);
     manyforge::core::python::register_deployment_candidate_bindings(m);
     manyforge::core::python::register_model_compiler_bindings(m);
 
@@ -231,12 +233,27 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def(py::init<>())
         .def(py::init<std::vector<std::string>, std::vector<double>>(),
              py::arg("joint_names"), py::arg("positions_rad"))
-        .def_readwrite("joint_names", &manyforge::core::JointGoalDTO::joint_names)
+        .def_readwrite("joint_names",
+                       &manyforge::core::JointGoalDTO::joint_names)
         .def_readwrite("positions_rad", &manyforge::core::JointGoalDTO::positions_rad)
         .def("__repr__", [](const manyforge::core::JointGoalDTO& j) {
             return py::str("JointGoalDTO(joint_names={}, positions_rad={})")
                 .format(py::cast(j.joint_names), py::cast(j.positions_rad));
         });
+
+    py::class_<manyforge::core::ResolvedJointGoalDTO>(
+        m, "_ResolvedJointGoalDTO")
+        .def(py::init<>())
+        .def(py::init<std::vector<manyforge::core::ResourceId>,
+                      std::vector<std::string>, std::vector<double>>(),
+             py::arg("resources"), py::arg("joint_names"),
+             py::arg("positions_rad"))
+        .def_readwrite("resources",
+                       &manyforge::core::ResolvedJointGoalDTO::resources)
+        .def_readwrite("joint_names",
+                       &manyforge::core::ResolvedJointGoalDTO::joint_names)
+        .def_readwrite("positions_rad",
+                       &manyforge::core::ResolvedJointGoalDTO::positions_rad);
 
     py::class_<manyforge::core::PoseGoalDTO>(m, "PoseGoalDTO")
         .def(py::init<>())
@@ -369,8 +386,12 @@ PYBIND11_MODULE(manyforge_core_py, m) {
 
     py::class_<manyforge::core::TrajectoryDTO>(m, "TrajectoryDTO")
         .def(py::init<>())
-        .def(py::init<std::vector<std::string>, std::vector<manyforge::core::TrajectoryWaypointDTO>>(),
-             py::arg("joint_names"), py::arg("waypoints"))
+        .def(py::init<std::vector<manyforge::core::ResourceId>,
+                      std::vector<std::string>,
+                      std::vector<manyforge::core::TrajectoryWaypointDTO>>(),
+             py::arg("resources"), py::arg("joint_names"),
+             py::arg("waypoints"))
+        .def_readwrite("resources", &manyforge::core::TrajectoryDTO::resources)
         .def_readwrite("joint_names", &manyforge::core::TrajectoryDTO::joint_names)
         .def_readwrite("waypoints", &manyforge::core::TrajectoryDTO::waypoints)
         .def("empty", &manyforge::core::TrajectoryDTO::empty)
@@ -394,41 +415,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def("__repr__", [](const manyforge::core::ExecutionStatus& s) {
             return py::str("ExecutionStatus(state={}, execution_id={}, progress={}, active_move_id='{}')")
                 .format(py::cast(s.state), s.execution_id, s.progress, s.active_move_id);
-        });
-
-    py::class_<manyforge::core::ExecuteRequestDTO>(m, "ExecuteRequestDTO")
-        .def(py::init<>())
-        .def(py::init<const std::string&, const std::string&, const std::string&,
-                      const std::string&, const std::string&,
-                      manyforge::core::TolerancesDTO, manyforge::core::SpeedProfileDTO,
-                      manyforge::core::TimeoutsDTO, manyforge::core::CacheMode,
-                      manyforge::core::MotionSpecDTO>(),
-             py::arg("robot_id"), py::arg("group_id"), py::arg("move_id"),
-             py::arg("base_frame"), py::arg("tcp_frame"),
-             py::arg("tolerances"), py::arg("speed_profile"),
-             py::arg("timeouts"), py::arg("cache_mode"), py::arg("motion"))
-        .def_readwrite("robot_id", &manyforge::core::ExecuteRequestDTO::robot_id)
-        .def_readwrite("group_id", &manyforge::core::ExecuteRequestDTO::group_id)
-        .def_readwrite("move_id", &manyforge::core::ExecuteRequestDTO::move_id)
-        .def_readwrite("base_frame", &manyforge::core::ExecuteRequestDTO::base_frame)
-        .def_readwrite("tcp_frame", &manyforge::core::ExecuteRequestDTO::tcp_frame)
-        .def_readwrite("tolerances", &manyforge::core::ExecuteRequestDTO::tolerances)
-        .def_readwrite("speed_profile", &manyforge::core::ExecuteRequestDTO::speed_profile)
-        .def_readwrite("per_joint_dynamics_limits", &manyforge::core::ExecuteRequestDTO::per_joint_dynamics_limits)
-        .def_readwrite("timeouts", &manyforge::core::ExecuteRequestDTO::timeouts)
-        .def_readwrite("cache_mode", &manyforge::core::ExecuteRequestDTO::cache_mode)
-        .def_readwrite("motion", &manyforge::core::ExecuteRequestDTO::motion)
-        .def_readwrite("planning_profile",
-                       &manyforge::core::ExecuteRequestDTO::planning_profile)
-        .def_readwrite("target_mode",
-                       &manyforge::core::ExecuteRequestDTO::target_mode)
-        .def_readwrite("target_reference",
-                       &manyforge::core::ExecuteRequestDTO::target_reference)
-        .def_readwrite("offset_reference",
-                       &manyforge::core::ExecuteRequestDTO::offset_reference)
-        .def("__repr__", [](const manyforge::core::ExecuteRequestDTO& r) {
-            return py::str("ExecuteRequestDTO(robot_id='{}', group_id='{}', move_id='{}')")
-                .format(r.robot_id, r.group_id, r.move_id);
         });
 
     // ========================================================================
@@ -520,38 +506,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             "projection_lease_id",
             &manyforge::core::ProjectionLeaseBindingDTO::projection_lease_id)
         .def("valid", &manyforge::core::ProjectionLeaseBindingDTO::valid);
-
-    py::class_<manyforge::core::PlanRequestDTO>(m, "PlanRequestDTO")
-        .def(py::init<>())
-        .def(py::init<const std::string&, const std::string&, const std::string&,
-                      const std::string&, const std::string&,
-                      manyforge::core::RobotStateDTO, manyforge::core::MotionSpecDTO,
-                      manyforge::core::TolerancesDTO, manyforge::core::SpeedProfileDTO,
-                      double>(),
-             py::arg("robot_id"), py::arg("group_id"), py::arg("move_id"),
-             py::arg("base_frame"), py::arg("tcp_frame"),
-             py::arg("start_state"), py::arg("motion"),
-             py::arg("tolerances"), py::arg("speed_profile"),
-             py::arg("planning_timeout_s"))
-        .def_readwrite("robot_id", &manyforge::core::PlanRequestDTO::robot_id)
-        .def_readwrite("group_id", &manyforge::core::PlanRequestDTO::group_id)
-        .def_readwrite("move_id", &manyforge::core::PlanRequestDTO::move_id)
-        .def_readwrite("base_frame", &manyforge::core::PlanRequestDTO::base_frame)
-        .def_readwrite("tcp_frame", &manyforge::core::PlanRequestDTO::tcp_frame)
-        .def_readwrite("start_state", &manyforge::core::PlanRequestDTO::start_state)
-        .def_readwrite("motion", &manyforge::core::PlanRequestDTO::motion)
-        .def_readwrite("tolerances", &manyforge::core::PlanRequestDTO::tolerances)
-        .def_readwrite("speed_profile", &manyforge::core::PlanRequestDTO::speed_profile)
-        .def_readwrite("planning_timeout_s", &manyforge::core::PlanRequestDTO::planning_timeout_s)
-        .def_readwrite("planning_profile",
-                       &manyforge::core::PlanRequestDTO::planning_profile)
-        .def_readwrite("per_joint_dynamics_limits", &manyforge::core::PlanRequestDTO::per_joint_dynamics_limits)
-        .def_readwrite("projection_binding",
-                       &manyforge::core::PlanRequestDTO::projection_binding)
-        .def("__repr__", [](const manyforge::core::PlanRequestDTO& p) {
-            return py::str("PlanRequestDTO(robot_id='{}', group_id='{}')")
-                .format(p.robot_id, p.group_id);
-        });
 
     py::class_<manyforge::core::PlanResultDTO>(m, "PlanResultDTO")
         .def(py::init<>())
@@ -690,10 +644,12 @@ PYBIND11_MODULE(manyforge_core_py, m) {
     // ========================================================================
 
     py::enum_<manyforge::core::CollisionOwnerKind>(m, "CollisionOwnerKind")
-        .value("kRobotLink", manyforge::core::CollisionOwnerKind::kRobotLink)
-        .value("kAttachedObject", manyforge::core::CollisionOwnerKind::kAttachedObject)
-        .value("kDetachedObject", manyforge::core::CollisionOwnerKind::kDetachedObject)
-        .value("kFixture", manyforge::core::CollisionOwnerKind::kFixture);
+        .value("kComponentModelBody",
+               manyforge::core::CollisionOwnerKind::kComponentModelBody)
+        .value("kSceneResource",
+               manyforge::core::CollisionOwnerKind::kSceneResource)
+        .value("kRuntimeObject",
+               manyforge::core::CollisionOwnerKind::kRuntimeObject);
 
     py::enum_<manyforge::core::CollisionGeometryKind>(m, "CollisionGeometryKind")
         .value("kBox", manyforge::core::CollisionGeometryKind::kBox)
@@ -782,20 +738,46 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         });
 
     py::enum_<manyforge::core::CollisionWorldMutationSource>(m, "CollisionWorldMutationSource")
-        .value("kProgramLoad",
-               manyforge::core::CollisionWorldMutationSource::kProgramLoad)
+        .value("kSceneInitialize",
+               manyforge::core::CollisionWorldMutationSource::kSceneInitialize)
         .value("kSceneEdit",
                manyforge::core::CollisionWorldMutationSource::kSceneEdit)
-        .value("kAttach", manyforge::core::CollisionWorldMutationSource::kAttach)
-        .value("kDetach", manyforge::core::CollisionWorldMutationSource::kDetach)
+        .value("kCarriedObjectAttach",
+               manyforge::core::CollisionWorldMutationSource::kCarriedObjectAttach)
+        .value("kCarriedObjectDetach",
+               manyforge::core::CollisionWorldMutationSource::kCarriedObjectDetach)
+        .value("kComponentAttachmentApply",
+               manyforge::core::CollisionWorldMutationSource::kComponentAttachmentApply)
         .value("kPoseSourceApply",
                manyforge::core::CollisionWorldMutationSource::kPoseSourceApply)
-        .value("kDeploymentLoad",
-               manyforge::core::CollisionWorldMutationSource::kDeploymentLoad)
+        .value("kDeploymentApply",
+               manyforge::core::CollisionWorldMutationSource::kDeploymentApply)
         .value("kPolicyUpdate",
-               manyforge::core::CollisionWorldMutationSource::kPolicyUpdate)
-        .value("kProjectionRebuild",
-               manyforge::core::CollisionWorldMutationSource::kProjectionRebuild);
+               manyforge::core::CollisionWorldMutationSource::kPolicyUpdate);
+
+    py::enum_<manyforge::core::RequestTransportDTO>(m, "RequestTransportDTO")
+        .value("kRos", manyforge::core::RequestTransportDTO::kRos)
+        .value("kHttp", manyforge::core::RequestTransportDTO::kHttp)
+        .value("kInternal", manyforge::core::RequestTransportDTO::kInternal);
+
+    py::enum_<manyforge::core::RequestAssuranceDTO>(m, "RequestAssuranceDTO")
+        .value("kUnverified",
+               manyforge::core::RequestAssuranceDTO::kUnverified)
+        .value("kExternallyAuthenticated",
+               manyforge::core::RequestAssuranceDTO::
+                   kExternallyAuthenticated);
+
+    py::class_<manyforge::core::RequestAttributionDTO>(
+        m, "RequestAttributionDTO")
+        .def(py::init<>())
+        .def_readwrite("transport",
+                       &manyforge::core::RequestAttributionDTO::transport)
+        .def_readwrite("assurance",
+                       &manyforge::core::RequestAttributionDTO::assurance)
+        .def_readwrite("principal_id",
+                       &manyforge::core::RequestAttributionDTO::principal_id)
+        .def("locally_valid",
+             &manyforge::core::RequestAttributionDTO::locally_valid);
 
     py::class_<manyforge::core::CollisionWorldLedgerEntry>(m, "CollisionWorldLedgerEntry")
         .def(py::init<>())
@@ -807,16 +789,21 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                        &manyforge::core::CollisionWorldLedgerEntry::mutation_source)
         .def_readwrite("affected_body_ids",
                        &manyforge::core::CollisionWorldLedgerEntry::affected_body_ids)
-        .def_readwrite("timestamp_ns",
-                       &manyforge::core::CollisionWorldLedgerEntry::timestamp_ns)
-        .def_readwrite("authority_source",
-                       &manyforge::core::CollisionWorldLedgerEntry::authority_source)
-        .def_readwrite("session_id",
-                       &manyforge::core::CollisionWorldLedgerEntry::session_id)
+        .def_readwrite("owner_sequence",
+                       &manyforge::core::CollisionWorldLedgerEntry::owner_sequence)
+        .def_readwrite(
+            "observed_timestamp_ns",
+            &manyforge::core::CollisionWorldLedgerEntry::observed_timestamp_ns)
+        .def_readwrite("attribution",
+                       &manyforge::core::CollisionWorldLedgerEntry::attribution)
+        .def_readwrite("source_label",
+                       &manyforge::core::CollisionWorldLedgerEntry::source_label)
+        .def_readwrite("correlation_id",
+                       &manyforge::core::CollisionWorldLedgerEntry::correlation_id)
         .def("__repr__", [](const manyforge::core::CollisionWorldLedgerEntry& e) {
             return py::str(
                        "CollisionWorldLedgerEntry(revision_id={}, source='{}')")
-                .format(e.revision.revision_id, e.authority_source);
+                .format(e.revision.revision_id, e.source_label);
         });
 
     py::class_<manyforge::core::CollisionPairId>(m, "CollisionPairId")
@@ -1032,8 +1019,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                        &manyforge::core::CollisionWorldBody::body_id)
         .def_readwrite("owner_kind",
                        &manyforge::core::CollisionWorldBody::owner_kind)
-        .def_readwrite("parent_link",
-                       &manyforge::core::CollisionWorldBody::parent_link)
+        .def_readwrite("parent_body_id",
+                       &manyforge::core::CollisionWorldBody::parent_body_id)
         .def_readwrite("frame_id",
                        &manyforge::core::CollisionWorldBody::frame_id)
         .def_readwrite("pose", &manyforge::core::CollisionWorldBody::pose)
@@ -1054,21 +1041,47 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                 .format(b.body_id);
         });
 
-    py::class_<manyforge::core::CollisionRobotModelFrame>(
-        m, "CollisionRobotModelFrame")
-        .def(py::init<>())
-        .def_readwrite("robot_id",
-                       &manyforge::core::CollisionRobotModelFrame::robot_id)
+    py::class_<manyforge::core::CollisionComponentModelFrame>(
+        m, "CollisionComponentModelFrame")
+        .def(py::init([](
+                 manyforge::core::ControllableComponentId component_id,
+                 manyforge::core::ModelInstanceId model_instance_id,
+                 manyforge::core::FrameRoleId frame_role_id,
+                 std::string compiled_frame_name,
+                 manyforge::core::ModelRevision model_revision,
+                 manyforge::core::Pose3DTO world_pose) {
+               return manyforge::core::CollisionComponentModelFrame{
+                   std::move(component_id), std::move(model_instance_id),
+                   std::move(frame_role_id), std::move(compiled_frame_name),
+                   std::move(model_revision), std::move(world_pose)};
+             }),
+             py::arg("controllable_component_id"),
+             py::arg("model_instance_id"), py::arg("frame_role_id"),
+             py::arg("compiled_frame_name"), py::arg("model_revision"),
+             py::arg("world_pose"))
         .def_readwrite(
-            "model_frame_id",
-            &manyforge::core::CollisionRobotModelFrame::model_frame_id)
+            "controllable_component_id",
+            &manyforge::core::CollisionComponentModelFrame::controllable_component_id)
+        .def_readwrite(
+            "model_instance_id",
+            &manyforge::core::CollisionComponentModelFrame::model_instance_id)
+        .def_readwrite(
+            "frame_role_id",
+            &manyforge::core::CollisionComponentModelFrame::frame_role_id)
+        .def_readwrite(
+            "compiled_frame_name",
+            &manyforge::core::CollisionComponentModelFrame::compiled_frame_name)
+        .def_readwrite(
+            "model_revision",
+            &manyforge::core::CollisionComponentModelFrame::model_revision)
         .def_readwrite("world_pose",
-                       &manyforge::core::CollisionRobotModelFrame::world_pose)
-        .def("__repr__", [](const manyforge::core::CollisionRobotModelFrame& f) {
+                       &manyforge::core::CollisionComponentModelFrame::world_pose)
+        .def("__repr__", [](const manyforge::core::CollisionComponentModelFrame& f) {
             return py::str(
-                       "CollisionRobotModelFrame(robot_id='{}', "
-                       "model_frame_id='{}')")
-                .format(f.robot_id, f.model_frame_id);
+                       "CollisionComponentModelFrame(component='{}', "
+                       "model='{}', frame_role='{}')")
+                .format(f.controllable_component_id.value(),
+                        f.model_instance_id.value(), f.frame_role_id.value());
         });
 
     py::class_<manyforge::core::CollisionWorldSnapshot,
@@ -1085,8 +1098,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("emitted_at_ns",
                        &manyforge::core::CollisionWorldSnapshot::emitted_at_ns)
         .def_readwrite(
-            "robot_model_frames",
-            &manyforge::core::CollisionWorldSnapshot::robot_model_frames)
+            "component_model_frames",
+            &manyforge::core::CollisionWorldSnapshot::component_model_frames)
         .def_readwrite("bodies",
                        &manyforge::core::CollisionWorldSnapshot::bodies)
         .def_readwrite("body_count",
@@ -1095,16 +1108,14 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             "geometry_count",
             &manyforge::core::CollisionWorldSnapshot::geometry_count)
         .def_readwrite(
-            "robot_link_count",
-            &manyforge::core::CollisionWorldSnapshot::robot_link_count)
+            "component_model_body_count",
+            &manyforge::core::CollisionWorldSnapshot::component_model_body_count)
         .def_readwrite(
-            "attached_object_count",
-            &manyforge::core::CollisionWorldSnapshot::attached_object_count)
+            "scene_resource_count",
+            &manyforge::core::CollisionWorldSnapshot::scene_resource_count)
         .def_readwrite(
-            "detached_object_count",
-            &manyforge::core::CollisionWorldSnapshot::detached_object_count)
-        .def_readwrite("fixture_count",
-                       &manyforge::core::CollisionWorldSnapshot::fixture_count)
+            "runtime_object_count",
+            &manyforge::core::CollisionWorldSnapshot::runtime_object_count)
         .def_readwrite(
             "contains_mesh_geometry",
             &manyforge::core::CollisionWorldSnapshot::contains_mesh_geometry)
@@ -1141,9 +1152,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             &manyforge::core::CollisionWorldSnapshotBuilder::set_emitted_at_ns,
             py::return_value_policy::reference_internal)
         .def(
-            "add_robot_model_frame",
+            "add_component_model_frame",
             &manyforge::core::CollisionWorldSnapshotBuilder::
-                add_robot_model_frame,
+                add_component_model_frame,
             py::return_value_policy::reference_internal)
         .def("add_body",
              &manyforge::core::CollisionWorldSnapshotBuilder::add_body,

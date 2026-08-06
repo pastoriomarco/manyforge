@@ -8,7 +8,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 1.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:94b9654bcf11b071b27ce959642c17b83ed63af2965d89a6fa0069895c85ca60
+catalog_digest: sha256:6ec8e6ffad4f128fb299bbd0a898751f1b04cba38abc6591ffd67842104a0aa9
 
 schema_types:
   coordinate_position:
@@ -170,11 +170,11 @@ schema_types:
   joint_target:
     type: object
     additional_properties: false
-    required: [resource_role, position_rad]
+    required: [joint_name, position_rad]
     properties:
-      resource_role:
+      joint_name:
         type: string
-        semantic_type: resource_role
+        semantic_type: source_joint
       position_rad: {type: float}
 
   joint_target_list:
@@ -394,7 +394,7 @@ entries:
   - id: motion.move_to_joint_target
     name: Move to joint target
     category: motion
-    description: Plan, validate, and execute a portable joint-resource goal.
+    description: Plan, validate, and execute a target-scoped source-joint goal.
     stability: stable
     tags: [motion, planning, execution]
     profiles: {min_program_profile: composable-cell-v1}

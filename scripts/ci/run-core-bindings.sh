@@ -219,8 +219,10 @@ cd "${REPO_ROOT}"
 /usr/local/bin/python3 -m pytest -p no:cacheprovider -q \
   manyforge_core/python/tests/test_bindings_smoke.py \
   manyforge_core/python/tests/test_collision_bindings.py \
+  manyforge_core/python/tests/test_command_schema_bindings.py \
   manyforge_core/python/tests/test_component_type_bindings.py \
   manyforge_core/python/tests/test_composable_cell_bindings.py \
+  manyforge_core/python/tests/test_coordinate_state_bindings.py \
   manyforge_core/python/tests/test_controller_topology_bindings.py \
   manyforge_core/python/tests/test_model_asset_bindings.py \
   manyforge_core/python/tests/test_model_compiler_bindings.py \

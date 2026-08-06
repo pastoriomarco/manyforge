@@ -639,7 +639,7 @@ validate_and_normalize_cartesian_trajectory_output(
 
 core::Result<CartesianJointDynamicsEnvelope>
 measure_cartesian_joint_dynamics_envelope(
-    const core::PlanRequestDTO& request,
+    const CartesianTrajectoryContractInput& request,
     const roboplan::JointTrajectory& trajectory,
     std::span<const double> model_velocity_limits,
     std::span<const double> model_acceleration_limits,
@@ -814,7 +814,7 @@ measure_cartesian_joint_dynamics_envelope(
 }
 
 core::Result<CartesianInterpolantPath> sample_cartesian_interpolant_path(
-    const core::PlanRequestDTO& request,
+    const CartesianTrajectoryContractInput& request,
     const std::shared_ptr<roboplan::Scene>& scene,
     const roboplan::JointTrajectory& trajectory,
     double translation_tolerance_m,
@@ -840,7 +840,7 @@ core::Result<CartesianInterpolantPath> sample_cartesian_interpolant_path(
                 "cartesian_trajectory_interpolant_invalid");
   }
   auto motion_bounds = resolve_cartesian_kinematic_motion_bounds(
-      scene, request.group_id, trajectory.joint_names);
+      scene, request.compiled_group_name, trajectory.joint_names);
   if (!motion_bounds.ok()) {
     return core::Result<CartesianInterpolantPath>::Err(
         motion_bounds.error());
@@ -892,9 +892,11 @@ core::Result<CartesianInterpolantPath> sample_cartesian_interpolant_path(
            {"failure_stage", "cartesian_output_validation"}}};
     }
     const auto full_positions =
-        scene->toFullJointPositions(request.group_id, group_positions);
+        scene->toFullJointPositions(request.compiled_group_name,
+                                    group_positions);
     const auto pose = scene->forwardKinematics(
-        full_positions, request.tcp_frame, request.base_frame);
+        full_positions, request.compiled_tcp_frame,
+        request.compiled_base_frame);
     if (!pose.allFinite()) {
       return core::ErrorDTO{
           core::kErrorCartesianIncomplete,
@@ -1086,7 +1088,7 @@ struct ControlledCartesianPathFidelityResult {
 };
 
 ControlledCartesianPathFidelityResult
-verify_cartesian_path_fidelity_controlled(
+verify_cartesian_path_fidelity_impl(
     std::span<const Eigen::Matrix4d> requested_path,
     std::span<const Eigen::Matrix4d> actual_path,
     double translation_tolerance_m, double rotation_tolerance_rad,
@@ -1306,10 +1308,27 @@ CartesianPathFidelityReport verify_cartesian_path_fidelity(
     std::span<const Eigen::Matrix4d> requested_path,
     std::span<const Eigen::Matrix4d> actual_path,
     double translation_tolerance_m, double rotation_tolerance_rad) {
-  return verify_cartesian_path_fidelity_controlled(
+  return verify_cartesian_path_fidelity_impl(
              requested_path, actual_path, translation_tolerance_m,
              rotation_tolerance_rad, nullptr)
       .report;
+}
+
+core::Result<CartesianPathFidelityReport>
+verify_cartesian_path_fidelity_controlled(
+    std::span<const Eigen::Matrix4d> requested_path,
+    std::span<const Eigen::Matrix4d> actual_path,
+    double translation_tolerance_m, double rotation_tolerance_rad,
+    const CartesianPlanningControl& control) {
+  auto result = verify_cartesian_path_fidelity_impl(
+      requested_path, actual_path, translation_tolerance_m,
+      rotation_tolerance_rad, &control);
+  if (result.error.has_value()) {
+    return core::Result<CartesianPathFidelityReport>::Err(
+        std::move(*result.error));
+  }
+  return core::Result<CartesianPathFidelityReport>::Ok(
+      std::move(result.report));
 }
 
 

@@ -22,6 +22,7 @@
 #include <manyforge_core/operator_stop_worker.hpp>
 #include <manyforge_core/ports/icollision_trajectory_projector.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
+#include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/ports/iobserved_robot_state_provider.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
@@ -269,7 +270,7 @@ struct ExecutionKernelPorts {
 ///
 /// Spec 230: all operations are ROS-free. This is an async v0.1
 /// implementation with event subscription.
-class ExecutionKernel {
+class ExecutionKernel : public IResolvedParticipantExecutionEngine {
  public:
   ExecutionKernel(IPlannerBackend& planner,
                   ExecutionKernelPorts ports,
@@ -279,35 +280,35 @@ class ExecutionKernel {
                   TrajectoryCache& cache,
                   ExecutionKernelConfig config = {});
 
-  ~ExecutionKernel();
+  ~ExecutionKernel() override;
 
   /// Execute a motion request. Only valid from Idle.
   /// Returns execution_id immediately; plan → validate → dispatch runs
   /// on a worker thread. Callers observe progress via get_status() and events.
-  Result<uint64_t> execute(const ExecuteRequestDTO& request);
+  Result<uint64_t> execute(const ExecuteRequestDTO& request) override;
 
   /// Non-blocking stop from any non-terminal state.
   /// Accepted stop invalidates older lifecycle/recovery commands by bumping
   /// `control_command_epoch()`. Stop is never rejectable by epoch staleness.
-  StopResultDTO stop();
+  StopResultDTO stop() override;
 
   /// Non-blocking pause. Only valid from Executing.
-  PauseResultDTO pause();
+  PauseResultDTO pause() override;
 
   /// Non-blocking resume. Only valid from Paused.
   ResumeResultDTO resume(
-      std::optional<std::uint64_t> expected_epoch = std::nullopt);
+      std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
   /// Non-blocking reset. Valid from any state except Idle.
   ResetResultDTO reset(
-      std::optional<std::uint64_t> expected_epoch = std::nullopt);
+      std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
   /// Backend-neutral gripper command surface. The injected adapter owns all
   /// progression and publishes immutable observer status.
   GripperCommandResultDTO command_gripper(
-      const GripperCommandRequestDTO& request);
+      const GripperCommandRequestDTO& request) override;
   GripperCommandStatusDTO get_gripper_status(
-      const std::string& gripper_id) const;
+      const std::string& gripper_id) const override;
   GripperCommandResultDTO mark_gripper_grasp_lost(
       const std::string& gripper_id,
       std::uint64_t expected_command_id,
@@ -338,7 +339,7 @@ class ExecutionKernel {
   /// execution_id. Failed and Stopped executions require Reset/recovery instead.
   AcknowledgeCompletedResultDTO acknowledge_completed(
       uint64_t execution_id,
-      std::optional<std::uint64_t> expected_epoch = std::nullopt);
+      std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
   /// RT-8B (spec/200, spec/230 §3.7.1): the only kernel statement of
   /// recovery admissibility. Pure bounded read of the latest published
@@ -368,7 +369,7 @@ class ExecutionKernel {
       double scale, std::optional<std::string> principal_id = std::nullopt);
 
   /// Get current kernel status.
-  ExecutionStatus get_status() const;
+  ExecutionStatus get_status() const override;
 
   /// Get the latest observer-safe execution snapshot published by the kernel.
   ExecutionSnapshot get_execution_snapshot() const;
@@ -456,10 +457,10 @@ class ExecutionKernel {
   /// Subscribe to kernel events.
   /// @param callback Called for each event. Must be thread-safe.
   /// @return Handle for unsubscribing.
-  SubscriptionHandle subscribe_events(EventCallback callback);
+  SubscriptionHandle subscribe_events(EventCallback callback) override;
 
   /// Unsubscribe from kernel events.
-  void unsubscribe_events(SubscriptionHandle handle);
+  void unsubscribe_events(SubscriptionHandle handle) override;
 
   /// Block until the current execution completes (reaches terminal state).
   /// Useful for tests and synchronous callers.

@@ -5,6 +5,7 @@
 
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/cache/trajectory_cache.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 
 namespace manyforge::core {
 namespace {
@@ -34,12 +35,10 @@ Pose3DTO make_pose(double x, double y, double z) {
 }
 
 ExecuteRequestDTO make_cartesian_request() {
-  ExecuteRequestDTO request;
-  request.robot_id = "robot0";
-  request.group_id = "arm";
+  auto request = testing::make_test_execute_request();
   request.move_id = "move";
-  request.base_frame = "base";
-  request.tcp_frame = "tool";
+  std::get<ResolvedComponentModelFrameDTO>(request.binding.tcp_frame)
+      .compiled_frame_name = "tool";
   request.tolerances = {0.01, 0.001, 0.01};
   request.speed_profile = {0.5, 0.5, 0.2};
   request.contact_policy_id = "free_space";
@@ -251,22 +250,27 @@ TEST(TrajectoryCacheIntentTest, EqualResolvedRequestsAreStable) {
   EXPECT_GT(identity.size(), 16U);
 }
 
-TEST(TrajectoryCacheIntentTest, EquivalentJointGoalOrderHasSameIdentity) {
+TEST(TrajectoryCacheIntentTest, JointGoalOrderingRemainsPartOfIdentity) {
   auto lhs = make_cartesian_request();
-  lhs.motion = JointGoalDTO{{"joint_a", "joint_b"}, {0.2, -0.4}};
+  lhs.motion = ResolvedJointGoalDTO{
+      {ResourceId("resource_a"), ResourceId("resource_b")},
+      {"joint_a", "joint_b"}, {0.2, -0.4}};
   auto rhs = lhs;
-  rhs.motion = JointGoalDTO{{"joint_b", "joint_a"}, {-0.4, 0.2}};
+  rhs.motion = ResolvedJointGoalDTO{
+      {ResourceId("resource_b"), ResourceId("resource_a")},
+      {"joint_b", "joint_a"}, {-0.4, 0.2}};
 
-  EXPECT_EQ(trajectory_cache_intent_identity(lhs),
+  EXPECT_NE(trajectory_cache_intent_identity(lhs),
             trajectory_cache_intent_identity(rhs));
 }
 
 TEST(TrajectoryCacheIntentTest,
      MalformedJointGoalExtraPositionCannotAliasAnotherRequest) {
   auto lhs = make_cartesian_request();
-  lhs.motion = JointGoalDTO{{"joint_a"}, {0.2, 1.0}};
+  lhs.motion = ResolvedJointGoalDTO{{ResourceId("resource_a")},
+                                    {"joint_a"}, {0.2, 1.0}};
   auto rhs = lhs;
-  std::get<JointGoalDTO>(rhs.motion).positions_rad[1] = 2.0;
+  std::get<ResolvedJointGoalDTO>(rhs.motion).positions_rad[1] = 2.0;
 
   EXPECT_NE(trajectory_cache_intent_identity(lhs),
             trajectory_cache_intent_identity(rhs));
@@ -301,22 +305,28 @@ TEST(TrajectoryCacheIntentTest, CanonicalModelBindingChangesIdentity) {
   for (const auto& changed : {
            [&] {
              auto request = baseline;
-             request.robot_id = "robot1";
+             request.binding.controllable_component_id =
+                 ControllableComponentId("component:other");
              return request;
            }(),
            [&] {
              auto request = baseline;
-             request.group_id = "secondary_arm";
+             request.binding.model_group_binding.compiled_group_name =
+                 "secondary_arm";
              return request;
            }(),
            [&] {
              auto request = baseline;
-             request.base_frame = "mobile_base";
+             std::get<ResolvedComponentModelFrameDTO>(
+                 request.binding.base_frame)
+                 .compiled_frame_name = "mobile_base";
              return request;
            }(),
            [&] {
              auto request = baseline;
-             request.tcp_frame = "alternate_tcp";
+             std::get<ResolvedComponentModelFrameDTO>(
+                 request.binding.tcp_frame)
+                 .compiled_frame_name = "alternate_tcp";
              return request;
            }(),
        }) {
@@ -342,7 +352,13 @@ TEST(TrajectoryCacheIntentTest, TargetModeReferenceAndProfileChangeIdentity) {
 TEST(TrajectoryCacheIntentTest, DynamicsAndCartesianOptionsChangeIdentity) {
   auto baseline = make_cartesian_request();
   auto capped = baseline;
-  capped.per_joint_dynamics_limits["joint1"].max_velocity_rad_s = 0.4;
+  JointDynamicsLimitDTO limit;
+  limit.max_velocity_rad_s = 0.4;
+  capped.per_resource_dynamics_limits.push_back(
+      ResolvedResourceDynamicsLimitDTO{
+          capped.binding.resources.front(),
+          capped.binding.model_group_binding.compiled_joint_names.front(),
+          limit});
   auto slower_cartesian = baseline;
   std::get<CartesianPathDTO>(slower_cartesian.motion).max_linear_speed_mps =
       0.05;

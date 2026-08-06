@@ -18,6 +18,7 @@
 #include "content_identity_internal.hpp"
 #include "control_domain_control_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
+#include "manyforge_core/types/command_schema.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/assistant_settings_codec.hpp"
 #include "manyforge_deployment/cell_graph_codec.hpp"
@@ -465,36 +466,79 @@ verify_structural_graph_projection(
     }
     return verified;
   }
-  if (graph.model_instances.size() != 1U ||
-      graph.controllable_components.size() != 1U ||
-      graph.control_domains.size() != 1U ||
-      graph.control_bindings.size() != 1U) {
+  if (graph.model_instances.empty() ||
+      graph.controllable_components.empty() || graph.control_domains.empty() ||
+      graph.control_bindings.empty()) {
     detail::fail_retained_bundle(
-        "retained structural control graph is not the exact one-component "
-        "subset");
+        "retained native control graph requires non-empty model, component, "
+        "domain, and binding tables");
   }
-  const auto& model = graph.model_instances.front();
-  const auto& component = graph.controllable_components.front();
-  const auto& domain = graph.control_domains.front();
-  const auto& binding = graph.control_bindings.front();
-  if (model.root_pose_in_cell.has_value() ||
-      !component.root_pose_in_cell.has_value() ||
-      component.model_role_bindings.size() != 1U ||
-      component.model_role_bindings.front().model_instance_id !=
-          model.model_instance_id ||
-      !component.runtime_unit_ids.empty() ||
-      !domain.runtime_unit_ids.empty() ||
-      binding.resource_bindings.empty() ||
-      binding.legal_control_route_ids.size() != 1U ||
-      binding.route_endpoint_projections.size() != 1U ||
-      binding.controllable_component_id !=
-          component.controllable_component_id ||
-      binding.control_domain_id != domain.control_domain_id ||
-      binding.controller_topology_id != domain.controller_topology_id ||
-      binding.topology_revision != domain.topology_revision) {
-    detail::fail_retained_bundle(
-        "retained structural control graph violates its exact component, "
-        "target, binding, or domain closure");
+
+  std::set<core::ModelInstanceId> owned_models;
+  for (const auto& component : graph.controllable_components) {
+    if (!component.root_pose_in_cell.has_value() ||
+        component.model_role_bindings.empty() ||
+        !component.runtime_unit_ids.empty()) {
+      detail::fail_retained_bundle(
+          "retained native component requires a direct cell placement, at "
+          "least one model role, and no runtime-unit owner");
+    }
+    for (const auto& role : component.model_role_bindings) {
+      const auto model = std::find_if(
+          graph.model_instances.begin(), graph.model_instances.end(),
+          [&role](const core::ModelInstanceDTO& value) {
+            return value.model_instance_id == role.model_instance_id;
+          });
+      if (model == graph.model_instances.end() ||
+          model->root_pose_in_cell.has_value() ||
+          !owned_models.insert(role.model_instance_id).second) {
+        detail::fail_retained_bundle(
+            "retained native component model roles must own distinct, "
+            "component-placed model instances");
+      }
+    }
+  }
+  for (const auto& model : graph.model_instances) {
+    if (!owned_models.contains(model.model_instance_id) &&
+        !model.root_pose_in_cell.has_value()) {
+      detail::fail_retained_bundle(
+          "retained passive model beside native components requires an "
+          "explicit cell placement");
+    }
+  }
+
+  for (const auto& domain : graph.control_domains) {
+    if (!domain.runtime_unit_ids.empty()) {
+      detail::fail_retained_bundle(
+          "retained native control domains cannot select a runtime-unit "
+          "owner");
+    }
+  }
+  for (const auto& binding : graph.control_bindings) {
+    const auto component = std::find_if(
+        graph.controllable_components.begin(),
+        graph.controllable_components.end(),
+        [&binding](const core::ControllableComponentDTO& value) {
+          return value.controllable_component_id ==
+                 binding.controllable_component_id;
+        });
+    const auto domain = std::find_if(
+        graph.control_domains.begin(), graph.control_domains.end(),
+        [&binding](const core::ControlDomainDTO& value) {
+          return value.control_domain_id == binding.control_domain_id;
+        });
+    if (component == graph.controllable_components.end() ||
+        domain == graph.control_domains.end() ||
+        binding.resource_bindings.empty() ||
+        binding.legal_control_route_ids.empty() ||
+        binding.route_endpoint_projections.size() !=
+            binding.legal_control_route_ids.size() ||
+        binding.controller_topology_id != domain->controller_topology_id ||
+        binding.topology_revision != domain->topology_revision) {
+      detail::fail_retained_bundle(
+          "retained native control binding violates its exact component, "
+          "route, or domain closure");
+    }
   }
   return verified;
 }
@@ -573,6 +617,12 @@ void require_structural_catalog_closure(
         core::CatalogRecordKind::kStopEvidencePolicy,
         binding.stop_evidence_policy_id.value(),
         binding.stop_evidence_policy_revision.value());
+    if (binding.capability_id.value() == "tool.gripper.command") {
+      graph_records.emplace(
+          core::CatalogRecordKind::kCommandSchema,
+          std::string(core::kGripperPositionCommandSchemaId),
+          std::string(core::kGripperPositionCommandSchemaRevision));
+    }
   }
 
   std::set<CatalogIdentity> catalog_records;
@@ -933,29 +983,53 @@ verify_structural_applicability_projection(
     }
     return verified;
   }
-  if (desired.size() != 1U || graph.control_domains.size() != 1U ||
-      graph.control_bindings.size() != 1U) {
+  if (desired.size() != graph.control_domains.size() ||
+      graph.control_bindings.empty()) {
     detail::fail_retained_bundle(
-        "one-component structural retention requires one desired control "
-        "configuration");
+        "native structural retention requires one desired control "
+        "configuration per control domain");
   }
-  const auto& domain = graph.control_domains.front();
-  const auto& binding = graph.control_bindings.front();
-  const auto& selected = desired.front();
-  if (selected.control_domain_id != domain.control_domain_id ||
-      selected.control_domain_revision != domain.control_domain_revision ||
-      selected.controller_topology_id != domain.controller_topology_id ||
-      selected.topology_revision != domain.topology_revision ||
-      selected.binding_routes.size() != 1U ||
-      selected.binding_routes.front().control_binding_id !=
-          binding.control_binding_id ||
-      selected.binding_routes.front().control_binding_revision !=
-          binding.control_binding_revision ||
-      selected.binding_routes.front().control_route_id !=
-          binding.legal_control_route_ids.front()) {
-    detail::fail_retained_bundle(
-        "retained desired control configuration is not the exact selected "
-        "domain/binding route");
+
+  for (const auto& domain : graph.control_domains) {
+    const auto selected = std::find_if(
+        desired.begin(), desired.end(), [&domain](const auto& value) {
+          return value.control_domain_id == domain.control_domain_id;
+        });
+    const auto binding_count = static_cast<std::size_t>(std::count_if(
+        graph.control_bindings.begin(), graph.control_bindings.end(),
+        [&domain](const core::ControlBindingDTO& binding) {
+          return binding.control_domain_id == domain.control_domain_id;
+        }));
+    if (selected == desired.end() || binding_count == 0U ||
+        selected->control_domain_revision != domain.control_domain_revision ||
+        selected->controller_topology_id != domain.controller_topology_id ||
+        selected->topology_revision != domain.topology_revision ||
+        selected->binding_routes.size() != binding_count) {
+      detail::fail_retained_bundle(
+          "retained desired control configuration is not the exact selected "
+          "domain projection");
+    }
+
+    for (const auto& binding : graph.control_bindings) {
+      if (binding.control_domain_id != domain.control_domain_id) {
+        continue;
+      }
+      const auto route = std::find_if(
+          selected->binding_routes.begin(), selected->binding_routes.end(),
+          [&binding](const core::DesiredControlBindingRouteDTO& value) {
+            return value.control_binding_id == binding.control_binding_id;
+          });
+      if (route == selected->binding_routes.end() ||
+          route->control_binding_revision != binding.control_binding_revision ||
+          std::find(binding.legal_control_route_ids.begin(),
+                    binding.legal_control_route_ids.end(),
+                    route->control_route_id) ==
+              binding.legal_control_route_ids.end()) {
+        detail::fail_retained_bundle(
+            "retained desired control configuration is not the exact "
+            "selected binding route");
+      }
+    }
   }
   return verified;
 }

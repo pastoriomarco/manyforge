@@ -29,6 +29,7 @@ collect_catalog_record_refs(
       composition.model_assets().size() +
       composition.component_types().size() +
       applicability.runtime_profiles().size() +
+      applicability.command_schemas().size() +
       applicability.capability_definitions().size() +
       applicability.control_interface_contracts().size() +
       applicability.controller_topologies().size() +
@@ -40,6 +41,7 @@ collect_catalog_record_refs(
   }
   append_references(references, composition.component_types());
   append_references(references, applicability.runtime_profiles());
+  append_references(references, applicability.command_schemas());
   append_references(references, applicability.capability_definitions());
   append_references(references,
                     applicability.control_interface_contracts());

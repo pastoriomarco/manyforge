@@ -45,8 +45,9 @@ const CollisionPairResult* find_pair(const std::vector<CollisionPairResult>& v,
 
 TEST(CollisionPolicyEvaluator, FreeSpacePairBlocks) {
   CollisionPolicyEvaluator ev(make_free_space_policy());
-  const auto p = pair("object/box_a/shape/0",
-                      "robot/ur10e/link/wrist_3_link/collision/0");
+  const auto p = pair(
+      "component/ur10e/model/ur10e_model/body/wrist/collision/0",
+      "scene/box_a/shape/0");
   auto out = ev.classify({p}, rev(2, "world-r2"));
   ASSERT_EQ(out.pairs.size(), 1u);
   EXPECT_EQ(out.pairs[0].classification,
@@ -69,7 +70,8 @@ TEST(CollisionPolicyEvaluator, NoObservedPairsAccepts) {
 
 TEST(CollisionPolicyEvaluator, StaticStaticAllowedWhenListed) {
   auto snapshot = make_free_space_policy();
-  const auto p = pair("object/fixture_a/shape/0", "object/fixture_b/shape/0");
+  const auto p = pair("scene/fixture_a/shape/0",
+                      "scene/fixture_b/shape/0");
   snapshot.allowed_static_static_pairs.push_back(p);
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
@@ -83,10 +85,11 @@ TEST(CollisionPolicyEvaluator, StaticStaticAllowedWhenListed) {
 TEST(CollisionPolicyEvaluator,
      StaticStaticAllowanceDoesNotMaskUnrelatedCollisions) {
   auto snapshot = make_free_space_policy();
-  const auto allowed = pair("object/fixture_a/shape/0",
-                            "object/fixture_b/shape/0");
-  const auto unrelated = pair("object/cheese_box/shape/0",
-                              "robot/ur10e/link/wrist_3_link/collision/0");
+  const auto allowed = pair("scene/fixture_a/shape/0",
+                            "scene/fixture_b/shape/0");
+  const auto unrelated = pair(
+      "component/ur10e/model/ur10e_model/body/wrist/collision/0",
+      "scene/cheese_box/shape/0");
   snapshot.allowed_static_static_pairs.push_back(allowed);
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
@@ -108,8 +111,9 @@ TEST(CollisionPolicyEvaluator,
 TEST(CollisionPolicyEvaluator,
      TouchLinkAllowedPairClassifiedAsAllowedTouchLink) {
   auto snapshot = make_free_space_policy();
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/link/wrist_3_link/collision/0");
+  const auto p = pair(
+      "component/ur10e/model/ur10e_model/body/wrist/collision/0",
+      "scene/cheese_box/shape/0");
   snapshot.allowed_touch_link_pairs.push_back(p);
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
@@ -123,10 +127,11 @@ TEST(CollisionPolicyEvaluator,
 TEST(CollisionPolicyEvaluator,
      TouchLinkAllowanceDoesNotMaskOtherCollisions) {
   auto snapshot = make_free_space_policy();
-  const auto allowed = pair("object/cheese_box/shape/0",
-                            "robot/ur10e/link/wrist_3_link/collision/0");
-  const auto blocking = pair("object/cheese_box/shape/0",
-                             "fixture/table_top/shape/0");
+  const auto allowed = pair(
+      "component/ur10e/model/ur10e_model/body/wrist/collision/0",
+      "scene/cheese_box/shape/0");
+  const auto blocking = pair("scene/cheese_box/shape/0",
+                             "scene/table_top/shape/0");
   snapshot.allowed_touch_link_pairs.push_back(allowed);
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
@@ -160,8 +165,8 @@ CollisionPolicySnapshot make_support_contact_policy(
 }
 
 TEST(CollisionPolicyEvaluator, SupportContactStartAllowedThenContinued) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/false));
 
@@ -179,8 +184,8 @@ TEST(CollisionPolicyEvaluator, SupportContactStartAllowedThenContinued) {
 }
 
 TEST(CollisionPolicyEvaluator, SupportContactSeparationEmitsSeparatedEntry) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/false));
 
@@ -196,8 +201,8 @@ TEST(CollisionPolicyEvaluator, SupportContactSeparationEmitsSeparatedEntry) {
 
 TEST(CollisionPolicyEvaluator,
      SupportContactRecontactBlocksWhenRecontactDisallowed) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/false));
 
@@ -213,8 +218,8 @@ TEST(CollisionPolicyEvaluator,
 }
 
 TEST(CollisionPolicyEvaluator, SupportContactRecontactAllowedWhenPolicySays) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/true));
 
@@ -229,8 +234,8 @@ TEST(CollisionPolicyEvaluator, SupportContactRecontactAllowedWhenPolicySays) {
 }
 
 TEST(CollisionPolicyEvaluator, ResetClearsSupportContactStateMachine) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
       make_support_contact_policy(p, /*allow_recontact=*/false));
 
@@ -249,7 +254,7 @@ TEST(CollisionPolicyEvaluator, ResetClearsSupportContactStateMachine) {
 TEST(ContactReleaseTransition,
      BinaryContactUsesPresenceOnlyAndAllowsContactPlateaus) {
   SupportContactPolicyEntry policy;
-  policy.pair = pair("object/part", "fixture/table");
+  policy.pair = pair("scene/part/shape/0", "scene/table/shape/0");
   policy.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
   policy.enforce_max_start_penetration = false;
   policy.release_tolerance_m = 0.0;
@@ -497,7 +502,9 @@ TEST(ContactReleaseTransition,
 
 TEST(CollisionPolicyEvaluator,
      BoundedPenetrationRecontactIsAllowedIndependentOfReleaseFlag) {
-  const auto p = pair("object/part", "robot/tool");
+  const auto p = pair(
+      "component/arm/model/arm_model/body/tool/collision/0",
+      "scene/part/shape/0");
   auto snapshot = make_support_contact_policy(p, /*allow_recontact=*/false);
   snapshot.support_contacts.front().mode =
       CollisionContactPolicyMode::kBoundedPenetration;
@@ -515,8 +522,8 @@ TEST(CollisionPolicyEvaluator,
 
 TEST(CollisionPolicyEvaluator,
      SharedPolicyIndexDoesNotShareSupportContactStateMachine) {
-  const auto p = pair("object/cheese_box/shape/0",
-                      "robot/ur10e/attached/cheese_box/shape/0");
+  const auto p = pair("scene/cheese_box/shape/0",
+                      "scene/table/shape/0");
   auto snapshot = std::make_shared<CollisionPolicySnapshot>(
       make_support_contact_policy(p, /*allow_recontact=*/false));
   auto index = build_collision_policy_index(*snapshot);

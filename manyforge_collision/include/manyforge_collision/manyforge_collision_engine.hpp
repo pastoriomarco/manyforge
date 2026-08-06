@@ -17,8 +17,53 @@
 
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
+#include <manyforge_core/types/error_code.hpp>
 
 namespace manyforge::collision {
+
+/// Compiler-owned identity for one logical component/model collision body.
+///
+/// The caller supplies only retained semantic coordinates and the exact
+/// compiled frame selected by the retained symbol/role map. The collision
+/// package resolves the physical geometry from its already-loaded immutable
+/// model; callers cannot inject replacement robot geometry through this
+/// boundary.
+struct RetainedComponentCollisionBodyProjectionInput final {
+  core::ControllableComponentId controllable_component_id;
+  core::ModelInstanceId model_instance_id;
+  core::ModelRevision model_revision;
+  core::CollisionBodyRoleId collision_body_role_id;
+  std::size_t collision_index = 0U;
+  std::string compiled_frame_name;
+};
+
+/// One compiler-resolved component frame used to bind the flattened retained
+/// model to the semantic cell collision-world frame.
+struct RetainedComponentModelFrameProjectionInput final {
+  core::ControllableComponentId controllable_component_id;
+  core::ModelInstanceId model_instance_id;
+  core::ModelRevision model_revision;
+  core::FrameRoleId frame_role_id;
+  std::string compiled_frame_name;
+};
+
+/// Immutable component-model half of a collision-world snapshot.
+struct RetainedComponentCollisionProjection final {
+  std::vector<core::CollisionComponentModelFrame> component_model_frames;
+  std::vector<core::CollisionWorldBody> component_bodies;
+};
+
+/// Exact fixed-frame bridge used to publish one carried scene-resource body.
+///
+/// The public parent is a stable component/model collision-body identity. The
+/// pose bridge converts a scene-owner-issued carrier-frame-relative pose into
+/// that body's compiled frame without exposing a backend geometry name.
+struct RetainedCarriedObjectParentProjection final {
+  core::CollisionBodyId parent_body_id;
+  std::string compiled_parent_frame_name;
+  core::Pose3DTO parent_frame_from_carrier;
+};
 
 namespace detail {
 
@@ -49,10 +94,12 @@ struct SelectedCollidingDistanceEvidence {
 /// GeometryModel, GeometryData, and contact buffers; no query touches
 /// RoboPlan planner-context APIs, RoboPlan scene locks, or adapter state.
 ///
-/// Primitive robot proxies, multi-primitive bodies, and authored scene triangle
-/// meshes are supported in the current production profile. Undecomposed
-/// compound and convex-mesh geometry kinds still fail closed until the snapshot
-/// contract carries a qualified decomposition.
+/// Exact retained component geometry, multi-primitive logical bodies, and
+/// authored scene triangle meshes are supported in the current production
+/// profile. Component bodies map stable role identities onto the retained
+/// Pinocchio geometry; they are never reconstructed as proxy shapes.
+/// Undecomposed compound and convex-mesh geometry kinds still fail closed until
+/// the snapshot contract carries a qualified decomposition.
 class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
  public:
   /// Direct mechanism counters for the most recent query executed by this
@@ -100,6 +147,32 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   /// Create an independently-owned revision cache over a shared model.
   static SharedSceneCachePtr make_shared_scene_cache(
       SharedModelPtr shared_model);
+
+  /// Project the exact retained native collision inventory into stable public
+  /// component/model/role identities.
+  ///
+  /// `compiled_cell_frame_name` is the compiler-owned frame representing the
+  /// semantic cell world. Every native geometry must resolve to exactly one
+  /// supplied body row and every component/model owning collision geometry
+  /// must have at least one supplied frame row. Missing, duplicate, ambiguous,
+  /// or foreign mappings fail closed.
+  [[nodiscard]] static core::Result<RetainedComponentCollisionProjection>
+  project_retained_component_collision(
+      SharedModelPtr shared_model,
+      const std::string& compiled_cell_frame_name,
+      std::span<const RetainedComponentCollisionBodyProjectionInput> bodies,
+      std::span<const RetainedComponentModelFrameProjectionInput> frames);
+
+  /// Resolve one portable carrier frame to a rigidly-related collision body
+  /// selected by the addressed command target. Ambiguous or articulated
+  /// relationships fail closed: a carried object's immutable snapshot pose
+  /// must not depend on an arbitrary body choice or on a changing joint.
+  [[nodiscard]] static core::Result<RetainedCarriedObjectParentProjection>
+  resolve_retained_carried_object_parent(
+      SharedModelPtr shared_model,
+      const std::string& compiled_carrier_frame_name,
+      std::span<const RetainedComponentCollisionBodyProjectionInput>
+          target_bodies);
 
   /// Construct an independent collision query engine from a ManyForge-owned
   /// model descriptor: URDF/SRDF paths, package-resolution paths, and the
@@ -185,7 +258,8 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   core::CollisionResult check_locked(
       const core::CollisionQuery& query,
       const core::CollisionWorldSnapshot* snapshot,
-      const core::CollisionCancellationToken* cancel);
+      const core::CollisionCancellationToken* cancel,
+      const Eigen::VectorXd& configuration);
   std::optional<Eigen::VectorXd> full_configuration_from_query(
       const core::CollisionQuery& query,
       std::string& error) const;

@@ -1,0 +1,251 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.command_schema.v1
+schema_revision: sha256:dd305be4c7071d4b5fcf31c031d80b7adb8d3a29562629a189b167922b1f29da
+schema_purpose: artifact_document
+root_definition_id: command_schema
+definitions:
+  - definition_id: command_schema
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values: [manyforge.command_schema.v1]
+              - kind: string_format
+                value: api_version
+        - field_id: command_schema_id
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: command_schema_revision
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: compatible_capabilities
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 64
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - [capability_id]
+            item_schema:
+              kind: local_ref
+              definition_id: compatible_capability
+        - field_id: command_value
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: local_ref
+            definition_id: command_value
+        - field_id: resource_role_selectors
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 64
+            collection: {kind: scalar_set}
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+        - field_id: channel_role_selectors
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 64
+            collection: {kind: scalar_set}
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+        - field_id: caller_options
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 64
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - [option_id]
+            item_schema:
+              kind: local_ref
+              definition_id: caller_option
+        - field_id: completion_rule
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values: [goal_fenced_target_reached]
+        - field_id: confirmation_rule
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values: [binding_feedback_required]
+        - field_id: stop_evidence_requirements
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 64
+            collection: {kind: scalar_set}
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: enum
+                  values: [command_terminal]
+  - definition_id: compatible_capability
+    value_schema:
+      kind: object
+      fields:
+        - field_id: capability_id
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: capability_definition_revision
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+  - definition_id: command_value
+    value_schema:
+      kind: tagged_union
+      tag_field: value_kind
+      alternatives:
+        - tag_value: gripper_position
+          value_schema:
+            kind: local_ref
+            definition_id: gripper_position_value
+  - definition_id: gripper_position_value
+    value_schema:
+      kind: object
+      fields:
+        - field_id: value_kind
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values: [gripper_position]
+        - field_id: accepted_position_kinds
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 2
+            collection: {kind: scalar_set}
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: enum
+                  values: [angular, linear]
+        - field_id: minimum_resource_count
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: minimum
+                value: 1
+              - kind: maximum
+                value: 4096
+        - field_id: maximum_resource_count
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: minimum
+                value: 1
+              - kind: maximum
+                value: 4096
+        - field_id: max_effort_contract
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values: [optional_nonnegative_matching_coordinate]
+  - definition_id: caller_option
+    value_schema:
+      kind: object
+      fields:
+        - field_id: option_id
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: value_kind
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values: [nonnegative_duration_seconds]
+        - field_id: required
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []

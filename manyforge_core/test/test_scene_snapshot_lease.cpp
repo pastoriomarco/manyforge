@@ -40,7 +40,7 @@ SceneSnapshotLeaseObject make_object(
   SceneSnapshotLeaseObject object;
   object.object_id = std::move(id);
   object.role = role;
-  object.collision_body_ids = {"object/" + object.object_id + "/shape/0"};
+  object.collision_body_ids = {"scene/" + object.object_id + "/shape/0"};
   object.object_revision_token = object.object_id + "-shape-v1";
   object.body_content_hashes.emplace(object.collision_body_ids.front(),
                                      object.object_id + "-body-hash-v1");
@@ -283,7 +283,7 @@ TEST(SceneSnapshotLeaseValidator,
   const auto lease = make_lease();
   auto context = make_context(lease);
   context.live_objects.front().collision_body_ids.push_back(
-      "object/box/shape/1");
+      "scene/box/shape/1");
 
   const auto result = validate_scene_snapshot_lease(lease, context);
 
@@ -415,7 +415,7 @@ TEST(SceneSnapshotLeaseValidator,
   context.live_world_revision = CollisionWorldRevision{8, "world-hash-v2"};
   ++context.topology_epoch;
   context.live_objects.front().collision_body_ids.push_back(
-      "object/box/shape/1");
+      "scene/box/shape/1");
   context.live_objects.front().object_revision_token = "box-shape-v2";
 
   const auto result = validate_scene_snapshot_lease(lease, context);

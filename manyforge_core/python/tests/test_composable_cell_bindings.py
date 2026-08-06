@@ -29,6 +29,7 @@ STRONG_STRING_TYPES = (
     "RuntimeProfileRevision",
     "RuntimeRoleId",
     "RuntimeUnitId",
+    "RuntimeEpoch",
     "RuntimePolicyId",
     "RuntimePolicyRevision",
     "ComponentTypeId",
@@ -39,7 +40,9 @@ STRONG_STRING_TYPES = (
     "ModelRevision",
     "ModelRoleId",
     "ModelGroupRoleId",
+    "ComponentRoleId",
     "CommandTargetId",
+    "TargetRoleId",
     "CapabilityId",
     "CapabilityDefinitionRevision",
     "FrameRoleId",
@@ -58,6 +61,7 @@ STRONG_STRING_TYPES = (
     "ControlDomainRevision",
     "ControlBindingId",
     "ControlBindingRevision",
+    "ActiveControlConfigurationId",
     "EndpointRoleId",
     "StateAuthorityId",
     "StopEvidencePolicyId",
@@ -85,6 +89,13 @@ STRONG_STRING_TYPES = (
     "ProjectionLeaseId",
     "CommandSchemaId",
     "CommandSchemaRevision",
+    "CommandOptionId",
+    "ChannelRoleId",
+    "ProgramId",
+    "ProgramRevision",
+    "ProgramBindingId",
+    "ProgramRunId",
+    "MoveId",
 )
 
 
@@ -662,7 +673,7 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
         with pytest.raises(TypeError):
             cls()
 
-    assert len(STRONG_STRING_TYPES) == 68
+    assert len(STRONG_STRING_TYPES) == 79
     assert len({type(value) for value in values}) == len(STRONG_STRING_TYPES)
     assert len(set(values)) == len(STRONG_STRING_TYPES)
     for index, left in enumerate(values):
@@ -1497,9 +1508,10 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 8
+    assert len(qualified_entries) == 9
     assert {entry.record_kind for entry in qualified_entries} == {
         core.CatalogRecordKind.kCapabilityDefinition,
+        core.CatalogRecordKind.kCommandSchema,
         core.CatalogRecordKind.kComponentType,
         core.CatalogRecordKind.kControlInterfaceContract,
         core.CatalogRecordKind.kControllerTopology,
@@ -1511,6 +1523,7 @@ target: 0.5
     assert all(entry.compiled_schema is not None for entry in qualified_entries)
     assert {entry.relative_path for entry in qualified_entries} == {
         "catalog/manyforge.capability_definition.v1.yaml",
+        "catalog/manyforge.command_schema.v1.yaml",
         "catalog/manyforge.component_type.v1.yaml",
         "catalog/manyforge.control_interface_contract.v1.yaml",
         "catalog/manyforge.controller_topology.v1.yaml",
@@ -1539,7 +1552,7 @@ target: 0.5
         ),
     }
     assert registry.qualification_registry_digest.value == (
-        "sha256:35e15d92f29c8e8173d73cf211586a8deb1ff5a945207f5476ea84d4c773d8f1"
+        "sha256:41a0185763ccb6a7bc7704130fc25948a3f4c3fe16d2560a2f4b0b14cae46939"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][

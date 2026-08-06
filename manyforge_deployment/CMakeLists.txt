@@ -452,6 +452,11 @@ manyforge_embed_closed_schema(
   resources/closed_schema/catalog/manyforge.provider_manifest.v1.yaml
   mf_pmanifest)
 manyforge_embed_closed_schema(
+  kEmbeddedCommandSchema
+  command_schema
+  resources/closed_schema/catalog/manyforge.command_schema.v1.yaml
+  mf_cmd_schema)
+manyforge_embed_closed_schema(
   kEmbeddedRuntimeProfileSchema
   runtime_profile
   resources/closed_schema/catalog/manyforge.runtime_profile.v1.yaml
@@ -502,6 +507,10 @@ add_library(manyforge_deployment_verification_core
   src/model_source.cpp
   src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp
+  src/program_contract.cpp
+  src/program_binding.cpp
+  src/program_binding_compiler.cpp
+  src/runtime_program_binding.cpp
   src/reference_runtime_unit_verifier.cpp
   src/verified_retained_projection.cpp
   src/runtime_profile_codec.cpp
@@ -530,6 +539,7 @@ add_library(manyforge_deployment
   src/build_manifest.cpp
   src/build_manifest_repository.cpp
   src/capability_definition_codec.cpp
+  src/command_schema_codec.cpp
   src/cell_applicability.cpp
   src/cell_compiler.cpp
   src/cell_composition.cpp
@@ -818,6 +828,42 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_content_identity
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_program_binding
+    test/test_program_binding.cpp)
+  target_compile_definitions(test_program_binding PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+  target_include_directories(test_program_binding PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_program_binding PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_program_binding
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_program_contract
+    test/test_program_contract.cpp)
+  target_compile_definitions(test_program_contract PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+  target_include_directories(test_program_contract PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_program_contract PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_program_contract
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_program_binding_compiler
+    test/test_program_binding_compiler.cpp)
+  target_compile_definitions(test_program_binding_compiler PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+  target_include_directories(test_program_binding_compiler PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_program_binding_compiler PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_program_binding_compiler
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_component_type_codec
     test/test_component_type_codec.cpp)
   target_link_libraries(test_component_type_codec PRIVATE
@@ -878,6 +924,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_closed_schema PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_closed_schema
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_command_schema_codec
+    test/test_command_schema_codec.cpp)
+  target_compile_definitions(test_command_schema_codec PRIVATE
+    MANYFORGE_DEPLOYMENT_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources")
+  target_link_libraries(test_command_schema_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_command_schema_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_control_interface_contract_codec

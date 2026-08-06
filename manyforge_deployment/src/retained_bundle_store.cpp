@@ -22,6 +22,7 @@
 #include "manyforge_deployment/content_identity.hpp"
 #include "catalog_artifact_store_internal.hpp"
 #include "posix_durability_internal.hpp"
+#include "program_binding_internal.hpp"
 #include "retained_bundle_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -34,6 +35,7 @@ enum class DurableValueKind {
   kRawArtifact,
   kCatalogArtifact,
   kRetainedBundle,
+  kProgramBinding,
 };
 
 struct DurableStoreLayout final {
@@ -53,6 +55,8 @@ struct DurableStoreLayout final {
               detail::kCatalogArtifactFileSuffix};
     case DurableValueKind::kRetainedBundle:
       return {"retained-bundles", "sha256", ".json"};
+    case DurableValueKind::kProgramBinding:
+      return {"program-bindings", "sha256", ".json"};
   }
   return {};
 }
@@ -171,6 +175,16 @@ constexpr posix::PublicationMessages kPublicationMessages{
       if (bundle->retained_bundle_id().value() != expected_digest) {
         fail("durable retained-bundle filename does not match its "
              "semantic identity");
+      }
+      return static_cast<std::uint64_t>(bytes.size());
+    }
+    case DurableValueKind::kProgramBinding: {
+      const auto binding =
+          detail::ProgramBindingConstructionAuthority::reload_intrinsic(
+              bytes);
+      if (binding->program_binding_id().value() != expected_digest) {
+        fail("durable Program-Binding filename does not match its semantic "
+             "identity");
       }
       return static_cast<std::uint64_t>(bytes.size());
     }
@@ -714,6 +728,92 @@ std::size_t FilesystemRetainedBundleRepository::size() const {
 
 std::uint64_t
 FilesystemRetainedBundleRepository::retained_bytes() const {
+  return storage_->files.retained_bytes();
+}
+
+struct FilesystemProgramBindingRepository::Storage final {
+  Storage(std::filesystem::path trusted_root,
+          std::size_t max_binding_count, std::uint64_t max_total_bytes,
+          std::uint64_t max_single_binding_bytes)
+      : files(DurableValueKind::kProgramBinding, std::move(trusted_root),
+              max_binding_count, max_total_bytes,
+              max_single_binding_bytes) {}
+
+  DurableFileCollection files;
+};
+
+FilesystemProgramBindingRepository::FilesystemProgramBindingRepository(
+    std::filesystem::path trusted_root,
+    std::size_t max_binding_count, std::uint64_t max_total_bytes,
+    std::uint64_t max_single_binding_bytes)
+    : storage_(std::make_unique<Storage>(
+          std::move(trusted_root), max_binding_count, max_total_bytes,
+          max_single_binding_bytes)) {}
+
+FilesystemProgramBindingRepository::~FilesystemProgramBindingRepository() =
+    default;
+
+bool FilesystemProgramBindingRepository::put_if_absent(
+    std::shared_ptr<const ProgramBinding> binding,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map) {
+  storage_->files.require_owner_process();
+  if (binding == nullptr) {
+    throw ProgramBindingError(
+        "durable Program-Binding repository rejects null");
+  }
+  storage_->files.require_insert_size(binding->canonical_bytes().size());
+  if (!verify_program_binding_identity(*binding)) {
+    throw ProgramBindingError(
+        "durable Program-Binding repository rejects an invalid identity");
+  }
+  const auto reloaded = reload_verified_program_binding(
+      binding->canonical_bytes(), retained_bundle, retained_model_map);
+  if (reloaded->program_binding_id() != binding->program_binding_id() ||
+      reloaded->value() != binding->value()) {
+    throw ProgramBindingError(
+        "durable Program-Binding repository rejects divergent typed and "
+        "canonical values");
+  }
+  const auto hex =
+      detail::retained_digest_hex(binding->program_binding_id().value());
+  if (!hex.has_value()) {
+    throw ProgramBindingError(
+        "durable Program Binding has an invalid strong identity");
+  }
+  return storage_->files.put_if_absent(*hex, binding->canonical_bytes());
+}
+
+std::shared_ptr<const ProgramBinding>
+FilesystemProgramBindingRepository::get_verified(
+    const core::ProgramBindingId& program_binding_id,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map) const {
+  storage_->files.require_owner_process();
+  const auto hex =
+      detail::retained_digest_hex(program_binding_id.value());
+  if (!hex.has_value()) {
+    return nullptr;
+  }
+  const auto bytes = storage_->files.get_verified(*hex);
+  if (!bytes.has_value()) {
+    return nullptr;
+  }
+  const auto binding = reload_verified_program_binding(
+      *bytes, retained_bundle, retained_model_map);
+  if (binding->program_binding_id() != program_binding_id) {
+    throw std::runtime_error(
+        "durable Program-Binding repository key/content mismatch");
+  }
+  return binding;
+}
+
+std::size_t FilesystemProgramBindingRepository::size() const {
+  return storage_->files.size();
+}
+
+std::uint64_t
+FilesystemProgramBindingRepository::retained_bytes() const {
   return storage_->files.retained_bytes();
 }
 

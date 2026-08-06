@@ -142,6 +142,8 @@ struct MotionInterruptStopProfileDTO {
   /// Bounded JSON-safe profile metadata (controller family / version
   /// / qualification artifact id).
   InterruptStructuredValue diagnostics;
+  friend bool operator==(const MotionInterruptStopProfileDTO&,
+                         const MotionInterruptStopProfileDTO&) = default;
 };
 
 inline double motion_interrupt_deceleration_time_or_default(
@@ -340,6 +342,8 @@ struct MotionInterruptScopeDTO {
   MotionInterruptNodeCategory node_category =
       MotionInterruptNodeCategory::kGeneric;
   InterruptStructuredValue metadata;
+  friend bool operator==(const MotionInterruptScopeDTO&,
+                         const MotionInterruptScopeDTO&) = default;
 };
 
 /// Source from which the kernel captured a controlled stop snapshot

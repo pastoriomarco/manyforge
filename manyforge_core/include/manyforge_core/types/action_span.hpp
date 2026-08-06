@@ -53,6 +53,7 @@ struct ActionSpanDTO {
   std::string node_instance_id;
   std::string node_attempt_id;
   std::string parent_node_attempt_id;
+  friend bool operator==(const ActionSpanDTO&, const ActionSpanDTO&) = default;
 };
 
 }  // namespace manyforge::core

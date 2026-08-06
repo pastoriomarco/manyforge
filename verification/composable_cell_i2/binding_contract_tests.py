@@ -2271,7 +2271,7 @@ deployment = module.compute_deployment_artifact_revision(parsed, ())
 composition = module.compose_cell_occurrences(deployment.graph, (), ())
 inputs = deployment.applicability_inputs
 overlay = module.select_site_overlay_for_deployment(inputs.value.site_overlay_ref, inputs.value.external_resources, None)
-applicability = module.qualify_cell_applicability(composition, inputs, (), (), (), (), (), (), overlay)
+applicability = module.qualify_cell_applicability(composition, inputs, (), (), (), (), (), (), (), overlay)
 compiler = module.compile_cell_ir(applicability)
 observation = {"module_file": module.__file__, "module_origin": module.__spec__.origin, "compiler_type": type(compiler).__name__, "cell_id": compiler.applicability.composition.graph.cell_id.value, "catalog_record_count": len(compiler.catalog_record_refs)}
 del compiler, applicability, composition, deployment

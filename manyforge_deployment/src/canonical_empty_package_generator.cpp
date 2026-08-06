@@ -74,6 +74,7 @@ constexpr posix::PublicationMessages kAdmissionPublicationMessages{
       qualify_cell_applicability(
           composition, deployment.applicability_inputs(),
           std::span<const QualifiedRuntimeProfile>{},
+          std::span<const QualifiedCommandSchema>{},
           std::span<const QualifiedCapabilityDefinition>{},
           std::span<const QualifiedControlInterfaceContract>{},
           std::span<const QualifiedControllerTopology>{},

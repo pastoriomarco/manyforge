@@ -26,6 +26,36 @@ struct PublicRequestContextDTO final {
   friend bool operator==(const PublicRequestContextDTO&, const PublicRequestContextDTO&) = default;
 };
 
+/// Transport-derived provenance added by the receiving adapter. Public
+/// request payloads never populate or promote this value themselves.
+enum class RequestTransportDTO {
+  kRos,
+  kHttp,
+  kInternal,
+};
+
+enum class RequestAssuranceDTO {
+  kUnverified,
+  kExternallyAuthenticated,
+};
+
+struct RequestAttributionDTO final {
+  RequestTransportDTO transport = RequestTransportDTO::kInternal;
+  RequestAssuranceDTO assurance = RequestAssuranceDTO::kUnverified;
+  std::optional<std::string> principal_id;
+
+  [[nodiscard]] bool locally_valid() const noexcept {
+    if (principal_id.has_value() && principal_id->empty()) {
+      return false;
+    }
+    return assurance == RequestAssuranceDTO::kExternallyAuthenticated ||
+           !principal_id.has_value();
+  }
+
+  friend bool operator==(const RequestAttributionDTO&,
+                         const RequestAttributionDTO&) = default;
+};
+
 enum class RequestReplayStatusDTO {
   kAcceptedNew,
   kReplayedExact,

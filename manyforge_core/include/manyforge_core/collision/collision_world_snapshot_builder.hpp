@@ -24,9 +24,9 @@ namespace manyforge::core {
 ///   - `snapshot_format_version` is non-zero.
 ///   - `revision_id` is non-zero (zero is reserved for "unset").
 ///   - `emitted_at_ns` is non-negative.
-///   - Each robot model frame has non-empty `robot_id` and
-///     `model_frame_id`, finite `world_pose`, and no duplicate
-///     `(robot_id, model_frame_id)` key.
+///   - Each component-model frame has complete component/model/frame/revision
+///     identity, a non-empty compiled frame, finite `world_pose`, and no
+///     duplicate `(component, model, frame-role)` key.
 ///   - Each body's `body_id` is non-empty.
 ///   - Each body's `body_id` matches its `owner_kind` namespace.
 ///   - Each body's `frame_id` is non-empty.
@@ -41,10 +41,9 @@ namespace manyforge::core {
 ///     kind and no unrelated primitive dimensions; mesh / compound
 ///     geometries carry `source_uri` or `source_hash` and no primitive
 ///     dimensions.
-///   - Each attached-object body declares a non-empty `parent_link`.
-///   - Each attached-object `parent_link` has `robot/<id>/link/<name>`
-///     shape (no `/collision/<idx>` suffix).
-///   - Each non-attached body does NOT declare a `parent_link`.
+///   - A present `parent_body_id` belongs only to a scene-resource body,
+///     names an existing component-model body, and uses the normative body-id
+///     form. Other owner categories do not carry a parent.
 ///
 /// **Deterministic outputs:**
 ///   - Bodies are sorted lexicographically by `body_id` after
@@ -52,15 +51,18 @@ namespace manyforge::core {
 ///     reuses it; publishers that precompute hashes must use
 ///     `compute_collision_world_body_content_hash()`.
 ///   - Each body's `body_content_hash` is computed by the builder
-///     using `ContentHasher` over (body_id, owner_kind, parent_link,
+///     using `ContentHasher` over (body_id, owner_kind, parent_body_id,
 ///     frame_id, pose, freshness budget, geometries' source-defining fields).
 ///     `source_timestamp_ns` is intentionally excluded so freshness-only
 ///     updates do not change collision-world content identity.
 ///   - The snapshot's `revision.content_hash` is the digest over
-///     `publisher_id`, `snapshot_format_version`, `revision_id`,
-///     and the sorted bodies' `body_content_hash` values.
+///     `publisher_id`, `snapshot_format_version`, component-model frames, and
+///     the sorted bodies' `body_content_hash` values, plus the effective policy
+///     content hash when supplied by the authoritative paired publisher. The
+///     monotonic
+///     `revision_id` is intentionally excluded from content identity.
 ///   - Cached counts (`body_count`, `geometry_count`,
-///     `robot_link_count`, etc.) are populated from the sorted body
+///     `component_model_body_count`, etc.) are populated from the sorted body
 ///     list.
 ///   - `contains_mesh_geometry` and `all_bodies_have_geometry` are
 ///     populated honestly from the geometry list.
@@ -82,8 +84,13 @@ class CollisionWorldSnapshotBuilder {
       std::uint32_t version);
   CollisionWorldSnapshotBuilder& set_revision_id(std::uint64_t revision_id);
   CollisionWorldSnapshotBuilder& set_emitted_at_ns(std::int64_t emitted_at_ns);
-  CollisionWorldSnapshotBuilder& add_robot_model_frame(
-      CollisionRobotModelFrame frame);
+  /// Bind the effective decision-policy content without copying mutable policy
+  /// state into CollisionWorldSnapshot. A coherent publisher serves that exact
+  /// policy beside the resulting world snapshot.
+  CollisionWorldSnapshotBuilder& set_policy_overlay_content_hash(
+      std::string content_hash);
+  CollisionWorldSnapshotBuilder& add_component_model_frame(
+      CollisionComponentModelFrame frame);
 
   /// Append a body. Bodies are validated and sorted at `build()`
   /// time, not at `add_body()` time, so callers may add bodies in
@@ -104,18 +111,19 @@ class CollisionWorldSnapshotBuilder {
 
   /// Convenience wrapper that wraps the built snapshot in a
   /// `shared_ptr<const>` for direct hand-off to engine workers.
-	  [[nodiscard]] Result<CollisionWorldSnapshotPtr> build_shared();
+  [[nodiscard]] Result<CollisionWorldSnapshotPtr> build_shared();
 
  private:
   std::string publisher_id_;
   std::uint32_t snapshot_format_version_ = 1;
   std::uint64_t revision_id_ = 0;
   std::int64_t emitted_at_ns_ = 0;
-  std::vector<CollisionRobotModelFrame> robot_model_frames_;
+  std::string policy_overlay_content_hash_;
+  std::vector<CollisionComponentModelFrame> component_model_frames_;
   std::vector<CollisionWorldBody> bodies_;
-	};
+};
 
-	std::string compute_collision_world_body_content_hash(
-	    const CollisionWorldBody& body);
+std::string compute_collision_world_body_content_hash(
+    const CollisionWorldBody& body);
 
 }  // namespace manyforge::core

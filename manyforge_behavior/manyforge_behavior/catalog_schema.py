@@ -51,6 +51,7 @@ _SEMANTIC_TYPES = {
     "frame_role",
     "parameter_ref",
     "resource_role",
+    "source_joint",
     "target_role",
 }
 

@@ -1,0 +1,1119 @@
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <manyforge_core/resource_addressed_execution_kernel.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+namespace manyforge::core {
+namespace {
+
+[[nodiscard]] ErrorDTO error(std::string code, std::string message, std::string reason) {
+  return ErrorDTO{std::move(code), std::move(message), {{"reason", std::move(reason)}}};
+}
+
+template <typename T>
+[[nodiscard]] Result<T> reject(std::string message, std::string reason,
+                               ErrorCode code = ErrorCode::kExecutionRejected) {
+  return Result<T>::Err(error(std::string(to_string(code)), std::move(message), std::move(reason)));
+}
+
+[[nodiscard]] std::vector<RuntimeParticipantBinding> extract_bindings(
+    const std::vector<RuntimeParticipantExecutionRegistration>& registrations) {
+  std::vector<RuntimeParticipantBinding> bindings;
+  bindings.reserve(registrations.size());
+  for (const auto& registration : registrations) {
+    if (registration.engine == nullptr) {
+      throw std::invalid_argument("runtime participant registration has no execution engine");
+    }
+    bindings.push_back(registration.binding);
+  }
+  return bindings;
+}
+
+[[nodiscard]] const ProgramFrameRoleBindingDTO* find_frame(
+    const RuntimeParticipantBindingDTO& binding, const FrameRoleId& role) noexcept {
+  const auto found = std::find_if(
+      binding.frame_bindings.begin(), binding.frame_bindings.end(),
+      [&](const ProgramFrameRoleBindingDTO& candidate) { return candidate.frame_role_id == role; });
+  return found == binding.frame_bindings.end() ? nullptr : &*found;
+}
+
+[[nodiscard]] const RuntimeResourceBindingDTO* find_source_joint(
+    const RuntimeParticipantBindingDTO& binding, const std::string& source_joint_name) noexcept {
+  const auto found = std::find_if(binding.resources.begin(), binding.resources.end(),
+                                  [&](const RuntimeResourceBindingDTO& candidate) {
+                                    return candidate.source_joint_name.has_value() &&
+                                           *candidate.source_joint_name == source_joint_name;
+                                  });
+  return found == binding.resources.end() ? nullptr : &*found;
+}
+
+[[nodiscard]] const ProgramModelRoleBindingDTO* find_model(
+    const RuntimeParticipantBindingDTO& binding,
+    const ModelInstanceId& model_instance_id) noexcept {
+  const auto found = std::find_if(binding.model_bindings.begin(), binding.model_bindings.end(),
+                                  [&](const ProgramModelRoleBindingDTO& candidate) {
+                                    return candidate.model_instance_id == model_instance_id;
+                                  });
+  return found == binding.model_bindings.end() ? nullptr : &*found;
+}
+
+[[nodiscard]] CapabilityId required_planner_capability(const MotionSpecDTO& motion) {
+  return std::visit(
+      [](const auto& value) {
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, JointGoalDTO>) {
+          return CapabilityId("planning.motion.joint_goal");
+        } else if constexpr (std::is_same_v<Value, PoseGoalDTO>) {
+          return CapabilityId("planning.motion.pose_goal");
+        } else if constexpr (std::is_same_v<Value, NamedTargetDTO>) {
+          return CapabilityId("planning.motion.named_target");
+        } else {
+          return CapabilityId("planning.motion.cartesian_path");
+        }
+      },
+      motion);
+}
+
+[[nodiscard]] ResolvedFrameDTO resolved_component_frame(const RuntimeParticipantBindingDTO& binding,
+                                                        const ProgramFrameRoleBindingDTO& frame) {
+  return ResolvedComponentModelFrameDTO{binding.controllable_component_id, frame.model_instance_id,
+                                        frame.frame_role_id, frame.compiled_frame_name,
+                                        frame.model_revision};
+}
+
+[[nodiscard]] Result<ExecuteRequestDTO> build_motion_request(
+    const OperationIntentDTO& operation, const OperationParticipantIntentDTO& participant,
+    const MotionParticipantIntentDTO& motion, const RuntimeParticipantBindingDTO& binding,
+    const OperationId& operation_id, const OperationParticipantId& participant_id) {
+  if (binding.model_groups.size() != 1U) {
+    return reject<ExecuteRequestDTO>("I6 motion requires exactly one retained model group",
+                                     "i6_motion_model_group_cardinality_invalid");
+  }
+  const auto* base = find_frame(binding, motion.base_frame_role_id);
+  const auto* tcp = find_frame(binding, motion.tcp_frame_role_id);
+  if (base == nullptr || tcp == nullptr) {
+    return reject<ExecuteRequestDTO>("motion frame roles do not resolve through the exact binding",
+                                     "motion_frame_role_unresolved");
+  }
+
+  const auto& model_group = binding.model_groups.front();
+  const auto* group_model = find_model(binding, model_group.model_instance_id);
+  if (group_model == nullptr || !binding.control_path.has_value()) {
+    return reject<ExecuteRequestDTO>(
+        "motion model group or control path is absent from the exact binding",
+        "motion_runtime_binding_incomplete", ErrorCode::kInvariantViolation);
+  }
+  std::vector<std::string> compiled_joint_names;
+  compiled_joint_names.reserve(binding.resources.size());
+  for (std::size_t index = 0U; index < binding.resources.size(); ++index) {
+    const auto& resource = binding.resources[index];
+    if (resource.coordinate_kind != CoordinateKind::kAngular ||
+        std::count(model_group.expanded_compiled_joint_names.begin(),
+                   model_group.expanded_compiled_joint_names.end(),
+                   resource.compiled_resource_name) != 1) {
+      return reject<ExecuteRequestDTO>(
+          "motion requires all-angular resources belonging to the exact retained model group",
+          "motion_resource_projection_not_all_angular", ErrorCode::kInvariantViolation);
+    }
+    compiled_joint_names.push_back(resource.compiled_resource_name);
+  }
+  const auto& control = *binding.control_path;
+  const auto planner_capability = required_planner_capability(motion.motion);
+  const auto* planner_definition = find_builtin_capability_definition(planner_capability);
+  if (planner_definition == nullptr) {
+    return reject<ExecuteRequestDTO>("motion kind has no registered planning capability",
+                                     "motion_planner_capability_unregistered",
+                                     ErrorCode::kInvariantViolation);
+  }
+  const CapabilityDefinitionRevision planner_revision(
+      std::string(planner_definition->capability_definition_revision));
+  const auto planner_path =
+      std::find_if(binding.supporting_capability_provider_paths.begin(),
+                   binding.supporting_capability_provider_paths.end(),
+                   [&](const RuntimeCapabilityProviderPathDTO& candidate) {
+                     return candidate.capability_id == planner_capability &&
+                            candidate.capability_definition_revision == planner_revision;
+                   });
+  if (planner_path == binding.supporting_capability_provider_paths.end()) {
+    return reject<ExecuteRequestDTO>(
+        "motion planner capability does not resolve through the exact binding",
+        "motion_planner_capability_unresolved", ErrorCode::kMissingReference);
+  }
+  std::vector<PlannerModelBindingDTO> models;
+  models.reserve(binding.model_bindings.size());
+  for (const auto& model : binding.model_bindings) {
+    models.push_back(PlannerModelBindingDTO{model.model_instance_id, model.model_revision});
+  }
+  std::vector<PlannerRuntimeUnitBindingDTO> runtime_units;
+  runtime_units.reserve(binding.runtime_unit_epochs.size());
+  for (const auto& runtime : binding.runtime_unit_epochs) {
+    runtime_units.push_back(
+        PlannerRuntimeUnitBindingDTO{runtime.runtime_unit_id, runtime.runtime_epoch});
+  }
+  std::vector<ResourceId> bound_resources;
+  bound_resources.reserve(binding.resources.size());
+  for (const auto& resource : binding.resources) {
+    bound_resources.push_back(resource.resource_id);
+  }
+
+  ResolvedExecutionBindingDTO exact_binding{
+      operation_id,
+      participant_id,
+      binding.program_id,
+      binding.program_revision,
+      binding.program_binding_id,
+      operation.program_run_id,
+      binding.controllable_component_id,
+      binding.component_type_id,
+      binding.component_type_revision,
+      binding.command_target_id,
+      binding.capability_id,
+      binding.capability_definition_revision,
+      PlannerCapabilityBindingDTO{
+          planner_path->capability_id, planner_path->capability_definition_revision,
+          planner_path->capability_provider_binding_id,
+          planner_path->capability_provider_binding_revision, planner_path->provider_instance_id,
+          planner_path->provider_manifest_id, planner_path->provider_manifest_revision,
+          planner_path->provider_runtime_epoch},
+      std::move(models),
+      PlannerModelGroupBindingDTO{model_group.model_group_role_id, model_group.model_instance_id,
+                                  group_model->model_revision, model_group.compiled_group_name,
+                                  std::move(compiled_joint_names)},
+      control.control_domain_id,
+      control.control_domain_revision,
+      control.control_binding_id,
+      control.control_binding_revision,
+      control.control_interface_contract_id,
+      control.control_interface_revision,
+      control.controller_topology_id,
+      control.topology_revision,
+      control.control_route_id,
+      control.activation_set_id,
+      control.active_control_configuration_id,
+      control.active_control_configuration_generation,
+      control.provider_instance_id,
+      control.provider_manifest_id,
+      control.provider_manifest_revision,
+      control.provider_runtime_epoch,
+      std::move(runtime_units),
+      std::move(bound_resources),
+      resolved_component_frame(binding, *base),
+      resolved_component_frame(binding, *tcp),
+      {},
+      {}};
+
+  ExecuteRequestDTO request(std::move(exact_binding));
+  request.move_id = motion.move_id.value();
+  request.tolerances = motion.tolerances;
+  request.speed_profile = motion.speed_profile;
+  request.timeouts = motion.timeouts;
+  request.cache_mode = motion.cache_mode;
+  request.planning_profile = motion.planning_profile;
+  request.target_mode = motion.target_mode;
+  request.target_reference = motion.target_reference;
+  request.offset_reference = motion.offset_reference;
+  request.motion_interrupt_scopes = motion.motion_interrupt_scopes;
+  request.action_span = participant.action_span;
+  request.contact_policy_id =
+      motion.contact_policy_id.has_value() ? motion.contact_policy_id->value() : std::string{};
+
+  if (const auto* goal = std::get_if<JointGoalDTO>(&motion.motion)) {
+    std::set<std::string, std::less<>> seen_joint_names;
+    std::vector<ResourceId> resolved_resources;
+    std::vector<std::string> compiled_names;
+    resolved_resources.reserve(goal->joint_names.size());
+    compiled_names.reserve(goal->joint_names.size());
+    for (const auto& joint_name : goal->joint_names) {
+      const auto* resource = find_source_joint(binding, joint_name);
+      if (resource == nullptr || resource->coordinate_kind != CoordinateKind::kAngular ||
+          !seen_joint_names.insert(joint_name).second) {
+        return reject<ExecuteRequestDTO>(
+            "joint goal source joints are missing, duplicated, or non-angular",
+            "joint_goal_source_joint_unresolved");
+      }
+      resolved_resources.push_back(resource->resource_id);
+      compiled_names.push_back(resource->compiled_resource_name);
+    }
+    request.motion = ResolvedJointGoalDTO{std::move(resolved_resources), std::move(compiled_names),
+                                          goal->positions_rad};
+  } else if (const auto* pose = std::get_if<PoseGoalDTO>(&motion.motion)) {
+    request.motion = *pose;
+  } else if (const auto* path = std::get_if<CartesianPathDTO>(&motion.motion)) {
+    request.motion = *path;
+  } else {
+    return reject<ExecuteRequestDTO>(
+        "named targets require the retained Program target map before planning",
+        "named_target_resolution_unavailable", ErrorCode::kMissingReference);
+  }
+
+  for (const auto& [joint_name, limit] : motion.per_joint_dynamics_limits) {
+    const auto* resource = find_source_joint(binding, joint_name);
+    if (resource == nullptr || resource->coordinate_kind != CoordinateKind::kAngular) {
+      return reject<ExecuteRequestDTO>(
+          "motion dynamics source joint does not resolve to an angular resource",
+          "motion_dynamics_source_joint_unresolved");
+    }
+    request.per_resource_dynamics_limits.push_back(ResolvedResourceDynamicsLimitDTO{
+        resource->resource_id, resource->compiled_resource_name, limit});
+  }
+  std::sort(request.per_resource_dynamics_limits.begin(),
+            request.per_resource_dynamics_limits.end(),
+            [&](const ResolvedResourceDynamicsLimitDTO& lhs,
+                const ResolvedResourceDynamicsLimitDTO& rhs) {
+              const auto left = std::find(request.binding.resources.begin(),
+                                          request.binding.resources.end(), lhs.resource_id);
+              const auto right = std::find(request.binding.resources.begin(),
+                                           request.binding.resources.end(), rhs.resource_id);
+              return left < right;
+            });
+  return Result<ExecuteRequestDTO>::Ok(std::move(request));
+}
+
+[[nodiscard]] Result<GripperCommandRequestDTO> build_command_request(
+    const CapabilityCommandIntentDTO& command, const RuntimeParticipantBindingDTO& binding) {
+  if (binding.model_groups.size() != 1U || binding.resources.size() != 1U) {
+    return reject<GripperCommandRequestDTO>(
+        "the retained I6 gripper mechanism requires one model group and one command resource",
+        "i6_gripper_command_scope_unsupported");
+  }
+  if (command.command_schema_id.value() != kGripperPositionCommandSchemaId ||
+      command.command_schema_revision.value() != kGripperPositionCommandSchemaRevision) {
+    return reject<GripperCommandRequestDTO>("the command is not the qualified I6 gripper schema",
+                                            "i6_command_schema_unsupported",
+                                            ErrorCode::kUnsupportedCapability);
+  }
+
+  double command_duration_s = 0.0;
+  for (const auto& option : command.caller_options) {
+    if (option.option_id.value() != "command_duration_s") {
+      return reject<GripperCommandRequestDTO>(
+          "the command carries an option not declared by its schema", "command_option_unsupported",
+          ErrorCode::kInvalidRequest);
+    }
+    command_duration_s = option.value_s;
+  }
+
+  const auto& value = std::get<GripperPositionCommandValueDTO>(command.command_value);
+  const auto kind = coordinate_kind(value.position);
+  const double target_position = kind == CoordinateKind::kAngular
+                                     ? std::get<AngularPositionDTO>(value.position).value_rad
+                                     : std::get<LinearPositionDTO>(value.position).value_m;
+  std::optional<double> max_effort;
+  if (value.max_effort.has_value()) {
+    max_effort = kind == CoordinateKind::kAngular
+                     ? std::get<AngularEffortDTO>(*value.max_effort).value_nm
+                     : std::get<LinearEffortDTO>(*value.max_effort).value_n;
+  }
+
+  GripperCommandRequestDTO request;
+  request.gripper_id = binding.command_target_id.value();
+  request.group_id = binding.model_groups.front().compiled_group_name;
+  request.joint_name = binding.resources.front().compiled_resource_name;
+  request.target_position = target_position;
+  request.duration_s = command_duration_s;
+  request.max_effort = max_effort;
+  request.commanded_state = "position";
+  request.actuation_kind = kind == CoordinateKind::kAngular ? "angular" : "linear";
+  request.state_authority = binding.control_path->state_authority_id.value();
+  request.completion_policy = "goal_fenced_target_reached";
+  request.grasp_confirmation_policy = "binding_feedback_required";
+  request.transport_kind = "resolved_binding";
+  request.evidence = {"command_terminal"};
+  request.evidence_state = "required_pending";
+  return Result<GripperCommandRequestDTO>::Ok(std::move(request));
+}
+
+[[nodiscard]] OperationStateKind operation_state(ExecutionState state) noexcept {
+  switch (state) {
+    case ExecutionState::kIdle:
+      return OperationStateKind::kPrepared;
+    case ExecutionState::kPlanning:
+      return OperationStateKind::kPlanning;
+    case ExecutionState::kValidating:
+      return OperationStateKind::kValidating;
+    case ExecutionState::kExecuting:
+      return OperationStateKind::kExecuting;
+    case ExecutionState::kInterrupted:
+      return OperationStateKind::kInterrupted;
+    case ExecutionState::kPaused:
+      return OperationStateKind::kPaused;
+    case ExecutionState::kStopping:
+      return OperationStateKind::kStopping;
+    case ExecutionState::kStopped:
+      return OperationStateKind::kStopped;
+    case ExecutionState::kCompleted:
+      return OperationStateKind::kCompleted;
+    case ExecutionState::kFailed:
+      return OperationStateKind::kFailed;
+    case ExecutionState::kInterventionRequired:
+      return OperationStateKind::kInterventionRequired;
+  }
+  return OperationStateKind::kInterventionRequired;
+}
+
+[[nodiscard]] bool terminal(OperationStateKind state) noexcept {
+  switch (state) {
+    case OperationStateKind::kCompleted:
+    case OperationStateKind::kStopped:
+    case OperationStateKind::kFailed:
+    case OperationStateKind::kInterrupted:
+    case OperationStateKind::kInterventionRequired:
+    case OperationStateKind::kCancelledPreDispatch:
+      return true;
+    default:
+      return false;
+  }
+}
+
+[[nodiscard]] bool control_admissible(OperationControlKind control,
+                                      OperationStateKind state) noexcept {
+  switch (control) {
+    case OperationControlKind::kPause:
+      return state == OperationStateKind::kExecuting;
+    case OperationControlKind::kResume:
+      return state == OperationStateKind::kPaused;
+    case OperationControlKind::kReset:
+      return state != OperationStateKind::kCompleted;
+    case OperationControlKind::kAcknowledgeCompleted:
+      return state == OperationStateKind::kCompleted;
+  }
+  return false;
+}
+
+[[nodiscard]] const char* control_name(OperationControlKind control) noexcept {
+  switch (control) {
+    case OperationControlKind::kPause:
+      return "pause";
+    case OperationControlKind::kResume:
+      return "resume";
+    case OperationControlKind::kReset:
+      return "reset";
+    case OperationControlKind::kAcknowledgeCompleted:
+      return "acknowledge_completed";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] std::optional<ResourceSlotState> slot_state_for(OperationStateKind state) noexcept {
+  switch (state) {
+    case OperationStateKind::kDispatching:
+    case OperationStateKind::kExecuting:
+    case OperationStateKind::kPaused:
+      return ResourceSlotState::kDispatched;
+    case OperationStateKind::kStopping:
+      return ResourceSlotState::kStopping;
+    case OperationStateKind::kCompleted:
+    case OperationStateKind::kStopped:
+    case OperationStateKind::kFailed:
+    case OperationStateKind::kInterrupted:
+    case OperationStateKind::kInterventionRequired:
+    case OperationStateKind::kCancelledPreDispatch:
+      return ResourceSlotState::kTerminal;
+    case OperationStateKind::kQueued:
+    case OperationStateKind::kResolving:
+    case OperationStateKind::kPlanning:
+    case OperationStateKind::kValidating:
+    case OperationStateKind::kPrepared:
+      return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] ErrorDTO status_error(ErrorCode code) {
+  return ErrorDTO{std::string(to_string(code)),
+                  "subordinate participant reached a terminal error state",
+                  {{"reason", "subordinate_terminal_error"}}};
+}
+
+}  // namespace
+
+struct ResourceAddressedExecutionKernel::ReplayEntry final {
+  OperationIntentDTO intent;
+  OperationAcceptedDTO accepted;
+};
+
+struct ResourceAddressedExecutionKernel::ControlReplayEntry final {
+  OperationControlRequestDTO request;
+  OperationControlAcceptedDTO accepted;
+};
+
+struct ResourceAddressedExecutionKernel::ActiveOperation final {
+  OperationIntentDTO intent;
+  OperationAcceptedDTO accepted;
+  RuntimeParticipantBinding binding;
+  IResolvedParticipantExecutionEngine* engine{};
+  ResourceSlotOwnerDTO slot_owner;
+  std::vector<ResourceId> resources;
+  OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
+  OperationStateDTO state;
+  ResourceSlotState slot_state{ResourceSlotState::kReserved};
+  std::uint64_t subordinate_id{};
+  std::uint64_t subordinate_generation{};
+  std::optional<OperationControlKind> pending_control;
+};
+
+struct ResourceAddressedExecutionKernel::EngineSubscription final {
+  IResolvedParticipantExecutionEngine* engine{};
+  SubscriptionHandle handle{};
+};
+
+ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
+    std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
+    ResourceAddressedExecutionKernelConfig config)
+    : registry_(extract_bindings(registrations)),
+      resource_slots_(registry_.resource_inventory()),
+      registrations_(std::move(registrations)),
+      clock_(clock),
+      config_(std::move(config)) {
+  if (config_.request_owner_epoch.empty() || config_.request_replay_capacity == 0U ||
+      config_.request_replay_capacity > kMaxI6OperationReplayEntries) {
+    throw std::invalid_argument("addressed Kernel request-owner epoch or replay bound is invalid");
+  }
+  replay_ledger_.reserve(config_.request_replay_capacity);
+  control_replay_ledger_.reserve(config_.request_replay_capacity);
+
+  for (const auto& registration : registrations_) {
+    if (std::any_of(
+            engine_subscriptions_.begin(), engine_subscriptions_.end(),
+            [&](const EngineSubscription& item) { return item.engine == registration.engine; })) {
+      continue;
+    }
+    auto* engine = registration.engine;
+    const auto handle = engine->subscribe_events(
+        [this, engine](const KernelEvent& event) { on_engine_event(engine, event); });
+    engine_subscriptions_.push_back(EngineSubscription{engine, handle});
+  }
+}
+
+ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
+  for (const auto& subscription : engine_subscriptions_) {
+    subscription.engine->unsubscribe_events(subscription.handle);
+  }
+}
+
+IResolvedParticipantExecutionEngine* ResourceAddressedExecutionKernel::engine_for(
+    const RuntimeParticipantBinding& binding) const noexcept {
+  const auto found = std::find_if(registrations_.begin(), registrations_.end(),
+                                  [&](const RuntimeParticipantExecutionRegistration& registration) {
+                                    return registration.binding.value() == binding.value();
+                                  });
+  return found == registrations_.end() ? nullptr : found->engine;
+}
+
+Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
+    const OperationIntentDTO& intent) {
+  std::lock_guard submit_lock(submission_mutex_);
+
+  auto validation = validate_operation_intent(intent);
+  if (!validation.ok()) {
+    return Result<OperationAcceptedDTO>::Err(validation.error());
+  }
+  if (intent.request_context.request_owner_epoch != config_.request_owner_epoch) {
+    return Result<OperationAcceptedDTO>::Err(
+        error("stale_request_owner_epoch", "operation request names a stale Kernel owner epoch",
+              "stale_request_owner_epoch"));
+  }
+  if (intent.participants.size() != 1U ||
+      intent.coordination_policy != OperationCoordinationPolicy::kIndependent) {
+    return reject<OperationAcceptedDTO>("I6 admits one independent participant per operation",
+                                        "i6_single_participant_only");
+  }
+
+  {
+    std::lock_guard state_lock(state_mutex_);
+    const auto replay =
+        std::find_if(replay_ledger_.begin(), replay_ledger_.end(), [&](const ReplayEntry& entry) {
+          return entry.intent.request_context.request_id == intent.request_context.request_id;
+        });
+    if (replay != replay_ledger_.end()) {
+      if (replay->intent != intent) {
+        return Result<OperationAcceptedDTO>::Err(
+            error("request_id_conflict", "operation request ID was reused with different intent",
+                  "request_id_conflict"));
+      }
+      auto accepted = replay->accepted;
+      accepted.replay_status = RequestReplayStatusDTO::kReplayedExact;
+      return Result<OperationAcceptedDTO>::Ok(std::move(accepted));
+    }
+    const auto control_request = std::find_if(
+        control_replay_ledger_.begin(), control_replay_ledger_.end(),
+        [&](const ControlReplayEntry& entry) {
+          return entry.request.request_context.request_id == intent.request_context.request_id;
+        });
+    if (control_request != control_replay_ledger_.end()) {
+      return Result<OperationAcceptedDTO>::Err(error(
+          "request_id_conflict", "operation request ID was already used by an operation control",
+          "request_id_conflict"));
+    }
+    if (replay_ledger_.size() + control_replay_ledger_.size() >= config_.request_replay_capacity) {
+      return Result<OperationAcceptedDTO>::Err(
+          error("request_ledger_full", "operation replay ledger reached its fixed bound",
+                "request_ledger_full"));
+    }
+    if (active_operation_ != nullptr) {
+      return reject<OperationAcceptedDTO>("I6 admits only one unsettled operation",
+                                          "i6_single_operation_busy");
+    }
+  }
+
+  auto resolved = registry_.resolve(intent, 0U);
+  if (!resolved.ok()) {
+    return Result<OperationAcceptedDTO>::Err(resolved.error());
+  }
+  auto* engine = engine_for(resolved.value());
+  if (engine == nullptr) {
+    return reject<OperationAcceptedDTO>("resolved participant has no registered subordinate engine",
+                                        "runtime_participant_engine_missing",
+                                        ErrorCode::kInvariantViolation);
+  }
+  if (next_operation_id_ == 0U || next_operation_id_ == std::numeric_limits<std::uint64_t>::max()) {
+    return reject<OperationAcceptedDTO>("operation identity space is exhausted",
+                                        "operation_id_exhausted", ErrorCode::kInternalError);
+  }
+
+  const auto& binding = resolved.value().value();
+  std::vector<ResourceId> resources;
+  resources.reserve(binding.resources.size());
+  for (const auto& resource : binding.resources) {
+    resources.push_back(resource.resource_id);
+  }
+  const auto operation_id = OperationId("operation:" + config_.request_owner_epoch.value() + ":" +
+                                        std::to_string(next_operation_id_));
+  const auto participant_id = OperationParticipantId(operation_id.value() + ":participant:1");
+  const OperationRevision operation_revision(1U);
+  const auto& control = *binding.control_path;
+  ResourceSlotOwnerDTO slot_owner{operation_id,
+                                  operation_revision,
+                                  participant_id,
+                                  control.control_domain_id,
+                                  control.control_domain_revision,
+                                  control.control_binding_id,
+                                  control.control_binding_revision,
+                                  control.controller_topology_id,
+                                  control.topology_revision,
+                                  control.control_route_id,
+                                  control.active_control_configuration_id,
+                                  control.active_control_configuration_generation,
+                                  control.containment_granularity};
+  auto reservation = resource_slots_.reserve(slot_owner, resources);
+  if (!reservation.ok()) {
+    return Result<OperationAcceptedDTO>::Err(reservation.error());
+  }
+
+  const OperationAcceptedDTO accepted{intent.request_context.request_id,
+                                      RequestReplayStatusDTO::kAcceptedNew,
+                                      operation_id,
+                                      operation_revision,
+                                      {OperationParticipantAssignmentDTO{0U, participant_id}},
+                                      clock_.now()};
+  const auto payload_kind =
+      std::holds_alternative<MotionParticipantIntentDTO>(intent.participants.front().payload)
+          ? OperationParticipantPayloadKind::kMotion
+          : OperationParticipantPayloadKind::kCapabilityCommand;
+  OperationParticipantStateDTO participant_state{
+      participant_id,
+      binding.controllable_component_id,
+      binding.command_target_id,
+      binding.capability_id,
+      control.control_domain_id,
+      control.control_domain_revision,
+      control.control_binding_id,
+      control.control_binding_revision,
+      binding.capability_provider_path.has_value()
+          ? std::optional(binding.capability_provider_path->capability_provider_binding_id)
+          : std::nullopt,
+      binding.capability_provider_path.has_value()
+          ? std::optional(binding.capability_provider_path->capability_provider_binding_revision)
+          : std::nullopt,
+      payload_kind,
+      OperationStateKind::kResolving,
+      0.0,
+      resources,
+      std::nullopt};
+  OperationStateDTO operation_state_dto{operation_id,
+                                        operation_revision,
+                                        intent.program_binding_id,
+                                        intent.program_run_id,
+                                        intent.coordination_policy,
+                                        OperationStateKind::kResolving,
+                                        {std::move(participant_state)},
+                                        clock_.now()};
+
+  {
+    std::lock_guard state_lock(state_mutex_);
+    active_operation_ = std::make_unique<ActiveOperation>(ActiveOperation{
+        intent, accepted, resolved.value(), engine, slot_owner, resources, payload_kind,
+        std::move(operation_state_dto), ResourceSlotState::kReserved, 0U, 0U, std::nullopt});
+  }
+
+  Result<void> dispatch_result = Result<void>::Ok();
+  if (payload_kind == OperationParticipantPayloadKind::kMotion) {
+    const auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+    auto request = build_motion_request(intent, intent.participants.front(), motion, binding,
+                                        operation_id, participant_id);
+    if (!request.ok()) {
+      dispatch_result = Result<void>::Err(request.error());
+    } else {
+      auto dispatch = engine->execute(request.value());
+      if (!dispatch.ok()) {
+        dispatch_result = Result<void>::Err(dispatch.error());
+      } else {
+        std::lock_guard state_lock(state_mutex_);
+        if (active_operation_ == nullptr ||
+            active_operation_->accepted.operation_id != operation_id) {
+          dispatch_result =
+              Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                                      "active operation disappeared during subordinate admission",
+                                      "active_operation_lost"));
+        } else if (active_operation_->subordinate_id != 0U &&
+                   active_operation_->subordinate_id != dispatch.value()) {
+          dispatch_result =
+              Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                                      "subordinate event and execute result identities disagree",
+                                      "subordinate_execution_id_mismatch"));
+        } else {
+          active_operation_->subordinate_id = dispatch.value();
+          if (active_operation_->state.state == OperationStateKind::kResolving) {
+            active_operation_->state.state = OperationStateKind::kPlanning;
+            active_operation_->state.participants.front().state = OperationStateKind::kPlanning;
+            active_operation_->state.updated_at_ns = clock_.now();
+          }
+        }
+      }
+    }
+  } else {
+    const auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
+    auto request = build_command_request(command, binding);
+    if (!request.ok()) {
+      dispatch_result = Result<void>::Err(request.error());
+    } else {
+      const auto dispatch = engine->command_gripper(request.value());
+      if (!dispatch.accepted || dispatch.error.has_value()) {
+        dispatch_result = Result<void>::Err(dispatch.error.value_or(
+            error(std::string(to_string(ErrorCode::kExecutionRejected)),
+                  "subordinate gripper command was rejected", "subordinate_command_rejected")));
+      } else {
+        auto transition =
+            resource_slots_.transition(slot_owner, resources, ResourceSlotState::kDispatched);
+        if (!transition.ok()) {
+          dispatch_result = transition;
+        } else {
+          std::lock_guard state_lock(state_mutex_);
+          if (active_operation_ == nullptr ||
+              active_operation_->accepted.operation_id != operation_id) {
+            dispatch_result =
+                Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                                        "active command disappeared during subordinate admission",
+                                        "active_operation_lost"));
+          } else {
+            active_operation_->subordinate_id = dispatch.command_id;
+            active_operation_->subordinate_generation = dispatch.generation;
+            active_operation_->slot_state = ResourceSlotState::kDispatched;
+            active_operation_->state.state = OperationStateKind::kExecuting;
+            active_operation_->state.participants.front().state = OperationStateKind::kExecuting;
+            active_operation_->state.updated_at_ns = clock_.now();
+          }
+        }
+      }
+    }
+  }
+
+  if (!dispatch_result.ok()) {
+    std::lock_guard state_lock(state_mutex_);
+    if (active_operation_ != nullptr && active_operation_->accepted.operation_id == operation_id) {
+      if (active_operation_->slot_state == ResourceSlotState::kReserved) {
+        const auto release = resource_slots_.release(slot_owner, resources);
+        if (!release.ok()) {
+          active_operation_->state.state = OperationStateKind::kInterventionRequired;
+          active_operation_->state.participants.front().state =
+              OperationStateKind::kInterventionRequired;
+          active_operation_->state.participants.front().terminal_error = release.error();
+          return Result<OperationAcceptedDTO>::Err(release.error());
+        }
+        active_operation_.reset();
+      } else {
+        active_operation_->state.state = OperationStateKind::kInterventionRequired;
+        active_operation_->state.participants.front().state =
+            OperationStateKind::kInterventionRequired;
+        active_operation_->state.participants.front().terminal_error = dispatch_result.error();
+        active_operation_->state.updated_at_ns = clock_.now();
+      }
+    }
+    return Result<OperationAcceptedDTO>::Err(dispatch_result.error());
+  }
+
+  {
+    std::lock_guard state_lock(state_mutex_);
+    replay_ledger_.push_back(ReplayEntry{intent, accepted});
+  }
+  ++next_operation_id_;
+  return Result<OperationAcceptedDTO>::Ok(accepted);
+}
+
+Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::pause(
+    const OperationControlRequestDTO& request) {
+  return apply_control(request, OperationControlKind::kPause);
+}
+
+Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::resume(
+    const OperationControlRequestDTO& request) {
+  return apply_control(request, OperationControlKind::kResume);
+}
+
+Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::reset(
+    const OperationControlRequestDTO& request) {
+  return apply_control(request, OperationControlKind::kReset);
+}
+
+Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::acknowledge_completed(
+    const OperationControlRequestDTO& request) {
+  return apply_control(request, OperationControlKind::kAcknowledgeCompleted);
+}
+
+Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_control(
+    const OperationControlRequestDTO& request, OperationControlKind control) {
+  std::lock_guard control_lock(control_mutex_);
+  if (request.request_context.request_id.empty() ||
+      request.request_context.request_owner_epoch.empty() ||
+      request.request_context.source_label.empty() || request.operation_id.empty() ||
+      !request.expected_operation_revision.nonzero() ||
+      (request.reason.has_value() && request.reason->empty())) {
+    return reject<OperationControlAcceptedDTO>("operation control request is malformed",
+                                               "operation_control_request_invalid",
+                                               ErrorCode::kInvalidRequest);
+  }
+  if (request.request_context.request_owner_epoch != config_.request_owner_epoch) {
+    return Result<OperationControlAcceptedDTO>::Err(
+        error("stale_request_owner_epoch", "operation control names a stale Kernel owner epoch",
+              "stale_request_owner_epoch"));
+  }
+
+  IResolvedParticipantExecutionEngine* engine = nullptr;
+  std::uint64_t subordinate_id = 0U;
+  OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
+  OperationRevision current_revision(0U);
+  {
+    std::lock_guard state_lock(state_mutex_);
+    const auto replay = std::find_if(control_replay_ledger_.begin(), control_replay_ledger_.end(),
+                                     [&](const ControlReplayEntry& entry) {
+                                       return entry.request.request_context.request_id ==
+                                              request.request_context.request_id;
+                                     });
+    if (replay != control_replay_ledger_.end()) {
+      if (replay->request != request || replay->accepted.control != control) {
+        return Result<OperationControlAcceptedDTO>::Err(error(
+            "request_id_conflict", "operation control request ID was reused with different intent",
+            "request_id_conflict"));
+      }
+      auto accepted = replay->accepted;
+      accepted.replay_status = RequestReplayStatusDTO::kReplayedExact;
+      return Result<OperationControlAcceptedDTO>::Ok(std::move(accepted));
+    }
+    if (std::any_of(replay_ledger_.begin(), replay_ledger_.end(), [&](const ReplayEntry& entry) {
+          return entry.intent.request_context.request_id == request.request_context.request_id;
+        })) {
+      return Result<OperationControlAcceptedDTO>::Err(
+          error("request_id_conflict", "operation control request ID was already used by Execute",
+                "request_id_conflict"));
+    }
+    if (replay_ledger_.size() + control_replay_ledger_.size() >= config_.request_replay_capacity) {
+      return Result<OperationControlAcceptedDTO>::Err(
+          error("request_ledger_full", "operation replay ledger reached its fixed bound",
+                "request_ledger_full"));
+    }
+    if (active_operation_ == nullptr ||
+        active_operation_->accepted.operation_id != request.operation_id) {
+      return reject<OperationControlAcceptedDTO>("operation control names a non-resident operation",
+                                                 "operation_not_resident",
+                                                 ErrorCode::kMissingReference);
+    }
+    current_revision = active_operation_->state.operation_revision;
+    if (current_revision != request.expected_operation_revision) {
+      return reject<OperationControlAcceptedDTO>("operation control expected revision is stale",
+                                                 "operation_revision_stale");
+    }
+    if (!control_admissible(control, active_operation_->state.state)) {
+      return reject<OperationControlAcceptedDTO>(
+          std::string(control_name(control)) + " is invalid for the current operation state",
+          "operation_control_state_invalid", ErrorCode::kInvalidStateTransition);
+    }
+    if (active_operation_->pending_control.has_value()) {
+      return reject<OperationControlAcceptedDTO>(
+          "another operation control is already being admitted", "operation_control_busy");
+    }
+    engine = active_operation_->engine;
+    subordinate_id = active_operation_->subordinate_id;
+    payload_kind = active_operation_->payload_kind;
+    active_operation_->pending_control = control;
+  }
+
+  bool accepted_by_subordinate = false;
+  std::optional<ErrorDTO> subordinate_error;
+  switch (control) {
+    case OperationControlKind::kPause:
+      if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
+        subordinate_error = error(std::string(to_string(ErrorCode::kUnsupportedCapability)),
+                                  "the qualified I6 command participant has no pause realization",
+                                  "command_pause_unsupported");
+      } else {
+        const auto result = engine->pause();
+        accepted_by_subordinate = result.accepted;
+        subordinate_error = result.error;
+      }
+      break;
+    case OperationControlKind::kResume:
+      if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
+        subordinate_error = error(std::string(to_string(ErrorCode::kUnsupportedCapability)),
+                                  "the qualified I6 command participant has no resume realization",
+                                  "command_resume_unsupported");
+      } else {
+        const auto result = engine->resume(std::nullopt);
+        accepted_by_subordinate = result.accepted;
+        subordinate_error = result.error;
+      }
+      break;
+    case OperationControlKind::kReset: {
+      const auto result = engine->reset(std::nullopt);
+      accepted_by_subordinate = result.accepted;
+      subordinate_error = result.error;
+      break;
+    }
+    case OperationControlKind::kAcknowledgeCompleted:
+      if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
+        // The command backend's immutable terminal status is already the
+        // subordinate acknowledgement evidence; it has no second motion-FSM
+        // acknowledgement surface.
+        accepted_by_subordinate = true;
+      } else {
+        const auto result = engine->acknowledge_completed(subordinate_id, std::nullopt);
+        accepted_by_subordinate = result.accepted;
+        subordinate_error = result.error;
+      }
+      break;
+  }
+  if (!accepted_by_subordinate) {
+    std::lock_guard state_lock(state_mutex_);
+    if (active_operation_ != nullptr &&
+        active_operation_->accepted.operation_id == request.operation_id &&
+        active_operation_->pending_control == control) {
+      active_operation_->pending_control.reset();
+    }
+    return Result<OperationControlAcceptedDTO>::Err(subordinate_error.value_or(
+        error(std::string(to_string(ErrorCode::kExecutionRejected)),
+              std::string("subordinate rejected ") + control_name(control),
+              "subordinate_control_rejected")));
+  }
+
+  if (current_revision.value() == std::numeric_limits<std::uint64_t>::max()) {
+    return reject<OperationControlAcceptedDTO>("operation revision space is exhausted",
+                                               "operation_revision_exhausted",
+                                               ErrorCode::kInternalError);
+  }
+  const OperationRevision next_revision(current_revision.value() + 1U);
+  const OperationControlAcceptedDTO accepted{request.request_context.request_id,
+                                             RequestReplayStatusDTO::kAcceptedNew,
+                                             request.operation_id,
+                                             current_revision,
+                                             control,
+                                             next_revision,
+                                             clock_.now()};
+
+  std::lock_guard state_lock(state_mutex_);
+  if (active_operation_ == nullptr ||
+      active_operation_->accepted.operation_id != request.operation_id ||
+      active_operation_->state.operation_revision != current_revision ||
+      active_operation_->pending_control != control) {
+    return reject<OperationControlAcceptedDTO>(
+        "operation changed while its control was being admitted", "operation_control_race",
+        ErrorCode::kInvariantViolation);
+  }
+
+  const bool settles_operation = control == OperationControlKind::kReset ||
+                                 control == OperationControlKind::kAcknowledgeCompleted;
+  if (settles_operation && active_operation_->slot_state != ResourceSlotState::kTerminal) {
+    auto terminal_transition = resource_slots_.transition(
+        active_operation_->slot_owner, active_operation_->resources, ResourceSlotState::kTerminal);
+    if (!terminal_transition.ok()) {
+      active_operation_->pending_control.reset();
+      return Result<OperationControlAcceptedDTO>::Err(terminal_transition.error());
+    }
+    active_operation_->slot_state = ResourceSlotState::kTerminal;
+  }
+
+  auto revised = resource_slots_.revise_owner(active_operation_->slot_owner,
+                                              active_operation_->resources, next_revision);
+  if (!revised.ok()) {
+    active_operation_->pending_control.reset();
+    return Result<OperationControlAcceptedDTO>::Err(revised.error());
+  }
+  active_operation_->slot_owner = revised.value();
+  active_operation_->state.operation_revision = next_revision;
+  active_operation_->state.updated_at_ns = clock_.now();
+  active_operation_->pending_control.reset();
+  control_replay_ledger_.push_back(ControlReplayEntry{request, accepted});
+
+  if (settles_operation) {
+    auto release =
+        resource_slots_.release(active_operation_->slot_owner, active_operation_->resources);
+    if (!release.ok()) {
+      active_operation_->state.state = OperationStateKind::kInterventionRequired;
+      active_operation_->state.participants.front().state =
+          OperationStateKind::kInterventionRequired;
+      active_operation_->state.participants.front().terminal_error = release.error();
+      return Result<OperationControlAcceptedDTO>::Err(release.error());
+    }
+    active_operation_.reset();
+  }
+  return Result<OperationControlAcceptedDTO>::Ok(accepted);
+}
+
+Result<OperationStateDTO> ResourceAddressedExecutionKernel::get_operation_state(
+    const OperationId& operation_id) const {
+  if (operation_id.empty()) {
+    return reject<OperationStateDTO>("operation identity is empty", "operation_id_empty",
+                                     ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard state_lock(state_mutex_);
+  if (active_operation_ == nullptr || active_operation_->accepted.operation_id != operation_id) {
+    return reject<OperationStateDTO>("operation is not resident", "operation_not_resident",
+                                     ErrorCode::kMissingReference);
+  }
+  return Result<OperationStateDTO>::Ok(active_operation_->state);
+}
+
+Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
+    IResolvedParticipantExecutionEngine* engine, std::uint64_t subordinate_id,
+    OperationStateKind state, double progress, std::optional<ErrorDTO> terminal_error) {
+  std::lock_guard state_lock(state_mutex_);
+  if (active_operation_ == nullptr || active_operation_->engine != engine) {
+    return Result<void>::Ok();
+  }
+  if (active_operation_->payload_kind == OperationParticipantPayloadKind::kMotion) {
+    if (subordinate_id == 0U) {
+      return reject<void>("subordinate execution identity is empty",
+                          "subordinate_execution_id_empty", ErrorCode::kInvariantViolation);
+    }
+    if (active_operation_->subordinate_id == 0U) {
+      active_operation_->subordinate_id = subordinate_id;
+    } else if (active_operation_->subordinate_id != subordinate_id) {
+      return Result<void>::Ok();
+    }
+  }
+
+  auto desired_slot = slot_state_for(state);
+  if (state == OperationStateKind::kStopping &&
+      active_operation_->pending_control == OperationControlKind::kPause) {
+    // Pause retains the reservation as dispatched while the subordinate
+    // mechanism reaches its controlled Paused state. ResourceSlot::kStopping
+    // is reserved for terminal containment/Reset paths.
+    desired_slot.reset();
+  }
+  if (desired_slot.has_value() && active_operation_->slot_state != *desired_slot) {
+    auto transition = resource_slots_.transition(active_operation_->slot_owner,
+                                                 active_operation_->resources, *desired_slot);
+    if (!transition.ok()) {
+      active_operation_->state.state = OperationStateKind::kInterventionRequired;
+      active_operation_->state.participants.front().state =
+          OperationStateKind::kInterventionRequired;
+      active_operation_->state.participants.front().terminal_error = transition.error();
+      active_operation_->state.updated_at_ns = clock_.now();
+      return transition;
+    }
+    active_operation_->slot_state = *desired_slot;
+  }
+
+  active_operation_->state.state = state;
+  auto& participant = active_operation_->state.participants.front();
+  participant.state = state;
+  participant.progress = std::clamp(progress, 0.0, 1.0);
+  if (terminal(state)) {
+    participant.terminal_error = std::move(terminal_error);
+  }
+  active_operation_->state.updated_at_ns = clock_.now();
+  return Result<void>::Ok();
+}
+
+void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecutionEngine* engine,
+                                                       const KernelEvent& event) {
+  if (event.type != KernelEventType::kStateTransition &&
+      event.type != KernelEventType::kExecuteStarted &&
+      event.type != KernelEventType::kExecuteCompleted) {
+    return;
+  }
+  auto state = event.type == KernelEventType::kExecuteStarted     ? OperationStateKind::kExecuting
+               : event.type == KernelEventType::kExecuteCompleted ? OperationStateKind::kCompleted
+                                                                  : operation_state(event.to_state);
+  std::optional<ErrorDTO> terminal_error = event.error;
+  if (!terminal_error.has_value() &&
+      (state == OperationStateKind::kFailed || state == OperationStateKind::kStopped ||
+       state == OperationStateKind::kInterventionRequired)) {
+    const auto status = engine->get_status();
+    terminal_error = status_error(status.last_error);
+  }
+  (void)apply_subordinate_state(engine, event.execution_id, state, engine->get_status().progress,
+                                std::move(terminal_error));
+}
+
+Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
+  IResolvedParticipantExecutionEngine* engine = nullptr;
+  OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
+  std::uint64_t subordinate_id = 0U;
+  std::string command_target;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    if (active_operation_ == nullptr) {
+      return Result<void>::Ok();
+    }
+    engine = active_operation_->engine;
+    payload_kind = active_operation_->payload_kind;
+    subordinate_id = active_operation_->subordinate_id;
+    command_target = active_operation_->binding.value().command_target_id.value();
+  }
+
+  if (payload_kind == OperationParticipantPayloadKind::kMotion) {
+    const auto status = engine->get_status();
+    std::optional<ErrorDTO> terminal_error;
+    const auto state = operation_state(status.state);
+    if (state == OperationStateKind::kFailed || state == OperationStateKind::kStopped ||
+        state == OperationStateKind::kInterventionRequired) {
+      terminal_error = status_error(status.last_error);
+    }
+    return apply_subordinate_state(engine, subordinate_id, state, status.progress,
+                                   std::move(terminal_error));
+  }
+
+  const auto status = engine->get_gripper_status(command_target);
+  switch (status.state) {
+    case GripperCommandState::kIdle:
+      return apply_subordinate_state(
+          engine, subordinate_id, OperationStateKind::kInterventionRequired, status.progress,
+          error("invariant_violation",
+                "accepted gripper command became idle without terminal evidence",
+                "gripper_command_lost"));
+    case GripperCommandState::kExecuting:
+      return apply_subordinate_state(engine, subordinate_id, OperationStateKind::kExecuting,
+                                     status.progress, std::nullopt);
+    case GripperCommandState::kCompleted:
+      return apply_subordinate_state(engine, subordinate_id, OperationStateKind::kCompleted,
+                                     status.progress, std::nullopt);
+    case GripperCommandState::kFailed:
+      return apply_subordinate_state(
+          engine, subordinate_id, OperationStateKind::kFailed, status.progress,
+          status.error.value_or(error("execution_aborted", "gripper command failed",
+                                      "gripper_command_failed_without_error")));
+  }
+  return reject<void>("gripper status is outside its closed enum", "gripper_status_unknown",
+                      ErrorCode::kInvariantViolation);
+}
+
+std::vector<ResourceSlotSnapshotDTO> ResourceAddressedExecutionKernel::resource_snapshot() const {
+  return resource_slots_.snapshot();
+}
+
+}  // namespace manyforge::core

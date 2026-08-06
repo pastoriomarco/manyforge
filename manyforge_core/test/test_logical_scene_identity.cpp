@@ -32,10 +32,13 @@ CollisionPolicySnapshot EmptyPolicy() {
 CollisionPolicySnapshot RichPolicy() {
   CollisionPolicySnapshot policy;
   policy.policy_id = "rich-policy";
-  policy.allowed_static_static_pairs = {{"fixture/a", "fixture/b"}};
-  policy.allowed_touch_link_pairs = {{"object/a", "robot/a"}};
+  policy.allowed_static_static_pairs = {
+      {"scene/fixture-a/shape/0", "scene/fixture-b/shape/0"}};
+  policy.allowed_touch_link_pairs = {{
+      "component/arm-a/model/arm-model/body/finger-a/collision/0",
+      "scene/object-a/shape/0"}};
   SupportContactPolicyEntry support;
-  support.pair = {"fixture/support", "object/a"};
+  support.pair = {"scene/object-a/shape/0", "scene/support/shape/0"};
   support.mode = CollisionContactPolicyMode::kContactRelease;
   support.release_evidence_mode =
       ContactReleaseEvidenceMode::kSignedPenetration;
@@ -49,7 +52,7 @@ CollisionPolicySnapshot RichPolicy() {
   support.allow_recontact = false;
   policy.support_contacts = {support};
   policy.contact_grasps = {ContactGraspPolicyEntry{
-      "grasp-a", "object/a", {"robot/finger-a", "robot/finger-b"},
+      "grasp-a", "object-a", {"finger-a", "finger-b"},
       0.0005, 0.8}};
   policy.require_full_diagnostics = true;
   return policy;
@@ -193,10 +196,10 @@ TEST(LogicalSceneIdentity, PolicyDigestCoversEverySemanticSection) {
 
   expect_changed([](auto& value) { value.policy_id = "other-policy"; });
   expect_changed([](auto& value) {
-    value.allowed_static_static_pairs[0].body_b = "fixture/c";
+    value.allowed_static_static_pairs[0].body_b = "scene/fixture-c/shape/0";
   });
   expect_changed([](auto& value) {
-    value.allowed_touch_link_pairs[0].body_b = "robot/b";
+    value.allowed_touch_link_pairs[0].body_b = "scene/object-b/shape/0";
   });
   expect_changed([](auto& value) {
     value.support_contacts[0].max_start_penetration_m = 0.002;
@@ -227,7 +230,7 @@ TEST(LogicalSceneIdentity, RejectsNoncanonicalPolicyInsteadOfNormalizingIt) {
 
   policy = RichPolicy();
   policy.contact_grasps[0].allowed_robot_links =
-      {"robot/finger-b", "robot/finger-a"};
+      {"finger-b", "finger-a"};
   EXPECT_THROW(ComputeCollisionPolicyContentDigest(policy),
                LogicalSceneIdentityError);
 }

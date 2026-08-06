@@ -370,7 +370,8 @@ resolve_cartesian_kinematic_motion_bounds(
 
 core::Result<CartesianFrameDynamicsEnvelope>
 measure_cartesian_frame_dynamics_envelope(
-    const core::PlanRequestDTO& request, const core::CartesianPathDTO& path,
+    const CartesianTrajectoryContractInput& request,
+    const core::CartesianPathDTO& path,
     const std::shared_ptr<roboplan::Scene>& scene,
     const roboplan::JointTrajectory& trajectory,
     const CartesianPlanningControl& control) {
@@ -385,9 +386,12 @@ measure_cartesian_frame_dynamics_envelope(
     return core::Result<CartesianFrameDynamicsEnvelope>::Ok(
         std::move(envelope));
   }
-  const auto group_info = scene->getJointGroupInfo(request.group_id);
-  const auto tip_frame_id = scene->getFrameId(request.tcp_frame);
-  const auto base_frame_id = scene->getFrameId(request.base_frame);
+  const auto group_info =
+      scene->getJointGroupInfo(request.compiled_group_name);
+  const auto tip_frame_id =
+      scene->getFrameId(request.compiled_tcp_frame);
+  const auto base_frame_id =
+      scene->getFrameId(request.compiled_base_frame);
   if (!group_info.has_value() || !tip_frame_id.has_value() ||
       !base_frame_id.has_value() ||
       group_info->joint_names != trajectory.joint_names ||
@@ -400,7 +404,7 @@ measure_cartesian_frame_dynamics_envelope(
         std::move(envelope));
   }
   auto amplification = resolve_cartesian_kinematic_motion_bounds(
-      scene, request.group_id, trajectory.joint_names);
+      scene, request.compiled_group_name, trajectory.joint_names);
   if (!amplification.ok()) {
     return core::Result<CartesianFrameDynamicsEnvelope>::Err(
         amplification.error());
@@ -540,7 +544,8 @@ measure_cartesian_frame_dynamics_envelope(
         return std::nullopt;
       }
       const auto full_positions =
-          scene->toFullJointPositions(request.group_id, group_positions);
+          scene->toFullJointPositions(request.compiled_group_name,
+                                      group_positions);
       full_velocities.setZero();
       full_accelerations.setZero();
       for (Eigen::Index joint = 0;

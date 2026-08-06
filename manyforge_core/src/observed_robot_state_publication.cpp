@@ -426,6 +426,17 @@ ObservedRobotStatePublication::ReadView ObservedRobotStatePublication::acquire(
                            : std::move(any_fallback);
 }
 
+ObservedRobotStatePublication::ReadView
+ObservedRobotStatePublication::acquire_latest() const noexcept {
+  for (const auto& lane : lanes_) {
+    auto candidate = acquire_lane(*lane);
+    if (candidate) {
+      return candidate;
+    }
+  }
+  return {};
+}
+
 ObservedRobotStatePublicationMetrics ObservedRobotStatePublication::metrics()
     const noexcept {
   return {
@@ -440,6 +451,30 @@ ObservedRobotStatePublicationMetrics ObservedRobotStatePublication::metrics()
 std::optional<ObservedRobotStateSnapshotDTO>
 ObservedRobotStatePublication::snapshot(std::int64_t now_ns) const {
   auto view = acquire(now_ns);
+  if (!view) {
+    return std::nullopt;
+  }
+  ObservedRobotStateSnapshotDTO dto;
+  dto.sequence = view.sequence();
+  dto.joint_names.assign(view.joint_names().begin(), view.joint_names().end());
+  dto.positions_rad.assign(view.positions_rad().begin(),
+                           view.positions_rad().end());
+  if (view.velocities_complete()) {
+    dto.velocities_rad_s.emplace(view.velocities_rad_s().begin(),
+                                 view.velocities_rad_s().end());
+  }
+  dto.source_id = std::string(view.source_id());
+  dto.source_kind = view.source_kind();
+  dto.source_timestamp_ns = view.source_timestamp_ns();
+  dto.received_timestamp_ns = view.received_timestamp_ns();
+  dto.authority_profile = std::string(view.authority_profile_id());
+  dto.complete = view.complete();
+  return dto;
+}
+
+std::optional<ObservedRobotStateSnapshotDTO>
+ObservedRobotStatePublication::snapshot_latest() const {
+  auto view = acquire_latest();
   if (!view) {
     return std::nullopt;
   }

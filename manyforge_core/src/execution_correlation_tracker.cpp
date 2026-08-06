@@ -10,7 +10,7 @@ void ExecutionCorrelationTracker::set_from_request(
   }
   {
     std::lock_guard<std::mutex> lock(program_run_id_mutex_);
-    program_run_id_ = request.program_run_id;
+    program_run_id_ = request.binding.program_run_id.value();
   }
   {
     std::lock_guard<std::mutex> lock(action_span_mutex_);

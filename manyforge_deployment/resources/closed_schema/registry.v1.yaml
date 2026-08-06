@@ -18,7 +18,9 @@ catalog_schemas:
     qualification: qualified
   - record_kind: command_schema
     schema_id: manyforge.command_schema.v1
-    qualification: unqualified
+    schema_revision: sha256:dd305be4c7071d4b5fcf31c031d80b7adb8d3a29562629a189b167922b1f29da
+    relative_path: catalog/manyforge.command_schema.v1.yaml
+    qualification: qualified
   - record_kind: component_type
     schema_id: manyforge.component_type.v1
     schema_revision: sha256:fdd03c397fb792d387002df453055d9ccd7d1826ae41d3b0706e5f7c27480d87

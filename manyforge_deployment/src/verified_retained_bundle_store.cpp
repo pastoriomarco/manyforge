@@ -507,6 +507,8 @@ read_verified_bundle_entry(
 struct DecodedRetainedModelMap final {
   CompositionCellFrame cell_frame;
   std::vector<CompositionModelOccurrence> model_occurrences;
+  std::vector<CompositionModelCollisionBodyResolution>
+      model_collision_bodies;
   std::vector<OccurrenceSymbolRewrite> symbols;
   std::vector<OccurrenceReferenceRewrite> references;
   std::vector<CompositionModelCoordinate> coordinates;
@@ -521,27 +523,46 @@ struct DecodedRetainedModelMap final {
           core::CellId(require_map_text(map, "cell_id")),
           require_map_text(require_map_member(map, "cell_frame"),
                            "compiled_frame_name")},
-      {}, {}, {}, {}, {}, {}};
+      {}, {}, {}, {}, {}, {}, {}};
 
   const auto& occurrences = require_map_array(map, "model_occurrences");
   result.model_occurrences.reserve(occurrences.size());
   for (const auto& row : occurrences) {
     const auto component = require_map_optional_text(row, "owner_component_id");
     const auto role = require_map_optional_text(row, "owner_model_role_id");
-    result.model_occurrences.push_back(CompositionModelOccurrence{
-        core::ModelInstanceId(require_map_text(row, "model_instance_id")),
-        core::ModelAssetId(require_map_text(row, "model_asset_id")),
-        core::ModelRevision(require_map_text(row, "model_revision")),
+    const core::ModelInstanceId model_instance_id(
+        require_map_text(row, "model_instance_id"));
+    const core::ModelRevision model_revision(
+        require_map_text(row, "model_revision"));
+    const std::optional<core::ControllableComponentId> owner_component_id =
         component.has_value()
             ? std::optional<core::ControllableComponentId>(
                   core::ControllableComponentId(*component))
-            : std::nullopt,
+            : std::nullopt;
+    result.model_occurrences.push_back(CompositionModelOccurrence{
+        model_instance_id,
+        core::ModelAssetId(require_map_text(row, "model_asset_id")),
+        model_revision,
+        owner_component_id,
         role.has_value()
             ? std::optional<core::ModelRoleId>(core::ModelRoleId(*role))
             : std::nullopt,
         require_map_text(row, "compiled_model_name"),
         require_map_text(row, "compiled_robot_name"),
         require_map_text(row, "compiled_root_link_name")});
+
+    const auto& collision_roles =
+        require_map_array(row, "collision_body_roles");
+    result.model_collision_bodies.reserve(
+        result.model_collision_bodies.size() + collision_roles.size());
+    for (const auto& collision : collision_roles) {
+      result.model_collision_bodies.push_back(
+          CompositionModelCollisionBodyResolution{
+              model_instance_id, model_revision, owner_component_id,
+              core::CollisionBodyRoleId(
+                  require_map_text(collision, "collision_body_role_id")),
+              require_map_text_array(collision, "compiled_link_names")});
+    }
   }
 
   const auto& symbols = require_map_array(map, "symbol_rows");
@@ -1318,6 +1339,26 @@ VerifiedRetainedModelMap::find_binding(
   return match;
 }
 
+const CompositionControlBindingCoordinateMap*
+VerifiedRetainedModelMap::find_binding(
+    const core::ControllableComponentId& component_id,
+    const core::CommandTargetId& command_target_id,
+    const core::ControlBindingId& control_binding_id) const noexcept {
+  const CompositionControlBindingCoordinateMap* match = nullptr;
+  for (const auto& candidate : control_bindings_) {
+    if (candidate.controllable_component_id != component_id ||
+        candidate.command_target_id != command_target_id ||
+        candidate.control_binding_id != control_binding_id) {
+      continue;
+    }
+    if (match != nullptr) {
+      return nullptr;
+    }
+    match = &candidate;
+  }
+  return match;
+}
+
 void VerifiedRetainedModelMap::require_same_bundle_as(
     const VerifiedRetainedPlanningModel& planning_model) const {
   if (query_.retained_bundle_id !=
@@ -1585,7 +1626,8 @@ FilesystemVerifiedRetainedModelMapSource::get_verified(
   return VerifiedRetainedModelMap(
       query, product->product_contract_id,
       product->product_contract_revision, std::move(decoded.cell_frame),
-      std::move(decoded.model_occurrences), std::move(decoded.symbols),
+      std::move(decoded.model_occurrences),
+      std::move(decoded.model_collision_bodies), std::move(decoded.symbols),
       std::move(decoded.references), std::move(decoded.coordinates),
       std::move(decoded.control_bindings), std::move(decoded.targets));
 }

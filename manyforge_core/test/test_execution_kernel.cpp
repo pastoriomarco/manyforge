@@ -14,6 +14,7 @@
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
 #include <map>
 #include <memory>
@@ -52,7 +53,11 @@ class MockPlanner : public IPlannerBackend {
   std::function<void(int)> on_plan;
   int plan_count = 0;
   int cancel_count = 0;
-  PlanRequestDTO last_request;
+  PlanRequestDTO last_request = testing::make_test_plan_request(
+      "unplanned", ResolvedJointGoalDTO{
+                       {ResourceId("resource:j1"), ResourceId("resource:j2")},
+                       {"j1", "j2"}, {0.0, 0.0}},
+      {"j1", "j2"}, {0.0, 0.0});
   std::vector<std::uint32_t> planning_attempt_indices;
 
   PlanResultDTO plan(const PlanRequestDTO& request) override {
@@ -70,6 +75,9 @@ class MockPlanner : public IPlannerBackend {
         result.projection_revision =
             request.projection_binding.projection_revision;
       }
+      if (result.trajectory.has_value() && result.trajectory->resources.empty()) {
+        result.trajectory->resources = request.resources;
+      }
       return result;
     }
     auto result = next_result;
@@ -77,6 +85,9 @@ class MockPlanner : public IPlannerBackend {
         !result.projection_revision.valid()) {
       result.projection_revision =
           request.projection_binding.projection_revision;
+    }
+    if (result.trajectory.has_value() && result.trajectory->resources.empty()) {
+      result.trajectory->resources = request.resources;
     }
     return result;
   }
@@ -91,10 +102,16 @@ class SlowMockPlanner : public IPlannerBackend {
   PlanResultDTO next_result;
   int plan_count = 0;
   int cancel_count = 0;
-  PlanRequestDTO last_request;
+  PlanRequestDTO last_request = testing::make_test_plan_request(
+      "unplanned", ResolvedJointGoalDTO{
+                       {ResourceId("resource:j1"), ResourceId("resource:j2")},
+                       {"j1", "j2"}, {0.0, 0.0}},
+      {"j1", "j2"}, {0.0, 0.0});
 
   SlowMockPlanner() {
     next_result.trajectory = TrajectoryDTO{};
+    next_result.trajectory->resources =
+        {ResourceId("resource:j1"), ResourceId("resource:j2")};
     next_result.trajectory->joint_names = {"j1", "j2"};
     next_result.trajectory->waypoints.push_back(
         TrajectoryWaypointDTO{0.0, {0.0, 0.0}, {}, {}});
@@ -136,6 +153,9 @@ class SlowMockPlanner : public IPlannerBackend {
         !result.projection_revision.valid()) {
       result.projection_revision =
           request.projection_binding.projection_revision;
+    }
+    if (result.trajectory.has_value() && result.trajectory->resources.empty()) {
+      result.trajectory->resources = request.resources;
     }
     return result;
   }
@@ -1813,6 +1833,7 @@ class ThreadSafeFakeClock final : public IClock {
 
 TrajectoryDTO make_test_trajectory() {
   TrajectoryDTO t;
+  t.resources = {ResourceId("resource:j1"), ResourceId("resource:j2")};
   t.joint_names = {"j1", "j2"};
   TrajectoryWaypointDTO wp0;
   wp0.time_from_start_s = 0.0;
@@ -1827,6 +1848,7 @@ TrajectoryDTO make_test_trajectory() {
 TrajectoryDTO make_test_trajectory_from(std::vector<double> start,
                                         std::vector<double> goal) {
   TrajectoryDTO t;
+  t.resources = {ResourceId("resource:j1"), ResourceId("resource:j2")};
   t.joint_names = {"j1", "j2"};
   TrajectoryWaypointDTO wp0;
   wp0.time_from_start_s = 0.0;
@@ -1846,19 +1868,22 @@ Pose3DTO make_pose(double x, double y, double z, QuaternionDTO orientation = {0.
 }
 
 ExecuteRequestDTO make_test_request(const std::string& move_id = "move_1") {
-  ExecuteRequestDTO req;
-  req.robot_id = "robot1";
-  req.group_id = "arm";
+  auto req = testing::make_test_execute_request({"j1", "j2"});
+  req.binding.controllable_component_id =
+      ControllableComponentId("robot1");
   req.move_id = move_id;
-  req.base_frame = "world";
-  req.tcp_frame = "tool0";
+  std::get<ResolvedComponentModelFrameDTO>(req.binding.base_frame)
+      .compiled_frame_name = "world";
+  std::get<ResolvedComponentModelFrameDTO>(req.binding.tcp_frame)
+      .compiled_frame_name = "tool0";
   req.tolerances.joint_position_tol_rad = 0.1;
   req.tolerances.translation_tol_m = 0.01;
   req.tolerances.rotation_tol_rad = 0.01;
   req.speed_profile.velocity_scale = 1.0;
   req.timeouts.planning_timeout_s = 10.0;
   req.cache_mode = CacheMode::kDefault;
-  req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 1.0}};
+  req.motion = ResolvedJointGoalDTO{
+      req.binding.resources, {"j1", "j2"}, {1.0, 1.0}};
   return req;
 }
 
@@ -1940,8 +1965,8 @@ CollisionWorldBody make_observed_box_body(
     std::optional<std::int64_t> source_timestamp_ns = std::nullopt,
     std::optional<std::int64_t> freshness_budget_ns = std::nullopt) {
   CollisionWorldBody body;
-  body.body_id = "object/" + object_id + "/shape/0";
-  body.owner_kind = CollisionOwnerKind::kDetachedObject;
+  body.body_id = "scene/" + object_id + "/shape/0";
+  body.owner_kind = CollisionOwnerKind::kSceneResource;
   body.frame_id = "universe";
   body.pose = pose;
   body.source_timestamp_ns = source_timestamp_ns;
@@ -1970,7 +1995,7 @@ CollisionWorldSnapshot make_test_collision_world_snapshot_with_object(
       freshness_budget_ns));
   snapshot.body_count = static_cast<std::int64_t>(snapshot.bodies.size());
   snapshot.geometry_count = 1;
-  snapshot.detached_object_count = 1;
+  snapshot.scene_resource_count = 1;
   return snapshot;
 }
 
@@ -1984,7 +2009,7 @@ SceneSnapshotLiveObject make_observed_box_live_object(
   SceneSnapshotLiveObject live;
   live.object_id = object_id;
   live.declared_role = declared_role;
-  live.collision_body_ids = {"object/" + object_id + "/shape/0"};
+  live.collision_body_ids = {"scene/" + object_id + "/shape/0"};
   live.object_revision_token = std::move(object_revision_token);
   live.pose = pose;
   live.source_id = "test_pose_source";
@@ -2010,9 +2035,9 @@ void install_mock_retained_object(MockCollisionWorldPublisher& publisher,
 
 CollisionWorldBody make_test_robot_link_body(const std::string& link_name) {
   CollisionWorldBody body;
-  body.body_id =
-      "robot/robot1/link/" + link_name + "/collision/0";
-  body.owner_kind = CollisionOwnerKind::kRobotLink;
+  body.body_id = "component/arm/model/arm_model/body/" + link_name +
+                 "/collision/0";
+  body.owner_kind = CollisionOwnerKind::kComponentModelBody;
   body.frame_id = "universe";
   body.pose.orientation.w = 1.0;
   CollisionGeometryDescriptor geom;
@@ -2040,7 +2065,7 @@ void install_mock_contact_grasp_world(
             });
   snapshot.body_count = static_cast<std::int64_t>(snapshot.bodies.size());
   snapshot.geometry_count = snapshot.body_count;
-  snapshot.robot_link_count =
+  snapshot.component_model_body_count =
       static_cast<std::int64_t>(allowed_links.size());
   publisher.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(std::move(snapshot));
@@ -2049,8 +2074,8 @@ void install_mock_contact_grasp_world(
 CollisionWorldBody make_dynamic_test_body(std::int64_t source_timestamp_ns,
                                           std::int64_t freshness_budget_ns) {
   CollisionWorldBody body;
-  body.body_id = "object/dynamic_box/shape/0";
-  body.owner_kind = CollisionOwnerKind::kDetachedObject;
+  body.body_id = "scene/dynamic_box/shape/0";
+  body.owner_kind = CollisionOwnerKind::kSceneResource;
   body.frame_id = "universe";
   body.pose.orientation.w = 1.0;
   body.source_timestamp_ns = source_timestamp_ns;
@@ -2077,8 +2102,8 @@ CollisionResult make_authoritative_collision_result() {
   CollisionResult result;
   result.in_collision = true;
   result.normalized_pairs = {CollisionPairId{
-      "robot/robot1/link/link1/collision/0",
-      "object/box/shape/0"}};
+      "component/arm/model/arm_model/body/link1/collision/0",
+      "scene/box/shape/0"}};
   result.engine_status = CollisionEngineStatus::kOk;
   result.decision = CollisionDecisionResult::kFail;
   return result;
@@ -2717,8 +2742,44 @@ TEST_F(ExecutionKernelTest,
 TEST_F(ExecutionKernelTest, Execute_HappyPath_CallsPlanner) {
   execute_sync(make_test_request());
   EXPECT_EQ(planner.plan_count, 1);
-  EXPECT_EQ(planner.last_request.robot_id, "robot1");
-  EXPECT_EQ(planner.last_request.move_id, "move_1");
+  EXPECT_EQ(planner.last_request.controllable_component_id.value(), "robot1");
+  EXPECT_EQ(planner.last_request.move_id.value(), "move_1");
+  EXPECT_EQ(planner.last_request.capability_id.value(), "execution.trajectory.execute");
+  EXPECT_EQ(planner.last_request.planner_capability_binding.capability_id.value(),
+            "planning.motion.joint_goal");
+  EXPECT_EQ(planner.last_request.planner_capability_binding.provider_instance_id.value(),
+            "planner-provider:test");
+  EXPECT_EQ(planner.last_request.resources,
+            (std::vector<ResourceId>{ResourceId("resource:j1"), ResourceId("resource:j2")}));
+  EXPECT_EQ(planner.last_request.start_state.resources, planner.last_request.resources);
+  EXPECT_EQ(planner.last_request.start_state.control_binding_id,
+            planner.last_request.control_binding_id);
+}
+
+TEST_F(ExecutionKernelTest, Execute_PlannerResultResourceMismatchFailsClosedBeforeDispatch) {
+  planner.next_result.trajectory = make_test_trajectory();
+  planner.next_result.trajectory->resources =
+      {ResourceId("resource:other-1"), ResourceId("resource:other-2")};
+
+  const auto result = execute_sync(make_test_request("wrong_resources"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_PlannerResultOrderingMismatchFailsClosedBeforeDispatch) {
+  planner.next_result.trajectory = make_test_trajectory();
+  planner.next_result.trajectory->resources =
+      {ResourceId("resource:j2"), ResourceId("resource:j1")};
+  planner.next_result.trajectory->joint_names = {"j2", "j1"};
+
+  const auto result = execute_sync(make_test_request("wrong_order"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, 0);
 }
 
 TEST_F(ExecutionKernelTest, Execute_RelativeMove_ResolvesToPoseGoalBeforePlanning) {
@@ -3323,7 +3384,10 @@ TEST_F(ExecutionKernelTest, Execute_PerJointDynamicsLimitsBypassCacheAndReplan) 
   auto req = make_test_request("move_dyn_capped");
   JointDynamicsLimitDTO lim;
   lim.max_velocity_rad_s = 0.5;
-  req.per_joint_dynamics_limits["joint1"] = lim;
+  req.per_resource_dynamics_limits.push_back(
+      ResolvedResourceDynamicsLimitDTO{
+          req.binding.resources.front(),
+          req.binding.model_group_binding.compiled_joint_names.front(), lim});
 
   auto result = execute_sync(req);
 
@@ -3337,7 +3401,10 @@ TEST_F(ExecutionKernelTest,
   auto req = make_test_request("move_capped_no_store");
   JointDynamicsLimitDTO lim;
   lim.max_velocity_rad_s = 0.5;
-  req.per_joint_dynamics_limits["joint1"] = lim;
+  req.per_resource_dynamics_limits.push_back(
+      ResolvedResourceDynamicsLimitDTO{
+          req.binding.resources.front(),
+          req.binding.model_group_binding.compiled_joint_names.front(), lim});
 
   auto result = execute_sync(req);
 
@@ -3546,32 +3613,35 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitFkFailure_InvalidatesAndReplans) {
   EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
 }
 
-TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalComparesByJointName) {
+TEST_F(ExecutionKernelTest,
+       Execute_CacheHitResourceProjectionReorderInvalidatesAndReplans) {
   auto cached = make_test_trajectory();
+  cached.resources = {ResourceId("resource:j2"), ResourceId("resource:j1")};
   cached.joint_names = {"j2", "j1"};
   cached.waypoints.front().positions_rad = {0.0, 0.0};
   cached.waypoints.back().positions_rad = {2.0, 1.0};
   auto req = make_test_request("move_joint_named");
-  req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 2.0}};
-  auto cached_request = req;
-  cached_request.motion = JointGoalDTO{{"j2", "j1"}, {2.0, 1.0}};
-  store_cache(cached_request, cached);
+  req.motion = ResolvedJointGoalDTO{
+      req.binding.resources, {"j1", "j2"}, {1.0, 2.0}};
+  store_cache(req, cached);
 
   auto result = execute_sync(req);
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(planner.plan_count, 1);
   EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalNameMismatch_InvalidatesAndReplans) {
   auto cached = make_test_trajectory();
+  cached.resources = {ResourceId("resource:j3"), ResourceId("resource:j1")};
   cached.joint_names = {"j3", "j1"};
   store_cache("move_joint_mismatch", cached);
-  context.current_state_value.joint_names = {"j3", "j1"};
 
   auto req = make_test_request("move_joint_mismatch");
-  req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 1.0}};
+  req.motion = ResolvedJointGoalDTO{
+      req.binding.resources, {"j1", "j2"}, {1.0, 1.0}};
 
   auto result = execute_sync(req);
 
@@ -3737,9 +3807,12 @@ TEST_F(ExecutionKernelTest, Execute_SyncObservedStateBeforePlanning_CalledBefore
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(execution.sync_count, 1);
   ASSERT_EQ(planner.plan_count, 1);
-  ASSERT_EQ(planner.last_request.start_state.positions_rad.size(), 2u);
-  EXPECT_DOUBLE_EQ(planner.last_request.start_state.positions_rad[0], 0.25);
-  EXPECT_DOUBLE_EQ(planner.last_request.start_state.positions_rad[1], -0.5);
+  const auto planned_start =
+      angular_position_projection(planner.last_request.start_state);
+  ASSERT_TRUE(planned_start.ok());
+  ASSERT_EQ(planned_start.value().size(), 2u);
+  EXPECT_DOUBLE_EQ(planned_start.value()[0], 0.25);
+  EXPECT_DOUBLE_EQ(planned_start.value()[1], -0.5);
 }
 
 TEST_F(ExecutionKernelTest, Execute_SyncObservedStateBeforePlanningFailure_BlocksPlanning) {
@@ -3916,8 +3989,8 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Execute_BoundedPenetrationLaterFirstContactEmitsNativePolicyViolation) {
-  const CollisionPairId pair{"object/insert/shape/0",
-                             "object/fixture/shape/0"};
+  const CollisionPairId pair{"scene/insert/shape/0",
+                             "scene/fixture/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.policy_id = "bounded-predispatch-contact";
   policy.require_full_diagnostics = true;
@@ -4011,11 +4084,11 @@ TEST_F(ExecutionKernelTest,
 TEST_F(ExecutionKernelTest,
        Execute_AuthoritativeCollisionDiagnosticsReportClassifiedFailurePair) {
   CollisionPairId allowed_pair{
-      "object/box_a/shape/0",
-      "object/box_b/shape/0"};
+      "scene/box_a/shape/0",
+      "scene/box_b/shape/0"};
   CollisionPairId blocking_pair{
-      "object/box_a/shape/0",
-      "robot/robot1/link/link1/collision/0"};
+      "scene/box_a/shape/0",
+      "component/arm/model/arm_model/body/link1/collision/0"};
   CollisionResult result;
   result.in_collision = true;
   result.normalized_pairs = {allowed_pair, blocking_pair};
@@ -4040,9 +4113,10 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(snapshot.error.has_value());
   const auto& details = snapshot.error->details;
   EXPECT_EQ(details.at("collision_result_first_pair"),
-            "object/box_a/shape/0 <-> object/box_b/shape/0");
+            "scene/box_a/shape/0 <-> scene/box_b/shape/0");
   EXPECT_EQ(details.at("collision_result_first_failure_pair"),
-            "object/box_a/shape/0 <-> robot/robot1/link/link1/collision/0");
+            "component/arm/model/arm_model/body/link1/collision/0 <-> "
+            "scene/box_a/shape/0");
   EXPECT_EQ(details.at("collision_result_first_failure_classification"),
             "blocking_collision");
   EXPECT_EQ(details.at("collision_result_first_failure_joint_names"),
@@ -4064,7 +4138,8 @@ TEST_F(ExecutionKernelTest,
     found_error_event = true;
     EXPECT_EQ(
         event.details.at("collision_result_first_failure_pair"),
-        "object/box_a/shape/0 <-> robot/robot1/link/link1/collision/0");
+        "component/arm/model/arm_model/body/link1/collision/0 <-> "
+        "scene/box_a/shape/0");
     EXPECT_EQ(event.details.at("collision_result_first_failure_classification"),
               "blocking_collision");
     EXPECT_EQ(event.error->details.at("collision_result_first_failure_pair"),
@@ -4643,8 +4718,8 @@ TEST_F(ExecutionKernelTest,
   configure_authoritative_collision_validation(local_kernel, local_publisher,
                                                 local_engine);
 
-  const CollisionPairId pair{"object/insert/shape/0",
-                             "object/fixture/shape/0"};
+  const CollisionPairId pair{"scene/insert/shape/0",
+                             "scene/fixture/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.policy_id = "bounded-replan-policy";
   SupportContactPolicyEntry entry;
@@ -4716,7 +4791,7 @@ TEST_F(ExecutionKernelTest,
 
   const auto span = make_test_action_span();
   auto request = make_test_request("replan_stop");
-  request.program_run_id = span.program_run_id;
+  request.binding.program_run_id = ProgramRunId(span.program_run_id);
   request.action_span = span;
   auto result = local_kernel.execute(request);
   ASSERT_TRUE(result.ok());
@@ -4789,7 +4864,7 @@ TEST_F(ExecutionKernelTest,
 
   const auto span = make_test_action_span();
   auto request = make_test_request("replan_interrupt");
-  request.program_run_id = span.program_run_id;
+  request.binding.program_run_id = ProgramRunId(span.program_run_id);
   request.action_span = span;
   auto result = local_kernel.execute(request);
   ASSERT_TRUE(result.ok());
@@ -5600,9 +5675,12 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
 
   EXPECT_EQ(planner.plan_count, 2);
   EXPECT_EQ(controlled_execution.sync_observed_state_count, 2);
-  ASSERT_EQ(planner.last_request.start_state.positions_rad.size(), 2u);
-  EXPECT_DOUBLE_EQ(planner.last_request.start_state.positions_rad[0], 0.25);
-  EXPECT_DOUBLE_EQ(planner.last_request.start_state.positions_rad[1], 0.25);
+  const auto resumed_start =
+      angular_position_projection(planner.last_request.start_state);
+  ASSERT_TRUE(resumed_start.ok());
+  ASSERT_EQ(resumed_start.value().size(), 2u);
+  EXPECT_DOUBLE_EQ(resumed_start.value()[0], 0.25);
+  EXPECT_DOUBLE_EQ(resumed_start.value()[1], 0.25);
   EXPECT_GE(context.validate_count, 2);
   ASSERT_FALSE(controlled_execution.last_resume_trajectory.waypoints.empty());
   EXPECT_DOUBLE_EQ(
@@ -6107,9 +6185,9 @@ TEST_F(ExecutionKernelTest,
                            e.details.at("collision_world_revision_id") ==
                                "99" &&
                            e.details.at("contact_a") ==
-                               "object/box/shape/0" &&
+                               "component/arm/model/arm_model/body/link1/collision/0" &&
                            e.details.at("contact_b") ==
-                               "robot/robot1/link/link1/collision/0";
+                               "scene/box/shape/0";
                   }));
 }
 
@@ -10069,7 +10147,7 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(latch->signal_snapshot.metadata.at("reason"),
             "stale_dynamic_collision_body");
   EXPECT_EQ(latch->signal_snapshot.metadata.at("dynamic_body_id"),
-            "object/dynamic_box/shape/0");
+            "scene/dynamic_box/shape/0");
   EXPECT_EQ(latch->signal_snapshot.metadata.at("dynamic_body_age_ns"),
             "20000000");
 }
@@ -10156,8 +10234,8 @@ TEST_F(ExecutionKernelTest,
       controlled_kernel, local_collision_world, local_collision_engine,
       local_runtime_engine);
 
-  const CollisionPairId pair{"object/support/shape/0",
-                             "robot/robot1/attached/part/shape/0"};
+  const CollisionPairId pair{"scene/part/shape/0",
+                             "scene/support/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.require_full_diagnostics = true;
   SupportContactPolicyEntry entry;
@@ -10216,8 +10294,8 @@ TEST_F(ExecutionKernelTest,
     events.push_back(event);
   });
 
-  const CollisionPairId pair{"object/support/shape/0",
-                             "robot/robot1/attached/part/shape/0"};
+  const CollisionPairId pair{"scene/part/shape/0",
+                             "scene/support/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.require_full_diagnostics = true;
   SupportContactPolicyEntry entry;
@@ -10314,8 +10392,8 @@ TEST_F(ExecutionKernelTest,
     events.push_back(event);
   });
 
-  const CollisionPairId pair{"object/insert/shape/0",
-                             "object/fixture/shape/0"};
+  const CollisionPairId pair{"scene/insert/shape/0",
+                             "scene/fixture/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.policy_id = "bounded-runtime-contact";
   policy.require_full_diagnostics = true;
@@ -10398,8 +10476,8 @@ TEST_F(ExecutionKernelTest,
     events.push_back(event);
   });
 
-  const CollisionPairId pair{"object/insert/shape/0",
-                             "object/fixture/shape/0"};
+  const CollisionPairId pair{"scene/insert/shape/0",
+                             "scene/fixture/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.policy_id = "bounded-runtime-missing-clearance";
   policy.require_full_diagnostics = true;
@@ -10451,11 +10529,11 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(violation->details.at("contact_policy_id"),
             "bounded-runtime-missing-clearance");
   EXPECT_EQ(violation->details.at("zone_id"),
-            "support_pair:object/fixture/shape/0<->object/insert/shape/0");
+            "support_pair:scene/fixture/shape/0<->scene/insert/shape/0");
   EXPECT_EQ(violation->details.at("contact_body_a"),
-            "object/fixture/shape/0");
+            "scene/fixture/shape/0");
   EXPECT_EQ(violation->details.at("contact_body_b"),
-            "object/insert/shape/0");
+            "scene/insert/shape/0");
   EXPECT_EQ(violation->details.at("contact_present"), "true");
   EXPECT_EQ(violation->details.at("distance_request_mode"),
             "selected_colliding_pairs");
@@ -10490,8 +10568,9 @@ TEST_F(ExecutionKernelTest,
       local_runtime_engine);
 
   constexpr const char* kPolicyId = "contact_grasp/graspable";
-  const CollisionPairId pair{"object/graspable/shape/0",
-                             "robot/robot1/link/right_finger/collision/0"};
+  const CollisionPairId pair{
+      "component/arm/model/arm_model/body/right_finger/collision/0",
+      "scene/graspable/shape/0"};
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
@@ -10544,8 +10623,9 @@ TEST_F(ExecutionKernelTest,
   });
 
   constexpr const char* kPolicyId = "contact_grasp/graspable";
-  const CollisionPairId pair{"object/graspable/shape/0",
-                             "robot/robot1/link/right_finger/collision/0"};
+  const CollisionPairId pair{
+      "component/arm/model/arm_model/body/right_finger/collision/0",
+      "scene/graspable/shape/0"};
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
@@ -10593,8 +10673,8 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(violation->details.at("contact_policy_id"), kPolicyId);
   EXPECT_EQ(violation->details.at("policy_mode"), "contact_grasp");
   EXPECT_EQ(violation->details.at("zone_id"),
-            "contact_grasp_pair:object/graspable/shape/0<->"
-            "robot/robot1/link/right_finger/collision/0");
+            "contact_grasp_pair:component/arm/model/arm_model/body/"
+            "right_finger/collision/0<->scene/graspable/shape/0");
   EXPECT_EQ(violation->details.at("contact_body_a"), pair.body_a);
   EXPECT_EQ(violation->details.at("contact_body_b"), pair.body_b);
   EXPECT_EQ(violation->details.at("contact_present"), "true");
@@ -10632,11 +10712,11 @@ TEST_F(ExecutionKernelTest,
 
   constexpr const char* kPolicyId = "contact_grasp/graspable";
   const CollisionPairId violating_pair{
-      "object/graspable/shape/0",
-      "robot/robot1/link/right_finger/collision/0"};
+      "component/arm/model/arm_model/body/right_finger/collision/0",
+      "scene/graspable/shape/0"};
   const CollisionPairId allowed_pair{
-      "object/graspable/shape/0",
-      "robot/robot1/link/left_finger/collision/0"};
+      "component/arm/model/arm_model/body/left_finger/collision/0",
+      "scene/graspable/shape/0"};
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
@@ -10677,8 +10757,8 @@ TEST_F(ExecutionKernelTest,
             "grasp_contact_penetration_exceeded");
   EXPECT_EQ(latch->signal_snapshot.metadata.at(
                 "collision_result_first_failure_pair"),
-            "object/graspable/shape/0 <-> "
-            "robot/robot1/link/right_finger/collision/0");
+            "component/arm/model/arm_model/body/right_finger/collision/0 <-> "
+            "scene/graspable/shape/0");
 }
 
 TEST_F(ExecutionKernelTest,
@@ -10703,8 +10783,9 @@ TEST_F(ExecutionKernelTest,
   });
 
   constexpr const char* kPolicyId = "contact_grasp/graspable";
-  const CollisionPairId pair{"object/graspable/shape/0",
-                             "robot/robot1/link/right_finger/collision/0"};
+  const CollisionPairId pair{
+      "component/arm/model/arm_model/body/right_finger/collision/0",
+      "scene/graspable/shape/0"};
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
@@ -10754,8 +10835,8 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(violation->details.at("contact_policy_id"), kPolicyId);
   EXPECT_EQ(violation->details.at("policy_mode"), "contact_grasp");
   EXPECT_EQ(violation->details.at("zone_id"),
-            "contact_grasp_pair:object/graspable/shape/0<->"
-            "robot/robot1/link/right_finger/collision/0");
+            "contact_grasp_pair:component/arm/model/arm_model/body/"
+            "right_finger/collision/0<->scene/graspable/shape/0");
   EXPECT_EQ(violation->details.at("contact_body_a"), pair.body_a);
   EXPECT_EQ(violation->details.at("contact_body_b"), pair.body_b);
   EXPECT_EQ(violation->details.at("contact_present"), "true");
@@ -10800,8 +10881,8 @@ TEST_F(ExecutionKernelTest,
 
   constexpr const char* kPolicyId = "contact_grasp/graspable";
   const CollisionPairId unexpected_pair{
-      "object/other_part/shape/0",
-      "robot/robot1/link/right_finger/collision/0"};
+      "component/arm/model/arm_model/body/right_finger/collision/0",
+      "scene/other_part/shape/0"};
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
@@ -15296,7 +15377,7 @@ TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcross
   });
 
   auto request = make_test_request("program_run_correlated_move");
-  request.program_run_id = "run-abc123";
+  request.binding.program_run_id = ProgramRunId("run-abc123");
   auto result = execute_sync(request);
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(kernel.acknowledge_completed(result.value()).accepted);
@@ -15345,7 +15426,7 @@ TEST_F(ExecutionKernelTest,
 
   const auto span = make_test_action_span();
   auto request = make_test_request("span_correlated_move");
-  request.program_run_id = span.program_run_id;
+  request.binding.program_run_id = ProgramRunId(span.program_run_id);
   request.action_span = span;
 
   auto result = execute_sync(request);
@@ -15420,7 +15501,7 @@ TEST_F(ExecutionKernelTest,
   const auto span = make_test_action_span();
   constexpr const char* kContactPolicyId = "contact_grasp/lite6_box";
   auto request = make_test_request("contact_policy_correlated_move");
-  request.program_run_id = span.program_run_id;
+  request.binding.program_run_id = ProgramRunId(span.program_run_id);
   request.action_span = span;
   request.contact_policy_id = kContactPolicyId;
 
@@ -15509,7 +15590,7 @@ TEST_F(ExecutionKernelTest,
 
   const auto span = make_test_action_span();
   auto request = make_test_request("replan_latch_fail");
-  request.program_run_id = span.program_run_id;
+  request.binding.program_run_id = ProgramRunId(span.program_run_id);
   request.action_span = span;
   auto result = local_kernel.execute(request);
   ASSERT_TRUE(result.ok());

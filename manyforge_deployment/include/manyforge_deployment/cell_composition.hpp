@@ -284,6 +284,22 @@ struct CompositionTargetCollisionResolution final {
       default;
 };
 
+/// One asset-scoped collision-body role from an exact retained model
+/// occurrence. Unlike a target-local collision alias, this inventory covers
+/// every declared body in the model, including fixed geometry that no command
+/// target selects.
+struct CompositionModelCollisionBodyResolution final {
+  core::ModelInstanceId model_instance_id;
+  core::ModelRevision model_revision;
+  std::optional<core::ControllableComponentId> owner_component_id;
+  core::CollisionBodyRoleId collision_body_role_id;
+  std::vector<std::string> compiled_link_names;
+
+  friend bool operator==(const CompositionModelCollisionBodyResolution&,
+                         const CompositionModelCollisionBodyResolution&) =
+      default;
+};
+
 struct CompositionTargetResolution final {
   core::ControllableComponentId controllable_component_id;
   core::CommandTargetId command_target_id;

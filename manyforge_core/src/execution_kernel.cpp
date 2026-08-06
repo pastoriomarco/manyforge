@@ -95,6 +95,78 @@ std::string diagnostic_double(double value) {
   return out.str();
 }
 
+Result<ControlledStateDTO> controlled_state_for_binding(
+    const ExecuteRequestDTO& request, const RobotStateDTO& observed) {
+  const auto reject_state = [](std::string reason) {
+    return Result<ControlledStateDTO>::Err(ErrorDTO{
+        kErrorExecutionRejected,
+        "Observed state does not match the resolved execution binding",
+        {{"reason", std::move(reason)}}});
+  };
+  if (observed.joint_names.empty() ||
+      observed.joint_names.size() != observed.positions_rad.size() ||
+      (!observed.velocities_rad_s.empty() &&
+       observed.velocities_rad_s.size() != observed.joint_names.size())) {
+    return reject_state("observed_angular_state_shape_mismatch");
+  }
+  const auto& expected_names =
+      request.binding.model_group_binding.compiled_joint_names;
+  if (request.binding.resources.empty() ||
+      request.binding.resources.size() != expected_names.size()) {
+    return reject_state("resolved_resource_projection_shape_mismatch");
+  }
+
+  std::unordered_map<std::string, std::size_t> observed_index;
+  observed_index.reserve(observed.joint_names.size());
+  for (std::size_t index = 0U; index < observed.joint_names.size(); ++index) {
+    if (observed.joint_names[index].empty() ||
+        !observed_index.emplace(observed.joint_names[index], index).second) {
+      return reject_state("observed_angular_state_identity_invalid");
+    }
+  }
+
+  std::vector<CoordinatePositionDTO> positions;
+  positions.reserve(expected_names.size());
+  std::optional<std::vector<CoordinateVelocityDTO>> velocities;
+  if (!observed.velocities_rad_s.empty()) {
+    velocities.emplace();
+    velocities->reserve(expected_names.size());
+  }
+  for (const auto& name : expected_names) {
+    const auto found = observed_index.find(name);
+    if (found == observed_index.end()) {
+      return reject_state("resolved_resource_missing_from_observed_state");
+    }
+    positions.emplace_back(
+        AngularPositionDTO{observed.positions_rad[found->second]});
+    if (velocities.has_value()) {
+      velocities->emplace_back(
+          AngularVelocityDTO{observed.velocities_rad_s[found->second]});
+    }
+  }
+
+  ControlledStateDTO state{
+      request.binding.controllable_component_id,
+      request.binding.command_target_id,
+      request.binding.control_domain_id,
+      request.binding.control_domain_revision,
+      request.binding.control_binding_id,
+      request.binding.control_binding_revision,
+      request.binding.controller_topology_id,
+      request.binding.topology_revision,
+      request.binding.control_route_id,
+      request.binding.active_control_configuration_id,
+      request.binding.active_control_configuration_generation,
+      request.binding.resources,
+      expected_names,
+      std::move(positions),
+      std::move(velocities)};
+  if (auto validation = validate_controlled_state(state); !validation.ok()) {
+    return Result<ControlledStateDTO>::Err(validation.error());
+  }
+  return Result<ControlledStateDTO>::Ok(std::move(state));
+}
+
 std::unordered_set<std::string> observed_target_object_ids(
     const ExecuteRequestDTO& request,
     const std::optional<CollisionPolicySnapshot>& policy_snapshot) {
@@ -9980,26 +10052,64 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
     return Result<TrajectoryDTO>::Err(current_state_result.error());
   }
   auto current_state = std::move(current_state_result.value());
+  auto controlled_state = controlled_state_for_binding(request, current_state);
+  if (!controlled_state.ok()) {
+    return Result<TrajectoryDTO>::Err(controlled_state.error());
+  }
 
-  PlanRequestDTO plan_req;
-  plan_req.robot_id = request.robot_id;
-  plan_req.group_id = request.group_id;
-  plan_req.move_id = request.move_id;
-  plan_req.base_frame = request.base_frame;
-  plan_req.tcp_frame = request.tcp_frame;
-  plan_req.start_state = current_state;
-  // Execute admission resolves target mode exactly once against the retained
-  // scene/start-state authority. Worker replans reuse that immutable result.
-  plan_req.motion = request.motion;
-  plan_req.tolerances = request.tolerances;
-  plan_req.speed_profile = request.speed_profile;
-  plan_req.planning_profile = request.planning_profile;
-  plan_req.per_joint_dynamics_limits = request.per_joint_dynamics_limits;
-  plan_req.action_span = request.action_span;
-  plan_req.contact_policy_id = request.contact_policy_id;
-  plan_req.planning_timeout_s = request.timeouts.planning_timeout_s;
-  plan_req.planning_attempt_index = planning_attempt_index;
-  plan_req.projection_binding = projection_binding;
+  const auto& binding = request.binding;
+  PlanRequestDTO plan_req{
+      binding.operation_id,
+      binding.participant_id,
+      binding.program_id,
+      binding.program_revision,
+      binding.program_binding_id,
+      binding.program_run_id,
+      MoveId(request.move_id),
+      binding.controllable_component_id,
+      binding.component_type_id,
+      binding.component_type_revision,
+      binding.command_target_id,
+      binding.capability_id,
+      binding.capability_definition_revision,
+      binding.planner_capability_binding,
+      binding.model_bindings,
+      binding.model_group_binding,
+      binding.control_domain_id,
+      binding.control_domain_revision,
+      binding.control_binding_id,
+      binding.control_binding_revision,
+      binding.control_interface_contract_id,
+      binding.control_interface_revision,
+      binding.controller_topology_id,
+      binding.topology_revision,
+      binding.control_route_id,
+      binding.activation_set_id,
+      binding.active_control_configuration_id,
+      binding.active_control_configuration_generation,
+      binding.provider_instance_id,
+      binding.provider_manifest_id,
+      binding.provider_manifest_revision,
+      binding.provider_runtime_epoch,
+      binding.runtime_unit_bindings,
+      binding.resources,
+      request.action_span,
+      binding.base_frame,
+      binding.tcp_frame,
+      std::move(controlled_state.value()),
+      request.motion,
+      request.tolerances,
+      request.speed_profile,
+      request.planning_profile,
+      request.contact_policy_id.empty()
+          ? std::nullopt
+          : std::optional<std::string>{request.contact_policy_id},
+      request.per_resource_dynamics_limits,
+      request.timeouts.planning_timeout_s,
+      planning_attempt_index,
+      projection_binding,
+      binding.component_attachment_revisions,
+      binding.carried_object_attachment_revisions};
 
   auto result = planner_.plan(plan_req);
 
@@ -10016,6 +10126,14 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
            {"returned_revision_id",
             std::to_string(result.projection_revision.scene_revision
                                .revision_id)}}});
+    }
+    if (result.trajectory->resources != binding.resources ||
+        result.trajectory->joint_names !=
+            binding.model_group_binding.compiled_joint_names) {
+      return Result<TrajectoryDTO>::Err(ErrorDTO{
+          kErrorInvariantViolation,
+          "Planner result changed the exact resolved resource projection",
+          {{"reason", "planner_result_resource_projection_mismatch"}}});
     }
     return Result<TrajectoryDTO>::Ok(std::move(*result.trajectory));
   }
@@ -10137,8 +10255,8 @@ ExecutionKernel::validate_trajectory(
   // collision authority, so the backend validator must not run its legacy
   // collision sweep first and reject contacts the active policy would allow.
   ValidationOptionsDTO opts;
-  opts.tcp_frame = request.tcp_frame;
-  opts.base_frame = request.base_frame;
+  opts.tcp_frame = compiled_frame_name(request.binding.tcp_frame);
+  opts.base_frame = compiled_frame_name(request.binding.base_frame);
   opts.max_tcp_linear_speed_mps =
       request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
   opts.run_collision_checks = false;

@@ -268,9 +268,9 @@ CollisionWorldSnapshot make_snapshot() {
     return body;
   };
   snapshot.bodies = {
-      make_body("object/part/shape/0"),
-      make_body("robot/arm/link/finger_left/collision/0"),
-      make_body("robot/arm/link/finger_right/collision/0"),
+      make_body("component/arm/model/arm_model/body/finger_left/collision/0"),
+      make_body("component/arm/model/arm_model/body/finger_right/collision/0"),
+      make_body("scene/part/shape/0"),
   };
   snapshot.body_count = static_cast<std::int64_t>(snapshot.bodies.size());
   snapshot.geometry_count = 0;
@@ -337,7 +337,7 @@ TEST(CollisionValidationCoordinatorTest,
      EngineBackedCollisionBeforeCancellationPreservesRejectDecision) {
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] =
-      make_colliding_result(CollisionPairId{"robot/link", "object/part"});
+      make_colliding_result(CollisionPairId{"component/arm/model/arm_model/body/link/collision/0", "scene/part/shape/0"});
   engine.result_by_waypoint[2] = make_cancelled_result("operator_stop");
   CollisionCancellationToken cancel;
 
@@ -386,7 +386,7 @@ TEST(CollisionValidationCoordinatorTest,
      EngineBackedCancelAfterPriorRejectPreservesRejectTimeAndReason) {
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[1] =
-      make_colliding_result(CollisionPairId{"robot/link", "object/part"});
+      make_colliding_result(CollisionPairId{"component/arm/model/arm_model/body/link/collision/0", "scene/part/shape/0"});
   engine.result_by_waypoint[3] = make_cancelled_result("operator_stop");
   CollisionCancellationToken cancel;
 
@@ -442,8 +442,8 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      SignedReleaseRequestsOnlySelectedCollidingLogicalPairs) {
-  const CollisionPairId authored_pair{"robot/grasp", "object/box"};
-  const CollisionPairId canonical_pair{"object/box", "robot/grasp"};
+  const CollisionPairId authored_pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
+  const CollisionPairId canonical_pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   CollisionCancellationToken cancel;
 
@@ -475,7 +475,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BinaryReleaseRequestsNoDistanceEvidence) {
-  const CollisionPairId pair{"object/box", "robot/grasp"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   CollisionCancellationToken cancel;
 
@@ -500,7 +500,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      SelectedScopeAdmissionNeverFallsBackToAllActiveDistance) {
-  const CollisionPairId pair{"object/box", "robot/grasp"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.set_distance_capabilities(
       {CollisionDistanceRequestMode::kNone,
@@ -536,7 +536,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      SelectedScopeReportsMissingPenetrationCapabilityPrecisely) {
-  const CollisionPairId pair{"object/box", "robot/grasp"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.set_distance_capabilities(
       {CollisionDistanceRequestMode::kNone,
@@ -578,7 +578,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BinaryContactAdmitsCollisionOnlyEngineWithExplicitNoneScope) {
-  const CollisionPairId pair{"object/box", "robot/grasp"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.set_distance_capabilities(
       {CollisionDistanceRequestMode::kNone},
@@ -602,8 +602,8 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BoundedPenetrationRequestsOnlyItsSelectedCollidingPair) {
-  const CollisionPairId authored_pair{"robot/grasp", "object/box"};
-  const CollisionPairId canonical_pair{"object/box", "robot/grasp"};
+  const CollisionPairId authored_pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
+  const CollisionPairId canonical_pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   CollisionCancellationToken cancel;
 
@@ -633,8 +633,8 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      MixedReleasePolicySelectsOnlySignedPairs) {
-  const CollisionPairId signed_pair{"object/box", "robot/grasp"};
-  const CollisionPairId binary_pair{"fixture/table", "object/part"};
+  const CollisionPairId signed_pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
+  const CollisionPairId binary_pair{"scene/part/shape/0", "scene/table/shape/0"};
   MockCollisionQueryEngine engine;
   CollisionCancellationToken cancel;
 
@@ -663,9 +663,9 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      MixedSignedBinaryAndBoundedContactsPreserveIndependentContracts) {
-  const CollisionPairId signed_pair{"object/signed", "robot/tool"};
-  const CollisionPairId binary_pair{"fixture/table", "object/binary"};
-  const CollisionPairId bounded_pair{"fixture/socket", "object/insert"};
+  const CollisionPairId signed_pair{"component/arm/model/arm_model/body/tool/collision/0", "scene/signed/shape/0"};
+  const CollisionPairId binary_pair{"scene/binary/shape/0", "scene/table/shape/0"};
+  const CollisionPairId bounded_pair{"scene/insert/shape/0", "scene/socket/shape/0"};
 
   CollisionValidationPassConfig cfg;
   cfg.policy_snapshot = make_contact_release_snapshot(
@@ -763,7 +763,7 @@ TEST(CollisionValidationCoordinatorTest,
   CollisionValidationPassConfig cfg;
   cfg.policy_snapshot = make_contact_grasp_snapshot();
   const auto binary = make_binary_contact_release_snapshot(
-      {"fixture/table", "object/binary_part"},
+      {"scene/table/shape/0", "scene/binary_part/shape/0"},
       /*require_separation_by_end=*/false);
   cfg.policy_snapshot.support_contacts.push_back(
       binary.support_contacts.front());
@@ -779,10 +779,8 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(query.distance_request_mode,
             CollisionDistanceRequestMode::kSelectedCollidingPairs);
   const std::vector<CollisionPairId> expected{
-      {"object/part/shape/0",
-       "robot/arm/link/finger_left/collision/0"},
-      {"object/part/shape/0",
-       "robot/arm/link/finger_right/collision/0"},
+      {"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"},
+      {"component/arm/model/arm_model/body/finger_right/collision/0", "scene/part/shape/0"},
   };
   EXPECT_EQ(query.selected_distance_pairs, expected);
   EXPECT_NE(std::find(query.required_capabilities.begin(),
@@ -795,7 +793,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      SignedContactReleaseAllowsAbsentPairWithoutNumericClearance) {
-  CollisionPairId pair{"robot/grasp", "object/box"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.default_result = make_pass_result_without_clearance();
   CollisionCancellationToken cancel;
@@ -817,7 +815,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      SignedContactReleaseFailsClosedWhenCollidingPairMetricIsMissing) {
-  CollisionPairId pair{"robot/grasp", "object/box"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.default_result = make_colliding_result(pair);
   CollisionCancellationToken cancel;
@@ -843,7 +841,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BoundedPenetrationAllowsAppearanceRecontactAndFinalContactUnderCap) {
-  const CollisionPairId pair{"robot/grasp", "object/box"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_pass_result_without_clearance();
   engine.result_by_waypoint[1] =
@@ -869,7 +867,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BoundedPenetrationRejectsFirstOverCapCollidingSample) {
-  const CollisionPairId pair{"robot/grasp", "object/box"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   // Bounded penetration does not require baseline contact. The first contact
   // may appear later; it is rejected only because this sample exceeds the cap.
@@ -905,7 +903,8 @@ TEST(CollisionValidationCoordinatorTest,
   ASSERT_TRUE(violation.has_value());
   EXPECT_EQ(violation->at("policy_mode"), "bounded_penetration");
   EXPECT_EQ(violation->at("zone_id"),
-            "support_pair:object/box<->robot/grasp");
+            "support_pair:component/arm/model/arm_model/body/grasp/"
+            "collision/0<->scene/box/shape/0");
   EXPECT_EQ(violation->at("contact_present"), "true");
   EXPECT_EQ(violation->at("initial_contact_pair_count"), "0");
   EXPECT_EQ(violation->at("current_contact_pair_count"), "1");
@@ -924,7 +923,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BoundedPenetrationFailsClosedWhenCollidingMetricIsMissing) {
-  const CollisionPairId pair{"robot/grasp", "object/box"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_pass_result_without_clearance();
   engine.result_by_waypoint[1] = make_colliding_result(pair);
@@ -948,8 +947,8 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BoundedPenetrationDoesNotAllowUndeclaredCollisionPairs) {
-  const CollisionPairId configured_pair{"robot/grasp", "object/box"};
-  const CollisionPairId undeclared_pair{"fixture/table", "robot/elbow"};
+  const CollisionPairId configured_pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
+  const CollisionPairId undeclared_pair{"component/arm/model/arm_model/body/elbow/collision/0", "scene/table/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_colliding_result(undeclared_pair);
   CollisionCancellationToken cancel;
@@ -977,7 +976,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BinaryContactAllowsPlateausAndSeparationWithoutMetrics) {
-  const CollisionPairId pair{"object/box", "robot/grasp"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_colliding_result(pair);
   engine.result_by_waypoint[1] = make_colliding_result(pair);
@@ -997,7 +996,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BinaryContactRejectsPairThatWasInitiallyClear) {
-  const CollisionPairId pair{"object/box", "robot/grasp"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[1] = make_colliding_result(pair);
   CollisionCancellationToken cancel;
@@ -1021,7 +1020,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      BinaryContactRequiresCurrentFinalAbsence) {
-  const CollisionPairId pair{"object/box", "robot/grasp"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.default_result = make_colliding_result(pair);
   CollisionCancellationToken cancel;
@@ -1059,7 +1058,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      ContactReleaseReportsRecontactAfterSparseSeparatedSample) {
-  CollisionPairId pair{"robot/grasp", "object/box"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.003);
   engine.result_by_waypoint[1] = make_pass_result_without_clearance();
@@ -1089,7 +1088,7 @@ TEST(CollisionValidationCoordinatorTest,
      ContactReleaseStrictlyDecreasingPenetrationPasses) {
   // Initial contact with penetration <= max_start, depth monotonically
   // decreases to 0 (clearance crosses positive at the end). Must pass.
-  CollisionPairId pair{"robot/grasp", "object/box"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.003);
   engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.001);
@@ -1115,7 +1114,7 @@ TEST(CollisionValidationCoordinatorTest,
      ContactReleaseInitialPenetrationExceedsEnvelopeFailsClosed) {
   // Initial depth > max_start_penetration_m + tolerance must reject at
   // waypoint 0 with reason "initial_penetration_exceeds_policy".
-  CollisionPairId pair{"robot/grasp", "object/box"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.020);
   engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.010);
@@ -1144,12 +1143,13 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(pre_dispatch_collision_validation_message(
                 details, bundle.decision.action),
             "Support-contact initial penetration exceeds the permitted "
-            "envelope: object/box <-> robot/grasp");
+            "envelope: component/arm/model/arm_model/body/grasp/collision/0 "
+            "<-> scene/box/shape/0");
 }
 
 TEST(CollisionValidationCoordinatorTest,
      ContactReleaseInitialPenetrationEnvelopeCanBeDisabled) {
-  CollisionPairId pair{"robot/grasp", "object/box"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.020);
   engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.010);
@@ -1176,7 +1176,7 @@ TEST(CollisionValidationCoordinatorTest,
   // Penetration monotonicity: a later waypoint deeper than previous beyond
   // tolerance must fail with reason "penetration_increased" at the first
   // violating index.
-  CollisionPairId pair{"robot/grasp", "object/box"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.004);
   engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.003);
@@ -1208,7 +1208,7 @@ TEST(CollisionValidationCoordinatorTest,
   // Strictly decreasing penetration but no separation by end, with
   // require_separation_by_end=true, must fail at the final waypoint
   // with reason "final_sample_not_separated".
-  CollisionPairId pair{"robot/grasp", "object/box"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0", "scene/box/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.004);
   engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.002);
@@ -1238,11 +1238,13 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(details.at("collision_result_contact_release_violation"),
             "final_sample_not_separated");
   EXPECT_EQ(details.at("collision_result_contact_release_pair"),
-            "object/box <-> robot/grasp");
+            "component/arm/model/arm_model/body/grasp/collision/0 <-> "
+            "scene/box/shape/0");
   EXPECT_EQ(pre_dispatch_collision_validation_message(
                 details, bundle.decision.action),
             "Support-contact pair did not separate by final waypoint: "
-            "object/box <-> robot/grasp");
+            "component/arm/model/arm_model/body/grasp/collision/0 <-> "
+            "scene/box/shape/0");
 }
 
 TEST(CollisionValidationCoordinatorTest,
@@ -1250,7 +1252,7 @@ TEST(CollisionValidationCoordinatorTest,
   // kContactProcess is reserved fail-closed until force/controller sensing
   // contracts qualify. Validation must reject with
   // "contact_process_policy_not_implemented".
-  CollisionPairId pair{"robot/tcp", "object/part"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/tcp/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.default_result = make_pass_result_with_clearance(pair, -0.001);
   CollisionCancellationToken cancel;
@@ -1275,9 +1277,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      ContactGraspAllowsSelectedObjectContactInTerminalWindow) {
-  CollisionPairId pair{
-      "object/part/shape/0",
-      "robot/arm/link/finger_left/collision/0"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[3] =
       make_colliding_result_with_clearance(pair, -0.001);
@@ -1303,8 +1303,8 @@ TEST(CollisionValidationCoordinatorTest,
 TEST(CollisionValidationCoordinatorTest,
      ContactGraspRejectsCollidingPairWithPositiveClearance) {
   const CollisionPairId pair{
-      "object/part/shape/0",
-      "robot/arm/link/finger_left/collision/0"};
+      "component/arm/model/arm_model/body/finger_left/collision/0",
+      "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[3] =
       make_colliding_result_with_clearance(pair, 0.001);
@@ -1329,9 +1329,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      ContactGraspFailsDiagnosticIncompleteWhenCollidingClearanceIsAbsent) {
-  const CollisionPairId pair{
-      "object/part/shape/0",
-      "robot/arm/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[3] = make_colliding_result(pair);
   CollisionCancellationToken cancel;
@@ -1359,15 +1357,14 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      ContactGraspEnrichesEngineDiagnosticIncompleteForMatchedMissingMetric) {
-  const CollisionPairId pair{
-      "object/part/shape/0",
-      "robot/arm/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   auto incomplete = make_colliding_result(pair);
   incomplete.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
   incomplete.decision = CollisionDecisionResult::kInconclusiveFail;
   incomplete.raw_diagnostics["missing_selected_distance_pairs"] =
-      "object/part/shape/0 <-> robot/arm/link/finger_left/collision/0";
+      "component/arm/model/arm_model/body/finger_left/collision/0 <-> "
+      "scene/part/shape/0";
   engine.result_by_waypoint[3] = std::move(incomplete);
   CollisionCancellationToken cancel;
 
@@ -1398,11 +1395,11 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(violation->at("contact_policy_id"), "contact_grasp/part");
   EXPECT_EQ(violation->at("policy_mode"), "contact_grasp");
   EXPECT_EQ(violation->at("zone_id"),
-            "contact_grasp_pair:object/part/shape/0<->"
-            "robot/arm/link/finger_left/collision/0");
-  EXPECT_EQ(violation->at("contact_body_a"), "object/part/shape/0");
-  EXPECT_EQ(violation->at("contact_body_b"),
-            "robot/arm/link/finger_left/collision/0");
+            "contact_grasp_pair:component/arm/model/arm_model/body/"
+            "finger_left/collision/0<->scene/part/shape/0");
+  EXPECT_EQ(violation->at("contact_body_a"),
+            "component/arm/model/arm_model/body/finger_left/collision/0");
+  EXPECT_EQ(violation->at("contact_body_b"), "scene/part/shape/0");
   EXPECT_EQ(violation->at("contact_present"), "true");
   EXPECT_EQ(violation->at("selected_object_id"), "part");
   EXPECT_EQ(violation->at("distance_request_mode"),
@@ -1419,9 +1416,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      ContactGraspOverCapProducesNativeViolationMetricEvidence) {
-  const CollisionPairId pair{
-      "object/part/shape/0",
-      "robot/arm/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[3] =
       make_colliding_result_with_clearance(pair, -0.004);
@@ -1457,9 +1452,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      ContactGraspInitialContactKeepsExplicitNativeReason) {
-  const CollisionPairId pair{
-      "object/part/shape/0",
-      "robot/arm/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] =
       make_colliding_result_with_clearance(pair, -0.001);
@@ -1488,9 +1481,7 @@ TEST(CollisionValidationCoordinatorTest,
 
 TEST(CollisionValidationCoordinatorTest,
      ContactGraspRejectsSelectedObjectContactBeforeTerminalWindow) {
-  CollisionPairId pair{
-      "object/part/shape/0",
-      "robot/arm/link/finger_left/collision/0"};
+  CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[1] =
       make_colliding_result_with_clearance(pair, -0.001);
@@ -1523,7 +1514,7 @@ TEST(CollisionValidationCoordinatorTest,
 }
 
 TEST(CollisionValidationCoordinatorTest, ContactGraspRuntimePrefixUsesOriginalTrajectoryFraction) {
-  const CollisionPairId pair{"object/part/shape/0", "robot/arm/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[2] = make_colliding_result_with_clearance(pair, -0.001);
   CollisionCancellationToken cancel;
@@ -1547,7 +1538,7 @@ TEST(CollisionValidationCoordinatorTest, ContactGraspRuntimePrefixUsesOriginalTr
 
 TEST(CollisionValidationCoordinatorTest,
      ContactGraspRuntimeTerminalPrefixDoesNotBecomeInitialSample) {
-  const CollisionPairId pair{"object/part/shape/0", "robot/arm/link/finger_left/collision/0"};
+  const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_colliding_result_with_clearance(pair, -0.001);
   CollisionCancellationToken cancel;

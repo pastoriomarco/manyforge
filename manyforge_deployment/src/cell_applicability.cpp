@@ -94,6 +94,18 @@ template <typename Qualified, typename Map, typename Set>
   return result;
 }
 
+template <typename Qualified, typename Map>
+[[nodiscard]] std::vector<Qualified> copy_index_in_key_order(
+    const Map& supplied) {
+  std::vector<Qualified> result;
+  result.reserve(supplied.size());
+  for (const auto& [unused, value] : supplied) {
+    (void)unused;
+    result.push_back(*value);
+  }
+  return result;
+}
+
 template <typename Range, typename Predicate>
 [[nodiscard]] const typename Range::value_type* find_one(
     const Range& values, Predicate predicate) {
@@ -232,6 +244,7 @@ class LogicalNameRegistry final {
 
 struct QualifiedIndexes final {
   std::map<PairKey, const QualifiedRuntimeProfile*> runtime_profiles;
+  std::map<PairKey, const QualifiedCommandSchema*> command_schemas;
   std::map<PairKey, const QualifiedCapabilityDefinition*>
       capability_definitions;
   std::map<PairKey, const QualifiedControlInterfaceContract*> contracts;
@@ -250,6 +263,7 @@ struct QualifiedIndexes final {
     const CompositionQualifiedCellIr& composition,
     const RevisionVerifiedDeploymentApplicabilityInputs& deployment_inputs,
     std::span<const QualifiedRuntimeProfile> runtime_profiles,
+    std::span<const QualifiedCommandSchema> command_schemas,
     std::span<const QualifiedCapabilityDefinition> capability_definitions,
     std::span<const QualifiedControlInterfaceContract> contracts,
     std::span<const QualifiedControllerTopology> topologies,
@@ -263,6 +277,13 @@ struct QualifiedIndexes final {
                             value.value().runtime_profile_revision);
           },
           "runtime-profile closure"),
+      index_exact_span(
+          command_schemas,
+          [](const auto& value) {
+            return pair_key(value.value().command_schema_id,
+                            value.value().command_schema_revision);
+          },
+          "command-schema closure"),
       index_exact_span(
           capability_definitions,
           [](const auto& value) {
@@ -355,6 +376,15 @@ struct QualifiedIndexes final {
     result.required_manifests.insert(
         pair_key(resource.provider_manifest_id,
                  resource.provider_manifest_revision));
+  }
+  for (const auto& [unused, command_schema] : result.command_schemas) {
+    (void)unused;
+    for (const auto& capability :
+         command_schema->value().compatible_capabilities) {
+      result.required_capability_definitions.insert(
+          pair_key(capability.capability_id,
+                   capability.capability_definition_revision));
+    }
   }
 
   require_exact_closure(result.runtime_profiles,
@@ -2510,6 +2540,7 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
     const CompositionQualifiedCellIr& composition,
     const RevisionVerifiedDeploymentApplicabilityInputs& deployment_inputs,
     std::span<const QualifiedRuntimeProfile> runtime_profiles,
+    std::span<const QualifiedCommandSchema> command_schemas,
     std::span<const QualifiedCapabilityDefinition> capability_definitions,
     std::span<const QualifiedControlInterfaceContract>
         control_interface_contracts,
@@ -2522,7 +2553,7 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
           deployment_inputs.assistant_settings(),
           deployment_inputs.value().external_resources);
   const auto indexes = build_qualified_indexes(
-      composition, deployment_inputs, runtime_profiles,
+      composition, deployment_inputs, runtime_profiles, command_schemas,
       capability_definitions, control_interface_contracts,
       controller_topologies, provider_manifests,
       stop_evidence_policies);
@@ -2587,6 +2618,8 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
       assistant_settings,
       copy_closure_in_key_order<QualifiedRuntimeProfile>(
           indexes.runtime_profiles, indexes.required_runtime_profiles),
+      copy_index_in_key_order<QualifiedCommandSchema>(
+          indexes.command_schemas),
       copy_closure_in_key_order<QualifiedCapabilityDefinition>(
           indexes.capability_definitions,
           indexes.required_capability_definitions),

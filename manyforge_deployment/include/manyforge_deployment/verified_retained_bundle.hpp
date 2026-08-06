@@ -389,6 +389,10 @@ class VerifiedRetainedModelMap final {
   model_occurrences() const noexcept {
     return model_occurrences_;
   }
+  [[nodiscard]] const std::vector<CompositionModelCollisionBodyResolution>&
+  model_collision_bodies() const noexcept {
+    return model_collision_bodies_;
+  }
   [[nodiscard]] const std::vector<OccurrenceSymbolRewrite>& symbols()
       const noexcept {
     return symbols_;
@@ -422,6 +426,14 @@ class VerifiedRetainedModelMap final {
       const core::ControllableComponentId& component_id,
       const core::CommandTargetId& command_target_id) const noexcept;
 
+  /// Exact binding lookup for addressed runtime consumers. Missing and
+  /// duplicate triples both fail closed instead of falling back to artifact
+  /// order.
+  [[nodiscard]] const CompositionControlBindingCoordinateMap* find_binding(
+      const core::ControllableComponentId& component_id,
+      const core::CommandTargetId& command_target_id,
+      const core::ControlBindingId& control_binding_id) const noexcept;
+
   /// Fails closed if a consumer attempts to combine this namespace with a
   /// planning product selected from another immutable bundle.
   void require_same_bundle_as(
@@ -434,6 +446,8 @@ class VerifiedRetainedModelMap final {
       core::ProductContractRevision product_contract_revision,
       CompositionCellFrame cell_frame,
       std::vector<CompositionModelOccurrence> model_occurrences,
+      std::vector<CompositionModelCollisionBodyResolution>
+          model_collision_bodies,
       std::vector<OccurrenceSymbolRewrite> symbols,
       std::vector<OccurrenceReferenceRewrite> references,
       std::vector<CompositionModelCoordinate> coordinates,
@@ -444,6 +458,7 @@ class VerifiedRetainedModelMap final {
         product_contract_revision_(std::move(product_contract_revision)),
         cell_frame_(std::move(cell_frame)),
         model_occurrences_(std::move(model_occurrences)),
+        model_collision_bodies_(std::move(model_collision_bodies)),
         symbols_(std::move(symbols)),
         references_(std::move(references)),
         coordinates_(std::move(coordinates)),
@@ -455,6 +470,8 @@ class VerifiedRetainedModelMap final {
   core::ProductContractRevision product_contract_revision_;
   CompositionCellFrame cell_frame_;
   std::vector<CompositionModelOccurrence> model_occurrences_;
+  std::vector<CompositionModelCollisionBodyResolution>
+      model_collision_bodies_;
   std::vector<OccurrenceSymbolRewrite> symbols_;
   std::vector<OccurrenceReferenceRewrite> references_;
   std::vector<CompositionModelCoordinate> coordinates_;

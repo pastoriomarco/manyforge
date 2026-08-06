@@ -28,9 +28,9 @@ struct DurableLite6RetainedConsumerFixture final {
 };
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_retained_consumer_fixture(
-    const std::filesystem::path& package_root) {
-  auto controllable = make_lite6_controllable_retention_fixture();
+materialize_lite6_retained_consumer_fixture_from(
+    const std::filesystem::path& package_root,
+    Lite6ControllableRetentionFixture controllable) {
   auto qualified = controllable.qualified;
   const Lite6ControllableCompilerInputArtifactSource input_source(
       controllable);
@@ -53,6 +53,20 @@ materialize_lite6_retained_consumer_fixture(
       std::move(controllable.structural),
       std::move(bundle),
   };
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_retained_consumer_fixture(
+    const std::filesystem::path& package_root) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_controllable_retention_fixture());
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
+    const std::filesystem::path& package_root) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_arm_gripper_aggregate_retention_fixture());
 }
 
 }  // namespace manyforge::deployment::test

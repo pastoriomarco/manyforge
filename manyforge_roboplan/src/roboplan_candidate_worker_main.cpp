@@ -1,0 +1,410 @@
+#include "roboplan_worker_protocol.hpp"
+
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <array>
+#include <cerrno>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+#include <roboplan/core/geometry_wrappers.hpp>
+#include <roboplan/core/scene.hpp>
+#include <tl/expected.hpp>
+
+namespace manyforge::roboplan_backend {
+namespace {
+
+using worker_protocol::Frame;
+using worker_protocol::MessageType;
+
+constexpr std::size_t kHeaderBytes = 16U;
+constexpr std::size_t kMaximumFrameBytes = 256U * 1024U * 1024U;
+
+[[noreturn]] void fail(std::string message) {
+  throw std::runtime_error("RoboPlan candidate worker: " +
+                           std::move(message));
+}
+
+void read_all(int descriptor, void* output, std::size_t size) {
+  auto* bytes = static_cast<char*>(output);
+  std::size_t offset = 0U;
+  while (offset < size) {
+    const auto count = ::read(descriptor, bytes + offset, size - offset);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      fail("read failed: " + std::string(std::strerror(errno)));
+    }
+    if (count == 0) {
+      fail("protocol peer closed");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+}
+
+void write_all(int descriptor, const void* input, std::size_t size) {
+  const auto* bytes = static_cast<const char*>(input);
+  std::size_t offset = 0U;
+  while (offset < size) {
+    const auto count =
+        ::send(descriptor, bytes + offset, size - offset, MSG_NOSIGNAL);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      fail("write failed: " + std::string(std::strerror(errno)));
+    }
+    if (count == 0) {
+      fail("protocol write made no progress");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+}
+
+void put_u16(std::array<unsigned char, kHeaderBytes>& header,
+             std::size_t offset, std::uint16_t value) {
+  header[offset] = static_cast<unsigned char>(value & 0xffU);
+  header[offset + 1U] = static_cast<unsigned char>((value >> 8U) & 0xffU);
+}
+
+void put_u32(std::array<unsigned char, kHeaderBytes>& header,
+             std::size_t offset, std::uint32_t value) {
+  for (unsigned shift = 0U; shift < 32U; shift += 8U) {
+    header[offset++] = static_cast<unsigned char>((value >> shift) & 0xffU);
+  }
+}
+
+void put_u64(std::array<unsigned char, kHeaderBytes>& header,
+             std::size_t offset, std::uint64_t value) {
+  for (unsigned shift = 0U; shift < 64U; shift += 8U) {
+    header[offset++] = static_cast<unsigned char>((value >> shift) & 0xffU);
+  }
+}
+
+[[nodiscard]] std::uint16_t get_u16(
+    const std::array<unsigned char, kHeaderBytes>& header,
+    std::size_t offset) {
+  return static_cast<std::uint16_t>(header[offset]) |
+         (static_cast<std::uint16_t>(header[offset + 1U]) << 8U);
+}
+
+[[nodiscard]] std::uint32_t get_u32(
+    const std::array<unsigned char, kHeaderBytes>& header,
+    std::size_t offset) {
+  std::uint32_t value = 0U;
+  for (unsigned shift = 0U; shift < 32U; shift += 8U) {
+    value |= static_cast<std::uint32_t>(header[offset++]) << shift;
+  }
+  return value;
+}
+
+[[nodiscard]] std::uint64_t get_u64(
+    const std::array<unsigned char, kHeaderBytes>& header,
+    std::size_t offset) {
+  std::uint64_t value = 0U;
+  for (unsigned shift = 0U; shift < 64U; shift += 8U) {
+    value |= static_cast<std::uint64_t>(header[offset++]) << shift;
+  }
+  return value;
+}
+
+[[nodiscard]] Frame receive_frame(int descriptor) {
+  std::array<unsigned char, kHeaderBytes> header{};
+  read_all(descriptor, header.data(), header.size());
+  if (get_u32(header, 0U) != worker_protocol::kFrameMagic ||
+      get_u16(header, 4U) != worker_protocol::kProtocolVersion) {
+    fail("frame header has an unsupported magic or version");
+  }
+  const auto raw_type = get_u16(header, 6U);
+  if (raw_type < static_cast<std::uint16_t>(MessageType::kInitialize) ||
+      raw_type > static_cast<std::uint16_t>(MessageType::kProtocolError)) {
+    fail("frame type is invalid");
+  }
+  const auto payload_size = get_u64(header, 8U);
+  if (payload_size > kMaximumFrameBytes ||
+      payload_size > std::numeric_limits<std::size_t>::max()) {
+    fail("frame payload exceeds its byte bound");
+  }
+  std::string payload(static_cast<std::size_t>(payload_size), '\0');
+  if (!payload.empty()) {
+    read_all(descriptor, payload.data(), payload.size());
+  }
+  return {static_cast<MessageType>(raw_type), std::move(payload)};
+}
+
+void send_frame(int descriptor, MessageType type, std::string_view payload) {
+  if (payload.size() > kMaximumFrameBytes) {
+    fail("outgoing frame payload exceeds its byte bound");
+  }
+  std::array<unsigned char, kHeaderBytes> header{};
+  put_u32(header, 0U, worker_protocol::kFrameMagic);
+  put_u16(header, 4U, worker_protocol::kProtocolVersion);
+  put_u16(header, 6U, static_cast<std::uint16_t>(type));
+  put_u64(header, 8U, payload.size());
+  write_all(descriptor, header.data(), header.size());
+  if (!payload.empty()) {
+    write_all(descriptor, payload.data(), payload.size());
+  }
+}
+
+[[nodiscard]] Eigen::Matrix4d transform(const core::Pose3DTO& pose) {
+  const auto& q = pose.orientation;
+  if (!std::isfinite(pose.position_m.x_m) ||
+      !std::isfinite(pose.position_m.y_m) ||
+      !std::isfinite(pose.position_m.z_m) || !std::isfinite(q.x) ||
+      !std::isfinite(q.y) || !std::isfinite(q.z) || !std::isfinite(q.w)) {
+    fail("geometry pose is non-finite");
+  }
+  Eigen::Quaterniond orientation(q.w, q.x, q.y, q.z);
+  const double scale = orientation.coeffs().cwiseAbs().maxCoeff();
+  if (!std::isfinite(scale) || scale <= 0.0) {
+    fail("geometry pose has a zero-norm orientation");
+  }
+  orientation.coeffs() /= scale;
+  orientation.normalize();
+  Eigen::Matrix4d value = Eigen::Matrix4d::Identity();
+  value.block<3, 3>(0, 0) = orientation.toRotationMatrix();
+  value(0, 3) = pose.position_m.x_m;
+  value(1, 3) = pose.position_m.y_m;
+  value(2, 3) = pose.position_m.z_m;
+  return value;
+}
+
+[[nodiscard]] bool finite_positive(double value) {
+  return std::isfinite(value) && value > 0.0;
+}
+
+void add_geometry(roboplan::Scene& scene,
+                  const RoboPlanWorkerGeometryDTO& geometry) {
+  if (geometry.native_geometry_name.empty() ||
+      geometry.compiled_parent_frame.empty()) {
+    fail("geometry identity is empty");
+  }
+  const Eigen::Vector4d color(0.55, 0.55, 0.55, 1.0);
+  auto pose = transform(geometry.pose_in_parent);
+  const auto result = std::visit(
+      [&](const auto& shape) -> tl::expected<void, std::string> {
+        using Shape = std::decay_t<decltype(shape)>;
+        if constexpr (std::is_same_v<Shape, core::BoxShapeDTO>) {
+          if (!finite_positive(shape.dimensions_m.x_m) ||
+              !finite_positive(shape.dimensions_m.y_m) ||
+              !finite_positive(shape.dimensions_m.z_m)) {
+            return tl::unexpected("box dimensions are invalid");
+          }
+          return scene.addBoxGeometry(
+              geometry.native_geometry_name,
+              geometry.compiled_parent_frame,
+              roboplan::Box(shape.dimensions_m.x_m, shape.dimensions_m.y_m,
+                            shape.dimensions_m.z_m),
+              pose, color);
+        } else if constexpr (std::is_same_v<Shape, core::SphereShapeDTO>) {
+          if (!finite_positive(shape.radius_m)) {
+            return tl::unexpected("sphere radius is invalid");
+          }
+          return scene.addSphereGeometry(
+              geometry.native_geometry_name,
+              geometry.compiled_parent_frame,
+              roboplan::Sphere(shape.radius_m), pose, color);
+        } else if constexpr (std::is_same_v<Shape,
+                                             core::CylinderShapeDTO>) {
+          if (!finite_positive(shape.radius_m) ||
+              !finite_positive(shape.height_m)) {
+            return tl::unexpected("cylinder dimensions are invalid");
+          }
+          return scene.addCylinderGeometry(
+              geometry.native_geometry_name,
+              geometry.compiled_parent_frame,
+              roboplan::Cylinder(shape.radius_m, shape.height_m), pose,
+              color);
+        } else {
+          if (shape.resource_uri.empty() ||
+              !finite_positive(shape.scale.x_m) ||
+              !finite_positive(shape.scale.y_m) ||
+              !finite_positive(shape.scale.z_m) ||
+              !geometry.resolved_mesh_path.has_value() ||
+              !geometry.resolved_mesh_path->is_absolute() ||
+              !std::filesystem::is_regular_file(
+                  *geometry.resolved_mesh_path)) {
+            return tl::unexpected("mesh resource is invalid or unavailable");
+          }
+          return scene.addMeshGeometry(
+              geometry.native_geometry_name,
+              geometry.compiled_parent_frame,
+              roboplan::Mesh(
+                  *geometry.resolved_mesh_path,
+                  Eigen::Vector3d(shape.scale.x_m, shape.scale.y_m,
+                                  shape.scale.z_m)),
+              pose, color);
+        }
+      },
+      geometry.shape);
+  if (!result.has_value()) {
+    fail("could not add resolved scene geometry: " + result.error());
+  }
+}
+
+[[nodiscard]] std::shared_ptr<roboplan::Scene> make_scene(
+    const RoboPlanWorkerModelDTO& model) {
+  if (model.native_scene_name.empty() || !model.urdf_path.is_absolute() ||
+      !model.srdf_path.is_absolute() ||
+      !std::filesystem::is_regular_file(model.urdf_path) ||
+      !std::filesystem::is_regular_file(model.srdf_path) ||
+      model.package_paths.empty()) {
+    fail("retained model paths are incomplete");
+  }
+  for (const auto& path : model.package_paths) {
+    if (!path.is_absolute() || !std::filesystem::is_directory(path)) {
+      fail("retained package path is invalid");
+    }
+  }
+  if (model.yaml_config_path.has_value() &&
+      (!model.yaml_config_path->is_absolute() ||
+       !std::filesystem::is_regular_file(*model.yaml_config_path))) {
+    fail("retained planner configuration path is invalid");
+  }
+  auto scene = std::make_shared<roboplan::Scene>(
+      model.native_scene_name, model.urdf_path, model.srdf_path,
+      model.package_paths,
+      model.yaml_config_path.value_or(std::filesystem::path{}));
+  for (const auto& geometry : model.geometries) {
+    add_geometry(*scene, geometry);
+  }
+  for (const auto& pair : model.allowed_collision_pairs) {
+    if (pair.first.empty() || pair.second.empty() ||
+        pair.second <= pair.first) {
+      fail("resolved allowed-collision pair is not canonical");
+    }
+    const auto result = scene->setCollisions(pair.first, pair.second, false);
+    if (!result.has_value()) {
+      fail("could not apply resolved collision policy: " + result.error());
+    }
+  }
+  return scene;
+}
+
+void constrain_process(pid_t expected_parent) {
+  if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+    fail("PR_SET_PDEATHSIG failed: " + std::string(std::strerror(errno)));
+  }
+  if (::getppid() != expected_parent) {
+    fail("parent exited before worker containment was established");
+  }
+  if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    fail("PR_SET_NO_NEW_PRIVS failed: " + std::string(std::strerror(errno)));
+  }
+  rlimit core_limit{0U, 0U};
+  if (::setrlimit(RLIMIT_CORE, &core_limit) != 0) {
+    fail("could not disable worker core dumps");
+  }
+}
+
+[[nodiscard]] pid_t parse_parent_pid(int argc, char** argv) {
+  if (argc != 3 || std::string_view(argv[1]) != "--parent-pid") {
+    fail("usage: manyforge_roboplan_candidate_worker --parent-pid PID");
+  }
+  std::string_view text(argv[2]);
+  if (text.empty()) {
+    fail("parent PID is empty");
+  }
+  std::uint64_t value = 0U;
+  for (char character : text) {
+    if (character < '0' || character > '9') {
+      fail("parent PID is malformed");
+    }
+    const auto digit = static_cast<std::uint64_t>(character - '0');
+    if (value > (static_cast<std::uint64_t>(
+                     std::numeric_limits<pid_t>::max()) - digit) /
+                    10U) {
+      fail("parent PID is out of range");
+    }
+    value = value * 10U + digit;
+  }
+  if (value == 0U) {
+    fail("parent PID is zero");
+  }
+  return static_cast<pid_t>(value);
+}
+
+int run_worker(int descriptor) {
+  const auto initialize = receive_frame(descriptor);
+  if (initialize.type != MessageType::kInitialize) {
+    fail("first message is not initialization");
+  }
+  auto input = worker_protocol::decode_initialization(initialize.payload);
+  auto scene = make_scene(input.model);
+  RoboPlanCandidateComputer computer(scene, std::move(input.binding),
+                                     input.candidate_config);
+  send_frame(descriptor, MessageType::kReady, {});
+
+  for (;;) {
+    auto request = receive_frame(descriptor);
+    switch (request.type) {
+      case MessageType::kPlan: {
+        auto candidate =
+            worker_protocol::decode_candidate_request(request.payload);
+        auto result = computer.compute(candidate);
+        send_frame(descriptor, MessageType::kPlanResult,
+                   worker_protocol::encode_trajectory_result(result));
+        break;
+      }
+      case MessageType::kIk: {
+        auto candidate = worker_protocol::decode_ik_request(request.payload);
+        auto result = computer.solve_ik(
+            candidate.goal, candidate.base_frame, candidate.tcp_frame,
+            candidate.seed_state, candidate.timeout_s);
+        send_frame(descriptor, MessageType::kIkResult,
+                   worker_protocol::encode_ik_result(result));
+        break;
+      }
+      case MessageType::kShutdown:
+        if (!request.payload.empty()) {
+          fail("shutdown message has a payload");
+        }
+        return 0;
+      default:
+        fail("received a message invalid for initialized state");
+    }
+  }
+}
+
+}  // namespace
+}  // namespace manyforge::roboplan_backend
+
+int main(int argc, char** argv) {
+  using namespace manyforge::roboplan_backend;
+  const int descriptor = worker_protocol::kProtocolDescriptor;
+  try {
+    const auto parent = parse_parent_pid(argc, argv);
+    constrain_process(parent);
+    return run_worker(descriptor);
+  } catch (const std::exception& error) {
+    try {
+      send_frame(descriptor, worker_protocol::MessageType::kProtocolError,
+                 worker_protocol::encode_protocol_error(error.what()));
+    } catch (...) {
+    }
+    std::cerr << error.what() << '\n';
+    return 2;
+  }
+}

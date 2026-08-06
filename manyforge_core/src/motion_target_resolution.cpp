@@ -9,19 +9,20 @@
 
 namespace manyforge::core {
 
-Result<MotionSpecDTO> resolve_motion_target(
+Result<ResolvedMotionSpecDTO> resolve_motion_target(
     const ExecuteRequestDTO& request,
     const ProjectionLeaseBindingDTO& projection_binding,
     const RobotStateDTO* observed_start_state,
     const IReferencePoseResolver& reference_resolver) {
   const auto invalid_target_shape = [](std::string message,
                                        std::string reason) {
-    return Result<MotionSpecDTO>::Err(ErrorDTO{
+    return Result<ResolvedMotionSpecDTO>::Err(ErrorDTO{
         kErrorInvalidRequest, std::move(message),
         {{"reason", std::move(reason)}}});
   };
 
-  const auto* joint_goal = std::get_if<JointGoalDTO>(&request.motion);
+  const auto* joint_goal =
+      std::get_if<ResolvedJointGoalDTO>(&request.motion);
   if (joint_goal != nullptr) {
     if (joint_goal->joint_names.empty()) {
       return invalid_target_shape(
@@ -63,7 +64,7 @@ Result<MotionSpecDTO> resolve_motion_target(
           "Absolute motion must not carry target references",
           "absolute_target_has_reference");
     }
-    return Result<MotionSpecDTO>::Ok(request.motion);
+    return Result<ResolvedMotionSpecDTO>::Ok(request.motion);
   }
 
   if (joint_goal != nullptr) {
@@ -75,7 +76,7 @@ Result<MotionSpecDTO> resolve_motion_target(
           "relative_joint_has_reference");
     }
     if (observed_start_state == nullptr) {
-      return Result<MotionSpecDTO>::Err(ErrorDTO{
+      return Result<ResolvedMotionSpecDTO>::Err(ErrorDTO{
           kErrorStartStateMismatch,
           "Relative joint motion requires a fresh authority-selected start state",
           {{"reason", "relative_joint_start_state_unavailable"}}});
@@ -101,11 +102,11 @@ Result<MotionSpecDTO> resolve_motion_target(
       }
     }
 
-    JointGoalDTO resolved = *joint_goal;
+    ResolvedJointGoalDTO resolved = *joint_goal;
     for (std::size_t index = 0; index < resolved.joint_names.size(); ++index) {
       const auto start = start_by_name.find(resolved.joint_names[index]);
       if (start == start_by_name.end()) {
-        return Result<MotionSpecDTO>::Err(ErrorDTO{
+        return Result<ResolvedMotionSpecDTO>::Err(ErrorDTO{
             kErrorInvalidRequest,
             "Relative joint target names a joint absent from the start state",
             {{"reason", "relative_joint_unknown_joint"},
@@ -118,7 +119,8 @@ Result<MotionSpecDTO> resolve_motion_target(
             "relative_joint_result_not_finite");
       }
     }
-    return Result<MotionSpecDTO>::Ok(MotionSpecDTO{std::move(resolved)});
+    return Result<ResolvedMotionSpecDTO>::Ok(
+        ResolvedMotionSpecDTO{std::move(resolved)});
   }
 
   if (std::holds_alternative<NamedTargetDTO>(request.motion)) {
@@ -132,16 +134,18 @@ Result<MotionSpecDTO> resolve_motion_target(
   }
 
   auto target_pose = reference_resolver.resolve_reference_pose(
-      *request.target_reference, request.base_frame, projection_binding);
+      *request.target_reference,
+      compiled_frame_name(request.binding.base_frame), projection_binding);
   if (!target_pose.ok()) {
-    return Result<MotionSpecDTO>::Err(target_pose.error());
+    return Result<ResolvedMotionSpecDTO>::Err(target_pose.error());
   }
   Pose3DTO offset_basis_pose = target_pose.value();
   if (request.offset_reference.has_value()) {
     auto offset_reference_pose = reference_resolver.resolve_reference_pose(
-        *request.offset_reference, request.base_frame, projection_binding);
+        *request.offset_reference,
+        compiled_frame_name(request.binding.base_frame), projection_binding);
     if (!offset_reference_pose.ok()) {
-      return Result<MotionSpecDTO>::Err(offset_reference_pose.error());
+      return Result<ResolvedMotionSpecDTO>::Err(offset_reference_pose.error());
     }
     offset_basis_pose = offset_reference_pose.value();
   }
@@ -153,15 +157,16 @@ Result<MotionSpecDTO> resolve_motion_target(
   };
 
   if (const auto* pose_goal = std::get_if<PoseGoalDTO>(&request.motion)) {
-    return Result<MotionSpecDTO>::Ok(
-        MotionSpecDTO{PoseGoalDTO{resolve_offset(pose_goal->goal)}});
+    return Result<ResolvedMotionSpecDTO>::Ok(
+        ResolvedMotionSpecDTO{PoseGoalDTO{resolve_offset(pose_goal->goal)}});
   }
   if (const auto* path = std::get_if<CartesianPathDTO>(&request.motion)) {
     CartesianPathDTO resolved = *path;
     for (auto& waypoint : resolved.waypoints) {
       waypoint = resolve_offset(waypoint);
     }
-    return Result<MotionSpecDTO>::Ok(MotionSpecDTO{std::move(resolved)});
+    return Result<ResolvedMotionSpecDTO>::Ok(
+        ResolvedMotionSpecDTO{std::move(resolved)});
   }
   return invalid_target_shape(
       "Relative target mode is unsupported for this motion payload",

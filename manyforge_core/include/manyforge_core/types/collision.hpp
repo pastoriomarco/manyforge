@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/geometry.hpp>
 #include <manyforge_core/types/robot_state.hpp>
 
@@ -22,14 +23,13 @@ namespace manyforge::core {
 /// Stable, engine-independent collision body id (spec §3.8.1).
 ///
 /// Normative formats (one of):
-///   robot/<robot_id>/link/<link_name>/collision/<index>
-///   robot/<robot_id>/attached/<object_id>/shape/<index>
-///   object/<object_id>/shape/<index>
-///   fixture/<fixture_id>/shape/<index>
+///   component/<component>/model/<model>/body/<role>/collision/<index>
+///   scene/<scene_resource>/shape/<index>
+///   runtime_object/<runtime_object>/shape/<index>
 ///
 /// Ids MUST be stable across process restarts for the same artifacts.
-/// Ids MUST NOT depend on backend-native geometry object names. Multi-robot
-/// scenes MUST include <robot_id> even while only one robot is supported.
+/// Ids MUST NOT depend on backend-native geometry object or generated link
+/// names. Multi-component scenes carry exact component and model identity.
 using CollisionBodyId = std::string;
 
 /// Collision-world revision (spec §3.8.1).
@@ -52,14 +52,14 @@ struct CollisionWorldRevision {
 /// this to reconstruct the chain of changes that produced a given world
 /// state.
 enum class CollisionWorldMutationSource {
-  kProgramLoad,
+  kSceneInitialize,
   kSceneEdit,
-  kAttach,
-  kDetach,
+  kCarriedObjectAttach,
+  kCarriedObjectDetach,
+  kComponentAttachmentApply,
   kPoseSourceApply,
-  kDeploymentLoad,
+  kDeploymentApply,
   kPolicyUpdate,
-  kProjectionRebuild,
 };
 
 /// Bounded-ledger entry recording a single collision-world revision
@@ -71,28 +71,33 @@ enum class CollisionWorldMutationSource {
 struct CollisionWorldLedgerEntry {
   CollisionWorldRevision revision;
 
-  /// Revision id immediately before this entry. Zero for the program-load
-  /// entry that establishes the initial revision.
+  /// Revision id immediately before this entry. Zero for the scene-initialize
+  /// or deployment-apply entry that establishes the initial revision.
   std::uint64_t previous_revision_id = 0;
 
   CollisionWorldMutationSource mutation_source =
-      CollisionWorldMutationSource::kProgramLoad;
+      CollisionWorldMutationSource::kSceneInitialize;
 
   /// Body ids whose identity or presence in the collision world is changed
-  /// by this mutation. MAY be empty for program-load / deployment-reload
+  /// by this mutation. MAY be empty for scene-initialize / deployment-apply
   /// entries that affect the whole inventory.
   std::vector<std::string> affected_body_ids;
 
-  /// Wall-clock timestamp for forensic ordering. Steady-clock equivalents
-  /// MAY be used for tests with FakeClock.
-  std::int64_t timestamp_ns = 0;
+  /// Authoritative ordering within the collision-world publisher epoch.
+  std::uint64_t owner_sequence = 0;
 
-  /// Caller identifier, e.g. "scene_edit_route", "pose_source_apply",
-  /// "kernel_factory".
-  std::string authority_source;
+  /// Injected-clock observation timestamp. Ordering never falls back to this
+  /// value when owner_sequence is available.
+  std::int64_t observed_timestamp_ns = 0;
 
-  /// Operator session id when available.
-  std::optional<std::string> session_id;
+  /// Provenance stamped by the receiving transport adapter.
+  RequestAttributionDTO attribution;
+
+  /// Accepted request-context label, e.g. "scene_edit_route".
+  std::string source_label;
+
+  /// Optional cross-owner/request correlation token.
+  std::optional<std::string> correlation_id;
 };
 
 /// Canonical unordered pair of collision body ids (spec §3.8.1).
@@ -158,10 +163,9 @@ struct CollisionPairClearance {
 
 /// Logical owner of a collision body (spec §3.8.1).
 enum class CollisionOwnerKind {
-  kRobotLink,
-  kAttachedObject,
-  kDetachedObject,
-  kFixture,
+  kComponentModelBody,
+  kSceneResource,
+  kRuntimeObject,
 };
 
 /// Geometry kind for a collision body (spec §3.8.1).
@@ -178,7 +182,7 @@ enum class CollisionGeometryKind {
 /// Normalized descriptor for one geometry element (spec §3.8.1).
 struct CollisionGeometryDescriptor {
   CollisionBodyId body_id;
-  CollisionOwnerKind owner_kind = CollisionOwnerKind::kFixture;
+  CollisionOwnerKind owner_kind = CollisionOwnerKind::kSceneResource;
   CollisionGeometryKind geometry_kind = CollisionGeometryKind::kBox;
   Pose3DTO local_pose;
   /// Full box dimensions in meters. Required when `geometry_kind == kBox`.

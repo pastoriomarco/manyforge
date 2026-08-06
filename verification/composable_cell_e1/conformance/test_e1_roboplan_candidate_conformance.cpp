@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <manyforge_core/testing/planner_backend_conformance.hpp>
 
 #include <algorithm>
@@ -200,10 +201,14 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
                     "candidate adapter requires its exact retained projection"),
               {}};
     }
-    if (request.group_id != kGroup || request.base_frame != kBase ||
-        request.tcp_frame != kTip ||
+    const auto start = angular_position_projection(request.start_state);
+    if (request.model_group_binding.compiled_group_name != kGroup ||
+        compiled_frame_name(request.base_frame) != kBase ||
+        compiled_frame_name(request.tcp_frame) != kTip ||
+        request.model_group_binding.compiled_joint_names != kJointNames ||
         request.start_state.joint_names != kJointNames ||
-        request.start_state.positions_rad.size() != kJointNames.size()) {
+        request.start_state.resources != request.resources || !start.ok() ||
+        start.value().size() != kJointNames.size()) {
       return {std::nullopt,
               error(kErrorInvalidRequest, "planner_request_model_mismatch",
                     "portable request does not match the retained model"),
@@ -224,20 +229,21 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
 
     try {
       std::optional<roboplan::JointTrajectory> trajectory;
-      if (const auto* goal = std::get_if<JointGoalDTO>(&request.motion)) {
+      if (const auto* goal =
+              std::get_if<ResolvedJointGoalDTO>(&request.motion)) {
         if (goal->joint_names != kJointNames ||
+            goal->resources != request.resources ||
             goal->positions_rad.size() != kJointNames.size()) {
           return {std::nullopt,
                   error(kErrorInvalidRequest, "joint_goal_shape_invalid",
                         "joint goal does not match the canonical group"),
                   {}};
         }
-        trajectory = plan_joint(request.start_state.positions_rad,
-                                goal->positions_rad, request);
+        trajectory = plan_joint(start.value(), goal->positions_rad, request);
       } else if (const auto* goal =
                      std::get_if<PoseGoalDTO>(&request.motion)) {
         const auto joint_goal = solve_pose_goal(
-            goal->goal, request.start_state.positions_rad,
+            goal->goal, start.value(),
             request.planning_timeout_s);
         if (!joint_goal.has_value()) {
           return {std::nullopt,
@@ -245,8 +251,7 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
                         "RoboPlan could not resolve the portable pose goal"),
                   {}};
         }
-        trajectory = plan_joint(request.start_state.positions_rad,
-                                *joint_goal, request);
+        trajectory = plan_joint(start.value(), *joint_goal, request);
       } else if (const auto* path =
                      std::get_if<CartesianPathDTO>(&request.motion)) {
         trajectory = plan_cartesian(*path, request);
@@ -264,7 +269,7 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
                       "RoboPlan did not produce a candidate trajectory"),
                 {}};
       }
-      return {portable_trajectory(*trajectory), std::nullopt,
+      return {portable_trajectory(*trajectory, request.resources), std::nullopt,
               binding_.projection_revision};
     } catch (const std::exception& exception) {
       return {std::nullopt,
@@ -277,21 +282,24 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
   }
 
   IkResultDTO solve_ik(const IkRequestDTO& request) override {
-    if (request.base_frame != kBase || request.tcp_frame != kTip ||
+    const auto seed = angular_position_projection(request.seed_state);
+    if (compiled_frame_name(request.base_frame) != kBase ||
+        compiled_frame_name(request.tcp_frame) != kTip ||
+        request.resources != request.seed_state.resources ||
         request.seed_state.joint_names != kJointNames ||
-        request.seed_state.positions_rad.size() != kJointNames.size()) {
-      return {false, {}, {},
+        !seed.ok() || seed.value().size() != kJointNames.size()) {
+      return {false, {}, {}, {},
               error(kErrorInvalidRequest, "ik_request_model_mismatch",
                     "portable IK request does not match the retained model")};
     }
     const auto solution = solve_pose_goal(
-        request.goal_pose, request.seed_state.positions_rad, request.timeout_s);
+        request.goal_pose, seed.value(), request.timeout_s);
     if (!solution.has_value()) {
-      return {false, {}, {},
+      return {false, {}, {}, {},
               error(kErrorPlanningFailed, "ik_no_solution",
                     "RoboPlan did not produce an IK candidate")};
     }
-    return {true, kJointNames, *solution, std::nullopt};
+    return {true, request.resources, kJointNames, *solution, std::nullopt};
   }
 
  private:
@@ -383,8 +391,12 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
     options.velocity_scale = request.speed_profile.velocity_scale;
     options.acceleration_scale = request.speed_profile.acceleration_scale;
     roboplan::CartesianPathPlanner planner(scene_, options);
+    const auto start = angular_position_projection(request.start_state);
+    if (!start.ok()) {
+      return std::nullopt;
+    }
     const roboplan::JointConfiguration native_start{
-        kJointNames, eigen_vector(request.start_state.positions_rad), {}, {}};
+        kJointNames, eigen_vector(start.value()), {}, {}};
     const auto trajectory = planner.plan(native_path, native_start);
     if (!trajectory.has_value()) {
       return std::nullopt;
@@ -393,11 +405,13 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
   }
 
   static TrajectoryDTO portable_trajectory(
-      const roboplan::JointTrajectory& native) {
+      const roboplan::JointTrajectory& native,
+      const std::vector<ResourceId>& resources) {
     if (native.positions.size() != native.times.size()) {
       throw std::runtime_error("native trajectory shape mismatch");
     }
     TrajectoryDTO output;
+    output.resources = resources;
     output.joint_names = native.joint_names;
     output.waypoints.reserve(native.positions.size());
     for (std::size_t index = 0; index < native.positions.size(); ++index) {
@@ -421,13 +435,16 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
 
 PlanRequestDTO request_base(std::string move_id,
                             std::vector<double> start) {
-  PlanRequestDTO request;
-  request.robot_id = "canonical_robot";
-  request.group_id = kGroup;
-  request.move_id = std::move(move_id);
-  request.base_frame = kBase;
-  request.tcp_frame = kTip;
-  request.start_state = {kJointNames, std::move(start), {}};
+  auto request = make_test_plan_request(
+      std::move(move_id),
+      ResolvedJointGoalDTO{{}, kJointNames,
+                           std::vector<double>(kJointNames.size(), 0.0)},
+      kJointNames, std::move(start));
+  request.model_group_binding.compiled_group_name = kGroup;
+  std::get<ResolvedComponentModelFrameDTO>(request.base_frame)
+      .compiled_frame_name = kBase;
+  std::get<ResolvedComponentModelFrameDTO>(request.tcp_frame)
+      .compiled_frame_name = kTip;
   request.tolerances = {1e-6, 0.01, 0.05};
   request.speed_profile = {0.5, 0.5, std::nullopt};
   request.planning_timeout_s = 1.0;
@@ -444,7 +461,7 @@ PlannerBackendConformanceInput make_candidate_input(
       -0.4132159894019849, -2.76715775824764, 0.7740437209968403};
   auto joint = request_base("candidate_joint", joint_start);
   joint.projection_binding = adapter.binding();
-  joint.motion = JointGoalDTO{kJointNames, joint_goal};
+  joint.motion = ResolvedJointGoalDTO{joint.resources, kJointNames, joint_goal};
 
   const std::vector<double> pose_target{
       0.0, -1.0, 1.0, -1.5, -1.5, 0.0};
@@ -487,7 +504,7 @@ PlannerBackendConformanceInput make_candidate_input(
         adapter.forward_kinematics(request.robot_state));
   };
   auto invalid = joint;
-  invalid.move_id = "invalid_binding";
+  invalid.move_id = MoveId("invalid_binding");
   invalid.projection_binding.projection_revision.scene_revision.content_hash =
       ContentDigest{kDigestD};
   input.expected_failures.push_back(
@@ -496,9 +513,12 @@ PlannerBackendConformanceInput make_candidate_input(
   input.ik_case = PlannerIkConformanceCase{
       "single_shot_ik",
       IkRequestDTO{
+          pose.controllable_component_id, pose.command_target_id,
+          pose.model_bindings, pose.resources,
           adapter.forward_kinematics(
               RobotStateDTO{kJointNames, pose_target, {}}),
-          kBase, kTip, pose.start_state, 1.0}};
+          pose.base_frame, pose.tcp_frame, pose.start_state,
+          pose.projection_binding, 1.0}};
   input.max_waypoint_count = 65'536;
   input.max_plan_wall_time = std::chrono::seconds(5);
   return input;

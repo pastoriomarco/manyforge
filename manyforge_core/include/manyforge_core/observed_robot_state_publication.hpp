@@ -194,10 +194,16 @@ class ObservedRobotStatePublication final {
   /// If no such source exists, returns the highest-precedence published sample
   /// so callers can report the exact incomplete/stale reason fail-closed.
   [[nodiscard]] ReadView acquire(std::int64_t now_ns) const noexcept;
+  /// Select the highest-precedence published source without evaluating
+  /// freshness. This is the immutable latest-publication surface; admission
+  /// callers must use acquire(now_ns) instead.
+  [[nodiscard]] ReadView acquire_latest() const noexcept;
   /// NRT value-copy surface for bindings/diagnostics. RT consumers use
   /// acquire() so no allocation or mutable storage crosses the hot path.
   [[nodiscard]] std::optional<ObservedRobotStateSnapshotDTO> snapshot(
       std::int64_t now_ns) const;
+  [[nodiscard]] std::optional<ObservedRobotStateSnapshotDTO>
+  snapshot_latest() const;
 
   [[nodiscard]] std::span<const std::string> canonical_joint_names() const {
     return canonical_joint_names_;

@@ -1,0 +1,155 @@
+#pragma once
+
+#include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/command_schema.hpp>
+#include <manyforge_core/types/coordinate_state.hpp>
+#include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/observed_state.hpp>
+#include <manyforge_core/types/program_binding.hpp>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace manyforge::core {
+
+struct RuntimeUnitEpochBindingDTO final {
+  RuntimeUnitId runtime_unit_id;
+  RuntimeEpoch runtime_epoch;
+
+  friend bool operator==(const RuntimeUnitEpochBindingDTO&,
+                         const RuntimeUnitEpochBindingDTO&) = default;
+};
+
+struct RuntimeModelGroupBindingDTO final {
+  ModelGroupRoleId model_group_role_id;
+  ModelInstanceId model_instance_id;
+  std::string compiled_group_name;
+  /// Exact expanded SRDF membership retained by the Deployment Compiler.
+  /// This includes fixed joints and therefore is not a command-coordinate
+  /// vector. The ordered command projection lives in `resources`.
+  std::vector<std::string> expanded_compiled_joint_names;
+
+  friend bool operator==(const RuntimeModelGroupBindingDTO&,
+                         const RuntimeModelGroupBindingDTO&) = default;
+};
+
+struct RuntimeResourceBindingDTO final {
+  ResourceRoleId resource_role_id;
+  ResourceId resource_id;
+  /// Exact source-local URDF joint for model-backed coordinates. Absent for a
+  /// non-model resource. Never contains a generated/prefixed runtime name.
+  std::optional<std::string> source_joint_name;
+  std::string compiled_resource_name;
+  CoordinateKind coordinate_kind{CoordinateKind::kAngular};
+
+  friend bool operator==(const RuntimeResourceBindingDTO&,
+                         const RuntimeResourceBindingDTO&) = default;
+};
+
+struct RuntimeControlPathDTO final {
+  ControlDomainId control_domain_id;
+  ControlDomainRevision control_domain_revision;
+  ControlBindingId control_binding_id;
+  ControlBindingRevision control_binding_revision;
+  ControlInterfaceContractId control_interface_contract_id;
+  ControlInterfaceRevision control_interface_revision;
+  ControllerTopologyId controller_topology_id;
+  TopologyRevision topology_revision;
+  ControlRouteId control_route_id;
+  ActivationSetId activation_set_id;
+  ActiveControlConfigurationId active_control_configuration_id;
+  ActiveControlConfigurationGeneration active_control_configuration_generation;
+  ProviderInstanceId provider_instance_id;
+  ProviderManifestId provider_manifest_id;
+  ProviderManifestRevision provider_manifest_revision;
+  RuntimeEpoch provider_runtime_epoch;
+  StateAuthorityId state_authority_id;
+  StateAuthorityClass state_authority_class{StateAuthorityClass::kMeasured};
+  StopEvidencePolicyId stop_evidence_policy_id;
+  StopEvidencePolicyRevision stop_evidence_policy_revision;
+  ContainmentGranularity containment_granularity{ContainmentGranularity::kResource};
+
+  friend bool operator==(const RuntimeControlPathDTO&, const RuntimeControlPathDTO&) = default;
+};
+
+struct RuntimeCapabilityProviderPathDTO final {
+  CapabilityId capability_id;
+  CapabilityDefinitionRevision capability_definition_revision;
+  CapabilityProviderBindingId capability_provider_binding_id;
+  CapabilityProviderBindingRevision capability_provider_binding_revision;
+  ProviderInstanceId provider_instance_id;
+  ProviderManifestId provider_manifest_id;
+  ProviderManifestRevision provider_manifest_revision;
+  RuntimeEpoch provider_runtime_epoch;
+
+  friend bool operator==(const RuntimeCapabilityProviderPathDTO&,
+                         const RuntimeCapabilityProviderPathDTO&) = default;
+};
+
+/// Complete owner-to-owner value before sealing. Public operation callers
+/// never construct or submit this record.
+struct RuntimeParticipantBindingDTO final {
+  ProgramId program_id;
+  ProgramRevision program_revision;
+  ProgramBindingId program_binding_id;
+  RetainedBundleId retained_bundle_id;
+  GraphRevision graph_revision;
+  ComponentRoleId component_role_id;
+  TargetRoleId target_role_id;
+  ControllableComponentId controllable_component_id;
+  ComponentTypeId component_type_id;
+  ComponentTypeRevision component_type_revision;
+  CommandTargetId command_target_id;
+  CapabilityId capability_id;
+  CapabilityDefinitionRevision capability_definition_revision;
+  std::optional<ProgramCommandSchemaRefDTO> command_schema;
+  std::vector<ProgramModelRoleBindingDTO> model_bindings;
+  std::vector<RuntimeModelGroupBindingDTO> model_groups;
+  std::vector<ProgramFrameRoleBindingDTO> frame_bindings;
+  std::vector<RuntimeResourceBindingDTO> resources;
+  std::vector<ProgramCollisionBodyRoleBindingDTO> collision_body_bindings;
+  std::optional<RuntimeControlPathDTO> control_path;
+  std::optional<RuntimeCapabilityProviderPathDTO> capability_provider_path;
+  /// Additional exact capability providers required to realize the selected
+  /// participant payload. For motion, the selected execution capability has
+  /// a control path while the motion-kind-specific planner is a separately
+  /// bound provider. Public callers cannot add or select these paths.
+  std::vector<RuntimeCapabilityProviderPathDTO> supporting_capability_provider_paths;
+  std::vector<RuntimeUnitEpochBindingDTO> runtime_unit_epochs;
+
+  friend bool operator==(const RuntimeParticipantBindingDTO&,
+                         const RuntimeParticipantBindingDTO&) = default;
+};
+
+/// Sealed participant binding consumed by the resource-addressed Kernel.
+class RuntimeParticipantBinding final {
+ public:
+  RuntimeParticipantBinding(const RuntimeParticipantBinding&) = default;
+  RuntimeParticipantBinding& operator=(const RuntimeParticipantBinding&) = default;
+  RuntimeParticipantBinding(RuntimeParticipantBinding&&) noexcept = default;
+  RuntimeParticipantBinding& operator=(RuntimeParticipantBinding&&) noexcept = default;
+
+  [[nodiscard]] const RuntimeParticipantBindingDTO& value() const noexcept { return value_; }
+
+ private:
+  explicit RuntimeParticipantBinding(RuntimeParticipantBindingDTO value)
+      : value_(std::move(value)) {}
+
+  RuntimeParticipantBindingDTO value_;
+
+  friend Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
+      RuntimeParticipantBindingDTO);
+};
+
+/// Validate ordering, uniqueness, scope agreement, and complete active facts,
+/// then seal one owner-produced runtime participant.
+[[nodiscard]] Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
+    RuntimeParticipantBindingDTO value);
+
+/// Derive the exact observed-state query coordinates from one sealed runtime
+/// participant. Freshness is an active runtime policy and is supplied
+/// separately; every identity and ordered unit comes only from the binding.
+[[nodiscard]] Result<ObservedStateQueryContextDTO> make_observed_state_query_context(
+    const RuntimeParticipantBinding& binding, std::int64_t freshness_budget_ns);
+
+}  // namespace manyforge::core

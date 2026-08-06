@@ -2165,6 +2165,11 @@ void register_model_compiler_bindings(py::module_& module) {
             return immutable_snapshot(value.capability_definitions());
           })
       .def_property_readonly(
+          "command_schemas",
+          [](const deployment::ApplicabilityQualifiedCellIr& value) {
+            return immutable_snapshot(value.command_schemas());
+          })
+      .def_property_readonly(
           "composition",
           [](const deployment::ApplicabilityQualifiedCellIr& value) {
             return value.composition();
@@ -2341,6 +2346,7 @@ void register_model_compiler_bindings(py::module_& module) {
          const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
              deployment_inputs,
          const py::iterable& runtime_profiles,
+         const py::iterable& command_schemas,
          const py::iterable& capability_definitions,
          const py::iterable& control_interface_contracts,
          const py::iterable& controller_topologies,
@@ -2353,6 +2359,11 @@ void register_model_compiler_bindings(py::module_& module) {
                 deployment::QualifiedRuntimeProfile>(
                 runtime_profiles, "runtime_profiles",
                 "QualifiedRuntimeProfile");
+        auto bounded_command_schemas =
+            bounded_qualified_closure_from_python<
+                deployment::QualifiedCommandSchema>(
+                command_schemas, "command_schemas",
+                "QualifiedCommandSchema");
         auto bounded_capability_definitions =
             bounded_qualified_closure_from_python<
                 deployment::QualifiedCapabilityDefinition>(
@@ -2384,6 +2395,8 @@ void register_model_compiler_bindings(py::module_& module) {
             composition, deployment_inputs,
             std::span<const deployment::QualifiedRuntimeProfile>{
                 bounded_runtime_profiles},
+            std::span<const deployment::QualifiedCommandSchema>{
+                bounded_command_schemas},
             std::span<const deployment::QualifiedCapabilityDefinition>{
                 bounded_capability_definitions},
             std::span<const deployment::QualifiedControlInterfaceContract>{
@@ -2397,7 +2410,8 @@ void register_model_compiler_bindings(py::module_& module) {
             selected_site_overlay);
       },
       py::arg("composition"), py::arg("deployment_inputs"),
-      py::arg("runtime_profiles"), py::arg("capability_definitions"),
+      py::arg("runtime_profiles"), py::arg("command_schemas"),
+      py::arg("capability_definitions"),
       py::arg("control_interface_contracts"),
       py::arg("controller_topologies"), py::arg("provider_manifests"),
       py::arg("stop_evidence_policies"),

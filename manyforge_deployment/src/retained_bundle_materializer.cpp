@@ -23,6 +23,7 @@
 #include "deployment_catalog_codec_internal.hpp"
 #include "manyforge_deployment/capability_definition_codec.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
+#include "manyforge_deployment/command_schema_codec.hpp"
 #include "manyforge_deployment/component_type_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/control_interface_contract_codec.hpp"
@@ -676,21 +677,21 @@ void require_qualified_structural_subset_before_store(
                               graph.controllable_components.empty() &&
       graph.control_domains.empty() && graph.control_bindings.empty() &&
       inputs.desired_control_configurations.empty();
-  const bool one_component_control_subset =
-      graph.runtime_units.empty() && graph.model_instances.size() == 1U &&
-      graph.controllable_components.size() == 1U &&
-      graph.control_domains.size() == 1U &&
-      graph.control_bindings.size() == 1U &&
-      inputs.desired_control_configurations.size() == 1U;
+  const bool native_control_subset =
+      graph.runtime_units.empty() && !graph.model_instances.empty() &&
+      !graph.controllable_components.empty() &&
+      !graph.control_domains.empty() && !graph.control_bindings.empty() &&
+      inputs.desired_control_configurations.size() ==
+          graph.control_domains.size();
   const bool reference_runtime_subset =
       graph.runtime_units.size() == 1U && graph.model_instances.empty() &&
       graph.controllable_components.empty() && graph.control_domains.empty() &&
       graph.control_bindings.empty() && inputs.desired_control_configurations.empty();
-  if (!passive_subset && !one_component_control_subset &&
+  if (!passive_subset && !native_control_subset &&
       !reference_runtime_subset) {
     detail::fail_retained_bundle(
-        "retention accepts passive models, exactly one bounded controllable "
-        "component, or the exact reference runtime unit");
+        "retention accepts passive models, a bounded native controllable "
+        "cell, or the exact reference runtime unit");
   }
 
   if (passive_subset) {
@@ -716,73 +717,70 @@ void require_qualified_structural_subset_before_store(
           "passive structural retention contains component/control "
           "semantics or an unplaced model");
     }
-  } else if (one_component_control_subset) {
-    const auto& model = graph.model_instances.front();
-    const auto& component = graph.controllable_components.front();
-    const auto& domain = graph.control_domains.front();
-    const auto& binding = graph.control_bindings.front();
-    const auto& desired = inputs.desired_control_configurations.front();
-    const std::size_t controller_count = applicability.controllers().size();
-    if (composition.component_types().size() != 1U ||
-        composition.control_binding_coordinate_maps().size() != 1U ||
-        composition.targets().size() != 1U) {
+  } else if (native_control_subset) {
+    const bool has_runtime_owned_component = std::any_of(
+        graph.controllable_components.begin(),
+        graph.controllable_components.end(),
+        [](const core::ControllableComponentDTO& component) {
+          return !component.runtime_unit_ids.empty();
+        });
+    const bool has_runtime_owned_domain = std::any_of(
+        graph.control_domains.begin(), graph.control_domains.end(),
+        [](const core::ControlDomainDTO& domain) {
+          return !domain.runtime_unit_ids.empty();
+        });
+    if (has_runtime_owned_component || has_runtime_owned_domain ||
+        composition.component_types().empty() ||
+        composition.control_binding_coordinate_maps().size() !=
+            graph.control_bindings.size() ||
+        composition.targets().empty() ||
+        applicability.binding_interfaces().size() !=
+            graph.control_bindings.size() ||
+        applicability.controllers().empty() || applicability.routes().empty() ||
+        applicability.capabilities().empty() ||
+        applicability.stop_applicability().size() !=
+            applicability.routes().size()) {
       detail::fail_retained_bundle(
-          "one-component structural control retention requires one exact "
-          "component type, target map, and binding coordinate map");
+          "native controllable retention is outside its bounded qualified "
+          "component/target/domain subset");
     }
-    const auto& coordinate_map =
-        composition.control_binding_coordinate_maps().front();
-    const auto& target = composition.targets().front();
-    if (model.root_pose_in_cell.has_value() ||
-        !component.root_pose_in_cell.has_value() ||
-        component.model_role_bindings.size() != 1U ||
-        component.model_role_bindings.front().model_instance_id !=
-            model.model_instance_id ||
-        !component.runtime_unit_ids.empty() ||
-        !domain.runtime_unit_ids.empty() ||
-        binding.resource_bindings.empty() ||
-        binding.legal_control_route_ids.size() != 1U ||
-        binding.route_endpoint_projections.size() != 1U ||
-        binding.controllable_component_id !=
-            component.controllable_component_id ||
-        binding.control_domain_id != domain.control_domain_id ||
-        binding.controller_topology_id != domain.controller_topology_id ||
-        binding.topology_revision != domain.topology_revision ||
-        desired.control_domain_id != domain.control_domain_id ||
-        desired.control_domain_revision != domain.control_domain_revision ||
-        desired.controller_topology_id != domain.controller_topology_id ||
-        desired.topology_revision != domain.topology_revision ||
-        desired.binding_routes.size() != 1U ||
-        desired.binding_routes.front().control_binding_id !=
-            binding.control_binding_id ||
-        desired.binding_routes.front().control_binding_revision !=
-            binding.control_binding_revision ||
-        desired.binding_routes.front().control_route_id !=
-            binding.legal_control_route_ids.front() ||
-        coordinate_map.control_binding_id != binding.control_binding_id ||
-        coordinate_map.controllable_component_id !=
-            component.controllable_component_id ||
-        coordinate_map.command_target_id != binding.command_target_id ||
-        coordinate_map.resources.size() !=
-            binding.resource_bindings.size() ||
-        target.controllable_component_id !=
-            component.controllable_component_id ||
-        target.command_target_id != binding.command_target_id ||
-        applicability.capability_definitions().size() != 1U ||
-        applicability.control_interface_contracts().size() != 1U ||
-        applicability.controller_topologies().size() != 1U ||
-        applicability.provider_manifests().size() != 1U ||
-        applicability.stop_evidence_policies().size() != 1U ||
-        applicability.binding_interfaces().size() != 1U ||
-        (controller_count != 1U && controller_count != 2U) ||
-        applicability.routes().size() != 1U ||
-        applicability.capabilities().size() != 1U ||
-        applicability.stop_applicability().size() != 1U ||
-        !std::holds_alternative<LogicalNotStoppableApplicabilityTemplate>(
-            applicability.stop_applicability().front())) {
-      detail::fail_retained_bundle(
-          "one-component structural control retention is outside its exact "
-          "qualified target/binding subset");
+
+    for (const auto& binding : graph.control_bindings) {
+      const auto coordinate_maps = std::count_if(
+          composition.control_binding_coordinate_maps().begin(),
+          composition.control_binding_coordinate_maps().end(),
+          [&binding](const CompositionControlBindingCoordinateMap& map) {
+            return map.control_binding_id == binding.control_binding_id &&
+                   map.controllable_component_id ==
+                       binding.controllable_component_id &&
+                   map.command_target_id == binding.command_target_id &&
+                   map.resources.size() == binding.resource_bindings.size();
+          });
+      const auto targets = std::count_if(
+          composition.targets().begin(), composition.targets().end(),
+          [&binding](const CompositionTargetResolution& target) {
+            return target.controllable_component_id ==
+                       binding.controllable_component_id &&
+                   target.command_target_id == binding.command_target_id;
+          });
+      const auto interface_templates = std::count_if(
+          applicability.binding_interfaces().begin(),
+          applicability.binding_interfaces().end(),
+          [&binding](const LogicalBindingInterfaceTemplate& value) {
+            return value.control_binding_id == binding.control_binding_id &&
+                   value.control_binding_revision ==
+                       binding.control_binding_revision;
+          });
+      if (binding.resource_bindings.empty() ||
+          binding.legal_control_route_ids.empty() ||
+          binding.route_endpoint_projections.size() !=
+              binding.legal_control_route_ids.size() ||
+          coordinate_maps != 1 || targets != 1 || interface_templates != 1) {
+        detail::fail_retained_bundle(
+            "native controllable retention lacks one exact qualified "
+            "coordinate, target, interface, or route projection for a "
+            "control binding");
+      }
     }
   } else {
     const auto& unit = graph.runtime_units.front();
@@ -1041,6 +1039,17 @@ prepare_planning_collision_product_before_store(
                 qualified.compiler_ir().applicability()
                     .capability_definitions(),
                 "capability definition");
+          } else if constexpr (std::is_same_v<
+                                   Record,
+                                   core::CommandSchemaCatalogRecordRefDTO>) {
+            const auto requalified = resolve_and_qualify_command_schema(
+                typed_reference,
+                typed_reference.content_addressed_store_key,
+                catalog_bytes);
+            require_exact_requalified_catalog_record(
+                requalified,
+                qualified.compiler_ir().applicability().command_schemas(),
+                "command schema");
           } else if constexpr (std::is_same_v<
                                    Record,
                                    core::ComponentTypeCatalogRecordRefDTO>) {

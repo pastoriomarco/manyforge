@@ -1,11 +1,11 @@
 #pragma once
 
-#include <string>
+#include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <optional>
+#include <string>
 #include <variant>
 #include <vector>
-
-#include <manyforge_core/types/geometry.hpp>
 
 namespace manyforge::core {
 
@@ -25,18 +25,33 @@ enum class PlanningProfileDTO {
 
 /// Joint goal for motion planning (spec §4.1)
 struct JointGoalDTO {
+  /// Exact source-local URDF joint names, scoped by the enclosing target role.
+  /// These are authoring semantics, not generated runtime names.
   std::vector<std::string> joint_names;
   std::vector<double> positions_rad;
+  friend bool operator==(const JointGoalDTO&, const JointGoalDTO&) = default;
+};
+
+/// Kernel-produced joint goal for a resolved planner participant. Generated
+/// names are adapter-private and can only appear after exact Program-Binding
+/// resolution.
+struct ResolvedJointGoalDTO {
+  std::vector<ResourceId> resources;
+  std::vector<std::string> joint_names;
+  std::vector<double> positions_rad;
+  friend bool operator==(const ResolvedJointGoalDTO&, const ResolvedJointGoalDTO&) = default;
 };
 
 /// Pose goal for motion planning (spec §4.2)
 struct PoseGoalDTO {
   Pose3DTO goal;  // expressed in base_frame
+  friend bool operator==(const PoseGoalDTO&, const PoseGoalDTO&) = default;
 };
 
 /// Named target reference (spec §4.3)
 struct NamedTargetDTO {
   std::string name;
+  friend bool operator==(const NamedTargetDTO&, const NamedTargetDTO&) = default;
 };
 
 /// Reference to a frame, object, robot link, or inline pose (spec §4.4)
@@ -50,6 +65,7 @@ struct ReferenceDTO {
   Type type;
   std::string id;
   std::optional<Pose3DTO> pose;
+  friend bool operator==(const ReferenceDTO&, const ReferenceDTO&) = default;
 };
 
 /// Cartesian path goal (spec §4.5)
@@ -76,12 +92,17 @@ struct CartesianPathDTO {
   double max_angular_speed_rad_s = 0.5;
   double max_linear_acceleration_mps2 = 0.5;
   double max_angular_acceleration_rad_s2 = 2.5;
-  CartesianFallbackPolicyDTO fallback_policy =
-      CartesianFallbackPolicyDTO::kFailClosed;
+  CartesianFallbackPolicyDTO fallback_policy = CartesianFallbackPolicyDTO::kFailClosed;
+  friend bool operator==(const CartesianPathDTO&, const CartesianPathDTO&) = default;
 };
 
 /// Motion specification as a tagged union (spec §4)
-using MotionSpecDTO =
-    std::variant<JointGoalDTO, PoseGoalDTO, NamedTargetDTO, CartesianPathDTO>;
+using MotionSpecDTO = std::variant<JointGoalDTO, PoseGoalDTO, NamedTargetDTO, CartesianPathDTO>;
+
+/// Internal absolute/resolution-bound motion consumed by planning. Named
+/// targets remain in this transitional union until the I6 program-target map
+/// is connected; the addressed boundary never copies an unresolved name.
+using ResolvedMotionSpecDTO =
+    std::variant<ResolvedJointGoalDTO, PoseGoalDTO, NamedTargetDTO, CartesianPathDTO>;
 
 }  // namespace manyforge::core

@@ -137,7 +137,7 @@ static_assert(!std::is_constructible_v<
       deployment.applicability_inputs().value().external_resources, nullptr);
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
-      {}, selected_overlay);
+      {}, {}, selected_overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
 }
@@ -918,8 +918,90 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(string_member(targets.front(), "command_target_id"),
             test::kLite6ArmTargetId);
   EXPECT_EQ(array_member(targets.front(), "model_groups").size(), 1U);
-  EXPECT_EQ(array_member(targets.front(), "frames").size(), 1U);
+  const auto& frames = array_member(targets.front(), "frames");
+  ASSERT_EQ(frames.size(), 2U);
+  EXPECT_EQ(string_member(frames[0], "frame_role_id"), "base");
+  EXPECT_EQ(string_member(frames[1], "frame_role_id"), "tcp");
   EXPECT_EQ(array_member(targets.front(), "collision_bodies").size(), 1U);
+}
+
+TEST(RetainedBundleMaterializer,
+     TwoSameTypeComponentsRetainDistinctTargetsResourcesAndDomains) {
+  const auto fixture =
+      test::make_two_lite6_same_type_controllable_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  ASSERT_EQ(bundle->value().cell_graph.controllable_components.size(), 2U);
+  ASSERT_EQ(bundle->value().cell_graph.control_domains.size(), 2U);
+  ASSERT_EQ(bundle->value().cell_graph.control_bindings.size(), 2U);
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 7U);
+  EXPECT_EQ(catalog_store.size(), 7U);
+  EXPECT_EQ(bundle->value().compiled_products.control_domain_products.size(),
+            2U);
+
+  const auto& components = bundle->value().cell_graph.controllable_components;
+  EXPECT_NE(components[0].controllable_component_id,
+            components[1].controllable_component_id);
+  EXPECT_EQ(components[0].component_type_id, components[1].component_type_id);
+  EXPECT_EQ(components[0].component_type_revision,
+            components[1].component_type_revision);
+
+  std::set<std::string> domain_ids;
+  for (const auto& group :
+       bundle->value().compiled_products.control_domain_products) {
+    EXPECT_TRUE(domain_ids.insert(group.control_domain_id.value()).second);
+    ASSERT_EQ(group.products.size(), 1U);
+    const std::string control_bytes = require_product_artifact_bytes(
+        group.products.front(), detail::kControlDomainControlArtifactRole,
+        raw_store);
+    EXPECT_NO_THROW(detail::require_control_domain_control_matches(
+        control_bytes, fixture.qualified.compiler_ir(),
+        group.control_domain_id));
+    const CanonicalValue control =
+        detail::parse_and_verify_control_domain_control(control_bytes);
+    ASSERT_EQ(array_member(control, "bindings").size(), 1U);
+  }
+
+  ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
+  const std::string symbol_map = require_product_artifact_bytes(
+      bundle->value().compiled_products.symbol_role_maps.front(),
+      detail::kComposedModelSymbolRoleMapArtifactRole, raw_store);
+  const CanonicalValue parsed =
+      detail::parse_and_verify_composed_model_symbol_role_map(symbol_map);
+  const auto& binding_maps =
+      array_member(parsed, "control_binding_coordinate_maps");
+  const auto& targets = array_member(parsed, "target_role_maps");
+  ASSERT_EQ(binding_maps.size(), 2U);
+  ASSERT_EQ(targets.size(), 2U);
+
+  std::set<std::string> binding_ids;
+  std::set<std::string> component_ids;
+  std::set<std::string> resource_ids;
+  for (const auto& map : binding_maps) {
+    EXPECT_TRUE(
+        binding_ids.insert(string_member(map, "control_binding_id")).second);
+    EXPECT_TRUE(component_ids
+                    .insert(string_member(map, "controllable_component_id"))
+                    .second);
+    EXPECT_EQ(string_member(map, "command_target_id"),
+              test::kLite6ArmTargetId);
+    for (const auto& resource : array_member(map, "resources")) {
+      EXPECT_TRUE(resource_ids
+                      .insert(string_member(resource, "resource_id"))
+                      .second);
+    }
+  }
+  EXPECT_EQ(resource_ids.size(), 12U);
 }
 
 TEST(RetainedBundleMaterializer,

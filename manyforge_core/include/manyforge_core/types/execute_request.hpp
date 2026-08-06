@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <manyforge_core/types/tolerances.hpp>
@@ -12,21 +13,69 @@
 #include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/plan_request.hpp>
 
 namespace manyforge::core {
 
+/// Exact binding evidence passed from the resource-addressed owner to its
+/// private motion engine. The subordinate engine may use generated names only
+/// through this owner-produced value; it cannot select a robot or group.
+struct ResolvedExecutionBindingDTO final {
+  OperationId operation_id;
+  OperationParticipantId participant_id;
+  ProgramId program_id;
+  ProgramRevision program_revision;
+  ProgramBindingId program_binding_id;
+  ProgramRunId program_run_id;
+  ControllableComponentId controllable_component_id;
+  ComponentTypeId component_type_id;
+  ComponentTypeRevision component_type_revision;
+  CommandTargetId command_target_id;
+  CapabilityId capability_id;
+  CapabilityDefinitionRevision capability_definition_revision;
+  PlannerCapabilityBindingDTO planner_capability_binding;
+  std::vector<PlannerModelBindingDTO> model_bindings;
+  PlannerModelGroupBindingDTO model_group_binding;
+  ControlDomainId control_domain_id;
+  ControlDomainRevision control_domain_revision;
+  ControlBindingId control_binding_id;
+  ControlBindingRevision control_binding_revision;
+  ControlInterfaceContractId control_interface_contract_id;
+  ControlInterfaceRevision control_interface_revision;
+  ControllerTopologyId controller_topology_id;
+  TopologyRevision topology_revision;
+  ControlRouteId control_route_id;
+  ActivationSetId activation_set_id;
+  ActiveControlConfigurationId active_control_configuration_id;
+  ActiveControlConfigurationGeneration active_control_configuration_generation;
+  ProviderInstanceId provider_instance_id;
+  ProviderManifestId provider_manifest_id;
+  ProviderManifestRevision provider_manifest_revision;
+  RuntimeEpoch provider_runtime_epoch;
+  std::vector<PlannerRuntimeUnitBindingDTO> runtime_unit_bindings;
+  std::vector<ResourceId> resources;
+  ResolvedFrameDTO base_frame;
+  ResolvedFrameDTO tcp_frame;
+  std::vector<ComponentAttachmentRevision> component_attachment_revisions;
+  std::vector<CarriedObjectAttachmentRevision>
+      carried_object_attachment_revisions;
+
+  friend bool operator==(const ResolvedExecutionBindingDTO&,
+                         const ResolvedExecutionBindingDTO&) = default;
+};
+
 /// Execute request - kernel input (spec §3.10)
 struct ExecuteRequestDTO {
-  std::string robot_id;
-  std::string group_id;
+  explicit ExecuteRequestDTO(ResolvedExecutionBindingDTO exact_binding)
+      : binding(std::move(exact_binding)) {}
+
+  ResolvedExecutionBindingDTO binding;
   std::string move_id;
-  std::string base_frame;
-  std::string tcp_frame;
   TolerancesDTO tolerances;
   SpeedProfileDTO speed_profile;
   TimeoutsDTO timeouts;
   CacheMode cache_mode;
-  MotionSpecDTO motion;
+  ResolvedMotionSpecDTO motion;
   PlanningProfileDTO planning_profile = PlanningProfileDTO::kFirstFeasible;
   MotionTargetModeDTO target_mode = MotionTargetModeDTO::kAbsolute;
   /// Required for relative pose/Cartesian targets; forbidden for joint and
@@ -45,13 +94,7 @@ struct ExecuteRequestDTO {
   /// Per-joint absolute dynamics caps (Phase 4-P5.1K). Empty preserves prior
   /// behavior. Resolved against model/backend/controller limits and enforced in
   /// time-parameterization; copied into the PlanRequestDTO by the kernel.
-  PerJointDynamicsLimitsDTO per_joint_dynamics_limits;
-  /// Program-run correlation id (spec/500 §2.2): minted once by the
-  /// orchestrator runner at program start, optional at the kernel boundary
-  /// (empty = absent). When non-empty the kernel stamps it into the details
-  /// of every kernel event emitted for this execution so durable history
-  /// can be joined across Composer -> kernel -> backend.
-  std::string program_run_id;
+  PerResourceDynamicsLimitsDTO per_resource_dynamics_limits;
   /// Causal action-span envelope for this motion request (spec/210 §3.1.1).
   /// Empty means the caller has no span context; the kernel does not mint
   /// behavior-node attempts.

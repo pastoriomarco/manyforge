@@ -35,6 +35,8 @@ endif()
 
 # Core library
 add_library(manyforge_core
+  src/addressed_observed_state_publication.cpp
+  src/coordinate_state.cpp
   src/state_machine.cpp
   src/terminal_committer.cpp
   src/error_code_mapping.cpp
@@ -53,12 +55,17 @@ add_library(manyforge_core
   src/motion_trip_stop_coordinator.cpp
   src/motion_target_resolution.cpp
   src/operator_stop_worker.cpp
+  src/operation_intent.cpp
   src/observed_robot_state_publication.cpp
   src/execution_progress_publication.cpp
   src/trajectory_progress_projection.cpp
   src/observed_robot_state_provider.cpp
   src/pose_math.cpp
+  src/resource_addressed_execution_kernel.cpp
+  src/resource_slot_table.cpp
   src/runtime_collision_monitor.cpp
+  src/runtime_participant_binding.cpp
+  src/runtime_participant_registry.cpp
   src/runtime_collision_query_session.cpp
   src/runtime_collision_lookahead_session.cpp
   src/scene_snapshot_lease.cpp
@@ -95,6 +102,7 @@ if(BUILD_TESTING)
   enable_testing()
   find_package(GTest REQUIRED)
   include(GoogleTest)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/test_support/include)
   set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
       "Per-test timeout for manyforge_core gtest cases")
 
@@ -132,6 +140,55 @@ if(BUILD_TESTING)
   target_link_libraries(test_composable_cell_contracts PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_composable_cell_contracts
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_coordinate_state
+    test/test_coordinate_state.cpp)
+  target_link_libraries(test_coordinate_state PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_coordinate_state
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_addressed_observed_state_publication
+    test/test_addressed_observed_state_publication.cpp)
+  target_link_libraries(test_addressed_observed_state_publication PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_addressed_observed_state_publication
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_operation_intent
+    test/test_operation_intent.cpp)
+  target_link_libraries(test_operation_intent PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_operation_intent
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_resource_slot_table
+    test/test_resource_slot_table.cpp)
+  target_link_libraries(test_resource_slot_table PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_resource_slot_table
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_resource_addressed_execution_kernel
+    test/test_resource_addressed_execution_kernel.cpp)
+  target_link_libraries(test_resource_addressed_execution_kernel PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_resource_addressed_execution_kernel
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_runtime_participant_binding
+    test/test_runtime_participant_binding.cpp)
+  target_link_libraries(test_runtime_participant_binding PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_runtime_participant_binding
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_runtime_participant_registry
+    test/test_runtime_participant_registry.cpp)
+  target_link_libraries(test_runtime_participant_registry PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_runtime_participant_registry
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_component_manager_ports

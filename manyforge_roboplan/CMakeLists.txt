@@ -12,6 +12,32 @@ find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 option(BUILD_TESTING "Build unit tests" ON)
 
+# I6 restores the selected native planning dependency as an ordinary product
+# target. Discover cmeel's prefix before resolving Pinocchio/RoboPlan so the
+# same pinned installation is used in test and non-test builds.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}" -c
+          "import site, pathlib; print(';'.join(str(pathlib.Path(p) / 'cmeel.prefix') for p in site.getsitepackages()))"
+  OUTPUT_VARIABLE _CMEEL_PREFIXES
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+foreach(_prefix ${_CMEEL_PREFIXES})
+  if(EXISTS "${_prefix}/include/boost/version.hpp")
+    set(BOOST_ROOT "${_prefix}")
+    set(BOOST_INCLUDEDIR "${_prefix}/include")
+    set(BOOST_LIBRARYDIR "${_prefix}/lib")
+    break()
+  endif()
+endforeach()
+set(COAL_DISABLE_HPP_FCL_WARNINGS ON)
+find_package(Eigen3 REQUIRED)
+find_package(pinocchio REQUIRED)
+find_package(roboplan REQUIRED)
+find_package(roboplan_rrt REQUIRED)
+find_package(roboplan_simple_ik REQUIRED)
+find_package(roboplan_toppra REQUIRED)
+find_package(roboplan_cartesian_planning REQUIRED)
+
 get_filename_component(
   _MANYFORGE_REPOSITORY_SOURCE_ROOT
   "${CMAKE_CURRENT_SOURCE_DIR}/.."
@@ -35,6 +61,23 @@ if(NOT TARGET manyforge_core)
   unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
 endif()
 
+# The I6 native projection boundary consumes the ManyForge-owned collision
+# model directly. Build it without its package-local integration suite here;
+# cumulative collision qualification remains owned by the dedicated collision
+# image/lane.
+if(NOT TARGET manyforge_collision)
+  set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
+  cmake_policy(PUSH)
+  cmake_policy(SET CMP0077 NEW)
+  set(BUILD_TESTING OFF)
+  add_subdirectory(
+    "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_collision"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_collision")
+  cmake_policy(POP)
+  set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
+  unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
+endif()
+
 # I3 keeps only the bounded, file-only bridge required to qualify exact
 # retained planning products against RoboPlan/Pinocchio. This target owns no
 # runtime scene truth, Kernel, execution backend, ROS node, or Python module.
@@ -49,6 +92,31 @@ target_include_directories(manyforge_roboplan_retained_consumer PUBLIC
 target_link_libraries(manyforge_roboplan_retained_consumer
   PUBLIC OpenSSL::Crypto)
 
+add_library(manyforge_roboplan_collision_projection
+  src/retained_collision_world_projector.cpp
+  src/retained_collision_world_publisher.cpp)
+target_include_directories(manyforge_roboplan_collision_projection PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_definitions(manyforge_roboplan_collision_projection PRIVATE
+  COAL_DISABLE_HPP_FCL_WARNINGS)
+target_link_libraries(manyforge_roboplan_collision_projection PUBLIC
+  manyforge_collision
+  manyforge_core)
+
+add_library(manyforge_roboplan_native_state_projection
+  src/retained_kinematic_state_projector.cpp
+  src/retained_observed_state_channel.cpp)
+target_include_directories(manyforge_roboplan_native_state_projection PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_definitions(manyforge_roboplan_native_state_projection PRIVATE
+  COAL_DISABLE_HPP_FCL_WARNINGS)
+target_link_libraries(manyforge_roboplan_native_state_projection PUBLIC
+  manyforge_core
+  Eigen3::Eigen
+  roboplan::roboplan)
+
 add_library(manyforge_roboplan_native_runtime_support
   src/native_runtime_support.cpp)
 target_include_directories(manyforge_roboplan_native_runtime_support PUBLIC
@@ -58,12 +126,141 @@ target_link_libraries(manyforge_roboplan_native_runtime_support
   PUBLIC manyforge_core
   PRIVATE Threads::Threads)
 
+add_library(manyforge_roboplan_native_gripper
+  src/retained_gripper_command_backend.cpp)
+target_include_directories(manyforge_roboplan_native_gripper PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_roboplan_native_gripper PUBLIC
+  manyforge_roboplan_native_state_projection
+  manyforge_roboplan_native_runtime_support)
+
+add_library(manyforge_roboplan_native_focused_adapters
+  src/retained_focused_adapters.cpp)
+target_include_directories(
+  manyforge_roboplan_native_focused_adapters PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_definitions(
+  manyforge_roboplan_native_focused_adapters PRIVATE
+  COAL_DISABLE_HPP_FCL_WARNINGS)
+target_link_libraries(
+  manyforge_roboplan_native_focused_adapters PUBLIC
+  manyforge_roboplan_native_state_projection
+  pinocchio::pinocchio
+  roboplan::roboplan)
+
+add_library(manyforge_roboplan_native_execution
+  src/roboplan_execution_backend.cpp)
+target_include_directories(manyforge_roboplan_native_execution PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_roboplan_native_execution PUBLIC
+  manyforge_roboplan_native_state_projection
+  manyforge_roboplan_native_runtime_support)
+
+# The safety/fidelity algorithms were retained and qualified before the native
+# owner returned. I6 promotes the same implementations into the production
+# planning boundary; no duplicate test-only copy remains.
+add_library(manyforge_roboplan_planning_contracts STATIC
+  src/cartesian_planning_contract.cpp
+  src/roboplan_cartesian_trajectory_dynamics.cpp
+  src/joint_cap_contract.cpp)
+target_include_directories(manyforge_roboplan_planning_contracts PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_definitions(manyforge_roboplan_planning_contracts PRIVATE
+  COAL_DISABLE_HPP_FCL_WARNINGS)
+target_link_libraries(manyforge_roboplan_planning_contracts PUBLIC
+  manyforge_core
+  Eigen3::Eigen
+  pinocchio::pinocchio
+  roboplan::roboplan)
+
+add_library(manyforge_roboplan_native_candidate
+  src/roboplan_candidate_computer.cpp)
+target_include_directories(manyforge_roboplan_native_candidate PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_definitions(manyforge_roboplan_native_candidate PRIVATE
+  COAL_DISABLE_HPP_FCL_WARNINGS)
+target_link_libraries(manyforge_roboplan_native_candidate
+  PUBLIC
+    manyforge_core
+    roboplan::roboplan
+  PRIVATE
+    manyforge_roboplan_planning_contracts
+    roboplan_rrt::roboplan_rrt
+    roboplan_simple_ik::roboplan_simple_ik
+    roboplan_toppra::roboplan_toppra
+    roboplan_cartesian_planning::roboplan_cartesian_planning)
+
+add_library(manyforge_roboplan_planner_backend
+  src/roboplan_planner_backend.cpp)
+target_include_directories(manyforge_roboplan_planner_backend PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_roboplan_planner_backend PUBLIC
+  manyforge_roboplan_native_candidate)
+
+add_library(manyforge_roboplan_native_runtime
+  src/retained_native_runtime.cpp)
+target_include_directories(manyforge_roboplan_native_runtime PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_definitions(manyforge_roboplan_native_runtime PRIVATE
+  COAL_DISABLE_HPP_FCL_WARNINGS)
+target_link_libraries(manyforge_roboplan_native_runtime PUBLIC
+  manyforge_roboplan_native_execution
+  manyforge_roboplan_native_focused_adapters
+  manyforge_roboplan_native_gripper
+  manyforge_roboplan_planner_backend
+  manyforge_roboplan_collision_projection
+  manyforge_collision
+  manyforge_core)
+
+add_library(manyforge_roboplan_worker_protocol STATIC
+  src/roboplan_worker_protocol.cpp)
+target_include_directories(manyforge_roboplan_worker_protocol
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(manyforge_roboplan_worker_protocol PUBLIC
+  manyforge_roboplan_planner_backend)
+
+add_library(manyforge_roboplan_process_candidate_client
+  src/process_contained_candidate_client.cpp)
+target_include_directories(manyforge_roboplan_process_candidate_client
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(manyforge_roboplan_process_candidate_client
+  PUBLIC
+    manyforge_roboplan_planner_backend
+  PRIVATE
+    manyforge_roboplan_worker_protocol
+    Threads::Threads)
+
+add_executable(manyforge_roboplan_candidate_worker
+  src/roboplan_candidate_worker_main.cpp)
+target_include_directories(manyforge_roboplan_candidate_worker PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(manyforge_roboplan_candidate_worker PRIVATE
+  COAL_DISABLE_HPP_FCL_WARNINGS)
+target_link_libraries(manyforge_roboplan_candidate_worker PRIVATE
+  manyforge_roboplan_worker_protocol
+  manyforge_roboplan_native_candidate)
+
 message(STATUS
-  "manyforge_roboplan destructive cutover: retained-product staging and "
-  "factory-neutral clock/scheduler support are built; native runtime "
-  "construction, event collection, gripper/planning/execution adapters, "
-  "ROS/Python, mutable scene projection, and product lanes remain "
-  "unavailable until their gates")
+  "manyforge_roboplan I6 cutover: retained-product projection, addressed "
+  "native state, focused planning, execution/gripper adapters, runtime "
+  "composition, and process-contained candidate computation are built; "
+  "event collection, ROS/Python clients, and product workflow lanes remain "
+  "unavailable until their I6 gates")
 
 # Tests
 if(BUILD_TESTING)
@@ -71,52 +268,12 @@ if(BUILD_TESTING)
   find_package(GTest QUIET)
   if(GTest_FOUND)
     include(GoogleTest)
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
-
-    # Direct retained-product qualification imports the model through the
-    # active RoboPlan/Pinocchio installation. Production staging itself has no
-    # planner dependency.
-    execute_process(
-      COMMAND "${Python3_EXECUTABLE}" -c
-              "import site, pathlib; print(';'.join(str(pathlib.Path(p) / 'cmeel.prefix') for p in site.getsitepackages()))"
-      OUTPUT_VARIABLE _CMEEL_PREFIXES
-      OUTPUT_STRIP_TRAILING_WHITESPACE)
-    foreach(_prefix ${_CMEEL_PREFIXES})
-      if(EXISTS "${_prefix}/include/boost/version.hpp")
-        set(BOOST_ROOT "${_prefix}")
-        set(BOOST_INCLUDEDIR "${_prefix}/include")
-        set(BOOST_LIBRARYDIR "${_prefix}/lib")
-        break()
-      endif()
-    endforeach()
-    set(COAL_DISABLE_HPP_FCL_WARNINGS ON)
-    find_package(Eigen3 REQUIRED)
-    find_package(pinocchio REQUIRED)
-    find_package(roboplan REQUIRED)
-    find_package(roboplan_rrt REQUIRED)
-    find_package(roboplan_simple_ik REQUIRED)
     find_package(roboplan_example_models REQUIRED)
 
-    # The I3 cross-consumer fixture proves that the authoritative collision
-    # engine imports the same retained model generation as RoboPlan. Keep this
-    # dependency test-only: neither production package may acquire the other
-    # consumer as a semantic owner.
-    if(NOT TARGET manyforge_collision)
-      set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
-      cmake_policy(PUSH)
-      cmake_policy(SET CMP0077 NEW)
-      set(BUILD_TESTING OFF)
-      add_subdirectory(
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_collision"
-        "${CMAKE_CURRENT_BINARY_DIR}/manyforge_collision")
-      cmake_policy(POP)
-      set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
-      unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
-    endif()
     if(NOT TARGET manyforge_collision)
       message(FATAL_ERROR
-        "I3 retained-model parity requires the authoritative collision "
-        "consumer target")
+        "I6 retained collision projection requires the authoritative "
+        "collision consumer target")
     endif()
 
     set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
@@ -138,24 +295,6 @@ if(BUILD_TESTING)
       PUBLIC manyforge_core
       PRIVATE Threads::Threads)
 
-    # Qualification-only compilation of bounded planning contracts. The
-    # former Cartesian request body and planner/scene/execution owners are not
-    # part of this target, and production staging keeps no planner dependency.
-    add_library(manyforge_roboplan_planning_contracts STATIC
-      src/cartesian_planning_contract.cpp
-      src/roboplan_cartesian_trajectory_dynamics.cpp
-      src/joint_cap_contract.cpp)
-    target_include_directories(manyforge_roboplan_planning_contracts PUBLIC
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-      $<INSTALL_INTERFACE:include>)
-    target_compile_definitions(manyforge_roboplan_planning_contracts PRIVATE
-      COAL_DISABLE_HPP_FCL_WARNINGS)
-    target_link_libraries(manyforge_roboplan_planning_contracts PUBLIC
-      manyforge_core
-      Eigen3::Eigen
-      pinocchio::pinocchio
-      roboplan::roboplan)
-
     add_library(manyforge_roboplan_planner_options_contract INTERFACE)
     target_include_directories(
       manyforge_roboplan_planner_options_contract INTERFACE
@@ -170,6 +309,8 @@ if(BUILD_TESTING)
 
     add_executable(test_roboplan_planning_qualification
       test/test_roboplan_planning_qualification.cpp)
+    target_include_directories(test_roboplan_planning_qualification PRIVATE
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include")
     target_link_libraries(test_roboplan_planning_qualification PRIVATE
       manyforge_roboplan_planning_evidence GTest::gtest_main)
 
@@ -189,6 +330,57 @@ if(BUILD_TESTING)
       test/test_joint_cap_contract.cpp)
     target_link_libraries(test_joint_cap_contract PRIVATE
       manyforge_roboplan_planning_contracts GTest::gtest_main)
+
+    add_executable(test_roboplan_candidate_computer
+      test/test_roboplan_candidate_computer.cpp)
+    target_compile_definitions(test_roboplan_candidate_computer PRIVATE
+      COAL_DISABLE_HPP_FCL_WARNINGS)
+    target_link_libraries(test_roboplan_candidate_computer PRIVATE
+      manyforge_roboplan_native_candidate
+      roboplan_example_models::roboplan_example_models
+      GTest::gtest_main)
+
+    add_executable(test_roboplan_planner_backend
+      test/test_roboplan_planner_backend.cpp)
+    target_include_directories(test_roboplan_planner_backend PRIVATE
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include")
+    target_link_libraries(test_roboplan_planner_backend PRIVATE
+      manyforge_roboplan_planner_backend GTest::gtest_main)
+
+    add_executable(test_retained_native_backends
+      test/test_retained_native_backends.cpp)
+    target_link_libraries(test_retained_native_backends PRIVATE
+      manyforge_roboplan_native_execution
+      manyforge_roboplan_native_gripper
+      GTest::gtest_main)
+
+    add_executable(fake_process_candidate_worker
+      test/fake_process_candidate_worker.cpp)
+    target_include_directories(fake_process_candidate_worker PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(fake_process_candidate_worker PRIVATE
+      manyforge_roboplan_worker_protocol)
+
+    add_executable(test_process_contained_candidate_client
+      test/test_process_contained_candidate_client.cpp)
+    add_dependencies(test_process_contained_candidate_client
+      manyforge_roboplan_candidate_worker
+      fake_process_candidate_worker)
+    target_compile_definitions(test_process_contained_candidate_client PRIVATE
+      MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH="$<TARGET_FILE:manyforge_roboplan_candidate_worker>"
+      MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH="$<TARGET_FILE:fake_process_candidate_worker>")
+    target_link_libraries(test_process_contained_candidate_client PRIVATE
+      manyforge_roboplan_process_candidate_client
+      roboplan_example_models::roboplan_example_models
+      Threads::Threads
+      GTest::gtest_main)
+
+    add_executable(test_roboplan_worker_protocol
+      test/test_roboplan_worker_protocol.cpp)
+    target_include_directories(test_roboplan_worker_protocol PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_roboplan_worker_protocol PRIVATE
+      manyforge_roboplan_worker_protocol GTest::gtest_main)
 
     add_executable(test_retained_planning_model_stage
       test/test_retained_planning_model_stage.cpp)
@@ -375,6 +567,9 @@ if(BUILD_TESTING)
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
     target_link_libraries(test_retained_product_consumer PRIVATE
       manyforge_roboplan_retained_consumer
+      manyforge_roboplan_collision_projection
+      manyforge_roboplan_native_state_projection
+      manyforge_roboplan_native_runtime
       manyforge_collision
       manyforge_core
       manyforge_deployment
@@ -436,6 +631,26 @@ if(BUILD_TESTING)
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_joint_cap_contract
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_roboplan_candidate_computer
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_roboplan_planner_backend
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_retained_native_backends
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_process_contained_candidate_client
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_roboplan_worker_protocol
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

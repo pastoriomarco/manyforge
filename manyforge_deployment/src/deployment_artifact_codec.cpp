@@ -295,10 +295,10 @@ struct DecodedDeployment final {
       case core::CatalogRecordKind::kControlInterfaceContract:
       case core::CatalogRecordKind::kControllerTopology:
       case core::CatalogRecordKind::kProviderManifest:
+      case core::CatalogRecordKind::kCommandSchema:
       case core::CatalogRecordKind::kCapabilityDefinition:
       case core::CatalogRecordKind::kStopEvidencePolicy:
         break;
-      case core::CatalogRecordKind::kCommandSchema:
       case core::CatalogRecordKind::kContactPolicy:
       case core::CatalogRecordKind::kRuntimePolicy:
         fail("$.catalogs.records",

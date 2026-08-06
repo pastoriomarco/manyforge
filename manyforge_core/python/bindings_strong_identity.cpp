@@ -34,6 +34,31 @@ void bind_strong_string(py::module_& module, const char* python_name) {
       });
 }
 
+template <typename StrongType>
+void bind_strong_counter(py::module_& module, const char* python_name) {
+  const std::string type_name{python_name};
+  py::class_<StrongType>(module, python_name, py::is_final())
+      .def(py::init<std::uint64_t>(), py::arg("value"))
+      .def_property_readonly("value", &StrongType::value)
+      .def_property_readonly("nonzero", &StrongType::nonzero)
+      .def("__repr__", [type_name](const StrongType& value) {
+        return py::str("{}({})").format(type_name, value.value());
+      })
+      .def("__eq__",
+           [](const StrongType& lhs, const StrongType& rhs) {
+             return lhs == rhs;
+           },
+           py::is_operator())
+      .def("__ne__",
+           [](const StrongType& lhs, const StrongType& rhs) {
+             return lhs != rhs;
+           },
+           py::is_operator())
+      .def("__hash__", [type_name](const StrongType& value) {
+        return py::hash(py::make_tuple(type_name, value.value()));
+      });
+}
+
 }  // namespace
 
 void register_strong_identity_bindings(py::module_& module) {
@@ -50,6 +75,7 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(RuntimeProfileRevision);
   MANYFORGE_BIND_STRONG_STRING(RuntimeRoleId);
   MANYFORGE_BIND_STRONG_STRING(RuntimeUnitId);
+  MANYFORGE_BIND_STRONG_STRING(RuntimeEpoch);
   MANYFORGE_BIND_STRONG_STRING(RuntimePolicyId);
   MANYFORGE_BIND_STRONG_STRING(RuntimePolicyRevision);
 
@@ -61,7 +87,9 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ModelRevision);
   MANYFORGE_BIND_STRONG_STRING(ModelRoleId);
   MANYFORGE_BIND_STRONG_STRING(ModelGroupRoleId);
+  MANYFORGE_BIND_STRONG_STRING(ComponentRoleId);
   MANYFORGE_BIND_STRONG_STRING(CommandTargetId);
+  MANYFORGE_BIND_STRONG_STRING(TargetRoleId);
   MANYFORGE_BIND_STRONG_STRING(CapabilityId);
   MANYFORGE_BIND_STRONG_STRING(CapabilityDefinitionRevision);
   MANYFORGE_BIND_STRONG_STRING(FrameRoleId);
@@ -81,6 +109,7 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ControlDomainRevision);
   MANYFORGE_BIND_STRONG_STRING(ControlBindingId);
   MANYFORGE_BIND_STRONG_STRING(ControlBindingRevision);
+  MANYFORGE_BIND_STRONG_STRING(ActiveControlConfigurationId);
   MANYFORGE_BIND_STRONG_STRING(EndpointRoleId);
   MANYFORGE_BIND_STRONG_STRING(StateAuthorityId);
   MANYFORGE_BIND_STRONG_STRING(StopEvidencePolicyId);
@@ -115,8 +144,18 @@ void register_strong_identity_bindings(py::module_& module) {
 
   MANYFORGE_BIND_STRONG_STRING(CommandSchemaId);
   MANYFORGE_BIND_STRONG_STRING(CommandSchemaRevision);
+  MANYFORGE_BIND_STRONG_STRING(CommandOptionId);
+  MANYFORGE_BIND_STRONG_STRING(ChannelRoleId);
+  MANYFORGE_BIND_STRONG_STRING(ProgramId);
+  MANYFORGE_BIND_STRONG_STRING(ProgramRevision);
+  MANYFORGE_BIND_STRONG_STRING(ProgramBindingId);
+  MANYFORGE_BIND_STRONG_STRING(ProgramRunId);
+  MANYFORGE_BIND_STRONG_STRING(MoveId);
 
 #undef MANYFORGE_BIND_STRONG_STRING
+
+  bind_strong_counter<ActiveControlConfigurationGeneration>(
+      module, "ActiveControlConfigurationGeneration");
 }
 
 }  // namespace manyforge::core::python

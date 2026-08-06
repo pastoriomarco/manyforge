@@ -194,7 +194,7 @@ TEST(CartesianTrajectoryContractTest,
   trajectory.accelerations = {Eigen::VectorXd::Zero(1),
                               Eigen::VectorXd::Zero(1)};
 
-  PlanRequestDTO request;
+  detail::CartesianTrajectoryContractInput request;
   request.speed_profile.velocity_scale = 1.0;
   request.speed_profile.acceleration_scale = 1.0;
   JointDynamicsLimitDTO limits;
@@ -258,10 +258,10 @@ TEST(CartesianTrajectoryContractTest,
   EXPECT_DOUBLE_EQ(
       static_cast<double>(bounds.value().prismatic_amplification[0]), 9.0);
 
-  PlanRequestDTO request;
-  request.group_id = "arm";
-  request.base_frame = "base";
-  request.tcp_frame = "tip";
+  detail::CartesianTrajectoryContractInput request;
+  request.compiled_group_name = "arm";
+  request.compiled_base_frame = "base";
+  request.compiled_tcp_frame = "tip";
   request.speed_profile.velocity_scale = 1.0;
   request.speed_profile.acceleration_scale = 1.0;
   CartesianPathDTO path;

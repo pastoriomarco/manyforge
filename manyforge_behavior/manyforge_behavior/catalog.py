@@ -33,7 +33,7 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
 EXPECTED_CONTENT_VERSION = "1.0.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:94b9654bcf11b071b27ce959642c17b83ed63af2965d89a6fa0069895c85ca60"
+    "sha256:6ec8e6ffad4f128fb299bbd0a898751f1b04cba38abc6591ffd67842104a0aa9"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -432,6 +432,27 @@ def _schema_semantic_type(
     return registry.resolve(schema).semantic_type
 
 
+def _schema_contains_semantic_type(
+    schema: CatalogSchema,
+    registry: CatalogSchemaRegistry,
+    semantic_type: str,
+) -> bool:
+    resolved = registry.resolve(schema)
+    return (
+        resolved.semantic_type == semantic_type
+        or any(
+            _schema_contains_semantic_type(nested, registry, semantic_type)
+            for nested in resolved.properties.values()
+        )
+        or (
+            resolved.items is not None
+            and _schema_contains_semantic_type(
+                resolved.items, registry, semantic_type
+            )
+        )
+    )
+
+
 def _schema_enum_values(
     schema: CatalogSchema,
     registry: CatalogSchemaRegistry,
@@ -666,6 +687,20 @@ class NodeCatalog:
             authoring_names=authoring_names,
         )
         parameter_by_id = {parameter.id: parameter for parameter in parameters}
+        if any(
+            _schema_contains_semantic_type(
+                parameter.schema, self._schema_registry, "source_joint"
+            )
+            for parameter in parameters
+        ) and sum(
+            _schema_semantic_type(parameter.schema, self._schema_registry)
+            == "target_role"
+            for parameter in parameters
+        ) != 1:
+            raise CatalogValidationError(
+                f"{label}.parameters with source_joint semantics require "
+                "exactly one target_role parameter"
+            )
         requirements = self._parse_capabilities(
             raw["required_capabilities"],
             parameters=parameter_by_id,

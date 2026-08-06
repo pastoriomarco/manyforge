@@ -13,11 +13,23 @@
 #include <roboplan/core/scene.hpp>
 #include <roboplan/core/types.hpp>
 
-#include <manyforge_core/types/plan_request.hpp>
+#include <manyforge_core/types/joint_dynamics_limits.hpp>
+#include <manyforge_core/types/motion_spec.hpp>
+#include <manyforge_core/types/speed_profile.hpp>
 
 #include <manyforge_roboplan/cartesian_planning_contract.hpp>
 
 namespace manyforge::roboplan_backend::detail {
+
+/// Adapter-private generated-name view used by trajectory certification after
+/// the addressed component/target/resource binding has been resolved.
+struct CartesianTrajectoryContractInput final {
+  std::string compiled_group_name;
+  std::string compiled_base_frame;
+  std::string compiled_tcp_frame;
+  core::SpeedProfileDTO speed_profile;
+  core::PerJointDynamicsLimitsDTO per_joint_dynamics_limits;
+};
 
 struct CartesianJointDynamicsEnvelope {
   bool complete = true;
@@ -67,7 +79,7 @@ validate_and_normalize_cartesian_trajectory_output(
 /// derivatives: extrema between waypoints are included in the envelope.
 core::Result<CartesianJointDynamicsEnvelope>
 measure_cartesian_joint_dynamics_envelope(
-    const core::PlanRequestDTO& request,
+    const CartesianTrajectoryContractInput& request,
     const roboplan::JointTrajectory& trajectory,
     std::span<const double> model_velocity_limits,
     std::span<const double> model_acceleration_limits,
@@ -79,7 +91,7 @@ measure_cartesian_joint_dynamics_envelope(
 /// time. Exhausting the declared work bound is a fail-closed planning error.
 core::Result<CartesianFrameDynamicsEnvelope>
 measure_cartesian_frame_dynamics_envelope(
-    const core::PlanRequestDTO& request,
+    const CartesianTrajectoryContractInput& request,
     const core::CartesianPathDTO& path,
     const std::shared_ptr<roboplan::Scene>& scene,
     const roboplan::JointTrajectory& trajectory,
@@ -96,7 +108,7 @@ resolve_cartesian_kinematic_motion_bounds(
 /// path verifier certify the continuous trajectory rather than only trusting
 /// planner waypoints.
 core::Result<CartesianInterpolantPath> sample_cartesian_interpolant_path(
-    const core::PlanRequestDTO& request,
+    const CartesianTrajectoryContractInput& request,
     const std::shared_ptr<roboplan::Scene>& scene,
     const roboplan::JointTrajectory& trajectory,
     double translation_tolerance_m,

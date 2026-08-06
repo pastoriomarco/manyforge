@@ -123,30 +123,12 @@ def test_joint_dynamics_limit_dto():
     assert lim.max_jerk_rad_s3 is None
 
 
-def test_per_joint_dynamics_limits_round_trip():
-    """Phase 4-P5.1K — the per_joint_dynamics_limits map round-trips through the
-    ExecuteRequestDTO and PlanRequestDTO pybind11 surface."""
+def test_internal_execution_requests_are_not_python_constructible():
+    """Resolved execution/planning requests are minted by the C++ Kernel."""
     import manyforge_core_py
 
-    caps = {
-        "elbow_joint": manyforge_core_py.JointDynamicsLimitDTO(
-            max_velocity_rad_s=0.4, max_acceleration_rad_s2=1.5
-        )
-    }
-
-    exec_req = manyforge_core_py.ExecuteRequestDTO()
-    assert exec_req.per_joint_dynamics_limits == {}
-    exec_req.per_joint_dynamics_limits = caps
-    assert "elbow_joint" in exec_req.per_joint_dynamics_limits
-    assert exec_req.per_joint_dynamics_limits["elbow_joint"].max_velocity_rad_s == 0.4
-
-    plan_req = manyforge_core_py.PlanRequestDTO()
-    assert plan_req.per_joint_dynamics_limits == {}
-    plan_req.per_joint_dynamics_limits = caps
-    assert (
-        plan_req.per_joint_dynamics_limits["elbow_joint"].max_acceleration_rad_s2
-        == 1.5
-    )
+    assert not hasattr(manyforge_core_py, "ExecuteRequestDTO")
+    assert not hasattr(manyforge_core_py, "PlanRequestDTO")
 
 
 def test_error_dto():
@@ -195,7 +177,15 @@ def test_trajectory_dto():
     wp1 = manyforge_core_py.TrajectoryWaypointDTO(0.0, [0.0, 0.0], [], [])
     wp2 = manyforge_core_py.TrajectoryWaypointDTO(1.0, [0.5, 0.5], [], [])
     
-    t = manyforge_core_py.TrajectoryDTO(["j1", "j2"], [wp1, wp2])
+    resources = [
+        manyforge_core_py.ResourceId("resource.j1"),
+        manyforge_core_py.ResourceId("resource.j2"),
+    ]
+    t = manyforge_core_py.TrajectoryDTO(resources, ["j1", "j2"], [wp1, wp2])
+    assert [resource.value for resource in t.resources] == [
+        "resource.j1",
+        "resource.j2",
+    ]
     assert t.joint_names == ["j1", "j2"]
     assert len(t.waypoints) == 2
     assert t.empty() is False
@@ -209,48 +199,6 @@ def test_execution_status():
     assert s.state == manyforge_core_py.ExecutionState.kIdle
     assert s.progress == 0.0
     assert s.execution_id == 0
-
-
-def test_execute_request_dto():
-    """Test ExecuteRequestDTO creation and attributes."""
-    import manyforge_core_py
-    
-    tolerances = manyforge_core_py.TolerancesDTO(0.05, 0.005, 0.05)
-    speed_profile = manyforge_core_py.SpeedProfileDTO(1.0, 1.0, None)
-    timeouts = manyforge_core_py.TimeoutsDTO(2.0, 10.0)
-    motion = manyforge_core_py.JointGoalDTO(["j1"], [0.5])
-    
-    req = manyforge_core_py.ExecuteRequestDTO(
-        "robot1", "group1", "move1",
-        "base_link", "tcp",
-        tolerances, speed_profile, timeouts,
-        manyforge_core_py.CacheMode.kDefault,
-        motion
-    )
-    
-    assert req.robot_id == "robot1"
-    assert req.group_id == "group1"
-    assert req.move_id == "move1"
-
-
-def test_plan_request_dto():
-    """Test PlanRequestDTO creation and attributes."""
-    import manyforge_core_py
-    
-    start_state = manyforge_core_py.RobotStateDTO(["j1"], [0.0], [])
-    motion = manyforge_core_py.JointGoalDTO(["j1"], [0.5])
-    tolerances = manyforge_core_py.TolerancesDTO(0.05, 0.005, 0.05)
-    speed_profile = manyforge_core_py.SpeedProfileDTO(1.0, 1.0, None)
-    
-    req = manyforge_core_py.PlanRequestDTO(
-        "robot1", "group1", "move1",
-        "base_link", "tcp",
-        start_state, motion, tolerances, speed_profile,
-        2.0
-    )
-    
-    assert req.robot_id == "robot1"
-    assert req.planning_timeout_s == 2.0
 
 
 def test_stop_result_dto():
@@ -375,24 +323,20 @@ def test_reference_dto_pose():
     assert r.pose.position_m.x_m == 0.3
 
 
-def test_orthogonal_relative_motion_contract():
-    """Relative targeting is mode/reference metadata on a typed motion."""
+def test_relative_motion_authoring_types_remain_available():
+    """Python authors intent, while C++ resolves and mints execution requests."""
     import manyforge_core_py
 
     ref = manyforge_core_py.ReferenceDTO(manyforge_core_py.ReferenceType.kFrame, "base_link")
-    req = manyforge_core_py.ExecuteRequestDTO()
-    req.target_mode = manyforge_core_py.MotionTargetMode.kRelative
-    req.planning_profile = manyforge_core_py.PlanningProfile.kBalanced
-    req.target_reference = ref
-    req.motion = manyforge_core_py.PoseGoalDTO(manyforge_core_py.Pose3DTO(
+    motion = manyforge_core_py.PoseGoalDTO(manyforge_core_py.Pose3DTO(
         manyforge_core_py.Vector3DTO(0.1, 0.0, 0.0),
         manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0)
     ))
 
-    assert req.target_mode == manyforge_core_py.MotionTargetMode.kRelative
-    assert req.planning_profile == manyforge_core_py.PlanningProfile.kBalanced
-    assert req.target_reference.id == "base_link"
-    assert req.offset_reference is None
+    assert ref.id == "base_link"
+    assert motion.goal.position_m.x_m == 0.1
+    assert manyforge_core_py.MotionTargetMode.kRelative is not None
+    assert manyforge_core_py.PlanningProfile.kBalanced is not None
 
 
 def test_cartesian_path_dto():

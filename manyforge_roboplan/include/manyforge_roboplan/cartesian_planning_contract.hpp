@@ -38,6 +38,15 @@ CartesianPathFidelityReport verify_cartesian_path_fidelity(
     std::span<const Eigen::Matrix4d> actual_path,
     double translation_tolerance_m, double rotation_tolerance_rad);
 
+/// Cancellation/deadline-aware production form of the same bounded fidelity
+/// proof.
+core::Result<CartesianPathFidelityReport>
+verify_cartesian_path_fidelity_controlled(
+    std::span<const Eigen::Matrix4d> requested_path,
+    std::span<const Eigen::Matrix4d> actual_path,
+    double translation_tolerance_m, double rotation_tolerance_rad,
+    const CartesianPlanningControl& control);
+
 core::ErrorDTO map_cartesian_backend_failure(
     std::string_view planner_error, double fraction_completed,
     std::optional<std::size_t> first_failing_waypoint_index);

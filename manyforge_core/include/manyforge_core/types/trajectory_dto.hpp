@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include <manyforge_core/types/strong_id.hpp>
+
 namespace manyforge::core {
 
 /// A single waypoint in a trajectory (spec §3.5)
@@ -15,6 +17,10 @@ struct TrajectoryWaypointDTO {
 
 /// A planned trajectory (spec §3.5)
 struct TrajectoryDTO {
+  /// Exact ordered operation resources represented by `joint_names`.
+  /// Trajectories are currently all-angular, but their identity is the
+  /// compiler-owned ResourceId rather than an adapter-private joint spelling.
+  std::vector<ResourceId> resources;
   std::vector<std::string> joint_names;
   std::vector<TrajectoryWaypointDTO> waypoints;
 

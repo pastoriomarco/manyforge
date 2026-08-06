@@ -31,6 +31,9 @@
 #include <manyforge_core/ports/itrajectory_validator.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
+
+#include <type_traits>
 
 // Test that Result works
 TEST(ContractsCompile, ResultOk) {
@@ -94,19 +97,22 @@ TEST(ContractsCompile, DefaultDTOs) {
   manyforge::core::TrajectoryDTO traj;
   EXPECT_TRUE(traj.empty());
 
-  // Plan request DTO
-  manyforge::core::PlanRequestDTO plan_request;
-  EXPECT_TRUE(plan_request.robot_id.empty());
-  EXPECT_FALSE(plan_request.projection_binding.valid());
+  // Authority-bearing requests cannot be default-constructed without an
+  // exact resolved binding.
+  static_assert(!std::is_default_constructible_v<
+                manyforge::core::PlanRequestDTO>);
+  static_assert(!std::is_default_constructible_v<
+                manyforge::core::ExecuteRequestDTO>);
 
   // Plan result DTO
   manyforge::core::PlanResultDTO plan_result;
   EXPECT_FALSE(plan_result.trajectory.has_value());
   EXPECT_FALSE(plan_result.error.has_value());
 
-  // Execute request DTO
-  manyforge::core::ExecuteRequestDTO execute_request;
-  EXPECT_TRUE(execute_request.robot_id.empty());
+  const auto execute_request =
+      manyforge::core::testing::make_test_execute_request();
+  EXPECT_EQ(execute_request.binding.controllable_component_id.value(),
+            "component:test");
 
   // Validation DTOs
   manyforge::core::ValidationOptionsDTO validation_options;
@@ -185,7 +191,7 @@ TEST(ContractsCompile, MotionSpecVariant) {
 
   // Joint goal
   JointGoalDTO joint_goal;
-  joint_goal.joint_names.push_back("joint_1");
+  joint_goal.joint_names.emplace_back("joint_1");
   joint_goal.positions_rad.push_back(1.0);
   MotionSpecDTO m1 = joint_goal;
   EXPECT_TRUE(std::holds_alternative<JointGoalDTO>(m1));
@@ -206,7 +212,8 @@ TEST(ContractsCompile, MotionSpecVariant) {
   pose_ref.pose = Pose3DTO{};
   pose_ref.pose->position_m = {0.1, 0.2, 0.3};
   pose_ref.pose->orientation = {0.0, 0.0, 0.0, 1.0};
-  ExecuteRequestDTO relative_pose_request;
+  auto relative_pose_request =
+      manyforge::core::testing::make_test_execute_request();
   relative_pose_request.motion = pose_goal;
   relative_pose_request.target_mode = MotionTargetModeDTO::kRelative;
   relative_pose_request.target_reference = pose_ref;
@@ -341,23 +348,27 @@ TEST(ContractsCompile, ErrorDTODetails) {
 TEST(ContractsCompile, ExecuteRequestComposition) {
   using namespace manyforge::core;
 
-  ExecuteRequestDTO req;
-  req.robot_id = "robot1";
-  req.group_id = "arm";
+  auto req = manyforge::core::testing::make_test_execute_request(
+      {"j1", "j2"});
+  req.binding.controllable_component_id =
+      ControllableComponentId("robot1");
   req.move_id = "move_001";
-  req.base_frame = "world";
-  req.tcp_frame = "tool0";
+  std::get<ResolvedComponentModelFrameDTO>(req.binding.base_frame)
+      .compiled_frame_name = "world";
+  std::get<ResolvedComponentModelFrameDTO>(req.binding.tcp_frame)
+      .compiled_frame_name = "tool0";
   req.tolerances.joint_position_tol_rad = 0.01;
   req.speed_profile.velocity_scale = 0.5;
   req.speed_profile.acceleration_scale = 0.5;
   req.timeouts.planning_timeout_s = 10.0;
   req.timeouts.execution_timeout_s = 30.0;
   req.cache_mode = CacheMode::kDefault;
-  req.motion = JointGoalDTO{{"j1", "j2"}, {0.0, 1.57}};
+  req.motion = ResolvedJointGoalDTO{{ResourceId("r1"), ResourceId("r2")},
+                                    {"j1", "j2"}, {0.0, 1.57}};
 
-  EXPECT_EQ(req.robot_id, "robot1");
+  EXPECT_EQ(req.binding.controllable_component_id.value(), "robot1");
   EXPECT_EQ(req.cache_mode, CacheMode::kDefault);
-  EXPECT_TRUE(std::holds_alternative<JointGoalDTO>(req.motion));
+  EXPECT_TRUE(std::holds_alternative<ResolvedJointGoalDTO>(req.motion));
 }
 
 // Test that port interfaces can be declared (not instantiated - they're abstract)

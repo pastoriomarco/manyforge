@@ -167,9 +167,10 @@ RuntimeCollisionQueryBundlePtr with_contact_grasp_world_bodies(
   auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*source);
   auto world = std::make_shared<CollisionWorldSnapshot>(*source->world);
   CollisionWorldBody object;
-  object.body_id = "object/part/shape/0";
+  object.body_id = "scene/part/shape/0";
   CollisionWorldBody finger;
-  finger.body_id = "robot/arm/link/finger_left/collision/0";
+  finger.body_id =
+      "component/arm/model/arm_model/body/finger_left/collision/0";
   world->bodies = {std::move(object), std::move(finger)};
   world->body_count = static_cast<std::int64_t>(world->bodies.size());
   bundle->world = std::move(world);
@@ -260,8 +261,8 @@ RuntimeCollisionQueryBundlePtr make_dynamic_bundle(
   auto base = make_bundle(epoch, revision);
   auto world = std::make_shared<CollisionWorldSnapshot>(*base->world);
   CollisionWorldBody body;
-  body.body_id = "object/dynamic_box/shape/0";
-  body.owner_kind = CollisionOwnerKind::kDetachedObject;
+  body.body_id = "scene/dynamic_box/shape/0";
+  body.owner_kind = CollisionOwnerKind::kSceneResource;
   body.frame_id = "universe";
   body.pose.orientation.w = 1.0;
   body.source_id = "vision";
@@ -1064,7 +1065,9 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   ASSERT_TRUE(progress.publish(3, 50'000'000, clock.now(), clock.now()).published);
   auto engine = std::make_shared<TestLookaheadEngine>("lookahead-grasp");
   engine->collision_local_waypoint = 2;
-  engine->collision_pair = {"object/part/shape/0", "robot/arm/link/finger_left/collision/0"};
+  engine->collision_pair = {
+      "component/arm/model/arm_model/body/finger_left/collision/0",
+      "scene/part/shape/0"};
   ResultSink sink;
   RuntimeCollisionLookaheadSession::Config config;
   config.workers = 1;
@@ -1088,8 +1091,8 @@ TEST(RuntimeCollisionLookaheadSessionTest,
             "contact_grasp/part");
   EXPECT_EQ(result.failure_details.at("policy_mode"), "contact_grasp");
   EXPECT_EQ(result.failure_details.at("zone_id"),
-            "contact_grasp_pair:object/part/shape/0<->"
-            "robot/arm/link/finger_left/collision/0");
+            "contact_grasp_pair:component/arm/model/arm_model/body/"
+            "finger_left/collision/0<->scene/part/shape/0");
   EXPECT_EQ(result.failure_details.at("contact_present"), "true");
   EXPECT_EQ(result.failure_details.at("distance_request_mode"),
             "selected_colliding_pairs");
@@ -1135,15 +1138,16 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   auto engine =
       std::make_shared<TestLookaheadEngine>("lookahead-grasp-missing-metric");
   const CollisionPairId pair{
-      "object/part/shape/0",
-      "robot/arm/link/finger_left/collision/0"};
+      "component/arm/model/arm_model/body/finger_left/collision/0",
+      "scene/part/shape/0"};
   CollisionResult incomplete;
   incomplete.in_collision = true;
   incomplete.normalized_pairs = {pair};
   incomplete.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
   incomplete.decision = CollisionDecisionResult::kInconclusiveFail;
   incomplete.raw_diagnostics["missing_selected_distance_pairs"] =
-      "object/part/shape/0 <-> robot/arm/link/finger_left/collision/0";
+      "component/arm/model/arm_model/body/finger_left/collision/0 <-> "
+      "scene/part/shape/0";
   engine->forced_result = std::move(incomplete);
   ResultSink sink;
   RuntimeCollisionLookaheadSession::Config config;
@@ -1171,8 +1175,8 @@ TEST(RuntimeCollisionLookaheadSessionTest,
             "contact_grasp/part");
   EXPECT_EQ(result.failure_details.at("policy_mode"), "contact_grasp");
   EXPECT_EQ(result.failure_details.at("zone_id"),
-            "contact_grasp_pair:object/part/shape/0<->"
-            "robot/arm/link/finger_left/collision/0");
+            "contact_grasp_pair:component/arm/model/arm_model/body/"
+            "finger_left/collision/0<->scene/part/shape/0");
   EXPECT_EQ(result.failure_details.at("classification"),
             "diagnostic_incomplete");
   EXPECT_EQ(result.failure_details.at("contact_present"), "true");

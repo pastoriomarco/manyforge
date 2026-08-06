@@ -1,4 +1,5 @@
 #include <manyforge_core/execution_correlation_tracker.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 
 #include <gtest/gtest.h>
 
@@ -6,9 +7,9 @@ namespace manyforge::core {
 namespace {
 
 ExecuteRequestDTO make_request() {
-  ExecuteRequestDTO request;
+  auto request = testing::make_test_execute_request(
+      {"joint1", "joint2"}, "run-1");
   request.move_id = "move-1";
-  request.program_run_id = "run-1";
   ActionSpanDTO span;
   span.action_source = ActionSource::kProgramNode;
   span.action_span_id = "span-1";

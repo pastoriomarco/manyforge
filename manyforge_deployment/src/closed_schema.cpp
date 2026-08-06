@@ -22,6 +22,7 @@
 #include "closed_schema_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "embedded_capability_definition_schema.hpp"
+#include "embedded_command_schema_schema.hpp"
 #include "embedded_component_type_schema.hpp"
 #include "embedded_control_interface_contract_schema.hpp"
 #include "embedded_controller_topology_schema.hpp"
@@ -1789,10 +1790,13 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
     std::string_view relative_path;
     std::string_view descriptor_yaml;
   };
-  const std::array<QualifiedCatalogSchemaSource, 8U> qualified_sources{{
+  const std::array<QualifiedCatalogSchemaSource, 9U> qualified_sources{{
       {core::CatalogRecordKind::kCapabilityDefinition,
        "catalog/manyforge.capability_definition.v1.yaml",
        detail::kEmbeddedCapabilityDefinitionSchema},
+      {core::CatalogRecordKind::kCommandSchema,
+       "catalog/manyforge.command_schema.v1.yaml",
+       detail::kEmbeddedCommandSchema},
       {core::CatalogRecordKind::kComponentType,
        "catalog/manyforge.component_type.v1.yaml",
        detail::kEmbeddedComponentTypeSchema},

@@ -24,7 +24,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 EXPECTED_CATALOG_DIGEST = (
-    "sha256:94b9654bcf11b071b27ce959642c17b83ed63af2965d89a6fa0069895c85ca60"
+    "sha256:6ec8e6ffad4f128fb299bbd0a898751f1b04cba38abc6591ffd67842104a0aa9"
 )
 
 
@@ -101,6 +101,7 @@ def test_profile_comparison_has_no_legacy_profile_family() -> None:
 def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     move = catalog.get("motion.move_to_pose")
+    joint_target = catalog.schema_registry.types["joint_target"]
     target_role = next(
         parameter for parameter in move.parameters if parameter.id == "target_role"
     )
@@ -109,11 +110,16 @@ def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
         for parameter in move.parameters
         if parameter.id == "planning_profile"
     )
+    joint_name = catalog.schema_registry.resolve(
+        joint_target.properties["joint_name"]
+    )
 
     assert (
         catalog.schema_registry.resolve(target_role.schema).semantic_type
         == "target_role"
     )
+    assert joint_target.required == ("joint_name", "position_rad")
+    assert joint_name.semantic_type == "source_joint"
     assert planning_profile.has_default is True
     assert planning_profile.default == "balanced"
     assert (
@@ -248,6 +254,30 @@ def test_recomputed_catalog_rejects_wrong_capability_scope(
 
     path = _write_recomputed(tmp_path, mutate)
     with pytest.raises(CatalogValidationError, match="scope must be 'target_binding'"):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_rejects_source_joint_without_one_target_scope(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        move = next(
+            entry
+            for entry in data["entries"]
+            if entry["id"] == "motion.move_to_joint_target"
+        )
+        target = next(
+            parameter
+            for parameter in move["parameters"]
+            if parameter["id"] == "target_role"
+        )
+        target["schema"]["semantic_type"] = "component_role"
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(
+        CatalogValidationError,
+        match="source_joint semantics require exactly one target_role parameter",
+    ):
         NodeCatalog(path)
 
 

@@ -19,28 +19,32 @@ CollisionPairId canonicalize(const CollisionPairId& pair) {
   return pair;
 }
 
-bool object_body_matches(const std::string& body,
-                         const std::string& object_id) noexcept {
-  constexpr std::string_view prefix = "object/";
-  if (body.size() <= prefix.size() + object_id.size() ||
+bool scene_resource_body_matches(const std::string& body,
+                                 const std::string& resource_id) noexcept {
+  constexpr std::string_view prefix = "scene/";
+  if (body.size() <= prefix.size() + resource_id.size() ||
       body.compare(0, prefix.size(), prefix) != 0 ||
-      body.compare(prefix.size(), object_id.size(), object_id) != 0) {
+      body.compare(prefix.size(), resource_id.size(), resource_id) != 0) {
     return false;
   }
-  return body[prefix.size() + object_id.size()] == '/';
+  return body[prefix.size() + resource_id.size()] == '/';
 }
 
-bool robot_link_body_matches(const std::string& body,
-                             const std::string& link) noexcept {
-  constexpr std::string_view marker = "/link/";
+bool component_body_role_matches(const std::string& body,
+                                 const std::string& body_role) noexcept {
+  constexpr std::string_view prefix = "component/";
+  constexpr std::string_view marker = "/body/";
+  if (body.rfind(prefix, 0) != 0) {
+    return false;
+  }
   const auto begin = body.find(marker);
   if (begin == std::string::npos) {
     return false;
   }
   const auto name_begin = begin + marker.size();
-  return body.size() > name_begin + link.size() &&
-         body.compare(name_begin, link.size(), link) == 0 &&
-         body[name_begin + link.size()] == '/';
+  return body.size() > name_begin + body_role.size() &&
+         body.compare(name_begin, body_role.size(), body_role) == 0 &&
+         body[name_begin + body_role.size()] == '/';
 }
 
 }  // namespace
@@ -51,12 +55,14 @@ bool contact_grasp_pair_matches(const CollisionPairId& pair,
     return std::any_of(policy.allowed_robot_links.begin(),
                        policy.allowed_robot_links.end(),
                        [&](const auto& link) {
-                         return robot_link_body_matches(body, link);
+                         return component_body_role_matches(body, link);
                        });
   };
-  return (object_body_matches(pair.body_a, policy.selected_object_id) &&
+  return (scene_resource_body_matches(pair.body_a,
+                                      policy.selected_object_id) &&
           link_matches(pair.body_b)) ||
-         (object_body_matches(pair.body_b, policy.selected_object_id) &&
+         (scene_resource_body_matches(pair.body_b,
+                                      policy.selected_object_id) &&
           link_matches(pair.body_a));
 }
 

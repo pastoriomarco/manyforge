@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/motion_target_resolution.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 
 #include <map>
 #include <string>
@@ -37,12 +38,11 @@ class ReferenceResolver final : public IReferencePoseResolver {
 };
 
 ExecuteRequestDTO base_request() {
-  ExecuteRequestDTO request;
-  request.robot_id = "robot";
-  request.group_id = "arm";
+  auto request = testing::make_test_execute_request(
+      {"joint_a", "joint_b"});
   request.move_id = "move";
-  request.base_frame = "base";
-  request.tcp_frame = "tool";
+  std::get<ResolvedComponentModelFrameDTO>(request.binding.tcp_frame)
+      .compiled_frame_name = "tool";
   return request;
 }
 
@@ -56,7 +56,9 @@ ReferenceDTO frame_reference(std::string id) {
 TEST(MotionTargetResolution, RelativeJointDeltasResolveByJointName) {
   auto request = base_request();
   request.target_mode = MotionTargetModeDTO::kRelative;
-  request.motion = JointGoalDTO{{"joint_b", "joint_a"}, {0.25, -0.5}};
+  request.motion = ResolvedJointGoalDTO{
+      {ResourceId("resource_b"), ResourceId("resource_a")},
+      {"joint_b", "joint_a"}, {0.25, -0.5}};
   RobotStateDTO start;
   start.joint_names = {"joint_a", "joint_b"};
   start.positions_rad = {1.0, 2.0};
@@ -66,8 +68,9 @@ TEST(MotionTargetResolution, RelativeJointDeltasResolveByJointName) {
       request, ProjectionLeaseBindingDTO{}, &start, resolver);
 
   ASSERT_TRUE(result.ok());
-  ASSERT_TRUE(std::holds_alternative<JointGoalDTO>(result.value()));
-  const auto& goal = std::get<JointGoalDTO>(result.value());
+  ASSERT_TRUE(
+      std::holds_alternative<ResolvedJointGoalDTO>(result.value()));
+  const auto& goal = std::get<ResolvedJointGoalDTO>(result.value());
   EXPECT_EQ(goal.joint_names,
             (std::vector<std::string>{"joint_b", "joint_a"}));
   EXPECT_EQ(goal.positions_rad, (std::vector<double>{2.25, 0.5}));
@@ -77,7 +80,8 @@ TEST(MotionTargetResolution, RelativeJointDeltasResolveByJointName) {
 TEST(MotionTargetResolution, RelativeJointRejectsMissingObservedStart) {
   auto request = base_request();
   request.target_mode = MotionTargetModeDTO::kRelative;
-  request.motion = JointGoalDTO{{"joint_a"}, {0.25}};
+  request.motion = ResolvedJointGoalDTO{{ResourceId("resource_a")},
+                                        {"joint_a"}, {0.25}};
   ReferenceResolver resolver;
 
   auto result = resolve_motion_target(
@@ -95,7 +99,9 @@ TEST(MotionTargetResolution, JointTargetsRejectDuplicateNamesInEveryMode) {
                           MotionTargetModeDTO::kRelative}) {
     auto request = base_request();
     request.target_mode = mode;
-    request.motion = JointGoalDTO{{"joint_a", "joint_a"}, {0.25, -0.5}};
+    request.motion = ResolvedJointGoalDTO{
+        {ResourceId("resource_a"), ResourceId("resource_a_duplicate")},
+        {"joint_a", "joint_a"}, {0.25, -0.5}};
     RobotStateDTO start;
     start.joint_names = {"joint_a"};
     start.positions_rad = {1.0};

@@ -2,7 +2,9 @@
 
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
 #include <manyforge_core/ports/irobot_kinematics.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace manyforge::core {
@@ -44,6 +46,8 @@ class FkOnlyKinematics final : public IRobotKinematics {
 
 TrajectoryDTO make_two_joint_trajectory() {
   TrajectoryDTO trajectory;
+  trajectory.resources = {ResourceId("resource:joint_a"),
+                          ResourceId("resource:joint_b")};
   trajectory.joint_names = {"joint_a", "joint_b"};
   trajectory.waypoints.push_back(
       TrajectoryWaypointDTO{0.0, {0.5, -0.25}, {}, {}});
@@ -54,9 +58,24 @@ TrajectoryDTO make_two_joint_trajectory() {
 
 ExecuteRequestDTO make_joint_request(std::vector<std::string> names,
                                      std::vector<double> positions) {
-  ExecuteRequestDTO request;
+  auto request =
+      testing::make_test_execute_request({"joint_a", "joint_b"});
   request.tolerances.joint_position_tol_rad = 1e-4;
-  JointGoalDTO goal;
+  ResolvedJointGoalDTO goal;
+  for (const auto& name : names) {
+    const auto found = std::find(
+        request.binding.model_group_binding.compiled_joint_names.begin(),
+        request.binding.model_group_binding.compiled_joint_names.end(), name);
+    if (found ==
+        request.binding.model_group_binding.compiled_joint_names.end()) {
+      goal.resources.emplace_back("resource:unknown");
+    } else {
+      goal.resources.push_back(request.binding.resources[static_cast<size_t>(
+          std::distance(
+              request.binding.model_group_binding.compiled_joint_names.begin(),
+              found))]);
+    }
+  }
   goal.joint_names = std::move(names);
   goal.positions_rad = std::move(positions);
   request.motion = goal;
@@ -64,9 +83,8 @@ ExecuteRequestDTO make_joint_request(std::vector<std::string> names,
 }
 
 ExecuteRequestDTO make_pose_request(Pose3DTO goal) {
-  ExecuteRequestDTO request;
-  request.base_frame = "base";
-  request.tcp_frame = "tcp";
+  auto request =
+      testing::make_test_execute_request({"joint_a", "joint_b"});
   request.tolerances.translation_tol_m = 1e-3;
   request.tolerances.rotation_tol_rad = 1e-3;
   PoseGoalDTO pose_goal;
@@ -76,7 +94,7 @@ ExecuteRequestDTO make_pose_request(Pose3DTO goal) {
 }
 
 TEST(TrajectoryCacheCompatibilityTest,
-     JointGoalMatchesByNameIndependentOfOrder) {
+     JointGoalMatchesByResourceIndependentOfGoalOrder) {
   FkOnlyKinematics context;
   auto trajectory = make_two_joint_trajectory();
   auto request =
@@ -90,12 +108,29 @@ TEST(TrajectoryCacheCompatibilityTest,
 }
 
 TEST(TrajectoryCacheCompatibilityTest,
-     JointGoalRejectsDuplicateTrajectoryNamesAsUnverifiable) {
+     RejectsChangedTrajectoryResourceProjectionBeforeGoalComparison) {
   FkOnlyKinematics context;
   auto trajectory = make_two_joint_trajectory();
-  trajectory.joint_names = {"joint_a", "joint_a"};
+  trajectory.resources = {ResourceId("resource:joint_a"),
+                          ResourceId("resource:joint_a")};
   auto request =
       make_joint_request({"joint_a", "joint_b"}, {1.0, -0.5});
+
+  const auto result =
+      cached_trajectory_matches_request_goal(context, trajectory, request);
+
+  EXPECT_FALSE(result.compatible);
+  EXPECT_EQ(result.reason, "resource_projection_changed");
+}
+
+TEST(TrajectoryCacheCompatibilityTest,
+     JointGoalRejectsCrossedResourceAndCompiledName) {
+  FkOnlyKinematics context;
+  const auto trajectory = make_two_joint_trajectory();
+  auto request =
+      make_joint_request({"joint_a", "joint_b"}, {1.0, -0.5});
+  auto& goal = std::get<ResolvedJointGoalDTO>(request.motion);
+  std::swap(goal.joint_names[0], goal.joint_names[1]);
 
   const auto result =
       cached_trajectory_matches_request_goal(context, trajectory, request);

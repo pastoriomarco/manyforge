@@ -6,7 +6,6 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/geometry.hpp>
 #include <manyforge_core/types/plan_request.hpp>
-#include <manyforge_core/types/robot_state.hpp>
 
 namespace manyforge::core {
 
@@ -14,16 +13,17 @@ namespace manyforge::core {
 /// without running a full plan(). Distinct from plan() to avoid the planning
 /// ramp + collision-search budget; used by validated Robot Control candidate
 /// Cartesian authoring.
-struct IkRequestDTO {
+struct IkRequestDTO final {
+    ControllableComponentId controllable_component_id;
+    CommandTargetId command_target_id;
+    std::vector<PlannerModelBindingDTO> model_bindings;
+    std::vector<ResourceId> resources;
     /// TCP pose-in-base to solve for.
     Pose3DTO goal_pose;
-    /// Reference frame the pose is expressed in.
-    std::string base_frame;
-    /// End-effector / TCP frame.
-    std::string tcp_frame;
-    /// Seed state (previous-frame joint positions for continuity).
-    /// Empty seed falls back to the planner backend's current state.
-    RobotStateDTO seed_state;
+    ResolvedFrameDTO base_frame;
+    ResolvedFrameDTO tcp_frame;
+    ControlledStateDTO seed_state;
+    ProjectionLeaseBindingDTO projection_binding;
     /// Optional caller budget for this IK request. A value <= 0 means the
     /// backend default applies. Interactive callers set this to a small budget
     /// so a slow IK attempt cannot stall the operator loop.
@@ -33,6 +33,8 @@ struct IkRequestDTO {
 /// Result of a single-shot IK solve.
 struct IkResultDTO {
     bool ok = false;
+    /// Exact ordered compiler-owned resources represented by joint_names.
+    std::vector<ResourceId> resources;
     /// Canonical joint names in dispatch order.
     std::vector<std::string> joint_names;
     /// Resolved joint positions in the same order.

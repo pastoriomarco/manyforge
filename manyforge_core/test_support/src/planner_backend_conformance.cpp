@@ -67,8 +67,8 @@ const char* profile_capability_key(PlanningProfileDTO profile) noexcept {
 }
 
 std::optional<PlannerMotionCapability> motion_capability(
-    const MotionSpecDTO& motion) noexcept {
-  if (std::holds_alternative<JointGoalDTO>(motion)) {
+    const ResolvedMotionSpecDTO& motion) noexcept {
+  if (std::holds_alternative<ResolvedJointGoalDTO>(motion)) {
     return PlannerMotionCapability::kJoint;
   }
   if (std::holds_alternative<PoseGoalDTO>(motion)) {
@@ -218,7 +218,8 @@ void validate_pose_goal(const std::string& case_id,
   final_state.joint_names = trajectory.joint_names;
   final_state.positions_rad = trajectory.waypoints.back().positions_rad;
   const auto actual = fk(
-      FkRequestDTO{final_state, request.tcp_frame, request.base_frame});
+      FkRequestDTO{final_state, compiled_frame_name(request.tcp_frame),
+                   compiled_frame_name(request.base_frame)});
   if (!actual.ok()) {
     add_violation(report, case_id, "goal.pose_fk",
                   "forward kinematics failed: " + actual.error().message);
@@ -261,7 +262,8 @@ void validate_cartesian_samples(const std::string& case_id,
     state.joint_names = trajectory.joint_names;
     state.positions_rad = waypoint.positions_rad;
     const auto pose =
-        fk(FkRequestDTO{state, request.tcp_frame, request.base_frame});
+        fk(FkRequestDTO{state, compiled_frame_name(request.tcp_frame),
+                        compiled_frame_name(request.base_frame)});
     if (!pose.ok() || !finite_pose(pose.value())) {
       add_violation(report, case_id, "cartesian.sample_fk",
                     pose.ok() ? "sample FK returned non-finite pose"
@@ -312,17 +314,23 @@ void validate_trajectory(const PlannerConformanceCase& test_case,
   }
   const auto trajectory_index = unique_name_index(trajectory.joint_names);
   const auto start_index = unique_name_index(request.start_state.joint_names);
+  const auto start_positions =
+      angular_position_projection(request.start_state);
   if (!trajectory_index.has_value()) {
     add_violation(report, test_case.id, "trajectory.joint_names",
                   "trajectory joint names are empty or duplicated");
     return;
   }
-  if (!start_index.has_value() ||
-      request.start_state.positions_rad.size() !=
+  if (!start_index.has_value() || !start_positions.ok() ||
+      start_positions.value().size() !=
           request.start_state.joint_names.size()) {
     add_violation(report, test_case.id, "request.start_state",
                   "request start state is malformed");
     return;
+  }
+  if (trajectory.resources != request.resources) {
+    add_violation(report, test_case.id, "trajectory.resource_projection",
+                  "trajectory resources differ from the resolved request");
   }
   if (trajectory_index->size() != start_index->size()) {
     add_violation(report, test_case.id, "model.canonical_joint_set",
@@ -390,7 +398,7 @@ void validate_trajectory(const PlannerConformanceCase& test_case,
         continue;
       }
       if (std::abs(first.positions_rad[found->second] -
-                   request.start_state.positions_rad[start_position]) >
+                   start_positions.value()[start_position]) >
           request.tolerances.joint_position_tol_rad + kNumericEpsilon) {
         add_violation(report, test_case.id, "trajectory.start_state",
                       "trajectory start differs for joint " + name);
@@ -398,7 +406,8 @@ void validate_trajectory(const PlannerConformanceCase& test_case,
     }
   }
 
-  if (const auto* goal = std::get_if<JointGoalDTO>(&request.motion)) {
+  if (const auto* goal =
+          std::get_if<ResolvedJointGoalDTO>(&request.motion)) {
     const auto goal_index = unique_name_index(goal->joint_names);
     if (!goal_index.has_value() ||
         goal->positions_rad.size() != goal->joint_names.size()) {
@@ -567,6 +576,7 @@ void validate_ik(const PlannerIkConformanceCase& test_case,
     return;
   }
   if (result.joint_names.empty() ||
+      result.resources != test_case.request.resources ||
       result.positions_rad.size() != result.joint_names.size() ||
       !unique_name_index(result.joint_names).has_value() ||
       !std::all_of(result.positions_rad.begin(), result.positions_rad.end(),
@@ -596,7 +606,8 @@ void validate_ik(const PlannerIkConformanceCase& test_case,
   if (input.forward_kinematics) {
     RobotStateDTO state{result.joint_names, result.positions_rad, {}};
     const auto pose = input.forward_kinematics(FkRequestDTO{
-        state, test_case.request.tcp_frame, test_case.request.base_frame});
+        state, compiled_frame_name(test_case.request.tcp_frame),
+        compiled_frame_name(test_case.request.base_frame)});
     if (!pose.ok()) {
       add_violation(report, test_case.id, "ik.fk_verification",
                     "FK verification failed: " + pose.error().message);
@@ -691,11 +702,11 @@ std::vector<PlannerConformanceCase> make_portable_planner_matrix(
   cases.reserve(requests.size() * profiles.size());
   for (const auto& [motion, request] : requests) {
     for (const auto profile : profiles) {
-      PlannerConformanceCase test_case;
-      test_case.id = std::string(motion_name(motion)) + "." +
-                     profile_name(profile);
-      test_case.request = *request;
-      test_case.request.move_id += "_" + test_case.id;
+      const auto case_id = std::string(motion_name(motion)) + "." +
+                           profile_name(profile);
+      PlannerConformanceCase test_case{case_id, *request};
+      test_case.request.move_id =
+          MoveId(request->move_id.value() + "_" + case_id);
       test_case.request.planning_profile = profile;
       cases.push_back(std::move(test_case));
     }

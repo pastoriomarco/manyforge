@@ -5,6 +5,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -34,31 +35,36 @@ bool all_non_empty(const std::vector<std::string>& parts) {
                      [](const std::string& part) { return !part.empty(); });
 }
 
+bool canonical_index(const std::string& value) {
+  return !value.empty() && (value.size() == 1U || value.front() != '0') &&
+         std::all_of(value.begin(), value.end(), [](char digit) {
+           return digit >= '0' && digit <= '9';
+         });
+}
+
+bool component_model_body_id(const std::string& value) {
+  const auto parts = split_body_id(value);
+  return parts.size() == 8U && all_non_empty(parts) &&
+         parts[0] == "component" && parts[2] == "model" &&
+         parts[4] == "body" && parts[6] == "collision" &&
+         canonical_index(parts[7]);
+}
+
 bool body_id_matches_owner_kind(const CollisionWorldBody& body) {
   const auto parts = split_body_id(body.body_id);
   switch (body.owner_kind) {
-    case CollisionOwnerKind::kRobotLink:
-      return parts.size() == 6 && all_non_empty(parts) &&
-             parts[0] == "robot" && parts[2] == "link" &&
-             parts[4] == "collision";
-    case CollisionOwnerKind::kAttachedObject:
-      return parts.size() == 6 && all_non_empty(parts) &&
-             parts[0] == "robot" && parts[2] == "attached" &&
-             parts[4] == "shape";
-    case CollisionOwnerKind::kDetachedObject:
-      return parts.size() == 4 && all_non_empty(parts) &&
-             parts[0] == "object" && parts[2] == "shape";
-    case CollisionOwnerKind::kFixture:
-      return parts.size() == 4 && all_non_empty(parts) &&
-             parts[0] == "fixture" && parts[2] == "shape";
+    case CollisionOwnerKind::kComponentModelBody:
+      return component_model_body_id(body.body_id);
+    case CollisionOwnerKind::kSceneResource:
+      return parts.size() == 4U && all_non_empty(parts) &&
+             parts[0] == "scene" && parts[2] == "shape" &&
+             canonical_index(parts[3]);
+    case CollisionOwnerKind::kRuntimeObject:
+      return parts.size() == 4U && all_non_empty(parts) &&
+             parts[0] == "runtime_object" && parts[2] == "shape" &&
+             canonical_index(parts[3]);
   }
   return false;
-}
-
-bool parent_link_has_robot_link_shape(const std::string& parent_link) {
-  const auto parts = split_body_id(parent_link);
-  return parts.size() == 4 && all_non_empty(parts) && parts[0] == "robot" &&
-         parts[2] == "link";
 }
 
 void mix_pose(ContentHasher& hasher, const Pose3DTO& pose) {
@@ -230,7 +236,7 @@ std::string compute_body_content_hash(const CollisionWorldBody& body) {
   ContentHasher h;
   h.mix(body.body_id);
   h.mix(static_cast<std::int64_t>(body.owner_kind));
-  h.mix(body.parent_link.value_or(""));
+  h.mix(body.parent_body_id.value_or(""));
   h.mix(body.frame_id);
   mix_pose(h, body.pose);
   h.mix(body.source_id.value_or(""));
@@ -286,9 +292,16 @@ CollisionWorldSnapshotBuilder& CollisionWorldSnapshotBuilder::set_emitted_at_ns(
 }
 
 CollisionWorldSnapshotBuilder&
-CollisionWorldSnapshotBuilder::add_robot_model_frame(
-    CollisionRobotModelFrame frame) {
-  robot_model_frames_.push_back(std::move(frame));
+CollisionWorldSnapshotBuilder::set_policy_overlay_content_hash(
+    std::string content_hash) {
+  policy_overlay_content_hash_ = std::move(content_hash);
+  return *this;
+}
+
+CollisionWorldSnapshotBuilder&
+CollisionWorldSnapshotBuilder::add_component_model_frame(
+    CollisionComponentModelFrame frame) {
+  component_model_frames_.push_back(std::move(frame));
   return *this;
 }
 
@@ -317,37 +330,39 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
   snapshot.publisher_id = publisher_id_;
   snapshot.revision.revision_id = revision_id_;
   snapshot.emitted_at_ns = emitted_at_ns_;
-  snapshot.robot_model_frames = std::move(robot_model_frames_);
-  robot_model_frames_.clear();
+  snapshot.component_model_frames = std::move(component_model_frames_);
+  component_model_frames_.clear();
   snapshot.bodies = std::move(bodies_);
   bodies_.clear();
 
-  std::set<std::pair<std::string, std::string>> seen_robot_frames;
-  for (const auto& frame : snapshot.robot_model_frames) {
-    if (frame.robot_id.empty()) {
-      return err("robot_model_frame robot_id must be non-empty");
-    }
-    if (frame.model_frame_id.empty()) {
-      return err("robot_model_frame model_frame_id must be non-empty");
+  using ComponentFrameKey =
+      std::tuple<ControllableComponentId, ModelInstanceId, FrameRoleId>;
+  std::set<ComponentFrameKey> seen_component_frames;
+  for (const auto& frame : snapshot.component_model_frames) {
+    if (frame.controllable_component_id.empty() ||
+        frame.model_instance_id.empty() || frame.frame_role_id.empty() ||
+        frame.compiled_frame_name.empty() || frame.model_revision.empty()) {
+      return err("component_model_frame identity must be complete");
     }
     if (!finite_pose(frame.world_pose)) {
-      return err("robot_model_frame world_pose must be finite");
+      return err("component_model_frame world_pose must be finite");
     }
-    const auto key = std::make_pair(frame.robot_id, frame.model_frame_id);
-    if (!seen_robot_frames.insert(key).second) {
-      return err("duplicate robot_model_frame: " + frame.robot_id + "/" +
-                 frame.model_frame_id);
+    const ComponentFrameKey key{frame.controllable_component_id,
+                                frame.model_instance_id,
+                                frame.frame_role_id};
+    if (!seen_component_frames.insert(key).second) {
+      return err("duplicate component_model_frame");
     }
   }
 
-  std::sort(snapshot.robot_model_frames.begin(),
-            snapshot.robot_model_frames.end(),
-            [](const CollisionRobotModelFrame& a,
-               const CollisionRobotModelFrame& b) {
-              if (a.robot_id != b.robot_id) {
-                return a.robot_id < b.robot_id;
-              }
-              return a.model_frame_id < b.model_frame_id;
+  std::sort(snapshot.component_model_frames.begin(),
+            snapshot.component_model_frames.end(),
+            [](const CollisionComponentModelFrame& a,
+               const CollisionComponentModelFrame& b) {
+              return std::tie(a.controllable_component_id,
+                              a.model_instance_id, a.frame_role_id) <
+                     std::tie(b.controllable_component_id,
+                              b.model_instance_id, b.frame_role_id);
             });
 
   std::set<CollisionBodyId> seen_ids;
@@ -415,24 +430,29 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
         return err(oss.str());
       }
     }
-    const bool is_attached =
-        body.owner_kind == CollisionOwnerKind::kAttachedObject;
-    if (is_attached) {
-      if (!body.parent_link.has_value() || body.parent_link->empty()) {
-        std::ostringstream oss;
-        oss << "attached body missing parent_link: " << body.body_id;
-        return err(oss.str());
-      }
-      if (!parent_link_has_robot_link_shape(*body.parent_link)) {
-        std::ostringstream oss;
-        oss << "attached body parent_link is not a robot link id: "
-            << body.body_id;
-        return err(oss.str());
-      }
-    } else if (body.parent_link.has_value()) {
+    if (body.parent_body_id.has_value() &&
+        (body.owner_kind != CollisionOwnerKind::kSceneResource ||
+         !component_model_body_id(*body.parent_body_id))) {
       std::ostringstream oss;
-      oss << "non-attached body has parent_link: " << body.body_id;
+      oss << "body has an invalid parent_body_id: " << body.body_id;
       return err(oss.str());
+    }
+  }
+
+  for (const auto& body : snapshot.bodies) {
+    if (!body.parent_body_id.has_value()) {
+      continue;
+    }
+    const auto parent = std::find_if(
+        snapshot.bodies.begin(), snapshot.bodies.end(),
+        [&](const CollisionWorldBody& candidate) {
+          return candidate.body_id == *body.parent_body_id &&
+                 candidate.owner_kind ==
+                     CollisionOwnerKind::kComponentModelBody;
+        });
+    if (parent == snapshot.bodies.end()) {
+      return err("parent_body_id does not name a component-model body: " +
+                 body.body_id);
     }
   }
 
@@ -445,10 +465,9 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
   // Populate counts + per-body hashes + flags.
   snapshot.body_count = static_cast<std::int64_t>(snapshot.bodies.size());
   snapshot.geometry_count = 0;
-  snapshot.robot_link_count = 0;
-  snapshot.attached_object_count = 0;
-  snapshot.detached_object_count = 0;
-  snapshot.fixture_count = 0;
+  snapshot.component_model_body_count = 0;
+  snapshot.scene_resource_count = 0;
+  snapshot.runtime_object_count = 0;
   snapshot.contains_mesh_geometry = false;
   snapshot.all_bodies_have_geometry = true;
 
@@ -460,17 +479,14 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
     snapshot.geometry_count +=
         static_cast<std::int64_t>(body.geometries.size());
     switch (body.owner_kind) {
-      case CollisionOwnerKind::kRobotLink:
-        snapshot.robot_link_count++;
+      case CollisionOwnerKind::kComponentModelBody:
+        snapshot.component_model_body_count++;
         break;
-      case CollisionOwnerKind::kAttachedObject:
-        snapshot.attached_object_count++;
+      case CollisionOwnerKind::kSceneResource:
+        snapshot.scene_resource_count++;
         break;
-      case CollisionOwnerKind::kDetachedObject:
-        snapshot.detached_object_count++;
-        break;
-      case CollisionOwnerKind::kFixture:
-        snapshot.fixture_count++;
+      case CollisionOwnerKind::kRuntimeObject:
+        snapshot.runtime_object_count++;
         break;
     }
     for (const auto& geom : body.geometries) {
@@ -489,15 +505,24 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
   world.mix("manyforge_core/CollisionWorldSnapshot");
   world.mix(static_cast<std::int64_t>(snapshot.snapshot_format_version));
   world.mix(snapshot.publisher_id);
-  world.mix(static_cast<std::int64_t>(snapshot.robot_model_frames.size()));
-  for (const auto& frame : snapshot.robot_model_frames) {
-    world.mix(frame.robot_id);
-    world.mix(frame.model_frame_id);
+  world.mix(
+      static_cast<std::int64_t>(snapshot.component_model_frames.size()));
+  for (const auto& frame : snapshot.component_model_frames) {
+    world.mix(frame.controllable_component_id.value());
+    world.mix(frame.model_instance_id.value());
+    world.mix(frame.frame_role_id.value());
+    world.mix(frame.compiled_frame_name);
+    world.mix(frame.model_revision.value());
     mix_pose(world, frame.world_pose);
   }
   world.mix(static_cast<std::int64_t>(snapshot.bodies.size()));
   for (const auto& body : snapshot.bodies) {
     world.mix(body.body_content_hash);
+  }
+  world.mix(static_cast<std::int64_t>(
+      policy_overlay_content_hash_.empty() ? 0 : 1));
+  if (!policy_overlay_content_hash_.empty()) {
+    world.mix(policy_overlay_content_hash_);
   }
   snapshot.revision.content_hash = world.finalize();
 

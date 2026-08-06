@@ -822,6 +822,7 @@ struct IdentityContractRow final {
            {"qualified_catalog_kinds",
             CanonicalValue(sorted_text_values({
                 "capability_definition",
+                "command_schema",
                 "component_type",
                 "control_interface_contract",
                 "controller_topology",
@@ -832,7 +833,6 @@ struct IdentityContractRow final {
             }))},
            {"unqualified_catalog_kinds",
             CanonicalValue(sorted_text_values({
-                "command_schema",
                 "contact_policy",
                 "runtime_policy",
             }))},

@@ -316,7 +316,7 @@ class ScopedTrustedRoot final {
       nullptr);
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
-      {}, selected_overlay);
+      {}, {}, selected_overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
 }
@@ -1275,6 +1275,19 @@ TEST(FilesystemVerifiedRetainedModelMapSourceTest,
   EXPECT_EQ(model_map->cell_frame().cell_id,
             reloaded->value().cell_graph.cell_id);
   EXPECT_EQ(model_map->model_occurrences().size(), 1U);
+  ASSERT_EQ(model_map->model_collision_bodies().size(), 2U);
+  EXPECT_EQ(model_map->model_collision_bodies()[0]
+                .collision_body_role_id.value(),
+            "arm_collision");
+  EXPECT_EQ(model_map->model_collision_bodies()[0]
+                .compiled_link_names.size(),
+            7U);
+  EXPECT_EQ(model_map->model_collision_bodies()[1]
+                .collision_body_role_id.value(),
+            "gripper_collision");
+  EXPECT_EQ(model_map->model_collision_bodies()[1]
+                .compiled_link_names.size(),
+            3U);
   EXPECT_FALSE(model_map->symbols().empty());
   EXPECT_FALSE(model_map->references().empty());
   EXPECT_FALSE(model_map->coordinates().empty());

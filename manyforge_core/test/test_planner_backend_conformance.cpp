@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/testing/planner_backend_conformance.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -67,7 +68,7 @@ class DeterministicPlanner final : public IPlannerBackend {
           {}};
     }
     const auto capability = [&]() -> std::pair<bool, std::string> {
-      if (std::holds_alternative<JointGoalDTO>(request.motion)) {
+      if (std::holds_alternative<ResolvedJointGoalDTO>(request.motion)) {
         return {capabilities.joint_goal, "planning.motion.joint_goal"};
       }
       if (std::holds_alternative<PoseGoalDTO>(request.motion)) {
@@ -100,7 +101,7 @@ class DeterministicPlanner final : public IPlannerBackend {
       return PlanResultDTO{std::nullopt, unsupported(profile.second), {}};
     }
 
-    if (request.move_id == "cancel_in_flight") {
+    if (request.move_id.value() == "cancel_in_flight") {
       {
         std::lock_guard<std::mutex> lock(mutex_);
         active_ = true;
@@ -119,6 +120,7 @@ class DeterministicPlanner final : public IPlannerBackend {
     }
 
     TrajectoryDTO trajectory;
+    trajectory.resources = request.resources;
     trajectory.joint_names = request.start_state.joint_names;
     if (leak_private_joint_name && !trajectory.joint_names.empty()) {
       trajectory.joint_names.front() = "backend_private_joint_0";
@@ -130,8 +132,14 @@ class DeterministicPlanner final : public IPlannerBackend {
           std::vector<double>(positions.size(), 0.0),
           std::vector<double>(positions.size(), 0.0)});
     };
-    append(0.0, request.start_state.positions_rad, trajectory);
-    if (const auto* goal = std::get_if<JointGoalDTO>(&request.motion)) {
+    const auto start_positions =
+        angular_position_projection(request.start_state);
+    if (!start_positions.ok()) {
+      return PlanResultDTO{std::nullopt, start_positions.error(), {}};
+    }
+    append(0.0, start_positions.value(), trajectory);
+    if (const auto* goal =
+            std::get_if<ResolvedJointGoalDTO>(&request.motion)) {
       append(1.0, goal->positions_rad, trajectory);
     } else if (const auto* goal = std::get_if<PoseGoalDTO>(&request.motion)) {
       append(1.0,
@@ -167,7 +175,7 @@ class DeterministicPlanner final : public IPlannerBackend {
 
   IkResultDTO solve_ik(const IkRequestDTO& request) override {
     if (!capabilities.single_shot_ik) {
-      return IkResultDTO{false, {}, {},
+      return IkResultDTO{false, {}, {}, {},
                          unsupported("planning.ik.single_shot")};
     }
     auto joint_names = request.seed_state.joint_names;
@@ -178,6 +186,7 @@ class DeterministicPlanner final : public IPlannerBackend {
       joint_names.front() = "backend_private_ik_joint_0";
     }
     return IkResultDTO{true,
+                       request.resources,
                        std::move(joint_names),
                        {request.goal_pose.position_m.x_m,
                         request.goal_pose.position_m.y_m},
@@ -198,13 +207,12 @@ class DeterministicPlanner final : public IPlannerBackend {
 };
 
 PlanRequestDTO base_request(std::string move_id) {
-  PlanRequestDTO request;
-  request.robot_id = "canonical_robot";
-  request.group_id = "arm";
-  request.move_id = std::move(move_id);
-  request.base_frame = "base";
-  request.tcp_frame = "tcp";
-  request.start_state = {{"joint_x", "joint_y"}, {0.0, 0.0}, {}};
+  auto request = make_test_plan_request(
+      std::move(move_id),
+      ResolvedJointGoalDTO{
+          {ResourceId("resource:joint_x"), ResourceId("resource:joint_y")},
+          {"joint_x", "joint_y"}, {0.0, 0.0}},
+      {"joint_x", "joint_y"}, {0.0, 0.0});
   request.tolerances = {1e-6, 1e-6, 1e-6};
   request.speed_profile = {0.5, 0.5, std::nullopt};
   request.planning_timeout_s = 1.0;
@@ -214,7 +222,9 @@ PlanRequestDTO base_request(std::string move_id) {
 
 PlannerBackendConformanceInput make_input(DeterministicPlanner& planner) {
   auto joint = base_request("joint");
-  joint.motion = JointGoalDTO{{"joint_x", "joint_y"}, {0.2, -0.1}};
+  joint.motion = ResolvedJointGoalDTO{
+      joint.resources,
+      {"joint_x", "joint_y"}, {0.2, -0.1}};
 
   auto pose = base_request("pose");
   pose.motion = PoseGoalDTO{pose_at(0.2, -0.1)};
@@ -242,17 +252,19 @@ PlannerBackendConformanceInput make_input(DeterministicPlanner& planner) {
                 request.robot_state.positions_rad[1]));
   };
   auto invalid = joint;
-  invalid.move_id = "invalid_binding";
+  invalid.move_id = MoveId("invalid_binding");
   invalid.projection_binding = {};
   input.expected_failures.push_back(PlannerExpectedFailureCase{
       "invalid_projection_binding", invalid, kErrorInvalidRequest,
       "planner_projection_binding_invalid"});
   input.ik_case = PlannerIkConformanceCase{
       "single_shot_ik",
-      IkRequestDTO{pose_at(0.15, -0.05), "base", "tcp",
-                   joint.start_state, 0.1}};
+      IkRequestDTO{joint.controllable_component_id, joint.command_target_id,
+                   joint.model_bindings, joint.resources,
+                   pose_at(0.15, -0.05), joint.base_frame, joint.tcp_frame,
+                   joint.start_state, joint.projection_binding, 0.1}};
   auto cancellation = joint;
-  cancellation.move_id = "cancel_in_flight";
+  cancellation.move_id = MoveId("cancel_in_flight");
   input.cancellation_case = PlannerCancellationConformanceCase{
       "cooperative_cancellation", &planner, cancellation,
       [&planner](std::chrono::milliseconds timeout) {
@@ -354,7 +366,12 @@ class PlannerWithoutIk final : public IPlannerBackend {
 
 TEST(PlannerBackendConformance, DefaultIkRejectionNamesPortableCapability) {
   PlannerWithoutIk planner;
-  const auto result = planner.solve_ik(IkRequestDTO{});
+  const auto plan = base_request("default_ik");
+  const auto result = planner.solve_ik(IkRequestDTO{
+      plan.controllable_component_id, plan.command_target_id,
+      plan.model_bindings, plan.resources, pose_at(0.0, 0.0),
+      plan.base_frame, plan.tcp_frame, plan.start_state,
+      plan.projection_binding, 0.1});
 
   ASSERT_FALSE(result.ok);
   ASSERT_TRUE(result.error.has_value());

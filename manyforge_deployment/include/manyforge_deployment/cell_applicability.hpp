@@ -5,6 +5,7 @@
 #include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
+#include <manyforge_deployment/command_schema_codec.hpp>
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <manyforge_deployment/controller_topology_codec.hpp>
 #include <manyforge_deployment/deployment_applicability_codec.hpp>
@@ -370,6 +371,10 @@ class ApplicabilityQualifiedCellIr final {
   capability_definitions() const noexcept {
     return data_->capability_definitions;
   }
+  [[nodiscard]] const std::vector<QualifiedCommandSchema>& command_schemas()
+      const noexcept {
+    return data_->command_schemas;
+  }
   [[nodiscard]] const std::vector<QualifiedControlInterfaceContract>&
   control_interface_contracts() const noexcept {
     return data_->control_interface_contracts;
@@ -425,6 +430,7 @@ class ApplicabilityQualifiedCellIr final {
         std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref_in,
         const QualifiedAssistantSettings& assistant_settings_in,
         std::vector<QualifiedRuntimeProfile> runtime_profiles_in,
+        std::vector<QualifiedCommandSchema> command_schemas_in,
         std::vector<QualifiedCapabilityDefinition>
             capability_definitions_in,
         std::vector<QualifiedControlInterfaceContract>
@@ -449,6 +455,7 @@ class ApplicabilityQualifiedCellIr final {
               std::move(selected_site_overlay_ref_in)),
           assistant_settings(assistant_settings_in),
           runtime_profiles(std::move(runtime_profiles_in)),
+          command_schemas(std::move(command_schemas_in)),
           capability_definitions(std::move(capability_definitions_in)),
           control_interface_contracts(
               std::move(control_interface_contracts_in)),
@@ -468,6 +475,7 @@ class ApplicabilityQualifiedCellIr final {
     std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref;
     QualifiedAssistantSettings assistant_settings;
     std::vector<QualifiedRuntimeProfile> runtime_profiles;
+    std::vector<QualifiedCommandSchema> command_schemas;
     std::vector<QualifiedCapabilityDefinition> capability_definitions;
     std::vector<QualifiedControlInterfaceContract>
         control_interface_contracts;
@@ -489,6 +497,7 @@ class ApplicabilityQualifiedCellIr final {
       std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref,
       const QualifiedAssistantSettings& assistant_settings,
       std::vector<QualifiedRuntimeProfile> runtime_profiles,
+      std::vector<QualifiedCommandSchema> command_schemas,
       std::vector<QualifiedCapabilityDefinition> capability_definitions,
       std::vector<QualifiedControlInterfaceContract>
           control_interface_contracts,
@@ -507,6 +516,7 @@ class ApplicabilityQualifiedCellIr final {
             std::move(selected_site_overlay_ref),
             assistant_settings,
             std::move(runtime_profiles),
+            std::move(command_schemas),
             std::move(capability_definitions),
             std::move(control_interface_contracts),
             std::move(controller_topologies),
@@ -524,6 +534,7 @@ class ApplicabilityQualifiedCellIr final {
       const CompositionQualifiedCellIr&,
       const RevisionVerifiedDeploymentApplicabilityInputs&,
       std::span<const QualifiedRuntimeProfile>,
+      std::span<const QualifiedCommandSchema>,
       std::span<const QualifiedCapabilityDefinition>,
       std::span<const QualifiedControlInterfaceContract>,
       std::span<const QualifiedControllerTopology>,
@@ -536,6 +547,7 @@ class ApplicabilityQualifiedCellIr final {
     const CompositionQualifiedCellIr& composition,
     const RevisionVerifiedDeploymentApplicabilityInputs& deployment_inputs,
     std::span<const QualifiedRuntimeProfile> runtime_profiles,
+    std::span<const QualifiedCommandSchema> command_schemas,
     std::span<const QualifiedCapabilityDefinition> capability_definitions,
     std::span<const QualifiedControlInterfaceContract>
         control_interface_contracts,
