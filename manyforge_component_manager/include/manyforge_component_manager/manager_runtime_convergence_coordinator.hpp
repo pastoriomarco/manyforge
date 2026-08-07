@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace manyforge::component_manager {
 
@@ -61,10 +62,12 @@ struct ManagerApplyRuntimeConvergenceResult final {
 /// persisted only after the exact predecessor public pointer is independently
 /// re-read as the current head.
 ///
-/// This checkpoint admits only the I3-qualified retained POSIX reference
-/// product. It does not provide a generic executor, external-runtime fallback,
-/// process retirement, scene mutation, activation, publication, or fence
-/// release.
+/// Product verification is generic only across the closed build-qualified
+/// runtime-product registry. The selected process/progress ports still own the
+/// concrete adapter and may never interpret a retained product as an arbitrary
+/// executable tuple. This coordinator does not provide an external-runtime
+/// fallback, process retirement, scene mutation, activation, publication, or
+/// fence release.
 class ManagerApplyRuntimeConvergenceCoordinator final {
  public:
   ManagerApplyRuntimeConvergenceCoordinator(
@@ -73,6 +76,16 @@ class ManagerApplyRuntimeConvergenceCoordinator final {
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource& artifact_source,
       IRuntimeUnitProcessPort& process_port, IRuntimeUnitProgressPort& progress_port,
       std::string operating_system, std::string shell_contract,
+      RuntimeObservationReducer::Clock clock_ns);
+  ManagerApplyRuntimeConvergenceCoordinator(
+      ManagerApplyFenceCoordinator& fence_coordinator,
+      SqliteManagerApplyJournal& apply_journal,
+      const manyforge::core::IActiveBundlePublicationReader& publication_reader,
+      const manyforge::deployment::IVerifiedRetainedProductArtifactSource&
+          artifact_source,
+      IRuntimeUnitProcessPort& process_port,
+      IRuntimeUnitProgressPort& progress_port, std::string operating_system,
+      std::vector<std::string> launch_environment_contracts,
       RuntimeObservationReducer::Clock clock_ns);
 
   [[nodiscard]] ManagerApplyRuntimeConvergenceResult ConvergeOrRecover(
@@ -95,7 +108,7 @@ class ManagerApplyRuntimeConvergenceCoordinator final {
   IRuntimeUnitProcessPort& process_port_;
   IRuntimeUnitProgressPort& progress_port_;
   std::string operating_system_;
-  std::string shell_contract_;
+  std::vector<std::string> launch_environment_contracts_;
   RuntimeObservationReducer::Clock clock_ns_;
   std::mutex operation_mutex_;
 };

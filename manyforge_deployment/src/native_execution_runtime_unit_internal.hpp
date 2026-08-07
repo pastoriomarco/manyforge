@@ -5,6 +5,7 @@
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <string>
 #include <string_view>
 
@@ -17,7 +18,7 @@ namespace detail {
 inline constexpr std::string_view kNativeExecutionRuntimeManifestApiVersion =
     "manyforge.native_execution_runtime_manifest.v1";
 inline constexpr std::string_view kNativeExecutionRuntimeProductContractId =
-    "manyforge.native_execution_runtime_unit";
+    native_execution_runtime_contract::kProductContractId;
 inline constexpr std::string_view kNativeExecutionRuntimeManifestArtifactRole =
     "runtime_manifest";
 inline constexpr std::string_view kNativeExecutionRuntimeManifestMediaType =
@@ -28,34 +29,34 @@ inline constexpr std::string_view
     kNativeExecutionRuntimeLaunchDescriptorMediaType =
         "application/vnd.manyforge.installed-target-launch+json";
 inline constexpr std::string_view kNativeExecutionRuntimeProfileId =
-    "manyforge.native_execution_runtime";
+    native_execution_runtime_contract::kRuntimeProfileId;
 inline constexpr std::string_view kNativeExecutionRuntimeRoleId =
-    "native_execution";
+    native_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view kNativeExecutionRuntimeStatusEndpointRoleId =
-    "native_execution_status";
+    native_execution_runtime_contract::kStatusEndpointRoleId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeProjectionEndpointRoleId =
-        "planner_scene_projection";
+        native_execution_runtime_contract::kProjectionEndpointRoleId;
 inline constexpr std::string_view kNativeExecutionRuntimeImplementationId =
-    "manyforge.native_execution_host";
+    native_execution_runtime_contract::kImplementationId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeProcessAdapterContractId =
-        "manyforge.installed_native_target";
+        native_execution_runtime_contract::kProcessAdapterContractId;
 inline constexpr std::string_view kNativeExecutionRuntimeRetrievalContractId =
-    "manyforge.retained_raw_artifact";
+    native_execution_runtime_contract::kRetrievalContractId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeStatusEndpointContractId =
-        "manyforge.native_execution.status_direct";
+        native_execution_runtime_contract::kStatusEndpointContractId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeProjectionEndpointContractId =
-        "manyforge.planner_scene_projection.rpc";
+        native_execution_runtime_contract::kProjectionEndpointContractId;
 inline constexpr std::string_view kNativeExecutionRuntimeOperatingSystem =
-    "linux";
+    native_execution_runtime_contract::kOperatingSystem;
 inline constexpr std::string_view
     kNativeExecutionRuntimeLaunchEnvironmentContract =
-        "manyforge.native_execution_host.abi.v1";
+        native_execution_runtime_contract::kLaunchEnvironmentContract;
 inline constexpr std::string_view kNativeExecutionRuntimeInstalledTargetId =
-    "manyforge_native_execution_host";
+    native_execution_runtime_contract::kInstalledTargetId;
 inline constexpr std::size_t kMaxNativeExecutionRuntimeManifestBytes =
     64U * 1024U;
 inline constexpr std::size_t kMaxNativeExecutionLaunchDescriptorBytes =

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <exception>
-#include <manyforge_component_manager/reference_runtime_unit_admission.hpp>
 #include <map>
 #include <set>
 #include <utility>
@@ -74,9 +73,9 @@ void VerifyApplyInputs(const ManagerApplyIntentDTO& apply_intent, const Retained
   return receipt;
 }
 
-[[nodiscard]] RuntimeUnitConvergencePlanRowDTO MakeReferencePlanRow(
+[[nodiscard]] RuntimeUnitConvergencePlanRowDTO MakeVerifiedPlanRow(
     const manyforge::core::RuntimeUnitDTO& runtime_unit,
-    const ReferenceRuntimeUnitAdmission& admission,
+    const manyforge::deployment::VerifiedRetainedRuntimeUnitProduct &product,
     const RuntimeUnitCandidateDisposition disposition) {
   RuntimeUnitConvergencePlanRowDTO row{
       runtime_unit.runtime_unit_id,
@@ -84,28 +83,29 @@ void VerifyApplyInputs(const ManagerApplyIntentDTO& apply_intent, const Retained
       runtime_unit.runtime_profile_revision,
       manyforge::core::RuntimeLifecycleControl::kManagerManaged,
       disposition,
-      admission.product_id(),
-      admission.product_contract_id(),
-      admission.product_contract_revision(),
-      ContentDigest(admission.product_identity()),
-      ContentDigest(admission.configuration_identity()),
+      product.product_id(),
+      product.product_contract_id(),
+      product.product_contract_revision(),
+      product.product_identity(),
+      product.configuration_identity(),
       runtime_unit.dependency_runtime_unit_ids,
-      {RuntimeRoleId(admission.runtime_role_id())},
-      manyforge::core::EndpointRoleId(admission.status_endpoint_role_id()),
-      admission.status_endpoint_contract_id(),
-      admission.status_endpoint_contract_revision(),
-      admission.status_transport(),
-      admission.process_adapter_contract_id(),
-      admission.process_adapter_contract_revision(),
-      admission.retrieval_contract_id(),
-      admission.retrieval_contract_revision(),
-      ContentDigest(admission.launchable_content_digest()),
-      static_cast<std::uint64_t>(admission.launchable_bytes().size()),
-      admission.operating_system(),
-      admission.shell_contract(),
+      {RuntimeRoleId(std::string(product.runtime_role_id()))},
+      manyforge::core::EndpointRoleId(
+          std::string(product.status_endpoint_role_id())),
+      std::string(product.status_endpoint_contract_id()),
+      std::string(product.status_endpoint_contract_revision()),
+      std::string(product.status_transport()),
+      std::string(product.process_adapter_contract_id()),
+      std::string(product.process_adapter_contract_revision()),
+      std::string(product.retrieval_contract_id()),
+      std::string(product.retrieval_contract_revision()),
+      product.launchable_artifact_ref().content_digest,
+      product.launchable_artifact_ref().byte_size,
+      std::string(product.operating_system()),
+      std::string(product.launch_environment_contract()),
   };
   if (!row.valid()) {
-    Fail("verified reference runtime produced an invalid convergence row");
+    Fail("verified runtime product produced an invalid convergence row");
   }
   return row;
 }
@@ -113,17 +113,30 @@ void VerifyApplyInputs(const ManagerApplyIntentDTO& apply_intent, const Retained
 [[nodiscard]] std::map<std::string, RuntimeUnitConvergencePlanRowDTO> VerifyRuntimeProducts(
     const RetainedBundle& bundle,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource& artifact_source,
-    const std::string_view operating_system, const std::string_view shell_contract) {
+    const std::string_view operating_system,
+    const std::vector<std::string>& launch_environment_contracts) {
   std::map<std::string, RuntimeUnitConvergencePlanRowDTO> plans;
   for (const auto& runtime_unit : bundle.value().cell_graph.runtime_units) {
-    const auto admission = VerifyReferenceRuntimeUnitForHost(
-        bundle, runtime_unit.runtime_unit_id, artifact_source, operating_system, shell_contract);
-    if (!admission.has_value()) {
+    const auto product = manyforge::deployment::verify_runtime_unit_product(
+        bundle, runtime_unit.runtime_unit_id, artifact_source);
+    if (!product.has_value()) {
       Fail("runtime unit has no I3-qualified I4 process adapter product: " +
            runtime_unit.runtime_unit_id.value());
     }
-    auto row = MakeReferencePlanRow(runtime_unit, *admission,
-                                    RuntimeUnitCandidateDisposition::kRetainedExact);
+    if (product->operating_system() != operating_system) {
+      Fail("runtime unit product is incompatible with the selected host OS: " +
+           runtime_unit.runtime_unit_id.value());
+    }
+    if (!std::binary_search(launch_environment_contracts.begin(),
+                            launch_environment_contracts.end(),
+                            product->launch_environment_contract())) {
+      Fail("runtime product is incompatible with the selected host launch "
+           "environment: " +
+           runtime_unit.runtime_unit_id.value());
+    }
+    auto row = MakeVerifiedPlanRow(
+        runtime_unit, *product,
+        RuntimeUnitCandidateDisposition::kRetainedExact);
     if (!plans.emplace(runtime_unit.runtime_unit_id.value(), std::move(row)).second) {
       Fail("retained bundle contains a duplicate runtime-unit identity");
     }
@@ -134,11 +147,14 @@ void VerifyApplyInputs(const ManagerApplyIntentDTO& apply_intent, const Retained
 [[nodiscard]] std::vector<RuntimeUnitConvergencePlanRowDTO> BuildCandidatePlan(
     const RetainedBundle& predecessor, const RetainedBundle& candidate,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource& artifact_source,
-    const std::string_view operating_system, const std::string_view shell_contract) {
+    const std::string_view operating_system,
+    const std::vector<std::string>& launch_environment_contracts) {
   auto predecessor_plans =
-      VerifyRuntimeProducts(predecessor, artifact_source, operating_system, shell_contract);
+      VerifyRuntimeProducts(predecessor, artifact_source, operating_system,
+                            launch_environment_contracts);
   auto candidate_plans =
-      VerifyRuntimeProducts(candidate, artifact_source, operating_system, shell_contract);
+      VerifyRuntimeProducts(candidate, artifact_source, operating_system,
+                            launch_environment_contracts);
   for (const auto& [runtime_id, predecessor_row] : predecessor_plans) {
     const auto candidate_row = candidate_plans.find(runtime_id);
     if (candidate_row == candidate_plans.end()) {
@@ -359,6 +375,23 @@ ManagerApplyRuntimeConvergenceCoordinator::ManagerApplyRuntimeConvergenceCoordin
     IRuntimeUnitProcessPort& process_port, IRuntimeUnitProgressPort& progress_port,
     std::string operating_system, std::string shell_contract,
     RuntimeObservationReducer::Clock clock_ns)
+    : ManagerApplyRuntimeConvergenceCoordinator(
+          fence_coordinator, apply_journal, publication_reader,
+          artifact_source, process_port, progress_port,
+          std::move(operating_system),
+          std::vector<std::string>{std::move(shell_contract)},
+          std::move(clock_ns)) {}
+
+ManagerApplyRuntimeConvergenceCoordinator::ManagerApplyRuntimeConvergenceCoordinator(
+    ManagerApplyFenceCoordinator& fence_coordinator,
+    SqliteManagerApplyJournal& apply_journal,
+    const manyforge::core::IActiveBundlePublicationReader& publication_reader,
+    const manyforge::deployment::IVerifiedRetainedProductArtifactSource&
+        artifact_source,
+    IRuntimeUnitProcessPort& process_port,
+    IRuntimeUnitProgressPort& progress_port, std::string operating_system,
+    std::vector<std::string> launch_environment_contracts,
+    RuntimeObservationReducer::Clock clock_ns)
     : fence_coordinator_(fence_coordinator),
       apply_journal_(apply_journal),
       publication_reader_(publication_reader),
@@ -366,9 +399,20 @@ ManagerApplyRuntimeConvergenceCoordinator::ManagerApplyRuntimeConvergenceCoordin
       process_port_(process_port),
       progress_port_(progress_port),
       operating_system_(std::move(operating_system)),
-      shell_contract_(std::move(shell_contract)),
+      launch_environment_contracts_(
+          std::move(launch_environment_contracts)),
       clock_ns_(std::move(clock_ns)) {
-  if (operating_system_.empty() || shell_contract_.empty() || !clock_ns_) {
+  std::sort(launch_environment_contracts_.begin(),
+            launch_environment_contracts_.end());
+  if (operating_system_.empty() ||
+      launch_environment_contracts_.empty() ||
+      std::any_of(launch_environment_contracts_.begin(),
+                  launch_environment_contracts_.end(),
+                  [](const auto& value) { return value.empty(); }) ||
+      std::adjacent_find(launch_environment_contracts_.begin(),
+                         launch_environment_contracts_.end()) !=
+          launch_environment_contracts_.end() ||
+      !clock_ns_) {
     throw std::invalid_argument("runtime convergence coordinator dependencies are invalid");
   }
 }
@@ -383,7 +427,8 @@ ManagerApplyRuntimeConvergenceResult ManagerApplyRuntimeConvergenceCoordinator::
   const auto initial_publication = VerifyCurrentPredecessor(publication_reader_, apply_intent,
                                                             predecessor_publication_generation);
   auto runtime_plans = BuildCandidatePlan(predecessor, candidate, artifact_source_,
-                                          operating_system_, shell_contract_);
+                                          operating_system_,
+                                          launch_environment_contracts_);
   const auto dependency_order = DependencyOrder(runtime_plans);
 
   auto fence = fence_coordinator_.AcquireOrRecoverFence(apply_intent, predecessor, candidate,

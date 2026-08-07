@@ -988,7 +988,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
                        {},
                    },
                    ActiveBundlePublicationGeneration(3U))),
-               ReferenceRuntimeUnitAdmissionError);
+               ManagerRuntimeConvergenceCoordinatorError);
   EXPECT_EQ(fixture.kernel.acquire_calls, 0);
   EXPECT_EQ(fixture.runtime_ports.observe_calls, 0);
   EXPECT_FALSE(

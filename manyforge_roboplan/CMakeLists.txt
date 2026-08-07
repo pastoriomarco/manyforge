@@ -297,6 +297,8 @@ target_link_libraries(manyforge_native_execution_host PRIVATE
   manyforge_component_manager
   manyforge_deployment
   Threads::Threads)
+install(TARGETS manyforge_native_execution_host
+  RUNTIME DESTINATION bin)
 
 message(STATUS
   "manyforge_roboplan I6 cutover: retained-product projection, addressed "
@@ -666,6 +668,20 @@ if(BUILD_TESTING)
       roboplan::roboplan
       GTest::gtest_main)
 
+    add_executable(test_retained_native_runtime_unit_adapter
+      test/test_retained_native_runtime_unit_adapter.cpp)
+    add_dependencies(test_retained_native_runtime_unit_adapter
+      generate_lite6_native_execution_fixture
+      manyforge_native_execution_host)
+    target_compile_definitions(
+      test_retained_native_runtime_unit_adapter PRIVATE
+      MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host>")
+    target_link_libraries(test_retained_native_runtime_unit_adapter PRIVATE
+      manyforge_component_manager
+      manyforge_deployment_verification_core
+      GTest::gtest_main)
+
     # Pinocchio/coal/roboplan .so files live in cmeel.prefix/lib.
     # Discover the active Python site-packages roots rather than hardcoding a
     # Python minor version into the test runtime path.
@@ -704,6 +720,10 @@ if(BUILD_TESTING)
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_retained_product_consumer
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_retained_native_runtime_unit_adapter
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

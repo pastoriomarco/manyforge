@@ -177,10 +177,13 @@ add_library(manyforge_component_manager
   src/manager_scene_stage_coordinator.cpp
   src/manager_selected_bundle_transition_coordinator.cpp
   src/manager_bootstrap_journal.cpp
+  src/native_execution_runtime_unit_admission.cpp
   src/reference_runtime_unit_admission.cpp
+  src/retained_native_runtime_unit_adapter.cpp
   src/retained_posix_runtime_unit_adapter.cpp
   src/runtime_convergence.cpp
   src/runtime_observation.cpp
+  src/runtime_unit_adapter_router.cpp
   src/scene_staging.cpp
   src/selected_bundle_transition.cpp
   src/sqlite_store_startup_internal.cpp

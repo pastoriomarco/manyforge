@@ -12,6 +12,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,7 @@
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
@@ -311,6 +313,194 @@ struct HostConfig final {
   std::string motion_target_role_id;
   std::string gripper_target_role_id;
 };
+
+struct ManagedRuntimeChildConfig final {
+  int manager_channel_fd{-1};
+  std::string runtime_unit_id;
+  std::string runtime_epoch;
+  std::string product_identity;
+  std::string configuration_identity;
+};
+
+[[nodiscard]] bool IsPortableRuntimeIdentity(
+    const std::string_view value) noexcept {
+  if (value.empty() || value.size() > 128U ||
+      !((value.front() >= 'a' && value.front() <= 'z') ||
+        (value.front() >= 'A' && value.front() <= 'Z') ||
+        (value.front() >= '0' && value.front() <= '9'))) {
+    return false;
+  }
+  return std::all_of(value.begin() + 1, value.end(), [](const char character) {
+    return (character >= 'a' && character <= 'z') ||
+           (character >= 'A' && character <= 'Z') ||
+           (character >= '0' && character <= '9') || character == '.' ||
+           character == '_' || character == '-';
+  });
+}
+
+[[nodiscard]] int ParseFileDescriptor(const std::string_view value) {
+  Require(!value.empty() && (value.size() == 1U || value.front() != '0'),
+          "managed runtime channel FD is not canonical");
+  unsigned int result = 0U;
+  for (const char digit : value) {
+    Require(digit >= '0' && digit <= '9',
+            "managed runtime channel FD is not decimal");
+    const auto next = static_cast<unsigned int>(digit - '0');
+    Require(result <=
+                (static_cast<unsigned int>(INT_MAX) - next) / 10U,
+            "managed runtime channel FD overflows");
+    result = result * 10U + next;
+  }
+  return static_cast<int>(result);
+}
+
+[[nodiscard]] ManagedRuntimeChildConfig ParseManagedRuntimeArguments(
+    const int argc, char **argv) {
+  ManagedRuntimeChildConfig config;
+  std::set<std::string> seen;
+  for (int index = 1; index < argc; index += 2) {
+    Require(index + 1 < argc,
+            "every managed runtime option requires one value");
+    const std::string option(argv[index]);
+    const std::string value(argv[index + 1]);
+    Require(seen.insert(option).second,
+            "duplicate managed runtime option " + option);
+    if (option == "--manyforge-managed-runtime-channel-fd") {
+      config.manager_channel_fd = ParseFileDescriptor(value);
+    } else if (option == "--runtime-unit-id") {
+      config.runtime_unit_id = value;
+    } else if (option == "--runtime-epoch") {
+      config.runtime_epoch = value;
+    } else if (option == "--product-identity") {
+      config.product_identity = value;
+    } else if (option == "--configuration-identity") {
+      config.configuration_identity = value;
+    } else {
+      Fail("unknown managed runtime option " + option);
+    }
+  }
+  Require(seen.size() == 5U && config.manager_channel_fd >= 0,
+          "managed runtime invocation is incomplete");
+  Require(IsPortableRuntimeIdentity(config.runtime_unit_id) &&
+              IsPortableRuntimeIdentity(config.runtime_epoch),
+          "managed runtime identity is invalid");
+  Require(core::IsExactLowercaseSha256Digest(config.product_identity) &&
+              core::IsExactLowercaseSha256Digest(
+                  config.configuration_identity),
+          "managed runtime retained identity is invalid");
+
+  struct stat status {};
+  int socket_type = 0;
+  socklen_t socket_type_size = sizeof(socket_type);
+  ucred credentials{};
+  socklen_t credentials_size = sizeof(credentials);
+  Require(::fstat(config.manager_channel_fd, &status) == 0 &&
+              S_ISSOCK(status.st_mode) &&
+              ::getsockopt(config.manager_channel_fd, SOL_SOCKET, SO_TYPE,
+                           &socket_type, &socket_type_size) == 0 &&
+              socket_type_size == sizeof(socket_type) &&
+              socket_type == SOCK_SEQPACKET &&
+              ::getsockopt(config.manager_channel_fd, SOL_SOCKET, SO_PEERCRED,
+                           &credentials, &credentials_size) == 0 &&
+              credentials_size == sizeof(credentials) &&
+              credentials.uid == ::geteuid() &&
+              credentials.pid == ::getppid(),
+          "managed runtime channel is not the direct same-user parent "
+          "channel");
+  return config;
+}
+
+void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
+  Require(!bytes.empty() && bytes.size() <= 4096U,
+          "managed runtime response is empty or oversized");
+  pollfd descriptor{fd, POLLOUT | POLLHUP, 0};
+  int ready = -1;
+  do {
+    ready = ::poll(&descriptor, 1U, 750);
+  } while (ready < 0 && errno == EINTR && g_stop_requested == 0);
+  Require(ready > 0 && (descriptor.revents & POLLOUT) != 0,
+          "managed runtime parent did not accept a response");
+  ssize_t sent = -1;
+  do {
+    sent = ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+  } while (sent < 0 && errno == EINTR);
+  Require(sent == static_cast<ssize_t>(bytes.size()),
+          "managed runtime response was not sent atomically");
+}
+
+[[nodiscard]] int RunManagedRuntimeChild(
+    const ManagedRuntimeChildConfig &config) {
+  const auto implementation_revision =
+      deployment::native_execution_runtime_contract::implementation_revision();
+  const std::string ready_packet =
+      "manyforge.native-execution-ready.v1 " + config.runtime_unit_id + " " +
+      config.runtime_epoch + " " + implementation_revision + " " +
+      config.product_identity + " " + config.configuration_identity;
+  std::uint64_t source_report_sequence = 0U;
+
+  while (g_stop_requested == 0) {
+    pollfd descriptor{config.manager_channel_fd, POLLIN | POLLHUP, 0};
+    int ready = -1;
+    do {
+      ready = ::poll(&descriptor, 1U, 1000);
+    } while (ready < 0 && errno == EINTR && g_stop_requested == 0);
+    if (g_stop_requested != 0) {
+      break;
+    }
+    if (ready < 0) {
+      FailErrno("poll managed runtime parent channel");
+    }
+    if ((descriptor.revents & POLLHUP) != 0 &&
+        (descriptor.revents & POLLIN) == 0) {
+      return 0;
+    }
+    Require((descriptor.revents & (POLLERR | POLLNVAL)) == 0,
+            "managed runtime parent channel became invalid");
+    if ((descriptor.revents & POLLIN) == 0) {
+      continue;
+    }
+    std::array<char, 4097U> bytes{};
+    ssize_t count = -1;
+    do {
+      count = ::recv(config.manager_channel_fd, bytes.data(), bytes.size(),
+                     MSG_TRUNC);
+    } while (count < 0 && errno == EINTR);
+    if (count == 0) {
+      return 0;
+    }
+    Require(count > 0 && static_cast<std::size_t>(count) <= 4096U,
+            "managed runtime request is absent or oversized");
+    const std::string_view request(bytes.data(),
+                                   static_cast<std::size_t>(count));
+    if (request == "hello") {
+      SendManagedRuntimePacket(config.manager_channel_fd, ready_packet);
+      continue;
+    }
+    if (request == "status") {
+      Require(source_report_sequence !=
+                  std::numeric_limits<std::uint64_t>::max(),
+              "managed runtime source sequence is exhausted");
+      ++source_report_sequence;
+      SendManagedRuntimePacket(
+          config.manager_channel_fd,
+          "manyforge.native-execution-status.v1 " + config.runtime_unit_id +
+              " " + config.runtime_epoch + " " +
+              std::to_string(source_report_sequence) +
+              " 1 serving healthy " + implementation_revision + " " +
+              config.product_identity + " " +
+              config.configuration_identity +
+              " native_execution closed_no_active_effect");
+      continue;
+    }
+    if (request == "shutdown") {
+      SendManagedRuntimePacket(config.manager_channel_fd,
+                               "shutdown-accepted");
+      return 0;
+    }
+    Fail("managed runtime received an unsupported private command");
+  }
+  return 0;
+}
 
 void RequireExactObjectSize(const CanonicalValue& value, std::size_t size, std::string_view label) {
   Require(value.is_object() && value.as_object().size() == size,
@@ -1279,7 +1469,7 @@ class AbsoluteOnlyReferenceResolver final : public core::IReferencePoseResolver 
 [[nodiscard]] deployment::ActiveRuntimeParticipantFactsDTO ActiveFacts(
     const deployment::RuntimeProgramTargetBinding& primary,
     std::span<const deployment::RuntimeProgramTargetBinding> supporting,
-    const core::RequestOwnerEpoch& owner_epoch,
+    const core::RuntimeEpoch& runtime_epoch,
     core::ActiveControlConfigurationId active_configuration_id) {
   Require(primary.desired_route().has_value(), "runtime binding has no desired I6 route");
   std::set<core::RuntimeUnitId> runtime_units(primary.component().runtime_unit_ids.begin(),
@@ -1288,9 +1478,11 @@ class AbsoluteOnlyReferenceResolver final : public core::IReferencePoseResolver 
     runtime_units.insert(primary.control_domain()->runtime_unit_ids.begin(),
                          primary.control_domain()->runtime_unit_ids.end());
   }
-  Require(runtime_units.empty(),
-          "I6 native host cannot invent runtime-unit epochs; lifecycle facts "
-          "arrive at N4/I7");
+  std::vector<core::RuntimeUnitEpochBindingDTO> runtime_epochs;
+  runtime_epochs.reserve(runtime_units.size());
+  for (const auto& runtime_unit : runtime_units) {
+    runtime_epochs.push_back({runtime_unit, runtime_epoch});
+  }
   std::set<core::ProviderInstanceId> providers;
   if (primary.control_binding().has_value()) {
     providers.insert(primary.control_binding()->provider_instance_id);
@@ -1306,13 +1498,13 @@ class AbsoluteOnlyReferenceResolver final : public core::IReferencePoseResolver 
   std::vector<deployment::RuntimeProviderEpochFactDTO> provider_epochs;
   provider_epochs.reserve(providers.size());
   for (const auto& provider : providers) {
-    provider_epochs.push_back({provider, core::RuntimeEpoch(owner_epoch.value())});
+    provider_epochs.push_back({provider, runtime_epoch});
   }
   return deployment::ActiveRuntimeParticipantFactsDTO{
       *primary.desired_route(),
       std::move(active_configuration_id),
       core::ActiveControlConfigurationGeneration(1U),
-      {},
+      std::move(runtime_epochs),
       std::move(provider_epochs)};
 }
 
@@ -1342,7 +1534,8 @@ struct Composition final {
 };
 
 [[nodiscard]] std::unique_ptr<Composition> BuildComposition(
-    const HostConfig& config, const core::RequestOwnerEpoch& owner_epoch) {
+    const HostConfig& config, const core::RequestOwnerEpoch& owner_epoch,
+    const core::RuntimeEpoch& runtime_epoch) {
   component_manager::SqliteActiveBundlePublicationStore publication_store(
       config.manager_state_root /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
@@ -1398,7 +1591,7 @@ struct Composition final {
   const std::array<deployment::RuntimeProgramTargetBinding, 1U> support{planner_target};
   auto motion_binding_dto = deployment::build_runtime_participant_binding_dto(
       motion_target,
-      ActiveFacts(motion_target, support, owner_epoch,
+      ActiveFacts(motion_target, support, runtime_epoch,
                   core::ActiveControlConfigurationId("active.i6.native.arm")),
       support);
   auto motion_binding = core::verify_runtime_participant_binding(std::move(motion_binding_dto));
@@ -1409,7 +1602,8 @@ struct Composition final {
   auto gripper_binding_dto = deployment::build_runtime_participant_binding_dto(
       gripper_target,
       ActiveFacts(gripper_target, std::span<const deployment::RuntimeProgramTargetBinding>{},
-                  owner_epoch, core::ActiveControlConfigurationId("active.i6.native.gripper")));
+                  runtime_epoch,
+                  core::ActiveControlConfigurationId("active.i6.native.gripper")));
   auto gripper_binding = core::verify_runtime_participant_binding(std::move(gripper_binding_dto));
   if (!gripper_binding.ok()) {
     Fail("active gripper participant binding failed verification: " +
@@ -1490,8 +1684,9 @@ class NativeExecutionHost final {
   explicit NativeExecutionHost(HostConfig config)
       : config_(std::move(config)),
         owner_epoch_(RandomToken("execution-host-")),
+        runtime_epoch_(RandomToken("native-runtime-")),
         host_lock_(config_.execution_state_root),
-        composition_(BuildComposition(config_, owner_epoch_)),
+        composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_)),
         command_socket_(config_.execution_state_root) {}
 
   int Run() {
@@ -1806,6 +2001,10 @@ class NativeExecutionHost final {
 
   HostConfig config_;
   core::RequestOwnerEpoch owner_epoch_;
+  // This complete pre-N5c host is itself one process incarnation. Keep its
+  // runtime identity independent from the operation-owner epoch. The
+  // Manager-launched mode receives its epoch from the direct-child adapter.
+  core::RuntimeEpoch runtime_epoch_;
   HostLock host_lock_;
   std::unique_ptr<Composition> composition_;
   CommandSocket command_socket_;
@@ -1891,6 +2090,13 @@ void InstallSignalHandlers() {
 int main(int argc, char** argv) {
   try {
     manyforge::roboplan_backend::InstallSignalHandlers();
+    if (argc > 1 &&
+        std::string_view(argv[1]) ==
+            "--manyforge-managed-runtime-channel-fd") {
+      return manyforge::roboplan_backend::RunManagedRuntimeChild(
+          manyforge::roboplan_backend::ParseManagedRuntimeArguments(argc,
+                                                                    argv));
+    }
     manyforge::roboplan_backend::NativeExecutionHost host(
         manyforge::roboplan_backend::ParseArguments(argc, argv));
     return host.Run();

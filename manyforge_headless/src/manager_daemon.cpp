@@ -5,9 +5,12 @@
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
+#include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
+#include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_scene/canonical_empty_scene_owner.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
@@ -137,6 +140,15 @@ std::filesystem::path DatabasePath(std::filesystem::path path) {
   Require(!std::filesystem::is_symlink(status),
           "logical-scene database path cannot be a symlink");
   return path;
+}
+
+std::filesystem::path InstalledTargetRoot() {
+  std::error_code error;
+  const auto executable = std::filesystem::canonical("/proc/self/exe", error);
+  Require(!error && executable.is_absolute() && executable.has_parent_path(),
+          "Manager executable installed-target root is unavailable");
+  return ExistingDirectory(executable.parent_path(),
+                           "Manager installed-target root");
 }
 
 std::string RandomToken(const std::string_view prefix) {
@@ -584,9 +596,21 @@ public:
                      stores_.active_bundle_publication_store(), bundle_source_),
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal()),
-        runtime_adapter_(config_.runtime_state_root, bundle_source_,
-                         artifact_source_, "linux", "posix.1-2017"),
-        active_runtime_(plan_source_, runtime_adapter_, runtime_adapter_,
+        reference_runtime_adapter_(config_.runtime_state_root, bundle_source_,
+                                   artifact_source_, "linux", "posix.1-2017"),
+        native_runtime_adapter_(
+            InstalledTargetRoot(), bundle_source_, artifact_source_, "linux",
+            std::string(deployment::native_execution_runtime_contract::
+                            kLaunchEnvironmentContract)),
+        runtime_adapter_router_(
+            {{std::string(component_manager::
+                              kRetainedPosixProcessAdapterContractId),
+              &reference_runtime_adapter_, &reference_runtime_adapter_},
+             {std::string(deployment::native_execution_runtime_contract::
+                              kProcessAdapterContractId),
+              &native_runtime_adapter_, &native_runtime_adapter_}}),
+        active_runtime_(plan_source_, runtime_adapter_router_,
+                        runtime_adapter_router_,
                         [this] { return ElapsedNs(); }),
         scene_runtime_owner_(
             [this] { return static_cast<std::int64_t>(ElapsedNs()); },
@@ -855,7 +879,10 @@ private:
   component_manager::ExternallyProvisionedManagerStores stores_;
   manyforge::scene::CanonicalEmptySceneOwner scene_owner_;
   component_manager::DurableManagerActiveRuntimePlanSource plan_source_;
-  component_manager::RetainedPosixRuntimeUnitAdapter runtime_adapter_;
+  component_manager::RetainedPosixRuntimeUnitAdapter
+      reference_runtime_adapter_;
+  component_manager::RetainedNativeRuntimeUnitAdapter native_runtime_adapter_;
+  component_manager::RuntimeUnitAdapterRouter runtime_adapter_router_;
   component_manager::ManagerActiveRuntimeCoordinator active_runtime_;
   SceneRuntimeStateOwner scene_runtime_owner_;
   AtomicSourceSnapshotChannel manager_channel_;

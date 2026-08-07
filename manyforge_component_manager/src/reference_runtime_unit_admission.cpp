@@ -1,5 +1,7 @@
 #include "manyforge_component_manager/reference_runtime_unit_admission.hpp"
 
+#include "manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp"
+
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <string>
 #include <utility>
@@ -48,7 +50,7 @@ std::optional<ReferenceRuntimeUnitAdmission> VerifyReferenceRuntimeUnitForHost(
         "reference runtime product is incompatible with the selected host");
   }
   if (product->process_adapter_contract_id() !=
-          "manyforge.posix_sh.retained_script" ||
+          kRetainedPosixProcessAdapterContractId ||
       product->retrieval_contract_id() != "manyforge.retained_raw_artifact" ||
       product->runtime_role_id() != "manager_fixture" ||
       product->status_endpoint_role_id() != "runtime_status") {

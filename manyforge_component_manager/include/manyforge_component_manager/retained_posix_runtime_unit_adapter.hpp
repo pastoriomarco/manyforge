@@ -5,6 +5,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace manyforge::deployment {
 class IVerifiedRetainedBundleSource;
@@ -12,6 +13,9 @@ class IVerifiedRetainedProductArtifactSource;
 } // namespace manyforge::deployment
 
 namespace manyforge::component_manager {
+
+inline constexpr std::string_view kRetainedPosixProcessAdapterContractId =
+    "manyforge.posix_sh.retained_script";
 
 class RetainedPosixRuntimeUnitAdapterError final : public std::runtime_error {
 public:

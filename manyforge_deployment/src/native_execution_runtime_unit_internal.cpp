@@ -280,7 +280,8 @@ std::string native_execution_runtime_process_adapter_revision() {
   return contract_revision(
       "process-adapter",
       "manager-managed;installed-target;fixed-argv;direct-child-epoch;"
-      "private-runtime-directory;command-fenced-readiness");
+      "inherited-seqpacket-channel;same-user-direct-parent;"
+      "command-fenced-readiness");
 }
 
 std::string native_execution_runtime_retrieval_contract_revision() {
@@ -458,3 +459,11 @@ void require_native_execution_runtime_product_matches_retained_bundle(
 }
 
 } // namespace manyforge::deployment::detail
+
+namespace manyforge::deployment::native_execution_runtime_contract {
+
+std::string implementation_revision() {
+  return detail::native_execution_runtime_implementation_revision();
+}
+
+} // namespace manyforge::deployment::native_execution_runtime_contract
