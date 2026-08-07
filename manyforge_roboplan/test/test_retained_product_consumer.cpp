@@ -1531,13 +1531,16 @@ TEST(RetainedProductCrossConsumer,
       inventory->projection_binding, candidate_binding,
       std::make_unique<CompositionCandidateClient>(candidate_binding));
   const core::RequestOwnerEpoch owner_epoch("i6.native.runtime.epoch.1");
-  RetainedNativeRuntimeConfig runtime_config{owner_epoch,
-                                             1024U,
-                                             core::CacheConfig{},
-                                             core::ExecutionKernelConfig{},
-                                             RoboPlanExecutionBackendConfig{},
-                                             SimpleSchedulerConfig{},
-                                             10'000'000};
+  RetainedNativeRuntimeConfig runtime_config{
+      owner_epoch,
+      materialized.bundle->value().cell_graph.cell_id,
+      temporary.path() / std::string(core::kOperationJournalFilename),
+      1024U,
+      core::CacheConfig{},
+      core::ExecutionKernelConfig{},
+      RoboPlanExecutionBackendConfig{},
+      SimpleSchedulerConfig{},
+      10'000'000};
   auto runtime = create_retained_native_runtime(
       RetainedNativeRuntimeInput{
           arm_binding, gripper_binding, scene, scene_mutex, state_projector,

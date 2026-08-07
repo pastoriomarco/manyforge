@@ -103,6 +103,13 @@ class ResourceSlotTable final {
   [[nodiscard]] Result<void> unfence(
       const std::vector<ResourceId>& resources);
 
+  /// Mark free resources conservatively unavailable after Kernel replacement.
+  /// No prior operation owner is recreated and this performs no controller or
+  /// transport effect. Later recovery must prove fresh quiescence before an
+  /// explicit reconciliation surface may release the marks.
+  [[nodiscard]] Result<void> mark_unreconciled_external_or_orphan_goal(
+      const std::vector<ResourceId>& resources);
+
   [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> snapshot() const;
   [[nodiscard]] std::optional<OperationId> active_operation_id() const;
 

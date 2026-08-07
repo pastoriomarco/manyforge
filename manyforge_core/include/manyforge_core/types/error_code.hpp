@@ -13,6 +13,8 @@ struct ErrorDTO {
     std::string code;
     std::string message;
     std::map<std::string, std::string> details;
+
+    friend bool operator==(const ErrorDTO&, const ErrorDTO&) = default;
 };
 
 /// Error code enum (spec §5.2)

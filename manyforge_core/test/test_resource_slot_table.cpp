@@ -172,4 +172,18 @@ TEST(ResourceSlotTableTest, RevisesExactOwnerWithoutChangingSlotState) {
                   .ok());
 }
 
+TEST(ResourceSlotTableTest, OrphanRecoveryMarksOnlyFreeUnownedResourcesAndBlocksAdmission) {
+  ResourceSlotTable table(arm_resources());
+  ASSERT_TRUE(table.mark_unreconciled_external_or_orphan_goal({ResourceId("joint.1")}).ok());
+  const auto snapshot = table.snapshot();
+  ASSERT_EQ(snapshot.size(), 2U);
+  EXPECT_EQ(snapshot.front().resource_id, ResourceId("joint.1"));
+  EXPECT_EQ(snapshot.front().state, ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
+  EXPECT_FALSE(snapshot.front().owner.has_value());
+  const auto blocked = table.reserve(owner(), arm_resources());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "resource_scope_busy");
+  EXPECT_FALSE(table.mark_unreconciled_external_or_orphan_goal({ResourceId("joint.1")}).ok());
+}
+
 }  // namespace

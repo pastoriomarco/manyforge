@@ -96,6 +96,34 @@ target_link_libraries(manyforge_core PRIVATE manyforge::content_identity)
 # static lib with PIC so a single .a serves both link paths.
 set_target_properties(manyforge_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# The durable I6 operation journal is an optional concrete adapter. Keep it
+# outside the pure Core target so DTO/compiler consumers do not acquire a
+# persistence dependency. It is enabled for a standalone Core build and by
+# execution hosts that explicitly select this adapter.
+set(_MANYFORGE_CORE_SQLITE_JOURNAL_DEFAULT OFF)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(_MANYFORGE_CORE_SQLITE_JOURNAL_DEFAULT ON)
+endif()
+option(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL
+       "Build the SQLite-backed durable operation journal"
+       ${_MANYFORGE_CORE_SQLITE_JOURNAL_DEFAULT})
+unset(_MANYFORGE_CORE_SQLITE_JOURNAL_DEFAULT)
+if(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)
+  find_package(SQLite3 3.37 REQUIRED)
+  add_library(manyforge_core_sqlite_operation_journal
+    src/sqlite_operation_journal.cpp)
+  add_library(manyforge::core_sqlite_operation_journal ALIAS
+    manyforge_core_sqlite_operation_journal)
+  target_include_directories(manyforge_core_sqlite_operation_journal PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+  target_link_libraries(manyforge_core_sqlite_operation_journal
+    PUBLIC manyforge_core
+    PRIVATE SQLite::SQLite3 manyforge::content_identity)
+  set_target_properties(manyforge_core_sqlite_operation_journal PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # Testing
 option(BUILD_TESTING "Build unit tests" ON)
 if(BUILD_TESTING)
@@ -176,6 +204,15 @@ if(BUILD_TESTING)
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_resource_addressed_execution_kernel
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  if(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)
+    add_executable(test_sqlite_operation_journal
+      test/test_sqlite_operation_journal.cpp)
+    target_link_libraries(test_sqlite_operation_journal PRIVATE
+      manyforge_core_sqlite_operation_journal GTest::gtest_main)
+    gtest_discover_tests(test_sqlite_operation_journal
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+  endif()
 
   add_executable(test_runtime_participant_binding
     test/test_runtime_participant_binding.cpp)

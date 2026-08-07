@@ -331,6 +331,26 @@ Result<void> ResourceSlotTable::unfence(
   return Result<void>::Ok();
 }
 
+Result<void> ResourceSlotTable::mark_unreconciled_external_or_orphan_goal(
+    const std::vector<ResourceId>& resources) {
+  std::lock_guard lock(mutex_);
+  std::vector<std::size_t> indices;
+  auto validation = validate_resource_set_locked(resources, indices);
+  if (!validation.ok()) {
+    return validation;
+  }
+  for (const auto index : indices) {
+    if (slots_[index].state != ResourceSlotState::kFree || slots_[index].owner.has_value()) {
+      return reject("only free unowned resources can become orphan-unreconciled",
+                    "resource_orphan_mark_state_invalid", ErrorCode::kInvalidStateTransition);
+    }
+  }
+  for (const auto index : indices) {
+    slots_[index].state = ResourceSlotState::kUnreconciledExternalOrOrphanGoal;
+  }
+  return Result<void>::Ok();
+}
+
 std::vector<ResourceSlotSnapshotDTO> ResourceSlotTable::snapshot() const {
   std::lock_guard lock(mutex_);
   return slots_;

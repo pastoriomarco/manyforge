@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -12,8 +13,9 @@
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/cache/trajectory_cache.hpp>
 #include <manyforge_core/execution_kernel.hpp>
-#include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
+#include <manyforge_core/resource_addressed_execution_kernel.hpp>
+#include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_focused_adapters.hpp>
@@ -25,6 +27,8 @@ namespace manyforge::roboplan_backend {
 
 struct RetainedNativeRuntimeConfig final {
   core::RequestOwnerEpoch request_owner_epoch;
+  core::CellId cell_id;
+  std::filesystem::path operation_journal_path;
   std::size_t request_replay_capacity{1024U};
   core::CacheConfig cache;
   core::ExecutionKernelConfig kernel;
@@ -94,6 +98,7 @@ struct RetainedNativeRuntime final {
       lookahead_collision_engines;
 
   std::shared_ptr<core::ExecutionKernel> participant_engine;
+  std::unique_ptr<core::SqliteOperationJournal> operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel> addressed_kernel;
 };
 

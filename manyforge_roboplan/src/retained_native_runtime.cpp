@@ -103,6 +103,7 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
   if (!input.scene || !input.scene_mutex || !input.state_projector ||
       !input.collision_publisher || !input.planner ||
       !input.reference_resolver || config.request_owner_epoch.empty() ||
+      config.cell_id.empty() || config.operation_journal_path.empty() ||
       config.request_replay_capacity == 0U ||
       config.request_replay_capacity > core::kMaxI6OperationReplayEntries ||
       config.kernel.validation_collision_workers < 1 ||
@@ -276,9 +277,12 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
     registrations.push_back(
         {*runtime->gripper_binding, runtime->participant_engine.get()});
   }
+  runtime->operation_journal = std::make_unique<core::SqliteOperationJournal>(
+      std::move(config.operation_journal_path), std::move(config.cell_id));
   runtime->addressed_kernel =
       std::make_unique<core::ResourceAddressedExecutionKernel>(
           std::move(registrations), *runtime->clock,
+          *runtime->operation_journal,
           core::ResourceAddressedExecutionKernelConfig{
               std::move(config.request_owner_epoch),
               config.request_replay_capacity});

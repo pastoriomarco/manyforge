@@ -52,6 +52,7 @@ if(NOT TARGET manyforge_core)
   cmake_policy(PUSH)
   cmake_policy(SET CMP0077 NEW)
   set(BUILD_TESTING OFF)
+  set(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL ON)
   add_subdirectory(
     "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core"
     "${CMAKE_CURRENT_BINARY_DIR}/manyforge_core"
@@ -59,6 +60,7 @@ if(NOT TARGET manyforge_core)
   cmake_policy(POP)
   set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
   unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
+  unset(MANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL)
 endif()
 
 # The I6 native projection boundary consumes the ManyForge-owned collision
@@ -241,7 +243,8 @@ target_link_libraries(manyforge_roboplan_native_runtime PUBLIC
   manyforge_roboplan_planner_backend
   manyforge_roboplan_collision_projection
   manyforge_collision
-  manyforge_core)
+  manyforge_core
+  manyforge_core_sqlite_operation_journal)
 
 add_library(manyforge_roboplan_worker_protocol STATIC
   src/roboplan_worker_protocol.cpp)

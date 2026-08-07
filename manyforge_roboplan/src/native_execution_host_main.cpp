@@ -939,12 +939,17 @@ struct Composition final {
   auto planner = std::make_unique<RoboPlanPlannerBackend>(
       inventory->projection_binding, candidate_binding, std::move(candidate_client));
   auto runtime = create_retained_native_runtime(
-      RetainedNativeRuntimeInput{runtime_binding.value(), std::nullopt, scene, scene_mutex,
-                                 state_projector, publisher, std::move(planner),
-                                 std::make_unique<AbsoluteOnlyReferenceResolver>()},
-      RetainedNativeRuntimeConfig{owner_epoch, 1024U, core::CacheConfig{},
-                                  core::ExecutionKernelConfig{}, RoboPlanExecutionBackendConfig{},
-                                  SimpleSchedulerConfig::from_environment(), 10'000'000});
+      RetainedNativeRuntimeInput{
+          runtime_binding.value(), std::nullopt, scene, scene_mutex,
+          state_projector, publisher, std::move(planner),
+          std::make_unique<AbsoluteOnlyReferenceResolver>()},
+      RetainedNativeRuntimeConfig{
+          owner_epoch, core::CellId(config.cell_id),
+          config.execution_state_root /
+              std::string(core::kOperationJournalFilename),
+          1024U, core::CacheConfig{}, core::ExecutionKernelConfig{},
+          RoboPlanExecutionBackendConfig{},
+          SimpleSchedulerConfig::from_environment(), 10'000'000});
   return std::make_unique<Composition>(
       std::move(bundle), std::move(program), std::move(program_binding), std::move(stage),
       std::move(runtime), receipt.request.candidate_projection_revision,

@@ -90,10 +90,8 @@ template <typename T>
 [[nodiscard]] Result<ExecuteRequestDTO> build_motion_request(
     const OperationIntentDTO& operation, const OperationParticipantIntentDTO& participant,
     const MotionParticipantIntentDTO& motion, const RuntimeParticipantBindingDTO& binding,
-    const OperationId& operation_id,
-    OperationRevision operation_revision,
-    const OperationParticipantId& participant_id,
-    const ControllerGoalId& controller_goal_id,
+    const OperationId& operation_id, OperationRevision operation_revision,
+    const OperationParticipantId& participant_id, const ControllerGoalId& controller_goal_id,
     ControllerGoalGeneration controller_goal_generation) {
   if (binding.model_groups.size() != 1U) {
     return reject<ExecuteRequestDTO>("I6 motion requires exactly one retained model group",
@@ -231,30 +229,30 @@ template <typename T>
       motion.contact_policy_id.has_value() ? motion.contact_policy_id->value() : std::string{};
   if (control.runtime_scale_qualification.has_value()) {
     const auto& qualification = *control.runtime_scale_qualification;
-    request.initial_runtime_scale = ResolvedRuntimeScaleCommandDTO{
-        operation_id,
-        operation_revision,
-        participant_id,
-        binding.controllable_component_id,
-        binding.command_target_id,
-        binding.capability_id,
-        control.control_domain_id,
-        control.control_domain_revision,
-        control.control_binding_id,
-        control.control_binding_revision,
-        controller_goal_id,
-        controller_goal_generation,
-        control.controller_topology_id,
-        control.topology_revision,
-        control.control_route_id,
-        qualification.scaling_domain_id,
-        qualification.coordinated_barrier_id,
-        request.binding.resources,
-        control.active_control_configuration_id,
-        control.active_control_configuration_generation,
-        RuntimeScaleGeneration(0U),
-        RuntimeScaleGeneration(0U),
-        1.0};
+    request.initial_runtime_scale =
+        ResolvedRuntimeScaleCommandDTO{operation_id,
+                                       operation_revision,
+                                       participant_id,
+                                       binding.controllable_component_id,
+                                       binding.command_target_id,
+                                       binding.capability_id,
+                                       control.control_domain_id,
+                                       control.control_domain_revision,
+                                       control.control_binding_id,
+                                       control.control_binding_revision,
+                                       controller_goal_id,
+                                       controller_goal_generation,
+                                       control.controller_topology_id,
+                                       control.topology_revision,
+                                       control.control_route_id,
+                                       qualification.scaling_domain_id,
+                                       qualification.coordinated_barrier_id,
+                                       request.binding.resources,
+                                       control.active_control_configuration_id,
+                                       control.active_control_configuration_generation,
+                                       RuntimeScaleGeneration(0U),
+                                       RuntimeScaleGeneration(0U),
+                                       1.0};
   }
 
   if (const auto* goal = std::get_if<JointGoalDTO>(&motion.motion)) {
@@ -511,11 +509,12 @@ struct ResourceAddressedExecutionKernel::EngineSubscription final {
 
 ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
-    ResourceAddressedExecutionKernelConfig config)
+    IOperationJournal& journal, ResourceAddressedExecutionKernelConfig config)
     : registry_(extract_bindings(registrations)),
       resource_slots_(registry_.resource_inventory()),
       registrations_(std::move(registrations)),
       clock_(clock),
+      journal_(journal),
       config_(std::move(config)) {
   if (config_.request_owner_epoch.empty() || config_.request_replay_capacity == 0U ||
       config_.request_replay_capacity > kMaxI6OperationReplayEntries) {
@@ -525,6 +524,23 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   control_replay_ledger_.reserve(config_.request_replay_capacity);
   stop_replay_ledger_.reserve(config_.request_replay_capacity);
   runtime_scale_replay_ledger_.reserve(config_.request_replay_capacity);
+
+  auto recovery =
+      journal_.BeginOwnerEpoch(config_.request_owner_epoch, clock_.now(),
+                               config_.request_replay_capacity, registry_.resource_inventory());
+  if (!recovery.ok()) {
+    throw std::runtime_error("addressed Kernel durable owner admission failed: " +
+                             recovery.error().code + ": " + recovery.error().message);
+  }
+  historical_operations_ = std::move(recovery.value().historical_operations);
+  if (!recovery.value().unreconciled_resources.empty()) {
+    auto marked = resource_slots_.mark_unreconciled_external_or_orphan_goal(
+        recovery.value().unreconciled_resources);
+    if (!marked.ok()) {
+      throw std::runtime_error("addressed Kernel durable orphan recovery failed: " +
+                               marked.error().code + ": " + marked.error().message);
+    }
+  }
 
   for (const auto& registration : registrations_) {
     if (std::any_of(
@@ -604,19 +620,16 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                       return entry.intent.request_context.request_id ==
                              intent.request_context.request_id;
                     }) ||
-        std::any_of(runtime_scale_replay_ledger_.begin(),
-                    runtime_scale_replay_ledger_.end(),
+        std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
                     [&](const RuntimeScaleReplayEntry& entry) {
                       return entry.request.request_context.request_id ==
                              intent.request_context.request_id;
                     })) {
       return Result<OperationAcceptedDTO>::Err(error(
-          "request_id_conflict",
-          "operation request ID was already used by another Kernel command",
+          "request_id_conflict", "operation request ID was already used by another Kernel command",
           "request_id_conflict"));
     }
-    if (replay_ledger_.size() + control_replay_ledger_.size() +
-            stop_replay_ledger_.size() +
+    if (replay_ledger_.size() + control_replay_ledger_.size() + stop_replay_ledger_.size() +
             runtime_scale_replay_ledger_.size() >=
         config_.request_replay_capacity) {
       return Result<OperationAcceptedDTO>::Err(
@@ -653,11 +666,14 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   const auto operation_id = OperationId("operation:" + config_.request_owner_epoch.value() + ":" +
                                         std::to_string(next_operation_id_));
   const auto participant_id = OperationParticipantId(operation_id.value() + ":participant:1");
-  const auto controller_goal_id =
-      ControllerGoalId(operation_id.value() + ":controller-goal:1");
+  const auto controller_goal_id = ControllerGoalId(operation_id.value() + ":controller-goal:1");
   const ControllerGoalGeneration controller_goal_generation(1U);
   const OperationRevision operation_revision(1U);
   const auto& control = *binding.control_path;
+  const auto payload_kind =
+      std::holds_alternative<MotionParticipantIntentDTO>(intent.participants.front().payload)
+          ? OperationParticipantPayloadKind::kMotion
+          : OperationParticipantPayloadKind::kCapabilityCommand;
   ResourceSlotOwnerDTO slot_owner{operation_id,
                                   operation_revision,
                                   participant_id,
@@ -671,21 +687,37 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                   control.active_control_configuration_id,
                                   control.active_control_configuration_generation,
                                   control.containment_granularity};
+  std::optional<ExecuteRequestDTO> motion_request;
+  std::optional<GripperCommandRequestDTO> command_request;
+  if (payload_kind == OperationParticipantPayloadKind::kMotion) {
+    const auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+    auto built = build_motion_request(intent, intent.participants.front(), motion, binding,
+                                      operation_id, operation_revision, participant_id,
+                                      controller_goal_id, controller_goal_generation);
+    if (!built.ok()) {
+      return Result<OperationAcceptedDTO>::Err(built.error());
+    }
+    motion_request = std::move(built.value());
+  } else {
+    const auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
+    auto built = build_command_request(command, binding);
+    if (!built.ok()) {
+      return Result<OperationAcceptedDTO>::Err(built.error());
+    }
+    command_request = std::move(built.value());
+  }
   auto reservation = resource_slots_.reserve(slot_owner, resources);
   if (!reservation.ok()) {
     return Result<OperationAcceptedDTO>::Err(reservation.error());
   }
 
+  const auto accepted_at_ns = clock_.now();
   const OperationAcceptedDTO accepted{intent.request_context.request_id,
                                       RequestReplayStatusDTO::kAcceptedNew,
                                       operation_id,
                                       operation_revision,
                                       {OperationParticipantAssignmentDTO{0U, participant_id}},
-                                      clock_.now()};
-  const auto payload_kind =
-      std::holds_alternative<MotionParticipantIntentDTO>(intent.participants.front().payload)
-          ? OperationParticipantPayloadKind::kMotion
-          : OperationParticipantPayloadKind::kCapabilityCommand;
+                                      accepted_at_ns};
   std::optional<RuntimeScaleStatusDTO> initial_runtime_scale_status;
   if (payload_kind == OperationParticipantPayloadKind::kMotion &&
       control.runtime_scale_qualification.has_value()) {
@@ -696,37 +728,36 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
         RuntimeScaleGeneration(0U),
         1.0,
         1.0,
-        {RuntimeScaleParticipantStatusDTO{
-            participant_id,
-            binding.controllable_component_id,
-            binding.command_target_id,
-            binding.capability_id,
-            control.control_domain_id,
-            control.control_domain_revision,
-            control.control_binding_id,
-            control.control_binding_revision,
-            controller_goal_id,
-            controller_goal_generation,
-            control.controller_topology_id,
-            control.topology_revision,
-            control.control_route_id,
-            qualification.scaling_domain_id,
-            qualification.coordinated_barrier_id,
-            resources,
-            control.active_control_configuration_id,
-            control.active_control_configuration_generation,
-            RuntimeScaleGeneration(0U),
-            1.0,
-            1.0,
-            0.0,
-            control.provider_runtime_epoch,
-            0U,
-            0,
-            true,
-            RuntimeScaleApplicationState::kPending,
-            std::nullopt}},
+        {RuntimeScaleParticipantStatusDTO{participant_id,
+                                          binding.controllable_component_id,
+                                          binding.command_target_id,
+                                          binding.capability_id,
+                                          control.control_domain_id,
+                                          control.control_domain_revision,
+                                          control.control_binding_id,
+                                          control.control_binding_revision,
+                                          controller_goal_id,
+                                          controller_goal_generation,
+                                          control.controller_topology_id,
+                                          control.topology_revision,
+                                          control.control_route_id,
+                                          qualification.scaling_domain_id,
+                                          qualification.coordinated_barrier_id,
+                                          resources,
+                                          control.active_control_configuration_id,
+                                          control.active_control_configuration_generation,
+                                          RuntimeScaleGeneration(0U),
+                                          1.0,
+                                          1.0,
+                                          0.0,
+                                          control.provider_runtime_epoch,
+                                          0U,
+                                          0,
+                                          true,
+                                          RuntimeScaleApplicationState::kPending,
+                                          std::nullopt}},
         RuntimeScaleApplicationState::kPending,
-        clock_.now()};
+        accepted_at_ns};
   }
   OperationParticipantStateDTO participant_state{
       participant_id,
@@ -757,94 +788,110 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                         intent.coordination_policy,
                                         OperationStateKind::kResolving,
                                         {std::move(participant_state)},
-                                        clock_.now(),
+                                        accepted_at_ns,
                                         std::nullopt,
                                         std::nullopt,
                                         std::nullopt};
   if (initial_runtime_scale_status.has_value()) {
-    operation_state_dto.runtime_scale_generation =
-        RuntimeScaleGeneration(0U);
+    operation_state_dto.runtime_scale_generation = RuntimeScaleGeneration(0U);
+  }
+
+  auto durable_acceptance = journal_.RecordOperationAccepted(config_.request_owner_epoch, intent,
+                                                             accepted, operation_state_dto);
+  if (!durable_acceptance.ok()) {
+    const auto release = resource_slots_.release(slot_owner, resources);
+    if (!release.ok()) {
+      return Result<OperationAcceptedDTO>::Err(release.error());
+    }
+    return Result<OperationAcceptedDTO>::Err(durable_acceptance.error());
   }
 
   {
     std::lock_guard state_lock(state_mutex_);
-    active_operation_ = std::make_unique<ActiveOperation>(
-        ActiveOperation{intent, accepted, resolved.value(), engine, slot_owner, resources,
-                        payload_kind, std::move(operation_state_dto), ResourceSlotState::kReserved,
-                        0U, 0U, std::nullopt, std::nullopt,
-                        std::move(initial_runtime_scale_status)});
+    active_operation_ = std::make_unique<ActiveOperation>(ActiveOperation{
+        intent, accepted, resolved.value(), engine, slot_owner, resources, payload_kind,
+        std::move(operation_state_dto), ResourceSlotState::kReserved, 0U, 0U, std::nullopt,
+        std::nullopt, std::move(initial_runtime_scale_status)});
+    replay_ledger_.push_back(ReplayEntry{intent, accepted});
   }
+  ++next_operation_id_;
 
   Result<void> dispatch_result = Result<void>::Ok();
   if (payload_kind == OperationParticipantPayloadKind::kMotion) {
-    const auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
-    auto request = build_motion_request(intent, intent.participants.front(),
-                                        motion, binding, operation_id,
-                                        operation_revision,
-                                        participant_id, controller_goal_id,
-                                        controller_goal_generation);
-    if (!request.ok()) {
-      dispatch_result = Result<void>::Err(request.error());
+    auto dispatch = engine->execute(*motion_request);
+    if (!dispatch.ok()) {
+      dispatch_result = Result<void>::Err(dispatch.error());
     } else {
-      auto dispatch = engine->execute(request.value());
-      if (!dispatch.ok()) {
-        dispatch_result = Result<void>::Err(dispatch.error());
+      std::lock_guard state_lock(state_mutex_);
+      if (active_operation_ == nullptr ||
+          active_operation_->accepted.operation_id != operation_id) {
+        dispatch_result = Result<void>::Err(error(
+            std::string(to_string(ErrorCode::kInvariantViolation)),
+            "active operation disappeared during subordinate admission", "active_operation_lost"));
+      } else if (active_operation_->subordinate_id != 0U &&
+                 active_operation_->subordinate_id != dispatch.value()) {
+        dispatch_result =
+            Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                                    "subordinate event and execute result identities disagree",
+                                    "subordinate_execution_id_mismatch"));
       } else {
-        std::lock_guard state_lock(state_mutex_);
-        if (active_operation_ == nullptr ||
-            active_operation_->accepted.operation_id != operation_id) {
-          dispatch_result =
-              Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
-                                      "active operation disappeared during subordinate admission",
-                                      "active_operation_lost"));
-        } else if (active_operation_->subordinate_id != 0U &&
-                   active_operation_->subordinate_id != dispatch.value()) {
-          dispatch_result =
-              Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
-                                      "subordinate event and execute result identities disagree",
-                                      "subordinate_execution_id_mismatch"));
-        } else {
-          active_operation_->subordinate_id = dispatch.value();
-          if (active_operation_->state.state == OperationStateKind::kResolving) {
-            active_operation_->state.state = OperationStateKind::kPlanning;
-            active_operation_->state.participants.front().state = OperationStateKind::kPlanning;
-            active_operation_->state.updated_at_ns = clock_.now();
+        active_operation_->subordinate_id = dispatch.value();
+        if (active_operation_->state.state == OperationStateKind::kResolving) {
+          auto planning_state = active_operation_->state;
+          planning_state.state = OperationStateKind::kPlanning;
+          planning_state.participants.front().state = OperationStateKind::kPlanning;
+          planning_state.updated_at_ns = clock_.now();
+          auto durable_state =
+              journal_.RecordOperationState(config_.request_owner_epoch, planning_state,
+                                            active_operation_->runtime_scale_status.has_value()
+                                                ? &*active_operation_->runtime_scale_status
+                                                : nullptr,
+                                            "subordinate_motion_admitted");
+          if (durable_state.ok()) {
+            active_operation_->state = std::move(planning_state);
+          } else {
+            dispatch_result = Result<void>::Err(durable_state.error());
           }
         }
       }
     }
   } else {
-    const auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
-    auto request = build_command_request(command, binding);
-    if (!request.ok()) {
-      dispatch_result = Result<void>::Err(request.error());
+    const auto dispatch = engine->command_gripper(*command_request);
+    if (!dispatch.accepted || dispatch.error.has_value()) {
+      dispatch_result = Result<void>::Err(dispatch.error.value_or(
+          error(std::string(to_string(ErrorCode::kExecutionRejected)),
+                "subordinate gripper command was rejected", "subordinate_command_rejected")));
     } else {
-      const auto dispatch = engine->command_gripper(request.value());
-      if (!dispatch.accepted || dispatch.error.has_value()) {
-        dispatch_result = Result<void>::Err(dispatch.error.value_or(
-            error(std::string(to_string(ErrorCode::kExecutionRejected)),
-                  "subordinate gripper command was rejected", "subordinate_command_rejected")));
+      std::lock_guard state_lock(state_mutex_);
+      if (active_operation_ == nullptr ||
+          active_operation_->accepted.operation_id != operation_id) {
+        dispatch_result = Result<void>::Err(error(
+            std::string(to_string(ErrorCode::kInvariantViolation)),
+            "active command disappeared during subordinate admission", "active_operation_lost"));
       } else {
-        auto transition =
-            resource_slots_.transition(slot_owner, resources, ResourceSlotState::kDispatched);
-        if (!transition.ok()) {
-          dispatch_result = transition;
-        } else {
-          std::lock_guard state_lock(state_mutex_);
-          if (active_operation_ == nullptr ||
-              active_operation_->accepted.operation_id != operation_id) {
-            dispatch_result =
-                Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
-                                        "active command disappeared during subordinate admission",
-                                        "active_operation_lost"));
+        active_operation_->subordinate_id = dispatch.command_id;
+        active_operation_->subordinate_generation = dispatch.generation;
+        auto executing_state = active_operation_->state;
+        executing_state.state = OperationStateKind::kExecuting;
+        executing_state.participants.front().state = OperationStateKind::kExecuting;
+        executing_state.updated_at_ns = clock_.now();
+        auto durable_state =
+            journal_.RecordOperationState(config_.request_owner_epoch, executing_state,
+                                          active_operation_->runtime_scale_status.has_value()
+                                              ? &*active_operation_->runtime_scale_status
+                                              : nullptr,
+                                          "subordinate_command_admitted");
+        if (durable_state.ok()) {
+          auto transition =
+              resource_slots_.transition(slot_owner, resources, ResourceSlotState::kDispatched);
+          if (!transition.ok()) {
+            dispatch_result = transition;
           } else {
-            active_operation_->subordinate_id = dispatch.command_id;
-            active_operation_->subordinate_generation = dispatch.generation;
             active_operation_->slot_state = ResourceSlotState::kDispatched;
-            active_operation_->state.state = OperationStateKind::kExecuting;
-            active_operation_->state.participants.front().state = OperationStateKind::kExecuting;
-            active_operation_->state.updated_at_ns = clock_.now();
+            active_operation_->state = std::move(executing_state);
           }
+        } else {
+          dispatch_result = Result<void>::Err(durable_state.error());
         }
       }
     }
@@ -853,32 +900,31 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   if (!dispatch_result.ok()) {
     std::lock_guard state_lock(state_mutex_);
     if (active_operation_ != nullptr && active_operation_->accepted.operation_id == operation_id) {
-      if (active_operation_->slot_state == ResourceSlotState::kReserved) {
-        const auto release = resource_slots_.release(slot_owner, resources);
-        if (!release.ok()) {
-          active_operation_->state.state = OperationStateKind::kInterventionRequired;
-          active_operation_->state.participants.front().state =
-              OperationStateKind::kInterventionRequired;
-          active_operation_->state.participants.front().terminal_error = release.error();
-          return Result<OperationAcceptedDTO>::Err(release.error());
+      auto failed_state = active_operation_->state;
+      failed_state.state = OperationStateKind::kInterventionRequired;
+      failed_state.participants.front().state = OperationStateKind::kInterventionRequired;
+      failed_state.participants.front().terminal_error = dispatch_result.error();
+      failed_state.updated_at_ns = clock_.now();
+      auto durable_failure =
+          journal_.RecordOperationState(config_.request_owner_epoch, failed_state,
+                                        active_operation_->runtime_scale_status.has_value()
+                                            ? &*active_operation_->runtime_scale_status
+                                            : nullptr,
+                                        "subordinate_dispatch_failed_after_acceptance");
+      if (durable_failure.ok()) {
+        if (active_operation_->slot_state != ResourceSlotState::kTerminal) {
+          const auto transition = resource_slots_.transition(active_operation_->slot_owner,
+                                                             active_operation_->resources,
+                                                             ResourceSlotState::kTerminal);
+          if (transition.ok()) {
+            active_operation_->slot_state = ResourceSlotState::kTerminal;
+          }
         }
-        active_operation_.reset();
-      } else {
-        active_operation_->state.state = OperationStateKind::kInterventionRequired;
-        active_operation_->state.participants.front().state =
-            OperationStateKind::kInterventionRequired;
-        active_operation_->state.participants.front().terminal_error = dispatch_result.error();
-        active_operation_->state.updated_at_ns = clock_.now();
+        active_operation_->state = std::move(failed_state);
       }
     }
-    return Result<OperationAcceptedDTO>::Err(dispatch_result.error());
+    return Result<OperationAcceptedDTO>::Ok(accepted);
   }
-
-  {
-    std::lock_guard state_lock(state_mutex_);
-    replay_ledger_.push_back(ReplayEntry{intent, accepted});
-  }
-  ++next_operation_id_;
   return Result<OperationAcceptedDTO>::Ok(accepted);
 }
 
@@ -923,7 +969,15 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
   IResolvedParticipantExecutionEngine* engine = nullptr;
   std::uint64_t subordinate_id = 0U;
   OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
-  OperationRevision current_revision(0U);
+  OperationControlAcceptedDTO accepted{RequestId("pending"),
+                                       RequestReplayStatusDTO::kAcceptedNew,
+                                       OperationId("pending"),
+                                       OperationRevision(0U),
+                                       control,
+                                       OperationRevision(0U),
+                                       0};
+  const bool settles_operation = control == OperationControlKind::kReset ||
+                                 control == OperationControlKind::kAcknowledgeCompleted;
   {
     std::lock_guard state_lock(state_mutex_);
     const auto replay = std::find_if(control_replay_ledger_.begin(), control_replay_ledger_.end(),
@@ -953,19 +1007,17 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
                       return entry.intent.request_context.request_id ==
                              request.request_context.request_id;
                     }) ||
-        std::any_of(runtime_scale_replay_ledger_.begin(),
-                    runtime_scale_replay_ledger_.end(),
+        std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
                     [&](const RuntimeScaleReplayEntry& entry) {
                       return entry.request.request_context.request_id ==
                              request.request_context.request_id;
                     })) {
-      return Result<OperationControlAcceptedDTO>::Err(error(
-          "request_id_conflict",
-          "operation control request ID was already used by another Kernel command",
-          "request_id_conflict"));
+      return Result<OperationControlAcceptedDTO>::Err(
+          error("request_id_conflict",
+                "operation control request ID was already used by another Kernel command",
+                "request_id_conflict"));
     }
-    if (replay_ledger_.size() + control_replay_ledger_.size() +
-            stop_replay_ledger_.size() +
+    if (replay_ledger_.size() + control_replay_ledger_.size() + stop_replay_ledger_.size() +
             runtime_scale_replay_ledger_.size() >=
         config_.request_replay_capacity) {
       return Result<OperationControlAcceptedDTO>::Err(
@@ -978,7 +1030,7 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
                                                  "operation_not_resident",
                                                  ErrorCode::kMissingReference);
     }
-    current_revision = active_operation_->state.operation_revision;
+    const auto current_revision = active_operation_->state.operation_revision;
     if (current_revision != request.expected_operation_revision) {
       return reject<OperationControlAcceptedDTO>("operation control expected revision is stale",
                                                  "operation_revision_stale");
@@ -995,34 +1047,86 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
     engine = active_operation_->engine;
     subordinate_id = active_operation_->subordinate_id;
     payload_kind = active_operation_->payload_kind;
+    if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
+        (control == OperationControlKind::kPause || control == OperationControlKind::kResume)) {
+      return reject<OperationControlAcceptedDTO>(
+          "the qualified I6 command participant has no pause or resume realization",
+          control == OperationControlKind::kPause ? "command_pause_unsupported"
+                                                  : "command_resume_unsupported",
+          ErrorCode::kUnsupportedCapability);
+    }
+    if (current_revision.value() == std::numeric_limits<std::uint64_t>::max()) {
+      return reject<OperationControlAcceptedDTO>("operation revision space is exhausted",
+                                                 "operation_revision_exhausted",
+                                                 ErrorCode::kInternalError);
+    }
+    const OperationRevision next_revision(current_revision.value() + 1U);
+    const auto accepted_at_ns = clock_.now();
+    accepted = OperationControlAcceptedDTO{request.request_context.request_id,
+                                           RequestReplayStatusDTO::kAcceptedNew,
+                                           request.operation_id,
+                                           current_revision,
+                                           control,
+                                           next_revision,
+                                           accepted_at_ns};
+    auto accepted_state = active_operation_->state;
+    accepted_state.operation_revision = next_revision;
+    accepted_state.updated_at_ns = accepted_at_ns;
+    auto durable_acceptance = journal_.RecordControlAccepted(config_.request_owner_epoch, request,
+                                                             accepted, accepted_state);
+    if (!durable_acceptance.ok()) {
+      return Result<OperationControlAcceptedDTO>::Err(durable_acceptance.error());
+    }
+
+    auto revised =
+        settles_operation && active_operation_->slot_state != ResourceSlotState::kTerminal
+            ? resource_slots_.transition_and_revise_owner(
+                  active_operation_->slot_owner, active_operation_->resources,
+                  ResourceSlotState::kTerminal, next_revision)
+            : resource_slots_.revise_owner(active_operation_->slot_owner,
+                                           active_operation_->resources, next_revision);
+    control_replay_ledger_.push_back(ControlReplayEntry{request, accepted});
+    if (!revised.ok()) {
+      auto intervention = accepted_state;
+      intervention.state = OperationStateKind::kInterventionRequired;
+      intervention.participants.front().state = OperationStateKind::kInterventionRequired;
+      intervention.participants.front().terminal_error = revised.error();
+      intervention.updated_at_ns = clock_.now();
+      auto durable_failure =
+          journal_.RecordOperationState(config_.request_owner_epoch, intervention, nullptr,
+                                        "resource_revision_failed_after_control_acceptance");
+      if (durable_failure.ok()) {
+        active_operation_->state = std::move(intervention);
+      }
+      return Result<OperationControlAcceptedDTO>::Ok(accepted);
+    }
+    active_operation_->slot_owner = revised.value();
+    if (settles_operation) {
+      active_operation_->slot_state = ResourceSlotState::kTerminal;
+    }
+    active_operation_->state = std::move(accepted_state);
+    if (active_operation_->runtime_scale_status.has_value()) {
+      active_operation_->runtime_scale_status->operation_revision = next_revision;
+      active_operation_->runtime_scale_status->updated_at_ns = accepted_at_ns;
+    }
     active_operation_->pending_control = control;
   }
 
   bool accepted_by_subordinate = false;
   std::optional<ErrorDTO> subordinate_error;
   switch (control) {
-    case OperationControlKind::kPause:
-      if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
-        subordinate_error = error(std::string(to_string(ErrorCode::kUnsupportedCapability)),
-                                  "the qualified I6 command participant has no pause realization",
-                                  "command_pause_unsupported");
-      } else {
-        const auto result = engine->pause();
-        accepted_by_subordinate = result.accepted;
-        subordinate_error = result.error;
-      }
+    case OperationControlKind::kPause: {
+      const auto result = engine->pause();
+      accepted_by_subordinate = result.accepted;
+      subordinate_error = result.error;
       break;
-    case OperationControlKind::kResume:
-      if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
-        subordinate_error = error(std::string(to_string(ErrorCode::kUnsupportedCapability)),
-                                  "the qualified I6 command participant has no resume realization",
-                                  "command_resume_unsupported");
-      } else {
-        const auto result = engine->resume(std::nullopt);
-        accepted_by_subordinate = result.accepted;
-        subordinate_error = result.error;
-      }
+    }
+    case OperationControlKind::kResume: {
+      const auto result = engine->resume(std::nullopt);
+      accepted_by_subordinate = result.accepted;
+      subordinate_error = result.error;
       break;
+    }
     case OperationControlKind::kReset: {
       const auto result = engine->reset(std::nullopt);
       accepted_by_subordinate = result.accepted;
@@ -1031,9 +1135,6 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
     }
     case OperationControlKind::kAcknowledgeCompleted:
       if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
-        // The command backend's immutable terminal status is already the
-        // subordinate acknowledgement evidence; it has no second motion-FSM
-        // acknowledgement surface.
         accepted_by_subordinate = true;
       } else {
         const auto result = engine->acknowledge_completed(subordinate_id, std::nullopt);
@@ -1043,127 +1144,90 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       break;
   }
   if (!accepted_by_subordinate) {
+    const auto failure = subordinate_error.value_or(
+        error(std::string(to_string(ErrorCode::kExecutionRejected)),
+              std::string("subordinate rejected accepted ") + control_name(control),
+              "subordinate_control_rejected"));
+    (void)apply_subordinate_state(engine, subordinate_id, OperationStateKind::kInterventionRequired,
+                                  0.0, failure);
     std::lock_guard state_lock(state_mutex_);
     if (active_operation_ != nullptr &&
         active_operation_->accepted.operation_id == request.operation_id &&
         active_operation_->pending_control == control) {
       active_operation_->pending_control.reset();
     }
-    return Result<OperationControlAcceptedDTO>::Err(subordinate_error.value_or(
-        error(std::string(to_string(ErrorCode::kExecutionRejected)),
-              std::string("subordinate rejected ") + control_name(control),
-              "subordinate_control_rejected")));
+    return Result<OperationControlAcceptedDTO>::Ok(accepted);
   }
-
-  if (current_revision.value() == std::numeric_limits<std::uint64_t>::max()) {
-    return reject<OperationControlAcceptedDTO>("operation revision space is exhausted",
-                                               "operation_revision_exhausted",
-                                               ErrorCode::kInternalError);
-  }
-  const OperationRevision next_revision(current_revision.value() + 1U);
-  const OperationControlAcceptedDTO accepted{request.request_context.request_id,
-                                             RequestReplayStatusDTO::kAcceptedNew,
-                                             request.operation_id,
-                                             current_revision,
-                                             control,
-                                             next_revision,
-                                             clock_.now()};
 
   std::lock_guard state_lock(state_mutex_);
   if (active_operation_ == nullptr ||
-      active_operation_->accepted.operation_id != request.operation_id ||
-      active_operation_->state.operation_revision != current_revision ||
-      active_operation_->pending_control != control) {
-    return reject<OperationControlAcceptedDTO>(
-        "operation changed while its control was being admitted", "operation_control_race",
-        ErrorCode::kInvariantViolation);
+      active_operation_->accepted.operation_id != request.operation_id) {
+    return Result<OperationControlAcceptedDTO>::Ok(accepted);
   }
-
-  const bool settles_operation = control == OperationControlKind::kReset ||
-                                 control == OperationControlKind::kAcknowledgeCompleted;
-  auto revised = settles_operation &&
-                         active_operation_->slot_state !=
-                             ResourceSlotState::kTerminal
-                     ? resource_slots_.transition_and_revise_owner(
-                           active_operation_->slot_owner,
-                           active_operation_->resources,
-                           ResourceSlotState::kTerminal, next_revision)
-                     : resource_slots_.revise_owner(
-                           active_operation_->slot_owner,
-                           active_operation_->resources, next_revision);
-  if (!revised.ok()) {
-    active_operation_->pending_control.reset();
-    return Result<OperationControlAcceptedDTO>::Err(revised.error());
-  }
-  if (settles_operation) {
-    active_operation_->slot_state = ResourceSlotState::kTerminal;
-  }
-  active_operation_->slot_owner = revised.value();
-  active_operation_->state.operation_revision = next_revision;
-  if (active_operation_->runtime_scale_status.has_value()) {
-    active_operation_->runtime_scale_status->operation_revision = next_revision;
-  }
-  active_operation_->state.updated_at_ns = clock_.now();
   active_operation_->pending_control.reset();
-  control_replay_ledger_.push_back(ControlReplayEntry{request, accepted});
-
   if (settles_operation) {
     auto release =
         resource_slots_.release(active_operation_->slot_owner, active_operation_->resources);
     if (!release.ok()) {
-      active_operation_->state.state = OperationStateKind::kInterventionRequired;
-      active_operation_->state.participants.front().state =
-          OperationStateKind::kInterventionRequired;
-      active_operation_->state.participants.front().terminal_error = release.error();
-      return Result<OperationControlAcceptedDTO>::Err(release.error());
+      auto intervention = active_operation_->state;
+      intervention.state = OperationStateKind::kInterventionRequired;
+      intervention.participants.front().state = OperationStateKind::kInterventionRequired;
+      intervention.participants.front().terminal_error = release.error();
+      intervention.updated_at_ns = clock_.now();
+      auto durable_failure =
+          journal_.RecordOperationState(config_.request_owner_epoch, intervention,
+                                        active_operation_->runtime_scale_status.has_value()
+                                            ? &*active_operation_->runtime_scale_status
+                                            : nullptr,
+                                        "resource_release_failed_after_control_effect");
+      if (durable_failure.ok()) {
+        active_operation_->state = std::move(intervention);
+      }
+      return Result<OperationControlAcceptedDTO>::Ok(accepted);
     }
+    historical_operations_.push_back(active_operation_->state);
     active_operation_.reset();
   }
   return Result<OperationControlAcceptedDTO>::Ok(accepted);
 }
 
-Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::stop(
-    const StopIntentDTO& intent) {
+Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::stop(const StopIntentDTO& intent) {
   std::lock_guard control_lock(control_mutex_);
   if (intent.request_context.request_id.empty() ||
       intent.request_context.request_owner_epoch.empty() ||
-      intent.request_context.source_label.empty() ||
-      intent.operations.size() != 1U ||
+      intent.request_context.source_label.empty() || intent.operations.size() != 1U ||
       intent.operations.front().operation_id.empty() ||
       !intent.operations.front().expected_operation_revision.nonzero() ||
       (intent.reason.has_value() && intent.reason->empty())) {
-    return reject<StopAcceptedDTO>("ordinary Stop intent is malformed",
-                                   "stop_intent_invalid",
+    return reject<StopAcceptedDTO>("ordinary Stop intent is malformed", "stop_intent_invalid",
                                    ErrorCode::kInvalidRequest);
   }
-  if (intent.request_context.request_owner_epoch !=
-      config_.request_owner_epoch) {
-    return Result<StopAcceptedDTO>::Err(error(
-        "stale_request_owner_epoch",
-        "Stop request names a stale Kernel owner epoch",
-        "stale_request_owner_epoch"));
+  if (intent.request_context.request_owner_epoch != config_.request_owner_epoch) {
+    return Result<StopAcceptedDTO>::Err(error("stale_request_owner_epoch",
+                                              "Stop request names a stale Kernel owner epoch",
+                                              "stale_request_owner_epoch"));
   }
 
   IResolvedParticipantExecutionEngine* engine = nullptr;
   std::uint64_t subordinate_id = 0U;
   StopAcceptedDTO accepted{intent.request_context.request_id,
                            RequestReplayStatusDTO::kAcceptedNew,
-                           StopId("pending"), StopGeneration(0U), {},
-                           OperationRevision(0U), 0};
+                           StopId("pending"),
+                           StopGeneration(0U),
+                           {},
+                           OperationRevision(0U),
+                           0};
   {
     std::lock_guard state_lock(state_mutex_);
     const auto replay = std::find_if(
-        stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-        [&](const StopReplayEntry& entry) {
-          return entry.intent.request_context.request_id ==
-                 intent.request_context.request_id;
+        stop_replay_ledger_.begin(), stop_replay_ledger_.end(), [&](const StopReplayEntry& entry) {
+          return entry.intent.request_context.request_id == intent.request_context.request_id;
         });
     if (replay != stop_replay_ledger_.end()) {
       if (replay->intent != intent) {
-        return Result<StopAcceptedDTO>::Err(error(
-            "request_id_conflict",
-            "Stop request ID was reused with different intent",
-            "request_id_conflict"));
+        return Result<StopAcceptedDTO>::Err(
+            error("request_id_conflict", "Stop request ID was reused with different intent",
+                  "request_id_conflict"));
       }
       auto replayed = replay->accepted;
       replayed.replay_status = RequestReplayStatusDTO::kReplayedExact;
@@ -1173,125 +1237,129 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::stop(
     const bool used_elsewhere =
         std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
                     [&](const ReplayEntry& entry) {
-                      return entry.intent.request_context.request_id ==
-                             request_id;
+                      return entry.intent.request_context.request_id == request_id;
                     }) ||
-        std::any_of(control_replay_ledger_.begin(),
-                    control_replay_ledger_.end(),
+        std::any_of(control_replay_ledger_.begin(), control_replay_ledger_.end(),
                     [&](const ControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             request_id;
+                      return entry.request.request_context.request_id == request_id;
                     }) ||
-        std::any_of(runtime_scale_replay_ledger_.begin(),
-                    runtime_scale_replay_ledger_.end(),
+        std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
                     [&](const RuntimeScaleReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             request_id;
+                      return entry.request.request_context.request_id == request_id;
                     });
     if (used_elsewhere) {
-      return Result<StopAcceptedDTO>::Err(error(
-          "request_id_conflict",
-          "Stop request ID was already used by another Kernel command",
-          "request_id_conflict"));
+      return Result<StopAcceptedDTO>::Err(
+          error("request_id_conflict", "Stop request ID was already used by another Kernel command",
+                "request_id_conflict"));
     }
-    if (replay_ledger_.size() + control_replay_ledger_.size() +
-            stop_replay_ledger_.size() +
+    if (replay_ledger_.size() + control_replay_ledger_.size() + stop_replay_ledger_.size() +
             runtime_scale_replay_ledger_.size() >=
         config_.request_replay_capacity) {
-      return Result<StopAcceptedDTO>::Err(error(
-          "request_ledger_full",
-          "operation replay ledger reached its fixed bound",
-          "request_ledger_full"));
+      return Result<StopAcceptedDTO>::Err(error("request_ledger_full",
+                                                "operation replay ledger reached its fixed bound",
+                                                "request_ledger_full"));
     }
 
     const auto& target = intent.operations.front();
     if (active_operation_ == nullptr ||
         active_operation_->accepted.operation_id != target.operation_id) {
-      return reject<StopAcceptedDTO>(
-          "Stop names a non-resident operation", "operation_not_resident",
-          ErrorCode::kMissingReference);
+      return reject<StopAcceptedDTO>("Stop names a non-resident operation",
+                                     "operation_not_resident", ErrorCode::kMissingReference);
     }
-    if (active_operation_->state.operation_revision !=
-        target.expected_operation_revision) {
-      return reject<StopAcceptedDTO>(
-          "Stop expected operation revision is stale",
-          "operation_revision_stale");
+    if (active_operation_->state.operation_revision != target.expected_operation_revision) {
+      return reject<StopAcceptedDTO>("Stop expected operation revision is stale",
+                                     "operation_revision_stale");
     }
     const StopGeneration current_generation =
-        active_operation_->state.active_stop_generation.value_or(
-            StopGeneration(0U));
+        active_operation_->state.active_stop_generation.value_or(StopGeneration(0U));
     if (current_generation != target.expected_stop_generation) {
-      return reject<StopAcceptedDTO>("Stop generation is stale",
-                                     "stop_generation_stale");
+      return reject<StopAcceptedDTO>("Stop generation is stale", "stop_generation_stale");
     }
 
     if (active_operation_->state.state == OperationStateKind::kStopping &&
         active_operation_->state.active_stop_id.has_value() &&
         active_operation_->state.active_stop_generation.has_value()) {
-      accepted = StopAcceptedDTO{
-          intent.request_context.request_id,
-          RequestReplayStatusDTO::kAcceptedNew,
-          *active_operation_->state.active_stop_id,
-          *active_operation_->state.active_stop_generation,
-          {target.operation_id}, active_operation_->state.operation_revision,
-          clock_.now()};
+      accepted = StopAcceptedDTO{intent.request_context.request_id,
+                                 RequestReplayStatusDTO::kAcceptedNew,
+                                 *active_operation_->state.active_stop_id,
+                                 *active_operation_->state.active_stop_generation,
+                                 {target.operation_id},
+                                 active_operation_->state.operation_revision,
+                                 clock_.now()};
+      auto durable_join = journal_.RecordStopAccepted(config_.request_owner_epoch, intent, accepted,
+                                                      active_operation_->state);
+      if (!durable_join.ok()) {
+        return Result<StopAcceptedDTO>::Err(durable_join.error());
+      }
       stop_replay_ledger_.push_back(StopReplayEntry{intent, accepted});
       return Result<StopAcceptedDTO>::Ok(accepted);
     }
     if (terminal(active_operation_->state.state) ||
         active_operation_->state.state == OperationStateKind::kStopping) {
-      return reject<StopAcceptedDTO>(
-          "Stop is invalid for the current operation state",
-          "stop_state_invalid", ErrorCode::kInvalidStateTransition);
+      return reject<StopAcceptedDTO>("Stop is invalid for the current operation state",
+                                     "stop_state_invalid", ErrorCode::kInvalidStateTransition);
     }
     if (active_operation_->pending_control.has_value()) {
-      return reject<StopAcceptedDTO>(
-          "another operation control is already being admitted",
-          "operation_control_busy");
+      return reject<StopAcceptedDTO>("another operation control is already being admitted",
+                                     "operation_control_busy");
     }
-    if (next_stop_id_ == 0U ||
-        next_stop_id_ == std::numeric_limits<std::uint64_t>::max() ||
+    if (next_stop_id_ == 0U || next_stop_id_ == std::numeric_limits<std::uint64_t>::max() ||
         active_operation_->state.operation_revision.value() ==
             std::numeric_limits<std::uint64_t>::max() ||
-        current_generation.value() ==
-            std::numeric_limits<std::uint64_t>::max()) {
-      return reject<StopAcceptedDTO>("Stop identity space is exhausted",
-                                     "stop_identity_exhausted",
+        current_generation.value() == std::numeric_limits<std::uint64_t>::max()) {
+      return reject<StopAcceptedDTO>("Stop identity space is exhausted", "stop_identity_exhausted",
                                      ErrorCode::kInternalError);
     }
 
-    const StopId stop_id("stop:" + config_.request_owner_epoch.value() +
-                         ":" + std::to_string(next_stop_id_));
+    const StopId stop_id("stop:" + config_.request_owner_epoch.value() + ":" +
+                         std::to_string(next_stop_id_));
     const StopGeneration next_generation(current_generation.value() + 1U);
-    const OperationRevision next_revision(
-        active_operation_->state.operation_revision.value() + 1U);
+    const OperationRevision next_revision(active_operation_->state.operation_revision.value() + 1U);
+    const auto accepted_at_ns = clock_.now();
+    auto stopping_state = active_operation_->state;
+    stopping_state.operation_revision = next_revision;
+    stopping_state.state = OperationStateKind::kStopping;
+    stopping_state.participants.front().state = OperationStateKind::kStopping;
+    stopping_state.active_stop_id = stop_id;
+    stopping_state.active_stop_generation = next_generation;
+    stopping_state.updated_at_ns = accepted_at_ns;
+    accepted = StopAcceptedDTO{intent.request_context.request_id,
+                               RequestReplayStatusDTO::kAcceptedNew,
+                               stop_id,
+                               next_generation,
+                               {target.operation_id},
+                               next_revision,
+                               accepted_at_ns};
+    auto durable_acceptance =
+        journal_.RecordStopAccepted(config_.request_owner_epoch, intent, accepted, stopping_state);
+    if (!durable_acceptance.ok()) {
+      return Result<StopAcceptedDTO>::Err(durable_acceptance.error());
+    }
     auto revised = resource_slots_.transition_and_revise_owner(
-        active_operation_->slot_owner, active_operation_->resources,
-        ResourceSlotState::kStopping, next_revision);
+        active_operation_->slot_owner, active_operation_->resources, ResourceSlotState::kStopping,
+        next_revision);
     if (!revised.ok()) {
-      return Result<StopAcceptedDTO>::Err(revised.error());
+      stop_replay_ledger_.push_back(StopReplayEntry{intent, accepted});
+      auto intervention = stopping_state;
+      intervention.state = OperationStateKind::kInterventionRequired;
+      intervention.participants.front().state = OperationStateKind::kInterventionRequired;
+      intervention.participants.front().terminal_error = revised.error();
+      intervention.updated_at_ns = clock_.now();
+      auto durable_failure =
+          journal_.RecordOperationState(config_.request_owner_epoch, intervention, nullptr,
+                                        "resource_revision_failed_after_stop_acceptance");
+      if (durable_failure.ok()) {
+        active_operation_->state = std::move(intervention);
+      }
+      return Result<StopAcceptedDTO>::Ok(accepted);
     }
     active_operation_->slot_owner = revised.value();
     active_operation_->slot_state = ResourceSlotState::kStopping;
-    active_operation_->state.operation_revision = next_revision;
+    active_operation_->state = std::move(stopping_state);
     if (active_operation_->runtime_scale_status.has_value()) {
-      active_operation_->runtime_scale_status->operation_revision =
-          next_revision;
+      active_operation_->runtime_scale_status->operation_revision = next_revision;
+      active_operation_->runtime_scale_status->updated_at_ns = accepted_at_ns;
     }
-    active_operation_->state.state = OperationStateKind::kStopping;
-    active_operation_->state.participants.front().state =
-        OperationStateKind::kStopping;
-    active_operation_->state.active_stop_id = stop_id;
-    active_operation_->state.active_stop_generation = next_generation;
-    active_operation_->state.updated_at_ns = clock_.now();
-    accepted = StopAcceptedDTO{
-        intent.request_context.request_id,
-        RequestReplayStatusDTO::kAcceptedNew,
-        stop_id,
-        next_generation,
-        {target.operation_id},
-        next_revision,
-        active_operation_->state.updated_at_ns};
     stop_replay_ledger_.push_back(StopReplayEntry{intent, accepted});
     ++next_stop_id_;
     engine = active_operation_->engine;
@@ -1300,65 +1368,53 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::stop(
 
   const auto subordinate = engine->stop();
   if (!subordinate.accepted || subordinate.error.has_value()) {
-    const auto failure = subordinate.error.value_or(error(
-        std::string(to_string(ErrorCode::kExecutionRejected)),
-        "subordinate rejected an accepted scoped Stop",
-        "subordinate_stop_rejected"));
-    (void)apply_subordinate_state(
-        engine, subordinate_id, OperationStateKind::kInterventionRequired,
-        0.0,
-        failure);
+    const auto failure = subordinate.error.value_or(
+        error(std::string(to_string(ErrorCode::kExecutionRejected)),
+              "subordinate rejected an accepted scoped Stop", "subordinate_stop_rejected"));
+    (void)apply_subordinate_state(engine, subordinate_id, OperationStateKind::kInterventionRequired,
+                                  0.0, failure);
   }
   return Result<StopAcceptedDTO>::Ok(std::move(accepted));
 }
 
-Result<RuntimeScaleAcceptedDTO>
-ResourceAddressedExecutionKernel::set_runtime_scale(
+Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_scale(
     const RuntimeScaleRequestDTO& request) {
   std::lock_guard control_lock(control_mutex_);
   if (request.request_context.request_id.empty() ||
       request.request_context.request_owner_epoch.empty() ||
-      request.request_context.source_label.empty() ||
-      request.operation_id.empty() ||
-      !request.expected_operation_revision.nonzero() ||
-      !std::isfinite(request.scale) || request.scale < 0.0 ||
-      request.scale > 1.0) {
-    return reject<RuntimeScaleAcceptedDTO>(
-        "runtime-scale request is malformed", "runtime_scale_request_invalid",
-        ErrorCode::kInvalidRequest);
+      request.request_context.source_label.empty() || request.operation_id.empty() ||
+      !request.expected_operation_revision.nonzero() || !std::isfinite(request.scale) ||
+      request.scale < 0.0 || request.scale > 1.0) {
+    return reject<RuntimeScaleAcceptedDTO>("runtime-scale request is malformed",
+                                           "runtime_scale_request_invalid",
+                                           ErrorCode::kInvalidRequest);
   }
-  if (request.request_context.request_owner_epoch !=
-      config_.request_owner_epoch) {
-    return Result<RuntimeScaleAcceptedDTO>::Err(error(
-        "stale_request_owner_epoch",
-        "runtime-scale request names a stale Kernel owner epoch",
-        "stale_request_owner_epoch"));
+  if (request.request_context.request_owner_epoch != config_.request_owner_epoch) {
+    return Result<RuntimeScaleAcceptedDTO>::Err(
+        error("stale_request_owner_epoch", "runtime-scale request names a stale Kernel owner epoch",
+              "stale_request_owner_epoch"));
   }
 
   IResolvedParticipantExecutionEngine* engine = nullptr;
   std::optional<ResolvedRuntimeScaleCommandDTO> resolved_command;
-  RuntimeScaleAcceptedDTO accepted{
-      request.request_context.request_id,
-      RequestReplayStatusDTO::kAcceptedNew,
-      request.operation_id,
-      request.expected_operation_revision,
-      request.scale,
-      RuntimeScaleGeneration(0U),
-      0};
+  RuntimeScaleAcceptedDTO accepted{request.request_context.request_id,
+                                   RequestReplayStatusDTO::kAcceptedNew,
+                                   request.operation_id,
+                                   request.expected_operation_revision,
+                                   request.scale,
+                                   RuntimeScaleGeneration(0U),
+                                   0};
   {
     std::lock_guard state_lock(state_mutex_);
     const auto replay = std::find_if(
-        runtime_scale_replay_ledger_.begin(),
-        runtime_scale_replay_ledger_.end(),
+        runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
         [&](const RuntimeScaleReplayEntry& entry) {
-          return entry.request.request_context.request_id ==
-                 request.request_context.request_id;
+          return entry.request.request_context.request_id == request.request_context.request_id;
         });
     if (replay != runtime_scale_replay_ledger_.end()) {
       if (replay->request != request) {
         return Result<RuntimeScaleAcceptedDTO>::Err(error(
-            "request_id_conflict",
-            "runtime-scale request ID was reused with different intent",
+            "request_id_conflict", "runtime-scale request ID was reused with different intent",
             "request_id_conflict"));
       }
       auto replayed = replay->accepted;
@@ -1369,52 +1425,42 @@ ResourceAddressedExecutionKernel::set_runtime_scale(
     const bool used_elsewhere =
         std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
                     [&](const ReplayEntry& entry) {
-                      return entry.intent.request_context.request_id ==
-                             request_id;
+                      return entry.intent.request_context.request_id == request_id;
                     }) ||
-        std::any_of(control_replay_ledger_.begin(),
-                    control_replay_ledger_.end(),
+        std::any_of(control_replay_ledger_.begin(), control_replay_ledger_.end(),
                     [&](const ControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             request_id;
+                      return entry.request.request_context.request_id == request_id;
                     }) ||
         std::any_of(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
                     [&](const StopReplayEntry& entry) {
-                      return entry.intent.request_context.request_id ==
-                             request_id;
+                      return entry.intent.request_context.request_id == request_id;
                     });
     if (used_elsewhere) {
-      return Result<RuntimeScaleAcceptedDTO>::Err(error(
-          "request_id_conflict",
-          "runtime-scale request ID was already used by another Kernel command",
-          "request_id_conflict"));
+      return Result<RuntimeScaleAcceptedDTO>::Err(
+          error("request_id_conflict",
+                "runtime-scale request ID was already used by another Kernel command",
+                "request_id_conflict"));
     }
-    if (replay_ledger_.size() + control_replay_ledger_.size() +
-            stop_replay_ledger_.size() +
+    if (replay_ledger_.size() + control_replay_ledger_.size() + stop_replay_ledger_.size() +
             runtime_scale_replay_ledger_.size() >=
         config_.request_replay_capacity) {
-      return Result<RuntimeScaleAcceptedDTO>::Err(error(
-          "request_ledger_full",
-          "operation replay ledger reached its fixed bound",
-          "request_ledger_full"));
+      return Result<RuntimeScaleAcceptedDTO>::Err(
+          error("request_ledger_full", "operation replay ledger reached its fixed bound",
+                "request_ledger_full"));
     }
     if (active_operation_ == nullptr ||
         active_operation_->accepted.operation_id != request.operation_id) {
-      return reject<RuntimeScaleAcceptedDTO>(
-          "runtime scale names a non-resident operation",
-          "operation_not_resident", ErrorCode::kMissingReference);
+      return reject<RuntimeScaleAcceptedDTO>("runtime scale names a non-resident operation",
+                                             "operation_not_resident",
+                                             ErrorCode::kMissingReference);
     }
-    if (active_operation_->state.operation_revision !=
-        request.expected_operation_revision) {
-      return reject<RuntimeScaleAcceptedDTO>(
-          "runtime scale expected operation revision is stale",
-          "operation_revision_stale");
+    if (active_operation_->state.operation_revision != request.expected_operation_revision) {
+      return reject<RuntimeScaleAcceptedDTO>("runtime scale expected operation revision is stale",
+                                             "operation_revision_stale");
     }
-    if (active_operation_->payload_kind !=
-            OperationParticipantPayloadKind::kMotion ||
+    if (active_operation_->payload_kind != OperationParticipantPayloadKind::kMotion ||
         !active_operation_->binding.value().control_path.has_value() ||
-        !active_operation_->binding.value()
-             .control_path->runtime_scale_qualification.has_value() ||
+        !active_operation_->binding.value().control_path->runtime_scale_qualification.has_value() ||
         !active_operation_->runtime_scale_status.has_value()) {
       return reject<RuntimeScaleAcceptedDTO>(
           "the exact operation binding has no qualified runtime scaling",
@@ -1423,82 +1469,81 @@ ResourceAddressedExecutionKernel::set_runtime_scale(
     const auto current_generation =
         active_operation_->runtime_scale_status->runtime_scale_generation;
     if (current_generation != request.expected_runtime_scale_generation) {
-      return reject<RuntimeScaleAcceptedDTO>(
-          "runtime-scale generation is stale",
-          "runtime_scale_generation_stale");
+      return reject<RuntimeScaleAcceptedDTO>("runtime-scale generation is stale",
+                                             "runtime_scale_generation_stale");
     }
     const auto state = active_operation_->state.state;
-    if (state != OperationStateKind::kPlanning &&
-        state != OperationStateKind::kValidating &&
-        state != OperationStateKind::kPrepared &&
-        state != OperationStateKind::kDispatching &&
-        state != OperationStateKind::kExecuting &&
-        state != OperationStateKind::kPaused) {
+    if (state != OperationStateKind::kPlanning && state != OperationStateKind::kValidating &&
+        state != OperationStateKind::kPrepared && state != OperationStateKind::kDispatching &&
+        state != OperationStateKind::kExecuting && state != OperationStateKind::kPaused) {
       return reject<RuntimeScaleAcceptedDTO>(
-          "runtime scale is invalid for the current operation state",
-          "runtime_scale_state_invalid", ErrorCode::kInvalidStateTransition);
+          "runtime scale is invalid for the current operation state", "runtime_scale_state_invalid",
+          ErrorCode::kInvalidStateTransition);
     }
-    if (current_generation.value() ==
-        std::numeric_limits<std::uint64_t>::max()) {
-      return reject<RuntimeScaleAcceptedDTO>(
-          "runtime-scale generation space is exhausted",
-          "runtime_scale_generation_exhausted", ErrorCode::kInternalError);
+    if (current_generation.value() == std::numeric_limits<std::uint64_t>::max()) {
+      return reject<RuntimeScaleAcceptedDTO>("runtime-scale generation space is exhausted",
+                                             "runtime_scale_generation_exhausted",
+                                             ErrorCode::kInternalError);
     }
 
-    const RuntimeScaleGeneration next_generation(
-        current_generation.value() + 1U);
-    accepted = RuntimeScaleAcceptedDTO{
-        request.request_context.request_id,
-        RequestReplayStatusDTO::kAcceptedNew,
-        request.operation_id,
-        request.expected_operation_revision,
-        request.scale,
-        next_generation,
-        clock_.now()};
-    auto& status = *active_operation_->runtime_scale_status;
-    status.runtime_scale_generation = next_generation;
-    status.requested_scale = request.scale;
-    status.state = RuntimeScaleApplicationState::kPending;
-    status.updated_at_ns = accepted.accepted_at_ns;
-    auto& participant = status.participants.front();
+    const RuntimeScaleGeneration next_generation(current_generation.value() + 1U);
+    accepted = RuntimeScaleAcceptedDTO{request.request_context.request_id,
+                                       RequestReplayStatusDTO::kAcceptedNew,
+                                       request.operation_id,
+                                       request.expected_operation_revision,
+                                       request.scale,
+                                       next_generation,
+                                       clock_.now()};
+    auto accepted_status = *active_operation_->runtime_scale_status;
+    accepted_status.runtime_scale_generation = next_generation;
+    accepted_status.requested_scale = request.scale;
+    accepted_status.state = RuntimeScaleApplicationState::kPending;
+    accepted_status.updated_at_ns = accepted.accepted_at_ns;
+    auto& participant = accepted_status.participants.front();
     participant.accepted_generation = next_generation;
     participant.commanded_scale = request.scale;
     participant.state = RuntimeScaleApplicationState::kPending;
     participant.error.reset();
-    active_operation_->state.runtime_scale_generation = next_generation;
-    active_operation_->state.updated_at_ns = accepted.accepted_at_ns;
-    runtime_scale_replay_ledger_.push_back(
-        RuntimeScaleReplayEntry{request, accepted});
+    auto accepted_state = active_operation_->state;
+    accepted_state.runtime_scale_generation = next_generation;
+    accepted_state.updated_at_ns = accepted.accepted_at_ns;
+    auto durable_acceptance = journal_.RecordRuntimeScaleAccepted(
+        config_.request_owner_epoch, request, accepted, accepted_state, accepted_status);
+    if (!durable_acceptance.ok()) {
+      return Result<RuntimeScaleAcceptedDTO>::Err(durable_acceptance.error());
+    }
+    active_operation_->state = std::move(accepted_state);
+    active_operation_->runtime_scale_status = std::move(accepted_status);
+    runtime_scale_replay_ledger_.push_back(RuntimeScaleReplayEntry{request, accepted});
     engine = active_operation_->engine;
     const auto& binding = active_operation_->binding.value();
     const auto& control = *binding.control_path;
     const auto& qualification = *control.runtime_scale_qualification;
-    const auto& operation_participant =
-        active_operation_->state.participants.front();
-    resolved_command = ResolvedRuntimeScaleCommandDTO{
-        request.operation_id,
-        request.expected_operation_revision,
-        operation_participant.participant_id,
-        binding.controllable_component_id,
-        binding.command_target_id,
-        binding.capability_id,
-        control.control_domain_id,
-        control.control_domain_revision,
-        control.control_binding_id,
-        control.control_binding_revision,
-        operation_participant.controller_goal_id,
-        operation_participant.controller_goal_generation,
-        control.controller_topology_id,
-        control.topology_revision,
-        control.control_route_id,
-        qualification.scaling_domain_id,
-        qualification.coordinated_barrier_id,
-        active_operation_->resources,
-        control.active_control_configuration_id,
-        control.active_control_configuration_generation,
-        current_generation,
-        next_generation,
-        request.scale};
+    const auto& operation_participant = active_operation_->state.participants.front();
+    resolved_command =
+        ResolvedRuntimeScaleCommandDTO{request.operation_id,
+                                       request.expected_operation_revision,
+                                       operation_participant.participant_id,
+                                       binding.controllable_component_id,
+                                       binding.command_target_id,
+                                       binding.capability_id,
+                                       control.control_domain_id,
+                                       control.control_domain_revision,
+                                       control.control_binding_id,
+                                       control.control_binding_revision,
+                                       operation_participant.controller_goal_id,
+                                       operation_participant.controller_goal_generation,
+                                       control.controller_topology_id,
+                                       control.topology_revision,
+                                       control.control_route_id,
+                                       qualification.scaling_domain_id,
+                                       qualification.coordinated_barrier_id,
+                                       active_operation_->resources,
+                                       control.active_control_configuration_id,
+                                       control.active_control_configuration_generation,
+                                       current_generation,
+                                       next_generation,
+                                       request.scale};
   }
 
   const auto commanded = engine->set_runtime_scale(*resolved_command);
@@ -1509,12 +1554,18 @@ ResourceAddressedExecutionKernel::set_runtime_scale(
         active_operation_->runtime_scale_status.has_value() &&
         active_operation_->runtime_scale_status->runtime_scale_generation ==
             accepted.runtime_scale_generation) {
-      auto& status = *active_operation_->runtime_scale_status;
+      auto status = *active_operation_->runtime_scale_status;
       status.state = RuntimeScaleApplicationState::kFailed;
       status.updated_at_ns = clock_.now();
-      status.participants.front().state =
-          RuntimeScaleApplicationState::kFailed;
+      status.participants.front().state = RuntimeScaleApplicationState::kFailed;
       status.participants.front().error = commanded.error();
+      auto state = active_operation_->state;
+      auto durable = journal_.RecordOperationState(config_.request_owner_epoch, state, &status,
+                                                   "runtime_scale_effect_rejected");
+      if (durable.ok()) {
+        active_operation_->state = std::move(state);
+        active_operation_->runtime_scale_status = std::move(status);
+      }
     }
   } else {
     const auto& exact = commanded.value();
@@ -1522,83 +1573,86 @@ ResourceAddressedExecutionKernel::set_runtime_scale(
         exact.operation_id == resolved_command->operation_id &&
         exact.operation_revision == resolved_command->operation_revision &&
         exact.participant_id == resolved_command->participant_id &&
-        exact.controllable_component_id ==
-            resolved_command->controllable_component_id &&
+        exact.controllable_component_id == resolved_command->controllable_component_id &&
         exact.command_target_id == resolved_command->command_target_id &&
         exact.capability_id == resolved_command->capability_id &&
         exact.control_domain_id == resolved_command->control_domain_id &&
-        exact.control_domain_revision ==
-            resolved_command->control_domain_revision &&
+        exact.control_domain_revision == resolved_command->control_domain_revision &&
         exact.control_binding_id == resolved_command->control_binding_id &&
-        exact.control_binding_revision ==
-            resolved_command->control_binding_revision &&
+        exact.control_binding_revision == resolved_command->control_binding_revision &&
         exact.controller_goal_id == resolved_command->controller_goal_id &&
-        exact.controller_goal_generation ==
-            resolved_command->controller_goal_generation &&
-        exact.controller_topology_id ==
-            resolved_command->controller_topology_id &&
+        exact.controller_goal_generation == resolved_command->controller_goal_generation &&
+        exact.controller_topology_id == resolved_command->controller_topology_id &&
         exact.topology_revision == resolved_command->topology_revision &&
         exact.control_route_id == resolved_command->control_route_id &&
         exact.scaling_domain_id == resolved_command->scaling_domain_id &&
-        exact.coordinated_barrier_id ==
-            resolved_command->coordinated_barrier_id &&
+        exact.coordinated_barrier_id == resolved_command->coordinated_barrier_id &&
         exact.resources == resolved_command->resources &&
         exact.active_control_configuration_id ==
             resolved_command->active_control_configuration_id &&
         exact.active_control_configuration_generation ==
             resolved_command->active_control_configuration_generation &&
-        exact.accepted_generation ==
-            resolved_command->requested_runtime_scale_generation &&
-        std::abs(exact.commanded_scale - resolved_command->requested_scale) <=
-            1e-12;
+        exact.accepted_generation == resolved_command->requested_runtime_scale_generation &&
+        std::abs(exact.commanded_scale - resolved_command->requested_scale) <= 1e-12;
     if (!acceptance_matches) {
       std::lock_guard state_lock(state_mutex_);
       if (active_operation_ != nullptr &&
           active_operation_->accepted.operation_id == request.operation_id &&
           active_operation_->runtime_scale_status.has_value()) {
-        auto& status = *active_operation_->runtime_scale_status;
+        auto status = *active_operation_->runtime_scale_status;
         status.state = RuntimeScaleApplicationState::kFailed;
         status.updated_at_ns = clock_.now();
-        status.participants.front().state =
-            RuntimeScaleApplicationState::kFailed;
-        status.participants.front().error = error(
-            std::string(to_string(ErrorCode::kInvariantViolation)),
-            "participant engine returned mismatched runtime-scale acceptance",
-            "runtime_scale_acceptance_mismatch");
+        status.participants.front().state = RuntimeScaleApplicationState::kFailed;
+        status.participants.front().error =
+            error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                  "participant engine returned mismatched runtime-scale acceptance",
+                  "runtime_scale_acceptance_mismatch");
+        auto state = active_operation_->state;
+        auto durable = journal_.RecordOperationState(config_.request_owner_epoch, state, &status,
+                                                     "runtime_scale_acceptance_mismatch");
+        if (durable.ok()) {
+          active_operation_->state = std::move(state);
+          active_operation_->runtime_scale_status = std::move(status);
+        }
       }
     } else {
-      const auto observed = engine->runtime_scale_status(
-          resolved_command->operation_id,
-          resolved_command->control_binding_id);
+      const auto observed = engine->runtime_scale_status(resolved_command->operation_id,
+                                                         resolved_command->control_binding_id);
       if (!observed.ok()) {
         std::lock_guard state_lock(state_mutex_);
         if (active_operation_ != nullptr &&
             active_operation_->accepted.operation_id == request.operation_id &&
             active_operation_->runtime_scale_status.has_value()) {
-          auto& status = *active_operation_->runtime_scale_status;
+          auto status = *active_operation_->runtime_scale_status;
           status.state = RuntimeScaleApplicationState::kFailed;
           status.updated_at_ns = clock_.now();
-          status.participants.front().state =
-              RuntimeScaleApplicationState::kFailed;
+          status.participants.front().state = RuntimeScaleApplicationState::kFailed;
           status.participants.front().error = observed.error();
+          auto state = active_operation_->state;
+          auto durable = journal_.RecordOperationState(config_.request_owner_epoch, state, &status,
+                                                       "runtime_scale_status_unavailable");
+          if (durable.ok()) {
+            active_operation_->state = std::move(state);
+            active_operation_->runtime_scale_status = std::move(status);
+          }
         }
       } else {
-        apply_runtime_scale_status(engine, observed.value());
+        (void)apply_runtime_scale_status(engine, observed.value());
       }
     }
   }
   return Result<RuntimeScaleAcceptedDTO>::Ok(std::move(accepted));
 }
 
-void ResourceAddressedExecutionKernel::apply_runtime_scale_status(
+Result<void> ResourceAddressedExecutionKernel::apply_runtime_scale_status(
     IResolvedParticipantExecutionEngine* engine,
     const ResolvedRuntimeScaleStatusDTO& resolved_status) {
   std::lock_guard state_lock(state_mutex_);
   if (active_operation_ == nullptr || active_operation_->engine != engine ||
       !active_operation_->runtime_scale_status.has_value()) {
-    return;
+    return Result<void>::Ok();
   }
-  auto& status = *active_operation_->runtime_scale_status;
+  auto status = *active_operation_->runtime_scale_status;
   auto& participant = status.participants.front();
   const auto& binding = active_operation_->binding.value();
   const auto& control = *binding.control_path;
@@ -1607,114 +1661,119 @@ void ResourceAddressedExecutionKernel::apply_runtime_scale_status(
       resolved_status.operation_id == status.operation_id &&
       resolved_status.operation_revision == status.operation_revision &&
       resolved_status.participant_id == participant.participant_id &&
-      resolved_status.controllable_component_id ==
-          participant.controllable_component_id &&
+      resolved_status.controllable_component_id == participant.controllable_component_id &&
       resolved_status.command_target_id == participant.command_target_id &&
       resolved_status.capability_id == participant.capability_id &&
       resolved_status.control_domain_id == participant.control_domain_id &&
-      resolved_status.control_domain_revision ==
-          participant.control_domain_revision &&
+      resolved_status.control_domain_revision == participant.control_domain_revision &&
       resolved_status.control_binding_id == participant.control_binding_id &&
-      resolved_status.control_binding_revision ==
-          participant.control_binding_revision &&
+      resolved_status.control_binding_revision == participant.control_binding_revision &&
       resolved_status.controller_goal_id == participant.controller_goal_id &&
-      resolved_status.controller_goal_generation ==
-          participant.controller_goal_generation &&
-      resolved_status.controller_topology_id ==
-          participant.controller_topology_id &&
+      resolved_status.controller_goal_generation == participant.controller_goal_generation &&
+      resolved_status.controller_topology_id == participant.controller_topology_id &&
       resolved_status.topology_revision == participant.topology_revision &&
       resolved_status.control_route_id == participant.control_route_id &&
       resolved_status.scaling_domain_id == participant.scaling_domain_id &&
-      resolved_status.coordinated_barrier_id ==
-          participant.coordinated_barrier_id &&
+      resolved_status.coordinated_barrier_id == participant.coordinated_barrier_id &&
       resolved_status.resources == participant.resources &&
       resolved_status.active_control_configuration_id ==
           participant.active_control_configuration_id &&
       resolved_status.active_control_configuration_generation ==
           participant.active_control_configuration_generation &&
-      resolved_status.acknowledgement_source_epoch ==
-          control.provider_runtime_epoch;
+      resolved_status.acknowledgement_source_epoch == control.provider_runtime_epoch;
   if (!exact_target_matches) {
     participant.state = RuntimeScaleApplicationState::kFailed;
     status.state = RuntimeScaleApplicationState::kFailed;
-    participant.error = error(
-        std::string(to_string(ErrorCode::kInvariantViolation)),
-        "participant engine returned runtime-scale status for another binding",
-        "runtime_scale_status_identity_mismatch");
+    participant.error =
+        error(std::string(to_string(ErrorCode::kInvariantViolation)),
+              "participant engine returned runtime-scale status for another binding",
+              "runtime_scale_status_identity_mismatch");
     status.updated_at_ns = clock_.now();
-    return;
+    auto state = active_operation_->state;
+    auto durable = journal_.RecordOperationState(config_.request_owner_epoch, state, &status,
+                                                 "runtime_scale_status_identity_mismatch");
+    if (!durable.ok()) {
+      return Result<void>::Err(durable.error());
+    }
+    active_operation_->state = std::move(state);
+    active_operation_->runtime_scale_status = std::move(status);
+    return Result<void>::Ok();
   }
   if (resolved_status.accepted_generation < status.runtime_scale_generation) {
-    return;
+    return Result<void>::Ok();
   }
   if (resolved_status.accepted_generation != status.runtime_scale_generation) {
     participant.state = RuntimeScaleApplicationState::kFailed;
     status.state = RuntimeScaleApplicationState::kFailed;
-    participant.error = error(
-        std::string(to_string(ErrorCode::kInvariantViolation)),
-        "participant engine advanced an unrequested runtime-scale generation",
-        "runtime_scale_status_generation_mismatch");
+    participant.error = error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                              "participant engine advanced an unrequested runtime-scale generation",
+                              "runtime_scale_status_generation_mismatch");
     status.updated_at_ns = clock_.now();
-    return;
+    auto state = active_operation_->state;
+    auto durable = journal_.RecordOperationState(config_.request_owner_epoch, state, &status,
+                                                 "runtime_scale_status_generation_mismatch");
+    if (!durable.ok()) {
+      return Result<void>::Err(durable.error());
+    }
+    active_operation_->state = std::move(state);
+    active_operation_->runtime_scale_status = std::move(status);
+    return Result<void>::Ok();
   }
   participant.commanded_scale = resolved_status.commanded_scale;
   participant.applied_scale = resolved_status.applied_scale;
-  participant.virtual_trajectory_time_s =
-      resolved_status.virtual_trajectory_time_s;
-  participant.acknowledgement_source_epoch =
-      resolved_status.acknowledgement_source_epoch;
-  participant.acknowledgement_sequence =
-      resolved_status.acknowledgement_sequence;
-  participant.acknowledgement_timestamp_ns =
-      resolved_status.acknowledgement_timestamp_ns;
-  participant.supported = resolved_status.state !=
-                          RuntimeScaleApplicationState::kRejected;
+  participant.virtual_trajectory_time_s = resolved_status.virtual_trajectory_time_s;
+  participant.acknowledgement_source_epoch = resolved_status.acknowledgement_source_epoch;
+  participant.acknowledgement_sequence = resolved_status.acknowledgement_sequence;
+  participant.acknowledgement_timestamp_ns = resolved_status.acknowledgement_timestamp_ns;
+  participant.supported = resolved_status.state != RuntimeScaleApplicationState::kRejected;
   participant.error = resolved_status.error;
   status.effective_scale = resolved_status.applied_scale;
   status.updated_at_ns = clock_.now();
 
-  const bool stale =
-      resolved_status.acknowledgement_timestamp_ns > 0 &&
-      status.updated_at_ns > resolved_status.acknowledgement_timestamp_ns &&
-      status.updated_at_ns - resolved_status.acknowledgement_timestamp_ns >
-          qualification.freshness_budget_ns;
+  const bool stale = resolved_status.acknowledgement_timestamp_ns > 0 &&
+                     status.updated_at_ns > resolved_status.acknowledgement_timestamp_ns &&
+                     status.updated_at_ns - resolved_status.acknowledgement_timestamp_ns >
+                         qualification.freshness_budget_ns;
   if (resolved_status.error.has_value() || stale) {
     participant.state = RuntimeScaleApplicationState::kFailed;
     status.state = RuntimeScaleApplicationState::kFailed;
     if (stale && !participant.error.has_value()) {
-      participant.error = error(
-          std::string(to_string(ErrorCode::kExecutionRejected)),
-          "runtime-scale applied-state acknowledgement is stale",
-          "runtime_scale_acknowledgement_stale");
+      participant.error = error(std::string(to_string(ErrorCode::kExecutionRejected)),
+                                "runtime-scale applied-state acknowledgement is stale",
+                                "runtime_scale_acknowledgement_stale");
     }
-    return;
+  } else {
+    participant.state = resolved_status.state;
+    status.state = participant.state;
   }
-  participant.state = resolved_status.state;
-  status.state = participant.state;
+  auto state = active_operation_->state;
+  auto durable = journal_.RecordOperationState(config_.request_owner_epoch, state, &status,
+                                               "runtime_scale_status_observed");
+  if (!durable.ok()) {
+    return Result<void>::Err(durable.error());
+  }
+  active_operation_->state = std::move(state);
+  active_operation_->runtime_scale_status = std::move(status);
+  return Result<void>::Ok();
 }
 
-Result<RuntimeScaleStatusDTO>
-ResourceAddressedExecutionKernel::get_runtime_scale(
+Result<RuntimeScaleStatusDTO> ResourceAddressedExecutionKernel::get_runtime_scale(
     const OperationId& operation_id) const {
   if (operation_id.empty()) {
-    return reject<RuntimeScaleStatusDTO>(
-        "operation identity is empty", "operation_id_empty",
-        ErrorCode::kInvalidRequest);
+    return reject<RuntimeScaleStatusDTO>("operation identity is empty", "operation_id_empty",
+                                         ErrorCode::kInvalidRequest);
   }
   std::lock_guard state_lock(state_mutex_);
-  if (active_operation_ == nullptr ||
-      active_operation_->accepted.operation_id != operation_id) {
-    return reject<RuntimeScaleStatusDTO>(
-        "operation is not resident", "operation_not_resident",
-        ErrorCode::kMissingReference);
+  if (active_operation_ == nullptr || active_operation_->accepted.operation_id != operation_id) {
+    return reject<RuntimeScaleStatusDTO>("operation is not resident", "operation_not_resident",
+                                         ErrorCode::kMissingReference);
   }
   if (!active_operation_->runtime_scale_status.has_value()) {
-    return reject<RuntimeScaleStatusDTO>(
-        "operation binding has no qualified runtime scaling",
-        "runtime_scale_unsupported", ErrorCode::kUnsupportedCapability);
+    return reject<RuntimeScaleStatusDTO>("operation binding has no qualified runtime scaling",
+                                         "runtime_scale_unsupported",
+                                         ErrorCode::kUnsupportedCapability);
   }
-  return Result<RuntimeScaleStatusDTO>::Ok(
-      *active_operation_->runtime_scale_status);
+  return Result<RuntimeScaleStatusDTO>::Ok(*active_operation_->runtime_scale_status);
 }
 
 Result<OperationStateDTO> ResourceAddressedExecutionKernel::get_operation_state(
@@ -1724,11 +1783,17 @@ Result<OperationStateDTO> ResourceAddressedExecutionKernel::get_operation_state(
                                      ErrorCode::kInvalidRequest);
   }
   std::lock_guard state_lock(state_mutex_);
-  if (active_operation_ == nullptr || active_operation_->accepted.operation_id != operation_id) {
-    return reject<OperationStateDTO>("operation is not resident", "operation_not_resident",
-                                     ErrorCode::kMissingReference);
+  if (active_operation_ != nullptr && active_operation_->accepted.operation_id == operation_id) {
+    return Result<OperationStateDTO>::Ok(active_operation_->state);
   }
-  return Result<OperationStateDTO>::Ok(active_operation_->state);
+  const auto historical = std::find_if(
+      historical_operations_.begin(), historical_operations_.end(),
+      [&](const OperationStateDTO& state) { return state.operation_id == operation_id; });
+  if (historical != historical_operations_.end()) {
+    return Result<OperationStateDTO>::Ok(*historical);
+  }
+  return reject<OperationStateDTO>("operation is not resident or retained",
+                                   "operation_not_resident", ErrorCode::kMissingReference);
 }
 
 Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
@@ -1736,6 +1801,14 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     OperationStateKind state, double progress, std::optional<ErrorDTO> terminal_error) {
   std::lock_guard state_lock(state_mutex_);
   if (active_operation_ == nullptr || active_operation_->engine != engine) {
+    return Result<void>::Ok();
+  }
+  if (state == OperationStateKind::kPrepared &&
+      (active_operation_->pending_control == OperationControlKind::kReset ||
+       active_operation_->pending_control == OperationControlKind::kAcknowledgeCompleted)) {
+    // The subordinate Idle transition confirms the settling effect. The
+    // durable owner retains the terminal state named by the accepted control;
+    // it does not republish that private FSM reset as a new active operation.
     return Result<void>::Ok();
   }
   if (active_operation_->payload_kind == OperationParticipantPayloadKind::kMotion) {
@@ -1758,23 +1831,10 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     // is reserved for terminal containment/Reset paths.
     desired_slot.reset();
   }
-  bool slot_changed = false;
-  if (desired_slot.has_value() && active_operation_->slot_state != *desired_slot) {
-    auto transition = resource_slots_.transition(active_operation_->slot_owner,
-                                                 active_operation_->resources, *desired_slot);
-    if (!transition.ok()) {
-      active_operation_->state.state = OperationStateKind::kInterventionRequired;
-      active_operation_->state.participants.front().state =
-          OperationStateKind::kInterventionRequired;
-      active_operation_->state.participants.front().terminal_error = transition.error();
-      active_operation_->state.updated_at_ns = clock_.now();
-      return transition;
-    }
-    active_operation_->slot_state = *desired_slot;
-    slot_changed = true;
-  }
-
-  auto& participant = active_operation_->state.participants.front();
+  const auto desired_slot_value = desired_slot.value_or(active_operation_->slot_state);
+  const bool slot_changed =
+      desired_slot.has_value() && active_operation_->slot_state != desired_slot_value;
+  const auto& participant = active_operation_->state.participants.front();
   const double bounded_progress = std::clamp(progress, 0.0, 1.0);
   const bool failure_terminal = state == OperationStateKind::kFailed ||
                                 state == OperationStateKind::kStopped ||
@@ -1800,13 +1860,47 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     return Result<void>::Ok();
   }
 
-  active_operation_->state.state = state;
-  participant.state = state;
-  participant.progress = bounded_progress;
+  auto observed_state = active_operation_->state;
+  auto& observed_participant = observed_state.participants.front();
+  observed_state.state = state;
+  observed_participant.state = state;
+  observed_participant.progress = bounded_progress;
   if (terminal(state)) {
-    participant.terminal_error = std::move(terminal_error);
+    observed_participant.terminal_error = std::move(terminal_error);
   }
-  active_operation_->state.updated_at_ns = clock_.now();
+  observed_state.updated_at_ns = clock_.now();
+  auto durable_state =
+      journal_.RecordOperationState(config_.request_owner_epoch, observed_state,
+                                    active_operation_->runtime_scale_status.has_value()
+                                        ? &*active_operation_->runtime_scale_status
+                                        : nullptr,
+                                    "subordinate_state_observed");
+  if (!durable_state.ok()) {
+    return Result<void>::Err(durable_state.error());
+  }
+  if (slot_changed) {
+    auto transition = resource_slots_.transition(active_operation_->slot_owner,
+                                                 active_operation_->resources, desired_slot_value);
+    if (!transition.ok()) {
+      auto intervention = observed_state;
+      intervention.state = OperationStateKind::kInterventionRequired;
+      intervention.participants.front().state = OperationStateKind::kInterventionRequired;
+      intervention.participants.front().terminal_error = transition.error();
+      intervention.updated_at_ns = clock_.now();
+      auto durable_failure =
+          journal_.RecordOperationState(config_.request_owner_epoch, intervention,
+                                        active_operation_->runtime_scale_status.has_value()
+                                            ? &*active_operation_->runtime_scale_status
+                                            : nullptr,
+                                        "resource_transition_failed_after_state_observation");
+      if (durable_failure.ok()) {
+        active_operation_->state = std::move(intervention);
+      }
+      return transition;
+    }
+    active_operation_->slot_state = desired_slot_value;
+  }
+  active_operation_->state = std::move(observed_state);
   return Result<void>::Ok();
 }
 
@@ -1860,8 +1954,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
     subordinate_id = active_operation_->subordinate_id;
     command_target = active_operation_->binding.value().command_target_id.value();
     if (active_operation_->runtime_scale_status.has_value()) {
-      runtime_scale_operation_id =
-          active_operation_->accepted.operation_id;
+      runtime_scale_operation_id = active_operation_->accepted.operation_id;
       runtime_scale_control_binding_id =
           active_operation_->binding.value().control_path->control_binding_id;
     }
@@ -1875,27 +1968,36 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
         state == OperationStateKind::kInterventionRequired) {
       terminal_error = status_error(status.last_error);
     }
-    auto applied = apply_subordinate_state(engine, subordinate_id, state,
-                                           status.progress,
+    auto applied = apply_subordinate_state(engine, subordinate_id, state, status.progress,
                                            std::move(terminal_error));
     if (applied.ok() && runtime_scale_operation_id.has_value() &&
         runtime_scale_control_binding_id.has_value()) {
-      const auto scale_status = engine->runtime_scale_status(
-          *runtime_scale_operation_id, *runtime_scale_control_binding_id);
+      const auto scale_status = engine->runtime_scale_status(*runtime_scale_operation_id,
+                                                             *runtime_scale_control_binding_id);
       if (scale_status.ok()) {
-        apply_runtime_scale_status(engine, scale_status.value());
+        auto scale_applied = apply_runtime_scale_status(engine, scale_status.value());
+        if (!scale_applied.ok()) {
+          return scale_applied;
+        }
       } else {
         std::lock_guard state_lock(state_mutex_);
         if (active_operation_ != nullptr &&
-            active_operation_->accepted.operation_id ==
-                *runtime_scale_operation_id &&
+            active_operation_->accepted.operation_id == *runtime_scale_operation_id &&
             active_operation_->runtime_scale_status.has_value()) {
-          auto& public_status = *active_operation_->runtime_scale_status;
+          auto public_status = *active_operation_->runtime_scale_status;
           public_status.state = RuntimeScaleApplicationState::kFailed;
           public_status.updated_at_ns = clock_.now();
-          public_status.participants.front().state =
-              RuntimeScaleApplicationState::kFailed;
+          public_status.participants.front().state = RuntimeScaleApplicationState::kFailed;
           public_status.participants.front().error = scale_status.error();
+          auto operation_state = active_operation_->state;
+          auto durable =
+              journal_.RecordOperationState(config_.request_owner_epoch, operation_state,
+                                            &public_status, "runtime_scale_reconcile_unavailable");
+          if (!durable.ok()) {
+            return Result<void>::Err(durable.error());
+          }
+          active_operation_->state = std::move(operation_state);
+          active_operation_->runtime_scale_status = std::move(public_status);
         }
       }
     }

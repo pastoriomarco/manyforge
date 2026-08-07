@@ -27,6 +27,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
 
   Result<std::uint64_t> execute(const ExecuteRequestDTO& request) override {
     ++execute_calls;
+    Trace("engine:execute");
     last_execute = request;
     if (request.initial_runtime_scale.has_value()) {
       const auto initialized = set_runtime_scale(*request.initial_runtime_scale);
@@ -41,10 +42,12 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
 
   StopResultDTO stop() override {
     ++stop_calls;
+    Trace("engine:stop");
     return next_stop_result;
   }
   PauseResultDTO pause() override {
     ++pause_calls;
+    Trace("engine:pause");
     if (next_pause_result.accepted) {
       emit_transition(status.state, ExecutionState::kStopping);
     }
@@ -52,6 +55,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
   }
   ResumeResultDTO resume(std::optional<std::uint64_t>) override {
     ++resume_calls;
+    Trace("engine:resume");
     if (next_resume_result.accepted) {
       emit_transition(status.state, ExecutionState::kValidating);
     }
@@ -59,6 +63,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
   }
   ResetResultDTO reset(std::optional<std::uint64_t>) override {
     ++reset_calls;
+    Trace("engine:reset");
     if (next_reset_result.accepted) {
       emit_transition(status.state, ExecutionState::kIdle);
     }
@@ -67,6 +72,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
   AcknowledgeCompletedResultDTO acknowledge_completed(std::uint64_t,
                                                       std::optional<std::uint64_t>) override {
     ++acknowledge_calls;
+    Trace("engine:acknowledge_completed");
     if (next_acknowledge_result.accepted) {
       emit_transition(status.state, ExecutionState::kIdle);
     }
@@ -76,6 +82,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
   Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
       const ResolvedRuntimeScaleCommandDTO& command) override {
     ++runtime_scale_calls;
+    Trace("engine:set_runtime_scale");
     if (!runtime_scale.supported) {
       return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{
           std::string(to_string(ErrorCode::kUnsupportedCapability)),
@@ -171,6 +178,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
 
   GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
     ++command_calls;
+    Trace("engine:command_gripper");
     last_command = request;
     return next_command_result;
   }
@@ -248,11 +256,87 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
   std::optional<ExecuteRequestDTO> last_execute;
   std::optional<ResolvedRuntimeScaleCommandDTO> last_runtime_scale_command;
   std::optional<GripperCommandRequestDTO> last_command;
+  std::vector<std::string>* timeline{};
 
  private:
+  void Trace(std::string value) {
+    if (timeline != nullptr) {
+      timeline->push_back(std::move(value));
+    }
+  }
+
   std::uint64_t next_subscription_id{1U};
   std::map<std::uint64_t, EventCallback> callbacks;
 };
+
+class FakeOperationJournal final : public IOperationJournal {
+ public:
+  Result<OperationJournalRecoveryDTO> BeginOwnerEpoch(const RequestOwnerEpoch&, std::int64_t,
+                                                      std::size_t,
+                                                      const std::vector<ResourceId>&) override {
+    calls = {"begin"};
+    states.clear();
+    return Result<OperationJournalRecoveryDTO>::Ok(recovery);
+  }
+
+  Result<std::uint64_t> RecordOperationAccepted(const RequestOwnerEpoch&, const OperationIntentDTO&,
+                                                const OperationAcceptedDTO&,
+                                                const OperationStateDTO& state) override {
+    return Record("operation_accepted", state);
+  }
+
+  Result<std::uint64_t> RecordControlAccepted(const RequestOwnerEpoch&,
+                                              const OperationControlRequestDTO&,
+                                              const OperationControlAcceptedDTO&,
+                                              const OperationStateDTO& state) override {
+    return Record("control_accepted", state);
+  }
+
+  Result<std::uint64_t> RecordStopAccepted(const RequestOwnerEpoch&, const StopIntentDTO&,
+                                           const StopAcceptedDTO&,
+                                           const OperationStateDTO& state) override {
+    return Record("stop_accepted", state);
+  }
+
+  Result<std::uint64_t> RecordRuntimeScaleAccepted(const RequestOwnerEpoch&,
+                                                   const RuntimeScaleRequestDTO&,
+                                                   const RuntimeScaleAcceptedDTO&,
+                                                   const OperationStateDTO& state,
+                                                   const RuntimeScaleStatusDTO&) override {
+    return Record("runtime_scale_accepted", state);
+  }
+
+  Result<std::uint64_t> RecordOperationState(const RequestOwnerEpoch&,
+                                             const OperationStateDTO& state,
+                                             const RuntimeScaleStatusDTO*,
+                                             const char* transition_reason) override {
+    return Record(std::string("state:") + transition_reason, state);
+  }
+
+  Result<std::uint64_t> Record(std::string kind, const OperationStateDTO& state) {
+    calls.push_back(kind);
+    if (timeline != nullptr) {
+      timeline->push_back("journal:" + kind);
+    }
+    if (fail_next_kind == kind) {
+      fail_next_kind.reset();
+      return Result<std::uint64_t>::Err(ErrorDTO{"operation_journal_test_failure",
+                                                 "injected journal failure",
+                                                 {{"reason", "injected_journal_failure"}}});
+    }
+    states.push_back(state);
+    return Result<std::uint64_t>::Ok(next_sequence++);
+  }
+
+  OperationJournalRecoveryDTO recovery;
+  std::optional<std::string> fail_next_kind;
+  std::vector<std::string> calls;
+  std::vector<OperationStateDTO> states;
+  std::uint64_t next_sequence{1U};
+  std::vector<std::string>* timeline{};
+};
+
+FakeOperationJournal default_journal;
 
 [[nodiscard]] RuntimeParticipantBinding make_binding(
     std::string target_role, std::string command_target, std::string capability,
@@ -443,7 +527,8 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), 8U});
 
   const auto result = kernel.execute(motion_operation());
   ASSERT_TRUE(result.ok()) << result.error().message;
@@ -479,7 +564,7 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsResourceRoleSpellingUsedAsASou
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   std::get<JointGoalDTO>(motion.motion).joint_names = {"arm_joints"};
@@ -498,7 +583,7 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsStalePlannerCapabilityRevision
                      std::nullopt, false,
                      "sha256:1111111111111111111111111111111111111111111111111111111111111111"),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
 
   const auto result = kernel.execute(motion_operation());
   ASSERT_FALSE(result.ok());
@@ -513,7 +598,7 @@ TEST(ResourceAddressedExecutionKernelTest, PreservesAuthoredSourceJointOrderingD
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular,
                      std::nullopt, true),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.motion = JointGoalDTO{{"joint_2", "joint_1"}, {0.4, -0.2}};
@@ -540,7 +625,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular,
                      std::nullopt, true),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.motion = JointGoalDTO{{"joint_2"}, {0.4}};
@@ -562,7 +647,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   const auto intent = motion_operation();
 
   const auto first = kernel.execute(intent);
@@ -589,7 +674,7 @@ TEST(ResourceAddressedExecutionKernelTest, SubordinateEventsAdvanceExactSlotsAnd
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -623,7 +708,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -644,7 +729,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -664,7 +749,7 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsStaleEpochBeforeResolutionOrSu
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   auto intent = motion_operation();
   intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.old");
 
@@ -686,7 +771,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {{make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear,
                      schema),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
 
   const auto accepted = kernel.execute(command_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -717,7 +802,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -747,7 +832,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.resume_calls, 1);
   EXPECT_EQ(engine.acknowledge_calls, 1);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
-  EXPECT_FALSE(kernel.get_operation_state(executed.value().operation_id).ok());
+  const auto retained = kernel.get_operation_state(executed.value().operation_id);
+  ASSERT_TRUE(retained.ok()) << retained.error().message;
+  EXPECT_EQ(retained.value().state, OperationStateKind::kCompleted);
+  EXPECT_EQ(retained.value().operation_revision, OperationRevision(4U));
 
   const auto replay =
       kernel.acknowledge_completed(control_request("request.ack.1", executed.value(), 3U));
@@ -763,7 +851,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kFailed,
@@ -786,10 +874,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   clock.set(1234);
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("arm", "arm", "execution.trajectory.execute",
-                     CoordinateKind::kAngular),
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
 
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
@@ -836,10 +923,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   clock.set(10);
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("arm", "arm", "execution.trajectory.execute",
-                     CoordinateKind::kAngular),
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 32U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 32U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating,
@@ -906,10 +992,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   clock.set(100);
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("arm", "arm", "execution.trajectory.execute",
-                     CoordinateKind::kAngular),
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 32U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 32U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating,
@@ -973,10 +1058,9 @@ TEST(ResourceAddressedExecutionKernelTest,
                "controller rejected Stop",
                {{"reason", "controller_stop_rejected"}}}};
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("arm", "arm", "execution.trajectory.execute",
-                     CoordinateKind::kAngular),
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating,
@@ -995,14 +1079,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     QualifiedScaleFailureIsVisibleAndUnsupportedMechanismsFailAdmission) {
+     QualifiedScaleFailureAndMechanismMismatchRemainVisibleAfterAcceptance) {
   FakeClock clock;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("arm", "arm", "execution.trajectory.execute",
-                     CoordinateKind::kAngular),
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating,
@@ -1024,18 +1107,21 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine unsupported_engine;
   unsupported_engine.runtime_scale.supported = false;
   ResourceAddressedExecutionKernel unsupported_kernel(
-      {{make_binding("arm", "arm", "execution.trajectory.execute",
-                     CoordinateKind::kAngular),
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &unsupported_engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
   auto unsupported_intent = motion_operation("request.motion.unsupported");
   const auto unsupported = unsupported_kernel.execute(unsupported_intent);
-  ASSERT_FALSE(unsupported.ok());
-  EXPECT_EQ(unsupported.error().details.at("reason"),
-            "runtime_scale_mechanism_unsupported");
+  ASSERT_TRUE(unsupported.ok()) << unsupported.error().message;
   EXPECT_EQ(unsupported_engine.execute_calls, 1);
-  EXPECT_EQ(unsupported_kernel.resource_snapshot().front().state,
-            ResourceSlotState::kFree);
+  const auto unsupported_state =
+      unsupported_kernel.get_operation_state(unsupported.value().operation_id);
+  ASSERT_TRUE(unsupported_state.ok()) << unsupported_state.error().message;
+  EXPECT_EQ(unsupported_state.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(unsupported_state.value().participants.front().terminal_error.has_value());
+  EXPECT_EQ(unsupported_state.value().participants.front().terminal_error->details.at("reason"),
+            "runtime_scale_mechanism_unsupported");
+  EXPECT_EQ(unsupported_kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -1043,10 +1129,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("arm", "arm", "execution.trajectory.execute",
-                     CoordinateKind::kAngular),
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
   auto direct = motion_operation("request.direct.1");
   direct.participants.front().action_span = ActionSpanDTO{
       ActionSource::kDirectControl, "direct/session.1", "run.1", "", "",
@@ -1070,6 +1155,180 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(rejected.error().details.at("reason"),
             "operation_action_span_invalid");
   EXPECT_EQ(engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     DurableAcceptancePrecedesEffectsAndWriteFailurePreventsDispatch) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  std::vector<std::string> timeline;
+  engine.timeline = &timeline;
+  journal.timeline = &timeline;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        &engine}},
+      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+  timeline.clear();
+
+  const auto accepted = kernel.execute(motion_operation());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_GE(timeline.size(), 2U);
+  EXPECT_EQ(timeline.front(), "journal:operation_accepted");
+  EXPECT_EQ(timeline[1], "engine:execute");
+
+  FakeParticipantEngine rejected_engine;
+  FakeOperationJournal failing_journal;
+  failing_journal.fail_next_kind = "operation_accepted";
+  ResourceAddressedExecutionKernel failing_kernel(
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        &rejected_engine}},
+      clock, failing_journal, {RequestOwnerEpoch("kernel.epoch.failure"), 16U});
+  auto rejected_intent = motion_operation("request.motion.failure");
+  rejected_intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.failure");
+  const auto rejected = failing_kernel.execute(rejected_intent);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "injected_journal_failure");
+  EXPECT_EQ(rejected_engine.execute_calls, 0);
+  EXPECT_EQ(failing_kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ScaleStopAndRejectedControlRemainDurableBeforeTheirEffects) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  std::vector<std::string> timeline;
+  engine.timeline = &timeline;
+  journal.timeline = &timeline;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        &engine}},
+      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), 32U});
+  const auto executed = kernel.execute(motion_operation());
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+
+  timeline.clear();
+  const auto scaled = kernel.set_runtime_scale(
+      runtime_scale_request("request.scale.ordered", executed.value(), 1U, 0U, 0.5));
+  ASSERT_TRUE(scaled.ok()) << scaled.error().message;
+  ASSERT_GE(timeline.size(), 2U);
+  EXPECT_EQ(timeline.front(), "journal:runtime_scale_accepted");
+  EXPECT_EQ(timeline[1], "engine:set_runtime_scale");
+
+  journal.fail_next_kind = "control_accepted";
+  timeline.clear();
+  const auto unpersisted_pause =
+      kernel.pause(control_request("request.pause.unpersisted", executed.value(), 1U));
+  ASSERT_FALSE(unpersisted_pause.ok());
+  EXPECT_TRUE(timeline.empty() || timeline.front() == "journal:control_accepted");
+  EXPECT_EQ(engine.pause_calls, 0);
+
+  engine.next_pause_result =
+      PauseResultDTO{false, ErrorDTO{"pause_failed",
+                                     "controller rejected pause",
+                                     {{"reason", "controller_pause_rejected"}}}};
+  timeline.clear();
+  const auto rejected_pause =
+      kernel.pause(control_request("request.pause.rejected", executed.value(), 1U));
+  ASSERT_TRUE(rejected_pause.ok()) << rejected_pause.error().message;
+  ASSERT_GE(timeline.size(), 2U);
+  EXPECT_EQ(timeline.front(), "journal:control_accepted");
+  EXPECT_EQ(timeline[1], "engine:pause");
+  const auto intervention = kernel.get_operation_state(executed.value().operation_id);
+  ASSERT_TRUE(intervention.ok()) << intervention.error().message;
+  EXPECT_EQ(intervention.value().state, OperationStateKind::kInterventionRequired);
+
+  FakeParticipantEngine stop_engine;
+  FakeOperationJournal stop_journal;
+  std::vector<std::string> stop_timeline;
+  stop_engine.timeline = &stop_timeline;
+  stop_journal.timeline = &stop_timeline;
+  ResourceAddressedExecutionKernel stop_kernel(
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        &stop_engine}},
+      clock, stop_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+  const auto stop_execution = stop_kernel.execute(motion_operation("request.motion.stop-order"));
+  ASSERT_TRUE(stop_execution.ok()) << stop_execution.error().message;
+  stop_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  stop_timeline.clear();
+  const auto stopped =
+      stop_kernel.stop(stop_request("request.stop.ordered", stop_execution.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_GE(stop_timeline.size(), 2U);
+  EXPECT_EQ(stop_timeline.front(), "journal:stop_accepted");
+  EXPECT_EQ(stop_timeline[1], "engine:stop");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ReplacementRecoveryPublishesHistoryAndDoesNotResumeOrStopOrphanWork) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto& value = binding.value();
+  const auto& control = *value.control_path;
+  const OperationId old_operation("operation:old-owner:1");
+  journal.recovery = OperationJournalRecoveryDTO{
+      {OperationStateDTO{
+          old_operation,
+          OperationRevision(3U),
+          ProgramBindingId("program-binding"),
+          ProgramRunId("run.old"),
+          OperationCoordinationPolicy::kIndependent,
+          OperationStateKind::kInterventionRequired,
+          {OperationParticipantStateDTO{
+              OperationParticipantId("operation:old-owner:1:participant:1"),
+              ControllerGoalId("operation:old-owner:1:controller-goal:1"),
+              ControllerGoalGeneration(1U),
+              value.controllable_component_id,
+              value.command_target_id,
+              value.capability_id,
+              control.control_domain_id,
+              control.control_domain_revision,
+              control.control_binding_id,
+              control.control_binding_revision,
+              value.capability_provider_path
+                  ? std::optional(value.capability_provider_path->capability_provider_binding_id)
+                  : std::nullopt,
+              value.capability_provider_path
+                  ? std::optional(
+                        value.capability_provider_path->capability_provider_binding_revision)
+                  : std::nullopt,
+              OperationParticipantPayloadKind::kMotion,
+              OperationStateKind::kInterventionRequired,
+              0.4,
+              {ResourceId("robot.joint_1")},
+              ErrorDTO{"execution_host_replaced",
+                       "old host was replaced",
+                       {{"reason", "unreconciled_external_or_orphan_goal"}}}}},
+          50,
+          std::nullopt,
+          std::nullopt,
+          RuntimeScaleGeneration(0U)}},
+      {ResourceId("robot.joint_1")}};
+
+  ResourceAddressedExecutionKernel kernel({{binding, &engine}}, clock, journal,
+                                          {RequestOwnerEpoch("kernel.epoch.new"), 16U});
+  const auto historical = kernel.get_operation_state(old_operation);
+  ASSERT_TRUE(historical.ok()) << historical.error().message;
+  EXPECT_EQ(historical.value().state, OperationStateKind::kInterventionRequired);
+  const auto slots = kernel.resource_snapshot();
+  ASSERT_EQ(slots.size(), 1U);
+  EXPECT_EQ(slots.front().state, ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
+  EXPECT_FALSE(slots.front().owner.has_value());
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(engine.stop_calls, 0);
+
+  auto intent = motion_operation("request.motion.after-replacement");
+  intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.new");
+  const auto blocked = kernel.execute(intent);
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "resource_scope_busy");
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(engine.stop_calls, 0);
 }
 
 }  // namespace

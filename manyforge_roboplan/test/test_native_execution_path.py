@@ -1,4 +1,4 @@
-"""N3 process test across host, headless, Behavior, and Composer callers."""
+"""I6 process test across host, headless, Behavior, and Composer callers."""
 
 from __future__ import annotations
 
@@ -263,9 +263,8 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             headless.execute(stale_submission)
         assert stale.value.code == "stale_request_owner_epoch"
         assert stale.value.status_code == 409
-        with pytest.raises(HeadlessClientError) as retired:
-            composer.operation(operation_id)
-        assert retired.value.status_code == 404
+        retained = composer.operation(operation_id)
+        assert retained["operation"] == terminal["operation"]
     finally:
         _stop_host(process)
         raw_composer.close()
