@@ -384,6 +384,57 @@ TEST(SqliteOperationJournalTest, UnresolvedOrphanFenceSurvivesBoundedHistoryComp
             std::vector<ResourceId>{ResourceId("robot.gripper")});
 }
 
+TEST(SqliteOperationJournalTest, BoundedEventPagesRetainStableWallTimeAndFenceOwnerEpoch) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.epoch.events");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  std::uint64_t wall_generation = 0U;
+  SqliteOperationJournal journal(database, cell_id, 8U, [&wall_generation]() {
+    ++wall_generation;
+    return "2026-08-07T10:00:00.00000000" + std::to_string(wall_generation) + "Z";
+  });
+  ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 4U, inventory).ok());
+  const auto intent = CommandIntent("request.event.1", epoch.value());
+  auto state =
+      OperationState("operation:execution-host.epoch.events:1", OperationStateKind::kExecuting, 10);
+  ASSERT_TRUE(
+      journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+  state.state = OperationStateKind::kCompleted;
+  state.participants.front().state = OperationStateKind::kCompleted;
+  state.participants.front().progress = 1.0;
+  state.updated_at_ns = 11;
+  ASSERT_TRUE(journal.RecordOperationState(epoch, state, nullptr, "subordinate_completed").ok());
+
+  const auto first = journal.ReadEvents(epoch, 0U, 1U);
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  ASSERT_EQ(first.value().events.size(), 1U);
+  EXPECT_TRUE(first.value().has_more);
+  EXPECT_EQ(first.value().events.front().record_kind, "operation_accepted");
+  EXPECT_EQ(first.value().events.front().occurred_at_wall, "2026-08-07T10:00:00.000000001Z");
+  EXPECT_EQ(first.value().next_after_sequence, first.value().events.front().sequence);
+
+  const auto second = journal.ReadEvents(epoch, first.value().next_after_sequence, 1U);
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  ASSERT_EQ(second.value().events.size(), 1U);
+  EXPECT_FALSE(second.value().has_more);
+  EXPECT_EQ(second.value().events.front().record_kind, "state_observed");
+  EXPECT_EQ(second.value().events.front().occurred_at_wall, "2026-08-07T10:00:00.000000002Z");
+  EXPECT_FALSE(second.value().events.front().payload_digest.empty());
+
+  const auto replay = journal.ReadEvents(epoch, 0U, 2U);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  ASSERT_EQ(replay.value().events.size(), 2U);
+  EXPECT_EQ(replay.value().events.front().occurred_at_wall,
+            first.value().events.front().occurred_at_wall);
+  EXPECT_EQ(replay.value().events.back().payload_digest,
+            second.value().events.front().payload_digest);
+  const auto stale = journal.ReadEvents(RequestOwnerEpoch("execution-host.epoch.stale"), 0U, 1U);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().code, "operation_journal_owner_epoch_stale");
+}
+
 TEST(SqliteOperationJournalTest, RequestCapacityAndFilesystemIdentityFailClosedBeforeMutation) {
   ScopedTemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);

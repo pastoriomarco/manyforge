@@ -4,12 +4,15 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -152,14 +155,35 @@ void send_frame(int descriptor, MessageType type, std::string_view payload) {
   if (goal == nullptr) {
     fail("fake worker requires a joint goal");
   }
-  const std::vector<double> zeros(goal->positions_rad.size(), 0.0);
+  auto start = angular_positions(request.start_state);
+  if (request.resources.size() != start.size() ||
+      request.start_state.joint_names.size() != start.size() ||
+      goal->resources.size() != goal->joint_names.size() ||
+      goal->resources.size() != goal->positions_rad.size()) {
+    fail("fake worker received inconsistent joint dimensions");
+  }
+  auto target = start;
+  for (std::size_t goal_index = 0U; goal_index < goal->resources.size();
+       ++goal_index) {
+    const auto found = std::find(request.resources.begin(),
+                                 request.resources.end(),
+                                 goal->resources[goal_index]);
+    if (found == request.resources.end()) {
+      fail("fake worker goal names an unbound resource");
+    }
+    const auto index = static_cast<std::size_t>(
+        std::distance(request.resources.begin(), found));
+    if (request.start_state.joint_names[index] != goal->joint_names[goal_index]) {
+      fail("fake worker goal resource and compiled joint disagree");
+    }
+    target[index] = goal->positions_rad[goal_index];
+  }
+  const std::vector<double> zeros(start.size(), 0.0);
   return core::TrajectoryDTO{
       request.resources,
-      goal->joint_names,
-      {core::TrajectoryWaypointDTO{0.0,
-                                   angular_positions(request.start_state),
-                                   zeros, zeros},
-       core::TrajectoryWaypointDTO{1.0, goal->positions_rad, zeros, zeros}}};
+      request.start_state.joint_names,
+      {core::TrajectoryWaypointDTO{0.0, std::move(start), zeros, zeros},
+       core::TrajectoryWaypointDTO{1.0, std::move(target), zeros, zeros}}};
 }
 
 int run() {
@@ -173,10 +197,13 @@ int run() {
   constexpr std::string_view kCrashOncePrefix = "crash-once:";
   const bool crash_once =
       input.model.native_scene_name.starts_with(kCrashOncePrefix);
+  const char* configured_marker = std::getenv("MANYFORGE_FAKE_WORKER_MARKER");
   const std::filesystem::path first_generation_marker(
-      crash_once
-          ? input.model.native_scene_name.substr(kCrashOncePrefix.size())
-          : input.model.native_scene_name);
+      configured_marker != nullptr && configured_marker[0] != '\0'
+          ? configured_marker
+          : (crash_once
+                 ? input.model.native_scene_name.substr(kCrashOncePrefix.size())
+                 : input.model.native_scene_name));
   send_frame(descriptor, MessageType::kReady, {});
 
   for (;;) {

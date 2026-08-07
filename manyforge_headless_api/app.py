@@ -12,7 +12,7 @@ from fastapi import FastAPI, Path, Query, Request
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .execution import ExecutionCommandClient
+from .execution import ExecutionCommandClient, ExecutionEventPump
 from .manager import ManagerCommandClient
 from .models import (
     AcknowledgeAlarmRequest,
@@ -189,6 +189,7 @@ def create_app(
     if (config is None) == (service is None):
         raise ValueError("provide exactly one of config or service")
     owns_core = service is None
+    event_pump: ExecutionEventPump | None = None
     if service is None:
         assert config is not None
         core = NativeHeadlessCore(config)
@@ -201,15 +202,30 @@ def create_app(
             timeout_seconds=config.execution_timeout_seconds,
         )
         service = HeadlessService(core, manager, execution)
+        event_execution = ExecutionCommandClient(
+            config.execution_state_root,
+            timeout_seconds=min(config.execution_timeout_seconds, 1.0),
+        )
+        event_pump = ExecutionEventPump(
+            core,
+            event_execution,
+            poll_seconds=config.execution_event_poll_milliseconds / 1_000.0,
+        )
     assert service is not None
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        if event_pump is not None:
+            event_pump.start()
         try:
             yield
         finally:
             if owns_core:
-                service.core.shutdown()
+                try:
+                    if event_pump is not None:
+                        event_pump.shutdown()
+                finally:
+                    service.core.shutdown()
 
     app = FastAPI(
         title="ManyForge Headless Runtime API",

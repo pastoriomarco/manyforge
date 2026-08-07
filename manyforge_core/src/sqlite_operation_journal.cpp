@@ -1,9 +1,14 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <ctime>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -32,6 +37,7 @@ constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
 constexpr std::int64_t kMaximumDatabasePageImageBytes = 128LL * 1024LL * 1024LL;
 constexpr std::size_t kMaximumRecordJsonBytes = 4U * 1024U * 1024U;
 constexpr std::size_t kMaximumRequestCapacity = 4096U;
+constexpr std::size_t kMaximumWallTimeBytes = 128U;
 
 constexpr std::string_view kSchema = R"sql(
 CREATE TABLE journal_metadata (
@@ -58,6 +64,7 @@ CREATE TABLE journal_records (
   operation_id TEXT NOT NULL,
   operation_revision INTEGER NOT NULL,
   occurred_at_ns INTEGER NOT NULL,
+  occurred_at_wall TEXT NOT NULL,
   effect_pending INTEGER NOT NULL CHECK (effect_pending IN (0, 1)),
   payload_json TEXT NOT NULL,
   payload_digest TEXT NOT NULL,
@@ -162,6 +169,32 @@ void Require(bool condition, std::string code, std::string message) {
   if (!condition) {
     Fail(std::move(code), std::move(message));
   }
+}
+
+[[nodiscard]] std::string ProductionWallTimeText() {
+  const auto now = std::chrono::system_clock::now();
+  const auto seconds = std::chrono::time_point_cast<std::chrono::seconds>(now);
+  const auto nanoseconds =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(now - seconds).count();
+  const std::time_t raw = std::chrono::system_clock::to_time_t(seconds);
+  std::tm value{};
+  Require(::gmtime_r(&raw, &value) != nullptr, "operation_journal_clock_failure",
+          "operation journal wall clock conversion failed");
+  std::array<char, 64> output{};
+  const auto count =
+      std::snprintf(output.data(), output.size(), "%04d-%02d-%02dT%02d:%02d:%02d.%09lldZ",
+                    value.tm_year + 1900, value.tm_mon + 1, value.tm_mday, value.tm_hour,
+                    value.tm_min, value.tm_sec, static_cast<long long>(nanoseconds));
+  Require(count > 0 && static_cast<std::size_t>(count) < output.size(),
+          "operation_journal_clock_failure", "operation journal wall clock formatting failed");
+  return std::string(output.data(), static_cast<std::size_t>(count));
+}
+
+void ValidateWallTimeText(const std::string& value) {
+  Require(!value.empty() && value.size() <= kMaximumWallTimeBytes &&
+              content_identity::is_utf8_nfc(value),
+          "operation_journal_clock_failure",
+          "operation journal wall time must be bounded NFC text");
 }
 
 [[nodiscard]] ErrorDTO JournalError(const JournalFailure& error) {
@@ -1406,10 +1439,12 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
 
 class SqliteOperationJournal::Impl final {
  public:
-  Impl(std::filesystem::path database_path, CellId cell_id, std::size_t history_capacity)
+  Impl(std::filesystem::path database_path, CellId cell_id, std::size_t history_capacity,
+       std::function<std::string()> wall_time_text)
       : database_path_(ValidatePath(std::move(database_path))),
         cell_id_(std::move(cell_id)),
-        history_capacity_(history_capacity) {
+        history_capacity_(history_capacity),
+        wall_time_text_(wall_time_text ? std::move(wall_time_text) : ProductionWallTimeText) {
     Require(!cell_id_.empty() && history_capacity_ > 0U &&
                 history_capacity_ <= kMaximumOperationJournalHistory,
             "operation_journal_configuration_invalid",
@@ -1489,6 +1524,9 @@ class SqliteOperationJournal::Impl final {
                                      const OperationStateDTO& state,
                                      const RuntimeScaleStatusDTO* scale_status,
                                      const char* transition_reason);
+
+  OperationJournalEventPageDTO ReadEvents(const RequestOwnerEpoch& owner_epoch,
+                                          std::uint64_t after_sequence, std::size_t limit);
 
  private:
   void RequireOpen() const {
@@ -1573,6 +1611,7 @@ class SqliteOperationJournal::Impl final {
   std::filesystem::path database_path_;
   CellId cell_id_;
   std::size_t history_capacity_;
+  std::function<std::string()> wall_time_text_;
   std::mutex mutex_;
   sqlite3* database_{};
   bool closed_{};
@@ -1597,6 +1636,8 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
 
   std::lock_guard lock(mutex_);
   RequireOpen();
+  const auto occurred_at_wall = wall_time_text_();
+  ValidateWallTimeText(occurred_at_wall);
   Transaction transaction(database_);
   Statement active(database_,
                    "SELECT request_capacity FROM owner_epochs "
@@ -1630,8 +1671,8 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
 
   Statement insert(database_,
                    "INSERT INTO journal_records(owner_epoch,record_kind,request_id,"
-                   "operation_id,operation_revision,occurred_at_ns,effect_pending,"
-                   "payload_json,payload_digest) VALUES(?,?,?,?,?,?,?,?,?)");
+                   "operation_id,operation_revision,occurred_at_ns,occurred_at_wall,"
+                   "effect_pending,payload_json,payload_digest) VALUES(?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, owner_epoch.value());
   insert.Bind(2, record_kind);
   if (request_id.has_value()) {
@@ -1642,9 +1683,10 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
   insert.Bind(4, state.operation_id.value());
   insert.Bind(5, static_cast<std::int64_t>(state.operation_revision.value()));
   insert.Bind(6, occurred_at_ns);
-  insert.Bind(7, static_cast<std::int64_t>(effect_pending ? 1 : 0));
-  insert.Bind(8, payload_json);
-  insert.Bind(9, payload_digest);
+  insert.Bind(7, occurred_at_wall);
+  insert.Bind(8, static_cast<std::int64_t>(effect_pending ? 1 : 0));
+  insert.Bind(9, payload_json);
+  insert.Bind(10, payload_digest);
   Require(!insert.Step(), "operation_journal_corrupt",
           "operation journal insert returned an unexpected row");
   const auto sequence = sqlite3_last_insert_rowid(database_);
@@ -1663,6 +1705,67 @@ std::uint64_t SqliteOperationJournal::Impl::Append(const RequestOwnerEpoch& owne
   }
   transaction.Commit();
   return bounded_sequence;
+}
+
+OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
+    const RequestOwnerEpoch& owner_epoch, const std::uint64_t after_sequence,
+    const std::size_t limit) {
+  Require(!owner_epoch.empty() && after_sequence <= kMaximumSafeInteger && limit > 0U &&
+              limit <= kMaximumOperationJournalEventPage,
+          "operation_journal_event_query_invalid",
+          "operation journal event query exceeds its identity or page bound");
+
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  active.Bind(1, owner_epoch.value());
+  Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
+          "operation_journal_owner_epoch_stale",
+          "operation event query names a non-active owner epoch");
+
+  Statement query(database_,
+                  "SELECT sequence,record_kind,request_id,operation_id,"
+                  "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,"
+                  "payload_json,payload_digest FROM journal_records "
+                  "WHERE owner_epoch=? AND sequence>? ORDER BY sequence LIMIT ?");
+  query.Bind(1, owner_epoch.value());
+  query.Bind(2, static_cast<std::int64_t>(after_sequence));
+  query.Bind(3, static_cast<std::int64_t>(limit + 1U));
+  std::vector<OperationJournalEventDTO> events;
+  events.reserve(limit + 1U);
+  while (query.Step()) {
+    const auto sequence = PositiveIdentifier(query.Integer(0), "operation journal event sequence");
+    const auto record_kind = query.Text(1);
+    const auto request_id = query.IsNull(2) ? std::optional<RequestId>{}
+                                            : std::optional<RequestId>(RequestId(query.Text(2)));
+    const auto operation_id = OperationId(query.Text(3));
+    const auto operation_revision =
+        OperationRevision(PositiveIdentifier(query.Integer(4), "operation revision"));
+    const auto occurred_at_ns = query.Integer(5);
+    const auto occurred_at_wall = query.Text(6);
+    const auto effect_pending_value = query.Integer(7);
+    const auto payload_json = query.Text(8);
+    const auto payload_digest = query.Text(9);
+    Require(sequence > after_sequence && !record_kind.empty() && !operation_id.empty() &&
+                occurred_at_ns >= 0 &&
+                static_cast<std::uint64_t>(occurred_at_ns) <= kMaximumSafeInteger &&
+                (effect_pending_value == 0 || effect_pending_value == 1) &&
+                payload_json.size() <= kMaximumRecordJsonBytes &&
+                content_identity::sha256_digest(payload_json) == payload_digest,
+            "operation_journal_corrupt", "operation journal event record is invalid or corrupt");
+    ValidateWallTimeText(occurred_at_wall);
+    events.push_back(OperationJournalEventDTO{
+        sequence, owner_epoch, std::move(record_kind), request_id, std::move(operation_id),
+        operation_revision, occurred_at_ns, std::move(occurred_at_wall), effect_pending_value == 1,
+        std::move(payload_json), std::move(payload_digest)});
+  }
+  const bool has_more = events.size() > limit;
+  if (has_more) {
+    events.erase(events.begin() + static_cast<std::ptrdiff_t>(limit), events.end());
+  }
+  const auto next_after_sequence = events.empty() ? after_sequence : events.back().sequence;
+  return OperationJournalEventPageDTO{owner_epoch, std::move(events), next_after_sequence,
+                                      has_more};
 }
 
 OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
@@ -1777,18 +1880,21 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
     const auto payload_json = content_identity::canonical_json(value);
     Require(payload_json.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
             "operation host-replacement record exceeds the payload bound");
+    const auto occurred_at_wall = wall_time_text_();
+    ValidateWallTimeText(occurred_at_wall);
     Statement insert_record(
         database_,
         "INSERT INTO journal_records(owner_epoch,record_kind,request_id,"
-        "operation_id,operation_revision,occurred_at_ns,effect_pending,"
-        "payload_json,payload_digest) VALUES(?,'host_replaced',NULL,?,?,?,?,?,?)");
+        "operation_id,operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,"
+        "payload_json,payload_digest) VALUES(?,'host_replaced',NULL,?,?,?,?,?,?,?)");
     insert_record.Bind(1, owner_epoch.value());
     insert_record.Bind(2, state.operation_id.value());
     insert_record.Bind(3, static_cast<std::int64_t>(state.operation_revision.value()));
     insert_record.Bind(4, state.updated_at_ns);
-    insert_record.Bind(5, static_cast<std::int64_t>(0));
-    insert_record.Bind(6, payload_json);
-    insert_record.Bind(7, content_identity::sha256_digest(payload_json));
+    insert_record.Bind(5, occurred_at_wall);
+    insert_record.Bind(6, static_cast<std::int64_t>(0));
+    insert_record.Bind(7, payload_json);
+    insert_record.Bind(8, content_identity::sha256_digest(payload_json));
     Require(!insert_record.Step(), "operation_journal_corrupt",
             "host-replacement journal insert returned an unexpected row");
     const auto sequence =
@@ -1965,9 +2071,10 @@ std::uint64_t SqliteOperationJournal::Impl::RecordOperationState(
 }
 
 SqliteOperationJournal::SqliteOperationJournal(std::filesystem::path database_path, CellId cell_id,
-                                               std::size_t history_capacity)
-    : impl_(
-          std::make_unique<Impl>(std::move(database_path), std::move(cell_id), history_capacity)) {}
+                                               std::size_t history_capacity,
+                                               std::function<std::string()> wall_time_text)
+    : impl_(std::make_unique<Impl>(std::move(database_path), std::move(cell_id), history_capacity,
+                                   std::move(wall_time_text))) {}
 
 SqliteOperationJournal::~SqliteOperationJournal() = default;
 
@@ -2015,6 +2122,13 @@ Result<std::uint64_t> SqliteOperationJournal::RecordOperationState(
   return AsResult<std::uint64_t>([&] {
     return impl_->RecordOperationState(owner_epoch, state, scale_status, transition_reason);
   });
+}
+
+Result<OperationJournalEventPageDTO> SqliteOperationJournal::ReadEvents(
+    const RequestOwnerEpoch& owner_epoch, const std::uint64_t after_sequence,
+    const std::size_t limit) {
+  return AsResult<OperationJournalEventPageDTO>(
+      [&] { return impl_->ReadEvents(owner_epoch, after_sequence, limit); });
 }
 
 void SqliteOperationJournal::Close() {

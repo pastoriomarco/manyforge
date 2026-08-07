@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <memory>
 #include <optional>
 #include <set>
@@ -13,8 +15,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <manyforge_deployment/canonical_empty_admission.hpp>
 
 #include "manyforge_headless/headless_api_core.hpp"
 #include "manyforge_headless/node_environment_projection.hpp"
@@ -195,6 +195,41 @@ CanonicalValue SceneRuntimePayload(const std::string &state,
                     {"reason", CanonicalValue("test")},
                     {"state", CanonicalValue(state)},
                 })},
+  });
+}
+
+CanonicalValue OperationJournalPayload(
+    const std::string &owner_epoch, const std::string &record_kind,
+    const std::string &state, const CanonicalValue &terminal_error,
+    const std::optional<std::string> &control = std::nullopt) {
+  const CanonicalValue result = control.has_value()
+                                    ? CanonicalValue(CanonicalValue::Object{
+                                          {"control", CanonicalValue(*control)},
+                                      })
+                                    : CanonicalValue(nullptr);
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.operation_journal_record.v1")},
+      {"effect_pending", CanonicalValue(record_kind != "state_observed")},
+      {"intent", CanonicalValue(CanonicalValue::Object{})},
+      {"operation_state",
+       CanonicalValue(CanonicalValue::Object{
+           {"operation_id", CanonicalValue("operation.test.1")},
+           {"operation_revision", CanonicalValue(1.0)},
+           {"participants",
+            CanonicalValue(
+                CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                    {"resources", CanonicalValue(CanonicalValue::Array{
+                                      CanonicalValue("resource.arm.a")})},
+                    {"terminal_error", terminal_error},
+                })})},
+           {"program_binding_id", CanonicalValue("program-binding.test")},
+           {"program_run_id", CanonicalValue("program-run.test")},
+           {"state", CanonicalValue(state)},
+       })},
+      {"owner_epoch", CanonicalValue(owner_epoch)},
+      {"record_kind", CanonicalValue(record_kind)},
+      {"result", result},
+      {"runtime_scale_status", CanonicalValue(nullptr)},
   });
 }
 
@@ -440,6 +475,129 @@ TEST(HeadlessApiCore,
     std::this_thread::yield();
   }
   EXPECT_EQ(HistoryCount(core), 2U);
+}
+
+TEST(HeadlessApiCore,
+     DurableOperationFactsDriveHistoryAndAlarmWithoutOwningExecutionState) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string source_epoch = "execution-host.epoch.1";
+  const auto failure = OperationJournalPayload(
+      source_epoch, "state_observed", "failed",
+      CanonicalValue(CanonicalValue::Object{
+          {"code", CanonicalValue("execution_aborted")},
+          {"details", CanonicalValue(CanonicalValue::Object{
+                          {"reason", CanonicalValue("planner_failed")},
+                      })},
+          {"message", CanonicalValue("planning failed")},
+      }));
+  const auto failure_json = content_identity::canonical_json(failure);
+  const auto failure_digest = content_identity::sha256_digest(failure_json);
+  const auto ingested = core.IngestOperationEvent(
+      source_epoch, 1U, "state_observed", std::nullopt, "operation.test.1", 1U,
+      100U, "2026-08-07T10:00:00.000000001Z", false, failure, failure_digest);
+  EXPECT_EQ(Text(ingested, "status"), "ingested");
+  EXPECT_FALSE(std::holds_alternative<std::nullptr_t>(
+      Member(ingested, "event_id").storage()));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 1U));
+
+  auto alarms = core.AlarmSnapshot();
+  const auto &fault = OnlyAlarm(alarms);
+  EXPECT_EQ(Text(fault, "definition_id"), "manyforge.motion.execution_fault");
+  EXPECT_EQ(Text(fault, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Text(Member(fault, "subject"), "subject_id"), "operation.test.1");
+
+  const auto replayed = core.IngestOperationEvent(
+      source_epoch, 1U, "state_observed", std::nullopt, "operation.test.1", 1U,
+      100U, "2026-08-07T10:00:00.000000001Z", false, failure, failure_digest);
+  EXPECT_EQ(Text(replayed, "status"), "already_ingested");
+
+  const auto unavailable = core.MarkOperationEventSourceUnknown(source_epoch);
+  EXPECT_EQ(Text(unavailable, "status"), "marked_unknown");
+  const auto unknown_snapshot = core.AlarmSnapshot();
+  const auto &unknown_domains = Array(unknown_snapshot, "domains");
+  const auto unknown_motion =
+      std::find_if(unknown_domains.begin(), unknown_domains.end(), [](const auto &domain) {
+        return Text(domain, "domain") == "motion";
+      });
+  ASSERT_NE(unknown_motion, unknown_domains.end());
+  EXPECT_FALSE(std::get<bool>(Member(*unknown_motion, "reconciled").storage()));
+  EXPECT_EQ(Unsigned(*unknown_motion, "unknown_source_count"), 1U);
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 1U));
+  const auto recovered_snapshot = core.AlarmSnapshot();
+  const auto &recovered_domains = Array(recovered_snapshot, "domains");
+  const auto recovered_motion =
+      std::find_if(recovered_domains.begin(), recovered_domains.end(), [](const auto &domain) {
+        return Text(domain, "domain") == "motion";
+      });
+  ASSERT_NE(recovered_motion, recovered_domains.end());
+  EXPECT_TRUE(std::get<bool>(Member(*recovered_motion, "reconciled").storage()));
+  EXPECT_EQ(Unsigned(*recovered_motion, "unknown_source_count"), 0U);
+
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (HistoryCount(core) < 2U &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(HistoryCount(core), 2U);
+
+  const auto retired =
+      core.CompleteOperationEventSnapshot("execution-host.epoch.2", 0U);
+  EXPECT_EQ(Text(retired, "status"), "complete");
+  alarms = core.AlarmSnapshot();
+  const auto &returned = OnlyAlarm(alarms);
+  EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
+  const auto returned_deadline = std::chrono::steady_clock::now() + 2s;
+  while (HistoryCount(core) < 3U &&
+         std::chrono::steady_clock::now() < returned_deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(HistoryCount(core), 3U);
+}
+
+TEST(HeadlessApiCore,
+     AcceptedResetClearsMatchingOperationFaultAndConflictsFailClosed) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::string source_epoch = "execution-host.epoch.reset";
+  const auto error = CanonicalValue(CanonicalValue::Object{
+      {"code", CanonicalValue("execution_aborted")},
+      {"details", CanonicalValue(CanonicalValue::Object{})},
+      {"message", CanonicalValue("failed")},
+  });
+  const auto failure = OperationJournalPayload(source_epoch, "state_observed",
+                                               "intervention_required", error);
+  const auto failure_json = content_identity::canonical_json(failure);
+  const auto failure_digest = content_identity::sha256_digest(failure_json);
+  static_cast<void>(core.IngestOperationEvent(
+      source_epoch, 4U, "state_observed", std::nullopt, "operation.test.1", 1U,
+      200U, "2026-08-07T10:00:00.000000004Z", false, failure, failure_digest));
+
+  auto conflicting = failure;
+  const auto conflicting_digest = content_identity::sha256_digest(
+      content_identity::canonical_json(conflicting));
+  try {
+    static_cast<void>(core.IngestOperationEvent(
+        source_epoch, 4U, "state_observed", std::nullopt, "operation.test.1",
+        1U, 201U, "2026-08-07T10:00:00.000000005Z", false,
+        std::move(conflicting), conflicting_digest));
+    FAIL() << "one native sequence accepted conflicting event content";
+  } catch (const OperatorAlarmError &error_value) {
+    EXPECT_EQ(error_value.code(), "headless_operation_event_identity_conflict");
+  }
+
+  const auto reset =
+      OperationJournalPayload(source_epoch, "control_accepted",
+                              "intervention_required", error, "reset");
+  const auto reset_json = content_identity::canonical_json(reset);
+  static_cast<void>(core.IngestOperationEvent(
+      source_epoch, 5U, "control_accepted", "request.reset.1",
+      "operation.test.1", 1U, 202U, "2026-08-07T10:00:00.000000006Z", true,
+      reset, content_identity::sha256_digest(reset_json)));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 5U));
+  const auto alarms = core.AlarmSnapshot();
+  const auto &returned = OnlyAlarm(alarms);
+  EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
 }
 
 } // namespace

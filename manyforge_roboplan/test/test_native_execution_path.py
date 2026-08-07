@@ -111,7 +111,13 @@ def _start_host(
     execution_root: Path,
     staging_root: Path,
     manifest: dict[str, Any],
+    *,
+    candidate_worker: Path | None = None,
+    fake_worker_marker: Path | None = None,
 ) -> subprocess.Popen[bytes]:
+    environment = os.environ.copy()
+    if fake_worker_marker is not None:
+        environment["MANYFORGE_FAKE_WORKER_MARKER"] = str(fake_worker_marker)
     process = subprocess.Popen(
         [
             str(_required_path("MANYFORGE_NATIVE_EXECUTION_HOST")),
@@ -130,12 +136,16 @@ def _start_host(
             "--motion-target-role-id",
             manifest["target_role_id"],
             "--candidate-worker",
-            str(_required_path("MANYFORGE_ROBOPLAN_CANDIDATE_WORKER")),
+            str(
+                candidate_worker
+                or _required_path("MANYFORGE_ROBOPLAN_CANDIDATE_WORKER")
+            ),
             "--cell-id",
             manifest["cell_id"],
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        env=environment,
     )
     client = ExecutionCommandClient(execution_root, timeout_seconds=2.0)
     deadline = time.monotonic() + 10.0
@@ -483,4 +493,152 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
     finally:
         _stop_host(process)
         raw_composer.close()
+        raw_api.close()
+
+
+def test_planning_stop_and_active_host_replacement_are_bounded(
+    tmp_path: Path,
+) -> None:
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_root = tmp_path / "execution"
+    staging_root = tmp_path / "staging"
+    execution_root.mkdir()
+    staging_root.mkdir()
+    marker = tmp_path / "fake-worker-generation"
+    fake_worker = _required_path("MANYFORGE_ROBOPLAN_FAKE_WORKER")
+
+    process = _start_host(
+        fixture_root,
+        execution_root,
+        staging_root,
+        manifest,
+        candidate_worker=fake_worker,
+        fake_worker_marker=marker,
+    )
+    raw_api = TestClient(
+        create_app(
+            service=HeadlessService(
+                UnusedCore(),  # type: ignore[arg-type]
+                UnusedManager(),  # type: ignore[arg-type]
+                ExecutionCommandClient(execution_root, timeout_seconds=10.0),
+            ),
+            trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
+        )
+    )
+    headless = HeadlessHttpClient("http://headless.test", client=raw_api)
+    recording = RecordingTransport(headless)
+    runner = OrchestratorRunner(KernelClient(recording))
+
+    try:
+        first_epoch = headless.execution_status()["status"]["owner_epoch"]
+        planning_acceptance = _runner_submission(
+            runner,
+            request_id="planning-stop-operation",
+            joint_names=("joint1",),
+            positions=(0.2,),
+        )
+        planning_id = planning_acceptance["accepted"]["operation_id"]
+        planning = _wait_state(runner, planning_id, {"planning"})["operation"]
+        assert marker.exists()
+
+        stop = runner.stop_operation(
+            request_id="stop-during-planning",
+            operation_id=planning_id,
+            expected_operation_revision=planning["operation_revision"],
+            expected_stop_generation=0,
+            reason="prove bounded planning cancellation",
+            correlation_id="n4d-process-test",
+        )
+        stopped = _wait_terminal(runner, planning_id)["operation"]
+        assert stopped["state"] == "stopped"
+        assert stopped["active_stop_id"] == stop["accepted"]["stop_id"]
+
+        reset = runner.reset_operation(
+            request_id="reset-planning-stop",
+            operation_id=planning_id,
+            expected_operation_revision=stopped["operation_revision"],
+            reason="release stopped operation",
+            correlation_id="n4d-process-test",
+        )
+        assert reset["accepted"]["control"] == "reset"
+
+        recovered_acceptance = _runner_submission(
+            runner,
+            request_id="worker-after-cancel",
+            joint_names=("joint1",),
+            positions=(0.1,),
+        )
+        recovered_id = recovered_acceptance["accepted"]["operation_id"]
+        recovered = _wait_terminal(runner, recovered_id)["operation"]
+        assert recovered["state"] == "completed", recovered
+        runner.acknowledge_completed_operation(
+            request_id="ack-worker-after-cancel",
+            operation_id=recovered_id,
+            expected_operation_revision=recovered["operation_revision"],
+            reason="release completed operation",
+            correlation_id="n4d-process-test",
+        )
+
+        marker.unlink()
+        orphan_acceptance = _runner_submission(
+            runner,
+            request_id="active-host-loss",
+            joint_names=("joint1",),
+            positions=(0.3,),
+        )
+        orphan_id = orphan_acceptance["accepted"]["operation_id"]
+        _wait_state(runner, orphan_id, {"planning"})
+        assert marker.exists()
+        _stop_host(process)
+
+        process = _start_host(
+            fixture_root,
+            execution_root,
+            staging_root,
+            manifest,
+            candidate_worker=fake_worker,
+            fake_worker_marker=marker,
+        )
+        restarted = headless.execution_status()["status"]
+        assert restarted["owner_epoch"] != first_epoch
+        orphan = runner.operation(orphan_id)["operation"]
+        assert orphan["state"] == "intervention_required"
+        terminal_error = orphan["participants"][0]["terminal_error"]
+        assert terminal_error["code"] == "execution_host_replaced"
+        assert terminal_error["details"]["reason"] == (
+            "unreconciled_external_or_orphan_goal"
+        )
+
+        native = ExecutionCommandClient(execution_root, timeout_seconds=2.0)
+        page = native.events(restarted["owner_epoch"], 0)
+        assert [event["record_kind"] for event in page["events"]] == [
+            "host_replaced"
+        ]
+        assert page["events"][0]["operation_id"] == orphan_id
+        assert page["events"][0]["occurred_at_wall"].endswith("Z")
+        with pytest.raises(HeadlessApiError) as stale_events:
+            native.events(first_epoch, 0)
+        assert stale_events.value.code == "operation_journal_owner_epoch_stale"
+
+        with pytest.raises(HeadlessClientError) as fenced:
+            _runner_submission(
+                runner,
+                request_id="reject-fenced-resource",
+                joint_names=("joint1",),
+                positions=(0.05,),
+            )
+        assert fenced.value.code == "execution_rejected"
+        assert recording.last_submission is not None
+        raw_fenced = raw_api.post(
+            "/api/execution/operations", json=recording.last_submission
+        )
+        assert raw_fenced.status_code == 400
+        assert raw_fenced.json()["error"]["details"]["reason"] == (
+            "resource_scope_busy"
+        )
+    finally:
+        _stop_host(process)
         raw_api.close()

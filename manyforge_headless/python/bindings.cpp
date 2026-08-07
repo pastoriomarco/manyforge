@@ -3,6 +3,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
 #include <memory>
 #include <optional>
 #include <set>
@@ -13,8 +15,6 @@
 #include <utility>
 #include <vector>
 
-#include <manyforge_content_identity/content_identity.hpp>
-
 #include "manyforge_headless/headless_api_core.hpp"
 
 namespace py = pybind11;
@@ -23,6 +23,7 @@ namespace manyforge::headless {
 namespace {
 
 using content_identity::CanonicalValue;
+namespace deployment = manyforge::deployment;
 
 CanonicalValue ErrorValue(const std::string_view code,
                           const std::string_view message) {
@@ -257,6 +258,65 @@ public:
         });
   }
 
+  std::string IngestOperationEvent(
+      std::string source_owner_epoch, const std::uint64_t source_sequence,
+      std::string record_kind, std::optional<std::string> request_id,
+      std::string operation_id, const std::uint64_t operation_revision,
+      const std::int64_t occurred_at_ns, std::string occurred_at_wall,
+      const bool effect_pending, std::string payload_json,
+      std::string payload_digest) {
+    py::gil_scoped_release release;
+    return Invoke([this, source_owner_epoch = std::move(source_owner_epoch),
+                   source_sequence, record_kind = std::move(record_kind),
+                   request_id = std::move(request_id),
+                   operation_id = std::move(operation_id), operation_revision,
+                   occurred_at_ns,
+                   occurred_at_wall = std::move(occurred_at_wall),
+                   effect_pending, payload_json = std::move(payload_json),
+                   payload_digest = std::move(payload_digest)]() mutable {
+      CanonicalValue payload;
+      try {
+        payload = deployment::parse_strict_json_model_yaml(payload_json).root();
+      } catch (const std::exception &error) {
+        throw OperatorAlarmError(
+            "headless_operation_event_invalid",
+            "operation event payload is not strict JSON: " +
+                std::string(error.what()));
+      }
+      if (content_identity::canonical_json(payload) != payload_json) {
+        throw OperatorAlarmError(
+            "headless_operation_event_invalid",
+            "operation event payload is not canonical JSON");
+      }
+      return core_->IngestOperationEvent(
+          std::move(source_owner_epoch), source_sequence,
+          std::move(record_kind), std::move(request_id),
+          std::move(operation_id), operation_revision, occurred_at_ns,
+          std::move(occurred_at_wall), effect_pending, std::move(payload),
+          std::move(payload_digest));
+    });
+  }
+
+  std::string
+  CompleteOperationEventSnapshot(std::string source_owner_epoch,
+                                 const std::uint64_t through_source_sequence) {
+    py::gil_scoped_release release;
+    return Invoke([this, source_owner_epoch = std::move(source_owner_epoch),
+                   through_source_sequence]() mutable {
+      return core_->CompleteOperationEventSnapshot(
+          std::move(source_owner_epoch), through_source_sequence);
+    });
+  }
+
+  std::string MarkOperationEventSourceUnknown(std::string source_owner_epoch) {
+    py::gil_scoped_release release;
+    return Invoke(
+        [this, source_owner_epoch = std::move(source_owner_epoch)]() mutable {
+          return core_->MarkOperationEventSourceUnknown(
+              std::move(source_owner_epoch));
+        });
+  }
+
   void Shutdown() {
     py::gil_scoped_release release;
     core_->Shutdown();
@@ -340,5 +400,18 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("adapter_id") = "manyforge.headless.http.v1",
            py::arg("assurance") = "unverified",
            py::arg("trusted_principal_id") = std::nullopt)
+      .def("ingest_operation_event", &HeadlessApiBridge::IngestOperationEvent,
+           py::arg("source_owner_epoch"), py::arg("source_sequence"),
+           py::arg("record_kind"), py::arg("request_id"),
+           py::arg("operation_id"), py::arg("operation_revision"),
+           py::arg("occurred_at_ns"), py::arg("occurred_at_wall"),
+           py::arg("effect_pending"), py::arg("payload_json"),
+           py::arg("payload_digest"))
+      .def("complete_operation_event_snapshot",
+           &HeadlessApiBridge::CompleteOperationEventSnapshot,
+           py::arg("source_owner_epoch"), py::arg("through_source_sequence"))
+      .def("mark_operation_event_source_unknown",
+           &HeadlessApiBridge::MarkOperationEventSourceUnknown,
+           py::arg("source_owner_epoch"))
       .def("shutdown", &HeadlessApiBridge::Shutdown);
 }

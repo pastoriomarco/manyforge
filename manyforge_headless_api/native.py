@@ -41,6 +41,7 @@ class HeadlessApiConfig:
     mutation_replay_capacity: int = 4_096
     manager_timeout_seconds: float = 0.25
     execution_timeout_seconds: float = 10.0
+    execution_event_poll_milliseconds: int = 100
     maximum_request_body_bytes: int = 1024 * 1024
 
     def __post_init__(self) -> None:
@@ -76,6 +77,10 @@ class HeadlessApiConfig:
             raise ValueError("manager_timeout_seconds must be in (0, 5]")
         if not 0 < self.execution_timeout_seconds <= 30:
             raise ValueError("execution_timeout_seconds must be in (0, 30]")
+        if not 10 <= self.execution_event_poll_milliseconds <= 5_000:
+            raise ValueError(
+                "execution_event_poll_milliseconds must be between 10 and 5000"
+            )
         if not 1_024 <= self.maximum_request_body_bytes <= 1024 * 1024:
             raise ValueError(
                 "maximum_request_body_bytes must be between 1024 and 1048576"
@@ -105,6 +110,18 @@ class HeadlessCorePort(Protocol):
     def historian_health(self) -> dict[str, Any]: ...
 
     def reconcile_historian_health(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]: ...
+
+    def ingest_operation_event(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def complete_operation_event_snapshot(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]: ...
+
+    def mark_operation_event_source_unknown(
         self,
         **kwargs: Any,
     ) -> dict[str, Any]: ...
@@ -276,6 +293,30 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("reconcile_historian_health", **kwargs),
             method="reconcile_historian_health",
+        )
+
+    def ingest_operation_event(self, **kwargs: Any) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("ingest_operation_event", **kwargs),
+            method="ingest_operation_event",
+        )
+
+    def complete_operation_event_snapshot(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("complete_operation_event_snapshot", **kwargs),
+            method="complete_operation_event_snapshot",
+        )
+
+    def mark_operation_event_source_unknown(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("mark_operation_event_source_unknown", **kwargs),
+            method="mark_operation_event_source_unknown",
         )
 
     def shutdown(self) -> None:

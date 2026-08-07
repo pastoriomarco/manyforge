@@ -68,6 +68,7 @@ constexpr std::size_t kMaximumPacketBytes = 1024U * 1024U;
 constexpr std::size_t kMaximumProgramBytes = 16U * 1024U * 1024U;
 constexpr std::size_t kMaximumIdentityBytes = 2048U;
 constexpr std::size_t kMaximumReasonBytes = 4096U;
+constexpr std::size_t kMaximumEventPage = 16U;
 constexpr double kMaximumSafeInteger = 9'007'199'254'740'991.0;
 constexpr std::size_t kOwnerEpochRandomBytes = 16U;
 constexpr int kSocketBacklog = 16;
@@ -645,6 +646,7 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
 
 enum class CommandKind {
   kStatus,
+  kEvents,
   kSubmit,
   kRead,
   kPause,
@@ -663,6 +665,9 @@ struct Command final {
   std::optional<core::OperationControlRequestDTO> control;
   std::optional<core::StopIntentDTO> stop;
   std::optional<core::RuntimeScaleRequestDTO> runtime_scale;
+  std::optional<core::RequestOwnerEpoch> event_owner_epoch{};
+  std::uint64_t after_sequence{};
+  std::size_t event_limit{};
 };
 
 [[nodiscard]] Command DecodeCommand(std::string_view bytes) {
@@ -684,6 +689,20 @@ struct Command final {
     RequireExactObjectSize(root, 2U, "status command");
     return {CommandKind::kStatus, std::nullopt, std::nullopt,
             std::nullopt,         std::nullopt, std::nullopt};
+  }
+  if (command == "events") {
+    RequireExactObjectSize(root, 5U, "events command");
+    const auto limit = Counter(root, "limit", 1U);
+    Require(limit <= kMaximumEventPage, "events command exceeds its page bound");
+    return {CommandKind::kEvents,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            core::RequestOwnerEpoch(Text(root, "owner_epoch")),
+            Counter(root, "after_sequence", 0U),
+            static_cast<std::size_t>(limit)};
   }
   if (command == "read") {
     RequireExactObjectSize(root, 3U, "read command");
@@ -1010,6 +1029,44 @@ struct Command final {
   });
 }
 
+[[nodiscard]] CanonicalValue OperationEventPageValue(
+    const core::OperationJournalEventPageDTO& page) {
+  CanonicalValue::Array events;
+  events.reserve(page.events.size());
+  for (const auto& event : page.events) {
+    CanonicalValue payload;
+    try {
+      payload = deployment::parse_strict_json_model_yaml(event.payload_json).root();
+    } catch (const std::exception& error) {
+      Fail("durable operation event payload is not strict JSON: " + std::string(error.what()));
+    }
+    Require(content_identity::canonical_json(payload) == event.payload_json,
+            "durable operation event payload is not canonical JSON");
+    events.emplace_back(CanonicalValue::Object{
+        {"effect_pending", CanonicalValue(event.effect_pending)},
+        {"occurred_at_ns", CanonicalValue(static_cast<double>(event.occurred_at_ns))},
+        {"occurred_at_wall", CanonicalValue(event.occurred_at_wall)},
+        {"operation_id", CanonicalValue(event.operation_id.value())},
+        {"operation_revision",
+         CanonicalValue(static_cast<double>(event.operation_revision.value()))},
+        {"owner_epoch", CanonicalValue(event.owner_epoch.value())},
+        {"payload", std::move(payload)},
+        {"payload_digest", CanonicalValue(event.payload_digest)},
+        {"record_kind", CanonicalValue(event.record_kind)},
+        {"request_id", event.request_id.has_value() ? CanonicalValue(event.request_id->value())
+                                                    : CanonicalValue(nullptr)},
+        {"sequence", CanonicalValue(static_cast<double>(event.sequence))},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"events", CanonicalValue(std::move(events))},
+      {"has_more", CanonicalValue(page.has_more)},
+      {"next_after_sequence", CanonicalValue(static_cast<double>(page.next_after_sequence))},
+      {"owner_epoch", CanonicalValue(page.owner_epoch.value())},
+      {"schema_version", CanonicalValue("manyforge.execution_event_page.v1")},
+  });
+}
+
 class AbsoluteOnlyReferenceResolver final : public core::IReferencePoseResolver {
  public:
   [[nodiscard]] core::Result<core::Pose3DTO> resolve_reference_pose(
@@ -1333,6 +1390,23 @@ class NativeExecutionHost final {
     if (command.kind == CommandKind::kStatus) {
       return StatusResponse();
     }
+    if (command.kind == CommandKind::kEvents) {
+      const auto page = composition_->runtime->operation_journal->ReadEvents(
+          *command.event_owner_epoch, command.after_sequence, command.event_limit);
+      if (!page.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(page.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("events")},
+          {"event_page", OperationEventPageValue(page.value())},
+          {"ok", CanonicalValue(true)},
+      });
+    }
     if (last_reconcile_error_.has_value()) {
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -1442,6 +1516,7 @@ class NativeExecutionHost final {
         case CommandKind::kAcknowledgeCompleted:
           return composition_->runtime->addressed_kernel->acknowledge_completed(*command.control);
         case CommandKind::kStatus:
+        case CommandKind::kEvents:
         case CommandKind::kSubmit:
         case CommandKind::kRead:
         case CommandKind::kStop:

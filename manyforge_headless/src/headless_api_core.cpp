@@ -6,13 +6,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <limits>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -22,8 +25,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <manyforge_content_identity/content_identity.hpp>
 
 namespace manyforge::headless {
 namespace {
@@ -163,6 +164,60 @@ CanonicalValue Number(const std::uint64_t value, const std::string_view label) {
   Require(value <= kMaximumSafeInteger, "headless_value_invalid",
           std::string(label) + " exceeds the I-JSON safe integer range");
   return CanonicalValue(static_cast<double>(value));
+}
+
+std::uint64_t RequiredCounter(const CanonicalValue &root,
+                              const std::string_view name,
+                              const std::uint64_t minimum = 0U) {
+  const auto *value =
+      std::get_if<double>(&RequiredMember(root, name).storage());
+  Require(value != nullptr && std::isfinite(*value) &&
+              *value >= static_cast<double>(minimum) &&
+              std::floor(*value) == *value &&
+              *value <= static_cast<double>(kMaximumSafeInteger),
+          "headless_operation_event_invalid",
+          "operation event field " + std::string(name) +
+              " must be a safe unsigned integer");
+  return static_cast<std::uint64_t>(*value);
+}
+
+const CanonicalValue::Array &RequiredArray(const CanonicalValue &root,
+                                           const std::string_view name) {
+  const auto *value =
+      std::get_if<CanonicalValue::Array>(&RequiredMember(root, name).storage());
+  Require(value != nullptr, "headless_operation_event_invalid",
+          "operation event field " + std::string(name) + " must be an array");
+  return *value;
+}
+
+bool IsOperationFaultState(const std::string_view state) noexcept {
+  return state == "failed" || state == "interrupted" ||
+         state == "intervention_required";
+}
+
+bool IsNormalOperationTerminal(const std::string_view state) noexcept {
+  return state == "completed" || state == "stopped" ||
+         state == "cancelled_pre_dispatch";
+}
+
+std::string OperationHistoryEventType(const std::string_view record_kind,
+                                      const CanonicalValue &payload) {
+  if (record_kind == "operation_accepted") {
+    return "operation_accepted";
+  }
+  if (record_kind == "stop_accepted") {
+    return "operation_stop_accepted";
+  }
+  if (record_kind == "runtime_scale_accepted") {
+    return "runtime_scale_requested";
+  }
+  if (record_kind == "control_accepted") {
+    return "operation_" +
+           RequiredString(RequiredMember(payload, "result"), "control") +
+           "_accepted";
+  }
+  const auto &state = RequiredMember(payload, "operation_state");
+  return "operation_" + RequiredString(state, "state");
 }
 
 CanonicalValue MembershipValue(const AlarmAcknowledgementMember &member) {
@@ -385,6 +440,16 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
           0U,
           {},
           std::nullopt,
+      },
+      operation_adapter_{
+          config_.owner_id + ".operation-condition-adapter",
+          "motion",
+          "manyforge.alarm_adapter.kernel_condition",
+          {},
+          0U,
+          0U,
+          {},
+          std::nullopt,
       } {
   RegisterAdapterEpochLocked(runtime_health_adapter_,
                              config_.owner_epoch + ".runtime-health");
@@ -576,6 +641,225 @@ CanonicalValue HeadlessApiCore::ReconcileHistorianHealth(
   });
   StoreReplayLocked(key, digest, response);
   return response;
+}
+
+CanonicalValue HeadlessApiCore::IngestOperationEvent(
+    std::string source_owner_epoch, const std::uint64_t source_sequence,
+    std::string record_kind, std::optional<std::string> request_id,
+    std::string operation_id, const std::uint64_t operation_revision,
+    const std::int64_t occurred_at_ns, std::string occurred_at_wall,
+    const bool effect_pending, CanonicalValue journal_payload,
+    std::string payload_digest) {
+  Require(
+      !source_owner_epoch.empty() && source_sequence != 0U &&
+          source_sequence <= kMaximumSafeInteger && !record_kind.empty() &&
+          !operation_id.empty() && operation_revision != 0U &&
+          operation_revision <= kMaximumSafeInteger && occurred_at_ns >= 0 &&
+          static_cast<std::uint64_t>(occurred_at_ns) <= kMaximumSafeInteger &&
+          !occurred_at_wall.empty() && occurred_at_wall.size() <= 128U &&
+          content_identity::is_utf8_nfc(occurred_at_wall) &&
+          (!request_id.has_value() || !request_id->empty()) &&
+          content_identity::is_sha256_digest(payload_digest) &&
+          journal_payload.is_object(),
+      "headless_operation_event_invalid",
+      "operation event envelope is malformed");
+  const std::set<std::string_view> supported_kinds{
+      "operation_accepted",     "control_accepted", "stop_accepted",
+      "runtime_scale_accepted", "state_observed",   "host_replaced"};
+  Require(supported_kinds.contains(record_kind),
+          "headless_operation_event_invalid",
+          "operation event record kind is unsupported");
+  const auto payload_json = content_identity::canonical_json(journal_payload);
+  Require(content_identity::sha256_digest(payload_json) == payload_digest &&
+              RequiredString(journal_payload, "api_version") ==
+                  "manyforge.operation_journal_record.v1" &&
+              RequiredString(journal_payload, "owner_epoch") ==
+                  source_owner_epoch &&
+              RequiredString(journal_payload, "record_kind") == record_kind &&
+              RequiredBool(journal_payload, "effect_pending") == effect_pending,
+          "headless_operation_event_invalid",
+          "operation event payload does not match its durable envelope");
+  const auto &operation_state =
+      RequiredMember(journal_payload, "operation_state");
+  Require(operation_state.is_object() &&
+              RequiredString(operation_state, "operation_id") == operation_id &&
+              RequiredCounter(operation_state, "operation_revision", 1U) ==
+                  operation_revision,
+          "headless_operation_event_invalid",
+          "operation event state does not match its durable envelope");
+  const auto event_type =
+      OperationHistoryEventType(record_kind, journal_payload);
+  const auto state_name = RequiredString(operation_state, "state");
+  const auto severity = IsOperationFaultState(state_name) ? "ERROR" : "INFO";
+  const auto native_record_digest = content_identity::framed_sha256(
+      "manyforge-operation-journal-event", "v1",
+      CanonicalValue(CanonicalValue::Object{
+          {"effect_pending", CanonicalValue(effect_pending)},
+          {"occurred_at_ns", Number(static_cast<std::uint64_t>(occurred_at_ns),
+                                    "occurred_at_ns")},
+          {"occurred_at_wall", CanonicalValue(occurred_at_wall)},
+          {"operation_id", CanonicalValue(operation_id)},
+          {"operation_revision",
+           Number(operation_revision, "operation_revision")},
+          {"payload_digest", CanonicalValue(payload_digest)},
+          {"record_kind", CanonicalValue(record_kind)},
+          {"request_id", OptionalStringValue(request_id)},
+          {"source_owner_epoch", CanonicalValue(source_owner_epoch)},
+          {"source_sequence", Number(source_sequence, "source_sequence")},
+      }));
+
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  RegisterOperationEpochLocked(source_owner_epoch);
+  if (source_sequence <= operation_native_sequence_) {
+    if (source_sequence == operation_native_sequence_) {
+      Require(native_record_digest == operation_native_record_digest_,
+              "headless_operation_event_identity_conflict",
+              "one native operation event sequence names conflicting content");
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"event_id", CanonicalValue(nullptr)},
+        {"native_sequence", Number(source_sequence, "native_sequence")},
+        {"schema_version",
+         CanonicalValue("manyforge.operation_event_ingest.v1")},
+        {"status", CanonicalValue("already_ingested")},
+    });
+  }
+
+  const bool native_sequence_gap =
+      operation_native_sequence_ != 0U &&
+      source_sequence > operation_native_sequence_ + 1U;
+  CanonicalValue history_payload(CanonicalValue::Object{
+      {"effect_pending", CanonicalValue(effect_pending)},
+      {"journal_payload", journal_payload},
+      {"native_sequence", Number(source_sequence, "native_sequence")},
+      {"native_sequence_gap", CanonicalValue(native_sequence_gap)},
+      {"operation_id", CanonicalValue(operation_id)},
+      {"operation_revision", Number(operation_revision, "operation_revision")},
+      {"payload_digest", CanonicalValue(payload_digest)},
+      {"record_kind", CanonicalValue(record_kind)},
+      {"request_id", OptionalStringValue(request_id)},
+      {"schema_version",
+       CanonicalValue("manyforge.operation_history_event.v1")},
+      {"source_owner_epoch", CanonicalValue(source_owner_epoch)},
+  });
+  std::optional<std::string> event_id;
+  try {
+    auto event = MakeHistorianEvent("manyforge.runtime", event_type, severity,
+                                    occurred_at_ns, occurred_at_wall,
+                                    std::move(history_payload));
+    const auto candidate_event_id = event.event_id;
+    if (historian_.TryEnqueue(std::move(event))) {
+      event_id = candidate_event_id;
+    } else {
+      alarm_owner_.MarkHealthUnavailable(
+          std::string(kHistorianOwnerHealthCode),
+          "historian delivery queue rejected a committed operation fact");
+    }
+  } catch (const std::exception &error) {
+    alarm_owner_.MarkHealthUnavailable(std::string(kHistorianOwnerHealthCode),
+                                       error.what());
+  } catch (...) {
+    alarm_owner_.MarkHealthUnavailable(
+        std::string(kHistorianOwnerHealthCode),
+        "operation historian delivery raised an unknown failure");
+  }
+
+  ReconcileOperationFaultLocked(
+      journal_payload, record_kind, request_id.value_or(""), source_sequence,
+      payload_digest, occurred_at_ns, occurred_at_wall, event_id.value_or(""));
+  operation_native_sequence_ = source_sequence;
+  operation_native_record_digest_ = native_record_digest;
+  SynchronizeHistorianHealthLocked();
+  return CanonicalValue(CanonicalValue::Object{
+      {"event_id", OptionalStringValue(event_id)},
+      {"native_sequence", Number(source_sequence, "native_sequence")},
+      {"schema_version", CanonicalValue("manyforge.operation_event_ingest.v1")},
+      {"status", CanonicalValue("ingested")},
+  });
+}
+
+CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
+    std::string source_owner_epoch,
+    const std::uint64_t through_source_sequence) {
+  Require(!source_owner_epoch.empty() &&
+              through_source_sequence <= kMaximumSafeInteger,
+          "headless_operation_event_invalid",
+          "operation event snapshot identity is invalid");
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  RegisterOperationEpochLocked(source_owner_epoch);
+  Require(
+      through_source_sequence == operation_native_sequence_,
+      "headless_operation_event_snapshot_incomplete",
+      "operation event snapshot completion is ahead of or behind ingestion");
+
+  std::vector<std::string> retired;
+  for (const auto &[operation, subject] : active_operation_faults_) {
+    if (observed_operation_faults_.contains(operation)) {
+      continue;
+    }
+    Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
+            "headless_adapter_sequence_exhausted",
+            "operation alarm adapter sequence is exhausted");
+    ++operation_adapter_.source_sequence;
+    AlarmConditionUpdate update{
+        "manyforge.motion.execution_fault",
+        subject,
+        false,
+        operation_adapter_.source_id,
+        operation_adapter_.source_epoch,
+        operation_adapter_.source_sequence,
+        clocks_.monotonic_time_ns(),
+        clocks_.wall_time_text(),
+        AlarmConditionQuality::kGood,
+        CanonicalValue(CanonicalValue::Object{}),
+        CanonicalValue(CanonicalValue::Object{
+            {"reason", CanonicalValue("execution_context_retired")},
+        }),
+        {},
+        CanonicalValue(CanonicalValue::Object{
+            {"operation_id", CanonicalValue(operation)},
+        }),
+    };
+    const auto mutation = alarm_owner_.Submit(std::move(update));
+    static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+    retired.push_back(operation);
+  }
+  for (const auto &operation : retired) {
+    active_operation_faults_.erase(operation);
+  }
+  alarm_owner_.CompleteSourceSnapshot(operation_adapter_.source_id,
+                                      operation_adapter_.source_epoch,
+                                      AlarmConditionQuality::kGood);
+  SynchronizeHistorianHealthLocked();
+  return CanonicalValue(CanonicalValue::Object{
+      {"native_sequence", Number(through_source_sequence, "native_sequence")},
+      {"schema_version",
+       CanonicalValue("manyforge.operation_event_snapshot.v1")},
+      {"source_owner_epoch", CanonicalValue(source_owner_epoch)},
+      {"status", CanonicalValue("complete")},
+  });
+}
+
+CanonicalValue HeadlessApiCore::MarkOperationEventSourceUnknown(
+    std::string source_owner_epoch) {
+  Require(!source_owner_epoch.empty(), "headless_operation_event_invalid",
+          "operation event source identity is empty");
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const bool current = operation_adapter_.source_epoch == source_owner_epoch;
+  if (current) {
+    alarm_owner_.MarkSourceQualityUnknown(operation_adapter_.source_id,
+                                          operation_adapter_.source_epoch);
+    SynchronizeHistorianHealthLocked();
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version",
+       CanonicalValue("manyforge.operation_event_source_quality.v1")},
+      {"source_owner_epoch", CanonicalValue(source_owner_epoch)},
+      {"status", CanonicalValue(current ? "marked_unknown" : "stale_ignored")},
+  });
 }
 
 void HeadlessApiCore::Shutdown() {
@@ -772,6 +1056,110 @@ void HeadlessApiCore::RefreshSceneAdapterLocked(
   alarm_owner_.CompleteSourceSnapshot(scene_adapter_.source_id,
                                       scene_adapter_.source_epoch,
                                       AlarmConditionQuality::kGood);
+}
+
+void HeadlessApiCore::RegisterOperationEpochLocked(
+    std::string source_owner_epoch) {
+  if (operation_adapter_.source_epoch == source_owner_epoch) {
+    return;
+  }
+  RegisterAdapterEpochLocked(operation_adapter_, std::move(source_owner_epoch));
+  operation_native_sequence_ = 0U;
+  operation_native_record_digest_.clear();
+  observed_operation_faults_.clear();
+}
+
+void HeadlessApiCore::ReconcileOperationFaultLocked(
+    const CanonicalValue &journal_payload, const std::string_view record_kind,
+    const std::string_view request_id, const std::uint64_t native_sequence,
+    const std::string_view payload_digest, const std::int64_t occurred_at_ns,
+    const std::string_view occurred_at_wall,
+    const std::string_view raw_event_id) {
+  const auto &state = RequiredMember(journal_payload, "operation_state");
+  const auto operation_id = RequiredString(state, "operation_id");
+  const auto state_name = RequiredString(state, "state");
+  bool reset_accepted = false;
+  if (record_kind == "control_accepted") {
+    reset_accepted = RequiredString(RequiredMember(journal_payload, "result"),
+                                    "control") == "reset";
+  }
+  const bool active = IsOperationFaultState(state_name) && !reset_accepted;
+  const bool clear = reset_accepted || IsNormalOperationTerminal(state_name);
+  if (!active && !clear) {
+    return;
+  }
+
+  AlarmSubject subject;
+  if (active) {
+    std::vector<std::string> resources;
+    for (const auto &participant : RequiredArray(state, "participants")) {
+      const auto participant_resources = StringArray(participant, "resources");
+      resources.insert(resources.end(), participant_resources.begin(),
+                       participant_resources.end());
+    }
+    std::sort(resources.begin(), resources.end());
+    resources.erase(std::unique(resources.begin(), resources.end()),
+                    resources.end());
+    Require(!resources.empty() &&
+                resources.size() <= kMaximumAlarmSubjectResources,
+            "headless_operation_event_invalid",
+            "I6 operation fault scope must contain at most 16 exact resources");
+    subject = AlarmSubject{"operation", operation_id, std::move(resources)};
+    active_operation_faults_.insert_or_assign(operation_id, subject);
+    observed_operation_faults_.insert(operation_id);
+  } else {
+    const auto found = active_operation_faults_.find(operation_id);
+    if (found == active_operation_faults_.end()) {
+      return;
+    }
+    subject = found->second;
+    active_operation_faults_.erase(found);
+    observed_operation_faults_.erase(operation_id);
+  }
+
+  Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
+          "headless_adapter_sequence_exhausted",
+          "operation alarm adapter sequence is exhausted");
+  ++operation_adapter_.source_sequence;
+  const auto &participants = RequiredArray(state, "participants");
+  const CanonicalValue terminal_error =
+      participants.empty()
+          ? CanonicalValue(nullptr)
+          : RequiredMember(participants.front(), "terminal_error");
+  std::vector<std::string> evidence_refs;
+  if (!raw_event_id.empty()) {
+    evidence_refs.emplace_back(raw_event_id);
+  }
+  AlarmConditionUpdate update{
+      "manyforge.motion.execution_fault",
+      std::move(subject),
+      active,
+      operation_adapter_.source_id,
+      operation_adapter_.source_epoch,
+      operation_adapter_.source_sequence,
+      occurred_at_ns,
+      std::string(occurred_at_wall),
+      AlarmConditionQuality::kGood,
+      CanonicalValue(CanonicalValue::Object{}),
+      CanonicalValue(CanonicalValue::Object{
+          {"native_sequence", Number(native_sequence, "native_sequence")},
+          {"payload_digest", CanonicalValue(std::string(payload_digest))},
+          {"record_kind", CanonicalValue(std::string(record_kind))},
+          {"state", CanonicalValue(state_name)},
+          {"terminal_error", terminal_error},
+      }),
+      std::move(evidence_refs),
+      CanonicalValue(CanonicalValue::Object{
+          {"operation_id", CanonicalValue(operation_id)},
+          {"program_binding_id", RequiredMember(state, "program_binding_id")},
+          {"program_run_id", RequiredMember(state, "program_run_id")},
+          {"request_id", request_id.empty()
+                             ? CanonicalValue(nullptr)
+                             : CanonicalValue(std::string(request_id))},
+      }),
+  };
+  const auto mutation = alarm_owner_.Submit(std::move(update));
+  static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
 }
 
 void HeadlessApiCore::RegisterAdapterEpochLocked(AdapterCursor &cursor,

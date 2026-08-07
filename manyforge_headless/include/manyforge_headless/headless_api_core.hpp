@@ -4,6 +4,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <manyforge_headless/event_historian.hpp>
+#include <manyforge_headless/node_environment_projection.hpp>
+#include <manyforge_headless/operator_alarm_owner.hpp>
+#include <manyforge_headless/runtime_snapshot.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -12,14 +18,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <manyforge_content_identity/canonical_value.hpp>
-#include <manyforge_deployment/verified_retained_bundle.hpp>
-
-#include <manyforge_headless/event_historian.hpp>
-#include <manyforge_headless/node_environment_projection.hpp>
-#include <manyforge_headless/operator_alarm_owner.hpp>
-#include <manyforge_headless/runtime_snapshot.hpp>
 
 namespace manyforge::headless {
 
@@ -87,6 +85,20 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ReconcileHistorianHealth(std::uint64_t expected_health_generation,
                            AlarmCallerAttribution caller);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  IngestOperationEvent(
+      std::string source_owner_epoch, std::uint64_t source_sequence,
+      std::string record_kind, std::optional<std::string> request_id,
+      std::string operation_id, std::uint64_t operation_revision,
+      std::int64_t occurred_at_ns, std::string occurred_at_wall,
+      bool effect_pending,
+      manyforge::content_identity::CanonicalValue journal_payload,
+      std::string payload_digest);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  CompleteOperationEventSnapshot(std::string source_owner_epoch,
+                                 std::uint64_t through_source_sequence);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  MarkOperationEventSourceUnknown(std::string source_owner_epoch);
   void Shutdown();
 
 private:
@@ -112,6 +124,13 @@ private:
   void
   RefreshRuntimeHealthAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
   void RefreshSceneAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
+  void RegisterOperationEpochLocked(std::string source_owner_epoch);
+  void ReconcileOperationFaultLocked(
+      const manyforge::content_identity::CanonicalValue &journal_payload,
+      std::string_view record_kind, std::string_view request_id,
+      std::uint64_t native_sequence, std::string_view payload_digest,
+      std::int64_t occurred_at_ns, std::string_view occurred_at_wall,
+      std::string_view raw_event_id);
   void RegisterAdapterEpochLocked(AdapterCursor &cursor,
                                   std::string source_epoch);
   [[nodiscard]] AlarmMutation SubmitAdapterUpdateLocked(
@@ -143,6 +162,11 @@ private:
   AlarmLifecycleOwner alarm_owner_;
   AdapterCursor runtime_health_adapter_;
   AdapterCursor scene_adapter_;
+  AdapterCursor operation_adapter_;
+  std::uint64_t operation_native_sequence_{};
+  std::string operation_native_record_digest_;
+  std::map<std::string, AlarmSubject> active_operation_faults_;
+  std::set<std::string> observed_operation_faults_;
   mutable std::mutex mutex_;
   std::map<std::string, ReplayEntry> replay_;
   std::uint64_t node_environment_generation_{};
