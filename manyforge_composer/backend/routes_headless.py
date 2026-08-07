@@ -12,6 +12,7 @@ from manyforge_headless_api.models import (
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    OperationIntentRequest,
 )
 
 
@@ -62,6 +63,20 @@ def create_headless_router(client: HeadlessHttpClient) -> APIRouter:
     @router.post("/api/manager/apply")
     def manager_apply(body: ManagerApplyRequest) -> dict[str, Any]:
         return _call(lambda: client.manager_apply(body.model_dump()))
+
+    @router.get("/api/execution/status")
+    def execution_status() -> dict[str, Any]:
+        return _call(client.execution_status)
+
+    @router.post("/api/execution/operations")
+    def execution_submit(body: OperationIntentRequest) -> dict[str, Any]:
+        return _call(lambda: client.execute(body.model_dump(mode="json")))
+
+    @router.get("/api/execution/operations/{operation_id}")
+    def execution_read(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.operation(operation_id))
 
     @router.get("/api/scene")
     def scene() -> dict[str, Any]:

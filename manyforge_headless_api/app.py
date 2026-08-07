@@ -12,12 +12,14 @@ from fastapi import FastAPI, Path, Query, Request
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .execution import ExecutionCommandClient
 from .manager import ManagerCommandClient
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    OperationIntentRequest,
 )
 from .native import HeadlessApiConfig, HeadlessApiError, NativeHeadlessCore
 from .service import HeadlessService, TrustedAttribution
@@ -116,12 +118,17 @@ def _error_status(code: str) -> int:
         "headless_projection_response_invalid",
         "headless_projection_response_oversized",
         "manager_command_response_invalid",
+        "execution_command_response_invalid",
+        "execution_command_response_identity_mismatch",
         "node_environment_projection_invalid",
     }:
         return 502
     if code == "headless_api_internal_failure":
         return 500
-    if code.endswith("_not_found") or code in {"operator_alarm_not_found"}:
+    if code.endswith("_not_found") or code in {
+        "missing_reference",
+        "operator_alarm_not_found",
+    }:
         return 404
     if "conflict" in code or "stale" in code or "fence" in code:
         return 409
@@ -186,7 +193,11 @@ def create_app(
             config.manager_state_root,
             timeout_seconds=config.manager_timeout_seconds,
         )
-        service = HeadlessService(core, manager)
+        execution = ExecutionCommandClient(
+            config.execution_state_root,
+            timeout_seconds=config.execution_timeout_seconds,
+        )
+        service = HeadlessService(core, manager, execution)
     assert service is not None
 
     @asynccontextmanager
@@ -269,6 +280,32 @@ def create_app(
                 "Manager rejection has no stable error code",
             )
         return JSONResponse(status_code=_error_status(code), content=response)
+
+    def execution_response(response: dict[str, Any]) -> JSONResponse:
+        if response.get("ok") is True:
+            return JSONResponse(status_code=200, content=response)
+        error = response.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        if not isinstance(code, str) or not code:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "execution rejection has no stable error code",
+            )
+        return JSONResponse(status_code=_error_status(code), content=response)
+
+    @app.get("/api/execution/status")
+    def execution_status() -> JSONResponse:
+        return execution_response(service.execution_status())
+
+    @app.post("/api/execution/operations")
+    def execution_submit(body: OperationIntentRequest) -> JSONResponse:
+        return execution_response(service.execution_submit(body))
+
+    @app.get("/api/execution/operations/{operation_id}")
+    def execution_read(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> JSONResponse:
+        return execution_response(service.execution_read(operation_id))
 
     @app.get("/api/scene")
     def scene() -> dict[str, Any]:

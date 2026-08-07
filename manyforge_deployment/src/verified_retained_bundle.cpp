@@ -193,17 +193,8 @@ void require_required_and_optional_fields(
   }
 }
 
-void require_empty_array(const CanonicalValue& value,
-                         std::string_view field) {
-  if (!require_array(value, field).empty()) {
-    detail::fail_retained_bundle(
-        std::string(field) +
-        " is outside the currently qualified structural retained subset");
-  }
-}
-
-[[nodiscard]] std::uint64_t require_i_json_size(
-    const CanonicalValue& value, std::string_view field) {
+[[nodiscard]] std::uint64_t require_i_json_size(const CanonicalValue& value,
+                                                std::string_view field) {
   const auto* number = std::get_if<double>(&value.storage());
   if (number == nullptr || !std::isfinite(*number) || *number < 0.0 ||
       std::trunc(*number) != *number ||
@@ -572,6 +563,7 @@ using CatalogIdentity =
 
 void require_structural_catalog_closure(
     const core::CellGraphDTO& graph,
+    std::span<const core::CapabilityProviderBindingDTO> provider_bindings,
     std::span<const core::CatalogRecordRefDTO> records) {
   std::set<CatalogIdentity> graph_records;
   for (const auto& instance : graph.model_instances) {
@@ -623,6 +615,14 @@ void require_structural_catalog_closure(
           std::string(core::kGripperPositionCommandSchemaId),
           std::string(core::kGripperPositionCommandSchemaRevision));
     }
+  }
+  for (const auto& binding : provider_bindings) {
+    graph_records.emplace(core::CatalogRecordKind::kCapabilityDefinition,
+                          binding.capability_id.value(),
+                          binding.capability_definition_revision.value());
+    graph_records.emplace(core::CatalogRecordKind::kProviderManifest,
+                          binding.provider_manifest_id.value(),
+                          binding.provider_manifest_revision.value());
   }
 
   std::set<CatalogIdentity> catalog_records;
@@ -916,15 +916,11 @@ void verify_node_environment_projection(const CanonicalValue& value) {
 }
 
 [[nodiscard]] RevisionVerifiedDeploymentApplicabilityInputs
-verify_structural_applicability_projection(
-    const CanonicalValue& desired_value,
-    const CanonicalValue& provider_value,
-    const CanonicalValue* site_overlay_ref_value,
-    const CanonicalValue* external_resources_value,
-    const core::CellGraphDTO& graph) {
-  require_empty_array(
-      provider_value,
-      "retained_bundle.capability_provider_bindings");
+verify_structural_applicability_projection(const CanonicalValue& desired_value,
+                                           const CanonicalValue& provider_value,
+                                           const CanonicalValue* site_overlay_ref_value,
+                                           const CanonicalValue* external_resources_value,
+                                           const core::CellGraphDTO& graph) {
   CanonicalValue::Object root_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"desired_control_configurations", desired_value},
@@ -975,11 +971,12 @@ verify_structural_applicability_projection(
         "projection");
   }
   const auto& desired = verified.value().desired_control_configurations;
+  const auto& providers = verified.value().capability_provider_bindings;
   if (graph.control_domains.empty()) {
-    if (!desired.empty()) {
+    if (!desired.empty() || !providers.empty()) {
       detail::fail_retained_bundle(
           "passive structural retention cannot select a control "
-          "configuration");
+          "configuration or capability provider");
     }
     return verified;
   }
@@ -1030,6 +1027,64 @@ verify_structural_applicability_projection(
             "selected binding route");
       }
     }
+  }
+
+  for (const auto& provider : providers) {
+    if (!provider.endpoint_bindings.empty()) {
+      detail::fail_retained_bundle(
+          "current native structural retention excludes capability-provider "
+          "endpoint bindings");
+    }
+    std::visit(
+        [&](const auto& target) {
+          using Target = std::decay_t<decltype(target)>;
+          if constexpr (std::is_same_v<Target, core::CellGlobalCapabilityProviderTargetDTO>) {
+            if (provider.scope != core::CapabilityScope::kCellGlobal ||
+                target.cell_id != graph.cell_id) {
+              detail::fail_retained_bundle(
+                  "retained cell-global capability provider does not target "
+                  "the exact retained cell");
+            }
+          } else if constexpr (std::is_same_v<Target,
+                                              core::ControlDomainCapabilityProviderTargetDTO>) {
+            const auto domain = std::find_if(
+                graph.control_domains.begin(), graph.control_domains.end(), [&](const auto& value) {
+                  return value.control_domain_id == target.control_domain_id;
+                });
+            if (provider.scope != core::CapabilityScope::kControlDomain ||
+                domain == graph.control_domains.end() ||
+                domain->control_domain_revision != target.control_domain_revision ||
+                domain->controller_topology_id != target.controller_topology_id ||
+                domain->topology_revision != target.topology_revision) {
+              detail::fail_retained_bundle(
+                  "retained control-domain capability provider does not "
+                  "target the exact retained domain");
+            }
+          } else {
+            const auto component = std::find_if(
+                graph.controllable_components.begin(), graph.controllable_components.end(),
+                [&](const auto& value) {
+                  return value.controllable_component_id == target.controllable_component_id;
+                });
+            const auto binding =
+                std::find_if(graph.control_bindings.begin(), graph.control_bindings.end(),
+                             [&](const auto& value) {
+                               return value.control_binding_id == target.control_binding_id;
+                             });
+            if (provider.scope != core::CapabilityScope::kTargetBinding ||
+                component == graph.controllable_components.end() ||
+                binding == graph.control_bindings.end() ||
+                component->component_type_revision != target.component_type_revision ||
+                binding->control_binding_revision != target.control_binding_revision ||
+                binding->controllable_component_id != target.controllable_component_id ||
+                binding->command_target_id != target.command_target_id) {
+              detail::fail_retained_bundle(
+                  "retained target capability provider does not target the "
+                  "exact retained component and control-binding anchor");
+            }
+          }
+        },
+        provider.target);
   }
   return verified;
 }
@@ -1123,8 +1178,13 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
   }
   const auto verified_graph = verify_structural_graph_projection(
       require_member(object, "cell_graph", "retained_bundle"), runtime_profiles);
+  const auto applicability = verify_structural_applicability_projection(
+      require_member(object, "desired_control_configurations", "retained_bundle"),
+      require_member(object, "capability_provider_bindings", "retained_bundle"),
+      root.find_object_member("site_overlay_ref"), root.find_object_member("external_resources"),
+      verified_graph.graph());
   require_structural_catalog_closure(
-      verified_graph.graph(), catalog_records);
+      verified_graph.graph(), applicability.value().capability_provider_bindings, catalog_records);
   const auto schema_artifacts = parse_structural_schema_artifacts(
       require_member(catalogs, "schema_artifacts",
                      "retained_bundle.catalogs"),
@@ -1135,14 +1195,6 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
   const auto& node_environment =
       require_object(node_environment_value, "catalogs.node_environment");
 
-  const auto applicability = verify_structural_applicability_projection(
-      require_member(object, "desired_control_configurations",
-                     "retained_bundle"),
-      require_member(object, "capability_provider_bindings",
-                     "retained_bundle"),
-      root.find_object_member("site_overlay_ref"),
-      root.find_object_member("external_resources"),
-      verified_graph.graph());
   std::optional<core::RetainedAssistantProjectionDTO> assistant;
   if (const CanonicalValue* retained_assistant =
           root.find_object_member("assistant");

@@ -140,6 +140,21 @@ TEST(RoboPlanPlannerBackendTest,
   EXPECT_EQ(fixture.client->last_request->planning_attempt_index, 7U);
 }
 
+TEST(RoboPlanPlannerBackendTest, AcceptsAnExactProviderGenerationWithoutInventingARuntimeUnit) {
+  BackendFixture fixture;
+  auto request = testing::make_test_plan_request(
+      "move:embedded-provider", ResolvedMotionSpecDTO{joint_goal(fixture.binding)});
+  request.runtime_unit_bindings.clear();
+
+  const auto result = fixture.backend->plan(request);
+
+  ASSERT_TRUE(result.trajectory.has_value());
+  EXPECT_FALSE(result.error.has_value());
+  EXPECT_EQ(fixture.client->compute_calls, 1);
+  EXPECT_FALSE(request.provider_runtime_epoch.empty());
+  EXPECT_FALSE(request.planner_capability_binding.provider_runtime_epoch.empty());
+}
+
 TEST(RoboPlanPlannerBackendTest,
      RejectsProjectionParticipantAndControlStateCrossingBeforeTransport) {
   BackendFixture fixture;

@@ -78,6 +78,30 @@ if(NOT TARGET manyforge_collision)
   unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
 endif()
 
+# The selected N3 host is a read-only consumer of I3 retained products and
+# I4's durable active-bundle publication. Embed those production libraries
+# without duplicating either package's independent test tree; the host does
+# not acquire compiler or Component Manager mutation authority.
+if(NOT TARGET manyforge_component_manager)
+  set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
+  cmake_policy(PUSH)
+  cmake_policy(SET CMP0077 NEW)
+  set(BUILD_TESTING OFF)
+  add_subdirectory(
+    "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_component_manager"
+    EXCLUDE_FROM_ALL)
+  cmake_policy(POP)
+  set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
+  unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
+endif()
+if(NOT TARGET manyforge_component_manager OR
+   NOT TARGET manyforge_deployment)
+  message(FATAL_ERROR
+    "I6 native execution requires retained-product verification and the "
+    "active-bundle publication reader")
+endif()
+
 # I3 keeps only the bounded, file-only bridge required to qualify exact
 # retained planning products against RoboPlan/Pinocchio. This target owns no
 # runtime scene truth, Kernel, execution backend, ROS node, or Python module.
@@ -255,12 +279,28 @@ target_link_libraries(manyforge_roboplan_candidate_worker PRIVATE
   manyforge_roboplan_worker_protocol
   manyforge_roboplan_native_candidate)
 
+# Selected composition root for the first complete addressed native path.
+# Its same-user Unix socket is a bounded private transport consumed by the
+# headless API; it is not a second public execution contract.
+add_executable(manyforge_native_execution_host
+  src/native_execution_host_main.cpp)
+target_compile_definitions(manyforge_native_execution_host PRIVATE
+  COAL_DISABLE_HPP_FCL_WARNINGS)
+target_link_libraries(manyforge_native_execution_host PRIVATE
+  manyforge_roboplan_native_runtime
+  manyforge_roboplan_process_candidate_client
+  manyforge_roboplan_retained_consumer
+  manyforge_component_manager
+  manyforge_deployment
+  Threads::Threads)
+
 message(STATUS
   "manyforge_roboplan I6 cutover: retained-product projection, addressed "
   "native state, focused planning, execution/gripper adapters, runtime "
   "composition, and process-contained candidate computation are built; "
-  "event collection, ROS/Python clients, and product workflow lanes remain "
-  "unavailable until their I6 gates")
+  "the bounded N3 headless/Python callers are available, while full Program "
+  "execution, event collection, ROS adapters, and product workflow lanes "
+  "remain unavailable until their I6 gates")
 
 # Tests
 if(BUILD_TESTING)
@@ -549,6 +589,51 @@ if(BUILD_TESTING)
       generate_lite6_retained_consumer_product
       DEPENDS "${_MANYFORGE_LITE6_RETAINED_CONSUMER_MANIFEST}")
 
+    # N3 process qualification needs one ordinary retained bundle, the exact
+    # compiled Program Binding selected for it, and I4's durable active
+    # publication. The generator remains test-only; the production host can
+    # consume any independently produced package with the same contracts.
+    add_executable(generate_lite6_native_execution_fixture_tool
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test/generate_lite6_native_execution_fixture.cpp")
+    target_compile_definitions(
+      generate_lite6_native_execution_fixture_tool PRIVATE
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}"
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}")
+    target_include_directories(
+      generate_lite6_native_execution_fixture_tool PRIVATE
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src"
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
+    target_link_libraries(
+      generate_lite6_native_execution_fixture_tool PRIVATE
+      manyforge_deployment
+      manyforge_component_manager
+      manyforge_core)
+
+    set(_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_execution_fixture")
+    set(_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_MANIFEST
+      "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}/manifest.json")
+    add_custom_command(
+      OUTPUT "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_MANIFEST}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E rm -rf
+        "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      COMMAND
+        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
+        --output-root
+        "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      DEPENDS
+        generate_lite6_native_execution_fixture_tool
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(generate_lite6_native_execution_fixture ALL
+      DEPENDS "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_MANIFEST}")
+
     add_executable(test_retained_product_consumer
       test/test_retained_product_consumer.cpp)
     add_dependencies(
@@ -682,6 +767,17 @@ if(BUILD_TESTING)
         ENVIRONMENT
           "PYTHONOPTIMIZE=1;PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    add_test(
+      NAME native_addressed_execution_process
+      COMMAND
+        "${Python3_EXECUTABLE}" -m pytest
+        "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_roboplan/test/test_native_execution_path.py")
+    set_tests_properties(
+      native_addressed_execution_process
+      PROPERTIES
+        ENVIRONMENT
+          "PYTHONOPTIMIZE=1;PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+        TIMEOUT 60)
 
   endif()
 endif()

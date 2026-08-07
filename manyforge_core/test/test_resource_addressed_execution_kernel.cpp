@@ -103,6 +103,22 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
     }
   }
 
+  void emit_error(ErrorDTO error) {
+    status.last_error = ErrorCode::kExecutionAborted;
+    const KernelEvent event{KernelEventType::kErrorRaised,
+                            next_execution_id,
+                            0,
+                            status.state,
+                            status.state,
+                            std::move(error),
+                            {}};
+    const auto snapshot = callbacks;
+    for (const auto& [id, callback] : snapshot) {
+      (void)id;
+      callback(event);
+    }
+  }
+
   int execute_calls{};
   int command_calls{};
   int stop_calls{};
@@ -447,6 +463,54 @@ TEST(ResourceAddressedExecutionKernelTest, SubordinateEventsAdvanceExactSlotsAnd
   ASSERT_TRUE(completed.ok());
   EXPECT_EQ(completed.value().state, OperationStateKind::kCompleted);
   EXPECT_EQ(completed.value().updated_at_ns, 3000);
+
+  clock.set(4000);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto unchanged = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(unchanged.ok());
+  EXPECT_EQ(unchanged.value().updated_at_ns, 3000);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreservesTheExactErrorRaisedBeforeASeparateTerminalTransition) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        &engine}},
+      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+  const auto accepted = kernel.execute(motion_operation());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+
+  engine.emit_error(ErrorDTO{"planning_failed", "exact planner failure", {{"reason", "no_path"}}});
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kFailed);
+
+  const auto failed = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(failed.ok()) << failed.error().message;
+  ASSERT_TRUE(failed.value().participants.front().terminal_error.has_value());
+  EXPECT_EQ(failed.value().participants.front().terminal_error->details.at("reason"), "no_path");
+  EXPECT_EQ(failed.value().participants.front().terminal_error->message, "exact planner failure");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     DoesNotAttachARecoveredSubordinateErrorToSuccessfulCompletion) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        &engine}},
+      clock, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+  const auto accepted = kernel.execute(motion_operation());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+
+  engine.emit_error(
+      ErrorDTO{"planning_warning", "recoverable planner warning", {{"reason", "recovered"}}});
+  engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
+
+  const auto completed = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(completed.ok()) << completed.error().message;
+  EXPECT_EQ(completed.value().state, OperationStateKind::kCompleted);
+  EXPECT_FALSE(completed.value().participants.front().terminal_error.has_value());
 }
 
 TEST(ResourceAddressedExecutionKernelTest, RejectsStaleEpochBeforeResolutionOrSubordinateEffect) {

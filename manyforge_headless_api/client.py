@@ -145,6 +145,21 @@ class HeadlessHttpClient:
     def manager_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/manager/apply", body=body)
 
+    def execution_status(self) -> dict[str, Any]:
+        return self.request("GET", "/api/execution/status")
+
+    def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/execution/operations", body=body)
+
+    def operation(self, operation_id: str) -> dict[str, Any]:
+        if not operation_id or len(operation_id.encode("utf-8")) > 256:
+            raise ValueError("operation_id must be bounded non-empty text")
+        if "/" in operation_id or ".." in operation_id:
+            raise ValueError("operation_id is invalid for an HTTP path")
+        return self.request(
+            "GET", f"/api/execution/operations/{operation_id}"
+        )
+
     def scene(self) -> dict[str, Any]:
         return self.request("GET", "/api/scene")
 

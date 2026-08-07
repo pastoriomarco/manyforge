@@ -3,12 +3,16 @@
 > **Current `dev` status:** this document still describes the last complete
 > three-lane runtime baseline. The composable-cell destructive cutover has
 > removed the legacy scene owner and RoboPlan native/ROS factories; program
-> execution and all three lanes are intentionally unavailable. The new Core,
+> execution and all three complete lanes are intentionally unavailable. The new Core,
 > retained-product, canonical-empty scene-owner, and Manager foundations now
 > include the I5/H0 Manager daemon, independent headless runtime/scene/alarm/
 > historian owners, public API/CLI, and thin Composer/assistant read clients.
-> Robot readiness, provider/authoring effects, and end-to-end execution remain
-> unavailable until their later gates.
+> I6/N3 additionally proves one exact retained Program/Program-Binding absolute
+> joint-goal path through a restartable C++ native owner and thin headless,
+> Behavior, and Composer clients. That bounded slice is not a complete product
+> lane. Robot readiness, lifecycle/controls, live scene/manipulation,
+> provider/authoring effects, and general Program execution remain unavailable
+> until their later gates.
 > Unless a section explicitly identifies a retained foundation or target
 > design, present-tense ownership and flow descriptions below refer to the
 > captured three-lane baseline.

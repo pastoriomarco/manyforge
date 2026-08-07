@@ -41,9 +41,15 @@ class ProcessStack:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.manager_root = root / "manager"
+        self.execution_root = root / "execution"
         self.runtime_root = root / "runtime"
         self.publication_root = root / "publications"
-        for path in (self.manager_root, self.runtime_root, self.publication_root):
+        for path in (
+            self.manager_root,
+            self.execution_root,
+            self.runtime_root,
+            self.publication_root,
+        ):
             path.mkdir()
         self.scene_database = root / "logical-scene.sqlite3"
         self.history_database = root / "history.sqlite3"
@@ -106,6 +112,8 @@ class ProcessStack:
                 str(self.history_database),
                 "--manager-state-root",
                 str(self.manager_root),
+                "--execution-state-root",
+                str(self.execution_root),
                 "--cell-id",
                 "c1_build_authority_cell",
                 "--owner-id",

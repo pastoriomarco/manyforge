@@ -47,6 +47,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--alarm-catalog-path", type=Path, required=True)
     serve.add_argument("--historian-database-path", type=Path, required=True)
     serve.add_argument("--manager-state-root", type=Path, required=True)
+    serve.add_argument("--execution-state-root", type=Path, required=True)
     serve.add_argument("--cell-id", required=True)
     serve.add_argument("--resource-id", action="append", default=[])
     serve.add_argument("--owner-id", default="headless-api")
@@ -129,6 +130,7 @@ def _serve(args: argparse.Namespace) -> int:
         alarm_catalog_path=args.alarm_catalog_path,
         historian_database_path=args.historian_database_path,
         manager_state_root=args.manager_state_root,
+        execution_state_root=args.execution_state_root,
         cell_id=args.cell_id,
         resource_ids=tuple(sorted(set(args.resource_id))),
         owner_id=args.owner_id,

@@ -1,20 +1,27 @@
-"""The old singleton Python Kernel contract is unavailable until I6/N."""
+"""The Python surface is a transport adapter, never a Kernel implementation."""
 
 import pytest
 
-from manyforge_behavior.kernel_client import (
-    KernelClient,
-    KernelClientBindingUnavailableError,
-)
+from manyforge_behavior.kernel_client import KernelClient
 
 
-def test_contract_fails_before_old_execute_or_stop_contract_is_exposed() -> None:
-    class PoisonBinding:
-        def __getattribute__(self, name: str) -> object:
-            raise AssertionError(f"binding was accessed: {name}")
+def test_contract_requires_only_the_three_headless_transport_calls() -> None:
+    class IncompleteTransport:
+        def execution_status(self):
+            return {"ok": True}
 
-    with pytest.raises(
-        KernelClientBindingUnavailableError,
-        match="composable_cell_kernel_client_binding_unavailable",
-    ):
-        KernelClient(PoisonBinding())
+    with pytest.raises(TypeError, match="execute"):
+        KernelClient(IncompleteTransport())  # type: ignore[arg-type]
+
+
+def test_contract_constructor_does_not_call_the_transport() -> None:
+    class PoisonCallable:
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("transport was called during construction")
+
+    class Transport:
+        execution_status = PoisonCallable()
+        execute = PoisonCallable()
+        operation = PoisonCallable()
+
+    KernelClient(Transport())

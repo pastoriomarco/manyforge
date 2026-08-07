@@ -21,8 +21,10 @@ NODE_CATALOG = Path("/workspace/manyforge_behavior/resources/node_catalog.yaml")
 def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
     publication_root = root / "publications"
     manager_state_root = root / "manager"
+    execution_state_root = root / "execution"
     publication_root.mkdir(exist_ok=True)
     manager_state_root.mkdir(exist_ok=True)
+    execution_state_root.mkdir(exist_ok=True)
     return HeadlessApiConfig(
         publication_root=publication_root,
         package_root=Path(os.environ["MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"]),
@@ -30,6 +32,7 @@ def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
         alarm_catalog_path=CATALOG,
         historian_database_path=root / "history.sqlite3",
         manager_state_root=manager_state_root,
+        execution_state_root=execution_state_root,
         cell_id="c1_build_authority_cell",
         resource_ids=("resource.arm.a",),
         owner_id="headless-api.test",

@@ -120,7 +120,7 @@ template <typename Value>
       return false;
     }
   }
-  return !units.empty();
+  return true;
 }
 
 [[nodiscard]] bool state_matches_request(

@@ -1,24 +1,115 @@
-"""Cutover gate for Program-Binding execution."""
+"""First Program-Binding Behavior caller remains transport-only."""
+
+from __future__ import annotations
+
+from typing import Any, Mapping
 
 import pytest
 
-from manyforge_behavior.runner import (
-    ORCHESTRATOR_RUNNER_RESTORATION_GATES,
-    OrchestratorRunner,
-    OrchestratorRunnerUnavailableError,
+from manyforge_behavior.kernel_client import (
+    KernelClient,
+    KernelClientResponseError,
 )
+from manyforge_behavior.runner import OrchestratorRunner
 
 
-def test_runner_fails_before_artifact_kernel_or_callback_access() -> None:
-    class PoisonCollaborator:
-        def __getattribute__(self, name: str) -> object:
-            raise AssertionError(f"runner collaborator was accessed: {name}")
+class RecordingTransport:
+    submitted: Mapping[str, Any] | None = None
 
-    poison = PoisonCollaborator()
-    with pytest.raises(
-        OrchestratorRunnerUnavailableError,
-        match="composable_cell_orchestrator_runner_unavailable",
-    ):
-        OrchestratorRunner(poison, poison, poison, event_recorder=poison)
+    def execution_status(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": {
+                "owner_epoch": "owner-epoch-7",
+                "program_id": "program-1",
+                "program_revision": "sha256:" + "1" * 64,
+                "program_binding_id": "binding-1",
+                "graph_revision": "sha256:" + "2" * 64,
+                "retained_bundle_id": "sha256:" + "3" * 64,
+                "motion_target_role_id": "arm",
+                "scene_revision": {
+                    "scene_id": "scene-1",
+                    "revision_id": 1,
+                    "content_hash": "sha256:" + "4" * 64,
+                },
+            },
+        }
 
-    assert ORCHESTRATOR_RUNNER_RESTORATION_GATES == ("I6", "N")
+    def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.submitted = body
+        return {
+            "ok": True,
+            "accepted": {"operation_id": "operation-1"},
+        }
+
+    def operation(self, operation_id: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "operation": {"operation_id": operation_id, "state": "completed"},
+        }
+
+
+def test_runner_submits_source_joint_names_against_exact_owner_selection() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport))
+
+    accepted = runner.submit_joint_goal(
+        request_id="request-1",
+        program_run_id="run-1",
+        component_role_id="robot",
+        target_role_id="arm",
+        node_instance_id="root/move[0]",
+        node_attempt_id="run-1/move[0]/attempt-1",
+        move_id="move-1",
+        joint_names=("joint2", "joint1"),
+        positions_rad=(0.2, -0.1),
+    )
+
+    assert accepted["accepted"]["operation_id"] == "operation-1"
+    assert transport.submitted is not None
+    request = transport.submitted
+    assert request["request_context"]["request_owner_epoch"] == "owner-epoch-7"
+    assert request["program_binding_id"] == "binding-1"
+    assert request["expected_retained_bundle_id"] == "sha256:" + "3" * 64
+    participant = request["participants"][0]
+    assert participant["component_role_id"] == "robot"
+    assert participant["target_role_id"] == "arm"
+    assert participant["payload"]["motion"] == {
+        "kind": "joint_goal",
+        "joint_names": ["joint2", "joint1"],
+        "positions_rad": [0.2, -0.1],
+    }
+    assert "robot_id" not in repr(request)
+    assert "group_id" not in repr(request)
+
+
+def test_runner_reads_owner_projection_without_reducing_it() -> None:
+    runner = OrchestratorRunner(KernelClient(RecordingTransport()))
+    assert runner.operation("operation-1")["operation"] == {
+        "operation_id": "operation-1",
+        "state": "completed",
+    }
+
+
+def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> None:
+    class IncompleteStatusTransport(RecordingTransport):
+        def execution_status(self) -> dict[str, Any]:
+            return {"ok": True, "status": {"owner_epoch": "owner-epoch-7"}}
+
+    transport = IncompleteStatusTransport()
+    runner = OrchestratorRunner(KernelClient(transport))
+
+    with pytest.raises(KernelClientResponseError, match="incomplete"):
+        runner.submit_joint_goal(
+            request_id="request-1",
+            program_run_id="run-1",
+            component_role_id="robot",
+            target_role_id="arm",
+            node_instance_id="root/move[0]",
+            node_attempt_id="run-1/move[0]/attempt-1",
+            move_id="move-1",
+            joint_names=("joint1",),
+            positions_rad=(0.1,),
+        )
+
+    assert transport.submitted is None

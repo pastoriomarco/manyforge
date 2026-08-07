@@ -1273,26 +1273,43 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
     roboplan::JointConfiguration native_goal;
     native_goal.joint_names = binding_.compiled_joint_names;
     bool resolved_from_pose = false;
-    if (const auto* joint =
-            std::get_if<core::ResolvedJointGoalDTO>(&request.motion)) {
-      if (joint->resources != binding_.resources ||
-          joint->joint_names != binding_.compiled_joint_names ||
-          joint->positions_rad.size() != binding_.resources.size() ||
-          !std::all_of(joint->positions_rad.begin(),
-                       joint->positions_rad.end(), finite)) {
+    if (const auto* joint = std::get_if<core::ResolvedJointGoalDTO>(&request.motion)) {
+      if (joint->resources.empty() || joint->resources.size() != joint->joint_names.size() ||
+          joint->resources.size() != joint->positions_rad.size() ||
+          joint->resources.size() > binding_.resources.size()) {
         return fail<core::TrajectoryDTO>(
             ErrorCode::kInvalidRequest,
             "Resolved joint goal differs from the exact participant binding",
             "native_joint_goal_binding_mismatch");
       }
-      native_goal.positions = eigen_vector(joint->positions_rad);
-    } else if (const auto* pose =
-                   std::get_if<core::PoseGoalDTO>(&request.motion)) {
-      auto solution = solve_ik_locked(
-          planning_scene, binding_, pose->goal, request.base_frame,
-          request.tcp_frame, request.start_state,
-          request.planning_timeout_s, control, request.planning_profile,
-          &request.tolerances);
+      native_goal.positions = native_start.positions;
+      std::set<std::size_t> selected_indices;
+      for (std::size_t index = 0U; index < joint->resources.size(); ++index) {
+        const auto selected = std::find(binding_.resources.begin(), binding_.resources.end(),
+                                        joint->resources[index]);
+        if (selected == binding_.resources.end() || !finite(joint->positions_rad[index])) {
+          return fail<core::TrajectoryDTO>(
+              ErrorCode::kInvalidRequest,
+              "Resolved joint goal differs from the exact participant binding",
+              "native_joint_goal_binding_mismatch");
+        }
+        const auto selected_index =
+            static_cast<std::size_t>(std::distance(binding_.resources.begin(), selected));
+        if (binding_.compiled_joint_names[selected_index] != joint->joint_names[index] ||
+            !selected_indices.insert(selected_index).second) {
+          return fail<core::TrajectoryDTO>(
+              ErrorCode::kInvalidRequest,
+              "Resolved joint goal differs from the exact participant binding",
+              "native_joint_goal_binding_mismatch");
+        }
+        native_goal.positions[static_cast<Eigen::Index>(selected_index)] =
+            joint->positions_rad[index];
+      }
+    } else if (const auto* pose = std::get_if<core::PoseGoalDTO>(&request.motion)) {
+      auto solution =
+          solve_ik_locked(planning_scene, binding_, pose->goal, request.base_frame,
+                          request.tcp_frame, request.start_state, request.planning_timeout_s,
+                          control, request.planning_profile, &request.tolerances);
       if (!solution.ok()) {
         return core::Result<core::TrajectoryDTO>::Err(solution.error());
       }

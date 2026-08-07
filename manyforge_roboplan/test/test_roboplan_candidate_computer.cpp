@@ -164,7 +164,28 @@ TEST(RoboPlanCandidateComputerTest,
 }
 
 TEST(RoboPlanCandidateComputerTest,
-     PoseAndCartesianInputsUseTheSameExactProjection) {
+     JointSubsetRetainsAuthoredPairsAndUsesStartForUnselectedCoordinates) {
+  auto fixture = make_fixture();
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01});
+  const std::size_t last = fixture.binding.resources.size() - 1U;
+  const ResolvedJointGoalDTO subset{
+      {fixture.binding.resources[last], fixture.binding.resources.front()},
+      {fixture.binding.compiled_joint_names[last], fixture.binding.compiled_joint_names.front()},
+      {fixture.goal[static_cast<Eigen::Index>(last)], fixture.goal[0]}};
+
+  const auto result = computer.compute(request(fixture, ResolvedMotionSpecDTO{subset}));
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  auto expected = fixture.start;
+  expected[0] = fixture.goal[0];
+  expected[static_cast<Eigen::Index>(last)] = fixture.goal[static_cast<Eigen::Index>(last)];
+  EXPECT_EQ(result.value().waypoints.back().positions_rad, values(expected));
+  EXPECT_EQ(result.value().resources, fixture.binding.resources);
+  EXPECT_EQ(result.value().joint_names, fixture.binding.compiled_joint_names);
+}
+
+TEST(RoboPlanCandidateComputerTest, PoseAndCartesianInputsUseTheSameExactProjection) {
   auto fixture = make_fixture();
   RoboPlanCandidateComputer computer(
       fixture.scene, fixture.binding,

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Regenerate code-owned structural Composer or headless H0 REST references.
+"""Regenerate code-owned structural Composer or headless REST references.
 
 The composable-cell cutover still removes the former aggregate MCP, assistant,
-viewer, execution, and lifecycle contract owners. The explicit generators are:
+viewer, and lifecycle contract owners. The explicit generators are:
 
   - ``docs/reference/REST_API.md`` from
     ``create_app(ComposerState()).openapi()``.
-  - ``docs/reference/HEADLESS_REST_API.md`` from the independent H0 FastAPI
+  - ``docs/reference/HEADLESS_REST_API.md`` from the independent H0/N3 FastAPI
     route owner.
 
 Do not add unavailable product surfaces or synthetic compatibility contracts
@@ -169,12 +169,14 @@ def gen_headless_rest_api() -> str:
         "# Headless Runtime REST API\n\n",
     ]
     body.append(
-        "This is the independent I5/H0 projection over Manager, logical-scene, "
-        "scene-runtime, Alarm Lifecycle, and Historian owners. Reads return "
-        "owner-issued facts. Alarm acknowledgement and Manager Apply are "
-        "attributed intents; Apply remains a typed `kernel_owner_unavailable` "
-        "operation until I6/N supplies the execution-host owner. No condition "
-        "mutation endpoint exists. `/api/health` reports only "
+        "This is the independent headless projection over Manager, "
+        "logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the "
+        "selected addressed execution owner. Reads return owner-issued facts. "
+        "Alarm acknowledgement, Manager Apply, and execution submission are "
+        "attributed intents; the API never owns or reduces execution state. "
+        "The N3 execution path does not by itself make Manager Apply's "
+        "separate Kernel fence operational. No condition mutation endpoint "
+        "exists. `/api/health` reports only "
         "`headless_projection_ready`; robot readiness has no H0 owner and is "
         "explicitly unavailable. The alarm page defaults to 32 records and is "
         "bounded at 128, history defaults to and is bounded at 32 records, "

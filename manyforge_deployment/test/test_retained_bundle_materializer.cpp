@@ -925,12 +925,33 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(array_member(targets.front(), "collision_bodies").size(), 1U);
 }
 
-TEST(RetainedBundleMaterializer,
-     TwoSameTypeComponentsRetainDistinctTargetsResourcesAndDomains) {
-  const auto fixture =
-      test::make_two_lite6_same_type_controllable_retention_fixture();
-  const test::Lite6ControllableCompilerInputArtifactSource input_source(
-      fixture);
+TEST(RetainedBundleMaterializer, ControllableLite6RetainsExactNativeMotionProviderBinding) {
+  const auto fixture = test::make_lite6_native_motion_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified, detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 1U);
+  const auto& provider = bundle->value().capability_provider_bindings.front();
+  EXPECT_EQ(provider.capability_provider_binding_id.value(), "lite6_joint_planner_binding");
+  EXPECT_EQ(provider.capability_id.value(), "planning.motion.joint_goal");
+  EXPECT_EQ(provider.provider_manifest_id.value(), "lite6_native_joint_planner");
+  EXPECT_TRUE(provider.endpoint_bindings.empty());
+  EXPECT_EQ(provider, fixture.qualified.deployment()
+                          .applicability_inputs()
+                          .value()
+                          .capability_provider_bindings.front());
+}
+
+TEST(RetainedBundleMaterializer, TwoSameTypeComponentsRetainDistinctTargetsResourcesAndDomains) {
+  const auto fixture = test::make_two_lite6_same_type_controllable_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(fixture);
   test::InMemoryCatalogArtifactStoreFixture catalog_store;
   test::InMemoryRawArtifactStoreFixture raw_store;
 

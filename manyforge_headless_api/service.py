@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from .execution import ExecutionPort
 from .manager import ManagerPort
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    OperationIntentRequest,
 )
 from .native import HeadlessApiError, HeadlessCorePort
 
@@ -28,9 +30,32 @@ class TrustedAttribution:
 class HeadlessService:
     """Select fields from immutable owner snapshots; own no runtime state."""
 
-    def __init__(self, core: HeadlessCorePort, manager: ManagerPort) -> None:
+    def __init__(
+        self,
+        core: HeadlessCorePort,
+        manager: ManagerPort,
+        execution: ExecutionPort | None = None,
+    ) -> None:
         self.core = core
         self.manager = manager
+        self.execution = execution
+
+    def _execution(self) -> ExecutionPort:
+        if self.execution is None:
+            raise HeadlessApiError(
+                "execution_owner_unavailable",
+                "native execution owner is not configured",
+            )
+        return self.execution
+
+    def execution_status(self) -> dict[str, Any]:
+        return self._execution().status()
+
+    def execution_submit(self, request: OperationIntentRequest) -> dict[str, Any]:
+        return self._execution().submit(request)
+
+    def execution_read(self, operation_id: str) -> dict[str, Any]:
+        return self._execution().read(operation_id)
 
     def runtime(self) -> dict[str, Any]:
         snapshot = self.core.runtime_snapshot()

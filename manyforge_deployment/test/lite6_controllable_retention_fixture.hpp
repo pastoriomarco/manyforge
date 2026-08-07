@@ -55,6 +55,8 @@ struct Lite6ControllableRetentionFixture final {
   std::optional<QualifiedControlInterfaceContract> gripper_control_contract;
   std::optional<QualifiedControllerTopology> gripper_topology;
   std::optional<QualifiedProviderManifest> gripper_provider_manifest;
+  std::optional<QualifiedCapabilityDefinition> planner_capability;
+  std::optional<QualifiedProviderManifest> planner_provider_manifest;
 
   [[nodiscard]] std::span<
       const BuildQualifiedStructuralModelPreparation>
@@ -178,6 +180,8 @@ struct QualifiedControlCatalog final {
   std::optional<QualifiedControlInterfaceContract> gripper_contract;
   std::optional<QualifiedControllerTopology> gripper_topology;
   std::optional<QualifiedProviderManifest> gripper_provider;
+  std::optional<QualifiedCapabilityDefinition> planner_capability;
+  std::optional<QualifiedProviderManifest> planner_provider;
 };
 
 struct AssistantOverlayFixture final {
@@ -293,17 +297,20 @@ struct AssistantOverlayFixture final {
 }
 
 [[nodiscard]] inline QualifiedControlCatalog
-qualify_control_catalog(bool chained) {
+qualify_control_catalog(bool chained, bool native_motion = false) {
+  const std::string_view primary_capability_id =
+      native_motion ? "execution.trajectory.execute" : "state.observed.current";
   const auto* descriptor =
-      core::find_builtin_capability_definition("state.observed.current");
+      core::find_builtin_capability_definition(primary_capability_id);
   if (descriptor == nullptr) {
     throw std::logic_error(
-        "Lite6 control fixture requires state.observed.current");
+        "Lite6 control fixture requires its primary capability");
   }
   CanonicalValue::Object capability_root{
       {"api_version",
        CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
-      {"capability_id", CanonicalValue("state.observed.current")},
+      {"capability_id",
+       CanonicalValue(std::string(primary_capability_id))},
       {"scope",
        CanonicalValue(std::string(core::to_string(descriptor->scope)))},
       {"provider_binding_kind",
@@ -320,7 +327,7 @@ qualify_control_catalog(bool chained) {
   const core::ContentAddressedStoreKey capability_key(
       catalog_key("capability", capability_digest.value()));
   const core::CapabilityDefinitionCatalogRecordRefDTO capability_ref{
-      core::CapabilityId("state.observed.current"),
+      core::CapabilityId(std::string(primary_capability_id)),
       core::CapabilityDefinitionRevision(
           std::string(descriptor->capability_definition_revision)),
       core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
@@ -330,6 +337,52 @@ qualify_control_catalog(bool chained) {
   };
   auto capability = resolve_and_qualify_capability_definition(
       capability_ref, capability_key, capability_bytes);
+
+  std::optional<QualifiedCapabilityDefinition> planner_capability;
+  std::optional<std::string> planner_capability_bytes;
+  if (native_motion) {
+    const auto* planner_descriptor =
+        core::find_builtin_capability_definition("planning.motion.joint_goal");
+    if (planner_descriptor == nullptr) {
+      throw std::logic_error("Lite6 native-motion fixture requires joint planning");
+    }
+    planner_capability_bytes = canonical_json(CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
+        {"capability_id", CanonicalValue("planning.motion.joint_goal")},
+        {"scope", CanonicalValue(std::string(core::to_string(planner_descriptor->scope)))},
+        {"provider_binding_kind",
+         CanonicalValue(std::string(core::to_string(planner_descriptor->provider_binding_kind)))},
+        {"capability_definition_revision",
+         CanonicalValue(std::string(planner_descriptor->capability_definition_revision))},
+    }));
+    const core::ContentDigest planner_digest(sha256_digest(*planner_capability_bytes));
+    const core::ContentAddressedStoreKey planner_key(
+        catalog_key("capability", planner_digest.value()));
+    const core::CapabilityDefinitionCatalogRecordRefDTO planner_ref{
+        core::CapabilityId("planning.motion.joint_goal"),
+        core::CapabilityDefinitionRevision(
+            std::string(planner_descriptor->capability_definition_revision)),
+        core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
+        planner_digest,
+        planner_key,
+    };
+    planner_capability = resolve_and_qualify_capability_definition(planner_ref, planner_key,
+                                                                   *planner_capability_bytes);
+  }
+
+  CanonicalValue::Array target_capabilities{CanonicalValue(CanonicalValue::Object{
+      {"capability_id", CanonicalValue(capability.value().capability_id.value())},
+      {"capability_definition_revision",
+       CanonicalValue(capability.value().capability_definition_revision.value())},
+  })};
+  if (planner_capability.has_value()) {
+    target_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(planner_capability->value().capability_id.value())},
+        {"capability_definition_revision",
+         CanonicalValue(planner_capability->value().capability_definition_revision.value())},
+    });
+  }
 
   const std::string component_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
@@ -400,17 +453,7 @@ qualify_control_catalog(bool chained) {
                              CanonicalValue("arm_collision")},
                         })})},
                    {"capabilities",
-                    CanonicalValue(CanonicalValue::Array{CanonicalValue(
-                        CanonicalValue::Object{
-                            {"capability_id",
-                             CanonicalValue(
-                                 capability.value().capability_id.value())},
-                            {"capability_definition_revision",
-                             CanonicalValue(
-                                 capability.value()
-                                     .capability_definition_revision
-                                     .value())},
-                        })})},
+                    CanonicalValue(std::move(target_capabilities))},
                })})},
           {"attachment_interfaces",
            CanonicalValue(CanonicalValue::Array{})},
@@ -429,9 +472,12 @@ qualify_control_catalog(bool chained) {
       component_digest,
       component_key,
   };
+  std::vector<QualifiedCapabilityDefinition> component_capabilities{capability};
+  if (planner_capability.has_value()) {
+    component_capabilities.push_back(*planner_capability);
+  }
   auto component_type = resolve_and_qualify_component_type(
-      component_ref, component_key, component_bytes,
-      std::span<const QualifiedCapabilityDefinition>(&capability, 1U));
+      component_ref, component_key, component_bytes, component_capabilities);
 
   const std::string contract_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
@@ -638,6 +684,42 @@ qualify_control_catalog(bool chained) {
   auto provider = resolve_and_qualify_provider_manifest(
       provider_ref, provider_key, provider_bytes);
 
+  std::optional<QualifiedProviderManifest> planner_provider;
+  std::optional<std::string> planner_provider_bytes;
+  if (planner_capability.has_value()) {
+    planner_provider_bytes = revisioned_document(
+        CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(core::kProviderManifestApiVersion))},
+            {"provider_manifest_id", CanonicalValue("lite6_native_joint_planner")},
+            {"offered_capabilities",
+             CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                 {"capability_id",
+                  CanonicalValue(planner_capability->value().capability_id.value())},
+                 {"capability_definition_revision",
+                  CanonicalValue(
+                      planner_capability->value().capability_definition_revision.value())},
+                 {"required_endpoint_role_ids", CanonicalValue(CanonicalValue::Array{})},
+             })})},
+            {"provider_contracts", CanonicalValue(CanonicalValue::Array{})},
+        }),
+        "catalog-record-revision/provider_manifest", core::kProviderManifestApiVersion,
+        "provider_manifest_revision");
+    const core::ContentDigest planner_provider_digest(sha256_digest(*planner_provider_bytes));
+    const core::ContentAddressedStoreKey planner_provider_key(
+        catalog_key("provider", planner_provider_digest.value()));
+    const core::ProviderManifestCatalogRecordRefDTO planner_provider_ref{
+        core::ProviderManifestId("lite6_native_joint_planner"),
+        core::ProviderManifestRevision(
+            revision_from_document(*planner_provider_bytes, "provider_manifest_revision")),
+        core::SchemaId(std::string(core::kProviderManifestApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kProviderManifest),
+        planner_provider_digest,
+        planner_provider_key,
+    };
+    planner_provider = resolve_and_qualify_provider_manifest(
+        planner_provider_ref, planner_provider_key, *planner_provider_bytes);
+  }
+
   const std::string stop_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
           {"api_version",
@@ -666,13 +748,11 @@ qualify_control_catalog(bool chained) {
       stop_ref, stop_key, stop_bytes);
 
   std::vector<Lite6InputArtifact> artifacts;
-  artifacts.reserve(6U);
-  artifacts.push_back(
-      catalog_artifact("catalog://capability/state.observed.current",
-                       capability_bytes, capability));
-  artifacts.push_back(
-      catalog_artifact("catalog://component_type/lite6_arm_component",
-                       component_bytes, component_type));
+  artifacts.reserve(native_motion ? 8U : 6U);
+  artifacts.push_back(catalog_artifact("catalog://capability/" + std::string(primary_capability_id),
+                                       capability_bytes, capability));
+  artifacts.push_back(catalog_artifact("catalog://component_type/lite6_arm_component",
+                                       component_bytes, component_type));
   artifacts.push_back(
       catalog_artifact("catalog://control_interface/lite6_arm_position",
                        contract_bytes, contract));
@@ -680,8 +760,14 @@ qualify_control_catalog(bool chained) {
       catalog_artifact("catalog://controller_topology/" + topology_id,
                        topology_bytes, topology));
   artifacts.push_back(
-      catalog_artifact("catalog://provider_manifest/lite6_arm_provider",
-                       provider_bytes, provider));
+      catalog_artifact("catalog://provider_manifest/lite6_arm_provider", provider_bytes, provider));
+  if (planner_capability.has_value() && planner_capability_bytes.has_value() &&
+      planner_provider.has_value() && planner_provider_bytes.has_value()) {
+    artifacts.push_back(catalog_artifact("catalog://capability/planning.motion.joint_goal",
+                                         *planner_capability_bytes, *planner_capability));
+    artifacts.push_back(catalog_artifact("catalog://provider_manifest/lite6_native_joint_planner",
+                                         *planner_provider_bytes, *planner_provider));
+  }
   artifacts.push_back(catalog_artifact(
       "catalog://stop_policy/lite6_not_stoppable", stop_bytes, stop));
 
@@ -698,6 +784,8 @@ qualify_control_catalog(bool chained) {
       std::nullopt,
       std::nullopt,
       std::nullopt,
+      std::move(planner_capability),
+      std::move(planner_provider),
   };
 }
 
@@ -1155,6 +1243,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog) {
     const QualifiedControlCatalog& catalog,
     std::size_t instance_count = 1U) {
   const bool aggregate = catalog.gripper_capability.has_value();
+  const bool native_motion = catalog.planner_capability.has_value();
   if (instance_count == 0U || instance_count > 32U) {
     throw std::logic_error(
         "Lite6 control fixture instance count is outside its test bound");
@@ -1278,8 +1367,11 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog) {
          CanonicalValue(
              catalog.provider.value().provider_manifest_revision.value())},
         {"state_authority_id",
-         CanonicalValue(indexed_id("lite6_measured_state", instance))},
-        {"state_authority_class", CanonicalValue("measured")},
+         CanonicalValue(indexed_id(
+             native_motion ? "lite6_predicted_state" : "lite6_measured_state",
+             instance))},
+        {"state_authority_class",
+         CanonicalValue(native_motion ? "predicted" : "measured")},
         {"stop_evidence_policy_id",
          CanonicalValue(
              catalog.stop.value().stop_evidence_policy_id.value())},
@@ -1378,6 +1470,8 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog) {
       {"cell_id",
        CanonicalValue(aggregate
                           ? "i6_lite6_arm_gripper_aggregate_cell"
+                          : native_motion
+                          ? "i6_lite6_native_motion_cell"
                           : instance_count == 1U
                           ? "i3_lite6_controllable_cell"
                           : "i6_two_lite6_controllable_cell")},
@@ -1397,7 +1491,9 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog) {
 [[nodiscard]] inline RevisionVerifiedDeploymentApplicabilityInputs
 make_applicability_inputs(const GraphRevisionVerifiedCellGraph& graph,
                           const QualifiedProviderManifest& provider,
-                          const AssistantOverlayFixture* assistant_overlay) {
+    const QualifiedCapabilityDefinition* planner_capability,
+    const QualifiedProviderManifest* planner_provider,
+    const AssistantOverlayFixture* assistant_overlay) {
   CanonicalValue::Array desired_configurations;
   desired_configurations.reserve(graph.graph().control_domains.size());
   for (const auto& domain : graph.graph().control_domains) {
@@ -1443,12 +1539,57 @@ make_applicability_inputs(const GraphRevisionVerifiedCellGraph& graph,
         {"binding_routes", CanonicalValue(std::move(binding_routes))},
     });
   }
+  CanonicalValue::Array capability_provider_bindings;
+  if ((planner_capability == nullptr) != (planner_provider == nullptr)) {
+    throw std::logic_error("Lite6 native-motion provider fixture is incomplete");
+  }
+  if (planner_capability != nullptr) {
+    for (std::size_t index = 0U;
+         index < graph.graph().control_bindings.size(); ++index) {
+      const auto& binding = graph.graph().control_bindings[index];
+      const auto component = std::find_if(
+          graph.graph().controllable_components.begin(),
+          graph.graph().controllable_components.end(), [&](const auto& candidate) {
+            return candidate.controllable_component_id == binding.controllable_component_id;
+          });
+      if (component == graph.graph().controllable_components.end()) {
+        throw std::logic_error("Lite6 native-motion binding has no component");
+      }
+      capability_provider_bindings.emplace_back(CanonicalValue::Object{
+          {"capability_provider_binding_id",
+           CanonicalValue(indexed_id("lite6_joint_planner_binding", index))},
+          {"capability_provider_binding_revision", CanonicalValue(std::string(kZeroDigest))},
+          {"capability_id", CanonicalValue(planner_capability->value().capability_id.value())},
+          {"capability_definition_revision",
+           CanonicalValue(planner_capability->value().capability_definition_revision.value())},
+          {"scope", CanonicalValue("target_binding")},
+          {"target", CanonicalValue(CanonicalValue::Object{
+                         {"controllable_component_id",
+                          CanonicalValue(binding.controllable_component_id.value())},
+                         {"component_type_revision",
+                          CanonicalValue(component->component_type_revision.value())},
+                         {"command_target_id", CanonicalValue(binding.command_target_id.value())},
+                         {"control_binding_id", CanonicalValue(binding.control_binding_id.value())},
+                         {"control_binding_revision",
+                          CanonicalValue(binding.control_binding_revision.value())},
+                     })},
+          {"provider_instance_id",
+           CanonicalValue(indexed_id("lite6_native_joint_planner", index))},
+          {"provider_manifest_id",
+           CanonicalValue(planner_provider->value().provider_manifest_id.value())},
+          {"provider_manifest_revision",
+           CanonicalValue(planner_provider->value().provider_manifest_revision.value())},
+          {"endpoint_bindings", CanonicalValue(CanonicalValue::Array{})},
+      });
+    }
+  }
+
   CanonicalValue::Object root_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"desired_control_configurations",
        CanonicalValue(std::move(desired_configurations))},
       {"capability_provider_bindings",
-       CanonicalValue(CanonicalValue::Array{})},
+       CanonicalValue(std::move(capability_provider_bindings))},
   };
   if (assistant_overlay != nullptr) {
     root_members.emplace_back("assistant", assistant_source());
@@ -1488,16 +1629,17 @@ make_applicability_inputs(const GraphRevisionVerifiedCellGraph& graph,
 make_lite6_controllable_retention_fixture(bool chained = false,
                                           bool assistant_enabled = false,
                                           std::size_t instance_count = 1U,
-                                          bool aggregate_gripper = false) {
+                                          bool aggregate_gripper = false,
+                                          bool native_motion = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (aggregate_gripper && (chained || assistant_enabled ||
-                            instance_count != 1U)) {
+                            instance_count != 1U || native_motion)) {
     throw std::logic_error(
         "Lite6 aggregate fixture currently selects one direct native "
         "component");
   }
   auto structural = make_lite6_structural_retention_fixture();
-  auto catalog = fixture_detail::qualify_control_catalog(chained);
+  auto catalog = fixture_detail::qualify_control_catalog(chained, native_motion);
   if (aggregate_gripper) {
     catalog = fixture_detail::add_aggregate_gripper_catalog(
         std::move(catalog));
@@ -1512,6 +1654,8 @@ make_lite6_controllable_retention_fixture(bool chained = false,
                               : std::nullopt;
   const auto inputs = fixture_detail::make_applicability_inputs(
       graph, catalog.provider,
+      catalog.planner_capability.has_value() ? &*catalog.planner_capability : nullptr,
+      catalog.planner_provider.has_value() ? &*catalog.planner_provider : nullptr,
       assistant_overlay.has_value() ? &*assistant_overlay : nullptr);
 
   std::vector<core::CatalogRecordRefDTO> catalog_records{
@@ -1530,6 +1674,10 @@ make_lite6_controllable_retention_fixture(bool chained = false,
     catalog_records.push_back(catalog.gripper_topology->reference());
     catalog_records.push_back(catalog.gripper_provider->reference());
   }
+  if (catalog.planner_capability.has_value()) {
+    catalog_records.push_back(catalog.planner_capability->reference());
+    catalog_records.push_back(catalog.planner_provider->reference());
+  }
   CanonicalValue::Object deployment_graph =
       graph.normalized_root().as_object();
   deployment_graph.erase(
@@ -1544,24 +1692,20 @@ make_lite6_controllable_retention_fixture(bool chained = false,
   CanonicalValue::Object deployment_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"deployment_artifact_id",
-       CanonicalValue(aggregate_gripper
-                          ? "i6_lite6_arm_gripper_aggregate_fixture"
-                          : instance_count == 1U
-                          ? (chained
-                                 ? "i3_lite6_chained_controllable_fixture"
-                                 : "i3_lite6_controllable_fixture")
-                          : "i6_two_lite6_controllable_fixture")},
+       CanonicalValue(native_motion          ? "i6_lite6_native_motion_fixture"
+                      : aggregate_gripper    ? "i6_lite6_arm_gripper_aggregate_fixture"
+                      : instance_count == 1U ? (chained ? "i3_lite6_chained_controllable_fixture"
+                                                        : "i3_lite6_controllable_fixture")
+                                             : "i6_two_lite6_controllable_fixture")},
       {"deployment_revision",
        CanonicalValue(std::string(fixture_detail::kZeroDigest))},
       {"cell_id", CanonicalValue(graph.graph().cell_id.value())},
       {"name",
-       CanonicalValue(aggregate_gripper
-                          ? "I6 Lite6 arm and gripper aggregate fixture"
-                          : instance_count == 1U
-                          ? (chained
-                                 ? "I3 Lite6 chained controllable fixture"
-                                 : "I3 Lite6 controllable fixture")
-                          : "I6 two same-type Lite6 controllable fixture")},
+       CanonicalValue(native_motion          ? "I6 Lite6 addressed native motion fixture"
+                      : aggregate_gripper    ? "I6 Lite6 arm and gripper aggregate fixture"
+                      : instance_count == 1U ? (chained ? "I3 Lite6 chained controllable fixture"
+                                                        : "I3 Lite6 controllable fixture")
+                                             : "I6 two same-type Lite6 controllable fixture")},
       {"catalogs", detail::encode_deployment_catalogs(catalog_records)},
       {"graph", CanonicalValue(std::move(deployment_graph))},
       {"desired_control_configurations",
@@ -1617,6 +1761,10 @@ make_lite6_controllable_retention_fixture(bool chained = false,
     topologies.push_back(*catalog.gripper_topology);
     providers.push_back(*catalog.gripper_provider);
   }
+  if (catalog.planner_capability.has_value()) {
+    capabilities.push_back(*catalog.planner_capability);
+    providers.push_back(*catalog.planner_provider);
+  }
   const std::array<QualifiedStopEvidencePolicy, 1U> stop_policies{
       catalog.stop};
   const auto applicability = qualify_cell_applicability(
@@ -1641,6 +1789,8 @@ make_lite6_controllable_retention_fixture(bool chained = false,
       std::move(catalog.gripper_contract),
       std::move(catalog.gripper_topology),
       std::move(catalog.gripper_provider),
+      std::move(catalog.planner_capability),
+      std::move(catalog.planner_provider),
   };
 }
 
@@ -1662,6 +1812,11 @@ make_lite6_assistant_retention_fixture() {
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_arm_gripper_aggregate_retention_fixture() {
   return make_lite6_controllable_retention_fixture(false, false, 1U, true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_native_motion_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(false, false, 1U, false, true);
 }
 
 class Lite6ControllableCompilerInputArtifactSource final

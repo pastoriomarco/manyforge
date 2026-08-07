@@ -28,6 +28,7 @@ class HeadlessApiConfig:
     alarm_catalog_path: Path
     historian_database_path: Path
     manager_state_root: Path
+    execution_state_root: Path
     cell_id: str
     resource_ids: tuple[str, ...] = ()
     owner_id: str = "headless-api"
@@ -39,6 +40,7 @@ class HeadlessApiConfig:
     historian_record_retention: int = 100_000
     mutation_replay_capacity: int = 4_096
     manager_timeout_seconds: float = 0.25
+    execution_timeout_seconds: float = 10.0
     maximum_request_body_bytes: int = 1024 * 1024
 
     def __post_init__(self) -> None:
@@ -72,6 +74,8 @@ class HeadlessApiConfig:
             raise ValueError("freshness_milliseconds must be positive")
         if not 0 < self.manager_timeout_seconds <= 5:
             raise ValueError("manager_timeout_seconds must be in (0, 5]")
+        if not 0 < self.execution_timeout_seconds <= 30:
+            raise ValueError("execution_timeout_seconds must be in (0, 30]")
         if not 1_024 <= self.maximum_request_body_bytes <= 1024 * 1024:
             raise ValueError(
                 "maximum_request_body_bytes must be between 1024 and 1048576"

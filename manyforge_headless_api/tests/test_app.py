@@ -409,6 +409,35 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert all("condition" not in path or "acknowledge" in path for path in paths)
 
 
+def test_execution_missing_reference_is_a_public_not_found() -> None:
+    class MissingExecution:
+        def status(self) -> dict[str, Any]:
+            raise AssertionError("not called")
+
+        def submit(self, _request: object) -> dict[str, Any]:
+            raise AssertionError("not called")
+
+        def read(self, _operation_id: str) -> dict[str, Any]:
+            return {
+                "api_version": "manyforge.execution_command_response.v1",
+                "ok": False,
+                "error": {
+                    "code": "missing_reference",
+                    "message": "operation is not resident",
+                    "details": {"reason": "operation_not_resident"},
+                },
+            }
+
+    app = create_app(
+        service=HeadlessService(FakeCore(), FakeManager(), MissingExecution())
+    )
+    with TestClient(app) as client:
+        response = client.get("/api/execution/operations/operation-retired")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "missing_reference"
+
+
 @pytest.mark.parametrize(
     ("code", "expected_status"),
     [

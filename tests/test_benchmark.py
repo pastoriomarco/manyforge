@@ -19,6 +19,7 @@ benchmark is rebuilt on the new bindings.
 
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 
 
@@ -35,32 +36,30 @@ if __name__ == "__main__":
     print(_DIRECT_ENTRYPOINT_UNAVAILABLE_MESSAGE, file=sys.stderr)
     raise SystemExit(78)
 
-import pytest
-
 from manyforge_behavior import kernel_client
-from manyforge_behavior.kernel_client import (
-    KERNEL_CLIENT_RESTORATION_GATES,
-    KERNEL_CLIENT_UNAVAILABLE_REASON_CODE,
-    KernelClient,
-    KernelClientBindingUnavailableError,
-)
+from manyforge_behavior.kernel_client import KernelClient
 
 
-class _PoisonBinding:
-    def __getattribute__(self, name: str) -> object:
-        raise AssertionError(f"benchmark gate accessed former binding: {name}")
+class _Transport:
+    def execution_status(self):
+        return {"ok": True, "status": {}}
+
+    def execute(self, body):
+        return {"ok": True, "accepted": {"request": body}}
+
+    def operation(self, operation_id):
+        return {"ok": True, "operation": {"operation_id": operation_id}}
 
 
-def test_native_benchmark_fails_before_binding_or_robot_access() -> None:
-    with pytest.raises(KernelClientBindingUnavailableError) as raised:
-        KernelClient(_PoisonBinding())
-
-    message = str(raised.value)
-    assert KERNEL_CLIENT_UNAVAILABLE_REASON_CODE in message
-    assert "I6/N" in message
-    assert "I8/P5" in message
+def test_native_benchmark_client_is_now_only_a_headless_transport() -> None:
+    client = KernelClient(_Transport())
+    assert client.execute({"component_role_id": "robot"})["accepted"] == {
+        "request": {"component_role_id": "robot"}
+    }
 
 
 def test_native_benchmark_uses_no_singleton_python_request_contract() -> None:
-    assert KERNEL_CLIENT_RESTORATION_GATES == ("I6", "N", "I8", "P5")
     assert not hasattr(kernel_client, "ExecuteRequest")
+    source = Path(kernel_client.__file__).read_text(encoding="utf-8")
+    assert "robot_id" not in source
+    assert "group_id" not in source

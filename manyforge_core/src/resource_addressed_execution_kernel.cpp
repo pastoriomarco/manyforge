@@ -456,6 +456,7 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   std::uint64_t subordinate_id{};
   std::uint64_t subordinate_generation{};
   std::optional<OperationControlKind> pending_control;
+  std::optional<ErrorDTO> last_subordinate_error;
 };
 
 struct ResourceAddressedExecutionKernel::EngineSubscription final {
@@ -647,9 +648,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
 
   {
     std::lock_guard state_lock(state_mutex_);
-    active_operation_ = std::make_unique<ActiveOperation>(ActiveOperation{
-        intent, accepted, resolved.value(), engine, slot_owner, resources, payload_kind,
-        std::move(operation_state_dto), ResourceSlotState::kReserved, 0U, 0U, std::nullopt});
+    active_operation_ = std::make_unique<ActiveOperation>(
+        ActiveOperation{intent, accepted, resolved.value(), engine, slot_owner, resources,
+                        payload_kind, std::move(operation_state_dto), ResourceSlotState::kReserved,
+                        0U, 0U, std::nullopt, std::nullopt});
   }
 
   Result<void> dispatch_result = Result<void>::Ok();
@@ -1014,6 +1016,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     // is reserved for terminal containment/Reset paths.
     desired_slot.reset();
   }
+  bool slot_changed = false;
   if (desired_slot.has_value() && active_operation_->slot_state != *desired_slot) {
     auto transition = resource_slots_.transition(active_operation_->slot_owner,
                                                  active_operation_->resources, *desired_slot);
@@ -1026,12 +1029,38 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       return transition;
     }
     active_operation_->slot_state = *desired_slot;
+    slot_changed = true;
+  }
+
+  auto& participant = active_operation_->state.participants.front();
+  const double bounded_progress = std::clamp(progress, 0.0, 1.0);
+  const bool failure_terminal = state == OperationStateKind::kFailed ||
+                                state == OperationStateKind::kStopped ||
+                                state == OperationStateKind::kInterrupted ||
+                                state == OperationStateKind::kInterventionRequired;
+  if (failure_terminal) {
+    const bool generic_subordinate_error =
+        terminal_error.has_value() && terminal_error->details.contains("reason") &&
+        terminal_error->details.at("reason") == "subordinate_terminal_error";
+    if ((!terminal_error.has_value() || generic_subordinate_error) &&
+        active_operation_->last_subordinate_error.has_value()) {
+      terminal_error = active_operation_->last_subordinate_error;
+    }
+  }
+  const bool same_terminal_error =
+      participant.terminal_error.has_value() == terminal_error.has_value() &&
+      (!terminal_error.has_value() ||
+       (participant.terminal_error->code == terminal_error->code &&
+        participant.terminal_error->message == terminal_error->message &&
+        participant.terminal_error->details == terminal_error->details));
+  if (!slot_changed && active_operation_->state.state == state && participant.state == state &&
+      participant.progress == bounded_progress && (!terminal(state) || same_terminal_error)) {
+    return Result<void>::Ok();
   }
 
   active_operation_->state.state = state;
-  auto& participant = active_operation_->state.participants.front();
   participant.state = state;
-  participant.progress = std::clamp(progress, 0.0, 1.0);
+  participant.progress = bounded_progress;
   if (terminal(state)) {
     participant.terminal_error = std::move(terminal_error);
   }
@@ -1041,6 +1070,18 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
 
 void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecutionEngine* engine,
                                                        const KernelEvent& event) {
+  if (event.type == KernelEventType::kErrorRaised) {
+    if (!event.error.has_value()) {
+      return;
+    }
+    std::lock_guard state_lock(state_mutex_);
+    if (active_operation_ != nullptr && active_operation_->engine == engine &&
+        (active_operation_->subordinate_id == 0U ||
+         active_operation_->subordinate_id == event.execution_id)) {
+      active_operation_->last_subordinate_error = event.error;
+    }
+    return;
+  }
   if (event.type != KernelEventType::kStateTransition &&
       event.type != KernelEventType::kExecuteStarted &&
       event.type != KernelEventType::kExecuteCompleted) {

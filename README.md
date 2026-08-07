@@ -16,9 +16,12 @@ not currently available on `dev`.
 > it across Manager replacement, reconciles crash/restart, and shuts it down
 > explicitly. I5/H0 now exposes the independent Manager/headless API, CLI,
 > alarms/history, verified NodeEnvironment projection, and thin Composer read
-> clients without restoring a product lane. Composer program execution and all
-> three product lanes remain intentionally unavailable. Native execution
-> returns at I6/N, and Isaac/real
+> clients without restoring a product lane. I6/N3 now proves one bounded native
+> absolute joint-goal path through an independently restartable C++ owner,
+> headless API, Behavior caller, and Composer proxy. It is development evidence,
+> not the complete native lane or an operator workflow. Composer Program-tree
+> execution and all three product lanes remain intentionally unavailable; the
+> full native lane closes at I6/N, and Isaac/real
 > operation at I9/I10. The launch recipes below describe the last qualified
 > baseline; they are not valid bring-up instructions for the current `dev`
 > branch.
@@ -175,14 +178,14 @@ manyforge_scene/         Canonical-empty and bounded runtime-only Apply logical-
 manyforge_deployment/    ROS-free composable-cell codec, qualification, final C++ trust boundary, and retention substrate
 manyforge_component_manager/  ROS-free I4 owner for the bounded M0 Apply/runtime fixture
 manyforge_collision/     C++ planner-neutral collision query implementation
-manyforge_roboplan/      Retained planning-model staging and offline RoboPlan import qualification
+manyforge_roboplan/      Retained planning-model staging and bounded N3 native execution host
 manyforge_ros2_control_execution/  Retained C++ ROS execution/admission library; no current product lane
 manyforge_robot_lifecycle/  Retained ROS-independent lifecycle core; no current physical ingress
 manyforge_robot_lifecycle_msgs/  ROS IDL for same-host lifecycle admission transport
 manyforge_xarm_adapter/  Experimental xArm model/binding/observation inputs; no live lane
 manyforge_xarm_control/  Experimental xArm lifecycle adapter; no live provider wiring
-manyforge_behavior/      Build-owned v2 node environment; runtime entry points unavailable
-manyforge_composer/      Structural FastAPI/React shell; runtime/MCP/viewer unavailable
+manyforge_behavior/      Build-owned v2 node environment and thin N3 joint-goal caller
+manyforge_composer/      Structural FastAPI/React shell and thin H0/N3 clients
 manyforge_ros/           Retained pure contracts and explicit unavailable runtime boundaries
 tests/                   Cutover and package contract tests
 scripts/                 Build/test/setup scripts
@@ -213,9 +216,9 @@ initialization, recovery, and observability model, see
 [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md).
 
 - **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
-- **manyforge_roboplan** currently provides retained planning-model staging
-  and offline RoboPlan import qualification. Runtime planning/execution is
-  intentionally unavailable until the target adapter is restored.
+- **manyforge_roboplan** provides retained planning-model staging and the
+  selected N3 native joint-goal host/adapter. Broader motion, controls, scene,
+  manipulation, and complete product-lane operation remain unavailable.
 - Python code calls C++ through pybind11 bindings -- no duplicate state machines.
 - The Docker container includes all dependencies (Pinocchio, RoboPlan, pybind11).
 
@@ -242,10 +245,12 @@ historical design inputs:
   The live OpenAPI schema is also available at `http://localhost:9000/docs`
   and `http://localhost:9000/openapi.json` once Composer is running.
 - **Headless REST/CLI** — the independent Manager, runtime, scene, alarm,
-  history, and health projection defaults to `http://127.0.0.1:9010` when
+  history, health, and thin N3 execution projection defaults to
+  `http://127.0.0.1:9010` when
   started with `python -m manyforge_headless_api serve`. Contract:
   [`docs/reference/HEADLESS_REST_API.md`](docs/reference/HEADLESS_REST_API.md).
-  It reports robot readiness and operational Apply as unavailable until I6/N.
+  It still reports robot readiness and operational Apply as unavailable; the
+  N3 execution endpoints expose only the selected bounded native slice.
 - **MCP Server (historical)** — former Model Context Protocol interface.
   Reference-only tool contract:
   [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md).

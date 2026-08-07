@@ -654,12 +654,10 @@ void require_qualified_structural_subset_before_store(
   const auto& inputs = deployment.applicability_inputs().value();
   const auto& compiler = qualified.compiler_ir();
 
-  if (graph.runtime_units.size() > 1U ||
-      !graph.component_attachments.empty() ||
-      !inputs.capability_provider_bindings.empty()) {
+  if (graph.runtime_units.size() > 1U || !graph.component_attachments.empty()) {
     detail::fail_retained_bundle(
-        "retained-bundle materialization excludes multiple runtime units, "
-        "attachments, and provider bindings");
+        "retained-bundle materialization excludes multiple runtime units "
+        "and attachments");
   }
 
   const auto& applicability = compiler.applicability();
