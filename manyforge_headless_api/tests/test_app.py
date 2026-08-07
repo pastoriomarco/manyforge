@@ -169,6 +169,86 @@ class FakeManager:
         }
 
 
+class FakeExecution:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, object]] = []
+        self.principals: list[tuple[str, str | None]] = []
+
+    def status(self) -> dict[str, Any]:
+        return {"ok": True, "command": "status", "status": {}}
+
+    def submit(
+        self,
+        request: object,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.requests.append(("submit", request))
+        self.principals.append(("submit", trusted_principal_id))
+        return {"ok": True, "command": "submit", "accepted": {}}
+
+    def read(self, operation_id: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "command": "read",
+            "operation": {"operation_id": operation_id},
+        }
+
+    def _control(
+        self,
+        kind: str,
+        request: object,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.requests.append((kind, request))
+        self.principals.append((kind, trusted_principal_id))
+        return {"ok": True, "command": kind, "accepted": {"control": kind}}
+
+    def pause(
+        self, request: object, *, trusted_principal_id: str | None
+    ) -> dict[str, Any]:
+        return self._control("pause", request, trusted_principal_id)
+
+    def resume(
+        self, request: object, *, trusted_principal_id: str | None
+    ) -> dict[str, Any]:
+        return self._control("resume", request, trusted_principal_id)
+
+    def reset(
+        self, request: object, *, trusted_principal_id: str | None
+    ) -> dict[str, Any]:
+        return self._control("reset", request, trusted_principal_id)
+
+    def acknowledge_completed(
+        self, request: object, *, trusted_principal_id: str | None
+    ) -> dict[str, Any]:
+        return self._control(
+            "acknowledge_completed", request, trusted_principal_id
+        )
+
+    def stop(
+        self, request: object, *, trusted_principal_id: str | None
+    ) -> dict[str, Any]:
+        self.requests.append(("stop", request))
+        self.principals.append(("stop", trusted_principal_id))
+        return {"ok": True, "command": "stop", "accepted": {}}
+
+    def set_runtime_scale(
+        self, request: object, *, trusted_principal_id: str | None
+    ) -> dict[str, Any]:
+        self.requests.append(("set_runtime_scale", request))
+        self.principals.append(("set_runtime_scale", trusted_principal_id))
+        return {"ok": True, "command": "set_runtime_scale", "accepted": {}}
+
+    def get_runtime_scale(self, operation_id: str) -> dict[str, Any]:
+        self.requests.append(("get_runtime_scale", operation_id))
+        return {
+            "ok": True,
+            "command": "get_runtime_scale",
+            "runtime_scale": {"operation_id": operation_id},
+        }
+
+
 class FakeTrustedAdapter:
     def resolve(self, _request) -> TrustedPrincipal:
         return TrustedPrincipal("operator.7", "authenticated:test")
@@ -406,6 +486,16 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         paths = client.get("/openapi.json").json()["paths"]
     assert "/api/execution/alarms/{condition_id}/acknowledge" in paths
     assert "/api/node-environment" in paths
+    assert {
+        "/api/execution/operations/{operation_id}/pause",
+        "/api/execution/operations/{operation_id}/resume",
+        "/api/execution/operations/{operation_id}/reset",
+        "/api/execution/operations/{operation_id}/acknowledge-completed",
+        "/api/execution/operations/{operation_id}/runtime-scale",
+        "/api/execution/stops",
+    }.issubset(paths)
+    assert "/api/kernel/stop" not in paths
+    assert "/api/cycle/stop" not in paths
     assert all("condition" not in path or "acknowledge" in path for path in paths)
 
 
@@ -414,7 +504,12 @@ def test_execution_missing_reference_is_a_public_not_found() -> None:
         def status(self) -> dict[str, Any]:
             raise AssertionError("not called")
 
-        def submit(self, _request: object) -> dict[str, Any]:
+        def submit(
+            self,
+            _request: object,
+            *,
+            trusted_principal_id: str | None,
+        ) -> dict[str, Any]:
             raise AssertionError("not called")
 
         def read(self, _operation_id: str) -> dict[str, Any]:
@@ -436,6 +531,175 @@ def test_execution_missing_reference_is_a_public_not_found() -> None:
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "missing_reference"
+
+
+def test_operation_controls_and_scale_are_thin_revision_fenced_routes() -> None:
+    execution = FakeExecution()
+    app = create_app(
+        service=HeadlessService(FakeCore(), FakeManager(), execution)
+    )
+    context = {
+        "request_id": "request.control.1",
+        "request_owner_epoch": "execution.epoch.1",
+        "source_label": "operator_ui",
+        "correlation_id": None,
+    }
+    control = {
+        "request_context": context,
+        "operation_id": "operation-1",
+        "expected_operation_revision": 3,
+        "reason": "operator request",
+    }
+    stop = {
+        "request_context": context,
+        "operations": [
+            {
+                "operation_id": "operation-1",
+                "expected_operation_revision": 3,
+                "expected_stop_generation": 0,
+            }
+        ],
+        "reason": "operator Stop",
+    }
+    scale = {
+        "request_context": context,
+        "operation_id": "operation-1",
+        "expected_operation_revision": 3,
+        "expected_runtime_scale_generation": 0,
+        "scale": 0.25,
+    }
+
+    with TestClient(app) as client:
+        for endpoint in ("pause", "resume", "reset", "acknowledge-completed"):
+            response = client.post(
+                f"/api/execution/operations/operation-1/{endpoint}",
+                json=control,
+            )
+            assert response.status_code == 200, response.text
+        assert client.post("/api/execution/stops", json=stop).status_code == 200
+        assert client.post(
+            "/api/execution/operations/operation-1/runtime-scale", json=scale
+        ).status_code == 200
+        observed = client.get(
+            "/api/execution/operations/operation-1/runtime-scale"
+        )
+        assert observed.json()["runtime_scale"]["operation_id"] == "operation-1"
+
+    assert [kind for kind, _request in execution.requests] == [
+        "pause",
+        "resume",
+        "reset",
+        "acknowledge_completed",
+        "stop",
+        "set_runtime_scale",
+        "get_runtime_scale",
+    ]
+    assert execution.principals == [
+        ("pause", None),
+        ("resume", None),
+        ("reset", None),
+        ("acknowledge_completed", None),
+        ("stop", None),
+        ("set_runtime_scale", None),
+    ]
+
+
+def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> None:
+    execution = FakeExecution()
+    app = create_app(
+        service=HeadlessService(FakeCore(), FakeManager(), execution),
+        trusted_principal_adapter=FakeTrustedAdapter(),
+    )
+    body = {
+        "request_context": {
+            "request_id": "request.control.trusted",
+            "request_owner_epoch": "execution.epoch.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+        },
+        "operation_id": "operation-1",
+        "expected_operation_revision": 3,
+        "reason": None,
+    }
+    with TestClient(app) as client:
+        forged = client.post(
+            "/api/execution/operations/operation-1/pause",
+            json={**body, "principal_id": "forged"},
+        )
+        forged_context = client.post(
+            "/api/execution/operations/operation-1/pause",
+            json={
+                **body,
+                "request_context": {
+                    **body["request_context"],
+                    "principal_id": "forged",
+                },
+            },
+        )
+        accepted = client.post(
+            "/api/execution/operations/operation-1/pause", json=body
+        )
+
+    assert forged.status_code == 422
+    assert forged_context.status_code == 422
+    assert accepted.status_code == 200
+    assert execution.principals == [("pause", "operator.7")]
+
+
+def test_operation_control_paths_reject_ambiguous_or_unbounded_scope() -> None:
+    execution = FakeExecution()
+    app = create_app(
+        service=HeadlessService(FakeCore(), FakeManager(), execution)
+    )
+    context = {
+        "request_id": "request.control.1",
+        "request_owner_epoch": "execution.epoch.1",
+        "source_label": "operator_ui",
+        "correlation_id": None,
+    }
+    with TestClient(app) as client:
+        mismatch = client.post(
+            "/api/execution/operations/operation-1/pause",
+            json={
+                "request_context": context,
+                "operation_id": "operation-2",
+                "expected_operation_revision": 1,
+                "reason": None,
+            },
+        )
+        broad_stop = client.post(
+            "/api/execution/stops",
+            json={
+                "request_context": context,
+                "operations": [
+                    {
+                        "operation_id": operation_id,
+                        "expected_operation_revision": 1,
+                        "expected_stop_generation": 0,
+                    }
+                    for operation_id in ("operation-1", "operation-2")
+                ],
+                "reason": None,
+            },
+        )
+        invalid_scale = client.post(
+            "/api/execution/operations/operation-1/runtime-scale",
+            json={
+                "request_context": context,
+                "operation_id": "operation-1",
+                "expected_operation_revision": 1,
+                "expected_runtime_scale_generation": 0,
+                "scale": 1.01,
+            },
+        )
+
+    assert mismatch.status_code == 400
+    assert mismatch.json()["detail"]["code"] == (
+        "execution_operation_path_invalid"
+    )
+    assert broad_stop.status_code == 422
+    assert invalid_scale.status_code == 422
+    assert execution.requests == []
 
 
 @pytest.mark.parametrize(

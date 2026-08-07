@@ -92,6 +92,8 @@ struct StopIntentDTO final {
   PublicRequestContextDTO request_context;
   std::vector<StopOperationTargetDTO> operations;
   std::optional<std::string> reason;
+  /// Receiving-adapter provenance. Public payloads cannot populate this field.
+  RequestAttributionDTO attribution{};
 
   friend bool operator==(const StopIntentDTO&, const StopIntentDTO&) = default;
 };
@@ -120,6 +122,8 @@ struct OperationControlRequestDTO final {
   OperationId operation_id;
   OperationRevision expected_operation_revision;
   std::optional<std::string> reason;
+  /// Receiving-adapter provenance. Public payloads cannot populate this field.
+  RequestAttributionDTO attribution{};
 
   friend bool operator==(const OperationControlRequestDTO&,
                          const OperationControlRequestDTO&) = default;

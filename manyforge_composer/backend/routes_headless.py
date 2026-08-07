@@ -12,7 +12,10 @@ from manyforge_headless_api.models import (
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    OperationControlRequest,
     OperationIntentRequest,
+    RuntimeScaleRequest,
+    StopIntentRequest,
 )
 
 
@@ -77,6 +80,87 @@ def create_headless_router(client: HeadlessHttpClient) -> APIRouter:
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
     ) -> dict[str, Any]:
         return _call(lambda: client.operation(operation_id))
+
+    def require_matching_operation(
+        path_operation_id: str,
+        body_operation_id: str,
+    ) -> None:
+        if path_operation_id != body_operation_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "execution_operation_path_invalid",
+                    "message": (
+                        "operation identity in the path and request body must match"
+                    ),
+                },
+            )
+
+    @router.post("/api/execution/operations/{operation_id}/pause")
+    def execution_pause(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: OperationControlRequest,
+    ) -> dict[str, Any]:
+        require_matching_operation(operation_id, body.operation_id)
+        return _call(
+            lambda: client.pause_operation(operation_id, body.model_dump())
+        )
+
+    @router.post("/api/execution/operations/{operation_id}/resume")
+    def execution_resume(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: OperationControlRequest,
+    ) -> dict[str, Any]:
+        require_matching_operation(operation_id, body.operation_id)
+        return _call(
+            lambda: client.resume_operation(operation_id, body.model_dump())
+        )
+
+    @router.post("/api/execution/operations/{operation_id}/reset")
+    def execution_reset(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: OperationControlRequest,
+    ) -> dict[str, Any]:
+        require_matching_operation(operation_id, body.operation_id)
+        return _call(
+            lambda: client.reset_operation(operation_id, body.model_dump())
+        )
+
+    @router.post(
+        "/api/execution/operations/{operation_id}/acknowledge-completed"
+    )
+    def execution_acknowledge_completed(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: OperationControlRequest,
+    ) -> dict[str, Any]:
+        require_matching_operation(operation_id, body.operation_id)
+        return _call(
+            lambda: client.acknowledge_completed_operation(
+                operation_id, body.model_dump()
+            )
+        )
+
+    @router.post("/api/execution/stops")
+    def execution_stop(body: StopIntentRequest) -> dict[str, Any]:
+        return _call(lambda: client.stop_operations(body.model_dump()))
+
+    @router.post("/api/execution/operations/{operation_id}/runtime-scale")
+    def execution_set_runtime_scale(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: RuntimeScaleRequest,
+    ) -> dict[str, Any]:
+        require_matching_operation(operation_id, body.operation_id)
+        return _call(
+            lambda: client.set_operation_runtime_scale(
+                operation_id, body.model_dump()
+            )
+        )
+
+    @router.get("/api/execution/operations/{operation_id}/runtime-scale")
+    def execution_get_runtime_scale(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.operation_runtime_scale(operation_id))
 
     @router.get("/api/scene")
     def scene() -> dict[str, Any]:

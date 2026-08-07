@@ -19,7 +19,10 @@ from .models import (
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    OperationControlRequest,
     OperationIntentRequest,
+    RuntimeScaleRequest,
+    StopIntentRequest,
 )
 from .native import HeadlessApiConfig, HeadlessApiError, NativeHeadlessCore
 from .service import HeadlessService, TrustedAttribution
@@ -298,14 +301,117 @@ def create_app(
         return execution_response(service.execution_status())
 
     @app.post("/api/execution/operations")
-    def execution_submit(body: OperationIntentRequest) -> JSONResponse:
-        return execution_response(service.execution_submit(body))
+    def execution_submit(
+        body: OperationIntentRequest,
+        request: Request,
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_submit(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
 
     @app.get("/api/execution/operations/{operation_id}")
     def execution_read(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
     ) -> JSONResponse:
         return execution_response(service.execution_read(operation_id))
+
+    def require_matching_operation(
+        path_operation_id: str,
+        body_operation_id: str,
+    ) -> None:
+        if path_operation_id != body_operation_id:
+            raise HeadlessApiError(
+                "execution_operation_path_invalid",
+                "operation identity in the path and request body must match",
+            )
+
+    @app.post("/api/execution/operations/{operation_id}/pause")
+    def execution_pause(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: OperationControlRequest,
+        request: Request,
+    ) -> JSONResponse:
+        require_matching_operation(operation_id, body.operation_id)
+        return execution_response(
+            service.execution_pause(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.post("/api/execution/operations/{operation_id}/resume")
+    def execution_resume(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: OperationControlRequest,
+        request: Request,
+    ) -> JSONResponse:
+        require_matching_operation(operation_id, body.operation_id)
+        return execution_response(
+            service.execution_resume(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.post("/api/execution/operations/{operation_id}/reset")
+    def execution_reset(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: OperationControlRequest,
+        request: Request,
+    ) -> JSONResponse:
+        require_matching_operation(operation_id, body.operation_id)
+        return execution_response(
+            service.execution_reset(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.post(
+        "/api/execution/operations/{operation_id}/acknowledge-completed"
+    )
+    def execution_acknowledge_completed(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: OperationControlRequest,
+        request: Request,
+    ) -> JSONResponse:
+        require_matching_operation(operation_id, body.operation_id)
+        return execution_response(
+            service.execution_acknowledge_completed(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.post("/api/execution/stops")
+    def execution_stop(
+        body: StopIntentRequest,
+        request: Request,
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_stop(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.post("/api/execution/operations/{operation_id}/runtime-scale")
+    def execution_set_runtime_scale(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: RuntimeScaleRequest,
+        request: Request,
+    ) -> JSONResponse:
+        require_matching_operation(operation_id, body.operation_id)
+        return execution_response(
+            service.execution_set_runtime_scale(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.get("/api/execution/operations/{operation_id}/runtime-scale")
+    def execution_get_runtime_scale(
+        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_get_runtime_scale(operation_id)
+        )
 
     @app.get("/api/scene")
     def scene() -> dict[str, Any]:

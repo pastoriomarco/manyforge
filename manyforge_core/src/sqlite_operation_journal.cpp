@@ -358,6 +358,36 @@ template <typename StrongId>
   });
 }
 
+[[nodiscard]] std::string_view RequestTransportName(RequestTransportDTO transport) noexcept {
+  switch (transport) {
+    case RequestTransportDTO::kRos:
+      return "ros";
+    case RequestTransportDTO::kHttp:
+      return "http";
+    case RequestTransportDTO::kInternal:
+      return "internal";
+  }
+  return {};
+}
+
+[[nodiscard]] std::string_view RequestAssuranceName(RequestAssuranceDTO assurance) noexcept {
+  switch (assurance) {
+    case RequestAssuranceDTO::kUnverified:
+      return "unverified";
+    case RequestAssuranceDTO::kExternallyAuthenticated:
+      return "externally_authenticated";
+  }
+  return {};
+}
+
+[[nodiscard]] CanonicalValue RequestAttributionValue(const RequestAttributionDTO& attribution) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"assurance", CanonicalValue(std::string(RequestAssuranceName(attribution.assurance)))},
+      {"principal_id", OptionalText(attribution.principal_id)},
+      {"transport", CanonicalValue(std::string(RequestTransportName(attribution.transport)))},
+  });
+}
+
 [[nodiscard]] std::string_view OperationStateName(OperationStateKind state) noexcept {
   switch (state) {
     case OperationStateKind::kQueued:
@@ -746,6 +776,7 @@ template <typename StrongId>
       {"program_id", CanonicalValue(intent.program_id.value())},
       {"program_revision", CanonicalValue(intent.program_revision.value())},
       {"program_run_id", CanonicalValue(intent.program_run_id.value())},
+      {"request_attribution", RequestAttributionValue(intent.attribution)},
       {"request_context", RequestContextValue(intent.request_context)},
   });
 }
@@ -825,6 +856,7 @@ template <typename StrongId>
        Number(request.expected_operation_revision.value(), "expected operation revision")},
       {"operation_id", CanonicalValue(request.operation_id.value())},
       {"reason", OptionalText(request.reason)},
+      {"request_attribution", RequestAttributionValue(request.attribution)},
       {"request_context", RequestContextValue(request.request_context)},
   });
 }
@@ -859,6 +891,7 @@ template <typename StrongId>
   return CanonicalValue(CanonicalValue::Object{
       {"operations", CanonicalValue(std::move(operations))},
       {"reason", OptionalText(intent.reason)},
+      {"request_attribution", RequestAttributionValue(intent.attribution)},
       {"request_context", RequestContextValue(intent.request_context)},
   });
 }
@@ -890,6 +923,7 @@ template <typename StrongId>
        Number(request.expected_runtime_scale_generation.value(),
               "expected runtime scale generation")},
       {"operation_id", CanonicalValue(request.operation_id.value())},
+      {"request_attribution", RequestAttributionValue(request.attribution)},
       {"request_context", RequestContextValue(request.request_context)},
       {"scale", CanonicalValue(request.scale)},
   });

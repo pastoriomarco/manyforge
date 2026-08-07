@@ -34,8 +34,7 @@ namespace {
   };
   if (span.action_span_id.empty() || !bounded(span.action_span_id) ||
       !bounded(span.program_run_id) || !bounded(span.node_instance_id) ||
-      !bounded(span.node_attempt_id) ||
-      !bounded(span.parent_node_attempt_id)) {
+      !bounded(span.node_attempt_id) || !bounded(span.parent_node_attempt_id)) {
     return false;
   }
   if (span.action_source == ActionSource::kProgramNode) {
@@ -185,6 +184,10 @@ Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
       intent.program_run_id.empty() || intent.expected_graph_revision.empty() ||
       intent.expected_retained_bundle_id.empty()) {
     return invalid("operation intent has an empty required identity", "operation_identity_empty");
+  }
+  if (!intent.attribution.locally_valid()) {
+    return invalid("operation intent has invalid adapter attribution",
+                   "operation_attribution_invalid");
   }
   if (intent.expected_scene_revision.has_value() && !intent.expected_scene_revision->valid()) {
     return invalid("operation expected scene revision is invalid",

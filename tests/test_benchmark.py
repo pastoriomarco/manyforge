@@ -50,6 +50,21 @@ class _Transport:
     def operation(self, operation_id):
         return {"ok": True, "operation": {"operation_id": operation_id}}
 
+    def pause_operation(self, operation_id, body):
+        return {"ok": True, "accepted": {"operation_id": operation_id, "request": body}}
+
+    resume_operation = pause_operation
+    reset_operation = pause_operation
+    acknowledge_completed_operation = pause_operation
+    set_operation_runtime_scale = pause_operation
+
+    def stop_operations(self, body):
+        operation_id = body["operations"][0]["operation_id"]
+        return {"ok": True, "accepted": {"operation_id": operation_id, "request": body}}
+
+    def operation_runtime_scale(self, operation_id):
+        return {"ok": True, "runtime_scale": {"operation_id": operation_id}}
+
 
 def test_native_benchmark_client_is_now_only_a_headless_transport() -> None:
     client = KernelClient(_Transport())

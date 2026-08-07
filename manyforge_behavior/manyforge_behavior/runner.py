@@ -138,5 +138,180 @@ class OrchestratorRunner:
     def operation(self, operation_id: str) -> dict[str, Any]:
         return self._kernel.operation(operation_id)
 
+    def _request_context(
+        self,
+        *,
+        request_id: str,
+        correlation_id: str | None,
+    ) -> dict[str, str | None]:
+        status = self._kernel.status().get("status")
+        owner_epoch = status.get("owner_epoch") if isinstance(status, dict) else None
+        if not isinstance(owner_epoch, str) or not owner_epoch:
+            raise KernelClientResponseError(
+                "headless execution status has no owner epoch"
+            )
+        return {
+            "request_id": request_id,
+            "request_owner_epoch": owner_epoch,
+            "source_label": "manyforge_behavior",
+            "correlation_id": correlation_id,
+        }
+
+    def _control_operation(
+        self,
+        control: str,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        reason: str | None,
+        correlation_id: str | None,
+    ) -> dict[str, Any]:
+        request = {
+            "request_context": self._request_context(
+                request_id=request_id,
+                correlation_id=correlation_id,
+            ),
+            "operation_id": operation_id,
+            "expected_operation_revision": expected_operation_revision,
+            "reason": reason,
+        }
+        callback = {
+            "pause": self._kernel.pause,
+            "resume": self._kernel.resume,
+            "reset": self._kernel.reset,
+            "acknowledge_completed": self._kernel.acknowledge_completed,
+        }.get(control)
+        if callback is None:
+            raise ValueError("operation control is unsupported")
+        return callback(operation_id, request)
+
+    def pause_operation(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._control_operation(
+            "pause",
+            request_id=request_id,
+            operation_id=operation_id,
+            expected_operation_revision=expected_operation_revision,
+            reason=reason,
+            correlation_id=correlation_id,
+        )
+
+    def resume_operation(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._control_operation(
+            "resume",
+            request_id=request_id,
+            operation_id=operation_id,
+            expected_operation_revision=expected_operation_revision,
+            reason=reason,
+            correlation_id=correlation_id,
+        )
+
+    def reset_operation(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._control_operation(
+            "reset",
+            request_id=request_id,
+            operation_id=operation_id,
+            expected_operation_revision=expected_operation_revision,
+            reason=reason,
+            correlation_id=correlation_id,
+        )
+
+    def acknowledge_completed_operation(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._control_operation(
+            "acknowledge_completed",
+            request_id=request_id,
+            operation_id=operation_id,
+            expected_operation_revision=expected_operation_revision,
+            reason=reason,
+            correlation_id=correlation_id,
+        )
+
+    def stop_operation(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        expected_stop_generation: int,
+        reason: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit one scoped Stop; owner projections settle its outcome."""
+
+        request = {
+            "request_context": self._request_context(
+                request_id=request_id,
+                correlation_id=correlation_id,
+            ),
+            "operations": [
+                {
+                    "operation_id": operation_id,
+                    "expected_operation_revision": expected_operation_revision,
+                    "expected_stop_generation": expected_stop_generation,
+                }
+            ],
+            "reason": reason,
+        }
+        return self._kernel.stop(request)
+
+    def set_operation_runtime_scale(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        expected_operation_revision: int,
+        expected_runtime_scale_generation: int,
+        scale: float,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        request = {
+            "request_context": self._request_context(
+                request_id=request_id,
+                correlation_id=correlation_id,
+            ),
+            "operation_id": operation_id,
+            "expected_operation_revision": expected_operation_revision,
+            "expected_runtime_scale_generation": (
+                expected_runtime_scale_generation
+            ),
+            "scale": scale,
+        }
+        return self._kernel.set_runtime_scale(operation_id, request)
+
+    def operation_runtime_scale(self, operation_id: str) -> dict[str, Any]:
+        return self._kernel.runtime_scale(operation_id)
+
 
 __all__ = ["OrchestratorRunner"]

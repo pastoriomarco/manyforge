@@ -67,6 +67,8 @@ constexpr std::string_view kLockFileName = ".execution-host.lock";
 constexpr std::size_t kMaximumPacketBytes = 1024U * 1024U;
 constexpr std::size_t kMaximumProgramBytes = 16U * 1024U * 1024U;
 constexpr std::size_t kMaximumIdentityBytes = 2048U;
+constexpr std::size_t kMaximumReasonBytes = 4096U;
+constexpr double kMaximumSafeInteger = 9'007'199'254'740'991.0;
 constexpr std::size_t kOwnerEpochRandomBytes = 16U;
 constexpr int kSocketBacklog = 16;
 constexpr int kReconcilePeriodMilliseconds = 5;
@@ -334,6 +336,14 @@ double Number(const CanonicalValue& root, std::string_view name) {
   return *value;
 }
 
+std::uint64_t Counter(const CanonicalValue& root, std::string_view name, std::uint64_t minimum) {
+  const double value = Number(root, name);
+  Require(value >= static_cast<double>(minimum) && std::floor(value) == value &&
+              value <= kMaximumSafeInteger,
+          "command field " + std::string(name) + " must be one safe unsigned integer");
+  return static_cast<std::uint64_t>(value);
+}
+
 std::optional<double> OptionalNumber(const CanonicalValue& root, std::string_view name) {
   const auto& member = Member(root, name);
   if (std::holds_alternative<std::nullptr_t>(member.storage())) {
@@ -352,6 +362,18 @@ std::optional<std::string> OptionalText(const CanonicalValue& root, std::string_
   }
   const auto* value = std::get_if<std::string>(&member.storage());
   Require(value != nullptr && !value->empty() && value->size() <= kMaximumIdentityBytes,
+          "command field " + std::string(name) + " must be null or one bounded string");
+  return *value;
+}
+
+std::optional<std::string> OptionalBoundedText(const CanonicalValue& root, std::string_view name,
+                                               std::size_t maximum_bytes) {
+  const auto& member = Member(root, name);
+  if (std::holds_alternative<std::nullptr_t>(member.storage())) {
+    return std::nullopt;
+  }
+  const auto* value = std::get_if<std::string>(&member.storage());
+  Require(value != nullptr && !value->empty() && value->size() <= maximum_bytes,
           "command field " + std::string(name) + " must be null or one bounded string");
   return *value;
 }
@@ -417,6 +439,42 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
                              optional_or_empty("node_instance_id"),
                              optional_or_empty("node_attempt_id"),
                              optional_or_empty("parent_node_attempt_id")};
+}
+
+[[nodiscard]] core::PublicRequestContextDTO DecodeRequestContext(const CanonicalValue& value) {
+  RequireExactObjectSize(value, 4U, "public request context");
+  return core::PublicRequestContextDTO{core::RequestId(Text(value, "request_id")),
+                                       core::RequestOwnerEpoch(Text(value, "request_owner_epoch")),
+                                       Text(value, "source_label"),
+                                       OptionalText(value, "correlation_id")};
+}
+
+[[nodiscard]] core::RequestAttributionDTO DecodeRequestAttribution(const CanonicalValue& value) {
+  RequireExactObjectSize(value, 3U, "request attribution");
+  core::RequestTransportDTO transport;
+  const auto transport_name = Text(value, "transport");
+  if (transport_name == "ros") {
+    transport = core::RequestTransportDTO::kRos;
+  } else if (transport_name == "http") {
+    transport = core::RequestTransportDTO::kHttp;
+  } else if (transport_name == "internal") {
+    transport = core::RequestTransportDTO::kInternal;
+  } else {
+    Fail("request attribution transport is unsupported");
+  }
+  core::RequestAssuranceDTO assurance;
+  const auto assurance_name = Text(value, "assurance");
+  if (assurance_name == "unverified") {
+    assurance = core::RequestAssuranceDTO::kUnverified;
+  } else if (assurance_name == "externally_authenticated") {
+    assurance = core::RequestAssuranceDTO::kExternallyAuthenticated;
+  } else {
+    Fail("request attribution assurance is unsupported");
+  }
+  core::RequestAttributionDTO attribution{transport, assurance,
+                                          OptionalText(value, "principal_id")};
+  Require(attribution.locally_valid(), "request attribution is internally inconsistent");
+  return attribution;
 }
 
 [[nodiscard]] core::JointDynamicsLimitDTO DecodeDynamicsLimit(const CanonicalValue& value) {
@@ -506,10 +564,10 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       {}};
 }
 
-[[nodiscard]] core::OperationIntentDTO DecodeOperation(const CanonicalValue& value) {
+[[nodiscard]] core::OperationIntentDTO DecodeOperation(
+    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
   RequireExactObjectSize(value, 10U, "operation intent");
   const auto& request = Member(value, "request_context");
-  RequireExactObjectSize(request, 4U, "operation request context");
   const auto& participants = Array(value, "participants");
   Require(participants.size() == 1U, "N3 admits exactly one operation participant");
   const auto& participant = participants.front();
@@ -527,10 +585,7 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   Require(Text(value, "coordination_policy") == "independent",
           "N3 admits only independent operation coordination");
   return core::OperationIntentDTO{
-      core::PublicRequestContextDTO{core::RequestId(Text(request, "request_id")),
-                                    core::RequestOwnerEpoch(Text(request, "request_owner_epoch")),
-                                    Text(request, "source_label"),
-                                    OptionalText(request, "correlation_id")},
+      DecodeRequestContext(request),
       core::ProgramId(Text(value, "program_id")),
       core::ProgramRevision(Text(value, "program_revision")),
       core::ProgramBindingId(Text(value, "program_binding_id")),
@@ -543,15 +598,71 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
           core::TargetRoleId(Text(participant, "target_role_id")),
           core::CapabilityId(Text(participant, "required_capability_id")), std::move(action_span),
           DecodeMotionPayload(Member(participant, "payload"))}},
-      core::OperationCoordinationPolicy::kIndependent};
+      core::OperationCoordinationPolicy::kIndependent,
+      attribution};
 }
 
-enum class CommandKind { kStatus, kSubmit, kRead };
+[[nodiscard]] core::OperationControlRequestDTO DecodeOperationControlRequest(
+    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
+  RequireExactObjectSize(value, 4U, "operation control request");
+  return core::OperationControlRequestDTO{
+      DecodeRequestContext(Member(value, "request_context")),
+      core::OperationId(Text(value, "operation_id")),
+      core::OperationRevision(Counter(value, "expected_operation_revision", 1U)),
+      OptionalBoundedText(value, "reason", kMaximumReasonBytes), attribution};
+}
+
+[[nodiscard]] core::StopIntentDTO DecodeStopIntent(const CanonicalValue& value,
+                                                   const core::RequestAttributionDTO& attribution) {
+  RequireExactObjectSize(value, 3U, "Stop intent");
+  const auto& operations = Array(value, "operations");
+  Require(operations.size() == 1U, "N4 admits exactly one operation in ordinary Stop intent");
+  const auto& target = operations.front();
+  RequireExactObjectSize(target, 3U, "Stop operation target");
+  return core::StopIntentDTO{
+      DecodeRequestContext(Member(value, "request_context")),
+      {core::StopOperationTargetDTO{
+          core::OperationId(Text(target, "operation_id")),
+          core::OperationRevision(Counter(target, "expected_operation_revision", 1U)),
+          core::StopGeneration(Counter(target, "expected_stop_generation", 0U))}},
+      OptionalBoundedText(value, "reason", kMaximumReasonBytes),
+      attribution};
+}
+
+[[nodiscard]] core::RuntimeScaleRequestDTO DecodeRuntimeScaleRequest(
+    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
+  RequireExactObjectSize(value, 5U, "runtime-scale request");
+  const double scale = Number(value, "scale");
+  Require(scale >= 0.0 && scale <= 1.0, "runtime scale must be in the closed interval [0, 1]");
+  return core::RuntimeScaleRequestDTO{
+      DecodeRequestContext(Member(value, "request_context")),
+      core::OperationId(Text(value, "operation_id")),
+      core::OperationRevision(Counter(value, "expected_operation_revision", 1U)),
+      core::RuntimeScaleGeneration(Counter(value, "expected_runtime_scale_generation", 0U)),
+      scale,
+      attribution};
+}
+
+enum class CommandKind {
+  kStatus,
+  kSubmit,
+  kRead,
+  kPause,
+  kResume,
+  kReset,
+  kAcknowledgeCompleted,
+  kStop,
+  kSetRuntimeScale,
+  kGetRuntimeScale,
+};
 
 struct Command final {
   CommandKind kind;
   std::optional<core::OperationIntentDTO> operation;
   std::optional<core::OperationId> operation_id;
+  std::optional<core::OperationControlRequestDTO> control;
+  std::optional<core::StopIntentDTO> stop;
+  std::optional<core::RuntimeScaleRequestDTO> runtime_scale;
 };
 
 [[nodiscard]] Command DecodeCommand(std::string_view bytes) {
@@ -571,15 +682,67 @@ struct Command final {
   const auto command = Text(root, "command");
   if (command == "status") {
     RequireExactObjectSize(root, 2U, "status command");
-    return {CommandKind::kStatus, std::nullopt, std::nullopt};
+    return {CommandKind::kStatus, std::nullopt, std::nullopt,
+            std::nullopt,         std::nullopt, std::nullopt};
   }
   if (command == "read") {
     RequireExactObjectSize(root, 3U, "read command");
-    return {CommandKind::kRead, std::nullopt, core::OperationId(Text(root, "operation_id"))};
+    return {CommandKind::kRead, std::nullopt, core::OperationId(Text(root, "operation_id")),
+            std::nullopt,       std::nullopt, std::nullopt};
   }
-  Require(command == "submit", "execution command kind is unsupported");
-  RequireExactObjectSize(root, 3U, "submit command");
-  return {CommandKind::kSubmit, DecodeOperation(Member(root, "operation")), std::nullopt};
+  if (command == "get_runtime_scale") {
+    RequireExactObjectSize(root, 3U, "runtime-scale read command");
+    return {CommandKind::kGetRuntimeScale,
+            std::nullopt,
+            core::OperationId(Text(root, "operation_id")),
+            std::nullopt,
+            std::nullopt,
+            std::nullopt};
+  }
+  if (command == "submit") {
+    RequireExactObjectSize(root, 4U, "submit command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    return {CommandKind::kSubmit, DecodeOperation(Member(root, "operation"), attribution),
+            std::nullopt,         std::nullopt,
+            std::nullopt,         std::nullopt};
+  }
+  if (command == "stop") {
+    RequireExactObjectSize(root, 4U, "Stop command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    return {CommandKind::kStop,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            DecodeStopIntent(Member(root, "request"), attribution),
+            std::nullopt};
+  }
+  if (command == "set_runtime_scale") {
+    RequireExactObjectSize(root, 4U, "runtime-scale command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    return {CommandKind::kSetRuntimeScale,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            DecodeRuntimeScaleRequest(Member(root, "request"), attribution)};
+  }
+  CommandKind kind;
+  if (command == "pause") {
+    kind = CommandKind::kPause;
+  } else if (command == "resume") {
+    kind = CommandKind::kResume;
+  } else if (command == "reset") {
+    kind = CommandKind::kReset;
+  } else if (command == "acknowledge_completed") {
+    kind = CommandKind::kAcknowledgeCompleted;
+  } else {
+    Fail("execution command kind is unsupported");
+  }
+  RequireExactObjectSize(root, 4U, "operation control command");
+  const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+  return {kind,         std::nullopt,
+          std::nullopt, DecodeOperationControlRequest(Member(root, "request"), attribution),
+          std::nullopt, std::nullopt};
 }
 
 [[nodiscard]] CanonicalValue ErrorValue(const core::ErrorDTO& error) {
@@ -658,6 +821,130 @@ struct Command final {
   });
 }
 
+[[nodiscard]] std::string_view ControlName(core::OperationControlKind control) {
+  switch (control) {
+    case core::OperationControlKind::kPause:
+      return "pause";
+    case core::OperationControlKind::kResume:
+      return "resume";
+    case core::OperationControlKind::kReset:
+      return "reset";
+    case core::OperationControlKind::kAcknowledgeCompleted:
+      return "acknowledge_completed";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] CanonicalValue ControlAcceptedValue(const core::OperationControlAcceptedDTO& value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"accepted_against_revision",
+       CanonicalValue(static_cast<double>(value.accepted_against_revision.value()))},
+      {"accepted_at_ns", CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"control", CanonicalValue(std::string(ControlName(value.control)))},
+      {"operation_id", CanonicalValue(value.operation_id.value())},
+      {"operation_revision_after_acceptance",
+       CanonicalValue(static_cast<double>(value.operation_revision_after_acceptance.value()))},
+      {"replay_status", CanonicalValue(std::string(core::to_string(value.replay_status)))},
+      {"request_id", CanonicalValue(value.request_id.value())},
+  });
+}
+
+[[nodiscard]] CanonicalValue StopAcceptedValue(const core::StopAcceptedDTO& value) {
+  CanonicalValue::Array operations;
+  operations.reserve(value.operations.size());
+  for (const auto& operation : value.operations) {
+    operations.emplace_back(operation.value());
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"accepted_at_ns", CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"operation_revision_after_acceptance",
+       CanonicalValue(static_cast<double>(value.operation_revision_after_acceptance.value()))},
+      {"operations", CanonicalValue(std::move(operations))},
+      {"replay_status", CanonicalValue(std::string(core::to_string(value.replay_status)))},
+      {"request_id", CanonicalValue(value.request_id.value())},
+      {"stop_generation", CanonicalValue(static_cast<double>(value.stop_generation.value()))},
+      {"stop_id", CanonicalValue(value.stop_id.value())},
+  });
+}
+
+[[nodiscard]] CanonicalValue RuntimeScaleAcceptedValue(const core::RuntimeScaleAcceptedDTO& value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"accepted_at_ns", CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"operation_id", CanonicalValue(value.operation_id.value())},
+      {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
+      {"replay_status", CanonicalValue(std::string(core::to_string(value.replay_status)))},
+      {"request_id", CanonicalValue(value.request_id.value())},
+      {"requested_scale", CanonicalValue(value.requested_scale)},
+      {"runtime_scale_generation",
+       CanonicalValue(static_cast<double>(value.runtime_scale_generation.value()))},
+  });
+}
+
+[[nodiscard]] CanonicalValue RuntimeScaleStatusValue(const core::RuntimeScaleStatusDTO& value) {
+  CanonicalValue::Array participants;
+  participants.reserve(value.participants.size());
+  for (const auto& participant : value.participants) {
+    CanonicalValue::Array resources;
+    resources.reserve(participant.resources.size());
+    for (const auto& resource : participant.resources) {
+      resources.emplace_back(resource.value());
+    }
+    participants.emplace_back(CanonicalValue::Object{
+        {"accepted_generation",
+         CanonicalValue(static_cast<double>(participant.accepted_generation.value()))},
+        {"acknowledgement_sequence",
+         CanonicalValue(static_cast<double>(participant.acknowledgement_sequence))},
+        {"acknowledgement_source_epoch",
+         CanonicalValue(participant.acknowledgement_source_epoch.value())},
+        {"acknowledgement_timestamp_ns",
+         CanonicalValue(static_cast<double>(participant.acknowledgement_timestamp_ns))},
+        {"active_control_configuration_generation",
+         CanonicalValue(
+             static_cast<double>(participant.active_control_configuration_generation.value()))},
+        {"active_control_configuration_id",
+         CanonicalValue(participant.active_control_configuration_id.value())},
+        {"applied_scale", CanonicalValue(participant.applied_scale)},
+        {"capability_id", CanonicalValue(participant.capability_id.value())},
+        {"commanded_scale", CanonicalValue(participant.commanded_scale)},
+        {"command_target_id", CanonicalValue(participant.command_target_id.value())},
+        {"controllable_component_id",
+         CanonicalValue(participant.controllable_component_id.value())},
+        {"control_binding_id", CanonicalValue(participant.control_binding_id.value())},
+        {"control_binding_revision", CanonicalValue(participant.control_binding_revision.value())},
+        {"control_domain_id", CanonicalValue(participant.control_domain_id.value())},
+        {"control_domain_revision", CanonicalValue(participant.control_domain_revision.value())},
+        {"control_route_id", CanonicalValue(participant.control_route_id.value())},
+        {"controller_goal_generation",
+         CanonicalValue(static_cast<double>(participant.controller_goal_generation.value()))},
+        {"controller_goal_id", CanonicalValue(participant.controller_goal_id.value())},
+        {"controller_topology_id", CanonicalValue(participant.controller_topology_id.value())},
+        {"coordinated_barrier_id", participant.coordinated_barrier_id.has_value()
+                                       ? CanonicalValue(participant.coordinated_barrier_id->value())
+                                       : CanonicalValue(nullptr)},
+        {"error",
+         participant.error.has_value() ? ErrorValue(*participant.error) : CanonicalValue(nullptr)},
+        {"participant_id", CanonicalValue(participant.participant_id.value())},
+        {"resources", CanonicalValue(std::move(resources))},
+        {"scaling_domain_id", CanonicalValue(participant.scaling_domain_id.value())},
+        {"state", CanonicalValue(std::string(core::to_string(participant.state)))},
+        {"supported", CanonicalValue(participant.supported)},
+        {"topology_revision", CanonicalValue(participant.topology_revision.value())},
+        {"virtual_trajectory_time_s", CanonicalValue(participant.virtual_trajectory_time_s)},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"effective_scale", CanonicalValue(value.effective_scale)},
+      {"operation_id", CanonicalValue(value.operation_id.value())},
+      {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
+      {"participants", CanonicalValue(std::move(participants))},
+      {"requested_scale", CanonicalValue(value.requested_scale)},
+      {"runtime_scale_generation",
+       CanonicalValue(static_cast<double>(value.runtime_scale_generation.value()))},
+      {"state", CanonicalValue(std::string(core::to_string(value.state)))},
+      {"updated_at_ns", CanonicalValue(static_cast<double>(value.updated_at_ns))},
+  });
+}
+
 [[nodiscard]] CanonicalValue OperationStateValue(const core::OperationStateDTO& value) {
   CanonicalValue::Array participants;
   participants.reserve(value.participants.size());
@@ -684,6 +971,9 @@ struct Command final {
         {"control_binding_revision", CanonicalValue(participant.control_binding_revision.value())},
         {"control_domain_id", CanonicalValue(participant.control_domain_id.value())},
         {"control_domain_revision", CanonicalValue(participant.control_domain_revision.value())},
+        {"controller_goal_generation",
+         CanonicalValue(static_cast<double>(participant.controller_goal_generation.value()))},
+        {"controller_goal_id", CanonicalValue(participant.controller_goal_id.value())},
         {"participant_id", CanonicalValue(participant.participant_id.value())},
         {"payload_kind",
          CanonicalValue(participant.payload_kind == core::OperationParticipantPayloadKind::kMotion
@@ -698,12 +988,23 @@ struct Command final {
     });
   }
   return CanonicalValue(CanonicalValue::Object{
+      {"active_stop_generation",
+       value.active_stop_generation.has_value()
+           ? CanonicalValue(static_cast<double>(value.active_stop_generation->value()))
+           : CanonicalValue(nullptr)},
+      {"active_stop_id", value.active_stop_id.has_value()
+                             ? CanonicalValue(value.active_stop_id->value())
+                             : CanonicalValue(nullptr)},
       {"coordination_policy", CanonicalValue("independent")},
       {"operation_id", CanonicalValue(value.operation_id.value())},
       {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
       {"participants", CanonicalValue(std::move(participants))},
       {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
       {"program_run_id", CanonicalValue(value.program_run_id.value())},
+      {"runtime_scale_generation",
+       value.runtime_scale_generation.has_value()
+           ? CanonicalValue(static_cast<double>(value.runtime_scale_generation->value()))
+           : CanonicalValue(nullptr)},
       {"state", CanonicalValue(std::string(StateName(value.state)))},
       {"updated_at_ns", CanonicalValue(static_cast<double>(value.updated_at_ns))},
   });
@@ -1063,20 +1364,105 @@ class NativeExecutionHost final {
           {"ok", CanonicalValue(false)},
       });
     }
-    const auto state =
-        composition_->runtime->addressed_kernel->get_operation_state(*command.operation_id);
-    if (!state.ok()) {
+    if (command.kind == CommandKind::kRead) {
+      const auto state =
+          composition_->runtime->addressed_kernel->get_operation_state(*command.operation_id);
+      if (!state.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(state.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"error", ErrorValue(state.error())},
+          {"command", CanonicalValue("read")},
+          {"ok", CanonicalValue(true)},
+          {"operation", OperationStateValue(state.value())},
+      });
+    }
+    if (command.kind == CommandKind::kGetRuntimeScale) {
+      const auto status =
+          composition_->runtime->addressed_kernel->get_runtime_scale(*command.operation_id);
+      if (!status.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(status.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("get_runtime_scale")},
+          {"ok", CanonicalValue(true)},
+          {"runtime_scale", RuntimeScaleStatusValue(status.value())},
+      });
+    }
+    if (command.kind == CommandKind::kStop) {
+      const auto result = composition_->runtime->addressed_kernel->stop(*command.stop);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"accepted", StopAcceptedValue(result.value())},
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("stop")},
+          {"ok", CanonicalValue(true)},
+      });
+    }
+    if (command.kind == CommandKind::kSetRuntimeScale) {
+      const auto result =
+          composition_->runtime->addressed_kernel->set_runtime_scale(*command.runtime_scale);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"accepted", RuntimeScaleAcceptedValue(result.value())},
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("set_runtime_scale")},
+          {"ok", CanonicalValue(true)},
+      });
+    }
+    const auto control_result = [&]() -> core::Result<core::OperationControlAcceptedDTO> {
+      switch (command.kind) {
+        case CommandKind::kPause:
+          return composition_->runtime->addressed_kernel->pause(*command.control);
+        case CommandKind::kResume:
+          return composition_->runtime->addressed_kernel->resume(*command.control);
+        case CommandKind::kReset:
+          return composition_->runtime->addressed_kernel->reset(*command.control);
+        case CommandKind::kAcknowledgeCompleted:
+          return composition_->runtime->addressed_kernel->acknowledge_completed(*command.control);
+        case CommandKind::kStatus:
+        case CommandKind::kSubmit:
+        case CommandKind::kRead:
+        case CommandKind::kStop:
+        case CommandKind::kSetRuntimeScale:
+        case CommandKind::kGetRuntimeScale:
+          Fail("execution command dispatch is inconsistent");
+      }
+      Fail("execution command dispatch is unreachable");
+    }();
+    if (!control_result.ok()) {
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"error", ErrorValue(control_result.error())},
           {"ok", CanonicalValue(false)},
       });
     }
     return CanonicalValue(CanonicalValue::Object{
+        {"accepted", ControlAcceptedValue(control_result.value())},
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-        {"command", CanonicalValue("read")},
+        {"command", CanonicalValue(std::string(ControlName(control_result.value().control)))},
         {"ok", CanonicalValue(true)},
-        {"operation", OperationStateValue(state.value())},
     });
   }
 

@@ -7,6 +7,9 @@ from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ManagerApplyRequest,
+    OperationControlRequest,
+    RuntimeScaleRequest,
+    StopIntentRequest,
 )
 
 
@@ -103,3 +106,56 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
             {**body, "reject_if_affected_busy": True, "principal_id": "forged"}
         )
     assert "Extra inputs are not permitted" in str(captured.value)
+
+
+def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
+    context = _caller()
+    control = {
+        "request_context": context,
+        "operation_id": "operation-1",
+        "expected_operation_revision": 1,
+        "reason": "r" * 4096,
+    }
+    assert OperationControlRequest.model_validate(control).reason == "r" * 4096
+    with pytest.raises(ValidationError, match="4096 UTF-8 bytes"):
+        OperationControlRequest.model_validate(
+            {**control, "reason": "r" * 4097}
+        )
+    with pytest.raises(ValidationError):
+        OperationControlRequest.model_validate(
+            {**control, "expected_operation_revision": 0}
+        )
+
+    stop_target = {
+        "operation_id": "operation-1",
+        "expected_operation_revision": 1,
+        "expected_stop_generation": 0,
+    }
+    assert StopIntentRequest.model_validate(
+        {
+            "request_context": context,
+            "operations": [stop_target],
+            "reason": None,
+        }
+    ).operations[0].expected_stop_generation == 0
+    with pytest.raises(ValidationError):
+        StopIntentRequest.model_validate(
+            {
+                "request_context": context,
+                "operations": [stop_target, {**stop_target, "operation_id": "operation-2"}],
+                "reason": None,
+            }
+        )
+
+    scale = {
+        "request_context": context,
+        "operation_id": "operation-1",
+        "expected_operation_revision": 1,
+        "expected_runtime_scale_generation": 0,
+        "scale": 0.0,
+    }
+    assert RuntimeScaleRequest.model_validate(scale).scale == 0.0
+    with pytest.raises(ValidationError):
+        RuntimeScaleRequest.model_validate({**scale, "scale": float("nan")})
+    with pytest.raises(ValidationError):
+        RuntimeScaleRequest.model_validate({**scale, "scale": 1.0001})

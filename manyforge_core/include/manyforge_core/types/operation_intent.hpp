@@ -99,6 +99,8 @@ struct OperationIntentDTO final {
   std::optional<SceneRevision> expected_scene_revision;
   std::vector<OperationParticipantIntentDTO> participants;
   OperationCoordinationPolicy coordination_policy{OperationCoordinationPolicy::kIndependent};
+  /// Receiving-adapter provenance. Public payloads cannot populate this field.
+  RequestAttributionDTO attribution{};
   friend bool operator==(const OperationIntentDTO&, const OperationIntentDTO&) = default;
 };
 

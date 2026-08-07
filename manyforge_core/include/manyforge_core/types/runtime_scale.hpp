@@ -52,6 +52,8 @@ struct RuntimeScaleRequestDTO final {
   OperationRevision expected_operation_revision;
   RuntimeScaleGeneration expected_runtime_scale_generation;
   double scale{1.0};
+  /// Receiving-adapter provenance. Public payloads cannot populate this field.
+  RequestAttributionDTO attribution{};
 
   friend bool operator==(const RuntimeScaleRequestDTO&,
                          const RuntimeScaleRequestDTO&) = default;

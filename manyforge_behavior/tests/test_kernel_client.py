@@ -19,6 +19,7 @@ from manyforge_behavior.kernel_client import (
 class FakeTransport:
     def __init__(self) -> None:
         self.submitted: Mapping[str, Any] | None = None
+        self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
 
     def execution_status(self) -> dict[str, Any]:
         return {"ok": True, "status": {"owner_epoch": "epoch-1"}}
@@ -31,6 +32,37 @@ class FakeTransport:
         return {
             "ok": True,
             "operation": {"operation_id": operation_id, "state": "completed"},
+        }
+
+    def _control(
+        self, kind: str, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self.controls.append((kind, operation_id, body))
+        return {"ok": True, "accepted": {"operation_id": operation_id}}
+
+    def pause_operation(self, operation_id, body):
+        return self._control("pause", operation_id, body)
+
+    def resume_operation(self, operation_id, body):
+        return self._control("resume", operation_id, body)
+
+    def reset_operation(self, operation_id, body):
+        return self._control("reset", operation_id, body)
+
+    def acknowledge_completed_operation(self, operation_id, body):
+        return self._control("acknowledge_completed", operation_id, body)
+
+    def stop_operations(self, body):
+        operation_id = body["operations"][0]["operation_id"]
+        return self._control("stop", operation_id, body)
+
+    def set_operation_runtime_scale(self, operation_id, body):
+        return self._control("runtime_scale", operation_id, body)
+
+    def operation_runtime_scale(self, operation_id):
+        return {
+            "ok": True,
+            "runtime_scale": {"operation_id": operation_id, "effective_scale": 1.0},
         }
 
 
@@ -82,6 +114,21 @@ def test_kernel_client_only_forwards_bounded_headless_operations() -> None:
     ] == "operation-1"
     assert transport.submitted == {"program_id": "program-1"}
     assert client.operation("operation-1")["operation"]["state"] == "completed"
+    request = {"expected_operation_revision": 1}
+    stop_request = {
+        "operations": [{"operation_id": "operation-1"}],
+    }
+    assert client.stop(stop_request)["accepted"]["operation_id"] == "operation-1"
+    assert client.set_runtime_scale("operation-1", request)["accepted"][
+        "operation_id"
+    ] == "operation-1"
+    assert client.runtime_scale("operation-1")["runtime_scale"][
+        "effective_scale"
+    ] == 1.0
+    assert transport.controls == [
+        ("stop", "operation-1", stop_request),
+        ("runtime_scale", "operation-1", request),
+    ]
 
 
 def test_malformed_success_and_legacy_stateful_mock_fail_closed() -> None:

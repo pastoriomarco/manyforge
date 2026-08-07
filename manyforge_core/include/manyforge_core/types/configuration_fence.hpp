@@ -48,8 +48,21 @@ struct RequestAttributionDTO final {
     if (principal_id.has_value() && principal_id->empty()) {
       return false;
     }
-    return assurance == RequestAssuranceDTO::kExternallyAuthenticated ||
-           !principal_id.has_value();
+    switch (transport) {
+      case RequestTransportDTO::kRos:
+      case RequestTransportDTO::kHttp:
+      case RequestTransportDTO::kInternal:
+        break;
+      default:
+        return false;
+    }
+    switch (assurance) {
+      case RequestAssuranceDTO::kUnverified:
+        return !principal_id.has_value();
+      case RequestAssuranceDTO::kExternallyAuthenticated:
+        return true;
+    }
+    return false;
   }
 
   friend bool operator==(const RequestAttributionDTO&,

@@ -141,6 +141,14 @@ def headless_client() -> Iterator[
                 },
                 request=request,
             )
+        elif path == "/api/execution/stops" or path.startswith(
+            "/api/execution/operations/"
+        ):
+            payload = {
+                "api_version": "manyforge.execution_command_response.v1",
+                "ok": True,
+                "operation": {"operation_id": "operation-1"},
+            }
         elif path == "/api/scene":
             payload = {"schema_version": "manyforge.scene_projection.v1"}
         elif path == "/api/execution/alarms":
@@ -254,6 +262,81 @@ def test_composer_forwards_only_strict_attributed_alarm_intent(
     forwarded = next(item for item in requests if item["method"] == "POST")
     assert forwarded["body"] == body
     assert "trusted_principal_id" not in forwarded["body"]
+
+
+def test_composer_operation_controls_are_strict_stateless_forwarders(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    context = {
+        "request_id": "request.control.1",
+        "request_owner_epoch": "execution.epoch.1",
+        "source_label": "composer_ui",
+        "correlation_id": None,
+    }
+    control = {
+        "request_context": context,
+        "operation_id": "operation-1",
+        "expected_operation_revision": 3,
+        "reason": None,
+    }
+    stop = {
+        "request_context": context,
+        "operations": [
+            {
+                "operation_id": "operation-1",
+                "expected_operation_revision": 3,
+                "expected_stop_generation": 0,
+            }
+        ],
+        "reason": "operator Stop",
+    }
+    scale = {
+        "request_context": context,
+        "operation_id": "operation-1",
+        "expected_operation_revision": 3,
+        "expected_runtime_scale_generation": 0,
+        "scale": 0.5,
+    }
+
+    with _composer(client) as composer:
+        for endpoint in ("pause", "resume", "reset", "acknowledge-completed"):
+            response = composer.post(
+                f"/api/execution/operations/operation-1/{endpoint}",
+                json=control,
+            )
+            assert response.status_code == 200, response.text
+        assert composer.post("/api/execution/stops", json=stop).status_code == 200
+        assert composer.post(
+            "/api/execution/operations/operation-1/runtime-scale", json=scale
+        ).status_code == 200
+        assert composer.get(
+            "/api/execution/operations/operation-1/runtime-scale"
+        ).status_code == 200
+        mismatch = composer.post(
+            "/api/execution/operations/operation-2/pause", json=control
+        )
+
+    assert mismatch.status_code == 400
+    forwarded = [
+        item
+        for item in requests
+        if item["path"] == "/api/execution/stops"
+        or item["path"].startswith("/api/execution/operations/")
+    ]
+    assert [item["path"].rsplit("/", 1)[-1] for item in forwarded] == [
+        "pause",
+        "resume",
+        "reset",
+        "acknowledge-completed",
+        "stops",
+        "runtime-scale",
+        "runtime-scale",
+    ]
+    assert forwarded[0]["body"] == control
+    assert forwarded[4]["body"] == stop
+    assert forwarded[5]["body"] == scale
+    assert forwarded[6]["method"] == "GET"
 
 
 def test_composer_preserves_headless_unavailability_code(

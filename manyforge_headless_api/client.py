@@ -151,13 +151,62 @@ class HeadlessHttpClient:
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/operations", body=body)
 
-    def operation(self, operation_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _operation_path(operation_id: str) -> str:
         if not operation_id or len(operation_id.encode("utf-8")) > 256:
             raise ValueError("operation_id must be bounded non-empty text")
         if "/" in operation_id or ".." in operation_id:
             raise ValueError("operation_id is invalid for an HTTP path")
+        return f"/api/execution/operations/{operation_id}"
+
+    def operation(self, operation_id: str) -> dict[str, Any]:
+        return self.request("GET", self._operation_path(operation_id))
+
+    def _operation_control(
+        self,
+        operation_id: str,
+        control: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
         return self.request(
-            "GET", f"/api/execution/operations/{operation_id}"
+            "POST",
+            f"{self._operation_path(operation_id)}/{control}",
+            body=body,
+        )
+
+    def pause_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._operation_control(operation_id, "pause", body)
+
+    def resume_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._operation_control(operation_id, "resume", body)
+
+    def reset_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._operation_control(operation_id, "reset", body)
+
+    def acknowledge_completed_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._operation_control(
+            operation_id, "acknowledge-completed", body
+        )
+
+    def stop_operations(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/execution/stops", body=body)
+
+    def set_operation_runtime_scale(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._operation_control(operation_id, "runtime-scale", body)
+
+    def operation_runtime_scale(self, operation_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET", f"{self._operation_path(operation_id)}/runtime-scale"
         )
 
     def scene(self) -> dict[str, Any]:

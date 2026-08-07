@@ -23,5 +23,12 @@ def test_contract_constructor_does_not_call_the_transport() -> None:
         execution_status = PoisonCallable()
         execute = PoisonCallable()
         operation = PoisonCallable()
+        pause_operation = PoisonCallable()
+        resume_operation = PoisonCallable()
+        reset_operation = PoisonCallable()
+        acknowledge_completed_operation = PoisonCallable()
+        stop_operations = PoisonCallable()
+        set_operation_runtime_scale = PoisonCallable()
+        operation_runtime_scale = PoisonCallable()
 
     KernelClient(Transport())

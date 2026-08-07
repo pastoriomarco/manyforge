@@ -388,6 +388,86 @@ class OperationIntentRequest(StrictRequest):
         return self
 
 
+class OperationControlRequest(StrictRequest):
+    request_context: CallerAttributionRequest
+    operation_id: str
+    expected_operation_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    reason: str | None = None
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="operation_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(value, label="reason", maximum_bytes=MAX_REASON_BYTES)
+
+
+class StopOperationTargetRequest(StrictRequest):
+    operation_id: str
+    expected_operation_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_stop_generation: Annotated[
+        int, Field(ge=0, le=9_007_199_254_740_991)
+    ]
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="operation_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class StopIntentRequest(StrictRequest):
+    request_context: CallerAttributionRequest
+    operations: Annotated[
+        list[StopOperationTargetRequest], Field(min_length=1, max_length=1)
+    ]
+    reason: str | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(value, label="reason", maximum_bytes=MAX_REASON_BYTES)
+
+
+class RuntimeScaleRequest(StrictRequest):
+    request_context: CallerAttributionRequest
+    operation_id: str
+    expected_operation_revision: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    expected_runtime_scale_generation: Annotated[
+        int, Field(ge=0, le=9_007_199_254_740_991)
+    ]
+    scale: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="operation_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
 class HistorianReconcileRequest(CallerAttributionRequest):
     expected_health_generation: Annotated[
         int,

@@ -12,7 +12,10 @@ from .models import (
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    OperationControlRequest,
     OperationIntentRequest,
+    RuntimeScaleRequest,
+    StopIntentRequest,
 )
 from .native import HeadlessApiError, HeadlessCorePort
 
@@ -51,11 +54,76 @@ class HeadlessService:
     def execution_status(self) -> dict[str, Any]:
         return self._execution().status()
 
-    def execution_submit(self, request: OperationIntentRequest) -> dict[str, Any]:
-        return self._execution().submit(request)
+    def execution_submit(
+        self,
+        request: OperationIntentRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().submit(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_read(self, operation_id: str) -> dict[str, Any]:
         return self._execution().read(operation_id)
+
+    def execution_pause(
+        self,
+        request: OperationControlRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().pause(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
+    def execution_resume(
+        self,
+        request: OperationControlRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().resume(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
+    def execution_reset(
+        self,
+        request: OperationControlRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().reset(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
+    def execution_acknowledge_completed(
+        self,
+        request: OperationControlRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().acknowledge_completed(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
+    def execution_stop(
+        self,
+        request: StopIntentRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().stop(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
+    def execution_set_runtime_scale(
+        self,
+        request: RuntimeScaleRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().set_runtime_scale(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
+    def execution_get_runtime_scale(
+        self, operation_id: str
+    ) -> dict[str, Any]:
+        return self._execution().get_runtime_scale(operation_id)
 
     def runtime(self) -> dict[str, Any]:
         snapshot = self.core.runtime_snapshot()

@@ -14,7 +14,9 @@ from manyforge_behavior.runner import OrchestratorRunner
 
 
 class RecordingTransport:
-    submitted: Mapping[str, Any] | None = None
+    def __init__(self) -> None:
+        self.submitted: Mapping[str, Any] | None = None
+        self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
 
     def execution_status(self) -> dict[str, Any]:
         return {
@@ -46,6 +48,44 @@ class RecordingTransport:
         return {
             "ok": True,
             "operation": {"operation_id": operation_id, "state": "completed"},
+        }
+
+    def _control(
+        self, kind: str, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self.controls.append((kind, operation_id, body))
+        return {
+            "ok": True,
+            "accepted": {
+                "operation_id": operation_id,
+                "operations": [operation_id],
+                "stop_id": "stop-1",
+            },
+        }
+
+    def pause_operation(self, operation_id, body):
+        return self._control("pause", operation_id, body)
+
+    def resume_operation(self, operation_id, body):
+        return self._control("resume", operation_id, body)
+
+    def reset_operation(self, operation_id, body):
+        return self._control("reset", operation_id, body)
+
+    def acknowledge_completed_operation(self, operation_id, body):
+        return self._control("acknowledge_completed", operation_id, body)
+
+    def stop_operations(self, body):
+        operation_id = body["operations"][0]["operation_id"]
+        return self._control("stop", operation_id, body)
+
+    def set_operation_runtime_scale(self, operation_id, body):
+        return self._control("runtime_scale", operation_id, body)
+
+    def operation_runtime_scale(self, operation_id):
+        return {
+            "ok": True,
+            "runtime_scale": {"operation_id": operation_id},
         }
 
 
@@ -88,6 +128,51 @@ def test_runner_reads_owner_projection_without_reducing_it() -> None:
     assert runner.operation("operation-1")["operation"] == {
         "operation_id": "operation-1",
         "state": "completed",
+    }
+
+
+def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport))
+
+    first = runner.stop_operation(
+        request_id="request-stop-1",
+        operation_id="operation-1",
+        expected_operation_revision=4,
+        expected_stop_generation=0,
+        reason="operator requested Stop",
+        correlation_id="cycle-1",
+    )
+    replay = runner.stop_operation(
+        request_id="request-stop-1",
+        operation_id="operation-1",
+        expected_operation_revision=4,
+        expected_stop_generation=0,
+        reason="operator requested Stop",
+        correlation_id="cycle-1",
+    )
+
+    assert first["accepted"]["stop_id"] == "stop-1"
+    assert replay["accepted"]["stop_id"] == "stop-1"
+    assert transport.controls[0] == transport.controls[1]
+    kind, operation_id, request = transport.controls[0]
+    assert kind == "stop"
+    assert operation_id == "operation-1"
+    assert request == {
+        "request_context": {
+            "request_id": "request-stop-1",
+            "request_owner_epoch": "owner-epoch-7",
+            "source_label": "manyforge_behavior",
+            "correlation_id": "cycle-1",
+        },
+        "operations": [
+            {
+                "operation_id": "operation-1",
+                "expected_operation_revision": 4,
+                "expected_stop_generation": 0,
+            }
+        ],
+        "reason": "operator requested Stop",
     }
 
 

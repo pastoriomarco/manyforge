@@ -955,7 +955,8 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       request.request_context.request_owner_epoch.empty() ||
       request.request_context.source_label.empty() || request.operation_id.empty() ||
       !request.expected_operation_revision.nonzero() ||
-      (request.reason.has_value() && request.reason->empty())) {
+      (request.reason.has_value() && request.reason->empty()) ||
+      !request.attribution.locally_valid()) {
     return reject<OperationControlAcceptedDTO>("operation control request is malformed",
                                                "operation_control_request_invalid",
                                                ErrorCode::kInvalidRequest);
@@ -1198,7 +1199,8 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::stop(const StopIntentD
       intent.request_context.source_label.empty() || intent.operations.size() != 1U ||
       intent.operations.front().operation_id.empty() ||
       !intent.operations.front().expected_operation_revision.nonzero() ||
-      (intent.reason.has_value() && intent.reason->empty())) {
+      (intent.reason.has_value() && intent.reason->empty()) ||
+      !intent.attribution.locally_valid()) {
     return reject<StopAcceptedDTO>("ordinary Stop intent is malformed", "stop_intent_invalid",
                                    ErrorCode::kInvalidRequest);
   }
@@ -1384,7 +1386,7 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
       request.request_context.request_owner_epoch.empty() ||
       request.request_context.source_label.empty() || request.operation_id.empty() ||
       !request.expected_operation_revision.nonzero() || !std::isfinite(request.scale) ||
-      request.scale < 0.0 || request.scale > 1.0) {
+      request.scale < 0.0 || request.scale > 1.0 || !request.attribution.locally_valid()) {
     return reject<RuntimeScaleAcceptedDTO>("runtime-scale request is malformed",
                                            "runtime_scale_request_invalid",
                                            ErrorCode::kInvalidRequest);

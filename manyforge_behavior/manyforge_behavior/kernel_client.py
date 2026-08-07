@@ -8,13 +8,37 @@ from typing import Any, Mapping, Protocol
 
 
 class HeadlessExecutionTransport(Protocol):
-    """The three bounded HTTP operations used by Behavior."""
+    """The bounded operation-addressed HTTP calls used by Behavior."""
 
     def execution_status(self) -> dict[str, Any]: ...
 
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def operation(self, operation_id: str) -> dict[str, Any]: ...
+
+    def pause_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def resume_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def reset_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def acknowledge_completed_operation(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def stop_operations(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def set_operation_runtime_scale(
+        self, operation_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def operation_runtime_scale(self, operation_id: str) -> dict[str, Any]: ...
 
 
 class KernelClientResponseError(RuntimeError):
@@ -91,7 +115,18 @@ class KernelClient:
     """Stateless adapter; the C++ host remains the only execution owner."""
 
     def __init__(self, transport: HeadlessExecutionTransport) -> None:
-        for method in ("execution_status", "execute", "operation"):
+        for method in (
+            "execution_status",
+            "execute",
+            "operation",
+            "pause_operation",
+            "resume_operation",
+            "reset_operation",
+            "acknowledge_completed_operation",
+            "stop_operations",
+            "set_operation_runtime_scale",
+            "operation_runtime_scale",
+        ):
             if not callable(getattr(transport, method, None)):
                 raise TypeError(f"execution transport has no callable {method}")
         self._transport = transport
@@ -117,6 +152,60 @@ class KernelClient:
     def operation(self, operation_id: str) -> dict[str, Any]:
         return self._successful(
             self._transport.operation(operation_id), label="observation"
+        )
+
+    def pause(
+        self, operation_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._successful(
+            self._transport.pause_operation(operation_id, request),
+            label="Pause",
+        )
+
+    def resume(
+        self, operation_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._successful(
+            self._transport.resume_operation(operation_id, request),
+            label="Resume",
+        )
+
+    def reset(
+        self, operation_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._successful(
+            self._transport.reset_operation(operation_id, request),
+            label="Reset",
+        )
+
+    def acknowledge_completed(
+        self, operation_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._successful(
+            self._transport.acknowledge_completed_operation(
+                operation_id, request
+            ),
+            label="completion acknowledgement",
+        )
+
+    def stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._successful(
+            self._transport.stop_operations(request),
+            label="Stop",
+        )
+
+    def set_runtime_scale(
+        self, operation_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._successful(
+            self._transport.set_operation_runtime_scale(operation_id, request),
+            label="runtime-scale update",
+        )
+
+    def runtime_scale(self, operation_id: str) -> dict[str, Any]:
+        return self._successful(
+            self._transport.operation_runtime_scale(operation_id),
+            label="runtime-scale observation",
         )
 
 

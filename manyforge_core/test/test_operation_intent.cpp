@@ -83,6 +83,25 @@ TEST(OperationIntentTest, RejectsMalformedIdentityBeforeRuntimeResolution) {
   EXPECT_EQ(result.error().details.at("reason"), "operation_identity_empty");
 }
 
+TEST(OperationIntentTest, RejectsPrincipalWithoutTrustedAdapterAssurance) {
+  auto operation = valid_motion_operation();
+  operation.attribution = RequestAttributionDTO{
+      RequestTransportDTO::kHttp, RequestAssuranceDTO::kUnverified, "forged-principal"};
+
+  const auto result = validate_operation_intent(operation);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "operation_attribution_invalid");
+}
+
+TEST(OperationIntentTest, RejectsUnknownAdapterAttributionEnum) {
+  auto operation = valid_motion_operation();
+  operation.attribution.transport = static_cast<RequestTransportDTO>(99);
+
+  const auto result = validate_operation_intent(operation);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "operation_attribution_invalid");
+}
+
 TEST(OperationIntentTest, RejectsAbsoluteMotionWithRelativeReference) {
   auto operation = valid_motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
