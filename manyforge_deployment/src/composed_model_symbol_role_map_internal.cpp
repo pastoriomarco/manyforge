@@ -261,6 +261,134 @@ using SymbolIndex = std::map<SymbolKey, std::string>;
   });
 }
 
+[[nodiscard]] CanonicalValue placement_pose_projection(
+    const core::PlacementPoseDTO& pose) {
+  CanonicalValue::Array position;
+  position.reserve(pose.position_m.size());
+  for (const double value : pose.position_m) {
+    position.emplace_back(value);
+  }
+  CanonicalValue::Array orientation;
+  orientation.reserve(pose.orientation_xyzw.size());
+  for (const double value : pose.orientation_xyzw) {
+    orientation.emplace_back(value);
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"position_m", CanonicalValue(std::move(position))},
+      {"orientation_xyzw", CanonicalValue(std::move(orientation))},
+  });
+}
+
+[[nodiscard]] CanonicalValue connection_source_projection(
+    const CompositionConnectionSource& source) {
+  return std::visit(
+      [](const auto& value) -> CanonicalValue {
+        using Source = std::remove_cvref_t<decltype(value)>;
+        if constexpr (std::is_same_v<Source,
+                                     CompositionDirectModelAnchor>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("direct_model_anchor")},
+              {"model_instance_id",
+               CanonicalValue(value.model_instance_id.value())},
+          });
+        } else if constexpr (std::is_same_v<
+                                 Source, CompositionDirectComponentAnchor>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("direct_component_anchor")},
+              {"controllable_component_id",
+               CanonicalValue(value.controllable_component_id.value())},
+              {"root_model_instance_id",
+               CanonicalValue(value.root_model_instance_id.value())},
+          });
+        } else if constexpr (std::is_same_v<Source,
+                                            CompositionModelMount>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("model_mount")},
+              {"controllable_component_id",
+               CanonicalValue(value.controllable_component_id.value())},
+              {"parent_model_instance_id",
+               CanonicalValue(value.parent_model_instance_id.value())},
+              {"child_model_instance_id",
+               CanonicalValue(value.child_model_instance_id.value())},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("component_attachment")},
+              {"component_attachment_id",
+               CanonicalValue(value.component_attachment_id.value())},
+              {"parent_component_id",
+               CanonicalValue(value.parent_component_id.value())},
+              {"child_component_id",
+               CanonicalValue(value.child_component_id.value())},
+          });
+        }
+      },
+      source);
+}
+
+[[nodiscard]] CanonicalValue fixed_connection_projection(
+    const CompositionFixedConnection& connection) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"source", connection_source_projection(connection.source)},
+      {"compiled_joint_name",
+       CanonicalValue(connection.compiled_joint_name)},
+      {"compiled_parent_link_name",
+       CanonicalValue(connection.compiled_parent_link_name)},
+      {"compiled_child_link_name",
+       CanonicalValue(connection.compiled_child_link_name)},
+      {"child_pose_in_parent",
+       placement_pose_projection(connection.child_pose_in_parent)},
+  });
+}
+
+[[nodiscard]] CanonicalValue frame_path_segment_projection(
+    const CompositionFramePathSegment& segment) {
+  return std::visit(
+      [](const auto& value) -> CanonicalValue {
+        using Segment = std::remove_cvref_t<decltype(value)>;
+        if constexpr (std::is_same_v<Segment,
+                                     CompositionFixedPathSegment>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("fixed_connection")},
+              {"fixed_connection_index",
+               CanonicalValue(
+                   static_cast<double>(value.fixed_connection_index))},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("model_joint")},
+              {"model_instance_id",
+               CanonicalValue(value.model_instance_id.value())},
+              {"composition_coordinate_index",
+               CanonicalValue(static_cast<double>(
+                   value.composition_coordinate_index))},
+              {"source_joint_name",
+               CanonicalValue(value.source_joint_name)},
+              {"compiled_joint_name",
+               CanonicalValue(value.compiled_joint_name)},
+              {"compiled_parent_link_name",
+               CanonicalValue(value.compiled_parent_link_name)},
+              {"compiled_child_link_name",
+               CanonicalValue(value.compiled_child_link_name)},
+          });
+        }
+      },
+      segment);
+}
+
+[[nodiscard]] CanonicalValue frame_path_projection(
+    const CompositionFramePath& path) {
+  CanonicalValue::Array segments;
+  segments.reserve(path.segments.size());
+  for (const auto& segment : path.segments) {
+    segments.push_back(frame_path_segment_projection(segment));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"terminal_frame", resolved_frame_projection(path.terminal_frame)},
+      {"segments", CanonicalValue(std::move(segments))},
+  });
+}
+
 [[nodiscard]] CanonicalValue occurrence_projection(
     const CompositionModelOccurrence& occurrence,
     const core::ModelAssetDTO& asset, const SymbolIndex& symbols) {
@@ -444,6 +572,18 @@ using SymbolIndex = std::map<SymbolKey, std::string>;
     });
   }
 
+  CanonicalValue::Array fixed_connections;
+  fixed_connections.reserve(composition.fixed_connections().size());
+  for (const auto& connection : composition.fixed_connections()) {
+    fixed_connections.push_back(fixed_connection_projection(connection));
+  }
+
+  CanonicalValue::Array frame_paths;
+  frame_paths.reserve(composition.frame_paths().size());
+  for (const auto& path : composition.frame_paths()) {
+    frame_paths.push_back(frame_path_projection(path));
+  }
+
   CanonicalValue::Array binding_maps;
   binding_maps.reserve(composition.control_binding_coordinate_maps().size());
   for (const auto& binding : composition.control_binding_coordinate_maps()) {
@@ -536,6 +676,8 @@ using SymbolIndex = std::map<SymbolKey, std::string>;
       {"symbol_rows", CanonicalValue(std::move(symbol_rows))},
       {"reference_rows", CanonicalValue(std::move(reference_rows))},
       {"coordinate_rows", CanonicalValue(std::move(coordinate_rows))},
+      {"fixed_connections", CanonicalValue(std::move(fixed_connections))},
+      {"frame_paths", CanonicalValue(std::move(frame_paths))},
       {"control_binding_coordinate_maps",
        CanonicalValue(std::move(binding_maps))},
       {"target_role_maps", CanonicalValue(std::move(targets))},

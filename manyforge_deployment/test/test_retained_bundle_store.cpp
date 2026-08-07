@@ -1316,6 +1316,56 @@ TEST(FilesystemVerifiedRetainedModelMapSourceTest,
   EXPECT_FALSE(model_map->symbols().empty());
   EXPECT_FALSE(model_map->references().empty());
   EXPECT_FALSE(model_map->coordinates().empty());
+  EXPECT_FALSE(model_map->fixed_connections().empty());
+  EXPECT_FALSE(model_map->frame_paths().empty());
+  ASSERT_EQ(model_map->kinematic_frame_paths().size(),
+            model_map->frame_paths().size());
+  const auto& cell_path = model_map->kinematic_frame_paths().front();
+  const auto* cell_terminal =
+      std::get_if<core::ResolvedCellFrameDTO>(&cell_path.terminal_frame);
+  ASSERT_NE(cell_terminal, nullptr);
+  EXPECT_EQ(cell_terminal->cell_id, reloaded->value().cell_graph.cell_id);
+  EXPECT_TRUE(cell_path.segments.empty());
+  EXPECT_EQ(model_map->find_kinematic_frame_path(cell_path.terminal_frame),
+            &cell_path);
+  const core::KinematicResourceCoordinateDependencyDTO*
+      retained_dependency = nullptr;
+  for (const auto& path : model_map->kinematic_frame_paths()) {
+    for (const auto& segment : path.segments) {
+      const auto* joint =
+          std::get_if<core::KinematicModelJointPathSegmentDTO>(&segment);
+      if (joint != nullptr &&
+          !joint->eligible_resource_dependencies.empty()) {
+        retained_dependency =
+            &joint->eligible_resource_dependencies.front();
+      }
+    }
+  }
+  ASSERT_NE(retained_dependency, nullptr);
+  const auto retained_binding = std::find_if(
+      reloaded->value().cell_graph.control_bindings.begin(),
+      reloaded->value().cell_graph.control_bindings.end(),
+      [retained_dependency](const core::ControlBindingDTO& candidate) {
+        return candidate.control_binding_id ==
+               retained_dependency->control_binding_id;
+      });
+  ASSERT_NE(retained_binding,
+            reloaded->value().cell_graph.control_bindings.end());
+  EXPECT_EQ(retained_dependency->control_binding_revision,
+            retained_binding->control_binding_revision);
+  EXPECT_EQ(retained_dependency->control_domain_id,
+            retained_binding->control_domain_id);
+  const auto retained_domain = std::find_if(
+      reloaded->value().cell_graph.control_domains.begin(),
+      reloaded->value().cell_graph.control_domains.end(),
+      [retained_dependency](const core::ControlDomainDTO& candidate) {
+        return candidate.control_domain_id ==
+               retained_dependency->control_domain_id;
+      });
+  ASSERT_NE(retained_domain,
+            reloaded->value().cell_graph.control_domains.end());
+  EXPECT_EQ(retained_dependency->control_domain_revision,
+            retained_domain->control_domain_revision);
 
   const core::ControllableComponentId component_id(
       std::string(test::kLite6ControllableComponentId));

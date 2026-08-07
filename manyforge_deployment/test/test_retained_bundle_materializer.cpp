@@ -775,6 +775,10 @@ TEST(RetainedBundleMaterializer,
             composition.reference_rewrites().size());
   EXPECT_EQ(array_member(parsed_symbol_map, "coordinate_rows").size(),
             composition.coordinates().size());
+  EXPECT_EQ(array_member(parsed_symbol_map, "fixed_connections").size(),
+            composition.fixed_connections().size());
+  EXPECT_EQ(array_member(parsed_symbol_map, "frame_paths").size(),
+            composition.frame_paths().size());
   EXPECT_EQ(
       array_member(parsed_symbol_map, "control_binding_coordinate_maps")
           .size(),
@@ -1536,6 +1540,43 @@ TEST(RetainedBundleMaterializer,
   EXPECT_THROW(
       static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
           canonical_json(duplicate_reverse))),
+      RetainedBundleError);
+
+  CanonicalValue::Array out_of_range_paths =
+      array_member(parsed, "frame_paths");
+  const auto path_with_fixed = std::find_if(
+      out_of_range_paths.begin(), out_of_range_paths.end(),
+      [](const CanonicalValue& path) {
+        const auto& segments = array_member(path, "segments");
+        return !segments.empty() &&
+               string_member(segments.front(), "kind") ==
+                   "fixed_connection";
+      });
+  ASSERT_NE(path_with_fixed, out_of_range_paths.end());
+  CanonicalValue::Array out_of_range_segments =
+      array_member(*path_with_fixed, "segments");
+  out_of_range_segments.front() = replace_object_member(
+      out_of_range_segments.front(), "fixed_connection_index",
+      CanonicalValue(9007199254740991.0));
+  *path_with_fixed = replace_object_member(
+      *path_with_fixed, "segments",
+      CanonicalValue(std::move(out_of_range_segments)));
+  const CanonicalValue out_of_range_path = replace_root_member(
+      parsed, "frame_paths", CanonicalValue(std::move(out_of_range_paths)));
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
+          canonical_json(out_of_range_path))),
+      RetainedBundleError);
+
+  CanonicalValue::Array reordered_paths =
+      array_member(parsed, "frame_paths");
+  ASSERT_GT(reordered_paths.size(), 1U);
+  std::swap(reordered_paths[0], reordered_paths[1]);
+  const CanonicalValue reordered_path = replace_root_member(
+      parsed, "frame_paths", CanonicalValue(std::move(reordered_paths)));
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
+          canonical_json(reordered_path))),
       RetainedBundleError);
 }
 

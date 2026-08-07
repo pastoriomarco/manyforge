@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <manyforge_core/types/kinematic_state_view.hpp>
 #include <manyforge_core/types/projection_bootstrap.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -426,10 +427,28 @@ class VerifiedRetainedModelMap final {
   control_bindings() const noexcept {
     return control_bindings_;
   }
+  [[nodiscard]] const std::vector<CompositionFixedConnection>&
+  fixed_connections() const noexcept {
+    return fixed_connections_;
+  }
+  [[nodiscard]] const std::vector<CompositionFramePath>& frame_paths()
+      const noexcept {
+    return frame_paths_;
+  }
+  [[nodiscard]] const std::vector<core::KinematicFramePathDTO>&
+  kinematic_frame_paths() const noexcept {
+    return kinematic_frame_paths_;
+  }
   [[nodiscard]] const std::vector<CompositionTargetResolution>& targets()
       const noexcept {
     return targets_;
   }
+
+  /// Exact compiler-owned path lookup for one retained runtime frame.
+  /// Missing and duplicate terminal identities both fail closed.
+  [[nodiscard]] const core::KinematicFramePathDTO*
+  find_kinematic_frame_path(
+      const core::ResolvedFrameDTO& terminal_frame) const noexcept;
 
   [[nodiscard]] const CompositionTargetResolution* find_target(
       const core::ControllableComponentId& component_id,
@@ -469,6 +488,9 @@ class VerifiedRetainedModelMap final {
       std::vector<OccurrenceReferenceRewrite> references,
       std::vector<CompositionModelCoordinate> coordinates,
       std::vector<CompositionControlBindingCoordinateMap> control_bindings,
+      std::vector<CompositionFixedConnection> fixed_connections,
+      std::vector<CompositionFramePath> frame_paths,
+      std::vector<core::KinematicFramePathDTO> kinematic_frame_paths,
       std::vector<CompositionTargetResolution> targets)
       : query_(std::move(query)),
         product_contract_id_(std::move(product_contract_id)),
@@ -480,6 +502,9 @@ class VerifiedRetainedModelMap final {
         references_(std::move(references)),
         coordinates_(std::move(coordinates)),
         control_bindings_(std::move(control_bindings)),
+        fixed_connections_(std::move(fixed_connections)),
+        frame_paths_(std::move(frame_paths)),
+        kinematic_frame_paths_(std::move(kinematic_frame_paths)),
         targets_(std::move(targets)) {}
 
   RetainedModelMapQuery query_;
@@ -493,6 +518,9 @@ class VerifiedRetainedModelMap final {
   std::vector<OccurrenceReferenceRewrite> references_;
   std::vector<CompositionModelCoordinate> coordinates_;
   std::vector<CompositionControlBindingCoordinateMap> control_bindings_;
+  std::vector<CompositionFixedConnection> fixed_connections_;
+  std::vector<CompositionFramePath> frame_paths_;
+  std::vector<core::KinematicFramePathDTO> kinematic_frame_paths_;
   std::vector<CompositionTargetResolution> targets_;
 
   friend class FilesystemVerifiedRetainedModelMapSource;

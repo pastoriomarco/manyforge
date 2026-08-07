@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -505,6 +506,99 @@ read_verified_bundle_entry(
       "verified symbol/role map has an unknown resolved-frame kind");
 }
 
+[[nodiscard]] double require_verified_number(
+    const CanonicalValue& value, std::string_view diagnostic) {
+  const auto* number = std::get_if<double>(&value.storage());
+  if (number == nullptr || !std::isfinite(*number)) {
+    detail::fail_retained_bundle(std::string(diagnostic));
+  }
+  return *number;
+}
+
+[[nodiscard]] core::PlacementPoseDTO decode_placement_pose(
+    const CanonicalValue& value) {
+  const auto& position = require_map_array(value, "position_m");
+  const auto& orientation = require_map_array(value, "orientation_xyzw");
+  if (position.size() != 3U || orientation.size() != 4U) {
+    detail::fail_retained_bundle(
+        "verified symbol/role map placement has an invalid shape");
+  }
+  core::PlacementPoseDTO result;
+  for (std::size_t index = 0U; index < position.size(); ++index) {
+    result.position_m[index] = require_verified_number(
+        position[index],
+        "verified symbol/role map placement position is not finite");
+  }
+  for (std::size_t index = 0U; index < orientation.size(); ++index) {
+    result.orientation_xyzw[index] = require_verified_number(
+        orientation[index],
+        "verified symbol/role map placement orientation is not finite");
+  }
+  return result;
+}
+
+[[nodiscard]] CompositionConnectionSource decode_connection_source(
+    const CanonicalValue& value) {
+  const std::string& kind = require_map_text(value, "kind");
+  if (kind == "direct_model_anchor") {
+    return CompositionDirectModelAnchor{
+        core::ModelInstanceId(
+            require_map_text(value, "model_instance_id")),
+        {}};
+  }
+  if (kind == "direct_component_anchor") {
+    return CompositionDirectComponentAnchor{
+        core::ControllableComponentId(
+            require_map_text(value, "controllable_component_id")),
+        core::ModelInstanceId(
+            require_map_text(value, "root_model_instance_id")),
+        {}};
+  }
+  if (kind == "model_mount") {
+    return CompositionModelMount{
+        core::ControllableComponentId(
+            require_map_text(value, "controllable_component_id")),
+        core::ModelInstanceId(
+            require_map_text(value, "parent_model_instance_id")),
+        core::ModelInstanceId(
+            require_map_text(value, "child_model_instance_id")),
+        {}};
+  }
+  if (kind == "component_attachment") {
+    return CompositionComponentAttachment{
+        core::ComponentAttachmentId(
+            require_map_text(value, "component_attachment_id")),
+        core::ControllableComponentId(
+            require_map_text(value, "parent_component_id")),
+        core::ControllableComponentId(
+            require_map_text(value, "child_component_id")),
+        {}};
+  }
+  detail::fail_retained_bundle(
+      "verified symbol/role map has an unknown connection-source kind");
+}
+
+[[nodiscard]] CompositionFramePathSegment decode_frame_path_segment(
+    const CanonicalValue& value) {
+  const std::string& kind = require_map_text(value, "kind");
+  if (kind == "fixed_connection") {
+    return CompositionFixedPathSegment{
+        require_map_index(value, "fixed_connection_index")};
+  }
+  if (kind == "model_joint") {
+    return CompositionModelJointPathSegment{
+        core::ModelInstanceId(
+            require_map_text(value, "model_instance_id")),
+        require_map_index(value, "composition_coordinate_index"),
+        require_map_text(value, "source_joint_name"),
+        require_map_text(value, "compiled_joint_name"),
+        require_map_text(value, "compiled_parent_link_name"),
+        require_map_text(value, "compiled_child_link_name")};
+  }
+  detail::fail_retained_bundle(
+      "verified symbol/role map has an unknown frame-path segment kind");
+}
+
 struct DecodedRetainedModelMap final {
   CompositionCellFrame cell_frame;
   std::vector<CompositionModelOccurrence> model_occurrences;
@@ -514,6 +608,8 @@ struct DecodedRetainedModelMap final {
   std::vector<OccurrenceReferenceRewrite> references;
   std::vector<CompositionModelCoordinate> coordinates;
   std::vector<CompositionControlBindingCoordinateMap> control_bindings;
+  std::vector<CompositionFixedConnection> fixed_connections;
+  std::vector<CompositionFramePath> frame_paths;
   std::vector<CompositionTargetResolution> targets;
 };
 
@@ -524,7 +620,7 @@ struct DecodedRetainedModelMap final {
           core::CellId(require_map_text(map, "cell_id")),
           require_map_text(require_map_member(map, "cell_frame"),
                            "compiled_frame_name")},
-      {}, {}, {}, {}, {}, {}, {}};
+      {}, {}, {}, {}, {}, {}, {}, {}, {}};
 
   const auto& occurrences = require_map_array(map, "model_occurrences");
   result.model_occurrences.reserve(occurrences.size());
@@ -660,6 +756,53 @@ struct DecodedRetainedModelMap final {
             std::move(resources)});
   }
 
+  const auto& fixed_connections =
+      require_map_array(map, "fixed_connections");
+  result.fixed_connections.reserve(fixed_connections.size());
+  for (const auto& row : fixed_connections) {
+    const auto source = decode_connection_source(
+        require_map_member(row, "source"));
+    const auto pose = decode_placement_pose(
+        require_map_member(row, "child_pose_in_parent"));
+    result.fixed_connections.push_back(CompositionFixedConnection{
+        std::visit(
+            [&pose](auto value) -> CompositionConnectionSource {
+              using Source = std::remove_cvref_t<decltype(value)>;
+              if constexpr (std::is_same_v<Source,
+                                           CompositionDirectModelAnchor>) {
+                value.root_pose_in_cell = pose;
+              } else if constexpr (std::is_same_v<
+                                       Source,
+                                       CompositionDirectComponentAnchor>) {
+                value.root_pose_in_cell = pose;
+              } else if constexpr (std::is_same_v<Source,
+                                                  CompositionModelMount>) {
+                value.child_frame_pose_in_parent_frame = pose;
+              } else {
+                value.child_interface_pose_in_parent_interface = pose;
+              }
+              return value;
+            },
+            source),
+        require_map_text(row, "compiled_joint_name"),
+        require_map_text(row, "compiled_parent_link_name"),
+        require_map_text(row, "compiled_child_link_name"), pose});
+  }
+
+  const auto& frame_paths = require_map_array(map, "frame_paths");
+  result.frame_paths.reserve(frame_paths.size());
+  for (const auto& row : frame_paths) {
+    std::vector<CompositionFramePathSegment> segments;
+    const auto& segment_rows = require_map_array(row, "segments");
+    segments.reserve(segment_rows.size());
+    for (const auto& segment : segment_rows) {
+      segments.push_back(decode_frame_path_segment(segment));
+    }
+    result.frame_paths.push_back(CompositionFramePath{
+        decode_resolved_frame(require_map_member(row, "terminal_frame")),
+        std::move(segments)});
+  }
+
   const auto& targets = require_map_array(map, "target_role_maps");
   result.targets.reserve(targets.size());
   for (const auto& row : targets) {
@@ -700,6 +843,331 @@ struct DecodedRetainedModelMap final {
             require_map_text(row, "controllable_component_id")),
         core::CommandTargetId(require_map_text(row, "command_target_id")),
         std::move(groups), std::move(frames), std::move(collisions)});
+  }
+  return result;
+}
+
+[[nodiscard]] core::ResolvedFrameDTO runtime_resolved_frame(
+    const CompositionResolvedFrame& frame) {
+  return std::visit(
+      [](const auto& value) -> core::ResolvedFrameDTO {
+        using Frame = std::remove_cvref_t<decltype(value)>;
+        if constexpr (std::is_same_v<Frame, CompositionCellFrame>) {
+          return core::ResolvedCellFrameDTO{
+              value.cell_id, value.compiled_frame_name};
+        } else if constexpr (std::is_same_v<
+                                 Frame, CompositionComponentModelFrame>) {
+          return core::ResolvedComponentModelFrameDTO{
+              value.controllable_component_id, value.model_instance_id,
+              value.frame_role_id, value.compiled_frame_name,
+              value.model_revision};
+        } else {
+          return core::ResolvedPassiveModelFrameDTO{
+              value.model_instance_id, value.frame_role_id,
+              value.compiled_frame_name, value.model_revision};
+        }
+      },
+      frame);
+}
+
+[[nodiscard]] core::KinematicJointCoordinateKind runtime_coordinate_kind(
+    UrdfCoordinateKind kind) {
+  switch (kind) {
+    case UrdfCoordinateKind::kNone:
+      return core::KinematicJointCoordinateKind::kFixed;
+    case UrdfCoordinateKind::kAngular:
+      return core::KinematicJointCoordinateKind::kAngular;
+    case UrdfCoordinateKind::kLinear:
+      return core::KinematicJointCoordinateKind::kLinear;
+    case UrdfCoordinateKind::kPlanar:
+      return core::KinematicJointCoordinateKind::kPlanar;
+    case UrdfCoordinateKind::kFloating:
+      return core::KinematicJointCoordinateKind::kFloating;
+  }
+  detail::fail_retained_bundle(
+      "retained model map has an unknown runtime coordinate kind");
+}
+
+[[nodiscard]] std::optional<core::CoordinateKind>
+runtime_scalar_coordinate_kind(UrdfCoordinateKind kind) {
+  switch (kind) {
+    case UrdfCoordinateKind::kAngular:
+      return core::CoordinateKind::kAngular;
+    case UrdfCoordinateKind::kLinear:
+      return core::CoordinateKind::kLinear;
+    case UrdfCoordinateKind::kNone:
+    case UrdfCoordinateKind::kPlanar:
+    case UrdfCoordinateKind::kFloating:
+      return std::nullopt;
+  }
+  detail::fail_retained_bundle(
+      "retained model map has an unknown scalar coordinate kind");
+}
+
+struct RuntimePathBuildIndex final {
+  std::map<std::string, const CompositionModelOccurrence*, std::less<>>
+      model_occurrences;
+  std::map<std::string, const core::ControlBindingDTO*, std::less<>>
+      control_bindings;
+  std::map<std::string, core::ControlDomainRevision, std::less<>>
+      control_domains;
+};
+
+[[nodiscard]] RuntimePathBuildIndex make_runtime_path_build_index(
+    const DecodedRetainedModelMap& decoded,
+    const core::CellGraphDTO& graph) {
+  RuntimePathBuildIndex result;
+  for (const auto& occurrence : decoded.model_occurrences) {
+    if (!result.model_occurrences
+             .emplace(occurrence.model_instance_id.value(), &occurrence)
+             .second) {
+      detail::fail_retained_bundle(
+          "retained model map repeats a model occurrence while building "
+          "runtime paths");
+    }
+  }
+  for (const auto& domain : graph.control_domains) {
+    if (!result.control_domains
+             .emplace(domain.control_domain_id.value(),
+                      domain.control_domain_revision)
+             .second) {
+      detail::fail_retained_bundle(
+          "retained graph repeats a control domain while building runtime "
+          "paths");
+    }
+  }
+  for (const auto& binding : graph.control_bindings) {
+    if (!result.control_bindings
+             .emplace(binding.control_binding_id.value(), &binding)
+             .second) {
+      detail::fail_retained_bundle(
+          "retained graph repeats a control binding while building runtime "
+          "paths");
+    }
+    if (!result.control_domains.contains(
+            binding.control_domain_id.value())) {
+      detail::fail_retained_bundle(
+          "retained binding references an absent control domain while "
+          "building runtime paths");
+    }
+  }
+  return result;
+}
+
+[[nodiscard]] const CompositionModelOccurrence& require_runtime_occurrence(
+    const RuntimePathBuildIndex& index,
+    const core::ModelInstanceId& model_instance_id) {
+  const auto found = index.model_occurrences.find(model_instance_id.value());
+  if (found == index.model_occurrences.end()) {
+    detail::fail_retained_bundle(
+        "retained runtime path references an absent model occurrence");
+  }
+  return *found->second;
+}
+
+using RuntimeDependencyKey =
+    std::tuple<std::string, std::string, std::string, std::string,
+               std::string>;
+
+[[nodiscard]] RuntimeDependencyKey runtime_dependency_key(
+    const core::KinematicResourceCoordinateDependencyDTO& dependency) {
+  return {dependency.control_domain_id.value(),
+          dependency.control_domain_revision.value(),
+          dependency.control_binding_id.value(),
+          dependency.control_binding_revision.value(),
+          dependency.resource_id.value()};
+}
+
+[[nodiscard]] std::vector<core::KinematicResourceCoordinateDependencyDTO>
+build_runtime_coordinate_dependencies(
+    const CompositionModelCoordinate& coordinate,
+    const DecodedRetainedModelMap& decoded,
+    const RuntimePathBuildIndex& index) {
+  std::map<RuntimeDependencyKey,
+           core::KinematicResourceCoordinateDependencyDTO>
+      dependencies;
+  for (const auto& binding_map : decoded.control_bindings) {
+    const auto graph_binding = index.control_bindings.find(
+        binding_map.control_binding_id.value());
+    if (graph_binding == index.control_bindings.end()) {
+      detail::fail_retained_bundle(
+          "retained coordinate dependency references an absent control "
+          "binding");
+    }
+    const auto domain_revision = index.control_domains.find(
+        graph_binding->second->control_domain_id.value());
+    if (domain_revision == index.control_domains.end()) {
+      detail::fail_retained_bundle(
+          "retained coordinate dependency references an absent control "
+          "domain");
+    }
+    for (const auto& resource : binding_map.resources) {
+      for (const auto& projection : resource.coordinates) {
+        if (projection.model_instance_id != coordinate.model_instance_id ||
+            projection.source_joint_name != coordinate.source_joint_name ||
+            projection.compiled_joint_name !=
+                coordinate.compiled_joint_name) {
+          continue;
+        }
+        if (projection.coordinate_kind != coordinate.coordinate_kind ||
+            projection.unit != coordinate.unit) {
+          detail::fail_retained_bundle(
+              "retained coordinate dependency disagrees with its exact "
+              "model coordinate kind or unit");
+        }
+        const auto scalar_kind =
+            runtime_scalar_coordinate_kind(projection.coordinate_kind);
+        if (!scalar_kind.has_value()) {
+          detail::fail_retained_bundle(
+              "retained coordinate dependency is not an angular or linear "
+              "resource");
+        }
+        core::KinematicResourceCoordinateDependencyDTO dependency{
+            graph_binding->second->control_domain_id,
+            domain_revision->second,
+            graph_binding->second->control_binding_id,
+            graph_binding->second->control_binding_revision,
+            resource.resource_id,
+            *scalar_kind,
+            projection.multiplier,
+            projection.offset,
+            projection.derived_mimic};
+        if (!dependencies
+                 .emplace(runtime_dependency_key(dependency), dependency)
+                 .second) {
+          detail::fail_retained_bundle(
+              "retained runtime path repeats one exact resource-coordinate "
+              "dependency");
+        }
+      }
+    }
+  }
+
+  std::vector<core::KinematicResourceCoordinateDependencyDTO> result;
+  result.reserve(dependencies.size());
+  for (auto& [unused, dependency] : dependencies) {
+    (void)unused;
+    result.push_back(std::move(dependency));
+  }
+  return result;
+}
+
+[[nodiscard]] core::KinematicFramePathSegmentDTO runtime_fixed_segment(
+    const CompositionFixedConnection& connection,
+    const RuntimePathBuildIndex& index) {
+  return std::visit(
+      [&connection, &index](const auto& source)
+          -> core::KinematicFramePathSegmentDTO {
+        using Source = std::remove_cvref_t<decltype(source)>;
+        if constexpr (std::is_same_v<Source,
+                                     CompositionDirectModelAnchor>) {
+          const auto& occurrence = require_runtime_occurrence(
+              index, source.model_instance_id);
+          return core::KinematicDirectModelAnchorPathSegmentDTO{
+              source.model_instance_id, occurrence.model_revision,
+              connection.compiled_joint_name,
+              connection.compiled_parent_link_name,
+              connection.compiled_child_link_name,
+              connection.child_pose_in_parent};
+        } else if constexpr (std::is_same_v<
+                                 Source, CompositionDirectComponentAnchor>) {
+          const auto& occurrence = require_runtime_occurrence(
+              index, source.root_model_instance_id);
+          return core::KinematicDirectComponentAnchorPathSegmentDTO{
+              source.controllable_component_id,
+              source.root_model_instance_id, occurrence.model_revision,
+              connection.compiled_joint_name,
+              connection.compiled_parent_link_name,
+              connection.compiled_child_link_name,
+              connection.child_pose_in_parent};
+        } else if constexpr (std::is_same_v<Source,
+                                            CompositionModelMount>) {
+          const auto& parent = require_runtime_occurrence(
+              index, source.parent_model_instance_id);
+          const auto& child = require_runtime_occurrence(
+              index, source.child_model_instance_id);
+          return core::KinematicModelMountPathSegmentDTO{
+              source.controllable_component_id,
+              source.parent_model_instance_id, parent.model_revision,
+              source.child_model_instance_id, child.model_revision,
+              connection.compiled_joint_name,
+              connection.compiled_parent_link_name,
+              connection.compiled_child_link_name,
+              connection.child_pose_in_parent};
+        } else {
+          return core::KinematicComponentAttachmentPathSegmentDTO{
+              source.component_attachment_id, source.parent_component_id,
+              source.child_component_id, connection.compiled_joint_name,
+              connection.compiled_parent_link_name,
+              connection.compiled_child_link_name,
+              connection.child_pose_in_parent};
+        }
+      },
+      connection.source);
+}
+
+[[nodiscard]] std::vector<core::KinematicFramePathDTO>
+build_runtime_kinematic_paths(const DecodedRetainedModelMap& decoded,
+                              const core::CellGraphDTO& graph) {
+  const RuntimePathBuildIndex index =
+      make_runtime_path_build_index(decoded, graph);
+  std::vector<core::KinematicFramePathDTO> result;
+  result.reserve(decoded.frame_paths.size());
+  for (const auto& path : decoded.frame_paths) {
+    std::vector<core::KinematicFramePathSegmentDTO> segments;
+    segments.reserve(path.segments.size());
+    for (const auto& segment : path.segments) {
+      std::visit(
+          [&decoded, &index, &segments](const auto& value) {
+            using Segment = std::remove_cvref_t<decltype(value)>;
+            if constexpr (std::is_same_v<Segment,
+                                         CompositionFixedPathSegment>) {
+              if (value.fixed_connection_index >=
+                  decoded.fixed_connections.size()) {
+                detail::fail_retained_bundle(
+                    "retained runtime path has an out-of-range fixed "
+                    "connection");
+              }
+              segments.push_back(runtime_fixed_segment(
+                  decoded.fixed_connections[value.fixed_connection_index],
+                  index));
+            } else {
+              if (value.composition_coordinate_index >=
+                  decoded.coordinates.size()) {
+                detail::fail_retained_bundle(
+                    "retained runtime path has an out-of-range model "
+                    "coordinate");
+              }
+              const auto& coordinate = decoded.coordinates[
+                  value.composition_coordinate_index];
+              if (coordinate.model_instance_id != value.model_instance_id ||
+                  coordinate.source_joint_name != value.source_joint_name ||
+                  coordinate.compiled_joint_name !=
+                      value.compiled_joint_name) {
+                detail::fail_retained_bundle(
+                    "retained runtime path model-joint segment differs from "
+                    "its exact coordinate");
+              }
+              const auto& occurrence = require_runtime_occurrence(
+                  index, value.model_instance_id);
+              segments.emplace_back(core::KinematicModelJointPathSegmentDTO{
+                  coordinate.owner_component_id,
+                  value.model_instance_id,
+                  occurrence.model_revision,
+                  value.composition_coordinate_index,
+                  value.source_joint_name,
+                  value.compiled_joint_name,
+                  value.compiled_parent_link_name,
+                  value.compiled_child_link_name,
+                  runtime_coordinate_kind(coordinate.coordinate_kind),
+                  build_runtime_coordinate_dependencies(
+                      coordinate, decoded, index)});
+            }
+          },
+          segment);
+    }
+    result.push_back(core::KinematicFramePathDTO{
+        runtime_resolved_frame(path.terminal_frame), std::move(segments)});
   }
   return result;
 }
@@ -1387,6 +1855,22 @@ VerifiedRetainedModelMap::find_binding(
   return match;
 }
 
+const core::KinematicFramePathDTO*
+VerifiedRetainedModelMap::find_kinematic_frame_path(
+    const core::ResolvedFrameDTO& terminal_frame) const noexcept {
+  const core::KinematicFramePathDTO* match = nullptr;
+  for (const auto& candidate : kinematic_frame_paths_) {
+    if (candidate.terminal_frame != terminal_frame) {
+      continue;
+    }
+    if (match != nullptr) {
+      return nullptr;
+    }
+    match = &candidate;
+  }
+  return match;
+}
+
 void VerifiedRetainedModelMap::require_same_bundle_as(
     const VerifiedRetainedPlanningModel& planning_model) const {
   if (query_.retained_bundle_id !=
@@ -1711,6 +2195,8 @@ FilesystemVerifiedRetainedModelMapSource::get_verified(
   require_symbol_role_map_matches_retained_graph(
       parsed, bundle->value().cell_graph);
   DecodedRetainedModelMap decoded = decode_retained_model_map(parsed);
+  std::vector<core::KinematicFramePathDTO> kinematic_frame_paths =
+      build_runtime_kinematic_paths(decoded, bundle->value().cell_graph);
 
   return VerifiedRetainedModelMap(
       query, product->product_contract_id,
@@ -1718,7 +2204,9 @@ FilesystemVerifiedRetainedModelMapSource::get_verified(
       std::move(decoded.model_occurrences),
       std::move(decoded.model_collision_bodies), std::move(decoded.symbols),
       std::move(decoded.references), std::move(decoded.coordinates),
-      std::move(decoded.control_bindings), std::move(decoded.targets));
+      std::move(decoded.control_bindings),
+      std::move(decoded.fixed_connections), std::move(decoded.frame_paths),
+      std::move(kinematic_frame_paths), std::move(decoded.targets));
 }
 
 FilesystemVerifiedRetainedPlanningModelSource::

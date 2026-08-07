@@ -13,13 +13,13 @@ class CompilerQualifiedCellIr;
 namespace manyforge::deployment::detail {
 
 inline constexpr std::string_view kComposedModelSymbolRoleMapApiVersion =
-    "manyforge.composed_model_symbol_role_map.v1";
+    "manyforge.composed_model_symbol_role_map.v2";
 inline constexpr std::string_view kComposedModelSymbolRoleMapContractId =
     "manyforge.composed_model_symbol_role_map";
 inline constexpr std::string_view kComposedModelSymbolRoleMapArtifactRole =
     "composed_model_symbol_role_map";
 inline constexpr std::string_view kComposedModelSymbolRoleMapMediaType =
-    "application/vnd.manyforge.composed-model-symbol-role-map+json";
+    "application/vnd.manyforge.composed-model-symbol-role-map.v2+json";
 
 // This first qualified map product deliberately uses the common strict
 // artifact-codec ceiling. I2 accepts a larger semantic universe, while I3

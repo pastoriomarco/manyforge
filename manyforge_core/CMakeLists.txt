@@ -52,6 +52,7 @@ add_library(manyforge_core
   src/kernel_event_publisher.cpp
   src/kernel_flight_recorder.cpp
   src/kernel_event_factories.cpp
+  src/kinematic_state_view_provider.cpp
   src/motion_trip_stop_coordinator.cpp
   src/motion_target_resolution.cpp
   src/operator_stop_worker.cpp
@@ -157,6 +158,13 @@ if(BUILD_TESTING)
   add_executable(test_version test/test_version.cpp)
   target_link_libraries(test_version PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_version
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_kinematic_state_view_provider
+    test/test_kinematic_state_view_provider.cpp)
+  target_link_libraries(test_kinematic_state_view_provider PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_kinematic_state_view_provider
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_contracts_compile test/test_contracts_compile.cpp)

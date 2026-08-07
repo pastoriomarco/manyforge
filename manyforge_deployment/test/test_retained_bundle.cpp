@@ -272,7 +272,7 @@ TEST(ProductContractRegistryTest,
   EXPECT_EQ(symbol_map->artifact_roles().front().artifact_role_id.value(),
             "composed_model_symbol_role_map");
   EXPECT_EQ(symbol_map->artifact_roles().front().media_type,
-            "application/vnd.manyforge.composed-model-symbol-role-map+json");
+            "application/vnd.manyforge.composed-model-symbol-role-map.v2+json");
   EXPECT_EQ(symbol_map->artifact_roles().front().cardinality,
             ProductArtifactCardinality::kRequiredExactlyOne);
   const auto *symbol_declared_revision =

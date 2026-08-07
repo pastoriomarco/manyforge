@@ -127,6 +127,43 @@ void require_fields(const CanonicalValue::Object& object,
   return *flag;
 }
 
+[[nodiscard]] core::PlacementPoseDTO require_placement_pose(
+    const CanonicalValue& value, std::string_view path) {
+  const auto& pose = require_object(value, path);
+  require_fields(pose, {"position_m", "orientation_xyzw"}, path);
+  const auto& position = require_array(
+      require_member(pose, "position_m", path),
+      std::string(path) + ".position_m");
+  const auto& orientation = require_array(
+      require_member(pose, "orientation_xyzw", path),
+      std::string(path) + ".orientation_xyzw");
+  if (position.size() != 3U || orientation.size() != 4U) {
+    fail_retained_bundle(std::string(path) +
+                         " must contain a 3-vector and XYZW quaternion");
+  }
+  core::PlacementPoseDTO result;
+  for (std::size_t index = 0U; index < result.position_m.size(); ++index) {
+    result.position_m[index] = require_finite(
+        position[index], std::string(path) + ".position_m[" +
+                             std::to_string(index) + "]");
+  }
+  double norm_squared = 0.0;
+  for (std::size_t index = 0U; index < result.orientation_xyzw.size();
+       ++index) {
+    result.orientation_xyzw[index] = require_finite(
+        orientation[index], std::string(path) + ".orientation_xyzw[" +
+                                std::to_string(index) + "]");
+    norm_squared += result.orientation_xyzw[index] *
+                    result.orientation_xyzw[index];
+  }
+  if (!std::isfinite(norm_squared) ||
+      std::abs(norm_squared - 1.0) > 1.0e-6) {
+    fail_retained_bundle(std::string(path) +
+                         " quaternion norm squared must be within 1e-6 of one");
+  }
+  return result;
+}
+
 [[nodiscard]] std::uint8_t symbol_kind_rank(std::string_view kind,
                                             std::string_view path) {
   constexpr std::array<std::string_view, 10U> values{
@@ -409,8 +446,8 @@ CanonicalValue parse_and_verify_composed_model_symbol_role_map(
   require_fields(object,
                  {"api_version", "cell_id", "cell_frame",
                   "model_occurrences", "symbol_rows", "reference_rows",
-                  "coordinate_rows", "control_binding_coordinate_maps",
-                  "target_role_maps"},
+                  "coordinate_rows", "fixed_connections", "frame_paths",
+                  "control_binding_coordinate_maps", "target_role_maps"},
                  "symbol_role_map");
   if (require_text(require_member(object, "api_version", "symbol_role_map"),
                    "symbol_role_map.api_version") !=
@@ -484,6 +521,12 @@ CanonicalValue parse_and_verify_composed_model_symbol_role_map(
         "a retained composed-model map must contain model occurrences");
   }
   std::map<std::string, OccurrenceInfo, std::less<>> occurrences;
+  using FramePathKey =
+      std::tuple<std::uint8_t, std::string, std::string, std::string,
+                 std::string, std::string>;
+  std::set<FramePathKey> expected_frame_paths;
+  expected_frame_paths.emplace(0U, cell_id, std::string{}, std::string{},
+                               std::string{}, cell_frame);
   std::string previous_model;
   for (std::size_t index = 0U; index < occurrence_values.size(); ++index) {
     const std::string path = "symbol_role_map.model_occurrences[" +
@@ -555,6 +598,27 @@ CanonicalValue parse_and_verify_composed_model_symbol_role_map(
                            " omits a compiled robot or root-link symbol");
     }
     validate_role_rows(row, model, symbols, path);
+    for (const auto& frame_role : require_array(
+             require_member(row, "frame_roles", path),
+             path + ".frame_roles")) {
+      const std::string& role =
+          require_text(require_member(require_object(frame_role, path),
+                                      "frame_role_id", path),
+                       path);
+      const std::string& compiled =
+          require_text(require_member(require_object(frame_role, path),
+                                      "compiled_link_name", path),
+                       path);
+      const auto key = owner.has_value()
+                           ? FramePathKey{1U, *owner, model, revision, role,
+                                          compiled}
+                           : FramePathKey{2U, std::string{}, model, revision,
+                                          role, compiled};
+      if (!expected_frame_paths.insert(key).second) {
+        fail_retained_bundle(path +
+                             " duplicates an exported frame-path identity");
+      }
+    }
   }
   for (const auto& [key, unused] : symbols) {
     (void)unused;
@@ -751,6 +815,346 @@ CanonicalValue parse_and_verify_composed_model_symbol_role_map(
           "joint-mimic reference does not select another coordinate in "
           "the same model occurrence");
     }
+  }
+
+  struct FixedConnectionInfo final {
+    std::string compiled_parent_link_name;
+    std::string compiled_child_link_name;
+  };
+  const auto& fixed_connection_values = require_array(
+      require_member(object, "fixed_connections", "symbol_role_map"),
+      "symbol_role_map.fixed_connections");
+  std::vector<FixedConnectionInfo> fixed_connections;
+  fixed_connections.reserve(fixed_connection_values.size());
+  std::set<std::string, std::less<>> fixed_joint_names;
+  std::set<std::string, std::less<>> fixed_child_links;
+  const auto require_occurrence_owner =
+      [&](std::string_view model, std::string_view component,
+          std::string_view path) {
+        const auto found = occurrences.find(std::string(model));
+        if (found == occurrences.end() ||
+            !found->second.owner_component_id.has_value() ||
+            *found->second.owner_component_id != component) {
+          fail_retained_bundle(std::string(path) +
+                               " disagrees with component/model ownership");
+        }
+      };
+  const auto require_compiled_model_link =
+      [&](std::string_view compiled, std::string_view model,
+          std::string_view path) {
+        const auto found = reverse_symbols.find(std::string(compiled));
+        if (found == reverse_symbols.end() ||
+            std::get<0>(found->second) != model ||
+            std::get<1>(found->second) !=
+                symbol_kind_rank("link", path)) {
+          fail_retained_bundle(std::string(path) +
+                               " does not name a link in the expected model");
+        }
+      };
+  const auto compiled_link_owner =
+      [&](std::string_view compiled, std::string_view path)
+      -> std::optional<std::string> {
+    const auto found = reverse_symbols.find(std::string(compiled));
+    if (found == reverse_symbols.end() ||
+        std::get<1>(found->second) != symbol_kind_rank("link", path)) {
+      return std::nullopt;
+    }
+    const auto occurrence = occurrences.find(std::get<0>(found->second));
+    if (occurrence == occurrences.end()) {
+      return std::nullopt;
+    }
+    return occurrence->second.owner_component_id;
+  };
+  for (std::size_t index = 0U; index < fixed_connection_values.size();
+       ++index) {
+    const std::string path = "symbol_role_map.fixed_connections[" +
+                             std::to_string(index) + "]";
+    const auto& row = require_object(fixed_connection_values[index], path);
+    require_fields(row,
+                   {"source", "compiled_joint_name",
+                    "compiled_parent_link_name", "compiled_child_link_name",
+                    "child_pose_in_parent"},
+                   path);
+    const std::string& joint = require_text(
+        require_member(row, "compiled_joint_name", path), path);
+    const std::string& parent = require_text(
+        require_member(row, "compiled_parent_link_name", path), path);
+    const std::string& child = require_text(
+        require_member(row, "compiled_child_link_name", path), path);
+    require_retained_portable_identity(joint, path);
+    require_retained_portable_identity(parent, path);
+    require_retained_portable_identity(child, path);
+    if (!fixed_joint_names.insert(joint).second ||
+        !fixed_child_links.insert(child).second || parent == child) {
+      fail_retained_bundle(path +
+                           " duplicates a fixed joint/child or self-connects");
+    }
+    (void)require_placement_pose(
+        require_member(row, "child_pose_in_parent", path),
+        path + ".child_pose_in_parent");
+
+    const auto& source = require_object(
+        require_member(row, "source", path), path + ".source");
+    const std::string& kind = require_text(
+        require_member(source, "kind", path + ".source"),
+        path + ".source.kind");
+    if (kind == "direct_model_anchor") {
+      require_fields(source, {"kind", "model_instance_id"},
+                     path + ".source");
+      const std::string& model = require_text(
+          require_member(source, "model_instance_id", path + ".source"),
+          path + ".source.model_instance_id");
+      const auto occurrence = occurrences.find(model);
+      if (occurrence == occurrences.end() ||
+          occurrence->second.owner_component_id.has_value() ||
+          parent != cell_frame) {
+        fail_retained_bundle(path +
+                             " is not an unowned model cell anchor");
+      }
+      require_compiled_model_link(child, model, path);
+    } else if (kind == "direct_component_anchor") {
+      require_fields(source,
+                     {"kind", "controllable_component_id",
+                      "root_model_instance_id"},
+                     path + ".source");
+      const std::string& component = require_text(
+          require_member(source, "controllable_component_id",
+                         path + ".source"),
+          path + ".source.controllable_component_id");
+      const std::string& model = require_text(
+          require_member(source, "root_model_instance_id",
+                         path + ".source"),
+          path + ".source.root_model_instance_id");
+      require_occurrence_owner(model, component, path);
+      if (parent != cell_frame) {
+        fail_retained_bundle(path +
+                             " direct component anchor is not cell-rooted");
+      }
+      require_compiled_model_link(child, model, path);
+    } else if (kind == "model_mount") {
+      require_fields(source,
+                     {"kind", "controllable_component_id",
+                      "parent_model_instance_id", "child_model_instance_id"},
+                     path + ".source");
+      const std::string& component = require_text(
+          require_member(source, "controllable_component_id",
+                         path + ".source"),
+          path + ".source.controllable_component_id");
+      const std::string& parent_model = require_text(
+          require_member(source, "parent_model_instance_id",
+                         path + ".source"),
+          path + ".source.parent_model_instance_id");
+      const std::string& child_model = require_text(
+          require_member(source, "child_model_instance_id",
+                         path + ".source"),
+          path + ".source.child_model_instance_id");
+      require_occurrence_owner(parent_model, component, path);
+      require_occurrence_owner(child_model, component, path);
+      if (parent_model == child_model) {
+        fail_retained_bundle(path + " mounts a model to itself");
+      }
+      require_compiled_model_link(parent, parent_model, path);
+      require_compiled_model_link(child, child_model, path);
+    } else if (kind == "component_attachment") {
+      require_fields(source,
+                     {"kind", "component_attachment_id",
+                      "parent_component_id", "child_component_id"},
+                     path + ".source");
+      const std::string& attachment = require_text(
+          require_member(source, "component_attachment_id",
+                         path + ".source"),
+          path + ".source.component_attachment_id");
+      const std::string& parent_component = require_text(
+          require_member(source, "parent_component_id", path + ".source"),
+          path + ".source.parent_component_id");
+      const std::string& child_component = require_text(
+          require_member(source, "child_component_id", path + ".source"),
+          path + ".source.child_component_id");
+      require_retained_portable_identity(attachment, path);
+      require_retained_portable_identity(parent_component, path);
+      require_retained_portable_identity(child_component, path);
+      const auto resolved_parent = compiled_link_owner(parent, path);
+      const auto resolved_child = compiled_link_owner(child, path);
+      if (parent_component == child_component ||
+          resolved_parent != parent_component ||
+          resolved_child != child_component) {
+        fail_retained_bundle(path +
+                             " disagrees with attachment endpoint ownership");
+      }
+    } else {
+      fail_retained_bundle(path + " has an unknown connection source kind");
+    }
+    fixed_connections.push_back(FixedConnectionInfo{parent, child});
+  }
+
+  const auto& frame_path_values = require_array(
+      require_member(object, "frame_paths", "symbol_role_map"),
+      "symbol_role_map.frame_paths");
+  if (frame_path_values.size() != expected_frame_paths.size()) {
+    fail_retained_bundle(
+        "frame paths do not exactly cover the cell and exported frames");
+  }
+  std::optional<FramePathKey> previous_frame_path;
+  std::set<FramePathKey> found_frame_paths;
+  for (std::size_t index = 0U; index < frame_path_values.size(); ++index) {
+    const std::string path = "symbol_role_map.frame_paths[" +
+                             std::to_string(index) + "]";
+    const auto& row = require_object(frame_path_values[index], path);
+    require_fields(row, {"terminal_frame", "segments"}, path);
+    const auto& terminal = require_object(
+        require_member(row, "terminal_frame", path),
+        path + ".terminal_frame");
+    const std::string& kind = require_text(
+        require_member(terminal, "kind", path + ".terminal_frame"),
+        path + ".terminal_frame.kind");
+    FramePathKey terminal_key;
+    if (kind == "cell") {
+      require_fields(terminal, {"kind", "cell_id", "compiled_frame_name"},
+                     path + ".terminal_frame");
+      terminal_key = FramePathKey{
+          0U,
+          require_text(require_member(terminal, "cell_id", path), path),
+          {}, {}, {},
+          require_text(require_member(terminal, "compiled_frame_name", path),
+                       path)};
+    } else if (kind == "component_model") {
+      require_fields(terminal,
+                     {"kind", "controllable_component_id",
+                      "model_instance_id", "model_revision", "frame_role_id",
+                      "compiled_frame_name"},
+                     path + ".terminal_frame");
+      terminal_key = FramePathKey{
+          1U,
+          require_text(require_member(terminal, "controllable_component_id",
+                                      path),
+                       path),
+          require_text(require_member(terminal, "model_instance_id", path),
+                       path),
+          require_text(require_member(terminal, "model_revision", path), path),
+          require_text(require_member(terminal, "frame_role_id", path), path),
+          require_text(require_member(terminal, "compiled_frame_name", path),
+                       path)};
+    } else if (kind == "passive_model") {
+      require_fields(terminal,
+                     {"kind", "model_instance_id", "model_revision",
+                      "frame_role_id", "compiled_frame_name"},
+                     path + ".terminal_frame");
+      terminal_key = FramePathKey{
+          2U, {},
+          require_text(require_member(terminal, "model_instance_id", path),
+                       path),
+          require_text(require_member(terminal, "model_revision", path), path),
+          require_text(require_member(terminal, "frame_role_id", path), path),
+          require_text(require_member(terminal, "compiled_frame_name", path),
+                       path)};
+    } else {
+      fail_retained_bundle(path + " has an unknown terminal-frame kind");
+    }
+    if (!expected_frame_paths.contains(terminal_key) ||
+        !found_frame_paths.insert(terminal_key).second ||
+        (previous_frame_path.has_value() &&
+         *previous_frame_path >= terminal_key)) {
+      fail_retained_bundle(path +
+                           " is not a canonical exact exported frame path");
+    }
+    previous_frame_path = terminal_key;
+
+    std::string current_link = cell_frame;
+    const auto& segments = require_array(
+        require_member(row, "segments", path), path + ".segments");
+    for (std::size_t segment_index = 0U;
+         segment_index < segments.size(); ++segment_index) {
+      const std::string segment_path =
+          path + ".segments[" + std::to_string(segment_index) + "]";
+      const auto& segment = require_object(segments[segment_index],
+                                           segment_path);
+      const std::string& segment_kind = require_text(
+          require_member(segment, "kind", segment_path), segment_path);
+      std::string parent;
+      std::string child;
+      if (segment_kind == "fixed_connection") {
+        require_fields(segment, {"kind", "fixed_connection_index"},
+                       segment_path);
+        const std::size_t connection_index = require_index(
+            require_member(segment, "fixed_connection_index", segment_path),
+            segment_path);
+        if (connection_index >= fixed_connections.size()) {
+          fail_retained_bundle(segment_path +
+                               " references an absent fixed connection");
+        }
+        parent = fixed_connections[connection_index]
+                     .compiled_parent_link_name;
+        child = fixed_connections[connection_index]
+                    .compiled_child_link_name;
+      } else if (segment_kind == "model_joint") {
+        require_fields(
+            segment,
+            {"kind", "model_instance_id",
+             "composition_coordinate_index", "source_joint_name",
+             "compiled_joint_name", "compiled_parent_link_name",
+             "compiled_child_link_name"},
+            segment_path);
+        const std::size_t coordinate_index = require_index(
+            require_member(segment, "composition_coordinate_index",
+                           segment_path),
+            segment_path);
+        if (coordinate_index >= coordinate_values.size()) {
+          fail_retained_bundle(segment_path +
+                               " references an absent model coordinate");
+        }
+        const auto& coordinate = require_object(
+            coordinate_values[coordinate_index], segment_path);
+        const std::string& model = require_text(
+            require_member(segment, "model_instance_id", segment_path),
+            segment_path);
+        const std::string& source = require_text(
+            require_member(segment, "source_joint_name", segment_path),
+            segment_path);
+        const std::string& compiled = require_text(
+            require_member(segment, "compiled_joint_name", segment_path),
+            segment_path);
+        if (model != require_text(
+                         require_member(coordinate, "model_instance_id",
+                                        segment_path),
+                         segment_path) ||
+            source != require_text(
+                          require_member(coordinate, "source_joint_name",
+                                         segment_path),
+                          segment_path) ||
+            compiled != require_text(
+                            require_member(coordinate, "compiled_joint_name",
+                                           segment_path),
+                            segment_path)) {
+          fail_retained_bundle(segment_path +
+                               " differs from its exact coordinate row");
+        }
+        parent = require_text(
+            require_member(segment, "compiled_parent_link_name",
+                           segment_path),
+            segment_path);
+        child = require_text(
+            require_member(segment, "compiled_child_link_name", segment_path),
+            segment_path);
+        require_compiled_model_link(parent, model, segment_path);
+        require_compiled_model_link(child, model, segment_path);
+      } else {
+        fail_retained_bundle(segment_path +
+                             " has an unknown path-segment kind");
+      }
+      if (parent != current_link || parent == child) {
+        fail_retained_bundle(segment_path +
+                             " does not continue the cell-rooted path");
+      }
+      current_link = std::move(child);
+    }
+    if (current_link != std::get<5>(terminal_key)) {
+      fail_retained_bundle(path +
+                           " does not terminate at its resolved frame");
+    }
+  }
+  if (found_frame_paths != expected_frame_paths) {
+    fail_retained_bundle(
+        "frame paths do not exactly cover the compiler-exported frames");
   }
 
   const auto& binding_values = require_array(
