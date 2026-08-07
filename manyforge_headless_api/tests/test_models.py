@@ -8,6 +8,7 @@ from manyforge_headless_api.models import (
     AcknowledgeAllAlarmsRequest,
     ManagerApplyRequest,
     OperationControlRequest,
+    OperationParticipantRequest,
     RuntimeScaleRequest,
     StopIntentRequest,
 )
@@ -159,3 +160,57 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
         RuntimeScaleRequest.model_validate({**scale, "scale": float("nan")})
     with pytest.raises(ValidationError):
         RuntimeScaleRequest.model_validate({**scale, "scale": 1.0001})
+
+
+def test_gripper_command_requires_unit_tags_and_matching_nonnegative_effort() -> None:
+    participant = {
+        "component_role_id": "robot",
+        "target_role_id": "gripper",
+        "required_capability_id": "tool.gripper.command",
+        "action_span": None,
+        "payload": {
+            "kind": "capability_command",
+            "command_schema_id": "gripper.command_position",
+            "command_schema_revision": "sha256:" + "a" * 64,
+            "command_value": {
+                "kind": "gripper_position",
+                "position": {"kind": "linear_m", "value_m": 0.004},
+                "max_effort": {"kind": "linear_newton", "value_n": 5.0},
+            },
+            "completion_timeout_s": 2.0,
+            "caller_options": [
+                {"option_id": "command_duration_s", "value_s": 0.25}
+            ],
+        },
+    }
+    parsed = OperationParticipantRequest.model_validate(participant)
+    assert parsed.payload.command_value.position.value_m == 0.004
+
+    mismatched = {
+        **participant,
+        "payload": {
+            **participant["payload"],
+            "command_value": {
+                **participant["payload"]["command_value"],
+                "max_effort": {
+                    "kind": "angular_newton_meter",
+                    "value_nm": 1.0,
+                },
+            },
+        },
+    }
+    with pytest.raises(ValidationError, match="must match"):
+        OperationParticipantRequest.model_validate(mismatched)
+
+    bare_position = {
+        **participant,
+        "payload": {
+            **participant["payload"],
+            "command_value": {
+                **participant["payload"]["command_value"],
+                "position": 0.004,
+            },
+        },
+    }
+    with pytest.raises(ValidationError):
+        OperationParticipantRequest.model_validate(bare_position)

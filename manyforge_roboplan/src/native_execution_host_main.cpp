@@ -309,6 +309,7 @@ struct HostConfig final {
   std::string cell_id;
   std::string program_binding_id;
   std::string motion_target_role_id;
+  std::string gripper_target_role_id;
 };
 
 void RequireExactObjectSize(const CanonicalValue& value, std::size_t size, std::string_view label) {
@@ -565,6 +566,76 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       {}};
 }
 
+[[nodiscard]] core::CoordinatePositionDTO DecodeCoordinatePosition(const CanonicalValue& value) {
+  RequireExactObjectSize(value, 2U, "coordinate position");
+  const auto kind = Text(value, "kind");
+  if (kind == "angular_rad") {
+    return core::AngularPositionDTO{Number(value, "value_rad")};
+  }
+  if (kind == "linear_m") {
+    return core::LinearPositionDTO{Number(value, "value_m")};
+  }
+  Fail("coordinate position kind is unsupported");
+}
+
+[[nodiscard]] core::CoordinateEffortDTO DecodeCoordinateEffort(const CanonicalValue& value) {
+  RequireExactObjectSize(value, 2U, "coordinate effort");
+  const auto kind = Text(value, "kind");
+  if (kind == "angular_newton_meter") {
+    return core::AngularEffortDTO{Number(value, "value_nm")};
+  }
+  if (kind == "linear_newton") {
+    return core::LinearEffortDTO{Number(value, "value_n")};
+  }
+  Fail("coordinate effort kind is unsupported");
+}
+
+[[nodiscard]] core::CapabilityCommandIntentDTO DecodeCapabilityCommandPayload(
+    const CanonicalValue& value) {
+  RequireExactObjectSize(value, 6U, "capability-command payload");
+  Require(Text(value, "kind") == "capability_command", "operation payload kind is unsupported");
+  const auto& command_value = Member(value, "command_value");
+  RequireExactObjectSize(command_value, 3U, "gripper-position command value");
+  Require(Text(command_value, "kind") == "gripper_position",
+          "capability-command value kind is unsupported");
+
+  std::optional<core::CoordinateEffortDTO> max_effort;
+  const auto& effort = Member(command_value, "max_effort");
+  if (!std::holds_alternative<std::nullptr_t>(effort.storage())) {
+    max_effort = DecodeCoordinateEffort(effort);
+  }
+
+  const auto& option_values = Array(value, "caller_options");
+  Require(option_values.size() <= core::kMaxOperationCommandOptions,
+          "capability-command options exceed their fixed bound");
+  std::vector<core::CommandDurationOptionDTO> caller_options;
+  caller_options.reserve(option_values.size());
+  for (const auto& option : option_values) {
+    RequireExactObjectSize(option, 2U, "capability-command option");
+    caller_options.push_back(core::CommandDurationOptionDTO{
+        core::CommandOptionId(Text(option, "option_id")), Number(option, "value_s")});
+  }
+
+  return core::CapabilityCommandIntentDTO{
+      core::CommandSchemaId(Text(value, "command_schema_id")),
+      core::CommandSchemaRevision(Text(value, "command_schema_revision")),
+      core::GripperPositionCommandValueDTO{
+          DecodeCoordinatePosition(Member(command_value, "position")), std::move(max_effort)},
+      Number(value, "completion_timeout_s"), std::move(caller_options)};
+}
+
+[[nodiscard]] core::OperationParticipantPayloadDTO DecodeParticipantPayload(
+    const CanonicalValue& value) {
+  const auto kind = Text(value, "kind");
+  if (kind == "motion") {
+    return DecodeMotionPayload(value);
+  }
+  if (kind == "capability_command") {
+    return DecodeCapabilityCommandPayload(value);
+  }
+  Fail("operation payload kind is unsupported");
+}
+
 [[nodiscard]] core::OperationIntentDTO DecodeOperation(
     const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
   RequireExactObjectSize(value, 10U, "operation intent");
@@ -598,7 +669,7 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
           core::ComponentRoleId(Text(participant, "component_role_id")),
           core::TargetRoleId(Text(participant, "target_role_id")),
           core::CapabilityId(Text(participant, "required_capability_id")), std::move(action_span),
-          DecodeMotionPayload(Member(participant, "payload"))}},
+          DecodeParticipantPayload(Member(participant, "payload"))}},
       core::OperationCoordinationPolicy::kIndependent,
       attribution};
 }
@@ -1067,6 +1138,88 @@ struct Command final {
   });
 }
 
+[[nodiscard]] CanonicalValue CoordinatePositionValue(const core::CoordinatePositionDTO& position) {
+  if (const auto* angular = std::get_if<core::AngularPositionDTO>(&position)) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"kind", CanonicalValue("angular_rad")},
+        {"value_rad", CanonicalValue(angular->value_rad)},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"kind", CanonicalValue("linear_m")},
+      {"value_m", CanonicalValue(std::get<core::LinearPositionDTO>(position).value_m)},
+  });
+}
+
+[[nodiscard]] CanonicalValue CoordinateVelocityValue(const core::CoordinateVelocityDTO& velocity) {
+  if (const auto* angular = std::get_if<core::AngularVelocityDTO>(&velocity)) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"kind", CanonicalValue("angular_rad_s")},
+        {"value_rad_s", CanonicalValue(angular->value_rad_s)},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"kind", CanonicalValue("linear_m_s")},
+      {"value_m_s", CanonicalValue(std::get<core::LinearVelocityDTO>(velocity).value_m_s)},
+  });
+}
+
+[[nodiscard]] CanonicalValue ObservedTargetValue(const core::TargetRoleId& target_role_id,
+                                                 const core::ObservedStateSnapshotDTO& state) {
+  CanonicalValue::Array resources;
+  resources.reserve(state.resources.size());
+  for (const auto& resource : state.resources) {
+    resources.emplace_back(resource.value());
+  }
+  CanonicalValue::Array joint_names;
+  joint_names.reserve(state.joint_names.size());
+  for (const auto& joint_name : state.joint_names) {
+    joint_names.emplace_back(joint_name);
+  }
+  CanonicalValue::Array positions;
+  positions.reserve(state.positions.size());
+  for (const auto& position : state.positions) {
+    positions.push_back(CoordinatePositionValue(position));
+  }
+  CanonicalValue velocities(nullptr);
+  if (state.velocities.has_value()) {
+    CanonicalValue::Array values;
+    values.reserve(state.velocities->size());
+    for (const auto& velocity : *state.velocities) {
+      values.push_back(CoordinateVelocityValue(velocity));
+    }
+    velocities = CanonicalValue(std::move(values));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"active_control_configuration_generation",
+       CanonicalValue(static_cast<double>(state.active_control_configuration_generation.value()))},
+      {"active_control_configuration_id",
+       CanonicalValue(state.active_control_configuration_id.value())},
+      {"command_target_id", CanonicalValue(state.command_target_id.value())},
+      {"complete", CanonicalValue(state.complete)},
+      {"controllable_component_id", CanonicalValue(state.controllable_component_id.value())},
+      {"control_binding_id", CanonicalValue(state.control_binding_id.value())},
+      {"control_binding_revision", CanonicalValue(state.control_binding_revision.value())},
+      {"control_domain_id", CanonicalValue(state.control_domain_id.value())},
+      {"control_domain_revision", CanonicalValue(state.control_domain_revision.value())},
+      {"control_route_id", CanonicalValue(state.control_route_id.value())},
+      {"joint_names", CanonicalValue(std::move(joint_names))},
+      {"positions", CanonicalValue(std::move(positions))},
+      {"received_timestamp_ns", CanonicalValue(static_cast<double>(state.received_timestamp_ns))},
+      {"resources", CanonicalValue(std::move(resources))},
+      {"sequence", CanonicalValue(static_cast<double>(state.sequence))},
+      {"source_epoch", CanonicalValue(state.source_epoch.value())},
+      {"source_id", CanonicalValue(state.source_id)},
+      {"source_kind", CanonicalValue(std::string(core::to_string(state.source_kind)))},
+      {"source_timestamp_ns", CanonicalValue(static_cast<double>(state.source_timestamp_ns))},
+      {"state_authority_class",
+       CanonicalValue(std::string(core::to_string(state.state_authority_class)))},
+      {"state_authority_id", CanonicalValue(state.state_authority_id.value())},
+      {"target_role_id", CanonicalValue(target_role_id.value())},
+      {"velocities", std::move(velocities)},
+  });
+}
+
 class AbsoluteOnlyReferenceResolver final : public core::IReferencePoseResolver {
  public:
   [[nodiscard]] core::Result<core::Pose3DTO> resolve_reference_pose(
@@ -1124,28 +1277,31 @@ class AbsoluteOnlyReferenceResolver final : public core::IReferencePoseResolver 
 }
 
 [[nodiscard]] deployment::ActiveRuntimeParticipantFactsDTO ActiveFacts(
-    const deployment::RuntimeProgramTargetBinding& motion,
-    const deployment::RuntimeProgramTargetBinding& planner,
-    const core::RequestOwnerEpoch& owner_epoch) {
-  Require(motion.desired_route().has_value(), "motion binding has no desired I6 route");
-  std::set<core::RuntimeUnitId> runtime_units(motion.component().runtime_unit_ids.begin(),
-                                              motion.component().runtime_unit_ids.end());
-  if (motion.control_domain().has_value()) {
-    runtime_units.insert(motion.control_domain()->runtime_unit_ids.begin(),
-                         motion.control_domain()->runtime_unit_ids.end());
+    const deployment::RuntimeProgramTargetBinding& primary,
+    std::span<const deployment::RuntimeProgramTargetBinding> supporting,
+    const core::RequestOwnerEpoch& owner_epoch,
+    core::ActiveControlConfigurationId active_configuration_id) {
+  Require(primary.desired_route().has_value(), "runtime binding has no desired I6 route");
+  std::set<core::RuntimeUnitId> runtime_units(primary.component().runtime_unit_ids.begin(),
+                                              primary.component().runtime_unit_ids.end());
+  if (primary.control_domain().has_value()) {
+    runtime_units.insert(primary.control_domain()->runtime_unit_ids.begin(),
+                         primary.control_domain()->runtime_unit_ids.end());
   }
   Require(runtime_units.empty(),
-          "N3 native host cannot invent runtime-unit epochs; lifecycle facts "
+          "I6 native host cannot invent runtime-unit epochs; lifecycle facts "
           "arrive at N4/I7");
   std::set<core::ProviderInstanceId> providers;
-  if (motion.control_binding().has_value()) {
-    providers.insert(motion.control_binding()->provider_instance_id);
+  if (primary.control_binding().has_value()) {
+    providers.insert(primary.control_binding()->provider_instance_id);
   }
-  if (motion.capability_provider_binding().has_value()) {
-    providers.insert(motion.capability_provider_binding()->provider_instance_id);
+  if (primary.capability_provider_binding().has_value()) {
+    providers.insert(primary.capability_provider_binding()->provider_instance_id);
   }
-  if (planner.capability_provider_binding().has_value()) {
-    providers.insert(planner.capability_provider_binding()->provider_instance_id);
+  for (const auto& support : supporting) {
+    if (support.capability_provider_binding().has_value()) {
+      providers.insert(support.capability_provider_binding()->provider_instance_id);
+    }
   }
   std::vector<deployment::RuntimeProviderEpochFactDTO> provider_epochs;
   provider_epochs.reserve(providers.size());
@@ -1153,8 +1309,8 @@ class AbsoluteOnlyReferenceResolver final : public core::IReferencePoseResolver 
     provider_epochs.push_back({provider, core::RuntimeEpoch(owner_epoch.value())});
   }
   return deployment::ActiveRuntimeParticipantFactsDTO{
-      *motion.desired_route(),
-      core::ActiveControlConfigurationId("active.i6.native"),
+      *primary.desired_route(),
+      std::move(active_configuration_id),
       core::ActiveControlConfigurationGeneration(1U),
       {},
       std::move(provider_epochs)};
@@ -1229,19 +1385,35 @@ struct Composition final {
           "Program and exact retained Program Binding disagree");
 
   const core::TargetRoleId motion_target_role(config.motion_target_role_id);
+  const core::TargetRoleId gripper_target_role(config.gripper_target_role_id);
   const auto motion_target = deployment::resolve_runtime_program_target(
       *program_binding, motion_target_role, core::CapabilityId("execution.trajectory.execute"),
       *bundle, *model_map);
   const auto planner_target = deployment::resolve_runtime_program_target(
       *program_binding, motion_target_role, core::CapabilityId("planning.motion.joint_goal"),
       *bundle, *model_map);
+  const auto gripper_target = deployment::resolve_runtime_program_target(
+      *program_binding, gripper_target_role, core::CapabilityId("tool.gripper.command"), *bundle,
+      *model_map);
   const std::array<deployment::RuntimeProgramTargetBinding, 1U> support{planner_target};
-  auto runtime_binding_dto = deployment::build_runtime_participant_binding_dto(
-      motion_target, ActiveFacts(motion_target, planner_target, owner_epoch), support);
-  auto runtime_binding = core::verify_runtime_participant_binding(std::move(runtime_binding_dto));
-  if (!runtime_binding.ok()) {
-    Fail("active runtime participant binding failed verification: " +
-         runtime_binding.error().message);
+  auto motion_binding_dto = deployment::build_runtime_participant_binding_dto(
+      motion_target,
+      ActiveFacts(motion_target, support, owner_epoch,
+                  core::ActiveControlConfigurationId("active.i6.native.arm")),
+      support);
+  auto motion_binding = core::verify_runtime_participant_binding(std::move(motion_binding_dto));
+  if (!motion_binding.ok()) {
+    Fail("active motion participant binding failed verification: " +
+         motion_binding.error().message);
+  }
+  auto gripper_binding_dto = deployment::build_runtime_participant_binding_dto(
+      gripper_target,
+      ActiveFacts(gripper_target, std::span<const deployment::RuntimeProgramTargetBinding>{},
+                  owner_epoch, core::ActiveControlConfigurationId("active.i6.native.gripper")));
+  auto gripper_binding = core::verify_runtime_participant_binding(std::move(gripper_binding_dto));
+  if (!gripper_binding.ok()) {
+    Fail("active gripper participant binding failed verification: " +
+         gripper_binding.error().message);
   }
 
   const deployment::FilesystemVerifiedRetainedPlanningModelSource planning_source(
@@ -1257,9 +1429,11 @@ struct Composition final {
   auto state_projector = std::make_shared<RetainedKinematicStateProjector>(
       RetainedKinematicStateProjector::create_verified(
           scene, scene_mutex, *bundle, *model_map, *retained_model,
-          std::vector<core::RuntimeParticipantBinding>{runtime_binding.value()}, 0));
+          std::vector<core::RuntimeParticipantBinding>{motion_binding.value(),
+                                                       gripper_binding.value()},
+          0));
 
-  const auto& group = runtime_binding.value().value().model_groups.front();
+  const auto& group = motion_binding.value().value().model_groups.front();
   auto collision_model = collision::ManyForgeCollisionEngine::load_shared_model(
       "manyforge_i6_native_execution_host", stage.loader_urdf_path(), stage.srdf_path(),
       stage.package_paths(), group.compiled_group_name);
@@ -1283,7 +1457,7 @@ struct Composition final {
   const auto inventory = publisher->current_scene_snapshot_lease_inventory();
   Require(inventory.has_value(), "retained collision publisher has no initial lease");
 
-  auto candidate_binding = CandidateBinding(runtime_binding.value());
+  auto candidate_binding = CandidateBinding(motion_binding.value());
   auto candidate_client = std::make_unique<ProcessContainedRoboPlanCandidateClient>(
       RoboPlanWorkerModelDTO{"manyforge_i6_native_execution_worker",
                              stage.loader_urdf_path(),
@@ -1297,16 +1471,13 @@ struct Composition final {
   auto planner = std::make_unique<RoboPlanPlannerBackend>(
       inventory->projection_binding, candidate_binding, std::move(candidate_client));
   auto runtime = create_retained_native_runtime(
-      RetainedNativeRuntimeInput{
-          runtime_binding.value(), std::nullopt, scene, scene_mutex,
-          state_projector, publisher, std::move(planner),
-          std::make_unique<AbsoluteOnlyReferenceResolver>()},
+      RetainedNativeRuntimeInput{motion_binding.value(), gripper_binding.value(), scene,
+                                 scene_mutex, state_projector, publisher, std::move(planner),
+                                 std::make_unique<AbsoluteOnlyReferenceResolver>()},
       RetainedNativeRuntimeConfig{
           owner_epoch, core::CellId(config.cell_id),
-          config.execution_state_root /
-              std::string(core::kOperationJournalFilename),
-          1024U, core::CacheConfig{}, core::ExecutionKernelConfig{},
-          RoboPlanExecutionBackendConfig{},
+          config.execution_state_root / std::string(core::kOperationJournalFilename), 1024U,
+          core::CacheConfig{}, core::ExecutionKernelConfig{}, RoboPlanExecutionBackendConfig{},
           SimpleSchedulerConfig::from_environment(), 10'000'000});
   return std::make_unique<Composition>(
       std::move(bundle), std::move(program), std::move(program_binding), std::move(stage),
@@ -1355,6 +1526,28 @@ class NativeExecutionHost final {
   [[nodiscard]] CanonicalValue StatusResponse() const {
     const auto& bundle = *composition_->bundle;
     const auto& program = composition_->program->value();
+    const auto motion_state = composition_->runtime->motion_state_channel->current_state(
+        composition_->runtime->clock->now());
+    if (!motion_state.ok()) {
+      Fail("selected motion observed state is unavailable: " + motion_state.error().message);
+    }
+    Require(composition_->runtime->gripper_state_channel != nullptr,
+            "selected aggregate gripper observed-state channel is absent");
+    Require(composition_->runtime->gripper_binding.has_value() &&
+                composition_->runtime->gripper_binding->value().command_schema.has_value(),
+            "selected aggregate gripper command schema is absent");
+    const auto& gripper_schema = *composition_->runtime->gripper_binding->value().command_schema;
+    const auto gripper_state = composition_->runtime->gripper_state_channel->current_state(
+        composition_->runtime->clock->now());
+    if (!gripper_state.ok()) {
+      Fail("selected gripper observed state is unavailable: " + gripper_state.error().message);
+    }
+    CanonicalValue::Array observed_targets;
+    observed_targets.reserve(2U);
+    observed_targets.push_back(ObservedTargetValue(
+        core::TargetRoleId(config_.motion_target_role_id), motion_state.value()));
+    observed_targets.push_back(ObservedTargetValue(
+        core::TargetRoleId(config_.gripper_target_role_id), gripper_state.value()));
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("status")},
@@ -1365,7 +1558,13 @@ class NativeExecutionHost final {
               CanonicalValue(static_cast<double>(composition_->publication_generation.value()))},
              {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
              {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
+             {"gripper_command_schema_id",
+              CanonicalValue(gripper_schema.command_schema_id.value())},
+             {"gripper_command_schema_revision",
+              CanonicalValue(gripper_schema.command_schema_revision.value())},
+             {"gripper_target_role_id", CanonicalValue(config_.gripper_target_role_id)},
              {"motion_target_role_id", CanonicalValue(config_.motion_target_role_id)},
+             {"observed_targets", CanonicalValue(std::move(observed_targets))},
              {"owner_epoch", CanonicalValue(owner_epoch_.value())},
              {"program_binding_id",
               CanonicalValue(composition_->program_binding->program_binding_id().value())},
@@ -1590,10 +1789,8 @@ class NativeExecutionHost final {
       pollfd outbound{client.get(), POLLOUT, 0};
       int response_ready = -1;
       do {
-        response_ready =
-            ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
-      } while (response_ready < 0 && errno == EINTR &&
-               g_stop_requested == 0);
+        response_ready = ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
+      } while (response_ready < 0 && errno == EINTR && g_stop_requested == 0);
       Require(response_ready > 0 && (outbound.revents & POLLOUT) != 0,
               "execution command client did not accept a response in time");
       ssize_t sent = -1;
@@ -1637,6 +1834,8 @@ class NativeExecutionHost final {
       config.program_binding_id = value;
     } else if (option == "--motion-target-role-id") {
       config.motion_target_role_id = value;
+    } else if (option == "--gripper-target-role-id") {
+      config.gripper_target_role_id = value;
     } else if (option == "--candidate-worker") {
       config.candidate_worker = value;
     } else if (option == "--cell-id") {
@@ -1645,9 +1844,10 @@ class NativeExecutionHost final {
       Fail("unknown option " + option);
     }
   }
-  Require(seen.size() == 9U,
+  Require(seen.size() == 10U,
           "package, Manager state, execution state, staging, Program, "
-          "Program Binding, target role, candidate worker, and cell options "
+          "Program Binding, motion/gripper target roles, candidate worker, and "
+          "cell options "
           "are required");
   config.package_root = ExistingDirectory(std::move(config.package_root), "package root");
   config.manager_state_root =
@@ -1662,7 +1862,9 @@ class NativeExecutionHost final {
               !config.program_binding_id.empty() &&
               config.program_binding_id.size() <= kMaximumIdentityBytes &&
               !config.motion_target_role_id.empty() &&
-              config.motion_target_role_id.size() <= kMaximumIdentityBytes,
+              config.motion_target_role_id.size() <= kMaximumIdentityBytes &&
+              !config.gripper_target_role_id.empty() &&
+              config.gripper_target_role_id.size() <= kMaximumIdentityBytes,
           "host identities must be bounded and non-empty");
   return config;
 }

@@ -84,14 +84,13 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
     ++runtime_scale_calls;
     Trace("engine:set_runtime_scale");
     if (!runtime_scale.supported) {
-      return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kUnsupportedCapability)),
-          "fake participant has no runtime-scale mechanism",
-          {{"reason", "runtime_scale_mechanism_unsupported"}}});
+      return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kUnsupportedCapability)),
+                   "fake participant has no runtime-scale mechanism",
+                   {{"reason", "runtime_scale_mechanism_unsupported"}}});
     }
     if (!next_runtime_scale_result.ok()) {
-      return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
-          next_runtime_scale_result.error());
+      return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(next_runtime_scale_result.error());
     }
     last_runtime_scale_command = command;
     runtime_scale.commanded_scale = command.requested_scale;
@@ -99,81 +98,76 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
     ++runtime_scale.acknowledgement_sequence;
     runtime_scale.acknowledgement_timestamp_ns = 1;
     return Result<ResolvedRuntimeScaleAcceptedDTO>::Ok(
-        ResolvedRuntimeScaleAcceptedDTO{
-            command.operation_id,
-            command.operation_revision,
-            command.participant_id,
-            command.controllable_component_id,
-            command.command_target_id,
-            command.capability_id,
-            command.control_domain_id,
-            command.control_domain_revision,
-            command.control_binding_id,
-            command.control_binding_revision,
-            command.controller_goal_id,
-            command.controller_goal_generation,
-            command.controller_topology_id,
-            command.topology_revision,
-            command.control_route_id,
-            command.scaling_domain_id,
-            command.coordinated_barrier_id,
-            command.resources,
-            command.active_control_configuration_id,
-            command.active_control_configuration_generation,
-            command.requested_runtime_scale_generation,
-            command.requested_scale,
-            runtime_scale.acknowledgement_sequence,
-            runtime_scale.acknowledgement_timestamp_ns});
+        ResolvedRuntimeScaleAcceptedDTO{command.operation_id,
+                                        command.operation_revision,
+                                        command.participant_id,
+                                        command.controllable_component_id,
+                                        command.command_target_id,
+                                        command.capability_id,
+                                        command.control_domain_id,
+                                        command.control_domain_revision,
+                                        command.control_binding_id,
+                                        command.control_binding_revision,
+                                        command.controller_goal_id,
+                                        command.controller_goal_generation,
+                                        command.controller_topology_id,
+                                        command.topology_revision,
+                                        command.control_route_id,
+                                        command.scaling_domain_id,
+                                        command.coordinated_barrier_id,
+                                        command.resources,
+                                        command.active_control_configuration_id,
+                                        command.active_control_configuration_generation,
+                                        command.requested_runtime_scale_generation,
+                                        command.requested_scale,
+                                        runtime_scale.acknowledgement_sequence,
+                                        runtime_scale.acknowledgement_timestamp_ns});
   }
 
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
-      const OperationId& operation_id,
-      const ControlBindingId& control_binding_id) const override {
+      const OperationId& operation_id, const ControlBindingId& control_binding_id) const override {
     if (!last_runtime_scale_command.has_value() ||
         last_runtime_scale_command->operation_id != operation_id ||
         last_runtime_scale_command->control_binding_id != control_binding_id ||
         !last_execute.has_value()) {
-      return Result<ResolvedRuntimeScaleStatusDTO>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kMissingReference)),
-          "fake runtime-scale status is not initialized",
-          {{"reason", "runtime_scale_status_not_initialized"}}});
+      return Result<ResolvedRuntimeScaleStatusDTO>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
+                   "fake runtime-scale status is not initialized",
+                   {{"reason", "runtime_scale_status_not_initialized"}}});
     }
     const auto& command = *last_runtime_scale_command;
-    return Result<ResolvedRuntimeScaleStatusDTO>::Ok(
-        ResolvedRuntimeScaleStatusDTO{
-            command.operation_id,
-            command.operation_revision,
-            command.participant_id,
-            command.controllable_component_id,
-            command.command_target_id,
-            command.capability_id,
-            command.control_domain_id,
-            command.control_domain_revision,
-            command.control_binding_id,
-            command.control_binding_revision,
-            command.controller_goal_id,
-            command.controller_goal_generation,
-            command.controller_topology_id,
-            command.topology_revision,
-            command.control_route_id,
-            command.scaling_domain_id,
-            command.coordinated_barrier_id,
-            command.resources,
-            command.active_control_configuration_id,
-            command.active_control_configuration_generation,
-            command.requested_runtime_scale_generation,
-            runtime_scale.commanded_scale,
-            runtime_scale.applied_scale,
-            runtime_scale.virtual_trajectory_time_s,
-            last_execute->binding.provider_runtime_epoch,
-            runtime_scale.acknowledgement_sequence,
-            runtime_scale.acknowledgement_timestamp_ns,
-            runtime_scale.error.has_value()
-                ? RuntimeScaleApplicationState::kFailed
-                : runtime_scale.active
-                      ? RuntimeScaleApplicationState::kApplied
-                      : RuntimeScaleApplicationState::kPending,
-            runtime_scale.error});
+    return Result<ResolvedRuntimeScaleStatusDTO>::Ok(ResolvedRuntimeScaleStatusDTO{
+        command.operation_id,
+        command.operation_revision,
+        command.participant_id,
+        command.controllable_component_id,
+        command.command_target_id,
+        command.capability_id,
+        command.control_domain_id,
+        command.control_domain_revision,
+        command.control_binding_id,
+        command.control_binding_revision,
+        command.controller_goal_id,
+        command.controller_goal_generation,
+        command.controller_topology_id,
+        command.topology_revision,
+        command.control_route_id,
+        command.scaling_domain_id,
+        command.coordinated_barrier_id,
+        command.resources,
+        command.active_control_configuration_id,
+        command.active_control_configuration_generation,
+        command.requested_runtime_scale_generation,
+        runtime_scale.commanded_scale,
+        runtime_scale.applied_scale,
+        runtime_scale.virtual_trajectory_time_s,
+        last_execute->binding.provider_runtime_epoch,
+        runtime_scale.acknowledgement_sequence,
+        runtime_scale.acknowledgement_timestamp_ns,
+        runtime_scale.error.has_value() ? RuntimeScaleApplicationState::kFailed
+        : runtime_scale.active          ? RuntimeScaleApplicationState::kApplied
+                                        : RuntimeScaleApplicationState::kPending,
+        runtime_scale.error});
   }
 
   GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
@@ -183,8 +177,44 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
     return next_command_result;
   }
 
+  Result<void> validate_gripper_command(const GripperCommandRequestDTO&) const override {
+    ++validate_command_calls;
+    return next_command_validation;
+  }
+
   GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
     return gripper_status;
+  }
+
+  Result<std::uint64_t> stop_gripper(const std::string& gripper_id,
+                                     std::uint64_t expected_command_id,
+                                     std::uint64_t expected_generation) override {
+    ++stop_gripper_calls;
+    Trace("engine:stop_gripper");
+    if (gripper_status.gripper_id != gripper_id ||
+        gripper_status.command_id != expected_command_id ||
+        gripper_status.generation != expected_generation) {
+      return Result<std::uint64_t>::Err(
+          ErrorDTO{"stale_gripper_state", "fake gripper generation is stale", {}});
+    }
+    gripper_status.state = GripperCommandState::kIdle;
+    ++gripper_status.generation;
+    return Result<std::uint64_t>::Ok(gripper_status.generation);
+  }
+
+  Result<void> reset_gripper(const std::string& gripper_id, std::uint64_t expected_command_id,
+                             std::uint64_t expected_generation) override {
+    ++reset_gripper_calls;
+    Trace("engine:reset_gripper");
+    if (gripper_status.gripper_id != gripper_id ||
+        gripper_status.command_id != expected_command_id ||
+        gripper_status.generation != expected_generation) {
+      return Result<void>::Err(
+          ErrorDTO{"stale_gripper_state", "fake gripper generation is stale", {}});
+    }
+    gripper_status.state = GripperCommandState::kIdle;
+    ++gripper_status.generation;
+    return Result<void>::Ok();
   }
 
   ExecutionStatus get_status() const override { return status; }
@@ -200,8 +230,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
   void emit_transition(ExecutionState from, ExecutionState to,
                        std::optional<ErrorDTO> error = std::nullopt) {
     status.state = to;
-    runtime_scale.active =
-        to == ExecutionState::kExecuting || to == ExecutionState::kPaused;
+    runtime_scale.active = to == ExecutionState::kExecuting || to == ExecutionState::kPaused;
     status.progress = to == ExecutionState::kCompleted ? 1.0 : 0.4;
     if (error.has_value()) {
       status.last_error = ErrorCode::kExecutionAborted;
@@ -233,6 +262,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
 
   int execute_calls{};
   int command_calls{};
+  mutable int validate_command_calls{};
+  int stop_gripper_calls{};
+  int reset_gripper_calls{};
   int stop_calls{};
   int pause_calls{};
   int resume_calls{};
@@ -242,15 +274,14 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
   std::uint64_t next_execution_id{41U};
   Result<std::uint64_t> next_execute_result = Result<std::uint64_t>::Ok(41U);
   GripperCommandResultDTO next_command_result{true, 73U, 9U, std::nullopt};
+  Result<void> next_command_validation = Result<void>::Ok();
   StopResultDTO next_stop_result{true, std::nullopt};
   PauseResultDTO next_pause_result{true, std::nullopt};
   ResumeResultDTO next_resume_result{true, std::nullopt};
   ResetResultDTO next_reset_result{true, std::nullopt};
   AcknowledgeCompletedResultDTO next_acknowledge_result{true, std::nullopt};
   Result<void> next_runtime_scale_result = Result<void>::Ok();
-  RuntimeScaleMechanismStatusDTO runtime_scale{true, false, 1.0, 1.0,
-                                                0.0, 1U, 1,
-                                                std::nullopt};
+  RuntimeScaleMechanismStatusDTO runtime_scale{true, false, 1.0, 1.0, 0.0, 1U, 1, std::nullopt};
   ExecutionStatus status{};
   GripperCommandStatusDTO gripper_status{};
   std::optional<ExecuteRequestDTO> last_execute;
@@ -419,12 +450,9 @@ FakeOperationJournal default_journal;
           ContainmentGranularity::kResource,
           kind == CoordinateKind::kAngular
               ? std::optional(RuntimeScaleRouteQualificationDTO{
-                    ControlRouteId("route.native"),
-                    ScalingDomainId("scale.native"),
-                    EndpointRoleId("runtime_scale_command"),
-                    EndpointRoleId("runtime_scale_state"), std::nullopt,
-                    RuntimeScaleAcknowledgementKind::kAppliedState, 4.0,
-                    100'000'000})
+                    ControlRouteId("route.native"), ScalingDomainId("scale.native"),
+                    EndpointRoleId("runtime_scale_command"), EndpointRoleId("runtime_scale_state"),
+                    std::nullopt, RuntimeScaleAcknowledgementKind::kAppliedState, 4.0, 100'000'000})
               : std::nullopt},
       std::nullopt,
       std::move(supporting_paths),
@@ -494,28 +522,26 @@ FakeOperationJournal default_journal;
       accepted.operation_id, OperationRevision(expected_revision), std::nullopt};
 }
 
-[[nodiscard]] StopIntentDTO stop_request(
-    std::string request_id, const OperationAcceptedDTO& accepted,
-    std::uint64_t expected_revision,
-    std::uint64_t expected_stop_generation = 0U) {
+[[nodiscard]] StopIntentDTO stop_request(std::string request_id,
+                                         const OperationAcceptedDTO& accepted,
+                                         std::uint64_t expected_revision,
+                                         std::uint64_t expected_stop_generation = 0U) {
   return StopIntentDTO{
-      PublicRequestContextDTO{RequestId(std::move(request_id)),
-                              RequestOwnerEpoch("kernel.epoch.1"), "test",
-                              std::nullopt},
-      {StopOperationTargetDTO{accepted.operation_id,
-                              OperationRevision(expected_revision),
+      PublicRequestContextDTO{RequestId(std::move(request_id)), RequestOwnerEpoch("kernel.epoch.1"),
+                              "test", std::nullopt},
+      {StopOperationTargetDTO{accepted.operation_id, OperationRevision(expected_revision),
                               StopGeneration(expected_stop_generation)}},
       std::nullopt};
 }
 
-[[nodiscard]] RuntimeScaleRequestDTO runtime_scale_request(
-    std::string request_id, const OperationAcceptedDTO& accepted,
-    std::uint64_t expected_revision, std::uint64_t expected_generation,
-    double scale) {
+[[nodiscard]] RuntimeScaleRequestDTO runtime_scale_request(std::string request_id,
+                                                           const OperationAcceptedDTO& accepted,
+                                                           std::uint64_t expected_revision,
+                                                           std::uint64_t expected_generation,
+                                                           double scale) {
   return RuntimeScaleRequestDTO{
-      PublicRequestContextDTO{RequestId(std::move(request_id)),
-                              RequestOwnerEpoch("kernel.epoch.1"), "test",
-                              std::nullopt},
+      PublicRequestContextDTO{RequestId(std::move(request_id)), RequestOwnerEpoch("kernel.epoch.1"),
+                              "test", std::nullopt},
       accepted.operation_id, OperationRevision(expected_revision),
       RuntimeScaleGeneration(expected_generation), scale};
 }
@@ -783,6 +809,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(engine.last_command->max_effort.has_value());
   EXPECT_DOUBLE_EQ(*engine.last_command->max_effort, 8.0);
   EXPECT_DOUBLE_EQ(engine.last_command->duration_s, 0.5);
+  EXPECT_DOUBLE_EQ(engine.last_command->completion_timeout_s, 2.0);
+  EXPECT_EQ(engine.validate_command_calls, 1);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kDispatched);
 
   engine.gripper_status.state = GripperCommandState::kCompleted;
@@ -793,6 +821,62 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto state = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(state.ok());
   EXPECT_EQ(state.value().state, OperationStateKind::kCompleted);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GripperValidationPrecedesAcceptanceAndScopedStopResetUseCommandLifecycle) {
+  FakeClock clock;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+
+  FakeParticipantEngine rejected_engine;
+  rejected_engine.next_command_validation = Result<void>::Err(
+      ErrorDTO{"gripper_position_limit_violation", "outside retained limits", {}});
+  FakeOperationJournal rejected_journal;
+  ResourceAddressedExecutionKernel rejected_kernel(
+      {{make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear,
+                     schema),
+        &rejected_engine}},
+      clock, rejected_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+  const auto rejected = rejected_kernel.execute(command_operation());
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code, "gripper_position_limit_violation");
+  EXPECT_EQ(rejected_engine.validate_command_calls, 1);
+  EXPECT_EQ(rejected_engine.command_calls, 0);
+  EXPECT_EQ(rejected_journal.calls, (std::vector<std::string>{"begin"}));
+  EXPECT_EQ(rejected_kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear,
+                     schema),
+        &engine}},
+      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+  const auto accepted = kernel.execute(command_operation());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+
+  const auto stopped = kernel.stop(stop_request("request.command.stop", accepted.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  EXPECT_EQ(engine.stop_gripper_calls, 1);
+  EXPECT_EQ(engine.stop_calls, 0);
+  const auto stopped_state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(stopped_state.ok()) << stopped_state.error().message;
+  EXPECT_EQ(stopped_state.value().state, OperationStateKind::kStopped);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
+  const auto reconciled_stop = kernel.reconcile_subordinate_state();
+  ASSERT_TRUE(reconciled_stop.ok()) << reconciled_stop.error().message;
+  const auto retained_stop = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(retained_stop.ok()) << retained_stop.error().message;
+  EXPECT_EQ(retained_stop.value().state, OperationStateKind::kStopped);
+
+  const auto reset = kernel.reset(control_request(
+      "request.command.reset", accepted.value(), stopped_state.value().operation_revision.value()));
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  EXPECT_EQ(engine.reset_gripper_calls, 1);
+  EXPECT_EQ(engine.reset_calls, 0);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -886,35 +970,27 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.runtime_scale_calls, 1);
   const auto& exact = *engine.last_runtime_scale_command;
   EXPECT_EQ(exact.operation_id, executed.value().operation_id);
-  EXPECT_EQ(exact.participant_id,
-            executed.value().participant_assignments.front().participant_id);
-  EXPECT_EQ(exact.controller_goal_id,
-            engine.last_execute->binding.controller_goal_id);
-  EXPECT_EQ(exact.control_binding_id,
-            engine.last_execute->binding.control_binding_id);
-  EXPECT_EQ(exact.control_route_id,
-            engine.last_execute->binding.control_route_id);
+  EXPECT_EQ(exact.participant_id, executed.value().participant_assignments.front().participant_id);
+  EXPECT_EQ(exact.controller_goal_id, engine.last_execute->binding.controller_goal_id);
+  EXPECT_EQ(exact.control_binding_id, engine.last_execute->binding.control_binding_id);
+  EXPECT_EQ(exact.control_route_id, engine.last_execute->binding.control_route_id);
   EXPECT_EQ(exact.resources, engine.last_execute->binding.resources);
-  EXPECT_EQ(exact.expected_runtime_scale_generation,
-            RuntimeScaleGeneration(0U));
-  EXPECT_EQ(exact.requested_runtime_scale_generation,
-            RuntimeScaleGeneration(0U));
+  EXPECT_EQ(exact.expected_runtime_scale_generation, RuntimeScaleGeneration(0U));
+  EXPECT_EQ(exact.requested_runtime_scale_generation, RuntimeScaleGeneration(0U));
   EXPECT_DOUBLE_EQ(exact.requested_scale, 1.0);
 
   const auto state = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(state.ok()) << state.error().message;
   ASSERT_EQ(state.value().participants.size(), 1U);
   const auto& participant = state.value().participants.front();
-  EXPECT_EQ(participant.controller_goal_id,
-            engine.last_execute->binding.controller_goal_id);
+  EXPECT_EQ(participant.controller_goal_id, engine.last_execute->binding.controller_goal_id);
   EXPECT_EQ(participant.resources, engine.last_execute->binding.resources);
   const auto slots = kernel.resource_snapshot();
   ASSERT_EQ(slots.size(), 1U);
   ASSERT_TRUE(slots.front().owner.has_value());
   EXPECT_EQ(slots.front().owner->operation_id, executed.value().operation_id);
   EXPECT_EQ(slots.front().owner->participant_id, participant.participant_id);
-  EXPECT_EQ(slots.front().owner->control_binding_id,
-            participant.control_binding_id);
+  EXPECT_EQ(slots.front().owner->control_binding_id, participant.control_binding_id);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -928,28 +1004,23 @@ TEST(ResourceAddressedExecutionKernelTest,
       clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 32U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
-  engine.emit_transition(ExecutionState::kValidating,
-                         ExecutionState::kExecuting);
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
 
-  const auto first_request = runtime_scale_request(
-      "request.scale.1", executed.value(), 1U, 0U, 0.25);
+  const auto first_request =
+      runtime_scale_request("request.scale.1", executed.value(), 1U, 0U, 0.25);
   const auto first = kernel.set_runtime_scale(first_request);
   ASSERT_TRUE(first.ok()) << first.error().message;
-  EXPECT_EQ(first.value().runtime_scale_generation,
-            RuntimeScaleGeneration(1U));
+  EXPECT_EQ(first.value().runtime_scale_generation, RuntimeScaleGeneration(1U));
   EXPECT_EQ(engine.runtime_scale_calls, 2);
   ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
-  EXPECT_EQ(engine.last_runtime_scale_command->operation_revision,
-            OperationRevision(1U));
-  EXPECT_EQ(engine.last_runtime_scale_command
-                ->requested_runtime_scale_generation,
+  EXPECT_EQ(engine.last_runtime_scale_command->operation_revision, OperationRevision(1U));
+  EXPECT_EQ(engine.last_runtime_scale_command->requested_runtime_scale_generation,
             RuntimeScaleGeneration(1U));
   EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.25);
 
   const auto replay = kernel.set_runtime_scale(first_request);
   ASSERT_TRUE(replay.ok()) << replay.error().message;
-  EXPECT_EQ(replay.value().replay_status,
-            RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
   EXPECT_EQ(engine.runtime_scale_calls, 2);
 
   auto conflict = first_request;
@@ -959,18 +1030,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(conflicting.error().code, "request_id_conflict");
   EXPECT_EQ(engine.runtime_scale_calls, 2);
 
-  const auto stale = kernel.set_runtime_scale(runtime_scale_request(
-      "request.scale.stale", executed.value(), 1U, 0U, 0.5));
+  const auto stale = kernel.set_runtime_scale(
+      runtime_scale_request("request.scale.stale", executed.value(), 1U, 0U, 0.5));
   ASSERT_FALSE(stale.ok());
-  EXPECT_EQ(stale.error().details.at("reason"),
-            "runtime_scale_generation_stale");
+  EXPECT_EQ(stale.error().details.at("reason"), "runtime_scale_generation_stale");
   EXPECT_EQ(engine.runtime_scale_calls, 2);
 
-  const auto held = kernel.set_runtime_scale(runtime_scale_request(
-      "request.scale.hold", executed.value(), 1U, 1U, 0.0));
+  const auto held = kernel.set_runtime_scale(
+      runtime_scale_request("request.scale.hold", executed.value(), 1U, 1U, 0.0));
   ASSERT_TRUE(held.ok()) << held.error().message;
-  EXPECT_EQ(held.value().runtime_scale_generation,
-            RuntimeScaleGeneration(2U));
+  EXPECT_EQ(held.value().runtime_scale_generation, RuntimeScaleGeneration(2U));
   EXPECT_EQ(engine.stop_calls, 0);
   const auto state = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(state.ok());
@@ -982,8 +1051,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_DOUBLE_EQ(status.value().effective_scale, 0.0);
   ASSERT_EQ(status.value().participants.size(), 1U);
   EXPECT_TRUE(status.value().participants.front().supported);
-  EXPECT_EQ(status.value().participants.front().accepted_generation,
-            RuntimeScaleGeneration(2U));
+  EXPECT_EQ(status.value().participants.front().accepted_generation, RuntimeScaleGeneration(2U));
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -997,15 +1065,13 @@ TEST(ResourceAddressedExecutionKernelTest,
       clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 32U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
-  engine.emit_transition(ExecutionState::kValidating,
-                         ExecutionState::kExecuting);
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
 
   const auto request = stop_request("request.stop.1", executed.value(), 1U);
   const auto stopped = kernel.stop(request);
   ASSERT_TRUE(stopped.ok()) << stopped.error().message;
   EXPECT_EQ(stopped.value().stop_generation, StopGeneration(1U));
-  EXPECT_EQ(stopped.value().operation_revision_after_acceptance,
-            OperationRevision(2U));
+  EXPECT_EQ(stopped.value().operation_revision_after_acceptance, OperationRevision(2U));
   EXPECT_EQ(engine.stop_calls, 1);
   const auto slots = kernel.resource_snapshot();
   ASSERT_EQ(slots.size(), 1U);
@@ -1021,30 +1087,25 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   const auto replay = kernel.stop(request);
   ASSERT_TRUE(replay.ok()) << replay.error().message;
-  EXPECT_EQ(replay.value().replay_status,
-            RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
   EXPECT_EQ(replay.value().stop_id, stopped.value().stop_id);
   EXPECT_EQ(engine.stop_calls, 1);
 
-  const auto joined = kernel.stop(
-      stop_request("request.stop.join", executed.value(), 2U, 1U));
+  const auto joined = kernel.stop(stop_request("request.stop.join", executed.value(), 2U, 1U));
   ASSERT_TRUE(joined.ok()) << joined.error().message;
   EXPECT_EQ(joined.value().stop_id, stopped.value().stop_id);
   EXPECT_EQ(joined.value().stop_generation, StopGeneration(1U));
   EXPECT_EQ(engine.stop_calls, 1);
 
-  const auto stale = kernel.stop(
-      stop_request("request.stop.stale", executed.value(), 1U, 0U));
+  const auto stale = kernel.stop(stop_request("request.stop.stale", executed.value(), 1U, 0U));
   ASSERT_FALSE(stale.ok());
   EXPECT_EQ(stale.error().details.at("reason"), "operation_revision_stale");
   EXPECT_EQ(engine.stop_calls, 1);
 
   const auto scaling_after_stop = kernel.set_runtime_scale(
-      runtime_scale_request("request.scale.after-stop", executed.value(), 2U,
-                            0U, 0.5));
+      runtime_scale_request("request.scale.after-stop", executed.value(), 2U, 0U, 0.5));
   ASSERT_FALSE(scaling_after_stop.ok());
-  EXPECT_EQ(scaling_after_stop.error().details.at("reason"),
-            "runtime_scale_state_invalid");
+  EXPECT_EQ(scaling_after_stop.error().details.at("reason"), "runtime_scale_state_invalid");
   EXPECT_EQ(engine.runtime_scale_calls, 1);
 }
 
@@ -1052,29 +1113,25 @@ TEST(ResourceAddressedExecutionKernelTest,
      AcceptedStopSurfacesSubordinateRejectionAsInterventionRequired) {
   FakeClock clock;
   FakeParticipantEngine engine;
-  engine.next_stop_result = StopResultDTO{
-      false,
-      ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
-               "controller rejected Stop",
-               {{"reason", "controller_stop_rejected"}}}};
+  engine.next_stop_result =
+      StopResultDTO{false, ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                    "controller rejected Stop",
+                                    {{"reason", "controller_stop_rejected"}}}};
   ResourceAddressedExecutionKernel kernel(
       {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
       clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
-  engine.emit_transition(ExecutionState::kValidating,
-                         ExecutionState::kExecuting);
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
 
-  const auto accepted =
-      kernel.stop(stop_request("request.stop.reject", executed.value(), 1U));
+  const auto accepted = kernel.stop(stop_request("request.stop.reject", executed.value(), 1U));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto state = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(state.ok());
   EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
   ASSERT_TRUE(state.value().participants.front().terminal_error.has_value());
-  EXPECT_EQ(state.value().participants.front().terminal_error->details.at(
-                "reason"),
+  EXPECT_EQ(state.value().participants.front().terminal_error->details.at("reason"),
             "controller_stop_rejected");
 }
 
@@ -1088,14 +1145,14 @@ TEST(ResourceAddressedExecutionKernelTest,
       clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
-  engine.emit_transition(ExecutionState::kValidating,
-                         ExecutionState::kExecuting);
-  engine.next_runtime_scale_result = Result<void>::Err(ErrorDTO{
-      std::string(to_string(ErrorCode::kExecutionRejected)),
-      "scale handoff failed", {{"reason", "scale_handoff_failed"}}});
+  engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
+  engine.next_runtime_scale_result =
+      Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                 "scale handoff failed",
+                                 {{"reason", "scale_handoff_failed"}}});
 
-  const auto accepted = kernel.set_runtime_scale(runtime_scale_request(
-      "request.scale.failure", executed.value(), 1U, 0U, 0.5));
+  const auto accepted = kernel.set_runtime_scale(
+      runtime_scale_request("request.scale.failure", executed.value(), 1U, 0U, 0.5));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto failed = kernel.get_runtime_scale(executed.value().operation_id);
   ASSERT_TRUE(failed.ok());
@@ -1133,27 +1190,26 @@ TEST(ResourceAddressedExecutionKernelTest,
         &engine}},
       clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
   auto direct = motion_operation("request.direct.1");
-  direct.participants.front().action_span = ActionSpanDTO{
-      ActionSource::kDirectControl, "direct/session.1", "run.1", "", "",
-      ""};
+  direct.participants.front().action_span =
+      ActionSpanDTO{ActionSource::kDirectControl, "direct/session.1", "run.1", "", "", ""};
   const auto accepted = kernel.execute(direct);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   ASSERT_TRUE(engine.last_execute.has_value());
   ASSERT_TRUE(engine.last_execute->action_span.has_value());
-  EXPECT_EQ(engine.last_execute->action_span->action_source,
-            ActionSource::kDirectControl);
-  EXPECT_EQ(engine.last_execute->action_span->action_span_id,
-            "direct/session.1");
+  EXPECT_EQ(engine.last_execute->action_span->action_source, ActionSource::kDirectControl);
+  EXPECT_EQ(engine.last_execute->action_span->action_span_id, "direct/session.1");
 
   auto oversized = motion_operation("request.direct.oversized");
-  oversized.participants.front().action_span = ActionSpanDTO{
-      ActionSource::kDirectControl,
-      std::string(kMaxActionSpanFieldBytes + 1U, 'x'), "run.2", "", "",
-      ""};
+  oversized.participants.front().action_span =
+      ActionSpanDTO{ActionSource::kDirectControl,
+                    std::string(kMaxActionSpanFieldBytes + 1U, 'x'),
+                    "run.2",
+                    "",
+                    "",
+                    ""};
   const auto rejected = kernel.execute(oversized);
   ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().details.at("reason"),
-            "operation_action_span_invalid");
+  EXPECT_EQ(rejected.error().details.at("reason"), "operation_action_span_invalid");
   EXPECT_EQ(engine.execute_calls, 1);
 }
 

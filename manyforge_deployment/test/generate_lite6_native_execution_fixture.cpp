@@ -4,6 +4,7 @@
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
@@ -90,6 +91,24 @@ void write_exact_file(const std::filesystem::path& path, std::string_view bytes)
                 {"required_model_roles",
                  CanonicalValue(CanonicalValue::Array{CanonicalValue("arm_model")})},
             })},
+           {"gripper",
+            CanonicalValue(CanonicalValue::Object{
+                {"component_role", CanonicalValue("robot")},
+                {"required_capabilities",
+                 CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                     {"capability_id", CanonicalValue("tool.gripper.command")},
+                     {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                     {"disposition", CanonicalValue("required")},
+                 })})},
+                {"required_frame_roles",
+                 CanonicalValue(CanonicalValue::Array{CanonicalValue("tcp")})},
+                {"required_resource_roles",
+                 CanonicalValue(CanonicalValue::Array{CanonicalValue("fingers")})},
+                {"required_collision_body_roles",
+                 CanonicalValue(CanonicalValue::Array{CanonicalValue("gripper_collision")})},
+                {"required_model_roles",
+                 CanonicalValue(CanonicalValue::Array{CanonicalValue("arm_model")})},
+            })},
        })},
       {"tree", CanonicalValue(CanonicalValue::Object{
                    {"node_id", CanonicalValue("sequence")},
@@ -162,7 +181,8 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(manager_state_root);
 
     const auto materialized =
-        deployment::test::materialize_lite6_native_motion_retained_consumer_fixture(package_root);
+        deployment::test::materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
+            package_root);
     if (materialized.bundle == nullptr) {
       throw std::logic_error("native execution fixture has no bundle");
     }
@@ -189,8 +209,11 @@ int main(int argc, char** argv) {
                 core::ControllableComponentId(
                     std::string(deployment::test::kLite6ControllableComponentId))}},
             {core::ProgramTargetRoleAssignmentDTO{
-                core::TargetRoleId("arm"),
-                core::CommandTargetId(std::string(deployment::test::kLite6ArmTargetId))}}},
+                 core::TargetRoleId("arm"),
+                 core::CommandTargetId(std::string(deployment::test::kLite6ArmTargetId))},
+             core::ProgramTargetRoleAssignmentDTO{
+                 core::TargetRoleId("gripper"),
+                 core::CommandTargetId(std::string(deployment::test::kLite6GripperTargetId))}}},
         bundle, *model_map, catalog_store);
     deployment::FilesystemProgramBindingRepository binding_repository(package_root);
     if (!binding_repository.put_if_absent(binding, bundle, *model_map)) {
@@ -232,8 +255,14 @@ int main(int argc, char** argv) {
         {"program_binding_id", CanonicalValue(binding->program_binding_id().value())},
         {"component_role_id", CanonicalValue("robot")},
         {"target_role_id", CanonicalValue("arm")},
+        {"gripper_target_role_id", CanonicalValue("gripper")},
         {"execution_capability_id", CanonicalValue("execution.trajectory.execute")},
         {"planning_capability_id", CanonicalValue("planning.motion.joint_goal")},
+        {"gripper_capability_id", CanonicalValue("tool.gripper.command")},
+        {"gripper_command_schema_id",
+         CanonicalValue(std::string(core::kGripperPositionCommandSchemaId))},
+        {"gripper_command_schema_revision",
+         CanonicalValue(std::string(core::kGripperPositionCommandSchemaRevision))},
         {"source_joint_names",
          CanonicalValue(CanonicalValue::Array{CanonicalValue("joint1"), CanonicalValue("joint2"),
                                               CanonicalValue("joint3"), CanonicalValue("joint4"),

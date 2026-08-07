@@ -1,8 +1,7 @@
 #pragma once
 
-#include <manyforge_core/types/error_code.hpp>
-
 #include <cstdint>
+#include <manyforge_core/types/error_code.hpp>
 #include <optional>
 #include <string>
 #include <vector>
@@ -16,8 +15,7 @@ enum class GripperCommandState {
   kFailed,
 };
 
-inline constexpr const char* gripper_command_state_name(
-    GripperCommandState state) noexcept {
+inline constexpr const char* gripper_command_state_name(GripperCommandState state) noexcept {
   switch (state) {
     case GripperCommandState::kIdle:
       return "idle";
@@ -38,8 +36,7 @@ enum class GripperProjectionState {
   kFailed,
 };
 
-inline constexpr const char* gripper_projection_state_name(
-    GripperProjectionState state) noexcept {
+inline constexpr const char* gripper_projection_state_name(GripperProjectionState state) noexcept {
   switch (state) {
     case GripperProjectionState::kNotRequired:
       return "not_required";
@@ -78,6 +75,9 @@ struct GripperCommandRequestDTO {
   std::string transport_kind;
   std::vector<std::string> evidence;
   std::string evidence_state;
+  /// Owner-resolved terminal deadline for this private command. The native
+  /// fixed-duration mechanism rejects a duration that cannot fit this bound.
+  double completion_timeout_s = 1.0;
 };
 
 struct GripperCommandResultDTO {
@@ -109,8 +109,7 @@ struct GripperCommandStatusDTO {
   std::string transport_kind;
   std::vector<std::string> evidence;
   std::string evidence_state;
-  GripperProjectionState projection_state =
-      GripperProjectionState::kNotRequired;
+  GripperProjectionState projection_state = GripperProjectionState::kNotRequired;
   std::string projection_reason;
   std::optional<ErrorDTO> error;
 };

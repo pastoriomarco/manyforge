@@ -5,10 +5,14 @@ from typing import Any, Sequence
 import pytest
 from fastapi.testclient import TestClient
 
-from manyforge_headless_api.app import TrustedPrincipal, create_app
+from manyforge_headless_api.app import TrustedPrincipal, _error_status, create_app
 from manyforge_headless_api.models import ManagerApplyRequest
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
+
+
+def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
+    assert _error_status("invalid_request") == 400
 
 
 def _manager_payload() -> dict[str, Any]:

@@ -22,11 +22,11 @@
 #include <manyforge_core/operator_stop_worker.hpp>
 #include <manyforge_core/ports/icollision_trajectory_projector.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
-#include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/ports/iobserved_robot_state_provider.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
+#include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/ports/irobot_kinematics.hpp>
 #include <manyforge_core/ports/itrajectory_validator.hpp>
 #include <manyforge_core/runtime_collision_lookahead_session.hpp>
@@ -259,8 +259,7 @@ struct ExecutionKernelPorts {
   IReferencePoseResolver& reference_resolver;
   ITrajectoryValidator& trajectory_validator;
   ICollisionTrajectoryProjector& collision_projector;
-  const ICollisionDiagnosticComparator* collision_diagnostic_comparator =
-      nullptr;
+  const ICollisionDiagnosticComparator* collision_diagnostic_comparator = nullptr;
   IGripperCommandBackend* gripper_command_backend = nullptr;
 };
 
@@ -272,13 +271,9 @@ struct ExecutionKernelPorts {
 /// implementation with event subscription.
 class ExecutionKernel : public IResolvedParticipantExecutionEngine {
  public:
-  ExecutionKernel(IPlannerBackend& planner,
-                  ExecutionKernelPorts ports,
-                  IExecutionBackend& execution_backend,
-                  IClock& clock,
-                  IScheduler& scheduler,
-                  TrajectoryCache& cache,
-                  ExecutionKernelConfig config = {});
+  ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts ports,
+                  IExecutionBackend& execution_backend, IClock& clock, IScheduler& scheduler,
+                  TrajectoryCache& cache, ExecutionKernelConfig config = {});
 
   ~ExecutionKernel() override;
 
@@ -296,26 +291,27 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   PauseResultDTO pause() override;
 
   /// Non-blocking resume. Only valid from Paused.
-  ResumeResultDTO resume(
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
+  ResumeResultDTO resume(std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
   /// Non-blocking reset. Valid from any state except Idle.
-  ResetResultDTO reset(
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
+  ResetResultDTO reset(std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
   /// Backend-neutral gripper command surface. The injected adapter owns all
   /// progression and publishes immutable observer status.
-  GripperCommandResultDTO command_gripper(
-      const GripperCommandRequestDTO& request) override;
-  GripperCommandStatusDTO get_gripper_status(
-      const std::string& gripper_id) const override;
-  GripperCommandResultDTO mark_gripper_grasp_lost(
-      const std::string& gripper_id,
-      std::uint64_t expected_command_id,
-      std::uint64_t expected_generation,
-      const std::string& evidence_label,
-      const std::string& message,
-      const std::string& reason_code);
+  GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override;
+  Result<void> validate_gripper_command(const GripperCommandRequestDTO& request) const override;
+  GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const override;
+  Result<std::uint64_t> stop_gripper(const std::string& gripper_id,
+                                     std::uint64_t expected_command_id,
+                                     std::uint64_t expected_generation) override;
+  Result<void> reset_gripper(const std::string& gripper_id, std::uint64_t expected_command_id,
+                             std::uint64_t expected_generation) override;
+  GripperCommandResultDTO mark_gripper_grasp_lost(const std::string& gripper_id,
+                                                  std::uint64_t expected_command_id,
+                                                  std::uint64_t expected_generation,
+                                                  const std::string& evidence_label,
+                                                  const std::string& message,
+                                                  const std::string& reason_code);
 
   /// Monotonic lifecycle/recovery command epoch. Python control surfaces use
   /// this only to stamp bounded control calls; the C++ kernel owns the actual
@@ -338,8 +334,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   /// Valid only when the kernel is currently Completed for exactly the supplied
   /// execution_id. Failed and Stopped executions require Reset/recovery instead.
   AcknowledgeCompletedResultDTO acknowledge_completed(
-      uint64_t execution_id,
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
+      uint64_t execution_id, std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
   /// RT-8B (spec/200, spec/230 §3.7.1): the only kernel statement of
   /// recovery admissibility. Pure bounded read of the latest published
@@ -365,14 +360,13 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   /// this is a high-rate operator surface and the backend's atomic store
   /// handles concurrency. `principal_id` is optional because lower-level
   /// backend/direct callers may not have a supervisory actor identity.
-  void set_runtime_velocity_scale(
-      double scale, std::optional<std::string> principal_id = std::nullopt);
+  void set_runtime_velocity_scale(double scale,
+                                  std::optional<std::string> principal_id = std::nullopt);
 
   Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
       const ResolvedRuntimeScaleCommandDTO& command) override;
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
-      const OperationId& operation_id,
-      const ControlBindingId& control_binding_id) const override;
+      const OperationId& operation_id, const ControlBindingId& control_binding_id) const override;
 
   /// Get current kernel status.
   ExecutionStatus get_status() const override;
@@ -397,8 +391,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   /// validate_trajectory(). Passing nullopt is allowed only for tests or
   /// bootstrap error paths; execution validation then fails closed because
   /// there is no authoritative collision policy.
-  void set_collision_validation_policy_snapshot(
-      std::optional<CollisionPolicySnapshot> snapshot);
+  void set_collision_validation_policy_snapshot(std::optional<CollisionPolicySnapshot> snapshot);
 
   /// Install role-owned collision resources. Production composition roots should
   /// use this API: runtime monitoring owns `runtime_monitor_engine`, while
@@ -412,8 +405,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   /// Optional pose-source / per-state retry configuration for the
   /// CollisionValidationCoordinator. Has no effect until a policy snapshot is
   /// installed via set_collision_validation_policy_snapshot.
-  void set_collision_validation_retry_config(
-      PoseSourceRetryConfig retry, std::int64_t per_state_timeout_ns = 0);
+  void set_collision_validation_retry_config(PoseSourceRetryConfig retry,
+                                             std::int64_t per_state_timeout_ns = 0);
 
   /// Check whether a non-dispatch validation surface may run against the
   /// current collision resources. Preview callers use this before direct
@@ -428,14 +421,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   // and event emission.
   // ---------------------------------------------------------------
 
-  Result<void> register_interrupt_source(
-      const InterruptSourceDefinition& source);
-  Result<void> register_interrupt_policy(
-      const InterruptPolicyDefinition& policy);
-  InterruptIngestResult publish_fast_interrupt_signal(
-      const InterruptSignalUpdate& update);
-  InterruptIngestResult publish_supervisory_interrupt_signal(
-      const InterruptSignalUpdate& update);
+  Result<void> register_interrupt_source(const InterruptSourceDefinition& source);
+  Result<void> register_interrupt_policy(const InterruptPolicyDefinition& policy);
+  InterruptIngestResult publish_fast_interrupt_signal(const InterruptSignalUpdate& update);
+  InterruptIngestResult publish_supervisory_interrupt_signal(const InterruptSignalUpdate& update);
   InterruptIngestResult publish_fast_interrupt_signals(
       const std::vector<InterruptSignalUpdate>& updates);
   std::optional<InterruptLatch> get_active_interrupt_latch() const;
@@ -452,13 +441,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   /// the kernel has emitted one. Outcomes survive subsequent executions
   /// so callers (BT, MCP, audit) can correlate by id; the bound is the
   /// `motion_execution_outcome_retention` config knob.
-  std::optional<MotionExecutionOutcomeDTO> get_execution_outcome(
-      std::uint64_t execution_id) const;
+  std::optional<MotionExecutionOutcomeDTO> get_execution_outcome(std::uint64_t execution_id) const;
 
   /// Diagnostics-only observer for armed move-scoped bindings
   /// (spec/260 §B.3). BT/policy code MUST NOT poll this for control flow.
-  std::vector<MotionInterruptScopeStatusDTO> active_motion_interrupt_scopes()
-      const;
+  std::vector<MotionInterruptScopeStatusDTO> active_motion_interrupt_scopes() const;
 
   /// Subscribe to kernel events.
   /// @param callback Called for each event. Must be thread-safe.
@@ -488,13 +475,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   std::string dump_flight_record(const char* reason) noexcept;
 
  private:
-  Result<TrajectoryDTO> plan_trajectory(
-      const ExecuteRequestDTO& request,
-      const ProjectionLeaseBindingDTO& projection_binding,
-      std::uint32_t planning_attempt_index = 0);
-  Result<TrajectoryDTO> plan_resume_trajectory(
-      const ExecuteRequestDTO& request,
-      const ProjectionLeaseBindingDTO& projection_binding);
+  Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request,
+                                        const ProjectionLeaseBindingDTO& projection_binding,
+                                        std::uint32_t planning_attempt_index = 0);
+  Result<TrajectoryDTO> plan_resume_trajectory(const ExecuteRequestDTO& request,
+                                               const ProjectionLeaseBindingDTO& projection_binding);
 
   /// Move-only ownership of one retained scene/projection revision. Destruction
   /// releases the publisher lookup entry on every success, rejection,
@@ -503,20 +488,15 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   class RetainedSceneSnapshotLease {
    public:
     RetainedSceneSnapshotLease() = default;
-    RetainedSceneSnapshotLease(
-        ICollisionWorldSnapshotPublisher& publisher,
-        CollisionWorldLeaseInventory inventory);
+    RetainedSceneSnapshotLease(ICollisionWorldSnapshotPublisher& publisher,
+                               CollisionWorldLeaseInventory inventory);
     ~RetainedSceneSnapshotLease();
     RetainedSceneSnapshotLease(const RetainedSceneSnapshotLease&) = delete;
-    RetainedSceneSnapshotLease& operator=(
-        const RetainedSceneSnapshotLease&) = delete;
+    RetainedSceneSnapshotLease& operator=(const RetainedSceneSnapshotLease&) = delete;
     RetainedSceneSnapshotLease(RetainedSceneSnapshotLease&& other) noexcept;
-    RetainedSceneSnapshotLease& operator=(
-        RetainedSceneSnapshotLease&& other) noexcept;
+    RetainedSceneSnapshotLease& operator=(RetainedSceneSnapshotLease&& other) noexcept;
 
-    [[nodiscard]] const CollisionWorldLeaseInventory& inventory() const {
-      return inventory_;
-    }
+    [[nodiscard]] const CollisionWorldLeaseInventory& inventory() const { return inventory_; }
     [[nodiscard]] ProjectionLeaseBindingDTO binding() const;
 
    private:
@@ -533,21 +513,16 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   };
 
   Result<CollisionValidationSuccess> validate_trajectory(
-      const TrajectoryDTO& trajectory,
-      const ExecuteRequestDTO& request,
-      const std::optional<CollisionWorldLeaseInventory>&
-          scene_snapshot_lease_inventory,
+      const TrajectoryDTO& trajectory, const ExecuteRequestDTO& request,
+      const std::optional<CollisionWorldLeaseInventory>& scene_snapshot_lease_inventory,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease);
 
   /// Async execution worker function.
-  void async_execute_worker(std::stop_token st,
-                            ExecuteRequestDTO request,
-                            uint64_t exec_id,
+  void async_execute_worker(std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
                             std::optional<TrajectoryDTO> cached_trajectory,
                             bool cache_revalidation_candidate,
                             RetainedSceneSnapshotLease retained_scene,
-                            std::optional<SceneSnapshotLease>
-                                scene_snapshot_lease);
+                            std::optional<SceneSnapshotLease> scene_snapshot_lease);
 
   /// Emit an event to all subscribers.
   void emit_event(KernelEvent event);
@@ -558,16 +533,14 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   static thread_local EventDeferralScope* active_event_deferral_;
   void set_active_request_correlation(const ExecuteRequestDTO& request);
   void clear_active_request_correlation();
-  void stamp_active_request_correlation(
-      std::map<std::string, std::string>& details) const;
+  void stamp_active_request_correlation(std::map<std::string, std::string>& details) const;
   void stamp_active_request_correlation(ExecutionSnapshot& snapshot) const;
 
   /// K3: route a terminal decision through the TerminalCommitter.
   /// Returns the outcome; `outcome.committed` is the state that must
   /// appear in any snapshot/event published for this commit.
   TerminalCommitter::CommitOutcome commit_terminal(
-      ExecutionState proposed,
-      const char* reason,
+      ExecutionState proposed, const char* reason,
       TerminalCommitter::Origin origin = TerminalCommitter::Origin::kGeneric);
 
   /// Publish an observer-safe execution snapshot.
@@ -578,12 +551,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   };
   std::uint64_t start_collision_monitoring(
       std::string reason,
-      RuntimeCollisionProtectionPurpose purpose =
-          RuntimeCollisionProtectionPurpose::kMotion);
-  void stop_collision_monitoring(
-      RuntimeCollisionMonitorRelease release,
-      std::optional<std::uint64_t> expected_generation = std::nullopt,
-      bool drain_callbacks = false);
+      RuntimeCollisionProtectionPurpose purpose = RuntimeCollisionProtectionPurpose::kMotion);
+  void stop_collision_monitoring(RuntimeCollisionMonitorRelease release,
+                                 std::optional<std::uint64_t> expected_generation = std::nullopt,
+                                 bool drain_callbacks = false);
   void arm_runtime_collision_lookahead(std::uint64_t execution_id,
                                        std::uint64_t execution_generation,
                                        std::shared_ptr<const TrajectoryDTO> collision_trajectory,
@@ -592,129 +563,97 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   void apply_runtime_collision_lookahead_result(
       RuntimeCollisionLookaheadResult result,
       const RuntimeCollisionLookaheadSession* source_session = nullptr);
-  RuntimeCollisionLookaheadAuthorityDisposition
-  apply_runtime_collision_lookahead_authority(
+  RuntimeCollisionLookaheadAuthorityDisposition apply_runtime_collision_lookahead_authority(
       RuntimeCollisionLookaheadResult& result,
       const RuntimeCollisionLookaheadSession* source_session);
-  void emit_runtime_collision_lookahead_evidence(
-      RuntimeCollisionLookaheadResult result);
+  void emit_runtime_collision_lookahead_evidence(RuntimeCollisionLookaheadResult result);
   void emit_contact_policy_violation_event(
-      std::uint64_t execution_id,
-      const std::map<std::string, std::string>& source_details,
+      std::uint64_t execution_id, const std::map<std::string, std::string>& source_details,
       std::optional<std::string_view> response_override = std::nullopt);
-  RuntimeCollisionProtectionSnapshot runtime_collision_protection_snapshot()
-      const;
+  RuntimeCollisionProtectionSnapshot runtime_collision_protection_snapshot() const;
   bool refresh_published_runtime_collision_snapshot(
       std::map<std::string, std::string>* details = nullptr,
       RuntimeCollisionQueryBundlePtr* bundle = nullptr);
-  void set_runtime_collision_state_projection(
-      RuntimeCollisionStateProjection projection);
+  void set_runtime_collision_state_projection(RuntimeCollisionStateProjection projection);
   void clear_runtime_collision_state_projection();
   void clear_runtime_collision_state_projection_unlocked();
   CollisionWorldRevision current_authoritative_collision_world_revision() const;
-  Result<RetainedSceneSnapshotLease>
-  retain_current_scene_snapshot_lease_inventory(std::uint64_t exec_id,
-                                                const std::string& move_id);
+  Result<RetainedSceneSnapshotLease> retain_current_scene_snapshot_lease_inventory(
+      std::uint64_t exec_id, const std::string& move_id);
   std::optional<SceneSnapshotLease> build_scene_snapshot_lease(
-      const CollisionWorldLeaseInventory& inventory,
-      const ExecuteRequestDTO& request,
+      const CollisionWorldLeaseInventory& inventory, const ExecuteRequestDTO& request,
       std::uint64_t exec_id) const;
   std::optional<SceneSnapshotLeaseValidationContext>
   current_scene_snapshot_lease_validation_context() const;
   std::shared_ptr<CollisionCancellationToken> install_validation_cancel_token();
-  void clear_validation_cancel_token(
-      const std::shared_ptr<CollisionCancellationToken>& token);
-  void request_validation_cancel_from_interrupt(
-      const InterruptIngestResult& result);
-  void request_planning_cancel_from_interrupt(
-      const InterruptIngestResult& result);
+  void clear_validation_cancel_token(const std::shared_ptr<CollisionCancellationToken>& token);
+  void request_validation_cancel_from_interrupt(const InterruptIngestResult& result);
+  void request_planning_cancel_from_interrupt(const InterruptIngestResult& result);
   void request_active_validation_cancel(std::string reason);
   void request_active_planning_cancel();
-  void record_terminal_fault_authority(
-      const InterruptIngestResult& result);
+  void record_terminal_fault_authority(const InterruptIngestResult& result);
   void mark_active_interrupt_preemption_result(
       InterruptPreemptionResult result,
       const std::map<std::string, std::string>& extra_details = {});
   void mark_interrupt_preemption_result(
-      const InterruptLatch& latch,
-      InterruptPreemptionResult result,
+      const InterruptLatch& latch, InterruptPreemptionResult result,
       const std::map<std::string, std::string>& extra_details = {});
   bool active_trajectory_preempt_pending() const;
-  void apply_interrupt_ingest_effects(
-      const InterruptIngestResult& result,
-      bool apply_preemption_inline);
+  void apply_interrupt_ingest_effects(const InterruptIngestResult& result,
+                                      bool apply_preemption_inline);
   void install_builtin_interrupt_sources();
   InterruptIngestResult publish_runtime_collision_fault_interrupt(
       const CollisionCheckResultDTO& check,
       const std::map<std::string, std::string>& metadata = {});
   InterruptIngestResult publish_fast_interrupt_signals_internal(
-      const std::vector<InterruptSignalUpdate>& updates,
-      bool apply_preemption_inline);
-  void schedule_latched_interrupt_preemption(
-      InterruptIngestResult result);
-  void apply_latched_interrupt_preemption(
-      const InterruptIngestResult& result,
-      std::stop_token worker_stop_token = {});
+      const std::vector<InterruptSignalUpdate>& updates, bool apply_preemption_inline);
+  void schedule_latched_interrupt_preemption(InterruptIngestResult result);
+  void apply_latched_interrupt_preemption(const InterruptIngestResult& result,
+                                          std::stop_token worker_stop_token = {});
   bool request_fault_preempt_controlled_stop();
   bool fault_preempt_stop_active() const;
   std::uint64_t fault_preempt_stop_generation() const;
 
   // RT-8B internals.
   RecoveryAuthorityCapture capture_recovery_authority_locked();
-  Result<void> apply_acknowledge_and_continue_locked(
-      const std::string& principal_id, const std::string& reason);
-  Result<void> apply_retry_after_scene_repair_locked(
-      const std::string& principal_id, const std::string& reason);
+  Result<void> apply_acknowledge_and_continue_locked(const std::string& principal_id,
+                                                     const std::string& reason);
+  Result<void> apply_retry_after_scene_repair_locked(const std::string& principal_id,
+                                                     const std::string& reason);
   RecoveryReadinessPolicy recovery_readiness_policy() const;
-  KernelRecoveryAssessmentDTO refresh_recovery_assessment_locked(
-      const char* trigger);
-  KernelRecoveryAssessmentDTO publish_recovery_assessment_locked(
-      RecoveryAuthorityCapture capture, const char* trigger);
-  KernelRecoveryAssessmentDTO
-  publish_terminal_recovery_assessment_locked(ExecutionState terminal_state,
-                                              const char* trigger);
+  KernelRecoveryAssessmentDTO refresh_recovery_assessment_locked(const char* trigger);
+  KernelRecoveryAssessmentDTO publish_recovery_assessment_locked(RecoveryAuthorityCapture capture,
+                                                                 const char* trigger);
+  KernelRecoveryAssessmentDTO publish_terminal_recovery_assessment_locked(
+      ExecutionState terminal_state, const char* trigger);
   void try_refresh_recovery_assessment(const char* trigger);
   void schedule_recovery_assessment_refresh(const char* trigger) noexcept;
   bool publish_stop_certificate(KernelStopCertificateDTO certificate,
                                 bool coalesce_owner_session = false);
-  std::uint64_t begin_operator_stop_owner_generation(
-      std::uint64_t execution_id);
-  std::uint64_t ensure_operator_stop_owner_generation(
-      std::uint64_t execution_id);
-  std::uint64_t operator_stop_owner_generation_for_execution(
-      std::uint64_t execution_id) const;
-  void publish_operator_stop_certificate(
-      std::uint64_t execution_id,
-      StopCertificateOutcome completion_result,
-      bool backend_stop_confirmed,
-      std::string command_source,
-      std::string requested_stop_mode = "hard_stop",
-      std::string executed_stop_mode = "hard_stop");
-  void schedule_recovery_freshness_deadline_locked(
-      const KernelRecoveryAssessmentDTO& assessment);
-  void schedule_recovery_observation_poll_locked(
-      const KernelRecoveryAssessmentDTO& assessment);
-  KernelRecoveryActionResultDTO apply_recovery_action_impl(
-      KernelRecoveryActionRequestDTO request);
-  bool signal_fault_preempt_stop_path_collision(
-      std::map<std::string, std::string> details);
-  std::optional<std::map<std::string, std::string>>
-  fault_preempt_stop_path_collision_details() const;
+  std::uint64_t begin_operator_stop_owner_generation(std::uint64_t execution_id);
+  std::uint64_t ensure_operator_stop_owner_generation(std::uint64_t execution_id);
+  std::uint64_t operator_stop_owner_generation_for_execution(std::uint64_t execution_id) const;
+  void publish_operator_stop_certificate(std::uint64_t execution_id,
+                                         StopCertificateOutcome completion_result,
+                                         bool backend_stop_confirmed, std::string command_source,
+                                         std::string requested_stop_mode = "hard_stop",
+                                         std::string executed_stop_mode = "hard_stop");
+  void schedule_recovery_freshness_deadline_locked(const KernelRecoveryAssessmentDTO& assessment);
+  void schedule_recovery_observation_poll_locked(const KernelRecoveryAssessmentDTO& assessment);
+  KernelRecoveryActionResultDTO apply_recovery_action_impl(KernelRecoveryActionRequestDTO request);
+  bool signal_fault_preempt_stop_path_collision(std::map<std::string, std::string> details);
+  std::optional<std::map<std::string, std::string>> fault_preempt_stop_path_collision_details()
+      const;
   void clear_fault_preempt_stop_path_collision();
   void set_fault_preempt_intervention_error(ErrorDTO error);
-  std::optional<ErrorDTO> fault_preempt_intervention_error_for_active_latch()
-      const;
+  std::optional<ErrorDTO> fault_preempt_intervention_error_for_active_latch() const;
   void clear_fault_preempt_intervention_error();
   bool request_operator_stop_controlled_stop();
-  bool signal_operator_stop_path_collision(
-      std::map<std::string, std::string> details);
-  std::optional<std::map<std::string, std::string>>
-  operator_stop_path_collision_details() const;
-  bool control_command_epoch_matches(
-      std::optional<std::uint64_t> expected_epoch) const;
+  bool signal_operator_stop_path_collision(std::map<std::string, std::string> details);
+  std::optional<std::map<std::string, std::string>> operator_stop_path_collision_details() const;
+  bool control_command_epoch_matches(std::optional<std::uint64_t> expected_epoch) const;
   InterruptRuntimeContext current_interrupt_context() const;
-  void stamp_interrupt_latch_collision_world_revision(
-      InterruptIngestResult& result);
+  void stamp_interrupt_latch_collision_world_revision(InterruptIngestResult& result);
   void emit_interrupt_events(const InterruptIngestResult& result);
 
   /// Operator-stop worker lifecycle. Operator stops can run a
@@ -724,20 +663,16 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   bool cancel_operator_stop_worker(bool invalidate_generation);
   void join_finished_operator_stop_worker();
   bool wait_for_operator_stop_worker(std::chrono::steady_clock::duration timeout);
-  bool start_operator_stop_worker(
-      MotionInterruptStopProfileDTO profile,
-      ExecutionState pre_completion_state,
-      std::optional<std::uint64_t> runtime_collision_generation,
-      std::uint64_t stop_owner_generation);
-  void run_operator_stop_worker(std::uint64_t generation,
-                                std::uint64_t stop_owner_generation,
+  bool start_operator_stop_worker(MotionInterruptStopProfileDTO profile,
+                                  ExecutionState pre_completion_state,
+                                  std::optional<std::uint64_t> runtime_collision_generation,
+                                  std::uint64_t stop_owner_generation);
+  void run_operator_stop_worker(std::uint64_t generation, std::uint64_t stop_owner_generation,
                                 MotionInterruptStopProfileDTO profile,
                                 ExecutionState pre_completion_state,
-                                std::optional<std::uint64_t>
-                                    runtime_collision_generation,
+                                std::optional<std::uint64_t> runtime_collision_generation,
                                 std::stop_token stop_token);
-  bool operator_stop_worker_is_current(std::uint64_t generation,
-                                       std::stop_token stop_token) const;
+  bool operator_stop_worker_is_current(std::uint64_t generation, std::stop_token stop_token) const;
   void begin_runtime_velocity_scale_freeze();
   void end_runtime_velocity_scale_freeze();
 
@@ -792,40 +727,29 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   void notify_execution_waiters();
   bool retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock);
 
-  void invalidate_gripper_authority(
-      GripperInvalidationReason reason) noexcept;
+  void invalidate_gripper_authority(GripperInvalidationReason reason) noexcept;
   void authorize_gripper_authority() noexcept;
 
-  bool finalize_overridden_terminal_authority(
-      const ExecuteRequestDTO& request,
-      std::uint64_t exec_id,
-      ActiveMotionExecution& motion_state,
-      ExecutionState committed,
-      const char* reason,
-      std::optional<ErrorDTO> error = std::nullopt);
+  bool finalize_overridden_terminal_authority(const ExecuteRequestDTO& request,
+                                              std::uint64_t exec_id,
+                                              ActiveMotionExecution& motion_state,
+                                              ExecutionState committed, const char* reason,
+                                              std::optional<ErrorDTO> error = std::nullopt);
 
-  bool finalize_competing_terminal_authority(
-      const ExecuteRequestDTO& request,
-      std::uint64_t exec_id,
-      ActiveMotionExecution& motion_state,
-      const char* reason);
+  bool finalize_competing_terminal_authority(const ExecuteRequestDTO& request,
+                                             std::uint64_t exec_id,
+                                             ActiveMotionExecution& motion_state,
+                                             const char* reason);
 
   ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
-      std::stop_token st,
-      const ExecuteRequestDTO& request,
-      const ProjectionLeaseBindingDTO& projection_binding,
-      std::uint64_t exec_id,
-      std::optional<TrajectoryDTO> cached_trajectory,
-      bool cache_revalidation_candidate,
-      ExecutionState worker_entry_state,
-      ActiveMotionExecution& motion_state);
+      std::stop_token st, const ExecuteRequestDTO& request,
+      const ProjectionLeaseBindingDTO& projection_binding, std::uint64_t exec_id,
+      std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
+      ExecutionState worker_entry_state, ActiveMotionExecution& motion_state);
 
   ExecuteWorkerValidationPhaseResult execute_worker_validate_replan_phase(
-      std::stop_token st,
-      const ExecuteRequestDTO& request,
-      std::uint64_t exec_id,
-      TrajectoryDTO& trajectory,
-      bool& active_trajectory_from_cache,
+      std::stop_token st, const ExecuteRequestDTO& request, std::uint64_t exec_id,
+      TrajectoryDTO& trajectory, bool& active_trajectory_from_cache,
       bool& cache_revalidation_candidate,
       const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const ProjectionLeaseBindingDTO& projection_binding,
@@ -840,11 +764,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
       std::shared_ptr<const TrajectoryDTO> collision_trajectory,
       ActiveMotionExecution& motion_state);
 
-  void execute_worker_finalize_phase(
-      const ExecuteRequestDTO& request,
-      std::uint64_t exec_id,
-      ExecutionHandle& execution_handle,
-      ActiveMotionExecution& motion_state);
+  void execute_worker_finalize_phase(const ExecuteRequestDTO& request, std::uint64_t exec_id,
+                                     ExecutionHandle& execution_handle,
+                                     ActiveMotionExecution& motion_state);
 
   /// Arm scopes carried by `request.motion_interrupt_scopes` atomically
   /// with dispatch (spec/230 §3.4): all scopes succeed or none do. On
@@ -852,10 +774,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   /// `motion_state.arm_succeeded` and emits
   /// `motion_interrupt_scope_armed` kernel events. Returns Err with the
   /// manager's failure reason; the caller fails the execution closed.
-  Result<void> arm_motion_scopes_for_dispatch(
-      const ExecuteRequestDTO& request,
-      std::uint64_t execution_id,
-      ActiveMotionExecution& motion_state);
+  Result<void> arm_motion_scopes_for_dispatch(const ExecuteRequestDTO& request,
+                                              std::uint64_t execution_id,
+                                              ActiveMotionExecution& motion_state);
 
   /// Build, validate, store, and emit the immutable
   /// `MotionExecutionOutcomeDTO` for `execution_id`. Always reaps any
@@ -863,12 +784,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   /// every terminal exit; subsequent calls for the same execution are
   /// no-ops so worker code can be defensive without producing duplicate
   /// records.
-  void finalize_motion_execution_outcome(
-      ActiveMotionExecution& motion_state,
-      MotionExecutionTerminalCause terminal_cause,
-      std::optional<ErrorDTO> error,
-      std::optional<MotionTripOutcomeDTO> trip,
-      std::string reap_reason);
+  void finalize_motion_execution_outcome(ActiveMotionExecution& motion_state,
+                                         MotionExecutionTerminalCause terminal_cause,
+                                         std::optional<ErrorDTO> error,
+                                         std::optional<MotionTripOutcomeDTO> trip,
+                                         std::string reap_reason);
 
   /// Handle a `complete_move_on_signal` latch (spec/260 §5.6) by
   /// running the controlled-stop flow end to end. The
@@ -880,17 +800,14 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   /// enforces the conjunctive fallback rule, transitions the state
   /// machine Stopping->Completed (signal_trip success) or
   /// Stopping->Failed (failure path), and finalizes the outcome.
-  void handle_motion_trip_latch(
-      const ExecuteRequestDTO& request,
-      const InterruptLatch& latch,
-      std::uint64_t exec_id,
-      const ExecutionSnapshot& latest_backend_snapshot,
-      ActiveMotionExecution& motion_state,
-      std::stop_token worker_stop_token);
+  void handle_motion_trip_latch(const ExecuteRequestDTO& request, const InterruptLatch& latch,
+                                std::uint64_t exec_id,
+                                const ExecutionSnapshot& latest_backend_snapshot,
+                                ActiveMotionExecution& motion_state,
+                                std::stop_token worker_stop_token);
 
-  void emit_interrupt_manager_events(
-      const std::vector<InterruptManagerEvent>& events,
-      std::uint64_t execution_id);
+  void emit_interrupt_manager_events(const std::vector<InterruptManagerEvent>& events,
+                                     std::uint64_t execution_id);
 
   IPlannerBackend& planner_;
   IObservedRobotStateProvider& observed_state_;
@@ -924,8 +841,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   PoseSourceRetryConfig coordinator_retry_config_{};
   std::int64_t coordinator_per_state_timeout_ns_ = 0;
   CollisionResourceManager collision_resources_;
-  std::unique_ptr<ParallelCollisionValidationWorkerPool>
-      collision_validation_worker_pool_;
+  std::unique_ptr<ParallelCollisionValidationWorkerPool> collision_validation_worker_pool_;
   std::atomic<std::uint64_t> validation_collision_workers_effective_{0};
   mutable std::mutex runtime_collision_protection_mutex_;
   RuntimeCollisionProtectionSnapshot runtime_collision_protection_;
@@ -950,9 +866,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   bool recovery_refresh_scheduled_ = false;
   ObservedReadinessTracker recovery_readiness_tracker_;
   ScheduleHandle recovery_freshness_deadline_handle_ = 0;  // lifecycle-guarded
-  std::int64_t recovery_freshness_deadline_ns_ = 0;  // lifecycle-guarded
-  ScheduleHandle recovery_observation_poll_handle_ = 0;  // lifecycle-guarded
-  std::uint64_t fault_preempt_stop_generation_ = 0;  // fault_preempt_stop_mutex_
+  std::int64_t recovery_freshness_deadline_ns_ = 0;        // lifecycle-guarded
+  ScheduleHandle recovery_observation_poll_handle_ = 0;    // lifecycle-guarded
+  std::uint64_t fault_preempt_stop_generation_ = 0;        // fault_preempt_stop_mutex_
   // One coherent operator-stop identity. The generation counter is global,
   // while the selected generation is bound to exactly one execution. Keeping
   // the pair under a leaf mutex prevents a capture from combining a new
@@ -962,11 +878,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   std::atomic<std::uint64_t> motion_trip_stop_generation_{0};
   std::atomic<bool> operator_stop_command_active_{false};
   mutable std::mutex runtime_collision_state_projection_mutex_;
-  std::optional<RuntimeCollisionStateProjection>
-      runtime_collision_state_projection_;
+  std::optional<RuntimeCollisionStateProjection> runtime_collision_state_projection_;
   std::atomic<std::uint64_t> runtime_collision_snapshot_invalidation_epoch_{0};
-  std::atomic<std::shared_ptr<RuntimeCollisionQuerySession>>
-      runtime_collision_query_session_;
+  std::atomic<std::shared_ptr<RuntimeCollisionQuerySession>> runtime_collision_query_session_;
   std::atomic<std::shared_ptr<RuntimeCollisionLookaheadSession>>
       runtime_collision_lookahead_session_;
   mutable std::mutex runtime_collision_query_prepare_error_mutex_;
@@ -991,10 +905,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   ExecutionCorrelationTracker active_correlation_;
   std::mutex resolved_runtime_scale_submission_mutex_;
   mutable std::mutex resolved_runtime_scale_mutex_;
-  std::optional<ResolvedRuntimeScaleCommandDTO>
-      accepted_resolved_runtime_scale_command_;
-  std::optional<ResolvedRuntimeScaleAcceptedDTO>
-      accepted_resolved_runtime_scale_result_;
+  std::optional<ResolvedRuntimeScaleCommandDTO> accepted_resolved_runtime_scale_command_;
+  std::optional<ResolvedRuntimeScaleAcceptedDTO> accepted_resolved_runtime_scale_result_;
   std::uint64_t runtime_scale_acceptance_sequence_ = 0;
 
   // Event subscription and copy-on-write callback dispatch.
@@ -1059,8 +971,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   std::shared_ptr<std::stop_source> fault_preempt_stop_source_;
   std::atomic<bool> fault_preempt_stop_path_collision_detected_{false};
   mutable std::mutex fault_preempt_stop_path_collision_mutex_;
-  std::map<std::string, std::string>
-      fault_preempt_stop_path_collision_details_;
+  std::map<std::string, std::string> fault_preempt_stop_path_collision_details_;
   mutable std::mutex fault_preempt_intervention_error_mutex_;
   std::optional<ErrorDTO> fault_preempt_intervention_error_;
   // Metrics. `metrics_` covers low-rate counters. Runtime-monitor cadence

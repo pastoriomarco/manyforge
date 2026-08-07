@@ -1,12 +1,11 @@
 #pragma once
 
 #include <filesystem>
+#include <manyforge_deployment/build_manifest.hpp>
+#include <manyforge_deployment/retained_bundle.hpp>
 #include <memory>
 #include <stdexcept>
 #include <utility>
-
-#include <manyforge_deployment/build_manifest.hpp>
-#include <manyforge_deployment/retained_bundle.hpp>
 
 #include "lite6_controllable_retention_fixture.hpp"
 #include "retained_bundle_internal.hpp"
@@ -28,26 +27,19 @@ struct DurableLite6RetainedConsumerFixture final {
 };
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_retained_consumer_fixture_from(
-    const std::filesystem::path& package_root,
-    Lite6ControllableRetentionFixture controllable) {
+materialize_lite6_retained_consumer_fixture_from(const std::filesystem::path& package_root,
+                                                 Lite6ControllableRetentionFixture controllable) {
   auto qualified = controllable.qualified;
-  const Lite6ControllableCompilerInputArtifactSource input_source(
-      controllable);
+  const Lite6ControllableCompilerInputArtifactSource input_source(controllable);
   FilesystemBuildManifestRepository manifest_repository(package_root);
   FilesystemCatalogArtifactStore catalog_store(package_root);
   FilesystemRawArtifactStore raw_store(package_root);
   FilesystemRetainedBundleRepository bundle_repository(package_root);
-  auto bundle =
-      detail::RetainedBundleMaterializer::
-          materialize_store_and_reload_production(
-              qualified, manifest_repository, input_source,
-              controllable.structural_preparations(), catalog_store,
-              raw_store,
-              bundle_repository);
+  auto bundle = detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
+      qualified, manifest_repository, input_source, controllable.structural_preparations(),
+      catalog_store, raw_store, bundle_repository);
   if (bundle == nullptr) {
-    throw std::logic_error(
-        "non-empty Lite6 materializer returned no durable bundle");
+    throw std::logic_error("non-empty Lite6 materializer returned no durable bundle");
   }
   return {
       std::move(controllable.structural),
@@ -56,8 +48,7 @@ materialize_lite6_retained_consumer_fixture_from(
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_retained_consumer_fixture(
-    const std::filesystem::path& package_root) {
+materialize_lite6_retained_consumer_fixture(const std::filesystem::path& package_root) {
   return materialize_lite6_retained_consumer_fixture_from(
       package_root, make_lite6_controllable_retention_fixture());
 }
@@ -74,6 +65,13 @@ materialize_lite6_native_motion_retained_consumer_fixture(
     const std::filesystem::path& package_root) {
   return materialize_lite6_retained_consumer_fixture_from(
       package_root, make_lite6_native_motion_retention_fixture());
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
+    const std::filesystem::path& package_root) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_native_motion_arm_gripper_aggregate_retention_fixture());
 }
 
 }  // namespace manyforge::deployment::test

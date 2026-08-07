@@ -145,7 +145,11 @@ def _error_status(code: str) -> int:
         }
     ):
         return 503
-    if code.endswith("_invalid") or code.endswith("_rejected"):
+    if (
+        code == "invalid_request"
+        or code.endswith("_invalid")
+        or code.endswith("_rejected")
+    ):
         return 400
     if code in {
         "operator_alarm_acknowledgement_confirmation_required",

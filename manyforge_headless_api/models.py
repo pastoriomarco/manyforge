@@ -284,6 +284,95 @@ class JointGoalRequest(StrictRequest):
         return self
 
 
+class AngularPositionRequest(StrictRequest):
+    kind: Literal["angular_rad"]
+    value_rad: Annotated[float, Field(allow_inf_nan=False)]
+
+
+class LinearPositionRequest(StrictRequest):
+    kind: Literal["linear_m"]
+    value_m: Annotated[float, Field(allow_inf_nan=False)]
+
+
+CoordinatePositionRequest = Annotated[
+    AngularPositionRequest | LinearPositionRequest,
+    Field(discriminator="kind"),
+]
+
+
+class AngularEffortRequest(StrictRequest):
+    kind: Literal["angular_newton_meter"]
+    value_nm: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+
+
+class LinearEffortRequest(StrictRequest):
+    kind: Literal["linear_newton"]
+    value_n: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+
+
+CoordinateEffortRequest = Annotated[
+    AngularEffortRequest | LinearEffortRequest,
+    Field(discriminator="kind"),
+]
+
+
+class GripperPositionCommandValueRequest(StrictRequest):
+    kind: Literal["gripper_position"]
+    position: CoordinatePositionRequest
+    max_effort: CoordinateEffortRequest | None
+
+    @model_validator(mode="after")
+    def require_matching_effort_kind(self) -> "GripperPositionCommandValueRequest":
+        if self.max_effort is None:
+            return self
+        angular_position = isinstance(self.position, AngularPositionRequest)
+        angular_effort = isinstance(self.max_effort, AngularEffortRequest)
+        if angular_position != angular_effort:
+            raise ValueError("max_effort must match the gripper position kind")
+        return self
+
+
+class CommandDurationOptionRequest(StrictRequest):
+    option_id: str
+    value_s: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+
+    @field_validator("option_id")
+    @classmethod
+    def validate_option_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="option_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class CapabilityCommandParticipantRequest(StrictRequest):
+    kind: Literal["capability_command"]
+    command_schema_id: str
+    command_schema_revision: str
+    command_value: GripperPositionCommandValueRequest
+    completion_timeout_s: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    caller_options: Annotated[
+        list[CommandDurationOptionRequest], Field(max_length=64)
+    ]
+
+    @field_validator("command_schema_id", "command_schema_revision")
+    @classmethod
+    def validate_command_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def require_unique_options(self) -> "CapabilityCommandParticipantRequest":
+        option_ids = [option.option_id for option in self.caller_options]
+        if len(option_ids) != len(set(option_ids)):
+            raise ValueError("caller_options must have unique option_id values")
+        return self
+
+
 class MotionParticipantRequest(StrictRequest):
     kind: Literal["motion"]
     move_id: str
@@ -332,7 +421,10 @@ class OperationParticipantRequest(StrictRequest):
     target_role_id: str
     required_capability_id: str
     action_span: ActionSpanRequest | None
-    payload: MotionParticipantRequest
+    payload: Annotated[
+        MotionParticipantRequest | CapabilityCommandParticipantRequest,
+        Field(discriminator="kind"),
+    ]
 
     @field_validator(
         "component_role_id", "target_role_id", "required_capability_id"

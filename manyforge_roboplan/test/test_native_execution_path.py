@@ -135,6 +135,8 @@ def _start_host(
             manifest["program_binding_id"],
             "--motion-target-role-id",
             manifest["target_role_id"],
+            "--gripper-target-role-id",
+            manifest["gripper_target_role_id"],
             "--candidate-worker",
             str(
                 candidate_worker
@@ -197,6 +199,29 @@ def _runner_submission(
         joint_names=joint_names,
         positions_rad=positions,
         correlation_id="n3-process-test",
+    )
+
+
+def _gripper_submission(
+    runner: OrchestratorRunner,
+    *,
+    request_id: str,
+    position_kind: str,
+    position: float,
+    command_duration_s: float = 0.05,
+) -> dict[str, Any]:
+    return runner.submit_gripper_position(
+        request_id=request_id,
+        program_run_id="n5-program-run-1",
+        component_role_id="robot",
+        target_role_id="gripper",
+        node_instance_id="root/native-gripper[0]",
+        node_attempt_id=f"n5-program-run-1/{request_id}",
+        position_kind=position_kind,  # type: ignore[arg-type]
+        position=position,
+        command_duration_s=command_duration_s,
+        completion_timeout_s=max(2.0, command_duration_s + 1.0),
+        correlation_id="n5-process-test",
     )
 
 
@@ -303,6 +328,26 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         first_status = headless.execution_status()["status"]
         assert first_status["program_binding_id"] == manifest["program_binding_id"]
         assert first_status["retained_bundle_id"] == manifest["retained_bundle_id"]
+        assert first_status["gripper_target_role_id"] == "gripper"
+        assert first_status["gripper_command_schema_id"] == manifest[
+            "gripper_command_schema_id"
+        ]
+        assert first_status["gripper_command_schema_revision"] == manifest[
+            "gripper_command_schema_revision"
+        ]
+        observed = {
+            target["target_role_id"]: target
+            for target in first_status["observed_targets"]
+        }
+        assert set(observed) == {"arm", "gripper"}
+        assert all(
+            position["kind"] == "angular_rad"
+            for position in observed["arm"]["positions"]
+        )
+        assert observed["gripper"]["positions"] == [
+            {"kind": "linear_m", "value_m": 0.0}
+        ]
+        assert observed["arm"]["resources"] != observed["gripper"]["resources"]
 
         with pytest.raises(HeadlessClientError) as rejected:
             _runner_submission(
@@ -362,6 +407,107 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         acknowledged_projection = composer.operation(operation_id)
         assert acknowledged_projection["operation"]["operation_revision"] == (
             acknowledged["accepted"]["operation_revision_after_acceptance"]
+        )
+
+        with pytest.raises(HeadlessClientError) as wrong_unit:
+            _gripper_submission(
+                runner,
+                request_id="reject-angular-gripper-unit",
+                position_kind="angular_rad",
+                position=0.004,
+            )
+        assert wrong_unit.value.status_code == 400
+        assert recording.last_submission is not None
+        raw_wrong_unit = raw_api.post(
+            "/api/execution/operations", json=recording.last_submission
+        )
+        assert raw_wrong_unit.json()["error"]["details"]["reason"] == (
+            "runtime_command_resource_unit_mismatch"
+        )
+
+        with pytest.raises(HeadlessClientError) as beyond_limit:
+            _gripper_submission(
+                runner,
+                request_id="reject-gripper-limit",
+                position_kind="linear_m",
+                position=0.02,
+            )
+        assert beyond_limit.value.status_code == 400
+        assert recording.last_submission is not None
+        raw_beyond_limit = raw_api.post(
+            "/api/execution/operations", json=recording.last_submission
+        )
+        assert raw_beyond_limit.json()["error"]["code"] == "invalid_request"
+        assert raw_beyond_limit.json()["error"]["details"]["reason"] == (
+            "gripper_position_limit_violation"
+        )
+
+        gripper_accepted = _gripper_submission(
+            runner,
+            request_id="accepted-linear-gripper",
+            position_kind="linear_m",
+            position=0.004,
+        )
+        gripper_id = gripper_accepted["accepted"]["operation_id"]
+        gripper_terminal = _wait_terminal(runner, gripper_id)["operation"]
+        assert gripper_terminal["state"] == "completed"
+        assert gripper_terminal["participants"][0]["payload_kind"] == (
+            "capability_command"
+        )
+        assert composer.operation(gripper_id)["operation"] == gripper_terminal
+        gripper_status = headless.execution_status()["status"]
+        gripper_observed = next(
+            target
+            for target in gripper_status["observed_targets"]
+            if target["target_role_id"] == "gripper"
+        )
+        assert gripper_observed["positions"] == [
+            {"kind": "linear_m", "value_m": pytest.approx(0.004)}
+        ]
+        runner.acknowledge_completed_operation(
+            request_id="ack-linear-gripper",
+            operation_id=gripper_id,
+            expected_operation_revision=gripper_terminal[
+                "operation_revision"
+            ],
+            reason="release completed gripper operation",
+            correlation_id="n5-process-test",
+        )
+
+        cancellable = _gripper_submission(
+            runner,
+            request_id="cancellable-linear-gripper",
+            position_kind="linear_m",
+            position=0.008,
+            command_duration_s=1.0,
+        )
+        cancellable_id = cancellable["accepted"]["operation_id"]
+        cancellable_state = _wait_state(
+            runner, cancellable_id, {"executing"}
+        )["operation"]
+        gripper_stop = runner.stop_operation(
+            request_id="stop-linear-gripper",
+            operation_id=cancellable_id,
+            expected_operation_revision=cancellable_state[
+                "operation_revision"
+            ],
+            expected_stop_generation=0,
+            reason="exercise addressed gripper Stop",
+            correlation_id="n5-process-test",
+        )
+        cancelled = _wait_terminal(runner, cancellable_id)["operation"]
+        assert cancelled["state"] == "stopped", json.dumps(
+            cancelled, sort_keys=True
+        )
+        assert cancelled["active_stop_id"] == gripper_stop["accepted"][
+            "stop_id"
+        ]
+        runner.reset_operation(
+            request_id="reset-linear-gripper",
+            operation_id=cancellable_id,
+            expected_operation_revision=cancelled["operation_revision"],
+            reason="release stopped gripper operation",
+            correlation_id="n5-process-test",
         )
 
         controlled = _runner_submission(
@@ -638,6 +784,125 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         assert raw_fenced.status_code == 400
         assert raw_fenced.json()["error"]["details"]["reason"] == (
             "resource_scope_busy"
+        )
+
+        independent_gripper = _gripper_submission(
+            runner,
+            request_id="gripper-after-arm-host-loss",
+            position_kind="linear_m",
+            position=0.003,
+        )
+        independent_gripper_id = independent_gripper["accepted"][
+            "operation_id"
+        ]
+        independent_terminal = _wait_terminal(
+            runner, independent_gripper_id
+        )["operation"]
+        assert independent_terminal["state"] == "completed"
+        assert independent_terminal["participants"][0]["resources"] != orphan[
+            "participants"
+        ][0]["resources"]
+        runner.acknowledge_completed_operation(
+            request_id="ack-gripper-after-arm-host-loss",
+            operation_id=independent_gripper_id,
+            expected_operation_revision=independent_terminal[
+                "operation_revision"
+            ],
+            reason="release independent gripper operation",
+            correlation_id="n5-process-test",
+        )
+    finally:
+        _stop_host(process)
+        raw_api.close()
+
+
+def test_active_gripper_host_replacement_fences_only_gripper(
+    tmp_path: Path,
+) -> None:
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_root = tmp_path / "execution"
+    staging_root = tmp_path / "staging"
+    execution_root.mkdir()
+    staging_root.mkdir()
+
+    process = _start_host(
+        fixture_root, execution_root, staging_root, manifest
+    )
+    raw_api = TestClient(
+        create_app(
+            service=HeadlessService(
+                UnusedCore(),  # type: ignore[arg-type]
+                UnusedManager(),  # type: ignore[arg-type]
+                ExecutionCommandClient(execution_root, timeout_seconds=10.0),
+            ),
+            trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
+        )
+    )
+    headless = HeadlessHttpClient("http://headless.test", client=raw_api)
+    recording = RecordingTransport(headless)
+    runner = OrchestratorRunner(KernelClient(recording))
+
+    try:
+        first_epoch = headless.execution_status()["status"]["owner_epoch"]
+        accepted = _gripper_submission(
+            runner,
+            request_id="active-gripper-host-loss",
+            position_kind="linear_m",
+            position=0.007,
+            command_duration_s=5.0,
+        )
+        operation_id = accepted["accepted"]["operation_id"]
+        before_loss = _wait_state(runner, operation_id, {"executing"})[
+            "operation"
+        ]
+        gripper_resources = before_loss["participants"][0]["resources"]
+        _stop_host(process)
+
+        process = _start_host(
+            fixture_root, execution_root, staging_root, manifest
+        )
+        restarted = headless.execution_status()["status"]
+        assert restarted["owner_epoch"] != first_epoch
+        orphan = runner.operation(operation_id)["operation"]
+        assert orphan["state"] == "intervention_required"
+        terminal_error = orphan["participants"][0]["terminal_error"]
+        assert terminal_error["code"] == "execution_host_replaced"
+        assert terminal_error["details"]["reason"] == (
+            "unreconciled_external_or_orphan_goal"
+        )
+
+        with pytest.raises(HeadlessClientError) as fenced:
+            _gripper_submission(
+                runner,
+                request_id="reject-fenced-gripper-resource",
+                position_kind="linear_m",
+                position=0.002,
+            )
+        assert fenced.value.status_code == 400
+        assert recording.last_submission is not None
+        raw_fenced = raw_api.post(
+            "/api/execution/operations", json=recording.last_submission
+        )
+        assert raw_fenced.json()["error"]["details"]["reason"] == (
+            "resource_scope_busy"
+        )
+
+        independent_arm = _runner_submission(
+            runner,
+            request_id="arm-after-gripper-host-loss",
+            joint_names=("joint1",),
+            positions=(0.05,),
+        )
+        independent_arm_id = independent_arm["accepted"]["operation_id"]
+        independent_arm_terminal = _wait_terminal(
+            runner, independent_arm_id
+        )["operation"]
+        assert independent_arm_terminal["state"] == "completed"
+        assert independent_arm_terminal["participants"][0]["resources"] != (
+            gripper_resources
         )
     finally:
         _stop_host(process)

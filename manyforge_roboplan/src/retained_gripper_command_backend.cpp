@@ -1,10 +1,9 @@
-#include <manyforge_roboplan/retained_gripper_command_backend.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <limits>
+#include <manyforge_roboplan/retained_gripper_command_backend.hpp>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -35,8 +34,8 @@ constexpr int kTerminalProjectionRetryLimit = 10;
   constexpr double kNanosPerSecond = 1'000'000'000.0;
   const double nanos = duration_s * kNanosPerSecond;
   if (!std::isfinite(nanos) ||
-      nanos >= static_cast<double>(
-                   std::numeric_limits<core::Duration>::max())) {
+      nanos >=
+          static_cast<double>(std::numeric_limits<core::Duration>::max())) {
     return std::numeric_limits<core::Duration>::max();
   }
   return static_cast<core::Duration>(nanos);
@@ -53,8 +52,7 @@ constexpr int kTerminalProjectionRetryLimit = 10;
 
 [[nodiscard]] double position_value(
     const core::CoordinatePositionDTO& position) noexcept {
-  if (const auto* angular =
-          std::get_if<core::AngularPositionDTO>(&position)) {
+  if (const auto* angular = std::get_if<core::AngularPositionDTO>(&position)) {
     return angular->value_rad;
   }
   return std::get<core::LinearPositionDTO>(position).value_m;
@@ -76,7 +74,7 @@ constexpr int kTerminalProjectionRetryLimit = 10;
   }
   const auto found = result.error->details.find("reason");
   return found == result.error->details.end() ? result.error->code
-                                               : found->second;
+                                              : found->second;
 }
 
 }  // namespace
@@ -101,6 +99,8 @@ struct RetainedGripperCommandBackend::SharedState {
   std::string joint_name;
   std::string actuation_kind;
   std::string state_authority;
+  double lower_position{};
+  double upper_position{};
 
   mutable std::mutex mutex;
   std::map<std::string, Runtime> runtimes;
@@ -119,14 +119,14 @@ struct ScheduleAttempt final {
   std::atomic<bool> callback_admitted{false};
 };
 
-[[nodiscard]] bool schedule_tick(
-    const std::shared_ptr<SharedState>& state,
-    const std::string& gripper_id, std::uint64_t command_id,
-    std::uint64_t generation, core::TimePoint deadline_ns);
+[[nodiscard]] bool schedule_tick(const std::shared_ptr<SharedState>& state,
+                                 const std::string& gripper_id,
+                                 std::uint64_t command_id,
+                                 std::uint64_t generation,
+                                 core::TimePoint deadline_ns);
 
 void update_projection_result_locked(
-    SharedState::Runtime& runtime,
-    const RetainedStateProjectionResult& result,
+    SharedState::Runtime& runtime, const RetainedStateProjectionResult& result,
     const bool terminal) {
   if (result.applied()) {
     runtime.status.projection_state = core::GripperProjectionState::kApplied;
@@ -139,9 +139,8 @@ void update_projection_result_locked(
   } else if (result.status == RetainedStateProjectionStatus::kBusy) {
     runtime.status.projection_state = core::GripperProjectionState::kPending;
     runtime.status.projection_reason = projection_reason(result);
-    if (terminal &&
-        ++runtime.terminal_projection_attempts >=
-            kTerminalProjectionRetryLimit) {
+    if (terminal && ++runtime.terminal_projection_attempts >=
+                        kTerminalProjectionRetryLimit) {
       runtime.status.state = core::GripperCommandState::kFailed;
       runtime.status.projection_state = core::GripperProjectionState::kFailed;
       runtime.status.error = gripper_error(
@@ -160,8 +159,7 @@ void update_projection_result_locked(
 }
 
 void run_tick(const std::shared_ptr<SharedState>& state,
-              const std::string& gripper_id,
-              const std::uint64_t command_id,
+              const std::string& gripper_id, const std::uint64_t command_id,
               const std::uint64_t generation,
               const std::uint64_t schedule_generation,
               const std::shared_ptr<ScheduleAttempt>& attempt) {
@@ -190,25 +188,24 @@ void run_tick(const std::shared_ptr<SharedState>& state,
     const auto now_ns = state->clock->now();
     const auto total_ns = std::max<core::Duration>(
         1, runtime.deadline_ns - runtime.started_at_ns);
-    const auto elapsed_ns = std::max<core::Duration>(
-        0, now_ns - runtime.started_at_ns);
+    const auto elapsed_ns =
+        std::max<core::Duration>(0, now_ns - runtime.started_at_ns);
     const double progress =
         runtime.deadline_ns <= runtime.started_at_ns
             ? 1.0
             : clamp_progress(static_cast<double>(elapsed_ns) /
                              static_cast<double>(total_ns));
-    position = runtime.start_position +
-               (*runtime.status.target_position - runtime.start_position) *
-                   progress;
+    position =
+        runtime.start_position +
+        (*runtime.status.target_position - runtime.start_position) * progress;
     runtime.status.progress = progress;
     runtime.status.current_position = position;
     runtime.status.observed_position = position;
     terminal = progress >= 1.0;
     ++runtime.status.revision;
-    next_deadline = terminal
-                        ? now_ns + state->update_period_ns
-                        : std::min(runtime.deadline_ns,
-                                   now_ns + state->update_period_ns);
+    next_deadline = terminal ? now_ns + state->update_period_ns
+                             : std::min(runtime.deadline_ns,
+                                        now_ns + state->update_period_ns);
   }
 
   bool schedule_again = false;
@@ -238,16 +235,14 @@ void run_tick(const std::shared_ptr<SharedState>& state,
           RetainedStateProjectionStatus::kFailed,
           gripper_error("gripper_projection_exception", error.what())};
     } catch (...) {
-      projection = {
-          RetainedStateProjectionStatus::kFailed,
-          gripper_error("gripper_projection_exception",
-                        "Native gripper state projection threw")};
+      projection = {RetainedStateProjectionStatus::kFailed,
+                    gripper_error("gripper_projection_exception",
+                                  "Native gripper state projection threw")};
     }
     update_projection_result_locked(found->second, projection, terminal);
     schedule_again =
         found->second.status.state == core::GripperCommandState::kExecuting ||
-        (found->second.status.state ==
-             core::GripperCommandState::kCompleted &&
+        (found->second.status.state == core::GripperCommandState::kCompleted &&
          found->second.status.projection_state ==
              core::GripperProjectionState::kPending);
   }
@@ -312,9 +307,9 @@ bool schedule_tick(const std::shared_ptr<SharedState>& state,
       found->second.status.projection_state =
           core::GripperProjectionState::kNotRequired;
       found->second.status.projection_reason.clear();
-      found->second.status.error = gripper_error(
-          "gripper_request_failed",
-          "Native gripper lifecycle could not be scheduled");
+      found->second.status.error =
+          gripper_error("gripper_request_failed",
+                        "Native gripper lifecycle could not be scheduled");
       ++found->second.status.revision;
     }
     return false;
@@ -344,9 +339,8 @@ bool schedule_tick(const std::shared_ptr<SharedState>& state,
   return admitted;
 }
 
-[[nodiscard]] bool exact_request(
-    const core::GripperCommandRequestDTO& request,
-    const SharedState& state) noexcept {
+[[nodiscard]] bool exact_request(const core::GripperCommandRequestDTO& request,
+                                 const SharedState& state) noexcept {
   return request.gripper_id == state.gripper_id &&
          request.group_id == state.group_id &&
          request.joint_name == state.joint_name &&
@@ -356,27 +350,58 @@ bool schedule_tick(const std::shared_ptr<SharedState>& state,
          request.transport_kind == "resolved_binding";
 }
 
+[[nodiscard]] std::optional<core::ErrorDTO> validate_request(
+    const core::GripperCommandRequestDTO& request, const SharedState& state) {
+  if (!exact_request(request, state) ||
+      !std::isfinite(request.target_position) ||
+      !std::isfinite(request.duration_s) || request.duration_s < 0.0 ||
+      !std::isfinite(request.completion_timeout_s) ||
+      request.completion_timeout_s <= 0.0 ||
+      request.duration_s > request.completion_timeout_s ||
+      (request.max_effort.has_value() &&
+       (!std::isfinite(*request.max_effort) || *request.max_effort < 0.0))) {
+    return gripper_error(
+        "gripper_invalid_command",
+        "Native gripper command differs from its exact retained target");
+  }
+  if (request.target_position < state.lower_position ||
+      request.target_position > state.upper_position) {
+    return gripper_error(
+        "gripper_position_limit_violation",
+        "Native gripper position is outside its retained URDF limits");
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 RetainedGripperCommandBackend::RetainedGripperCommandBackend(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<IRetainedObservedStateChannel> state_channel,
-    core::IClock& clock, core::IScheduler& scheduler,
-    const core::Duration update_period_ns) {
-  if (!state_channel || update_period_ns <= 0) {
+    const RetainedGripperPositionLimits position_limits, core::IClock& clock,
+    core::IScheduler& scheduler, const core::Duration update_period_ns) {
+  if (!state_channel || update_period_ns <= 0 ||
+      !std::isfinite(position_limits.lower_position) ||
+      !std::isfinite(position_limits.upper_position) ||
+      position_limits.lower_position > position_limits.upper_position) {
     throw std::invalid_argument(
-        "retained gripper backend requires state and a positive period");
+        "retained gripper backend requires state, "
+        "limits, and a positive period");
   }
   const auto& value = binding.value();
   if (!value.control_path.has_value() || value.model_groups.size() != 1U ||
       value.resources.size() != 1U ||
-      std::count(value.model_groups.front()
-                     .expanded_compiled_joint_names.begin(),
-                 value.model_groups.front()
-                     .expanded_compiled_joint_names.end(),
-                 value.resources.front().compiled_resource_name) != 1) {
+      std::count(
+          value.model_groups.front().expanded_compiled_joint_names.begin(),
+          value.model_groups.front().expanded_compiled_joint_names.end(),
+          value.resources.front().compiled_resource_name) != 1) {
     throw std::invalid_argument(
         "retained gripper backend requires one exact command coordinate");
+  }
+  if (value.resources.front().coordinate_kind !=
+      position_limits.coordinate_kind) {
+    throw std::invalid_argument(
+        "retained gripper limits differ from the bound coordinate kind");
   }
   auto expected_context = core::make_observed_state_query_context(
       binding, state_channel->query_context().freshness_budget_ns);
@@ -399,6 +424,8 @@ RetainedGripperCommandBackend::RetainedGripperCommandBackend(
           ? "angular"
           : "linear";
   state_->state_authority = value.control_path->state_authority_id.value();
+  state_->lower_position = position_limits.lower_position;
+  state_->upper_position = position_limits.upper_position;
 }
 
 RetainedGripperCommandBackend::~RetainedGripperCommandBackend() {
@@ -406,29 +433,35 @@ RetainedGripperCommandBackend::~RetainedGripperCommandBackend() {
   state_.reset();
 }
 
-core::GripperCommandResultDTO
-RetainedGripperCommandBackend::command_gripper(
+core::Result<void> RetainedGripperCommandBackend::validate_gripper_command(
+    const core::GripperCommandRequestDTO& request) const {
+  const auto invalid = validate_request(request, *state_);
+  if (!invalid.has_value()) {
+    return core::Result<void>::Ok();
+  }
+  auto public_error = *invalid;
+  public_error.details["reason"] = public_error.code;
+  public_error.code =
+      std::string(core::to_string(core::ErrorCode::kInvalidRequest));
+  return core::Result<void>::Err(std::move(public_error));
+}
+
+core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
     const core::GripperCommandRequestDTO& request) {
-  if (!exact_request(request, *state_) ||
-      !std::isfinite(request.target_position) ||
-      !std::isfinite(request.duration_s) || request.duration_s < 0.0 ||
-      (request.max_effort.has_value() &&
-       !std::isfinite(*request.max_effort))) {
-    return {false, 0U, 0U,
-            gripper_error("gripper_invalid_command",
-                          "Native gripper command differs from its exact "
-                          "retained target")};
+  if (const auto invalid = validate_request(request, *state_);
+      invalid.has_value()) {
+    return {false, 0U, 0U, *invalid};
   }
 
   std::uint64_t authority_generation = 0U;
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->closing || state_->admission_blocked) {
-      return {false, 0U, 0U,
-              gripper_error(
-                  "gripper_command_not_authorized",
-                  "Gripper command admission is closed by the execution "
-                  "lifecycle")};
+      return {
+          false, 0U, 0U,
+          gripper_error("gripper_command_not_authorized",
+                        "Gripper command admission is closed by the execution "
+                        "lifecycle")};
     }
     authority_generation = state_->authority_generation;
     const auto current = state_->runtimes.find(request.gripper_id);
@@ -440,8 +473,7 @@ RetainedGripperCommandBackend::command_gripper(
                 gripper_error("gripper_busy",
                               "Gripper is already executing a command")};
       }
-      if (current->second.status.state ==
-              core::GripperCommandState::kFailed &&
+      if (current->second.status.state == core::GripperCommandState::kFailed &&
           !supersedable_grasp_loss(current->second.status.error)) {
         return {false, current->second.status.command_id,
                 current->second.status.generation,
@@ -482,8 +514,7 @@ RetainedGripperCommandBackend::command_gripper(
     }
     const auto current = state_->runtimes.find(request.gripper_id);
     if (current != state_->runtimes.end() &&
-        current->second.status.state ==
-            core::GripperCommandState::kExecuting) {
+        current->second.status.state == core::GripperCommandState::kExecuting) {
       return {false, current->second.status.command_id,
               current->second.status.generation,
               gripper_error("gripper_busy",
@@ -493,8 +524,7 @@ RetainedGripperCommandBackend::command_gripper(
         current->second.status.state == core::GripperCommandState::kFailed &&
         !supersedable_grasp_loss(current->second.status.error)) {
       return {false, current->second.status.command_id,
-              current->second.status.generation,
-              current->second.status.error};
+              current->second.status.generation, current->second.status.error};
     }
 
     command_id = state_->next_command_id++;
@@ -503,13 +533,13 @@ RetainedGripperCommandBackend::command_gripper(
     runtime = SharedState::Runtime{};
     runtime.start_position = start_position;
     runtime.started_at_ns = state_->clock->now();
-    runtime.deadline_ns = saturating_deadline(
-        runtime.started_at_ns, duration_ns(request.duration_s));
-    first_deadline = request.duration_s <= 0.0
-                         ? runtime.started_at_ns
-                         : std::min(runtime.deadline_ns,
-                                    runtime.started_at_ns +
-                                        state_->update_period_ns);
+    runtime.deadline_ns = saturating_deadline(runtime.started_at_ns,
+                                              duration_ns(request.duration_s));
+    first_deadline =
+        request.duration_s <= 0.0
+            ? runtime.started_at_ns
+            : std::min(runtime.deadline_ns,
+                       runtime.started_at_ns + state_->update_period_ns);
 
     auto& status = runtime.status;
     status.state = core::GripperCommandState::kExecuting;
@@ -537,8 +567,7 @@ RetainedGripperCommandBackend::command_gripper(
     const auto status = get_gripper_status(request.gripper_id);
     return {false, command_id, generation,
             status.command_id == command_id &&
-                    status.generation == generation &&
-                    status.error.has_value()
+                    status.generation == generation && status.error.has_value()
                 ? status.error
                 : std::optional<core::ErrorDTO>(gripper_error(
                       "gripper_command_not_authorized",
@@ -547,8 +576,7 @@ RetainedGripperCommandBackend::command_gripper(
   return {true, command_id, generation, std::nullopt};
 }
 
-core::GripperCommandStatusDTO
-RetainedGripperCommandBackend::get_gripper_status(
+core::GripperCommandStatusDTO RetainedGripperCommandBackend::get_gripper_status(
     const std::string& gripper_id) const {
   std::lock_guard<std::mutex> lock(state_->mutex);
   const auto found = state_->runtimes.find(gripper_id);
@@ -562,19 +590,16 @@ RetainedGripperCommandBackend::get_gripper_status(
 
 core::GripperCommandResultDTO
 RetainedGripperCommandBackend::mark_gripper_grasp_lost(
-    const std::string& gripper_id,
-    const std::uint64_t expected_command_id,
-    const std::uint64_t expected_generation,
-    const std::string& evidence_label, const std::string& message,
-    const std::string& reason_code) {
+    const std::string& gripper_id, const std::uint64_t expected_command_id,
+    const std::uint64_t expected_generation, const std::string& evidence_label,
+    const std::string& message, const std::string& reason_code) {
   std::optional<core::ScheduleHandle> handle;
   std::uint64_t command_id = 0U;
   std::uint64_t generation = 0U;
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     const auto found = state_->runtimes.find(gripper_id);
-    if (gripper_id != state_->gripper_id ||
-        found == state_->runtimes.end() ||
+    if (gripper_id != state_->gripper_id || found == state_->runtimes.end() ||
         found->second.status.command_id == 0U ||
         found->second.status.command_id != expected_command_id ||
         found->second.status.generation != expected_generation) {
@@ -598,8 +623,8 @@ RetainedGripperCommandBackend::mark_gripper_grasp_lost(
     runtime.status.evidence_state = "pressure_or_part_lost";
     if (!evidence_label.empty() &&
         std::find(runtime.status.evidence.begin(),
-                  runtime.status.evidence.end(), evidence_label) ==
-            runtime.status.evidence.end()) {
+                  runtime.status.evidence.end(),
+                  evidence_label) == runtime.status.evidence.end()) {
       runtime.status.evidence.push_back(evidence_label);
     }
     runtime.status.error = gripper_error(

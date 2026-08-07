@@ -66,7 +66,8 @@ using namespace manyforge::core;
           StateAuthorityClass::kPredicted,
           StopEvidencePolicyId("stop.native"),
           StopEvidencePolicyRevision("stop-revision"),
-          ContainmentGranularity::kResource},
+          ContainmentGranularity::kResource,
+          std::nullopt},
       std::nullopt,
       {},
       {}};

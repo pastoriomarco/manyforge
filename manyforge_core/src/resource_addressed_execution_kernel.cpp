@@ -333,6 +333,11 @@ template <typename T>
 
   const auto& value = std::get<GripperPositionCommandValueDTO>(command.command_value);
   const auto kind = coordinate_kind(value.position);
+  if (kind != binding.resources.front().coordinate_kind) {
+    return reject<GripperCommandRequestDTO>(
+        "gripper command unit differs from its retained resource",
+        "gripper_command_coordinate_kind_mismatch", ErrorCode::kInvalidRequest);
+  }
   const double target_position = kind == CoordinateKind::kAngular
                                      ? std::get<AngularPositionDTO>(value.position).value_rad
                                      : std::get<LinearPositionDTO>(value.position).value_m;
@@ -358,6 +363,7 @@ template <typename T>
   request.transport_kind = "resolved_binding";
   request.evidence = {"command_terminal"};
   request.evidence_state = "required_pending";
+  request.completion_timeout_s = command.completion_timeout_s;
   return Result<GripperCommandRequestDTO>::Ok(std::move(request));
 }
 
@@ -705,6 +711,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       return Result<OperationAcceptedDTO>::Err(built.error());
     }
     command_request = std::move(built.value());
+    auto private_validation = engine->validate_gripper_command(*command_request);
+    if (!private_validation.ok()) {
+      return Result<OperationAcceptedDTO>::Err(private_validation.error());
+    }
   }
   auto reservation = resource_slots_.reserve(slot_owner, resources);
   if (!reservation.ok()) {
@@ -969,6 +979,8 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
 
   IResolvedParticipantExecutionEngine* engine = nullptr;
   std::uint64_t subordinate_id = 0U;
+  std::uint64_t subordinate_generation = 0U;
+  std::string command_target;
   OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
   OperationControlAcceptedDTO accepted{RequestId("pending"),
                                        RequestReplayStatusDTO::kAcceptedNew,
@@ -1047,6 +1059,8 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
     }
     engine = active_operation_->engine;
     subordinate_id = active_operation_->subordinate_id;
+    subordinate_generation = active_operation_->subordinate_generation;
+    command_target = active_operation_->binding.value().command_target_id.value();
     payload_kind = active_operation_->payload_kind;
     if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
         (control == OperationControlKind::kPause || control == OperationControlKind::kResume)) {
@@ -1129,9 +1143,18 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       break;
     }
     case OperationControlKind::kReset: {
-      const auto result = engine->reset(std::nullopt);
-      accepted_by_subordinate = result.accepted;
-      subordinate_error = result.error;
+      if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
+        const auto result =
+            engine->reset_gripper(command_target, subordinate_id, subordinate_generation);
+        accepted_by_subordinate = result.ok();
+        if (!result.ok()) {
+          subordinate_error = result.error();
+        }
+      } else {
+        const auto result = engine->reset(std::nullopt);
+        accepted_by_subordinate = result.accepted;
+        subordinate_error = result.error;
+      }
       break;
     }
     case OperationControlKind::kAcknowledgeCompleted:
@@ -1212,6 +1235,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::stop(const StopIntentD
 
   IResolvedParticipantExecutionEngine* engine = nullptr;
   std::uint64_t subordinate_id = 0U;
+  std::uint64_t subordinate_generation = 0U;
+  std::string command_target;
+  OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
   StopAcceptedDTO accepted{intent.request_context.request_id,
                            RequestReplayStatusDTO::kAcceptedNew,
                            StopId("pending"),
@@ -1366,6 +1392,30 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::stop(const StopIntentD
     ++next_stop_id_;
     engine = active_operation_->engine;
     subordinate_id = active_operation_->subordinate_id;
+    subordinate_generation = active_operation_->subordinate_generation;
+    command_target = active_operation_->binding.value().command_target_id.value();
+    payload_kind = active_operation_->payload_kind;
+  }
+
+  if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
+    const auto subordinate =
+        engine->stop_gripper(command_target, subordinate_id, subordinate_generation);
+    if (!subordinate.ok()) {
+      (void)apply_subordinate_state(engine, subordinate_id,
+                                    OperationStateKind::kInterventionRequired, 0.0,
+                                    subordinate.error());
+      return Result<StopAcceptedDTO>::Ok(std::move(accepted));
+    }
+    {
+      std::lock_guard state_lock(state_mutex_);
+      if (active_operation_ != nullptr &&
+          active_operation_->accepted.operation_id == intent.operations.front().operation_id) {
+        active_operation_->subordinate_generation = subordinate.value();
+      }
+    }
+    (void)apply_subordinate_state(engine, subordinate_id, OperationStateKind::kStopped, 0.0,
+                                  std::nullopt);
+    return Result<StopAcceptedDTO>::Ok(std::move(accepted));
   }
 
   const auto subordinate = engine->stop();
@@ -1940,10 +1990,13 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
 }
 
 Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
+  std::lock_guard control_lock(control_mutex_);
   IResolvedParticipantExecutionEngine* engine = nullptr;
   OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
   std::uint64_t subordinate_id = 0U;
+  std::uint64_t subordinate_generation = 0U;
   std::string command_target;
+  OperationStateKind public_state{OperationStateKind::kPrepared};
   std::optional<OperationId> runtime_scale_operation_id;
   std::optional<ControlBindingId> runtime_scale_control_binding_id;
   {
@@ -1954,7 +2007,9 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
     engine = active_operation_->engine;
     payload_kind = active_operation_->payload_kind;
     subordinate_id = active_operation_->subordinate_id;
+    subordinate_generation = active_operation_->subordinate_generation;
     command_target = active_operation_->binding.value().command_target_id.value();
+    public_state = active_operation_->state.state;
     if (active_operation_->runtime_scale_status.has_value()) {
       runtime_scale_operation_id = active_operation_->accepted.operation_id;
       runtime_scale_control_binding_id =
@@ -2009,6 +2064,10 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
   const auto status = engine->get_gripper_status(command_target);
   switch (status.state) {
     case GripperCommandState::kIdle:
+      if (public_state == OperationStateKind::kStopped && status.command_id == subordinate_id &&
+          status.generation == subordinate_generation) {
+        return Result<void>::Ok();
+      }
       return apply_subordinate_state(
           engine, subordinate_id, OperationStateKind::kInterventionRequired, status.progress,
           error("invariant_violation",

@@ -1,9 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
-#include <string>
-
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/execution_result.hpp>
@@ -11,6 +8,8 @@
 #include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
+#include <optional>
+#include <string>
 
 namespace manyforge::core {
 
@@ -24,13 +23,10 @@ class IResolvedParticipantExecutionEngine {
   virtual Result<std::uint64_t> execute(const ExecuteRequestDTO& request) = 0;
   virtual StopResultDTO stop() = 0;
   virtual PauseResultDTO pause() = 0;
-  virtual ResumeResultDTO resume(
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
-  virtual ResetResultDTO reset(
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
+  virtual ResumeResultDTO resume(std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
+  virtual ResetResultDTO reset(std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
   virtual AcknowledgeCompletedResultDTO acknowledge_completed(
-      std::uint64_t execution_id,
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
+      std::uint64_t execution_id, std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
 
   /// Private single-participant realization for the addressed owner's exact,
   /// generation-fenced runtime-scale contract. The engine validates and
@@ -38,13 +34,20 @@ class IResolvedParticipantExecutionEngine {
   virtual Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
       const ResolvedRuntimeScaleCommandDTO& command) = 0;
   virtual Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
-      const OperationId& operation_id,
-      const ControlBindingId& control_binding_id) const = 0;
+      const OperationId& operation_id, const ControlBindingId& control_binding_id) const = 0;
 
-  virtual GripperCommandResultDTO command_gripper(
-      const GripperCommandRequestDTO& request) = 0;
-  virtual GripperCommandStatusDTO get_gripper_status(
-      const std::string& gripper_id) const = 0;
+  virtual GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) = 0;
+  virtual Result<void> validate_gripper_command(const GripperCommandRequestDTO& request) const = 0;
+  virtual GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const = 0;
+  /// Cancel or reset the exact subordinate gripper generation without routing
+  /// through the motion state machine. The addressed owner has already
+  /// journaled and generation-fenced the enclosing operation.
+  virtual Result<std::uint64_t> stop_gripper(const std::string& gripper_id,
+                                             std::uint64_t expected_command_id,
+                                             std::uint64_t expected_generation) = 0;
+  virtual Result<void> reset_gripper(const std::string& gripper_id,
+                                     std::uint64_t expected_command_id,
+                                     std::uint64_t expected_generation) = 0;
 
   virtual ExecutionStatus get_status() const = 0;
   virtual SubscriptionHandle subscribe_events(EventCallback callback) = 0;

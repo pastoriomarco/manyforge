@@ -1,16 +1,15 @@
 #include <gtest/gtest.h>
 
-#include <manyforge_core/runtime_participant_binding.hpp>
-#include <manyforge_core/time/fake_clock.hpp>
-#include <manyforge_core/time/manual_scheduler.hpp>
-#include <manyforge_roboplan/retained_gripper_command_backend.hpp>
-#include <manyforge_roboplan/roboplan_execution_backend.hpp>
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <future>
 #include <limits>
+#include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_roboplan/retained_gripper_command_backend.hpp>
+#include <manyforge_roboplan/roboplan_execution_backend.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,8 +26,8 @@ namespace {
 using namespace manyforge::core;
 using namespace std::chrono_literals;
 
-[[nodiscard]] RuntimeParticipantBinding
-make_binding(CoordinateKind kind, std::string target = "gripper.target") {
+[[nodiscard]] RuntimeParticipantBinding make_binding(
+    CoordinateKind kind, std::string target = "gripper.target") {
   const bool angular = kind == CoordinateKind::kAngular;
   const std::vector<std::string> joints =
       angular ? std::vector<std::string>{"joint_1", "joint_2"}
@@ -109,15 +108,14 @@ make_binding(CoordinateKind kind, std::string target = "gripper.target") {
           StopEvidencePolicyId("stop.native"),
           StopEvidencePolicyRevision("stop-revision"),
           ContainmentGranularity::kResource,
-          angular
-              ? std::optional(RuntimeScaleRouteQualificationDTO{
-                    ControlRouteId("route.native"),
-                    ScalingDomainId("scale.native"),
-                    EndpointRoleId("runtime_scale_command"),
-                    EndpointRoleId("runtime_scale_state"), std::nullopt,
-                    RuntimeScaleAcknowledgementKind::kAppliedState, 4.0,
-                    100'000'000})
-              : std::nullopt},
+          angular ? std::optional(RuntimeScaleRouteQualificationDTO{
+                        ControlRouteId("route.native"),
+                        ScalingDomainId("scale.native"),
+                        EndpointRoleId("runtime_scale_command"),
+                        EndpointRoleId("runtime_scale_state"), std::nullopt,
+                        RuntimeScaleAcknowledgementKind::kAppliedState, 4.0,
+                        100'000'000})
+                  : std::nullopt},
       std::nullopt,
       std::move(supporting_paths),
       {RuntimeUnitEpochBindingDTO{RuntimeUnitId("runtime.native"),
@@ -144,8 +142,8 @@ make_binding(CoordinateKind kind, std::string target = "gripper.target") {
 }
 
 class FakeRetainedStateChannel final : public IRetainedObservedStateChannel {
-public:
-  explicit FakeRetainedStateChannel(const RuntimeParticipantBinding &binding,
+ public:
+  explicit FakeRetainedStateChannel(const RuntimeParticipantBinding& binding,
                                     std::vector<double> initial)
       : context_([&] {
           auto context = make_observed_state_query_context(binding, 0);
@@ -176,13 +174,17 @@ public:
     }
   }
 
-  RetainedStateProjectionResult
-  publish_state(std::span<const double> positions_si,
-                std::span<const double> velocities_si,
-                std::int64_t source_timestamp_ns,
-                std::int64_t received_timestamp_ns) override {
-    std::lock_guard lock(mutex_);
+  RetainedStateProjectionResult publish_state(
+      std::span<const double> positions_si,
+      std::span<const double> velocities_si, std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns) override {
+    std::unique_lock lock(mutex_);
     ++publish_calls_;
+    if (block_publish_) {
+      publish_entered_ = true;
+      publish_cv_.notify_all();
+      publish_cv_.wait_for(lock, 2s, [&] { return release_publish_; });
+    }
     if (positions_si.size() != context_.resources.size() ||
         (!velocities_si.empty() &&
          velocities_si.size() != context_.resources.size())) {
@@ -209,8 +211,8 @@ public:
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
 
-  RetainedStateProjectionResult
-  project_latest(std::int64_t, RetainedStateProjectionMode) override {
+  RetainedStateProjectionResult project_latest(
+      std::int64_t, RetainedStateProjectionMode) override {
     std::lock_guard lock(mutex_);
     ++project_calls_;
     if (projection_fail_) {
@@ -226,12 +228,11 @@ public:
     return {RetainedStateProjectionStatus::kApplied, std::nullopt};
   }
 
-  RetainedStateProjectionResult
-  publish_and_project(std::span<const double> positions_si,
-                      std::span<const double> velocities_si,
-                      std::int64_t source_timestamp_ns,
-                      std::int64_t received_timestamp_ns,
-                      RetainedStateProjectionMode mode) override {
+  RetainedStateProjectionResult publish_and_project(
+      std::span<const double> positions_si,
+      std::span<const double> velocities_si, std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns,
+      RetainedStateProjectionMode mode) override {
     auto published = publish_state(positions_si, velocities_si,
                                    source_timestamp_ns, received_timestamp_ns);
     return published.applied() ? project_latest(received_timestamp_ns, mode)
@@ -282,18 +283,39 @@ public:
     return Result<ControlledStateDTO>::Ok(state_);
   }
 
-  const ObservedStateQueryContextDTO &query_context() const noexcept override {
+  const ObservedStateQueryContextDTO& query_context() const noexcept override {
     return context_;
   }
 
-  const AddressedObservedStatePublication *
-  addressed_publication() const noexcept override {
+  const AddressedObservedStatePublication* addressed_publication()
+      const noexcept override {
     return nullptr;
   }
 
   void make_projection_busy(int count) {
     std::lock_guard lock(mutex_);
     projection_busy_count_ = count;
+  }
+
+  void block_publish() {
+    std::lock_guard lock(mutex_);
+    block_publish_ = true;
+    publish_entered_ = false;
+    release_publish_ = false;
+  }
+
+  [[nodiscard]] bool wait_for_publish() const {
+    std::unique_lock lock(mutex_);
+    return publish_cv_.wait_for(lock, 2s, [&] { return publish_entered_; });
+  }
+
+  void release_publish() {
+    {
+      std::lock_guard lock(mutex_);
+      release_publish_ = true;
+      block_publish_ = false;
+    }
+    publish_cv_.notify_all();
   }
 
   void block_read() {
@@ -332,9 +354,9 @@ public:
     return project_applied_calls_;
   }
 
-private:
-  [[nodiscard]] static RetainedStateProjectionResult
-  failure(RetainedStateProjectionStatus status, std::string reason) {
+ private:
+  [[nodiscard]] static RetainedStateProjectionResult failure(
+      RetainedStateProjectionStatus status, std::string reason) {
     return {status, ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
                              "injected retained-state result",
                              {{"reason", std::move(reason)}}}};
@@ -342,6 +364,7 @@ private:
 
   ObservedStateQueryContextDTO context_;
   mutable std::mutex mutex_;
+  mutable std::condition_variable publish_cv_;
   mutable std::condition_variable read_cv_;
   ControlledStateDTO state_;
   std::uint64_t sequence_{};
@@ -352,13 +375,16 @@ private:
   int project_applied_calls_{};
   int projection_busy_count_{};
   bool projection_fail_{};
+  bool block_publish_{};
+  bool publish_entered_{};
+  bool release_publish_{};
   mutable bool block_read_{};
   mutable bool read_entered_{};
   mutable bool release_read_{};
 };
 
 class RejectingScheduler final : public IScheduler {
-public:
+ public:
   ScheduleHandle schedule(TimePoint, std::function<void()>,
                           SchedulerPriority) override {
     throw std::runtime_error("injected schedule failure");
@@ -367,7 +393,7 @@ public:
 };
 
 class InlineScheduler final : public IScheduler {
-public:
+ public:
   ScheduleHandle schedule(TimePoint, std::function<void()> callback,
                           SchedulerPriority) override {
     const auto handle = next_++;
@@ -376,12 +402,12 @@ public:
   }
   void cancel(ScheduleHandle) override {}
 
-private:
+ private:
   ScheduleHandle next_{1U};
 };
 
 class InlineThenThrowScheduler final : public IScheduler {
-public:
+ public:
   ScheduleHandle schedule(TimePoint, std::function<void()> callback,
                           SchedulerPriority) override {
     callback();
@@ -391,19 +417,19 @@ public:
 };
 
 class AutoAdvanceClock final : public IClock {
-public:
+ public:
   TimePoint now() const override {
     return current_.fetch_add(10'000'000, std::memory_order_acq_rel);
   }
 
-private:
+ private:
   mutable std::atomic<TimePoint> current_{1};
 };
 
-[[nodiscard]] GripperCommandRequestDTO
-gripper_request(const RuntimeParticipantBinding &binding, double target,
-                double duration_s) {
-  const auto &value = binding.value();
+[[nodiscard]] GripperCommandRequestDTO gripper_request(
+    const RuntimeParticipantBinding& binding, double target,
+    double duration_s) {
+  const auto& value = binding.value();
   return GripperCommandRequestDTO{
       value.command_target_id.value(),
       value.model_groups.front().compiled_group_name,
@@ -423,12 +449,18 @@ gripper_request(const RuntimeParticipantBinding &binding, double target,
       "commanded"};
 }
 
-[[nodiscard]] TrajectoryDTO trajectory(const RuntimeParticipantBinding &binding,
+[[nodiscard]] RetainedGripperPositionLimits gripper_limits(
+    const RuntimeParticipantBinding& binding) {
+  return RetainedGripperPositionLimits{
+      binding.value().resources.front().coordinate_kind, -1.0, 1.0};
+}
+
+[[nodiscard]] TrajectoryDTO trajectory(const RuntimeParticipantBinding& binding,
                                        double duration_s = 0.02) {
-  const auto &value = binding.value();
+  const auto& value = binding.value();
   std::vector<ResourceId> resources;
   std::vector<std::string> joint_names;
-  for (const auto &resource : value.resources) {
+  for (const auto& resource : value.resources) {
     resources.push_back(resource.resource_id);
     joint_names.push_back(resource.compiled_resource_name);
   }
@@ -446,7 +478,8 @@ TEST(RetainedGripperCommandBackendTest,
       binding, std::vector<double>{0.0});
   FakeClock clock;
   ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(binding, channel, clock, scheduler);
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler);
 
   const auto admitted =
       backend.command_gripper(gripper_request(binding, 0.02, 1.0));
@@ -482,9 +515,15 @@ TEST(RetainedGripperCommandBackendTest,
       binding, std::vector<double>{0.0});
   FakeClock clock;
   ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(binding, channel, clock, scheduler);
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler);
   auto crossed = gripper_request(binding, 0.02, 1.0);
   crossed.actuation_kind = "angular";
+
+  const auto preflight = backend.validate_gripper_command(crossed);
+  ASSERT_FALSE(preflight.ok());
+  EXPECT_EQ(preflight.error().code, "invalid_request");
+  EXPECT_EQ(preflight.error().details.at("reason"), "gripper_invalid_command");
 
   const auto result = backend.command_gripper(crossed);
 
@@ -492,6 +531,35 @@ TEST(RetainedGripperCommandBackendTest,
   ASSERT_TRUE(result.error.has_value());
   EXPECT_EQ(result.error->code, "gripper_invalid_command");
   EXPECT_EQ(channel->publish_calls(), 0);
+
+  auto outside_limits = gripper_request(binding, 2.0, 1.0);
+  const auto limit_preflight = backend.validate_gripper_command(outside_limits);
+  ASSERT_FALSE(limit_preflight.ok());
+  EXPECT_EQ(limit_preflight.error().code, "invalid_request");
+  EXPECT_EQ(limit_preflight.error().details.at("reason"),
+            "gripper_position_limit_violation");
+  EXPECT_EQ(channel->publish_calls(), 0);
+}
+
+TEST(RetainedGripperCommandBackendTest,
+     RejectsNonFiniteStartPositionBeforeScheduling) {
+  auto binding = make_binding(CoordinateKind::kLinear);
+  auto channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{std::numeric_limits<double>::quiet_NaN()});
+  FakeClock clock;
+  ManualScheduler scheduler;
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler);
+
+  const auto result =
+      backend.command_gripper(gripper_request(binding, 0.02, 1.0));
+
+  ASSERT_FALSE(result.accepted);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, "gripper_state_not_finite");
+  EXPECT_EQ(channel->publish_calls(), 0);
+  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
+            GripperCommandState::kIdle);
 }
 
 TEST(RetainedGripperCommandBackendTest,
@@ -501,7 +569,8 @@ TEST(RetainedGripperCommandBackendTest,
       binding, std::vector<double>{0.0});
   FakeClock clock;
   ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(binding, channel, clock, scheduler);
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler);
   const auto first =
       backend.command_gripper(gripper_request(binding, 0.02, 1.0));
   ASSERT_TRUE(first.accepted);
@@ -532,7 +601,8 @@ TEST(RetainedGripperCommandBackendTest,
   channel->make_projection_busy(10);
   FakeClock clock;
   ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(binding, channel, clock, scheduler, 1);
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler, 1);
   ASSERT_TRUE(
       backend.command_gripper(gripper_request(binding, 0.02, 0.0)).accepted);
 
@@ -557,7 +627,8 @@ TEST(RetainedGripperCommandBackendTest,
   channel->block_read();
   FakeClock clock;
   ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(binding, channel, clock, scheduler);
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler);
   auto pending = std::async(std::launch::async, [&] {
     return backend.command_gripper(gripper_request(binding, 0.02, 1.0));
   });
@@ -582,13 +653,48 @@ TEST(RetainedGripperCommandBackendTest,
 }
 
 TEST(RetainedGripperCommandBackendTest,
+     InvalidationLinearizesAgainstDequeuedStatePublication) {
+  auto binding = make_binding(CoordinateKind::kLinear);
+  auto channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{0.0});
+  channel->block_publish();
+  FakeClock clock;
+  ManualScheduler scheduler;
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler);
+
+  const auto admitted =
+      backend.command_gripper(gripper_request(binding, 0.02, 0.0));
+  ASSERT_TRUE(admitted.accepted);
+  auto callback = std::async(std::launch::async,
+                             [&] { scheduler.advance_to(clock.now()); });
+  ASSERT_TRUE(channel->wait_for_publish());
+
+  auto invalidate = std::async(std::launch::async, [&] {
+    backend.invalidate_gripper_commands(GripperInvalidationReason::kReset);
+  });
+  EXPECT_EQ(invalidate.wait_for(20ms), std::future_status::timeout);
+
+  channel->release_publish();
+  callback.get();
+  invalidate.get();
+  const auto calls_after_invalidation = channel->publish_calls();
+  clock.advance(1'000'000'000);
+  scheduler.advance_to(clock.now());
+  EXPECT_EQ(channel->publish_calls(), calls_after_invalidation);
+  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
+            GripperCommandState::kIdle);
+}
+
+TEST(RetainedGripperCommandBackendTest,
      GraspLossAdvancesGenerationAndPreservesEvidence) {
   auto binding = make_binding(CoordinateKind::kLinear);
   auto channel = std::make_shared<FakeRetainedStateChannel>(
       binding, std::vector<double>{0.0});
   FakeClock clock;
   ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(binding, channel, clock, scheduler);
+  RetainedGripperCommandBackend backend(
+      binding, channel, gripper_limits(binding), clock, scheduler);
   const auto admitted =
       backend.command_gripper(gripper_request(binding, 0.02, 1.0));
   ASSERT_TRUE(admitted.accepted);
@@ -614,7 +720,8 @@ TEST(RetainedGripperCommandBackendTest,
     auto channel = std::make_shared<FakeRetainedStateChannel>(
         binding, std::vector<double>{0.0});
     RejectingScheduler scheduler;
-    RetainedGripperCommandBackend backend(binding, channel, clock, scheduler);
+    RetainedGripperCommandBackend backend(
+        binding, channel, gripper_limits(binding), clock, scheduler);
     const auto result =
         backend.command_gripper(gripper_request(binding, 0.02, 1.0));
     ASSERT_FALSE(result.accepted);
@@ -626,8 +733,8 @@ TEST(RetainedGripperCommandBackendTest,
         binding, std::vector<double>{0.0});
     channel->make_projection_busy(1);
     InlineScheduler scheduler;
-    RetainedGripperCommandBackend backend(binding, channel, clock, scheduler,
-                                          1);
+    RetainedGripperCommandBackend backend(
+        binding, channel, gripper_limits(binding), clock, scheduler, 1);
     const auto result =
         backend.command_gripper(gripper_request(binding, 0.02, 0.0));
     EXPECT_TRUE(result.accepted);
@@ -638,7 +745,8 @@ TEST(RetainedGripperCommandBackendTest,
     auto channel = std::make_shared<FakeRetainedStateChannel>(
         binding, std::vector<double>{0.0});
     InlineThenThrowScheduler scheduler;
-    RetainedGripperCommandBackend backend(binding, channel, clock, scheduler);
+    RetainedGripperCommandBackend backend(
+        binding, channel, gripper_limits(binding), clock, scheduler);
     const auto result =
         backend.command_gripper(gripper_request(binding, 0.02, 0.0));
     EXPECT_TRUE(result.accepted);
@@ -738,5 +846,5 @@ TEST(RoboPlanExecutionBackendTest,
   EXPECT_GT(backend.scene_projection_metrics().misses_total, 0U);
 }
 
-} // namespace
-} // namespace manyforge::roboplan_backend
+}  // namespace
+}  // namespace manyforge::roboplan_backend

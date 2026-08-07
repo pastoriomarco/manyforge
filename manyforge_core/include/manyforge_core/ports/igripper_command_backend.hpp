@@ -1,7 +1,6 @@
 #pragma once
 
 #include <manyforge_core/types/gripper.hpp>
-
 #include <string>
 
 namespace manyforge::core {
@@ -15,26 +14,29 @@ class IGripperCommandBackend {
  public:
   virtual ~IGripperCommandBackend() = default;
 
-  virtual GripperCommandResultDTO command_gripper(
-      const GripperCommandRequestDTO& request) = 0;
+  /// Side-effect-free private-wire admission check. Backends with retained
+  /// hardware/model limits override this so the addressed owner can reject an
+  /// impossible command before journaling an accepted effect.
+  virtual Result<void> validate_gripper_command(const GripperCommandRequestDTO&) const {
+    return Result<void>::Ok();
+  }
 
-  virtual GripperCommandStatusDTO get_gripper_status(
-      const std::string& gripper_id) const = 0;
+  virtual GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) = 0;
 
-  virtual GripperCommandResultDTO mark_gripper_grasp_lost(
-      const std::string& gripper_id,
-      std::uint64_t expected_command_id,
-      std::uint64_t expected_generation,
-      const std::string& evidence_label,
-      const std::string& message,
-      const std::string& reason_code) = 0;
+  virtual GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const = 0;
+
+  virtual GripperCommandResultDTO mark_gripper_grasp_lost(const std::string& gripper_id,
+                                                          std::uint64_t expected_command_id,
+                                                          std::uint64_t expected_generation,
+                                                          const std::string& evidence_label,
+                                                          const std::string& message,
+                                                          const std::string& reason_code) = 0;
 
   /// Invalidate every admitted generation before reset, replacement, or
   /// teardown can retire its resources. Late callbacks must become no-ops.
   /// This also closes command admission until `authorize_gripper_commands()`
   /// establishes a new lifecycle boundary.
-  virtual void invalidate_gripper_commands(
-      GripperInvalidationReason reason) noexcept = 0;
+  virtual void invalidate_gripper_commands(GripperInvalidationReason reason) noexcept = 0;
 
   /// Open command admission after a successful reset, resume, or new execute
   /// admission. Implementations must invalidate any preflight work captured

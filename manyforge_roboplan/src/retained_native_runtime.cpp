@@ -1,6 +1,6 @@
-#include <manyforge_roboplan/retained_native_runtime.hpp>
-
 #include <algorithm>
+#include <cmath>
+#include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -22,8 +22,7 @@ namespace {
       "roboplan_native/" + value.controllable_component_id.value() + "/" +
           value.command_target_id.value() + "/" +
           value.control_path->control_binding_revision.value(),
-      0,
-      1U};
+      0, 1U};
 }
 
 void require_planner_binding(
@@ -56,25 +55,20 @@ void require_planner_binding(
   for (const auto& frame : value.frame_bindings) {
     permitted_frames.emplace_back(core::ResolvedComponentModelFrameDTO{
         value.controllable_component_id, frame.model_instance_id,
-        frame.frame_role_id, frame.compiled_frame_name,
-        frame.model_revision});
+        frame.frame_role_id, frame.compiled_frame_name, frame.model_revision});
   }
   std::vector<std::string> resource_joint_names;
   resource_joint_names.reserve(value.resources.size());
   for (const auto& resource : value.resources) {
     resource_joint_names.push_back(resource.compiled_resource_name);
   }
-  if (planner.projection_binding().projection_revision !=
-          projection_revision ||
-      candidate.controllable_component_id !=
-          value.controllable_component_id ||
+  if (planner.projection_binding().projection_revision != projection_revision ||
+      candidate.controllable_component_id != value.controllable_component_id ||
       candidate.command_target_id != value.command_target_id ||
       candidate.model_instance_id != model_group.model_instance_id ||
       candidate.model_revision != model->model_revision ||
-      candidate.compiled_group_name !=
-          model_group.compiled_group_name ||
-      candidate.compiled_joint_names !=
-          resource_joint_names ||
+      candidate.compiled_group_name != model_group.compiled_group_name ||
+      candidate.compiled_joint_names != resource_joint_names ||
       candidate.permitted_frames != permitted_frames) {
     throw std::invalid_argument(
         "native planner crosses its retained participant or projection");
@@ -88,6 +82,39 @@ void require_planner_binding(
     throw std::invalid_argument(
         "native planner resource order differs from its retained target");
   }
+}
+
+[[nodiscard]] RetainedGripperPositionLimits retained_gripper_limits(
+    const roboplan::Scene& scene,
+    const core::RuntimeParticipantBinding& binding) {
+  const auto& value = binding.value();
+  if (value.resources.size() != 1U) {
+    throw std::invalid_argument(
+        "native gripper limits require one retained resource");
+  }
+  const auto& resource = value.resources.front();
+  const auto joint = scene.getJointInfo(resource.compiled_resource_name);
+  if (!joint.has_value() || joint->num_position_dofs != 1U ||
+      joint->limits.min_position.size() != 1 ||
+      joint->limits.max_position.size() != 1 ||
+      !std::isfinite(joint->limits.min_position[0]) ||
+      !std::isfinite(joint->limits.max_position[0]) ||
+      joint->limits.min_position[0] > joint->limits.max_position[0]) {
+    throw std::invalid_argument(
+        "native gripper resource has no exact finite retained position limits");
+  }
+  const bool matching_joint_kind =
+      (resource.coordinate_kind == core::CoordinateKind::kAngular &&
+       joint->type == roboplan::JointType::REVOLUTE) ||
+      (resource.coordinate_kind == core::CoordinateKind::kLinear &&
+       joint->type == roboplan::JointType::PRISMATIC);
+  if (!matching_joint_kind) {
+    throw std::invalid_argument(
+        "native gripper resource kind differs from its retained model joint");
+  }
+  return RetainedGripperPositionLimits{resource.coordinate_kind,
+                                       joint->limits.min_position[0],
+                                       joint->limits.max_position[0]};
 }
 
 [[nodiscard]] std::shared_ptr<core::ICollisionQueryEngine> collision_engine(
@@ -137,7 +164,8 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
             RoboPlanExecutionBackend::
                 qualified_runtime_scale_slew_per_second()) {
       throw std::invalid_argument(
-          "native motion runtime-scale qualification differs from the selected mechanism");
+          "native motion runtime-scale qualification "
+          "differs from the selected mechanism");
     }
   }
   if (projection_revision.retained_bundle_id !=
@@ -149,8 +177,8 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
   require_planner_binding(input.motion_binding, *input.planner,
                           projection_revision);
 
-  auto runtime = std::make_shared<RetainedNativeRuntime>(
-      input.motion_binding, input.gripper_binding);
+  auto runtime = std::make_shared<RetainedNativeRuntime>(input.motion_binding,
+                                                         input.gripper_binding);
   runtime->scene = std::move(input.scene);
   runtime->scene_mutex = std::move(input.scene_mutex);
   runtime->state_projector = std::move(input.state_projector);
@@ -177,22 +205,20 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
   runtime->angular_observed_state =
       std::make_unique<core::AddressedAngularObservedRobotStateAdapter>(
           runtime->motion_state_channel->publication());
-  runtime->kinematics =
-      std::make_unique<RetainedRoboPlanKinematicsAdapter>(
-          runtime->motion_binding, runtime->scene, runtime->scene_mutex);
+  runtime->kinematics = std::make_unique<RetainedRoboPlanKinematicsAdapter>(
+      runtime->motion_binding, runtime->scene, runtime->scene_mutex);
   runtime->trajectory_validator = RoboPlanTrajectoryValidator::create(
       runtime->motion_binding, runtime->scene, runtime->scene_mutex);
   runtime->collision_trajectory_projector =
       RoboPlanCollisionTrajectoryProjector::create(
           runtime->motion_binding, runtime->scene, runtime->scene_mutex);
   runtime->execution = std::make_unique<RoboPlanExecutionBackend>(
-      runtime->motion_binding, runtime->motion_state_channel,
-      *runtime->clock, std::move(config.execution));
+      runtime->motion_binding, runtime->motion_state_channel, *runtime->clock,
+      std::move(config.execution));
 
   if (runtime->gripper_binding.has_value()) {
     const auto& gripper_value = runtime->gripper_binding->value();
-    if (gripper_value.retained_bundle_id !=
-            motion_value.retained_bundle_id ||
+    if (gripper_value.retained_bundle_id != motion_value.retained_bundle_id ||
         gripper_value.graph_revision != motion_value.graph_revision ||
         gripper_value.controllable_component_id !=
             motion_value.controllable_component_id) {
@@ -212,8 +238,8 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
     }
     runtime->gripper = std::make_unique<RetainedGripperCommandBackend>(
         *runtime->gripper_binding, runtime->gripper_state_channel,
-        *runtime->clock, *runtime->scheduler,
-        config.gripper_update_period_ns);
+        retained_gripper_limits(*runtime->scene, *runtime->gripper_binding),
+        *runtime->clock, *runtime->scheduler, config.gripper_update_period_ns);
   }
 
   const auto& shared_model =
@@ -232,8 +258,8 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
   runtime->validation_collision_engines.reserve(
       static_cast<std::size_t>(config.kernel.validation_collision_workers));
   for (std::size_t index = 0U;
-       index < static_cast<std::size_t>(
-                   config.kernel.validation_collision_workers);
+       index <
+       static_cast<std::size_t>(config.kernel.validation_collision_workers);
        ++index) {
     runtime->validation_collision_engines.push_back(
         collision_engine(shared_model, validation_cache));
@@ -241,9 +267,8 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
   const auto lookahead_cache =
       collision::ManyForgeCollisionEngine::make_shared_scene_cache(
           shared_model);
-  runtime->lookahead_collision_engines.reserve(
-      static_cast<std::size_t>(
-          config.kernel.runtime_collision_lookahead_workers));
+  runtime->lookahead_collision_engines.reserve(static_cast<std::size_t>(
+      config.kernel.runtime_collision_lookahead_workers));
   for (std::size_t index = 0U;
        index < static_cast<std::size_t>(
                    config.kernel.runtime_collision_lookahead_workers);
@@ -252,14 +277,13 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
         collision_engine(shared_model, lookahead_cache));
   }
 
-  core::ExecutionKernelPorts ports{
-      *runtime->angular_observed_state,
-      *runtime->kinematics,
-      *runtime->reference_resolver,
-      *runtime->trajectory_validator,
-      *runtime->collision_trajectory_projector,
-      nullptr,
-      runtime->gripper.get()};
+  core::ExecutionKernelPorts ports{*runtime->angular_observed_state,
+                                   *runtime->kinematics,
+                                   *runtime->reference_resolver,
+                                   *runtime->trajectory_validator,
+                                   *runtime->collision_trajectory_projector,
+                                   nullptr,
+                                   runtime->gripper.get()};
   runtime->participant_engine = std::make_shared<core::ExecutionKernel>(
       *runtime->planner, ports, *runtime->execution, *runtime->clock,
       *runtime->scheduler, *runtime->cache, std::move(config.kernel));

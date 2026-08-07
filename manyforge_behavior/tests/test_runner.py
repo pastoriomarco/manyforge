@@ -29,6 +29,9 @@ class RecordingTransport:
                 "graph_revision": "sha256:" + "2" * 64,
                 "retained_bundle_id": "sha256:" + "3" * 64,
                 "motion_target_role_id": "arm",
+                "gripper_target_role_id": "gripper",
+                "gripper_command_schema_id": "gripper.command_position",
+                "gripper_command_schema_revision": "sha256:" + "5" * 64,
                 "scene_revision": {
                     "scene_id": "scene-1",
                     "revision_id": 1,
@@ -129,6 +132,47 @@ def test_runner_reads_owner_projection_without_reducing_it() -> None:
         "operation_id": "operation-1",
         "state": "completed",
     }
+
+
+def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport))
+
+    accepted = runner.submit_gripper_position(
+        request_id="request-gripper-1",
+        program_run_id="run-1",
+        component_role_id="robot",
+        target_role_id="gripper",
+        node_instance_id="root/gripper[0]",
+        node_attempt_id="run-1/gripper[0]/attempt-1",
+        position_kind="linear_m",
+        position=0.004,
+        max_effort=5.0,
+        command_duration_s=0.25,
+        completion_timeout_s=2.0,
+    )
+
+    assert accepted["accepted"]["operation_id"] == "operation-1"
+    assert transport.submitted is not None
+    participant = transport.submitted["participants"][0]
+    assert participant["target_role_id"] == "gripper"
+    assert participant["required_capability_id"] == "tool.gripper.command"
+    assert participant["payload"] == {
+        "kind": "capability_command",
+        "command_schema_id": "gripper.command_position",
+        "command_schema_revision": "sha256:" + "5" * 64,
+        "command_value": {
+            "kind": "gripper_position",
+            "position": {"kind": "linear_m", "value_m": 0.004},
+            "max_effort": {"kind": "linear_newton", "value_n": 5.0},
+        },
+        "completion_timeout_s": 2.0,
+        "caller_options": [
+            {"option_id": "command_duration_s", "value_s": 0.25}
+        ],
+    }
+    assert "robot_id" not in repr(transport.submitted)
+    assert "group_id" not in repr(transport.submitted)
 
 
 def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
