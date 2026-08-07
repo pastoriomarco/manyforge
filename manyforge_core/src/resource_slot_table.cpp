@@ -204,6 +204,48 @@ Result<ResourceSlotOwnerDTO> ResourceSlotTable::revise_owner(
   return Result<ResourceSlotOwnerDTO>::Ok(std::move(revised));
 }
 
+Result<ResourceSlotOwnerDTO>
+ResourceSlotTable::transition_and_revise_owner(
+    const ResourceSlotOwnerDTO& owner,
+    const std::vector<ResourceId>& resources, ResourceSlotState next_state,
+    OperationRevision next_operation_revision) {
+  if (!owner.valid() || !next_operation_revision.nonzero() ||
+      next_operation_revision <= owner.operation_revision) {
+    return Result<ResourceSlotOwnerDTO>::Err(ErrorDTO{
+        std::string(to_string(ErrorCode::kInvalidRequest)),
+        "resource owner revision must advance monotonically",
+        {{"reason", "resource_owner_revision_invalid"}}});
+  }
+  std::lock_guard lock(mutex_);
+  std::vector<std::size_t> indices;
+  auto validation = validate_resource_set_locked(resources, indices);
+  if (!validation.ok()) {
+    return Result<ResourceSlotOwnerDTO>::Err(validation.error());
+  }
+  for (const auto index : indices) {
+    const auto& slot = slots_[index];
+    if (!slot.owner.has_value() || *slot.owner != owner) {
+      return Result<ResourceSlotOwnerDTO>::Err(ErrorDTO{
+          std::string(to_string(ErrorCode::kExecutionRejected)),
+          "resource transition owner does not match the slot",
+          {{"reason", "resource_owner_mismatch"}}});
+    }
+    if (!legal_transition(slot.state, next_state)) {
+      return Result<ResourceSlotOwnerDTO>::Err(ErrorDTO{
+          std::string(to_string(ErrorCode::kInvalidStateTransition)),
+          "resource transition is illegal",
+          {{"reason", "resource_transition_illegal"}}});
+    }
+  }
+  auto revised = owner;
+  revised.operation_revision = next_operation_revision;
+  for (const auto index : indices) {
+    slots_[index].state = next_state;
+    slots_[index].owner = revised;
+  }
+  return Result<ResourceSlotOwnerDTO>::Ok(std::move(revised));
+}
+
 void ResourceSlotTable::clear_active_operation_if_unused_locked() {
   if (!active_operation_id_.has_value()) {
     return;

@@ -5,6 +5,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/runtime_scale.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 #include <stop_token>
 
@@ -124,6 +125,14 @@ class IExecutionBackend {
     /// implementations should still defend in depth.
     virtual void set_runtime_velocity_scale(double /*scale*/) {
       // Default: no-op. Backends that support runtime velocity scaling override.
+    }
+
+    /// Observer-safe acknowledgement/application status for the private
+    /// mechanism. `supported=false` is the fail-closed default; retained
+    /// binding qualification is a separate mandatory admission check.
+    virtual RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status()
+        const {
+      return RuntimeScaleMechanismStatusDTO{};
     }
 
     // ---------------------------------------------------------------

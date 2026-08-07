@@ -656,6 +656,42 @@ TEST(CellGraphCodec, NormalizesSetsButPreservesResourceBindingOrder) {
             "command_a");
 }
 
+TEST(CellGraphCodec,
+     RuntimeScaleQualificationIsOptionalCanonicalAndRouteProjected) {
+  const auto with_scale = replace_once(
+      full_graph(),
+      "    containment_granularity: controller_set\ncomponent_attachments:",
+      "    containment_granularity: controller_set\n"
+      "    runtime_scale_route_qualifications:\n"
+      "      - control_route_id: route_a\n"
+      "        scaling_domain_id: scale_a\n"
+      "        command_endpoint_role_id: command_a\n"
+      "        applied_state_endpoint_role_id: state_a\n"
+      "        acknowledgement_kind: applied_state\n"
+      "        maximum_slew_per_second: 4.0\n"
+      "        freshness_budget_ns: 100000000\n"
+      "component_attachments:");
+  const auto validated = validate(with_scale);
+  const auto& qualifications =
+      validated.graph().control_bindings.front()
+          .runtime_scale_route_qualifications;
+  ASSERT_EQ(qualifications.size(), 1U);
+  EXPECT_EQ(qualifications.front().control_route_id.value(), "route_a");
+  EXPECT_EQ(qualifications.front().scaling_domain_id.value(), "scale_a");
+  EXPECT_DOUBLE_EQ(qualifications.front().maximum_slew_per_second, 4.0);
+  EXPECT_EQ(qualifications.front().freshness_budget_ns, 100000000);
+
+  EXPECT_THROW(
+      (void)validate(replace_once(with_scale,
+                                  "command_endpoint_role_id: command_a",
+                                  "command_endpoint_role_id: missing")),
+      CellGraphCodecError);
+  EXPECT_THROW(
+      (void)decode(replace_once(with_scale, "freshness_budget_ns: 100000000",
+                                "freshness_budget_ns: 9007199254740992")),
+      ArtifactCodecError);
+}
+
 TEST(CellGraphCodec, FullGraphMatchesIndependentNormalizedJsonGolden) {
   const TypedCellGraphCandidate candidate = decode(full_graph());
 

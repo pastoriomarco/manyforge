@@ -14,6 +14,7 @@
 #include <manyforge_core/types/motion_spec.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/plan_request.hpp>
+#include <manyforge_core/types/runtime_scale.hpp>
 
 namespace manyforge::core {
 
@@ -23,6 +24,8 @@ namespace manyforge::core {
 struct ResolvedExecutionBindingDTO final {
   OperationId operation_id;
   OperationParticipantId participant_id;
+  ControllerGoalId controller_goal_id;
+  ControllerGoalGeneration controller_goal_generation;
   ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
@@ -59,6 +62,7 @@ struct ResolvedExecutionBindingDTO final {
   std::vector<ComponentAttachmentRevision> component_attachment_revisions;
   std::vector<CarriedObjectAttachmentRevision>
       carried_object_attachment_revisions;
+  std::optional<RuntimeScaleRouteQualificationDTO> runtime_scale_qualification;
 
   friend bool operator==(const ResolvedExecutionBindingDTO&,
                          const ResolvedExecutionBindingDTO&) = default;
@@ -102,6 +106,10 @@ struct ExecuteRequestDTO {
   /// Effective concrete contact-policy binding for this move. Empty means
   /// free-space validation/execution.
   std::string contact_policy_id;
+  /// Owner-resolved scale captured atomically with execution admission. This
+  /// prevents a prior operation's participant-local scale from leaking into a
+  /// newly dispatched operation before the first focused-port update.
+  std::optional<ResolvedRuntimeScaleCommandDTO> initial_runtime_scale;
 };
 
 }  // namespace manyforge::core

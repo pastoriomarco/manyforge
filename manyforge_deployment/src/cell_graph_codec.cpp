@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -498,11 +499,97 @@ template <typename StrongType>
   return result;
 }
 
+[[nodiscard]] core::RuntimeScaleAcknowledgementKind
+parse_runtime_scale_acknowledgement(const CanonicalValue& value,
+                                    std::string_view path) {
+  const auto& token = require_string(value, path);
+  if (token == "applied_state") {
+    return core::RuntimeScaleAcknowledgementKind::kAppliedState;
+  }
+  fail(path, "unknown runtime-scale acknowledgement kind");
+}
+
+[[nodiscard]] std::int64_t parse_positive_int64(const CanonicalValue& value,
+                                                std::string_view path) {
+  constexpr double kMaxSafeJsonInteger = 9007199254740991.0;
+  const double number = require_number(value, path);
+  if (number <= 0.0 || std::trunc(number) != number ||
+      number > kMaxSafeJsonInteger) {
+    fail(path, "expected a positive integral I-JSON-safe value");
+  }
+  return static_cast<std::int64_t>(number);
+}
+
+[[nodiscard]] std::vector<core::RuntimeScaleRouteQualificationDTO>
+parse_runtime_scale_route_qualifications(const CanonicalValue& value,
+                                         std::string_view path) {
+  const auto& array = require_array(value, path);
+  if (array.empty()) {
+    fail(path, "present runtime-scale qualification table must be non-empty");
+  }
+  std::vector<core::RuntimeScaleRouteQualificationDTO> result;
+  result.reserve(array.size());
+  for (std::size_t index = 0U; index < array.size(); ++index) {
+    const auto item_path = index_path(path, index);
+    const auto& object = require_object(array[index], item_path);
+    require_fields(object,
+                   {"control_route_id", "scaling_domain_id",
+                    "command_endpoint_role_id",
+                    "applied_state_endpoint_role_id",
+                    "acknowledgement_kind", "maximum_slew_per_second",
+                    "freshness_budget_ns"},
+                   {"coordinated_barrier_id"}, item_path);
+    const double maximum_slew = require_number(
+        require_member(object, "maximum_slew_per_second", item_path),
+        child_path(item_path, "maximum_slew_per_second"));
+    if (maximum_slew <= 0.0) {
+      fail(child_path(item_path, "maximum_slew_per_second"),
+           "must be positive");
+    }
+    std::optional<core::CoordinatedScalingBarrierId> barrier;
+    if (const auto* member = find_member(object, "coordinated_barrier_id")) {
+      barrier = parse_identity<core::CoordinatedScalingBarrierId>(
+          *member, child_path(item_path, "coordinated_barrier_id"));
+    }
+    result.push_back(core::RuntimeScaleRouteQualificationDTO{
+        parse_identity<core::ControlRouteId>(
+            require_member(object, "control_route_id", item_path),
+            child_path(item_path, "control_route_id")),
+        parse_identity<core::ScalingDomainId>(
+            require_member(object, "scaling_domain_id", item_path),
+            child_path(item_path, "scaling_domain_id")),
+        parse_identity<core::EndpointRoleId>(
+            require_member(object, "command_endpoint_role_id", item_path),
+            child_path(item_path, "command_endpoint_role_id")),
+        parse_identity<core::EndpointRoleId>(
+            require_member(object, "applied_state_endpoint_role_id", item_path),
+            child_path(item_path, "applied_state_endpoint_role_id")),
+        std::move(barrier),
+        parse_runtime_scale_acknowledgement(
+            require_member(object, "acknowledgement_kind", item_path),
+            child_path(item_path, "acknowledgement_kind")),
+        maximum_slew,
+        parse_positive_int64(
+            require_member(object, "freshness_budget_ns", item_path),
+            child_path(item_path, "freshness_budget_ns"))});
+  }
+  std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+    return left.control_route_id < right.control_route_id;
+  });
+  if (std::adjacent_find(result.begin(), result.end(),
+                         [](const auto& left, const auto& right) {
+                           return left.control_route_id == right.control_route_id;
+                         }) != result.end()) {
+    fail(path, "duplicate runtime-scale control_route_id");
+  }
+  return result;
+}
+
 [[nodiscard]] ControlBindingDTO parse_control_binding(const CanonicalValue& value,
                                                       std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(object,
-                       {"control_binding_id",
+  require_fields(object,
+                 {"control_binding_id",
                         "control_binding_revision",
                         "controllable_component_id",
                         "command_target_id",
@@ -524,7 +611,7 @@ template <typename StrongType>
                         "stop_evidence_policy_id",
                         "stop_evidence_policy_revision",
                         "containment_granularity"},
-                       path);
+                 {"runtime_scale_route_qualifications"}, path);
 
   std::vector<ControlRouteId> legal_routes =
       parse_identity_set<ControlRouteId>(require_member(object, "legal_control_route_ids", path),
@@ -543,6 +630,37 @@ template <typename StrongType>
     if (legal_routes[index] != projections[index].control_route_id) {
       fail(child_path(path, "route_endpoint_projections"),
            "projection route IDs must exactly equal legal route IDs");
+    }
+  }
+
+  std::vector<core::RuntimeScaleRouteQualificationDTO>
+      runtime_scale_route_qualifications;
+  if (const auto* qualifications =
+          find_member(object, "runtime_scale_route_qualifications")) {
+    runtime_scale_route_qualifications =
+        parse_runtime_scale_route_qualifications(
+            *qualifications,
+            child_path(path, "runtime_scale_route_qualifications"));
+  }
+  for (const auto& qualification : runtime_scale_route_qualifications) {
+    const auto projection = std::find_if(
+        projections.begin(), projections.end(), [&](const auto& candidate) {
+          return candidate.control_route_id == qualification.control_route_id;
+        });
+    if (projection == projections.end()) {
+      fail(child_path(path, "runtime_scale_route_qualifications"),
+           "qualification names a route outside the binding");
+    }
+    if (std::find(projection->command_endpoint_role_ids.begin(),
+                  projection->command_endpoint_role_ids.end(),
+                  qualification.command_endpoint_role_id) ==
+            projection->command_endpoint_role_ids.end() ||
+        std::find(projection->state_endpoint_role_ids.begin(),
+                  projection->state_endpoint_role_ids.end(),
+                  qualification.applied_state_endpoint_role_id) ==
+            projection->state_endpoint_role_ids.end()) {
+      fail(child_path(path, "runtime_scale_route_qualifications"),
+           "runtime-scale command/applied-state roles are absent from the exact route projection");
     }
   }
 
@@ -594,7 +712,8 @@ template <typename StrongType>
           require_member(object, "stop_evidence_policy_revision", path),
           child_path(path, "stop_evidence_policy_revision")),
       parse_containment_granularity(require_member(object, "containment_granularity", path),
-                                    child_path(path, "containment_granularity"))};
+                                    child_path(path, "containment_granularity")),
+      std::move(runtime_scale_route_qualifications)};
 }
 
 [[nodiscard]] ComponentAttachmentEndpointDTO parse_attachment_endpoint(const CanonicalValue& value,
@@ -788,7 +907,7 @@ template <typename StrongType>
         {"command_endpoint_role_ids", identity_array(projection.command_endpoint_role_ids)},
         {"state_endpoint_role_ids", identity_array(projection.state_endpoint_role_ids)}});
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object object{
       {"control_binding_id", identity_value(record.control_binding_id)},
       {"control_binding_revision", identity_value(record.control_binding_revision)},
       {"controllable_component_id", identity_value(record.controllable_component_id)},
@@ -813,7 +932,40 @@ template <typename StrongType>
       {"stop_evidence_policy_id", identity_value(record.stop_evidence_policy_id)},
       {"stop_evidence_policy_revision", identity_value(record.stop_evidence_policy_revision)},
       {"containment_granularity",
-       CanonicalValue(std::string(core::to_string(record.containment_granularity)))}});
+       CanonicalValue(std::string(core::to_string(record.containment_granularity)))}};
+  if (!record.runtime_scale_route_qualifications.empty()) {
+    CanonicalValue::Array qualifications;
+    qualifications.reserve(record.runtime_scale_route_qualifications.size());
+    for (const auto& qualification :
+         record.runtime_scale_route_qualifications) {
+      CanonicalValue::Object value{
+          {"control_route_id",
+           identity_value(qualification.control_route_id)},
+          {"scaling_domain_id",
+           identity_value(qualification.scaling_domain_id)},
+          {"command_endpoint_role_id",
+           identity_value(qualification.command_endpoint_role_id)},
+          {"applied_state_endpoint_role_id",
+           identity_value(qualification.applied_state_endpoint_role_id)},
+          {"acknowledgement_kind",
+           CanonicalValue(std::string(
+               core::to_string(qualification.acknowledgement_kind)))},
+          {"maximum_slew_per_second",
+           CanonicalValue(qualification.maximum_slew_per_second)},
+          {"freshness_budget_ns",
+           CanonicalValue(
+               static_cast<double>(qualification.freshness_budget_ns))}};
+      if (qualification.coordinated_barrier_id.has_value()) {
+        value.emplace_back(
+            "coordinated_barrier_id",
+            identity_value(*qualification.coordinated_barrier_id));
+      }
+      qualifications.emplace_back(std::move(value));
+    }
+    object.emplace_back("runtime_scale_route_qualifications",
+                        CanonicalValue(std::move(qualifications)));
+  }
+  return CanonicalValue(std::move(object));
 }
 
 [[nodiscard]] CanonicalValue attachment_endpoint_value(

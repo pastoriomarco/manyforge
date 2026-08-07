@@ -363,6 +363,19 @@ require_fixture_one(const Range &values, Predicate predicate,
          core::RuntimeEpoch("epoch." + runtime_unit_id.value())});
   }
 
+  std::optional<core::RuntimeScaleRouteQualificationDTO>
+      runtime_scale_qualification;
+  const auto qualification = std::find_if(
+      control_binding.runtime_scale_route_qualifications.begin(),
+      control_binding.runtime_scale_route_qualifications.end(),
+      [&](const auto &candidate) {
+        return candidate.control_route_id == desired_route.control_route_id;
+      });
+  if (qualification !=
+      control_binding.runtime_scale_route_qualifications.end()) {
+    runtime_scale_qualification = *qualification;
+  }
+
   core::RuntimeParticipantBindingDTO value{
       core::ProgramId("i6.aggregate.state.fixture"),
       core::ProgramRevision(std::string(kZeroDigest)),
@@ -407,6 +420,7 @@ require_fixture_one(const Range &values, Predicate predicate,
           control_binding.stop_evidence_policy_id,
           control_binding.stop_evidence_policy_revision,
           control_binding.containment_granularity,
+          std::move(runtime_scale_qualification),
       },
       std::nullopt,
       {},

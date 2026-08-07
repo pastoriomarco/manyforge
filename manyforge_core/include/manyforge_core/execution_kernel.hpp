@@ -368,6 +368,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   void set_runtime_velocity_scale(
       double scale, std::optional<std::string> principal_id = std::nullopt);
 
+  Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
+      const ResolvedRuntimeScaleCommandDTO& command) override;
+  Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
+      const OperationId& operation_id,
+      const ControlBindingId& control_binding_id) const override;
+
   /// Get current kernel status.
   ExecutionStatus get_status() const override;
 
@@ -983,6 +989,13 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   std::optional<double> deferred_runtime_velocity_scale_;
   std::optional<std::string> deferred_runtime_velocity_scale_principal_id_;
   ExecutionCorrelationTracker active_correlation_;
+  std::mutex resolved_runtime_scale_submission_mutex_;
+  mutable std::mutex resolved_runtime_scale_mutex_;
+  std::optional<ResolvedRuntimeScaleCommandDTO>
+      accepted_resolved_runtime_scale_command_;
+  std::optional<ResolvedRuntimeScaleAcceptedDTO>
+      accepted_resolved_runtime_scale_result_;
+  std::uint64_t runtime_scale_acceptance_sequence_ = 0;
 
   // Event subscription and copy-on-write callback dispatch.
   KernelEventPublisher event_publisher_;

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <set>
 #include <string>
@@ -40,7 +41,8 @@ template <typename Range, typename Projection>
 }
 
 [[nodiscard]] bool valid_control_path(const RuntimeControlPathDTO& path) noexcept {
-  return !path.control_domain_id.empty() && !path.control_domain_revision.empty() &&
+  const bool base_valid =
+         !path.control_domain_id.empty() && !path.control_domain_revision.empty() &&
          !path.control_binding_id.empty() && !path.control_binding_revision.empty() &&
          !path.control_interface_contract_id.empty() && !path.control_interface_revision.empty() &&
          !path.controller_topology_id.empty() && !path.topology_revision.empty() &&
@@ -51,6 +53,22 @@ template <typename Range, typename Projection>
          !path.provider_manifest_revision.empty() && !path.provider_runtime_epoch.empty() &&
          !path.state_authority_id.empty() && !path.stop_evidence_policy_id.empty() &&
          !path.stop_evidence_policy_revision.empty();
+  if (!base_valid || !path.runtime_scale_qualification.has_value()) {
+    return base_valid;
+  }
+  const auto& scale = *path.runtime_scale_qualification;
+  return scale.control_route_id == path.control_route_id &&
+         !scale.scaling_domain_id.empty() &&
+         !scale.command_endpoint_role_id.empty() &&
+         !scale.applied_state_endpoint_role_id.empty() &&
+         (!scale.coordinated_barrier_id.has_value() ||
+          !scale.coordinated_barrier_id->empty()) &&
+         std::isfinite(scale.maximum_slew_per_second) &&
+         scale.maximum_slew_per_second > 0.0 &&
+         scale.freshness_budget_ns > 0 &&
+         scale.freshness_budget_ns <= 9007199254740991LL &&
+         scale.acknowledgement_kind ==
+             RuntimeScaleAcknowledgementKind::kAppliedState;
 }
 
 [[nodiscard]] bool valid_provider_path(const RuntimeCapabilityProviderPathDTO& path) noexcept {

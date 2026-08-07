@@ -158,6 +158,10 @@ void register_cell_graph_bindings(py::module_& module) {
       .value("kCommanded", StateAuthorityClass::kCommanded)
       .value("kPredicted", StateAuthorityClass::kPredicted);
 
+  py::enum_<RuntimeScaleAcknowledgementKind>(
+      module, "RuntimeScaleAcknowledgementKind")
+      .value("kAppliedState", RuntimeScaleAcknowledgementKind::kAppliedState);
+
   py::class_<JsonValueDTO>(module, "JsonValueDTO", py::is_final())
       .def(py::init<>())
       .def(py::init([](py::handle value) { return json_value_from_python(value); }),
@@ -246,6 +250,67 @@ void register_cell_graph_bindings(py::module_& module) {
       .def(
           "__ne__",
           [](const RouteEndpointProjectionDTO& lhs, const RouteEndpointProjectionDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<RuntimeScaleRouteQualificationDTO>(
+      module, "RuntimeScaleRouteQualificationDTO", py::is_final())
+      .def(py::init([](
+                        ControlRouteId control_route_id,
+                        ScalingDomainId scaling_domain_id,
+                        EndpointRoleId command_endpoint_role_id,
+                        EndpointRoleId applied_state_endpoint_role_id,
+                        std::optional<CoordinatedScalingBarrierId>
+                            coordinated_barrier_id,
+                        RuntimeScaleAcknowledgementKind acknowledgement_kind,
+                        double maximum_slew_per_second,
+                        std::int64_t freshness_budget_ns) {
+             return RuntimeScaleRouteQualificationDTO{
+                 std::move(control_route_id),
+                 std::move(scaling_domain_id),
+                 std::move(command_endpoint_role_id),
+                 std::move(applied_state_endpoint_role_id),
+                 std::move(coordinated_barrier_id),
+                 acknowledgement_kind,
+                 maximum_slew_per_second,
+                 freshness_budget_ns};
+           }),
+           py::arg("control_route_id"), py::arg("scaling_domain_id"),
+           py::arg("command_endpoint_role_id"),
+           py::arg("applied_state_endpoint_role_id"),
+           py::arg("coordinated_barrier_id"),
+           py::arg("acknowledgement_kind"),
+           py::arg("maximum_slew_per_second"),
+           py::arg("freshness_budget_ns"))
+      .def_readonly("control_route_id",
+                    &RuntimeScaleRouteQualificationDTO::control_route_id)
+      .def_readonly("scaling_domain_id",
+                    &RuntimeScaleRouteQualificationDTO::scaling_domain_id)
+      .def_readonly("command_endpoint_role_id",
+                    &RuntimeScaleRouteQualificationDTO::command_endpoint_role_id)
+      .def_readonly(
+          "applied_state_endpoint_role_id",
+          &RuntimeScaleRouteQualificationDTO::applied_state_endpoint_role_id)
+      .def_readonly("coordinated_barrier_id",
+                    &RuntimeScaleRouteQualificationDTO::coordinated_barrier_id)
+      .def_readonly("acknowledgement_kind",
+                    &RuntimeScaleRouteQualificationDTO::acknowledgement_kind)
+      .def_readonly("maximum_slew_per_second",
+                    &RuntimeScaleRouteQualificationDTO::maximum_slew_per_second)
+      .def_readonly("freshness_budget_ns",
+                    &RuntimeScaleRouteQualificationDTO::freshness_budget_ns)
+      .def(
+          "__eq__",
+          [](const RuntimeScaleRouteQualificationDTO& lhs,
+             const RuntimeScaleRouteQualificationDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const RuntimeScaleRouteQualificationDTO& lhs,
+             const RuntimeScaleRouteQualificationDTO& rhs) {
             return lhs != rhs;
           },
           py::is_operator());
@@ -420,7 +485,9 @@ void register_cell_graph_bindings(py::module_& module) {
                        StateAuthorityClass state_authority_class,
                        StopEvidencePolicyId stop_evidence_policy_id,
                        StopEvidencePolicyRevision stop_evidence_policy_revision,
-                       ContainmentGranularity containment_granularity) {
+                       ContainmentGranularity containment_granularity,
+                       std::vector<RuntimeScaleRouteQualificationDTO>
+                           runtime_scale_route_qualifications) {
              return ControlBindingDTO{
                  std::move(control_binding_id),
                  std::move(control_binding_revision),
@@ -444,6 +511,7 @@ void register_cell_graph_bindings(py::module_& module) {
                  std::move(stop_evidence_policy_id),
                  std::move(stop_evidence_policy_revision),
                  containment_granularity,
+                 std::move(runtime_scale_route_qualifications),
              };
            }),
            py::arg("control_binding_id"), py::arg("control_binding_revision"),
@@ -457,7 +525,9 @@ void register_cell_graph_bindings(py::module_& module) {
            py::arg("provider_manifest_revision"),
            py::arg("state_authority_id"), py::arg("state_authority_class"),
            py::arg("stop_evidence_policy_id"), py::arg("stop_evidence_policy_revision"),
-           py::arg("containment_granularity"))
+           py::arg("containment_granularity"),
+           py::arg("runtime_scale_route_qualifications") =
+               std::vector<RuntimeScaleRouteQualificationDTO>{})
       .def_readonly("control_binding_id", &ControlBindingDTO::control_binding_id)
       .def_readonly("control_binding_revision", &ControlBindingDTO::control_binding_revision)
       .def_readonly("controllable_component_id", &ControlBindingDTO::controllable_component_id)
@@ -483,6 +553,8 @@ void register_cell_graph_bindings(py::module_& module) {
       .def_readonly("stop_evidence_policy_revision",
                     &ControlBindingDTO::stop_evidence_policy_revision)
       .def_readonly("containment_granularity", &ControlBindingDTO::containment_granularity)
+      .def_readonly("runtime_scale_route_qualifications",
+                    &ControlBindingDTO::runtime_scale_route_qualifications)
       .def(
           "__eq__",
           [](const ControlBindingDTO& lhs, const ControlBindingDTO& rhs) { return lhs == rhs; },

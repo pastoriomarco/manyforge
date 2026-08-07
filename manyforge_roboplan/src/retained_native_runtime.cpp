@@ -125,6 +125,20 @@ std::shared_ptr<RetainedNativeRuntime> create_retained_native_runtime(
   const auto& projection_revision =
       current_inventory->projection_binding.projection_revision;
   const auto& motion_value = input.motion_binding.value();
+  if (motion_value.control_path.has_value() &&
+      motion_value.control_path->runtime_scale_qualification.has_value()) {
+    const auto& runtime_scale =
+        *motion_value.control_path->runtime_scale_qualification;
+    if (runtime_scale.acknowledgement_kind !=
+            core::RuntimeScaleAcknowledgementKind::kAppliedState ||
+        runtime_scale.coordinated_barrier_id.has_value() ||
+        runtime_scale.maximum_slew_per_second !=
+            RoboPlanExecutionBackend::
+                qualified_runtime_scale_slew_per_second()) {
+      throw std::invalid_argument(
+          "native motion runtime-scale qualification differs from the selected mechanism");
+    }
+  }
   if (projection_revision.retained_bundle_id !=
           motion_value.retained_bundle_id ||
       projection_revision.graph_revision != motion_value.graph_revision) {

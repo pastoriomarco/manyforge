@@ -24,6 +24,7 @@ class ExecutionCorrelationTracker {
 
   std::string move_id() const;
   std::optional<ActionSpanDTO> action_span() const;
+  std::optional<ResolvedExecutionBindingDTO> resolved_binding() const;
 
   void stamp_details(std::map<std::string, std::string>& details) const;
   void stamp_snapshot(ExecutionSnapshot& snapshot) const;
@@ -37,6 +38,9 @@ class ExecutionCorrelationTracker {
 
   mutable std::mutex action_span_mutex_;
   std::optional<ActionSpanDTO> action_span_;
+
+  mutable std::mutex resolved_binding_mutex_;
+  std::optional<ResolvedExecutionBindingDTO> resolved_binding_;
 };
 
 }  // namespace manyforge::core

@@ -1,6 +1,7 @@
 #include "manyforge_deployment/cell_applicability.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -622,6 +623,59 @@ require_route_projection(const core::ControlBindingDTO& binding,
   return *projection;
 }
 
+void validate_runtime_scale_qualifications(
+    const core::ControlBindingDTO& binding) {
+  std::optional<core::ControlRouteId> previous_route;
+  for (const auto& qualification :
+       binding.runtime_scale_route_qualifications) {
+    if (qualification.control_route_id.empty() ||
+        qualification.scaling_domain_id.empty() ||
+        qualification.command_endpoint_role_id.empty() ||
+        qualification.applied_state_endpoint_role_id.empty() ||
+        (qualification.coordinated_barrier_id.has_value() &&
+         qualification.coordinated_barrier_id->empty()) ||
+        !std::isfinite(qualification.maximum_slew_per_second) ||
+        qualification.maximum_slew_per_second <= 0.0 ||
+        qualification.freshness_budget_ns <= 0 ||
+        qualification.freshness_budget_ns > 9007199254740991LL) {
+      fail("runtime-scale route qualification is malformed or outside the "
+           "lossless retained-artifact bounds");
+    }
+    if (previous_route.has_value() &&
+        qualification.control_route_id <= *previous_route) {
+      fail("runtime-scale route qualifications are not canonical and unique");
+    }
+    previous_route = qualification.control_route_id;
+    if (!std::binary_search(binding.legal_control_route_ids.begin(),
+                            binding.legal_control_route_ids.end(),
+                            qualification.control_route_id)) {
+      fail("runtime-scale qualification names a route outside the binding's "
+           "legal set");
+    }
+    const auto& projection =
+        require_route_projection(binding, qualification.control_route_id);
+    if (std::count(projection.command_endpoint_role_ids.begin(),
+                   projection.command_endpoint_role_ids.end(),
+                   qualification.command_endpoint_role_id) != 1) {
+      fail("runtime-scale command endpoint is not an exact command projection "
+           "of the qualified route");
+    }
+    if (std::count(projection.state_endpoint_role_ids.begin(),
+                   projection.state_endpoint_role_ids.end(),
+                   qualification.applied_state_endpoint_role_id) != 1) {
+      fail("runtime-scale acknowledgement endpoint is not an exact state "
+           "projection of the qualified route");
+    }
+    switch (qualification.acknowledgement_kind) {
+      case core::RuntimeScaleAcknowledgementKind::kAppliedState:
+        break;
+      default:
+        fail("runtime-scale qualification has an unknown acknowledgement "
+             "kind");
+    }
+  }
+}
+
 [[nodiscard]] std::vector<core::ResourceRoleId>
 target_resource_role_order(
     const core::ComponentTypeCommandTargetDTO& target) {
@@ -993,6 +1047,7 @@ void require_target_capability(
         *indexes.topologies.at(
             pair_key(binding.controller_topology_id,
                      binding.topology_revision));
+    validate_runtime_scale_qualifications(binding);
     const auto& manifest =
         *indexes.manifests.at(
             pair_key(binding.provider_manifest_id,

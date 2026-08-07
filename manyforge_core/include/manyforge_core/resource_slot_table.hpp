@@ -83,6 +83,14 @@ class ResourceSlotTable final {
       const std::vector<ResourceId>& resources,
       OperationRevision next_operation_revision);
 
+  /// Atomically advance slot state and owning operation revision. This is the
+  /// acceptance primitive for controls such as scoped Stop whose state and
+  /// CAS fence must never be observably split.
+  [[nodiscard]] Result<ResourceSlotOwnerDTO> transition_and_revise_owner(
+      const ResourceSlotOwnerDTO& owner,
+      const std::vector<ResourceId>& resources, ResourceSlotState next_state,
+      OperationRevision next_operation_revision);
+
   /// Clear an exact pre-dispatch reservation or acknowledged terminal scope.
   [[nodiscard]] Result<void> release(
       const ResourceSlotOwnerDTO& owner,

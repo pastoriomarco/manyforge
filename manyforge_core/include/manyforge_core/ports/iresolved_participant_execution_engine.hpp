@@ -10,6 +10,7 @@
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
+#include <manyforge_core/types/runtime_scale.hpp>
 
 namespace manyforge::core {
 
@@ -30,6 +31,15 @@ class IResolvedParticipantExecutionEngine {
   virtual AcknowledgeCompletedResultDTO acknowledge_completed(
       std::uint64_t execution_id,
       std::optional<std::uint64_t> expected_epoch = std::nullopt) = 0;
+
+  /// Private single-participant realization for the addressed owner's exact,
+  /// generation-fenced runtime-scale contract. The engine validates and
+  /// echoes the owner-resolved binding; it never selects or mints identities.
+  virtual Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
+      const ResolvedRuntimeScaleCommandDTO& command) = 0;
+  virtual Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
+      const OperationId& operation_id,
+      const ControlBindingId& control_binding_id) const = 0;
 
   virtual GripperCommandResultDTO command_gripper(
       const GripperCommandRequestDTO& request) = 0;

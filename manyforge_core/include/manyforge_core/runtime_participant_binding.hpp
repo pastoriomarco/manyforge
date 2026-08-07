@@ -68,6 +68,10 @@ struct RuntimeControlPathDTO final {
   StopEvidencePolicyId stop_evidence_policy_id;
   StopEvidencePolicyRevision stop_evidence_policy_revision;
   ContainmentGranularity containment_granularity{ContainmentGranularity::kResource};
+  /// Exact route-specific retained scaling evidence. Absence is an explicit
+  /// unsupported result, never permission for adapter inference.
+  std::optional<RuntimeScaleRouteQualificationDTO>
+      runtime_scale_qualification;
 
   friend bool operator==(const RuntimeControlPathDTO&, const RuntimeControlPathDTO&) = default;
 };

@@ -7157,6 +7157,14 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   auto prev_state = sm_.status().state;
   sm_.set_execution_id(exec_id);
   set_active_request_correlation(request);
+  if (request.initial_runtime_scale.has_value()) {
+    auto scale_acceptance = set_runtime_scale(*request.initial_runtime_scale);
+    if (!scale_acceptance.ok()) {
+      clear_active_request_correlation();
+      sm_.set_execution_id(0);
+      return Result<uint64_t>::Err(scale_acceptance.error());
+    }
+  }
   auto transition = sm_.try_transition(ExecutionState::kPlanning);
   if (!transition.ok()) {
     clear_active_request_correlation();
@@ -10683,6 +10691,275 @@ void ExecutionKernel::set_runtime_velocity_scale(
               {},
               std::nullopt,
               std::move(details)});
+}
+
+namespace {
+
+[[nodiscard]] bool resolved_scale_target_matches(
+    const ResolvedRuntimeScaleCommandDTO& command,
+    const ResolvedExecutionBindingDTO& binding) {
+  if (!binding.runtime_scale_qualification.has_value()) {
+    return false;
+  }
+  const auto& qualification = *binding.runtime_scale_qualification;
+  return command.operation_id == binding.operation_id &&
+         command.participant_id == binding.participant_id &&
+         command.controllable_component_id ==
+             binding.controllable_component_id &&
+         command.command_target_id == binding.command_target_id &&
+         command.capability_id == binding.capability_id &&
+         command.control_domain_id == binding.control_domain_id &&
+         command.control_domain_revision == binding.control_domain_revision &&
+         command.control_binding_id == binding.control_binding_id &&
+         command.control_binding_revision ==
+             binding.control_binding_revision &&
+         command.controller_goal_id == binding.controller_goal_id &&
+         command.controller_goal_generation ==
+             binding.controller_goal_generation &&
+         command.controller_topology_id == binding.controller_topology_id &&
+         command.topology_revision == binding.topology_revision &&
+         command.control_route_id == binding.control_route_id &&
+         command.control_route_id == qualification.control_route_id &&
+         command.scaling_domain_id == qualification.scaling_domain_id &&
+         command.coordinated_barrier_id ==
+             qualification.coordinated_barrier_id &&
+         command.resources == binding.resources &&
+         command.active_control_configuration_id ==
+             binding.active_control_configuration_id &&
+         command.active_control_configuration_generation ==
+             binding.active_control_configuration_generation;
+}
+
+[[nodiscard]] bool resolved_scale_command_well_formed(
+    const ResolvedRuntimeScaleCommandDTO& command) {
+  return !command.operation_id.empty() &&
+         command.operation_revision.nonzero() &&
+         !command.participant_id.empty() &&
+         !command.controllable_component_id.empty() &&
+         !command.command_target_id.empty() && !command.capability_id.empty() &&
+         !command.control_domain_id.empty() &&
+         !command.control_domain_revision.empty() &&
+         !command.control_binding_id.empty() &&
+         !command.control_binding_revision.empty() &&
+         !command.controller_goal_id.empty() &&
+         command.controller_goal_generation.nonzero() &&
+         !command.controller_topology_id.empty() &&
+         !command.topology_revision.empty() &&
+         !command.control_route_id.empty() &&
+         !command.scaling_domain_id.empty() && !command.resources.empty() &&
+         !command.active_control_configuration_id.empty() &&
+         command.active_control_configuration_generation.nonzero() &&
+         std::isfinite(command.requested_scale) &&
+         command.requested_scale >= 0.0 && command.requested_scale <= 1.0;
+}
+
+[[nodiscard]] ResolvedRuntimeScaleAcceptedDTO make_scale_acceptance(
+    const ResolvedRuntimeScaleCommandDTO& command, std::uint64_t sequence,
+    std::int64_t accepted_at_ns) {
+  return ResolvedRuntimeScaleAcceptedDTO{
+      command.operation_id,
+      command.operation_revision,
+      command.participant_id,
+      command.controllable_component_id,
+      command.command_target_id,
+      command.capability_id,
+      command.control_domain_id,
+      command.control_domain_revision,
+      command.control_binding_id,
+      command.control_binding_revision,
+      command.controller_goal_id,
+      command.controller_goal_generation,
+      command.controller_topology_id,
+      command.topology_revision,
+      command.control_route_id,
+      command.scaling_domain_id,
+      command.coordinated_barrier_id,
+      command.resources,
+      command.active_control_configuration_id,
+      command.active_control_configuration_generation,
+      command.requested_runtime_scale_generation,
+      command.requested_scale,
+      sequence,
+      accepted_at_ns};
+}
+
+}  // namespace
+
+Result<ResolvedRuntimeScaleAcceptedDTO> ExecutionKernel::set_runtime_scale(
+    const ResolvedRuntimeScaleCommandDTO& command) {
+  std::lock_guard submission_lock(resolved_runtime_scale_submission_mutex_);
+  if (!resolved_scale_command_well_formed(command)) {
+    return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{
+        std::string(to_string(ErrorCode::kInvalidRequest)),
+        "resolved runtime-scale command is malformed",
+        {{"reason", "resolved_runtime_scale_command_invalid"}}});
+  }
+  const auto binding = active_correlation_.resolved_binding();
+  if (!binding.has_value() ||
+      !resolved_scale_target_matches(command, *binding)) {
+    return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{
+        std::string(to_string(ErrorCode::kExecutionRejected)),
+        "resolved runtime-scale command does not match the active binding",
+        {{"reason", "resolved_runtime_scale_binding_mismatch"}}});
+  }
+  const auto state = sm_.status().state;
+  if (state == ExecutionState::kStopping || state == ExecutionState::kStopped ||
+      state == ExecutionState::kCompleted || state == ExecutionState::kFailed ||
+      state == ExecutionState::kInterrupted ||
+      state == ExecutionState::kInterventionRequired) {
+    return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{
+        std::string(to_string(ErrorCode::kInvalidStateTransition)),
+        "runtime scale is not admissible in the current execution state",
+        {{"reason", "runtime_scale_state_invalid"},
+         {"state", to_string(state)}}});
+  }
+  const auto mechanism = execution_backend_.runtime_velocity_scale_status();
+  if (!mechanism.supported) {
+    return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{
+        std::string(to_string(ErrorCode::kUnsupportedCapability)),
+        "execution mechanism has no qualified runtime-scale status",
+        {{"reason", "runtime_scale_mechanism_unsupported"}}});
+  }
+  if (mechanism.error.has_value()) {
+    return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(*mechanism.error);
+  }
+
+  ResolvedRuntimeScaleAcceptedDTO accepted = make_scale_acceptance(
+      command, 0U, 0);
+  {
+    std::lock_guard scale_lock(resolved_runtime_scale_mutex_);
+    if (accepted_resolved_runtime_scale_command_.has_value() &&
+        accepted_resolved_runtime_scale_command_->operation_id ==
+            command.operation_id) {
+      if (*accepted_resolved_runtime_scale_command_ == command &&
+          accepted_resolved_runtime_scale_result_.has_value()) {
+        return Result<ResolvedRuntimeScaleAcceptedDTO>::Ok(
+            *accepted_resolved_runtime_scale_result_);
+      }
+      const auto previous_generation =
+          accepted_resolved_runtime_scale_command_
+              ->requested_runtime_scale_generation;
+      if (command.expected_runtime_scale_generation != previous_generation ||
+          previous_generation.value() ==
+              std::numeric_limits<std::uint64_t>::max() ||
+          command.requested_runtime_scale_generation.value() !=
+              previous_generation.value() + 1U ||
+          command.operation_revision <
+              accepted_resolved_runtime_scale_command_->operation_revision) {
+        return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{
+            std::string(to_string(ErrorCode::kExecutionRejected)),
+            "resolved runtime-scale generation or operation revision is stale",
+            {{"reason", "resolved_runtime_scale_generation_stale"}}});
+      }
+    } else if (command.expected_runtime_scale_generation.value() != 0U ||
+               command.requested_runtime_scale_generation.value() != 0U) {
+      return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{
+          std::string(to_string(ErrorCode::kExecutionRejected)),
+          "a new operation must initialize runtime scale at generation zero",
+          {{"reason", "resolved_runtime_scale_initial_generation_invalid"}}});
+    }
+    if (runtime_scale_acceptance_sequence_ ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{
+          std::string(to_string(ErrorCode::kInternalError)),
+          "runtime-scale acceptance sequence is exhausted",
+          {{"reason", "runtime_scale_acceptance_sequence_exhausted"}}});
+    }
+    accepted = make_scale_acceptance(
+        command, ++runtime_scale_acceptance_sequence_, clock_.now());
+    accepted_resolved_runtime_scale_command_ = command;
+    accepted_resolved_runtime_scale_result_ = accepted;
+  }
+
+  set_runtime_velocity_scale(command.requested_scale);
+  return Result<ResolvedRuntimeScaleAcceptedDTO>::Ok(std::move(accepted));
+}
+
+Result<ResolvedRuntimeScaleStatusDTO> ExecutionKernel::runtime_scale_status(
+    const OperationId& operation_id,
+    const ControlBindingId& control_binding_id) const {
+  if (operation_id.empty() || control_binding_id.empty()) {
+    return Result<ResolvedRuntimeScaleStatusDTO>::Err(ErrorDTO{
+        std::string(to_string(ErrorCode::kInvalidRequest)),
+        "runtime-scale status query has an empty exact identity",
+        {{"reason", "runtime_scale_status_query_invalid"}}});
+  }
+  const auto binding = active_correlation_.resolved_binding();
+  if (!binding.has_value() || binding->operation_id != operation_id ||
+      binding->control_binding_id != control_binding_id) {
+    return Result<ResolvedRuntimeScaleStatusDTO>::Err(ErrorDTO{
+        std::string(to_string(ErrorCode::kMissingReference)),
+        "runtime-scale status query does not name the active binding",
+        {{"reason", "runtime_scale_status_binding_not_active"}}});
+  }
+  std::optional<ResolvedRuntimeScaleCommandDTO> command;
+  {
+    std::lock_guard scale_lock(resolved_runtime_scale_mutex_);
+    if (!accepted_resolved_runtime_scale_command_.has_value() ||
+        accepted_resolved_runtime_scale_command_->operation_id != operation_id ||
+        accepted_resolved_runtime_scale_command_->control_binding_id !=
+            control_binding_id) {
+      return Result<ResolvedRuntimeScaleStatusDTO>::Err(ErrorDTO{
+          std::string(to_string(ErrorCode::kMissingReference)),
+          "active binding has no accepted runtime-scale generation",
+          {{"reason", "runtime_scale_status_not_initialized"}}});
+    }
+    command = *accepted_resolved_runtime_scale_command_;
+  }
+
+  auto mechanism = execution_backend_.runtime_velocity_scale_status();
+  RuntimeScaleApplicationState application_state =
+      RuntimeScaleApplicationState::kPending;
+  if (!mechanism.supported) {
+    application_state = RuntimeScaleApplicationState::kRejected;
+    if (!mechanism.error.has_value()) {
+      mechanism.error = ErrorDTO{
+          std::string(to_string(ErrorCode::kUnsupportedCapability)),
+          "execution mechanism no longer reports runtime-scale support",
+          {{"reason", "runtime_scale_mechanism_unsupported"}}};
+    }
+  } else if (mechanism.error.has_value()) {
+    application_state = RuntimeScaleApplicationState::kFailed;
+  } else if (mechanism.active &&
+             mechanism.acknowledgement_sequence != 0U &&
+             std::abs(mechanism.commanded_scale - command->requested_scale) <=
+                 1e-12 &&
+             std::abs(mechanism.applied_scale - command->requested_scale) <=
+                 1e-9) {
+    application_state = RuntimeScaleApplicationState::kApplied;
+  }
+
+  return Result<ResolvedRuntimeScaleStatusDTO>::Ok(
+      ResolvedRuntimeScaleStatusDTO{
+          command->operation_id,
+          command->operation_revision,
+          command->participant_id,
+          command->controllable_component_id,
+          command->command_target_id,
+          command->capability_id,
+          command->control_domain_id,
+          command->control_domain_revision,
+          command->control_binding_id,
+          command->control_binding_revision,
+          command->controller_goal_id,
+          command->controller_goal_generation,
+          command->controller_topology_id,
+          command->topology_revision,
+          command->control_route_id,
+          command->scaling_domain_id,
+          command->coordinated_barrier_id,
+          command->resources,
+          command->active_control_configuration_id,
+          command->active_control_configuration_generation,
+          command->requested_runtime_scale_generation,
+          mechanism.commanded_scale,
+          mechanism.applied_scale,
+          mechanism.virtual_trajectory_time_s,
+          binding->provider_runtime_epoch,
+          mechanism.acknowledgement_sequence,
+          mechanism.acknowledgement_timestamp_ns,
+          application_state,
+          mechanism.error});
 }
 
 }  // namespace manyforge::core

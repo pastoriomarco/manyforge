@@ -29,7 +29,13 @@ namespace {
 }
 
 [[nodiscard]] bool valid_action_span(const ActionSpanDTO& span) noexcept {
-  if (span.action_span_id.empty()) {
+  const auto bounded = [](const std::string& value) {
+    return value.size() <= kMaxActionSpanFieldBytes;
+  };
+  if (span.action_span_id.empty() || !bounded(span.action_span_id) ||
+      !bounded(span.program_run_id) || !bounded(span.node_instance_id) ||
+      !bounded(span.node_attempt_id) ||
+      !bounded(span.parent_node_attempt_id)) {
     return false;
   }
   if (span.action_source == ActionSource::kProgramNode) {

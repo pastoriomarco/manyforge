@@ -1326,7 +1326,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog) {
          CanonicalValue(catalog.topology.value().topology_revision.value())},
         {"containment_granularity", CanonicalValue("resource")},
     });
-    bindings.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object arm_binding{
         {"control_binding_id", CanonicalValue(binding_id)},
         {"control_binding_revision",
          CanonicalValue(std::string(kZeroDigest))},
@@ -1379,7 +1379,24 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog) {
          CanonicalValue(
              catalog.stop.value().stop_evidence_policy_revision.value())},
         {"containment_granularity", CanonicalValue("resource")},
-    });
+    };
+    if (native_motion) {
+      arm_binding.emplace_back(
+          "runtime_scale_route_qualifications",
+          CanonicalValue(CanonicalValue::Array{CanonicalValue(
+              CanonicalValue::Object{
+                  {"control_route_id", CanonicalValue("arm_position")},
+                  {"scaling_domain_id",
+                   CanonicalValue(indexed_id("lite6_native_scale", instance))},
+                  {"command_endpoint_role_id", CanonicalValue("command")},
+                  {"applied_state_endpoint_role_id", CanonicalValue("state")},
+                  {"acknowledgement_kind",
+                   CanonicalValue("applied_state")},
+                  {"maximum_slew_per_second", CanonicalValue(4.0)},
+                  {"freshness_budget_ns", CanonicalValue(100'000'000.0)},
+              })}));
+    }
+    bindings.emplace_back(std::move(arm_binding));
     if (aggregate) {
       const auto& gripper_capability = *catalog.gripper_capability;
       const auto& gripper_contract = *catalog.gripper_contract;

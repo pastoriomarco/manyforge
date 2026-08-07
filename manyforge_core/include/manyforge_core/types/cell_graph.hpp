@@ -25,6 +25,13 @@ enum class StateAuthorityClass : std::uint8_t {
   kPredicted,
 };
 
+/// Binding-selected acknowledgement contract for a live runtime-scale
+/// command. The current closed alternative requires an independently readable
+/// applied-state value; command delivery alone is never application evidence.
+enum class RuntimeScaleAcknowledgementKind : std::uint8_t {
+  kAppliedState = 0,
+};
+
 [[nodiscard]] constexpr std::string_view to_string(ContainmentGranularity value) noexcept {
   switch (value) {
     case ContainmentGranularity::kResource:
@@ -45,6 +52,15 @@ enum class StateAuthorityClass : std::uint8_t {
       return "commanded";
     case StateAuthorityClass::kPredicted:
       return "predicted";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr std::string_view to_string(
+    RuntimeScaleAcknowledgementKind value) noexcept {
+  switch (value) {
+    case RuntimeScaleAcknowledgementKind::kAppliedState:
+      return "applied_state";
   }
   return {};
 }
@@ -70,6 +86,25 @@ struct RouteEndpointProjectionDTO {
 
   friend bool operator==(const RouteEndpointProjectionDTO&,
                          const RouteEndpointProjectionDTO&) = default;
+};
+
+/// Route-specific retained qualification for ADR-0018 runtime scaling.
+/// Absence means unsupported. Endpoint roles must belong to the named route's
+/// exact command/state projections; no runtime adapter may infer support from
+/// provider brand or implementation type.
+struct RuntimeScaleRouteQualificationDTO {
+  ControlRouteId control_route_id;
+  ScalingDomainId scaling_domain_id;
+  EndpointRoleId command_endpoint_role_id;
+  EndpointRoleId applied_state_endpoint_role_id;
+  std::optional<CoordinatedScalingBarrierId> coordinated_barrier_id;
+  RuntimeScaleAcknowledgementKind acknowledgement_kind{
+      RuntimeScaleAcknowledgementKind::kAppliedState};
+  double maximum_slew_per_second{};
+  std::int64_t freshness_budget_ns{};
+
+  friend bool operator==(const RuntimeScaleRouteQualificationDTO&,
+                         const RuntimeScaleRouteQualificationDTO&) = default;
 };
 
 struct ComponentAttachmentEndpointDTO {
@@ -154,6 +189,10 @@ struct ControlBindingDTO {
   StopEvidencePolicyId stop_evidence_policy_id;
   StopEvidencePolicyRevision stop_evidence_policy_revision;
   ContainmentGranularity containment_granularity;
+  /// Canonical route-keyed qualifications. Empty means this binding has no
+  /// retained operation-scoped runtime-scaling support.
+  std::vector<RuntimeScaleRouteQualificationDTO>
+      runtime_scale_route_qualifications;
 
   friend bool operator==(const ControlBindingDTO&, const ControlBindingDTO&) = default;
 };

@@ -90,6 +90,13 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   // ADR-0018: atomic per-tick read of the runtime velocity scale so the UI
   // slider retimes in-flight discrete motion without stopping.
   void set_runtime_velocity_scale(double scale) override;
+  core::RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status()
+      const override;
+
+  [[nodiscard]] static constexpr double
+  qualified_runtime_scale_slew_per_second() noexcept {
+    return 4.0;
+  }
 
   RoboPlanSceneProjectionMetrics scene_projection_metrics() const;
 

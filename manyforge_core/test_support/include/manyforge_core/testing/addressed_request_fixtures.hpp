@@ -31,6 +31,8 @@ inline ResolvedExecutionBindingDTO make_test_execution_binding(
   return ResolvedExecutionBindingDTO{
       OperationId("operation:test"),
       OperationParticipantId("participant:test"),
+      ControllerGoalId("controller-goal:test"),
+      ControllerGoalGeneration(1U),
       ProgramId("program:test"),
       ProgramRevision("program-revision:test"),
       ProgramBindingId("program-binding:test"),
@@ -78,7 +80,8 @@ inline ResolvedExecutionBindingDTO make_test_execution_binding(
       ResolvedComponentModelFrameDTO{component_id, model_id, FrameRoleId("frame-role:tcp"), "tcp",
                                      model_revision},
       {},
-      {}};
+      {},
+      std::nullopt};
 }
 
 inline ExecuteRequestDTO make_test_execute_request(

@@ -1246,6 +1246,7 @@ def test_all_six_graph_records_and_envelope_round_trip_read_only():
     assert values["binding"].provider_manifest_id == core.ProviderManifestId(
         "provider/xarm"
     )
+    assert values["binding"].runtime_scale_route_qualifications == []
     assert graph.component_attachments == [values["attachment"]]
     assert values["model_instance"].root_pose_in_cell is None
     assert values["component"].root_pose_in_cell == core.PlacementPoseDTO(
@@ -1359,6 +1360,26 @@ def test_control_binding_requires_distinct_manifest_identity():
     wrong_type_arguments["provider_manifest_id"] = binding.provider_instance_id
     with pytest.raises(TypeError):
         core.ControlBindingDTO(**wrong_type_arguments)
+
+
+def test_runtime_scale_route_qualification_preserves_strong_id_types():
+    qualification = core.RuntimeScaleRouteQualificationDTO(
+        control_route_id=core.ControlRouteId("route/jtc"),
+        scaling_domain_id=core.ScalingDomainId("scale/arm"),
+        command_endpoint_role_id=core.EndpointRoleId("runtime_scale_command"),
+        applied_state_endpoint_role_id=core.EndpointRoleId("runtime_scale_state"),
+        coordinated_barrier_id=core.CoordinatedScalingBarrierId("barrier/cell"),
+        acknowledgement_kind=core.RuntimeScaleAcknowledgementKind.kAppliedState,
+        maximum_slew_per_second=4.0,
+        freshness_budget_ns=100_000_000,
+    )
+
+    assert qualification.scaling_domain_id == core.ScalingDomainId("scale/arm")
+    assert qualification.coordinated_barrier_id == core.CoordinatedScalingBarrierId(
+        "barrier/cell"
+    )
+    assert qualification.maximum_slew_per_second == 4.0
+    assert qualification.freshness_budget_ns == 100_000_000
 
 
 def test_graph_dto_constructors_do_not_coerce_raw_strings_to_strong_ids():

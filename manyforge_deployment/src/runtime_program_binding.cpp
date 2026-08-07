@@ -330,6 +330,18 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
           resource_binding.resource_role_id, resource_binding.resource_id,
           projection.source_joint_name, projection.compiled_joint_name, kind});
     }
+    std::optional<core::RuntimeScaleRouteQualificationDTO>
+        runtime_scale_qualification;
+    const auto qualified_scale = std::find_if(
+        binding.runtime_scale_route_qualifications.begin(),
+        binding.runtime_scale_route_qualifications.end(),
+        [&](const auto &candidate) {
+          return candidate.control_route_id == active_facts.control_route_id;
+        });
+    if (qualified_scale !=
+        binding.runtime_scale_route_qualifications.end()) {
+      runtime_scale_qualification = *qualified_scale;
+    }
     control_path = core::RuntimeControlPathDTO{
         domain.control_domain_id,
         domain.control_domain_revision,
@@ -351,7 +363,8 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
         binding.state_authority_class,
         binding.stop_evidence_policy_id,
         binding.stop_evidence_policy_revision,
-        binding.containment_granularity};
+        binding.containment_granularity,
+        std::move(runtime_scale_qualification)};
   }
 
   std::optional<core::RuntimeCapabilityProviderPathDTO> provider_path;

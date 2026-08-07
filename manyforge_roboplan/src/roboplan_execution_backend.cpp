@@ -18,7 +18,6 @@ namespace {
 constexpr auto kExecutionTick = std::chrono::milliseconds(10);
 constexpr int kTerminalSceneProjectionRetryAttempts = 10;
 constexpr auto kTerminalSceneProjectionRetryDelay = std::chrono::milliseconds(20);
-constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
 
 double controlled_stop_wait_timeout_s(
     const core::MotionInterruptStopProfileDTO& profile,
@@ -451,7 +450,9 @@ void RoboPlanExecutionBackend::execution_worker(
     last_tick_ns = now_ns;
     const double target_scale = std::max(
         0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
-    const double max_delta = kRuntimeScaleSlewPerSecond * dt_s;
+    const double max_delta =
+        RoboPlanExecutionBackend::qualified_runtime_scale_slew_per_second() *
+        dt_s;
     if (target_scale > applied_runtime_scale + max_delta) {
       applied_runtime_scale += max_delta;
     } else if (target_scale < applied_runtime_scale - max_delta) {
@@ -1449,6 +1450,20 @@ void RoboPlanExecutionBackend::set_runtime_velocity_scale(double scale) {
   }
   // Wake the execution worker so a scale=0 hold or resume takes effect promptly.
   execution_cv_.notify_all();
+}
+
+core::RuntimeScaleMechanismStatusDTO
+RoboPlanExecutionBackend::runtime_velocity_scale_status() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  return core::RuntimeScaleMechanismStatusDTO{
+      true,
+      state_.running.load(std::memory_order_acquire),
+      runtime_velocity_scale_.load(std::memory_order_acquire),
+      state_.active_runtime_velocity_scale,
+      state_.active_trajectory_time_s,
+      state_.snapshot.sequence_number,
+      state_.snapshot.timestamp_ns,
+      std::nullopt};
 }
 
 void RoboPlanExecutionBackend::begin_controlled_stop_runtime_scale_freeze() {

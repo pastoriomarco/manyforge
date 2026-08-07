@@ -41,6 +41,8 @@ enum class OperationParticipantPayloadKind {
 
 struct OperationParticipantStateDTO final {
   OperationParticipantId participant_id;
+  ControllerGoalId controller_goal_id;
+  ControllerGoalGeneration controller_goal_generation;
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
   CapabilityId capability_id;
@@ -72,6 +74,39 @@ struct OperationStateDTO final {
   OperationStateKind state{OperationStateKind::kResolving};
   std::vector<OperationParticipantStateDTO> participants;
   std::int64_t updated_at_ns{};
+  std::optional<StopId> active_stop_id;
+  std::optional<StopGeneration> active_stop_generation;
+  std::optional<RuntimeScaleGeneration> runtime_scale_generation;
+};
+
+struct StopOperationTargetDTO final {
+  OperationId operation_id;
+  OperationRevision expected_operation_revision;
+  StopGeneration expected_stop_generation;
+
+  friend bool operator==(const StopOperationTargetDTO&,
+                         const StopOperationTargetDTO&) = default;
+};
+
+/// N4 ordinary operation Stop intent. I8 extends the same resource-addressed
+/// public identity with selected policy/certificate settlement; it does not
+/// replace this caller-owned scope.
+struct StopIntentDTO final {
+  PublicRequestContextDTO request_context;
+  std::vector<StopOperationTargetDTO> operations;
+  std::optional<std::string> reason;
+
+  friend bool operator==(const StopIntentDTO&, const StopIntentDTO&) = default;
+};
+
+struct StopAcceptedDTO final {
+  RequestId request_id;
+  RequestReplayStatusDTO replay_status;
+  StopId stop_id;
+  StopGeneration stop_generation;
+  std::vector<OperationId> operations;
+  OperationRevision operation_revision_after_acceptance;
+  std::int64_t accepted_at_ns{};
 };
 
 enum class OperationControlKind {
@@ -146,6 +181,12 @@ class ResourceAddressedExecutionKernel final {
   [[nodiscard]] Result<OperationControlAcceptedDTO> acknowledge_completed(
       const OperationControlRequestDTO& request);
 
+  [[nodiscard]] Result<StopAcceptedDTO> stop(const StopIntentDTO& intent);
+  [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale(
+      const RuntimeScaleRequestDTO& request);
+  [[nodiscard]] Result<RuntimeScaleStatusDTO> get_runtime_scale(
+      const OperationId& operation_id) const;
+
   /// Read-only owner projection. Subordinate polling and state advancement are
   /// performed only by reconcile_subordinate_state(), never by this method.
   [[nodiscard]] Result<OperationStateDTO> get_operation_state(
@@ -165,6 +206,8 @@ class ResourceAddressedExecutionKernel final {
  private:
   struct ReplayEntry;
   struct ControlReplayEntry;
+  struct StopReplayEntry;
+  struct RuntimeScaleReplayEntry;
   struct ActiveOperation;
   struct EngineSubscription;
 
@@ -179,6 +222,9 @@ class ResourceAddressedExecutionKernel final {
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
       const OperationControlRequestDTO& request,
       OperationControlKind control);
+  void apply_runtime_scale_status(
+      IResolvedParticipantExecutionEngine* engine,
+      const ResolvedRuntimeScaleStatusDTO& resolved_status);
 
   RuntimeParticipantRegistry registry_;
   ResourceSlotTable resource_slots_;
@@ -194,9 +240,12 @@ class ResourceAddressedExecutionKernel final {
   mutable std::mutex state_mutex_;
   std::vector<ReplayEntry> replay_ledger_;
   std::vector<ControlReplayEntry> control_replay_ledger_;
+  std::vector<StopReplayEntry> stop_replay_ledger_;
+  std::vector<RuntimeScaleReplayEntry> runtime_scale_replay_ledger_;
   std::unique_ptr<ActiveOperation> active_operation_;
   std::vector<EngineSubscription> engine_subscriptions_;
   std::uint64_t next_operation_id_{1U};
+  std::uint64_t next_stop_id_{1U};
 };
 
 }  // namespace manyforge::core

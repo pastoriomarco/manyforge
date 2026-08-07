@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace manyforge::core {
+
+inline constexpr std::size_t kMaxActionSpanFieldBytes = 512U;
 
 enum class ActionSource {
   kProgramNode,

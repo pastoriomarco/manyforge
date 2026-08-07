@@ -16,6 +16,10 @@ void ExecutionCorrelationTracker::set_from_request(
     std::lock_guard<std::mutex> lock(action_span_mutex_);
     action_span_ = request.action_span;
   }
+  {
+    std::lock_guard<std::mutex> lock(resolved_binding_mutex_);
+    resolved_binding_ = request.binding;
+  }
 }
 
 void ExecutionCorrelationTracker::clear_all() {
@@ -37,6 +41,10 @@ void ExecutionCorrelationTracker::clear_program_run_and_action_span() {
     std::lock_guard<std::mutex> lock(action_span_mutex_);
     action_span_.reset();
   }
+  {
+    std::lock_guard<std::mutex> lock(resolved_binding_mutex_);
+    resolved_binding_.reset();
+  }
 }
 
 std::string ExecutionCorrelationTracker::move_id() const {
@@ -47,6 +55,12 @@ std::string ExecutionCorrelationTracker::move_id() const {
 std::optional<ActionSpanDTO> ExecutionCorrelationTracker::action_span() const {
   std::lock_guard<std::mutex> lock(action_span_mutex_);
   return action_span_;
+}
+
+std::optional<ResolvedExecutionBindingDTO>
+ExecutionCorrelationTracker::resolved_binding() const {
+  std::lock_guard<std::mutex> lock(resolved_binding_mutex_);
+  return resolved_binding_;
 }
 
 void ExecutionCorrelationTracker::stamp_details(

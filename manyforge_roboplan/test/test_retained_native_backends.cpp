@@ -108,7 +108,16 @@ make_binding(CoordinateKind kind, std::string target = "gripper.target") {
           StateAuthorityClass::kPredicted,
           StopEvidencePolicyId("stop.native"),
           StopEvidencePolicyRevision("stop-revision"),
-          ContainmentGranularity::kResource},
+          ContainmentGranularity::kResource,
+          angular
+              ? std::optional(RuntimeScaleRouteQualificationDTO{
+                    ControlRouteId("route.native"),
+                    ScalingDomainId("scale.native"),
+                    EndpointRoleId("runtime_scale_command"),
+                    EndpointRoleId("runtime_scale_state"), std::nullopt,
+                    RuntimeScaleAcknowledgementKind::kAppliedState, 4.0,
+                    100'000'000})
+              : std::nullopt},
       std::nullopt,
       std::move(supporting_paths),
       {RuntimeUnitEpochBindingDTO{RuntimeUnitId("runtime.native"),
