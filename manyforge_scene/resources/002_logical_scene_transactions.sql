@@ -1,17 +1,20 @@
--- ManyForge N5b logical-scene transaction extension, version 3.
+-- ManyForge N5b logical-scene transaction extension, version 4.
 --
 -- Version 2 remains the immutable I4 bootstrap/Apply lineage. This migration
 -- adds the bounded append-only public request journal without moving or
--- rewriting any accepted I4 fact.
+-- rewriting any accepted I4 fact. Version 4 also fixes the stored payload
+-- contract after restoring portable object support declarations and the
+-- configured/effective collision-policy distinction. Version-3 stores are
+-- rejected rather than interpreted under the wider payload semantics.
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 
 CREATE TABLE IF NOT EXISTS logical_scene_store_migrations (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL CHECK (
-        schema_id = 'manyforge.internal.logical-scene.n5b.v3'
+        schema_id = 'manyforge.internal.logical-scene.n5b.v4'
     ),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 3),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 4),
     migration_artifact_digest TEXT NOT NULL CHECK (
         length(migration_artifact_digest) = 71
         AND substr(migration_artifact_digest, 1, 7) = 'sha256:'
@@ -193,7 +196,7 @@ CREATE TABLE IF NOT EXISTS logical_scene_projection_results (
 ) WITHOUT ROWID, STRICT;
 
 -- One durable total order for accepted scene intents and finalized named
--- Applies. The individual v2/v3 ledgers remain the complete typed evidence;
+-- Applies. The individual v2/v4 ledgers remain the complete typed evidence;
 -- this table records only ordering so restart cannot guess whether a scene
 -- request (including a failed or interrupted one) preceded or followed a
 -- structural transition.

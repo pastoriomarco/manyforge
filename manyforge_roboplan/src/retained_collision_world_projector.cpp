@@ -49,14 +49,12 @@ core::Pose3DTO compose_pose(const core::Pose3DTO& parent_from_frame,
       quaternion(parent_from_frame.orientation);
   const Eigen::Quaterniond object_rotation =
       quaternion(frame_from_object.orientation);
-  const Eigen::Vector3d parent_translation(
-      parent_from_frame.position_m.x_m,
-      parent_from_frame.position_m.y_m,
-      parent_from_frame.position_m.z_m);
-  const Eigen::Vector3d object_translation(
-      frame_from_object.position_m.x_m,
-      frame_from_object.position_m.y_m,
-      frame_from_object.position_m.z_m);
+  const Eigen::Vector3d parent_translation(parent_from_frame.position_m.x_m,
+                                           parent_from_frame.position_m.y_m,
+                                           parent_from_frame.position_m.z_m);
+  const Eigen::Vector3d object_translation(frame_from_object.position_m.x_m,
+                                           frame_from_object.position_m.y_m,
+                                           frame_from_object.position_m.z_m);
   const Eigen::Vector3d translation =
       parent_translation + parent_rotation * object_translation;
   const Eigen::Quaterniond rotation =
@@ -71,14 +69,14 @@ const RetainedCollisionModelMapInput::Target* find_target(
     const RetainedCollisionModelMapInput& model_map,
     const core::ControllableComponentId& component_id,
     const core::CommandTargetId& command_target_id) {
-  const auto found = std::lower_bound(
-      model_map.targets.begin(), model_map.targets.end(),
-      std::tie(component_id, command_target_id),
-      [](const RetainedCollisionModelMapInput::Target& target,
-         const auto& key) {
-        return std::tie(target.controllable_component_id,
-                        target.command_target_id) < key;
-      });
+  const auto found =
+      std::lower_bound(model_map.targets.begin(), model_map.targets.end(),
+                       std::tie(component_id, command_target_id),
+                       [](const RetainedCollisionModelMapInput::Target& target,
+                          const auto& key) {
+                         return std::tie(target.controllable_component_id,
+                                         target.command_target_id) < key;
+                       });
   return found != model_map.targets.end() &&
                  found->controllable_component_id == component_id &&
                  found->command_target_id == command_target_id
@@ -86,8 +84,7 @@ const RetainedCollisionModelMapInput::Target* find_target(
              : nullptr;
 }
 
-const collision::RetainedComponentModelFrameProjectionInput*
-find_carrier_frame(
+const collision::RetainedComponentModelFrameProjectionInput* find_carrier_frame(
     const RetainedCollisionModelMapInput::Target& target,
     const core::ComponentSceneFrameRefDTO& carrier) {
   const auto found = std::find_if(
@@ -106,6 +103,23 @@ core::CollisionPairId canonical_pair(core::CollisionBodyId left,
     std::swap(left, right);
   }
   return {std::move(left), std::move(right)};
+}
+
+core::SupportContactPolicyEntry support_policy_entry(
+    core::CollisionPairId pair, const core::SupportContactDTO& declaration) {
+  return {
+      std::move(pair),
+      declaration.mode,
+      declaration.release_evidence_mode,
+      declaration.enforce_max_start_penetration,
+      declaration.max_start_penetration_m,
+      declaration.release_tolerance_m,
+      declaration.min_release_progress_m,
+      declaration.max_contact_penetration_m,
+      declaration.require_separation_by_end,
+      declaration.require_strictly_decreasing_penetration,
+      declaration.allow_recontact,
+  };
 }
 
 std::string scene_body_id(const core::SceneResourceId& resource_id,
@@ -139,16 +153,14 @@ core::CollisionGeometryDescriptor scene_geometry_descriptor(
           descriptor.cylinder_height_m = value.height_m;
           descriptor.quality_labels.push_back("primitive");
         } else {
-          descriptor.geometry_kind =
-              core::CollisionGeometryKind::kTriangleMesh;
+          descriptor.geometry_kind = core::CollisionGeometryKind::kTriangleMesh;
           descriptor.source_uri = value.resource_uri;
           descriptor.mesh_scale = value.scale;
           descriptor.quality_labels.push_back("collision_mesh");
         }
       },
       shape);
-  std::sort(descriptor.quality_labels.begin(),
-            descriptor.quality_labels.end());
+  std::sort(descriptor.quality_labels.begin(), descriptor.quality_labels.end());
   return descriptor;
 }
 
@@ -170,8 +182,8 @@ RetainedCollisionWorldProjector RetainedCollisionWorldProjector::create(
                      std::tie(right.controllable_component_id,
                               right.command_target_id);
             });
-  for (std::size_t target_index = 0U;
-       target_index < model_map.targets.size(); ++target_index) {
+  for (std::size_t target_index = 0U; target_index < model_map.targets.size();
+       ++target_index) {
     const auto& target = model_map.targets[target_index];
     if (target.controllable_component_id.empty() ||
         target.command_target_id.empty() ||
@@ -184,15 +196,13 @@ RetainedCollisionWorldProjector RetainedCollisionWorldProjector::create(
           "retained collision target identity is incomplete or duplicated");
     }
     for (const auto& frame : target.frames) {
-      if (frame.controllable_component_id !=
-          target.controllable_component_id) {
+      if (frame.controllable_component_id != target.controllable_component_id) {
         throw RetainedCollisionWorldProjectionError(
             "retained collision target contains a foreign frame");
       }
     }
     for (const auto& body : target.bodies) {
-      if (body.controllable_component_id !=
-          target.controllable_component_id) {
+      if (body.controllable_component_id != target.controllable_component_id) {
         throw RetainedCollisionWorldProjectionError(
             "retained collision target contains a foreign body");
       }
@@ -258,23 +268,23 @@ RetainedCollisionWorldProjector::project_effective_policy(
     if (carried == nullptr) {
       continue;
     }
-    const auto attachment = std::lower_bound(
-        logical_scene.carried_object_attachments.begin(),
-        logical_scene.carried_object_attachments.end(),
-        carried->carried_object_attachment_id,
-        [](const core::CarriedObjectAttachmentDTO& candidate,
-           const core::CarriedObjectAttachmentId& id) {
-          return candidate.carried_object_attachment_id < id;
-        });
+    const auto attachment =
+        std::lower_bound(logical_scene.carried_object_attachments.begin(),
+                         logical_scene.carried_object_attachments.end(),
+                         carried->carried_object_attachment_id,
+                         [](const core::CarriedObjectAttachmentDTO& candidate,
+                            const core::CarriedObjectAttachmentId& id) {
+                           return candidate.carried_object_attachment_id < id;
+                         });
     if (attachment == logical_scene.carried_object_attachments.end() ||
         attachment->carried_object_attachment_id !=
             carried->carried_object_attachment_id) {
       return policy_projection_error(
           "carried scene resource has no exact attachment row");
     }
-    const auto* target = find_target(
-        model_map_, attachment->controllable_component_id,
-        attachment->command_target_id);
+    const auto* target =
+        find_target(model_map_, attachment->controllable_component_id,
+                    attachment->command_target_id);
     if (target == nullptr) {
       return policy_projection_error(
           "carried attachment names an unknown component/command target");
@@ -288,9 +298,8 @@ RetainedCollisionWorldProjector::project_effective_policy(
         }
         role_found = true;
         const std::string component_body_id =
-            "component/" +
-            target_body.controllable_component_id.value() + "/model/" +
-            target_body.model_instance_id.value() + "/body/" +
+            "component/" + target_body.controllable_component_id.value() +
+            "/model/" + target_body.model_instance_id.value() + "/body/" +
             target_body.collision_body_role_id.value() + "/collision/" +
             std::to_string(target_body.collision_index);
         for (std::size_t shape_index = 0U;
@@ -306,6 +315,37 @@ RetainedCollisionWorldProjector::project_effective_policy(
             "command target");
       }
     }
+
+    for (const auto& declaration : object.support_contacts) {
+      const auto support = std::lower_bound(
+          logical_scene.objects.begin(), logical_scene.objects.end(),
+          declaration.support_object_id,
+          [](const core::SceneObjectSnapshotDTO& candidate,
+             const std::string& support_id) {
+            return candidate.scene_resource_id.value() < support_id;
+          });
+      if (support == logical_scene.objects.end() ||
+          support->scene_resource_id.value() != declaration.support_object_id ||
+          support->scene_resource_id == object.scene_resource_id) {
+        return policy_projection_error(
+            "support declaration names an unknown or identical scene "
+            "resource");
+      }
+      for (std::size_t object_shape_index = 0U;
+           object_shape_index < object.collision_shapes.size();
+           ++object_shape_index) {
+        for (std::size_t support_shape_index = 0U;
+             support_shape_index < support->collision_shapes.size();
+             ++support_shape_index) {
+          effective.support_contacts.push_back(support_policy_entry(
+              canonical_pair(
+                  scene_body_id(object.scene_resource_id, object_shape_index),
+                  scene_body_id(support->scene_resource_id,
+                                support_shape_index)),
+              declaration));
+        }
+      }
+    }
   }
 
   std::sort(effective.allowed_touch_link_pairs.begin(),
@@ -314,6 +354,19 @@ RetainedCollisionWorldProjector::project_effective_policy(
       std::unique(effective.allowed_touch_link_pairs.begin(),
                   effective.allowed_touch_link_pairs.end()),
       effective.allowed_touch_link_pairs.end());
+  std::sort(effective.support_contacts.begin(),
+            effective.support_contacts.end(),
+            [](const auto& left, const auto& right) {
+              return left.pair < right.pair;
+            });
+  for (std::size_t index = 1U; index < effective.support_contacts.size();
+       ++index) {
+    if (effective.support_contacts[index - 1U].pair ==
+        effective.support_contacts[index].pair) {
+      return policy_projection_error(
+          "configured and derived support policy contain the same body pair");
+    }
+  }
 
   const auto validate_pair = [&](const core::CollisionPairId& pair) {
     return !pair.body_a.empty() && !pair.body_b.empty() &&
@@ -325,11 +378,9 @@ RetainedCollisionWorldProjector::project_effective_policy(
                    validate_pair) ||
       !std::all_of(effective.allowed_touch_link_pairs.begin(),
                    effective.allowed_touch_link_pairs.end(), validate_pair) ||
-      !std::all_of(effective.support_contacts.begin(),
-                   effective.support_contacts.end(),
-                   [&](const auto& entry) {
-                     return validate_pair(entry.pair);
-                   })) {
+      !std::all_of(
+          effective.support_contacts.begin(), effective.support_contacts.end(),
+          [&](const auto& entry) { return validate_pair(entry.pair); })) {
     return policy_projection_error(
         "effective collision policy references a body outside the projected "
         "collision world");
@@ -346,16 +397,14 @@ RetainedCollisionWorldProjector::project_effective_policy(
         "effective collision policy cannot be normalized: " +
         std::string(error.what()));
   }
-  return core::Result<core::CollisionPolicySnapshot>::Ok(
-      std::move(effective));
+  return core::Result<core::CollisionPolicySnapshot>::Ok(std::move(effective));
 }
 
 core::Result<core::CollisionWorldSnapshot>
 RetainedCollisionWorldProjector::project(
     const core::LogicalSceneSnapshotDTO& logical_scene,
     const std::uint64_t collision_world_revision_id,
-    const std::int64_t emitted_at_ns,
-    std::string publisher_id) const {
+    const std::int64_t emitted_at_ns, std::string publisher_id) const {
   if (!logical_scene.locally_valid()) {
     return projection_error(
         "logical scene is not a valid immutable projection input");
@@ -387,8 +436,7 @@ RetainedCollisionWorldProjector::project(
     const auto* fixed =
         std::get_if<core::CellFixedSceneObjectPlacementDTO>(&object.placement);
     if (fixed != nullptr && fixed->cell_id != model_map_.cell_id) {
-      return projection_error(
-          "cell-fixed scene resource names a foreign cell");
+      return projection_error("cell-fixed scene resource names a foreign cell");
     }
     std::optional<collision::RetainedCarriedObjectParentProjection>
         carried_parent;
@@ -400,14 +448,14 @@ RetainedCollisionWorldProjector::project(
         return projection_error(
             "scene resource has an unsupported placement variant");
       }
-      const auto attachment = std::lower_bound(
-          logical_scene.carried_object_attachments.begin(),
-          logical_scene.carried_object_attachments.end(),
-          carried->carried_object_attachment_id,
-          [](const core::CarriedObjectAttachmentDTO& candidate,
-             const core::CarriedObjectAttachmentId& id) {
-            return candidate.carried_object_attachment_id < id;
-          });
+      const auto attachment =
+          std::lower_bound(logical_scene.carried_object_attachments.begin(),
+                           logical_scene.carried_object_attachments.end(),
+                           carried->carried_object_attachment_id,
+                           [](const core::CarriedObjectAttachmentDTO& candidate,
+                              const core::CarriedObjectAttachmentId& id) {
+                             return candidate.carried_object_attachment_id < id;
+                           });
       if (attachment == logical_scene.carried_object_attachments.end() ||
           attachment->carried_object_attachment_id !=
               carried->carried_object_attachment_id) {
@@ -418,19 +466,17 @@ RetainedCollisionWorldProjector::project(
         return projection_error(
             "carried scene resource retains provider pose authority");
       }
-      const auto* target = find_target(
-          model_map_, attachment->controllable_component_id,
-          attachment->command_target_id);
+      const auto* target =
+          find_target(model_map_, attachment->controllable_component_id,
+                      attachment->command_target_id);
       if (target == nullptr) {
         return projection_error(
             "carried attachment names an unknown component/command target");
       }
-      const auto* carrier =
-          std::get_if<core::ComponentSceneFrameRefDTO>(
-              &attachment->carrier_frame_ref);
-      if (carrier == nullptr ||
-          carrier->controllable_component_id !=
-              target->controllable_component_id) {
+      const auto* carrier = std::get_if<core::ComponentSceneFrameRefDTO>(
+          &attachment->carrier_frame_ref);
+      if (carrier == nullptr || carrier->controllable_component_id !=
+                                    target->controllable_component_id) {
         return projection_error(
             "carried attachment has no exact component carrier frame");
       }
@@ -440,11 +486,10 @@ RetainedCollisionWorldProjector::project(
             "carried attachment carrier frame is absent from its addressed "
             "command target");
       }
-      auto resolved =
-          collision::ManyForgeCollisionEngine::
-              resolve_retained_carried_object_parent(
-                  shared_model_, carrier_frame->compiled_frame_name,
-                  target->bodies);
+      auto resolved = collision::ManyForgeCollisionEngine::
+          resolve_retained_carried_object_parent(
+              shared_model_, carrier_frame->compiled_frame_name,
+              target->bodies);
       if (!resolved.ok()) {
         return projection_error(resolved.error().message);
       }
@@ -459,17 +504,14 @@ RetainedCollisionWorldProjector::project(
       if (carried_parent.has_value()) {
         body.parent_body_id = carried_parent->parent_body_id;
         body.frame_id = carried_parent->compiled_parent_frame_name;
-        body.pose = compose_pose(
-            carried_parent->parent_frame_from_carrier,
-            carried_attachment->pose_in_carrier_frame);
+        body.pose = compose_pose(carried_parent->parent_frame_from_carrier,
+                                 carried_attachment->pose_in_carrier_frame);
       } else {
         body.frame_id = model_map_.compiled_cell_frame_name;
         body.pose = fixed->pose_in_cell;
       }
-      if (!carried_parent.has_value() &&
-          object.provider_evidence.has_value()) {
-        body.source_id =
-            object.provider_evidence->provider_instance_id.value();
+      if (!carried_parent.has_value() && object.provider_evidence.has_value()) {
+        body.source_id = object.provider_evidence->provider_instance_id.value();
         body.source_timestamp_ns = object.provider_evidence->received_at_ns;
         body.source_freshness_budget_ns =
             object.provider_evidence->source_freshness_budget_ns;

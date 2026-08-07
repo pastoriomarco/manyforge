@@ -355,6 +355,121 @@ class SupportContactPolicyRequest(StrictRequest):
     allow_recontact: bool
 
 
+class SceneSupportContactRequest(StrictRequest):
+    """Portable object-to-object support intent, never a native body pair."""
+
+    support_object_id: str
+    mode: Literal[
+        "contact_release", "bounded_penetration", "contact_process"
+    ] = "contact_release"
+    release_evidence_mode: Literal[
+        "signed_penetration", "binary_contact"
+    ] = "signed_penetration"
+    enforce_max_start_penetration: bool = True
+    max_start_penetration_m: Annotated[
+        float, Field(ge=0, allow_inf_nan=False)
+    ] = 0.0
+    release_tolerance_m: Annotated[
+        float, Field(ge=0, allow_inf_nan=False)
+    ] = 1e-5
+    min_release_progress_m: Annotated[
+        float, Field(ge=0, allow_inf_nan=False)
+    ] = 0.0
+    max_contact_penetration_m: Annotated[
+        float, Field(ge=0, allow_inf_nan=False)
+    ] = 0.0
+    require_separation_by_end: bool = True
+    require_strictly_decreasing_penetration: bool = True
+    allow_recontact: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_mode_scoped_neutral_defaults(cls, value):
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        mode = normalized.get("mode", "contact_release")
+        if mode in {"bounded_penetration", "contact_process"}:
+            normalized.setdefault("release_evidence_mode", "signed_penetration")
+            normalized.setdefault("enforce_max_start_penetration", False)
+            normalized.setdefault("max_start_penetration_m", 0.0)
+            normalized.setdefault("release_tolerance_m", 0.0)
+            normalized.setdefault("min_release_progress_m", 0.0)
+            normalized.setdefault("require_separation_by_end", False)
+            normalized.setdefault(
+                "require_strictly_decreasing_penetration", False
+            )
+            normalized.setdefault("allow_recontact", False)
+        elif normalized.get(
+            "release_evidence_mode", "signed_penetration"
+        ) == "binary_contact":
+            normalized.setdefault("enforce_max_start_penetration", False)
+            normalized.setdefault("max_start_penetration_m", 0.0)
+            normalized.setdefault("release_tolerance_m", 0.0)
+            normalized.setdefault("min_release_progress_m", 0.0)
+            normalized.setdefault(
+                "require_strictly_decreasing_penetration", False
+            )
+        return normalized
+
+    @field_validator("support_object_id")
+    @classmethod
+    def validate_support_object_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="support_object_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def validate_mode_scoped_fields(self) -> "SceneSupportContactRequest":
+        if self.mode == "contact_release":
+            if self.max_contact_penetration_m != 0.0:
+                raise ValueError(
+                    "max_contact_penetration_m is valid only for "
+                    "bounded_penetration"
+                )
+            if self.release_evidence_mode == "binary_contact" and (
+                self.enforce_max_start_penetration
+                or self.max_start_penetration_m != 0.0
+                or self.release_tolerance_m != 0.0
+                or self.min_release_progress_m != 0.0
+                or self.require_strictly_decreasing_penetration
+            ):
+                raise ValueError(
+                    "signed-distance metric fields must be neutral for "
+                    "binary_contact"
+                )
+            return self
+
+        if self.release_evidence_mode != "signed_penetration":
+            raise ValueError(
+                "release_evidence_mode is not applicable outside "
+                "contact_release"
+            )
+        if (
+            self.enforce_max_start_penetration
+            or self.max_start_penetration_m != 0.0
+            or self.release_tolerance_m != 0.0
+            or self.min_release_progress_m != 0.0
+            or self.require_separation_by_end
+            or self.require_strictly_decreasing_penetration
+            or self.allow_recontact
+        ):
+            raise ValueError(
+                "release-only fields must be neutral outside contact_release"
+            )
+        if (
+            self.mode == "contact_process"
+            and self.max_contact_penetration_m != 0.0
+        ):
+            raise ValueError(
+                "max_contact_penetration_m is valid only for "
+                "bounded_penetration"
+            )
+        return self
+
+
 class ContactGraspPolicyRequest(StrictRequest):
     policy_id: str
     selected_object_id: str
@@ -441,6 +556,9 @@ class AddSceneObjectRequest(StrictRequest):
     shape: CollisionShapeRequest
     pose: Pose3Request
     frame_ref: SceneFrameRequest
+    support_contacts: Annotated[
+        list[SceneSupportContactRequest], Field(max_length=4096)
+    ] = Field(default_factory=list)
 
     @field_validator("scene_resource_id")
     @classmethod
@@ -450,6 +568,26 @@ class AddSceneObjectRequest(StrictRequest):
             label="scene_resource_id",
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
+
+    @field_validator("support_contacts")
+    @classmethod
+    def canonicalize_support_contacts(
+        cls, values: list[SceneSupportContactRequest]
+    ) -> list[SceneSupportContactRequest]:
+        ordered = sorted(values, key=lambda value: value.support_object_id)
+        ids = [value.support_object_id for value in ordered]
+        if len(ids) != len(set(ids)):
+            raise ValueError("support_contacts contains a duplicate support")
+        return ordered
+
+    @model_validator(mode="after")
+    def reject_self_support(self) -> "AddSceneObjectRequest":
+        if any(
+            contact.support_object_id == self.scene_resource_id
+            for contact in self.support_contacts
+        ):
+            raise ValueError("scene resource cannot support itself")
+        return self
 
 
 class RemoveSceneObjectRequest(StrictRequest):

@@ -1,5 +1,4 @@
 #include <gtest/gtest.h>
-
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -10,14 +9,13 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <manyforge_component_manager/durable_store_set.hpp>
+#include <manyforge_component_manager/manager_apply_journal.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <manyforge_component_manager/durable_store_set.hpp>
-#include <manyforge_component_manager/manager_apply_journal.hpp>
-#include <manyforge_content_identity/content_identity.hpp>
 
 #include "manyforge_headless/source_snapshot.hpp"
 
@@ -325,6 +323,7 @@ std::string SceneAddRequest(const SourceSnapshot &scene_source,
                                           })},
                      {"type", CanonicalValue("box")},
                  })},
+                {"support_contacts", CanonicalValue(CanonicalValue::Array{})},
             })},
            {"request_context",
             CanonicalValue(CanonicalValue::Object{

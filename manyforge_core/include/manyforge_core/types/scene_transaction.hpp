@@ -19,6 +19,10 @@ struct AddObjectRequestDTO final {
   CollisionShapeDTO shape;
   Pose3DTO pose;
   SceneFrameRefDTO frame_ref;
+  /// Backend-neutral object-to-object support declarations. The scene owner
+  /// resolves these portable resource ids to instance-scoped collision bodies;
+  /// callers never author planner-native body names here.
+  std::vector<SupportContactDTO> support_contacts{};
 };
 
 struct RemoveObjectRequestDTO final {
@@ -91,6 +95,9 @@ struct ResolvedDetachCarriedObjectDTO final {
 };
 
 struct ResolvedCollisionPolicyDTO final {
+  /// The exact caller-configured policy retained in logical scene truth.
+  CollisionPolicySnapshot configured_policy;
+  /// The projection-ready policy after owner-derived touch/support allowances.
   CollisionPolicySnapshot effective_policy;
 };
 

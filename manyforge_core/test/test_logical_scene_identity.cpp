@@ -34,9 +34,9 @@ CollisionPolicySnapshot RichPolicy() {
   policy.policy_id = "rich-policy";
   policy.allowed_static_static_pairs = {
       {"scene/fixture-a/shape/0", "scene/fixture-b/shape/0"}};
-  policy.allowed_touch_link_pairs = {{
-      "component/arm-a/model/arm-model/body/finger-a/collision/0",
-      "scene/object-a/shape/0"}};
+  policy.allowed_touch_link_pairs = {
+      {"component/arm-a/model/arm-model/body/finger-a/collision/0",
+       "scene/object-a/shape/0"}};
   SupportContactPolicyEntry support;
   support.pair = {"scene/object-a/shape/0", "scene/support/shape/0"};
   support.mode = CollisionContactPolicyMode::kContactRelease;
@@ -52,8 +52,7 @@ CollisionPolicySnapshot RichPolicy() {
   support.allow_recontact = false;
   policy.support_contacts = {support};
   policy.contact_grasps = {ContactGraspPolicyEntry{
-      "grasp-a", "object-a", {"finger-a", "finger-b"},
-      0.0005, 0.8}};
+      "grasp-a", "object-a", {"finger-a", "finger-b"}, 0.0005, 0.8}};
   policy.require_full_diagnostics = true;
   return policy;
 }
@@ -96,8 +95,7 @@ LogicalSceneSnapshotDTO RichSnapshot() {
   snapshot.objects = {
       SceneObjectSnapshotDTO{
           SceneResourceId("object-a"),
-          {SphereShapeDTO{0.04},
-           BoxShapeDTO{Vector3DTO{0.1, 0.2, 0.3}}},
+          {SphereShapeDTO{0.04}, BoxShapeDTO{Vector3DTO{0.1, 0.2, 0.3}}},
           CellFixedSceneObjectPlacementDTO{
               CellId("cell-alpha"),
               Pose3DTO{Vector3DTO{0.1, 0.2, 0.3},
@@ -117,8 +115,7 @@ LogicalSceneSnapshotDTO RichSnapshot() {
       SceneObjectSnapshotDTO{
           SceneResourceId("object-b"),
           {MeshShapeDTO{"asset://tool.stl", Vector3DTO{1.0, 1.0, 1.0}}},
-          CarriedSceneObjectPlacementDTO{attachment_id,
-                                         attachment_revision},
+          CarriedSceneObjectPlacementDTO{attachment_id, attachment_revision},
           std::nullopt,
       },
   };
@@ -168,10 +165,10 @@ TEST(LogicalSceneIdentity, MintsPublishedSceneLineageGolden) {
 }
 
 TEST(LogicalSceneIdentity, RejectsInvalidOrUnsafeBootstrapIdentity) {
-  EXPECT_THROW(MintSceneId(LogicalSceneBootstrapIdentityInputDTO{
-                   CellId(""), BootstrapId("bootstrap-alpha"),
-                   BootstrapGeneration(1U)}),
-               LogicalSceneIdentityError);
+  EXPECT_THROW(
+      MintSceneId(LogicalSceneBootstrapIdentityInputDTO{
+          CellId(""), BootstrapId("bootstrap-alpha"), BootstrapGeneration(1U)}),
+      LogicalSceneIdentityError);
   EXPECT_THROW(MintSceneId(LogicalSceneBootstrapIdentityInputDTO{
                    CellId("cell-alpha"), BootstrapId("bootstrap-alpha"),
                    BootstrapGeneration(9007199254740992ULL)}),
@@ -207,8 +204,7 @@ TEST(LogicalSceneIdentity, PolicyDigestCoversEverySemanticSection) {
   expect_changed([](auto& value) {
     value.contact_grasps[0].terminal_window_start_fraction = 0.9;
   });
-  expect_changed(
-      [](auto& value) { value.require_full_diagnostics = false; });
+  expect_changed([](auto& value) { value.require_full_diagnostics = false; });
 
   auto revision_only = baseline;
   revision_only.revision = {123U, std::string(kDigestB)};
@@ -229,8 +225,7 @@ TEST(LogicalSceneIdentity, RejectsNoncanonicalPolicyInsteadOfNormalizingIt) {
                LogicalSceneIdentityError);
 
   policy = RichPolicy();
-  policy.contact_grasps[0].allowed_robot_links =
-      {"finger-b", "finger-a"};
+  policy.contact_grasps[0].allowed_robot_links = {"finger-b", "finger-a"};
   EXPECT_THROW(ComputeCollisionPolicyContentDigest(policy),
                LogicalSceneIdentityError);
 }
@@ -281,12 +276,16 @@ TEST(LogicalSceneIdentity, SceneHashCoversPortableContent) {
     value.objects[0].provider_evidence->provider_source_sequence += 1U;
   });
   expect_changed([](auto& value) {
+    value.objects[1].support_contacts = {
+        SupportContactDTO{.support_object_id = "object-a"}};
+  });
+  expect_changed([](auto& value) {
     value.carried_object_attachments[0].command_target_id =
         CommandTargetId("other-target");
     const auto revision = ComputeCarriedObjectAttachmentRevision(
         value.carried_object_attachments[0]);
-    value.carried_object_attachments[0]
-        .carried_object_attachment_revision = revision;
+    value.carried_object_attachments[0].carried_object_attachment_revision =
+        revision;
     std::get<CarriedSceneObjectPlacementDTO>(value.objects[1].placement)
         .carried_object_attachment_revision = revision;
   });
@@ -299,9 +298,9 @@ TEST(LogicalSceneIdentity, SceneHashExcludesLineageAndOwnerCounters) {
   const auto baseline = RichSnapshot();
   const auto digest = ComputeLogicalSceneContentHash(baseline);
   auto changed = baseline;
-  changed.revision = SceneRevision{
-      SceneId(kDigestB), std::numeric_limits<std::uint64_t>::max(),
-      ContentDigest("not-even-a-digest")};
+  changed.revision = SceneRevision{SceneId(kDigestB),
+                                   std::numeric_limits<std::uint64_t>::max(),
+                                   ContentDigest("not-even-a-digest")};
   changed.transaction_sequence = std::numeric_limits<std::uint64_t>::max();
   changed.topology_epoch = std::numeric_limits<std::uint64_t>::max();
   changed.policy_epoch = std::numeric_limits<std::uint64_t>::max();

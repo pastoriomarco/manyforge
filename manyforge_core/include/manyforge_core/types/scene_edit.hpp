@@ -2,6 +2,7 @@
 
 #include <string>
 #include <variant>
+#include <vector>
 
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/geometry.hpp>
@@ -53,6 +54,9 @@ struct SupportContactDTO {
   bool require_separation_by_end = true;
   bool require_strictly_decreasing_penetration = true;
   bool allow_recontact = false;
+
+  friend bool operator==(const SupportContactDTO&,
+                         const SupportContactDTO&) = default;
 };
 
 }  // namespace manyforge::core

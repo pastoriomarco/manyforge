@@ -291,6 +291,67 @@ def test_scene_transaction_is_strict_and_cannot_assert_attribution() -> None:
         SceneTransactionRequest.model_validate(malformed_revision)
 
 
+def test_scene_support_declarations_are_portable_and_mode_normalized() -> None:
+    body = _scene_transaction()
+    body["operation"] = {
+        **body["operation"],
+        "support_contacts": [
+            {
+                "support_object_id": "support-b",
+                "mode": "bounded_penetration",
+                "max_contact_penetration_m": 0.002,
+            },
+            {
+                "support_object_id": "support-a",
+                "release_evidence_mode": "binary_contact",
+            },
+        ],
+    }
+    parsed = SceneTransactionRequest.model_validate(body)
+    contacts = parsed.operation.support_contacts
+    assert [contact.support_object_id for contact in contacts] == [
+        "support-a",
+        "support-b",
+    ]
+    assert contacts[0].enforce_max_start_penetration is False
+    assert contacts[0].release_tolerance_m == 0.0
+    assert contacts[1].require_separation_by_end is False
+    assert contacts[1].max_contact_penetration_m == 0.002
+
+    self_supported = _scene_transaction()
+    self_supported["operation"] = {
+        **self_supported["operation"],
+        "support_contacts": [{"support_object_id": "part.1"}],
+    }
+    with pytest.raises(ValidationError, match="cannot support itself"):
+        SceneTransactionRequest.model_validate(self_supported)
+
+    duplicate = _scene_transaction()
+    duplicate["operation"] = {
+        **duplicate["operation"],
+        "support_contacts": [
+            {"support_object_id": "support-a"},
+            {"support_object_id": "support-a"},
+        ],
+    }
+    with pytest.raises(ValidationError, match="duplicate support"):
+        SceneTransactionRequest.model_validate(duplicate)
+
+    invalid_mode_mix = _scene_transaction()
+    invalid_mode_mix["operation"] = {
+        **invalid_mode_mix["operation"],
+        "support_contacts": [
+            {
+                "support_object_id": "support-a",
+                "mode": "contact_process",
+                "require_separation_by_end": True,
+            }
+        ],
+    }
+    with pytest.raises(ValidationError, match="release-only fields"):
+        SceneTransactionRequest.model_validate(invalid_mode_mix)
+
+
 def test_scene_policy_and_attachment_sets_require_canonical_order() -> None:
     body = _scene_transaction()
     body["operation"] = {

@@ -23,8 +23,7 @@ constexpr char kNonemptySceneDigest[] =
     "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 
 LogicalSceneSnapshotIdentityDTO Identity(
-    std::string cell = "cell-alpha",
-    std::string scene = kSceneId,
+    std::string cell = "cell-alpha", std::string scene = kSceneId,
     std::string content_hash = kCanonicalEmptySceneDigest) {
   return {
       SceneRevision{
@@ -57,17 +56,17 @@ LogicalSceneSnapshotDTO CanonicalEmptySnapshot(
   };
 }
 
-CollisionShapeDTO Box() {
-  return BoxShapeDTO{Vector3DTO{0.1, 0.2, 0.3}};
-}
+CollisionShapeDTO Box() { return BoxShapeDTO{Vector3DTO{0.1, 0.2, 0.3}}; }
 
 TEST(LogicalSceneSnapshot, DigestSpellingIsExactLowercaseSha256) {
   EXPECT_TRUE(IsExactLowercaseSha256Digest(kSceneId));
   EXPECT_FALSE(IsExactLowercaseSha256Digest(""));
   EXPECT_FALSE(IsExactLowercaseSha256Digest(
-      "SHA256:1702618655fff8c8b8f86181440bc94fb28d0a7853113bb5d162ebbe1d71be17"));
+      "SHA256:"
+      "1702618655fff8c8b8f86181440bc94fb28d0a7853113bb5d162ebbe1d71be17"));
   EXPECT_FALSE(IsExactLowercaseSha256Digest(
-      "sha256:1702618655fff8c8b8f86181440bc94fb28d0a7853113bb5d162ebbe1d71be1G"));
+      "sha256:"
+      "1702618655fff8c8b8f86181440bc94fb28d0a7853113bb5d162ebbe1d71be1G"));
   EXPECT_FALSE(IsExactLowercaseSha256Digest("sha256:1234"));
 }
 
@@ -97,15 +96,14 @@ TEST(LogicalSceneSnapshot, CanonicalEmptyRecognizesOwnerMintedValue) {
 
   EXPECT_FALSE(snapshot.canonical_empty_for(
       Identity("cell-beta", kOtherSceneId, kCanonicalEmptySceneDigest)));
-  EXPECT_FALSE(snapshot.canonical_empty_for(
-      LogicalSceneSnapshotIdentityDTO{
-          SceneRevision{
-              SceneId(kSceneId),
-              2U,
-              ContentDigest(kCanonicalEmptySceneDigest),
-          },
-          CellId("cell-alpha"),
-      }));
+  EXPECT_FALSE(snapshot.canonical_empty_for(LogicalSceneSnapshotIdentityDTO{
+      SceneRevision{
+          SceneId(kSceneId),
+          2U,
+          ContentDigest(kCanonicalEmptySceneDigest),
+      },
+      CellId("cell-alpha"),
+  }));
 }
 
 TEST(LogicalSceneSnapshot, CanonicalEmptyRequiresExactCountersAndPolicy) {
@@ -136,7 +134,8 @@ TEST(LogicalSceneSnapshot, RevisionRejectsNoncanonicalDigestSpellings) {
   EXPECT_FALSE(revision.valid());
   revision.scene_id = SceneId(kSceneId);
   revision.content_hash = ContentDigest(
-      "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+      "sha256:"
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   EXPECT_FALSE(revision.valid());
 }
 
@@ -177,6 +176,47 @@ TEST(LogicalSceneSnapshot, CellFixedRowsMustUseSnapshotCellAndCanonicalOrder) {
   EXPECT_FALSE(snapshot.locally_valid());
 }
 
+TEST(LogicalSceneSnapshot,
+     SupportDeclarationsRequireCanonicalResolvableUniqueRelationships) {
+  auto snapshot = CanonicalEmptySnapshot(
+      Identity("cell-alpha", kSceneId, kNonemptySceneDigest));
+  snapshot.objects = {
+      SceneObjectSnapshotDTO{
+          SceneResourceId("object-a"),
+          {Box()},
+          CellFixedSceneObjectPlacementDTO{CellId("cell-alpha"), Pose3DTO{}},
+          std::nullopt,
+          {SupportContactDTO{.support_object_id = "support-a"}},
+      },
+      SceneObjectSnapshotDTO{
+          SceneResourceId("support-a"),
+          {Box()},
+          CellFixedSceneObjectPlacementDTO{CellId("cell-alpha"), Pose3DTO{}},
+          std::nullopt,
+          {},
+      },
+  };
+  EXPECT_TRUE(snapshot.locally_valid());
+
+  auto missing = snapshot;
+  missing.objects[0].support_contacts[0].support_object_id = "support-missing";
+  EXPECT_FALSE(missing.locally_valid());
+
+  auto self = snapshot;
+  self.objects[0].support_contacts[0].support_object_id = "object-a";
+  EXPECT_FALSE(self.locally_valid());
+
+  auto reciprocal = snapshot;
+  reciprocal.objects[1].support_contacts = {
+      SupportContactDTO{.support_object_id = "object-a"}};
+  EXPECT_FALSE(reciprocal.locally_valid());
+
+  auto noncanonical_binary = snapshot;
+  noncanonical_binary.objects[0].support_contacts[0].release_evidence_mode =
+      ContactReleaseEvidenceMode::kBinaryContact;
+  EXPECT_FALSE(noncanonical_binary.locally_valid());
+}
+
 TEST(LogicalSceneSnapshot, CarriedObjectAndAttachmentAreOneToOne) {
   auto snapshot = CanonicalEmptySnapshot(
       Identity("cell-alpha", kSceneId, kNonemptySceneDigest));
@@ -185,7 +225,8 @@ TEST(LogicalSceneSnapshot, CarriedObjectAndAttachmentAreOneToOne) {
   snapshot.policy_epoch = 2U;
   const CarriedObjectAttachmentId attachment_id("attachment-a");
   const CarriedObjectAttachmentRevision attachment_revision(
-      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      "sha256:"
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
   snapshot.objects = {
       SceneObjectSnapshotDTO{
           SceneResourceId("object-a"),

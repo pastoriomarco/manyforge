@@ -3,6 +3,10 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <manyforge_core/types/active_bundle_publication.hpp>
+#include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/configuration_fence.hpp>
+#include <manyforge_core/types/logical_scene_snapshot.hpp>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -10,11 +14,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <manyforge_core/types/active_bundle_publication.hpp>
-#include <manyforge_core/types/collision.hpp>
-#include <manyforge_core/types/configuration_fence.hpp>
-#include <manyforge_core/types/logical_scene_snapshot.hpp>
 
 namespace manyforge::headless {
 namespace {
@@ -529,6 +528,28 @@ CanonicalValue CollisionPolicy(const core::CollisionPolicySnapshot &value) {
   });
 }
 
+CanonicalValue SupportDeclaration(const core::SupportContactDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"allow_recontact", CanonicalValue(value.allow_recontact)},
+      {"enforce_max_start_penetration",
+       CanonicalValue(value.enforce_max_start_penetration)},
+      {"max_contact_penetration_m",
+       CanonicalValue(value.max_contact_penetration_m)},
+      {"max_start_penetration_m",
+       CanonicalValue(value.max_start_penetration_m)},
+      {"min_release_progress_m", CanonicalValue(value.min_release_progress_m)},
+      {"mode", CanonicalValue(std::string(ContactMode(value.mode)))},
+      {"release_evidence_mode", CanonicalValue(std::string(ReleaseEvidence(
+                                    value.release_evidence_mode)))},
+      {"release_tolerance_m", CanonicalValue(value.release_tolerance_m)},
+      {"require_separation_by_end",
+       CanonicalValue(value.require_separation_by_end)},
+      {"require_strictly_decreasing_penetration",
+       CanonicalValue(value.require_strictly_decreasing_penetration)},
+      {"support_object_id", CanonicalValue(value.support_object_id)},
+  });
+}
+
 CanonicalValue Vector(const core::Vector3DTO &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"x", CanonicalValue(value.x_m)},
@@ -642,6 +663,11 @@ CanonicalValue SceneObject(const core::SceneObjectSnapshotDTO &value) {
   for (const auto &shape : value.collision_shapes) {
     shapes.emplace_back(Shape(shape));
   }
+  CanonicalValue::Array support_contacts;
+  support_contacts.reserve(value.support_contacts.size());
+  for (const auto &contact : value.support_contacts) {
+    support_contacts.emplace_back(SupportDeclaration(contact));
+  }
   const auto placement = std::visit(
       [](const auto &entry) -> CanonicalValue {
         using T = std::decay_t<decltype(entry)>;
@@ -671,6 +697,7 @@ CanonicalValue SceneObject(const core::SceneObjectSnapshotDTO &value) {
                                 ? ProviderEvidence(*value.provider_evidence)
                                 : CanonicalValue(nullptr)},
       {"scene_resource_id", CanonicalValue(value.scene_resource_id.value())},
+      {"support_contacts", CanonicalValue(std::move(support_contacts))},
   });
 }
 

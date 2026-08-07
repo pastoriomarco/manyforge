@@ -1,14 +1,12 @@
 #include "logical_scene_codec_internal.hpp"
 
-#include <manyforge_scene/scene_transaction_codec.hpp>
-
-#include <manyforge_content_identity/canonical_value.hpp>
-#include <manyforge_core/logical_scene_identity.hpp>
-#include <manyforge_deployment/artifact_codec.hpp>
-
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_scene/scene_transaction_codec.hpp>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -327,6 +325,73 @@ core::ContactReleaseEvidenceMode DecodeReleaseMode(std::string_view mode) {
   Fail("contact release evidence mode is unsupported");
 }
 
+CanonicalValue SupportDeclaration(const core::SupportContactDTO &contact) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"allow_recontact", CanonicalValue(contact.allow_recontact)},
+      {"enforce_max_start_penetration",
+       CanonicalValue(contact.enforce_max_start_penetration)},
+      {"max_contact_penetration_m",
+       CanonicalValue(contact.max_contact_penetration_m)},
+      {"max_start_penetration_m",
+       CanonicalValue(contact.max_start_penetration_m)},
+      {"min_release_progress_m",
+       CanonicalValue(contact.min_release_progress_m)},
+      {"mode", CanonicalValue(std::string(ContactMode(contact.mode)))},
+      {"release_evidence_mode",
+       CanonicalValue(std::string(ReleaseMode(contact.release_evidence_mode)))},
+      {"release_tolerance_m", CanonicalValue(contact.release_tolerance_m)},
+      {"require_separation_by_end",
+       CanonicalValue(contact.require_separation_by_end)},
+      {"require_strictly_decreasing_penetration",
+       CanonicalValue(contact.require_strictly_decreasing_penetration)},
+      {"support_object_id", CanonicalValue(contact.support_object_id)},
+  });
+}
+
+CanonicalValue
+SupportDeclarations(const std::vector<core::SupportContactDTO> &contacts) {
+  CanonicalValue::Array result;
+  result.reserve(contacts.size());
+  for (const auto &contact : contacts) {
+    result.emplace_back(SupportDeclaration(contact));
+  }
+  return CanonicalValue(std::move(result));
+}
+
+core::SupportContactDTO DecodeSupportDeclaration(const CanonicalValue &value) {
+  ExactObject(value, 11U, "support declaration");
+  return {
+      String(Member(value, "support_object_id"), "support_object_id"),
+      DecodeContactMode(String(Member(value, "mode"), "support mode")),
+      DecodeReleaseMode(String(Member(value, "release_evidence_mode"),
+                               "support release evidence mode")),
+      Boolean(Member(value, "enforce_max_start_penetration"),
+              "enforce_max_start_penetration"),
+      Number(Member(value, "max_start_penetration_m"),
+             "max_start_penetration_m"),
+      Number(Member(value, "release_tolerance_m"), "release_tolerance_m"),
+      Number(Member(value, "min_release_progress_m"), "min_release_progress_m"),
+      Number(Member(value, "max_contact_penetration_m"),
+             "max_contact_penetration_m"),
+      Boolean(Member(value, "require_separation_by_end"),
+              "require_separation_by_end"),
+      Boolean(Member(value, "require_strictly_decreasing_penetration"),
+              "require_strictly_decreasing_penetration"),
+      Boolean(Member(value, "allow_recontact"), "allow_recontact"),
+  };
+}
+
+std::vector<core::SupportContactDTO>
+DecodeSupportDeclarations(const CanonicalValue &value) {
+  std::vector<core::SupportContactDTO> result;
+  const auto &contacts = Array(value, "support_contacts");
+  result.reserve(contacts.size());
+  for (const auto &contact : contacts) {
+    result.emplace_back(DecodeSupportDeclaration(contact));
+  }
+  return result;
+}
+
 CanonicalValue Policy(const core::CollisionPolicySnapshot &policy) {
   CanonicalValue::Array contacts;
   contacts.reserve(policy.support_contacts.size());
@@ -630,6 +695,7 @@ CanonicalValue Object(const core::SceneObjectSnapshotDTO &object) {
       {"collision_shapes", CanonicalValue(std::move(shapes))},
       {"placement", Placement(object.placement)},
       {"scene_resource_id", CanonicalValue(object.scene_resource_id.value())},
+      {"support_contacts", SupportDeclarations(object.support_contacts)},
   };
   if (object.provider_evidence.has_value()) {
     value.emplace_back("provider_evidence",
@@ -639,8 +705,8 @@ CanonicalValue Object(const core::SceneObjectSnapshotDTO &object) {
 }
 
 core::SceneObjectSnapshotDTO DecodeObject(const CanonicalValue &value) {
-  if (!value.is_object() || value.as_object().size() < 3U ||
-      value.as_object().size() > 4U) {
+  if (!value.is_object() || value.as_object().size() < 4U ||
+      value.as_object().size() > 5U) {
     Fail("scene object has an unknown or missing field");
   }
   core::SceneObjectSnapshotDTO result{
@@ -649,6 +715,7 @@ core::SceneObjectSnapshotDTO DecodeObject(const CanonicalValue &value) {
       {},
       DecodePlacement(Member(value, "placement")),
       std::nullopt,
+      DecodeSupportDeclarations(Member(value, "support_contacts")),
   };
   for (const auto &shape :
        Array(Member(value, "collision_shapes"), "collision_shapes")) {
@@ -847,6 +914,8 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
               {"scene_resource_id",
                CanonicalValue(request.scene_resource_id.value())},
               {"shape", Shape(request.shape)},
+              {"support_contacts",
+               SupportDeclarations(request.support_contacts)},
           });
         } else if constexpr (std::is_same_v<T, core::RemoveObjectRequestDTO>) {
           return CanonicalValue(CanonicalValue::Object{
@@ -929,13 +998,14 @@ DecodeRequestOperation(const CanonicalValue &value) {
   }
   const auto kind = String(Member(value, "kind"), "operation kind");
   if (kind == "add_object") {
-    ExactObject(value, 5U, "add-object request");
+    ExactObject(value, 6U, "add-object request");
     return core::AddObjectRequestDTO{
         core::SceneResourceId(
             String(Member(value, "scene_resource_id"), "scene_resource_id")),
         DecodeShape(Member(value, "shape")),
         DecodePose(Member(value, "pose")),
         DecodeFrame(Member(value, "frame_ref")),
+        DecodeSupportDeclarations(Member(value, "support_contacts")),
     };
   }
   if (kind == "remove_object") {
@@ -1053,6 +1123,7 @@ CanonicalValue ResolvedOperation(const core::ResolvedSceneOperationDTO &value) {
           });
         } else {
           return CanonicalValue(CanonicalValue::Object{
+              {"configured_policy", Policy(operation.configured_policy)},
               {"effective_policy", Policy(operation.effective_policy)},
               {"kind", CanonicalValue("set_collision_policy")},
           });

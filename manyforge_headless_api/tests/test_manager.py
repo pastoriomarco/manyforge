@@ -6,6 +6,7 @@ import socket
 import threading
 
 import pytest
+import rfc8785
 
 from manyforge_headless_api.manager import ManagerCommandClient
 from manyforge_headless_api.models import ManagerApplyRequest, SceneTransactionRequest
@@ -183,9 +184,31 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
 
     worker = threading.Thread(target=serve)
     worker.start()
+    request = _scene_request()
+    request = SceneTransactionRequest.model_validate(
+        {
+            **request.model_dump(mode="json"),
+            "operation": {
+                "kind": "add_object",
+                "scene_resource_id": "part.1",
+                "shape": {
+                    "type": "sphere",
+                    "sphere_radius_m": 0.01,
+                },
+                "pose": {
+                    "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.01},
+                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                },
+                "frame_ref": {"kind": "cell_frame", "cell_id": "cell-a"},
+                "support_contacts": [
+                    {"support_object_id": "table.1"},
+                ],
+            },
+        }
+    )
     try:
         response = ManagerCommandClient(tmp_path).commit_scene_transaction(
-            _scene_request(), trusted_principal_id="operator.7"
+            request, trusted_principal_id="operator.7"
         )
         assert response["projection_status"] == "committed"
     finally:
@@ -193,13 +216,8 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
         worker.join(timeout=1.0)
     assert not worker.is_alive()
     command = json.loads(received[0])
-    assert received[0] == json.dumps(
-        command,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
+    assert received[0] == rfc8785.dumps(command)
+    assert b'"release_tolerance_m":0.00001' in received[0]
     assert set(command) == {"api_version", "command", "transaction"}
     assert command["command"] == "scene_commit"
     assert command["transaction"]["attribution"] == {
@@ -207,6 +225,21 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
         "principal_id": "operator.7",
         "transport": "http",
     }
+    assert command["transaction"]["operation"]["support_contacts"] == [
+        {
+            "allow_recontact": False,
+            "enforce_max_start_penetration": True,
+            "max_contact_penetration_m": 0.0,
+            "max_start_penetration_m": 0.0,
+            "min_release_progress_m": 0.0,
+            "mode": "contact_release",
+            "release_evidence_mode": "signed_penetration",
+            "release_tolerance_m": 1e-5,
+            "require_separation_by_end": True,
+            "require_strictly_decreasing_penetration": True,
+            "support_object_id": "table.1",
+        }
+    ]
 
 
 def test_scene_client_rejects_mismatched_or_inconsistent_owner_result(

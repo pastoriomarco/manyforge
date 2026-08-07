@@ -1,26 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <iterator>
-#include <map>
-#include <memory>
-#include <optional>
-#include <set>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <tuple>
-#include <type_traits>
-#include <utility>
-#include <variant>
-#include <vector>
-
-#include <Eigen/Core>
-#include <Eigen/Geometry>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
@@ -34,10 +21,21 @@
 #include <manyforge_roboplan/retained_kinematic_state_projector.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
+#include <map>
+#include <memory>
+#include <optional>
 #include <roboplan/core/geometry_wrappers.hpp>
 #include <roboplan/core/scene.hpp>
-
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "lite6_retained_consumer_fixture.hpp"
 #include "mf2_joint_name_internal.hpp"
@@ -1863,6 +1861,27 @@ TEST(RetainedProductCrossConsumer,
   core::LogicalSceneSnapshotDTO carried_scene = make_collision_scene_snapshot(
       materialized.bundle->value().cell_graph.cell_id, 4U,
       core::SceneResourceId("carried-part"), 0.0, 0.02);
+  carried_scene.objects.front().support_contacts = {
+      core::SupportContactDTO{.support_object_id = "support-table"},
+  };
+  carried_scene.objects.push_back(core::SceneObjectSnapshotDTO{
+      core::SceneResourceId("support-table"),
+      {core::BoxShapeDTO{{0.5, 0.5, 0.05}}},
+      core::CellFixedSceneObjectPlacementDTO{
+          materialized.bundle->value().cell_graph.cell_id,
+          {{10.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}},
+      },
+      std::nullopt,
+      {},
+  });
+  carried_scene.revision.content_hash =
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(
+          carried_scene);
+  auto detached_policy_result =
+      collision_projector.project_effective_policy(carried_scene, 2U);
+  ASSERT_TRUE(detached_policy_result.ok())
+      << detached_policy_result.error().message;
+  EXPECT_TRUE(detached_policy_result.value().support_contacts.empty());
   core::CarriedObjectAttachmentDTO attachment{
       core::CarriedObjectAttachmentId("carried-part-attachment"),
       core::CarriedObjectAttachmentRevision(std::string(kZeroDigest)),
@@ -1919,6 +1938,10 @@ TEST(RetainedProductCrossConsumer,
     EXPECT_TRUE(pair.body_a == carried_body->body_id ||
                 pair.body_b == carried_body->body_id);
   }
+  ASSERT_EQ(carried_policy.support_contacts.size(), 1U);
+  EXPECT_EQ(carried_policy.support_contacts.front().pair,
+            (core::CollisionPairId{"scene/carried-part/shape/0",
+                                   "scene/support-table/shape/0"}));
 
   core::CollisionQuery carried_query;
   carried_query.query_id = "lite6-carried-object-ingestion";

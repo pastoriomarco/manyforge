@@ -1,8 +1,9 @@
 #include "manyforge_scene/canonical_empty_scene_owner.hpp"
 
-#include "embedded_canonical_empty_scene_schema.hpp"
-#include "logical_scene_codec_internal.hpp"
-#include "sqlite_scene_lifecycle_internal.hpp"
+#include <fcntl.h>
+#include <sqlite3.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
@@ -10,11 +11,9 @@
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 
-#include <sqlite3.h>
-
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "embedded_canonical_empty_scene_schema.hpp"
+#include "logical_scene_codec_internal.hpp"
+#include "sqlite_scene_lifecycle_internal.hpp"
 
 #if SQLITE_VERSION_NUMBER < 3037000
 #error "canonical-empty scene owner requires SQLite 3.37.0 or newer"
@@ -27,6 +26,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -336,7 +336,7 @@ SchemaObjects ReadSchemaObjects(sqlite3 *database) {
     ++count;
     if (count > kExpectedSchemaObjectCardinality) {
       throw CanonicalEmptySceneOwnerIntegrityError(
-          "logical-scene schema object cardinality exceeds v3");
+          "logical-scene schema object cardinality exceeds v4");
     }
     objects.emplace(std::make_pair(statement.Text(0), statement.Text(1)),
                     NormalizedSql(statement.Text(2)));
@@ -483,7 +483,7 @@ std::string TransactionMigrationArtifactDigest() {
 
 std::string CurrentSchemaArtifactDigest() {
   return manyforge::content_identity::sha256_digest(
-      std::string(detail::kEmbeddedCanonicalEmptySceneSchema) + "\n--v3--\n" +
+      std::string(detail::kEmbeddedCanonicalEmptySceneSchema) + "\n--v4--\n" +
       std::string(detail::kEmbeddedLogicalSceneTransactionMigration));
 }
 
@@ -1256,6 +1256,164 @@ private:
   std::map<std::string, std::string> details_;
 };
 
+bool ReleaseFieldsMatchDefaults(const core::SupportContactDTO &contact) {
+  return contact.enforce_max_start_penetration &&
+         contact.max_start_penetration_m == 0.0 &&
+         contact.release_tolerance_m == 1e-5 &&
+         contact.min_release_progress_m == 0.0 &&
+         contact.require_separation_by_end &&
+         contact.require_strictly_decreasing_penetration &&
+         !contact.allow_recontact;
+}
+
+bool ReleaseFieldsAreNeutral(const core::SupportContactDTO &contact) {
+  return !contact.enforce_max_start_penetration &&
+         contact.max_start_penetration_m == 0.0 &&
+         contact.release_tolerance_m == 0.0 &&
+         contact.min_release_progress_m == 0.0 &&
+         !contact.require_separation_by_end &&
+         !contact.require_strictly_decreasing_penetration &&
+         !contact.allow_recontact;
+}
+
+bool BinaryFieldsMatchDefaults(const core::SupportContactDTO &contact) {
+  return contact.enforce_max_start_penetration &&
+         contact.max_start_penetration_m == 0.0 &&
+         contact.release_tolerance_m == 1e-5 &&
+         contact.min_release_progress_m == 0.0 &&
+         contact.require_strictly_decreasing_penetration;
+}
+
+bool BinaryFieldsAreNeutral(const core::SupportContactDTO &contact) {
+  return !contact.enforce_max_start_penetration &&
+         contact.max_start_penetration_m == 0.0 &&
+         contact.release_tolerance_m == 0.0 &&
+         contact.min_release_progress_m == 0.0 &&
+         !contact.require_strictly_decreasing_penetration;
+}
+
+[[noreturn]] void RejectSupportContact(const std::size_t index,
+                                       const std::string_view reason,
+                                       const std::string_view field,
+                                       const std::string_view message) {
+  throw SceneRequestRejectionError(
+      "invalid_contact_policy", std::string(message),
+      {{"support_contact_index", std::to_string(index)},
+       {"reason", std::string(reason)},
+       {"field", std::string(field)}});
+}
+
+void ValidateAndNormalizeSupportContact(core::SupportContactDTO &contact,
+                                        const std::size_t index) {
+  try {
+    ValidateBoundedIdentity(contact.support_object_id, "support_object_id");
+  } catch (const std::invalid_argument &error) {
+    RejectSupportContact(index, "invalid_support_contact_reference",
+                         "support_object_id", error.what());
+  }
+  const auto nonnegative_finite = [](const double value) {
+    return std::isfinite(value) && value >= 0.0;
+  };
+  if (!nonnegative_finite(contact.max_start_penetration_m) ||
+      !nonnegative_finite(contact.release_tolerance_m) ||
+      !nonnegative_finite(contact.min_release_progress_m) ||
+      !nonnegative_finite(contact.max_contact_penetration_m)) {
+    RejectSupportContact(index, "support_contact_metric_invalid", "metrics",
+                         "support-contact metrics must be finite and "
+                         "non-negative");
+  }
+
+  switch (contact.mode) {
+  case core::CollisionContactPolicyMode::kBoundedPenetration:
+    if (contact.release_evidence_mode !=
+        core::ContactReleaseEvidenceMode::kSignedPenetration) {
+      RejectSupportContact(index, "release_evidence_mode_not_applicable",
+                           "release_evidence_mode",
+                           "binary release evidence is not applicable to "
+                           "bounded penetration");
+    }
+    if (!ReleaseFieldsMatchDefaults(contact) &&
+        !ReleaseFieldsAreNeutral(contact)) {
+      RejectSupportContact(index, "release_field_for_bounded_penetration",
+                           "release_fields",
+                           "release-only fields are not applicable to "
+                           "bounded penetration");
+    }
+    break;
+  case core::CollisionContactPolicyMode::kContactProcess:
+    if (contact.max_contact_penetration_m != 0.0) {
+      RejectSupportContact(index, "bounded_penetration_field_not_applicable",
+                           "max_contact_penetration_m",
+                           "max_contact_penetration_m is valid only for "
+                           "bounded penetration");
+    }
+    if (contact.release_evidence_mode !=
+            core::ContactReleaseEvidenceMode::kSignedPenetration ||
+        (!ReleaseFieldsMatchDefaults(contact) &&
+         !ReleaseFieldsAreNeutral(contact))) {
+      RejectSupportContact(index, "release_field_not_applicable",
+                           "release_fields",
+                           "release-only fields are not applicable to "
+                           "contact process");
+    }
+    break;
+  case core::CollisionContactPolicyMode::kContactRelease:
+    if (contact.max_contact_penetration_m != 0.0) {
+      RejectSupportContact(index, "bounded_penetration_field_not_applicable",
+                           "max_contact_penetration_m",
+                           "max_contact_penetration_m is valid only for "
+                           "bounded penetration");
+    }
+    switch (contact.release_evidence_mode) {
+    case core::ContactReleaseEvidenceMode::kSignedPenetration:
+      break;
+    case core::ContactReleaseEvidenceMode::kBinaryContact:
+      if (!BinaryFieldsMatchDefaults(contact) &&
+          !BinaryFieldsAreNeutral(contact)) {
+        RejectSupportContact(index, "metric_field_for_binary_contact",
+                             "metric_fields",
+                             "signed-distance metric fields are not valid "
+                             "for binary contact evidence");
+      }
+      break;
+    default:
+      RejectSupportContact(index, "unknown_release_evidence_mode",
+                           "release_evidence_mode",
+                           "support-contact release evidence is unsupported");
+    }
+    break;
+  default:
+    RejectSupportContact(index, "unknown_contact_policy_mode", "mode",
+                         "support-contact mode is unsupported");
+  }
+
+  if (contact.mode == core::CollisionContactPolicyMode::kContactRelease) {
+    contact.max_contact_penetration_m = 0.0;
+    if (contact.release_evidence_mode ==
+        core::ContactReleaseEvidenceMode::kBinaryContact) {
+      contact.enforce_max_start_penetration = false;
+      contact.max_start_penetration_m = 0.0;
+      contact.release_tolerance_m = 0.0;
+      contact.min_release_progress_m = 0.0;
+      contact.require_strictly_decreasing_penetration = false;
+    }
+    return;
+  }
+
+  contact.release_evidence_mode =
+      core::ContactReleaseEvidenceMode::kSignedPenetration;
+  contact.enforce_max_start_penetration = false;
+  contact.max_start_penetration_m = 0.0;
+  contact.release_tolerance_m = 0.0;
+  contact.min_release_progress_m = 0.0;
+  contact.require_separation_by_end = false;
+  contact.require_strictly_decreasing_penetration = false;
+  contact.allow_recontact = false;
+  if (contact.mode == core::CollisionContactPolicyMode::kContactProcess) {
+    contact.max_contact_penetration_m = 0.0;
+  }
+}
+
 const core::CellSceneFrameRefDTO &
 RequireCellFrame(const core::SceneFrameRefDTO &frame, const CellId &cell_id) {
   const auto *cell = std::get_if<core::CellSceneFrameRefDTO>(&frame);
@@ -1346,12 +1504,55 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                 "object_already_exists", "scene resource already exists",
                 {{"scene_resource_id", operation.scene_resource_id.value()}});
           }
+          auto support_contacts = operation.support_contacts;
+          for (std::size_t index = 0U; index < support_contacts.size();
+               ++index) {
+            ValidateAndNormalizeSupportContact(support_contacts[index], index);
+          }
+          std::sort(support_contacts.begin(), support_contacts.end(),
+                    [](const auto &left, const auto &right) {
+                      return left.support_object_id < right.support_object_id;
+                    });
+          for (std::size_t index = 0U; index < support_contacts.size();
+               ++index) {
+            const auto &contact = support_contacts[index];
+            if (index != 0U && support_contacts[index - 1U].support_object_id ==
+                                   contact.support_object_id) {
+              RejectSupportContact(index, "duplicate_support_contact_pair",
+                                   "support_object_id",
+                                   "support object is declared more than once");
+            }
+            if (contact.support_object_id ==
+                operation.scene_resource_id.value()) {
+              RejectSupportContact(index, "self_support_contact",
+                                   "support_object_id",
+                                   "scene resource cannot support itself");
+            }
+            const auto support = std::lower_bound(
+                current.objects.begin(), current.objects.end(),
+                contact.support_object_id,
+                [](const SceneObjectSnapshotDTO &object,
+                   const std::string &support_id) {
+                  return object.scene_resource_id.value() < support_id;
+                });
+            if (support == current.objects.end() ||
+                support->scene_resource_id.value() !=
+                    contact.support_object_id) {
+              throw SceneRequestRejectionError(
+                  "missing_reference",
+                  "support contact names an unknown scene resource",
+                  {{"reference_type", "support_scene_resource"},
+                   {"reference_id", contact.support_object_id},
+                   {"scene_resource_id", operation.scene_resource_id.value()}});
+            }
+          }
           SceneObjectSnapshotDTO object{
               operation.scene_resource_id,
               {operation.shape},
               core::CellFixedSceneObjectPlacementDTO{current.cell_id,
                                                      operation.pose},
               std::nullopt,
+              std::move(support_contacts),
           };
           candidate.snapshot.objects.insert(found, object);
           candidate.operation = core::ResolvedUpsertSceneObjectDTO{object};
@@ -1372,6 +1573,26 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
             throw SceneRequestRejectionError(
                 "object_not_found", "scene resource does not exist",
                 {{"scene_resource_id", operation.scene_resource_id.value()}});
+          }
+          for (const auto &object : candidate.snapshot.objects) {
+            if (object.scene_resource_id == operation.scene_resource_id) {
+              continue;
+            }
+            const auto dependent = std::find_if(
+                object.support_contacts.begin(), object.support_contacts.end(),
+                [&](const core::SupportContactDTO &contact) {
+                  return contact.support_object_id ==
+                         operation.scene_resource_id.value();
+                });
+            if (dependent != object.support_contacts.end()) {
+              throw SceneRequestRejectionError(
+                  "scene_object_state_conflict",
+                  "scene resource is still referenced as a support",
+                  {{"reason", "support_contact_reference_exists"},
+                   {"scene_resource_id", operation.scene_resource_id.value()},
+                   {"dependent_scene_resource_id",
+                    object.scene_resource_id.value()}});
+            }
           }
           if (std::holds_alternative<core::CarriedSceneObjectPlacementDTO>(
                   found->placement)) {
@@ -1562,8 +1783,10 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
             policy_changed = true;
           }
           candidate.snapshot.configured_collision_policy = next_policy;
-          candidate.operation =
-              core::ResolvedCollisionPolicyDTO{std::move(next_policy)};
+          candidate.operation = core::ResolvedCollisionPolicyDTO{
+              next_policy,
+              std::move(next_policy),
+          };
         }
       },
       request.operation);
@@ -2378,7 +2601,7 @@ std::vector<NamedApplyStageState> ReadNamedApplyStages(
     }
     // A public scene transaction may have advanced only the scene member
     // since the preceding structural publication. The v2 Apply row captures
-    // that exact predecessor; the v3 publication ledger cross-validates the
+    // that exact predecessor; the v4 publication ledger cross-validates the
     // interleaving after both typed histories have been read.
     current_projection = stage.predecessor;
     if (finalized) {
@@ -2724,7 +2947,7 @@ void ValidateDatabase(
   ValidateMechanicalDatabaseIntegrity(database);
   if (ReadSchemaObjects(database) != ExpectedSchemaObjects()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
-        "logical-scene schema differs from its exact v3 artifacts");
+        "logical-scene schema differs from its exact v4 artifacts");
   }
   ValidateMetadata(database, fixed_query, admission_digest);
   ValidateMigrationMetadata(database);

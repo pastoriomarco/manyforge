@@ -113,9 +113,8 @@ struct CarriedSceneObjectPlacementDTO final {
   CarriedObjectAttachmentRevision carried_object_attachment_revision;
 };
 
-using SceneObjectPlacementDTO =
-    std::variant<CellFixedSceneObjectPlacementDTO,
-                 CarriedSceneObjectPlacementDTO>;
+using SceneObjectPlacementDTO = std::variant<CellFixedSceneObjectPlacementDTO,
+                                             CarriedSceneObjectPlacementDTO>;
 
 /// Receiver-local evidence retained for one provider-backed object snapshot.
 /// Presence as one optional record prevents partial provider identity from
@@ -139,6 +138,9 @@ struct SceneObjectSnapshotDTO final {
   std::vector<CollisionShapeDTO> collision_shapes;
   SceneObjectPlacementDTO placement;
   std::optional<SceneObjectProviderEvidenceDTO> provider_evidence;
+  /// Portable authored support relationships retained independently of any
+  /// planner's generated collision-body ids.
+  std::vector<SupportContactDTO> support_contacts{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 };
@@ -213,10 +215,9 @@ namespace logical_scene_detail {
       !std::isfinite(orientation.w)) {
     return false;
   }
-  const double norm_squared = orientation.x * orientation.x +
-                              orientation.y * orientation.y +
-                              orientation.z * orientation.z +
-                              orientation.w * orientation.w;
+  const double norm_squared =
+      orientation.x * orientation.x + orientation.y * orientation.y +
+      orientation.z * orientation.z + orientation.w * orientation.w;
   return std::isfinite(norm_squared) && norm_squared > 0.0;
 }
 
@@ -248,8 +249,7 @@ namespace logical_scene_detail {
       shape);
 }
 
-[[nodiscard]] inline bool CanonicalPair(
-    const CollisionPairId& pair) noexcept {
+[[nodiscard]] inline bool CanonicalPair(const CollisionPairId& pair) noexcept {
   return !pair.body_a.empty() && !pair.body_b.empty() &&
          pair.body_a <= pair.body_b;
 }
@@ -309,6 +309,52 @@ template <typename T, typename Projection>
   return std::visit([](const auto& value) { return value.valid(); }, frame);
 }
 
+[[nodiscard]] inline bool NormalizedSupportContact(
+    const SupportContactDTO& contact) noexcept {
+  const auto nonnegative_finite = [](const double value) {
+    return std::isfinite(value) && value >= 0.0;
+  };
+  if (contact.support_object_id.empty() ||
+      !nonnegative_finite(contact.max_start_penetration_m) ||
+      !nonnegative_finite(contact.release_tolerance_m) ||
+      !nonnegative_finite(contact.min_release_progress_m) ||
+      !nonnegative_finite(contact.max_contact_penetration_m)) {
+    return false;
+  }
+
+  switch (contact.mode) {
+    case CollisionContactPolicyMode::kContactRelease:
+      if (contact.max_contact_penetration_m != 0.0) {
+        return false;
+      }
+      switch (contact.release_evidence_mode) {
+        case ContactReleaseEvidenceMode::kSignedPenetration:
+          return true;
+        case ContactReleaseEvidenceMode::kBinaryContact:
+          return !contact.enforce_max_start_penetration &&
+                 contact.max_start_penetration_m == 0.0 &&
+                 contact.release_tolerance_m == 0.0 &&
+                 contact.min_release_progress_m == 0.0 &&
+                 !contact.require_strictly_decreasing_penetration;
+      }
+      return false;
+    case CollisionContactPolicyMode::kBoundedPenetration:
+    case CollisionContactPolicyMode::kContactProcess:
+      return contact.release_evidence_mode ==
+                 ContactReleaseEvidenceMode::kSignedPenetration &&
+             !contact.enforce_max_start_penetration &&
+             contact.max_start_penetration_m == 0.0 &&
+             contact.release_tolerance_m == 0.0 &&
+             contact.min_release_progress_m == 0.0 &&
+             !contact.require_separation_by_end &&
+             !contact.require_strictly_decreasing_penetration &&
+             !contact.allow_recontact &&
+             (contact.mode == CollisionContactPolicyMode::kBoundedPenetration ||
+              contact.max_contact_penetration_m == 0.0);
+  }
+  return false;
+}
+
 }  // namespace logical_scene_detail
 
 inline bool IsCanonicalEmptyCollisionPolicy(
@@ -324,7 +370,8 @@ inline bool IsCanonicalEmptyCollisionPolicy(
 
 inline bool SceneObjectProviderEvidenceDTO::valid() const noexcept {
   return !provider_instance_id.empty() && !provider_manifest_id.empty() &&
-         !provider_manifest_revision.empty() && !provider_source_epoch.empty() &&
+         !provider_manifest_revision.empty() &&
+         !provider_source_epoch.empty() &&
          (!source_freshness_budget_ns.has_value() ||
           *source_freshness_budget_ns > 0);
 }
@@ -333,14 +380,20 @@ inline bool SceneObjectSnapshotDTO::locally_valid() const noexcept {
   if (scene_resource_id.empty() || collision_shapes.empty() ||
       !std::all_of(collision_shapes.begin(), collision_shapes.end(),
                    logical_scene_detail::ValidCollisionShape) ||
-      (provider_evidence.has_value() && !provider_evidence->valid())) {
+      (provider_evidence.has_value() && !provider_evidence->valid()) ||
+      !logical_scene_detail::StrictlyIncreasing(
+          support_contacts,
+          [](const SupportContactDTO& contact) -> const std::string& {
+            return contact.support_object_id;
+          }) ||
+      !std::all_of(support_contacts.begin(), support_contacts.end(),
+                   logical_scene_detail::NormalizedSupportContact)) {
     return false;
   }
   return std::visit(
       [](const auto& value) {
         using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T,
-                                     CellFixedSceneObjectPlacementDTO>) {
+        if constexpr (std::is_same_v<T, CellFixedSceneObjectPlacementDTO>) {
           return !value.cell_id.empty() &&
                  logical_scene_detail::FinitePose(value.pose_in_cell);
         } else {
@@ -353,9 +406,8 @@ inline bool SceneObjectSnapshotDTO::locally_valid() const noexcept {
 
 inline bool CarriedObjectAttachmentDTO::locally_valid() const noexcept {
   if (carried_object_attachment_id.empty() ||
-      carried_object_attachment_revision.empty() ||
-      scene_resource_id.empty() || controllable_component_id.empty() ||
-      command_target_id.empty() ||
+      carried_object_attachment_revision.empty() || scene_resource_id.empty() ||
+      controllable_component_id.empty() || command_target_id.empty() ||
       !logical_scene_detail::ValidFrameRef(carrier_frame_ref) ||
       !logical_scene_detail::FinitePose(pose_in_carrier_frame) ||
       !logical_scene_detail::StrictlyIncreasing(
@@ -372,18 +424,22 @@ inline bool CarriedObjectAttachmentDTO::locally_valid() const noexcept {
              controllable_component_id;
 }
 
-inline bool LogicalSceneSnapshotDTO::locally_valid() const noexcept {
-  if (!revision.valid() || cell_id.empty() ||
-      !logical_scene_detail::LocallyValidConfiguredPolicy(
-          configured_collision_policy) ||
+namespace logical_scene_detail {
+
+/// Validates exactly the semantic content covered by
+/// ComputeLogicalSceneContentHash. Owner lineage and sequencing fields are
+/// deliberately outside this predicate because they are outside that hash.
+[[nodiscard]] inline bool LocallyValidSceneContent(
+    const LogicalSceneSnapshotDTO& snapshot) noexcept {
+  if (snapshot.cell_id.empty() ||
+      !LocallyValidConfiguredPolicy(snapshot.configured_collision_policy) ||
       !logical_scene_detail::StrictlyIncreasing(
-          objects,
-          [](const SceneObjectSnapshotDTO& object)
-              -> const std::string& {
+          snapshot.objects,
+          [](const SceneObjectSnapshotDTO& object) -> const std::string& {
             return object.scene_resource_id.value();
           }) ||
       !logical_scene_detail::StrictlyIncreasing(
-          carried_object_attachments,
+          snapshot.carried_object_attachments,
           [](const CarriedObjectAttachmentDTO& attachment)
               -> const std::string& {
             return attachment.carried_object_attachment_id.value();
@@ -391,39 +447,69 @@ inline bool LogicalSceneSnapshotDTO::locally_valid() const noexcept {
     return false;
   }
 
-  for (const auto& object : objects) {
+  for (const auto& object : snapshot.objects) {
     if (!object.locally_valid()) {
       return false;
     }
     if (const auto* placement =
             std::get_if<CellFixedSceneObjectPlacementDTO>(&object.placement);
-        placement != nullptr && placement->cell_id != cell_id) {
+        placement != nullptr && placement->cell_id != snapshot.cell_id) {
       return false;
     }
   }
-  for (const auto& attachment : carried_object_attachments) {
+
+  for (const auto& object : snapshot.objects) {
+    for (const auto& contact : object.support_contacts) {
+      if (contact.support_object_id == object.scene_resource_id.value()) {
+        return false;
+      }
+      const auto support = std::lower_bound(
+          snapshot.objects.begin(), snapshot.objects.end(),
+          contact.support_object_id,
+          [](const SceneObjectSnapshotDTO& candidate,
+             const std::string& support_id) {
+            return candidate.scene_resource_id.value() < support_id;
+          });
+      if (support == snapshot.objects.end() ||
+          support->scene_resource_id.value() != contact.support_object_id) {
+        return false;
+      }
+      const auto reciprocal = std::lower_bound(
+          support->support_contacts.begin(), support->support_contacts.end(),
+          object.scene_resource_id.value(),
+          [](const SupportContactDTO& candidate,
+             const std::string& support_id) {
+            return candidate.support_object_id < support_id;
+          });
+      if (reciprocal != support->support_contacts.end() &&
+          reciprocal->support_object_id == object.scene_resource_id.value()) {
+        return false;
+      }
+    }
+  }
+  for (const auto& attachment : snapshot.carried_object_attachments) {
     if (!attachment.locally_valid()) {
       return false;
     }
   }
 
   std::size_t carried_object_count = 0U;
-  for (const auto& object : objects) {
+  for (const auto& object : snapshot.objects) {
     const auto* placement =
         std::get_if<CarriedSceneObjectPlacementDTO>(&object.placement);
     if (placement == nullptr) {
       continue;
     }
     ++carried_object_count;
-    const auto match = std::lower_bound(
-        carried_object_attachments.begin(),
-        carried_object_attachments.end(),
-        placement->carried_object_attachment_id,
-        [](const CarriedObjectAttachmentDTO& attachment,
-           const CarriedObjectAttachmentId& id) {
-          return attachment.carried_object_attachment_id < id;
-        });
-    if (match == carried_object_attachments.end() ||
+    const auto match =
+        std::lower_bound(snapshot.carried_object_attachments.begin(),
+                         snapshot.carried_object_attachments.end(),
+                         placement->carried_object_attachment_id,
+                         [](const CarriedObjectAttachmentDTO& attachment,
+                            const CarriedObjectAttachmentId& id) {
+                           return attachment.carried_object_attachment_id < id;
+                         });
+    if (match == snapshot.carried_object_attachments.end() ||
         match->carried_object_attachment_id !=
             placement->carried_object_attachment_id ||
         match->carried_object_attachment_revision !=
@@ -432,7 +518,14 @@ inline bool LogicalSceneSnapshotDTO::locally_valid() const noexcept {
       return false;
     }
   }
-  return carried_object_count == carried_object_attachments.size();
+  return carried_object_count == snapshot.carried_object_attachments.size();
+}
+
+}  // namespace logical_scene_detail
+
+inline bool LogicalSceneSnapshotDTO::locally_valid() const noexcept {
+  return revision.valid() &&
+         logical_scene_detail::LocallyValidSceneContent(*this);
 }
 
 inline bool LogicalSceneSnapshotDTO::has_exact_identity(

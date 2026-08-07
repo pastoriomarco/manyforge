@@ -2,15 +2,14 @@
 
 #include <cstdlib>
 #include <filesystem>
-#include <memory>
-#include <optional>
-#include <string>
-#include <vector>
-
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_component_manager/runtime_observation.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include "manyforge_headless/owner_publication.hpp"
 
@@ -155,6 +154,45 @@ core::LogicalSceneSnapshotRoot SceneSnapshot(
           }));
 }
 
+core::LogicalSceneSnapshotRoot SceneSnapshotWithSupport(
+    const deployment::CanonicalEmptyRetainedBundleAdmission &admission) {
+  auto policy = SceneSnapshot(admission).shared()->configured_collision_policy;
+  const auto fixed_placement = core::CellFixedSceneObjectPlacementDTO{
+      admission.cell_id(),
+      core::Pose3DTO{
+          core::Vector3DTO{0.0, 0.0, 0.0},
+          core::QuaternionDTO{0.0, 0.0, 0.0, 1.0},
+      },
+  };
+  return core::LogicalSceneSnapshotRoot(
+      std::make_shared<const core::LogicalSceneSnapshotDTO>(
+          core::LogicalSceneSnapshotDTO{
+              SceneRevision(),
+              admission.cell_id(),
+              2U,
+              2U,
+              1U,
+              std::move(policy),
+              {
+                  core::SceneObjectSnapshotDTO{
+                      core::SceneResourceId("part"),
+                      {core::SphereShapeDTO{0.01}},
+                      fixed_placement,
+                      std::nullopt,
+                      {core::SupportContactDTO{.support_object_id = "table"}},
+                  },
+                  core::SceneObjectSnapshotDTO{
+                      core::SceneResourceId("table"),
+                      {core::BoxShapeDTO{core::Vector3DTO{1.0, 1.0, 0.1}}},
+                      fixed_placement,
+                      std::nullopt,
+                      {},
+                  },
+              },
+              {},
+          }));
+}
+
 TEST(ManagerSourcePublication,
      ProjectsVerifiedActiveGraphAndExplicitKernelUnavailability) {
   const auto admission = LoadAdmission();
@@ -252,6 +290,25 @@ TEST(LogicalSceneSourcePublication, RejectsCrossOwnerRevisionMismatch) {
           },
           SceneSnapshot(admission)),
       std::invalid_argument);
+}
+
+TEST(LogicalSceneSourcePublication,
+     PublishesPortableSupportDeclarationWithoutNativeBodyNames) {
+  const auto admission = LoadAdmission();
+  const auto projection = ProjectionRevision(admission);
+  const auto bytes =
+      content_identity::canonical_json(BuildLogicalSceneSourcePayload(
+          manyforge::scene::CanonicalEmptySceneAccessStatus{
+              manyforge::scene::CanonicalEmptySceneBootstrapPhase::kFinalized,
+              true,
+              true,
+              projection,
+          },
+          SceneSnapshotWithSupport(admission)));
+
+  EXPECT_NE(bytes.find("\"support_object_id\":\"table\""), std::string::npos);
+  EXPECT_NE(bytes.find("\"mode\":\"contact_release\""), std::string::npos);
+  EXPECT_EQ(bytes.find("scene/part/shape/0"), std::string::npos);
 }
 
 TEST(SceneRuntimeSourcePublication,

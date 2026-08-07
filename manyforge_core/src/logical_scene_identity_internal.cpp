@@ -47,8 +47,7 @@ CanonicalValue Unsigned(std::uint64_t value, std::string_view field,
                         bool nonzero = false) {
   Require(value <= kMaxSafeIntegral,
           std::string(field) + " exceeds the RFC-8785 safe-integral range");
-  Require(!nonzero || value != 0U,
-          std::string(field) + " must be nonzero");
+  Require(!nonzero || value != 0U, std::string(field) + " must be nonzero");
   return CanonicalValue(static_cast<double>(value));
 }
 
@@ -64,8 +63,7 @@ CanonicalValue Number(double value, std::string_view field,
   Require(std::isfinite(value), std::string(field) + " must be finite");
   Require(!std::signbit(value) || value != 0.0,
           std::string(field) + " must not be negative zero");
-  Require(!positive || value > 0.0,
-          std::string(field) + " must be positive");
+  Require(!positive || value > 0.0, std::string(field) + " must be positive");
   Require(!nonnegative || value >= 0.0,
           std::string(field) + " must be nonnegative");
   return CanonicalValue(value);
@@ -82,8 +80,7 @@ CanonicalValue Vector3(const Vector3DTO& value, std::string_view field,
   });
 }
 
-CanonicalValue Quaternion(const QuaternionDTO& value,
-                          std::string_view field) {
+CanonicalValue Quaternion(const QuaternionDTO& value, std::string_view field) {
   const double norm_squared = value.x * value.x + value.y * value.y +
                               value.z * value.z + value.w * value.w;
   Require(std::isfinite(norm_squared) && norm_squared > 0.0,
@@ -98,15 +95,14 @@ CanonicalValue Quaternion(const QuaternionDTO& value,
 
 CanonicalValue Pose(const Pose3DTO& value, std::string_view field) {
   return CanonicalValue(CanonicalValue::Object{
-      {"position_m", Vector3(value.position_m,
-                              std::string(field) + ".position_m")},
-      {"orientation", Quaternion(value.orientation,
-                                  std::string(field) + ".orientation")},
+      {"position_m",
+       Vector3(value.position_m, std::string(field) + ".position_m")},
+      {"orientation",
+       Quaternion(value.orientation, std::string(field) + ".orientation")},
   });
 }
 
-void RequireCanonicalPair(const CollisionPairId& pair,
-                          std::string_view field) {
+void RequireCanonicalPair(const CollisionPairId& pair, std::string_view field) {
   (void)String(pair.body_a, std::string(field) + ".body_a");
   (void)String(pair.body_b, std::string(field) + ".body_b");
   Require(pair.body_a <= pair.body_b,
@@ -138,9 +134,8 @@ CanonicalValue PairSet(const std::vector<CollisionPairId>& values,
   CanonicalValue::Array result;
   result.reserve(values.size());
   for (std::size_t index = 0U; index < values.size(); ++index) {
-    result.push_back(Pair(values[index],
-                          std::string(field) + "[" +
-                              std::to_string(index) + "]"));
+    result.push_back(Pair(
+        values[index], std::string(field) + "[" + std::to_string(index) + "]"));
   }
   return CanonicalValue(std::move(result));
 }
@@ -177,28 +172,26 @@ void RequireNormalizedSupportContact(const SupportContactPolicyEntry& entry,
   (void)Number(entry.min_release_progress_m,
                std::string(field) + ".min_release_progress_m", false, true);
   (void)Number(entry.max_contact_penetration_m,
-               std::string(field) + ".max_contact_penetration_m", false,
-               true);
+               std::string(field) + ".max_contact_penetration_m", false, true);
 
   if (entry.mode == CollisionContactPolicyMode::kContactRelease) {
     Require(entry.max_contact_penetration_m == 0.0,
-            std::string(field) +
-                ".max_contact_penetration_m must be neutral");
+            std::string(field) + ".max_contact_penetration_m must be neutral");
     if (entry.release_evidence_mode ==
         ContactReleaseEvidenceMode::kBinaryContact) {
-      Require(!entry.enforce_max_start_penetration &&
-                  entry.max_start_penetration_m == 0.0 &&
-                  entry.release_tolerance_m == 0.0 &&
-                  entry.min_release_progress_m == 0.0 &&
-                  !entry.require_strictly_decreasing_penetration,
-              std::string(field) +
-                  " binary-contact metric fields must be neutral");
+      Require(
+          !entry.enforce_max_start_penetration &&
+              entry.max_start_penetration_m == 0.0 &&
+              entry.release_tolerance_m == 0.0 &&
+              entry.min_release_progress_m == 0.0 &&
+              !entry.require_strictly_decreasing_penetration,
+          std::string(field) + " binary-contact metric fields must be neutral");
     }
     return;
   }
 
   Require(entry.release_evidence_mode ==
-              ContactReleaseEvidenceMode::kSignedPenetration &&
+                  ContactReleaseEvidenceMode::kSignedPenetration &&
               !entry.enforce_max_start_penetration &&
               entry.max_start_penetration_m == 0.0 &&
               entry.release_tolerance_m == 0.0 &&
@@ -209,8 +202,7 @@ void RequireNormalizedSupportContact(const SupportContactPolicyEntry& entry,
           std::string(field) + " mode-scoped release fields must be neutral");
   if (entry.mode == CollisionContactPolicyMode::kContactProcess) {
     Require(entry.max_contact_penetration_m == 0.0,
-            std::string(field) +
-                ".max_contact_penetration_m must be neutral");
+            std::string(field) + ".max_contact_penetration_m must be neutral");
   }
 }
 
@@ -220,8 +212,8 @@ CanonicalValue SupportContact(const SupportContactPolicyEntry& entry,
   return CanonicalValue(CanonicalValue::Object{
       {"pair", Pair(entry.pair, std::string(field) + ".pair")},
       {"mode", CanonicalValue(std::string(ContactMode(entry.mode)))},
-      {"release_evidence_mode",
-       CanonicalValue(std::string(ReleaseEvidence(entry.release_evidence_mode)))},
+      {"release_evidence_mode", CanonicalValue(std::string(ReleaseEvidence(
+                                    entry.release_evidence_mode)))},
       {"enforce_max_start_penetration",
        Bool(entry.enforce_max_start_penetration)},
       {"max_start_penetration_m",
@@ -235,8 +227,7 @@ CanonicalValue SupportContact(const SupportContactPolicyEntry& entry,
               std::string(field) + ".min_release_progress_m", false, true)},
       {"max_contact_penetration_m",
        Number(entry.max_contact_penetration_m,
-              std::string(field) + ".max_contact_penetration_m", false,
-              true)},
+              std::string(field) + ".max_contact_penetration_m", false, true)},
       {"require_separation_by_end", Bool(entry.require_separation_by_end)},
       {"require_strictly_decreasing_penetration",
        Bool(entry.require_strictly_decreasing_penetration)},
@@ -261,14 +252,77 @@ CanonicalValue SupportContacts(
   return CanonicalValue(std::move(result));
 }
 
+void RequireNormalizedSupportDeclaration(const SupportContactDTO& entry,
+                                         std::string_view field) {
+  (void)String(entry.support_object_id,
+               std::string(field) + ".support_object_id");
+  (void)Number(entry.max_start_penetration_m,
+               std::string(field) + ".max_start_penetration_m", false, true);
+  (void)Number(entry.release_tolerance_m,
+               std::string(field) + ".release_tolerance_m", false, true);
+  (void)Number(entry.min_release_progress_m,
+               std::string(field) + ".min_release_progress_m", false, true);
+  (void)Number(entry.max_contact_penetration_m,
+               std::string(field) + ".max_contact_penetration_m", false, true);
+  Require(logical_scene_detail::NormalizedSupportContact(entry),
+          std::string(field) + " is not a normalized support declaration");
+}
+
+CanonicalValue SupportDeclaration(const SupportContactDTO& entry,
+                                  std::string_view field) {
+  RequireNormalizedSupportDeclaration(entry, field);
+  return CanonicalValue(CanonicalValue::Object{
+      {"support_object_id", String(entry.support_object_id,
+                                   std::string(field) + ".support_object_id")},
+      {"mode", CanonicalValue(std::string(ContactMode(entry.mode)))},
+      {"release_evidence_mode", CanonicalValue(std::string(ReleaseEvidence(
+                                    entry.release_evidence_mode)))},
+      {"enforce_max_start_penetration",
+       Bool(entry.enforce_max_start_penetration)},
+      {"max_start_penetration_m",
+       Number(entry.max_start_penetration_m,
+              std::string(field) + ".max_start_penetration_m", false, true)},
+      {"release_tolerance_m",
+       Number(entry.release_tolerance_m,
+              std::string(field) + ".release_tolerance_m", false, true)},
+      {"min_release_progress_m",
+       Number(entry.min_release_progress_m,
+              std::string(field) + ".min_release_progress_m", false, true)},
+      {"max_contact_penetration_m",
+       Number(entry.max_contact_penetration_m,
+              std::string(field) + ".max_contact_penetration_m", false, true)},
+      {"require_separation_by_end", Bool(entry.require_separation_by_end)},
+      {"require_strictly_decreasing_penetration",
+       Bool(entry.require_strictly_decreasing_penetration)},
+      {"allow_recontact", Bool(entry.allow_recontact)},
+  });
+}
+
+CanonicalValue SupportDeclarations(
+    const std::vector<SupportContactDTO>& entries, std::string_view field) {
+  RequireStrictlyIncreasing(
+      entries,
+      [](const auto& left, const auto& right) {
+        return left.support_object_id < right.support_object_id;
+      },
+      field);
+  CanonicalValue::Array result;
+  result.reserve(entries.size());
+  for (std::size_t index = 0U; index < entries.size(); ++index) {
+    result.push_back(SupportDeclaration(
+        entries[index],
+        std::string(field) + "[" + std::to_string(index) + "]"));
+  }
+  return CanonicalValue(std::move(result));
+}
+
 CanonicalValue ContactGrasp(const ContactGraspPolicyEntry& entry,
                             std::string_view field) {
   (void)String(entry.policy_id, std::string(field) + ".policy_id");
   (void)String(entry.selected_object_id,
                std::string(field) + ".selected_object_id");
-  RequireStrictlyIncreasing(
-      entry.allowed_robot_links, std::less<std::string>{},
-      std::string(field) + ".allowed_robot_links");
+  RequireStrictlyIncreasing(entry.allowed_robot_links, std::less<std::string>{},
+                            std::string(field) + ".allowed_robot_links");
   CanonicalValue::Array links;
   links.reserve(entry.allowed_robot_links.size());
   for (std::size_t index = 0U; index < entry.allowed_robot_links.size();
@@ -282,8 +336,7 @@ CanonicalValue ContactGrasp(const ContactGraspPolicyEntry& entry,
           std::string(field) +
               ".terminal_window_start_fraction must be within [0, 1]");
   return CanonicalValue(CanonicalValue::Object{
-      {"policy_id", String(entry.policy_id,
-                           std::string(field) + ".policy_id")},
+      {"policy_id", String(entry.policy_id, std::string(field) + ".policy_id")},
       {"selected_object_id",
        String(entry.selected_object_id,
               std::string(field) + ".selected_object_id")},
@@ -336,14 +389,13 @@ ContentDigest PolicyDigest(const CollisionPolicySnapshot& policy) {
 
 CanonicalValue CompletePolicy(const CollisionPolicySnapshot& policy) {
   const CanonicalValue semantics = PolicySemantics(policy);
-  const ContentDigest computed(
-      manyforge::content_identity::framed_sha256(
-          kCollisionPolicyContentIdentityDomain, kCollisionPolicyApiVersion,
-          semantics));
+  const ContentDigest computed(manyforge::content_identity::framed_sha256(
+      kCollisionPolicyContentIdentityDomain, kCollisionPolicyApiVersion,
+      semantics));
   Require(policy.revision.revision_id != 0U,
           "collision policy revision_id must be nonzero");
-  (void)Unsigned(policy.revision.revision_id,
-                 "collision policy revision_id", true);
+  (void)Unsigned(policy.revision.revision_id, "collision policy revision_id",
+                 true);
   Require(manyforge::content_identity::is_sha256_digest(
               policy.revision.content_hash),
           "collision policy content_hash has invalid spelling");
@@ -358,9 +410,9 @@ CanonicalValue CompletePolicy(const CollisionPolicySnapshot& policy) {
       "revision",
       CanonicalValue(CanonicalValue::Object{
           {"revision_id", Unsigned(policy.revision.revision_id,
-                                    "collision policy revision_id", true)},
+                                   "collision policy revision_id", true)},
           {"content_hash", String(policy.revision.content_hash,
-                                   "collision policy content_hash")},
+                                  "collision policy content_hash")},
       }));
   return CanonicalValue(std::move(object));
 }
@@ -380,18 +432,18 @@ CanonicalValue Shape(const CollisionShapeDTO& shape, std::string_view field) {
           return CanonicalValue(CanonicalValue::Object{
               {"type", CanonicalValue("sphere")},
               {"sphere_radius_m",
-               Number(value.radius_m,
-                      std::string(field) + ".sphere_radius_m", true)},
+               Number(value.radius_m, std::string(field) + ".sphere_radius_m",
+                      true)},
           });
         } else if constexpr (std::is_same_v<T, CylinderShapeDTO>) {
           return CanonicalValue(CanonicalValue::Object{
               {"type", CanonicalValue("cylinder")},
               {"cylinder_radius_m",
-               Number(value.radius_m,
-                      std::string(field) + ".cylinder_radius_m", true)},
+               Number(value.radius_m, std::string(field) + ".cylinder_radius_m",
+                      true)},
               {"cylinder_height_m",
-               Number(value.height_m,
-                      std::string(field) + ".cylinder_height_m", true)},
+               Number(value.height_m, std::string(field) + ".cylinder_height_m",
+                      true)},
           });
         } else {
           return CanonicalValue(CanonicalValue::Object{
@@ -400,8 +452,7 @@ CanonicalValue Shape(const CollisionShapeDTO& shape, std::string_view field) {
                String(value.resource_uri,
                       std::string(field) + ".mesh_resource_uri")},
               {"mesh_scale",
-               Vector3(value.scale, std::string(field) + ".mesh_scale",
-                       true)},
+               Vector3(value.scale, std::string(field) + ".mesh_scale", true)},
           });
         }
       },
@@ -414,16 +465,14 @@ CanonicalValue ShapeSet(const std::vector<CollisionShapeDTO>& shapes,
   std::vector<std::pair<std::string, CanonicalValue>> rows;
   rows.reserve(shapes.size());
   for (std::size_t index = 0U; index < shapes.size(); ++index) {
-    CanonicalValue row =
-        Shape(shapes[index], std::string(field) + "[" +
-                                 std::to_string(index) + "]");
+    CanonicalValue row = Shape(
+        shapes[index], std::string(field) + "[" + std::to_string(index) + "]");
     rows.emplace_back(manyforge::content_identity::canonical_json(row),
                       std::move(row));
   }
-  std::sort(rows.begin(), rows.end(),
-            [](const auto& left, const auto& right) {
-              return left.first < right.first;
-            });
+  std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+    return left.first < right.first;
+  });
   CanonicalValue::Array result;
   result.reserve(rows.size());
   for (std::size_t index = 0U; index < rows.size(); ++index) {
@@ -439,18 +488,16 @@ CanonicalValue Placement(const SceneObjectPlacementDTO& placement,
   return std::visit(
       [&](const auto& value) -> CanonicalValue {
         using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T,
-                                     CellFixedSceneObjectPlacementDTO>) {
-          Require(value.cell_id == snapshot_cell,
-                  std::string(field) +
-                      ".cell_id must equal the snapshot cell_id");
+        if constexpr (std::is_same_v<T, CellFixedSceneObjectPlacementDTO>) {
+          Require(
+              value.cell_id == snapshot_cell,
+              std::string(field) + ".cell_id must equal the snapshot cell_id");
           return CanonicalValue(CanonicalValue::Object{
               {"kind", CanonicalValue("cell_fixed")},
-              {"cell_id", String(value.cell_id.value(),
-                                  std::string(field) + ".cell_id")},
+              {"cell_id",
+               String(value.cell_id.value(), std::string(field) + ".cell_id")},
               {"pose_in_cell",
-               Pose(value.pose_in_cell,
-                    std::string(field) + ".pose_in_cell")},
+               Pose(value.pose_in_cell, std::string(field) + ".pose_in_cell")},
           });
         } else {
           Require(manyforge::content_identity::is_sha256_digest(
@@ -462,12 +509,11 @@ CanonicalValue Placement(const SceneObjectPlacementDTO& placement,
               {"kind", CanonicalValue("carried")},
               {"carried_object_attachment_id",
                String(value.carried_object_attachment_id.value(),
-                      std::string(field) +
-                          ".carried_object_attachment_id")},
+                      std::string(field) + ".carried_object_attachment_id")},
               {"carried_object_attachment_revision",
-               String(value.carried_object_attachment_revision.value(),
-                      std::string(field) +
-                          ".carried_object_attachment_revision")},
+               String(
+                   value.carried_object_attachment_revision.value(),
+                   std::string(field) + ".carried_object_attachment_revision")},
           });
         }
       },
@@ -476,10 +522,10 @@ CanonicalValue Placement(const SceneObjectPlacementDTO& placement,
 
 CanonicalValue ProviderEvidence(const SceneObjectProviderEvidenceDTO& value,
                                 std::string_view field) {
-  Require(manyforge::content_identity::is_sha256_digest(
-              value.provider_manifest_revision.value()),
-          std::string(field) +
-              ".provider_manifest_revision has invalid spelling");
+  Require(
+      manyforge::content_identity::is_sha256_digest(
+          value.provider_manifest_revision.value()),
+      std::string(field) + ".provider_manifest_revision has invalid spelling");
   CanonicalValue::Object object{
       {"provider_instance_id",
        String(value.provider_instance_id.value(),
@@ -497,19 +543,17 @@ CanonicalValue ProviderEvidence(const SceneObjectProviderEvidenceDTO& value,
        Unsigned(value.provider_source_sequence,
                 std::string(field) + ".provider_source_sequence")},
       {"received_at_ns",
-       Signed(value.received_at_ns,
-              std::string(field) + ".received_at_ns")},
+       Signed(value.received_at_ns, std::string(field) + ".received_at_ns")},
   };
   if (value.source_timestamp_ns.has_value()) {
-    object.emplace_back(
-        "source_timestamp_ns",
-        Signed(*value.source_timestamp_ns,
-               std::string(field) + ".source_timestamp_ns"));
+    object.emplace_back("source_timestamp_ns",
+                        Signed(*value.source_timestamp_ns,
+                               std::string(field) + ".source_timestamp_ns"));
   }
   if (value.source_freshness_budget_ns.has_value()) {
-    Require(*value.source_freshness_budget_ns > 0,
-            std::string(field) +
-                ".source_freshness_budget_ns must be positive");
+    Require(
+        *value.source_freshness_budget_ns > 0,
+        std::string(field) + ".source_freshness_budget_ns must be positive");
     object.emplace_back(
         "source_freshness_budget_ns",
         Signed(*value.source_freshness_budget_ns,
@@ -522,15 +566,16 @@ CanonicalValue SceneObject(const SceneObjectSnapshotDTO& object,
                            std::string_view field,
                            const CellId& snapshot_cell) {
   CanonicalValue::Object result{
-      {"scene_resource_id",
-       String(object.scene_resource_id.value(),
-              std::string(field) + ".scene_resource_id")},
-      {"collision_shapes",
-       ShapeSet(object.collision_shapes,
-                std::string(field) + ".collision_shapes")},
+      {"scene_resource_id", String(object.scene_resource_id.value(),
+                                   std::string(field) + ".scene_resource_id")},
+      {"collision_shapes", ShapeSet(object.collision_shapes,
+                                    std::string(field) + ".collision_shapes")},
       {"placement",
        Placement(object.placement, std::string(field) + ".placement",
                  snapshot_cell)},
+      {"support_contacts",
+       SupportDeclarations(object.support_contacts,
+                           std::string(field) + ".support_contacts")},
   };
   if (object.provider_evidence.has_value()) {
     result.emplace_back(
@@ -541,31 +586,27 @@ CanonicalValue SceneObject(const SceneObjectSnapshotDTO& object,
   return CanonicalValue(std::move(result));
 }
 
-CanonicalValue FrameRef(const SceneFrameRefDTO& frame,
-                        std::string_view field) {
+CanonicalValue FrameRef(const SceneFrameRefDTO& frame, std::string_view field) {
   return std::visit(
       [&](const auto& value) -> CanonicalValue {
         using T = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<T, CellSceneFrameRefDTO>) {
           return CanonicalValue(CanonicalValue::Object{
               {"kind", CanonicalValue("cell_frame")},
-              {"cell_id", String(value.cell_id.value(),
-                                  std::string(field) + ".cell_id")},
+              {"cell_id",
+               String(value.cell_id.value(), std::string(field) + ".cell_id")},
           });
-        } else if constexpr (std::is_same_v<T,
-                                            ComponentSceneFrameRefDTO>) {
+        } else if constexpr (std::is_same_v<T, ComponentSceneFrameRefDTO>) {
           return CanonicalValue(CanonicalValue::Object{
               {"kind", CanonicalValue("component_frame")},
               {"controllable_component_id",
                String(value.controllable_component_id.value(),
-                      std::string(field) +
-                          ".controllable_component_id")},
+                      std::string(field) + ".controllable_component_id")},
               {"model_instance_id",
                String(value.model_instance_id.value(),
                       std::string(field) + ".model_instance_id")},
-              {"frame_role_id",
-               String(value.frame_role_id.value(),
-                      std::string(field) + ".frame_role_id")},
+              {"frame_role_id", String(value.frame_role_id.value(),
+                                       std::string(field) + ".frame_role_id")},
           });
         } else {
           return CanonicalValue(CanonicalValue::Object{
@@ -573,22 +614,20 @@ CanonicalValue FrameRef(const SceneFrameRefDTO& frame,
               {"model_instance_id",
                String(value.model_instance_id.value(),
                       std::string(field) + ".model_instance_id")},
-              {"frame_role_id",
-               String(value.frame_role_id.value(),
-                      std::string(field) + ".frame_role_id")},
+              {"frame_role_id", String(value.frame_role_id.value(),
+                                       std::string(field) + ".frame_role_id")},
           });
         }
       },
       frame);
 }
 
-CanonicalValue AttachmentPayload(
-    const CarriedObjectAttachmentDTO& attachment, std::string_view field) {
+CanonicalValue AttachmentPayload(const CarriedObjectAttachmentDTO& attachment,
+                                 std::string_view field) {
   const auto* component_frame =
       std::get_if<ComponentSceneFrameRefDTO>(&attachment.carrier_frame_ref);
   Require(component_frame != nullptr,
-          std::string(field) +
-              ".carrier_frame_ref must be a component frame");
+          std::string(field) + ".carrier_frame_ref must be a component frame");
   Require(component_frame->controllable_component_id ==
               attachment.controllable_component_id,
           std::string(field) +
@@ -603,24 +642,21 @@ CanonicalValue AttachmentPayload(
   touch_roles.reserve(attachment.touch_body_roles.size());
   for (std::size_t index = 0U; index < attachment.touch_body_roles.size();
        ++index) {
-    touch_roles.push_back(String(
-        attachment.touch_body_roles[index].value(),
-        std::string(field) + ".touch_body_roles[" +
-            std::to_string(index) + "]"));
+    touch_roles.push_back(String(attachment.touch_body_roles[index].value(),
+                                 std::string(field) + ".touch_body_roles[" +
+                                     std::to_string(index) + "]"));
   }
   return CanonicalValue(CanonicalValue::Object{
       {"carried_object_attachment_id",
        String(attachment.carried_object_attachment_id.value(),
               std::string(field) + ".carried_object_attachment_id")},
-      {"scene_resource_id",
-       String(attachment.scene_resource_id.value(),
-              std::string(field) + ".scene_resource_id")},
+      {"scene_resource_id", String(attachment.scene_resource_id.value(),
+                                   std::string(field) + ".scene_resource_id")},
       {"controllable_component_id",
        String(attachment.controllable_component_id.value(),
               std::string(field) + ".controllable_component_id")},
-      {"command_target_id",
-       String(attachment.command_target_id.value(),
-              std::string(field) + ".command_target_id")},
+      {"command_target_id", String(attachment.command_target_id.value(),
+                                   std::string(field) + ".command_target_id")},
       {"carrier_frame_ref",
        FrameRef(attachment.carrier_frame_ref,
                 std::string(field) + ".carrier_frame_ref")},
@@ -639,8 +675,8 @@ CarriedObjectAttachmentRevision AttachmentRevision(
           kLogicalSceneApiVersion, AttachmentPayload(attachment, field)));
 }
 
-CanonicalValue CompleteAttachment(
-    const CarriedObjectAttachmentDTO& attachment, std::string_view field) {
+CanonicalValue CompleteAttachment(const CarriedObjectAttachmentDTO& attachment,
+                                  std::string_view field) {
   Require(manyforge::content_identity::is_sha256_digest(
               attachment.carried_object_attachment_revision.value()),
           std::string(field) +
@@ -657,17 +693,17 @@ CanonicalValue CompleteAttachment(
               ".carried_object_attachment_revision does not match its "
               "semantic attachment");
   const auto& payload_members = payload.as_object();
-  CanonicalValue::Object result(payload_members.begin(),
-                                payload_members.end());
+  CanonicalValue::Object result(payload_members.begin(), payload_members.end());
   result.emplace_back(
       "carried_object_attachment_revision",
       String(attachment.carried_object_attachment_revision.value(),
-             std::string(field) +
-                 ".carried_object_attachment_revision"));
+             std::string(field) + ".carried_object_attachment_revision"));
   return CanonicalValue(std::move(result));
 }
 
 CanonicalValue SceneContent(const LogicalSceneSnapshotDTO& snapshot) {
+  Require(logical_scene_detail::LocallyValidSceneContent(snapshot),
+          "logical scene content is invalid");
   (void)String(snapshot.cell_id.value(), "cell_id");
   RequireStrictlyIncreasing(
       snapshot.objects,
@@ -686,9 +722,9 @@ CanonicalValue SceneContent(const LogicalSceneSnapshotDTO& snapshot) {
   CanonicalValue::Array objects;
   objects.reserve(snapshot.objects.size());
   for (std::size_t index = 0U; index < snapshot.objects.size(); ++index) {
-    objects.push_back(SceneObject(
-        snapshot.objects[index],
-        "objects[" + std::to_string(index) + "]", snapshot.cell_id));
+    objects.push_back(SceneObject(snapshot.objects[index],
+                                  "objects[" + std::to_string(index) + "]",
+                                  snapshot.cell_id));
   }
   CanonicalValue::Array attachments;
   attachments.reserve(snapshot.carried_object_attachments.size());
@@ -707,13 +743,13 @@ CanonicalValue SceneContent(const LogicalSceneSnapshotDTO& snapshot) {
       continue;
     }
     ++carried_count;
-    const auto found = std::lower_bound(
-        snapshot.carried_object_attachments.begin(),
-        snapshot.carried_object_attachments.end(),
-        carried->carried_object_attachment_id,
-        [](const auto& attachment, const auto& id) {
-          return attachment.carried_object_attachment_id < id;
-        });
+    const auto found =
+        std::lower_bound(snapshot.carried_object_attachments.begin(),
+                         snapshot.carried_object_attachments.end(),
+                         carried->carried_object_attachment_id,
+                         [](const auto& attachment, const auto& id) {
+                           return attachment.carried_object_attachment_id < id;
+                         });
     Require(found != snapshot.carried_object_attachments.end() &&
                 found->carried_object_attachment_id ==
                     carried->carried_object_attachment_id &&
@@ -752,11 +788,9 @@ SceneId MintSceneId(const LogicalSceneBootstrapIdentityInputDTO& input) {
     Require(input.valid(), "logical-scene bootstrap identity input is invalid");
     const CanonicalValue payload(CanonicalValue::Object{
         {"cell_id", String(input.cell_id.value(), "cell_id")},
-        {"bootstrap_id",
-         String(input.bootstrap_id.value(), "bootstrap_id")},
-        {"bootstrap_generation",
-         Unsigned(input.bootstrap_generation.value(), "bootstrap_generation",
-                  true)},
+        {"bootstrap_id", String(input.bootstrap_id.value(), "bootstrap_id")},
+        {"bootstrap_generation", Unsigned(input.bootstrap_generation.value(),
+                                          "bootstrap_generation", true)},
     });
     return SceneId(manyforge::content_identity::framed_sha256(
         kLogicalSceneIdIdentityDomain, kLogicalSceneApiVersion, payload));

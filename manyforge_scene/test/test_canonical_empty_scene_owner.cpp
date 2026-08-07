@@ -1,8 +1,3 @@
-#include "logical_scene_codec_internal.hpp"
-#include "manyforge_scene/canonical_empty_scene_owner.hpp"
-#include "manyforge_scene/scene_transaction_codec.hpp"
-#include "sqlite_scene_lifecycle_internal.hpp"
-
 #include <gtest/gtest.h>
 #include <sqlite3.h>
 
@@ -16,6 +11,9 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,9 +23,10 @@
 #include <utility>
 #include <vector>
 
-#include <manyforge_core/logical_scene_identity.hpp>
-#include <manyforge_deployment/canonical_empty_admission.hpp>
-#include <manyforge_deployment/verified_retained_bundle.hpp>
+#include "logical_scene_codec_internal.hpp"
+#include "manyforge_scene/canonical_empty_scene_owner.hpp"
+#include "manyforge_scene/scene_transaction_codec.hpp"
+#include "sqlite_scene_lifecycle_internal.hpp"
 
 namespace manyforge::scene {
 namespace {
@@ -557,6 +556,8 @@ TEST(CanonicalEmptySceneOwner, SealedAdmissionMintsGoldenAndHoldsGatesClosed) {
   EXPECT_FALSE(access.active_projection.has_value());
   EXPECT_FALSE(owner.ReadActiveSnapshot().has_value());
   const auto integrity = owner.VerifyIntegrity();
+  EXPECT_EQ(integrity.schema_id, kLogicalSceneStoreSchemaId);
+  EXPECT_EQ(integrity.schema_version, kLogicalSceneStoreSchemaVersion);
   EXPECT_EQ(integrity.acceptance_row_count, 1);
   EXPECT_EQ(integrity.rebuild_row_count, 0);
   EXPECT_EQ(integrity.finalization_row_count, 0);
@@ -1324,6 +1325,23 @@ TEST(CanonicalEmptySceneOwner,
       CanonicalEmptySceneOwnerIntegrityError);
 }
 
+TEST(CanonicalEmptySceneOwner,
+     StartupRejectsTheProvisionalV3PayloadContract) {
+  TemporaryDirectory directory;
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  {
+    CanonicalEmptySceneOwner owner(database_path, admission,
+                                   publication_reader);
+    owner.Close();
+  }
+  ExecuteSql(database_path, "PRAGMA user_version = 3;");
+  EXPECT_THROW(
+      CanonicalEmptySceneOwner(database_path, admission, publication_reader),
+      CanonicalEmptySceneOwnerIntegrityError);
+}
+
 TEST(CanonicalEmptySceneOwner, StartupRejectsOversizedDatabaseImage) {
   TemporaryDirectory directory;
   const auto database_path = directory.path() / "logical-scene.sqlite3";
@@ -1405,7 +1423,8 @@ TEST(CanonicalEmptySceneOwner, RejectsOverBoundBootstrapIdentifier) {
 
 core::SceneTransactionRequestDTO
 AddBoxRequest(const ProjectionRevisionDTO &expected, const CellId &cell_id,
-              std::string request_id = "scene-request-add-box") {
+              std::string request_id = "scene-request-add-box",
+              std::vector<core::SupportContactDTO> support_contacts = {}) {
   core::Pose3DTO pose;
   pose.position_m = {0.25, -0.5, 0.75};
   return {
@@ -1422,9 +1441,14 @@ AddBoxRequest(const ProjectionRevisionDTO &expected, const CellId &cell_id,
           core::BoxShapeDTO{{0.1, 0.2, 0.3}},
           pose,
           core::CellSceneFrameRefDTO{cell_id},
+          std::move(support_contacts),
       },
   };
 }
+
+core::PublicRequestContextDTO
+SceneRequestContext(std::string request_id,
+                    const ProjectionRevisionDTO &expected);
 
 TEST(LogicalSceneTransactionCodec,
      CanonicalInternalRequestRoundTripsAndRejectsWireDrift) {
@@ -1438,6 +1462,9 @@ TEST(LogicalSceneTransactionCodec,
       },
   };
   auto request = AddBoxRequest(expected, CellId("cell-a"));
+  std::get<core::AddObjectRequestDTO>(request.operation).support_contacts = {
+      core::SupportContactDTO{.support_object_id = "support-table"},
+  };
   request.attribution = {
       core::RequestTransportDTO::kHttp,
       core::RequestAssuranceDTO::kExternallyAuthenticated,
@@ -1465,6 +1492,13 @@ TEST(LogicalSceneTransactionCodec,
   EXPECT_EQ(
       std::get<core::AddObjectRequestDTO>(decoded.operation).scene_resource_id,
       core::SceneResourceId("scene-box"));
+  ASSERT_EQ(std::get<core::AddObjectRequestDTO>(decoded.operation)
+                .support_contacts.size(),
+            1U);
+  EXPECT_EQ(std::get<core::AddObjectRequestDTO>(decoded.operation)
+                .support_contacts.front()
+                .support_object_id,
+            "support-table");
   EXPECT_THROW(DecodeCanonicalSceneTransactionRequest(" " + encoded),
                std::invalid_argument);
   auto unknown_field = encoded;
@@ -1566,6 +1600,128 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(replay.committed_projection_revision, committed_projection);
 }
 
+TEST(CanonicalEmptySceneOwner,
+     PortableSupportDeclarationsNormalizePersistAndProtectReferences) {
+  TemporaryDirectory directory("scene-support-declarations");
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  ProjectionRevisionDTO projection;
+  {
+    CanonicalEmptySceneOwner owner(database_path, admission,
+                                   publication_reader);
+    projection =
+        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+            .canonical_empty_target;
+
+    for (const auto &support_id : {"support-a", "support-b"}) {
+      auto request =
+          AddBoxRequest(projection, admission.cell_id(),
+                        std::string("scene-request-add-") + support_id);
+      std::get<core::AddObjectRequestDTO>(request.operation).scene_resource_id =
+          core::SceneResourceId(support_id);
+      const auto result = owner.Commit(request);
+      ASSERT_TRUE(result.success);
+      projection = *result.committed_projection_revision;
+    }
+
+    core::SupportContactDTO bounded;
+    bounded.support_object_id = "support-b";
+    bounded.mode = core::CollisionContactPolicyMode::kBoundedPenetration;
+    bounded.max_contact_penetration_m = 0.002;
+    core::SupportContactDTO binary;
+    binary.support_object_id = "support-a";
+    binary.release_evidence_mode =
+        core::ContactReleaseEvidenceMode::kBinaryContact;
+    auto add_supported =
+        AddBoxRequest(projection, admission.cell_id(),
+                      "scene-request-add-supported", {bounded, binary});
+    const auto supported = owner.Commit(add_supported);
+    ASSERT_TRUE(supported.success);
+    projection = *supported.committed_projection_revision;
+
+    const auto snapshot = owner.LogicalSnapshot();
+    const auto object =
+        std::lower_bound(snapshot->objects.begin(), snapshot->objects.end(),
+                         core::SceneResourceId("scene-box"),
+                         [](const core::SceneObjectSnapshotDTO &candidate,
+                            const core::SceneResourceId &id) {
+                           return candidate.scene_resource_id < id;
+                         });
+    ASSERT_NE(object, snapshot->objects.end());
+    ASSERT_EQ(object->support_contacts.size(), 2U);
+    EXPECT_EQ(object->support_contacts[0].support_object_id, "support-a");
+    EXPECT_EQ(object->support_contacts[1].support_object_id, "support-b");
+    EXPECT_FALSE(object->support_contacts[0].enforce_max_start_penetration);
+    EXPECT_DOUBLE_EQ(object->support_contacts[0].release_tolerance_m, 0.0);
+    EXPECT_FALSE(
+        object->support_contacts[0].require_strictly_decreasing_penetration);
+    EXPECT_FALSE(object->support_contacts[1].require_separation_by_end);
+    EXPECT_DOUBLE_EQ(object->support_contacts[1].max_contact_penetration_m,
+                     0.002);
+
+    core::SceneTransactionRequestDTO remove_support{
+        SceneRequestContext("scene-request-remove-support", projection),
+        {},
+        projection,
+        core::RemoveObjectRequestDTO{core::SceneResourceId("support-a")},
+    };
+    const auto removal = owner.Commit(remove_support);
+    ASSERT_FALSE(removal.success);
+    ASSERT_TRUE(removal.error.has_value());
+    EXPECT_EQ(removal.error->code, "scene_object_state_conflict");
+    EXPECT_EQ(removal.error->details.at("reason"),
+              "support_contact_reference_exists");
+
+    auto missing = AddBoxRequest(
+        projection, admission.cell_id(), "scene-request-missing-support",
+        {core::SupportContactDTO{.support_object_id = "missing-support"}});
+    std::get<core::AddObjectRequestDTO>(missing.operation).scene_resource_id =
+        core::SceneResourceId("missing-dependent");
+    const auto missing_result = owner.Commit(missing);
+    ASSERT_FALSE(missing_result.success);
+    ASSERT_TRUE(missing_result.error.has_value());
+    EXPECT_EQ(missing_result.error->code, "missing_reference");
+
+    auto self = AddBoxRequest(
+        projection, admission.cell_id(), "scene-request-self-support",
+        {core::SupportContactDTO{.support_object_id = "self-supported"}});
+    std::get<core::AddObjectRequestDTO>(self.operation).scene_resource_id =
+        core::SceneResourceId("self-supported");
+    const auto self_result = owner.Commit(self);
+    ASSERT_FALSE(self_result.success);
+    ASSERT_TRUE(self_result.error.has_value());
+    EXPECT_EQ(self_result.error->code, "invalid_contact_policy");
+    EXPECT_EQ(self_result.error->details.at("reason"), "self_support_contact");
+
+    auto duplicate = AddBoxRequest(
+        projection, admission.cell_id(), "scene-request-duplicate-support",
+        {core::SupportContactDTO{.support_object_id = "support-a"},
+         core::SupportContactDTO{.support_object_id = "support-a"}});
+    std::get<core::AddObjectRequestDTO>(duplicate.operation).scene_resource_id =
+        core::SceneResourceId("duplicate-dependent");
+    const auto duplicate_result = owner.Commit(duplicate);
+    ASSERT_FALSE(duplicate_result.success);
+    ASSERT_TRUE(duplicate_result.error.has_value());
+    EXPECT_EQ(duplicate_result.error->details.at("reason"),
+              "duplicate_support_contact_pair");
+    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 3);
+    owner.Close();
+  }
+
+  CanonicalEmptySceneOwner reopened(database_path, admission,
+                                    publication_reader);
+  EXPECT_EQ(reopened.CurrentProjectionRevision(), projection);
+  const auto restored = reopened.LogicalSnapshot();
+  const auto object = std::find_if(
+      restored->objects.begin(), restored->objects.end(), [](const auto &row) {
+        return row.scene_resource_id == core::SceneResourceId("scene-box");
+      });
+  ASSERT_NE(object, restored->objects.end());
+  ASSERT_EQ(object->support_contacts.size(), 2U);
+  EXPECT_EQ(object->support_contacts.front().support_object_id, "support-a");
+}
+
 TEST(CanonicalEmptySceneOwner, CommitsTheClosedPortableCollisionShapeSet) {
   TemporaryDirectory directory("scene-shape-set");
   const auto admission = LoadAdmission();
@@ -1644,6 +1800,10 @@ public:
   }
 
   [[nodiscard]] std::size_t calls() const noexcept { return calls_; }
+  [[nodiscard]] const std::vector<core::SceneTransactionDTO> &
+  transactions() const noexcept {
+    return transactions_;
+  }
 
   core::ProjectionCommitResultDTO
   ApplyTransaction(const core::SceneTransactionDTO &transaction) override {
@@ -1830,6 +1990,49 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(integrity.transaction_intent_count, 0);
   EXPECT_EQ(integrity.request_outcome_count, 0);
   EXPECT_EQ(integrity.projection_attempt_count, 0);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     PolicyProjectionCarriesConfiguredAndEffectiveValuesSeparately) {
+  TemporaryDirectory directory("scene-policy-resolution");
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  FakePlannerSceneProjection projection("policy-resolution");
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader, bundle_source,
+                                 {&projection});
+  const auto accepted =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+  projection.Reset(accepted.canonical_empty_target,
+                   FakePlannerSceneProjection::Mode::kCommit);
+
+  auto configured = owner.LogicalSnapshot()->configured_collision_policy;
+  configured.policy_id = "strict-diagnostics";
+  core::SceneTransactionRequestDTO request{
+      SceneRequestContext("scene-request-policy-resolution",
+                          accepted.canonical_empty_target),
+      {},
+      accepted.canonical_empty_target,
+      core::SetCollisionPolicyRequestDTO{
+          configured,
+          owner.LogicalSnapshot()->configured_collision_policy.revision,
+      },
+  };
+  const auto result = owner.Commit(request);
+  ASSERT_TRUE(result.success);
+  ASSERT_EQ(projection.transactions().size(), 1U);
+  const auto *resolved = std::get_if<core::ResolvedCollisionPolicyDTO>(
+      &projection.transactions().front().resolved_operation);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->configured_policy.policy_id, "strict-diagnostics");
+  EXPECT_EQ(resolved->effective_policy.policy_id, "strict-diagnostics");
+  EXPECT_EQ(resolved->configured_policy.revision.content_hash,
+            owner.LogicalSnapshot()
+                ->configured_collision_policy.revision.content_hash);
+  EXPECT_EQ(resolved->effective_policy.revision.content_hash,
+            resolved->configured_policy.revision.content_hash);
 }
 
 TEST(CanonicalEmptySceneOwner,

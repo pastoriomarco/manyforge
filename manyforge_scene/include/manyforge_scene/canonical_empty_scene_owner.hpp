@@ -3,17 +3,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <manyforge_core/ports/iactive_bundle_publication_store.hpp>
+#include <manyforge_core/ports/imanager_scene_projection.hpp>
+#include <manyforge_core/ports/iplanner_scene_projection.hpp>
+#include <manyforge_core/ports/iscene_authority.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <manyforge_core/ports/iactive_bundle_publication_store.hpp>
-#include <manyforge_core/ports/imanager_scene_projection.hpp>
-#include <manyforge_core/ports/iplanner_scene_projection.hpp>
-#include <manyforge_core/ports/iscene_authority.hpp>
 
 namespace manyforge::deployment {
 class CanonicalEmptyRetainedBundleAdmission;
@@ -26,8 +25,8 @@ inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
     "manyforge.internal.logical-scene.i4.v2";
 inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
 inline constexpr std::string_view kLogicalSceneStoreSchemaId =
-    "manyforge.internal.logical-scene.n5b.v3";
-inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 3;
+    "manyforge.internal.logical-scene.n5b.v4";
+inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 4;
 inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
     1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;

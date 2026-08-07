@@ -499,6 +499,45 @@ def test_scene_transaction_is_forwarded_with_adapter_only_attribution() -> None:
     assert forged.status_code == 422
 
 
+def test_scene_support_declaration_crosses_http_without_native_names() -> None:
+    client, _core, manager = _client(trusted=True)
+    body = _scene_body()
+    body["operation"] = {
+        "kind": "add_object",
+        "scene_resource_id": "part.1",
+        "shape": {
+            "type": "box",
+            "box_dimensions_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
+        },
+        "pose": {
+            "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.15},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        },
+        "frame_ref": {"kind": "cell_frame", "cell_id": "cell-a"},
+        "support_contacts": [
+            {
+                "support_object_id": "table.1",
+                "mode": "bounded_penetration",
+                "max_contact_penetration_m": 0.002,
+            }
+        ],
+    }
+    with client:
+        response = client.post("/api/scene/transactions", json=body)
+        openapi = client.get("/openapi.json").json()
+
+    assert response.status_code == 200
+    operation = manager.scene_requests[0][0].operation
+    assert operation.support_contacts[0].support_object_id == "table.1"
+    assert operation.support_contacts[0].max_contact_penetration_m == 0.002
+    assert "support_contacts" in openapi["components"]["schemas"][
+        "AddSceneObjectRequest"
+    ]["properties"]
+    assert "body_a" not in openapi["components"]["schemas"][
+        "SceneSupportContactRequest"
+    ]["properties"]
+
+
 def test_request_body_bound_is_enforced_before_model_decode() -> None:
     client, _core, _manager = _client()
     with client:
