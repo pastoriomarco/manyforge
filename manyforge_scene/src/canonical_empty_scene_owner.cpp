@@ -7,6 +7,7 @@
 
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/logical_scene_projection.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
@@ -5086,6 +5087,14 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
       candidate->operation,
       candidate->resolution_evidence_digest,
   };
+
+  const auto reconstructed = core::ApplyResolvedSceneTransaction(
+      *observed_state.active_scene_snapshot, scene_transaction);
+  if (!reconstructed.ok() || reconstructed.value() != candidate->snapshot) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "owner-normalized scene transaction does not reproduce its exact "
+        "candidate snapshot");
+  }
 
   std::vector<RequiredSceneProjection> projections;
   projections.reserve(impl_->required_projections_.size());

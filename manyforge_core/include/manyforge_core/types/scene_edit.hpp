@@ -12,23 +12,33 @@ namespace manyforge::core {
 /// Box shape (spec §3.9)
 struct BoxShapeDTO {
   Vector3DTO dimensions_m;  // full dimensions, matching URDF/ROS conventions
+
+  friend bool operator==(const BoxShapeDTO&, const BoxShapeDTO&) = default;
 };
 
 /// Sphere shape (spec §3.9)
 struct SphereShapeDTO {
   double radius_m;  // > 0
+
+  friend bool operator==(const SphereShapeDTO&, const SphereShapeDTO&) =
+      default;
 };
 
 /// Cylinder shape (spec §3.9)
 struct CylinderShapeDTO {
   double radius_m;   // > 0
   double height_m;   // > 0
+
+  friend bool operator==(const CylinderShapeDTO&, const CylinderShapeDTO&) =
+      default;
 };
 
 /// Mesh shape (spec §3.9)
 struct MeshShapeDTO {
   std::string resource_uri;
   Vector3DTO scale;  // default {1,1,1}
+
+  friend bool operator==(const MeshShapeDTO&, const MeshShapeDTO&) = default;
 };
 
 /// Collision shape as a tagged union (spec §3.9)

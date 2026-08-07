@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/logical_scene_snapshot.hpp>
 #include <manyforge_core/types/projection_common.hpp>
@@ -77,21 +78,33 @@ struct SceneTransactionRequestDTO final {
 /// normalized into the semantic cell frame and contains no authored frame.
 struct ResolvedUpsertSceneObjectDTO final {
   SceneObjectSnapshotDTO object;
+
+  friend bool operator==(const ResolvedUpsertSceneObjectDTO&,
+                         const ResolvedUpsertSceneObjectDTO&) = default;
 };
 
 struct ResolvedRemoveSceneObjectDTO final {
   SceneResourceId scene_resource_id;
+
+  friend bool operator==(const ResolvedRemoveSceneObjectDTO&,
+                         const ResolvedRemoveSceneObjectDTO&) = default;
 };
 
 struct ResolvedAttachCarriedObjectDTO final {
   SceneObjectSnapshotDTO object;
   CarriedObjectAttachmentDTO attachment;
+
+  friend bool operator==(const ResolvedAttachCarriedObjectDTO&,
+                         const ResolvedAttachCarriedObjectDTO&) = default;
 };
 
 struct ResolvedDetachCarriedObjectDTO final {
   SceneObjectSnapshotDTO object;
   CarriedObjectAttachmentId removed_attachment_id;
   CarriedObjectAttachmentRevision removed_attachment_revision;
+
+  friend bool operator==(const ResolvedDetachCarriedObjectDTO&,
+                         const ResolvedDetachCarriedObjectDTO&) = default;
 };
 
 struct ResolvedCollisionPolicyDTO final {
@@ -99,6 +112,9 @@ struct ResolvedCollisionPolicyDTO final {
   CollisionPolicySnapshot configured_policy;
   /// The projection-ready policy after owner-derived touch/support allowances.
   CollisionPolicySnapshot effective_policy;
+
+  friend bool operator==(const ResolvedCollisionPolicyDTO&,
+                         const ResolvedCollisionPolicyDTO&) = default;
 };
 
 using ResolvedSceneOperationDTO =
@@ -116,6 +132,32 @@ struct SceneTransactionDTO final {
   ContentDigest original_request_digest;
   ResolvedSceneOperationDTO resolved_operation;
   std::optional<ContentDigest> resolution_evidence_digest;
+
+  friend bool operator==(const SceneTransactionDTO&,
+                         const SceneTransactionDTO&) = default;
+};
+
+/// Exact authoritative input for recovery of one already-selected native
+/// projection. The retained product is identity evidence; concrete verified
+/// artifact/model handles remain adapter-private.
+struct NativeProjectionRebuildDTO final {
+  ProjectionNativeRuntimeBindingDTO expected_native_runtime_binding;
+  ProjectionRevisionDTO target_projection_revision;
+  RetainedProductDTO planning_collision_model;
+  std::shared_ptr<const LogicalSceneSnapshotDTO> logical_scene;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return expected_native_runtime_binding.valid() &&
+           target_projection_revision.valid() &&
+           planning_collision_model.product_kind ==
+               RetainedProductKind::kPlanningCollisionModel &&
+           !planning_collision_model.product_id.empty() &&
+           !planning_collision_model.product_contract_id.empty() &&
+           !planning_collision_model.product_contract_revision.empty() &&
+           logical_scene != nullptr && logical_scene->locally_valid() &&
+           logical_scene->revision ==
+               target_projection_revision.scene_revision;
+  }
 };
 
 enum class SceneUpdateStatusDTO {
@@ -208,7 +250,7 @@ inline bool ProjectionCommitResultDTO::presence_valid() const noexcept {
   }
   switch (result) {
     case ProjectionCommitResultStateDTO::kCommitted:
-      return transaction_sequence.has_value() && acknowledged_projection_revision.has_value() &&
+      return acknowledged_projection_revision.has_value() &&
              *acknowledged_projection_revision == proposed_projection_revision &&
              !rollback_proven && !error.has_value() &&
              resulting_health.healthy_for_target(proposed_projection_revision);

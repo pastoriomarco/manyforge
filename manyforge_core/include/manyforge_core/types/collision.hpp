@@ -442,6 +442,9 @@ struct SupportContactPolicyEntry {
   /// this false.
   bool require_strictly_decreasing_penetration = true;
   bool allow_recontact = false;
+
+  friend bool operator==(const SupportContactPolicyEntry&,
+                         const SupportContactPolicyEntry&) = default;
 };
 
 /// Geometry-only grasp-contact policy for detached pick approaches.
@@ -456,6 +459,9 @@ struct ContactGraspPolicyEntry {
   std::vector<std::string> allowed_robot_links;
   double max_penetration_m = 0.0;
   double terminal_window_start_fraction = 0.8;
+
+  friend bool operator==(const ContactGraspPolicyEntry&,
+                         const ContactGraspPolicyEntry&) = default;
 };
 
 /// Policy-revision twin of CollisionWorldRevision (spec §3.8.1, added in
@@ -463,6 +469,9 @@ struct ContactGraspPolicyEntry {
 struct CollisionPolicyRevision {
   std::uint64_t revision_id = 0;
   std::string content_hash;
+
+  friend bool operator==(const CollisionPolicyRevision&,
+                         const CollisionPolicyRevision&) = default;
 };
 
 /// Immutable policy configuration consumed by the policy evaluator for one
@@ -498,6 +507,9 @@ struct CollisionPolicySnapshot {
   /// when false, the evaluator classifies opportunistically with the
   /// available data.
   bool require_full_diagnostics = true;
+
+  friend bool operator==(const CollisionPolicySnapshot&,
+                         const CollisionPolicySnapshot&) = default;
 };
 
 /// Severity grade of a CollisionDecision (spec §3.8.1).

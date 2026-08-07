@@ -120,7 +120,8 @@ target_link_libraries(manyforge_roboplan_retained_consumer
 
 add_library(manyforge_roboplan_collision_projection
   src/retained_collision_world_projector.cpp
-  src/retained_collision_world_publisher.cpp)
+  src/retained_collision_world_publisher.cpp
+  src/retained_planner_scene_projection.cpp)
 target_include_directories(manyforge_roboplan_collision_projection PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)

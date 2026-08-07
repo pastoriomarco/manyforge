@@ -106,11 +106,17 @@ using SceneFrameRefDTO =
 struct CellFixedSceneObjectPlacementDTO final {
   CellId cell_id;
   Pose3DTO pose_in_cell;
+
+  friend bool operator==(const CellFixedSceneObjectPlacementDTO&,
+                         const CellFixedSceneObjectPlacementDTO&) = default;
 };
 
 struct CarriedSceneObjectPlacementDTO final {
   CarriedObjectAttachmentId carried_object_attachment_id;
   CarriedObjectAttachmentRevision carried_object_attachment_revision;
+
+  friend bool operator==(const CarriedSceneObjectPlacementDTO&,
+                         const CarriedSceneObjectPlacementDTO&) = default;
 };
 
 using SceneObjectPlacementDTO = std::variant<CellFixedSceneObjectPlacementDTO,
@@ -130,6 +136,8 @@ struct SceneObjectProviderEvidenceDTO final {
   std::optional<std::int64_t> source_freshness_budget_ns;
 
   [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const SceneObjectProviderEvidenceDTO&,
+                         const SceneObjectProviderEvidenceDTO&) = default;
 };
 
 /// One portable logical-scene resource row.
@@ -143,6 +151,8 @@ struct SceneObjectSnapshotDTO final {
   std::vector<SupportContactDTO> support_contacts{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const SceneObjectSnapshotDTO&,
+                         const SceneObjectSnapshotDTO&) = default;
 };
 
 /// One canonical scene-owned carried-object attachment row.
@@ -157,6 +167,8 @@ struct CarriedObjectAttachmentDTO final {
   std::vector<CollisionBodyRoleId> touch_body_roles;
 
   [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const CarriedObjectAttachmentDTO&,
+                         const CarriedObjectAttachmentDTO&) = default;
 };
 
 /// Exact scene identity carried by an immutable logical snapshot.
@@ -202,6 +214,9 @@ struct LogicalSceneSnapshotDTO final {
 
   [[nodiscard]] bool canonical_empty_for(
       const LogicalSceneSnapshotIdentityDTO& expected) const noexcept;
+
+  friend bool operator==(const LogicalSceneSnapshotDTO&,
+                         const LogicalSceneSnapshotDTO&) = default;
 };
 
 namespace logical_scene_detail {

@@ -1881,8 +1881,34 @@ public:
     };
   }
 
+  core::Result<core::CollisionWorldLeaseInventory>
+  RetainProjection(const ProjectionRevisionDTO &,
+                   core::ProjectionLeaseId) override {
+    return core::Result<core::CollisionWorldLeaseInventory>::Err(
+        ErrorDTO{"unsupported_capability",
+                 "test projection does not provide leases",
+                 {}});
+  }
+
+  void ReleaseProjection(const core::ProjectionLeaseId &) override {}
+
   core::ProjectionHealthDTO ProjectionHealth() const override {
     return health_;
+  }
+
+  core::ProjectionCommitResultDTO
+  RebuildProjection(const core::NativeProjectionRebuildDTO &request) override {
+    auto error = ErrorDTO{"unsupported_capability",
+                          "test projection does not provide rebuild",
+                          {}};
+    return {std::nullopt,
+            request.target_projection_revision,
+            core::ProjectionCommitResultStateDTO::kRejectedRollbackProven,
+            health_.active_projection_revision,
+            health_.native_projection_generation,
+            true,
+            health_,
+            std::move(error)};
   }
 
 private:

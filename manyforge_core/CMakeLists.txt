@@ -80,6 +80,7 @@ add_library(manyforge_core
   src/parallel_collision_validation_worker_pool.cpp
   src/collision_world_snapshot_builder.cpp
   src/logical_scene_identity_internal.cpp
+  src/logical_scene_projection.cpp
   src/interrupt_manager.cpp
   src/soft_on_path_stop_planner.cpp
   src/execution_kernel.cpp
@@ -247,6 +248,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_logical_scene_identity PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_logical_scene_identity
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_logical_scene_projection
+    test/test_logical_scene_projection.cpp)
+  target_link_libraries(test_logical_scene_projection PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_logical_scene_projection
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_execution_state_sink test/test_execution_state_sink.cpp)
