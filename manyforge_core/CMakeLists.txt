@@ -49,6 +49,7 @@ add_library(manyforge_core
   src/execution_snapshot_publisher.cpp
   src/execution_stop_support.cpp
   src/execution_worker_signals.cpp
+  src/external_observed_state_provider.cpp
   src/kernel_event_publisher.cpp
   src/kernel_flight_recorder.cpp
   src/kernel_event_factories.cpp
@@ -58,6 +59,7 @@ add_library(manyforge_core
   src/operator_stop_worker.cpp
   src/operation_intent.cpp
   src/observed_robot_state_publication.cpp
+  src/observed_state.cpp
   src/execution_progress_publication.cpp
   src/trajectory_progress_projection.cpp
   src/observed_robot_state_provider.cpp
@@ -165,6 +167,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_kinematic_state_view_provider PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_kinematic_state_view_provider
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_external_observed_state_provider
+    test/test_external_observed_state_provider.cpp)
+  target_link_libraries(test_external_observed_state_provider PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_external_observed_state_provider
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_contracts_compile test/test_contracts_compile.cpp)

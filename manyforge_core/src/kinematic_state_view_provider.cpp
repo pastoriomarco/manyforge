@@ -232,33 +232,6 @@ using ModelKey = std::tuple<ControllableComponentId, ModelInstanceId, ModelRevis
   return &*found;
 }
 
-[[nodiscard]] bool publication_is_self_consistent(const ObservedStatePublicationDTO& publication,
-                                                  std::int64_t now_ns) {
-  const auto& snapshot = publication.snapshot;
-  return publication.controllable_component_id == snapshot.controllable_component_id &&
-         publication.command_target_id == snapshot.command_target_id &&
-         publication.control_domain_id == snapshot.control_domain_id &&
-         publication.control_domain_revision == snapshot.control_domain_revision &&
-         publication.control_binding_id == snapshot.control_binding_id &&
-         publication.control_binding_revision == snapshot.control_binding_revision &&
-         publication.controller_topology_id == snapshot.controller_topology_id &&
-         publication.topology_revision == snapshot.topology_revision &&
-         publication.control_route_id == snapshot.control_route_id &&
-         publication.active_control_configuration_id == snapshot.active_control_configuration_id &&
-         publication.active_control_configuration_generation ==
-             snapshot.active_control_configuration_generation &&
-         publication.provider_instance_id == snapshot.provider_instance_id &&
-         publication.provider_manifest_id == snapshot.provider_manifest_id &&
-         publication.provider_manifest_revision == snapshot.provider_manifest_revision &&
-         publication.state_authority_id == snapshot.state_authority_id &&
-         publication.state_authority_class == snapshot.state_authority_class &&
-         publication.runtime_epoch == snapshot.source_epoch &&
-         publication.authority_generation == snapshot.authority_generation &&
-         publication.publication_sequence == snapshot.sequence &&
-         publication.received_timestamp_ns == snapshot.received_timestamp_ns &&
-         validate_observed_state_snapshot(snapshot, now_ns).ok();
-}
-
 [[nodiscard]] const CoordinatePositionDTO* find_resource_position(
     const ObservedStatePublicationDTO& publication, const ResourceId& resource_id) {
   const auto& resources = publication.snapshot.resources;
@@ -693,7 +666,7 @@ Result<KinematicStatePathViewDTO> ImmutableKinematicStateViewProvider::current_k
       const auto* configuration = find_expected_configuration(query, value);
       const CoordinatePositionDTO* position =
           find_resource_position(value, source_projection.resource_id);
-      if (!publication_is_self_consistent(value, now_ns) || configuration == nullptr ||
+      if (!validate_observed_state_publication(value, now_ns).ok() || configuration == nullptr ||
           position == nullptr || value.control_domain_id != path_source->second.first ||
           value.control_domain_revision != path_source->second.second ||
           value.provider_instance_id != source_projection.provider_instance_id ||

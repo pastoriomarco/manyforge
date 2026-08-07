@@ -1,10 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/types/coordinate_state.hpp>
 #include <string>
 #include <vector>
-
-#include <manyforge_core/types/coordinate_state.hpp>
 
 namespace manyforge::core {
 
@@ -68,5 +67,10 @@ struct ObservedStatePublicationDTO final {
   friend bool operator==(const ObservedStatePublicationDTO&,
                          const ObservedStatePublicationDTO&) = default;
 };
+
+/// Validate the complete immutable publication envelope and its nested
+/// snapshot against one receiver-local evaluation time.
+[[nodiscard]] Result<void> validate_observed_state_publication(
+    const ObservedStatePublicationDTO& publication, std::int64_t now_ns);
 
 }  // namespace manyforge::core

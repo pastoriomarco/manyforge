@@ -33,8 +33,6 @@ PRUNED_PARTS = {
 
 FORBIDDEN = (
     (re.compile(r"\bIPlanningContext\b"), "deleted IPlanningContext interface"),
-    (re.compile(r"\bIPlannerSceneProjection\b"), "deleted planner-scene projection interface"),
-    (re.compile(r"\bISceneAuthority\b"), "deleted Core scene-authority interface"),
     (
         re.compile(r"\b(?:class\s+SceneAuthority|manyforge::core::SceneAuthority)\b"),
         "deleted Core SceneAuthority owner",
@@ -62,6 +60,8 @@ REQUIRED = (
     "manyforge_core/include/manyforge_core/ports/icollision_trajectory_projector.hpp",
     "manyforge_core/include/manyforge_core/ports/igripper_command_backend.hpp",
     "manyforge_core/include/manyforge_core/ports/imanager_scene_projection.hpp",
+    "manyforge_core/include/manyforge_core/ports/iplanner_scene_projection.hpp",
+    "manyforge_core/include/manyforge_core/ports/iscene_authority.hpp",
     "manyforge_core/include/manyforge_core/collision/i_collision_query_engine.hpp",
     "manyforge_core/include/manyforge_core/collision/i_collision_diagnostic_comparator.hpp",
     "manyforge_core/include/manyforge_core/logical_scene_identity.hpp",
@@ -71,8 +71,6 @@ REQUIRED = (
 
 DELETED = (
     "manyforge_core/include/manyforge_core/ports/iplanning_context.hpp",
-    "manyforge_core/include/manyforge_core/ports/iplanner_scene_projection.hpp",
-    "manyforge_core/include/manyforge_core/ports/iscene_authority.hpp",
     "manyforge_core/include/manyforge_core/scene_authority.hpp",
     "manyforge_core/src/scene_authority.cpp",
     "manyforge_roboplan/include/manyforge_roboplan/roboplan_planning_context.hpp",

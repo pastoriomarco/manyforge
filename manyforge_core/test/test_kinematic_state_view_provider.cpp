@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <manyforge_core/external_observed_state_provider.hpp>
 #include <manyforge_core/kinematic_state_view_provider.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <map>
@@ -174,6 +175,44 @@ class FakeObservedStateProvider final : public IObservedStateProvider {
   return source;
 }
 
+[[nodiscard]] ExternalObservedStateSourceContractDTO external_contract() {
+  return ExternalObservedStateSourceContractDTO{
+      CellId("cell-a"),
+      RetainedBundleId("bundle-a"),
+      GraphRevision("graph-a"),
+      ProjectionStageGeneration(5U),
+      RuntimeUnitId("local-projection-runtime-a"),
+      RuntimeEpoch("local-projection-epoch-a"),
+      RuntimeUnitId("peer-runtime-a"),
+      {ModelInstanceId("model-a")},
+      ObservedStateQueryContextDTO{ControllableComponentId("robot-a"),
+                                   CommandTargetId("arm"),
+                                   CapabilityId("state.observed.current"),
+                                   ControlDomainId("domain-a"),
+                                   ControlDomainRevision("domain-rev-a"),
+                                   ControlBindingId("binding-a"),
+                                   ControlBindingRevision("binding-rev-a"),
+                                   ControllerTopologyId("topology-a"),
+                                   TopologyRevision("topology-rev-a"),
+                                   ControlRouteId("route-a"),
+                                   {ResourceId("resource-1"), ResourceId("resource-2")},
+                                   {"joint_1", "joint_2"},
+                                   {CoordinateKind::kAngular, CoordinateKind::kLinear},
+                                   ControlInterfaceContractId("control-contract-a"),
+                                   ControlInterfaceRevision("control-contract-rev-a"),
+                                   ActiveControlConfigurationId("active-a"),
+                                   ActiveControlConfigurationGeneration(7U),
+                                   ProviderInstanceId("state-provider-a"),
+                                   ProviderManifestId("state-manifest"),
+                                   ProviderManifestRevision("state-manifest-rev"),
+                                   RuntimeEpoch("runtime-epoch-a"),
+                                   StateAuthorityId("authority-a"),
+                                   StateAuthorityClass::kMeasured,
+                                   200},
+      "local-controller",
+      ObservedStateSourceKind::kControllerState};
+}
+
 TEST(ImmutableKinematicStateViewProviderTest,
      ProducesExactImmutableModelViewWithOneReadPerBinding) {
   const auto source = valid_source();
@@ -194,6 +233,28 @@ TEST(ImmutableKinematicStateViewProviderTest,
       std::get<LinearPositionDTO>(result.value().model_states.front().positions[1]).value_m, 0.5);
   EXPECT_TRUE(IsExactLowercaseSha256Digest(result.value().view_digest.value()));
   EXPECT_EQ(result.value().actual_receiver_time_skew_ns, 0);
+}
+
+TEST(ImmutableKinematicStateViewProviderTest,
+     ExternalTransportAdapterFeedsTheUnchangedPathViewContract) {
+  auto external = std::make_shared<ExternalObservedStateProvider>(external_contract());
+  const auto ingested = external->ingest(ExternalObservedStatePublicationDTO{
+      external->contract_digest(),
+      publication({ResourceId("resource-1"), ResourceId("resource-2")},
+                  {AngularPositionDTO{0.5}, LinearPositionDTO{0.2}}, 100),
+      900});
+  ASSERT_TRUE(ingested.ok()) << ingested.error().message;
+  const ImmutableKinematicStateViewProvider provider({KinematicObservedStateSourceBinding{
+      ControlBindingId("binding-a"), ControlBindingRevision("binding-rev-a"), external}});
+
+  const auto result = provider.current_kinematic_state_path(query(), 1000);
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_EQ(result.value().resource_states.size(), 2U);
+  EXPECT_EQ(result.value().resource_states.front().snapshot_received_timestamp_ns, 900);
+  EXPECT_EQ(result.value().resource_states.front().publication_received_timestamp_ns, 900);
+  EXPECT_DOUBLE_EQ(
+      std::get<AngularPositionDTO>(result.value().resource_states.front().position).value_rad, 0.5);
 }
 
 TEST(ImmutableKinematicStateViewProviderTest,
