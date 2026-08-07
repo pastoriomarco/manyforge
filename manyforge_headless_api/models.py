@@ -164,7 +164,7 @@ class ManagerApplyRequest(CallerAttributionRequest):
 
 
 class SceneRevisionRequest(StrictRequest):
-    scene_id: str
+    scene_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     revision_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     content_hash: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
@@ -176,6 +176,416 @@ class SceneRevisionRequest(StrictRequest):
             label="scene_id",
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
+
+
+class ProjectionRevisionRequest(StrictRequest):
+    retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    scene_revision: SceneRevisionRequest
+
+    @field_validator("retained_bundle_id", "graph_revision")
+    @classmethod
+    def validate_projection_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class Vector3Request(StrictRequest):
+    x_m: Annotated[float, Field(allow_inf_nan=False)]
+    y_m: Annotated[float, Field(allow_inf_nan=False)]
+    z_m: Annotated[float, Field(allow_inf_nan=False)]
+
+
+class QuaternionRequest(StrictRequest):
+    x: Annotated[float, Field(allow_inf_nan=False)]
+    y: Annotated[float, Field(allow_inf_nan=False)]
+    z: Annotated[float, Field(allow_inf_nan=False)]
+    w: Annotated[float, Field(allow_inf_nan=False)]
+
+
+class Pose3Request(StrictRequest):
+    position_m: Vector3Request
+    orientation: QuaternionRequest
+
+
+class BoxShapeRequest(StrictRequest):
+    type: Literal["box"]
+    box_dimensions_m: Vector3Request
+
+    @model_validator(mode="after")
+    def require_positive_dimensions(self) -> "BoxShapeRequest":
+        dimensions = self.box_dimensions_m
+        if min(dimensions.x_m, dimensions.y_m, dimensions.z_m) <= 0:
+            raise ValueError("box dimensions must be positive")
+        return self
+
+
+class SphereShapeRequest(StrictRequest):
+    type: Literal["sphere"]
+    sphere_radius_m: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+
+
+class CylinderShapeRequest(StrictRequest):
+    type: Literal["cylinder"]
+    cylinder_radius_m: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    cylinder_height_m: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+
+
+class MeshShapeRequest(StrictRequest):
+    type: Literal["mesh"]
+    mesh_resource_uri: str
+    mesh_scale: Vector3Request
+
+    @field_validator("mesh_resource_uri")
+    @classmethod
+    def validate_mesh_uri(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="mesh_resource_uri",
+            maximum_bytes=MAX_ACTIVATION_ID_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def require_positive_scale(self) -> "MeshShapeRequest":
+        if min(self.mesh_scale.x_m, self.mesh_scale.y_m, self.mesh_scale.z_m) <= 0:
+            raise ValueError("mesh scale must be positive")
+        return self
+
+
+CollisionShapeRequest = Annotated[
+    BoxShapeRequest | SphereShapeRequest | CylinderShapeRequest | MeshShapeRequest,
+    Field(discriminator="type"),
+]
+
+
+class CellSceneFrameRequest(StrictRequest):
+    kind: Literal["cell_frame"]
+    cell_id: str
+
+    @field_validator("cell_id")
+    @classmethod
+    def validate_cell_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="cell_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class ComponentSceneFrameRequest(StrictRequest):
+    kind: Literal["component_frame"]
+    controllable_component_id: str
+    model_instance_id: str
+    frame_role_id: str
+
+    @field_validator(
+        "controllable_component_id", "model_instance_id", "frame_role_id"
+    )
+    @classmethod
+    def validate_frame_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class PassiveModelSceneFrameRequest(StrictRequest):
+    kind: Literal["passive_model_frame"]
+    model_instance_id: str
+    frame_role_id: str
+
+    @field_validator("model_instance_id", "frame_role_id")
+    @classmethod
+    def validate_frame_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+SceneFrameRequest = Annotated[
+    CellSceneFrameRequest
+    | ComponentSceneFrameRequest
+    | PassiveModelSceneFrameRequest,
+    Field(discriminator="kind"),
+]
+
+
+class CollisionPairRequest(StrictRequest):
+    body_a: str
+    body_b: str
+
+    @field_validator("body_a", "body_b")
+    @classmethod
+    def validate_body(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def require_canonical_pair(self) -> "CollisionPairRequest":
+        if self.body_a >= self.body_b:
+            raise ValueError("collision pair must use canonical distinct body order")
+        return self
+
+
+class CollisionPolicyRevisionRequest(StrictRequest):
+    revision_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    content_hash: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+
+class SupportContactPolicyRequest(StrictRequest):
+    pair: CollisionPairRequest
+    mode: Literal["contact_release", "bounded_penetration", "contact_process"]
+    release_evidence_mode: Literal["signed_penetration", "binary_contact"]
+    enforce_max_start_penetration: bool
+    max_start_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    release_tolerance_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    min_release_progress_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    max_contact_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    require_separation_by_end: bool
+    require_strictly_decreasing_penetration: bool
+    allow_recontact: bool
+
+
+class ContactGraspPolicyRequest(StrictRequest):
+    policy_id: str
+    selected_object_id: str
+    allowed_robot_links: Annotated[list[str], Field(max_length=4096)]
+    max_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    terminal_window_start_fraction: Annotated[
+        float, Field(ge=0, le=1, allow_inf_nan=False)
+    ]
+
+    @field_validator("policy_id", "selected_object_id")
+    @classmethod
+    def validate_grasp_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @field_validator("allowed_robot_links")
+    @classmethod
+    def validate_allowed_links(cls, values: list[str]) -> list[str]:
+        normalized = [
+            _bounded_nfc(
+                value,
+                label="allowed_robot_link",
+                maximum_bytes=MAX_IDENTITY_BYTES,
+            )
+            for value in values
+        ]
+        if normalized != sorted(set(normalized)):
+            raise ValueError("allowed_robot_links must be sorted and unique")
+        return normalized
+
+
+class CollisionPolicyRequest(StrictRequest):
+    policy_id: str
+    revision: CollisionPolicyRevisionRequest
+    allowed_static_static_pairs: Annotated[
+        list[CollisionPairRequest], Field(max_length=4096)
+    ]
+    allowed_touch_link_pairs: Annotated[
+        list[CollisionPairRequest], Field(max_length=4096)
+    ]
+    support_contacts: Annotated[
+        list[SupportContactPolicyRequest], Field(max_length=4096)
+    ]
+    contact_grasps: Annotated[
+        list[ContactGraspPolicyRequest], Field(max_length=4096)
+    ]
+    require_full_diagnostics: bool
+
+    @field_validator("policy_id")
+    @classmethod
+    def validate_policy_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="policy_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def require_canonical_collections(self) -> "CollisionPolicyRequest":
+        for label, values in (
+            ("allowed_static_static_pairs", self.allowed_static_static_pairs),
+            ("allowed_touch_link_pairs", self.allowed_touch_link_pairs),
+        ):
+            keys = [(item.body_a, item.body_b) for item in values]
+            if keys != sorted(set(keys)):
+                raise ValueError(f"{label} must be sorted and unique")
+        support_keys = [
+            (item.pair.body_a, item.pair.body_b) for item in self.support_contacts
+        ]
+        if support_keys != sorted(set(support_keys)):
+            raise ValueError("support_contacts must be sorted and unique by pair")
+        grasp_keys = [item.policy_id for item in self.contact_grasps]
+        if grasp_keys != sorted(set(grasp_keys)):
+            raise ValueError("contact_grasps must be sorted and unique by policy_id")
+        return self
+
+
+class AddSceneObjectRequest(StrictRequest):
+    kind: Literal["add_object"]
+    scene_resource_id: str
+    shape: CollisionShapeRequest
+    pose: Pose3Request
+    frame_ref: SceneFrameRequest
+
+    @field_validator("scene_resource_id")
+    @classmethod
+    def validate_scene_resource_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="scene_resource_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class RemoveSceneObjectRequest(StrictRequest):
+    kind: Literal["remove_object"]
+    scene_resource_id: str
+
+    @field_validator("scene_resource_id")
+    @classmethod
+    def validate_scene_resource_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="scene_resource_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class UpdateSceneObjectPoseRequest(StrictRequest):
+    kind: Literal["update_object_pose"]
+    scene_resource_id: str
+    pose: Pose3Request
+    frame_ref: SceneFrameRequest
+    # Provider-backed ingress requires a separately configured trusted
+    # provider adapter so received_at_ns cannot be forged by an open caller.
+    provider_evidence: None = None
+    expected_attached: bool | None = None
+
+    @field_validator("scene_resource_id")
+    @classmethod
+    def validate_scene_resource_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="scene_resource_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class AttachCarriedObjectRequest(StrictRequest):
+    kind: Literal["attach_carried_object"]
+    carried_object_attachment_id: str
+    scene_resource_id: str
+    controllable_component_id: str
+    command_target_id: str
+    frame_role_id: str
+    touch_body_roles: Annotated[list[str], Field(max_length=4096)]
+    expected_component_attachment_revisions: Annotated[
+        list[Annotated[str, Field(pattern=SHA256_PATTERN)]],
+        Field(max_length=4096),
+    ]
+
+    @field_validator(
+        "carried_object_attachment_id",
+        "scene_resource_id",
+        "controllable_component_id",
+        "command_target_id",
+        "frame_role_id",
+    )
+    @classmethod
+    def validate_attachment_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @field_validator(
+        "touch_body_roles", "expected_component_attachment_revisions"
+    )
+    @classmethod
+    def validate_sorted_identities(cls, values: list[str], info) -> list[str]:
+        normalized = [
+            _bounded_nfc(
+                value,
+                label=info.field_name,
+                maximum_bytes=MAX_IDENTITY_BYTES,
+            )
+            for value in values
+        ]
+        if normalized != sorted(set(normalized)):
+            raise ValueError(f"{info.field_name} must be sorted and unique")
+        return normalized
+
+
+class DetachCarriedObjectRequest(StrictRequest):
+    kind: Literal["detach_carried_object"]
+    carried_object_attachment_id: str
+    expected_carried_object_attachment_revision: Annotated[
+        str, Field(pattern=SHA256_PATTERN)
+    ]
+    pose: Pose3Request
+    frame_ref: SceneFrameRequest
+
+    @field_validator(
+        "carried_object_attachment_id",
+        "expected_carried_object_attachment_revision",
+    )
+    @classmethod
+    def validate_attachment_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class SetCollisionPolicyRequest(StrictRequest):
+    kind: Literal["set_collision_policy"]
+    configured_policy: CollisionPolicyRequest
+    expected_configured_policy_revision: CollisionPolicyRevisionRequest
+
+
+SceneOperationRequest = Annotated[
+    AddSceneObjectRequest
+    | RemoveSceneObjectRequest
+    | UpdateSceneObjectPoseRequest
+    | AttachCarriedObjectRequest
+    | DetachCarriedObjectRequest
+    | SetCollisionPolicyRequest,
+    Field(discriminator="kind"),
+]
+
+
+class SceneTransactionRequest(StrictRequest):
+    request_context: CallerAttributionRequest
+    expected_projection_revision: ProjectionRevisionRequest
+    operation: SceneOperationRequest
+
+    @model_validator(mode="after")
+    def require_scene_owner_epoch(self) -> "SceneTransactionRequest":
+        if (
+            self.request_context.request_owner_epoch
+            != self.expected_projection_revision.scene_revision.scene_id
+        ):
+            raise ValueError(
+                "request_owner_epoch must equal the expected scene_id"
+            )
+        return self
 
 
 class ActionSpanRequest(StrictRequest):

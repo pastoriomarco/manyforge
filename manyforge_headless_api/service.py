@@ -15,6 +15,7 @@ from .models import (
     OperationControlRequest,
     OperationIntentRequest,
     RuntimeScaleRequest,
+    SceneTransactionRequest,
     StopIntentRequest,
 )
 from .native import HeadlessApiError, HeadlessCorePort
@@ -336,6 +337,16 @@ class HeadlessService:
 
     def manager_apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         return self.manager.apply(request)
+
+    def scene_commit(
+        self,
+        request: SceneTransactionRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self.manager.commit_scene_transaction(
+            request,
+            trusted_principal_id=attribution.principal_id,
+        )
 
     def health(self) -> dict[str, Any]:
         runtime = self.runtime()

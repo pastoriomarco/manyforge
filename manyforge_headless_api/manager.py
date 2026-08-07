@@ -2,36 +2,65 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import socket
 import stat
 from typing import Any, Protocol
+import unicodedata
 
-from .models import ManagerApplyRequest
+import rfc8785
+
+from .models import (
+    ManagerApplyRequest,
+    ProjectionRevisionRequest,
+    SceneTransactionRequest,
+)
 from .native import HeadlessApiError, strict_json_object
 
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
 MANAGER_COMMAND_VERSION = "manyforge.manager_command.v1"
 MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v1"
-MAX_MANAGER_PACKET_BYTES = 16 * 1024
+MAX_MANAGER_PACKET_BYTES = 128 * 1024 + 4 * 1024
 MAX_MANAGER_RESPONSE_BYTES = 64 * 1024
+_MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
+_SCENE_REPLAY_STATUSES = {
+    "accepted_new",
+    "replayed_exact",
+    "request_result_expired",
+    "request_id_conflict",
+    "request_ledger_full",
+    "stale_request_owner_epoch",
+}
+_SCENE_PROJECTION_STATUSES = {
+    "not_attempted",
+    "committed",
+    "rejected_rollback_proven",
+    "failed_projection_uncertain",
+}
+_SCENE_UPDATE_STATUSES = {"geometry_changed", "freshness_only", "no_op"}
 
 
 class ManagerPort(Protocol):
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]: ...
 
+    def commit_scene_transaction(
+        self,
+        request: SceneTransactionRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
 
 def _canonical_json(value: dict[str, Any]) -> bytes:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    try:
+        return rfc8785.dumps(value)
+    except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
+        raise HeadlessApiError(
+            "manager_command_invalid",
+            f"Manager command is not canonically encodable: {exc}",
+        ) from exc
 
 
 class ManagerCommandClient:
@@ -98,6 +127,11 @@ class ManagerCommandClient:
                 "Manager command response is not UTF-8",
             ) from exc
         response = strict_json_object(text, label="Manager command response")
+        if _canonical_json(response) != payload:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "Manager command response is not canonical JSON",
+            )
         if response.get("api_version") != MANAGER_RESPONSE_VERSION:
             raise HeadlessApiError(
                 "manager_command_response_invalid",
@@ -133,4 +167,163 @@ class ManagerCommandClient:
                 "manager_command_response_identity_mismatch",
                 "Manager Apply response does not match the submitted request",
             )
+        return response
+
+    @staticmethod
+    def _validate_scene_response(
+        response: dict[str, Any], request: SceneTransactionRequest
+    ) -> None:
+        expected_fields = {
+            "api_version",
+            "committed_projection_revision",
+            "error",
+            "ok",
+            "projection_status",
+            "replay_status",
+            "request_id",
+            "request_owner_epoch",
+            "transaction_sequence",
+            "update_status",
+        }
+        context = request.request_context
+        if set(response) != expected_fields:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "scene commit response has an unknown or missing field",
+            )
+        if (
+            response.get("request_id") != context.request_id
+            or response.get("request_owner_epoch") != context.request_owner_epoch
+        ):
+            raise HeadlessApiError(
+                "manager_command_response_identity_mismatch",
+                "Manager scene response does not match the submitted request",
+            )
+        if response.get("replay_status") not in _SCENE_REPLAY_STATUSES:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "scene commit response has an invalid replay status",
+            )
+        projection_status = response.get("projection_status")
+        if projection_status not in _SCENE_PROJECTION_STATUSES:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "scene commit response has an invalid projection status",
+            )
+        error = response.get("error")
+        if error is not None:
+            if (
+                not isinstance(error, dict)
+                or set(error) != {"code", "details", "message"}
+                or not isinstance(error.get("code"), str)
+                or not error["code"]
+                or not isinstance(error.get("message"), str)
+                or not error["message"]
+                or not isinstance(error.get("details"), dict)
+                or any(
+                    not isinstance(key, str) or not isinstance(value, str)
+                    for key, value in error["details"].items()
+                )
+            ):
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    "scene commit response has an invalid error",
+                )
+        sequence = response.get("transaction_sequence")
+        if sequence is not None and (
+            type(sequence) is not int
+            or sequence < 1
+            or sequence > _MAXIMUM_SAFE_INTEGER
+        ):
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "scene commit response has an invalid transaction sequence",
+            )
+        projection = response.get("committed_projection_revision")
+        parsed_projection: ProjectionRevisionRequest | None = None
+        if projection is not None:
+            try:
+                parsed_projection = ProjectionRevisionRequest.model_validate(projection)
+            except ValueError as exc:
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    "scene commit response has an invalid projection revision",
+                ) from exc
+        update_status = response.get("update_status")
+        success = response["ok"]
+        if success:
+            if (
+                error is not None
+                or sequence is None
+                or projection is None
+                or projection_status != "committed"
+                or update_status not in _SCENE_UPDATE_STATUSES
+                or response["replay_status"]
+                not in {"accepted_new", "replayed_exact"}
+            ):
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    "successful scene commit response is internally inconsistent",
+                )
+            assert parsed_projection is not None
+            expected = request.expected_projection_revision
+            if (
+                parsed_projection.retained_bundle_id
+                != expected.retained_bundle_id
+                or parsed_projection.graph_revision != expected.graph_revision
+                or parsed_projection.scene_revision.scene_id
+                != expected.scene_revision.scene_id
+            ):
+                raise HeadlessApiError(
+                    "manager_command_response_identity_mismatch",
+                    "Manager scene response changed structural or "
+                    "scene-lineage identity",
+                )
+        elif (
+            error is None
+            or sequence is not None
+            or projection is not None
+            or projection_status == "committed"
+            or update_status is not None
+        ):
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "failed scene commit response is internally inconsistent",
+            )
+
+    def commit_scene_transaction(
+        self,
+        request: SceneTransactionRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        if trusted_principal_id is not None and (
+            not trusted_principal_id
+            or unicodedata.normalize("NFC", trusted_principal_id)
+            != trusted_principal_id
+            or len(trusted_principal_id.encode("utf-8")) > 256
+        ):
+            raise HeadlessApiError(
+                "scene_request_attribution_invalid",
+                "trusted scene principal must be bounded non-empty NFC text",
+            )
+        attribution = {
+            "assurance": (
+                "externally_authenticated"
+                if trusted_principal_id is not None
+                else "unverified"
+            ),
+            "principal_id": trusted_principal_id,
+            "transport": "http",
+        }
+        transaction = request.model_dump(mode="json")
+        transaction["attribution"] = attribution
+        response = self._exchange(
+            {
+                "api_version": MANAGER_COMMAND_VERSION,
+                "command": "scene_commit",
+                "transaction": transaction,
+            }
+        )
+        self._validate_scene_response(response, request)
         return response

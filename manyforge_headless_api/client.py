@@ -17,10 +17,20 @@ _CONDITION_ID_PATTERN = re.compile(r"^condition-[0-9a-f]{24}$")
 
 
 class HeadlessClientError(RuntimeError):
-    def __init__(self, code: str, message: str, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status_code: int | None = None,
+        *,
+        details: Mapping[str, str] | None = None,
+        response: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.details = dict(details or {})
+        self.response = dict(response) if response is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,16 +66,29 @@ class HeadlessHttpClient:
         if isinstance(detail, dict):
             code = detail.get("code")
             message = detail.get("message")
+            details = detail.get("details")
         else:
             error = value.get("error")
             code = error.get("code") if isinstance(error, dict) else None
             message = error.get("message") if isinstance(error, dict) else None
+            details = error.get("details") if isinstance(error, dict) else None
+        normalized_details = (
+            {
+                key: item
+                for key, item in details.items()
+                if isinstance(key, str) and isinstance(item, str)
+            }
+            if isinstance(details, dict)
+            else {}
+        )
         return HeadlessClientError(
             code if isinstance(code, str) and code else "headless_http_error",
             message
             if isinstance(message, str) and message
             else f"headless API returned HTTP {status_code}",
             status_code,
+            details=normalized_details,
+            response=value,
         )
 
     def request(
@@ -211,6 +234,11 @@ class HeadlessHttpClient:
 
     def scene(self) -> dict[str, Any]:
         return self.request("GET", "/api/scene")
+
+    def commit_scene_transaction(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request("POST", "/api/scene/transactions", body=body)
 
     def alarms(
         self,

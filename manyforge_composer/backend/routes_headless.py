@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi.responses import JSONResponse
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.models import (
@@ -15,6 +16,7 @@ from manyforge_headless_api.models import (
     OperationControlRequest,
     OperationIntentRequest,
     RuntimeScaleRequest,
+    SceneTransactionRequest,
     StopIntentRequest,
 )
 
@@ -22,6 +24,18 @@ from manyforge_headless_api.models import (
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
+_SCENE_RESULT_FIELDS = {
+    "api_version",
+    "committed_projection_revision",
+    "error",
+    "ok",
+    "projection_status",
+    "replay_status",
+    "request_id",
+    "request_owner_epoch",
+    "transaction_sequence",
+    "update_status",
+}
 
 
 def _translate(error: HeadlessClientError) -> HTTPException:
@@ -35,6 +49,29 @@ def _call(callback):
     try:
         return callback()
     except HeadlessClientError as error:
+        raise _translate(error) from error
+
+
+def _call_scene(callback, body: SceneTransactionRequest):
+    try:
+        return callback()
+    except HeadlessClientError as error:
+        response = error.response
+        context = body.request_context
+        if (
+            error.status_code is not None
+            and isinstance(response, dict)
+            and set(response) == _SCENE_RESULT_FIELDS
+            and response.get("api_version")
+            == "manyforge.manager_command_response.v1"
+            and response.get("ok") is False
+            and response.get("request_id") == context.request_id
+            and response.get("request_owner_epoch")
+            == context.request_owner_epoch
+            and isinstance(response.get("error"), dict)
+            and response["error"].get("code") == error.code
+        ):
+            return JSONResponse(status_code=error.status_code, content=response)
         raise _translate(error) from error
 
 
@@ -165,6 +202,13 @@ def create_headless_router(client: HeadlessHttpClient) -> APIRouter:
     @router.get("/api/scene")
     def scene() -> dict[str, Any]:
         return _call(client.scene)
+
+    @router.post("/api/scene/transactions")
+    def scene_commit(body: SceneTransactionRequest):
+        return _call_scene(
+            lambda: client.commit_scene_transaction(body.model_dump(mode="json")),
+            body,
+        )
 
     @router.get("/api/execution/alarms")
     def alarms(

@@ -9,6 +9,8 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <manyforge_scene/canonical_empty_scene_owner.hpp>
+#include <manyforge_scene/scene_transaction_codec.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -43,6 +45,7 @@ namespace component_manager = manyforge::component_manager;
 namespace content_identity = manyforge::content_identity;
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
+namespace scene = manyforge::scene;
 
 using content_identity::CanonicalValue;
 
@@ -57,7 +60,8 @@ constexpr std::string_view kSceneRuntimeSourceFileName =
     "scene-runtime-source.json";
 constexpr std::string_view kManagerSocketFileName = "manager-command.sock";
 constexpr std::string_view kManagerDaemonLockFileName = ".manager-daemon.lock";
-constexpr std::size_t kMaximumCommandBytes = 16U * 1024U;
+constexpr std::size_t kMaximumCommandBytes =
+    scene::kMaximumLogicalSceneTransactionBytes + 4U * 1024U;
 constexpr std::size_t kMaximumCommandIdentityBytes = 256U;
 constexpr std::size_t kOwnerEpochRandomBytes = 16U;
 constexpr std::size_t kSocketBacklog = 16U;
@@ -258,6 +262,7 @@ struct DaemonConfig final {
 
 enum class CommandKind {
   kApply,
+  kSceneCommit,
   kReconcile,
   kShutdownRuntime,
 };
@@ -268,6 +273,7 @@ struct ManagerCommand final {
   std::optional<std::string> request_owner_epoch;
   std::optional<std::string> source_label;
   std::optional<std::string> correlation_id;
+  std::optional<core::SceneTransactionRequestDTO> scene_transaction;
 };
 
 const CanonicalValue &RequiredMember(const CanonicalValue &root,
@@ -333,13 +339,34 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   const auto command = RequiredString(root, "command");
   if (command == "reconcile") {
     RequireExactObjectSize(root, 2U, "reconcile command");
-    return {CommandKind::kReconcile, std::nullopt, std::nullopt, std::nullopt,
+    return {CommandKind::kReconcile,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
             std::nullopt};
   }
   if (command == "shutdown_runtime") {
     RequireExactObjectSize(root, 2U, "shutdown command");
-    return {CommandKind::kShutdownRuntime, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt};
+    return {CommandKind::kShutdownRuntime,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt};
+  }
+  if (command == "scene_commit") {
+    RequireExactObjectSize(root, 3U, "scene commit command");
+    auto transaction = scene::DecodeCanonicalSceneTransactionRequest(
+        content_identity::canonical_json(RequiredMember(root, "transaction")));
+    return {
+        CommandKind::kSceneCommit,
+        transaction.request_context.request_id.value(),
+        transaction.request_context.request_owner_epoch.value(),
+        transaction.request_context.source_label,
+        transaction.request_context.correlation_id,
+        std::move(transaction),
+    };
   }
   Require(command == "apply", "command kind is unsupported");
   RequireExactObjectSize(root, 10U, "Apply command");
@@ -359,8 +386,83 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   static_cast<void>(RequiredString(expected, "retained_bundle_id"));
   Require(RequiredBool(root, "reject_if_affected_busy"),
           "Apply busy disposition must be reject_if_affected_busy");
-  return {CommandKind::kApply, request_id, request_owner_epoch, source_label,
-          correlation_id};
+  return {CommandKind::kApply, request_id,     request_owner_epoch,
+          source_label,        correlation_id, std::nullopt};
+}
+
+CanonicalValue Unsigned(const std::uint64_t value,
+                        const std::string_view label) {
+  constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
+  Require(value <= kMaximumSafeInteger,
+          std::string(label) + " exceeds the I-JSON safe-integral range");
+  return CanonicalValue(static_cast<double>(value));
+}
+
+CanonicalValue ProjectionRevision(const core::ProjectionRevisionDTO &value) {
+  Require(value.valid(), "scene response projection revision is invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"graph_revision", CanonicalValue(value.graph_revision.value())},
+      {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
+      {"scene_revision",
+       CanonicalValue(CanonicalValue::Object{
+           {"content_hash",
+            CanonicalValue(value.scene_revision.content_hash.value())},
+           {"revision_id",
+            Unsigned(value.scene_revision.revision_id, "scene revision")},
+           {"scene_id", CanonicalValue(value.scene_revision.scene_id.value())},
+       })},
+  });
+}
+
+CanonicalValue ErrorValue(const core::ErrorDTO &error) {
+  Require(!error.code.empty() && !error.message.empty(),
+          "scene response error is incomplete");
+  CanonicalValue::Object details;
+  details.reserve(error.details.size());
+  for (const auto &[key, value] : error.details) {
+    details.emplace_back(key, CanonicalValue(value));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"code", CanonicalValue(error.code)},
+      {"details", CanonicalValue(std::move(details))},
+      {"message", CanonicalValue(error.message)},
+  });
+}
+
+CanonicalValue SceneCommitResponse(const ManagerCommand &command,
+                                   const core::SceneCommitResultDTO &result) {
+  Require(command.scene_transaction.has_value() &&
+              command.request_id.has_value() &&
+              command.request_owner_epoch.has_value(),
+          "decoded scene command lacks request identity");
+  Require(result.presence_valid() &&
+              result.request_id.value() == *command.request_id,
+          "scene owner returned an invalid or mismatched result");
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"committed_projection_revision",
+       result.committed_projection_revision.has_value()
+           ? ProjectionRevision(*result.committed_projection_revision)
+           : CanonicalValue(nullptr)},
+      {"error", result.error.has_value() ? ErrorValue(*result.error)
+                                         : CanonicalValue(nullptr)},
+      {"ok", CanonicalValue(result.success)},
+      {"projection_status",
+       CanonicalValue(std::string(core::to_string(result.projection_status)))},
+      {"replay_status",
+       CanonicalValue(std::string(core::to_string(result.replay_status)))},
+      {"request_id", CanonicalValue(*command.request_id)},
+      {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
+      {"transaction_sequence",
+       result.transaction_sequence.has_value()
+           ? Unsigned(*result.transaction_sequence, "transaction sequence")
+           : CanonicalValue(nullptr)},
+      {"update_status",
+       result.update_status.has_value()
+           ? CanonicalValue(std::string(core::to_string(*result.update_status)))
+           : CanonicalValue(nullptr)},
+  });
 }
 
 CanonicalValue ErrorResponse(const std::string_view code,
@@ -616,21 +718,40 @@ private:
             *active_bundle, runtime, stores_.apply_journal(),
             ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
 
-    const auto access = scene_owner_.ReadAccessStatus();
-    const auto scene = scene_owner_.ReadActiveSnapshot();
-    Require(scene.has_value(),
-            "Manager daemon cannot publish an absent post-bootstrap scene");
-    const auto scene_epoch = scene->shared()->revision.scene_id.value();
-    const auto scene_publication = scene_channel_.Publish(
-        "logical_scene", scene_owner_id_, scene_epoch, observed_at,
-        BuildLogicalSceneSourcePayload(access, scene));
+    const auto scene_generation = PublishLogicalScene(observed_at);
     const auto scene_runtime_publication = scene_runtime_channel_.Publish(
         "scene_runtime", scene_runtime_owner_id_, scene_runtime_owner_epoch_,
         observed_at,
         BuildSceneRuntimeSourcePayload(admission_.cell_id().value(),
                                        scene_runtime_owner_.Snapshot()));
-    return {manager.source_generation, scene_publication.source_generation,
+    return {manager.source_generation, scene_generation,
             scene_runtime_publication.source_generation};
+  }
+
+  std::uint64_t PublishLogicalScene(const std::int64_t observed_at) {
+    const auto access = scene_owner_.ReadAccessStatus();
+    const auto snapshot = scene_owner_.ReadActiveSnapshot();
+    Require(snapshot.has_value(),
+            "Manager daemon cannot publish an absent post-bootstrap scene");
+    const auto scene_epoch = snapshot->shared()->revision.scene_id.value();
+    return scene_channel_
+        .Publish("logical_scene", scene_owner_id_, scene_epoch, observed_at,
+                 BuildLogicalSceneSourcePayload(access, snapshot))
+        .source_generation;
+  }
+
+  void TryPublishLogicalScene() noexcept {
+    try {
+      static_cast<void>(
+          PublishLogicalScene(static_cast<std::int64_t>(ElapsedNs())));
+    } catch (const std::exception &error) {
+      std::cerr << "Manager daemon scene publication failed after durable "
+                   "commit: "
+                << error.what() << '\n';
+    } catch (...) {
+      std::cerr << "Manager daemon scene publication failed after durable "
+                   "commit with an unknown error\n";
+    }
   }
 
   void TryPeriodicReconcile() noexcept {
@@ -685,6 +806,20 @@ private:
         }
         TrySendResponse(client.get(), ApplyUnavailableResponse(command));
         return false;
+      case CommandKind::kSceneCommit: {
+        Require(command.scene_transaction.has_value(),
+                "decoded scene command lacks its transaction");
+        const auto result = scene_owner_.Commit(*command.scene_transaction);
+        if (result.success) {
+          // The durable scene result remains authoritative if this projection
+          // write fails. Periodic reconciliation republishes it, and exact
+          // request replay returns the same owner result without a second
+          // native scene effect.
+          TryPublishLogicalScene();
+        }
+        TrySendResponse(client.get(), SceneCommitResponse(command, result));
+        return false;
+      }
       case CommandKind::kReconcile: {
         const auto generations = ReconcileAndPublish();
         TrySendResponse(client.get(),

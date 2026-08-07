@@ -8,7 +8,7 @@ import threading
 import pytest
 
 from manyforge_headless_api.manager import ManagerCommandClient
-from manyforge_headless_api.models import ManagerApplyRequest
+from manyforge_headless_api.models import ManagerApplyRequest, SceneTransactionRequest
 from manyforge_headless_api.native import HeadlessApiError
 
 
@@ -26,6 +26,33 @@ def _request() -> ManagerApplyRequest:
                 "retained_bundle_id": "bundle.1",
             },
             "reject_if_affected_busy": True,
+        }
+    )
+
+
+def _scene_request() -> SceneTransactionRequest:
+    scene_id = "sha256:" + "d" * 64
+    return SceneTransactionRequest.model_validate(
+        {
+            "request_context": {
+                "request_id": "scene-request.1",
+                "request_owner_epoch": scene_id,
+                "source_label": "behavior",
+                "correlation_id": None,
+            },
+            "expected_projection_revision": {
+                "retained_bundle_id": "sha256:" + "b" * 64,
+                "graph_revision": "sha256:" + "c" * 64,
+                "scene_revision": {
+                    "scene_id": scene_id,
+                    "revision_id": 1,
+                    "content_hash": "sha256:" + "a" * 64,
+                },
+            },
+            "operation": {
+                "kind": "remove_object",
+                "scene_resource_id": "part.1",
+            },
         }
     )
 
@@ -108,4 +135,135 @@ def test_manager_client_rejects_a_response_for_another_request(
     ) as captured:
         client.apply(_request())
 
+    assert captured.value.code == "manager_command_response_identity_mismatch"
+
+
+def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
+    tmp_path: Path,
+) -> None:
+    scene_id = "sha256:" + "d" * 64
+    socket_path = tmp_path / "manager-command.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    server.bind(str(socket_path))
+    server.listen(1)
+    received: list[bytes] = []
+
+    def serve() -> None:
+        connection, _address = server.accept()
+        with connection:
+            received.append(connection.recv(132 * 1024))
+            connection.send(
+                json.dumps(
+                    {
+                        "api_version": "manyforge.manager_command_response.v1",
+                        "committed_projection_revision": {
+                            "retained_bundle_id": "sha256:" + "b" * 64,
+                            "graph_revision": "sha256:" + "c" * 64,
+                            "scene_revision": {
+                                "scene_id": scene_id,
+                                "revision_id": 2,
+                                "content_hash": "sha256:" + "b" * 64,
+                            },
+                        },
+                        "error": None,
+                        "ok": True,
+                        "projection_status": "committed",
+                        "replay_status": "accepted_new",
+                        "request_id": "scene-request.1",
+                        "request_owner_epoch": scene_id,
+                        "transaction_sequence": 1,
+                        "update_status": "geometry_changed",
+                    },
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode()
+            )
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    try:
+        response = ManagerCommandClient(tmp_path).commit_scene_transaction(
+            _scene_request(), trusted_principal_id="operator.7"
+        )
+        assert response["projection_status"] == "committed"
+    finally:
+        server.close()
+        worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    command = json.loads(received[0])
+    assert received[0] == json.dumps(
+        command,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    assert set(command) == {"api_version", "command", "transaction"}
+    assert command["command"] == "scene_commit"
+    assert command["transaction"]["attribution"] == {
+        "assurance": "externally_authenticated",
+        "principal_id": "operator.7",
+        "transport": "http",
+    }
+
+
+def test_scene_client_rejects_mismatched_or_inconsistent_owner_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+    valid_failure = {
+        "api_version": "manyforge.manager_command_response.v1",
+        "committed_projection_revision": None,
+        "error": {"code": "object_not_found", "details": {}, "message": "absent"},
+        "ok": False,
+        "projection_status": "not_attempted",
+        "replay_status": "accepted_new",
+        "request_id": "other-request",
+        "request_owner_epoch": "sha256:" + "d" * 64,
+        "transaction_sequence": None,
+        "update_status": None,
+    }
+    monkeypatch.setattr(client, "_exchange", lambda _command: valid_failure)
+    with pytest.raises(HeadlessApiError) as captured:
+        client.commit_scene_transaction(
+            _scene_request(), trusted_principal_id=None
+        )
+    assert captured.value.code == "manager_command_response_identity_mismatch"
+
+    valid_failure["request_id"] = "scene-request.1"
+    valid_failure["projection_status"] = "committed"
+    with pytest.raises(HeadlessApiError) as captured:
+        client.commit_scene_transaction(
+            _scene_request(), trusted_principal_id=None
+        )
+    assert captured.value.code == "manager_command_response_invalid"
+
+    scene_id = "sha256:" + "d" * 64
+    mismatched_success = {
+        "api_version": "manyforge.manager_command_response.v1",
+        "committed_projection_revision": {
+            "retained_bundle_id": "sha256:" + "e" * 64,
+            "graph_revision": "sha256:" + "c" * 64,
+            "scene_revision": {
+                "scene_id": scene_id,
+                "revision_id": 2,
+                "content_hash": "sha256:" + "f" * 64,
+            },
+        },
+        "error": None,
+        "ok": True,
+        "projection_status": "committed",
+        "replay_status": "accepted_new",
+        "request_id": "scene-request.1",
+        "request_owner_epoch": scene_id,
+        "transaction_sequence": 1,
+        "update_status": "geometry_changed",
+    }
+    monkeypatch.setattr(client, "_exchange", lambda _command: mismatched_success)
+    with pytest.raises(HeadlessApiError) as captured:
+        client.commit_scene_transaction(
+            _scene_request(), trusted_principal_id=None
+        )
     assert captured.value.code == "manager_command_response_identity_mismatch"

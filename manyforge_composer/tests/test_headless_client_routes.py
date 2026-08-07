@@ -37,6 +37,35 @@ def _alarms() -> dict[str, Any]:
     }
 
 
+def _scene_body(
+    *,
+    request_id: str = "request.scene.1",
+    scene_resource_id: str = "part.1",
+) -> dict[str, Any]:
+    scene_id = "sha256:" + "d" * 64
+    return {
+        "request_context": {
+            "request_id": request_id,
+            "request_owner_epoch": scene_id,
+            "source_label": "composer_ui",
+            "correlation_id": None,
+        },
+        "expected_projection_revision": {
+            "retained_bundle_id": "sha256:" + "b" * 64,
+            "graph_revision": "sha256:" + "c" * 64,
+            "scene_revision": {
+                "scene_id": scene_id,
+                "revision_id": 1,
+                "content_hash": "sha256:" + "a" * 64,
+            },
+        },
+        "operation": {
+            "kind": "remove_object",
+            "scene_resource_id": scene_resource_id,
+        },
+    }
+
+
 @pytest.fixture
 def headless_client() -> Iterator[
     tuple[HeadlessHttpClient, list[dict[str, Any]], dict[str, Any]]
@@ -148,6 +177,48 @@ def headless_client() -> Iterator[
                 "api_version": "manyforge.execution_command_response.v1",
                 "ok": True,
                 "operation": {"operation_id": "operation-1"},
+            }
+        elif path == "/api/scene/transactions":
+            if body["operation"]["scene_resource_id"] == "missing-part":
+                return httpx.Response(
+                    404,
+                    json={
+                        "api_version": "manyforge.manager_command_response.v1",
+                        "committed_projection_revision": None,
+                        "error": {
+                            "code": "object_not_found",
+                            "details": {"scene_resource_id": "missing-part"},
+                            "message": "scene resource does not exist",
+                        },
+                        "ok": False,
+                        "projection_status": "not_attempted",
+                        "replay_status": "accepted_new",
+                        "request_id": "request.scene.missing",
+                        "request_owner_epoch": "sha256:" + "d" * 64,
+                        "transaction_sequence": None,
+                        "update_status": None,
+                    },
+                    request=request,
+                )
+            payload = {
+                "api_version": "manyforge.manager_command_response.v1",
+                "committed_projection_revision": {
+                    "retained_bundle_id": "sha256:" + "b" * 64,
+                    "graph_revision": "sha256:" + "c" * 64,
+                    "scene_revision": {
+                        "scene_id": "sha256:" + "d" * 64,
+                        "revision_id": 2,
+                        "content_hash": "sha256:" + "b" * 64,
+                    },
+                },
+                "error": None,
+                "ok": True,
+                "projection_status": "committed",
+                "replay_status": "accepted_new",
+                "request_id": "request.scene.1",
+                "request_owner_epoch": "sha256:" + "d" * 64,
+                "transaction_sequence": 1,
+                "update_status": "geometry_changed",
             }
         elif path == "/api/scene":
             payload = {"schema_version": "manyforge.scene_projection.v1"}
@@ -337,6 +408,62 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
     assert forwarded[4]["body"] == stop
     assert forwarded[5]["body"] == scale
     assert forwarded[6]["method"] == "GET"
+
+
+def test_composer_scene_transaction_is_a_strict_stateless_forwarder(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    body = _scene_body()
+    with _composer(client) as composer:
+        response = composer.post("/api/scene/transactions", json=body)
+        forged = composer.post(
+            "/api/scene/transactions",
+            json={**body, "attribution": {"transport": "http"}},
+        )
+    assert response.status_code == 200
+    assert response.json()["projection_status"] == "committed"
+    assert forged.status_code == 422
+    forwarded = [
+        item for item in requests if item["path"] == "/api/scene/transactions"
+    ]
+    assert forwarded == [
+        {
+            "method": "POST",
+            "path": "/api/scene/transactions",
+            "query": "",
+            "body": body,
+        }
+    ]
+
+
+def test_composer_preserves_complete_scene_rejection(
+    headless_client,
+) -> None:
+    client, _requests, _node_environment = headless_client
+    body = _scene_body(
+        request_id="request.scene.missing",
+        scene_resource_id="missing-part",
+    )
+    with _composer(client) as composer:
+        response = composer.post("/api/scene/transactions", json=body)
+    assert response.status_code == 404
+    assert response.json() == {
+        "api_version": "manyforge.manager_command_response.v1",
+        "committed_projection_revision": None,
+        "error": {
+            "code": "object_not_found",
+            "details": {"scene_resource_id": "missing-part"},
+            "message": "scene resource does not exist",
+        },
+        "ok": False,
+        "projection_status": "not_attempted",
+        "replay_status": "accepted_new",
+        "request_id": "request.scene.missing",
+        "request_owner_epoch": "sha256:" + "d" * 64,
+        "transaction_sequence": None,
+        "update_status": None,
+    }
 
 
 def test_composer_preserves_headless_unavailability_code(

@@ -22,6 +22,7 @@ from .models import (
     OperationControlRequest,
     OperationIntentRequest,
     RuntimeScaleRequest,
+    SceneTransactionRequest,
     StopIntentRequest,
 )
 from .native import HeadlessApiConfig, HeadlessApiError, NativeHeadlessCore
@@ -121,6 +122,7 @@ def _error_status(code: str) -> int:
         "headless_projection_response_invalid",
         "headless_projection_response_oversized",
         "manager_command_response_invalid",
+        "manager_command_response_identity_mismatch",
         "execution_command_response_invalid",
         "execution_command_response_identity_mismatch",
         "node_environment_projection_invalid",
@@ -133,7 +135,10 @@ def _error_status(code: str) -> int:
         "operator_alarm_not_found",
     }:
         return 404
-    if "conflict" in code or "stale" in code or "fence" in code:
+    if "conflict" in code or "stale" in code or "fence" in code or code in {
+        "object_already_exists",
+        "scene_projection_transition_in_progress",
+    }:
         return 409
     if (
         "unavailable" in code
@@ -142,6 +147,8 @@ def _error_status(code: str) -> int:
             "headless_request_ledger_full",
             "kernel_owner_unavailable",
             "operator_alarm_state_unavailable",
+            "request_ledger_full",
+            "scene_projection_commit_uncertain",
         }
     ):
         return 503
@@ -436,6 +443,25 @@ def create_app(
     @app.get("/api/scene")
     def scene() -> dict[str, Any]:
         return service.scene()
+
+    @app.post("/api/scene/transactions")
+    def scene_commit(
+        body: SceneTransactionRequest,
+        request: Request,
+    ) -> JSONResponse:
+        response = service.scene_commit(
+            body, _trusted_attribution(request, trusted_principal_adapter)
+        )
+        if response.get("ok") is True:
+            return JSONResponse(status_code=200, content=response)
+        error = response.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        if not isinstance(code, str) or not code:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "scene rejection has no stable error code",
+            )
+        return JSONResponse(status_code=_error_status(code), content=response)
 
     @app.get("/api/execution/alarms")
     def alarms(

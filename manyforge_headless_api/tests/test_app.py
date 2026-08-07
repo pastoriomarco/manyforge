@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from manyforge_headless_api.app import TrustedPrincipal, _error_status, create_app
-from manyforge_headless_api.models import ManagerApplyRequest
+from manyforge_headless_api.models import ManagerApplyRequest, SceneTransactionRequest
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
 
@@ -158,6 +158,7 @@ class FakeCore:
 class FakeManager:
     def __init__(self) -> None:
         self.requests: list[ManagerApplyRequest] = []
+        self.scene_requests: list[tuple[SceneTransactionRequest, str | None]] = []
 
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         self.requests.append(request)
@@ -170,6 +171,35 @@ class FakeManager:
             },
             "request_id": request.request_id,
             "request_owner_epoch": request.request_owner_epoch,
+        }
+
+    def commit_scene_transaction(
+        self,
+        request: SceneTransactionRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.scene_requests.append((request, trusted_principal_id))
+        context = request.request_context
+        return {
+            "api_version": "manyforge.manager_command_response.v1",
+            "committed_projection_revision": {
+                "retained_bundle_id": "sha256:" + "b" * 64,
+                "graph_revision": "sha256:" + "c" * 64,
+                "scene_revision": {
+                    "scene_id": "sha256:" + "d" * 64,
+                    "revision_id": 2,
+                    "content_hash": "sha256:" + "c" * 64,
+                },
+            },
+            "error": None,
+            "ok": True,
+            "projection_status": "committed",
+            "replay_status": "accepted_new",
+            "request_id": context.request_id,
+            "request_owner_epoch": context.request_owner_epoch,
+            "transaction_sequence": 1,
+            "update_status": "geometry_changed",
         }
 
 
@@ -422,6 +452,51 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "kernel_owner_unavailable"
     assert manager.requests[0].source_label == "operator_ui"
+
+
+def _scene_body() -> dict[str, Any]:
+    scene_id = "sha256:" + "d" * 64
+    return {
+        "request_context": {
+            **_caller(),
+            "request_owner_epoch": scene_id,
+        },
+        "expected_projection_revision": {
+            "retained_bundle_id": "sha256:" + "b" * 64,
+            "graph_revision": "sha256:" + "c" * 64,
+            "scene_revision": {
+                "scene_id": scene_id,
+                "revision_id": 1,
+                "content_hash": "sha256:" + "a" * 64,
+            },
+        },
+        "operation": {
+            "kind": "remove_object",
+            "scene_resource_id": "part.1",
+        },
+    }
+
+
+def test_scene_transaction_is_forwarded_with_adapter_only_attribution() -> None:
+    client, _core, manager = _client(trusted=True)
+    with client:
+        response = client.post("/api/scene/transactions", json=_scene_body())
+        forged = client.post(
+            "/api/scene/transactions",
+            json={
+                **_scene_body(),
+                "attribution": {
+                    "transport": "http",
+                    "assurance": "externally_authenticated",
+                    "principal_id": "forged",
+                },
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["projection_status"] == "committed"
+    assert manager.scene_requests[0][0].operation.scene_resource_id == "part.1"
+    assert manager.scene_requests[0][1] == "operator.7"
+    assert forged.status_code == 422
 
 
 def test_request_body_bound_is_enforced_before_model_decode() -> None:

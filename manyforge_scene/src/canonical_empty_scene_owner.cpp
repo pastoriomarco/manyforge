@@ -1,6 +1,7 @@
 #include "manyforge_scene/canonical_empty_scene_owner.hpp"
 
 #include "embedded_canonical_empty_scene_schema.hpp"
+#include "logical_scene_codec_internal.hpp"
 #include "sqlite_scene_lifecycle_internal.hpp"
 
 #include <manyforge_content_identity/content_identity.hpp>
@@ -94,18 +95,29 @@ using core::ProjectionRevisionDTO;
 using core::ProjectionStageGeneration;
 using core::ProjectionTransitionEvidenceDTO;
 using core::ProjectionTransitionEvidenceState;
+using core::RequestId;
 using core::RetainedBundleDTO;
 using core::RetainedBundleId;
+using core::SceneCommitResultDTO;
 using core::SceneId;
+using core::SceneObjectSnapshotDTO;
+using core::SceneObjectStateDTO;
+using core::SceneProjectionCommitStatusDTO;
+using core::SceneResourceId;
 using core::SceneRevision;
+using core::SceneTransactionRequestDTO;
+using core::SceneUpdateStatusDTO;
 
 constexpr int kBusyTimeoutMilliseconds = 10000;
 constexpr std::int64_t kPageSizeBytes = 4096;
 constexpr std::int64_t kMaximumPageCount =
     kMaximumSceneStoreDatabasePageImageBytes / kPageSizeBytes;
-constexpr std::int64_t kExpectedSchemaObjectCardinality = 24;
+constexpr std::int64_t kExpectedBaseSchemaObjectCardinality = 24;
+constexpr std::int64_t kExpectedSchemaObjectCardinality = 42;
 constexpr std::uint64_t kMaximumSafeIntegral = 9007199254740991ULL;
 constexpr int kMaximumSqliteValueBytes = 1024 * 1024;
+constexpr std::size_t kMaximumLogicalSceneOwnerEvents =
+    kMaximumLogicalSceneTransactions + kMaximumNamedApplySceneStages;
 
 [[noreturn]] void ThrowSqlite(sqlite3 *database, const int result,
                               const std::string_view context) {
@@ -194,6 +206,10 @@ public:
   void Bind(const int index, const std::int64_t value) {
     Check(database_, sqlite3_bind_int64(statement_, index, value),
           "bind SQLite integer");
+  }
+
+  void BindNull(const int index) {
+    Check(database_, sqlite3_bind_null(statement_, index), "bind SQLite null");
   }
 
   [[nodiscard]] bool Step() {
@@ -313,14 +329,14 @@ using SchemaObjects =
 SchemaObjects ReadSchemaObjects(sqlite3 *database) {
   Statement statement(
       database, "SELECT type,name,sql FROM sqlite_master "
-                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 25");
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 43");
   SchemaObjects objects;
   std::int64_t count = 0;
   while (statement.Step()) {
     ++count;
     if (count > kExpectedSchemaObjectCardinality) {
       throw CanonicalEmptySceneOwnerIntegrityError(
-          "logical-scene schema object cardinality exceeds v2");
+          "logical-scene schema object cardinality exceeds v3");
     }
     objects.emplace(std::make_pair(statement.Text(0), statement.Text(1)),
                     NormalizedSql(statement.Text(2)));
@@ -328,37 +344,49 @@ SchemaObjects ReadSchemaObjects(sqlite3 *database) {
   return objects;
 }
 
-const SchemaObjects &ExpectedSchemaObjects() {
-  static const SchemaObjects expected = [] {
-    sqlite3 *database = nullptr;
-    const auto result = sqlite3_open_v2(
-        ":memory:", &database,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-        nullptr);
-    if (result != SQLITE_OK) {
-      const std::string detail = database == nullptr ? sqlite3_errstr(result)
-                                                     : sqlite3_errmsg(database);
-      if (database != nullptr) {
-        sqlite3_close(database);
-      }
+SchemaObjects BuildExpectedSchemaObjects(const bool include_transactions) {
+  sqlite3 *database = nullptr;
+  const auto result = sqlite3_open_v2(
+      ":memory:", &database,
+      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+      nullptr);
+  if (result != SQLITE_OK) {
+    const std::string detail =
+        database == nullptr ? sqlite3_errstr(result) : sqlite3_errmsg(database);
+    if (database != nullptr) {
+      sqlite3_close(database);
+    }
+    throw CanonicalEmptySceneOwnerError(
+        "cannot open in-memory scene schema validator: " + detail);
+  }
+  try {
+    Exec(database, detail::kEmbeddedCanonicalEmptySceneSchema);
+    if (include_transactions) {
+      Exec(database, detail::kEmbeddedLogicalSceneTransactionMigration);
+    }
+    auto objects = ReadSchemaObjects(database);
+    const auto expected_count = include_transactions
+                                    ? kExpectedSchemaObjectCardinality
+                                    : kExpectedBaseSchemaObjectCardinality;
+    if (objects.size() != static_cast<std::size_t>(expected_count)) {
       throw CanonicalEmptySceneOwnerError(
-          "cannot open in-memory scene schema validator: " + detail);
+          "embedded logical-scene schema cardinality is invalid");
     }
-    try {
-      Exec(database, detail::kEmbeddedCanonicalEmptySceneSchema);
-      auto objects = ReadSchemaObjects(database);
-      if (objects.size() !=
-          static_cast<std::size_t>(kExpectedSchemaObjectCardinality)) {
-        throw CanonicalEmptySceneOwnerError(
-            "embedded logical-scene schema cardinality is invalid");
-      }
-      sqlite3_close(database);
-      return objects;
-    } catch (...) {
-      sqlite3_close(database);
-      throw;
-    }
-  }();
+    sqlite3_close(database);
+    return objects;
+  } catch (...) {
+    sqlite3_close(database);
+    throw;
+  }
+}
+
+const SchemaObjects &ExpectedBaseSchemaObjects() {
+  static const SchemaObjects expected = BuildExpectedSchemaObjects(false);
+  return expected;
+}
+
+const SchemaObjects &ExpectedSchemaObjects() {
+  static const SchemaObjects expected = BuildExpectedSchemaObjects(true);
   return expected;
 }
 
@@ -443,9 +471,20 @@ AdmittedBootstrapAuthority AuthorityFromAdmission(
   };
 }
 
-std::string SchemaArtifactDigest() {
+std::string BaseSchemaArtifactDigest() {
   return manyforge::content_identity::sha256_digest(
       detail::kEmbeddedCanonicalEmptySceneSchema);
+}
+
+std::string TransactionMigrationArtifactDigest() {
+  return manyforge::content_identity::sha256_digest(
+      detail::kEmbeddedLogicalSceneTransactionMigration);
+}
+
+std::string CurrentSchemaArtifactDigest() {
+  return manyforge::content_identity::sha256_digest(
+      std::string(detail::kEmbeddedCanonicalEmptySceneSchema) + "\n--v3--\n" +
+      std::string(detail::kEmbeddedLogicalSceneTransactionMigration));
 }
 
 struct AcceptedState final {
@@ -473,6 +512,9 @@ struct DurableState final {
   std::optional<ActiveBundlePublicationReceiptDTO> finalization_receipt;
   std::vector<NamedApplyStageState> named_apply_stages;
   std::optional<ProjectionRevisionDTO> active_projection;
+  std::optional<LogicalSceneSnapshotDTO> active_scene_snapshot;
+  bool projection_desynchronized{};
+  bool unresolved_scene_transaction{};
 
   [[nodiscard]] const NamedApplyStageState *
   FindNamedApply(const ApplyId &apply_id,
@@ -522,6 +564,1433 @@ struct DurableState final {
     return CanonicalEmptySceneBootstrapPhase::kInitialCommandFenced;
   }
 };
+
+struct StoredSceneOutcome final {
+  std::string request_owner_epoch;
+  RequestId request_id;
+  ContentDigest request_digest;
+  std::optional<std::uint64_t> transaction_sequence;
+  bool success;
+  SceneProjectionCommitStatusDTO projection_status;
+  std::size_t attempted_projection_count;
+  std::optional<ErrorDTO> error;
+};
+
+struct StoredSceneIntent final {
+  std::uint64_t transaction_sequence;
+  std::string request_owner_epoch;
+  RequestId request_id;
+  ContentDigest request_digest;
+  std::string request_json;
+  ProjectionRevisionDTO prior;
+  ProjectionRevisionDTO proposed;
+  std::string resolved_operation_json;
+  std::optional<ContentDigest> resolution_evidence_digest;
+  LogicalSceneSnapshotDTO candidate_snapshot;
+  SceneUpdateStatusDTO update_status;
+  std::size_t required_projection_count;
+};
+
+struct SceneTransactionStoreState final {
+  ProjectionRevisionDTO active_projection;
+  LogicalSceneSnapshotDTO active_snapshot;
+  std::uint64_t next_transaction_sequence;
+  std::uint64_t next_owner_event_sequence;
+  bool projection_desynchronized;
+  bool unresolved_native_attempt;
+  std::optional<std::uint64_t> unresolved_transaction_sequence;
+};
+
+struct StoredSceneRecord final {
+  StoredSceneIntent intent;
+  std::size_t projection_attempt_count;
+  std::size_t projection_result_count;
+  std::optional<StoredSceneOutcome> outcome;
+};
+
+SceneProjectionCommitStatusDTO
+DecodeProjectionStatus(const std::string_view value) {
+  if (value == "not_attempted") {
+    return SceneProjectionCommitStatusDTO::kNotAttempted;
+  }
+  if (value == "committed") {
+    return SceneProjectionCommitStatusDTO::kCommitted;
+  }
+  if (value == "rejected_rollback_proven") {
+    return SceneProjectionCommitStatusDTO::kRejectedRollbackProven;
+  }
+  if (value == "failed_projection_uncertain") {
+    return SceneProjectionCommitStatusDTO::kFailedProjectionUncertain;
+  }
+  throw CanonicalEmptySceneOwnerIntegrityError(
+      "stored scene projection status is invalid");
+}
+
+SceneUpdateStatusDTO DecodeUpdateStatus(const std::string_view value) {
+  if (value == "geometry_changed") {
+    return SceneUpdateStatusDTO::kGeometryChanged;
+  }
+  if (value == "freshness_only") {
+    return SceneUpdateStatusDTO::kFreshnessOnly;
+  }
+  if (value == "no_op") {
+    return SceneUpdateStatusDTO::kNoOp;
+  }
+  throw CanonicalEmptySceneOwnerIntegrityError(
+      "stored logical-scene update status is invalid");
+}
+
+ProjectionRevisionDTO ReadProjectionColumns(const Statement &statement,
+                                            const int offset) {
+  const auto revision_id = statement.Integer(offset + 3);
+  if (revision_id <= 0) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "stored logical-scene projection revision is invalid");
+  }
+  ProjectionRevisionDTO projection{
+      RetainedBundleId(statement.Text(offset)),
+      GraphRevision(statement.Text(offset + 1)),
+      SceneRevision{
+          SceneId(statement.Text(offset + 2)),
+          static_cast<std::uint64_t>(revision_id),
+          ContentDigest(statement.Text(offset + 4)),
+      },
+  };
+  if (!projection.valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "stored logical-scene projection identity is invalid");
+  }
+  return projection;
+}
+
+std::optional<StoredSceneOutcome>
+ReadOutcomeForRequest(sqlite3 *database,
+                      const std::string_view request_owner_epoch,
+                      const RequestId &request_id) {
+  Statement statement(database,
+                      "SELECT request_owner_epoch,request_id,request_digest,"
+                      "transaction_sequence,success,projection_status,"
+                      "attempted_projection_count,error_code,error_message,"
+                      "error_details_json FROM logical_scene_request_outcomes "
+                      "WHERE request_owner_epoch=? AND request_id=? LIMIT 2");
+  statement.Bind(1, request_owner_epoch);
+  statement.Bind(2, request_id.value());
+  if (!statement.Step()) {
+    return std::nullopt;
+  }
+  StoredSceneOutcome outcome{
+      statement.Text(0),
+      RequestId(statement.Text(1)),
+      ContentDigest(statement.Text(2)),
+      statement.IsNull(3)
+          ? std::nullopt
+          : std::optional<std::uint64_t>(
+                static_cast<std::uint64_t>(statement.Integer(3))),
+      statement.Integer(4) == 1,
+      DecodeProjectionStatus(statement.Text(5)),
+      static_cast<std::size_t>(statement.Integer(6)),
+      std::nullopt,
+  };
+  if (outcome.transaction_sequence.has_value() &&
+      *outcome.transaction_sequence == 0U) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "stored scene outcome has a zero transaction sequence");
+  }
+  if (outcome.success) {
+    if (!statement.IsNull(7) || !statement.IsNull(8) || !statement.IsNull(9)) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "successful scene outcome carries an error");
+    }
+  } else {
+    if (statement.IsNull(7) || statement.IsNull(8) || statement.IsNull(9)) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "failed scene outcome lacks its error");
+    }
+    outcome.error = ErrorDTO{
+        statement.Text(7),
+        statement.Text(8),
+        logical_scene_codec_internal::DecodeErrorDetails(statement.Text(9)),
+    };
+  }
+  if (statement.Step() ||
+      !core::IsExactLowercaseSha256Digest(outcome.request_digest.value()) ||
+      outcome.request_owner_epoch != request_owner_epoch ||
+      outcome.request_id != request_id ||
+      (outcome.success && (outcome.projection_status !=
+                               SceneProjectionCommitStatusDTO::kCommitted ||
+                           !outcome.transaction_sequence.has_value() ||
+                           outcome.error.has_value())) ||
+      (!outcome.success && outcome.projection_status ==
+                               SceneProjectionCommitStatusDTO::kCommitted)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "stored scene outcome violates its closed result shape");
+  }
+  return outcome;
+}
+
+std::optional<StoredSceneOutcome>
+ReadOutcomeForSequence(sqlite3 *database,
+                       const std::uint64_t transaction_sequence) {
+  Statement key(database, "SELECT request_owner_epoch,request_id FROM "
+                          "logical_scene_transaction_intents WHERE "
+                          "transaction_sequence=? LIMIT 2");
+  key.Bind(1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
+  if (!key.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene outcome lookup has no matching intent");
+  }
+  const auto epoch = key.Text(0);
+  const RequestId request_id(key.Text(1));
+  if (key.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene intent sequence is not unique");
+  }
+  return ReadOutcomeForRequest(database, epoch, request_id);
+}
+
+struct ProjectionEvidenceState final {
+  std::size_t attempt_count{};
+  std::size_t result_count{};
+  bool all_results_committed{true};
+  bool all_results_rollback_proven{true};
+  bool any_result_committed{};
+  bool any_result_uncertain{};
+};
+
+ProjectionEvidenceState
+ReadProjectionEvidenceState(sqlite3 *database,
+                            const std::uint64_t transaction_sequence,
+                            const ProjectionRevisionDTO &proposed) {
+  ProjectionEvidenceState evidence;
+  std::optional<core::ProjectionNativeRuntimeBindingDTO> previous_binding;
+  Statement attempts(
+      database,
+      "SELECT projection_ordinal,provider_binding_id,"
+      "provider_binding_revision,runtime_unit_id,runtime_epoch FROM "
+      "logical_scene_projection_attempts WHERE transaction_sequence=? "
+      "ORDER BY projection_ordinal LIMIT 257");
+  attempts.Bind(
+      1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
+  while (attempts.Step()) {
+    if (attempts.Integer(0) !=
+        static_cast<std::int64_t>(evidence.attempt_count)) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene projection attempt ordinals are not contiguous");
+    }
+    core::ProjectionNativeRuntimeBindingDTO binding{
+        core::CapabilityProviderBindingId(attempts.Text(1)),
+        core::CapabilityProviderBindingRevision(attempts.Text(2)),
+        core::RuntimeUnitId(attempts.Text(3)),
+        core::RuntimeEpoch(attempts.Text(4)),
+    };
+    if (!binding.valid() || (previous_binding.has_value() &&
+                             !core::CanonicalProjectionNativeBindingLess(
+                                 *previous_binding, binding))) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene projection attempt bindings are invalid");
+    }
+    previous_binding = std::move(binding);
+    ++evidence.attempt_count;
+  }
+
+  Statement results(
+      database,
+      "SELECT projection_ordinal,result_state,"
+      "acknowledged_retained_bundle_id,acknowledged_graph_revision,"
+      "acknowledged_scene_id,acknowledged_scene_revision_id,"
+      "acknowledged_scene_content_hash,rollback_proven,"
+      "resulting_health_state,error_code,error_message,error_details_json "
+      "FROM logical_scene_projection_results WHERE transaction_sequence=? "
+      "ORDER BY projection_ordinal LIMIT 257");
+  results.Bind(
+      1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
+  while (results.Step()) {
+    if (results.Integer(0) !=
+            static_cast<std::int64_t>(evidence.result_count) ||
+        evidence.result_count >= evidence.attempt_count) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene projection result ordinals are invalid");
+    }
+    const auto state = results.Text(1);
+    const bool acknowledgement_present = !results.IsNull(2);
+    for (int column = 2; column <= 6; ++column) {
+      if (results.IsNull(column) == acknowledgement_present) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "stored projection acknowledgement has partial presence");
+      }
+    }
+    std::optional<ProjectionRevisionDTO> acknowledgement;
+    if (acknowledgement_present) {
+      acknowledgement = ReadProjectionColumns(results, 2);
+    }
+    const bool rollback_proven = results.Integer(7) == 1;
+    const auto health_state = results.Text(8);
+    const bool error_present = !results.IsNull(9);
+    if (results.IsNull(10) != !error_present ||
+        results.IsNull(11) != !error_present) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "stored projection result error has partial presence");
+    }
+    if (error_present) {
+      static_cast<void>(
+          logical_scene_codec_internal::DecodeErrorDetails(results.Text(11)));
+    }
+    if (state == "committed") {
+      if (!acknowledgement.has_value() || *acknowledgement != proposed ||
+          rollback_proven || health_state != "healthy" || error_present) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "stored committed projection result is contradictory");
+      }
+      evidence.any_result_committed = true;
+      evidence.all_results_rollback_proven = false;
+    } else if (state == "rejected_rollback_proven") {
+      if (!rollback_proven || health_state != "healthy" || !error_present) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "stored rollback-proven projection result is contradictory");
+      }
+      evidence.all_results_committed = false;
+    } else if (state == "failed_projection_uncertain") {
+      if (rollback_proven ||
+          (health_state != "desynchronized" && health_state != "unavailable") ||
+          !error_present) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "stored uncertain projection result is contradictory");
+      }
+      evidence.all_results_committed = false;
+      evidence.all_results_rollback_proven = false;
+      evidence.any_result_uncertain = true;
+    } else {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "stored projection result state is invalid");
+    }
+    ++evidence.result_count;
+  }
+  if (evidence.result_count == 0U) {
+    evidence.all_results_committed = false;
+    evidence.all_results_rollback_proven = false;
+  }
+  return evidence;
+}
+
+SceneTransactionStoreState
+ReadSceneTransactionStoreState(sqlite3 *database,
+                               const DurableState &durable_state) {
+  if (!durable_state.accepted.has_value() ||
+      !durable_state.finalization_receipt.has_value()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene transaction history requires finalized bootstrap");
+  }
+  const auto &bootstrap_projection = durable_state.accepted->target;
+  const auto &bootstrap_snapshot = durable_state.accepted->snapshot;
+  SceneTransactionStoreState state{
+      bootstrap_projection, bootstrap_snapshot, 1U, 1U, false, false,
+      std::nullopt,
+  };
+  std::vector<StoredSceneRecord> records;
+  Statement statement(
+      database,
+      "SELECT transaction_sequence,request_owner_epoch,request_id,"
+      "request_digest,request_json,prior_retained_bundle_id,"
+      "prior_graph_revision,prior_scene_id,prior_scene_revision_id,"
+      "prior_scene_content_hash,proposed_retained_bundle_id,"
+      "proposed_graph_revision,proposed_scene_id,"
+      "proposed_scene_revision_id,proposed_scene_content_hash,"
+      "resolved_operation_json,resolution_evidence_digest,"
+      "candidate_snapshot_json,update_status,required_projection_count "
+      "FROM logical_scene_transaction_intents ORDER BY "
+      "transaction_sequence LIMIT 257");
+  std::uint64_t expected_sequence = 1U;
+  while (statement.Step()) {
+    if (!records.empty() &&
+        (!records.back().outcome.has_value() ||
+         records.back().outcome->projection_status ==
+             SceneProjectionCommitStatusDTO::kFailedProjectionUncertain)) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene history continues after an unresolved or "
+          "desynchronized transaction");
+    }
+    const auto sequence_value = statement.Integer(0);
+    if (sequence_value <= 0 ||
+        static_cast<std::uint64_t>(sequence_value) != expected_sequence) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene transaction sequence is not contiguous");
+    }
+    StoredSceneIntent intent{
+        expected_sequence,
+        statement.Text(1),
+        RequestId(statement.Text(2)),
+        ContentDigest(statement.Text(3)),
+        statement.Text(4),
+        ReadProjectionColumns(statement, 5),
+        ReadProjectionColumns(statement, 10),
+        statement.Text(15),
+        statement.IsNull(16)
+            ? std::nullopt
+            : std::optional<ContentDigest>(ContentDigest(statement.Text(16))),
+        logical_scene_codec_internal::DecodeSnapshot(statement.Text(17)),
+        DecodeUpdateStatus(statement.Text(18)),
+        static_cast<std::size_t>(statement.Integer(19)),
+    };
+    const auto stored_request =
+        logical_scene_codec_internal::DecodeRequest(intent.request_json);
+    if (intent.request_owner_epoch !=
+            bootstrap_snapshot.revision.scene_id.value() ||
+        intent.request_id.empty() ||
+        !core::IsExactLowercaseSha256Digest(intent.request_digest.value()) ||
+        intent.request_json.empty() ||
+        intent.request_json.size() > kMaximumLogicalSceneTransactionBytes ||
+        manyforge::content_identity::sha256_digest(
+            logical_scene_codec_internal::EncodeRequestDigestInput(
+                stored_request)) != intent.request_digest.value() ||
+        stored_request.request_context.request_owner_epoch.value() !=
+            intent.request_owner_epoch ||
+        stored_request.request_context.request_id != intent.request_id ||
+        stored_request.expected_projection_revision != intent.prior ||
+        intent.resolved_operation_json.empty() ||
+        intent.resolved_operation_json.size() >
+            kMaximumLogicalSceneTransactionBytes ||
+        (intent.resolution_evidence_digest.has_value() &&
+         !core::IsExactLowercaseSha256Digest(
+             intent.resolution_evidence_digest->value())) ||
+        intent.required_projection_count > 256U ||
+        intent.proposed.retained_bundle_id != intent.prior.retained_bundle_id ||
+        intent.proposed.graph_revision != intent.prior.graph_revision ||
+        intent.proposed.scene_revision.scene_id !=
+            intent.prior.scene_revision.scene_id ||
+        intent.proposed.scene_revision != intent.candidate_snapshot.revision ||
+        intent.prior.scene_revision.scene_id !=
+            bootstrap_snapshot.revision.scene_id ||
+        intent.candidate_snapshot.transaction_sequence != expected_sequence ||
+        intent.candidate_snapshot.cell_id != bootstrap_snapshot.cell_id) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "durable logical-scene transaction intent is invalid");
+    }
+    const auto projection_evidence = ReadProjectionEvidenceState(
+        database, expected_sequence, intent.proposed);
+    const auto attempts = projection_evidence.attempt_count;
+    const auto results = projection_evidence.result_count;
+    if (attempts > intent.required_projection_count || results > attempts) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene projection evidence cardinality is invalid");
+    }
+    const auto outcome = ReadOutcomeForSequence(database, expected_sequence);
+    if (!outcome.has_value()) {
+      state.unresolved_transaction_sequence = expected_sequence;
+      if (attempts != 0U || results != 0U ||
+          intent.required_projection_count != 0U) {
+        state.projection_desynchronized = true;
+      }
+      state.unresolved_native_attempt = true;
+    } else {
+      if (outcome->transaction_sequence != expected_sequence ||
+          outcome->request_digest != intent.request_digest ||
+          outcome->attempted_projection_count != attempts ||
+          (outcome->projection_status !=
+               SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
+           results != attempts)) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "logical-scene outcome does not match its durable intent");
+      }
+      if (outcome->success && attempts != intent.required_projection_count) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "successful scene outcome lacks complete projection evidence");
+      }
+      if ((outcome->success && !projection_evidence.all_results_committed &&
+           attempts != 0U) ||
+          (outcome->projection_status ==
+               SceneProjectionCommitStatusDTO::kRejectedRollbackProven &&
+           !projection_evidence.all_results_rollback_proven) ||
+          (outcome->projection_status ==
+               SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
+           !projection_evidence.any_result_uncertain &&
+           !projection_evidence.any_result_committed && results == attempts)) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "scene outcome contradicts its native projection evidence");
+      }
+      if (outcome->projection_status ==
+          SceneProjectionCommitStatusDTO::kFailedProjectionUncertain) {
+        state.projection_desynchronized = true;
+      }
+    }
+    records.push_back(
+        StoredSceneRecord{std::move(intent), attempts, results, outcome});
+    ++expected_sequence;
+    state.next_transaction_sequence = expected_sequence;
+  }
+  if (expected_sequence > kMaximumLogicalSceneTransactions + 1U) {
+    throw CanonicalEmptySceneOwnerLimitError(
+        "logical-scene transaction ledger exceeds its fixed bound");
+  }
+
+  std::vector<bool> transaction_event_seen(records.size(), false);
+  std::vector<bool> named_apply_event_seen(
+      durable_state.named_apply_stages.size(), false);
+  std::vector<ProjectionRevisionDTO> published_projections{
+      bootstrap_projection};
+  Statement events(
+      database,
+      "SELECT owner_event_sequence,event_kind,transaction_sequence,"
+      "named_apply_lineage_generation FROM logical_scene_owner_events "
+      "ORDER BY owner_event_sequence LIMIT 513");
+  std::uint64_t expected_event_sequence = 1U;
+  bool history_sealed = false;
+  while (events.Step()) {
+    if (history_sealed) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene owner history continues after an unresolved or "
+          "desynchronized event");
+    }
+    if (expected_event_sequence > kMaximumLogicalSceneOwnerEvents ||
+        events.Integer(0) !=
+            static_cast<std::int64_t>(expected_event_sequence)) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene owner event sequence is invalid");
+    }
+    const auto kind = events.Text(1);
+    if (kind == "scene_transaction_intent") {
+      if (events.IsNull(2) || !events.IsNull(3)) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "scene transaction owner event has invalid referent presence");
+      }
+      const auto sequence = events.Integer(2);
+      if (sequence <= 0 ||
+          static_cast<std::size_t>(sequence) > records.size()) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "scene transaction owner event references an absent intent");
+      }
+      const auto index = static_cast<std::size_t>(sequence - 1);
+      auto &record = records[index];
+      if (transaction_event_seen[index] ||
+          record.intent.prior != state.active_projection) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "scene transaction event does not follow the active composite");
+      }
+      transaction_event_seen[index] = true;
+      if (!record.outcome.has_value()) {
+        history_sealed = true;
+      } else if (record.outcome->success) {
+        state.active_projection = record.intent.proposed;
+        state.active_snapshot = record.intent.candidate_snapshot;
+        published_projections.push_back(state.active_projection);
+      } else if (record.outcome->projection_status ==
+                 SceneProjectionCommitStatusDTO::kFailedProjectionUncertain) {
+        history_sealed = true;
+      }
+    } else if (kind == "named_apply_finalized") {
+      if (!events.IsNull(2) || events.IsNull(3)) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "named Apply owner event has invalid referent presence");
+      }
+      const auto lineage = events.Integer(3);
+      if (lineage <= 0 || static_cast<std::size_t>(lineage) >
+                              durable_state.named_apply_stages.size()) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "named Apply owner event references an absent stage");
+      }
+      const auto index = static_cast<std::size_t>(lineage - 1);
+      const auto &stage = durable_state.named_apply_stages[index];
+      if (named_apply_event_seen[index] ||
+          !stage.finalization_receipt.has_value() ||
+          stage.predecessor != state.active_projection) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "named Apply event does not follow the active composite");
+      }
+      named_apply_event_seen[index] = true;
+      state.active_projection = stage.candidate;
+      if (state.active_snapshot.revision !=
+          state.active_projection.scene_revision) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "named Apply event changes logical-scene content");
+      }
+      published_projections.push_back(state.active_projection);
+    } else {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene owner event kind is invalid");
+    }
+    ++expected_event_sequence;
+  }
+  state.next_owner_event_sequence = expected_event_sequence;
+
+  for (std::size_t index = 0U; index < records.size(); ++index) {
+    if (!transaction_event_seen[index]) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "logical-scene intent lacks its owner-order event");
+    }
+  }
+  for (std::size_t index = 0U; index < durable_state.named_apply_stages.size();
+       ++index) {
+    const auto &stage = durable_state.named_apply_stages[index];
+    if (stage.finalization_receipt.has_value() !=
+        named_apply_event_seen[index]) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "named Apply finalization and owner-order event disagree");
+    }
+    if (!stage.finalization_receipt.has_value()) {
+      const auto predecessor_was_published =
+          std::find(published_projections.begin(), published_projections.end(),
+                    stage.predecessor) != published_projections.end();
+      if (!predecessor_was_published ||
+          (!stage.discarded && stage.predecessor != state.active_projection)) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "non-finalized named Apply did not capture an active composite");
+      }
+    }
+  }
+  if (!durable_state.active_projection.has_value() ||
+      durable_state.active_projection->retained_bundle_id !=
+          state.active_projection.retained_bundle_id ||
+      durable_state.active_projection->graph_revision !=
+          state.active_projection.graph_revision ||
+      durable_state.active_projection->scene_revision.scene_id !=
+          state.active_projection.scene_revision.scene_id ||
+      durable_state.active_projection->scene_revision.revision_id >
+          state.active_projection.scene_revision.revision_id ||
+      (durable_state.active_projection->scene_revision.revision_id ==
+           state.active_projection.scene_revision.revision_id &&
+       durable_state.active_projection->scene_revision.content_hash !=
+           state.active_projection.scene_revision.content_hash)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "typed structural head disagrees with owner-event replay");
+  }
+  return state;
+}
+
+ErrorDTO SceneError(const std::string_view code, const std::string_view message,
+                    std::map<std::string, std::string> details = {}) {
+  return {std::string(code), std::string(message), std::move(details)};
+}
+
+SceneCommitResultDTO
+FailedSceneResult(const RequestId &request_id,
+                  const core::RequestReplayStatusDTO replay, ErrorDTO error,
+                  const SceneProjectionCommitStatusDTO projection_status) {
+  SceneCommitResultDTO result{
+      request_id,        replay,       false,
+      std::move(error),  std::nullopt, std::nullopt,
+      projection_status, std::nullopt,
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot construct a valid failed scene result");
+  }
+  return result;
+}
+
+void ValidateBoundedText(const std::string_view value,
+                         const std::string_view label,
+                         const bool allow_empty = false) {
+  if ((!allow_empty && value.empty()) ||
+      value.size() > kMaximumSceneStoreIdentifierBytes ||
+      !manyforge::content_identity::is_utf8_nfc(value)) {
+    throw std::invalid_argument(std::string(label) +
+                                " must be bounded NFC text");
+  }
+}
+
+bool SamePose(const core::Pose3DTO &left,
+              const core::Pose3DTO &right) noexcept {
+  return left == right;
+}
+
+bool SameProviderEvidence(
+    const std::optional<core::SceneObjectProviderEvidenceDTO> &left,
+    const std::optional<core::SceneObjectProviderEvidenceDTO> &right) {
+  if (left.has_value() != right.has_value()) {
+    return false;
+  }
+  if (!left.has_value()) {
+    return true;
+  }
+  return left->provider_instance_id == right->provider_instance_id &&
+         left->provider_manifest_id == right->provider_manifest_id &&
+         left->provider_manifest_revision ==
+             right->provider_manifest_revision &&
+         left->provider_source_epoch == right->provider_source_epoch &&
+         left->provider_source_sequence == right->provider_source_sequence &&
+         left->received_at_ns == right->received_at_ns &&
+         left->source_timestamp_ns == right->source_timestamp_ns &&
+         left->source_freshness_budget_ns == right->source_freshness_budget_ns;
+}
+
+template <typename Value, typename Projection>
+bool CanonicalVector(const std::vector<Value> &values, Projection projection) {
+  for (std::size_t index = 1U; index < values.size(); ++index) {
+    if (!(projection(values[index - 1U]) < projection(values[index]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct ResolvedSceneCandidate final {
+  LogicalSceneSnapshotDTO snapshot;
+  core::ResolvedSceneOperationDTO operation;
+  SceneUpdateStatusDTO update_status;
+  std::optional<ContentDigest> resolution_evidence_digest;
+};
+
+ContentDigest CellResolutionEvidence(const ContentDigest &request_digest,
+                                     const ProjectionRevisionDTO &projection) {
+  return ContentDigest(manyforge::content_identity::sha256_digest(
+      "manyforge.scene-frame-resolution.cell.v1\n" + request_digest.value() +
+      "\n" + projection.retained_bundle_id.value() + "\n" +
+      projection.graph_revision.value() + "\n" +
+      projection.scene_revision.content_hash.value()));
+}
+
+class SceneRequestRejectionError final : public std::runtime_error {
+public:
+  SceneRequestRejectionError(std::string code, std::string message,
+                             std::map<std::string, std::string> details = {})
+      : std::runtime_error(std::move(message)), code_(std::move(code)),
+        details_(std::move(details)) {}
+
+  [[nodiscard]] const std::string &code() const noexcept { return code_; }
+  [[nodiscard]] const std::map<std::string, std::string> &
+  details() const noexcept {
+    return details_;
+  }
+
+private:
+  std::string code_;
+  std::map<std::string, std::string> details_;
+};
+
+const core::CellSceneFrameRefDTO &
+RequireCellFrame(const core::SceneFrameRefDTO &frame, const CellId &cell_id) {
+  const auto *cell = std::get_if<core::CellSceneFrameRefDTO>(&frame);
+  if (cell == nullptr) {
+    throw SceneRequestRejectionError(
+        "scene_frame_resolution_unavailable",
+        "component and passive-model scene-frame resolution is installed by "
+        "N5c",
+        {{"reason", "scene_frame_resolver_not_installed"}});
+  }
+  if (cell->cell_id != cell_id) {
+    throw SceneRequestRejectionError(
+        "missing_reference",
+        "scene frame does not name the active semantic cell",
+        {{"reference_type", "cell_frame"},
+         {"reference_id", cell->cell_id.value()}});
+  }
+  return *cell;
+}
+
+std::string CurrentFrameId(const LogicalSceneSnapshotDTO &snapshot,
+                           const SceneObjectSnapshotDTO &object) {
+  if (const auto *cell = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+          &object.placement)) {
+    return cell->cell_id.value();
+  }
+  const auto &carried =
+      std::get<core::CarriedSceneObjectPlacementDTO>(object.placement);
+  const auto attachment =
+      std::lower_bound(snapshot.carried_object_attachments.begin(),
+                       snapshot.carried_object_attachments.end(),
+                       carried.carried_object_attachment_id,
+                       [](const core::CarriedObjectAttachmentDTO &entry,
+                          const core::CarriedObjectAttachmentId &id) {
+                         return entry.carried_object_attachment_id < id;
+                       });
+  if (attachment == snapshot.carried_object_attachments.end() ||
+      attachment->carried_object_attachment_id !=
+          carried.carried_object_attachment_id ||
+      attachment->carried_object_attachment_revision !=
+          carried.carried_object_attachment_revision) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "carried scene object has no exact attachment row");
+  }
+  const auto *frame = std::get_if<core::ComponentSceneFrameRefDTO>(
+      &attachment->carrier_frame_ref);
+  if (frame == nullptr) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "carried scene object attachment has no component frame");
+  }
+  return frame->frame_role_id.value();
+}
+
+ResolvedSceneCandidate
+ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
+                      const LogicalSceneSnapshotDTO &current,
+                      const std::uint64_t transaction_sequence,
+                      const ContentDigest &request_digest) {
+  ResolvedSceneCandidate candidate{
+      current,
+      core::ResolvedRemoveSceneObjectDTO{SceneResourceId(std::string{})},
+      SceneUpdateStatusDTO::kGeometryChanged,
+      std::nullopt,
+  };
+  candidate.snapshot.transaction_sequence = transaction_sequence;
+  bool content_expected_to_change = true;
+  bool topology_changed = true;
+  bool policy_changed = false;
+
+  std::visit(
+      [&](const auto &operation) {
+        using T = std::decay_t<decltype(operation)>;
+        if constexpr (std::is_same_v<T, core::AddObjectRequestDTO>) {
+          ValidateBoundedIdentity(operation.scene_resource_id.value(),
+                                  "scene_resource_id");
+          static_cast<void>(
+              RequireCellFrame(operation.frame_ref, current.cell_id));
+          const auto found = std::lower_bound(
+              candidate.snapshot.objects.begin(),
+              candidate.snapshot.objects.end(), operation.scene_resource_id,
+              [](const SceneObjectSnapshotDTO &object,
+                 const SceneResourceId &id) {
+                return object.scene_resource_id < id;
+              });
+          if (found != candidate.snapshot.objects.end() &&
+              found->scene_resource_id == operation.scene_resource_id) {
+            throw SceneRequestRejectionError(
+                "object_already_exists", "scene resource already exists",
+                {{"scene_resource_id", operation.scene_resource_id.value()}});
+          }
+          SceneObjectSnapshotDTO object{
+              operation.scene_resource_id,
+              {operation.shape},
+              core::CellFixedSceneObjectPlacementDTO{current.cell_id,
+                                                     operation.pose},
+              std::nullopt,
+          };
+          candidate.snapshot.objects.insert(found, object);
+          candidate.operation = core::ResolvedUpsertSceneObjectDTO{object};
+          candidate.resolution_evidence_digest = CellResolutionEvidence(
+              request_digest, request.expected_projection_revision);
+        } else if constexpr (std::is_same_v<T, core::RemoveObjectRequestDTO>) {
+          ValidateBoundedIdentity(operation.scene_resource_id.value(),
+                                  "scene_resource_id");
+          const auto found = std::lower_bound(
+              candidate.snapshot.objects.begin(),
+              candidate.snapshot.objects.end(), operation.scene_resource_id,
+              [](const SceneObjectSnapshotDTO &object,
+                 const SceneResourceId &id) {
+                return object.scene_resource_id < id;
+              });
+          if (found == candidate.snapshot.objects.end() ||
+              found->scene_resource_id != operation.scene_resource_id) {
+            throw SceneRequestRejectionError(
+                "object_not_found", "scene resource does not exist",
+                {{"scene_resource_id", operation.scene_resource_id.value()}});
+          }
+          if (std::holds_alternative<core::CarriedSceneObjectPlacementDTO>(
+                  found->placement)) {
+            throw CanonicalEmptySceneOwnerConflictError(
+                "a carried object must be detached before removal");
+          }
+          candidate.snapshot.objects.erase(found);
+          candidate.operation =
+              core::ResolvedRemoveSceneObjectDTO{operation.scene_resource_id};
+        } else if constexpr (std::is_same_v<T,
+                                            core::UpdateObjectPoseRequestDTO>) {
+          ValidateBoundedIdentity(operation.scene_resource_id.value(),
+                                  "scene_resource_id");
+          static_cast<void>(
+              RequireCellFrame(operation.frame_ref, current.cell_id));
+          auto found = std::lower_bound(candidate.snapshot.objects.begin(),
+                                        candidate.snapshot.objects.end(),
+                                        operation.scene_resource_id,
+                                        [](const SceneObjectSnapshotDTO &object,
+                                           const SceneResourceId &id) {
+                                          return object.scene_resource_id < id;
+                                        });
+          if (found == candidate.snapshot.objects.end() ||
+              found->scene_resource_id != operation.scene_resource_id) {
+            throw SceneRequestRejectionError(
+                "object_not_found", "scene resource does not exist",
+                {{"scene_resource_id", operation.scene_resource_id.value()}});
+          }
+          const bool attached =
+              std::holds_alternative<core::CarriedSceneObjectPlacementDTO>(
+                  found->placement);
+          if (operation.expected_attached.has_value() &&
+              *operation.expected_attached != attached) {
+            throw SceneRequestRejectionError(
+                "scene_object_state_conflict",
+                "scene object attachment precondition failed",
+                {{"reason", "scene_object_attachment_precondition_failed"},
+                 {"scene_resource_id", operation.scene_resource_id.value()},
+                 {"expected_attached",
+                  *operation.expected_attached ? "true" : "false"},
+                 {"current_attached", attached ? "true" : "false"},
+                 {"current_frame_id", CurrentFrameId(current, *found)}});
+          }
+          if (attached) {
+            throw SceneRequestRejectionError(
+                "scene_object_state_conflict",
+                "a carried object pose is derived from its attachment",
+                {{"reason", "scene_object_is_attached"},
+                 {"scene_resource_id", operation.scene_resource_id.value()},
+                 {"current_frame_id", CurrentFrameId(current, *found)}});
+          }
+          if (operation.provider_evidence.has_value() &&
+              found->provider_evidence.has_value()) {
+            const auto &next = *operation.provider_evidence;
+            const auto &previous = *found->provider_evidence;
+            if (next.provider_instance_id == previous.provider_instance_id &&
+                next.provider_manifest_id == previous.provider_manifest_id &&
+                next.provider_manifest_revision ==
+                    previous.provider_manifest_revision &&
+                next.provider_source_epoch == previous.provider_source_epoch &&
+                next.provider_source_sequence <=
+                    previous.provider_source_sequence) {
+              throw SceneRequestRejectionError(
+                  "scene_object_state_conflict",
+                  "provider source sequence did not advance",
+                  {{"reason", "provider_source_sequence_not_increasing"},
+                   {"scene_resource_id", operation.scene_resource_id.value()},
+                   {"provider_instance_id", next.provider_instance_id.value()},
+                   {"provider_source_epoch", next.provider_source_epoch},
+                   {"previous_provider_source_sequence",
+                    std::to_string(previous.provider_source_sequence)},
+                   {"received_provider_source_sequence",
+                    std::to_string(next.provider_source_sequence)}});
+            }
+          }
+          const auto previous_pose =
+              std::get<core::CellFixedSceneObjectPlacementDTO>(found->placement)
+                  .pose_in_cell;
+          const bool pose_changed = !SamePose(previous_pose, operation.pose);
+          const bool evidence_changed = !SameProviderEvidence(
+              found->provider_evidence, operation.provider_evidence);
+          found->placement = core::CellFixedSceneObjectPlacementDTO{
+              current.cell_id, operation.pose};
+          found->provider_evidence = operation.provider_evidence;
+          candidate.operation = core::ResolvedUpsertSceneObjectDTO{*found};
+          candidate.resolution_evidence_digest = CellResolutionEvidence(
+              request_digest, request.expected_projection_revision);
+          if (!pose_changed && !evidence_changed) {
+            candidate.update_status = SceneUpdateStatusDTO::kNoOp;
+            content_expected_to_change = false;
+            topology_changed = false;
+          } else if (!pose_changed) {
+            candidate.update_status = SceneUpdateStatusDTO::kFreshnessOnly;
+            topology_changed = false;
+          }
+        } else if constexpr (std::is_same_v<
+                                 T, core::AttachCarriedObjectRequestDTO>) {
+          throw SceneRequestRejectionError(
+              "scene_frame_resolution_unavailable",
+              "carried-object attach requires the N5c immutable component "
+              "frame resolver",
+              {{"reason", "scene_frame_resolver_not_installed"}});
+        } else if constexpr (std::is_same_v<
+                                 T, core::DetachCarriedObjectRequestDTO>) {
+          static_cast<void>(
+              RequireCellFrame(operation.frame_ref, current.cell_id));
+          const auto attachment = std::lower_bound(
+              candidate.snapshot.carried_object_attachments.begin(),
+              candidate.snapshot.carried_object_attachments.end(),
+              operation.carried_object_attachment_id,
+              [](const core::CarriedObjectAttachmentDTO &entry,
+                 const core::CarriedObjectAttachmentId &id) {
+                return entry.carried_object_attachment_id < id;
+              });
+          if (attachment ==
+                  candidate.snapshot.carried_object_attachments.end() ||
+              attachment->carried_object_attachment_id !=
+                  operation.carried_object_attachment_id ||
+              attachment->carried_object_attachment_revision !=
+                  operation.expected_carried_object_attachment_revision) {
+            throw CanonicalEmptySceneOwnerConflictError(
+                "carried-object attachment precondition failed");
+          }
+          const auto object = std::lower_bound(
+              candidate.snapshot.objects.begin(),
+              candidate.snapshot.objects.end(), attachment->scene_resource_id,
+              [](const SceneObjectSnapshotDTO &entry,
+                 const SceneResourceId &id) {
+                return entry.scene_resource_id < id;
+              });
+          if (object == candidate.snapshot.objects.end() ||
+              object->scene_resource_id != attachment->scene_resource_id) {
+            throw CanonicalEmptySceneOwnerIntegrityError(
+                "carried attachment has no matching scene object");
+          }
+          const auto removed_id = attachment->carried_object_attachment_id;
+          const auto removed_revision =
+              attachment->carried_object_attachment_revision;
+          object->placement = core::CellFixedSceneObjectPlacementDTO{
+              current.cell_id, operation.pose};
+          candidate.snapshot.carried_object_attachments.erase(attachment);
+          candidate.operation = core::ResolvedDetachCarriedObjectDTO{
+              *object, removed_id, removed_revision};
+          candidate.resolution_evidence_digest = CellResolutionEvidence(
+              request_digest, request.expected_projection_revision);
+        } else {
+          topology_changed = false;
+          const auto &current_policy = current.configured_collision_policy;
+          if (operation.expected_configured_policy_revision.revision_id !=
+                  current_policy.revision.revision_id ||
+              operation.expected_configured_policy_revision.content_hash !=
+                  current_policy.revision.content_hash) {
+            throw SceneRequestRejectionError(
+                "stale_revision",
+                "configured collision-policy precondition failed",
+                {{"expected_collision_policy_revision",
+                  operation.expected_configured_policy_revision.content_hash},
+                 {"current_collision_policy_revision",
+                  current_policy.revision.content_hash}});
+          }
+          if (!operation.configured_policy.allowed_static_static_pairs
+                   .empty() ||
+              !operation.configured_policy.allowed_touch_link_pairs.empty() ||
+              !operation.configured_policy.support_contacts.empty()) {
+            throw SceneRequestRejectionError(
+                "scene_policy_derivation_unavailable",
+                "derived collision-policy allowances require the N5c retained "
+                "world and attachment resolver",
+                {{"reason", "collision_policy_resolver_not_installed"}});
+          }
+          auto next_policy = operation.configured_policy;
+          const auto digest =
+              core::logical_scene_identity::ComputeCollisionPolicyContentDigest(
+                  next_policy);
+          if (digest.value() == current_policy.revision.content_hash) {
+            next_policy.revision = current_policy.revision;
+            candidate.update_status = SceneUpdateStatusDTO::kNoOp;
+            content_expected_to_change = false;
+          } else {
+            if (current_policy.revision.revision_id >= kMaximumSafeIntegral) {
+              throw CanonicalEmptySceneOwnerLimitError(
+                  "collision-policy revision is exhausted");
+            }
+            next_policy.revision = {
+                current_policy.revision.revision_id + 1U,
+                digest.value(),
+            };
+            policy_changed = true;
+          }
+          candidate.snapshot.configured_collision_policy = next_policy;
+          candidate.operation =
+              core::ResolvedCollisionPolicyDTO{std::move(next_policy)};
+        }
+      },
+      request.operation);
+
+  if (content_expected_to_change) {
+    if (candidate.snapshot.revision.revision_id >= kMaximumSafeIntegral) {
+      throw CanonicalEmptySceneOwnerLimitError(
+          "logical-scene revision is exhausted");
+    }
+    candidate.snapshot.revision.revision_id += 1U;
+    if (topology_changed) {
+      if (candidate.snapshot.topology_epoch >= kMaximumSafeIntegral) {
+        throw CanonicalEmptySceneOwnerLimitError(
+            "logical-scene topology epoch is exhausted");
+      }
+      candidate.snapshot.topology_epoch += 1U;
+    }
+    if (policy_changed) {
+      if (candidate.snapshot.policy_epoch >= kMaximumSafeIntegral) {
+        throw CanonicalEmptySceneOwnerLimitError(
+            "logical-scene policy epoch is exhausted");
+      }
+      candidate.snapshot.policy_epoch += 1U;
+    }
+    candidate.snapshot.revision.content_hash =
+        core::logical_scene_identity::ComputeLogicalSceneContentHash(
+            candidate.snapshot);
+  }
+  if (!candidate.snapshot.locally_valid()) {
+    throw std::invalid_argument(
+        "scene operation does not form a valid logical snapshot");
+  }
+  return candidate;
+}
+
+void InsertSceneIntent(sqlite3 *database,
+                       const SceneTransactionRequestDTO &request,
+                       const ContentDigest &request_digest,
+                       const std::string_view request_json,
+                       const core::SceneTransactionDTO &transaction,
+                       const ResolvedSceneCandidate &candidate,
+                       const std::size_t required_projection_count) {
+  const auto resolved_json =
+      logical_scene_codec_internal::EncodeResolvedOperation(
+          transaction.resolved_operation);
+  const auto snapshot_json =
+      logical_scene_codec_internal::EncodeSnapshot(candidate.snapshot);
+  if (request_json.size() > kMaximumLogicalSceneTransactionBytes ||
+      resolved_json.size() > kMaximumLogicalSceneTransactionBytes ||
+      snapshot_json.size() > kMaximumLogicalSceneTransactionBytes) {
+    throw CanonicalEmptySceneOwnerLimitError(
+        "logical-scene transaction exceeds its durable byte bound");
+  }
+  Statement statement(
+      database,
+      "INSERT INTO logical_scene_transaction_intents("
+      "transaction_sequence,request_owner_epoch,request_id,request_digest,"
+      "request_json,prior_retained_bundle_id,prior_graph_revision,"
+      "prior_scene_id,prior_scene_revision_id,prior_scene_content_hash,"
+      "proposed_retained_bundle_id,proposed_graph_revision,"
+      "proposed_scene_id,proposed_scene_revision_id,"
+      "proposed_scene_content_hash,resolved_operation_json,"
+      "resolution_evidence_digest,candidate_snapshot_json,update_status,"
+      "required_projection_count) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+  statement.Bind(1, CheckedSafeCounter(transaction.transaction_sequence,
+                                       "transaction_sequence"));
+  statement.Bind(2, request.request_context.request_owner_epoch.value());
+  statement.Bind(3, request.request_context.request_id.value());
+  statement.Bind(4, request_digest.value());
+  statement.Bind(5, request_json);
+  statement.Bind(
+      6, transaction.prior_projection_revision.retained_bundle_id.value());
+  statement.Bind(7,
+                 transaction.prior_projection_revision.graph_revision.value());
+  statement.Bind(
+      8, transaction.prior_projection_revision.scene_revision.scene_id.value());
+  statement.Bind(
+      9, CheckedSafeCounter(
+             transaction.prior_projection_revision.scene_revision.revision_id,
+             "prior scene revision"));
+  statement.Bind(10, transaction.prior_projection_revision.scene_revision
+                         .content_hash.value());
+  statement.Bind(
+      11, transaction.proposed_projection_revision.retained_bundle_id.value());
+  statement.Bind(
+      12, transaction.proposed_projection_revision.graph_revision.value());
+  statement.Bind(
+      13,
+      transaction.proposed_projection_revision.scene_revision.scene_id.value());
+  statement.Bind(
+      14,
+      CheckedSafeCounter(
+          transaction.proposed_projection_revision.scene_revision.revision_id,
+          "proposed scene revision"));
+  statement.Bind(15, transaction.proposed_projection_revision.scene_revision
+                         .content_hash.value());
+  statement.Bind(16, resolved_json);
+  if (transaction.resolution_evidence_digest.has_value()) {
+    statement.Bind(17, transaction.resolution_evidence_digest->value());
+  } else {
+    statement.BindNull(17);
+  }
+  statement.Bind(18, snapshot_json);
+  statement.Bind(19, core::to_string(candidate.update_status));
+  statement.Bind(20, static_cast<std::int64_t>(required_projection_count));
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene intent insert unexpectedly returned a row");
+  }
+}
+
+std::uint64_t NextSceneOwnerEventSequence(sqlite3 *database) {
+  Statement statement(
+      database, "SELECT count(*),coalesce(max(owner_event_sequence),0) FROM "
+                "logical_scene_owner_events");
+  if (!statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene owner event aggregate is missing");
+  }
+  const auto count = statement.Integer(0);
+  const auto maximum = statement.Integer(1);
+  if (statement.Step() || count < 0 ||
+      count >= static_cast<std::int64_t>(kMaximumLogicalSceneOwnerEvents) ||
+      maximum < 0 ||
+      static_cast<std::uint64_t>(maximum) >= kMaximumSafeIntegral) {
+    throw CanonicalEmptySceneOwnerLimitError(
+        "logical-scene owner event ledger is exhausted or invalid");
+  }
+  return static_cast<std::uint64_t>(maximum) + 1U;
+}
+
+void InsertSceneTransactionOwnerEvent(
+    sqlite3 *database, const std::uint64_t owner_event_sequence,
+    const std::uint64_t transaction_sequence) {
+  Statement statement(
+      database,
+      "INSERT INTO logical_scene_owner_events(owner_event_sequence,"
+      "event_kind,transaction_sequence,named_apply_lineage_generation) "
+      "VALUES(?,'scene_transaction_intent',?,NULL)");
+  statement.Bind(
+      1, CheckedSafeCounter(owner_event_sequence, "owner_event_sequence"));
+  statement.Bind(
+      2, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene transaction owner event insert unexpectedly returned a row");
+  }
+}
+
+void InsertNamedApplyOwnerEvent(sqlite3 *database,
+                                const std::uint64_t owner_event_sequence,
+                                const std::uint64_t lineage_generation) {
+  Statement statement(
+      database,
+      "INSERT INTO logical_scene_owner_events(owner_event_sequence,"
+      "event_kind,transaction_sequence,named_apply_lineage_generation) "
+      "VALUES(?,'named_apply_finalized',NULL,?)");
+  statement.Bind(
+      1, CheckedSafeCounter(owner_event_sequence, "owner_event_sequence"));
+  statement.Bind(2, CheckedSafeCounter(lineage_generation,
+                                       "named Apply lineage generation"));
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "named Apply owner event insert unexpectedly returned a row");
+  }
+}
+
+void InsertSceneOutcome(sqlite3 *database,
+                        const std::string_view request_owner_epoch,
+                        const RequestId &request_id,
+                        const ContentDigest &request_digest,
+                        const std::optional<std::uint64_t> transaction_sequence,
+                        const bool success,
+                        const SceneProjectionCommitStatusDTO projection_status,
+                        const std::size_t attempted_projection_count,
+                        const std::optional<ErrorDTO> &error) {
+  Statement statement(
+      database,
+      "INSERT INTO logical_scene_request_outcomes("
+      "request_owner_epoch,request_id,request_digest,transaction_sequence,"
+      "success,projection_status,attempted_projection_count,error_code,"
+      "error_message,error_details_json) VALUES(?,?,?,?,?,?,?,?,?,?)");
+  statement.Bind(1, request_owner_epoch);
+  statement.Bind(2, request_id.value());
+  statement.Bind(3, request_digest.value());
+  if (transaction_sequence.has_value()) {
+    statement.Bind(
+        4, CheckedSafeCounter(*transaction_sequence, "transaction_sequence"));
+  } else {
+    statement.BindNull(4);
+  }
+  statement.Bind(5, success ? 1 : 0);
+  statement.Bind(6, core::to_string(projection_status));
+  statement.Bind(7, static_cast<std::int64_t>(attempted_projection_count));
+  if (error.has_value()) {
+    statement.Bind(8, error->code);
+    statement.Bind(9, error->message);
+    statement.Bind(
+        10, logical_scene_codec_internal::EncodeErrorDetails(error->details));
+  } else {
+    statement.BindNull(8);
+    statement.BindNull(9);
+    statement.BindNull(10);
+  }
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene outcome insert unexpectedly returned a row");
+  }
+}
+
+void InsertProjectionAttempt(
+    sqlite3 *database, const std::uint64_t transaction_sequence,
+    const std::size_t ordinal,
+    const core::ProjectionNativeRuntimeBindingDTO &binding) {
+  Statement statement(
+      database, "INSERT INTO logical_scene_projection_attempts("
+                "transaction_sequence,projection_ordinal,provider_binding_id,"
+                "provider_binding_revision,runtime_unit_id,runtime_epoch) "
+                "VALUES(?,?,?,?,?,?)");
+  statement.Bind(
+      1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
+  statement.Bind(2, static_cast<std::int64_t>(ordinal));
+  statement.Bind(3, binding.provider_binding_id.value());
+  statement.Bind(4, binding.provider_binding_revision.value());
+  statement.Bind(5, binding.runtime_unit_id.value());
+  statement.Bind(6, binding.runtime_epoch.value());
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "projection attempt insert unexpectedly returned a row");
+  }
+}
+
+std::string_view
+ProjectionResultState(const core::ProjectionCommitResultStateDTO state) {
+  switch (state) {
+  case core::ProjectionCommitResultStateDTO::kCommitted:
+    return "committed";
+  case core::ProjectionCommitResultStateDTO::kRejectedRollbackProven:
+    return "rejected_rollback_proven";
+  case core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain:
+    return "failed_projection_uncertain";
+  }
+  return {};
+}
+
+void InsertProjectionResult(sqlite3 *database,
+                            const std::uint64_t transaction_sequence,
+                            const std::size_t ordinal,
+                            const core::ProjectionCommitResultDTO &result) {
+  Statement statement(
+      database,
+      "INSERT INTO logical_scene_projection_results("
+      "transaction_sequence,projection_ordinal,result_state,"
+      "acknowledged_retained_bundle_id,acknowledged_graph_revision,"
+      "acknowledged_scene_id,acknowledged_scene_revision_id,"
+      "acknowledged_scene_content_hash,rollback_proven,"
+      "resulting_health_state,error_code,error_message,error_details_json) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)");
+  statement.Bind(
+      1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
+  statement.Bind(2, static_cast<std::int64_t>(ordinal));
+  statement.Bind(3, ProjectionResultState(result.result));
+  if (result.acknowledged_projection_revision.has_value()) {
+    const auto &ack = *result.acknowledged_projection_revision;
+    statement.Bind(4, ack.retained_bundle_id.value());
+    statement.Bind(5, ack.graph_revision.value());
+    statement.Bind(6, ack.scene_revision.scene_id.value());
+    statement.Bind(7, CheckedSafeCounter(ack.scene_revision.revision_id,
+                                         "acknowledged scene revision"));
+    statement.Bind(8, ack.scene_revision.content_hash.value());
+  } else {
+    for (int index = 4; index <= 8; ++index) {
+      statement.BindNull(index);
+    }
+  }
+  statement.Bind(9, result.rollback_proven ? 1 : 0);
+  statement.Bind(10, core::to_string(result.resulting_health.state));
+  if (result.error.has_value()) {
+    statement.Bind(11, result.error->code);
+    statement.Bind(12, result.error->message);
+    statement.Bind(13, logical_scene_codec_internal::EncodeErrorDetails(
+                           result.error->details));
+  } else {
+    statement.BindNull(11);
+    statement.BindNull(12);
+    statement.BindNull(13);
+  }
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "projection result insert unexpectedly returned a row");
+  }
+}
+
+ProjectionRevisionDTO ReadProposedProjection(sqlite3 *database,
+                                             const std::uint64_t sequence) {
+  Statement statement(
+      database,
+      "SELECT proposed_retained_bundle_id,proposed_graph_revision,"
+      "proposed_scene_id,proposed_scene_revision_id,"
+      "proposed_scene_content_hash FROM logical_scene_transaction_intents "
+      "WHERE transaction_sequence=? LIMIT 2");
+  statement.Bind(1, CheckedSafeCounter(sequence, "transaction_sequence"));
+  if (!statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene result references an absent transaction intent");
+  }
+  auto result = ReadProjectionColumns(statement, 0);
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene transaction sequence is not unique");
+  }
+  return result;
+}
+
+SceneUpdateStatusDTO ReadStoredUpdateStatus(sqlite3 *database,
+                                            const std::uint64_t sequence) {
+  Statement statement(
+      database,
+      "SELECT update_status FROM logical_scene_transaction_intents WHERE "
+      "transaction_sequence=? LIMIT 2");
+  statement.Bind(1, CheckedSafeCounter(sequence, "transaction_sequence"));
+  if (!statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene result update status is absent");
+  }
+  const auto result = DecodeUpdateStatus(statement.Text(0));
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene result update status is not unique");
+  }
+  return result;
+}
+
+SceneCommitResultDTO
+ResultFromStoredOutcome(sqlite3 *database, const StoredSceneOutcome &outcome,
+                        const core::RequestReplayStatusDTO replay_status) {
+  if (!outcome.success) {
+    return FailedSceneResult(outcome.request_id, replay_status, *outcome.error,
+                             outcome.projection_status);
+  }
+  const auto sequence = *outcome.transaction_sequence;
+  SceneCommitResultDTO result{
+      outcome.request_id,
+      replay_status,
+      true,
+      std::nullopt,
+      sequence,
+      ReadProposedProjection(database, sequence),
+      SceneProjectionCommitStatusDTO::kCommitted,
+      ReadStoredUpdateStatus(database, sequence),
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "stored scene outcome cannot form a valid public result");
+  }
+  return result;
+}
+
+struct RequiredSceneProjection final {
+  core::IPlannerSceneProjection *projection;
+  core::ProjectionHealthDTO preflight_health;
+};
+
+core::ProjectionCommitResultDTO
+UncertainProjectionResult(const core::SceneTransactionDTO &transaction,
+                          const core::ProjectionHealthDTO &preflight_health,
+                          ErrorDTO error) {
+  auto unavailable = preflight_health;
+  unavailable.state = ProjectionHealthState::kUnavailable;
+  unavailable.staged_candidate = std::nullopt;
+  unavailable.error = error;
+  core::ProjectionCommitResultDTO result{
+      transaction.transaction_sequence,
+      transaction.proposed_projection_revision,
+      core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain,
+      std::nullopt,
+      unavailable.native_projection_generation,
+      false,
+      std::move(unavailable),
+      std::move(error),
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot construct a fail-closed projection result");
+  }
+  return result;
+}
+
+core::ProjectionCommitResultDTO
+NormalizeProjectionResult(const core::SceneTransactionDTO &transaction,
+                          const core::ProjectionHealthDTO &preflight_health,
+                          core::ProjectionCommitResultDTO result) {
+  const auto contract_error = [&] {
+    return UncertainProjectionResult(
+        transaction, preflight_health,
+        SceneError("scene_projection_contract_violation",
+                   "native scene projection returned contradictory or "
+                   "incomplete acknowledgement evidence"));
+  };
+  if (!result.presence_valid() ||
+      result.transaction_sequence != transaction.transaction_sequence ||
+      result.proposed_projection_revision !=
+          transaction.proposed_projection_revision ||
+      result.resulting_health.native_runtime_binding !=
+          preflight_health.native_runtime_binding ||
+      result.resulting_health.source_sequence <
+          preflight_health.source_sequence) {
+    return contract_error();
+  }
+  switch (result.result) {
+  case core::ProjectionCommitResultStateDTO::kCommitted:
+    return result;
+  case core::ProjectionCommitResultStateDTO::kRejectedRollbackProven:
+    if (!result.resulting_health.healthy_for_target(
+            transaction.prior_projection_revision) ||
+        (result.acknowledged_projection_revision.has_value() &&
+         *result.acknowledged_projection_revision !=
+             transaction.prior_projection_revision)) {
+      return contract_error();
+    }
+    return result;
+  case core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain:
+    return result;
+  }
+  return contract_error();
+}
 
 std::optional<AcceptedState>
 ReadAcceptance(sqlite3 *database,
@@ -891,11 +2360,27 @@ std::vector<NamedApplyStageState> ReadNamedApplyStages(
     };
     if (!stage.predecessor.valid() || !stage.candidate.valid() ||
         !current_projection.has_value() ||
-        stage.predecessor != *current_projection ||
+        stage.predecessor.retained_bundle_id !=
+            current_projection->retained_bundle_id ||
+        stage.predecessor.graph_revision !=
+            current_projection->graph_revision ||
+        stage.predecessor.scene_revision.scene_id !=
+            current_projection->scene_revision.scene_id ||
+        stage.predecessor.scene_revision.revision_id <
+            current_projection->scene_revision.revision_id ||
+        (stage.predecessor.scene_revision.revision_id ==
+             current_projection->scene_revision.revision_id &&
+         stage.predecessor.scene_revision.content_hash !=
+             current_projection->scene_revision.content_hash) ||
         stage.candidate.scene_revision != stage.predecessor.scene_revision) {
       throw CanonicalEmptySceneOwnerIntegrityError(
           "stored named Apply stage differs from the active logical lineage");
     }
+    // A public scene transaction may have advanced only the scene member
+    // since the preceding structural publication. The v2 Apply row captures
+    // that exact predecessor; the v3 publication ledger cross-validates the
+    // interleaving after both typed histories have been read.
+    current_projection = stage.predecessor;
     if (finalized) {
       const auto expected_previous_generation = statement.Integer(18);
       const auto publication_generation = statement.Integer(19);
@@ -994,6 +2479,7 @@ ReadDurableState(sqlite3 *database,
                                                   state.finalization_receipt);
   if (state.accepted.has_value() && state.finalization_receipt.has_value()) {
     state.active_projection = state.accepted->target;
+    state.active_scene_snapshot = state.accepted->snapshot;
     for (const auto &stage : state.named_apply_stages) {
       if (stage.finalization_receipt.has_value()) {
         state.active_projection = stage.candidate;
@@ -1001,6 +2487,112 @@ ReadDurableState(sqlite3 *database,
     }
   }
   return state;
+}
+
+DurableState ReadCompleteDurableState(
+    sqlite3 *database,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
+  auto state = ReadDurableState(database, fixed_query);
+  if (!state.finalization_receipt.has_value()) {
+    return state;
+  }
+  const auto transactions = ReadSceneTransactionStoreState(database, state);
+  state.active_projection = transactions.active_projection;
+  state.active_scene_snapshot = transactions.active_snapshot;
+  state.projection_desynchronized = transactions.projection_desynchronized;
+  state.unresolved_scene_transaction = transactions.unresolved_native_attempt;
+  return state;
+}
+
+bool RecoverIncompleteSceneTransaction(
+    sqlite3 *database,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
+  Transaction recovery(database, "BEGIN IMMEDIATE");
+  const auto durable_state = ReadDurableState(database, fixed_query);
+  if (!durable_state.finalization_receipt.has_value()) {
+    recovery.Commit();
+    return false;
+  }
+  const auto transactions =
+      ReadSceneTransactionStoreState(database, durable_state);
+  if (!transactions.unresolved_transaction_sequence.has_value()) {
+    recovery.Commit();
+    return false;
+  }
+  const auto sequence = *transactions.unresolved_transaction_sequence;
+  Statement intent(
+      database,
+      "SELECT request_owner_epoch,request_id,request_digest,"
+      "required_projection_count,proposed_retained_bundle_id,"
+      "proposed_graph_revision,proposed_scene_id,"
+      "proposed_scene_revision_id,proposed_scene_content_hash FROM "
+      "logical_scene_transaction_intents WHERE transaction_sequence=? "
+      "LIMIT 2");
+  intent.Bind(1, CheckedSafeCounter(sequence, "transaction_sequence"));
+  if (!intent.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "unresolved scene transaction intent is absent");
+  }
+  const auto request_owner_epoch = intent.Text(0);
+  const RequestId request_id(intent.Text(1));
+  const ContentDigest request_digest(intent.Text(2));
+  const auto required_count_value = intent.Integer(3);
+  const auto proposed = ReadProjectionColumns(intent, 4);
+  if (intent.Step() || required_count_value < 0 || required_count_value > 256) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "unresolved scene transaction intent is invalid");
+  }
+  const auto required_count = static_cast<std::size_t>(required_count_value);
+  const auto evidence =
+      ReadProjectionEvidenceState(database, sequence, proposed);
+
+  bool success = false;
+  SceneProjectionCommitStatusDTO status =
+      SceneProjectionCommitStatusDTO::kNotAttempted;
+  std::optional<ErrorDTO> error;
+  if (evidence.attempt_count == 0U) {
+    if (required_count == 0U) {
+      success = true;
+      status = SceneProjectionCommitStatusDTO::kCommitted;
+    } else {
+      error = SceneError(
+          "scene_request_recovered_before_projection",
+          "scene request was durably accepted but no native projection call "
+          "began before owner restart");
+    }
+  } else if (evidence.result_count == evidence.attempt_count &&
+             evidence.attempt_count == required_count &&
+             evidence.all_results_committed) {
+    success = true;
+    status = SceneProjectionCommitStatusDTO::kCommitted;
+  } else if (evidence.result_count == evidence.attempt_count &&
+             evidence.all_results_rollback_proven) {
+    status = SceneProjectionCommitStatusDTO::kRejectedRollbackProven;
+    error = SceneError(
+        "scene_projection_rejected_rollback_proven",
+        "restart verified that every invoked projection retained the "
+        "predecessor state");
+  } else {
+    status = SceneProjectionCommitStatusDTO::kFailedProjectionUncertain;
+    error =
+        SceneError("scene_projection_recovery_uncertain",
+                   "restart cannot prove a common native predecessor after the "
+                   "interrupted scene transaction");
+  }
+  InsertSceneOutcome(database, request_owner_epoch, request_id, request_digest,
+                     sequence, success, status, evidence.attempt_count, error);
+  const auto recovered = ReadCompleteDurableState(database, fixed_query);
+  if (recovered.unresolved_scene_transaction ||
+      (success && (!recovered.active_projection.has_value() ||
+                   *recovered.active_projection != proposed)) ||
+      (!success &&
+       status == SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
+       !recovered.projection_desynchronized)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene transaction recovery did not settle the durable owner state");
+  }
+  recovery.Commit();
+  return true;
 }
 
 void ValidateMetadata(
@@ -1037,7 +2629,7 @@ void ValidateMetadata(
   }
   if (schema_id != kCanonicalEmptySceneStoreSchemaId ||
       schema_version != kCanonicalEmptySceneStoreSchemaVersion ||
-      schema_digest != SchemaArtifactDigest() ||
+      schema_digest != BaseSchemaArtifactDigest() ||
       stored_admission_digest != admission_digest.value() ||
       cell_id != fixed_query.cell_id.value() ||
       retained_bundle_id !=
@@ -1054,17 +2646,7 @@ void ValidateMetadata(
   }
 }
 
-void ValidateDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest) {
-  if (ScalarInteger(database, "PRAGMA application_id") !=
-          kCanonicalEmptySceneSqliteApplicationId ||
-      ScalarInteger(database, "PRAGMA user_version") !=
-          kCanonicalEmptySceneStoreSchemaVersion) {
-    throw CanonicalEmptySceneOwnerIntegrityError(
-        "logical-scene SQLite application/schema version is invalid");
-  }
+void ValidateMechanicalDatabaseIntegrity(sqlite3 *database) {
   if (ScalarText(database, "PRAGMA quick_check(1)") != "ok") {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "logical-scene SQLite quick_check failed");
@@ -1074,10 +2656,6 @@ void ValidateDatabase(
     throw CanonicalEmptySceneOwnerIntegrityError(
         "logical-scene SQLite foreign-key check failed");
   }
-  if (ReadSchemaObjects(database) != ExpectedSchemaObjects()) {
-    throw CanonicalEmptySceneOwnerIntegrityError(
-        "logical-scene schema differs from its exact v1 artifact");
-  }
   const auto page_count = ScalarInteger(database, "PRAGMA page_count");
   const auto page_size = ScalarInteger(database, "PRAGMA page_size");
   if (page_count < 0 || page_size <= 0 ||
@@ -1085,8 +2663,95 @@ void ValidateDatabase(
     throw CanonicalEmptySceneOwnerLimitError(
         "logical-scene database page image exceeds its fixed ceiling");
   }
+}
+
+void ValidateBaseDatabase(
+    sqlite3 *database,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
+    const ContentDigest &admission_digest) {
+  if (ScalarInteger(database, "PRAGMA application_id") !=
+          kCanonicalEmptySceneSqliteApplicationId ||
+      ScalarInteger(database, "PRAGMA user_version") !=
+          kCanonicalEmptySceneStoreSchemaVersion) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene SQLite base application/schema version is invalid");
+  }
+  ValidateMechanicalDatabaseIntegrity(database);
+  if (ReadSchemaObjects(database) != ExpectedBaseSchemaObjects()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene base schema differs from its exact v2 artifact");
+  }
   ValidateMetadata(database, fixed_query, admission_digest);
   static_cast<void>(ReadDurableState(database, fixed_query));
+}
+
+void ValidateMigrationMetadata(sqlite3 *database) {
+  Statement statement(
+      database,
+      "SELECT schema_id,schema_version,migration_artifact_digest,"
+      "maximum_scene_transactions,maximum_transaction_bytes "
+      "FROM logical_scene_store_migrations ORDER BY singleton LIMIT 2");
+  if (!statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene transaction migration metadata is missing");
+  }
+  const auto valid =
+      statement.Text(0) == kLogicalSceneStoreSchemaId &&
+      statement.Integer(1) == kLogicalSceneStoreSchemaVersion &&
+      statement.Text(2) == TransactionMigrationArtifactDigest() &&
+      statement.Integer(3) ==
+          static_cast<std::int64_t>(kMaximumLogicalSceneTransactions) &&
+      statement.Integer(4) ==
+          static_cast<std::int64_t>(kMaximumLogicalSceneTransactionBytes) &&
+      !statement.Step();
+  if (!valid) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene transaction migration metadata is invalid");
+  }
+}
+
+void ValidateDatabase(
+    sqlite3 *database,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
+    const ContentDigest &admission_digest) {
+  if (ScalarInteger(database, "PRAGMA application_id") !=
+          kCanonicalEmptySceneSqliteApplicationId ||
+      ScalarInteger(database, "PRAGMA user_version") !=
+          kLogicalSceneStoreSchemaVersion) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene SQLite application/schema version is invalid");
+  }
+  ValidateMechanicalDatabaseIntegrity(database);
+  if (ReadSchemaObjects(database) != ExpectedSchemaObjects()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene schema differs from its exact v3 artifacts");
+  }
+  ValidateMetadata(database, fixed_query, admission_digest);
+  ValidateMigrationMetadata(database);
+  const auto durable_state = ReadDurableState(database, fixed_query);
+  if (durable_state.finalization_receipt.has_value()) {
+    static_cast<void>(ReadSceneTransactionStoreState(database, durable_state));
+  } else if (ScalarInteger(
+                 database,
+                 "SELECT count(*) FROM logical_scene_transaction_intents") !=
+                 0 ||
+             ScalarInteger(
+                 database,
+                 "SELECT count(*) FROM logical_scene_request_outcomes") != 0 ||
+             ScalarInteger(
+                 database,
+                 "SELECT count(*) FROM logical_scene_projection_attempts") !=
+                 0 ||
+             ScalarInteger(
+                 database,
+                 "SELECT count(*) FROM logical_scene_projection_results") !=
+                 0 ||
+             ScalarInteger(database,
+                           "SELECT count(*) FROM logical_scene_owner_events") !=
+                 0) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "scene transaction history exists before bootstrap finalization");
+  }
 }
 
 void InsertMetadata(sqlite3 *database,
@@ -1103,7 +2768,7 @@ void InsertMetadata(sqlite3 *database,
       "VALUES(1,?,?,?,?,?,?,?,?,?,?,?)");
   statement.Bind(1, kCanonicalEmptySceneStoreSchemaId);
   statement.Bind(2, kCanonicalEmptySceneStoreSchemaVersion);
-  statement.Bind(3, SchemaArtifactDigest());
+  statement.Bind(3, BaseSchemaArtifactDigest());
   statement.Bind(4, admission_digest.value());
   statement.Bind(5, fixed_query.cell_id.value());
   statement.Bind(6, fixed_query.canonical_empty_retained_bundle_id.value());
@@ -1116,6 +2781,25 @@ void InsertMetadata(sqlite3 *database,
   if (statement.Step()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "metadata insert unexpectedly returned a row");
+  }
+}
+
+void InsertMigrationMetadata(sqlite3 *database) {
+  Statement statement(
+      database, "INSERT INTO logical_scene_store_migrations("
+                "singleton,schema_id,schema_version,migration_artifact_digest,"
+                "maximum_scene_transactions,maximum_transaction_bytes) "
+                "VALUES(1,?,?,?,?,?)");
+  statement.Bind(1, kLogicalSceneStoreSchemaId);
+  statement.Bind(2, kLogicalSceneStoreSchemaVersion);
+  statement.Bind(3, TransactionMigrationArtifactDigest());
+  statement.Bind(4,
+                 static_cast<std::int64_t>(kMaximumLogicalSceneTransactions));
+  statement.Bind(
+      5, static_cast<std::int64_t>(kMaximumLogicalSceneTransactionBytes));
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "migration metadata insert unexpectedly returned a row");
   }
 }
 
@@ -1478,10 +3162,12 @@ ProjectionBootstrapAcceptedDTO AcceptedResult(const AcceptedState &accepted) {
 CanonicalEmptySceneAccessStatus AccessStatus(const DurableState &state) {
   const bool has_active = state.active_projection.has_value();
   const bool transition_open = state.OpenNamedApply() != nullptr;
+  const bool projection_available =
+      !state.projection_desynchronized && !state.unresolved_scene_transaction;
   return {
       state.phase(),
-      has_active && !transition_open,
-      has_active && !transition_open,
+      has_active && !transition_open && projection_available,
+      has_active && !transition_open && projection_available,
       state.active_projection,
   };
 }
@@ -2008,7 +3694,7 @@ bool CanonicalEmptySceneAccessStatus::valid() const noexcept {
     return !scene_writes_open && !projection_leases_open &&
            !active_projection.has_value();
   case CanonicalEmptySceneBootstrapPhase::kFinalized:
-    return scene_writes_open && projection_leases_open &&
+    return scene_writes_open == projection_leases_open &&
            active_projection.has_value() && active_projection->valid();
   case CanonicalEmptySceneBootstrapPhase::kNamedApplyStaged:
   case CanonicalEmptySceneBootstrapPhase::kNamedApplyActivated:
@@ -2016,7 +3702,7 @@ bool CanonicalEmptySceneAccessStatus::valid() const noexcept {
            active_projection.has_value() && active_projection->valid();
   case CanonicalEmptySceneBootstrapPhase::kNamedApplyDiscarded:
   case CanonicalEmptySceneBootstrapPhase::kNamedApplyFinalized:
-    return scene_writes_open && projection_leases_open &&
+    return scene_writes_open == projection_leases_open &&
            active_projection.has_value() && active_projection->valid();
   }
   return false;
@@ -2028,26 +3714,44 @@ public:
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
-             publication_reader, nullptr) {}
+             publication_reader, nullptr, {}) {}
 
   Impl(std::filesystem::path database_path,
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader,
        const deployment::IVerifiedRetainedBundleSource &retained_bundle_source)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
-             publication_reader, &retained_bundle_source) {}
+             publication_reader, &retained_bundle_source, {}) {}
+
+  Impl(std::filesystem::path database_path,
+       const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
+       const core::IActiveBundlePublicationReader &publication_reader,
+       const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
+       std::vector<core::IPlannerSceneProjection *> required_projections)
+      : Impl(std::move(database_path), AuthorityFromAdmission(admission),
+             publication_reader, &retained_bundle_source,
+             std::move(required_projections)) {}
 
   Impl(std::filesystem::path database_path,
        AdmittedBootstrapAuthority authority,
        const core::IActiveBundlePublicationReader &publication_reader,
-       const deployment::IVerifiedRetainedBundleSource *retained_bundle_source)
+       const deployment::IVerifiedRetainedBundleSource *retained_bundle_source,
+       std::vector<core::IPlannerSceneProjection *> required_projections)
       : database_path_(std::move(database_path)),
         fixed_query_(std::move(authority.query)),
         admission_digest_(std::move(authority.admission_digest)),
         admitted_bundle_(std::move(authority.retained_bundle)),
         publication_reader_(publication_reader),
-        retained_bundle_source_(retained_bundle_source) {
+        retained_bundle_source_(retained_bundle_source),
+        required_projections_(std::move(required_projections)) {
     ValidateFixedQuery(fixed_query_);
+    if (required_projections_.size() > kMaximumLogicalSceneTransactions ||
+        std::any_of(
+            required_projections_.begin(), required_projections_.end(),
+            [](const auto *projection) { return projection == nullptr; })) {
+      throw std::invalid_argument(
+          "required logical-scene projections must be bounded and non-null");
+    }
     if (database_path_.empty() || database_path_.filename().empty()) {
       throw std::invalid_argument(
           "logical-scene database path must name one file");
@@ -2081,7 +3785,14 @@ public:
           },
           [&](sqlite3 *preflight) {
             if (!IsExactUninitializedDatabase(preflight)) {
-              ValidateDatabase(preflight, fixed_query_, admission_digest_);
+              const auto version =
+                  ScalarInteger(preflight, "PRAGMA user_version");
+              if (version == kCanonicalEmptySceneStoreSchemaVersion) {
+                ValidateBaseDatabase(preflight, fixed_query_,
+                                     admission_digest_);
+              } else {
+                ValidateDatabase(preflight, fixed_query_, admission_digest_);
+              }
             }
           }));
     } catch (const CanonicalEmptySceneOwnerError &) {
@@ -2114,7 +3825,7 @@ public:
       const auto schema_count = ScalarInteger(
           database_, "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE "
                      "'sqlite_%'");
-      bool initialized_schema = false;
+      bool changed_schema = false;
       if (schema_count == 0) {
         if (!IsExactUninitializedDatabase(database_)) {
           throw CanonicalEmptySceneOwnerIntegrityError(
@@ -2125,14 +3836,32 @@ public:
         Transaction transaction(database_, "BEGIN IMMEDIATE");
         Exec(database_, detail::kEmbeddedCanonicalEmptySceneSchema);
         InsertMetadata(database_, fixed_query_, admission_digest_);
+        Exec(database_, detail::kEmbeddedLogicalSceneTransactionMigration);
+        InsertMigrationMetadata(database_);
         transaction.Commit();
-        initialized_schema = true;
+        changed_schema = true;
       } else {
-        ValidateDatabase(database_, fixed_query_, admission_digest_);
-        ConfigureDurability(database_);
+        const auto version = ScalarInteger(database_, "PRAGMA user_version");
+        if (version == kCanonicalEmptySceneStoreSchemaVersion) {
+          ValidateBaseDatabase(database_, fixed_query_, admission_digest_);
+          ConfigureDurability(database_);
+          Transaction transaction(database_, "BEGIN IMMEDIATE");
+          Exec(database_, detail::kEmbeddedLogicalSceneTransactionMigration);
+          InsertMigrationMetadata(database_);
+          transaction.Commit();
+          changed_schema = true;
+        } else {
+          ValidateDatabase(database_, fixed_query_, admission_digest_);
+          ConfigureDurability(database_);
+        }
       }
       ValidateDatabase(database_, fixed_query_, admission_digest_);
-      if (initialized_schema) {
+      const bool recovered_scene_transaction =
+          RecoverIncompleteSceneTransaction(database_, fixed_query_);
+      if (recovered_scene_transaction) {
+        ValidateDatabase(database_, fixed_query_, admission_digest_);
+      }
+      if (changed_schema || recovered_scene_transaction) {
         FsyncDatabaseDirectory(database_path_);
       }
     } catch (...) {
@@ -2187,7 +3916,7 @@ public:
   [[nodiscard]] DurableState ReadStateTransaction() const {
     auto *value = database();
     Transaction transaction(value, "BEGIN");
-    auto state = ReadDurableState(value, fixed_query_);
+    auto state = ReadCompleteDurableState(value, fixed_query_);
     transaction.Commit();
     return state;
   }
@@ -2198,6 +3927,7 @@ public:
   RetainedBundleDTO admitted_bundle_;
   const core::IActiveBundlePublicationReader &publication_reader_;
   const deployment::IVerifiedRetainedBundleSource *retained_bundle_source_;
+  std::vector<core::IPlannerSceneProjection *> required_projections_;
   mutable std::mutex mutex_;
   sqlite3 *database_{};
 };
@@ -2217,6 +3947,16 @@ CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
     : impl_(std::make_unique<Impl>(std::move(database_path), admission,
                                    publication_reader,
                                    retained_bundle_source)) {}
+
+CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
+    std::filesystem::path database_path,
+    const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
+    const core::IActiveBundlePublicationReader &publication_reader,
+    const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
+    std::vector<core::IPlannerSceneProjection *> required_projections)
+    : impl_(std::make_unique<Impl>(std::move(database_path), admission,
+                                   publication_reader, retained_bundle_source,
+                                   std::move(required_projections))) {}
 
 CanonicalEmptySceneOwner::~CanonicalEmptySceneOwner() = default;
 CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
@@ -2292,7 +4032,7 @@ CanonicalEmptySceneOwner::BeginProjectionBootstrap(
   std::lock_guard lock(impl_->mutex_);
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
-  auto state = ReadDurableState(database, impl_->fixed_query_);
+  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
   if (state.accepted.has_value()) {
     if (state.accepted->bootstrap_id != intent.bootstrap_id ||
         state.accepted->bootstrap_generation != intent.bootstrap_generation) {
@@ -2313,7 +4053,7 @@ CanonicalEmptySceneOwner::BeginProjectionBootstrap(
   }
   const auto accepted = MintAcceptedState(intent, impl_->fixed_query_);
   InsertAcceptance(database, accepted);
-  state = ReadDurableState(database, impl_->fixed_query_);
+  state = ReadCompleteDurableState(database, impl_->fixed_query_);
   if (!state.accepted.has_value() || state.rebuilt ||
       state.finalization_receipt.has_value() ||
       state.accepted->target != accepted.target) {
@@ -2333,7 +4073,7 @@ CanonicalEmptySceneOwner::RebuildProjectionBootstrap(
   std::lock_guard lock(impl_->mutex_);
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
-  auto state = ReadDurableState(database, impl_->fixed_query_);
+  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
   if (!state.accepted.has_value() ||
       request.bootstrap_id != state.accepted->bootstrap_id ||
       request.bootstrap_generation != state.accepted->bootstrap_generation ||
@@ -2343,7 +4083,7 @@ CanonicalEmptySceneOwner::RebuildProjectionBootstrap(
   }
   if (!state.rebuilt) {
     InsertRebuild(database, *state.accepted);
-    state = ReadDurableState(database, impl_->fixed_query_);
+    state = ReadCompleteDurableState(database, impl_->fixed_query_);
   }
   if (!state.rebuilt) {
     throw CanonicalEmptySceneOwnerIntegrityError(
@@ -2472,7 +4212,7 @@ CanonicalEmptySceneOwner::FinalizeProjectionBootstrap(
 
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
-  state = ReadDurableState(database, impl_->fixed_query_);
+  state = ReadCompleteDurableState(database, impl_->fixed_query_);
   if (!state.accepted.has_value() || !state.rebuilt) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "durable bootstrap state changed before Finalize commit");
@@ -2480,7 +4220,7 @@ CanonicalEmptySceneOwner::FinalizeProjectionBootstrap(
   ValidateFinalizeRequest(request, *state.accepted);
   if (!state.finalization_receipt.has_value()) {
     InsertFinalization(database, request);
-    state = ReadDurableState(database, impl_->fixed_query_);
+    state = ReadCompleteDurableState(database, impl_->fixed_query_);
   }
   if (!state.finalization_receipt.has_value() ||
       *state.finalization_receipt != request.publication_receipt) {
@@ -2565,7 +4305,7 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
   std::lock_guard lock(impl_->mutex_);
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
-  auto state = ReadDurableState(database, impl_->fixed_query_);
+  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
   if (const auto *staged =
           state.FindNamedApply(request.apply_id, request.apply_generation);
       staged != nullptr) {
@@ -2629,7 +4369,7 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
       std::nullopt,
   };
   InsertNamedApplyStage(database, stage);
-  state = ReadDurableState(database, impl_->fixed_query_);
+  state = ReadCompleteDurableState(database, impl_->fixed_query_);
   const auto *persisted =
       state.FindNamedApply(stage.apply_id, stage.apply_generation);
   if (persisted == nullptr ||
@@ -2660,7 +4400,7 @@ CanonicalEmptySceneOwner::ActivateStagedProjection(
   std::lock_guard lock(impl_->mutex_);
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
-  auto state = ReadDurableState(database, impl_->fixed_query_);
+  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
   const auto *stage =
       state.FindNamedApply(request.apply_id, request.apply_generation);
   if (stage == nullptr) {
@@ -2705,7 +4445,7 @@ CanonicalEmptySceneOwner::ActivateStagedProjection(
     return result;
   }
   InsertNamedApplyActivation(database, *stage);
-  state = ReadDurableState(database, impl_->fixed_query_);
+  state = ReadCompleteDurableState(database, impl_->fixed_query_);
   stage = state.FindNamedApply(request.apply_id, request.apply_generation);
   if (stage == nullptr || !stage->activated || stage->discarded ||
       stage->stage_generation != request.projection_stage_generation ||
@@ -2734,7 +4474,7 @@ CanonicalEmptySceneOwner::DiscardStagedProjection(
   std::lock_guard lock(impl_->mutex_);
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
-  auto state = ReadDurableState(database, impl_->fixed_query_);
+  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
   const auto *stage =
       state.FindNamedApply(request.apply_id, request.apply_generation);
   if (stage == nullptr) {
@@ -2776,7 +4516,7 @@ CanonicalEmptySceneOwner::DiscardStagedProjection(
     return result;
   }
   InsertNamedApplyDiscard(database, *stage);
-  state = ReadDurableState(database, impl_->fixed_query_);
+  state = ReadCompleteDurableState(database, impl_->fixed_query_);
   stage = state.FindNamedApply(request.apply_id, request.apply_generation);
   const auto access = AccessStatus(state);
   if (stage == nullptr || !stage->discarded || stage->activated ||
@@ -2874,7 +4614,7 @@ CanonicalEmptySceneOwner::FinalizeProjectionTransition(
 
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
-  state = ReadDurableState(database, impl_->fixed_query_);
+  state = ReadCompleteDurableState(database, impl_->fixed_query_);
   stage = state.FindNamedApply(request.apply_id, request.apply_generation);
   if (stage == nullptr || stage->discarded || !stage->activated ||
       stage->stage_generation != request.projection_stage_generation ||
@@ -2883,8 +4623,12 @@ CanonicalEmptySceneOwner::FinalizeProjectionTransition(
         "named Apply transition changed before Finalize commit");
   }
   if (!stage->finalization_receipt.has_value()) {
+    const auto owner_event_sequence = NextSceneOwnerEventSequence(database);
+    const auto lineage_generation = stage->lineage_generation;
     InsertNamedApplyFinalization(database, request);
-    state = ReadDurableState(database, impl_->fixed_query_);
+    InsertNamedApplyOwnerEvent(database, owner_event_sequence,
+                               lineage_generation);
+    state = ReadCompleteDurableState(database, impl_->fixed_query_);
     stage = state.FindNamedApply(request.apply_id, request.apply_generation);
   }
   const auto access = AccessStatus(state);
@@ -2962,6 +4706,429 @@ ProjectionApplyStatusDTO CanonicalEmptySceneOwner::ProjectionApplyStatus(
   return status;
 }
 
+SceneCommitResultDTO
+CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
+  if (request.request_context.request_id.empty()) {
+    throw std::invalid_argument("scene request_id must be non-empty");
+  }
+  const auto reject = [&](const core::RequestReplayStatusDTO replay_status,
+                          const std::string_view code,
+                          const std::string_view message,
+                          std::map<std::string, std::string> details = {}) {
+    return FailedSceneResult(request.request_context.request_id, replay_status,
+                             SceneError(code, message, std::move(details)),
+                             SceneProjectionCommitStatusDTO::kNotAttempted);
+  };
+
+  try {
+    ValidateBoundedIdentity(request.request_context.request_id.value(),
+                            "request_id");
+    ValidateBoundedIdentity(request.request_context.request_owner_epoch.value(),
+                            "request_owner_epoch");
+    ValidateBoundedText(request.request_context.source_label, "source_label");
+    if (request.request_context.correlation_id.has_value()) {
+      ValidateBoundedText(*request.request_context.correlation_id,
+                          "correlation_id");
+    }
+    if (!request.attribution.locally_valid()) {
+      throw std::invalid_argument("request attribution is invalid");
+    }
+    if (request.attribution.principal_id.has_value()) {
+      ValidateBoundedText(*request.attribution.principal_id, "principal_id");
+    }
+    if (!request.expected_projection_revision.valid()) {
+      throw std::invalid_argument("expected projection revision is invalid");
+    }
+  } catch (const std::invalid_argument &error) {
+    return reject(core::RequestReplayStatusDTO::kAcceptedNew, "invalid_request",
+                  error.what());
+  }
+
+  std::string request_json;
+  std::string request_digest_input;
+  ContentDigest request_digest(std::string{});
+  try {
+    request_json = logical_scene_codec_internal::EncodeRequest(request);
+    if (request_json.empty() ||
+        request_json.size() > kMaximumLogicalSceneTransactionBytes) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "invalid_request",
+                    "scene request exceeds its canonical byte bound");
+    }
+    request_digest_input =
+        logical_scene_codec_internal::EncodeRequestDigestInput(request);
+    request_digest = ContentDigest(
+        manyforge::content_identity::sha256_digest(request_digest_input));
+  } catch (const std::exception &error) {
+    return reject(core::RequestReplayStatusDTO::kAcceptedNew, "invalid_request",
+                  error.what());
+  }
+
+  std::lock_guard lock(impl_->mutex_);
+  auto *database = impl_->database();
+  DurableState observed_state;
+  std::optional<SceneTransactionStoreState> observed_transactions;
+  std::optional<ResolvedSceneCandidate> candidate;
+
+  {
+    Transaction read(database, "BEGIN");
+    observed_state = ReadCompleteDurableState(database, impl_->fixed_query_);
+    if (!observed_state.active_projection.has_value() ||
+        !observed_state.active_scene_snapshot.has_value()) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "live_scene_snapshot_unavailable",
+                    "logical-scene bootstrap is not finalized");
+    }
+    const auto owner_epoch =
+        observed_state.active_scene_snapshot->revision.scene_id.value();
+    if (request.request_context.request_owner_epoch.value() != owner_epoch) {
+      return reject(core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch,
+                    "stale_request_owner_epoch",
+                    "scene request names a stale logical-owner epoch",
+                    {{"expected_request_owner_epoch", owner_epoch}});
+    }
+    if (const auto existing = ReadOutcomeForRequest(
+            database, owner_epoch, request.request_context.request_id);
+        existing.has_value()) {
+      if (existing->request_digest != request_digest) {
+        return reject(core::RequestReplayStatusDTO::kRequestIdConflict,
+                      "request_id_conflict",
+                      "scene request ID was reused with different intent");
+      }
+      return ResultFromStoredOutcome(
+          database, *existing, core::RequestReplayStatusDTO::kReplayedExact);
+    }
+    const auto access = AccessStatus(observed_state);
+    if (!access.scene_writes_open) {
+      if (observed_state.OpenNamedApply() != nullptr) {
+        return reject(
+            core::RequestReplayStatusDTO::kAcceptedNew,
+            "scene_projection_transition_in_progress",
+            "a structural projection transition currently fences scene "
+            "writes");
+      }
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "live_scene_snapshot_unavailable",
+                    "logical-scene projection is unavailable or "
+                    "desynchronized");
+    }
+    if (request.expected_projection_revision !=
+        *observed_state.active_projection) {
+      return reject(
+          core::RequestReplayStatusDTO::kAcceptedNew, "stale_revision",
+          "expected composite projection revision is no longer active");
+    }
+    observed_transactions =
+        ReadSceneTransactionStoreState(database, observed_state);
+    if (observed_transactions->next_transaction_sequence >
+            kMaximumLogicalSceneTransactions ||
+        observed_transactions->next_owner_event_sequence >
+            kMaximumLogicalSceneOwnerEvents) {
+      return reject(core::RequestReplayStatusDTO::kRequestLedgerFull,
+                    "request_ledger_full",
+                    "logical-scene request ledger reached its fixed bound");
+    }
+    try {
+      candidate = ResolveSceneCandidate(
+          request, *observed_state.active_scene_snapshot,
+          observed_transactions->next_transaction_sequence, request_digest);
+    } catch (const SceneRequestRejectionError &error) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew, error.code(),
+                    error.what(), error.details());
+    } catch (const CanonicalEmptySceneOwnerConflictError &error) {
+      std::string_view code = "scene_object_state_conflict";
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew, code,
+                    error.what());
+    } catch (const CanonicalEmptySceneOwnerLimitError &error) {
+      return reject(core::RequestReplayStatusDTO::kRequestLedgerFull,
+                    "request_ledger_full", error.what());
+    } catch (const std::invalid_argument &error) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "invalid_request", error.what());
+    }
+    read.Commit();
+  }
+
+  core::SceneTransactionDTO scene_transaction{
+      request.request_context.request_id,
+      request.attribution,
+      observed_transactions->next_transaction_sequence,
+      *observed_state.active_projection,
+      ProjectionRevisionDTO{
+          observed_state.active_projection->retained_bundle_id,
+          observed_state.active_projection->graph_revision,
+          candidate->snapshot.revision,
+      },
+      request_digest,
+      candidate->operation,
+      candidate->resolution_evidence_digest,
+  };
+
+  std::vector<RequiredSceneProjection> projections;
+  projections.reserve(impl_->required_projections_.size());
+  for (auto *projection : impl_->required_projections_) {
+    try {
+      auto health = projection->ProjectionHealth();
+      if (!health.valid() || health.source_sequence == 0U ||
+          !health.healthy_for_target(
+              scene_transaction.prior_projection_revision)) {
+        return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                      "live_scene_snapshot_unavailable",
+                      "a required native scene projection is not healthy at "
+                      "the exact predecessor revision");
+      }
+      projections.push_back({projection, std::move(health)});
+    } catch (const std::exception &error) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "live_scene_snapshot_unavailable", error.what());
+    } catch (...) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "live_scene_snapshot_unavailable",
+                    "native scene projection health threw a non-standard "
+                    "exception");
+    }
+  }
+  std::sort(projections.begin(), projections.end(),
+            [](const RequiredSceneProjection &left,
+               const RequiredSceneProjection &right) {
+              return core::CanonicalProjectionNativeBindingLess(
+                  left.preflight_health.native_runtime_binding,
+                  right.preflight_health.native_runtime_binding);
+            });
+  for (std::size_t index = 1U; index < projections.size(); ++index) {
+    if (!core::CanonicalProjectionNativeBindingLess(
+            projections[index - 1U].preflight_health.native_runtime_binding,
+            projections[index].preflight_health.native_runtime_binding)) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "live_scene_snapshot_unavailable",
+                    "required native scene projection identities are not "
+                    "unique");
+    }
+  }
+
+  {
+    Transaction write(database, "BEGIN IMMEDIATE");
+    const auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
+    const auto transactions = ReadSceneTransactionStoreState(database, state);
+    const auto access = AccessStatus(state);
+    if (!access.scene_writes_open || !state.active_projection.has_value() ||
+        *state.active_projection !=
+            scene_transaction.prior_projection_revision ||
+        transactions.next_transaction_sequence !=
+            scene_transaction.transaction_sequence ||
+        transactions.next_owner_event_sequence !=
+            observed_transactions->next_owner_event_sequence ||
+        NextSceneOwnerEventSequence(database) !=
+            observed_transactions->next_owner_event_sequence ||
+        ReadOutcomeForRequest(
+            database, request.request_context.request_owner_epoch.value(),
+            request.request_context.request_id)
+            .has_value()) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "stale_revision",
+                    "logical-scene state changed before durable acceptance");
+    }
+    InsertSceneIntent(database, request, request_digest, request_json,
+                      scene_transaction, *candidate, projections.size());
+    InsertSceneTransactionOwnerEvent(
+        database, observed_transactions->next_owner_event_sequence,
+        scene_transaction.transaction_sequence);
+    write.Commit();
+  }
+
+  bool every_attempt_rolled_back = true;
+  for (std::size_t ordinal = 0U; ordinal < projections.size(); ++ordinal) {
+    const auto &projection = projections[ordinal];
+    {
+      Transaction attempt(database, "BEGIN IMMEDIATE");
+      InsertProjectionAttempt(
+          database, scene_transaction.transaction_sequence, ordinal,
+          projection.preflight_health.native_runtime_binding);
+      attempt.Commit();
+    }
+
+    core::ProjectionCommitResultDTO projection_result = [&] {
+      try {
+        return NormalizeProjectionResult(
+            scene_transaction, projection.preflight_health,
+            projection.projection->ApplyTransaction(scene_transaction));
+      } catch (const std::exception &error) {
+        return UncertainProjectionResult(
+            scene_transaction, projection.preflight_health,
+            SceneError("scene_projection_call_failed", error.what()));
+      } catch (...) {
+        return UncertainProjectionResult(
+            scene_transaction, projection.preflight_health,
+            SceneError("scene_projection_call_failed",
+                       "native scene projection threw a non-standard "
+                       "exception"));
+      }
+    }();
+    every_attempt_rolled_back =
+        every_attempt_rolled_back &&
+        projection_result.result ==
+            core::ProjectionCommitResultStateDTO::kRejectedRollbackProven;
+    const bool committed = projection_result.result ==
+                           core::ProjectionCommitResultStateDTO::kCommitted;
+
+    Transaction result_write(database, "BEGIN IMMEDIATE");
+    InsertProjectionResult(database, scene_transaction.transaction_sequence,
+                           ordinal, projection_result);
+    if (!committed) {
+      const auto status =
+          every_attempt_rolled_back
+              ? SceneProjectionCommitStatusDTO::kRejectedRollbackProven
+              : SceneProjectionCommitStatusDTO::kFailedProjectionUncertain;
+      ErrorDTO error =
+          status == SceneProjectionCommitStatusDTO::kRejectedRollbackProven
+              ? *projection_result.error
+              : SceneError(
+                    "scene_projection_commit_uncertain",
+                    "at least one invoked native projection cannot prove the "
+                    "predecessor state");
+      InsertSceneOutcome(database,
+                         request.request_context.request_owner_epoch.value(),
+                         request.request_context.request_id, request_digest,
+                         scene_transaction.transaction_sequence, false, status,
+                         ordinal + 1U, error);
+      const auto failed_state =
+          ReadCompleteDurableState(database, impl_->fixed_query_);
+      if (status ==
+              SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
+          AccessStatus(failed_state).projection_leases_open) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "uncertain projection result did not close projection leases");
+      }
+      result_write.Commit();
+      return FailedSceneResult(request.request_context.request_id,
+                               core::RequestReplayStatusDTO::kAcceptedNew,
+                               std::move(error), status);
+    }
+    result_write.Commit();
+  }
+
+  {
+    Transaction outcome(database, "BEGIN IMMEDIATE");
+    InsertSceneOutcome(database,
+                       request.request_context.request_owner_epoch.value(),
+                       request.request_context.request_id, request_digest,
+                       scene_transaction.transaction_sequence, true,
+                       SceneProjectionCommitStatusDTO::kCommitted,
+                       projections.size(), std::nullopt);
+    const auto committed_state =
+        ReadCompleteDurableState(database, impl_->fixed_query_);
+    if (!committed_state.active_projection.has_value() ||
+        *committed_state.active_projection !=
+            scene_transaction.proposed_projection_revision ||
+        !AccessStatus(committed_state).scene_writes_open) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "successful scene outcome did not publish the exact composite");
+    }
+    outcome.Commit();
+  }
+
+  SceneCommitResultDTO result{
+      request.request_context.request_id,
+      core::RequestReplayStatusDTO::kAcceptedNew,
+      true,
+      std::nullopt,
+      scene_transaction.transaction_sequence,
+      scene_transaction.proposed_projection_revision,
+      SceneProjectionCommitStatusDTO::kCommitted,
+      candidate->update_status,
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "successful scene commit cannot form a valid public result");
+  }
+  return result;
+}
+
+ProjectionRevisionDTO
+CanonicalEmptySceneOwner::CurrentProjectionRevision() const {
+  std::lock_guard lock(impl_->mutex_);
+  const auto state = impl_->ReadStateTransaction();
+  if (!AccessStatus(state).projection_leases_open ||
+      !state.active_projection.has_value()) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "live logical-scene projection is unavailable");
+  }
+  return *state.active_projection;
+}
+
+std::shared_ptr<const LogicalSceneSnapshotDTO>
+CanonicalEmptySceneOwner::LogicalSnapshot() const {
+  std::lock_guard lock(impl_->mutex_);
+  const auto state = impl_->ReadStateTransaction();
+  if (!AccessStatus(state).projection_leases_open ||
+      !state.active_scene_snapshot.has_value()) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "live logical-scene snapshot is unavailable");
+  }
+  return std::make_shared<const LogicalSceneSnapshotDTO>(
+      *state.active_scene_snapshot);
+}
+
+std::vector<SceneObjectSnapshotDTO>
+CanonicalEmptySceneOwner::GetSceneObjects() const {
+  return LogicalSnapshot()->objects;
+}
+
+SceneObjectStateDTO CanonicalEmptySceneOwner::GetObjectState(
+    const core::SceneResourceId &scene_resource_id) const {
+  ValidateBoundedIdentity(scene_resource_id.value(), "scene_resource_id");
+  const auto snapshot = LogicalSnapshot();
+  const auto found = std::lower_bound(
+      snapshot->objects.begin(), snapshot->objects.end(), scene_resource_id,
+      [](const SceneObjectSnapshotDTO &object,
+         const core::SceneResourceId &id) {
+        return object.scene_resource_id < id;
+      });
+  if (found == snapshot->objects.end() ||
+      found->scene_resource_id != scene_resource_id) {
+    return {scene_resource_id, false, false, std::nullopt, std::nullopt};
+  }
+  const auto *carried =
+      std::get_if<core::CarriedSceneObjectPlacementDTO>(&found->placement);
+  return {
+      scene_resource_id,
+      true,
+      carried != nullptr,
+      carried == nullptr ? std::nullopt
+                         : std::optional<core::CarriedObjectAttachmentId>(
+                               carried->carried_object_attachment_id),
+      found->provider_evidence,
+  };
+}
+
+core::Result<core::Pose3DTO> CanonicalEmptySceneOwner::GetObjectPose(
+    const core::SceneResourceId &scene_resource_id) const {
+  ValidateBoundedIdentity(scene_resource_id.value(), "scene_resource_id");
+  const auto snapshot = LogicalSnapshot();
+  const auto found = std::lower_bound(
+      snapshot->objects.begin(), snapshot->objects.end(), scene_resource_id,
+      [](const SceneObjectSnapshotDTO &object,
+         const core::SceneResourceId &id) {
+        return object.scene_resource_id < id;
+      });
+  if (found == snapshot->objects.end() ||
+      found->scene_resource_id != scene_resource_id) {
+    return core::Result<core::Pose3DTO>::Err(
+        SceneError("object_not_found", "scene resource does not exist",
+                   {{"scene_resource_id", scene_resource_id.value()}}));
+  }
+  const auto *fixed =
+      std::get_if<core::CellFixedSceneObjectPlacementDTO>(&found->placement);
+  if (fixed == nullptr) {
+    return core::Result<core::Pose3DTO>::Err(
+        SceneError("live_scene_snapshot_unavailable",
+                   "carried-object cell pose requires the N5c immutable frame "
+                   "projection",
+                   {{"scene_resource_id", scene_resource_id.value()}}));
+  }
+  return core::Result<core::Pose3DTO>::Ok(fixed->pose_in_cell);
+}
+
 CanonicalEmptySceneAccessStatus
 CanonicalEmptySceneOwner::ReadAccessStatus() const {
   std::lock_guard lock(impl_->mutex_);
@@ -2977,20 +5144,20 @@ std::optional<LogicalSceneSnapshotRoot>
 CanonicalEmptySceneOwner::ReadActiveSnapshot() const {
   std::lock_guard lock(impl_->mutex_);
   const auto state = impl_->ReadStateTransaction();
-  if (!state.active_projection.has_value()) {
+  if (!state.active_projection.has_value() ||
+      !state.active_scene_snapshot.has_value()) {
     return std::nullopt;
   }
-  if (!state.accepted.has_value() ||
-      state.accepted->snapshot.revision !=
+  if (state.active_scene_snapshot->revision !=
           state.active_projection->scene_revision ||
-      state.accepted->snapshot.cell_id != impl_->fixed_query_.cell_id) {
+      state.active_scene_snapshot->cell_id != impl_->fixed_query_.cell_id) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "active projection does not identify the durable logical-scene "
         "snapshot");
   }
   return LogicalSceneSnapshotRoot(
       std::make_shared<const LogicalSceneSnapshotDTO>(
-          state.accepted->snapshot));
+          *state.active_scene_snapshot));
 }
 
 CanonicalEmptySceneStoreIntegrityReport
@@ -2999,12 +5166,12 @@ CanonicalEmptySceneOwner::VerifyIntegrity() const {
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN");
   ValidateDatabase(database, impl_->fixed_query_, impl_->admission_digest_);
-  const auto state = ReadDurableState(database, impl_->fixed_query_);
+  const auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
   CanonicalEmptySceneStoreIntegrityReport report{
       impl_->fixed_query_,
-      std::string(kCanonicalEmptySceneStoreSchemaId),
-      kCanonicalEmptySceneStoreSchemaVersion,
-      SchemaArtifactDigest(),
+      std::string(kLogicalSceneStoreSchemaId),
+      kLogicalSceneStoreSchemaVersion,
+      CurrentSchemaArtifactDigest(),
       ScalarInteger(database,
                     "SELECT count(*) FROM canonical_empty_scene_acceptance"),
       ScalarInteger(database,
@@ -3021,6 +5188,17 @@ CanonicalEmptySceneOwner::VerifyIntegrity() const {
       ScalarInteger(
           database,
           "SELECT count(*) FROM logical_scene_named_apply_finalizations"),
+      ScalarInteger(database,
+                    "SELECT count(*) FROM logical_scene_transaction_intents"),
+      ScalarInteger(database,
+                    "SELECT count(*) FROM logical_scene_request_outcomes"),
+      ScalarInteger(database,
+                    "SELECT count(*) FROM logical_scene_projection_attempts"),
+      ScalarInteger(database,
+                    "SELECT count(*) FROM logical_scene_projection_results"),
+      ScalarInteger(database,
+                    "SELECT count(*) FROM logical_scene_owner_events"),
+      state.projection_desynchronized || state.unresolved_scene_transaction,
       AccessStatus(state),
   };
   transaction.Commit();
@@ -3036,7 +5214,20 @@ CanonicalEmptySceneOwner::VerifyIntegrity() const {
       report.named_apply_discard_count > report.named_apply_stage_count ||
       report.named_apply_finalization_count < 0 ||
       report.named_apply_finalization_count >
-          report.named_apply_activation_count) {
+          report.named_apply_activation_count ||
+      report.transaction_intent_count < 0 ||
+      report.transaction_intent_count >
+          static_cast<std::int64_t>(kMaximumLogicalSceneTransactions) ||
+      report.request_outcome_count < 0 ||
+      report.request_outcome_count > report.transaction_intent_count ||
+      report.projection_attempt_count < 0 ||
+      report.projection_attempt_count >
+          static_cast<std::int64_t>(kMaximumLogicalSceneTransactions * 256U) ||
+      report.projection_result_count < 0 ||
+      report.projection_result_count > report.projection_attempt_count ||
+      report.owner_event_count < 0 ||
+      report.owner_event_count >
+          static_cast<std::int64_t>(kMaximumLogicalSceneOwnerEvents)) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "logical-scene integrity report violates fixed row bounds");
   }

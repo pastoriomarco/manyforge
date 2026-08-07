@@ -1,0 +1,1235 @@
+#include "logical_scene_codec_internal.hpp"
+
+#include <manyforge_scene/scene_transaction_codec.hpp>
+
+#include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
+
+namespace manyforge::scene::logical_scene_codec_internal {
+namespace {
+
+namespace ci = manyforge::content_identity;
+namespace core = manyforge::core;
+namespace deployment = manyforge::deployment;
+
+using ci::CanonicalValue;
+
+constexpr std::uint64_t kMaximumSafeIntegral = 9007199254740991ULL;
+
+[[noreturn]] void Fail(const std::string &detail) {
+  throw std::invalid_argument("logical-scene codec: " + detail);
+}
+
+CanonicalValue Unsigned(const std::uint64_t value,
+                        const std::string_view label) {
+  if (value > kMaximumSafeIntegral) {
+    Fail(std::string(label) + " exceeds the safe-integral range");
+  }
+  return CanonicalValue(static_cast<double>(value));
+}
+
+CanonicalValue Integer(const std::int64_t value, const std::string_view label) {
+  constexpr auto kMaximum = static_cast<std::int64_t>(kMaximumSafeIntegral);
+  if (value < -kMaximum || value > kMaximum) {
+    Fail(std::string(label) + " exceeds the safe-integral range");
+  }
+  return CanonicalValue(static_cast<double>(value));
+}
+
+const CanonicalValue &Member(const CanonicalValue &object,
+                             const std::string_view name) {
+  const auto *value = object.find_object_member(name);
+  if (value == nullptr) {
+    Fail("missing field " + std::string(name));
+  }
+  return *value;
+}
+
+void ExactObject(const CanonicalValue &value, const std::size_t count,
+                 const std::string_view label) {
+  if (!value.is_object() || value.as_object().size() != count) {
+    Fail(std::string(label) + " has an unknown or missing field");
+  }
+}
+
+const std::string &String(const CanonicalValue &value,
+                          const std::string_view label) {
+  const auto *text = std::get_if<std::string>(&value.storage());
+  if (text == nullptr) {
+    Fail(std::string(label) + " must be a string");
+  }
+  return *text;
+}
+
+bool Boolean(const CanonicalValue &value, const std::string_view label) {
+  const auto *flag = std::get_if<bool>(&value.storage());
+  if (flag == nullptr) {
+    Fail(std::string(label) + " must be boolean");
+  }
+  return *flag;
+}
+
+double Number(const CanonicalValue &value, const std::string_view label) {
+  const auto *number = std::get_if<double>(&value.storage());
+  if (number == nullptr || !std::isfinite(*number)) {
+    Fail(std::string(label) + " must be finite numeric data");
+  }
+  return *number;
+}
+
+std::uint64_t DecodeUnsigned(const CanonicalValue &value,
+                             const std::string_view label) {
+  const auto number = Number(value, label);
+  if (number < 0.0 || number > static_cast<double>(kMaximumSafeIntegral) ||
+      std::floor(number) != number) {
+    Fail(std::string(label) + " must be an unsigned safe integer");
+  }
+  return static_cast<std::uint64_t>(number);
+}
+
+std::int64_t DecodeInteger(const CanonicalValue &value,
+                           const std::string_view label) {
+  const auto number = Number(value, label);
+  constexpr auto kMaximum = static_cast<double>(kMaximumSafeIntegral);
+  if (number < -kMaximum || number > kMaximum || std::floor(number) != number) {
+    Fail(std::string(label) + " must be a signed safe integer");
+  }
+  return static_cast<std::int64_t>(number);
+}
+
+const CanonicalValue::Array &Array(const CanonicalValue &value,
+                                   const std::string_view label) {
+  const auto *array = std::get_if<CanonicalValue::Array>(&value.storage());
+  if (array == nullptr) {
+    Fail(std::string(label) + " must be an array");
+  }
+  return *array;
+}
+
+CanonicalValue StringArray(const std::vector<std::string> &values) {
+  CanonicalValue::Array result;
+  result.reserve(values.size());
+  for (const auto &value : values) {
+    result.emplace_back(value);
+  }
+  return CanonicalValue(std::move(result));
+}
+
+template <typename Strong>
+CanonicalValue StrongArray(const std::vector<Strong> &values) {
+  CanonicalValue::Array result;
+  result.reserve(values.size());
+  for (const auto &value : values) {
+    result.emplace_back(value.value());
+  }
+  return CanonicalValue(std::move(result));
+}
+
+template <typename Strong>
+std::vector<Strong> DecodeStrongArray(const CanonicalValue &value,
+                                      const std::string_view label) {
+  const auto &values = Array(value, label);
+  std::vector<Strong> result;
+  result.reserve(values.size());
+  for (const auto &entry : values) {
+    result.emplace_back(String(entry, label));
+  }
+  return result;
+}
+
+CanonicalValue Vector(const core::Vector3DTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"x_m", CanonicalValue(value.x_m)},
+      {"y_m", CanonicalValue(value.y_m)},
+      {"z_m", CanonicalValue(value.z_m)},
+  });
+}
+
+core::Vector3DTO DecodeVector(const CanonicalValue &value) {
+  ExactObject(value, 3U, "vector");
+  return {
+      Number(Member(value, "x_m"), "x_m"),
+      Number(Member(value, "y_m"), "y_m"),
+      Number(Member(value, "z_m"), "z_m"),
+  };
+}
+
+CanonicalValue Pose(const core::Pose3DTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"orientation", CanonicalValue(CanonicalValue::Object{
+                          {"w", CanonicalValue(value.orientation.w)},
+                          {"x", CanonicalValue(value.orientation.x)},
+                          {"y", CanonicalValue(value.orientation.y)},
+                          {"z", CanonicalValue(value.orientation.z)},
+                      })},
+      {"position_m", Vector(value.position_m)},
+  });
+}
+
+core::Pose3DTO DecodePose(const CanonicalValue &value) {
+  ExactObject(value, 2U, "pose");
+  const auto &orientation = Member(value, "orientation");
+  ExactObject(orientation, 4U, "orientation");
+  core::Pose3DTO result;
+  result.position_m = DecodeVector(Member(value, "position_m"));
+  result.orientation = {
+      Number(Member(orientation, "x"), "orientation.x"),
+      Number(Member(orientation, "y"), "orientation.y"),
+      Number(Member(orientation, "z"), "orientation.z"),
+      Number(Member(orientation, "w"), "orientation.w"),
+  };
+  return result;
+}
+
+CanonicalValue Shape(const core::CollisionShapeDTO &value) {
+  return std::visit(
+      [](const auto &shape) -> CanonicalValue {
+        using T = std::decay_t<decltype(shape)>;
+        if constexpr (std::is_same_v<T, core::BoxShapeDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"box_dimensions_m", Vector(shape.dimensions_m)},
+              {"type", CanonicalValue("box")},
+          });
+        } else if constexpr (std::is_same_v<T, core::SphereShapeDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"sphere_radius_m", CanonicalValue(shape.radius_m)},
+              {"type", CanonicalValue("sphere")},
+          });
+        } else if constexpr (std::is_same_v<T, core::CylinderShapeDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"cylinder_height_m", CanonicalValue(shape.height_m)},
+              {"cylinder_radius_m", CanonicalValue(shape.radius_m)},
+              {"type", CanonicalValue("cylinder")},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"mesh_resource_uri", CanonicalValue(shape.resource_uri)},
+              {"mesh_scale", Vector(shape.scale)},
+              {"type", CanonicalValue("mesh")},
+          });
+        }
+      },
+      value);
+}
+
+core::CollisionShapeDTO DecodeShape(const CanonicalValue &value) {
+  const auto type = String(Member(value, "type"), "shape.type");
+  if (type == "box") {
+    ExactObject(value, 2U, "box shape");
+    return core::BoxShapeDTO{DecodeVector(Member(value, "box_dimensions_m"))};
+  }
+  if (type == "sphere") {
+    ExactObject(value, 2U, "sphere shape");
+    return core::SphereShapeDTO{
+        Number(Member(value, "sphere_radius_m"), "sphere_radius_m")};
+  }
+  if (type == "cylinder") {
+    ExactObject(value, 3U, "cylinder shape");
+    return core::CylinderShapeDTO{
+        Number(Member(value, "cylinder_radius_m"), "cylinder_radius_m"),
+        Number(Member(value, "cylinder_height_m"), "cylinder_height_m"),
+    };
+  }
+  if (type == "mesh") {
+    ExactObject(value, 3U, "mesh shape");
+    return core::MeshShapeDTO{
+        String(Member(value, "mesh_resource_uri"), "mesh_resource_uri"),
+        DecodeVector(Member(value, "mesh_scale")),
+    };
+  }
+  Fail("shape.type is unsupported");
+}
+
+CanonicalValue Pair(const core::CollisionPairId &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"body_a", CanonicalValue(value.body_a)},
+      {"body_b", CanonicalValue(value.body_b)},
+  });
+}
+
+core::CollisionPairId DecodePair(const CanonicalValue &value) {
+  ExactObject(value, 2U, "collision pair");
+  return {
+      String(Member(value, "body_a"), "body_a"),
+      String(Member(value, "body_b"), "body_b"),
+  };
+}
+
+CanonicalValue Pairs(const std::vector<core::CollisionPairId> &values) {
+  CanonicalValue::Array result;
+  result.reserve(values.size());
+  for (const auto &value : values) {
+    result.emplace_back(Pair(value));
+  }
+  return CanonicalValue(std::move(result));
+}
+
+std::vector<core::CollisionPairId> DecodePairs(const CanonicalValue &value) {
+  std::vector<core::CollisionPairId> result;
+  const auto &values = Array(value, "collision pairs");
+  result.reserve(values.size());
+  for (const auto &entry : values) {
+    result.emplace_back(DecodePair(entry));
+  }
+  return result;
+}
+
+std::string_view ContactMode(const core::CollisionContactPolicyMode mode) {
+  switch (mode) {
+  case core::CollisionContactPolicyMode::kContactRelease:
+    return "contact_release";
+  case core::CollisionContactPolicyMode::kBoundedPenetration:
+    return "bounded_penetration";
+  case core::CollisionContactPolicyMode::kContactProcess:
+    return "contact_process";
+  }
+  return {};
+}
+
+core::CollisionContactPolicyMode DecodeContactMode(std::string_view mode) {
+  if (mode == "contact_release") {
+    return core::CollisionContactPolicyMode::kContactRelease;
+  }
+  if (mode == "bounded_penetration") {
+    return core::CollisionContactPolicyMode::kBoundedPenetration;
+  }
+  if (mode == "contact_process") {
+    return core::CollisionContactPolicyMode::kContactProcess;
+  }
+  Fail("collision contact mode is unsupported");
+}
+
+std::string_view ReleaseMode(const core::ContactReleaseEvidenceMode mode) {
+  switch (mode) {
+  case core::ContactReleaseEvidenceMode::kSignedPenetration:
+    return "signed_penetration";
+  case core::ContactReleaseEvidenceMode::kBinaryContact:
+    return "binary_contact";
+  }
+  return {};
+}
+
+core::ContactReleaseEvidenceMode DecodeReleaseMode(std::string_view mode) {
+  if (mode == "signed_penetration") {
+    return core::ContactReleaseEvidenceMode::kSignedPenetration;
+  }
+  if (mode == "binary_contact") {
+    return core::ContactReleaseEvidenceMode::kBinaryContact;
+  }
+  Fail("contact release evidence mode is unsupported");
+}
+
+CanonicalValue Policy(const core::CollisionPolicySnapshot &policy) {
+  CanonicalValue::Array contacts;
+  contacts.reserve(policy.support_contacts.size());
+  for (const auto &contact : policy.support_contacts) {
+    contacts.emplace_back(CanonicalValue(CanonicalValue::Object{
+        {"allow_recontact", CanonicalValue(contact.allow_recontact)},
+        {"enforce_max_start_penetration",
+         CanonicalValue(contact.enforce_max_start_penetration)},
+        {"max_contact_penetration_m",
+         CanonicalValue(contact.max_contact_penetration_m)},
+        {"max_start_penetration_m",
+         CanonicalValue(contact.max_start_penetration_m)},
+        {"min_release_progress_m",
+         CanonicalValue(contact.min_release_progress_m)},
+        {"mode", CanonicalValue(std::string(ContactMode(contact.mode)))},
+        {"pair", Pair(contact.pair)},
+        {"release_evidence_mode", CanonicalValue(std::string(ReleaseMode(
+                                      contact.release_evidence_mode)))},
+        {"release_tolerance_m", CanonicalValue(contact.release_tolerance_m)},
+        {"require_separation_by_end",
+         CanonicalValue(contact.require_separation_by_end)},
+        {"require_strictly_decreasing_penetration",
+         CanonicalValue(contact.require_strictly_decreasing_penetration)},
+    }));
+  }
+  CanonicalValue::Array grasps;
+  grasps.reserve(policy.contact_grasps.size());
+  for (const auto &grasp : policy.contact_grasps) {
+    grasps.emplace_back(CanonicalValue(CanonicalValue::Object{
+        {"allowed_robot_links", StringArray(grasp.allowed_robot_links)},
+        {"max_penetration_m", CanonicalValue(grasp.max_penetration_m)},
+        {"policy_id", CanonicalValue(grasp.policy_id)},
+        {"selected_object_id", CanonicalValue(grasp.selected_object_id)},
+        {"terminal_window_start_fraction",
+         CanonicalValue(grasp.terminal_window_start_fraction)},
+    }));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"allowed_static_static_pairs",
+       Pairs(policy.allowed_static_static_pairs)},
+      {"allowed_touch_link_pairs", Pairs(policy.allowed_touch_link_pairs)},
+      {"contact_grasps", CanonicalValue(std::move(grasps))},
+      {"policy_id", CanonicalValue(policy.policy_id)},
+      {"require_full_diagnostics",
+       CanonicalValue(policy.require_full_diagnostics)},
+      {"revision",
+       CanonicalValue(CanonicalValue::Object{
+           {"content_hash", CanonicalValue(policy.revision.content_hash)},
+           {"revision_id",
+            Unsigned(policy.revision.revision_id, "policy revision")},
+       })},
+      {"support_contacts", CanonicalValue(std::move(contacts))},
+  });
+}
+
+core::CollisionPolicySnapshot DecodePolicy(const CanonicalValue &value) {
+  ExactObject(value, 7U, "collision policy");
+  core::CollisionPolicySnapshot policy;
+  policy.policy_id = String(Member(value, "policy_id"), "policy_id");
+  const auto &revision = Member(value, "revision");
+  ExactObject(revision, 2U, "policy revision");
+  policy.revision = {
+      DecodeUnsigned(Member(revision, "revision_id"), "policy revision_id"),
+      String(Member(revision, "content_hash"), "policy content_hash"),
+  };
+  policy.allowed_static_static_pairs =
+      DecodePairs(Member(value, "allowed_static_static_pairs"));
+  policy.allowed_touch_link_pairs =
+      DecodePairs(Member(value, "allowed_touch_link_pairs"));
+  for (const auto &entry :
+       Array(Member(value, "support_contacts"), "support_contacts")) {
+    ExactObject(entry, 11U, "support contact");
+    core::SupportContactPolicyEntry contact;
+    contact.pair = DecodePair(Member(entry, "pair"));
+    contact.mode = DecodeContactMode(
+        String(Member(entry, "mode"), "support contact mode"));
+    contact.release_evidence_mode = DecodeReleaseMode(String(
+        Member(entry, "release_evidence_mode"), "release evidence mode"));
+    contact.enforce_max_start_penetration =
+        Boolean(Member(entry, "enforce_max_start_penetration"),
+                "enforce_max_start_penetration");
+    contact.max_start_penetration_m = Number(
+        Member(entry, "max_start_penetration_m"), "max_start_penetration_m");
+    contact.release_tolerance_m =
+        Number(Member(entry, "release_tolerance_m"), "release_tolerance_m");
+    contact.min_release_progress_m = Number(
+        Member(entry, "min_release_progress_m"), "min_release_progress_m");
+    contact.max_contact_penetration_m =
+        Number(Member(entry, "max_contact_penetration_m"),
+               "max_contact_penetration_m");
+    contact.require_separation_by_end =
+        Boolean(Member(entry, "require_separation_by_end"),
+                "require_separation_by_end");
+    contact.require_strictly_decreasing_penetration =
+        Boolean(Member(entry, "require_strictly_decreasing_penetration"),
+                "require_strictly_decreasing_penetration");
+    contact.allow_recontact =
+        Boolean(Member(entry, "allow_recontact"), "allow_recontact");
+    policy.support_contacts.emplace_back(std::move(contact));
+  }
+  for (const auto &entry :
+       Array(Member(value, "contact_grasps"), "contact_grasps")) {
+    ExactObject(entry, 5U, "contact grasp");
+    core::ContactGraspPolicyEntry grasp;
+    grasp.policy_id = String(Member(entry, "policy_id"), "grasp policy_id");
+    grasp.selected_object_id =
+        String(Member(entry, "selected_object_id"), "selected_object_id");
+    for (const auto &link :
+         Array(Member(entry, "allowed_robot_links"), "allowed_robot_links")) {
+      grasp.allowed_robot_links.emplace_back(String(link, "robot link"));
+    }
+    grasp.max_penetration_m =
+        Number(Member(entry, "max_penetration_m"), "max_penetration_m");
+    grasp.terminal_window_start_fraction =
+        Number(Member(entry, "terminal_window_start_fraction"),
+               "terminal_window_start_fraction");
+    policy.contact_grasps.emplace_back(std::move(grasp));
+  }
+  policy.require_full_diagnostics = Boolean(
+      Member(value, "require_full_diagnostics"), "require_full_diagnostics");
+  return policy;
+}
+
+CanonicalValue Frame(const core::SceneFrameRefDTO &frame) {
+  return std::visit(
+      [](const auto &value) -> CanonicalValue {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, core::CellSceneFrameRefDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"cell_id", CanonicalValue(value.cell_id.value())},
+              {"kind", CanonicalValue("cell_frame")},
+          });
+        } else if constexpr (std::is_same_v<T,
+                                            core::ComponentSceneFrameRefDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"controllable_component_id",
+               CanonicalValue(value.controllable_component_id.value())},
+              {"frame_role_id", CanonicalValue(value.frame_role_id.value())},
+              {"kind", CanonicalValue("component_frame")},
+              {"model_instance_id",
+               CanonicalValue(value.model_instance_id.value())},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"frame_role_id", CanonicalValue(value.frame_role_id.value())},
+              {"kind", CanonicalValue("passive_model_frame")},
+              {"model_instance_id",
+               CanonicalValue(value.model_instance_id.value())},
+          });
+        }
+      },
+      frame);
+}
+
+core::SceneFrameRefDTO DecodeFrame(const CanonicalValue &value) {
+  const auto kind = String(Member(value, "kind"), "frame kind");
+  if (kind == "cell_frame") {
+    ExactObject(value, 2U, "cell frame");
+    return core::CellSceneFrameRefDTO{
+        core::CellId(String(Member(value, "cell_id"), "cell_id"))};
+  }
+  if (kind == "component_frame") {
+    ExactObject(value, 4U, "component frame");
+    return core::ComponentSceneFrameRefDTO{
+        core::ControllableComponentId(
+            String(Member(value, "controllable_component_id"),
+                   "controllable_component_id")),
+        core::ModelInstanceId(
+            String(Member(value, "model_instance_id"), "model_instance_id")),
+        core::FrameRoleId(
+            String(Member(value, "frame_role_id"), "frame_role_id")),
+    };
+  }
+  if (kind == "passive_model_frame") {
+    ExactObject(value, 3U, "passive model frame");
+    return core::PassiveModelSceneFrameRefDTO{
+        core::ModelInstanceId(
+            String(Member(value, "model_instance_id"), "model_instance_id")),
+        core::FrameRoleId(
+            String(Member(value, "frame_role_id"), "frame_role_id")),
+    };
+  }
+  Fail("scene frame kind is unsupported");
+}
+
+CanonicalValue
+ProviderEvidence(const core::SceneObjectProviderEvidenceDTO &value) {
+  CanonicalValue::Object object{
+      {"provider_instance_id",
+       CanonicalValue(value.provider_instance_id.value())},
+      {"provider_manifest_id",
+       CanonicalValue(value.provider_manifest_id.value())},
+      {"provider_manifest_revision",
+       CanonicalValue(value.provider_manifest_revision.value())},
+      {"provider_source_epoch", CanonicalValue(value.provider_source_epoch)},
+      {"provider_source_sequence",
+       Unsigned(value.provider_source_sequence, "provider_source_sequence")},
+      {"received_at_ns", Integer(value.received_at_ns, "received_at_ns")},
+  };
+  if (value.source_timestamp_ns.has_value()) {
+    object.emplace_back(
+        "source_timestamp_ns",
+        Integer(*value.source_timestamp_ns, "source_timestamp_ns"));
+  }
+  if (value.source_freshness_budget_ns.has_value()) {
+    object.emplace_back("source_freshness_budget_ns",
+                        Integer(*value.source_freshness_budget_ns,
+                                "source_freshness_budget_ns"));
+  }
+  return CanonicalValue(std::move(object));
+}
+
+core::SceneObjectProviderEvidenceDTO
+DecodeProviderEvidence(const CanonicalValue &value) {
+  if (!value.is_object() || value.as_object().size() < 6U ||
+      value.as_object().size() > 8U) {
+    Fail("provider evidence has an unknown or missing field");
+  }
+  core::SceneObjectProviderEvidenceDTO result{
+      core::ProviderInstanceId(String(Member(value, "provider_instance_id"),
+                                      "provider_instance_id")),
+      core::ProviderManifestId(String(Member(value, "provider_manifest_id"),
+                                      "provider_manifest_id")),
+      core::ProviderManifestRevision(
+          String(Member(value, "provider_manifest_revision"),
+                 "provider_manifest_revision")),
+      String(Member(value, "provider_source_epoch"), "provider_source_epoch"),
+      DecodeUnsigned(Member(value, "provider_source_sequence"),
+                     "provider_source_sequence"),
+      DecodeInteger(Member(value, "received_at_ns"), "received_at_ns"),
+      std::nullopt,
+      std::nullopt,
+  };
+  if (const auto *timestamp = value.find_object_member("source_timestamp_ns")) {
+    result.source_timestamp_ns =
+        DecodeInteger(*timestamp, "source_timestamp_ns");
+  }
+  if (const auto *budget =
+          value.find_object_member("source_freshness_budget_ns")) {
+    result.source_freshness_budget_ns =
+        DecodeInteger(*budget, "source_freshness_budget_ns");
+  }
+  return result;
+}
+
+CanonicalValue Placement(const core::SceneObjectPlacementDTO &placement) {
+  return std::visit(
+      [](const auto &value) -> CanonicalValue {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T,
+                                     core::CellFixedSceneObjectPlacementDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"cell_id", CanonicalValue(value.cell_id.value())},
+              {"kind", CanonicalValue("cell_fixed")},
+              {"pose_in_cell", Pose(value.pose_in_cell)},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"carried_object_attachment_id",
+               CanonicalValue(value.carried_object_attachment_id.value())},
+              {"carried_object_attachment_revision",
+               CanonicalValue(
+                   value.carried_object_attachment_revision.value())},
+              {"kind", CanonicalValue("carried")},
+          });
+        }
+      },
+      placement);
+}
+
+core::SceneObjectPlacementDTO DecodePlacement(const CanonicalValue &value) {
+  const auto kind = String(Member(value, "kind"), "placement kind");
+  if (kind == "cell_fixed") {
+    ExactObject(value, 3U, "cell-fixed placement");
+    return core::CellFixedSceneObjectPlacementDTO{
+        core::CellId(String(Member(value, "cell_id"), "cell_id")),
+        DecodePose(Member(value, "pose_in_cell")),
+    };
+  }
+  if (kind == "carried") {
+    ExactObject(value, 3U, "carried placement");
+    return core::CarriedSceneObjectPlacementDTO{
+        core::CarriedObjectAttachmentId(
+            String(Member(value, "carried_object_attachment_id"),
+                   "carried_object_attachment_id")),
+        core::CarriedObjectAttachmentRevision(
+            String(Member(value, "carried_object_attachment_revision"),
+                   "carried_object_attachment_revision")),
+    };
+  }
+  Fail("scene placement kind is unsupported");
+}
+
+CanonicalValue Object(const core::SceneObjectSnapshotDTO &object) {
+  CanonicalValue::Array shapes;
+  shapes.reserve(object.collision_shapes.size());
+  for (const auto &shape : object.collision_shapes) {
+    shapes.emplace_back(Shape(shape));
+  }
+  CanonicalValue::Object value{
+      {"collision_shapes", CanonicalValue(std::move(shapes))},
+      {"placement", Placement(object.placement)},
+      {"scene_resource_id", CanonicalValue(object.scene_resource_id.value())},
+  };
+  if (object.provider_evidence.has_value()) {
+    value.emplace_back("provider_evidence",
+                       ProviderEvidence(*object.provider_evidence));
+  }
+  return CanonicalValue(std::move(value));
+}
+
+core::SceneObjectSnapshotDTO DecodeObject(const CanonicalValue &value) {
+  if (!value.is_object() || value.as_object().size() < 3U ||
+      value.as_object().size() > 4U) {
+    Fail("scene object has an unknown or missing field");
+  }
+  core::SceneObjectSnapshotDTO result{
+      core::SceneResourceId(
+          String(Member(value, "scene_resource_id"), "scene_resource_id")),
+      {},
+      DecodePlacement(Member(value, "placement")),
+      std::nullopt,
+  };
+  for (const auto &shape :
+       Array(Member(value, "collision_shapes"), "collision_shapes")) {
+    result.collision_shapes.emplace_back(DecodeShape(shape));
+  }
+  if (const auto *evidence = value.find_object_member("provider_evidence")) {
+    result.provider_evidence = DecodeProviderEvidence(*evidence);
+  }
+  return result;
+}
+
+CanonicalValue Attachment(const core::CarriedObjectAttachmentDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"carried_object_attachment_id",
+       CanonicalValue(value.carried_object_attachment_id.value())},
+      {"carried_object_attachment_revision",
+       CanonicalValue(value.carried_object_attachment_revision.value())},
+      {"carrier_frame_ref", Frame(value.carrier_frame_ref)},
+      {"command_target_id", CanonicalValue(value.command_target_id.value())},
+      {"controllable_component_id",
+       CanonicalValue(value.controllable_component_id.value())},
+      {"pose_in_carrier_frame", Pose(value.pose_in_carrier_frame)},
+      {"scene_resource_id", CanonicalValue(value.scene_resource_id.value())},
+      {"touch_body_roles", StrongArray(value.touch_body_roles)},
+  });
+}
+
+core::CarriedObjectAttachmentDTO DecodeAttachment(const CanonicalValue &value) {
+  ExactObject(value, 8U, "carried attachment");
+  return {
+      core::CarriedObjectAttachmentId(
+          String(Member(value, "carried_object_attachment_id"),
+                 "carried_object_attachment_id")),
+      core::CarriedObjectAttachmentRevision(
+          String(Member(value, "carried_object_attachment_revision"),
+                 "carried_object_attachment_revision")),
+      core::SceneResourceId(
+          String(Member(value, "scene_resource_id"), "scene_resource_id")),
+      core::ControllableComponentId(
+          String(Member(value, "controllable_component_id"),
+                 "controllable_component_id")),
+      core::CommandTargetId(
+          String(Member(value, "command_target_id"), "command_target_id")),
+      DecodeFrame(Member(value, "carrier_frame_ref")),
+      DecodePose(Member(value, "pose_in_carrier_frame")),
+      DecodeStrongArray<core::CollisionBodyRoleId>(
+          Member(value, "touch_body_roles"), "touch_body_roles"),
+  };
+}
+
+CanonicalValue Projection(const core::ProjectionRevisionDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"graph_revision", CanonicalValue(value.graph_revision.value())},
+      {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
+      {"scene_revision",
+       CanonicalValue(CanonicalValue::Object{
+           {"content_hash",
+            CanonicalValue(value.scene_revision.content_hash.value())},
+           {"revision_id",
+            Unsigned(value.scene_revision.revision_id, "scene revision")},
+           {"scene_id", CanonicalValue(value.scene_revision.scene_id.value())},
+       })},
+  });
+}
+
+core::ProjectionRevisionDTO DecodeProjection(const CanonicalValue &value) {
+  ExactObject(value, 3U, "projection revision");
+  const auto &scene = Member(value, "scene_revision");
+  ExactObject(scene, 3U, "scene revision");
+  core::ProjectionRevisionDTO projection{
+      core::RetainedBundleId(
+          String(Member(value, "retained_bundle_id"), "retained_bundle_id")),
+      core::GraphRevision(
+          String(Member(value, "graph_revision"), "graph_revision")),
+      core::SceneRevision{
+          core::SceneId(String(Member(scene, "scene_id"), "scene_id")),
+          DecodeUnsigned(Member(scene, "revision_id"), "revision_id"),
+          core::ContentDigest(
+              String(Member(scene, "content_hash"), "content_hash")),
+      },
+  };
+  if (!projection.valid()) {
+    Fail("projection revision is invalid");
+  }
+  return projection;
+}
+
+CanonicalValue RequestContext(const core::PublicRequestContextDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"correlation_id", value.correlation_id.has_value()
+                             ? CanonicalValue(*value.correlation_id)
+                             : CanonicalValue(nullptr)},
+      {"request_id", CanonicalValue(value.request_id.value())},
+      {"request_owner_epoch",
+       CanonicalValue(value.request_owner_epoch.value())},
+      {"source_label", CanonicalValue(value.source_label)},
+  });
+}
+
+core::PublicRequestContextDTO
+DecodeRequestContext(const CanonicalValue &value) {
+  ExactObject(value, 4U, "request context");
+  std::optional<std::string> correlation_id;
+  const auto &correlation = Member(value, "correlation_id");
+  if (!std::holds_alternative<std::nullptr_t>(correlation.storage())) {
+    correlation_id = String(correlation, "correlation_id");
+  }
+  return {
+      core::RequestId(String(Member(value, "request_id"), "request_id")),
+      core::RequestOwnerEpoch(
+          String(Member(value, "request_owner_epoch"), "request_owner_epoch")),
+      String(Member(value, "source_label"), "source_label"),
+      std::move(correlation_id),
+  };
+}
+
+std::string_view Transport(const core::RequestTransportDTO value) {
+  switch (value) {
+  case core::RequestTransportDTO::kRos:
+    return "ros";
+  case core::RequestTransportDTO::kHttp:
+    return "http";
+  case core::RequestTransportDTO::kInternal:
+    return "internal";
+  }
+  return {};
+}
+
+std::string_view Assurance(const core::RequestAssuranceDTO value) {
+  switch (value) {
+  case core::RequestAssuranceDTO::kUnverified:
+    return "unverified";
+  case core::RequestAssuranceDTO::kExternallyAuthenticated:
+    return "externally_authenticated";
+  }
+  return {};
+}
+
+CanonicalValue Attribution(const core::RequestAttributionDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"assurance", CanonicalValue(std::string(Assurance(value.assurance)))},
+      {"principal_id", value.principal_id.has_value()
+                           ? CanonicalValue(*value.principal_id)
+                           : CanonicalValue(nullptr)},
+      {"transport", CanonicalValue(std::string(Transport(value.transport)))},
+  });
+}
+
+core::RequestAttributionDTO DecodeAttribution(const CanonicalValue &value) {
+  ExactObject(value, 3U, "request attribution");
+  const auto transport_text = String(Member(value, "transport"), "transport");
+  const auto assurance_text = String(Member(value, "assurance"), "assurance");
+  core::RequestTransportDTO transport;
+  if (transport_text == "ros") {
+    transport = core::RequestTransportDTO::kRos;
+  } else if (transport_text == "http") {
+    transport = core::RequestTransportDTO::kHttp;
+  } else if (transport_text == "internal") {
+    transport = core::RequestTransportDTO::kInternal;
+  } else {
+    Fail("request attribution transport is invalid");
+  }
+  core::RequestAssuranceDTO assurance;
+  if (assurance_text == "unverified") {
+    assurance = core::RequestAssuranceDTO::kUnverified;
+  } else if (assurance_text == "externally_authenticated") {
+    assurance = core::RequestAssuranceDTO::kExternallyAuthenticated;
+  } else {
+    Fail("request attribution assurance is invalid");
+  }
+  std::optional<std::string> principal_id;
+  const auto &principal = Member(value, "principal_id");
+  if (!std::holds_alternative<std::nullptr_t>(principal.storage())) {
+    principal_id = String(principal, "principal_id");
+  }
+  core::RequestAttributionDTO result{
+      transport,
+      assurance,
+      std::move(principal_id),
+  };
+  if (!result.locally_valid()) {
+    Fail("request attribution is invalid");
+  }
+  return result;
+}
+
+CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
+  return std::visit(
+      [](const auto &request) -> CanonicalValue {
+        using T = std::decay_t<decltype(request)>;
+        if constexpr (std::is_same_v<T, core::AddObjectRequestDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"frame_ref", Frame(request.frame_ref)},
+              {"kind", CanonicalValue("add_object")},
+              {"pose", Pose(request.pose)},
+              {"scene_resource_id",
+               CanonicalValue(request.scene_resource_id.value())},
+              {"shape", Shape(request.shape)},
+          });
+        } else if constexpr (std::is_same_v<T, core::RemoveObjectRequestDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("remove_object")},
+              {"scene_resource_id",
+               CanonicalValue(request.scene_resource_id.value())},
+          });
+        } else if constexpr (std::is_same_v<T,
+                                            core::UpdateObjectPoseRequestDTO>) {
+          CanonicalValue::Object object{
+              {"expected_attached",
+               request.expected_attached.has_value()
+                   ? CanonicalValue(*request.expected_attached)
+                   : CanonicalValue(nullptr)},
+              {"frame_ref", Frame(request.frame_ref)},
+              {"kind", CanonicalValue("update_object_pose")},
+              {"pose", Pose(request.pose)},
+              {"provider_evidence",
+               request.provider_evidence.has_value()
+                   ? ProviderEvidence(*request.provider_evidence)
+                   : CanonicalValue(nullptr)},
+              {"scene_resource_id",
+               CanonicalValue(request.scene_resource_id.value())},
+          };
+          return CanonicalValue(std::move(object));
+        } else if constexpr (std::is_same_v<
+                                 T, core::AttachCarriedObjectRequestDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"carried_object_attachment_id",
+               CanonicalValue(request.carried_object_attachment_id.value())},
+              {"command_target_id",
+               CanonicalValue(request.command_target_id.value())},
+              {"controllable_component_id",
+               CanonicalValue(request.controllable_component_id.value())},
+              {"expected_component_attachment_revisions",
+               StrongArray(request.expected_component_attachment_revisions)},
+              {"frame_role_id", CanonicalValue(request.frame_role_id.value())},
+              {"kind", CanonicalValue("attach_carried_object")},
+              {"scene_resource_id",
+               CanonicalValue(request.scene_resource_id.value())},
+              {"touch_body_roles", StrongArray(request.touch_body_roles)},
+          });
+        } else if constexpr (std::is_same_v<
+                                 T, core::DetachCarriedObjectRequestDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"carried_object_attachment_id",
+               CanonicalValue(request.carried_object_attachment_id.value())},
+              {"expected_carried_object_attachment_revision",
+               CanonicalValue(
+                   request.expected_carried_object_attachment_revision
+                       .value())},
+              {"frame_ref", Frame(request.frame_ref)},
+              {"kind", CanonicalValue("detach_carried_object")},
+              {"pose", Pose(request.pose)},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"configured_policy", Policy(request.configured_policy)},
+              {"expected_configured_policy_revision",
+               CanonicalValue(CanonicalValue::Object{
+                   {"content_hash",
+                    CanonicalValue(request.expected_configured_policy_revision
+                                       .content_hash)},
+                   {"revision_id",
+                    Unsigned(
+                        request.expected_configured_policy_revision.revision_id,
+                        "expected policy revision")},
+               })},
+              {"kind", CanonicalValue("set_collision_policy")},
+          });
+        }
+      },
+      value);
+}
+
+core::SceneOperationRequestDTO
+DecodeRequestOperation(const CanonicalValue &value) {
+  if (!value.is_object()) {
+    Fail("scene operation must be an object");
+  }
+  const auto kind = String(Member(value, "kind"), "operation kind");
+  if (kind == "add_object") {
+    ExactObject(value, 5U, "add-object request");
+    return core::AddObjectRequestDTO{
+        core::SceneResourceId(
+            String(Member(value, "scene_resource_id"), "scene_resource_id")),
+        DecodeShape(Member(value, "shape")),
+        DecodePose(Member(value, "pose")),
+        DecodeFrame(Member(value, "frame_ref")),
+    };
+  }
+  if (kind == "remove_object") {
+    ExactObject(value, 2U, "remove-object request");
+    return core::RemoveObjectRequestDTO{
+        core::SceneResourceId(
+            String(Member(value, "scene_resource_id"), "scene_resource_id")),
+    };
+  }
+  if (kind == "update_object_pose") {
+    ExactObject(value, 6U, "update-object-pose request");
+    std::optional<core::SceneObjectProviderEvidenceDTO> provider_evidence;
+    const auto &provider = Member(value, "provider_evidence");
+    if (!std::holds_alternative<std::nullptr_t>(provider.storage())) {
+      provider_evidence = DecodeProviderEvidence(provider);
+    }
+    std::optional<bool> expected_attached;
+    const auto &attached = Member(value, "expected_attached");
+    if (!std::holds_alternative<std::nullptr_t>(attached.storage())) {
+      expected_attached = Boolean(attached, "expected_attached");
+    }
+    return core::UpdateObjectPoseRequestDTO{
+        core::SceneResourceId(
+            String(Member(value, "scene_resource_id"), "scene_resource_id")),
+        DecodePose(Member(value, "pose")),
+        DecodeFrame(Member(value, "frame_ref")),
+        std::move(provider_evidence),
+        expected_attached,
+    };
+  }
+  if (kind == "attach_carried_object") {
+    ExactObject(value, 8U, "attach-carried-object request");
+    return core::AttachCarriedObjectRequestDTO{
+        core::CarriedObjectAttachmentId(
+            String(Member(value, "carried_object_attachment_id"),
+                   "carried_object_attachment_id")),
+        core::SceneResourceId(
+            String(Member(value, "scene_resource_id"), "scene_resource_id")),
+        core::ControllableComponentId(
+            String(Member(value, "controllable_component_id"),
+                   "controllable_component_id")),
+        core::CommandTargetId(
+            String(Member(value, "command_target_id"), "command_target_id")),
+        core::FrameRoleId(
+            String(Member(value, "frame_role_id"), "frame_role_id")),
+        DecodeStrongArray<core::CollisionBodyRoleId>(
+            Member(value, "touch_body_roles"), "touch_body_roles"),
+        DecodeStrongArray<core::ComponentAttachmentRevision>(
+            Member(value, "expected_component_attachment_revisions"),
+            "expected_component_attachment_revisions"),
+    };
+  }
+  if (kind == "detach_carried_object") {
+    ExactObject(value, 5U, "detach-carried-object request");
+    return core::DetachCarriedObjectRequestDTO{
+        core::CarriedObjectAttachmentId(
+            String(Member(value, "carried_object_attachment_id"),
+                   "carried_object_attachment_id")),
+        core::CarriedObjectAttachmentRevision(
+            String(Member(value, "expected_carried_object_attachment_revision"),
+                   "expected_carried_object_attachment_revision")),
+        DecodePose(Member(value, "pose")),
+        DecodeFrame(Member(value, "frame_ref")),
+    };
+  }
+  if (kind == "set_collision_policy") {
+    ExactObject(value, 3U, "set-collision-policy request");
+    const auto &expected = Member(value, "expected_configured_policy_revision");
+    ExactObject(expected, 2U, "expected collision-policy revision");
+    return core::SetCollisionPolicyRequestDTO{
+        DecodePolicy(Member(value, "configured_policy")),
+        core::CollisionPolicyRevision{
+            DecodeUnsigned(Member(expected, "revision_id"),
+                           "expected policy revision_id"),
+            String(Member(expected, "content_hash"),
+                   "expected policy content_hash"),
+        },
+    };
+  }
+  Fail("scene operation kind is unsupported");
+}
+
+CanonicalValue ResolvedOperation(const core::ResolvedSceneOperationDTO &value) {
+  return std::visit(
+      [](const auto &operation) -> CanonicalValue {
+        using T = std::decay_t<decltype(operation)>;
+        if constexpr (std::is_same_v<T, core::ResolvedUpsertSceneObjectDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("upsert_object")},
+              {"object", Object(operation.object)},
+          });
+        } else if constexpr (std::is_same_v<
+                                 T, core::ResolvedRemoveSceneObjectDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("remove_object")},
+              {"scene_resource_id",
+               CanonicalValue(operation.scene_resource_id.value())},
+          });
+        } else if constexpr (std::is_same_v<
+                                 T, core::ResolvedAttachCarriedObjectDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"attachment", Attachment(operation.attachment)},
+              {"kind", CanonicalValue("attach_carried_object")},
+              {"object", Object(operation.object)},
+          });
+        } else if constexpr (std::is_same_v<
+                                 T, core::ResolvedDetachCarriedObjectDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("detach_carried_object")},
+              {"object", Object(operation.object)},
+              {"removed_attachment_id",
+               CanonicalValue(operation.removed_attachment_id.value())},
+              {"removed_attachment_revision",
+               CanonicalValue(operation.removed_attachment_revision.value())},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"effective_policy", Policy(operation.effective_policy)},
+              {"kind", CanonicalValue("set_collision_policy")},
+          });
+        }
+      },
+      value);
+}
+
+CanonicalValue Snapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
+  if (!snapshot.locally_valid()) {
+    Fail("cannot encode an invalid logical snapshot");
+  }
+  CanonicalValue::Array objects;
+  objects.reserve(snapshot.objects.size());
+  for (const auto &object : snapshot.objects) {
+    objects.emplace_back(Object(object));
+  }
+  CanonicalValue::Array attachments;
+  attachments.reserve(snapshot.carried_object_attachments.size());
+  for (const auto &attachment : snapshot.carried_object_attachments) {
+    attachments.emplace_back(Attachment(attachment));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"carried_object_attachments", CanonicalValue(std::move(attachments))},
+      {"cell_id", CanonicalValue(snapshot.cell_id.value())},
+      {"configured_collision_policy",
+       Policy(snapshot.configured_collision_policy)},
+      {"objects", CanonicalValue(std::move(objects))},
+      {"policy_epoch", Unsigned(snapshot.policy_epoch, "policy_epoch")},
+      {"revision",
+       CanonicalValue(CanonicalValue::Object{
+           {"content_hash",
+            CanonicalValue(snapshot.revision.content_hash.value())},
+           {"revision_id",
+            Unsigned(snapshot.revision.revision_id, "scene revision")},
+           {"scene_id", CanonicalValue(snapshot.revision.scene_id.value())},
+       })},
+      {"topology_epoch", Unsigned(snapshot.topology_epoch, "topology_epoch")},
+      {"transaction_sequence",
+       Unsigned(snapshot.transaction_sequence, "transaction_sequence")},
+  });
+}
+
+} // namespace
+
+std::string EncodeRequest(const core::SceneTransactionRequestDTO &request) {
+  return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"attribution", Attribution(request.attribution)},
+      {"expected_projection_revision",
+       Projection(request.expected_projection_revision)},
+      {"operation", RequestOperation(request.operation)},
+      {"request_context", RequestContext(request.request_context)},
+  }));
+}
+
+std::string
+EncodeRequestDigestInput(const core::SceneTransactionRequestDTO &request) {
+  return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"expected_projection_revision",
+       Projection(request.expected_projection_revision)},
+      {"operation", RequestOperation(request.operation)},
+      {"request_context", RequestContext(request.request_context)},
+  }));
+}
+
+core::SceneTransactionRequestDTO DecodeRequest(const std::string_view bytes) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  const auto &root = parsed.root();
+  if (ci::canonical_json(root) != bytes) {
+    Fail("scene transaction request is not canonical JSON");
+  }
+  ExactObject(root, 4U, "scene transaction request");
+  core::SceneTransactionRequestDTO request{
+      DecodeRequestContext(Member(root, "request_context")),
+      DecodeAttribution(Member(root, "attribution")),
+      DecodeProjection(Member(root, "expected_projection_revision")),
+      DecodeRequestOperation(Member(root, "operation")),
+  };
+  if (!request.attribution.locally_valid() ||
+      !request.expected_projection_revision.valid()) {
+    Fail("scene transaction request is invalid");
+  }
+  return request;
+}
+
+std::string
+EncodeResolvedOperation(const core::ResolvedSceneOperationDTO &operation) {
+  return ci::canonical_json(ResolvedOperation(operation));
+}
+
+std::string EncodeSnapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
+  return ci::canonical_json(Snapshot(snapshot));
+}
+
+core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  const auto &root = parsed.root();
+  if (ci::canonical_json(root) != bytes) {
+    Fail("stored snapshot is not canonical JSON");
+  }
+  ExactObject(root, 8U, "logical scene snapshot");
+  const auto &revision = Member(root, "revision");
+  ExactObject(revision, 3U, "scene revision");
+  core::LogicalSceneSnapshotDTO snapshot{
+      core::SceneRevision{
+          core::SceneId(String(Member(revision, "scene_id"), "scene_id")),
+          DecodeUnsigned(Member(revision, "revision_id"), "revision_id"),
+          core::ContentDigest(
+              String(Member(revision, "content_hash"), "content_hash")),
+      },
+      core::CellId(String(Member(root, "cell_id"), "cell_id")),
+      DecodeUnsigned(Member(root, "transaction_sequence"),
+                     "transaction_sequence"),
+      DecodeUnsigned(Member(root, "topology_epoch"), "topology_epoch"),
+      DecodeUnsigned(Member(root, "policy_epoch"), "policy_epoch"),
+      DecodePolicy(Member(root, "configured_collision_policy")),
+      {},
+      {},
+  };
+  for (const auto &object : Array(Member(root, "objects"), "objects")) {
+    snapshot.objects.emplace_back(DecodeObject(object));
+  }
+  for (const auto &attachment :
+       Array(Member(root, "carried_object_attachments"),
+             "carried_object_attachments")) {
+    snapshot.carried_object_attachments.emplace_back(
+        DecodeAttachment(attachment));
+  }
+  if (!snapshot.locally_valid() ||
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(snapshot) !=
+          snapshot.revision.content_hash ||
+      core::logical_scene_identity::ComputeCollisionPolicyContentDigest(
+          snapshot.configured_collision_policy)
+              .value() !=
+          snapshot.configured_collision_policy.revision.content_hash) {
+    Fail("stored snapshot identity or local invariants are invalid");
+  }
+  for (const auto &attachment : snapshot.carried_object_attachments) {
+    if (core::logical_scene_identity::ComputeCarriedObjectAttachmentRevision(
+            attachment) != attachment.carried_object_attachment_revision) {
+      Fail("stored carried attachment revision is invalid");
+    }
+  }
+  return snapshot;
+}
+
+std::string
+EncodeErrorDetails(const std::map<std::string, std::string> &details) {
+  CanonicalValue::Object object;
+  object.reserve(details.size());
+  for (const auto &[key, value] : details) {
+    object.emplace_back(key, CanonicalValue(value));
+  }
+  return ci::canonical_json(CanonicalValue(std::move(object)));
+}
+
+std::map<std::string, std::string>
+DecodeErrorDetails(const std::string_view bytes) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  const auto &root = parsed.root();
+  if (!root.is_object() || ci::canonical_json(root) != bytes) {
+    Fail("stored error details are not a canonical object");
+  }
+  std::map<std::string, std::string> result;
+  for (const auto &[key, value] : root.as_object()) {
+    result.emplace(key, String(value, "error detail"));
+  }
+  return result;
+}
+
+} // namespace manyforge::scene::logical_scene_codec_internal
+
+namespace manyforge::scene {
+
+core::SceneTransactionRequestDTO
+DecodeCanonicalSceneTransactionRequest(const std::string_view bytes) {
+  return logical_scene_codec_internal::DecodeRequest(bytes);
+}
+
+} // namespace manyforge::scene

@@ -7,4 +7,7 @@ namespace manyforge::scene::detail {
 inline constexpr std::string_view kEmbeddedCanonicalEmptySceneSchema =
     R"mf_sces(@MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL@)mf_sces";
 
+inline constexpr std::string_view kEmbeddedLogicalSceneTransactionMigration =
+    R"mf_sctm(@MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_SQL@)mf_sctm";
+
 }  // namespace manyforge::scene::detail

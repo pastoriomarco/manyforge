@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-08-07 00:24:29 UTC
+  Last regenerated: 2026-08-07 08:28:30 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -28,7 +28,14 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/execution/history/reconcile` |  | Historian Reconcile |
 | `POST` | `/api/execution/operations` |  | Execution Submit |
 | `GET` | `/api/execution/operations/{operation_id}` |  | Execution Read |
+| `POST` | `/api/execution/operations/{operation_id}/acknowledge-completed` |  | Execution Acknowledge Completed |
+| `POST` | `/api/execution/operations/{operation_id}/pause` |  | Execution Pause |
+| `POST` | `/api/execution/operations/{operation_id}/reset` |  | Execution Reset |
+| `POST` | `/api/execution/operations/{operation_id}/resume` |  | Execution Resume |
+| `GET` | `/api/execution/operations/{operation_id}/runtime-scale` |  | Execution Get Runtime Scale |
+| `POST` | `/api/execution/operations/{operation_id}/runtime-scale` |  | Execution Set Runtime Scale |
 | `GET` | `/api/execution/status` |  | Execution Status |
+| `POST` | `/api/execution/stops` |  | Execution Stop |
 | `GET` | `/api/health` |  | Health |
 | `POST` | `/api/manager/apply` |  | Manager Apply |
 | `GET` | `/api/manager/diff` |  | Manager Diff |
@@ -37,3 +44,4 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/node-environment` |  | Node Environment |
 | `GET` | `/api/runtime` |  | Runtime |
 | `GET` | `/api/scene` |  | Scene |
+| `POST` | `/api/scene/transactions` |  | Scene Commit |

@@ -109,12 +109,19 @@ endif()
 set(
   MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/001_canonical_empty_scene_store.sql")
+set(
+  MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/002_logical_scene_transactions.sql")
 set_property(
   DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-  "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA}")
+  "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA}"
+  "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION}")
 file(READ
   "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA}"
   MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL)
+file(READ
+  "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION}"
+  MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_SQL)
 string(
   FIND
   "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL}"
@@ -125,6 +132,16 @@ if(NOT MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_DELIMITER_COLLISION EQUAL -1)
     "canonical-empty scene schema collides with its generated-header "
     "raw-string delimiter")
 endif()
+string(
+  FIND
+  "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_SQL}"
+  ")mf_sctm\""
+  MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_DELIMITER_COLLISION)
+if(NOT MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_DELIMITER_COLLISION EQUAL -1)
+  message(FATAL_ERROR
+    "logical-scene transaction migration collides with its generated-header "
+    "raw-string delimiter")
+endif()
 configure_file(
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_scene_schema.hpp.in"
   "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_canonical_empty_scene_schema.hpp"
@@ -132,6 +149,7 @@ configure_file(
 
 add_library(manyforge_scene
   src/canonical_empty_scene_owner.cpp
+  src/logical_scene_codec_internal.cpp
   src/sqlite_scene_lifecycle_internal.cpp)
 add_library(manyforge::scene ALIAS manyforge_scene)
 target_include_directories(manyforge_scene PUBLIC

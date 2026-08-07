@@ -31,6 +31,17 @@ namespace core = manyforge::core;
 constexpr std::string_view kDeploymentRevision =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
+const content_identity::CanonicalValue &
+RequiredMember(const content_identity::CanonicalValue &value,
+               const std::string_view name) {
+  const auto *member = value.find_object_member(name);
+  if (member == nullptr) {
+    throw std::runtime_error("Manager source fixture lacks " +
+                             std::string(name));
+  }
+  return *member;
+}
+
 class DaemonDirectory final {
 public:
   DaemonDirectory() {
@@ -264,6 +275,69 @@ std::string ApplyRequest(const std::string_view manager_owner_epoch) {
          "\",\"source_label\":\"manager-process-test\"}";
 }
 
+std::string SceneAddRequest(const SourceSnapshot &scene_source,
+                            const std::string_view request_id,
+                            const double box_x = 0.1) {
+  using content_identity::CanonicalValue;
+  const auto &projection = RequiredMember(
+      RequiredMember(scene_source.payload, "access"), "active_projection");
+  const auto &cell_id = RequiredMember(
+      RequiredMember(scene_source.payload, "snapshot"), "cell_id");
+  return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"command", CanonicalValue("scene_commit")},
+      {"transaction",
+       CanonicalValue(CanonicalValue::Object{
+           {"attribution", CanonicalValue(CanonicalValue::Object{
+                               {"assurance", CanonicalValue("unverified")},
+                               {"principal_id", CanonicalValue(nullptr)},
+                               {"transport", CanonicalValue("http")},
+                           })},
+           {"expected_projection_revision", projection},
+           {"operation",
+            CanonicalValue(CanonicalValue::Object{
+                {"frame_ref", CanonicalValue(CanonicalValue::Object{
+                                  {"cell_id", cell_id},
+                                  {"kind", CanonicalValue("cell_frame")},
+                              })},
+                {"kind", CanonicalValue("add_object")},
+                {"pose",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"orientation", CanonicalValue(CanonicalValue::Object{
+                                         {"w", CanonicalValue(1.0)},
+                                         {"x", CanonicalValue(0.0)},
+                                         {"y", CanonicalValue(0.0)},
+                                         {"z", CanonicalValue(0.0)},
+                                     })},
+                     {"position_m", CanonicalValue(CanonicalValue::Object{
+                                        {"x_m", CanonicalValue(0.0)},
+                                        {"y_m", CanonicalValue(0.0)},
+                                        {"z_m", CanonicalValue(0.15)},
+                                    })},
+                 })},
+                {"scene_resource_id", CanonicalValue("scene-process-box")},
+                {"shape",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"box_dimensions_m", CanonicalValue(CanonicalValue::Object{
+                                              {"x_m", CanonicalValue(box_x)},
+                                              {"y_m", CanonicalValue(0.2)},
+                                              {"z_m", CanonicalValue(0.3)},
+                                          })},
+                     {"type", CanonicalValue("box")},
+                 })},
+            })},
+           {"request_context",
+            CanonicalValue(CanonicalValue::Object{
+                {"correlation_id", CanonicalValue(nullptr)},
+                {"request_id", CanonicalValue(std::string(request_id))},
+                {"request_owner_epoch",
+                 CanonicalValue(scene_source.source_owner_epoch)},
+                {"source_label", CanonicalValue("manager-process-test")},
+            })},
+       })},
+  }));
+}
+
 TEST(ManagerDaemonProcess,
      PublishesWithoutComposerAndSurvivesManagerReplacement) {
   DaemonDirectory directory;
@@ -433,6 +507,66 @@ TEST(ManagerDaemonProcess, EnforcesOneProcessOwnerPerManagerStateRoot) {
   const auto owner_status = owner.Stop(SIGTERM);
   EXPECT_TRUE(WIFEXITED(owner_status));
   EXPECT_EQ(WEXITSTATUS(owner_status), 0);
+}
+
+TEST(ManagerDaemonProcess,
+     SceneCommandCommitsPublishesReplaysAndSurvivesReplacement) {
+  DaemonDirectory directory;
+  std::string request;
+  std::string committed_digest;
+  std::uint64_t committed_generation = 0U;
+  {
+    ManagerProcess manager(directory);
+    manager.WaitReady(directory);
+    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
+                                             "logical-scene-source.json");
+    const auto initial = scene_source.Read();
+    ASSERT_TRUE(initial.has_value());
+    request = SceneAddRequest(*initial, "scene-process-request.1");
+    const auto committed = SendCommand(directory.socket_path(), request);
+    EXPECT_NE(committed.find("\"ok\":true"), std::string::npos);
+    EXPECT_NE(committed.find("\"replay_status\":\"accepted_new\""),
+              std::string::npos);
+    const auto replayed = SendCommand(directory.socket_path(), request);
+    EXPECT_NE(replayed.find("\"replay_status\":\"replayed_exact\""),
+              std::string::npos);
+
+    const auto published = scene_source.Read();
+    ASSERT_TRUE(published.has_value());
+    EXPECT_EQ(published->source_generation, initial->source_generation + 1U);
+    EXPECT_NE(content_identity::canonical_json(published->payload)
+                  .find("\"scene_resource_id\":\"scene-process-box\""),
+              std::string::npos);
+    committed_digest = published->semantic_content_digest;
+    committed_generation = published->source_generation;
+
+    const auto conflict =
+        SendCommand(directory.socket_path(),
+                    SceneAddRequest(*initial, "scene-process-request.1", 0.15));
+    EXPECT_NE(conflict.find("\"request_id_conflict\""), std::string::npos);
+    const auto stale =
+        SendCommand(directory.socket_path(),
+                    SceneAddRequest(*initial, "scene-process-request.stale"));
+    EXPECT_NE(stale.find("\"stale_revision\""), std::string::npos);
+
+    const auto status = manager.Stop(SIGKILL);
+    EXPECT_TRUE(WIFSIGNALED(status));
+  }
+
+  ManagerProcess replacement(directory);
+  replacement.WaitReady(directory);
+  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
+                                           "logical-scene-source.json");
+  const auto recovered = scene_source.Read();
+  ASSERT_TRUE(recovered.has_value());
+  EXPECT_EQ(recovered->semantic_content_digest, committed_digest);
+  EXPECT_EQ(recovered->source_generation, committed_generation);
+  const auto replayed = SendCommand(directory.socket_path(), request);
+  EXPECT_NE(replayed.find("\"ok\":true"), std::string::npos);
+  EXPECT_NE(replayed.find("\"replay_status\":\"replayed_exact\""),
+            std::string::npos);
+  const auto stopped = replacement.Stop(SIGTERM);
+  EXPECT_TRUE(WIFEXITED(stopped));
 }
 
 } // namespace

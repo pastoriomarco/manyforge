@@ -10,6 +10,7 @@ from manyforge_headless_api.models import (
     OperationControlRequest,
     OperationParticipantRequest,
     RuntimeScaleRequest,
+    SceneTransactionRequest,
     StopIntentRequest,
 )
 
@@ -214,3 +215,101 @@ def test_gripper_command_requires_unit_tags_and_matching_nonnegative_effort() ->
     }
     with pytest.raises(ValidationError):
         OperationParticipantRequest.model_validate(bare_position)
+
+
+def _scene_transaction() -> dict[str, object]:
+    scene_id = "sha256:" + "d" * 64
+    return {
+        "request_context": {
+            **_caller(),
+            "request_owner_epoch": scene_id,
+        },
+        "expected_projection_revision": {
+            "retained_bundle_id": "sha256:" + "b" * 64,
+            "graph_revision": "sha256:" + "c" * 64,
+            "scene_revision": {
+                "scene_id": scene_id,
+                "revision_id": 1,
+                "content_hash": "sha256:" + "a" * 64,
+            },
+        },
+        "operation": {
+            "kind": "add_object",
+            "scene_resource_id": "part.1",
+            "shape": {
+                "type": "box",
+                "box_dimensions_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
+            },
+            "pose": {
+                "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.15},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            },
+            "frame_ref": {"kind": "cell_frame", "cell_id": "cell-a"},
+        },
+    }
+
+
+def test_scene_transaction_is_strict_and_cannot_assert_attribution() -> None:
+    parsed = SceneTransactionRequest.model_validate(_scene_transaction())
+    assert parsed.operation.scene_resource_id == "part.1"
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        SceneTransactionRequest.model_validate(
+            {**_scene_transaction(), "attribution": {"transport": "http"}}
+        )
+
+    body = _scene_transaction()
+    body["operation"] = {
+        "kind": "update_object_pose",
+        "scene_resource_id": "part.1",
+        "pose": {
+            "position_m": {"x_m": 0.1, "y_m": 0.0, "z_m": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        },
+        "frame_ref": {"kind": "cell_frame", "cell_id": "cell-a"},
+        "provider_evidence": {
+            "provider_instance_id": "forged-provider",
+        },
+    }
+    with pytest.raises(ValidationError):
+        SceneTransactionRequest.model_validate(body)
+
+    wrong_epoch = _scene_transaction()
+    wrong_epoch["request_context"] = {
+        **wrong_epoch["request_context"],
+        "request_owner_epoch": "sha256:" + "e" * 64,
+    }
+    with pytest.raises(ValidationError, match="must equal the expected scene_id"):
+        SceneTransactionRequest.model_validate(wrong_epoch)
+
+    malformed_revision = _scene_transaction()
+    malformed_revision["expected_projection_revision"] = {
+        **malformed_revision["expected_projection_revision"],
+        "graph_revision": "graph.1",
+    }
+    with pytest.raises(ValidationError):
+        SceneTransactionRequest.model_validate(malformed_revision)
+
+
+def test_scene_policy_and_attachment_sets_require_canonical_order() -> None:
+    body = _scene_transaction()
+    body["operation"] = {
+        "kind": "attach_carried_object",
+        "carried_object_attachment_id": "attachment.1",
+        "scene_resource_id": "part.1",
+        "controllable_component_id": "robot.1",
+        "command_target_id": "arm",
+        "frame_role_id": "tool0",
+        "touch_body_roles": ["finger.right", "finger.left"],
+        "expected_component_attachment_revisions": [],
+    }
+    with pytest.raises(ValidationError, match="sorted and unique"):
+        SceneTransactionRequest.model_validate(body)
+
+    body["operation"] = {
+        **body["operation"],
+        "touch_body_roles": [],
+        "expected_component_attachment_revisions": ["not-a-digest"],
+    }
+    with pytest.raises(ValidationError):
+        SceneTransactionRequest.model_validate(body)
