@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -364,6 +365,30 @@ materialize_durable_controllable_lite6_bundle(
   if (bundle == nullptr) {
     throw std::logic_error(
         "controllable Lite6 fixture materialization returned no bundle");
+  }
+  return {std::move(input), std::move(bundle)};
+}
+
+[[nodiscard]] DurableControllableLite6Fixture
+materialize_durable_native_motion_lite6_bundle(
+    const std::filesystem::path &root, bool two_instances = false) {
+  auto input =
+      two_instances
+          ? test::make_two_lite6_same_type_native_motion_retention_fixture()
+          : test::make_lite6_native_motion_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(input);
+  FilesystemBuildManifestRepository manifest_repository(root);
+  FilesystemCatalogArtifactStore catalog_store(root);
+  FilesystemRawArtifactStore raw_store(root);
+  FilesystemRetainedBundleRepository bundle_repository(root);
+  auto bundle = detail::RetainedBundleMaterializer::
+      materialize_store_and_reload_production(
+          input.qualified, manifest_repository, input_source,
+          input.structural_preparations(), catalog_store, raw_store,
+          bundle_repository);
+  if (bundle == nullptr) {
+    throw std::logic_error(
+        "native-motion Lite6 fixture materialization returned no bundle");
   }
   return {std::move(input), std::move(bundle)};
 }
@@ -2391,4 +2416,59 @@ TEST(FilesystemRetentionStoreTest,
   EXPECT_EQ(verified_runtime->status_endpoint_role_id(), "runtime_status");
 }
 
-}  // namespace manyforge::deployment
+TEST(FilesystemRetentionStoreTest,
+     NativeRuntimeProductsDurablyReloadAndVerifyPerExactRuntimeUnit) {
+  ScopedTrustedRoot root;
+  const auto materialized =
+      materialize_durable_native_motion_lite6_bundle(root.path(), true);
+  ASSERT_NE(materialized.bundle, nullptr);
+  ASSERT_EQ(materialized.bundle->value()
+                .compiled_products.runtime_unit_products.size(),
+            2U);
+
+  FilesystemVerifiedRetainedBundleSource bundle_source(root.path());
+  const auto reloaded =
+      bundle_source.get_verified(materialized.bundle->retained_bundle_id());
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_EQ(reloaded->canonical_bytes(),
+            materialized.bundle->canonical_bytes());
+
+  FilesystemVerifiedRetainedProductArtifactSource artifact_source(root.path());
+  std::set<std::string> product_ids;
+  std::set<std::string> configuration_identities;
+  for (const auto &group :
+       reloaded->value().compiled_products.runtime_unit_products) {
+    ASSERT_EQ(group.products.size(), 1U);
+    const auto verified = verify_runtime_unit_product(
+        *reloaded, group.runtime_unit_id, artifact_source);
+    ASSERT_TRUE(verified.has_value());
+    EXPECT_EQ(verified->retained_bundle_id(), reloaded->retained_bundle_id());
+    EXPECT_EQ(verified->runtime_unit_id(), group.runtime_unit_id);
+    EXPECT_EQ(verified->product_id(), group.products.front().product_id);
+    EXPECT_EQ(verified->product_contract_id().value(),
+              detail::kNativeExecutionRuntimeProductContractId);
+    EXPECT_EQ(verified->product_contract_revision(),
+              detail::native_execution_runtime_product_contract_revision());
+    EXPECT_EQ(verified->launchable_bytes(),
+              detail::native_execution_runtime_launch_descriptor());
+    EXPECT_EQ(verified->operating_system(), "linux");
+    EXPECT_EQ(verified->launch_environment_contract(),
+              detail::kNativeExecutionRuntimeLaunchEnvironmentContract);
+    EXPECT_EQ(verified->runtime_role_id(),
+              detail::kNativeExecutionRuntimeRoleId);
+    EXPECT_EQ(verified->status_endpoint_role_id(),
+              detail::kNativeExecutionRuntimeStatusEndpointRoleId);
+    EXPECT_EQ(verified->status_transport(), "adapter_private");
+    EXPECT_EQ(verified->process_adapter_contract_id(),
+              detail::kNativeExecutionRuntimeProcessAdapterContractId);
+    EXPECT_TRUE(product_ids.insert(verified->product_id().value()).second);
+    EXPECT_TRUE(configuration_identities
+                    .insert(verified->configuration_identity().value())
+                    .second);
+    EXPECT_THROW(static_cast<void>(verify_reference_runtime_unit_product(
+                     *reloaded, group.runtime_unit_id, artifact_source)),
+                 RetainedBundleError);
+  }
+}
+
+} // namespace manyforge::deployment

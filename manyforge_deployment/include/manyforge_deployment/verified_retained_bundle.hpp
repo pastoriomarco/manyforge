@@ -172,7 +172,7 @@ class IVerifiedRetainedProductArtifactSource {
   get_verified(const RetainedProductArtifactQuery& query) const = 0;
 };
 
-/// Sealed verification result for the one build-qualified reference runtime
+/// Sealed verification result for one exact build-qualified runtime-product
 /// row.
 ///
 /// This value exists only after the semantic bundle and both runtime product
@@ -228,6 +228,9 @@ class VerifiedRetainedRuntimeUnitProduct final {
     return operating_system_;
   }
   [[nodiscard]] std::string_view shell_contract() const noexcept {
+    return shell_contract_;
+  }
+  [[nodiscard]] std::string_view launch_environment_contract() const noexcept {
     return shell_contract_;
   }
   [[nodiscard]] std::string_view runtime_role_id() const noexcept {
@@ -329,9 +332,23 @@ class VerifiedRetainedRuntimeUnitProduct final {
 
   friend std::optional<VerifiedRetainedRuntimeUnitProduct>
   verify_reference_runtime_unit_product(
-      const RetainedBundle&, const core::RuntimeUnitId&,
-      const IVerifiedRetainedProductArtifactSource&);
+      const RetainedBundle &, const core::RuntimeUnitId &,
+      const IVerifiedRetainedProductArtifactSource &);
+  friend std::optional<VerifiedRetainedRuntimeUnitProduct>
+  verify_runtime_unit_product(const RetainedBundle &,
+                              const core::RuntimeUnitId &,
+                              const IVerifiedRetainedProductArtifactSource &);
 };
+
+/// Verify one exact build-qualified runtime product for a Manager consumer.
+///
+/// Missing runtime-unit coordinates return no value. A present but unsupported
+/// or internally inconsistent product fails closed; no generic executable
+/// tuple or caller-selected launch path is returned.
+[[nodiscard]] std::optional<VerifiedRetainedRuntimeUnitProduct>
+verify_runtime_unit_product(
+    const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
+    const IVerifiedRetainedProductArtifactSource &artifact_source);
 
 /// Verify one exact reference runtime product for an I4 consumer.
 ///

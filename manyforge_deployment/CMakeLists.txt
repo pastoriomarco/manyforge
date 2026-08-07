@@ -505,6 +505,7 @@ add_library(manyforge_deployment_verification_core
   src/deployment_catalog_codec.cpp
   src/model_asset_codec.cpp
   src/model_source.cpp
+  src/native_execution_runtime_unit_internal.cpp
   src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp
   src/program_contract.cpp
@@ -550,6 +551,7 @@ add_library(manyforge_deployment
   src/control_interface_contract_codec.cpp
   src/controller_topology_codec.cpp
   src/mf2_joint_name_internal.cpp
+  src/native_execution_runtime_unit_emitter.cpp
   src/posix_durability_internal.cpp
   src/provider_manifest_codec.cpp
   src/reference_runtime_unit_internal.cpp

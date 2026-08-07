@@ -28,6 +28,7 @@
 #include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/structural_model_preparation.hpp"
 #include "composed_model_symbol_role_map_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
@@ -81,6 +82,13 @@ constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
          detail::kReferenceRuntimeLaunchableMediaType, true},
         {detail::kReferenceRuntimeManifestArtifactRole,
          detail::kReferenceRuntimeManifestMediaType, true},
+    }};
+constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
+    kNativeExecutionRuntimeArtifactRoles{{
+        {detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole,
+         detail::kNativeExecutionRuntimeLaunchDescriptorMediaType, true},
+        {detail::kNativeExecutionRuntimeManifestArtifactRole,
+         detail::kNativeExecutionRuntimeManifestMediaType, true},
     }};
 constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 1U>
     kComposedModelSymbolRoleMapArtifactRoles{{
@@ -308,6 +316,14 @@ qualified_product_contract_state(
     static const QualifiedProductContractState state = build_state();
     return state;
   }
+  if (contract_id == detail::kNativeExecutionRuntimeProductContractId &&
+      product_kind == core::RetainedProductKind::kRuntimeUnitConfiguration &&
+      placement == kReferenceRuntimePlacement &&
+      artifact_roles.data() == kNativeExecutionRuntimeArtifactRoles.data() &&
+      artifact_roles.size() == kNativeExecutionRuntimeArtifactRoles.size()) {
+    static const QualifiedProductContractState state = build_state();
+    return state;
+  }
   if (contract_id == detail::kComposedModelSymbolRoleMapContractId &&
       product_kind == core::RetainedProductKind::kSymbolRoleMap &&
       placement == kSymbolRoleMapPlacement &&
@@ -465,14 +481,33 @@ verify_structural_graph_projection(
         "domain, and binding tables");
   }
 
+  std::set<core::RuntimeUnitId> native_runtime_units;
+  for (const auto &unit : graph.runtime_units) {
+    if (unit.runtime_profile_id.value() !=
+            detail::kNativeExecutionRuntimeProfileId ||
+        unit.runtime_profile_revision.value() !=
+            detail::native_execution_runtime_profile_revision() ||
+        !unit.dependency_runtime_unit_ids.empty() ||
+        !unit.configuration.empty() ||
+        !native_runtime_units.insert(unit.runtime_unit_id).second) {
+      detail::fail_retained_bundle(
+          "retained native control graph has an unqualified execution "
+          "runtime");
+    }
+  }
+  const bool has_native_runtime = !native_runtime_units.empty();
+
   std::set<core::ModelInstanceId> owned_models;
   for (const auto& component : graph.controllable_components) {
     if (!component.root_pose_in_cell.has_value() ||
         component.model_role_bindings.empty() ||
-        !component.runtime_unit_ids.empty()) {
+        (has_native_runtime ? component.runtime_unit_ids.size() != 1U
+                            : !component.runtime_unit_ids.empty()) ||
+        (has_native_runtime &&
+         !native_runtime_units.contains(component.runtime_unit_ids.front()))) {
       detail::fail_retained_bundle(
           "retained native component requires a direct cell placement, at "
-          "least one model role, and no runtime-unit owner");
+          "least one model role, and its exact execution-runtime owner");
     }
     for (const auto& role : component.model_role_bindings) {
       const auto model = std::find_if(
@@ -498,10 +533,13 @@ verify_structural_graph_projection(
     }
   }
 
-  for (const auto& domain : graph.control_domains) {
-    if (!domain.runtime_unit_ids.empty()) {
+  for (const auto &domain : graph.control_domains) {
+    if ((has_native_runtime ? domain.runtime_unit_ids.size() != 1U
+                            : !domain.runtime_unit_ids.empty()) ||
+        (has_native_runtime &&
+         !native_runtime_units.contains(domain.runtime_unit_ids.front()))) {
       detail::fail_retained_bundle(
-          "retained native control domains cannot select a runtime-unit "
+          "retained native control domain has no exact execution-runtime "
           "owner");
     }
   }
@@ -916,11 +954,12 @@ void verify_node_environment_projection(const CanonicalValue& value) {
 }
 
 [[nodiscard]] RevisionVerifiedDeploymentApplicabilityInputs
-verify_structural_applicability_projection(const CanonicalValue& desired_value,
-                                           const CanonicalValue& provider_value,
-                                           const CanonicalValue* site_overlay_ref_value,
-                                           const CanonicalValue* external_resources_value,
-                                           const core::CellGraphDTO& graph) {
+verify_structural_applicability_projection(
+    const CanonicalValue &desired_value, const CanonicalValue &provider_value,
+    const CanonicalValue *site_overlay_ref_value,
+    const CanonicalValue *external_resources_value,
+    const core::CellGraphDTO &graph,
+    std::span<const QualifiedRuntimeProfile> runtime_profiles) {
   CanonicalValue::Object root_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"desired_control_configurations", desired_value},
@@ -1029,11 +1068,62 @@ verify_structural_applicability_projection(const CanonicalValue& desired_value,
     }
   }
 
-  for (const auto& provider : providers) {
-    if (!provider.endpoint_bindings.empty()) {
-      detail::fail_retained_bundle(
-          "current native structural retention excludes capability-provider "
-          "endpoint bindings");
+  for (const auto &provider : providers) {
+    for (const auto &endpoint : provider.endpoint_bindings) {
+      if (endpoint.source_kind ==
+          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+        const auto *runtime_unit_id =
+            std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+        const auto runtime_unit =
+            runtime_unit_id == nullptr
+                ? graph.runtime_units.end()
+                : std::find_if(
+                      graph.runtime_units.begin(), graph.runtime_units.end(),
+                      [&](const auto &unit) {
+                        return unit.runtime_unit_id == *runtime_unit_id;
+                      });
+        const auto runtime_profile =
+            runtime_unit == graph.runtime_units.end()
+                ? runtime_profiles.end()
+                : std::find_if(
+                      runtime_profiles.begin(), runtime_profiles.end(),
+                      [&](const auto &profile) {
+                        return profile.value().runtime_profile_id ==
+                                   runtime_unit->runtime_profile_id &&
+                               profile.value().runtime_profile_revision ==
+                                   runtime_unit->runtime_profile_revision;
+                      });
+        if (runtime_unit_id == nullptr ||
+            runtime_unit == graph.runtime_units.end() ||
+            runtime_profile == runtime_profiles.end() ||
+            !std::binary_search(
+                runtime_profile->value().source_endpoint_role_ids.begin(),
+                runtime_profile->value().source_endpoint_role_ids.end(),
+                endpoint.source_endpoint_role_id)) {
+          detail::fail_retained_bundle(
+              "retained capability endpoint is outside its exact runtime "
+              "unit/profile source closure");
+        }
+      } else {
+        const auto *alias =
+            std::get_if<core::ExternalResourceAlias>(&endpoint.source_id);
+        const auto resource =
+            alias == nullptr
+                ? verified.value().external_resources.end()
+                : std::find_if(verified.value().external_resources.begin(),
+                               verified.value().external_resources.end(),
+                               [&](const auto &candidate) {
+                                 return candidate.external_resource_alias ==
+                                        *alias;
+                               });
+        if (alias == nullptr ||
+            resource == verified.value().external_resources.end() ||
+            resource->endpoint_role_id != endpoint.source_endpoint_role_id) {
+          detail::fail_retained_bundle(
+              "retained capability endpoint differs from its exact external "
+              "resource source");
+        }
+      }
     }
     std::visit(
         [&](const auto& target) {
@@ -1167,9 +1257,22 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       if (profile == nullptr) {
         continue;
       }
+      std::string profile_document;
+      if (profile->record_id.value() == detail::kReferenceRuntimeProfileId &&
+          profile->record_revision.value() ==
+              detail::reference_runtime_profile_revision()) {
+        profile_document = detail::reference_runtime_profile_document();
+      } else if (profile->record_id.value() ==
+                     detail::kNativeExecutionRuntimeProfileId &&
+                 profile->record_revision.value() ==
+                     detail::native_execution_runtime_profile_revision()) {
+        profile_document = detail::native_execution_runtime_profile_document();
+      } else {
+        detail::fail_retained_bundle(
+            "retained runtime profile has no build-qualified verifier");
+      }
       runtime_profiles.push_back(resolve_and_qualify_runtime_profile(
-          *profile, profile->content_addressed_store_key,
-          detail::reference_runtime_profile_document()));
+          *profile, profile->content_addressed_store_key, profile_document));
     }
   } catch (const RuntimeProfileCodecError& error) {
     detail::fail_retained_bundle(
@@ -1181,8 +1284,9 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
   const auto applicability = verify_structural_applicability_projection(
       require_member(object, "desired_control_configurations", "retained_bundle"),
       require_member(object, "capability_provider_bindings", "retained_bundle"),
-      root.find_object_member("site_overlay_ref"), root.find_object_member("external_resources"),
-      verified_graph.graph());
+      root.find_object_member("site_overlay_ref"),
+      root.find_object_member("external_resources"), verified_graph.graph(),
+      runtime_profiles);
   require_structural_catalog_closure(
       verified_graph.graph(), applicability.value().capability_provider_bindings, catalog_records);
   const auto schema_artifacts = parse_structural_schema_artifacts(
@@ -1341,16 +1445,11 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
     detail::require_retained_portable_identity(runtime_unit_id, path + ".runtime_unit_id");
     const auto& expected_unit = verified_graph.graph().runtime_units[index];
     if (runtime_unit_id != expected_unit.runtime_unit_id.value() ||
-        runtime_unit_id != detail::kReferenceRuntimeUnitId ||
-        expected_unit.runtime_profile_id.value() !=
-            detail::kReferenceRuntimeProfileId ||
-        expected_unit.runtime_profile_revision.value() !=
-            detail::reference_runtime_profile_revision() ||
         !expected_unit.dependency_runtime_unit_ids.empty() ||
         !expected_unit.configuration.empty()) {
       detail::fail_retained_bundle(
-          "retained runtime-unit product group is outside the qualified "
-          "reference row");
+          "retained runtime-unit product group differs from its graph "
+          "subject");
     }
     const auto& group_products =
         require_array(require_member(group, "products", path), path + ".products");
@@ -1358,14 +1457,37 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       detail::fail_retained_bundle(
           "each qualified runtime unit requires exactly one runtime product");
     }
-    core::RetainedProductDTO product =
-        parse_retained_product(group_products.front(), path + ".products[0]",
-                               core::RetainedProductKind::kRuntimeUnitConfiguration);
-    if (product.product_id.value() !=
-        detail::reference_runtime_product_id(
-            core::RuntimeUnitId(runtime_unit_id))) {
+    core::RetainedProductDTO product = parse_retained_product(
+        group_products.front(), path + ".products[0]",
+        core::RetainedProductKind::kRuntimeUnitConfiguration);
+    const bool reference =
+        expected_unit.runtime_unit_id.value() ==
+            detail::kReferenceRuntimeUnitId &&
+        expected_unit.runtime_profile_id.value() ==
+            detail::kReferenceRuntimeProfileId &&
+        expected_unit.runtime_profile_revision.value() ==
+            detail::reference_runtime_profile_revision() &&
+        product.product_id.value() == detail::reference_runtime_product_id(
+                                          expected_unit.runtime_unit_id) &&
+        product.product_contract_id.value() ==
+            detail::kReferenceRuntimeProductContractId &&
+        product.product_contract_revision ==
+            detail::reference_runtime_product_contract_revision();
+    const bool native_execution =
+        expected_unit.runtime_profile_id.value() ==
+            detail::kNativeExecutionRuntimeProfileId &&
+        expected_unit.runtime_profile_revision.value() ==
+            detail::native_execution_runtime_profile_revision() &&
+        product.product_id.value() ==
+            detail::native_execution_runtime_product_id(
+                expected_unit.runtime_unit_id) &&
+        product.product_contract_id.value() ==
+            detail::kNativeExecutionRuntimeProductContractId &&
+        product.product_contract_revision ==
+            detail::native_execution_runtime_product_contract_revision();
+    if (!reference && !native_execution) {
       detail::fail_retained_bundle(
-          "reference runtime product has the wrong stable product ID");
+          "runtime-unit product has no exact build-qualified product row");
     }
     runtime_unit_products.push_back(core::RetainedRuntimeUnitProductsDTO{
         core::RuntimeUnitId(runtime_unit_id),
@@ -1623,8 +1745,33 @@ const CanonicalValue& reference_runtime_product_contract_descriptor() {
       .descriptor;
 }
 
-std::string_view
-composed_model_symbol_role_map_product_contract_id() noexcept {
+std::string_view native_execution_runtime_product_contract_id() noexcept {
+  return kNativeExecutionRuntimeProductContractId;
+}
+
+const core::ProductContractRevision &
+native_execution_runtime_product_contract_revision() {
+  return qualified_product_contract_state(
+             kNativeExecutionRuntimeProductContractId,
+             core::RetainedProductKind::kRuntimeUnitConfiguration,
+             kReferenceRuntimePlacement, kNativeExecutionRuntimeArtifactRoles)
+      .revision;
+}
+
+std::span<const QualifiedRetainedProductArtifactRole>
+native_execution_runtime_product_artifact_roles() noexcept {
+  return kNativeExecutionRuntimeArtifactRoles;
+}
+
+const CanonicalValue &native_execution_runtime_product_contract_descriptor() {
+  return qualified_product_contract_state(
+             kNativeExecutionRuntimeProductContractId,
+             core::RetainedProductKind::kRuntimeUnitConfiguration,
+             kReferenceRuntimePlacement, kNativeExecutionRuntimeArtifactRoles)
+      .descriptor;
+}
+
+std::string_view composed_model_symbol_role_map_product_contract_id() noexcept {
   return kComposedModelSymbolRoleMapContractId;
 }
 
@@ -1748,6 +1895,13 @@ void require_current_retained_product_conformance(
       product.product_kind ==
           core::RetainedProductKind::kRuntimeUnitConfiguration) {
     artifact_roles = kReferenceRuntimeArtifactRoles;
+  } else if (product.product_contract_id.value() ==
+                 kNativeExecutionRuntimeProductContractId &&
+             product.product_contract_revision ==
+                 native_execution_runtime_product_contract_revision() &&
+             product.product_kind ==
+                 core::RetainedProductKind::kRuntimeUnitConfiguration) {
+    artifact_roles = kNativeExecutionRuntimeArtifactRoles;
   } else {
     fail_retained_bundle("retained product references an unqualified contract");
   }

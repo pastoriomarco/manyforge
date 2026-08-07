@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <variant>
 
 #include "retained_bundle_internal.hpp"
 #include "composed_model_symbol_role_map_internal.hpp"
@@ -925,7 +926,8 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(array_member(targets.front(), "collision_bodies").size(), 1U);
 }
 
-TEST(RetainedBundleMaterializer, ControllableLite6RetainsExactNativeMotionProviderBinding) {
+TEST(RetainedBundleMaterializer,
+     NativeMotionLite6RetainsExactRuntimeProductAndProviderEndpoint) {
   const auto fixture = test::make_lite6_native_motion_retention_fixture();
   const test::Lite6ControllableCompilerInputArtifactSource input_source(fixture);
   test::InMemoryCatalogArtifactStoreFixture catalog_store;
@@ -937,16 +939,215 @@ TEST(RetainedBundleMaterializer, ControllableLite6RetainsExactNativeMotionProvid
 
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 10U);
+  EXPECT_EQ(catalog_store.size(), 10U);
+  ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
   ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 1U);
   const auto& provider = bundle->value().capability_provider_bindings.front();
   EXPECT_EQ(provider.capability_provider_binding_id.value(), "lite6_joint_planner_binding");
   EXPECT_EQ(provider.capability_id.value(), "planning.motion.joint_goal");
-  EXPECT_EQ(provider.provider_manifest_id.value(), "lite6_native_joint_planner");
-  EXPECT_TRUE(provider.endpoint_bindings.empty());
+  EXPECT_EQ(provider.provider_manifest_id.value(),
+            "lite6_native_joint_planner");
+  ASSERT_EQ(provider.endpoint_bindings.size(), 1U);
+  const auto &endpoint = provider.endpoint_bindings.front();
+  EXPECT_EQ(endpoint.endpoint_role_id.value(),
+            detail::kNativeExecutionRuntimeProjectionEndpointRoleId);
+  EXPECT_EQ(endpoint.source_kind,
+            core::CapabilityEndpointSourceKind::kRuntimeUnit);
+  ASSERT_TRUE(std::holds_alternative<core::RuntimeUnitId>(endpoint.source_id));
+  EXPECT_EQ(std::get<core::RuntimeUnitId>(endpoint.source_id).value(),
+            test::kLite6NativeExecutionRuntimeId);
+  EXPECT_EQ(endpoint.source_endpoint_role_id.value(),
+            detail::kNativeExecutionRuntimeProjectionEndpointRoleId);
   EXPECT_EQ(provider, fixture.qualified.deployment()
                           .applicability_inputs()
                           .value()
                           .capability_provider_bindings.front());
+
+  ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(), 1U);
+  const auto &group =
+      bundle->value().compiled_products.runtime_unit_products.front();
+  EXPECT_EQ(group.runtime_unit_id.value(),
+            test::kLite6NativeExecutionRuntimeId);
+  ASSERT_EQ(group.products.size(), 1U);
+  const auto &product = group.products.front();
+  EXPECT_EQ(product.product_kind,
+            core::RetainedProductKind::kRuntimeUnitConfiguration);
+  EXPECT_EQ(product.product_id.value(),
+            detail::native_execution_runtime_product_id(group.runtime_unit_id));
+  EXPECT_EQ(product.product_contract_id.value(),
+            detail::kNativeExecutionRuntimeProductContractId);
+  EXPECT_EQ(product.product_contract_revision,
+            detail::native_execution_runtime_product_contract_revision());
+  ASSERT_EQ(product.artifact_refs.size(), 2U);
+  const std::string manifest = require_product_artifact_bytes(
+      product, detail::kNativeExecutionRuntimeManifestArtifactRole, raw_store);
+  const std::string launch_descriptor = require_product_artifact_bytes(
+      product, detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole,
+      raw_store);
+  EXPECT_EQ(launch_descriptor,
+            detail::native_execution_runtime_launch_descriptor());
+  EXPECT_NO_THROW(static_cast<void>(
+      detail::parse_and_verify_native_execution_runtime_manifest(manifest)));
+  EXPECT_NO_THROW(
+      detail::require_native_execution_runtime_product_matches_retained_bundle(
+          manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
+
+  test::InMemoryCatalogArtifactStoreFixture second_catalog_store;
+  test::InMemoryRawArtifactStoreFixture second_raw_store;
+  const auto regenerated = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), second_catalog_store,
+      second_raw_store);
+  ASSERT_NE(regenerated, nullptr);
+  EXPECT_EQ(regenerated->retained_bundle_id(), bundle->retained_bundle_id());
+  EXPECT_EQ(regenerated->canonical_bytes(), bundle->canonical_bytes());
+}
+
+TEST(RetainedBundleMaterializer,
+     TwoNativeMotionLite6InstancesRetainDistinctRuntimeProductsAndEndpoints) {
+  const auto fixture =
+      test::make_two_lite6_same_type_native_motion_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 2U);
+  ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 2U);
+  ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(), 2U);
+
+  std::set<std::string> endpoint_runtime_ids;
+  for (const auto &provider : bundle->value().capability_provider_bindings) {
+    ASSERT_EQ(provider.endpoint_bindings.size(), 1U);
+    const auto &endpoint = provider.endpoint_bindings.front();
+    ASSERT_TRUE(
+        std::holds_alternative<core::RuntimeUnitId>(endpoint.source_id));
+    EXPECT_TRUE(
+        endpoint_runtime_ids
+            .insert(std::get<core::RuntimeUnitId>(endpoint.source_id).value())
+            .second);
+  }
+
+  std::set<std::string> product_runtime_ids;
+  std::set<std::string> product_ids;
+  for (const auto &group :
+       bundle->value().compiled_products.runtime_unit_products) {
+    EXPECT_TRUE(
+        product_runtime_ids.insert(group.runtime_unit_id.value()).second);
+    ASSERT_EQ(group.products.size(), 1U);
+    const auto &product = group.products.front();
+    EXPECT_TRUE(product_ids.insert(product.product_id.value()).second);
+    EXPECT_EQ(
+        product.product_id.value(),
+        detail::native_execution_runtime_product_id(group.runtime_unit_id));
+    const std::string manifest = require_product_artifact_bytes(
+        product, detail::kNativeExecutionRuntimeManifestArtifactRole,
+        raw_store);
+    const std::string launch_descriptor = require_product_artifact_bytes(
+        product, detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole,
+        raw_store);
+    EXPECT_NO_THROW(
+        detail::
+            require_native_execution_runtime_product_matches_retained_bundle(
+                manifest, launch_descriptor, bundle->value(),
+                group.runtime_unit_id));
+  }
+  EXPECT_EQ(endpoint_runtime_ids, product_runtime_ids);
+}
+
+TEST(RetainedBundleMaterializer,
+     NativeRuntimeProductRejectsMutableLaunchAndTransportSeams) {
+  const auto fixture = test::make_lite6_native_motion_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  const auto &group =
+      bundle->value().compiled_products.runtime_unit_products.front();
+  const auto &product = group.products.front();
+  const std::string manifest = require_product_artifact_bytes(
+      product, detail::kNativeExecutionRuntimeManifestArtifactRole, raw_store);
+  const std::string launch_descriptor = require_product_artifact_bytes(
+      product, detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole,
+      raw_store);
+
+  struct Mutation final {
+    std::string_view name;
+    std::string from;
+    std::string to;
+  };
+  const std::array<Mutation, 8U> mutations{{
+      {"API version", "manyforge.native_execution_runtime_manifest.v1",
+       "manyforge.native_execution_runtime_manifest.v2"},
+      {"lifecycle", "manager_managed", "externally_managed"},
+      {"process adapter", "manyforge.installed_native_target",
+       "manyforge.arbitrary_command"},
+      {"retrieval contract", "manyforge.retained_raw_artifact",
+       "manyforge.mutable_local_artifact"},
+      {"status endpoint", "manyforge.native_execution.status_direct",
+       "manyforge.native_execution.status_discovered"},
+      {"projection endpoint", "manyforge.planner_scene_projection.rpc",
+       "manyforge.planner_scene_projection.ros_topic"},
+      {"operating system", "\"operating_system\":\"linux\"",
+       "\"operating_system\":\"other\""},
+      {"launch environment", "manyforge.native_execution_host.abi.v1",
+       "manyforge.caller_selected_environment"},
+  }};
+  for (const auto &mutation : mutations) {
+    SCOPED_TRACE(mutation.name);
+    EXPECT_THROW(static_cast<void>(
+                     detail::parse_and_verify_native_execution_runtime_manifest(
+                         replace_once(manifest, mutation.from, mutation.to))),
+                 RetainedBundleError);
+  }
+
+  CanonicalValue::Object injected =
+      parse_strict_json_model_yaml(manifest).root().as_object();
+  injected.emplace_back("command", CanonicalValue(CanonicalValue::Array{
+                                       CanonicalValue("/tmp/other")}));
+  injected.emplace_back("environment",
+                        CanonicalValue(CanonicalValue::Object{
+                            {"UNQUALIFIED", CanonicalValue("injected")},
+                        }));
+  injected.emplace_back("socket_path", CanonicalValue("/tmp/discovered"));
+  EXPECT_THROW(static_cast<void>(
+                   detail::parse_and_verify_native_execution_runtime_manifest(
+                       canonical_json(CanonicalValue(std::move(injected))))),
+               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(
+          detail::parse_and_verify_native_execution_runtime_manifest(
+              std::string(detail::kMaxNativeExecutionRuntimeManifestBytes + 1U,
+                          'x'))),
+      RetainedBundleError);
+  EXPECT_THROW(
+      detail::require_native_execution_runtime_product_matches_retained_bundle(
+          manifest,
+          replace_once(launch_descriptor,
+                       detail::kNativeExecutionRuntimeInstalledTargetId,
+                       "caller_selected_target"),
+          bundle->value(), group.runtime_unit_id),
+      RetainedBundleError);
+  EXPECT_THROW(
+      detail::require_native_execution_runtime_product_matches_retained_bundle(
+          manifest, launch_descriptor, bundle->value(),
+          core::RuntimeUnitId("different_runtime")),
+      RetainedBundleError);
 }
 
 TEST(RetainedBundleMaterializer, TwoSameTypeComponentsRetainDistinctTargetsResourcesAndDomains) {

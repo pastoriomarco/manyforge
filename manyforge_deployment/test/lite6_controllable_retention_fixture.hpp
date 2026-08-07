@@ -11,6 +11,7 @@
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <manyforge_deployment/controller_topology_codec.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
+#include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
 #include <map>
@@ -23,6 +24,7 @@
 #include <vector>
 
 #include "lite6_structural_retention_fixture.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment::test {
 
@@ -37,6 +39,8 @@ inline constexpr std::string_view kLite6GripperBindingId =
     "lite6_gripper_binding";
 inline constexpr std::string_view kLite6GripperDomainId =
     "lite6_gripper_domain";
+inline constexpr std::string_view kLite6NativeExecutionRuntimeId =
+    "lite6_native_execution";
 
 struct Lite6ControllableRetentionFixture final {
   Lite6StructuralRetentionFixture structural;
@@ -55,6 +59,7 @@ struct Lite6ControllableRetentionFixture final {
   std::optional<QualifiedProviderManifest> gripper_provider_manifest;
   std::optional<QualifiedCapabilityDefinition> planner_capability;
   std::optional<QualifiedProviderManifest> planner_provider_manifest;
+  std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
 
   [[nodiscard]] std::span<const BuildQualifiedStructuralModelPreparation>
   structural_preparations() const noexcept {
@@ -174,6 +179,7 @@ struct QualifiedControlCatalog final {
   std::optional<QualifiedProviderManifest> gripper_provider;
   std::optional<QualifiedCapabilityDefinition> planner_capability;
   std::optional<QualifiedProviderManifest> planner_provider;
+  std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
 };
 
 struct AssistantOverlayFixture final {
@@ -358,6 +364,29 @@ struct AssistantOverlayFixture final {
     };
     planner_capability = resolve_and_qualify_capability_definition(
         planner_ref, planner_key, *planner_capability_bytes);
+  }
+
+  std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
+  std::optional<std::string> native_execution_runtime_profile_bytes;
+  if (native_motion) {
+    native_execution_runtime_profile_bytes =
+        detail::native_execution_runtime_profile_document();
+    const core::ContentDigest profile_digest(
+        sha256_digest(*native_execution_runtime_profile_bytes));
+    const core::ContentAddressedStoreKey profile_key(
+        catalog_key("runtime_profile", profile_digest.value()));
+    const core::RuntimeProfileCatalogRecordRefDTO profile_ref{
+        core::RuntimeProfileId(
+            std::string(detail::kNativeExecutionRuntimeProfileId)),
+        core::RuntimeProfileRevision(
+            detail::native_execution_runtime_profile_revision()),
+        core::SchemaId(std::string(core::kRuntimeProfileApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kRuntimeProfile),
+        profile_digest,
+        profile_key,
+    };
+    native_execution_runtime_profile = resolve_and_qualify_runtime_profile(
+        profile_ref, profile_key, *native_execution_runtime_profile_bytes);
   }
 
   CanonicalValue::Array target_capabilities{
@@ -682,7 +711,9 @@ struct AssistantOverlayFixture final {
                           planner_capability->value()
                               .capability_definition_revision.value())},
                      {"required_endpoint_role_ids",
-                      CanonicalValue(CanonicalValue::Array{})},
+                      text_array(
+                          {detail::
+                               kNativeExecutionRuntimeProjectionEndpointRoleId})},
                  })})},
             {"provider_contracts", CanonicalValue(CanonicalValue::Array{})},
         }),
@@ -731,10 +762,10 @@ struct AssistantOverlayFixture final {
       resolve_and_qualify_stop_evidence_policy(stop_ref, stop_key, stop_bytes);
 
   std::vector<Lite6InputArtifact> artifacts;
-  artifacts.reserve(native_motion ? 8U : 6U);
-  artifacts.push_back(catalog_artifact(
-      "catalog://capability/" + std::string(primary_capability_id),
-      capability_bytes, capability));
+  artifacts.reserve(native_motion ? 9U : 6U);
+  artifacts.push_back(catalog_artifact("catalog://capability/" +
+                                           std::string(primary_capability_id),
+                                       capability_bytes, capability));
   artifacts.push_back(
       catalog_artifact("catalog://component_type/lite6_arm_component",
                        component_bytes, component_type));
@@ -756,6 +787,13 @@ struct AssistantOverlayFixture final {
         "catalog://provider_manifest/lite6_native_joint_planner",
         *planner_provider_bytes, *planner_provider));
   }
+  if (native_execution_runtime_profile.has_value() &&
+      native_execution_runtime_profile_bytes.has_value()) {
+    artifacts.push_back(catalog_artifact(
+        "catalog://runtime_profile/manyforge.native_execution_runtime",
+        *native_execution_runtime_profile_bytes,
+        *native_execution_runtime_profile));
+  }
   artifacts.push_back(catalog_artifact(
       "catalog://stop_policy/lite6_not_stoppable", stop_bytes, stop));
 
@@ -774,6 +812,7 @@ struct AssistantOverlayFixture final {
       std::nullopt,
       std::move(planner_capability),
       std::move(planner_provider),
+      std::move(native_execution_runtime_profile),
   };
 }
 
@@ -1224,10 +1263,12 @@ struct AssistantOverlayFixture final {
   }
 
   CanonicalValue::Array model_instances;
+  CanonicalValue::Array runtime_units;
   CanonicalValue::Array components;
   CanonicalValue::Array domains;
   CanonicalValue::Array bindings;
   model_instances.reserve(instance_count);
+  runtime_units.reserve(native_motion ? instance_count : 0U);
   components.reserve(instance_count);
   domains.reserve(instance_count);
   bindings.reserve(instance_count);
@@ -1239,6 +1280,8 @@ struct AssistantOverlayFixture final {
         indexed_id(kLite6ControllableComponentId, instance);
     const std::string domain_id = indexed_id(kLite6ArmDomainId, instance);
     const std::string binding_id = indexed_id(kLite6ArmBindingId, instance);
+    const std::string runtime_unit_id =
+        indexed_id(kLite6NativeExecutionRuntimeId, instance);
     const std::string resource_prefix =
         instance == 0U ? "lite6" : "lite6_" + std::to_string(instance + 1U);
 
@@ -1258,6 +1301,19 @@ struct AssistantOverlayFixture final {
         {"model_revision",
          CanonicalValue(structural.catalog_reference.record_revision.value())},
     });
+    if (native_motion) {
+      runtime_units.emplace_back(CanonicalValue::Object{
+          {"runtime_unit_id", CanonicalValue(runtime_unit_id)},
+          {"runtime_profile_id",
+           CanonicalValue(
+               std::string(detail::kNativeExecutionRuntimeProfileId))},
+          {"runtime_profile_revision",
+           CanonicalValue(detail::native_execution_runtime_profile_revision())},
+          {"dependency_runtime_unit_ids",
+           CanonicalValue(CanonicalValue::Array{})},
+          {"configuration", CanonicalValue(CanonicalValue::Object{})},
+      });
+    }
     components.emplace_back(CanonicalValue::Object{
         {"controllable_component_id", CanonicalValue(component_id)},
         {"component_type_id",
@@ -1272,14 +1328,18 @@ struct AssistantOverlayFixture final {
                  {"model_role_id", CanonicalValue("arm_model")},
                  {"model_instance_id", CanonicalValue(model_instance_id)},
              })})},
-        {"runtime_unit_ids", CanonicalValue(CanonicalValue::Array{})},
+        {"runtime_unit_ids", native_motion
+                                 ? text_array({runtime_unit_id})
+                                 : CanonicalValue(CanonicalValue::Array{})},
         {"root_pose_in_cell",
          translated_pose(static_cast<double>(instance) * 2.0)},
     });
     domains.emplace_back(CanonicalValue::Object{
         {"control_domain_id", CanonicalValue(domain_id)},
         {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
-        {"runtime_unit_ids", CanonicalValue(CanonicalValue::Array{})},
+        {"runtime_unit_ids", native_motion
+                                 ? text_array({runtime_unit_id})
+                                 : CanonicalValue(CanonicalValue::Array{})},
         {"control_coordinator_endpoint_role", CanonicalValue("coordinator")},
         {"controller_topology_id",
          CanonicalValue(
@@ -1364,7 +1424,9 @@ struct AssistantOverlayFixture final {
           {"control_domain_id",
            CanonicalValue(std::string(kLite6GripperDomainId))},
           {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
-          {"runtime_unit_ids", CanonicalValue(CanonicalValue::Array{})},
+          {"runtime_unit_ids", native_motion
+                                   ? text_array({runtime_unit_id})
+                                   : CanonicalValue(CanonicalValue::Array{})},
           {"control_coordinator_endpoint_role", CanonicalValue("coordinator")},
           {"controller_topology_id",
            CanonicalValue(
@@ -1446,7 +1508,7 @@ struct AssistantOverlayFixture final {
                       : instance_count == 1U
                           ? "i3_lite6_controllable_cell"
                           : "i6_two_lite6_controllable_cell")},
-      {"runtime_units", CanonicalValue(CanonicalValue::Array{})},
+      {"runtime_units", CanonicalValue(std::move(runtime_units))},
       {"model_instances", CanonicalValue(std::move(model_instances))},
       {"controllable_components", CanonicalValue(std::move(components))},
       {"control_domains", CanonicalValue(std::move(domains))},
@@ -1456,7 +1518,13 @@ struct AssistantOverlayFixture final {
   const auto intrinsic =
       validate_intrinsic_cell_graph_candidate(decode_cell_graph_candidate(
           parse_strict_json_model_yaml(canonical_json(graph))));
-  return compute_graph_revision(prepare_cell_graph_identity(intrinsic, {}));
+  const std::span<const QualifiedRuntimeProfile> runtime_profiles =
+      catalog.native_execution_runtime_profile.has_value()
+          ? std::span<const QualifiedRuntimeProfile>(
+                &*catalog.native_execution_runtime_profile, 1U)
+          : std::span<const QualifiedRuntimeProfile>{};
+  return compute_graph_revision(
+      prepare_cell_graph_identity(intrinsic, runtime_profiles));
 }
 
 [[nodiscard]] inline RevisionVerifiedDeploymentApplicabilityInputs
@@ -1530,6 +1598,11 @@ make_applicability_inputs(
       if (component == graph.graph().controllable_components.end()) {
         throw std::logic_error("Lite6 native-motion binding has no component");
       }
+      if (component->runtime_unit_ids.size() != 1U) {
+        throw std::logic_error(
+            "Lite6 native-motion planner requires one exact execution "
+            "runtime owner");
+      }
       capability_provider_bindings.emplace_back(CanonicalValue::Object{
           {"capability_provider_binding_id",
            CanonicalValue(indexed_id("lite6_joint_planner_binding", index))},
@@ -1562,7 +1635,23 @@ make_applicability_inputs(
           {"provider_manifest_revision",
            CanonicalValue(
                planner_provider->value().provider_manifest_revision.value())},
-          {"endpoint_bindings", CanonicalValue(CanonicalValue::Array{})},
+          {"endpoint_bindings",
+           CanonicalValue(CanonicalValue::Array{
+               CanonicalValue(CanonicalValue::Object{
+                   {"endpoint_role_id",
+                    CanonicalValue(std::string(
+                        detail::
+                            kNativeExecutionRuntimeProjectionEndpointRoleId))},
+                   {"source_kind", CanonicalValue("runtime_unit")},
+                   {"source_id",
+                    CanonicalValue(
+                        component->runtime_unit_ids.front().value())},
+                   {"source_endpoint_role_id",
+                    CanonicalValue(std::string(
+                        detail::
+                            kNativeExecutionRuntimeProjectionEndpointRoleId))},
+               }),
+           })},
       });
     }
   }
@@ -1658,6 +1747,10 @@ make_lite6_controllable_retention_fixture(bool chained = false,
     catalog_records.push_back(catalog.planner_capability->reference());
     catalog_records.push_back(catalog.planner_provider->reference());
   }
+  if (catalog.native_execution_runtime_profile.has_value()) {
+    catalog_records.push_back(
+        catalog.native_execution_runtime_profile->reference());
+  }
   CanonicalValue::Object deployment_graph = graph.normalized_root().as_object();
   deployment_graph.erase(
       std::remove_if(deployment_graph.begin(), deployment_graph.end(),
@@ -1704,9 +1797,13 @@ make_lite6_controllable_retention_fixture(bool chained = false,
                                     *inputs.normalized_site_overlay_ref());
   }
   const CanonicalValue deployment_value(std::move(deployment_members));
+  std::vector<QualifiedRuntimeProfile> runtime_profiles;
+  if (catalog.native_execution_runtime_profile.has_value()) {
+    runtime_profiles.push_back(*catalog.native_execution_runtime_profile);
+  }
   const auto deployment = compute_deployment_artifact_revision(
       parse_strict_json_model_yaml(canonical_json(deployment_value)),
-      std::span<const QualifiedRuntimeProfile>{});
+      runtime_profiles);
 
   const std::array<SourceVerifiedModelAsset, 1U> assets{
       structural.verified_asset};
@@ -1744,8 +1841,9 @@ make_lite6_controllable_retention_fixture(bool chained = false,
   }
   const std::array<QualifiedStopEvidencePolicy, 1U> stop_policies{catalog.stop};
   const auto applicability = qualify_cell_applicability(
-      composition, deployment.applicability_inputs(), {}, command_schemas,
-      capabilities, contracts, topologies, providers, stop_policies, overlay);
+      composition, deployment.applicability_inputs(), runtime_profiles,
+      command_schemas, capabilities, contracts, topologies, providers,
+      stop_policies, overlay);
   auto qualified = qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
 
@@ -1766,6 +1864,7 @@ make_lite6_controllable_retention_fixture(bool chained = false,
       std::move(catalog.gripper_provider),
       std::move(catalog.planner_capability),
       std::move(catalog.planner_provider),
+      std::move(catalog.native_execution_runtime_profile),
   };
 }
 
@@ -1792,6 +1891,12 @@ make_lite6_arm_gripper_aggregate_retention_fixture() {
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_native_motion_retention_fixture() {
   return make_lite6_controllable_retention_fixture(false, false, 1U, false,
+                                                   true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_two_lite6_same_type_native_motion_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(false, false, 2U, false,
                                                    true);
 }
 

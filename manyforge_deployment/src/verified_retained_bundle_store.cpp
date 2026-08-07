@@ -19,13 +19,14 @@
 #include <variant>
 #include <vector>
 
+#include "catalog_artifact_store_internal.hpp"
+#include "composed_model_symbol_role_map_internal.hpp"
 #include "control_domain_control_internal.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/model_asset_codec.hpp"
 #include "manyforge_deployment/model_source.hpp"
-#include "catalog_artifact_store_internal.hpp"
-#include "composed_model_symbol_role_map_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "posix_durability_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
@@ -875,17 +876,34 @@ void require_verified_product_artifacts(
       if (runtime_unit_subject == nullptr) {
         detail::fail_retained_bundle("runtime-unit product is missing its envelope subject");
       }
-      if (artifact.artifact_role_id.value() ==
-          detail::kReferenceRuntimeManifestArtifactRole) {
-        if (artifact.media_type != detail::kReferenceRuntimeManifestMediaType ||
+      const bool native_execution =
+          product.product_contract_id.value() ==
+              detail::kNativeExecutionRuntimeProductContractId &&
+          product.product_contract_revision ==
+              detail::native_execution_runtime_product_contract_revision();
+      const std::string_view manifest_role =
+          native_execution ? detail::kNativeExecutionRuntimeManifestArtifactRole
+                           : detail::kReferenceRuntimeManifestArtifactRole;
+      const std::string_view manifest_media =
+          native_execution ? detail::kNativeExecutionRuntimeManifestMediaType
+                           : detail::kReferenceRuntimeManifestMediaType;
+      const std::string_view launchable_role =
+          native_execution
+              ? detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole
+              : detail::kReferenceRuntimeLaunchableArtifactRole;
+      const std::string_view launchable_media =
+          native_execution
+              ? detail::kNativeExecutionRuntimeLaunchDescriptorMediaType
+              : detail::kReferenceRuntimeLaunchableMediaType;
+      if (artifact.artifact_role_id.value() == manifest_role) {
+        if (artifact.media_type != manifest_media ||
             runtime_manifest.has_value()) {
           detail::fail_retained_bundle(
               "runtime-unit product has an incoherent manifest artifact");
         }
         runtime_manifest = bytes;
-      } else if (artifact.artifact_role_id.value() ==
-                 detail::kReferenceRuntimeLaunchableArtifactRole) {
-        if (artifact.media_type != detail::kReferenceRuntimeLaunchableMediaType ||
+      } else if (artifact.artifact_role_id.value() == launchable_role) {
+        if (artifact.media_type != launchable_media ||
             runtime_launchable.has_value()) {
           detail::fail_retained_bundle(
               "runtime-unit product has an incoherent launchable artifact");
@@ -902,8 +920,18 @@ void require_verified_product_artifacts(
       detail::fail_retained_bundle(
           "runtime-unit product omits its manifest or launchable artifact");
     }
-    detail::require_reference_runtime_product_matches_retained_bundle(
-        *runtime_manifest, *runtime_launchable, bundle, *runtime_unit_subject);
+    if (product.product_contract_id.value() ==
+            detail::kNativeExecutionRuntimeProductContractId &&
+        product.product_contract_revision ==
+            detail::native_execution_runtime_product_contract_revision()) {
+      detail::require_native_execution_runtime_product_matches_retained_bundle(
+          *runtime_manifest, *runtime_launchable, bundle,
+          *runtime_unit_subject);
+    } else {
+      detail::require_reference_runtime_product_matches_retained_bundle(
+          *runtime_manifest, *runtime_launchable, bundle,
+          *runtime_unit_subject);
+    }
   }
 }
 
@@ -1493,10 +1521,9 @@ FilesystemVerifiedRetainedProductArtifactSource::get_verified(
                                          *artifact, std::move(bytes));
 }
 
-std::optional<VerifiedRetainedRuntimeUnitProduct>
-verify_reference_runtime_unit_product(
-    const RetainedBundle& bundle, const core::RuntimeUnitId& runtime_unit_id,
-    const IVerifiedRetainedProductArtifactSource& artifact_source) {
+std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
+    const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
+    const IVerifiedRetainedProductArtifactSource &artifact_source) {
   if (!verify_retained_bundle_identity(bundle)) {
     detail::fail_retained_bundle(
         "runtime-unit verification requires one sealed valid bundle");
@@ -1513,20 +1540,39 @@ verify_reference_runtime_unit_product(
     detail::fail_retained_bundle(
         "runtime-unit verification found an incoherent product group");
   }
-  const auto& product = group->products.front();
+  const auto &product = group->products.front();
+  const bool native_execution =
+      product.product_contract_id.value() ==
+          detail::kNativeExecutionRuntimeProductContractId &&
+      product.product_contract_revision ==
+          detail::native_execution_runtime_product_contract_revision();
+  const bool reference =
+      product.product_contract_id.value() ==
+          detail::kReferenceRuntimeProductContractId &&
+      product.product_contract_revision ==
+          detail::reference_runtime_product_contract_revision();
+  if (!native_execution && !reference) {
+    detail::fail_retained_bundle(
+        "runtime-unit product has no build-qualified verifier");
+  }
+  const std::string_view manifest_role =
+      native_execution ? detail::kNativeExecutionRuntimeManifestArtifactRole
+                       : detail::kReferenceRuntimeManifestArtifactRole;
+  const std::string_view launchable_role =
+      native_execution
+          ? detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole
+          : detail::kReferenceRuntimeLaunchableArtifactRole;
   const RetainedProductArtifactQuery manifest_query{
       bundle.retained_bundle_id(),
       product.product_id,
       core::RetainedProductKind::kRuntimeUnitConfiguration,
-      core::ArtifactRoleId(
-          std::string(detail::kReferenceRuntimeManifestArtifactRole)),
+      core::ArtifactRoleId(std::string(manifest_role)),
   };
   const RetainedProductArtifactQuery launchable_query{
       bundle.retained_bundle_id(),
       product.product_id,
       core::RetainedProductKind::kRuntimeUnitConfiguration,
-      core::ArtifactRoleId(
-          std::string(detail::kReferenceRuntimeLaunchableArtifactRole)),
+      core::ArtifactRoleId(std::string(launchable_role)),
   };
   const auto manifest = artifact_source.get_verified(manifest_query);
   const auto launchable = artifact_source.get_verified(launchable_query);
@@ -1540,24 +1586,67 @@ verify_reference_runtime_unit_product(
     detail::fail_retained_bundle(
         "runtime-unit artifact source did not return the exact product pair");
   }
-  detail::require_reference_runtime_product_matches_retained_bundle(
-      manifest->bytes(), launchable->bytes(), bundle.value(), runtime_unit_id);
+  if (native_execution) {
+    detail::require_native_execution_runtime_product_matches_retained_bundle(
+        manifest->bytes(), launchable->bytes(), bundle.value(),
+        runtime_unit_id);
+  } else {
+    detail::require_reference_runtime_product_matches_retained_bundle(
+        manifest->bytes(), launchable->bytes(), bundle.value(),
+        runtime_unit_id);
+  }
   return VerifiedRetainedRuntimeUnitProduct(
       bundle.retained_bundle_id(), runtime_unit_id, product.product_id,
       detail::retained_product_output_digest(product),
       manifest->artifact_ref().content_digest, product.product_contract_id,
       product.product_contract_revision, launchable->artifact_ref(),
       std::string(launchable->bytes()),
-      std::string(detail::kReferenceRuntimeOperatingSystem),
-      std::string(detail::kReferenceRuntimeShellContract),
-      std::string(detail::kReferenceRuntimeRoleId),
-      std::string(detail::kReferenceRuntimeStatusEndpointRoleId),
-      std::string(detail::kReferenceRuntimeStatusEndpointContractId),
-      detail::reference_runtime_status_endpoint_revision(), "stdout_line",
-      std::string(detail::kReferenceRuntimeProcessAdapterContractId),
-      detail::reference_runtime_process_adapter_revision(),
-      std::string(detail::kReferenceRuntimeRetrievalContractId),
-      detail::reference_runtime_retrieval_contract_revision());
+      native_execution
+          ? std::string(detail::kNativeExecutionRuntimeOperatingSystem)
+          : std::string(detail::kReferenceRuntimeOperatingSystem),
+      native_execution
+          ? std::string(
+                detail::kNativeExecutionRuntimeLaunchEnvironmentContract)
+          : std::string(detail::kReferenceRuntimeShellContract),
+      native_execution ? std::string(detail::kNativeExecutionRuntimeRoleId)
+                       : std::string(detail::kReferenceRuntimeRoleId),
+      native_execution
+          ? std::string(detail::kNativeExecutionRuntimeStatusEndpointRoleId)
+          : std::string(detail::kReferenceRuntimeStatusEndpointRoleId),
+      native_execution
+          ? std::string(detail::kNativeExecutionRuntimeStatusEndpointContractId)
+          : std::string(detail::kReferenceRuntimeStatusEndpointContractId),
+      native_execution
+          ? detail::native_execution_runtime_status_endpoint_revision()
+          : detail::reference_runtime_status_endpoint_revision(),
+      native_execution ? "adapter_private" : "stdout_line",
+      native_execution
+          ? std::string(detail::kNativeExecutionRuntimeProcessAdapterContractId)
+          : std::string(detail::kReferenceRuntimeProcessAdapterContractId),
+      native_execution
+          ? detail::native_execution_runtime_process_adapter_revision()
+          : detail::reference_runtime_process_adapter_revision(),
+      native_execution
+          ? std::string(detail::kNativeExecutionRuntimeRetrievalContractId)
+          : std::string(detail::kReferenceRuntimeRetrievalContractId),
+      native_execution
+          ? detail::native_execution_runtime_retrieval_contract_revision()
+          : detail::reference_runtime_retrieval_contract_revision());
+}
+
+std::optional<VerifiedRetainedRuntimeUnitProduct>
+verify_reference_runtime_unit_product(
+    const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
+    const IVerifiedRetainedProductArtifactSource &artifact_source) {
+  auto product =
+      verify_runtime_unit_product(bundle, runtime_unit_id, artifact_source);
+  if (product.has_value() && product->product_contract_id().value() !=
+                                 detail::kReferenceRuntimeProductContractId) {
+    detail::fail_retained_bundle(
+        "reference runtime verifier received a different runtime-product "
+        "contract");
+  }
+  return product;
 }
 
 FilesystemVerifiedRetainedModelMapSource::

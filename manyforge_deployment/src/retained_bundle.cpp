@@ -84,6 +84,15 @@ BuildQualifiedProductContractRegistry::
           detail::reference_runtime_product_artifact_roles()),
       detail::reference_runtime_product_contract_descriptor()));
   contracts_.push_back(BuildQualifiedProductContract(
+      core::ProductContractId(
+          std::string(detail::native_execution_runtime_product_contract_id())),
+      detail::native_execution_runtime_product_contract_revision(),
+      core::RetainedProductKind::kRuntimeUnitConfiguration,
+      ProductPlacement::kRuntimeUnit,
+      public_artifact_roles(
+          detail::native_execution_runtime_product_artifact_roles()),
+      detail::native_execution_runtime_product_contract_descriptor()));
+  contracts_.push_back(BuildQualifiedProductContract(
       core::ProductContractId(std::string(
           detail::composed_model_symbol_role_map_product_contract_id())),
       detail::composed_model_symbol_role_map_product_contract_revision(),

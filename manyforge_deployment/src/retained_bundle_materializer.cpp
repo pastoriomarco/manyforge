@@ -32,6 +32,7 @@
 #include "manyforge_deployment/provider_manifest_codec.hpp"
 #include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
 #include "retained_bundle_internal.hpp"
@@ -120,6 +121,23 @@ require_control_domain_control_contract() {
     throw std::logic_error(
         "build-qualified reference runtime product contract is absent or "
         "incoherent");
+  }
+  return *contract;
+}
+
+[[nodiscard]] const BuildQualifiedProductContract &
+require_native_execution_runtime_contract() {
+  const auto *contract = build_qualified_product_contract_registry().find(
+      core::ProductContractId(
+          std::string(detail::native_execution_runtime_product_contract_id())),
+      detail::native_execution_runtime_product_contract_revision());
+  if (contract == nullptr ||
+      contract->product_kind() !=
+          core::RetainedProductKind::kRuntimeUnitConfiguration ||
+      contract->placement() != ProductPlacement::kRuntimeUnit) {
+    throw std::logic_error(
+        "build-qualified native execution runtime product contract is absent "
+        "or incoherent");
   }
   return *contract;
 }
@@ -538,7 +556,6 @@ struct PreparedPlanningCollisionProduct final {
   std::vector<detail::PreparedControlDomainArtifact> control_domain_artifacts;
   const BuildQualifiedProductContract *control_domain_contract;
   std::vector<detail::PreparedRuntimeUnitArtifact> runtime_unit_artifacts;
-  const BuildQualifiedProductContract* runtime_unit_contract;
   std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts;
   std::vector<core::CatalogRecordKind> schema_artifact_kinds;
   std::vector<core::RetainedSourceRecordDTO> source_records;
@@ -654,16 +671,27 @@ void require_qualified_structural_subset_before_store(
   const auto& inputs = deployment.applicability_inputs().value();
   const auto& compiler = qualified.compiler_ir();
 
-  if (graph.runtime_units.size() > 1U || !graph.component_attachments.empty()) {
+  if (!graph.component_attachments.empty()) {
     detail::fail_retained_bundle(
-        "retained-bundle materialization excludes multiple runtime units "
-        "and attachments");
+        "retained-bundle materialization excludes component attachments");
   }
 
-  const auto& applicability = compiler.applicability();
-  const auto& composition = applicability.composition();
-  if (applicability.runtime_profiles().size() != graph.runtime_units.size() ||
-      !applicability.provider_endpoints().empty() ||
+  const auto &applicability = compiler.applicability();
+  const auto &composition = applicability.composition();
+  std::set<std::pair<core::RuntimeProfileId, core::RuntimeProfileRevision>>
+      graph_runtime_profiles;
+  for (const auto &unit : graph.runtime_units) {
+    graph_runtime_profiles.emplace(unit.runtime_profile_id,
+                                   unit.runtime_profile_revision);
+  }
+  std::set<std::pair<core::RuntimeProfileId, core::RuntimeProfileRevision>>
+      qualified_runtime_profiles;
+  for (const auto &profile : applicability.runtime_profiles()) {
+    qualified_runtime_profiles.emplace(
+        profile.value().runtime_profile_id,
+        profile.value().runtime_profile_revision);
+  }
+  if (qualified_runtime_profiles != graph_runtime_profiles ||
       applicability.external_resources().size() !=
           inputs.external_resources.size()) {
     detail::fail_retained_bundle(
@@ -676,7 +704,7 @@ void require_qualified_structural_subset_before_store(
       graph.control_domains.empty() && graph.control_bindings.empty() &&
       inputs.desired_control_configurations.empty();
   const bool native_control_subset =
-      graph.runtime_units.empty() && !graph.model_instances.empty() &&
+      !graph.model_instances.empty() &&
       !graph.controllable_components.empty() &&
       !graph.control_domains.empty() && !graph.control_bindings.empty() &&
       inputs.desired_control_configurations.size() ==
@@ -716,18 +744,27 @@ void require_qualified_structural_subset_before_store(
           "semantics or an unplaced model");
     }
   } else if (native_control_subset) {
-    const bool has_runtime_owned_component = std::any_of(
-        graph.controllable_components.begin(),
-        graph.controllable_components.end(),
-        [](const core::ControllableComponentDTO& component) {
-          return !component.runtime_unit_ids.empty();
+    const bool has_runtime_units = !graph.runtime_units.empty();
+    const bool exact_native_runtime_units = std::all_of(
+        graph.runtime_units.begin(), graph.runtime_units.end(),
+        [](const core::RuntimeUnitDTO &unit) {
+          return unit.runtime_profile_id.value() ==
+                     detail::kNativeExecutionRuntimeProfileId &&
+                 unit.runtime_profile_revision.value() ==
+                     detail::native_execution_runtime_profile_revision() &&
+                 unit.dependency_runtime_unit_ids.empty() &&
+                 unit.configuration.empty();
         });
-    const bool has_runtime_owned_domain = std::any_of(
-        graph.control_domains.begin(), graph.control_domains.end(),
-        [](const core::ControlDomainDTO& domain) {
-          return !domain.runtime_unit_ids.empty();
-        });
-    if (has_runtime_owned_component || has_runtime_owned_domain ||
+    const auto exact_runtime_owner = [&](const auto &owner) {
+      return has_runtime_units ? owner.runtime_unit_ids.size() == 1U
+                               : owner.runtime_unit_ids.empty();
+    };
+    if (!exact_native_runtime_units ||
+        !std::all_of(graph.controllable_components.begin(),
+                     graph.controllable_components.end(),
+                     exact_runtime_owner) ||
+        !std::all_of(graph.control_domains.begin(), graph.control_domains.end(),
+                     exact_runtime_owner) ||
         composition.component_types().empty() ||
         composition.control_binding_coordinate_maps().size() !=
             graph.control_bindings.size() ||
@@ -743,7 +780,27 @@ void require_qualified_structural_subset_before_store(
           "component/target/domain subset");
     }
 
-    for (const auto& binding : graph.control_bindings) {
+    if (has_runtime_units) {
+      std::set<core::RuntimeUnitId> declared;
+      for (const auto &unit : graph.runtime_units) {
+        declared.insert(unit.runtime_unit_id);
+      }
+      for (const auto &component : graph.controllable_components) {
+        if (!declared.contains(component.runtime_unit_ids.front())) {
+          detail::fail_retained_bundle(
+              "native component selects an undeclared execution runtime");
+        }
+      }
+      for (const auto &domain : graph.control_domains) {
+        if (!declared.contains(domain.runtime_unit_ids.front())) {
+          detail::fail_retained_bundle(
+              "native control domain selects an undeclared execution "
+              "runtime");
+        }
+      }
+    }
+
+    for (const auto &binding : graph.control_bindings) {
       const auto coordinate_maps = std::count_if(
           composition.control_binding_coordinate_maps().begin(),
           composition.control_binding_coordinate_maps().end(),
@@ -1273,32 +1330,83 @@ prepare_planning_collision_product_before_store(
     control_domain_contract = &qualified_control_contract;
   }
   std::vector<detail::PreparedRuntimeUnitArtifact> runtime_unit_artifacts;
-  const BuildQualifiedProductContract* runtime_unit_contract = nullptr;
-  if (!composition.graph().runtime_units.empty()) {
-    const auto& qualified_runtime_contract = require_reference_runtime_contract();
-    const auto& unit = composition.graph().runtime_units.front();
-    std::string manifest =
-        detail::emit_reference_runtime_manifest(qualified.compiler_ir(), unit.runtime_unit_id);
-    detail::require_reference_runtime_manifest_matches(manifest, qualified.compiler_ir(),
-                                                       unit.runtime_unit_id);
-    std::string launchable(detail::reference_runtime_launchable_script());
-    if (launchable.empty() || launchable.size() > detail::kMaxReferenceRuntimeLaunchableBytes) {
-      throw std::logic_error("build-owned reference runtime launchable exceeds its bound");
+  runtime_unit_artifacts.reserve(composition.graph().runtime_units.size());
+  for (const auto &unit : composition.graph().runtime_units) {
+    detail::PreparedRuntimeUnitKind kind;
+    const BuildQualifiedProductContract *qualified_runtime_contract = nullptr;
+    std::string manifest;
+    std::string launchable;
+    std::string_view manifest_role;
+    std::string_view manifest_media_type;
+    std::string_view launchable_role;
+    std::string_view launchable_media_type;
+    core::ProductId product_id(std::string{});
+    if (unit.runtime_profile_id.value() == detail::kReferenceRuntimeProfileId &&
+        unit.runtime_profile_revision.value() ==
+            detail::reference_runtime_profile_revision()) {
+      kind = detail::PreparedRuntimeUnitKind::kReference;
+      qualified_runtime_contract = &require_reference_runtime_contract();
+      manifest = detail::emit_reference_runtime_manifest(
+          qualified.compiler_ir(), unit.runtime_unit_id);
+      detail::require_reference_runtime_manifest_matches(
+          manifest, qualified.compiler_ir(), unit.runtime_unit_id);
+      launchable = std::string(detail::reference_runtime_launchable_script());
+      if (launchable.empty() ||
+          launchable.size() > detail::kMaxReferenceRuntimeLaunchableBytes) {
+        throw std::logic_error(
+            "build-owned reference runtime launchable exceeds its bound");
+      }
+      manifest_role = detail::kReferenceRuntimeManifestArtifactRole;
+      manifest_media_type = detail::kReferenceRuntimeManifestMediaType;
+      launchable_role = detail::kReferenceRuntimeLaunchableArtifactRole;
+      launchable_media_type = detail::kReferenceRuntimeLaunchableMediaType;
+      product_id = core::ProductId(
+          detail::reference_runtime_product_id(unit.runtime_unit_id));
+    } else if (unit.runtime_profile_id.value() ==
+                   detail::kNativeExecutionRuntimeProfileId &&
+               unit.runtime_profile_revision.value() ==
+                   detail::native_execution_runtime_profile_revision()) {
+      kind = detail::PreparedRuntimeUnitKind::kNativeExecution;
+      qualified_runtime_contract = &require_native_execution_runtime_contract();
+      manifest = detail::emit_native_execution_runtime_manifest(
+          qualified.compiler_ir(), unit.runtime_unit_id);
+      detail::require_native_execution_runtime_manifest_matches(
+          manifest, qualified.compiler_ir(), unit.runtime_unit_id);
+      launchable = detail::native_execution_runtime_launch_descriptor();
+      if (launchable.empty() ||
+          launchable.size() >
+              detail::kMaxNativeExecutionLaunchDescriptorBytes) {
+        throw std::logic_error(
+            "build-owned native execution launch descriptor exceeds its "
+            "bound");
+      }
+      manifest_role = detail::kNativeExecutionRuntimeManifestArtifactRole;
+      manifest_media_type = detail::kNativeExecutionRuntimeManifestMediaType;
+      launchable_role =
+          detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole;
+      launchable_media_type =
+          detail::kNativeExecutionRuntimeLaunchDescriptorMediaType;
+      product_id = core::ProductId(
+          detail::native_execution_runtime_product_id(unit.runtime_unit_id));
+    } else {
+      detail::fail_retained_bundle(
+          "runtime unit selects no build-qualified retained runtime product");
     }
     const std::array<detail::RetainedArtifactInput, 2U> runtime_inputs{{
-        {core::ArtifactRoleId(std::string(detail::kReferenceRuntimeLaunchableArtifactRole)),
-         std::string(detail::kReferenceRuntimeLaunchableMediaType), launchable},
-        {core::ArtifactRoleId(std::string(detail::kReferenceRuntimeManifestArtifactRole)),
-         std::string(detail::kReferenceRuntimeManifestMediaType), manifest},
+        {core::ArtifactRoleId(std::string(launchable_role)),
+         std::string(launchable_media_type), launchable},
+        {core::ArtifactRoleId(std::string(manifest_role)),
+         std::string(manifest_media_type), manifest},
     }};
     detail::preflight_retained_product(
-        core::ProductId(detail::reference_runtime_product_id(unit.runtime_unit_id)),
-        core::RetainedProductKind::kRuntimeUnitConfiguration, ProductPlacement::kRuntimeUnit,
-        qualified_runtime_contract.product_contract_id(),
-        qualified_runtime_contract.product_contract_revision(), runtime_inputs);
+        product_id, core::RetainedProductKind::kRuntimeUnitConfiguration,
+        ProductPlacement::kRuntimeUnit,
+        qualified_runtime_contract->product_contract_id(),
+        qualified_runtime_contract->product_contract_revision(),
+        runtime_inputs);
     runtime_unit_artifacts.push_back(detail::PreparedRuntimeUnitArtifact{
-        unit.runtime_unit_id, std::move(manifest), std::move(launchable)});
-    runtime_unit_contract = &qualified_runtime_contract;
+        unit.runtime_unit_id, std::move(manifest), std::move(launchable), kind,
+        qualified_runtime_contract});
   }
   std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts;
   std::vector<core::CatalogRecordKind> schema_artifact_kinds;
@@ -1332,7 +1440,6 @@ prepare_planning_collision_product_before_store(
       std::move(control_domain_artifacts),
       control_domain_contract,
       std::move(runtime_unit_artifacts),
-      runtime_unit_contract,
       std::move(schema_artifacts),
       std::move(schema_artifact_kinds),
       std::move(source_records),
@@ -1599,6 +1706,14 @@ void require_verified_current_bundle_artifacts(
     }
     const auto& product = group.products.front();
     require_verified_product_artifact_readback(product, artifact_store);
+    const std::string_view manifest_role =
+        expected.kind == detail::PreparedRuntimeUnitKind::kReference
+            ? detail::kReferenceRuntimeManifestArtifactRole
+            : detail::kNativeExecutionRuntimeManifestArtifactRole;
+    const std::string_view launchable_role =
+        expected.kind == detail::PreparedRuntimeUnitKind::kReference
+            ? detail::kReferenceRuntimeLaunchableArtifactRole
+            : detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole;
     std::optional<std::string> manifest;
     std::optional<std::string> launchable;
     for (const auto& artifact : product.artifact_refs) {
@@ -1608,10 +1723,9 @@ void require_verified_current_bundle_artifacts(
       if (!bytes.has_value()) {
         throw std::runtime_error("reloaded runtime-unit artifact failed exact read-back");
       }
-      if (artifact.artifact_role_id.value() == detail::kReferenceRuntimeManifestArtifactRole) {
+      if (artifact.artifact_role_id.value() == manifest_role) {
         manifest = *bytes;
-      } else if (artifact.artifact_role_id.value() ==
-                 detail::kReferenceRuntimeLaunchableArtifactRole) {
+      } else if (artifact.artifact_role_id.value() == launchable_role) {
         launchable = *bytes;
       }
     }
@@ -1620,8 +1734,13 @@ void require_verified_current_bundle_artifacts(
         *launchable != expected.launchable_bytes) {
       throw std::runtime_error("reloaded runtime-unit product differs from its prepared bytes");
     }
-    detail::require_reference_runtime_product_matches_retained_bundle(
-        *manifest, *launchable, value, group.runtime_unit_id);
+    if (expected.kind == detail::PreparedRuntimeUnitKind::kReference) {
+      detail::require_reference_runtime_product_matches_retained_bundle(
+          *manifest, *launchable, value, group.runtime_unit_id);
+    } else {
+      detail::require_native_execution_runtime_product_matches_retained_bundle(
+          *manifest, *launchable, value, group.runtime_unit_id);
+    }
   }
 }
 
@@ -1719,7 +1838,6 @@ detail::RetainedBundleMaterializer::materialize_prepared(
         control_domain_artifacts,
     const BuildQualifiedProductContract *control_domain_contract,
     std::span<const detail::PreparedRuntimeUnitArtifact> runtime_unit_artifacts,
-    const BuildQualifiedProductContract* runtime_unit_contract,
     std::span<const core::RetainedSchemaArtifactRefDTO> schema_artifacts,
     std::span<const core::RetainedSourceRecordDTO> source_records,
     std::span<const core::RetainedGeneratorRecordDTO> generator_records,
@@ -1830,32 +1948,63 @@ detail::RetainedBundleMaterializer::materialize_prepared(
         std::vector<core::RetainedProductDTO>{std::move(product)}});
   }
 
-  if (runtime_unit_artifacts.empty() != (runtime_unit_contract == nullptr)) {
-    throw std::logic_error(
-        "runtime-unit artifact bytes and qualified contract must be present "
-        "together");
-  }
   std::vector<core::RetainedRuntimeUnitProductsDTO> runtime_unit_products;
   runtime_unit_products.reserve(runtime_unit_artifacts.size());
-  for (const auto& input : runtime_unit_artifacts) {
-    detail::require_reference_runtime_manifest_matches(
-        input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
-    if (input.launchable_bytes !=
-        detail::reference_runtime_launchable_script()) {
+  for (const auto &input : runtime_unit_artifacts) {
+    if (input.contract == nullptr) {
       throw std::logic_error(
-          "prepared reference runtime launchable changed before retention");
+          "prepared runtime-unit product has no qualified contract");
+    }
+    std::string_view manifest_role;
+    std::string_view manifest_media_type;
+    std::string_view launchable_role;
+    std::string_view launchable_media_type;
+    core::ProductId product_id(std::string{});
+    switch (input.kind) {
+    case detail::PreparedRuntimeUnitKind::kReference:
+      detail::require_reference_runtime_manifest_matches(
+          input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
+      if (input.launchable_bytes !=
+          detail::reference_runtime_launchable_script()) {
+        throw std::logic_error(
+            "prepared reference runtime launchable changed before retention");
+      }
+      manifest_role = detail::kReferenceRuntimeManifestArtifactRole;
+      manifest_media_type = detail::kReferenceRuntimeManifestMediaType;
+      launchable_role = detail::kReferenceRuntimeLaunchableArtifactRole;
+      launchable_media_type = detail::kReferenceRuntimeLaunchableMediaType;
+      product_id = core::ProductId(
+          detail::reference_runtime_product_id(input.runtime_unit_id));
+      break;
+    case detail::PreparedRuntimeUnitKind::kNativeExecution:
+      detail::require_native_execution_runtime_manifest_matches(
+          input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
+      if (input.launchable_bytes !=
+          detail::native_execution_runtime_launch_descriptor()) {
+        throw std::logic_error(
+            "prepared native execution launch descriptor changed before "
+            "retention");
+      }
+      manifest_role = detail::kNativeExecutionRuntimeManifestArtifactRole;
+      manifest_media_type = detail::kNativeExecutionRuntimeManifestMediaType;
+      launchable_role =
+          detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole;
+      launchable_media_type =
+          detail::kNativeExecutionRuntimeLaunchDescriptorMediaType;
+      product_id = core::ProductId(
+          detail::native_execution_runtime_product_id(input.runtime_unit_id));
+      break;
     }
     const std::array<detail::RetainedArtifactInput, 2U> runtime_artifacts{{
-        {core::ArtifactRoleId(std::string(detail::kReferenceRuntimeLaunchableArtifactRole)),
-         std::string(detail::kReferenceRuntimeLaunchableMediaType), input.launchable_bytes},
-        {core::ArtifactRoleId(std::string(detail::kReferenceRuntimeManifestArtifactRole)),
-         std::string(detail::kReferenceRuntimeManifestMediaType), input.manifest_bytes},
+        {core::ArtifactRoleId(std::string(launchable_role)),
+         std::string(launchable_media_type), input.launchable_bytes},
+        {core::ArtifactRoleId(std::string(manifest_role)),
+         std::string(manifest_media_type), input.manifest_bytes},
     }};
     core::RetainedProductDTO product = detail::build_and_retain_product(
-        core::ProductId(detail::reference_runtime_product_id(input.runtime_unit_id)),
-        core::RetainedProductKind::kRuntimeUnitConfiguration, ProductPlacement::kRuntimeUnit,
-        runtime_unit_contract->product_contract_id(),
-        runtime_unit_contract->product_contract_revision(), runtime_artifacts,
+        product_id, core::RetainedProductKind::kRuntimeUnitConfiguration,
+        ProductPlacement::kRuntimeUnit, input.contract->product_contract_id(),
+        input.contract->product_contract_revision(), runtime_artifacts,
         artifact_store);
     std::optional<std::string> retained_manifest;
     std::optional<std::string> retained_launchable;
@@ -1864,19 +2013,20 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           artifact.content_addressed_store_key, artifact.content_digest,
           artifact.byte_size);
       if (!readback.has_value()) {
-        throw std::runtime_error("reference runtime artifact vanished after verified retention");
+        throw std::runtime_error(
+            "runtime-unit artifact vanished after verified retention");
       }
-      if (artifact.artifact_role_id.value() == detail::kReferenceRuntimeManifestArtifactRole) {
+      if (artifact.artifact_role_id.value() == manifest_role) {
         retained_manifest = *readback;
-      } else if (artifact.artifact_role_id.value() ==
-                 detail::kReferenceRuntimeLaunchableArtifactRole) {
+      } else if (artifact.artifact_role_id.value() == launchable_role) {
         retained_launchable = *readback;
       }
     }
     if (!retained_manifest.has_value() || !retained_launchable.has_value() ||
         *retained_manifest != input.manifest_bytes ||
         *retained_launchable != input.launchable_bytes) {
-      throw std::runtime_error("reference runtime product failed exact artifact read-back");
+      throw std::runtime_error(
+          "runtime-unit product failed exact artifact read-back");
     }
     runtime_unit_products.push_back(core::RetainedRuntimeUnitProductsDTO{
         input.runtime_unit_id, std::vector<core::RetainedProductDTO>{std::move(product)}});
@@ -1912,8 +2062,18 @@ detail::RetainedBundleMaterializer::materialize_prepared(
       core::RetainedBundleId(retained_bundle_id), std::move(value),
       std::move(root), std::move(bytes));
   if (!verify_retained_bundle_identity(*bundle)) {
+    try {
+      static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+          bundle->canonical_bytes()));
+    } catch (const std::exception &error) {
+      throw std::logic_error(
+          std::string("I3 materializer produced an invalid retained-bundle "
+                      "projection: ") +
+          error.what());
+    }
     throw std::logic_error(
-        "I3 materializer produced an invalid retained-bundle projection");
+        "I3 materializer projection reparsed but differed from its typed "
+        "value");
   }
   return bundle;
 }
@@ -1948,9 +2108,8 @@ detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
           : std::nullopt,
       prepared.symbol_role_map_contract, prepared.control_domain_artifacts,
       prepared.control_domain_contract, prepared.runtime_unit_artifacts,
-      prepared.runtime_unit_contract, prepared.schema_artifacts,
-      prepared.source_records, prepared.generator_records,
-      artifact_store);
+      prepared.schema_artifacts, prepared.source_records,
+      prepared.generator_records, artifact_store);
   (void)bundle_repository.put_if_absent(bundle);
   const auto reloaded =
       bundle_repository.get_verified_envelope(
@@ -1994,9 +2153,8 @@ detail::RetainedBundleMaterializer::materialize(
           : std::nullopt,
       prepared.symbol_role_map_contract, prepared.control_domain_artifacts,
       prepared.control_domain_contract, prepared.runtime_unit_artifacts,
-      prepared.runtime_unit_contract, prepared.schema_artifacts,
-      prepared.source_records, prepared.generator_records,
-      artifact_store);
+      prepared.schema_artifacts, prepared.source_records,
+      prepared.generator_records, artifact_store);
 }
 
 }  // namespace manyforge::deployment
