@@ -72,7 +72,9 @@ public:
       const manyforge::deployment::IVerifiedRetainedBundleSource
           &retained_bundle_source,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
-      manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner);
+      manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner,
+      manyforge::core::IManagerSceneProjectionBootstrapPort
+          *bootstrap_scene_owner = nullptr);
 
   [[nodiscard]] ManagerSceneStageResult
   StageOrRecover(const manyforge::core::ApplyId &apply_id,
@@ -88,6 +90,8 @@ private:
       &retained_bundle_source_;
   const manyforge::core::IActiveBundlePublicationReader &publication_reader_;
   manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner_;
+  manyforge::core::IManagerSceneProjectionBootstrapPort
+      *bootstrap_scene_owner_;
   std::mutex operation_mutex_;
 };
 

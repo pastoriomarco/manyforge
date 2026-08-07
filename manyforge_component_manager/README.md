@@ -17,8 +17,9 @@ Composable Cell Component Manager. It currently owns these bounded mechanisms:
 - the whole-Apply affected-scope/fence coordinator, observe-first runtime
   convergence coordinator, scene stage/activation and selected-bundle
   completion coordinators;
-- one closed concrete Linux/POSIX adapter for the exact I3-qualified retained
-  reference runtime product; and
+- closed concrete Linux/POSIX adapters for the exact I3-qualified reference
+  and native runtime products, including direct-child epoch observation and a
+  private transport-neutral scene-projection resolver; and
 - active-plan reconstruction plus dependency-ordered steady-state
   reconciliation and explicit reverse-order shutdown.
 
@@ -288,17 +289,19 @@ command surface. The first runtime-only named Apply is operational inside the
 bounded M0 composition through the production logical-scene owner and durable
 public pointer. Its external-process proof covers bootstrap, Manager
 loss/replacement, Apply recovery, runtime crash/restart, and explicit shutdown.
-I4 intentionally does not add the public Manager daemon/CLI/HTTP projection
-assigned to I5/H0. It also does not
-qualify an external-runtime adapter, nonempty native projection transition,
+The I5/H0 headless surface does not turn this private handoff into a second
+public command API. The current N5c checkpoint qualifies nonempty native
+projection transitions and finalized-host replacement, but does not yet
+qualify mid-transition host-loss recovery, the execution-facing lease path,
 nonempty obsolete-command-surface retirement, controller/robot lifecycle,
-motion effect, or restored product lane.
+remote placement, motion effects, or the restored product lane.
 The lower-level journal still treats bundle and graph identities as opaque;
 only the external store composition root and coordinator require the sealed,
 verified I3 admission. The coordinator does not retain the scene owner's
-logical-scene value, implement native projection adapters, or directly open
-scene writes and leases. Those openings remain the scene owner's responsibility
-inside a successful Finalize after its independent receipt and health checks.
+logical-scene value or directly open scene writes and leases. Native placement
+and transport remain adapter-private; those openings remain the scene owner's
+responsibility inside a successful Finalize or completed replacement recovery
+after its independent receipt, snapshot, and health checks.
 
 The journal itself has no effect surface; effects remain behind focused owner
 ports and observe-first coordinators. The qualified M0 fixture is the

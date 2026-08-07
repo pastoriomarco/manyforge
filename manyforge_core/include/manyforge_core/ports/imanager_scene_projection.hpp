@@ -1,5 +1,6 @@
 #pragma once
 
+#include <manyforge_core/types/native_projection_handoff.hpp>
 #include <manyforge_core/types/projection_apply.hpp>
 #include <manyforge_core/types/projection_bootstrap.hpp>
 
@@ -28,6 +29,20 @@ class IManagerSceneProjectionHandoffPort {
 
   [[nodiscard]] virtual ProjectionApplyStatusDTO ProjectionApplyStatus(
       const ProjectionApplyStatusQueryDTO& query) const = 0;
+
+  /// Reconciles only the exact Manager-observed process incarnations for the
+  /// already-active structural deployment. The scene owner remains the sole
+  /// owner of snapshot selection, native rebuild effects, and durable binding
+  /// replacement evidence.
+  [[nodiscard]] virtual ActiveProjectionRuntimeRecoveryResultDTO
+  ReconcileActiveProjectionRuntimes(
+      const ActiveProjectionRuntimeSetDTO& runtime_set) = 0;
+
+  /// Observes the exact current native set after applying any completed
+  /// process-replacement recovery. Historical Apply transition evidence is not
+  /// rewritten when a host epoch changes.
+  [[nodiscard]] virtual ProjectionAggregateHealthDTO
+  ActiveProjectionHealth() const = 0;
 };
 
 /// Focused canonical-empty initialization handoff.

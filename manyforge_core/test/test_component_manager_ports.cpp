@@ -71,6 +71,12 @@ using FinalizeSignature = ProjectionApplyFinalizeResultDTO (IManagerSceneProject
     const ProjectionApplyFinalizeDTO&);
 using ApplyStatusSignature = ProjectionApplyStatusDTO (IManagerSceneProjectionHandoffPort::*)(
     const ProjectionApplyStatusQueryDTO&) const;
+using ReconcileActiveProjectionSignature =
+    ActiveProjectionRuntimeRecoveryResultDTO (
+        IManagerSceneProjectionHandoffPort::*)(
+        const ActiveProjectionRuntimeSetDTO&);
+using ActiveProjectionHealthSignature = ProjectionAggregateHealthDTO (
+    IManagerSceneProjectionHandoffPort::*)() const;
 static_assert(
     std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::StageCandidateProjection),
                    StageSignature>);
@@ -84,6 +90,14 @@ static_assert(
                    FinalizeSignature>);
 static_assert(std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::ProjectionApplyStatus),
                              ApplyStatusSignature>);
+static_assert(std::is_same_v<
+              decltype(&IManagerSceneProjectionHandoffPort::
+                           ReconcileActiveProjectionRuntimes),
+              ReconcileActiveProjectionSignature>);
+static_assert(std::is_same_v<
+              decltype(&IManagerSceneProjectionHandoffPort::
+                           ActiveProjectionHealth),
+              ActiveProjectionHealthSignature>);
 
 using BeginBootstrapSignature = ProjectionBootstrapAcceptedDTO (
     IManagerSceneProjectionBootstrapPort::*)(const ProjectionBootstrapIntentDTO&);
@@ -849,6 +863,55 @@ TEST(ComponentManagerPortContracts, TransitionInputAndEvidenceRowsRequireCanonic
       evidence_row(first),
   };
   EXPECT_FALSE(evidence.valid());
+}
+
+TEST(ComponentManagerPortContracts,
+     ActiveRuntimeRecoverySetIsCanonicalAndGenerationExact) {
+  const auto target = Projection();
+  const auto first = NativeBinding("provider-binding.a", "runtime.a");
+  const auto second = NativeBinding("provider-binding.b", "runtime.b");
+  ActiveProjectionRuntimeSetDTO runtime_set{target, {first, second}};
+  ASSERT_TRUE(runtime_set.valid());
+
+  std::swap(runtime_set.native_runtime_bindings[0],
+            runtime_set.native_runtime_bindings[1]);
+  EXPECT_FALSE(runtime_set.valid());
+  runtime_set.native_runtime_bindings = {first, first};
+  EXPECT_FALSE(runtime_set.valid());
+  auto replacement_epoch = first;
+  replacement_epoch.runtime_epoch = RuntimeEpoch("runtime-epoch-2");
+  runtime_set.native_runtime_bindings = {first, replacement_epoch};
+  EXPECT_FALSE(runtime_set.valid());
+  auto replacement_runtime = first;
+  replacement_runtime.runtime_unit_id = RuntimeUnitId("runtime.z");
+  runtime_set.native_runtime_bindings = {first, replacement_runtime};
+  EXPECT_FALSE(runtime_set.valid());
+
+  runtime_set.native_runtime_bindings = {first, second};
+  EXPECT_TRUE((ActiveProjectionRuntimeRecoveryResultDTO{
+                  runtime_set,
+                  ActiveProjectionRuntimeRecoveryState::kCurrent,
+                  std::nullopt,
+              }
+                   .valid()));
+  EXPECT_FALSE((ActiveProjectionRuntimeRecoveryResultDTO{
+                   runtime_set,
+                   ActiveProjectionRuntimeRecoveryState::kRecovered,
+                   std::nullopt,
+               }
+                    .valid()));
+  EXPECT_TRUE((ActiveProjectionRuntimeRecoveryResultDTO{
+                  runtime_set,
+                  ActiveProjectionRuntimeRecoveryState::kRecovered,
+                  NativeProjectionRecoveryGeneration(1U),
+              }
+                   .valid()));
+  EXPECT_FALSE((ActiveProjectionRuntimeRecoveryResultDTO{
+                   runtime_set,
+                   ActiveProjectionRuntimeRecoveryState::kCurrent,
+                   NativeProjectionRecoveryGeneration(0U),
+               }
+                    .valid()));
 }
 
 TEST(ComponentManagerPortContracts, TransitionDispositionRequiresTheExactPredecessor) {

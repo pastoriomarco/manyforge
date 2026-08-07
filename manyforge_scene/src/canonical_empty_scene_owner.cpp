@@ -8,6 +8,7 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/logical_scene_projection.hpp>
+#include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
@@ -33,6 +34,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -44,6 +46,9 @@ namespace {
 using core::ActiveBundlePublicationGeneration;
 using core::ActiveBundlePublicationReceiptDTO;
 using core::ActiveBundlePublicationRequestDTO;
+using core::ActiveProjectionRuntimeRecoveryResultDTO;
+using core::ActiveProjectionRuntimeRecoveryState;
+using core::ActiveProjectionRuntimeSetDTO;
 using core::ApplyGeneration;
 using core::ApplyId;
 using core::BootstrapGeneration;
@@ -60,6 +65,7 @@ using core::LogicalSceneSnapshotDTO;
 using core::LogicalSceneSnapshotRoot;
 using core::NamedApplyProjectionSetSourceDTO;
 using core::NamedApplyPublicationTransactionDTO;
+using core::NativeProjectionRecoveryGeneration;
 using core::ProjectionAggregateHealthDTO;
 using core::ProjectionApplyActivationDTO;
 using core::ProjectionApplyActivationResultDTO;
@@ -114,7 +120,11 @@ constexpr std::int64_t kPageSizeBytes = 4096;
 constexpr std::int64_t kMaximumPageCount =
     kMaximumSceneStoreDatabasePageImageBytes / kPageSizeBytes;
 constexpr std::int64_t kExpectedBaseSchemaObjectCardinality = 24;
-constexpr std::int64_t kExpectedSchemaObjectCardinality = 42;
+constexpr std::int64_t kExpectedTransactionSchemaObjectCardinality = 42;
+constexpr std::int64_t kExpectedSchemaObjectCardinality = 66;
+constexpr std::int64_t kLogicalSceneTransactionStoreSchemaVersion = 4;
+constexpr std::string_view kLogicalSceneTransactionStoreSchemaId =
+    "manyforge.internal.logical-scene.n5b.v4";
 constexpr std::uint64_t kMaximumSafeIntegral = 9007199254740991ULL;
 constexpr int kMaximumSqliteValueBytes = 1024 * 1024;
 constexpr std::size_t kMaximumLogicalSceneOwnerEvents =
@@ -330,7 +340,7 @@ using SchemaObjects =
 SchemaObjects ReadSchemaObjects(sqlite3 *database) {
   Statement statement(
       database, "SELECT type,name,sql FROM sqlite_master "
-                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 43");
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 67");
   SchemaObjects objects;
   std::int64_t count = 0;
   while (statement.Step()) {
@@ -345,7 +355,7 @@ SchemaObjects ReadSchemaObjects(sqlite3 *database) {
   return objects;
 }
 
-SchemaObjects BuildExpectedSchemaObjects(const bool include_transactions) {
+SchemaObjects BuildExpectedSchemaObjects(const std::int64_t schema_version) {
   sqlite3 *database = nullptr;
   const auto result = sqlite3_open_v2(
       ":memory:", &database,
@@ -362,13 +372,19 @@ SchemaObjects BuildExpectedSchemaObjects(const bool include_transactions) {
   }
   try {
     Exec(database, detail::kEmbeddedCanonicalEmptySceneSchema);
-    if (include_transactions) {
+    if (schema_version >= kLogicalSceneTransactionStoreSchemaVersion) {
       Exec(database, detail::kEmbeddedLogicalSceneTransactionMigration);
     }
+    if (schema_version >= kLogicalSceneStoreSchemaVersion) {
+      Exec(database, detail::kEmbeddedNativeProjectionHandoffMigration);
+    }
     auto objects = ReadSchemaObjects(database);
-    const auto expected_count = include_transactions
-                                    ? kExpectedSchemaObjectCardinality
-                                    : kExpectedBaseSchemaObjectCardinality;
+    const auto expected_count =
+        schema_version == kCanonicalEmptySceneStoreSchemaVersion
+            ? kExpectedBaseSchemaObjectCardinality
+        : schema_version == kLogicalSceneTransactionStoreSchemaVersion
+            ? kExpectedTransactionSchemaObjectCardinality
+            : kExpectedSchemaObjectCardinality;
     if (objects.size() != static_cast<std::size_t>(expected_count)) {
       throw CanonicalEmptySceneOwnerError(
           "embedded logical-scene schema cardinality is invalid");
@@ -382,12 +398,20 @@ SchemaObjects BuildExpectedSchemaObjects(const bool include_transactions) {
 }
 
 const SchemaObjects &ExpectedBaseSchemaObjects() {
-  static const SchemaObjects expected = BuildExpectedSchemaObjects(false);
+  static const SchemaObjects expected =
+      BuildExpectedSchemaObjects(kCanonicalEmptySceneStoreSchemaVersion);
+  return expected;
+}
+
+const SchemaObjects &ExpectedTransactionSchemaObjects() {
+  static const SchemaObjects expected =
+      BuildExpectedSchemaObjects(kLogicalSceneTransactionStoreSchemaVersion);
   return expected;
 }
 
 const SchemaObjects &ExpectedSchemaObjects() {
-  static const SchemaObjects expected = BuildExpectedSchemaObjects(true);
+  static const SchemaObjects expected =
+      BuildExpectedSchemaObjects(kLogicalSceneStoreSchemaVersion);
   return expected;
 }
 
@@ -482,10 +506,17 @@ std::string TransactionMigrationArtifactDigest() {
       detail::kEmbeddedLogicalSceneTransactionMigration);
 }
 
+std::string NativeHandoffMigrationArtifactDigest() {
+  return manyforge::content_identity::sha256_digest(
+      detail::kEmbeddedNativeProjectionHandoffMigration);
+}
+
 std::string CurrentSchemaArtifactDigest() {
   return manyforge::content_identity::sha256_digest(
       std::string(detail::kEmbeddedCanonicalEmptySceneSchema) + "\n--v4--\n" +
-      std::string(detail::kEmbeddedLogicalSceneTransactionMigration));
+      std::string(detail::kEmbeddedLogicalSceneTransactionMigration) +
+      "\n--v5--\n" +
+      std::string(detail::kEmbeddedNativeProjectionHandoffMigration));
 }
 
 struct AcceptedState final {
@@ -505,6 +536,18 @@ struct NamedApplyStageState final {
   bool activated{};
   bool discarded{};
   std::optional<ActiveBundlePublicationReceiptDTO> finalization_receipt;
+  std::vector<core::ProjectionTransitionRowDTO> native_transition_rows;
+  std::optional<LogicalSceneSnapshotDTO> frozen_snapshot;
+  bool stage_completed{true};
+  bool activation_selected{};
+};
+
+struct NativeRuntimeRecoveryState final {
+  NativeProjectionRecoveryGeneration recovery_generation;
+  std::uint64_t structural_lineage_generation;
+  ProjectionRevisionDTO target;
+  std::vector<core::ProjectionNativeRuntimeBindingDTO> bindings;
+  std::optional<std::vector<core::ProjectionHealthDTO>> completion_health;
 };
 
 struct DurableState final {
@@ -514,6 +557,7 @@ struct DurableState final {
   std::vector<NamedApplyStageState> named_apply_stages;
   std::optional<ProjectionRevisionDTO> active_projection;
   std::optional<LogicalSceneSnapshotDTO> active_scene_snapshot;
+  std::vector<NativeRuntimeRecoveryState> native_runtime_recoveries;
   bool projection_desynchronized{};
   bool unresolved_scene_transaction{};
 
@@ -537,6 +581,31 @@ struct DurableState final {
     return !stage.discarded && !stage.finalization_receipt.has_value()
                ? &stage
                : nullptr;
+  }
+
+  [[nodiscard]] const NamedApplyStageState *
+  ActiveStructuralStage() const noexcept {
+    const auto found = std::find_if(
+        named_apply_stages.rbegin(), named_apply_stages.rend(),
+        [](const NamedApplyStageState &stage) {
+          return stage.finalization_receipt.has_value();
+        });
+    return found == named_apply_stages.rend() ? nullptr : &*found;
+  }
+
+  [[nodiscard]] const NativeRuntimeRecoveryState *
+  LatestActiveRuntimeRecovery() const noexcept {
+    const auto *active_stage = ActiveStructuralStage();
+    if (active_stage == nullptr) {
+      return nullptr;
+    }
+    const auto found = std::find_if(
+        native_runtime_recoveries.rbegin(), native_runtime_recoveries.rend(),
+        [&](const NativeRuntimeRecoveryState &recovery) {
+          return recovery.structural_lineage_generation ==
+                 active_stage->lineage_generation;
+        });
+    return found == native_runtime_recoveries.rend() ? nullptr : &*found;
   }
 
   [[nodiscard]] CanonicalEmptySceneBootstrapPhase phase() const noexcept {
@@ -565,6 +634,38 @@ struct DurableState final {
     return CanonicalEmptySceneBootstrapPhase::kInitialCommandFenced;
   }
 };
+
+/// Returns the exact native set selected by the latest finalized structural
+/// transition. Discarded or still-open stages never alter the active set.
+/// Canonical-empty bootstrap currently has an intentionally empty native set.
+[[nodiscard]] std::vector<core::ProjectionNativeRuntimeBindingDTO>
+ActiveNativeRuntimeBindings(const DurableState &state) {
+  const auto *finalized = state.ActiveStructuralStage();
+  if (finalized == nullptr) {
+    return {};
+  }
+  std::vector<core::ProjectionNativeRuntimeBindingDTO> bindings;
+  for (const auto &row : finalized->native_transition_rows) {
+    if (row.disposition !=
+        core::ProjectionTransitionDisposition::kRemoved) {
+      bindings.push_back(row.native_runtime_binding);
+    }
+  }
+  for (const auto &recovery : state.native_runtime_recoveries) {
+    if (recovery.structural_lineage_generation ==
+            finalized->lineage_generation &&
+        recovery.completion_health.has_value()) {
+      bindings = recovery.bindings;
+    }
+  }
+  if (!std::is_sorted(bindings.begin(), bindings.end(),
+                      core::CanonicalProjectionNativeBindingLess) ||
+      std::adjacent_find(bindings.begin(), bindings.end()) != bindings.end()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "finalized native projection set is not canonical and unique");
+  }
+  return bindings;
+}
 
 struct StoredSceneOutcome final {
   std::string request_owner_epoch;
@@ -2148,9 +2249,189 @@ ResultFromStoredOutcome(sqlite3 *database, const StoredSceneOutcome &outcome,
 }
 
 struct RequiredSceneProjection final {
-  core::IPlannerSceneProjection *projection;
+  std::shared_ptr<core::IPlannerSceneProjection> projection;
   core::ProjectionHealthDTO preflight_health;
 };
+
+using ProjectionProviderBindingKey =
+    std::pair<core::CapabilityProviderBindingId,
+              core::CapabilityProviderBindingRevision>;
+
+using ProjectionProviderRuntimeRequirements =
+    std::map<ProjectionProviderBindingKey, core::RuntimeUnitId>;
+
+[[nodiscard]] ProjectionProviderRuntimeRequirements
+NativeSceneProviderBindings(const RetainedBundleDTO &bundle) {
+  std::set<core::RuntimeUnitId> declared_runtime_units;
+  for (const auto &runtime_unit : bundle.cell_graph.runtime_units) {
+    if (!declared_runtime_units.insert(runtime_unit.runtime_unit_id).second) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "verified retained bundle repeats a runtime-unit identity");
+    }
+  }
+  ProjectionProviderRuntimeRequirements result;
+  for (const auto &binding : bundle.capability_provider_bindings) {
+    if (!core::RequiresNativeSceneProjection(
+            binding.capability_id,
+            binding.capability_definition_revision)) {
+      continue;
+    }
+    std::set<core::RuntimeUnitId> runtime_sources;
+    for (const auto &endpoint : binding.endpoint_bindings) {
+      if (endpoint.source_kind !=
+          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+        continue;
+      }
+      const auto *runtime_unit =
+          std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+      if (runtime_unit == nullptr || runtime_unit->empty()) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "verified native provider has a malformed runtime endpoint");
+      }
+      runtime_sources.insert(*runtime_unit);
+    }
+    if (runtime_sources.size() != 1U ||
+        !declared_runtime_units.contains(*runtime_sources.begin())) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "verified native provider does not resolve one declared runtime "
+          "unit");
+    }
+    const auto inserted = result.emplace(
+        ProjectionProviderBindingKey{
+            binding.capability_provider_binding_id,
+            binding.capability_provider_binding_revision},
+        *runtime_sources.begin());
+    if (!inserted.second) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "verified retained bundle repeats a native scene provider binding");
+    }
+  }
+  return result;
+}
+
+[[nodiscard]] bool TransitionRowsMatchVerifiedBundles(
+    const std::vector<core::ProjectionTransitionRowDTO> &rows,
+    const RetainedBundleDTO &predecessor, const RetainedBundleDTO &candidate) {
+  const auto predecessor_bindings = NativeSceneProviderBindings(predecessor);
+  const auto candidate_bindings = NativeSceneProviderBindings(candidate);
+  std::set<ProjectionProviderBindingKey> observed_predecessor;
+  std::set<ProjectionProviderBindingKey> observed_candidate;
+  for (const auto &row : rows) {
+    const ProjectionProviderBindingKey key{
+        row.native_runtime_binding.provider_binding_id,
+        row.native_runtime_binding.provider_binding_revision};
+    const auto predecessor_requirement = predecessor_bindings.find(key);
+    const auto candidate_requirement = candidate_bindings.find(key);
+    const bool matches_predecessor =
+        predecessor_requirement != predecessor_bindings.end() &&
+        predecessor_requirement->second ==
+            row.native_runtime_binding.runtime_unit_id;
+    const bool matches_candidate =
+        candidate_requirement != candidate_bindings.end() &&
+        candidate_requirement->second == row.native_runtime_binding.runtime_unit_id;
+    switch (row.disposition) {
+    case core::ProjectionTransitionDisposition::kRetained:
+      if (!matches_predecessor || !matches_candidate ||
+          !observed_predecessor.insert(key).second ||
+          !observed_candidate.insert(key).second) {
+        return false;
+      }
+      break;
+    case core::ProjectionTransitionDisposition::kAdded:
+      if (!matches_candidate ||
+          !observed_candidate.insert(key).second) {
+        return false;
+      }
+      break;
+    case core::ProjectionTransitionDisposition::kRemoved:
+      if (!matches_predecessor ||
+          !observed_predecessor.insert(key).second) {
+        return false;
+      }
+      break;
+    }
+  }
+  const auto exact_keys = [](const auto &requirements) {
+    std::set<ProjectionProviderBindingKey> keys;
+    for (const auto &[key, unused] : requirements) {
+      static_cast<void>(unused);
+      keys.insert(key);
+    }
+    return keys;
+  };
+  return observed_predecessor == exact_keys(predecessor_bindings) &&
+         observed_candidate == exact_keys(candidate_bindings);
+}
+
+struct NativeTransitionParticipant final {
+  core::ProjectionTransitionRowDTO transition_row;
+  std::shared_ptr<core::IPlannerSceneProjection> projection;
+  core::ProjectionHealthDTO observed_health;
+};
+
+[[nodiscard]] RequiredSceneProjection ResolveRequiredProjection(
+    const core::ProjectionNativeRuntimeBindingDTO &binding,
+    const core::IPlannerSceneProjectionResolver *resolver) {
+  if (resolver == nullptr) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "native projection requires an installed projection resolver");
+  }
+  core::Result<std::shared_ptr<core::IPlannerSceneProjection>> resolved =
+      [&]() {
+        try {
+          return resolver->ResolveProjection(binding);
+        } catch (const std::exception &error) {
+          return core::Result<
+              std::shared_ptr<core::IPlannerSceneProjection>>::Err(
+              core::ErrorDTO{"native_projection_resolution_failed",
+                             error.what(), {}});
+        } catch (...) {
+          return core::Result<
+              std::shared_ptr<core::IPlannerSceneProjection>>::Err(
+              core::ErrorDTO{
+                  "native_projection_resolution_failed",
+                  "projection resolver threw a non-standard exception", {}});
+        }
+      }();
+  if (!resolved.ok() || !resolved.value()) {
+    const std::string detail =
+        resolved.ok() ? "projection resolver returned a null client"
+                      : resolved.error().message;
+    throw CanonicalEmptySceneOwnerConflictError(
+        "native projection is unavailable: " + detail);
+  }
+  auto projection = std::move(resolved.value());
+  auto health = projection->ProjectionHealth();
+  if (!health.valid() || health.source_sequence == 0U) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "native projection returned malformed health");
+  }
+  if (health.native_runtime_binding != binding) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "resolved native projection differs from the selected host "
+        "incarnation");
+  }
+  return {std::move(projection), std::move(health)};
+}
+
+[[nodiscard]] std::vector<NativeTransitionParticipant>
+ObserveNativeTransitionParticipants(
+    const std::vector<core::ProjectionTransitionRowDTO> &rows,
+    const core::IPlannerSceneProjectionResolver *resolver) {
+  if (!rows.empty() && resolver == nullptr) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "native transition requires an installed projection resolver");
+  }
+  std::vector<NativeTransitionParticipant> result;
+  result.reserve(rows.size());
+  for (const auto &row : rows) {
+    auto observed =
+        ResolveRequiredProjection(row.native_runtime_binding, resolver);
+    result.push_back({row, std::move(observed.projection),
+                      std::move(observed.preflight_health)});
+  }
+  return result;
+}
 
 core::ProjectionCommitResultDTO
 UncertainProjectionResult(const core::SceneTransactionDTO &transaction,
@@ -2453,9 +2734,268 @@ ReadFinalization(sqlite3 *database,
   return receipt;
 }
 
+struct NativeApplyIntentState final {
+  std::uint64_t lineage_generation;
+  ApplyId apply_id;
+  ApplyGeneration apply_generation;
+  ProjectionStageGeneration stage_generation;
+  ProjectionRevisionDTO predecessor;
+  ProjectionRevisionDTO candidate;
+  LogicalSceneSnapshotDTO frozen_snapshot;
+  std::vector<core::ProjectionTransitionRowDTO> transition_rows;
+  bool activation_selected{};
+};
+
+std::vector<core::ProjectionTransitionRowDTO>
+ReadNativeTransitionRows(sqlite3 *database, const ApplyId &apply_id,
+                         const ApplyGeneration apply_generation,
+                         const ProjectionStageGeneration stage_generation,
+                         const ProjectionRevisionDTO &predecessor,
+                         const std::size_t expected_count) {
+  Statement statement(
+      database,
+      "SELECT transition_ordinal,provider_binding_id,"
+      "provider_binding_revision,runtime_unit_id,runtime_epoch,disposition,"
+      "expected_local_retained_bundle_id,expected_local_graph_revision,"
+      "expected_local_scene_id,expected_local_scene_revision_id,"
+      "expected_local_scene_content_hash "
+      "FROM logical_scene_named_apply_native_transition_rows "
+      "WHERE apply_id=? AND apply_generation=? AND "
+      "projection_stage_generation=? ORDER BY transition_ordinal LIMIT 257");
+  statement.Bind(1, apply_id.value());
+  statement.Bind(2, CheckedSafeCounter(apply_generation.value(),
+                                       "native transition Apply generation"));
+  statement.Bind(3, CheckedSafeCounter(stage_generation.value(),
+                                       "native transition stage generation"));
+  std::vector<core::ProjectionTransitionRowDTO> rows;
+  while (statement.Step()) {
+    if (rows.size() >= kMaximumNativeProjectionTransitionRows ||
+        statement.Integer(0) != static_cast<std::int64_t>(rows.size())) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native transition row order or cardinality is invalid");
+    }
+    const auto provider_binding_id = statement.Text(1);
+    const auto provider_binding_revision = statement.Text(2);
+    const auto runtime_unit_id = statement.Text(3);
+    const auto runtime_epoch = statement.Text(4);
+    ValidateBoundedIdentity(provider_binding_id,
+                            "stored projection provider binding ID");
+    ValidateBoundedIdentity(provider_binding_revision,
+                            "stored projection provider binding revision");
+    ValidateBoundedIdentity(runtime_unit_id,
+                            "stored projection runtime unit ID");
+    ValidateBoundedIdentity(runtime_epoch, "stored projection runtime epoch");
+    core::ProjectionTransitionDisposition disposition;
+    const auto disposition_text = statement.Text(5);
+    if (disposition_text == "retained") {
+      disposition = core::ProjectionTransitionDisposition::kRetained;
+    } else if (disposition_text == "added") {
+      disposition = core::ProjectionTransitionDisposition::kAdded;
+    } else if (disposition_text == "removed") {
+      disposition = core::ProjectionTransitionDisposition::kRemoved;
+    } else {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "stored native transition disposition is invalid");
+    }
+    const bool expected_absent = statement.IsNull(6);
+    for (int column = 6; column <= 10; ++column) {
+      if (statement.IsNull(column) != expected_absent) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "stored native transition predecessor has partial presence");
+      }
+    }
+    std::optional<ProjectionRevisionDTO> expected_local;
+    if (!expected_absent) {
+      const auto bundle = statement.Text(6);
+      const auto graph = statement.Text(7);
+      const auto scene_id = statement.Text(8);
+      const auto scene_revision = statement.Integer(9);
+      const auto scene_hash = statement.Text(10);
+      ValidateDigest(bundle, "stored native predecessor bundle");
+      ValidateDigest(graph, "stored native predecessor graph");
+      ValidateDigest(scene_id, "stored native predecessor scene ID");
+      ValidateDigest(scene_hash, "stored native predecessor scene hash");
+      if (scene_revision <= 0) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "stored native predecessor scene revision is invalid");
+      }
+      expected_local = ProjectionRevisionDTO{
+          RetainedBundleId(bundle), GraphRevision(graph),
+          SceneRevision{SceneId(scene_id),
+                        static_cast<std::uint64_t>(scene_revision),
+                        ContentDigest(scene_hash)}};
+    }
+    core::ProjectionTransitionRowDTO row{
+        core::ProjectionNativeRuntimeBindingDTO{
+            core::CapabilityProviderBindingId(provider_binding_id),
+            core::CapabilityProviderBindingRevision(provider_binding_revision),
+            core::RuntimeUnitId(runtime_unit_id),
+            core::RuntimeEpoch(runtime_epoch)},
+        disposition, std::move(expected_local)};
+    if (!row.valid() || !row.matches_predecessor(predecessor)) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "stored native transition row is invalid for its predecessor");
+    }
+    rows.push_back(std::move(row));
+  }
+  if (rows.size() != expected_count ||
+      !core::CanonicalProjectionTransitionRows(rows)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "stored native transition rows do not match their captured count");
+  }
+  return rows;
+}
+
+std::vector<NativeApplyIntentState> ReadNativeApplyIntents(
+    sqlite3 *database,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
+  if (ScalarInteger(database,
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND "
+                    "name='logical_scene_named_apply_native_intents'") == 0) {
+    return {};
+  }
+  Statement statement(
+      database, "SELECT lineage_generation,apply_id,apply_generation,"
+                "projection_stage_generation,predecessor_retained_bundle_id,"
+                "predecessor_graph_revision,predecessor_scene_id,"
+                "predecessor_scene_revision_id,predecessor_scene_content_hash,"
+                "candidate_retained_bundle_id,candidate_graph_revision,"
+                "candidate_scene_id,candidate_scene_revision_id,"
+                "candidate_scene_content_hash,frozen_snapshot_json,"
+                "native_transition_row_count "
+                "FROM logical_scene_named_apply_native_intents "
+                "ORDER BY lineage_generation LIMIT 257");
+  std::vector<NativeApplyIntentState> intents;
+  std::size_t total_transition_rows = 0U;
+  std::size_t activation_selection_count = 0U;
+  while (statement.Step()) {
+    if (intents.size() >= kMaximumNamedApplySceneStages) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native Apply intent history exceeds its fixed bound");
+    }
+    const auto lineage = statement.Integer(0);
+    const auto apply_id_text = statement.Text(1);
+    const auto apply_generation_value = statement.Integer(2);
+    const auto stage_generation_value = statement.Integer(3);
+    const auto predecessor_bundle = statement.Text(4);
+    const auto predecessor_graph = statement.Text(5);
+    const auto predecessor_scene_id = statement.Text(6);
+    const auto predecessor_scene_revision = statement.Integer(7);
+    const auto predecessor_scene_hash = statement.Text(8);
+    const auto candidate_bundle = statement.Text(9);
+    const auto candidate_graph = statement.Text(10);
+    const auto candidate_scene_id = statement.Text(11);
+    const auto candidate_scene_revision = statement.Integer(12);
+    const auto candidate_scene_hash = statement.Text(13);
+    const auto frozen_snapshot_json = statement.Text(14);
+    const auto transition_count = statement.Integer(15);
+    ValidateBoundedIdentity(apply_id_text, "stored native Apply ID");
+    ValidateDigest(predecessor_bundle, "stored native predecessor bundle");
+    ValidateDigest(predecessor_graph, "stored native predecessor graph");
+    ValidateDigest(predecessor_scene_id, "stored native predecessor scene ID");
+    ValidateDigest(predecessor_scene_hash,
+                   "stored native predecessor scene hash");
+    ValidateDigest(candidate_bundle, "stored native candidate bundle");
+    ValidateDigest(candidate_graph, "stored native candidate graph");
+    ValidateDigest(candidate_scene_id, "stored native candidate scene ID");
+    ValidateDigest(candidate_scene_hash, "stored native candidate scene hash");
+    if (lineage <= 0 || apply_generation_value <= 0 ||
+        stage_generation_value <= 0 || predecessor_scene_revision <= 0 ||
+        candidate_scene_revision <= 0 || transition_count < 0 ||
+        transition_count >
+            static_cast<std::int64_t>(kMaximumNativeProjectionTransitionRows) ||
+        frozen_snapshot_json.empty() ||
+        frozen_snapshot_json.size() > kMaximumLogicalSceneTransactionBytes) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "stored native Apply intent is structurally invalid");
+    }
+    ProjectionRevisionDTO predecessor{
+        RetainedBundleId(predecessor_bundle), GraphRevision(predecessor_graph),
+        SceneRevision{SceneId(predecessor_scene_id),
+                      static_cast<std::uint64_t>(predecessor_scene_revision),
+                      ContentDigest(predecessor_scene_hash)}};
+    ProjectionRevisionDTO candidate{
+        RetainedBundleId(candidate_bundle), GraphRevision(candidate_graph),
+        SceneRevision{SceneId(candidate_scene_id),
+                      static_cast<std::uint64_t>(candidate_scene_revision),
+                      ContentDigest(candidate_scene_hash)}};
+    auto snapshot =
+        logical_scene_codec_internal::DecodeSnapshot(frozen_snapshot_json);
+    if (!predecessor.valid() || !candidate.valid() ||
+        candidate.scene_revision != predecessor.scene_revision ||
+        !snapshot.has_exact_identity(
+            {candidate.scene_revision, fixed_query.cell_id})) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "stored native Apply capture differs from its frozen scene");
+    }
+    NativeApplyIntentState intent{
+        static_cast<std::uint64_t>(lineage),
+        ApplyId(apply_id_text),
+        ApplyGeneration(static_cast<std::uint64_t>(apply_generation_value)),
+        ProjectionStageGeneration(
+            static_cast<std::uint64_t>(stage_generation_value)),
+        std::move(predecessor),
+        std::move(candidate),
+        std::move(snapshot),
+        {},
+        false};
+    intent.transition_rows = ReadNativeTransitionRows(
+        database, intent.apply_id, intent.apply_generation,
+        intent.stage_generation, intent.predecessor,
+        static_cast<std::size_t>(transition_count));
+    total_transition_rows += intent.transition_rows.size();
+
+    Statement selection(
+        database,
+        "SELECT candidate_retained_bundle_id,candidate_graph_revision,"
+        "candidate_scene_id,candidate_scene_revision_id,"
+        "candidate_scene_content_hash "
+        "FROM logical_scene_named_apply_activation_selections "
+        "WHERE apply_id=? AND apply_generation=? AND "
+        "projection_stage_generation=? LIMIT 2");
+    selection.Bind(1, intent.apply_id.value());
+    selection.Bind(2, CheckedSafeCounter(intent.apply_generation.value(),
+                                         "activation selection generation"));
+    selection.Bind(3, CheckedSafeCounter(intent.stage_generation.value(),
+                                         "activation selection stage"));
+    if (selection.Step()) {
+      const ProjectionRevisionDTO selected{
+          RetainedBundleId(selection.Text(0)), GraphRevision(selection.Text(1)),
+          SceneRevision{SceneId(selection.Text(2)),
+                        static_cast<std::uint64_t>(selection.Integer(3)),
+                        ContentDigest(selection.Text(4))}};
+      if (selected != intent.candidate || selection.Step()) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "stored native activation selection differs from its candidate");
+      }
+      intent.activation_selected = true;
+      ++activation_selection_count;
+    }
+    intents.push_back(std::move(intent));
+  }
+  if (ScalarInteger(
+          database,
+          "SELECT count(*) FROM logical_scene_named_apply_native_intents") !=
+          static_cast<std::int64_t>(intents.size()) ||
+      ScalarInteger(database,
+                    "SELECT count(*) FROM "
+                    "logical_scene_named_apply_native_transition_rows") !=
+          static_cast<std::int64_t>(total_transition_rows) ||
+      ScalarInteger(database,
+                    "SELECT count(*) FROM "
+                    "logical_scene_named_apply_activation_selections") !=
+          static_cast<std::int64_t>(activation_selection_count)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native Apply intent tables have inconsistent cardinality");
+  }
+  return intents;
+}
+
 std::vector<NamedApplyStageState> ReadNamedApplyStages(
     sqlite3 *database, const std::optional<AcceptedState> &accepted,
-    const std::optional<ActiveBundlePublicationReceiptDTO> &finalization) {
+    const std::optional<ActiveBundlePublicationReceiptDTO> &finalization,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
+  const auto native_intents = ReadNativeApplyIntents(database, fixed_query);
   Statement statement(
       database, "SELECT s.lineage_generation,s.apply_id,s.apply_generation,"
                 "s.projection_stage_generation,"
@@ -2494,6 +3034,8 @@ std::vector<NamedApplyStageState> ReadNamedApplyStages(
   std::int64_t activation_count = 0;
   std::int64_t discard_count = 0;
   std::int64_t named_finalization_count = 0;
+  std::size_t base_stage_count = 0U;
+  std::size_t next_native_intent = 0U;
   while (statement.Step()) {
     if (stages.size() >= kMaximumNamedApplySceneStages) {
       throw CanonicalEmptySceneOwnerIntegrityError(
@@ -2581,6 +3123,10 @@ std::vector<NamedApplyStageState> ReadNamedApplyStages(
         activated,
         discarded,
         std::nullopt,
+        {},
+        std::nullopt,
+        true,
+        false,
     };
     if (!stage.predecessor.valid() || !stage.candidate.valid() ||
         !current_projection.has_value() ||
@@ -2599,6 +3145,31 @@ std::vector<NamedApplyStageState> ReadNamedApplyStages(
         stage.candidate.scene_revision != stage.predecessor.scene_revision) {
       throw CanonicalEmptySceneOwnerIntegrityError(
           "stored named Apply stage differs from the active logical lineage");
+    }
+    if (next_native_intent < native_intents.size() &&
+        native_intents[next_native_intent].lineage_generation <
+            expected_lineage_generation) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "stored native Apply intent has no matching completion stage");
+    }
+    if (next_native_intent < native_intents.size() &&
+        native_intents[next_native_intent].lineage_generation ==
+            expected_lineage_generation) {
+      const auto &intent = native_intents[next_native_intent];
+      if (intent.apply_id != stage.apply_id ||
+          intent.apply_generation != stage.apply_generation ||
+          intent.stage_generation != stage.stage_generation ||
+          intent.predecessor != stage.predecessor ||
+          intent.candidate != stage.candidate ||
+          (intent.activation_selected && discarded) ||
+          ((activated || finalized) && !intent.activation_selected)) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "stored native Apply intent differs from its completion stage");
+      }
+      stage.native_transition_rows = intent.transition_rows;
+      stage.frozen_snapshot = intent.frozen_snapshot;
+      stage.activation_selected = intent.activation_selected;
+      ++next_native_intent;
     }
     // A public scene transaction may have advanced only the scene member
     // since the preceding structural publication. The v2 Apply row captures
@@ -2668,11 +3239,60 @@ std::vector<NamedApplyStageState> ReadNamedApplyStages(
     discard_count += discarded ? 1 : 0;
     unresolved_transition = !discarded && !finalized;
     stages.push_back(std::move(stage));
+    ++base_stage_count;
     ++expected_lineage_generation;
+  }
+  if (next_native_intent < native_intents.size()) {
+    if (native_intents.size() - next_native_intent != 1U ||
+        unresolved_transition || !accepted.has_value() ||
+        !finalization.has_value() || !current_projection.has_value()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native Apply intent history has an invalid unresolved suffix");
+    }
+    const auto &intent = native_intents[next_native_intent];
+    if (intent.lineage_generation != expected_lineage_generation ||
+        intent.activation_selected ||
+        intent.predecessor.retained_bundle_id !=
+            current_projection->retained_bundle_id ||
+        intent.predecessor.graph_revision !=
+            current_projection->graph_revision ||
+        intent.predecessor.scene_revision.scene_id !=
+            current_projection->scene_revision.scene_id ||
+        intent.predecessor.scene_revision.revision_id <
+            current_projection->scene_revision.revision_id ||
+        (intent.predecessor.scene_revision.revision_id ==
+             current_projection->scene_revision.revision_id &&
+         intent.predecessor.scene_revision.content_hash !=
+             current_projection->scene_revision.content_hash) ||
+        intent.candidate.scene_revision != intent.predecessor.scene_revision) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "unresolved native Apply intent differs from the active logical "
+          "lineage");
+    }
+    stages.push_back(NamedApplyStageState{
+        intent.lineage_generation,
+        intent.apply_id,
+        intent.apply_generation,
+        intent.stage_generation,
+        intent.predecessor,
+        intent.candidate,
+        false,
+        false,
+        std::nullopt,
+        intent.transition_rows,
+        intent.frozen_snapshot,
+        false,
+        false,
+    });
+    ++next_native_intent;
+  }
+  if (next_native_intent != native_intents.size()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native Apply intent history was not consumed exactly");
   }
   if (ScalarInteger(database,
                     "SELECT count(*) FROM logical_scene_named_apply_stages") !=
-          static_cast<std::int64_t>(stages.size()) ||
+          static_cast<std::int64_t>(base_stage_count) ||
       ScalarInteger(
           database,
           "SELECT count(*) FROM logical_scene_named_apply_activations") !=
@@ -2691,6 +3311,253 @@ std::vector<NamedApplyStageState> ReadNamedApplyStages(
   return stages;
 }
 
+[[nodiscard]] std::vector<core::ProjectionNativeRuntimeBindingDTO>
+ReadNativeRuntimeRecoveryBindings(sqlite3 *database,
+                                  const std::uint64_t recovery_generation,
+                                  const std::size_t expected_count,
+                                  const ProjectionRevisionDTO &target) {
+  Statement statement(
+      database,
+      "SELECT binding_ordinal,provider_binding_id,"
+      "provider_binding_revision,runtime_unit_id,runtime_epoch FROM "
+      "logical_scene_native_runtime_recovery_bindings WHERE "
+      "recovery_generation=? ORDER BY binding_ordinal LIMIT 257");
+  statement.Bind(1, CheckedSafeCounter(recovery_generation,
+                                       "native recovery generation"));
+  std::vector<core::ProjectionNativeRuntimeBindingDTO> bindings;
+  while (statement.Step()) {
+    if (bindings.size() >= kMaximumNativeProjectionTransitionRows ||
+        statement.Integer(0) != static_cast<std::int64_t>(bindings.size())) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native recovery binding order or cardinality is invalid");
+    }
+    const auto provider_binding_id = statement.Text(1);
+    const auto provider_binding_revision = statement.Text(2);
+    const auto runtime_unit_id = statement.Text(3);
+    const auto runtime_epoch = statement.Text(4);
+    ValidateBoundedIdentity(provider_binding_id,
+                            "stored recovery provider binding ID");
+    ValidateBoundedIdentity(provider_binding_revision,
+                            "stored recovery provider binding revision");
+    ValidateBoundedIdentity(runtime_unit_id,
+                            "stored recovery runtime unit ID");
+    ValidateBoundedIdentity(runtime_epoch, "stored recovery runtime epoch");
+    bindings.push_back({
+        core::CapabilityProviderBindingId(provider_binding_id),
+        core::CapabilityProviderBindingRevision(provider_binding_revision),
+        core::RuntimeUnitId(runtime_unit_id),
+        core::RuntimeEpoch(runtime_epoch),
+    });
+  }
+  if (bindings.size() != expected_count ||
+      !ActiveProjectionRuntimeSetDTO{target, bindings}.valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "stored native recovery bindings are not exact and canonical");
+  }
+  return bindings;
+}
+
+[[nodiscard]] bool SameProjectionRequirementSet(
+    const NamedApplyStageState &stage,
+    const std::vector<core::ProjectionNativeRuntimeBindingDTO> &bindings) {
+  std::map<ProjectionProviderBindingKey, core::RuntimeUnitId> expected;
+  for (const auto &row : stage.native_transition_rows) {
+    if (row.disposition == core::ProjectionTransitionDisposition::kRemoved) {
+      continue;
+    }
+    expected.emplace(
+        ProjectionProviderBindingKey{
+            row.native_runtime_binding.provider_binding_id,
+            row.native_runtime_binding.provider_binding_revision},
+        row.native_runtime_binding.runtime_unit_id);
+  }
+  if (expected.size() != bindings.size()) {
+    return false;
+  }
+  for (const auto &binding : bindings) {
+    const auto found = expected.find(
+        {binding.provider_binding_id, binding.provider_binding_revision});
+    if (found == expected.end() || found->second != binding.runtime_unit_id) {
+      return false;
+    }
+    expected.erase(found);
+  }
+  return expected.empty();
+}
+
+[[nodiscard]] std::optional<std::vector<core::ProjectionHealthDTO>>
+ReadNativeRuntimeRecoveryCompletion(
+    sqlite3 *database, const std::uint64_t recovery_generation,
+    const ProjectionRevisionDTO &target,
+    const std::vector<core::ProjectionNativeRuntimeBindingDTO> &bindings) {
+  Statement completion(
+      database,
+      "SELECT result_count FROM "
+      "logical_scene_native_runtime_recovery_completions WHERE "
+      "recovery_generation=? LIMIT 2");
+  completion.Bind(1, CheckedSafeCounter(recovery_generation,
+                                        "native recovery generation"));
+  if (!completion.Step()) {
+    Statement result_count(
+        database,
+        "SELECT count(*) FROM logical_scene_native_runtime_recovery_results "
+        "WHERE recovery_generation=?");
+    result_count.Bind(1, CheckedSafeCounter(recovery_generation,
+                                            "native recovery generation"));
+    if (!result_count.Step() || result_count.Integer(0) != 0 ||
+        result_count.Step()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "incomplete native recovery carries result rows");
+    }
+    return std::nullopt;
+  }
+  const auto result_count = completion.Integer(0);
+  if (completion.Step() || result_count <= 0 ||
+      result_count != static_cast<std::int64_t>(bindings.size())) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native recovery completion count is invalid");
+  }
+
+  Statement results(
+      database,
+      "SELECT binding_ordinal,source_sequence,native_projection_generation,"
+      "projection_content_digest FROM "
+      "logical_scene_native_runtime_recovery_results WHERE "
+      "recovery_generation=? ORDER BY binding_ordinal LIMIT 257");
+  results.Bind(1, CheckedSafeCounter(recovery_generation,
+                                     "native recovery generation"));
+  std::vector<core::ProjectionHealthDTO> health;
+  while (results.Step()) {
+    if (health.size() >= bindings.size() ||
+        results.Integer(0) != static_cast<std::int64_t>(health.size()) ||
+        results.Integer(1) <= 0 || results.Integer(2) <= 0) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native recovery result order or counters are invalid");
+    }
+    const auto digest = results.Text(3);
+    ValidateDigest(digest, "stored native recovery projection digest");
+    health.push_back(core::ProjectionHealthDTO{
+        bindings[health.size()],
+        static_cast<std::uint64_t>(results.Integer(1)),
+        ProjectionHealthState::kHealthy,
+        target,
+        std::nullopt,
+        static_cast<std::uint64_t>(results.Integer(2)),
+        ContentDigest(digest),
+        std::nullopt,
+    });
+  }
+  if (health.size() != bindings.size()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native recovery result set is incomplete");
+  }
+  return health;
+}
+
+[[nodiscard]] std::vector<NativeRuntimeRecoveryState>
+ReadNativeRuntimeRecoveries(
+    sqlite3 *database,
+    const std::vector<NamedApplyStageState> &named_apply_stages) {
+  Statement statement(
+      database,
+      "SELECT recovery_generation,structural_lineage_generation,"
+      "target_retained_bundle_id,target_graph_revision,target_scene_id,"
+      "target_scene_revision_id,target_scene_content_hash,"
+      "native_binding_count FROM "
+      "logical_scene_native_runtime_recovery_intents ORDER BY "
+      "recovery_generation LIMIT 257");
+  std::vector<NativeRuntimeRecoveryState> recoveries;
+  std::size_t total_bindings = 0U;
+  std::size_t total_results = 0U;
+  std::size_t total_completions = 0U;
+  while (statement.Step()) {
+    if (recoveries.size() >= kMaximumNativeProjectionRecoveries ||
+        statement.Integer(0) !=
+            static_cast<std::int64_t>(recoveries.size() + 1U)) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native recovery history exceeds or breaks its fixed generation "
+          "sequence");
+    }
+    const auto generation = static_cast<std::uint64_t>(statement.Integer(0));
+    const auto lineage = statement.Integer(1);
+    const auto bundle = statement.Text(2);
+    const auto graph = statement.Text(3);
+    const auto scene_id = statement.Text(4);
+    const auto scene_revision = statement.Integer(5);
+    const auto scene_hash = statement.Text(6);
+    const auto binding_count = statement.Integer(7);
+    ValidateDigest(bundle, "stored recovery target bundle");
+    ValidateDigest(graph, "stored recovery target graph");
+    ValidateDigest(scene_id, "stored recovery target scene ID");
+    ValidateDigest(scene_hash, "stored recovery target scene hash");
+    if (lineage <= 0 || scene_revision <= 0 || binding_count <= 0 ||
+        binding_count >
+            static_cast<std::int64_t>(kMaximumNativeProjectionTransitionRows)) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "stored native recovery intent is structurally invalid");
+    }
+    const auto stage = std::find_if(
+        named_apply_stages.begin(), named_apply_stages.end(),
+        [&](const NamedApplyStageState &candidate) {
+          return candidate.lineage_generation ==
+                 static_cast<std::uint64_t>(lineage);
+        });
+    ProjectionRevisionDTO target{
+        RetainedBundleId(bundle), GraphRevision(graph),
+        SceneRevision{SceneId(scene_id),
+                      static_cast<std::uint64_t>(scene_revision),
+                      ContentDigest(scene_hash)}};
+    if (stage == named_apply_stages.end() ||
+        !stage->finalization_receipt.has_value() ||
+        stage->native_transition_rows.empty() || !target.valid() ||
+        target.retained_bundle_id != stage->candidate.retained_bundle_id ||
+        target.graph_revision != stage->candidate.graph_revision ||
+        target.scene_revision.scene_id !=
+            stage->candidate.scene_revision.scene_id ||
+        target.scene_revision.revision_id <
+            stage->candidate.scene_revision.revision_id) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native recovery target is not in its finalized structural "
+          "lineage");
+    }
+    auto bindings = ReadNativeRuntimeRecoveryBindings(
+        database, generation, static_cast<std::size_t>(binding_count), target);
+    if (!SameProjectionRequirementSet(*stage, bindings)) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native recovery bindings differ from the finalized provider set");
+    }
+    auto completion = ReadNativeRuntimeRecoveryCompletion(
+        database, generation, target, bindings);
+    total_bindings += bindings.size();
+    total_results += completion.has_value() ? completion->size() : 0U;
+    total_completions += completion.has_value() ? 1U : 0U;
+    recoveries.push_back({NativeProjectionRecoveryGeneration(generation),
+                          static_cast<std::uint64_t>(lineage),
+                          std::move(target), std::move(bindings),
+                          std::move(completion)});
+  }
+  if (ScalarInteger(
+          database,
+          "SELECT count(*) FROM logical_scene_native_runtime_recovery_intents") !=
+          static_cast<std::int64_t>(recoveries.size()) ||
+      ScalarInteger(
+          database,
+          "SELECT count(*) FROM logical_scene_native_runtime_recovery_bindings") !=
+          static_cast<std::int64_t>(total_bindings) ||
+      ScalarInteger(
+          database,
+          "SELECT count(*) FROM logical_scene_native_runtime_recovery_results") !=
+          static_cast<std::int64_t>(total_results) ||
+      ScalarInteger(
+          database,
+          "SELECT count(*) FROM logical_scene_native_runtime_recovery_completions") !=
+          static_cast<std::int64_t>(total_completions)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native recovery tables have inconsistent cardinality");
+  }
+  return recoveries;
+}
+
 DurableState
 ReadDurableState(sqlite3 *database,
                  const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
@@ -2699,8 +3566,8 @@ ReadDurableState(sqlite3 *database,
   state.rebuilt = ReadRebuild(database, state.accepted);
   state.finalization_receipt =
       ReadFinalization(database, state.accepted, state.rebuilt);
-  state.named_apply_stages = ReadNamedApplyStages(database, state.accepted,
-                                                  state.finalization_receipt);
+  state.named_apply_stages = ReadNamedApplyStages(
+      database, state.accepted, state.finalization_receipt, fixed_query);
   if (state.accepted.has_value() && state.finalization_receipt.has_value()) {
     state.active_projection = state.accepted->target;
     state.active_scene_snapshot = state.accepted->snapshot;
@@ -2718,6 +3585,8 @@ DurableState ReadCompleteDurableState(
     const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
   auto state = ReadDurableState(database, fixed_query);
   if (!state.finalization_receipt.has_value()) {
+    state.native_runtime_recoveries =
+        ReadNativeRuntimeRecoveries(database, state.named_apply_stages);
     return state;
   }
   const auto transactions = ReadSceneTransactionStoreState(database, state);
@@ -2725,6 +3594,25 @@ DurableState ReadCompleteDurableState(
   state.active_scene_snapshot = transactions.active_snapshot;
   state.projection_desynchronized = transactions.projection_desynchronized;
   state.unresolved_scene_transaction = transactions.unresolved_native_attempt;
+  state.native_runtime_recoveries =
+      ReadNativeRuntimeRecoveries(database, state.named_apply_stages);
+  if (const auto *latest = state.LatestActiveRuntimeRecovery();
+      latest != nullptr &&
+      (latest->target.retained_bundle_id !=
+           state.active_projection->retained_bundle_id ||
+       latest->target.graph_revision != state.active_projection->graph_revision ||
+       latest->target.scene_revision.scene_id !=
+           state.active_projection->scene_revision.scene_id ||
+       latest->target.scene_revision.revision_id >
+           state.active_projection->scene_revision.revision_id ||
+       (latest->target.scene_revision.revision_id ==
+            state.active_projection->scene_revision.revision_id &&
+        latest->target.scene_revision.content_hash !=
+            state.active_projection->scene_revision.content_hash))) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "latest native recovery target is not an observed active scene "
+        "revision");
+  }
   return state;
 }
 
@@ -2920,8 +3808,8 @@ void ValidateMigrationMetadata(sqlite3 *database) {
         "logical-scene transaction migration metadata is missing");
   }
   const auto valid =
-      statement.Text(0) == kLogicalSceneStoreSchemaId &&
-      statement.Integer(1) == kLogicalSceneStoreSchemaVersion &&
+      statement.Text(0) == kLogicalSceneTransactionStoreSchemaId &&
+      statement.Integer(1) == kLogicalSceneTransactionStoreSchemaVersion &&
       statement.Text(2) == TransactionMigrationArtifactDigest() &&
       statement.Integer(3) ==
           static_cast<std::int64_t>(kMaximumLogicalSceneTransactions) &&
@@ -2931,6 +3819,59 @@ void ValidateMigrationMetadata(sqlite3 *database) {
   if (!valid) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "logical-scene transaction migration metadata is invalid");
+  }
+}
+
+void ValidateNativeHandoffMigrationMetadata(sqlite3 *database) {
+  Statement statement(
+      database,
+      "SELECT schema_id,schema_version,migration_artifact_digest,"
+      "maximum_native_transition_rows,maximum_native_recoveries,"
+      "maximum_frozen_snapshot_bytes "
+      "FROM logical_scene_native_handoff_migrations ORDER BY singleton "
+      "LIMIT 2");
+  if (!statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native projection handoff migration metadata is missing");
+  }
+  const auto valid =
+      statement.Text(0) == kLogicalSceneStoreSchemaId &&
+      statement.Integer(1) == kLogicalSceneStoreSchemaVersion &&
+      statement.Text(2) == NativeHandoffMigrationArtifactDigest() &&
+      statement.Integer(3) ==
+          static_cast<std::int64_t>(kMaximumNativeProjectionTransitionRows) &&
+      statement.Integer(4) ==
+          static_cast<std::int64_t>(kMaximumNativeProjectionRecoveries) &&
+      statement.Integer(5) ==
+          static_cast<std::int64_t>(kMaximumLogicalSceneTransactionBytes) &&
+      !statement.Step();
+  if (!valid) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native projection handoff migration metadata is invalid");
+  }
+}
+
+void ValidateTransactionDatabase(
+    sqlite3 *database,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
+    const ContentDigest &admission_digest) {
+  if (ScalarInteger(database, "PRAGMA application_id") !=
+          kCanonicalEmptySceneSqliteApplicationId ||
+      ScalarInteger(database, "PRAGMA user_version") !=
+          kLogicalSceneTransactionStoreSchemaVersion) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene SQLite transaction schema version is invalid");
+  }
+  ValidateMechanicalDatabaseIntegrity(database);
+  if (ReadSchemaObjects(database) != ExpectedTransactionSchemaObjects()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "logical-scene schema differs from its exact v4 artifacts");
+  }
+  ValidateMetadata(database, fixed_query, admission_digest);
+  ValidateMigrationMetadata(database);
+  const auto durable_state = ReadDurableState(database, fixed_query);
+  if (durable_state.finalization_receipt.has_value()) {
+    static_cast<void>(ReadSceneTransactionStoreState(database, durable_state));
   }
 }
 
@@ -2952,6 +3893,7 @@ void ValidateDatabase(
   }
   ValidateMetadata(database, fixed_query, admission_digest);
   ValidateMigrationMetadata(database);
+  ValidateNativeHandoffMigrationMetadata(database);
   const auto durable_state = ReadDurableState(database, fixed_query);
   if (durable_state.finalization_receipt.has_value()) {
     static_cast<void>(ReadSceneTransactionStoreState(database, durable_state));
@@ -3014,8 +3956,8 @@ void InsertMigrationMetadata(sqlite3 *database) {
                 "singleton,schema_id,schema_version,migration_artifact_digest,"
                 "maximum_scene_transactions,maximum_transaction_bytes) "
                 "VALUES(1,?,?,?,?,?)");
-  statement.Bind(1, kLogicalSceneStoreSchemaId);
-  statement.Bind(2, kLogicalSceneStoreSchemaVersion);
+  statement.Bind(1, kLogicalSceneTransactionStoreSchemaId);
+  statement.Bind(2, kLogicalSceneTransactionStoreSchemaVersion);
   statement.Bind(3, TransactionMigrationArtifactDigest());
   statement.Bind(4,
                  static_cast<std::int64_t>(kMaximumLogicalSceneTransactions));
@@ -3024,6 +3966,27 @@ void InsertMigrationMetadata(sqlite3 *database) {
   if (statement.Step()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "migration metadata insert unexpectedly returned a row");
+  }
+}
+
+void InsertNativeHandoffMigrationMetadata(sqlite3 *database) {
+  Statement statement(
+      database, "INSERT INTO logical_scene_native_handoff_migrations("
+                "singleton,schema_id,schema_version,migration_artifact_digest,"
+                "maximum_native_transition_rows,maximum_native_recoveries,"
+                "maximum_frozen_snapshot_bytes) VALUES(1,?,?,?,?,?,?)");
+  statement.Bind(1, kLogicalSceneStoreSchemaId);
+  statement.Bind(2, kLogicalSceneStoreSchemaVersion);
+  statement.Bind(3, NativeHandoffMigrationArtifactDigest());
+  statement.Bind(
+      4, static_cast<std::int64_t>(kMaximumNativeProjectionTransitionRows));
+  statement.Bind(
+      5, static_cast<std::int64_t>(kMaximumNativeProjectionRecoveries));
+  statement.Bind(
+      6, static_cast<std::int64_t>(kMaximumLogicalSceneTransactionBytes));
+  if (statement.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native handoff migration metadata insert returned a row");
   }
 }
 
@@ -3386,8 +4349,12 @@ ProjectionBootstrapAcceptedDTO AcceptedResult(const AcceptedState &accepted) {
 CanonicalEmptySceneAccessStatus AccessStatus(const DurableState &state) {
   const bool has_active = state.active_projection.has_value();
   const bool transition_open = state.OpenNamedApply() != nullptr;
+  const auto *latest_recovery = state.LatestActiveRuntimeRecovery();
+  const bool recovery_complete =
+      latest_recovery == nullptr || latest_recovery->completion_health.has_value();
   const bool projection_available =
-      !state.projection_desynchronized && !state.unresolved_scene_transaction;
+      recovery_complete && !state.projection_desynchronized &&
+      !state.unresolved_scene_transaction;
   return {
       state.phase(),
       has_active && !transition_open && projection_available,
@@ -3475,6 +4442,366 @@ ProjectionTransitionEvidenceDTO ZeroNativeTransitionEvidence(
   return evidence;
 }
 
+ProjectionTransitionEvidenceDTO NativeTransitionEvidence(
+    const NamedApplyStageState &stage,
+    const ProjectionTransitionEvidenceState evidence_state,
+    std::vector<core::ProjectionTransitionRowEvidenceDTO> rows,
+    std::optional<ErrorDTO> error = std::nullopt) {
+  ProjectionTransitionEvidenceDTO evidence{
+      stage.apply_id,    stage.apply_generation, stage.stage_generation,
+      stage.predecessor, stage.candidate,        evidence_state,
+      std::move(rows),   std::move(error),
+  };
+  if (!evidence.phase_consistent(evidence_state) ||
+      evidence.transition_rows.size() != stage.native_transition_rows.size()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent native named Apply transition evidence");
+  }
+  for (std::size_t index = 0U; index < evidence.transition_rows.size();
+       ++index) {
+    if (evidence.transition_rows[index].transition_row !=
+        stage.native_transition_rows[index]) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native named Apply evidence differs from its durable rows");
+    }
+  }
+  return evidence;
+}
+
+core::ProjectionTransitionRowEvidenceDTO
+UncertainTransitionRowEvidence(const core::ProjectionTransitionRowDTO &row,
+                               core::ProjectionHealthDTO health,
+                               ErrorDTO error) {
+  health.state = ProjectionHealthState::kUnavailable;
+  health.error = error;
+  core::ProjectionTransitionRowEvidenceDTO evidence{
+      row,
+      core::ProjectionTransitionRowEvidenceState::kUncertain,
+      std::nullopt,
+      health.active_projection_revision,
+      std::move(health),
+      std::move(error),
+  };
+  if (!evidence.valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent uncertain native transition row");
+  }
+  return evidence;
+}
+
+core::NativeProjectionStatusDTO
+ReadNativeStageStatus(const NamedApplyStageState &stage,
+                      const NativeTransitionParticipant &participant) {
+  const core::NativeProjectionStatusQueryDTO query{
+      stage.apply_id,
+      stage.apply_generation,
+      stage.stage_generation,
+      participant.transition_row,
+  };
+  auto status = participant.projection->ProjectionStageStatus(query);
+  const auto &echo = status.query;
+  if (!status.presence_valid() || echo.apply_id != query.apply_id ||
+      echo.apply_generation != query.apply_generation ||
+      echo.projection_stage_generation != query.projection_stage_generation ||
+      echo.transition_row != query.transition_row) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native projection returned malformed or foreign stage status");
+  }
+  return status;
+}
+
+core::NativeProjectionRetireStatusDTO
+ReadNativeRetireStatus(const NamedApplyStageState &stage,
+                       const NativeTransitionParticipant &participant) {
+  const core::NativeProjectionRetireDTO request{
+      stage.apply_id,         stage.apply_generation,
+      stage.stage_generation, participant.transition_row,
+      stage.predecessor,      stage.candidate,
+  };
+  const core::NativeProjectionRetireStatusQueryDTO query{request};
+  auto status = participant.projection->ProjectionRetireStatus(query);
+  const auto &echo = status.request;
+  if (!status.presence_valid() || echo.apply_id != request.apply_id ||
+      echo.apply_generation != request.apply_generation ||
+      echo.projection_stage_generation != request.projection_stage_generation ||
+      echo.transition_row != request.transition_row ||
+      echo.expected_predecessor_projection_revision !=
+          request.expected_predecessor_projection_revision ||
+      echo.candidate_projection_revision !=
+          request.candidate_projection_revision) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native projection returned malformed or foreign retirement status");
+  }
+  return status;
+}
+
+core::ProjectionTransitionRowEvidenceDTO
+StagedRowEvidence(const NamedApplyStageState &stage,
+                  const NativeTransitionParticipant &participant,
+                  const core::NativeProjectionStatusDTO &status) {
+  const core::ProjectionStagedCandidateDTO expected_stage{
+      stage.apply_id, stage.apply_generation, stage.stage_generation,
+      stage.candidate};
+  if (status.state != core::NativeProjectionStatusState::kStaged ||
+      status.staged_or_active_candidate_revision !=
+          std::optional<ProjectionRevisionDTO>{stage.candidate} ||
+      status.observed_local_active !=
+          participant.transition_row.expected_local_active ||
+      status.resulting_health.staged_candidate !=
+          std::optional<core::ProjectionStagedCandidateDTO>{expected_stage}) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "native projection is not exactly staged without active effect");
+  }
+  return {
+      participant.transition_row,
+      core::ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect,
+      stage.candidate,
+      status.observed_local_active,
+      status.resulting_health,
+      std::nullopt,
+  };
+}
+
+core::ProjectionTransitionRowEvidenceDTO PredecessorUnchangedRowEvidence(
+    const NamedApplyStageState &stage,
+    const NativeTransitionParticipant &participant,
+    const core::NativeProjectionRetireStatusDTO &status) {
+  if (status.state != core::NativeProjectionRetireStatusState::kPending ||
+      status.observed_local_active !=
+          participant.transition_row.expected_local_active ||
+      !status.resulting_health.healthy_for_target(stage.predecessor)) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "removed native projection did not remain at its exact predecessor");
+  }
+  return {
+      participant.transition_row,
+      core::ProjectionTransitionRowEvidenceState::kPredecessorUnchanged,
+      std::nullopt,
+      status.observed_local_active,
+      status.resulting_health,
+      std::nullopt,
+  };
+}
+
+core::ProjectionTransitionRowEvidenceDTO
+CandidateActiveRowEvidence(const NamedApplyStageState &stage,
+                           const NativeTransitionParticipant &participant,
+                           const core::NativeProjectionStatusDTO &status) {
+  if (status.state != core::NativeProjectionStatusState::kActivated ||
+      status.staged_or_active_candidate_revision !=
+          std::optional<ProjectionRevisionDTO>{stage.candidate} ||
+      status.observed_local_active !=
+          std::optional<ProjectionRevisionDTO>{stage.candidate} ||
+      !status.resulting_health.healthy_for_target(stage.candidate)) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "candidate native projection is not exactly active");
+  }
+  return {
+      participant.transition_row,
+      core::ProjectionTransitionRowEvidenceState::kCandidateActive,
+      stage.candidate,
+      status.observed_local_active,
+      status.resulting_health,
+      std::nullopt,
+  };
+}
+
+core::ProjectionTransitionRowEvidenceDTO
+RemovedRetiredRowEvidence(const NativeTransitionParticipant &participant,
+                          const core::NativeProjectionRetireStatusDTO &status) {
+  if ((status.state != core::NativeProjectionRetireStatusState::kRetired &&
+       status.state !=
+           core::NativeProjectionRetireStatusState::kAlreadyAbsent) ||
+      status.observed_local_active.has_value() ||
+      status.resulting_health.active_projection_revision.has_value() ||
+      status.resulting_health.staged_candidate.has_value() ||
+      status.resulting_health.error.has_value()) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "removed native projection is not positively retired");
+  }
+  return {
+      participant.transition_row,
+      core::ProjectionTransitionRowEvidenceState::kRemovedRetired,
+      std::nullopt,
+      std::nullopt,
+      status.resulting_health,
+      std::nullopt,
+  };
+}
+
+core::ProjectionTransitionRowEvidenceDTO
+CandidateDiscardedRowEvidence(const NamedApplyStageState &stage,
+                              const NativeTransitionParticipant &participant,
+                              const core::NativeProjectionStatusDTO &status) {
+  if ((status.state != core::NativeProjectionStatusState::kAbsent &&
+       status.state != core::NativeProjectionStatusState::kDiscarded) ||
+      status.staged_or_active_candidate_revision.has_value() ||
+      status.observed_local_active !=
+          participant.transition_row.expected_local_active ||
+      status.resulting_health.staged_candidate.has_value() ||
+      (participant.transition_row.expected_local_active.has_value()
+           ? !status.resulting_health.healthy_for_target(stage.predecessor)
+           : status.resulting_health.state !=
+                 ProjectionHealthState::kUninitialized)) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "candidate native stage is not positively absent");
+  }
+  return {
+      participant.transition_row,
+      core::ProjectionTransitionRowEvidenceState::kCandidateStageDiscarded,
+      std::nullopt,
+      status.observed_local_active,
+      status.resulting_health,
+      std::nullopt,
+  };
+}
+
+ProjectionAggregateHealthDTO CandidateAggregateHealth(
+    const NamedApplyStageState &stage,
+    const std::vector<core::ProjectionTransitionRowEvidenceDTO> &rows) {
+  std::vector<core::ProjectionHealthDTO> candidate_health;
+  for (const auto &row : rows) {
+    if (row.transition_row.disposition !=
+        core::ProjectionTransitionDisposition::kRemoved) {
+      candidate_health.push_back(row.resulting_health);
+    }
+  }
+  ProjectionAggregateHealthDTO aggregate{
+      NamedApplyProjectionSetSourceDTO{stage.apply_id, stage.apply_generation,
+                                       stage.stage_generation, stage.candidate},
+      ProjectionHealthState::kHealthy,
+      std::move(candidate_health),
+      std::nullopt,
+  };
+  if (!aggregate.matches_named_apply(stage.apply_id, stage.apply_generation,
+                                     stage.stage_generation, stage.candidate) ||
+      !aggregate.healthy_for_target(stage.candidate)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent complete candidate native health");
+  }
+  return aggregate;
+}
+
+ProjectionAggregateHealthDTO
+UnavailableCandidateAggregateHealth(const NamedApplyStageState &stage,
+                                    const ErrorDTO &error) {
+  std::vector<core::ProjectionHealthDTO> candidate_health;
+  for (const auto &row : stage.native_transition_rows) {
+    if (row.disposition == core::ProjectionTransitionDisposition::kRemoved) {
+      continue;
+    }
+    candidate_health.push_back(core::ProjectionHealthDTO{
+        row.native_runtime_binding,
+        1U,
+        ProjectionHealthState::kUnavailable,
+        row.expected_local_active,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        error,
+    });
+  }
+  ProjectionAggregateHealthDTO aggregate{
+      NamedApplyProjectionSetSourceDTO{stage.apply_id, stage.apply_generation,
+                                       stage.stage_generation, stage.candidate},
+      ProjectionHealthState::kUnavailable,
+      std::move(candidate_health),
+      error,
+  };
+  if (!aggregate.matches_named_apply(stage.apply_id, stage.apply_generation,
+                                     stage.stage_generation, stage.candidate)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent unavailable candidate native health");
+  }
+  return aggregate;
+}
+
+ProjectionTransitionEvidenceDTO ObserveNativeTransitionEvidence(
+    const NamedApplyStageState &stage,
+    const std::vector<NativeTransitionParticipant> &participants,
+    const ProjectionTransitionEvidenceState evidence_state) {
+  if (evidence_state == ProjectionTransitionEvidenceState::kUncertain) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "closed native transition observation cannot manufacture uncertainty");
+  }
+  std::vector<core::ProjectionTransitionRowEvidenceDTO> rows;
+  rows.reserve(participants.size());
+  for (const auto &participant : participants) {
+    const bool removed = participant.transition_row.disposition ==
+                         core::ProjectionTransitionDisposition::kRemoved;
+    switch (evidence_state) {
+    case ProjectionTransitionEvidenceState::kStaged:
+      rows.push_back(removed ? PredecessorUnchangedRowEvidence(
+                                   stage, participant,
+                                   ReadNativeRetireStatus(stage, participant))
+                             : StagedRowEvidence(
+                                   stage, participant,
+                                   ReadNativeStageStatus(stage, participant)));
+      break;
+    case ProjectionTransitionEvidenceState::kAborted:
+      rows.push_back(removed ? PredecessorUnchangedRowEvidence(
+                                   stage, participant,
+                                   ReadNativeRetireStatus(stage, participant))
+                             : CandidateDiscardedRowEvidence(
+                                   stage, participant,
+                                   ReadNativeStageStatus(stage, participant)));
+      break;
+    case ProjectionTransitionEvidenceState::kActivatedAndRetired:
+    case ProjectionTransitionEvidenceState::kFinalized:
+      rows.push_back(
+          removed ? RemovedRetiredRowEvidence(
+                        participant, ReadNativeRetireStatus(stage, participant))
+                  : CandidateActiveRowEvidence(
+                        stage, participant,
+                        ReadNativeStageStatus(stage, participant)));
+      break;
+    case ProjectionTransitionEvidenceState::kUncertain:
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "unreachable native transition observation state");
+    }
+  }
+  return NativeTransitionEvidence(stage, evidence_state, std::move(rows));
+}
+
+ProjectionTransitionEvidenceDTO UncertainNativeTransitionEvidence(
+    const NamedApplyStageState &stage,
+    const std::vector<NativeTransitionParticipant> &participants,
+    const ErrorDTO &error) {
+  std::vector<core::ProjectionTransitionRowEvidenceDTO> rows;
+  rows.reserve(participants.size());
+  for (const auto &participant : participants) {
+    rows.push_back(UncertainTransitionRowEvidence(
+        participant.transition_row, participant.observed_health, error));
+  }
+  return NativeTransitionEvidence(stage,
+                                  ProjectionTransitionEvidenceState::kUncertain,
+                                  std::move(rows), error);
+}
+
+ProjectionTransitionEvidenceDTO
+UnavailableNativeTransitionEvidence(const NamedApplyStageState &stage,
+                                    const ErrorDTO &error) {
+  std::vector<core::ProjectionTransitionRowEvidenceDTO> rows;
+  rows.reserve(stage.native_transition_rows.size());
+  for (const auto &row : stage.native_transition_rows) {
+    core::ProjectionHealthDTO unavailable{
+        row.native_runtime_binding,
+        1U,
+        ProjectionHealthState::kUnavailable,
+        row.expected_local_active,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        error,
+    };
+    rows.push_back(
+        UncertainTransitionRowEvidence(row, std::move(unavailable), error));
+  }
+  return NativeTransitionEvidence(stage,
+                                  ProjectionTransitionEvidenceState::kUncertain,
+                                  std::move(rows), error);
+}
+
 ProjectionTransitionEvidenceDTO
 ZeroNativeStageEvidence(const NamedApplyStageState &stage) {
   return ZeroNativeTransitionEvidence(
@@ -3522,6 +4849,51 @@ ProjectionApplyStageResultDTO StagedResult(const NamedApplyStageState &stage) {
   return result;
 }
 
+ProjectionApplyStageResultDTO
+StagedResult(const NamedApplyStageState &stage,
+             ProjectionTransitionEvidenceDTO evidence) {
+  ProjectionApplyStageResultDTO result{
+      stage.apply_id,
+      stage.apply_generation,
+      stage.predecessor,
+      stage.candidate,
+      stage.stage_generation,
+      std::move(evidence),
+      ProjectionApplyStageResultState::kStaged,
+      std::nullopt,
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent native named Apply staged result");
+  }
+  return result;
+}
+
+ProjectionApplyStageResultDTO
+CapturedStageFailureResult(const NamedApplyStageState &stage,
+                           const ProjectionApplyStageResultState state,
+                           ProjectionTransitionEvidenceDTO evidence,
+                           ErrorDTO error) {
+  if (state == ProjectionApplyStageResultState::kStaged ||
+      (state == ProjectionApplyStageResultState::kRejected &&
+       evidence.state != ProjectionTransitionEvidenceState::kAborted) ||
+      (state == ProjectionApplyStageResultState::kFailedProjectionUncertain &&
+       evidence.state != ProjectionTransitionEvidenceState::kUncertain)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "captured stage failure helper received contradictory state");
+  }
+  ProjectionApplyStageResultDTO result{
+      stage.apply_id,  stage.apply_generation, stage.predecessor,
+      stage.candidate, stage.stage_generation, std::move(evidence),
+      state,           std::move(error),
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent captured named Apply stage failure");
+  }
+  return result;
+}
+
 ProjectionApplyActivationResultDTO
 ActivatedResult(const NamedApplyStageState &stage) {
   ProjectionApplyActivationResultDTO result{
@@ -3543,6 +4915,23 @@ ActivatedResult(const NamedApplyStageState &stage) {
   return result;
 }
 
+ProjectionApplyActivationResultDTO
+ActivatedResult(const NamedApplyStageState &stage,
+                ProjectionTransitionEvidenceDTO evidence) {
+  ProjectionApplyActivationResultDTO result{
+      stage.apply_id,    stage.apply_generation,
+      stage.predecessor, stage.stage_generation,
+      stage.candidate,   ProjectionApplyActivationResultState::kActivated,
+      stage.candidate,   std::move(evidence),
+      std::nullopt,
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent native named Apply activation");
+  }
+  return result;
+}
+
 ProjectionApplyDiscardResultDTO
 DiscardedResult(const NamedApplyStageState &stage,
                 const ProjectionApplyDiscardResultState state) {
@@ -3560,6 +4949,22 @@ DiscardedResult(const NamedApplyStageState &stage,
   if (!result.presence_valid()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "cannot represent zero-native named Apply discard");
+  }
+  return result;
+}
+
+ProjectionApplyDiscardResultDTO
+DiscardedResult(const NamedApplyStageState &stage,
+                const ProjectionApplyDiscardResultState state,
+                ProjectionTransitionEvidenceDTO evidence) {
+  ProjectionApplyDiscardResultDTO result{
+      stage.apply_id,      stage.apply_generation, stage.stage_generation,
+      stage.candidate,     stage.predecessor,      state,
+      std::move(evidence), std::nullopt,
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent native named Apply discard");
   }
   return result;
 }
@@ -3590,6 +4995,33 @@ FinalizedResult(const NamedApplyStageState &stage) {
   return result;
 }
 
+ProjectionApplyFinalizeResultDTO
+FinalizedResult(const NamedApplyStageState &stage,
+                ProjectionTransitionEvidenceDTO evidence,
+                ProjectionAggregateHealthDTO candidate_health) {
+  if (!stage.finalization_receipt.has_value()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot form native named Apply Finalize without a durable receipt");
+  }
+  ProjectionApplyFinalizeResultDTO result{
+      stage.apply_id,
+      stage.apply_generation,
+      stage.stage_generation,
+      stage.candidate,
+      *stage.finalization_receipt,
+      ProjectionApplyFinalizeResultState::kFinalized,
+      stage.candidate,
+      std::move(evidence),
+      std::move(candidate_health),
+      std::nullopt,
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent native named Apply Finalize");
+  }
+  return result;
+}
+
 NamedApplyStageState
 StageIdentityFrom(const ProjectionApplyActivationDTO &request) {
   return {
@@ -3602,6 +5034,10 @@ StageIdentityFrom(const ProjectionApplyActivationDTO &request) {
       false,
       false,
       std::nullopt,
+      {},
+      std::nullopt,
+      true,
+      false,
   };
 }
 
@@ -3617,6 +5053,10 @@ StageIdentityFrom(const ProjectionApplyDiscardDTO &request) {
       false,
       false,
       std::nullopt,
+      {},
+      std::nullopt,
+      true,
+      false,
   };
 }
 
@@ -3656,6 +5096,28 @@ FailedActivationResult(const ProjectionApplyActivationDTO &request,
   return result;
 }
 
+ProjectionApplyActivationResultDTO
+FailedActivationResult(const NamedApplyStageState &stage,
+                       const ProjectionApplyActivationResultState state,
+                       ProjectionTransitionEvidenceDTO evidence,
+                       std::string code, std::string message) {
+  if (state == ProjectionApplyActivationResultState::kActivated) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "failed native activation helper received success state");
+  }
+  ErrorDTO error{std::move(code), std::move(message), {}};
+  ProjectionApplyActivationResultDTO result{
+      stage.apply_id,         stage.apply_generation, stage.predecessor,
+      stage.stage_generation, stage.candidate,        state,
+      std::nullopt,           std::move(evidence),    std::move(error),
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent failed native named Apply activation");
+  }
+  return result;
+}
+
 ProjectionApplyDiscardResultDTO
 FailedDiscardResult(const ProjectionApplyDiscardDTO &request, std::string code,
                     std::string message) {
@@ -3675,6 +5137,28 @@ FailedDiscardResult(const ProjectionApplyDiscardDTO &request, std::string code,
   if (!result.presence_valid()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "cannot represent failed named Apply discard");
+  }
+  return result;
+}
+
+ProjectionApplyDiscardResultDTO
+FailedDiscardResult(const NamedApplyStageState &stage,
+                    ProjectionTransitionEvidenceDTO evidence, std::string code,
+                    std::string message) {
+  ErrorDTO error{std::move(code), std::move(message), {}};
+  ProjectionApplyDiscardResultDTO result{
+      stage.apply_id,
+      stage.apply_generation,
+      stage.stage_generation,
+      stage.candidate,
+      stage.predecessor,
+      ProjectionApplyDiscardResultState::kFailedProjectionUncertain,
+      std::move(evidence),
+      std::move(error),
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent failed native named Apply discard");
   }
   return result;
 }
@@ -3718,6 +5202,48 @@ FailedNamedFinalizeResult(const NamedApplyStageState &stage,
   if (!result.presence_valid()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "cannot represent failed named Apply Finalize");
+  }
+  return result;
+}
+
+ProjectionApplyFinalizeResultDTO
+FailedNamedFinalizeResult(const NamedApplyStageState &stage,
+                          const ProjectionApplyFinalizeDTO &request,
+                          const ProjectionApplyFinalizeResultState state,
+                          ProjectionTransitionEvidenceDTO evidence,
+                          ProjectionAggregateHealthDTO candidate_health,
+                          std::string code, std::string message) {
+  if (state == ProjectionApplyFinalizeResultState::kFinalized ||
+      request.apply_id != stage.apply_id ||
+      request.apply_generation != stage.apply_generation ||
+      request.projection_stage_generation != stage.stage_generation ||
+      request.candidate_projection_revision != stage.candidate ||
+      !evidence.matches_apply(stage.apply_id, stage.apply_generation,
+                              stage.stage_generation, stage.predecessor,
+                              stage.candidate) ||
+      !candidate_health.matches_named_apply(
+          stage.apply_id, stage.apply_generation, stage.stage_generation,
+          stage.candidate)) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "failed native Finalize helper received contradictory identity or "
+        "state");
+  }
+  ErrorDTO error{std::move(code), std::move(message), {}};
+  ProjectionApplyFinalizeResultDTO result{
+      request.apply_id,
+      request.apply_generation,
+      request.projection_stage_generation,
+      request.candidate_projection_revision,
+      request.publication_receipt,
+      state,
+      std::nullopt,
+      std::move(evidence),
+      std::move(candidate_health),
+      std::move(error),
+  };
+  if (!result.presence_valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent failed native named Apply Finalize");
   }
   return result;
 }
@@ -3778,6 +5304,256 @@ void InsertNamedApplyStage(sqlite3 *database,
   if (insert.Step()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "named Apply stage insert unexpectedly returned a row");
+  }
+}
+
+void InsertNativeApplyIntent(
+    sqlite3 *database, const NamedApplyStageState &stage,
+    const LogicalSceneSnapshotDTO &frozen_snapshot,
+    const std::vector<core::ProjectionTransitionRowDTO> &transition_rows) {
+  if (!stage.predecessor.valid() || !stage.candidate.valid() ||
+      stage.candidate.scene_revision != stage.predecessor.scene_revision ||
+      !frozen_snapshot.has_exact_identity(
+          {stage.candidate.scene_revision, frozen_snapshot.cell_id}) ||
+      transition_rows.size() > kMaximumNativeProjectionTransitionRows ||
+      !core::CanonicalProjectionTransitionRows(transition_rows) ||
+      std::any_of(transition_rows.begin(), transition_rows.end(),
+                  [&](const auto &row) {
+                    return !row.matches_predecessor(stage.predecessor);
+                  })) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot persist an invalid native Apply intent");
+  }
+  const auto snapshot_json =
+      logical_scene_codec_internal::EncodeSnapshot(frozen_snapshot);
+  if (snapshot_json.empty() ||
+      snapshot_json.size() > kMaximumLogicalSceneTransactionBytes) {
+    throw CanonicalEmptySceneOwnerLimitError(
+        "native Apply frozen snapshot exceeds its fixed byte bound");
+  }
+
+  Statement intent(
+      database,
+      "INSERT INTO logical_scene_named_apply_native_intents("
+      "lineage_generation,apply_id,apply_generation,"
+      "projection_stage_generation,predecessor_retained_bundle_id,"
+      "predecessor_graph_revision,predecessor_scene_id,"
+      "predecessor_scene_revision_id,predecessor_scene_content_hash,"
+      "candidate_retained_bundle_id,candidate_graph_revision,"
+      "candidate_scene_id,candidate_scene_revision_id,"
+      "candidate_scene_content_hash,frozen_snapshot_json,"
+      "native_transition_row_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+  intent.Bind(1, CheckedSafeCounter(stage.lineage_generation,
+                                    "scene lineage generation"));
+  intent.Bind(2, stage.apply_id.value());
+  intent.Bind(3, CheckedSafeCounter(stage.apply_generation.value(),
+                                    "native Apply generation"));
+  intent.Bind(4, CheckedSafeCounter(stage.stage_generation.value(),
+                                    "native projection stage generation"));
+  intent.Bind(5, stage.predecessor.retained_bundle_id.value());
+  intent.Bind(6, stage.predecessor.graph_revision.value());
+  intent.Bind(7, stage.predecessor.scene_revision.scene_id.value());
+  intent.Bind(8,
+              CheckedSafeCounter(stage.predecessor.scene_revision.revision_id,
+                                 "native predecessor scene revision"));
+  intent.Bind(9, stage.predecessor.scene_revision.content_hash.value());
+  intent.Bind(10, stage.candidate.retained_bundle_id.value());
+  intent.Bind(11, stage.candidate.graph_revision.value());
+  intent.Bind(12, stage.candidate.scene_revision.scene_id.value());
+  intent.Bind(13, CheckedSafeCounter(stage.candidate.scene_revision.revision_id,
+                                     "native candidate scene revision"));
+  intent.Bind(14, stage.candidate.scene_revision.content_hash.value());
+  intent.Bind(15, snapshot_json);
+  intent.Bind(16, static_cast<std::int64_t>(transition_rows.size()));
+  if (intent.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native Apply intent insert unexpectedly returned a row");
+  }
+
+  for (std::size_t ordinal = 0U; ordinal < transition_rows.size(); ++ordinal) {
+    const auto &row = transition_rows[ordinal];
+    const auto &binding = row.native_runtime_binding;
+    Statement insert(
+        database,
+        "INSERT INTO logical_scene_named_apply_native_transition_rows("
+        "apply_id,apply_generation,projection_stage_generation,"
+        "transition_ordinal,provider_binding_id,provider_binding_revision,"
+        "runtime_unit_id,runtime_epoch,disposition,"
+        "expected_local_retained_bundle_id,expected_local_graph_revision,"
+        "expected_local_scene_id,expected_local_scene_revision_id,"
+        "expected_local_scene_content_hash) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    insert.Bind(1, stage.apply_id.value());
+    insert.Bind(2, CheckedSafeCounter(stage.apply_generation.value(),
+                                      "native Apply generation"));
+    insert.Bind(3, CheckedSafeCounter(stage.stage_generation.value(),
+                                      "native projection stage generation"));
+    insert.Bind(4, static_cast<std::int64_t>(ordinal));
+    insert.Bind(5, binding.provider_binding_id.value());
+    insert.Bind(6, binding.provider_binding_revision.value());
+    insert.Bind(7, binding.runtime_unit_id.value());
+    insert.Bind(8, binding.runtime_epoch.value());
+    insert.Bind(9, core::to_string(row.disposition));
+    if (row.expected_local_active.has_value()) {
+      const auto &expected = *row.expected_local_active;
+      insert.Bind(10, expected.retained_bundle_id.value());
+      insert.Bind(11, expected.graph_revision.value());
+      insert.Bind(12, expected.scene_revision.scene_id.value());
+      insert.Bind(13, CheckedSafeCounter(expected.scene_revision.revision_id,
+                                         "native expected scene revision"));
+      insert.Bind(14, expected.scene_revision.content_hash.value());
+    } else {
+      for (int index = 10; index <= 14; ++index) {
+        insert.BindNull(index);
+      }
+    }
+    if (insert.Step()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native Apply transition-row insert unexpectedly returned a row");
+    }
+  }
+}
+
+void InsertNativeActivationSelection(sqlite3 *database,
+                                     const NamedApplyStageState &stage) {
+  Statement insert(
+      database, "INSERT INTO logical_scene_named_apply_activation_selections("
+                "apply_id,apply_generation,projection_stage_generation,"
+                "candidate_retained_bundle_id,candidate_graph_revision,"
+                "candidate_scene_id,candidate_scene_revision_id,"
+                "candidate_scene_content_hash) VALUES(?,?,?,?,?,?,?,?)");
+  insert.Bind(1, stage.apply_id.value());
+  insert.Bind(2, CheckedSafeCounter(stage.apply_generation.value(),
+                                    "native Apply generation"));
+  insert.Bind(3, CheckedSafeCounter(stage.stage_generation.value(),
+                                    "native projection stage generation"));
+  insert.Bind(4, stage.candidate.retained_bundle_id.value());
+  insert.Bind(5, stage.candidate.graph_revision.value());
+  insert.Bind(6, stage.candidate.scene_revision.scene_id.value());
+  insert.Bind(7, CheckedSafeCounter(stage.candidate.scene_revision.revision_id,
+                                    "native candidate scene revision"));
+  insert.Bind(8, stage.candidate.scene_revision.content_hash.value());
+  if (insert.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native activation-selection insert unexpectedly returned a row");
+  }
+}
+
+void InsertNativeRuntimeRecoveryIntent(
+    sqlite3 *database,
+    const NativeProjectionRecoveryGeneration recovery_generation,
+    const std::uint64_t structural_lineage_generation,
+    const ActiveProjectionRuntimeSetDTO &runtime_set) {
+  if (!recovery_generation.nonzero() || !runtime_set.valid() ||
+      runtime_set.native_runtime_bindings.empty() ||
+      runtime_set.native_runtime_bindings.size() >
+          kMaximumNativeProjectionTransitionRows) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot persist an invalid native runtime recovery intent");
+  }
+  Statement intent(
+      database,
+      "INSERT INTO logical_scene_native_runtime_recovery_intents("
+      "recovery_generation,structural_lineage_generation,"
+      "target_retained_bundle_id,target_graph_revision,target_scene_id,"
+      "target_scene_revision_id,target_scene_content_hash,"
+      "native_binding_count) VALUES(?,?,?,?,?,?,?,?)");
+  intent.Bind(1, CheckedSafeCounter(recovery_generation.value(),
+                                    "native recovery generation"));
+  intent.Bind(2, CheckedSafeCounter(structural_lineage_generation,
+                                    "native recovery structural lineage"));
+  intent.Bind(3, runtime_set.active_projection_revision.retained_bundle_id.value());
+  intent.Bind(4, runtime_set.active_projection_revision.graph_revision.value());
+  intent.Bind(5,
+              runtime_set.active_projection_revision.scene_revision.scene_id.value());
+  intent.Bind(
+      6, CheckedSafeCounter(
+             runtime_set.active_projection_revision.scene_revision.revision_id,
+             "native recovery target scene revision"));
+  intent.Bind(
+      7,
+      runtime_set.active_projection_revision.scene_revision.content_hash.value());
+  intent.Bind(
+      8, static_cast<std::int64_t>(runtime_set.native_runtime_bindings.size()));
+  if (intent.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native runtime recovery intent insert returned a row");
+  }
+
+  for (std::size_t ordinal = 0U;
+       ordinal < runtime_set.native_runtime_bindings.size(); ++ordinal) {
+    const auto &binding = runtime_set.native_runtime_bindings[ordinal];
+    Statement insert(
+        database,
+        "INSERT INTO logical_scene_native_runtime_recovery_bindings("
+        "recovery_generation,binding_ordinal,provider_binding_id,"
+        "provider_binding_revision,runtime_unit_id,runtime_epoch) "
+        "VALUES(?,?,?,?,?,?)");
+    insert.Bind(1, CheckedSafeCounter(recovery_generation.value(),
+                                      "native recovery generation"));
+    insert.Bind(2, static_cast<std::int64_t>(ordinal));
+    insert.Bind(3, binding.provider_binding_id.value());
+    insert.Bind(4, binding.provider_binding_revision.value());
+    insert.Bind(5, binding.runtime_unit_id.value());
+    insert.Bind(6, binding.runtime_epoch.value());
+    if (insert.Step()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native runtime recovery binding insert returned a row");
+    }
+  }
+}
+
+void InsertNativeRuntimeRecoveryCompletion(
+    sqlite3 *database,
+    const NativeProjectionRecoveryGeneration recovery_generation,
+    const ProjectionRevisionDTO &target,
+    const std::vector<core::ProjectionHealthDTO> &health) {
+  if (!recovery_generation.nonzero() || !target.valid() || health.empty() ||
+      health.size() > kMaximumNativeProjectionTransitionRows) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot persist an invalid native runtime recovery completion");
+  }
+  for (std::size_t ordinal = 0U; ordinal < health.size(); ++ordinal) {
+    const auto &row = health[ordinal];
+    if (!row.healthy_for_target(target) || row.source_sequence == 0U ||
+        !row.native_projection_generation.has_value() ||
+        !row.projection_content_digest.has_value() ||
+        (ordinal != 0U &&
+         !core::CanonicalProjectionNativeBindingLess(
+             health[ordinal - 1U].native_runtime_binding,
+             row.native_runtime_binding))) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native runtime recovery completion lacks exact healthy evidence");
+    }
+    Statement insert(
+        database,
+        "INSERT INTO logical_scene_native_runtime_recovery_results("
+        "recovery_generation,binding_ordinal,source_sequence,"
+        "native_projection_generation,projection_content_digest) "
+        "VALUES(?,?,?,?,?)");
+    insert.Bind(1, CheckedSafeCounter(recovery_generation.value(),
+                                      "native recovery generation"));
+    insert.Bind(2, static_cast<std::int64_t>(ordinal));
+    insert.Bind(3, CheckedSafeCounter(row.source_sequence,
+                                      "native recovery source sequence"));
+    insert.Bind(4, CheckedSafeCounter(*row.native_projection_generation,
+                                      "native projection generation"));
+    insert.Bind(5, row.projection_content_digest->value());
+    if (insert.Step()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native runtime recovery result insert returned a row");
+    }
+  }
+  Statement completion(
+      database,
+      "INSERT INTO logical_scene_native_runtime_recovery_completions("
+      "recovery_generation,result_count) VALUES(?,?)");
+  completion.Bind(1, CheckedSafeCounter(recovery_generation.value(),
+                                        "native recovery generation"));
+  completion.Bind(2, static_cast<std::int64_t>(health.size()));
+  if (completion.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native runtime recovery completion insert returned a row");
   }
 }
 
@@ -3938,44 +5714,37 @@ public:
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
-             publication_reader, nullptr, {}) {}
+             publication_reader, nullptr, nullptr) {}
 
   Impl(std::filesystem::path database_path,
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader,
        const deployment::IVerifiedRetainedBundleSource &retained_bundle_source)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
-             publication_reader, &retained_bundle_source, {}) {}
+             publication_reader, &retained_bundle_source, nullptr) {}
 
   Impl(std::filesystem::path database_path,
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader,
        const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
-       std::vector<core::IPlannerSceneProjection *> required_projections)
+       const core::IPlannerSceneProjectionResolver &projection_resolver)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
              publication_reader, &retained_bundle_source,
-             std::move(required_projections)) {}
+             &projection_resolver) {}
 
   Impl(std::filesystem::path database_path,
        AdmittedBootstrapAuthority authority,
        const core::IActiveBundlePublicationReader &publication_reader,
        const deployment::IVerifiedRetainedBundleSource *retained_bundle_source,
-       std::vector<core::IPlannerSceneProjection *> required_projections)
+       const core::IPlannerSceneProjectionResolver *projection_resolver)
       : database_path_(std::move(database_path)),
         fixed_query_(std::move(authority.query)),
         admission_digest_(std::move(authority.admission_digest)),
         admitted_bundle_(std::move(authority.retained_bundle)),
         publication_reader_(publication_reader),
         retained_bundle_source_(retained_bundle_source),
-        required_projections_(std::move(required_projections)) {
+        projection_resolver_(projection_resolver) {
     ValidateFixedQuery(fixed_query_);
-    if (required_projections_.size() > kMaximumLogicalSceneTransactions ||
-        std::any_of(
-            required_projections_.begin(), required_projections_.end(),
-            [](const auto *projection) { return projection == nullptr; })) {
-      throw std::invalid_argument(
-          "required logical-scene projections must be bounded and non-null");
-    }
     if (database_path_.empty() || database_path_.filename().empty()) {
       throw std::invalid_argument(
           "logical-scene database path must name one file");
@@ -4014,6 +5783,10 @@ public:
               if (version == kCanonicalEmptySceneStoreSchemaVersion) {
                 ValidateBaseDatabase(preflight, fixed_query_,
                                      admission_digest_);
+              } else if (version ==
+                         kLogicalSceneTransactionStoreSchemaVersion) {
+                ValidateTransactionDatabase(preflight, fixed_query_,
+                                            admission_digest_);
               } else {
                 ValidateDatabase(preflight, fixed_query_, admission_digest_);
               }
@@ -4062,6 +5835,8 @@ public:
         InsertMetadata(database_, fixed_query_, admission_digest_);
         Exec(database_, detail::kEmbeddedLogicalSceneTransactionMigration);
         InsertMigrationMetadata(database_);
+        Exec(database_, detail::kEmbeddedNativeProjectionHandoffMigration);
+        InsertNativeHandoffMigrationMetadata(database_);
         transaction.Commit();
         changed_schema = true;
       } else {
@@ -4072,6 +5847,17 @@ public:
           Transaction transaction(database_, "BEGIN IMMEDIATE");
           Exec(database_, detail::kEmbeddedLogicalSceneTransactionMigration);
           InsertMigrationMetadata(database_);
+          Exec(database_, detail::kEmbeddedNativeProjectionHandoffMigration);
+          InsertNativeHandoffMigrationMetadata(database_);
+          transaction.Commit();
+          changed_schema = true;
+        } else if (version == kLogicalSceneTransactionStoreSchemaVersion) {
+          ValidateTransactionDatabase(database_, fixed_query_,
+                                      admission_digest_);
+          ConfigureDurability(database_);
+          Transaction transaction(database_, "BEGIN IMMEDIATE");
+          Exec(database_, detail::kEmbeddedNativeProjectionHandoffMigration);
+          InsertNativeHandoffMigrationMetadata(database_);
           transaction.Commit();
           changed_schema = true;
         } else {
@@ -4151,7 +5937,7 @@ public:
   RetainedBundleDTO admitted_bundle_;
   const core::IActiveBundlePublicationReader &publication_reader_;
   const deployment::IVerifiedRetainedBundleSource *retained_bundle_source_;
-  std::vector<core::IPlannerSceneProjection *> required_projections_;
+  const core::IPlannerSceneProjectionResolver *projection_resolver_;
   mutable std::mutex mutex_;
   sqlite3 *database_{};
 };
@@ -4177,10 +5963,10 @@ CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const core::IActiveBundlePublicationReader &publication_reader,
     const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
-    std::vector<core::IPlannerSceneProjection *> required_projections)
+    const core::IPlannerSceneProjectionResolver &projection_resolver)
     : impl_(std::make_unique<Impl>(std::move(database_path), admission,
                                    publication_reader, retained_bundle_source,
-                                   std::move(required_projections))) {}
+                                   projection_resolver)) {}
 
 CanonicalEmptySceneOwner::~CanonicalEmptySceneOwner() = default;
 CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
@@ -4485,12 +6271,6 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
         "this scene owner was not provisioned with the verified retained "
         "bundle source required by named Apply");
   }
-  if (!request.native_transition_rows.empty()) {
-    return RejectedStageResult(
-        request, "native_projection_transition_unavailable",
-        "the current I4 scene owner admits only the zero-native named Apply "
-        "fixture");
-  }
 
   std::shared_ptr<const deployment::RetainedBundle> predecessor;
   std::shared_ptr<const deployment::RetainedBundle> candidate;
@@ -4516,98 +6296,416 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
       !deployment::verify_retained_bundle_identity(*candidate) ||
       predecessor->value() != request.predecessor_retained_bundle ||
       candidate->value() != request.candidate_retained_bundle ||
-      !predecessor->value().capability_provider_bindings.empty() ||
-      !candidate->value().capability_provider_bindings.empty() ||
       predecessor->value().cell_graph.cell_id != impl_->fixed_query_.cell_id ||
-      candidate->value().cell_graph.cell_id != impl_->fixed_query_.cell_id) {
+      candidate->value().cell_graph.cell_id != impl_->fixed_query_.cell_id ||
+      !TransitionRowsMatchVerifiedBundles(request.native_transition_rows,
+                                          predecessor->value(),
+                                          candidate->value())) {
     return RejectedStageResult(
         request, "named_apply_retained_bundle_mismatch",
         "the complete independently verified retained bundles do not match "
-        "the request or this logical-scene lineage");
+        "the request, native transition set, or this logical-scene lineage");
   }
 
   std::lock_guard lock(impl_->mutex_);
   auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN IMMEDIATE");
-  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
-  if (const auto *staged =
+  auto state = impl_->ReadStateTransaction();
+  std::optional<NamedApplyStageState> stage;
+  bool new_stage = false;
+  if (const auto *existing =
           state.FindNamedApply(request.apply_id, request.apply_generation);
-      staged != nullptr) {
-    if (staged->predecessor != request.expected_active_projection_revision ||
-        staged->candidate.retained_bundle_id !=
+      existing != nullptr) {
+    if (existing->predecessor != request.expected_active_projection_revision ||
+        existing->candidate.retained_bundle_id !=
             request.candidate_retained_bundle.retained_bundle_id ||
-        staged->candidate.graph_revision !=
-            request.candidate_retained_bundle.cell_graph.graph_revision) {
-      transaction.Commit();
+        existing->candidate.graph_revision !=
+            request.candidate_retained_bundle.cell_graph.graph_revision ||
+        existing->native_transition_rows != request.native_transition_rows) {
       return RejectedStageResult(
           request, "named_apply_transition_conflict",
           "another exact named Apply transition already owns the scene "
           "quiesce");
     }
-    transaction.Commit();
-    return StagedResult(*staged);
-  }
-  if (state.OpenNamedApply() != nullptr) {
-    transaction.Commit();
-    return RejectedStageResult(
-        request, "named_apply_transition_conflict",
-        "another exact named Apply transition already owns the scene "
-        "quiesce");
-  }
-  const auto access = AccessStatus(state);
-  if (!state.accepted.has_value() || !access.scene_writes_open ||
-      !access.projection_leases_open || !access.active_projection.has_value() ||
-      request.expected_active_projection_revision !=
-          *access.active_projection ||
-      request.predecessor_retained_bundle.retained_bundle_id !=
-          access.active_projection->retained_bundle_id ||
-      request.predecessor_retained_bundle.cell_graph.graph_revision !=
-          access.active_projection->graph_revision) {
-    transaction.Commit();
-    return RejectedStageResult(
-        request, "named_apply_predecessor_mismatch",
-        "named Apply expected predecessor is not the exact open active "
-        "logical-scene composite");
-  }
-  if (state.named_apply_stages.size() >= kMaximumNamedApplySceneStages) {
-    transaction.Commit();
-    return RejectedStageResult(
-        request, "named_apply_stage_history_exhausted",
-        "the logical-scene owner has reached its bounded named Apply "
-        "history limit");
+    stage = *existing;
+  } else {
+    if (state.OpenNamedApply() != nullptr) {
+      return RejectedStageResult(
+          request, "named_apply_transition_conflict",
+          "another exact named Apply transition already owns the scene "
+          "quiesce");
+    }
+    const auto access = AccessStatus(state);
+    if (!state.accepted.has_value() || !access.scene_writes_open ||
+        !access.projection_leases_open ||
+        !access.active_projection.has_value() ||
+        !state.active_scene_snapshot.has_value() ||
+        request.expected_active_projection_revision !=
+            *access.active_projection ||
+        request.predecessor_retained_bundle.retained_bundle_id !=
+            access.active_projection->retained_bundle_id ||
+        request.predecessor_retained_bundle.cell_graph.graph_revision !=
+            access.active_projection->graph_revision) {
+      return RejectedStageResult(
+          request, "named_apply_predecessor_mismatch",
+          "named Apply expected predecessor is not the exact open active "
+          "logical-scene composite");
+    }
+    if (state.named_apply_stages.size() >= kMaximumNamedApplySceneStages) {
+      return RejectedStageResult(
+          request, "named_apply_stage_history_exhausted",
+          "the logical-scene owner has reached its bounded named Apply "
+          "history limit");
+    }
+    stage = NamedApplyStageState{
+        state.named_apply_stages.size() + 1U,
+        request.apply_id,
+        request.apply_generation,
+        ProjectionStageGeneration(1U),
+        request.expected_active_projection_revision,
+        ProjectionRevisionDTO{
+            request.candidate_retained_bundle.retained_bundle_id,
+            request.candidate_retained_bundle.cell_graph.graph_revision,
+            access.active_projection->scene_revision,
+        },
+        false,
+        false,
+        std::nullopt,
+        request.native_transition_rows,
+        *state.active_scene_snapshot,
+        request.native_transition_rows.empty(),
+        false,
+    };
+    new_stage = true;
   }
 
-  NamedApplyStageState stage{
-      state.named_apply_stages.size() + 1U,
-      request.apply_id,
-      request.apply_generation,
-      ProjectionStageGeneration(1U),
-      request.expected_active_projection_revision,
-      ProjectionRevisionDTO{
-          request.candidate_retained_bundle.retained_bundle_id,
-          request.candidate_retained_bundle.cell_graph.graph_revision,
-          access.active_projection->scene_revision,
-      },
-      false,
-      false,
-      std::nullopt,
-  };
-  InsertNamedApplyStage(database, stage);
-  state = ReadCompleteDurableState(database, impl_->fixed_query_);
-  const auto *persisted =
-      state.FindNamedApply(stage.apply_id, stage.apply_generation);
-  if (persisted == nullptr ||
-      persisted->stage_generation != stage.stage_generation ||
-      persisted->predecessor != stage.predecessor ||
-      persisted->candidate != stage.candidate || persisted->activated ||
-      persisted->discarded || persisted->finalization_receipt.has_value() ||
-      AccessStatus(state).scene_writes_open ||
-      AccessStatus(state).projection_leases_open) {
-    throw CanonicalEmptySceneOwnerIntegrityError(
-        "named Apply Stage did not durably close gates and replay exactly");
+  if (request.native_transition_rows.empty()) {
+    if (stage->discarded) {
+      const ErrorDTO error{
+          "named_apply_stage_discarded",
+          "the exact named Apply stage was already discarded",
+          {},
+      };
+      return CapturedStageFailureResult(
+          *stage, ProjectionApplyStageResultState::kRejected,
+          ZeroNativeTransitionEvidence(
+              *stage, ProjectionTransitionEvidenceState::kAborted),
+          error);
+    }
+    if (stage->activated || stage->activation_selected ||
+        stage->finalization_receipt.has_value()) {
+      const ErrorDTO error{
+          "named_apply_stage_already_selected",
+          "the exact named Apply stage has entered forward-only activation",
+          {},
+      };
+      return CapturedStageFailureResult(
+          *stage, ProjectionApplyStageResultState::kFailedProjectionUncertain,
+          ZeroNativeTransitionEvidence(
+              *stage, ProjectionTransitionEvidenceState::kUncertain, error),
+          error);
+    }
+    if (new_stage) {
+      Transaction transaction(database, "BEGIN IMMEDIATE");
+      const auto current =
+          ReadCompleteDurableState(database, impl_->fixed_query_);
+      const auto access = AccessStatus(current);
+      if (current.OpenNamedApply() != nullptr || !access.scene_writes_open ||
+          !access.projection_leases_open ||
+          access.active_projection !=
+              std::optional<ProjectionRevisionDTO>{stage->predecessor}) {
+        return RejectedStageResult(
+            request, "named_apply_predecessor_mismatch",
+            "logical-scene state changed before durable stage capture");
+      }
+      InsertNamedApplyStage(database, *stage);
+      transaction.Commit();
+    }
+    return StagedResult(*stage);
   }
-  transaction.Commit();
-  return StagedResult(*persisted);
+
+  std::vector<NativeTransitionParticipant> participants;
+  try {
+    participants = ObserveNativeTransitionParticipants(
+        request.native_transition_rows, impl_->projection_resolver_);
+  } catch (const std::exception &error) {
+    if (!new_stage) {
+      const ErrorDTO failure{
+          "native_projection_status_unavailable", error.what(), {}};
+      return CapturedStageFailureResult(
+          *stage, ProjectionApplyStageResultState::kFailedProjectionUncertain,
+          UnavailableNativeTransitionEvidence(*stage, failure), failure);
+    }
+    return RejectedStageResult(request, "native_projection_set_unavailable",
+                               error.what());
+  }
+
+  if (stage->discarded) {
+    const ErrorDTO error{
+        "named_apply_stage_discarded",
+        "the exact named Apply stage was already discarded",
+        {},
+    };
+    try {
+      return CapturedStageFailureResult(
+          *stage, ProjectionApplyStageResultState::kRejected,
+          ObserveNativeTransitionEvidence(
+              *stage, participants,
+              ProjectionTransitionEvidenceState::kAborted),
+          error);
+    } catch (const std::exception &status_error) {
+      const ErrorDTO failure{
+          "native_projection_abort_status_uncertain", status_error.what(), {}};
+      return CapturedStageFailureResult(
+          *stage, ProjectionApplyStageResultState::kFailedProjectionUncertain,
+          UncertainNativeTransitionEvidence(*stage, participants, failure),
+          failure);
+    }
+  }
+  if (stage->activated || stage->activation_selected ||
+      stage->finalization_receipt.has_value()) {
+    const ErrorDTO error{
+        "named_apply_stage_already_selected",
+        "the exact named Apply stage has entered forward-only activation",
+        {},
+    };
+    try {
+      auto observed = ObserveNativeTransitionEvidence(
+          *stage, participants,
+          stage->finalization_receipt.has_value()
+              ? ProjectionTransitionEvidenceState::kFinalized
+              : ProjectionTransitionEvidenceState::kActivatedAndRetired);
+      return CapturedStageFailureResult(
+          *stage, ProjectionApplyStageResultState::kFailedProjectionUncertain,
+          NativeTransitionEvidence(
+              *stage, ProjectionTransitionEvidenceState::kUncertain,
+              std::move(observed.transition_rows), error),
+          error);
+    } catch (const std::exception &status_error) {
+      const ErrorDTO failure{"native_projection_activation_status_uncertain",
+                             status_error.what(),
+                             {}};
+      return CapturedStageFailureResult(
+          *stage, ProjectionApplyStageResultState::kFailedProjectionUncertain,
+          UncertainNativeTransitionEvidence(*stage, participants, failure),
+          failure);
+    }
+  }
+
+  if (new_stage) {
+    for (const auto &participant : participants) {
+      const auto &row = participant.transition_row;
+      const auto &health = participant.observed_health;
+      const bool predecessor_exact =
+          row.expected_local_active.has_value()
+              ? health.healthy_for_target(stage->predecessor)
+              : health.state == ProjectionHealthState::kUninitialized &&
+                    !health.active_projection_revision.has_value() &&
+                    !health.staged_candidate.has_value() &&
+                    !health.error.has_value();
+      if (!predecessor_exact) {
+        return RejectedStageResult(
+            request, "native_projection_predecessor_mismatch",
+            "a required native host is not at its exact row predecessor");
+      }
+    }
+    Transaction capture(database, "BEGIN IMMEDIATE");
+    const auto current =
+        ReadCompleteDurableState(database, impl_->fixed_query_);
+    const auto access = AccessStatus(current);
+    if (current.OpenNamedApply() != nullptr || !access.scene_writes_open ||
+        !access.projection_leases_open ||
+        access.active_projection !=
+            std::optional<ProjectionRevisionDTO>{stage->predecessor} ||
+        !current.active_scene_snapshot.has_value() ||
+        *current.active_scene_snapshot != *stage->frozen_snapshot) {
+      return RejectedStageResult(
+          request, "named_apply_predecessor_mismatch",
+          "logical-scene state changed before durable frozen capture");
+    }
+    InsertNativeApplyIntent(database, *stage, *stage->frozen_snapshot,
+                            stage->native_transition_rows);
+    capture.Commit();
+    state = impl_->ReadStateTransaction();
+    const auto *captured =
+        state.FindNamedApply(stage->apply_id, stage->apply_generation);
+    if (captured == nullptr || captured->stage_completed ||
+        captured->native_transition_rows != stage->native_transition_rows ||
+        !captured->frozen_snapshot.has_value() ||
+        *captured->frozen_snapshot != *stage->frozen_snapshot ||
+        AccessStatus(state).scene_writes_open ||
+        AccessStatus(state).projection_leases_open) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native Apply capture did not durably close the scene gates");
+    }
+    stage = *captured;
+  }
+
+  const auto uncertain_result =
+      [&](std::vector<core::ProjectionTransitionRowEvidenceDTO> rows,
+          const std::size_t next_row, ErrorDTO error) {
+        rows.reserve(participants.size());
+        for (std::size_t index = next_row; index < participants.size();
+             ++index) {
+          rows.push_back(UncertainTransitionRowEvidence(
+              participants[index].transition_row,
+              participants[index].observed_health, error));
+        }
+        return CapturedStageFailureResult(
+            *stage, ProjectionApplyStageResultState::kFailedProjectionUncertain,
+            NativeTransitionEvidence(
+                *stage, ProjectionTransitionEvidenceState::kUncertain,
+                std::move(rows), error),
+            error);
+      };
+
+  std::vector<core::ProjectionTransitionRowEvidenceDTO> staged_rows;
+  staged_rows.reserve(participants.size());
+  bool clean_stage_rejection = false;
+  ErrorDTO stage_error{"native_projection_stage_rejected",
+                       "a native projection rejected candidate staging",
+                       {}};
+  for (std::size_t index = 0U; index < participants.size(); ++index) {
+    const auto &participant = participants[index];
+    try {
+      if (participant.transition_row.disposition ==
+          core::ProjectionTransitionDisposition::kRemoved) {
+        staged_rows.push_back(PredecessorUnchangedRowEvidence(
+            *stage, participant, ReadNativeRetireStatus(*stage, participant)));
+        continue;
+      }
+      auto status = ReadNativeStageStatus(*stage, participant);
+      if (status.state == core::NativeProjectionStatusState::kAbsent) {
+        const core::NativeProjectionStageDTO native_request{
+            stage->apply_id,
+            stage->apply_generation,
+            stage->stage_generation,
+            participant.transition_row,
+            stage->predecessor,
+            stage->candidate,
+            candidate->value().compiled_products.planning_collision_model,
+            LogicalSceneSnapshotRoot(
+                std::make_shared<const LogicalSceneSnapshotDTO>(
+                    *stage->frozen_snapshot)),
+        };
+        static_cast<void>(
+            participant.projection->StageProjection(native_request));
+        status = ReadNativeStageStatus(*stage, participant);
+      }
+      if (status.state == core::NativeProjectionStatusState::kStaged) {
+        staged_rows.push_back(StagedRowEvidence(*stage, participant, status));
+        continue;
+      }
+      if (status.state == core::NativeProjectionStatusState::kAbsent ||
+          status.state == core::NativeProjectionStatusState::kDiscarded) {
+        clean_stage_rejection = true;
+        stage_error = {"native_projection_stage_rejected",
+                       "a native projection left its candidate stage "
+                       "positively absent",
+                       {}};
+        break;
+      }
+      throw CanonicalEmptySceneOwnerConflictError(
+          "native projection entered a non-staged state before selection");
+    } catch (const std::exception &error) {
+      const ErrorDTO failure{
+          "native_projection_stage_uncertain", error.what(), {}};
+      staged_rows.push_back(UncertainTransitionRowEvidence(
+          participant.transition_row, participant.observed_health, failure));
+      return uncertain_result(std::move(staged_rows), index + 1U, failure);
+    } catch (...) {
+      const ErrorDTO failure{
+          "native_projection_stage_uncertain",
+          "native projection stage threw a non-standard exception",
+          {}};
+      staged_rows.push_back(UncertainTransitionRowEvidence(
+          participant.transition_row, participant.observed_health, failure));
+      return uncertain_result(std::move(staged_rows), index + 1U, failure);
+    }
+  }
+
+  if (clean_stage_rejection) {
+    std::vector<core::ProjectionTransitionRowEvidenceDTO> aborted_rows;
+    aborted_rows.reserve(participants.size());
+    for (std::size_t index = 0U; index < participants.size(); ++index) {
+      const auto &participant = participants[index];
+      try {
+        if (participant.transition_row.disposition ==
+            core::ProjectionTransitionDisposition::kRemoved) {
+          aborted_rows.push_back(PredecessorUnchangedRowEvidence(
+              *stage, participant,
+              ReadNativeRetireStatus(*stage, participant)));
+          continue;
+        }
+        auto status = ReadNativeStageStatus(*stage, participant);
+        if (status.state == core::NativeProjectionStatusState::kStaged) {
+          const core::NativeProjectionDiscardDTO discard{
+              stage->apply_id,         stage->apply_generation,
+              stage->stage_generation, participant.transition_row,
+              stage->candidate,
+          };
+          static_cast<void>(
+              participant.projection->DiscardStagedProjection(discard));
+          status = ReadNativeStageStatus(*stage, participant);
+        }
+        aborted_rows.push_back(
+            CandidateDiscardedRowEvidence(*stage, participant, status));
+      } catch (const std::exception &error) {
+        const ErrorDTO failure{
+            "native_projection_discard_uncertain", error.what(), {}};
+        aborted_rows.push_back(UncertainTransitionRowEvidence(
+            participant.transition_row, participant.observed_health, failure));
+        return uncertain_result(std::move(aborted_rows), index + 1U, failure);
+      } catch (...) {
+        const ErrorDTO failure{
+            "native_projection_discard_uncertain",
+            "native projection discard threw a non-standard exception",
+            {}};
+        aborted_rows.push_back(UncertainTransitionRowEvidence(
+            participant.transition_row, participant.observed_health, failure));
+        return uncertain_result(std::move(aborted_rows), index + 1U, failure);
+      }
+    }
+    Transaction completion(database, "BEGIN IMMEDIATE");
+    auto current = ReadCompleteDurableState(database, impl_->fixed_query_);
+    const auto *persisted =
+        current.FindNamedApply(stage->apply_id, stage->apply_generation);
+    if (persisted == nullptr || persisted->stage_completed ||
+        persisted->activation_selected) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native stage cleanup changed before durable completion");
+    }
+    InsertNamedApplyStage(database, *stage);
+    InsertNamedApplyDiscard(database, *stage);
+    completion.Commit();
+    stage->stage_completed = true;
+    stage->discarded = true;
+    return CapturedStageFailureResult(
+        *stage, ProjectionApplyStageResultState::kRejected,
+        NativeTransitionEvidence(*stage,
+                                 ProjectionTransitionEvidenceState::kAborted,
+                                 std::move(aborted_rows)),
+        stage_error);
+  }
+
+  if (!stage->stage_completed) {
+    Transaction completion(database, "BEGIN IMMEDIATE");
+    const auto current =
+        ReadCompleteDurableState(database, impl_->fixed_query_);
+    const auto *persisted =
+        current.FindNamedApply(stage->apply_id, stage->apply_generation);
+    if (persisted == nullptr || persisted->stage_completed ||
+        persisted->activation_selected || persisted->discarded) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native stage capture changed before completion commit");
+    }
+    InsertNamedApplyStage(database, *stage);
+    completion.Commit();
+    stage->stage_completed = true;
+  }
+  return StagedResult(*stage,
+                      NativeTransitionEvidence(
+                          *stage, ProjectionTransitionEvidenceState::kStaged,
+                          std::move(staged_rows)));
 }
 
 ProjectionApplyActivationResultDTO
@@ -4623,17 +6721,15 @@ CanonicalEmptySceneOwner::ActivateStagedProjection(
       request.projection_stage_generation.value(), "stage generation"));
   std::lock_guard lock(impl_->mutex_);
   auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN IMMEDIATE");
-  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
-  const auto *stage =
+  auto state = impl_->ReadStateTransaction();
+  const auto *stored =
       state.FindNamedApply(request.apply_id, request.apply_generation);
-  if (stage == nullptr) {
+  if (stored == nullptr) {
     const auto access = AccessStatus(state);
     const bool clean_absence = state.OpenNamedApply() == nullptr &&
                                access.active_projection.has_value() &&
                                *access.active_projection ==
                                    request.expected_active_projection_revision;
-    transaction.Commit();
     return FailedActivationResult(
         request,
         clean_absence
@@ -4646,42 +6742,253 @@ CanonicalEmptySceneOwner::ActivateStagedProjection(
             : "another or contradictory scene transition prevents proving "
               "the requested stage absent");
   }
-  if (stage->stage_generation != request.projection_stage_generation ||
-      stage->predecessor != request.expected_active_projection_revision ||
-      stage->candidate != request.candidate_projection_revision) {
-    transaction.Commit();
+  if (stored->stage_generation != request.projection_stage_generation ||
+      stored->predecessor != request.expected_active_projection_revision ||
+      stored->candidate != request.candidate_projection_revision) {
     return FailedActivationResult(
         request,
         ProjectionApplyActivationResultState::kFailedProjectionUncertain,
         "named_apply_activation_identity_mismatch",
         "the activation request does not match the exact durable stage");
   }
-  if (stage->discarded) {
+  NamedApplyStageState stage = *stored;
+
+  if (stage.native_transition_rows.empty()) {
+    if (stage.discarded) {
+      return FailedActivationResult(
+          request, ProjectionApplyActivationResultState::kStale,
+          "named_apply_stage_discarded",
+          "the exact named Apply stage was durably discarded");
+    }
+    if (!stage.stage_completed) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "zero-native stage cannot have an incomplete native capture");
+    }
+    if (stage.activated) {
+      return ActivatedResult(stage);
+    }
+    Transaction transaction(database, "BEGIN IMMEDIATE");
+    state = ReadCompleteDurableState(database, impl_->fixed_query_);
+    stored = state.FindNamedApply(request.apply_id, request.apply_generation);
+    if (stored == nullptr || stored->discarded || stored->activated ||
+        !stored->stage_completed ||
+        stored->stage_generation != request.projection_stage_generation ||
+        stored->candidate != request.candidate_projection_revision) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "zero-native named Apply changed before activation commit");
+    }
+    InsertNamedApplyActivation(database, *stored);
+    state = ReadCompleteDurableState(database, impl_->fixed_query_);
+    stored = state.FindNamedApply(request.apply_id, request.apply_generation);
+    if (stored == nullptr || !stored->activated || stored->discarded ||
+        AccessStatus(state).scene_writes_open ||
+        AccessStatus(state).projection_leases_open) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "named Apply activation did not persist exactly under quiesce");
+    }
+    stage = *stored;
     transaction.Commit();
+    return ActivatedResult(stage);
+  }
+
+  std::vector<NativeTransitionParticipant> participants;
+  try {
+    participants = ObserveNativeTransitionParticipants(
+        stage.native_transition_rows, impl_->projection_resolver_);
+  } catch (const std::exception &error) {
+    const ErrorDTO failure{
+        "native_projection_set_unavailable", error.what(), {}};
     return FailedActivationResult(
-        request, ProjectionApplyActivationResultState::kStale,
-        "named_apply_stage_discarded",
-        "the exact named Apply stage was durably discarded");
+        stage, ProjectionApplyActivationResultState::kFailedProjectionUncertain,
+        UnavailableNativeTransitionEvidence(stage, failure), failure.code,
+        failure.message);
+  } catch (...) {
+    const ErrorDTO failure{
+        "native_projection_set_unavailable",
+        "native projection participant observation threw a non-standard "
+        "exception",
+        {}};
+    return FailedActivationResult(
+        stage, ProjectionApplyActivationResultState::kFailedProjectionUncertain,
+        UnavailableNativeTransitionEvidence(stage, failure), failure.code,
+        failure.message);
   }
-  if (stage->activated) {
-    const auto result = ActivatedResult(*stage);
-    transaction.Commit();
-    return result;
+
+  if (stage.discarded) {
+    try {
+      return FailedActivationResult(
+          stage, ProjectionApplyActivationResultState::kStale,
+          ObserveNativeTransitionEvidence(
+              stage, participants, ProjectionTransitionEvidenceState::kAborted),
+          "named_apply_stage_discarded",
+          "the exact named Apply stage was durably discarded");
+    } catch (const std::exception &error) {
+      const ErrorDTO failure{
+          "native_projection_abort_status_uncertain", error.what(), {}};
+      return FailedActivationResult(
+          stage,
+          ProjectionApplyActivationResultState::kFailedProjectionUncertain,
+          UncertainNativeTransitionEvidence(stage, participants, failure),
+          failure.code, failure.message);
+    }
   }
-  InsertNamedApplyActivation(database, *stage);
+  if (!stage.stage_completed) {
+    const ErrorDTO failure{
+        "native_projection_stage_incomplete",
+        "the frozen native stage has not reached union-complete durable "
+        "staging",
+        {}};
+    return FailedActivationResult(
+        stage, ProjectionApplyActivationResultState::kFailedProjectionUncertain,
+        UncertainNativeTransitionEvidence(stage, participants, failure),
+        failure.code, failure.message);
+  }
+  if (stage.activated) {
+    try {
+      return ActivatedResult(
+          stage, ObserveNativeTransitionEvidence(
+                     stage, participants,
+                     ProjectionTransitionEvidenceState::kActivatedAndRetired));
+    } catch (const std::exception &error) {
+      const ErrorDTO failure{
+          "native_projection_activation_status_uncertain", error.what(), {}};
+      return FailedActivationResult(
+          stage,
+          ProjectionApplyActivationResultState::kFailedProjectionUncertain,
+          UncertainNativeTransitionEvidence(stage, participants, failure),
+          failure.code, failure.message);
+    }
+  }
+
+  if (!stage.activation_selected) {
+    try {
+      static_cast<void>(ObserveNativeTransitionEvidence(
+          stage, participants, ProjectionTransitionEvidenceState::kStaged));
+    } catch (const std::exception &error) {
+      const ErrorDTO failure{
+          "native_projection_stage_status_uncertain", error.what(), {}};
+      return FailedActivationResult(
+          stage,
+          ProjectionApplyActivationResultState::kFailedProjectionUncertain,
+          UncertainNativeTransitionEvidence(stage, participants, failure),
+          failure.code, failure.message);
+    }
+    Transaction selection(database, "BEGIN IMMEDIATE");
+    const auto current =
+        ReadCompleteDurableState(database, impl_->fixed_query_);
+    const auto *persisted =
+        current.FindNamedApply(stage.apply_id, stage.apply_generation);
+    if (persisted == nullptr || !persisted->stage_completed ||
+        persisted->discarded || persisted->activated ||
+        persisted->activation_selected ||
+        persisted->native_transition_rows != stage.native_transition_rows ||
+        persisted->candidate != stage.candidate) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native stage changed before durable activation selection");
+    }
+    InsertNativeActivationSelection(database, *persisted);
+    selection.Commit();
+    stage.activation_selected = true;
+  }
+
+  const auto uncertain_result =
+      [&](std::vector<core::ProjectionTransitionRowEvidenceDTO> rows,
+          const std::size_t next_row, const ErrorDTO &failure) {
+        rows.reserve(participants.size());
+        for (std::size_t index = next_row; index < participants.size();
+             ++index) {
+          rows.push_back(UncertainTransitionRowEvidence(
+              participants[index].transition_row,
+              participants[index].observed_health, failure));
+        }
+        return FailedActivationResult(
+            stage,
+            ProjectionApplyActivationResultState::kFailedProjectionUncertain,
+            NativeTransitionEvidence(
+                stage, ProjectionTransitionEvidenceState::kUncertain,
+                std::move(rows), failure),
+            failure.code, failure.message);
+      };
+
+  std::vector<core::ProjectionTransitionRowEvidenceDTO> activated_rows;
+  activated_rows.reserve(participants.size());
+  for (std::size_t index = 0U; index < participants.size(); ++index) {
+    const auto &participant = participants[index];
+    try {
+      if (participant.transition_row.disposition ==
+          core::ProjectionTransitionDisposition::kRemoved) {
+        auto status = ReadNativeRetireStatus(stage, participant);
+        if (status.state == core::NativeProjectionRetireStatusState::kPending) {
+          const core::NativeProjectionRetireDTO retire{
+              stage.apply_id,         stage.apply_generation,
+              stage.stage_generation, participant.transition_row,
+              stage.predecessor,      stage.candidate,
+          };
+          static_cast<void>(participant.projection->RetireProjection(retire));
+          status = ReadNativeRetireStatus(stage, participant);
+        }
+        activated_rows.push_back(
+            RemovedRetiredRowEvidence(participant, status));
+      } else {
+        auto status = ReadNativeStageStatus(stage, participant);
+        if (status.state == core::NativeProjectionStatusState::kStaged) {
+          const core::NativeProjectionActivationDTO activation{
+              stage.apply_id,         stage.apply_generation,
+              stage.stage_generation, participant.transition_row,
+              stage.predecessor,      stage.candidate,
+          };
+          static_cast<void>(
+              participant.projection->ActivateStagedProjection(activation));
+          status = ReadNativeStageStatus(stage, participant);
+        }
+        activated_rows.push_back(
+            CandidateActiveRowEvidence(stage, participant, status));
+      }
+    } catch (const std::exception &error) {
+      const ErrorDTO failure{
+          "native_projection_activation_uncertain", error.what(), {}};
+      activated_rows.push_back(UncertainTransitionRowEvidence(
+          participant.transition_row, participant.observed_health, failure));
+      return uncertain_result(std::move(activated_rows), index + 1U, failure);
+    } catch (...) {
+      const ErrorDTO failure{
+          "native_projection_activation_uncertain",
+          "native projection activation or retirement threw a non-standard "
+          "exception",
+          {}};
+      activated_rows.push_back(UncertainTransitionRowEvidence(
+          participant.transition_row, participant.observed_health, failure));
+      return uncertain_result(std::move(activated_rows), index + 1U, failure);
+    }
+  }
+
+  auto evidence = NativeTransitionEvidence(
+      stage, ProjectionTransitionEvidenceState::kActivatedAndRetired,
+      std::move(activated_rows));
+  Transaction completion(database, "BEGIN IMMEDIATE");
   state = ReadCompleteDurableState(database, impl_->fixed_query_);
-  stage = state.FindNamedApply(request.apply_id, request.apply_generation);
-  if (stage == nullptr || !stage->activated || stage->discarded ||
-      stage->stage_generation != request.projection_stage_generation ||
-      stage->candidate != request.candidate_projection_revision ||
-      AccessStatus(state).scene_writes_open ||
+  stored = state.FindNamedApply(stage.apply_id, stage.apply_generation);
+  if (stored == nullptr || !stored->stage_completed ||
+      !stored->activation_selected || stored->discarded ||
+      stored->finalization_receipt.has_value() ||
+      stored->native_transition_rows != stage.native_transition_rows) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native activation selection changed before completion commit");
+  }
+  if (!stored->activated) {
+    InsertNamedApplyActivation(database, *stored);
+  }
+  state = ReadCompleteDurableState(database, impl_->fixed_query_);
+  stored = state.FindNamedApply(stage.apply_id, stage.apply_generation);
+  if (stored == nullptr || !stored->activated || !stored->activation_selected ||
+      stored->discarded || AccessStatus(state).scene_writes_open ||
       AccessStatus(state).projection_leases_open) {
     throw CanonicalEmptySceneOwnerIntegrityError(
-        "named Apply activation did not persist exactly under quiesce");
+        "native activation did not persist exactly under quiesce");
   }
-  const auto result = ActivatedResult(*stage);
-  transaction.Commit();
-  return result;
+  stage = *stored;
+  completion.Commit();
+  return ActivatedResult(stage, std::move(evidence));
 }
 
 ProjectionApplyDiscardResultDTO
@@ -4697,63 +7004,222 @@ CanonicalEmptySceneOwner::DiscardStagedProjection(
       request.projection_stage_generation.value(), "stage generation"));
   std::lock_guard lock(impl_->mutex_);
   auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN IMMEDIATE");
-  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
-  const auto *stage =
+  auto state = impl_->ReadStateTransaction();
+  const auto *stored =
       state.FindNamedApply(request.apply_id, request.apply_generation);
-  if (stage == nullptr) {
+  if (stored == nullptr) {
     const auto access = AccessStatus(state);
     if (state.OpenNamedApply() == nullptr &&
         access.active_projection.has_value() &&
         *access.active_projection ==
             request.expected_predecessor_projection_revision) {
-      const auto result =
-          DiscardedResult(StageIdentityFrom(request),
-                          ProjectionApplyDiscardResultState::kAlreadyAbsent);
-      transaction.Commit();
-      return result;
+      return DiscardedResult(StageIdentityFrom(request),
+                             ProjectionApplyDiscardResultState::kAlreadyAbsent);
     }
-    transaction.Commit();
     return FailedDiscardResult(
         request, "named_apply_discard_identity_uncertain",
         "another or contradictory transition prevents proving the exact "
         "candidate stage absent");
   }
-  if (stage->stage_generation != request.projection_stage_generation ||
-      stage->predecessor != request.expected_predecessor_projection_revision ||
-      stage->candidate != request.candidate_projection_revision) {
-    transaction.Commit();
+  if (stored->stage_generation != request.projection_stage_generation ||
+      stored->predecessor != request.expected_predecessor_projection_revision ||
+      stored->candidate != request.candidate_projection_revision) {
     return FailedDiscardResult(
         request, "named_apply_discard_identity_mismatch",
         "the discard request does not match the exact durable stage");
   }
-  if (stage->activated || stage->finalization_receipt.has_value()) {
+  NamedApplyStageState stage = *stored;
+
+  if (stage.native_transition_rows.empty()) {
+    if (stage.activated || stage.finalization_receipt.has_value()) {
+      return FailedDiscardResult(
+          request, "named_apply_discard_forbidden_after_activation",
+          "the exact transition has activated and can only recover forward");
+    }
+    if (stage.discarded) {
+      return DiscardedResult(stage,
+                             ProjectionApplyDiscardResultState::kDiscarded);
+    }
+    Transaction transaction(database, "BEGIN IMMEDIATE");
+    state = ReadCompleteDurableState(database, impl_->fixed_query_);
+    stored = state.FindNamedApply(request.apply_id, request.apply_generation);
+    if (stored == nullptr || stored->activated || stored->discarded ||
+        stored->finalization_receipt.has_value()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "zero-native stage changed before discard commit");
+    }
+    InsertNamedApplyDiscard(database, *stored);
+    state = ReadCompleteDurableState(database, impl_->fixed_query_);
+    stored = state.FindNamedApply(request.apply_id, request.apply_generation);
+    const auto access = AccessStatus(state);
+    if (stored == nullptr || !stored->discarded || stored->activated ||
+        stored->finalization_receipt.has_value() || !access.scene_writes_open ||
+        !access.projection_leases_open ||
+        access.active_projection !=
+            std::optional<ProjectionRevisionDTO>{stored->predecessor}) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "named Apply discard did not restore the exact predecessor");
+    }
+    stage = *stored;
     transaction.Commit();
+    return DiscardedResult(stage,
+                           ProjectionApplyDiscardResultState::kDiscarded);
+  }
+
+  std::vector<NativeTransitionParticipant> participants;
+  try {
+    participants = ObserveNativeTransitionParticipants(
+        stage.native_transition_rows, impl_->projection_resolver_);
+  } catch (const std::exception &error) {
+    const ErrorDTO failure{
+        "native_projection_set_unavailable", error.what(), {}};
     return FailedDiscardResult(
-        request, "named_apply_discard_forbidden_after_activation",
-        "the exact transition has activated and can only recover forward");
+        stage, UnavailableNativeTransitionEvidence(stage, failure),
+        failure.code, failure.message);
+  } catch (...) {
+    const ErrorDTO failure{
+        "native_projection_set_unavailable",
+        "native projection participant observation threw a non-standard "
+        "exception",
+        {}};
+    return FailedDiscardResult(
+        stage, UnavailableNativeTransitionEvidence(stage, failure),
+        failure.code, failure.message);
   }
-  if (stage->discarded) {
-    const auto result =
-        DiscardedResult(*stage, ProjectionApplyDiscardResultState::kDiscarded);
-    transaction.Commit();
-    return result;
+
+  if (stage.activation_selected || stage.activated ||
+      stage.finalization_receipt.has_value()) {
+    const ErrorDTO failure{
+        "named_apply_discard_forbidden_after_activation",
+        "the exact transition has selected activation and can only recover "
+        "forward",
+        {}};
+    try {
+      auto observed = ObserveNativeTransitionEvidence(
+          stage, participants,
+          stage.finalization_receipt.has_value()
+              ? ProjectionTransitionEvidenceState::kFinalized
+              : ProjectionTransitionEvidenceState::kActivatedAndRetired);
+      return FailedDiscardResult(
+          stage,
+          NativeTransitionEvidence(
+              stage, ProjectionTransitionEvidenceState::kUncertain,
+              std::move(observed.transition_rows), failure),
+          failure.code, failure.message);
+    } catch (const std::exception &) {
+      return FailedDiscardResult(
+          stage,
+          UncertainNativeTransitionEvidence(stage, participants, failure),
+          failure.code, failure.message);
+    }
   }
-  InsertNamedApplyDiscard(database, *stage);
+  if (stage.discarded) {
+    try {
+      return DiscardedResult(stage,
+                             ProjectionApplyDiscardResultState::kDiscarded,
+                             ObserveNativeTransitionEvidence(
+                                 stage, participants,
+                                 ProjectionTransitionEvidenceState::kAborted));
+    } catch (const std::exception &error) {
+      const ErrorDTO failure{
+          "native_projection_abort_status_uncertain", error.what(), {}};
+      return FailedDiscardResult(
+          stage,
+          UncertainNativeTransitionEvidence(stage, participants, failure),
+          failure.code, failure.message);
+    }
+  }
+
+  const auto uncertain_result =
+      [&](std::vector<core::ProjectionTransitionRowEvidenceDTO> rows,
+          const std::size_t next_row, const ErrorDTO &failure) {
+        rows.reserve(participants.size());
+        for (std::size_t index = next_row; index < participants.size();
+             ++index) {
+          rows.push_back(UncertainTransitionRowEvidence(
+              participants[index].transition_row,
+              participants[index].observed_health, failure));
+        }
+        return FailedDiscardResult(
+            stage,
+            NativeTransitionEvidence(
+                stage, ProjectionTransitionEvidenceState::kUncertain,
+                std::move(rows), failure),
+            failure.code, failure.message);
+      };
+
+  std::vector<core::ProjectionTransitionRowEvidenceDTO> aborted_rows;
+  aborted_rows.reserve(participants.size());
+  for (std::size_t index = 0U; index < participants.size(); ++index) {
+    const auto &participant = participants[index];
+    try {
+      if (participant.transition_row.disposition ==
+          core::ProjectionTransitionDisposition::kRemoved) {
+        aborted_rows.push_back(PredecessorUnchangedRowEvidence(
+            stage, participant, ReadNativeRetireStatus(stage, participant)));
+      } else {
+        auto status = ReadNativeStageStatus(stage, participant);
+        if (status.state == core::NativeProjectionStatusState::kStaged) {
+          const core::NativeProjectionDiscardDTO discard{
+              stage.apply_id,         stage.apply_generation,
+              stage.stage_generation, participant.transition_row,
+              stage.candidate,
+          };
+          static_cast<void>(
+              participant.projection->DiscardStagedProjection(discard));
+          status = ReadNativeStageStatus(stage, participant);
+        }
+        aborted_rows.push_back(
+            CandidateDiscardedRowEvidence(stage, participant, status));
+      }
+    } catch (const std::exception &error) {
+      const ErrorDTO failure{
+          "native_projection_discard_uncertain", error.what(), {}};
+      aborted_rows.push_back(UncertainTransitionRowEvidence(
+          participant.transition_row, participant.observed_health, failure));
+      return uncertain_result(std::move(aborted_rows), index + 1U, failure);
+    } catch (...) {
+      const ErrorDTO failure{
+          "native_projection_discard_uncertain",
+          "native projection discard threw a non-standard exception",
+          {}};
+      aborted_rows.push_back(UncertainTransitionRowEvidence(
+          participant.transition_row, participant.observed_health, failure));
+      return uncertain_result(std::move(aborted_rows), index + 1U, failure);
+    }
+  }
+
+  auto evidence = NativeTransitionEvidence(
+      stage, ProjectionTransitionEvidenceState::kAborted,
+      std::move(aborted_rows));
+  Transaction transaction(database, "BEGIN IMMEDIATE");
   state = ReadCompleteDurableState(database, impl_->fixed_query_);
-  stage = state.FindNamedApply(request.apply_id, request.apply_generation);
-  const auto access = AccessStatus(state);
-  if (stage == nullptr || !stage->discarded || stage->activated ||
-      stage->finalization_receipt.has_value() || !access.scene_writes_open ||
-      !access.projection_leases_open || !access.active_projection.has_value() ||
-      *access.active_projection != stage->predecessor) {
+  stored = state.FindNamedApply(stage.apply_id, stage.apply_generation);
+  if (stored == nullptr || stored->activation_selected || stored->activated ||
+      stored->discarded || stored->finalization_receipt.has_value() ||
+      stored->native_transition_rows != stage.native_transition_rows) {
     throw CanonicalEmptySceneOwnerIntegrityError(
-        "named Apply discard did not restore the exact predecessor");
+        "native stage changed before discard completion");
   }
-  const auto result =
-      DiscardedResult(*stage, ProjectionApplyDiscardResultState::kDiscarded);
+  if (!stored->stage_completed) {
+    InsertNamedApplyStage(database, *stored);
+  }
+  InsertNamedApplyDiscard(database, *stored);
+  state = ReadCompleteDurableState(database, impl_->fixed_query_);
+  stored = state.FindNamedApply(stage.apply_id, stage.apply_generation);
+  const auto access = AccessStatus(state);
+  if (stored == nullptr || !stored->discarded || stored->activated ||
+      stored->activation_selected || stored->finalization_receipt.has_value() ||
+      !access.scene_writes_open || !access.projection_leases_open ||
+      access.active_projection !=
+          std::optional<ProjectionRevisionDTO>{stored->predecessor}) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native named Apply discard did not restore the exact predecessor");
+  }
+  stage = *stored;
   transaction.Commit();
-  return result;
+  return DiscardedResult(stage, ProjectionApplyDiscardResultState::kDiscarded,
+                         std::move(evidence));
 }
 
 ProjectionApplyFinalizeResultDTO
@@ -4769,27 +7235,154 @@ CanonicalEmptySceneOwner::FinalizeProjectionTransition(
       request.projection_stage_generation.value(), "stage generation"));
   std::lock_guard lock(impl_->mutex_);
   auto state = impl_->ReadStateTransaction();
-  const auto *stage =
+  const auto *stored =
       state.FindNamedApply(request.apply_id, request.apply_generation);
-  if (stage == nullptr) {
+  if (stored == nullptr) {
     throw CanonicalEmptySceneOwnerConflictError(
         "named Apply Finalize has no exact durable stage");
   }
-  if (stage->stage_generation != request.projection_stage_generation ||
-      stage->candidate != request.candidate_projection_revision) {
+  if (stored->stage_generation != request.projection_stage_generation ||
+      stored->candidate != request.candidate_projection_revision) {
     throw CanonicalEmptySceneOwnerConflictError(
         "named Apply Finalize does not match the durable stage identity");
   }
-  if (stage->discarded || !stage->activated) {
+  if (stored->discarded || !stored->activated) {
     throw CanonicalEmptySceneOwnerConflictError(
         "named Apply Finalize requires the exact activated transition");
   }
-  if (stage->finalization_receipt.has_value()) {
-    if (*stage->finalization_receipt != request.publication_receipt) {
-      throw CanonicalEmptySceneOwnerConflictError(
-          "named Apply Finalize replay carries a different receipt");
+  NamedApplyStageState stage = *stored;
+  if (stage.finalization_receipt.has_value() &&
+      *stage.finalization_receipt != request.publication_receipt) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "named Apply Finalize replay carries a different receipt");
+  }
+
+  if (stage.native_transition_rows.empty()) {
+    if (stage.finalization_receipt.has_value()) {
+      return FinalizedResult(stage);
     }
-    return FinalizedResult(*stage);
+    core::Result<ActiveBundlePublicationReceiptDTO> durable = [&] {
+      try {
+        return impl_->publication_reader_.ReadActiveBundlePublication(
+            request.publication_receipt.publication_generation);
+      } catch (const std::exception &error) {
+        return core::Result<ActiveBundlePublicationReceiptDTO>::Err(ErrorDTO{
+            "active_bundle_publication_read_uncertain", error.what(), {}});
+      } catch (...) {
+        return core::Result<ActiveBundlePublicationReceiptDTO>::Err(
+            ErrorDTO{"active_bundle_publication_read_uncertain",
+                     "publication reader threw a non-standard exception",
+                     {}});
+      }
+    }();
+    if (!durable.ok()) {
+      const auto &read_error_code = durable.error().code;
+      const bool definitively_not_current =
+          read_error_code == "missing_reference" ||
+          read_error_code == "stale_generation" ||
+          read_error_code == "publication_generation_not_current";
+      return FailedNamedFinalizeResult(
+          stage, request,
+          definitively_not_current
+              ? ProjectionApplyFinalizeResultState::kStale
+              : ProjectionApplyFinalizeResultState::kFailedProjectionUncertain,
+          definitively_not_current ? "active_bundle_publication_not_current"
+                                   : "active_bundle_publication_read_uncertain",
+          definitively_not_current
+              ? "the requested publication generation is not the current "
+                "durable head"
+              : "the current publication head could not be read "
+                "authoritatively");
+    }
+    if (durable.value() != request.publication_receipt) {
+      return FailedNamedFinalizeResult(
+          stage, request, ProjectionApplyFinalizeResultState::kStale,
+          "active_bundle_publication_receipt_mismatch",
+          "the independently reread current receipt is not byte-equivalent");
+    }
+
+    auto *database = impl_->database();
+    Transaction transaction(database, "BEGIN IMMEDIATE");
+    state = ReadCompleteDurableState(database, impl_->fixed_query_);
+    stored = state.FindNamedApply(request.apply_id, request.apply_generation);
+    if (stored == nullptr || stored->discarded || !stored->activated ||
+        stored->stage_generation != request.projection_stage_generation ||
+        stored->candidate != request.candidate_projection_revision) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "named Apply transition changed before Finalize commit");
+    }
+    if (!stored->finalization_receipt.has_value()) {
+      const auto owner_event_sequence = NextSceneOwnerEventSequence(database);
+      const auto lineage_generation = stored->lineage_generation;
+      InsertNamedApplyFinalization(database, request);
+      InsertNamedApplyOwnerEvent(database, owner_event_sequence,
+                                 lineage_generation);
+      state = ReadCompleteDurableState(database, impl_->fixed_query_);
+      stored = state.FindNamedApply(request.apply_id, request.apply_generation);
+    }
+    const auto access = AccessStatus(state);
+    if (stored == nullptr || !stored->finalization_receipt.has_value() ||
+        *stored->finalization_receipt != request.publication_receipt ||
+        !access.scene_writes_open || !access.projection_leases_open ||
+        access.active_projection !=
+            std::optional<ProjectionRevisionDTO>{stored->candidate}) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "named Apply Finalize did not durably open the exact candidate");
+    }
+    stage = *stored;
+    transaction.Commit();
+    return FinalizedResult(stage);
+  }
+
+  if (!stage.activation_selected) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native named Apply activation lacks its durable selection");
+  }
+
+  std::vector<NativeTransitionParticipant> participants;
+  try {
+    participants = ObserveNativeTransitionParticipants(
+        stage.native_transition_rows, impl_->projection_resolver_);
+  } catch (const std::exception &error) {
+    const ErrorDTO failure{
+        "native_projection_set_unavailable", error.what(), {}};
+    return FailedNamedFinalizeResult(
+        stage, request,
+        ProjectionApplyFinalizeResultState::kFailedProjectionUncertain,
+        UnavailableNativeTransitionEvidence(stage, failure),
+        UnavailableCandidateAggregateHealth(stage, failure), failure.code,
+        failure.message);
+  } catch (...) {
+    const ErrorDTO failure{
+        "native_projection_set_unavailable",
+        "native projection participant observation threw a non-standard "
+        "exception",
+        {}};
+    return FailedNamedFinalizeResult(
+        stage, request,
+        ProjectionApplyFinalizeResultState::kFailedProjectionUncertain,
+        UnavailableNativeTransitionEvidence(stage, failure),
+        UnavailableCandidateAggregateHealth(stage, failure), failure.code,
+        failure.message);
+  }
+
+  std::optional<ProjectionTransitionEvidenceDTO> activated_evidence;
+  std::optional<ProjectionAggregateHealthDTO> candidate_health;
+  try {
+    activated_evidence.emplace(ObserveNativeTransitionEvidence(
+        stage, participants,
+        ProjectionTransitionEvidenceState::kActivatedAndRetired));
+    candidate_health.emplace(
+        CandidateAggregateHealth(stage, activated_evidence->transition_rows));
+  } catch (const std::exception &error) {
+    const ErrorDTO failure{
+        "native_projection_finalize_status_uncertain", error.what(), {}};
+    return FailedNamedFinalizeResult(
+        stage, request,
+        ProjectionApplyFinalizeResultState::kFailedProjectionUncertain,
+        UncertainNativeTransitionEvidence(stage, participants, failure),
+        UnavailableCandidateAggregateHealth(stage, failure), failure.code,
+        failure.message);
   }
 
   core::Result<ActiveBundlePublicationReceiptDTO> durable = [&] {
@@ -4798,16 +7391,12 @@ CanonicalEmptySceneOwner::FinalizeProjectionTransition(
           request.publication_receipt.publication_generation);
     } catch (const std::exception &error) {
       return core::Result<ActiveBundlePublicationReceiptDTO>::Err(ErrorDTO{
-          "active_bundle_publication_read_uncertain",
-          error.what(),
-          {},
-      });
+          "active_bundle_publication_read_uncertain", error.what(), {}});
     } catch (...) {
-      return core::Result<ActiveBundlePublicationReceiptDTO>::Err(ErrorDTO{
-          "active_bundle_publication_read_uncertain",
-          "publication reader threw a non-standard exception",
-          {},
-      });
+      return core::Result<ActiveBundlePublicationReceiptDTO>::Err(
+          ErrorDTO{"active_bundle_publication_read_uncertain",
+                   "publication reader threw a non-standard exception",
+                   {}});
     }
   }();
   if (!durable.ok()) {
@@ -4816,57 +7405,75 @@ CanonicalEmptySceneOwner::FinalizeProjectionTransition(
         read_error_code == "missing_reference" ||
         read_error_code == "stale_generation" ||
         read_error_code == "publication_generation_not_current";
+    if (definitively_not_current) {
+      return FailedNamedFinalizeResult(
+          stage, request, ProjectionApplyFinalizeResultState::kStale,
+          std::move(*activated_evidence), std::move(*candidate_health),
+          "active_bundle_publication_not_current",
+          "the requested publication generation is not the current durable "
+          "head");
+    }
+    const ErrorDTO failure{"active_bundle_publication_read_uncertain",
+                           "the current publication head could not be read "
+                           "authoritatively",
+                           {}};
+    auto rows = std::move(activated_evidence->transition_rows);
     return FailedNamedFinalizeResult(
-        *stage, request,
-        definitively_not_current
-            ? ProjectionApplyFinalizeResultState::kStale
-            : ProjectionApplyFinalizeResultState::kFailedProjectionUncertain,
-        definitively_not_current ? "active_bundle_publication_not_current"
-                                 : "active_bundle_publication_read_uncertain",
-        definitively_not_current
-            ? "the requested publication generation is not the current "
-              "durable head"
-            : "the current publication head could not be read "
-              "authoritatively");
+        stage, request,
+        ProjectionApplyFinalizeResultState::kFailedProjectionUncertain,
+        NativeTransitionEvidence(stage,
+                                 ProjectionTransitionEvidenceState::kUncertain,
+                                 std::move(rows), failure),
+        UnavailableCandidateAggregateHealth(stage, failure), failure.code,
+        failure.message);
   }
   if (durable.value() != request.publication_receipt) {
     return FailedNamedFinalizeResult(
-        *stage, request, ProjectionApplyFinalizeResultState::kStale,
+        stage, request, ProjectionApplyFinalizeResultState::kStale,
+        std::move(*activated_evidence), std::move(*candidate_health),
         "active_bundle_publication_receipt_mismatch",
         "the independently reread current receipt is not byte-equivalent");
   }
 
+  auto finalized_rows = activated_evidence->transition_rows;
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
   state = ReadCompleteDurableState(database, impl_->fixed_query_);
-  stage = state.FindNamedApply(request.apply_id, request.apply_generation);
-  if (stage == nullptr || stage->discarded || !stage->activated ||
-      stage->stage_generation != request.projection_stage_generation ||
-      stage->candidate != request.candidate_projection_revision) {
+  stored = state.FindNamedApply(request.apply_id, request.apply_generation);
+  if (stored == nullptr || stored->discarded || !stored->activated ||
+      !stored->activation_selected ||
+      stored->stage_generation != request.projection_stage_generation ||
+      stored->candidate != request.candidate_projection_revision ||
+      stored->native_transition_rows != stage.native_transition_rows) {
     throw CanonicalEmptySceneOwnerIntegrityError(
-        "named Apply transition changed before Finalize commit");
+        "native named Apply transition changed before Finalize commit");
   }
-  if (!stage->finalization_receipt.has_value()) {
+  if (!stored->finalization_receipt.has_value()) {
     const auto owner_event_sequence = NextSceneOwnerEventSequence(database);
-    const auto lineage_generation = stage->lineage_generation;
+    const auto lineage_generation = stored->lineage_generation;
     InsertNamedApplyFinalization(database, request);
     InsertNamedApplyOwnerEvent(database, owner_event_sequence,
                                lineage_generation);
     state = ReadCompleteDurableState(database, impl_->fixed_query_);
-    stage = state.FindNamedApply(request.apply_id, request.apply_generation);
+    stored = state.FindNamedApply(request.apply_id, request.apply_generation);
   }
   const auto access = AccessStatus(state);
-  if (stage == nullptr || !stage->finalization_receipt.has_value() ||
-      *stage->finalization_receipt != request.publication_receipt ||
+  if (stored == nullptr || !stored->finalization_receipt.has_value() ||
+      *stored->finalization_receipt != request.publication_receipt ||
       !access.scene_writes_open || !access.projection_leases_open ||
-      !access.active_projection.has_value() ||
-      *access.active_projection != stage->candidate) {
+      access.active_projection !=
+          std::optional<ProjectionRevisionDTO>{stored->candidate}) {
     throw CanonicalEmptySceneOwnerIntegrityError(
-        "named Apply Finalize did not durably open the exact candidate");
+        "native named Apply Finalize did not durably open the exact candidate");
   }
-  const auto result = FinalizedResult(*stage);
+  stage = *stored;
   transaction.Commit();
-  return result;
+  return FinalizedResult(
+      stage,
+      NativeTransitionEvidence(stage,
+                               ProjectionTransitionEvidenceState::kFinalized,
+                               std::move(finalized_rows)),
+      std::move(*candidate_health));
 }
 
 ProjectionApplyStatusDTO CanonicalEmptySceneOwner::ProjectionApplyStatus(
@@ -4895,39 +7502,449 @@ ProjectionApplyStatusDTO CanonicalEmptySceneOwner::ProjectionApplyStatus(
     }
     return absent;
   }
+  const NamedApplyStageState stage = *staged;
   const auto status_state =
-      staged->finalization_receipt.has_value()
+      stage.finalization_receipt.has_value()
           ? ProjectionApplyStatusState::kFinalized
-      : staged->discarded ? ProjectionApplyStatusState::kDiscarded
-      : staged->activated ? ProjectionApplyStatusState::kActivated
-                          : ProjectionApplyStatusState::kStaged;
+      : stage.discarded ? ProjectionApplyStatusState::kDiscarded
+      : stage.activated ? ProjectionApplyStatusState::kActivated
+                        : ProjectionApplyStatusState::kStaged;
   const auto evidence_state =
-      staged->finalization_receipt.has_value()
+      stage.finalization_receipt.has_value()
           ? ProjectionTransitionEvidenceState::kFinalized
-      : staged->discarded ? ProjectionTransitionEvidenceState::kAborted
-      : staged->activated
+      : stage.discarded ? ProjectionTransitionEvidenceState::kAborted
+      : stage.activated
           ? ProjectionTransitionEvidenceState::kActivatedAndRetired
           : ProjectionTransitionEvidenceState::kStaged;
-  ProjectionApplyStatusDTO status{
-      staged->apply_id,
-      staged->apply_generation,
-      staged->predecessor,
-      staged->stage_generation,
-      staged->candidate,
-      status_state,
-      ZeroNativeTransitionEvidence(*staged, evidence_state),
-      staged->finalization_receipt,
-      staged->finalization_receipt.has_value()
-          ? std::optional<ProjectionAggregateHealthDTO>(
-                ZeroNativeNamedApplyHealth(*staged))
-          : std::nullopt,
-      std::nullopt,
-  };
-  if (!status.presence_valid()) {
-    throw CanonicalEmptySceneOwnerIntegrityError(
-        "durable named Apply stage cannot form a valid status");
+
+  if (stage.native_transition_rows.empty()) {
+    ProjectionApplyStatusDTO status{
+        stage.apply_id,
+        stage.apply_generation,
+        stage.predecessor,
+        stage.stage_generation,
+        stage.candidate,
+        status_state,
+        ZeroNativeTransitionEvidence(stage, evidence_state),
+        stage.finalization_receipt,
+        stage.finalization_receipt.has_value()
+            ? std::optional<ProjectionAggregateHealthDTO>(
+                  ZeroNativeNamedApplyHealth(stage))
+            : std::nullopt,
+        std::nullopt,
+    };
+    if (!status.presence_valid()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "durable zero-native named Apply stage cannot form a valid status");
+    }
+    return status;
   }
-  return status;
+
+  const auto failed_status = [&](ProjectionTransitionEvidenceDTO evidence,
+                                 ErrorDTO error) {
+    ProjectionApplyStatusDTO status{
+        stage.apply_id,
+        stage.apply_generation,
+        stage.predecessor,
+        stage.stage_generation,
+        stage.candidate,
+        ProjectionApplyStatusState::kFailedProjectionUncertain,
+        std::move(evidence),
+        stage.finalization_receipt,
+        std::nullopt,
+        std::move(error),
+    };
+    if (!status.presence_valid()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native named Apply uncertainty cannot form a valid status");
+    }
+    return status;
+  };
+
+  std::vector<NativeTransitionParticipant> participants;
+  try {
+    participants = ObserveNativeTransitionParticipants(
+        stage.native_transition_rows, impl_->projection_resolver_);
+  } catch (const std::exception &error) {
+    const ErrorDTO failure{
+        "native_projection_set_unavailable", error.what(), {}};
+    return failed_status(UnavailableNativeTransitionEvidence(stage, failure),
+                         failure);
+  } catch (...) {
+    const ErrorDTO failure{
+        "native_projection_set_unavailable",
+        "native projection participant observation threw a non-standard "
+        "exception",
+        {}};
+    return failed_status(UnavailableNativeTransitionEvidence(stage, failure),
+                         failure);
+  }
+
+  if (!stage.stage_completed ||
+      (stage.activation_selected && !stage.activated)) {
+    const ErrorDTO failure{
+        stage.activation_selected ? "native_projection_activation_incomplete"
+                                  : "native_projection_stage_incomplete",
+        stage.activation_selected
+            ? "forward-only native activation has not reached a durable "
+              "union-complete result"
+            : "native candidate staging has not reached a durable "
+              "union-complete result",
+        {}};
+    return failed_status(
+        UncertainNativeTransitionEvidence(stage, participants, failure),
+        failure);
+  }
+
+  try {
+    auto evidence =
+        ObserveNativeTransitionEvidence(stage, participants, evidence_state);
+    std::optional<ProjectionAggregateHealthDTO> candidate_health;
+    if (stage.finalization_receipt.has_value()) {
+      candidate_health =
+          CandidateAggregateHealth(stage, evidence.transition_rows);
+    }
+    ProjectionApplyStatusDTO status{
+        stage.apply_id,
+        stage.apply_generation,
+        stage.predecessor,
+        stage.stage_generation,
+        stage.candidate,
+        status_state,
+        std::move(evidence),
+        stage.finalization_receipt,
+        std::move(candidate_health),
+        std::nullopt,
+    };
+    if (!status.presence_valid()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native named Apply stage cannot form a valid status");
+    }
+    return status;
+  } catch (const std::exception &error) {
+    const ErrorDTO failure{
+        "native_projection_status_uncertain", error.what(), {}};
+    return failed_status(
+        UncertainNativeTransitionEvidence(stage, participants, failure),
+        failure);
+  } catch (...) {
+    const ErrorDTO failure{
+        "native_projection_status_uncertain",
+        "native projection status query threw a non-standard exception",
+        {}};
+    return failed_status(
+        UncertainNativeTransitionEvidence(stage, participants, failure),
+        failure);
+  }
+}
+
+ActiveProjectionRuntimeRecoveryResultDTO
+CanonicalEmptySceneOwner::ReconcileActiveProjectionRuntimes(
+    const ActiveProjectionRuntimeSetDTO &runtime_set) {
+  if (!runtime_set.valid() ||
+      runtime_set.native_runtime_bindings.size() >
+          kMaximumNativeProjectionTransitionRows) {
+    throw std::invalid_argument(
+        "active native projection runtime set is invalid");
+  }
+  for (const auto &binding : runtime_set.native_runtime_bindings) {
+    ValidateBoundedIdentity(binding.provider_binding_id.value(),
+                            "provider binding ID");
+    ValidateBoundedIdentity(binding.provider_binding_revision.value(),
+                            "provider binding revision");
+    ValidateBoundedIdentity(binding.runtime_unit_id.value(),
+                            "runtime unit ID");
+    ValidateBoundedIdentity(binding.runtime_epoch.value(), "runtime epoch");
+  }
+
+  std::lock_guard lock(impl_->mutex_);
+  auto *database = impl_->database();
+  auto state = impl_->ReadStateTransaction();
+  if (!state.active_projection.has_value() ||
+      !state.active_scene_snapshot.has_value() ||
+      *state.active_projection != runtime_set.active_projection_revision ||
+      state.OpenNamedApply() != nullptr || state.projection_desynchronized ||
+      state.unresolved_scene_transaction) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "native runtime recovery requires the exact stable active scene");
+  }
+
+  const auto current_bindings = ActiveNativeRuntimeBindings(state);
+  const auto *latest_recovery = state.LatestActiveRuntimeRecovery();
+  const bool pending_recovery =
+      latest_recovery != nullptr &&
+      !latest_recovery->completion_health.has_value();
+  if (current_bindings == runtime_set.native_runtime_bindings &&
+      !pending_recovery) {
+    ActiveProjectionRuntimeRecoveryResultDTO result{
+        runtime_set,
+        ActiveProjectionRuntimeRecoveryState::kCurrent,
+        latest_recovery == nullptr
+            ? std::nullopt
+            : std::optional<NativeProjectionRecoveryGeneration>{
+                  latest_recovery->recovery_generation},
+    };
+    if (!result.valid()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "cannot represent current native runtime recovery result");
+    }
+    return result;
+  }
+
+  const auto *active_stage = state.ActiveStructuralStage();
+  if (active_stage == nullptr || active_stage->native_transition_rows.empty() ||
+      runtime_set.native_runtime_bindings.empty() ||
+      !SameProjectionRequirementSet(*active_stage,
+                                    runtime_set.native_runtime_bindings) ||
+      impl_->retained_bundle_source_ == nullptr ||
+      impl_->projection_resolver_ == nullptr) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "active deployment has no exact recoverable native projection set");
+  }
+
+  std::shared_ptr<const deployment::RetainedBundle> retained_bundle;
+  try {
+    retained_bundle = impl_->retained_bundle_source_->get_verified(
+        runtime_set.active_projection_revision.retained_bundle_id);
+  } catch (const std::exception &error) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "active retained bundle reload failed during native recovery: " +
+        std::string(error.what()));
+  } catch (...) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "active retained bundle reload failed during native recovery");
+  }
+  if (retained_bundle == nullptr ||
+      !deployment::verify_retained_bundle_identity(*retained_bundle) ||
+      retained_bundle->retained_bundle_id() !=
+          runtime_set.active_projection_revision.retained_bundle_id ||
+      retained_bundle->value().cell_graph.graph_revision !=
+          runtime_set.active_projection_revision.graph_revision ||
+      retained_bundle->value().cell_graph.cell_id != impl_->fixed_query_.cell_id ||
+      NativeSceneProviderBindings(retained_bundle->value()).size() !=
+          runtime_set.native_runtime_bindings.size()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "active retained bundle differs from the native recovery target");
+  }
+
+  NativeProjectionRecoveryGeneration recovery_generation(0U);
+  if (pending_recovery && latest_recovery->target ==
+                              runtime_set.active_projection_revision &&
+      latest_recovery->bindings == runtime_set.native_runtime_bindings) {
+    recovery_generation = latest_recovery->recovery_generation;
+  } else {
+    if (state.native_runtime_recoveries.size() >=
+        kMaximumNativeProjectionRecoveries) {
+      throw CanonicalEmptySceneOwnerLimitError(
+          "native runtime recovery history reached its fixed bound");
+    }
+    recovery_generation = NativeProjectionRecoveryGeneration(
+        state.native_runtime_recoveries.size() + 1U);
+    Transaction intent(database, "BEGIN IMMEDIATE");
+    const auto current = ReadCompleteDurableState(database, impl_->fixed_query_);
+    if (!current.active_projection.has_value() ||
+        !current.active_scene_snapshot.has_value() ||
+        *current.active_projection != runtime_set.active_projection_revision ||
+        *current.active_scene_snapshot != *state.active_scene_snapshot ||
+        current.OpenNamedApply() != nullptr ||
+        current.native_runtime_recoveries.size() !=
+            state.native_runtime_recoveries.size()) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "active scene changed before native recovery intent commit");
+    }
+    InsertNativeRuntimeRecoveryIntent(
+        database, recovery_generation, active_stage->lineage_generation,
+        runtime_set);
+    intent.Commit();
+    state = impl_->ReadStateTransaction();
+    latest_recovery = state.LatestActiveRuntimeRecovery();
+    if (latest_recovery == nullptr ||
+        latest_recovery->recovery_generation != recovery_generation ||
+        latest_recovery->target != runtime_set.active_projection_revision ||
+        latest_recovery->bindings != runtime_set.native_runtime_bindings ||
+        latest_recovery->completion_health.has_value() ||
+        AccessStatus(state).scene_writes_open ||
+        AccessStatus(state).projection_leases_open) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "native runtime recovery intent did not close the scene gates");
+    }
+  }
+
+  const LogicalSceneSnapshotRoot snapshot(
+      std::make_shared<const LogicalSceneSnapshotDTO>(
+          *state.active_scene_snapshot));
+  std::vector<core::ProjectionHealthDTO> recovered_health;
+  recovered_health.reserve(runtime_set.native_runtime_bindings.size());
+  for (const auto &binding : runtime_set.native_runtime_bindings) {
+    auto required =
+        ResolveRequiredProjection(binding, impl_->projection_resolver_);
+    auto health = std::move(required.preflight_health);
+    if (!health.healthy_for_target(runtime_set.active_projection_revision)) {
+      const core::NativeProjectionRebuildDTO rebuild{
+          binding,
+          runtime_set.active_projection_revision,
+          retained_bundle->value().compiled_products.planning_collision_model,
+          snapshot.shared(),
+      };
+      auto result = required.projection->RebuildProjection(rebuild);
+      if (!result.presence_valid() || result.transaction_sequence.has_value() ||
+          result.proposed_projection_revision !=
+              runtime_set.active_projection_revision ||
+          result.result != core::ProjectionCommitResultStateDTO::kCommitted ||
+          result.acknowledged_projection_revision !=
+              std::optional<ProjectionRevisionDTO>{
+                  runtime_set.active_projection_revision} ||
+          result.resulting_health.native_runtime_binding != binding ||
+          !result.resulting_health.healthy_for_target(
+              runtime_set.active_projection_revision)) {
+        throw CanonicalEmptySceneOwnerConflictError(
+            "replacement native projection did not acknowledge the exact "
+            "active snapshot rebuild");
+      }
+      health = std::move(result.resulting_health);
+    }
+    if (health.native_runtime_binding != binding || health.source_sequence == 0U ||
+        !health.native_projection_generation.has_value() ||
+        !health.projection_content_digest.has_value() ||
+        !health.healthy_for_target(runtime_set.active_projection_revision)) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "replacement native projection lacks complete healthy rebuild "
+          "evidence");
+    }
+    recovered_health.push_back(std::move(health));
+  }
+
+  Transaction completion(database, "BEGIN IMMEDIATE");
+  const auto before_completion =
+      ReadCompleteDurableState(database, impl_->fixed_query_);
+  const auto *pending = before_completion.LatestActiveRuntimeRecovery();
+  if (!before_completion.active_projection.has_value() ||
+      !before_completion.active_scene_snapshot.has_value() ||
+      *before_completion.active_projection !=
+          runtime_set.active_projection_revision ||
+      *before_completion.active_scene_snapshot != *state.active_scene_snapshot ||
+      pending == nullptr ||
+      pending->recovery_generation != recovery_generation ||
+      pending->target != runtime_set.active_projection_revision ||
+      pending->bindings != runtime_set.native_runtime_bindings ||
+      pending->completion_health.has_value()) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "active scene changed before native recovery completion commit");
+  }
+  InsertNativeRuntimeRecoveryCompletion(
+      database, recovery_generation, runtime_set.active_projection_revision,
+      recovered_health);
+  completion.Commit();
+
+  const auto completed = impl_->ReadStateTransaction();
+  const auto *stored = completed.LatestActiveRuntimeRecovery();
+  const auto access = AccessStatus(completed);
+  if (stored == nullptr ||
+      stored->recovery_generation != recovery_generation ||
+      !stored->completion_health.has_value() ||
+      ActiveNativeRuntimeBindings(completed) !=
+          runtime_set.native_runtime_bindings ||
+      !access.scene_writes_open || !access.projection_leases_open) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "native runtime recovery did not select the exact rebuilt set");
+  }
+  ActiveProjectionRuntimeRecoveryResultDTO result{
+      runtime_set,
+      ActiveProjectionRuntimeRecoveryState::kRecovered,
+      recovery_generation,
+  };
+  if (!result.valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cannot represent completed native runtime recovery result");
+  }
+  return result;
+}
+
+ProjectionAggregateHealthDTO
+CanonicalEmptySceneOwner::ActiveProjectionHealth() const {
+  std::lock_guard lock(impl_->mutex_);
+  const auto state = impl_->ReadStateTransaction();
+  if (!state.active_projection.has_value() ||
+      !state.active_scene_snapshot.has_value() || !state.accepted.has_value()) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "active native projection health requires finalized bootstrap");
+  }
+  core::RequiredNativeProjectionSetSourceDTO source = [&]()
+      -> core::RequiredNativeProjectionSetSourceDTO {
+    if (const auto *stage = state.ActiveStructuralStage(); stage != nullptr) {
+      return NamedApplyProjectionSetSourceDTO{
+          stage->apply_id, stage->apply_generation, stage->stage_generation,
+          stage->candidate};
+    }
+    return BootstrapProjectionSetSourceDTO{
+        state.accepted->bootstrap_id, state.accepted->bootstrap_generation,
+        state.accepted->target};
+  }();
+
+  const auto bindings = ActiveNativeRuntimeBindings(state);
+  std::vector<core::ProjectionHealthDTO> health;
+  health.reserve(bindings.size());
+  std::optional<ErrorDTO> aggregate_error;
+  const auto access = AccessStatus(state);
+  for (const auto &binding : bindings) {
+    try {
+      auto observed =
+          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+      if (!observed.preflight_health.healthy_for_target(
+              *state.active_projection)) {
+        throw CanonicalEmptySceneOwnerConflictError(
+            "native projection is not healthy at the active revision");
+      }
+      health.push_back(std::move(observed.preflight_health));
+    } catch (const std::exception &error) {
+      ErrorDTO unavailable{"active_native_projection_unavailable", error.what(),
+                           {}};
+      health.push_back(core::ProjectionHealthDTO{
+          binding,
+          1U,
+          ProjectionHealthState::kUnavailable,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          unavailable,
+      });
+      aggregate_error = std::move(unavailable);
+    } catch (...) {
+      ErrorDTO unavailable{
+          "active_native_projection_unavailable",
+          "native projection health threw a non-standard exception", {}};
+      health.push_back(core::ProjectionHealthDTO{
+          binding,
+          1U,
+          ProjectionHealthState::kUnavailable,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          unavailable,
+      });
+      aggregate_error = std::move(unavailable);
+    }
+  }
+  if (!access.scene_writes_open || !access.projection_leases_open) {
+    aggregate_error = ErrorDTO{
+        "active_native_projection_recovery_pending",
+        "active native projection recovery or scene transition is incomplete",
+        {}};
+  }
+  ProjectionAggregateHealthDTO aggregate{
+      std::move(source),
+      aggregate_error.has_value() ? ProjectionHealthState::kUnavailable
+                                  : ProjectionHealthState::kHealthy,
+      std::move(health),
+      std::move(aggregate_error),
+  };
+  if (!aggregate.valid()) {
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "active native projection set cannot form aggregate health");
+  }
+  return aggregate;
 }
 
 SceneCommitResultDTO
@@ -5097,19 +8114,20 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   std::vector<RequiredSceneProjection> projections;
-  projections.reserve(impl_->required_projections_.size());
-  for (auto *projection : impl_->required_projections_) {
+  const auto required_bindings = ActiveNativeRuntimeBindings(observed_state);
+  projections.reserve(required_bindings.size());
+  for (const auto &binding : required_bindings) {
     try {
-      auto health = projection->ProjectionHealth();
-      if (!health.valid() || health.source_sequence == 0U ||
-          !health.healthy_for_target(
+      auto projection =
+          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+      if (!projection.preflight_health.healthy_for_target(
               scene_transaction.prior_projection_revision)) {
         return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                       "live_scene_snapshot_unavailable",
                       "a required native scene projection is not healthy at "
                       "the exact predecessor revision");
       }
-      projections.push_back({projection, std::move(health)});
+      projections.push_back(std::move(projection));
     } catch (const std::exception &error) {
       return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                     "live_scene_snapshot_unavailable", error.what());
@@ -5120,24 +8138,6 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                     "exception");
     }
   }
-  std::sort(projections.begin(), projections.end(),
-            [](const RequiredSceneProjection &left,
-               const RequiredSceneProjection &right) {
-              return core::CanonicalProjectionNativeBindingLess(
-                  left.preflight_health.native_runtime_binding,
-                  right.preflight_health.native_runtime_binding);
-            });
-  for (std::size_t index = 1U; index < projections.size(); ++index) {
-    if (!core::CanonicalProjectionNativeBindingLess(
-            projections[index - 1U].preflight_health.native_runtime_binding,
-            projections[index].preflight_health.native_runtime_binding)) {
-      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                    "live_scene_snapshot_unavailable",
-                    "required native scene projection identities are not "
-                    "unique");
-    }
-  }
-
   {
     Transaction write(database, "BEGIN IMMEDIATE");
     const auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
@@ -5420,6 +8420,18 @@ CanonicalEmptySceneOwner::VerifyIntegrity() const {
       ScalarInteger(
           database,
           "SELECT count(*) FROM logical_scene_named_apply_finalizations"),
+      ScalarInteger(
+          database,
+          "SELECT count(*) FROM logical_scene_native_runtime_recovery_intents"),
+      ScalarInteger(
+          database,
+          "SELECT count(*) FROM logical_scene_native_runtime_recovery_completions"),
+      ScalarInteger(
+          database,
+          "SELECT count(*) FROM logical_scene_native_runtime_recovery_bindings"),
+      ScalarInteger(
+          database,
+          "SELECT count(*) FROM logical_scene_native_runtime_recovery_results"),
       ScalarInteger(database,
                     "SELECT count(*) FROM logical_scene_transaction_intents"),
       ScalarInteger(database,
@@ -5430,7 +8442,9 @@ CanonicalEmptySceneOwner::VerifyIntegrity() const {
                     "SELECT count(*) FROM logical_scene_projection_results"),
       ScalarInteger(database,
                     "SELECT count(*) FROM logical_scene_owner_events"),
-      state.projection_desynchronized || state.unresolved_scene_transaction,
+      state.projection_desynchronized || state.unresolved_scene_transaction ||
+          (state.LatestActiveRuntimeRecovery() != nullptr &&
+           !state.LatestActiveRuntimeRecovery()->completion_health.has_value()),
       AccessStatus(state),
   };
   transaction.Commit();
@@ -5447,6 +8461,20 @@ CanonicalEmptySceneOwner::VerifyIntegrity() const {
       report.named_apply_finalization_count < 0 ||
       report.named_apply_finalization_count >
           report.named_apply_activation_count ||
+      report.native_recovery_intent_count < 0 ||
+      report.native_recovery_intent_count >
+          static_cast<std::int64_t>(kMaximumNativeProjectionRecoveries) ||
+      report.native_recovery_completion_count < 0 ||
+      report.native_recovery_completion_count >
+          report.native_recovery_intent_count ||
+      report.native_recovery_binding_count < 0 ||
+      report.native_recovery_binding_count >
+          report.native_recovery_intent_count *
+              static_cast<std::int64_t>(
+                  kMaximumNativeProjectionTransitionRows) ||
+      report.native_recovery_result_count < 0 ||
+      report.native_recovery_result_count >
+          report.native_recovery_binding_count ||
       report.transaction_intent_count < 0 ||
       report.transaction_intent_count >
           static_cast<std::int64_t>(kMaximumLogicalSceneTransactions) ||

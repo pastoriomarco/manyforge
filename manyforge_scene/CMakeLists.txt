@@ -112,16 +112,23 @@ set(
 set(
   MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/002_logical_scene_transactions.sql")
+set(
+  MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/003_native_projection_handoff.sql")
 set_property(
   DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA}"
-  "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION}")
+  "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION}"
+  "${MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION}")
 file(READ
   "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA}"
   MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL)
 file(READ
   "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION}"
   MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_SQL)
+file(READ
+  "${MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION}"
+  MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_SQL)
 string(
   FIND
   "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL}"
@@ -142,14 +149,36 @@ if(NOT MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_DELIMITER_COLLISION EQUAL -
     "logical-scene transaction migration collides with its generated-header "
     "raw-string delimiter")
 endif()
+string(
+  FIND
+  "${MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_SQL}"
+  ")mf_nphm\""
+  MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_DELIMITER_COLLISION)
+if(NOT MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_DELIMITER_COLLISION EQUAL -1)
+  message(FATAL_ERROR
+    "native-projection handoff migration collides with its generated-header "
+    "raw-string delimiter")
+endif()
 configure_file(
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_scene_schema.hpp.in"
   "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_canonical_empty_scene_schema.hpp"
   @ONLY)
 
+add_library(manyforge_scene_value_codec
+  src/logical_scene_codec_internal.cpp)
+add_library(manyforge::scene_value_codec ALIAS manyforge_scene_value_codec)
+target_include_directories(manyforge_scene_value_codec PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_scene_value_codec PUBLIC manyforge_core)
+target_link_libraries(manyforge_scene_value_codec PRIVATE
+  manyforge::content_identity
+  manyforge::deployment_verification_core)
+set_target_properties(manyforge_scene_value_codec PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
 add_library(manyforge_scene
   src/canonical_empty_scene_owner.cpp
-  src/logical_scene_codec_internal.cpp
   src/sqlite_scene_lifecycle_internal.cpp)
 add_library(manyforge::scene ALIAS manyforge_scene)
 target_include_directories(manyforge_scene PUBLIC
@@ -162,15 +191,62 @@ target_link_libraries(manyforge_scene PRIVATE
   SQLite::SQLite3
   manyforge::content_identity
   manyforge::deployment_admission
+  manyforge::scene_value_codec
   manyforge::persistence)
 set_target_properties(manyforge_scene PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(BUILD_TESTING)
   enable_testing()
   find_package(GTest REQUIRED)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
   include(GoogleTest)
   set(MANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
       "Per-test timeout for manyforge_scene gtest cases")
+
+  set(
+    _MANYFORGE_SCENE_LITE6_SOURCE_ROOT
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+  set(
+    _MANYFORGE_SCENE_LITE6_FIXTURE_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/lite6_structural_scene_fixture")
+  set(
+    _MANYFORGE_SCENE_STRUCTURAL_PREPARATION_TOOL
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/tools/prepare_structural_model.py")
+  file(GLOB_RECURSE _MANYFORGE_SCENE_LITE6_RESOURCE_INPUTS
+    CONFIGURE_DEPENDS
+    LIST_DIRECTORIES false
+    "${_MANYFORGE_SCENE_LITE6_SOURCE_ROOT}/meshes/*")
+  file(MAKE_DIRECTORY "${_MANYFORGE_SCENE_LITE6_FIXTURE_ROOT}")
+  execute_process(
+    COMMAND
+      "${Python3_EXECUTABLE}"
+      "${_MANYFORGE_SCENE_STRUCTURAL_PREPARATION_TOOL}"
+      --urdf
+      "${_MANYFORGE_SCENE_LITE6_SOURCE_ROOT}/lite6_lite_gripper.urdf"
+      --srdf
+      "${_MANYFORGE_SCENE_LITE6_SOURCE_ROOT}/lite6_lite_gripper.srdf"
+      --model-asset-id
+      lite6_lite_gripper
+      --accepted-package-uri-prefix
+      "package://manyforge_example_models/models/lite6_lite_gripper/"
+      --resource-root
+      "${_MANYFORGE_SCENE_LITE6_SOURCE_ROOT}"
+      --output-directory
+      "${_MANYFORGE_SCENE_LITE6_FIXTURE_ROOT}"
+    RESULT_VARIABLE _MANYFORGE_SCENE_LITE6_PREPARATION_RESULT
+    OUTPUT_VARIABLE _MANYFORGE_SCENE_LITE6_PREPARATION_OUTPUT
+    ERROR_VARIABLE _MANYFORGE_SCENE_LITE6_PREPARATION_ERROR)
+  if(NOT _MANYFORGE_SCENE_LITE6_PREPARATION_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "N5c scene native-fixture preparation failed:\n"
+      "${_MANYFORGE_SCENE_LITE6_PREPARATION_OUTPUT}"
+      "${_MANYFORGE_SCENE_LITE6_PREPARATION_ERROR}")
+  endif()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_MANYFORGE_SCENE_STRUCTURAL_PREPARATION_TOOL}"
+    "${_MANYFORGE_SCENE_LITE6_SOURCE_ROOT}/lite6_lite_gripper.urdf"
+    "${_MANYFORGE_SCENE_LITE6_SOURCE_ROOT}/lite6_lite_gripper.srdf"
+    ${_MANYFORGE_SCENE_LITE6_RESOURCE_INPUTS})
 
   add_executable(test_canonical_empty_scene_owner
     test/test_canonical_empty_scene_owner.cpp)
@@ -201,11 +277,16 @@ if(BUILD_TESTING)
     test_canonical_empty_scene_owner
     manyforge_scene_test_canonical_empty_package)
   target_compile_definitions(test_canonical_empty_scene_owner PRIVATE
-    MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
+    MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_SCENE_LITE6_FIXTURE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_SCENE_LITE6_SOURCE_ROOT}")
   target_include_directories(test_canonical_empty_scene_owner PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
   target_link_libraries(test_canonical_empty_scene_owner PRIVATE
     manyforge_scene
+    manyforge_deployment
     manyforge::deployment_admission
     SQLite::SQLite3
     GTest::gtest_main)

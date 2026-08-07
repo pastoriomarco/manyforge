@@ -3,6 +3,7 @@
 #include "manyforge_headless/source_snapshot.hpp"
 
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
+#include <manyforge_component_manager/active_native_projection_runtime_set.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
@@ -40,6 +41,7 @@
 #include <system_error>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace manyforge::headless {
 namespace {
@@ -591,17 +593,19 @@ public:
                        .load_verified()),
         bundle_source_(config_.package_root),
         artifact_source_(config_.package_root),
+        native_runtime_adapter_(
+            InstalledTargetRoot(), config_.package_root,
+            config_.runtime_state_root, bundle_source_, artifact_source_, "linux",
+            std::string(deployment::native_execution_runtime_contract::
+                            kLaunchEnvironmentContract)),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
-                     stores_.active_bundle_publication_store(), bundle_source_),
+                     stores_.active_bundle_publication_store(), bundle_source_,
+                     native_runtime_adapter_),
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal()),
         reference_runtime_adapter_(config_.runtime_state_root, bundle_source_,
                                    artifact_source_, "linux", "posix.1-2017"),
-        native_runtime_adapter_(
-            InstalledTargetRoot(), bundle_source_, artifact_source_, "linux",
-            std::string(deployment::native_execution_runtime_contract::
-                            kLaunchEnvironmentContract)),
         runtime_adapter_router_(
             {{std::string(component_manager::
                               kRetainedPosixProcessAdapterContractId),
@@ -721,6 +725,34 @@ private:
     const auto active_bundle = bundle_source_.get_verified(bundle_id);
     Require(active_bundle != nullptr,
             "active publication has no independently verified retained bundle");
+    if (runtime.state == component_manager::
+                             ManagerActiveRuntimeConvergenceState::kConverged) {
+      const auto current_bindings = component_manager::
+          DeriveActiveNativeProjectionRuntimeBindings(active_bundle->value(),
+                                                       runtime.observations);
+      if (!last_reconciled_native_runtime_bindings_.has_value() ||
+          *last_reconciled_native_runtime_bindings_ != current_bindings) {
+        // Full native rebuild/recovery is a startup or process-incarnation
+        // transition effect. Unchanged observations perform no scene-store
+        // read and no native recovery work.
+        if (!current_bindings.empty()) {
+          const auto scene_access = scene_owner_.ReadAccessStatus();
+          Require(scene_access.active_projection.has_value(),
+                  "active publication has no finalized logical-scene "
+                  "projection");
+          const auto runtime_set =
+              component_manager::DeriveActiveNativeProjectionRuntimeSet(
+                  active_bundle->value(), *scene_access.active_projection,
+                  runtime.observations);
+          const auto recovery =
+              scene_owner_.ReconcileActiveProjectionRuntimes(runtime_set);
+          Require(
+              recovery.valid() && recovery.runtime_set == runtime_set,
+              "active native projection recovery returned foreign evidence");
+        }
+        last_reconciled_native_runtime_bindings_ = current_bindings;
+      }
+    }
     const auto observed_at = static_cast<std::int64_t>(ElapsedNs());
     if (scene_runtime_owner_.Snapshot().initialization_generation == 0U) {
       const auto publication_generation =
@@ -876,12 +908,12 @@ private:
   deployment::CanonicalEmptyRetainedBundleAdmission admission_;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
   deployment::FilesystemVerifiedRetainedProductArtifactSource artifact_source_;
+  component_manager::RetainedNativeRuntimeUnitAdapter native_runtime_adapter_;
   component_manager::ExternallyProvisionedManagerStores stores_;
   manyforge::scene::CanonicalEmptySceneOwner scene_owner_;
   component_manager::DurableManagerActiveRuntimePlanSource plan_source_;
   component_manager::RetainedPosixRuntimeUnitAdapter
       reference_runtime_adapter_;
-  component_manager::RetainedNativeRuntimeUnitAdapter native_runtime_adapter_;
   component_manager::RuntimeUnitAdapterRouter runtime_adapter_router_;
   component_manager::ManagerActiveRuntimeCoordinator active_runtime_;
   SceneRuntimeStateOwner scene_runtime_owner_;
@@ -893,6 +925,8 @@ private:
   std::string manager_owner_id_;
   std::string scene_owner_id_;
   std::string scene_runtime_owner_id_;
+  std::optional<std::vector<core::ProjectionNativeRuntimeBindingDTO>>
+      last_reconciled_native_runtime_bindings_;
 };
 
 std::uint64_t ParsePeriod(const std::string_view value) {

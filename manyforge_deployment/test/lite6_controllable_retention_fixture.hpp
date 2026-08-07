@@ -1246,7 +1246,8 @@ struct AssistantOverlayFixture final {
 
 [[nodiscard]] inline GraphRevisionVerifiedCellGraph make_graph(
     const Lite6StructuralRetentionFixture& structural,
-    const QualifiedControlCatalog& catalog, std::size_t instance_count = 1U) {
+    const QualifiedControlCatalog& catalog, std::size_t instance_count = 1U,
+    std::string_view cell_id = {}) {
   const bool aggregate = catalog.gripper_capability.has_value();
   const bool native_motion = catalog.planner_capability.has_value();
   if (instance_count == 0U || instance_count > 32U) {
@@ -1499,15 +1500,17 @@ struct AssistantOverlayFixture final {
     }
   }
 
+  const std::string selected_cell_id =
+      cell_id.empty()
+          ? (aggregate       ? "i6_lite6_arm_gripper_aggregate_cell"
+             : native_motion ? "i6_lite6_native_motion_cell"
+             : instance_count == 1U ? "i3_lite6_controllable_cell"
+                                    : "i6_two_lite6_controllable_cell")
+          : std::string(cell_id);
   const CanonicalValue graph(CanonicalValue::Object{
       {"api_version", CanonicalValue(std::string(core::kCellGraphApiVersion))},
       {"graph_revision", CanonicalValue(std::string(kZeroDigest))},
-      {"cell_id",
-       CanonicalValue(aggregate       ? "i6_lite6_arm_gripper_aggregate_cell"
-                      : native_motion ? "i6_lite6_native_motion_cell"
-                      : instance_count == 1U
-                          ? "i3_lite6_controllable_cell"
-                          : "i6_two_lite6_controllable_cell")},
+      {"cell_id", CanonicalValue(selected_cell_id)},
       {"runtime_units", CanonicalValue(std::move(runtime_units))},
       {"model_instances", CanonicalValue(std::move(model_instances))},
       {"controllable_components", CanonicalValue(std::move(components))},
@@ -1700,7 +1703,8 @@ make_lite6_controllable_retention_fixture(bool chained = false,
                                           bool assistant_enabled = false,
                                           std::size_t instance_count = 1U,
                                           bool aggregate_gripper = false,
-                                          bool native_motion = false) {
+                                          bool native_motion = false,
+                                          std::string_view cell_id = {}) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (aggregate_gripper &&
       (chained || assistant_enabled || instance_count != 1U)) {
@@ -1715,7 +1719,7 @@ make_lite6_controllable_retention_fixture(bool chained = false,
     catalog = fixture_detail::add_aggregate_gripper_catalog(std::move(catalog));
   }
   const auto graph =
-      fixture_detail::make_graph(structural, catalog, instance_count);
+      fixture_detail::make_graph(structural, catalog, instance_count, cell_id);
   const std::optional<fixture_detail::AssistantOverlayFixture>
       assistant_overlay =
           assistant_enabled
@@ -1895,9 +1899,30 @@ make_lite6_native_motion_retention_fixture() {
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_native_motion_retention_fixture_for_cell(
+    std::string_view cell_id) {
+  if (cell_id.empty()) {
+    throw std::invalid_argument("native-motion fixture cell ID is empty");
+  }
+  return make_lite6_controllable_retention_fixture(false, false, 1U, false,
+                                                   true, cell_id);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
 make_two_lite6_same_type_native_motion_retention_fixture() {
   return make_lite6_controllable_retention_fixture(false, false, 2U, false,
                                                    true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_two_lite6_same_type_native_motion_retention_fixture_for_cell(
+    std::string_view cell_id) {
+  if (cell_id.empty()) {
+    throw std::invalid_argument(
+        "two-instance native-motion fixture cell ID is empty");
+  }
+  return make_lite6_controllable_retention_fixture(false, false, 2U, false,
+                                                   true, cell_id);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <manyforge_component_manager/runtime_convergence.hpp>
+#include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -26,11 +27,15 @@ public:
 /// adoption, public socket, executable/argument selection, or caller
 /// authorization. A child is staged-ready only after its direct status report
 /// matches the verified retained product and reports a closed command surface.
-class RetainedNativeRuntimeUnitAdapter final : public IRuntimeUnitProcessPort,
-                                               public IRuntimeUnitProgressPort {
+class RetainedNativeRuntimeUnitAdapter final
+    : public IRuntimeUnitProcessPort,
+      public IRuntimeUnitProgressPort,
+      public manyforge::core::IPlannerSceneProjectionResolver {
 public:
   RetainedNativeRuntimeUnitAdapter(
       std::filesystem::path trusted_installed_target_root,
+      std::filesystem::path trusted_package_root,
+      std::filesystem::path private_staging_root,
       const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,
@@ -55,10 +60,15 @@ public:
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
                   const manyforge::core::RuntimeEpoch &runtime_epoch) override;
+  [[nodiscard]] manyforge::core::Result<
+      std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
+  ResolveProjection(
+      const manyforge::core::ProjectionNativeRuntimeBindingDTO
+          &native_runtime_binding) const override;
 
 private:
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 };
 
 } // namespace manyforge::component_manager

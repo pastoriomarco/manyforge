@@ -5,16 +5,15 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
+#include <manyforge_core/ports/iplanner_scene_projection.hpp>
+#include <manyforge_core/types/retained_product.hpp>
+#include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-
-#include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
-#include <manyforge_core/ports/iplanner_scene_projection.hpp>
-#include <manyforge_core/types/retained_product.hpp>
-#include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 
 namespace manyforge::roboplan_backend {
 
@@ -56,6 +55,15 @@ public:
       core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
       RetainedPlannerSceneProjectionConfig config, Clock clock);
 
+  /// Preload one exact candidate structural model while the current
+  /// projection remains active. This is a host-internal staged-ready step,
+  /// not part of the logical-scene projection port: StageProjection still
+  /// consumes only the owner-issued frozen scene and retained product
+  /// identity and never resolves deployment artifacts itself.
+  [[nodiscard]] core::Result<void> PrepareCandidateProjection(
+      RetainedCollisionWorldProjector candidate_projector,
+      core::RetainedProductDTO candidate_planning_collision_model);
+
   [[nodiscard]] core::ProjectionCommitResultDTO
   ApplyTransaction(const core::SceneTransactionDTO &transaction) override;
   [[nodiscard]] core::Result<core::CollisionWorldLeaseInventory>
@@ -66,11 +74,30 @@ public:
   [[nodiscard]] core::ProjectionHealthDTO ProjectionHealth() const override;
   [[nodiscard]] core::ProjectionCommitResultDTO
   RebuildProjection(const core::NativeProjectionRebuildDTO &request) override;
+  [[nodiscard]] core::NativeProjectionBootstrapRebuildResultDTO
+  RebuildBootstrapProjection(
+      const core::NativeProjectionBootstrapRebuildDTO &request) override;
+  [[nodiscard]] core::NativeProjectionBootstrapStatusDTO
+  BootstrapProjectionStatus(const core::NativeProjectionBootstrapStatusQueryDTO
+                                &query) const override;
+  [[nodiscard]] core::NativeProjectionStageResultDTO
+  StageProjection(const core::NativeProjectionStageDTO &request) override;
+  [[nodiscard]] core::NativeProjectionActivationResultDTO
+  ActivateStagedProjection(
+      const core::NativeProjectionActivationDTO &request) override;
+  [[nodiscard]] core::NativeProjectionRetireResultDTO
+  RetireProjection(const core::NativeProjectionRetireDTO &request) override;
+  [[nodiscard]] core::NativeProjectionRetireStatusDTO ProjectionRetireStatus(
+      const core::NativeProjectionRetireStatusQueryDTO &query) const override;
+  [[nodiscard]] core::NativeProjectionDiscardResultDTO DiscardStagedProjection(
+      const core::NativeProjectionDiscardDTO &request) override;
+  [[nodiscard]] core::NativeProjectionStatusDTO ProjectionStageStatus(
+      const core::NativeProjectionStatusQueryDTO &query) const override;
 
   [[nodiscard]] std::shared_ptr<const core::LogicalSceneSnapshotDTO>
   logical_snapshot() const;
-  [[nodiscard]] const collision::ManyForgeCollisionEngine::SharedModelPtr &
-  collision_shared_model() const noexcept;
+  [[nodiscard]] collision::ManyForgeCollisionEngine::SharedModelPtr
+  collision_shared_model() const;
 
   [[nodiscard]] core::CollisionWorldSnapshotPtr snapshot() const override;
   [[nodiscard]] core::CollisionWorldRevision
@@ -98,6 +125,27 @@ private:
     core::ProjectionCommitResultDTO result;
   };
 
+  struct BootstrapRecord final {
+    core::BootstrapId bootstrap_id;
+    core::BootstrapGeneration bootstrap_generation;
+    core::ProjectionRevisionDTO target;
+  };
+
+  struct StageRecord final {
+    core::NativeProjectionStageDTO request;
+    RetainedCollisionWorldProjector candidate_projector;
+    core::RetainedProductDTO candidate_planning_collision_model;
+    std::shared_ptr<RetainedCollisionWorldPublisher> candidate_publisher;
+    core::NativeProjectionStageResultDTO stage_result;
+    bool activated{};
+    bool discarded{};
+  };
+
+  struct RetireRecord final {
+    core::NativeProjectionRetireDTO request;
+    core::NativeProjectionRetireResultDTO result;
+  };
+
   RetainedPlannerSceneProjection(
       RetainedCollisionWorldProjector projector,
       core::RetainedProductDTO planning_collision_model,
@@ -105,7 +153,8 @@ private:
       RetainedPlannerSceneProjectionConfig config, Clock clock);
 
   [[nodiscard]] core::Result<std::shared_ptr<RetainedCollisionWorldPublisher>>
-  BuildPublisher(const core::LogicalSceneSnapshotDTO &snapshot,
+  BuildPublisher(const RetainedCollisionWorldProjector &projector,
+                 const core::LogicalSceneSnapshotDTO &snapshot,
                  core::CollisionWorldMutationSource source,
                  std::string source_label) const;
   [[nodiscard]] core::ProjectionCommitResultDTO
@@ -118,9 +167,16 @@ private:
                 core::ErrorDTO error);
   [[nodiscard]] bool
   HealthyAt(const core::ProjectionRevisionDTO &revision) const noexcept;
+  [[nodiscard]] core::ProjectionCommitResultDTO
+  RebuildProjectionLocked(const core::NativeProjectionRebuildDTO &request);
 
   RetainedCollisionWorldProjector projector_;
   core::RetainedProductDTO planning_collision_model_;
+  struct PreparedCandidateModel final {
+    RetainedCollisionWorldProjector projector;
+    core::RetainedProductDTO planning_collision_model;
+  };
+  std::optional<PreparedCandidateModel> prepared_candidate_model_;
   core::ProjectionNativeRuntimeBindingDTO native_runtime_binding_;
   RetainedPlannerSceneProjectionConfig config_;
   Clock clock_;
@@ -129,6 +185,9 @@ private:
   core::ProjectionHealthDTO health_;
   std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_snapshot_;
   std::map<std::uint64_t, TransactionRecord> transaction_records_;
+  std::optional<BootstrapRecord> bootstrap_record_;
+  std::optional<StageRecord> stage_record_;
+  std::optional<RetireRecord> retire_record_;
   std::map<core::ProjectionLeaseId,
            std::shared_ptr<RetainedCollisionWorldPublisher>>
       retained_lease_publishers_;

@@ -8,6 +8,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "native_projection_rpc_internal.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -25,6 +27,7 @@
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/program_binding.hpp>
@@ -36,6 +39,7 @@
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_kinematic_state_projector.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
+#include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
 #include <map>
 #include <memory>
@@ -43,11 +47,13 @@
 #include <roboplan/core/scene.hpp>
 #include <set>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -316,6 +322,8 @@ struct HostConfig final {
 
 struct ManagedRuntimeChildConfig final {
   int manager_channel_fd{-1};
+  std::filesystem::path package_root;
+  std::filesystem::path staging_root;
   std::string runtime_unit_id;
   std::string runtime_epoch;
   std::string product_identity;
@@ -367,6 +375,10 @@ struct ManagedRuntimeChildConfig final {
             "duplicate managed runtime option " + option);
     if (option == "--manyforge-managed-runtime-channel-fd") {
       config.manager_channel_fd = ParseFileDescriptor(value);
+    } else if (option == "--manyforge-managed-package-root") {
+      config.package_root = value;
+    } else if (option == "--manyforge-managed-staging-root") {
+      config.staging_root = value;
     } else if (option == "--runtime-unit-id") {
       config.runtime_unit_id = value;
     } else if (option == "--runtime-epoch") {
@@ -379,7 +391,7 @@ struct ManagedRuntimeChildConfig final {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() == 5U && config.manager_channel_fd >= 0,
+  Require(seen.size() == 7U && config.manager_channel_fd >= 0,
           "managed runtime invocation is incomplete");
   Require(IsPortableRuntimeIdentity(config.runtime_unit_id) &&
               IsPortableRuntimeIdentity(config.runtime_epoch),
@@ -388,6 +400,10 @@ struct ManagedRuntimeChildConfig final {
               core::IsExactLowercaseSha256Digest(
                   config.configuration_identity),
           "managed runtime retained identity is invalid");
+  config.package_root = ExistingDirectory(
+      std::move(config.package_root), "managed retained-package root");
+  config.staging_root = ExistingDirectory(
+      std::move(config.staging_root), "managed native staging root");
 
   struct stat status {};
   int socket_type = 0;
@@ -411,7 +427,9 @@ struct ManagedRuntimeChildConfig final {
 }
 
 void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
-  Require(!bytes.empty() && bytes.size() <= 4096U,
+  Require(!bytes.empty() &&
+              bytes.size() <= component_manager::detail::
+                                  kMaximumNativeProjectionRpcPacketBytes,
           "managed runtime response is empty or oversized");
   pollfd descriptor{fd, POLLOUT | POLLHUP, 0};
   int ready = -1;
@@ -428,6 +446,327 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
           "managed runtime response was not sent atomically");
 }
 
+[[nodiscard]] std::optional<std::string>
+ReceiveManagedRuntimePacket(const int fd) {
+  char probe = '\0';
+  ssize_t size = -1;
+  do {
+    size = ::recv(fd, &probe, 1U, MSG_PEEK | MSG_TRUNC);
+  } while (size < 0 && errno == EINTR);
+  if (size == 0) {
+    return std::nullopt;
+  }
+  Require(size > 0 &&
+              static_cast<std::size_t>(size) <=
+                  component_manager::detail::
+                      kMaximumNativeProjectionRpcPacketBytes,
+          "managed runtime request is absent or oversized");
+  std::string bytes(static_cast<std::size_t>(size), '\0');
+  ssize_t received = -1;
+  do {
+    received = ::recv(fd, bytes.data(), bytes.size(), 0);
+  } while (received < 0 && errno == EINTR);
+  Require(received == size,
+          "managed runtime request changed while being received");
+  return bytes;
+}
+
+using ManagedProjectionKey =
+    std::pair<core::CapabilityProviderBindingId,
+              core::CapabilityProviderBindingRevision>;
+
+class ManagedProjectionRegistry final {
+ public:
+  explicit ManagedProjectionRegistry(const ManagedRuntimeChildConfig &config)
+      : config_(config), bundle_source_(config.package_root),
+        map_source_(config.package_root), planning_source_(config.package_root) {
+  }
+
+  [[nodiscard]] component_manager::detail::NativeProjectionRpcResponse
+  Dispatch(const component_manager::detail::NativeProjectionRpcRequest
+               &request) {
+    return std::visit(
+        [&](const auto &value)
+            -> component_manager::detail::NativeProjectionRpcResponse {
+          using T = std::decay_t<decltype(value)>;
+          if constexpr (std::is_same_v<
+                            T, component_manager::detail::
+                                   NativeProjectionPrepareRequest>) {
+            Prepare(value);
+            return component_manager::detail::NativeProjectionPrepareResult{
+                value};
+          } else if constexpr (std::is_same_v<
+                                   T, component_manager::detail::
+                                          NativeProjectionHealthQuery>) {
+            return Projection(value.native_runtime_binding)
+                .ProjectionHealth();
+          } else if constexpr (std::is_same_v<
+                                   T, component_manager::detail::
+                                          NativeProjectionTransactionRequest>) {
+            return Projection(value.native_runtime_binding)
+                .ApplyTransaction(value.transaction);
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionRebuildDTO>) {
+            return Projection(value.expected_native_runtime_binding)
+                .RebuildProjection(value);
+          } else if constexpr (std::is_same_v<
+                                   T,
+                                   core::NativeProjectionBootstrapRebuildDTO>) {
+            return Projection(value.native_runtime_binding)
+                .RebuildBootstrapProjection(value);
+          } else if constexpr (std::is_same_v<
+                                   T, core::
+                                          NativeProjectionBootstrapStatusQueryDTO>) {
+            return Projection(value.native_runtime_binding)
+                .BootstrapProjectionStatus(value);
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionStageDTO>) {
+            return Projection(value.transition_row.native_runtime_binding)
+                .StageProjection(value);
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionActivationDTO>) {
+            return Projection(value.transition_row.native_runtime_binding)
+                .ActivateStagedProjection(value);
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionRetireDTO>) {
+            return Projection(value.transition_row.native_runtime_binding)
+                .RetireProjection(value);
+          } else if constexpr (std::is_same_v<
+                                   T,
+                                   core::NativeProjectionRetireStatusQueryDTO>) {
+            return Projection(
+                       value.request.transition_row.native_runtime_binding)
+                .ProjectionRetireStatus(value);
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionDiscardDTO>) {
+            return Projection(value.transition_row.native_runtime_binding)
+                .DiscardStagedProjection(value);
+          } else {
+            return Projection(value.transition_row.native_runtime_binding)
+                .ProjectionStageStatus(value);
+          }
+        },
+        request);
+  }
+
+ private:
+  struct PreparedIdentity final {
+    core::RetainedBundleId retained_bundle_id;
+    core::GraphRevision graph_revision;
+    core::RetainedProductDTO planning_collision_model;
+  };
+
+  [[nodiscard]] static ManagedProjectionKey Key(
+      const core::ProjectionNativeRuntimeBindingDTO &binding) {
+    return {binding.provider_binding_id,
+            binding.provider_binding_revision};
+  }
+
+  void RequireLocalBinding(
+      const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+    Require(binding.valid() &&
+                binding.runtime_unit_id.value() == config_.runtime_unit_id &&
+                binding.runtime_epoch.value() == config_.runtime_epoch,
+            "native projection request names another runtime child");
+  }
+
+  [[nodiscard]] RetainedPlannerSceneProjection &Projection(
+      const core::ProjectionNativeRuntimeBindingDTO &binding) {
+    RequireLocalBinding(binding);
+    const auto found = projections_.find(Key(binding));
+    Require(found != projections_.end() && found->second != nullptr &&
+                found->second->ProjectionHealth().native_runtime_binding ==
+                    binding,
+            "native projection request names an unprepared binding");
+    return *found->second;
+  }
+
+  [[nodiscard]] const core::CapabilityProviderBindingDTO &
+  RequireProviderBinding(
+      const deployment::RetainedBundle &bundle,
+      const core::ProjectionNativeRuntimeBindingDTO &runtime_binding) const {
+    const auto &bindings = bundle.value().capability_provider_bindings;
+    const auto found = std::find_if(
+        bindings.begin(), bindings.end(), [&](const auto &candidate) {
+          return candidate.capability_provider_binding_id ==
+                     runtime_binding.provider_binding_id &&
+                 candidate.capability_provider_binding_revision ==
+                     runtime_binding.provider_binding_revision;
+        });
+    Require(found != bindings.end() &&
+                core::RequiresNativeSceneProjection(
+                    found->capability_id,
+                    found->capability_definition_revision),
+            "prepared provider is absent or not a native projection "
+            "participant");
+    std::set<core::RuntimeUnitId> runtime_sources;
+    for (const auto &endpoint : found->endpoint_bindings) {
+      if (endpoint.source_kind !=
+          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+        continue;
+      }
+      const auto *runtime_unit =
+          std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+      Require(runtime_unit != nullptr && !runtime_unit->empty(),
+              "prepared provider has a mismatched runtime endpoint");
+      runtime_sources.insert(*runtime_unit);
+    }
+    Require(runtime_sources.size() == 1U &&
+                runtime_sources.begin()->value() == config_.runtime_unit_id,
+            "prepared provider is assigned to another runtime unit");
+    return *found;
+  }
+
+  [[nodiscard]] static std::string SelectProjectionGroup(
+      const core::CapabilityProviderBindingDTO &provider,
+      const deployment::VerifiedRetainedModelMap &model_map) {
+    std::vector<std::string> groups;
+    if (const auto *target =
+            std::get_if<core::TargetBindingCapabilityProviderTargetDTO>(
+                &provider.target)) {
+      const auto *resolved = model_map.find_target(
+          target->controllable_component_id, target->command_target_id);
+      Require(resolved != nullptr,
+              "native provider target is absent from its retained model map");
+      for (const auto &group : resolved->model_groups) {
+        groups.push_back(group.compiled_group_name);
+      }
+    } else {
+      for (const auto &target : model_map.targets()) {
+        for (const auto &group : target.model_groups) {
+          groups.push_back(group.compiled_group_name);
+        }
+      }
+    }
+    groups.erase(std::remove(groups.begin(), groups.end(), std::string{}),
+                 groups.end());
+    std::sort(groups.begin(), groups.end());
+    groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
+    Require(!groups.empty(),
+            "retained native projection has no compiled planning group");
+    return groups.front();
+  }
+
+  [[nodiscard]] RetainedCollisionWorldProjector BuildProjector(
+      const component_manager::detail::NativeProjectionPrepareRequest
+          &request) {
+    auto bundle =
+        bundle_source_.get_verified(request.candidate_retained_bundle_id);
+    Require(bundle != nullptr &&
+                bundle->value().cell_graph.graph_revision ==
+                    request.candidate_graph_revision &&
+                bundle->value().compiled_products.planning_collision_model ==
+                    request.planning_collision_model,
+            "prepared native projection differs from its verified retained "
+            "bundle");
+    const auto &provider =
+        RequireProviderBinding(*bundle, request.native_runtime_binding);
+    const auto &products = bundle->value().compiled_products;
+    Require(products.symbol_role_maps.size() == 1U,
+            "native projection requires one exact retained model map");
+    auto model_map = map_source_.get_verified(
+        deployment::RetainedModelMapQuery{
+            bundle->retained_bundle_id(),
+            products.symbol_role_maps.front().product_id});
+    Require(model_map.has_value(),
+            "native projection retained model map is absent or invalid");
+    const auto group = SelectProjectionGroup(provider, *model_map);
+    const auto cache_key = std::make_tuple(
+        request.candidate_retained_bundle_id.value(),
+        request.candidate_graph_revision.value(), group);
+    if (const auto cached = projector_cache_.find(cache_key);
+        cached != projector_cache_.end()) {
+      return cached->second;
+    }
+
+    auto planning_model = planning_source_.get_verified(
+        deployment::RetainedPlanningModelQuery{
+            bundle->retained_bundle_id(),
+            request.planning_collision_model.product_id});
+    Require(planning_model.has_value(),
+            "native projection retained planning model is absent or invalid");
+    auto stage = RetainedPlanningModelStage::create_verified(
+        *planning_model, config_.staging_root);
+    auto shared_model = collision::ManyForgeCollisionEngine::load_shared_model(
+        "manyforge_managed_native_projection", stage.loader_urdf_path(),
+        stage.srdf_path(), stage.package_paths(), group);
+    auto projector = RetainedCollisionWorldProjector::create_verified(
+        std::move(shared_model), *bundle, *model_map, *planning_model);
+    const auto [inserted, unique] =
+        projector_cache_.emplace(cache_key, projector);
+    Require(unique, "native projection model cache insertion conflicted");
+    return inserted->second;
+  }
+
+  void Prepare(
+      const component_manager::detail::NativeProjectionPrepareRequest
+          &request) {
+    Require(request.valid(), "native projection preparation is invalid");
+    RequireLocalBinding(request.native_runtime_binding);
+    const auto key = Key(request.native_runtime_binding);
+    if (const auto prior = prepared_.find(key);
+        prior != prepared_.end() &&
+        prior->second.retained_bundle_id ==
+            request.candidate_retained_bundle_id &&
+        prior->second.graph_revision == request.candidate_graph_revision &&
+        prior->second.planning_collision_model ==
+            request.planning_collision_model) {
+      return;
+    }
+
+    auto projector = BuildProjector(request);
+    const auto found = projections_.find(key);
+    if (found == projections_.end()) {
+      auto created = RetainedPlannerSceneProjection::CreateUninitialized(
+          std::move(projector), request.planning_collision_model,
+          request.native_runtime_binding,
+          RetainedPlannerSceneProjectionConfig{
+              "managed-native-projection-" +
+                  request.native_runtime_binding.provider_binding_id.value(),
+              256U,
+              RetainedCollisionWorldPublisher::kDefaultLedgerCapacity},
+          [] {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                .count();
+          });
+      if (!created.ok()) {
+        Fail("native projection construction failed: " +
+             created.error().message);
+      }
+      const auto [inserted, unique] =
+          projections_.emplace(key, std::move(created.value()));
+      Require(unique && inserted->second != nullptr,
+              "native projection registry insertion conflicted");
+    } else {
+      Require(found->second != nullptr,
+              "native projection registry contains an empty participant");
+      auto prepared = found->second->PrepareCandidateProjection(
+          std::move(projector), request.planning_collision_model);
+      if (!prepared.ok()) {
+        Fail("native projection candidate preparation failed: " +
+             prepared.error().message);
+      }
+    }
+    prepared_.insert_or_assign(
+        key, PreparedIdentity{request.candidate_retained_bundle_id,
+                              request.candidate_graph_revision,
+                              request.planning_collision_model});
+  }
+
+  const ManagedRuntimeChildConfig &config_;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
+  deployment::FilesystemVerifiedRetainedModelMapSource map_source_;
+  deployment::FilesystemVerifiedRetainedPlanningModelSource planning_source_;
+  std::map<std::tuple<std::string, std::string, std::string>,
+           RetainedCollisionWorldProjector>
+      projector_cache_;
+  std::map<ManagedProjectionKey,
+           std::shared_ptr<RetainedPlannerSceneProjection>>
+      projections_;
+  std::map<ManagedProjectionKey, PreparedIdentity> prepared_;
+};
+
 [[nodiscard]] int RunManagedRuntimeChild(
     const ManagedRuntimeChildConfig &config) {
   const auto implementation_revision =
@@ -437,6 +776,7 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
       config.runtime_epoch + " " + implementation_revision + " " +
       config.product_identity + " " + config.configuration_identity;
   std::uint64_t source_report_sequence = 0U;
+  ManagedProjectionRegistry projections(config);
 
   while (g_stop_requested == 0) {
     pollfd descriptor{config.manager_channel_fd, POLLIN | POLLHUP, 0};
@@ -459,19 +799,11 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
     if ((descriptor.revents & POLLIN) == 0) {
       continue;
     }
-    std::array<char, 4097U> bytes{};
-    ssize_t count = -1;
-    do {
-      count = ::recv(config.manager_channel_fd, bytes.data(), bytes.size(),
-                     MSG_TRUNC);
-    } while (count < 0 && errno == EINTR);
-    if (count == 0) {
+    const auto packet = ReceiveManagedRuntimePacket(config.manager_channel_fd);
+    if (!packet.has_value()) {
       return 0;
     }
-    Require(count > 0 && static_cast<std::size_t>(count) <= 4096U,
-            "managed runtime request is absent or oversized");
-    const std::string_view request(bytes.data(),
-                                   static_cast<std::size_t>(count));
+    const std::string_view request(*packet);
     if (request == "hello") {
       SendManagedRuntimePacket(config.manager_channel_fd, ready_packet);
       continue;
@@ -497,7 +829,24 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
                                "shutdown-accepted");
       return 0;
     }
-    Fail("managed runtime received an unsupported private command");
+    component_manager::detail::NativeProjectionRpcResponse response;
+    try {
+      response = projections.Dispatch(
+          component_manager::detail::DecodeNativeProjectionRpcRequest(
+              request));
+    } catch (const std::exception &error) {
+      response = component_manager::detail::NativeProjectionRpcFailure{
+          core::ErrorDTO{"native_projection_request_failed", error.what(),
+                         {}}};
+    } catch (...) {
+      response = component_manager::detail::NativeProjectionRpcFailure{
+          core::ErrorDTO{"native_projection_request_failed",
+                         "native projection request failed", {}}};
+    }
+    SendManagedRuntimePacket(
+        config.manager_channel_fd,
+        component_manager::detail::EncodeNativeProjectionRpcResponse(
+            response));
   }
   return 0;
 }

@@ -11,6 +11,8 @@
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
+#include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -31,6 +33,36 @@ namespace deployment = manyforge::deployment;
 
 constexpr std::string_view kIntentDigest =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+constexpr std::string_view kZeroDigest =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+[[nodiscard]] core::LogicalSceneSnapshotRoot MakeEmptyScene(
+    const core::CellId &cell_id, const std::uint64_t revision_id) {
+  core::CollisionPolicySnapshot policy;
+  policy.revision = {
+      1U, std::string(core::kCanonicalEmptyCollisionPolicyDigest)};
+  auto scene = std::make_shared<core::LogicalSceneSnapshotDTO>(
+      core::LogicalSceneSnapshotDTO{
+          {core::logical_scene_identity::MintSceneId(
+               {cell_id, core::BootstrapId("native_adapter_bootstrap"),
+                core::BootstrapGeneration(1U)}),
+           revision_id,
+           core::ContentDigest(std::string(kZeroDigest))},
+          cell_id,
+          revision_id - 1U,
+          0U,
+          0U,
+          std::move(policy),
+          {},
+          {},
+      });
+  scene->revision.content_hash =
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(*scene);
+  if (!scene->locally_valid()) {
+    throw std::logic_error("native adapter empty scene is invalid");
+  }
+  return core::LogicalSceneSnapshotRoot(std::move(scene));
+}
 
 class ScopedTemporaryRoot final {
 public:
@@ -150,6 +182,7 @@ struct NativeFixture final {
   }
 
   std::filesystem::path root;
+  ScopedTemporaryRoot staging_root;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source;
   deployment::FilesystemVerifiedRetainedProductArtifactSource artifact_source;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
@@ -210,9 +243,45 @@ MakeActivePlan(const component_manager::RuntimeUnitConvergenceQueryDTO &query) {
 [[nodiscard]] component_manager::RetainedNativeRuntimeUnitAdapter
 MakeAdapter(NativeFixture &fixture, const std::filesystem::path &target_root) {
   return component_manager::RetainedNativeRuntimeUnitAdapter(
-      target_root, fixture.bundle_source, fixture.artifact_source,
+      target_root, fixture.root / "retained-package",
+      fixture.staging_root.path(), fixture.bundle_source,
+      fixture.artifact_source,
       std::string(contract::kOperatingSystem),
       std::string(contract::kLaunchEnvironmentContract));
+}
+
+[[nodiscard]] core::ProjectionNativeRuntimeBindingDTO NativeProjectionBinding(
+    const NativeFixture &fixture, const core::RuntimeEpoch &runtime_epoch) {
+  const auto found = std::find_if(
+      fixture.bundle->value().capability_provider_bindings.begin(),
+      fixture.bundle->value().capability_provider_bindings.end(),
+      [&](const auto &binding) {
+        if (!core::RequiresNativeSceneProjection(
+                binding.capability_id,
+                binding.capability_definition_revision)) {
+          return false;
+        }
+        return std::any_of(
+            binding.endpoint_bindings.begin(), binding.endpoint_bindings.end(),
+            [&](const auto &endpoint) {
+              const auto *runtime_unit =
+                  std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+              return endpoint.source_kind ==
+                         core::CapabilityEndpointSourceKind::kRuntimeUnit &&
+                     runtime_unit != nullptr &&
+                     *runtime_unit == fixture.query->plan.runtime_unit_id;
+            });
+      });
+  if (found == fixture.bundle->value().capability_provider_bindings.end()) {
+    throw std::logic_error(
+        "native adapter fixture has no projection provider binding");
+  }
+  return {
+      found->capability_provider_binding_id,
+      found->capability_provider_binding_revision,
+      fixture.query->plan.runtime_unit_id,
+      runtime_epoch,
+  };
 }
 
 TEST(NativeExecutionRuntimeUnitAdmission,
@@ -301,6 +370,151 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_EQ(restarted.state(),
             component_manager::ProcessPresenceState::kPresent);
   EXPECT_NE(restarted.process_incarnation(), first_epoch.value());
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     ExactIdentityResolverReturnsPrivateChildProjectionClient) {
+  NativeFixture fixture;
+  auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch first_epoch(started.process_incarnation());
+  const auto binding = NativeProjectionBinding(fixture, first_epoch);
+
+  const auto resolved = adapter.ResolveProjection(binding);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  const auto health = resolved.value()->ProjectionHealth();
+  EXPECT_EQ(health.native_runtime_binding, binding);
+  EXPECT_EQ(health.state, core::ProjectionHealthState::kUninitialized);
+  EXPECT_FALSE(health.active_projection_revision.has_value());
+  EXPECT_FALSE(health.staged_candidate.has_value());
+  EXPECT_FALSE(health.error.has_value());
+  EXPECT_GT(health.source_sequence, 0U);
+
+  const auto initial_scene =
+      MakeEmptyScene(fixture.bundle->value().cell_graph.cell_id, 1U);
+  const core::ProjectionRevisionDTO initial_revision{
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      initial_scene.shared()->revision};
+  const core::NativeProjectionBootstrapStatusQueryDTO bootstrap_query{
+      core::BootstrapId("native-adapter-bootstrap"),
+      core::BootstrapGeneration(1U), binding, initial_revision};
+  EXPECT_EQ(resolved.value()->BootstrapProjectionStatus(bootstrap_query).state,
+            core::NativeProjectionBootstrapStatusState::kAbsent);
+  const core::NativeProjectionBootstrapRebuildDTO bootstrap_request{
+      bootstrap_query.bootstrap_id,
+      bootstrap_query.bootstrap_generation,
+      binding,
+      initial_revision,
+      fixture.bundle->value().compiled_products.planning_collision_model,
+      initial_scene};
+  const auto bootstrapped =
+      resolved.value()->RebuildBootstrapProjection(bootstrap_request);
+  ASSERT_TRUE(bootstrapped.presence_valid());
+  EXPECT_EQ(bootstrapped.state,
+            core::NativeProjectionBootstrapRebuildState::kRebuilt);
+  EXPECT_TRUE(bootstrapped.resulting_health.healthy_for_target(
+      initial_revision));
+
+  auto candidate_scene = std::make_shared<core::LogicalSceneSnapshotDTO>(
+      *initial_scene.shared());
+  candidate_scene->revision.revision_id = 2U;
+  candidate_scene->transaction_sequence = 1U;
+  candidate_scene->revision.content_hash =
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(
+          *candidate_scene);
+  const core::LogicalSceneSnapshotRoot candidate_scene_root(candidate_scene);
+  const core::ProjectionRevisionDTO candidate_revision{
+      initial_revision.retained_bundle_id, initial_revision.graph_revision,
+      candidate_scene->revision};
+  const core::ProjectionTransitionRowDTO retained_row{
+      binding, core::ProjectionTransitionDisposition::kRetained,
+      initial_revision};
+  const core::NativeProjectionStageDTO stage_request{
+      core::ApplyId("native-adapter-transition"),
+      core::ApplyGeneration(2U),
+      core::ProjectionStageGeneration(1U),
+      retained_row,
+      initial_revision,
+      candidate_revision,
+      fixture.bundle->value().compiled_products.planning_collision_model,
+      candidate_scene_root};
+  const auto staged = resolved.value()->StageProjection(stage_request);
+  ASSERT_TRUE(staged.presence_valid());
+  EXPECT_EQ(staged.state, core::NativeProjectionStageResultState::kStaged);
+  const core::NativeProjectionStatusQueryDTO stage_query{
+      stage_request.apply_id, stage_request.apply_generation,
+      stage_request.projection_stage_generation, retained_row};
+  EXPECT_EQ(resolved.value()->ProjectionStageStatus(stage_query).state,
+            core::NativeProjectionStatusState::kStaged);
+  const core::NativeProjectionActivationDTO activation_request{
+      stage_request.apply_id, stage_request.apply_generation,
+      stage_request.projection_stage_generation, retained_row,
+      initial_revision, candidate_revision};
+  const auto activated =
+      resolved.value()->ActivateStagedProjection(activation_request);
+  ASSERT_TRUE(activated.presence_valid());
+  EXPECT_EQ(activated.state,
+            core::NativeProjectionActivationResultState::kActivated);
+  EXPECT_TRUE(activated.resulting_health.healthy_for_target(
+      candidate_revision));
+
+  const core::ProjectionTransitionRowDTO removed_row{
+      binding, core::ProjectionTransitionDisposition::kRemoved,
+      candidate_revision};
+  const core::NativeProjectionRetireDTO retire_request{
+      core::ApplyId("native-adapter-retire"),
+      core::ApplyGeneration(3U),
+      core::ProjectionStageGeneration(2U),
+      removed_row,
+      candidate_revision,
+      candidate_revision};
+  EXPECT_EQ(resolved.value()
+                ->ProjectionRetireStatus(
+                    core::NativeProjectionRetireStatusQueryDTO{
+                        retire_request})
+                .state,
+            core::NativeProjectionRetireStatusState::kPending);
+  const auto retired = resolved.value()->RetireProjection(retire_request);
+  ASSERT_TRUE(retired.presence_valid());
+  EXPECT_EQ(retired.state, core::NativeProjectionRetireResultState::kRetired);
+
+  auto foreign = binding;
+  foreign.provider_binding_revision =
+      core::CapabilityProviderBindingRevision("foreign-binding-revision");
+  EXPECT_FALSE(adapter.ResolveProjection(foreign).ok());
+
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+  EXPECT_THROW(static_cast<void>(resolved.value()->ProjectionHealth()),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_FALSE(adapter.ResolveProjection(binding).ok());
+
+  const auto restarted = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(restarted.state(), component_manager::ProcessPresenceState::kPresent);
+  const auto replacement = NativeProjectionBinding(
+      fixture, core::RuntimeEpoch(restarted.process_incarnation()));
+  const auto replacement_client = adapter.ResolveProjection(replacement);
+  ASSERT_TRUE(replacement_client.ok()) << replacement_client.error().message;
+  EXPECT_EQ(replacement_client.value()->ProjectionHealth().native_runtime_binding,
+            replacement);
+  const core::NativeProjectionRebuildDTO replacement_rebuild{
+      replacement,
+      candidate_revision,
+      fixture.bundle->value().compiled_products.planning_collision_model,
+      candidate_scene_root.shared(),
+  };
+  const auto rebuilt =
+      replacement_client.value()->RebuildProjection(replacement_rebuild);
+  ASSERT_TRUE(rebuilt.presence_valid());
+  EXPECT_EQ(rebuilt.result,
+            core::ProjectionCommitResultStateDTO::kCommitted);
+  EXPECT_FALSE(rebuilt.transaction_sequence.has_value());
+  EXPECT_TRUE(
+      rebuilt.resulting_health.healthy_for_target(candidate_revision));
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
 }

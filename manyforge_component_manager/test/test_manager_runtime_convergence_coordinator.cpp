@@ -777,6 +777,22 @@ public:
     };
   }
 
+  [[nodiscard]] ActiveProjectionRuntimeRecoveryResultDTO
+  ReconcileActiveProjectionRuntimes(
+      const ActiveProjectionRuntimeSetDTO &runtime_set) override {
+    return {runtime_set, ActiveProjectionRuntimeRecoveryState::kCurrent,
+            std::nullopt};
+  }
+
+  [[nodiscard]] ProjectionAggregateHealthDTO
+  ActiveProjectionHealth() const override {
+    if (!finalization_result_.has_value()) {
+      throw std::runtime_error(
+          "active projection health is absent before finalization");
+    }
+    return finalization_result_->candidate_aggregate_health;
+  }
+
   bool throw_after_stage_effect{false};
   bool throw_after_activation_effect{false};
   bool throw_after_finalize_effect{false};

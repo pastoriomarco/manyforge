@@ -5,6 +5,7 @@
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 #include "lite6_controllable_retention_fixture.hpp"
@@ -65,6 +66,23 @@ materialize_lite6_native_motion_retained_consumer_fixture(
     const std::filesystem::path& package_root) {
   return materialize_lite6_retained_consumer_fixture_from(
       package_root, make_lite6_native_motion_retention_fixture());
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+    const std::filesystem::path& package_root, std::string_view cell_id) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root,
+      make_lite6_native_motion_retention_fixture_for_cell(cell_id));
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+    const std::filesystem::path& package_root, std::string_view cell_id) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root,
+      make_two_lite6_same_type_native_motion_retention_fixture_for_cell(
+          cell_id));
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture

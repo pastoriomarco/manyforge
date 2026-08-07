@@ -6,6 +6,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
 #include <stdexcept>
 #include <type_traits>
@@ -1132,6 +1133,45 @@ CanonicalValue ResolvedOperation(const core::ResolvedSceneOperationDTO &value) {
       value);
 }
 
+core::ResolvedSceneOperationDTO
+DecodeResolvedOperation(const CanonicalValue &value) {
+  const auto kind = String(Member(value, "kind"), "resolved operation kind");
+  if (kind == "upsert_object") {
+    ExactObject(value, 2U, "resolved upsert-object operation");
+    return core::ResolvedUpsertSceneObjectDTO{
+        DecodeObject(Member(value, "object"))};
+  }
+  if (kind == "remove_object") {
+    ExactObject(value, 2U, "resolved remove-object operation");
+    return core::ResolvedRemoveSceneObjectDTO{core::SceneResourceId(
+        String(Member(value, "scene_resource_id"), "scene_resource_id"))};
+  }
+  if (kind == "attach_carried_object") {
+    ExactObject(value, 3U, "resolved attach-carried-object operation");
+    return core::ResolvedAttachCarriedObjectDTO{
+        DecodeObject(Member(value, "object")),
+        DecodeAttachment(Member(value, "attachment"))};
+  }
+  if (kind == "detach_carried_object") {
+    ExactObject(value, 4U, "resolved detach-carried-object operation");
+    return core::ResolvedDetachCarriedObjectDTO{
+        DecodeObject(Member(value, "object")),
+        core::CarriedObjectAttachmentId(String(
+            Member(value, "removed_attachment_id"),
+            "removed_attachment_id")),
+        core::CarriedObjectAttachmentRevision(String(
+            Member(value, "removed_attachment_revision"),
+            "removed_attachment_revision"))};
+  }
+  if (kind == "set_collision_policy") {
+    ExactObject(value, 3U, "resolved collision-policy operation");
+    return core::ResolvedCollisionPolicyDTO{
+        DecodePolicy(Member(value, "configured_policy")),
+        DecodePolicy(Member(value, "effective_policy"))};
+  }
+  Fail("resolved scene operation kind is unsupported");
+}
+
 CanonicalValue Snapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
   if (!snapshot.locally_valid()) {
     Fail("cannot encode an invalid logical snapshot");
@@ -1295,6 +1335,122 @@ DecodeErrorDetails(const std::string_view bytes) {
 }
 
 } // namespace manyforge::scene::logical_scene_codec_internal
+
+namespace manyforge::scene {
+
+namespace ci = manyforge::content_identity;
+namespace core = manyforge::core;
+namespace deployment = manyforge::deployment;
+
+using ci::CanonicalValue;
+
+std::string
+EncodeLogicalSceneSnapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
+  return logical_scene_codec_internal::EncodeSnapshot(snapshot);
+}
+
+core::LogicalSceneSnapshotDTO
+DecodeLogicalSceneSnapshot(const std::string_view bytes) {
+  return logical_scene_codec_internal::DecodeSnapshot(bytes);
+}
+
+std::string EncodeResolvedSceneOperation(
+    const core::ResolvedSceneOperationDTO &operation) {
+  return logical_scene_codec_internal::EncodeResolvedOperation(operation);
+}
+
+core::ResolvedSceneOperationDTO
+DecodeResolvedSceneOperation(const std::string_view bytes) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  const auto &root = parsed.root();
+  if (ci::canonical_json(root) != bytes) {
+    throw std::invalid_argument(
+        "logical-scene codec: resolved operation is not canonical JSON");
+  }
+  return logical_scene_codec_internal::DecodeResolvedOperation(root);
+}
+
+std::string EncodeSceneTransaction(
+    const core::SceneTransactionDTO &transaction) {
+  CanonicalValue resolution = nullptr;
+  if (transaction.resolution_evidence_digest.has_value()) {
+    resolution = CanonicalValue(
+        transaction.resolution_evidence_digest->value());
+  }
+  return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"attribution",
+       logical_scene_codec_internal::Attribution(transaction.attribution)},
+      {"original_request_digest",
+       CanonicalValue(transaction.original_request_digest.value())},
+      {"prior_projection_revision",
+       logical_scene_codec_internal::Projection(
+           transaction.prior_projection_revision)},
+      {"proposed_projection_revision",
+       logical_scene_codec_internal::Projection(
+           transaction.proposed_projection_revision)},
+      {"request_id", CanonicalValue(transaction.request_id.value())},
+      {"resolution_evidence_digest", std::move(resolution)},
+      {"resolved_operation",
+       logical_scene_codec_internal::ResolvedOperation(
+           transaction.resolved_operation)},
+      {"transaction_sequence",
+       logical_scene_codec_internal::Unsigned(
+           transaction.transaction_sequence, "transaction_sequence")},
+  }));
+}
+
+core::SceneTransactionDTO
+DecodeSceneTransaction(const std::string_view bytes) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  const auto &root = parsed.root();
+  if (ci::canonical_json(root) != bytes) {
+    throw std::invalid_argument(
+        "logical-scene codec: scene transaction is not canonical JSON");
+  }
+  logical_scene_codec_internal::ExactObject(root, 8U, "scene transaction");
+  std::optional<core::ContentDigest> resolution;
+  const auto &encoded_resolution =
+      logical_scene_codec_internal::Member(root,
+                                           "resolution_evidence_digest");
+  if (!std::holds_alternative<std::nullptr_t>(
+          encoded_resolution.storage())) {
+    resolution = core::ContentDigest(logical_scene_codec_internal::String(
+        encoded_resolution, "resolution_evidence_digest"));
+  }
+  core::SceneTransactionDTO transaction{
+      core::RequestId(logical_scene_codec_internal::String(
+          logical_scene_codec_internal::Member(root, "request_id"),
+          "request_id")),
+      logical_scene_codec_internal::DecodeAttribution(
+          logical_scene_codec_internal::Member(root, "attribution")),
+      logical_scene_codec_internal::DecodeUnsigned(
+          logical_scene_codec_internal::Member(root, "transaction_sequence"),
+          "transaction_sequence"),
+      logical_scene_codec_internal::DecodeProjection(
+          logical_scene_codec_internal::Member(
+              root, "prior_projection_revision")),
+      logical_scene_codec_internal::DecodeProjection(
+          logical_scene_codec_internal::Member(
+              root, "proposed_projection_revision")),
+      core::ContentDigest(logical_scene_codec_internal::String(
+          logical_scene_codec_internal::Member(root,
+                                               "original_request_digest"),
+          "original_request_digest")),
+      logical_scene_codec_internal::DecodeResolvedOperation(
+          logical_scene_codec_internal::Member(root, "resolved_operation")),
+      std::move(resolution)};
+  if (transaction.request_id.empty() || transaction.transaction_sequence == 0U ||
+      !transaction.attribution.locally_valid() ||
+      !transaction.prior_projection_revision.valid() ||
+      !transaction.proposed_projection_revision.valid() ||
+      transaction.original_request_digest.empty()) {
+    throw std::invalid_argument(
+        "logical-scene codec: decoded scene transaction is invalid");
+  }
+  return transaction;
+}
+
+} // namespace manyforge::scene
 
 namespace manyforge::scene {
 

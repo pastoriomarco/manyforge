@@ -89,6 +89,32 @@ if(NOT TARGET manyforge::deployment_admission)
 endif()
 
 set(
+  MANYFORGE_SCENE_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_scene"
+  CACHE PATH
+  "Path to the manyforge_scene source tree for the value-only wire codec")
+if(NOT TARGET manyforge::scene_value_codec)
+  if(NOT EXISTS
+     "${MANYFORGE_SCENE_SOURCE_DIR}/include/manyforge_scene/logical_scene_value_codec.hpp")
+    message(FATAL_ERROR
+      "manyforge_component_manager requires the logical-scene value codec")
+  endif()
+  set(_MANYFORGE_MANAGER_SCENE_BUILD_TESTING "${BUILD_TESTING}")
+  set(BUILD_TESTING OFF)
+  add_subdirectory(
+    "${MANYFORGE_SCENE_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_scene"
+    EXCLUDE_FROM_ALL)
+  set(BUILD_TESTING "${_MANYFORGE_MANAGER_SCENE_BUILD_TESTING}")
+  unset(_MANYFORGE_MANAGER_SCENE_BUILD_TESTING)
+endif()
+if(NOT TARGET manyforge::scene_value_codec)
+  message(FATAL_ERROR
+    "manyforge_component_manager could not resolve the logical-scene value "
+    "codec")
+endif()
+
+set(
   MANYFORGE_MANAGER_BOOTSTRAP_JOURNAL_SCHEMA
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/001_manager_bootstrap_journal.sql")
 set_property(
@@ -176,6 +202,8 @@ add_library(manyforge_component_manager
   src/manager_scene_activation_coordinator.cpp
   src/manager_scene_stage_coordinator.cpp
   src/manager_selected_bundle_transition_coordinator.cpp
+  src/native_projection_rpc_internal.cpp
+  src/native_projection_transition_internal.cpp
   src/manager_bootstrap_journal.cpp
   src/native_execution_runtime_unit_admission.cpp
   src/reference_runtime_unit_admission.cpp
@@ -203,6 +231,7 @@ target_link_libraries(manyforge_component_manager PRIVATE
   manyforge::deployment_admission
   manyforge::deployment_verification_core
   manyforge::persistence
+  manyforge::scene_value_codec
 )
 get_target_property(
   MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS
@@ -366,6 +395,17 @@ if(BUILD_TESTING)
     manyforge::deployment
     GTest::gtest_main)
   gtest_discover_tests(test_manager_runtime_convergence_coordinator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_native_projection_transition_internal
+    test/test_native_projection_transition_internal.cpp)
+  target_include_directories(
+    test_native_projection_transition_internal PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_native_projection_transition_internal PRIVATE
+    manyforge_component_manager
+    GTest::gtest_main)
+  gtest_discover_tests(test_native_projection_transition_internal
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_manager_active_runtime_coordinator

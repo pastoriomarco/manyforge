@@ -10,4 +10,7 @@ inline constexpr std::string_view kEmbeddedCanonicalEmptySceneSchema =
 inline constexpr std::string_view kEmbeddedLogicalSceneTransactionMigration =
     R"mf_sctm(@MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_SQL@)mf_sctm";
 
+inline constexpr std::string_view kEmbeddedNativeProjectionHandoffMigration =
+    R"mf_nphm(@MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_SQL@)mf_nphm";
+
 }  // namespace manyforge::scene::detail

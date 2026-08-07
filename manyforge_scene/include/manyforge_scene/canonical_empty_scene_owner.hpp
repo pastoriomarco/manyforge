@@ -25,8 +25,8 @@ inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
     "manyforge.internal.logical-scene.i4.v2";
 inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
 inline constexpr std::string_view kLogicalSceneStoreSchemaId =
-    "manyforge.internal.logical-scene.n5b.v4";
-inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 4;
+    "manyforge.internal.logical-scene.n5c.v5";
+inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 5;
 inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
     1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;
@@ -35,6 +35,8 @@ inline constexpr std::int64_t kMaximumSceneStoreDatabasePageImageBytes =
 inline constexpr std::int64_t kMaximumSceneStoreWalBytes =
     16LL * 1024LL * 1024LL;
 inline constexpr std::size_t kMaximumNamedApplySceneStages = 256U;
+inline constexpr std::size_t kMaximumNativeProjectionTransitionRows = 256U;
+inline constexpr std::size_t kMaximumNativeProjectionRecoveries = 256U;
 inline constexpr std::size_t kMaximumLogicalSceneTransactions = 256U;
 inline constexpr std::size_t kMaximumLogicalSceneTransactionBytes =
     128U * 1024U;
@@ -115,6 +117,10 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
   std::int64_t named_apply_activation_count;
   std::int64_t named_apply_discard_count;
   std::int64_t named_apply_finalization_count;
+  std::int64_t native_recovery_intent_count;
+  std::int64_t native_recovery_completion_count;
+  std::int64_t native_recovery_binding_count;
+  std::int64_t native_recovery_result_count;
   std::int64_t transaction_intent_count;
   std::int64_t request_outcome_count;
   std::int64_t projection_attempt_count;
@@ -124,7 +130,7 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
   CanonicalEmptySceneAccessStatus access;
 };
 
-/// Production owner for the exact zero-native I4 logical-scene lineage.
+/// Production owner for one exact logical-scene lineage.
 ///
 /// Construction accepts only the deployment-owned sealed canonical-empty
 /// admission, derives its fixed cell/bundle/graph prerequisite query, and opens
@@ -146,17 +152,18 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
 /// its corresponding transition. During initial bootstrap no successor can be
 /// admitted before this Finalize completes.
 ///
-/// With an independently verified retained-bundle source, the same owner also
-/// admits the first zero-native named-Apply stage, atomically closes writes and
-/// leases, captures the current immutable scene revision, and durably returns
-/// one replayable staged candidate. N5b extends this same lineage with durable
-/// compare-and-commit logical-scene transactions, immutable reads, exact
-/// replay, and required-projection acknowledgement. Cell-frame operations are
-/// active here; component/passive-frame resolution, derived collision-policy
-/// allowances, carried-object attachment, nonzero native projection, and
-/// revision-bound projection leases remain fail-closed until the N5c adapters
-/// are installed. This owner implements no compatibility wrapper, ROS adapter,
-/// robot command, or legacy SceneAuthority fallback.
+/// With an independently verified retained-bundle source and an injected
+/// projection resolver, the same owner admits zero- or nonzero-native named
+/// Apply transitions, owns their immutable capture and forward-only native
+/// handoff, and appends current-binding recovery evidence when a finalized
+/// Manager-managed host is replaced. N5b supplies durable compare-and-commit
+/// logical-scene transactions, immutable reads, exact replay, and projection
+/// acknowledgement. Cell-frame operations are active here; component/passive-
+/// frame resolution, derived collision-policy allowances, carried-object
+/// attachment, the end-to-end projection-lease consumer, and remote/ROS
+/// adapters remain fail-closed until their later N5c slices. This owner
+/// implements no compatibility wrapper, robot command, authorization layer,
+/// or legacy SceneAuthority fallback.
 class CanonicalEmptySceneOwner final
     : public manyforge::core::IManagerSceneProjectionBootstrapPort,
       public manyforge::core::IManagerSceneProjectionHandoffPort,
@@ -182,8 +189,8 @@ public:
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
       const manyforge::deployment::IVerifiedRetainedBundleSource
           &retained_bundle_source,
-      std::vector<manyforge::core::IPlannerSceneProjection *>
-          required_projections);
+      const manyforge::core::IPlannerSceneProjectionResolver
+          &projection_resolver);
   ~CanonicalEmptySceneOwner() override;
 
   CanonicalEmptySceneOwner(CanonicalEmptySceneOwner &&) noexcept;
@@ -234,6 +241,12 @@ public:
   [[nodiscard]] manyforge::core::ProjectionApplyStatusDTO ProjectionApplyStatus(
       const manyforge::core::ProjectionApplyStatusQueryDTO &query)
       const override;
+  [[nodiscard]] manyforge::core::ActiveProjectionRuntimeRecoveryResultDTO
+  ReconcileActiveProjectionRuntimes(
+      const manyforge::core::ActiveProjectionRuntimeSetDTO &runtime_set)
+      override;
+  [[nodiscard]] manyforge::core::ProjectionAggregateHealthDTO
+  ActiveProjectionHealth() const override;
 
   [[nodiscard]] CanonicalEmptySceneAccessStatus ReadAccessStatus() const;
   [[nodiscard]] manyforge::core::SceneCommitResultDTO

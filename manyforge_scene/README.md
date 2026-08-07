@@ -1,17 +1,19 @@
 # ManyForge logical-scene owner
 
 `manyforge_scene` is the ROS-free semantic owner for ManyForge logical-scene
-state. This I4 slice implements only the production canonical-empty bootstrap
-path. It is the replacement direction for the legacy Core `SceneAuthority`,
-not a second owner, compatibility facade, or fallback.
+state. It owns the production canonical-empty bootstrap, named structural
+Apply handoff, logical-scene transactions, and the durable current-binding
+overlay used when a finalized Manager-managed native host is replaced. It is
+the replacement direction for the legacy Core `SceneAuthority`, not a second
+owner, compatibility facade, or fallback.
 
 The owner's public constructor accepts the deployment-owned sealed
 `CanonicalEmptyRetainedBundleAdmission`; there is no bare query constructor.
 It derives and durably binds the admission's cell/bundle/graph identities and
 admission digest, and requires Begin's complete retained bundle to equal the
-owned verified bundle. Its separate bounded SQLite database contains one immutable
-revision-one scene acceptance, one immutable zero-native rebuild record, and
-one immutable finalization receipt. Begin atomically rechecks the empty,
+owned verified bundle. Its separate bounded SQLite database contains the
+immutable bootstrap facts plus append-only named-Apply, scene-transaction, and
+managed-runtime-recovery evidence. Begin atomically rechecks the empty,
 command-fenced prerequisites and uses the public Core logical-scene identity
 codec, which in turn uses the shared `manyforge_content_identity` RFC 8785 and
 SHA-256 implementation. No caller supplies a scene ID, content hash, policy,
@@ -57,11 +59,13 @@ acquisition timed out. Concurrent teardown in one process and startup in
 another process is not qualified by this I4 foundation and requires the future
 operational process-lifecycle owner plus forked replacement coverage.
 
-Not implemented in this slice: nonzero native projection materialization,
-named Apply/stage/activation/retirement, public scene edits, projection lease
-objects, ROS adapters, or process/Kernel/controller/robot effects. Destructive
-legacy Core owner/DTO demolition belongs to the same I4 cutover; no copy,
-compatibility path, or fallback is retained in this package.
+Not implemented in the current N5c checkpoint: component/passive-frame and
+carried-object activation, the complete execution-facing projection-lease
+path, sustained-history lifetime management, remote/ROS adapters, or robot
+effects. Native participants are reached only through the injected exact-
+identity resolver; the scene owner contains no process discovery, placement,
+authorization, or transport selection. No legacy owner copy, compatibility
+path, or fallback is retained in this package.
 
 Build and test in the ManyForge development container:
 

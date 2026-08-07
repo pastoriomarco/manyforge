@@ -1,5 +1,7 @@
 #include "manyforge_component_manager/manager_scene_stage_coordinator.hpp"
 
+#include "native_projection_transition_internal.hpp"
+
 #include <algorithm>
 #include <exception>
 #include <memory>
@@ -100,20 +102,59 @@ VerifyCurrentPredecessor(const core::IActiveBundlePublicationReader &reader,
   return receipt;
 }
 
-[[nodiscard]] std::vector<ProjectionTransitionRowDTO> DeriveTransitionRows(
-    const RetainedBundle &predecessor, const RetainedBundle &candidate,
-    const PersistedManagerApplyRuntimeStagedReady &staged_ready) {
-  static_cast<void>(staged_ready);
-  // The first admitted I4 named fixture is runtime-only. A nonempty provider
-  // set cannot be guessed from generic endpoints: it requires the later exact
-  // planner/collision provider-to-runtime derivation and scene adapter. Failing
-  // here keeps unsupported lanes offline without accepting caller rows.
-  if (!predecessor.value().capability_provider_bindings.empty() ||
-      !candidate.value().capability_provider_bindings.empty()) {
-    Fail("nonempty native scene transition is not admitted by the current "
-         "I4 runtime-only product boundary");
+[[nodiscard]] std::vector<core::ProjectionHealthDTO>
+ObservePredecessorNativeHealth(
+    const ActiveBundlePublicationReceiptDTO &current_publication,
+    const core::ProjectionRevisionDTO &expected_predecessor,
+    core::IManagerSceneProjectionHandoffPort &scene_owner,
+    core::IManagerSceneProjectionBootstrapPort *bootstrap_scene_owner) {
+  try {
+    if (const auto *bootstrap =
+            std::get_if<core::BootstrapPublicationTransactionDTO>(
+                &current_publication.request.transaction_ref)) {
+      if (bootstrap_scene_owner == nullptr) {
+        Fail("native predecessor bootstrap status is unavailable");
+      }
+      const auto status = bootstrap_scene_owner->ProjectionBootstrapStatus(
+          {bootstrap->bootstrap_id, bootstrap->bootstrap_generation});
+      if (!status.presence_valid() ||
+          status.state != core::ProjectionBootstrapStatusState::kFinalized ||
+          status.canonical_empty_target !=
+              std::optional<core::ProjectionRevisionDTO>{expected_predecessor} ||
+          status.publication_receipt !=
+              std::optional<ActiveBundlePublicationReceiptDTO>{
+                  current_publication} ||
+          !status.finalized_aggregate_health.has_value() ||
+          !status.finalized_aggregate_health->healthy_for_target(
+              expected_predecessor)) {
+        Fail("current bootstrap does not provide exact healthy native "
+             "predecessor evidence");
+      }
+      return status.finalized_aggregate_health->native_projection_health;
+    }
+    const auto *named = std::get_if<core::NamedApplyPublicationTransactionDTO>(
+        &current_publication.request.transaction_ref);
+    if (named == nullptr) {
+      Fail("current publication has an unknown transaction source");
+    }
+    const auto health = scene_owner.ActiveProjectionHealth();
+    if (!health.matches_named_apply(
+            named->apply_id, named->apply_generation,
+            named->projection_stage_generation,
+            current_publication.request.candidate_projection_revision) ||
+        !health.healthy_for_target(expected_predecessor)) {
+      Fail("current named Apply does not provide exact healthy active native "
+           "predecessor evidence");
+    }
+    return health.native_projection_health;
+  } catch (const ManagerSceneStageCoordinatorError &) {
+    throw;
+  } catch (const std::exception &error) {
+    Fail("native predecessor status observation failed: " +
+         std::string(error.what()));
+  } catch (...) {
+    Fail("native predecessor status observation failed");
   }
-  return {};
 }
 
 [[nodiscard]] bool
@@ -222,10 +263,12 @@ ManagerSceneStageCoordinator::ManagerSceneStageCoordinator(
     SqliteManagerApplyJournal &apply_journal,
     const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
     const core::IActiveBundlePublicationReader &publication_reader,
-    core::IManagerSceneProjectionHandoffPort &scene_owner)
+    core::IManagerSceneProjectionHandoffPort &scene_owner,
+    core::IManagerSceneProjectionBootstrapPort *bootstrap_scene_owner)
     : apply_journal_(apply_journal),
       retained_bundle_source_(retained_bundle_source),
-      publication_reader_(publication_reader), scene_owner_(scene_owner) {}
+      publication_reader_(publication_reader), scene_owner_(scene_owner),
+      bootstrap_scene_owner_(bootstrap_scene_owner) {}
 
 ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) {
@@ -252,6 +295,29 @@ ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
     if (existing.has_value()) {
       return ManagerApplySceneStageIntentWriteResult{*existing, false};
     }
+    std::vector<core::ProjectionHealthDTO> predecessor_health;
+    if (detail::HasNativeProjectionRequirements(predecessor->value())) {
+      const auto current = VerifyCurrentPredecessor(
+          publication_reader_,
+          ManagerApplySceneStageIntentDTO{
+              apply_id,
+              apply_generation,
+              staged_ready->staged_ready_digest,
+              staged_ready->staged_ready.predecessor_publication_generation,
+              staged_ready->staged_ready.predecessor_public_pointer_digest,
+              apply->intent.expected_active_projection_revision,
+              apply->intent.candidate_retained_bundle_id,
+              apply->intent.candidate_graph_revision,
+              {},
+          });
+      predecessor_health = ObservePredecessorNativeHealth(
+          current, apply->intent.expected_active_projection_revision,
+          scene_owner_, bootstrap_scene_owner_);
+    }
+    auto transition_rows = detail::DeriveNativeProjectionTransitionRows(
+        predecessor->value(), candidate->value(),
+        apply->intent.expected_active_projection_revision,
+        predecessor_health, staged_ready->staged_ready);
     ManagerApplySceneStageIntentDTO intent{
         apply_id,
         apply_generation,
@@ -261,7 +327,7 @@ ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
         apply->intent.expected_active_projection_revision,
         apply->intent.candidate_retained_bundle_id,
         apply->intent.candidate_graph_revision,
-        DeriveTransitionRows(*predecessor, *candidate, *staged_ready),
+        std::move(transition_rows),
     };
     return apply_journal_.EnsureSceneStageIntent(intent);
   }();

@@ -1,13 +1,11 @@
-#include <manyforge_roboplan/retained_planner_scene_projection.hpp>
-
 #include <algorithm>
 #include <limits>
+#include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/logical_scene_projection.hpp>
+#include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-
-#include <manyforge_core/logical_scene_identity.hpp>
-#include <manyforge_core/logical_scene_projection.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -152,7 +150,8 @@ RetainedPlannerSceneProjection::CreateInitialized(
         "native_projection_initial_scene_mismatch");
   }
   auto publisher = projection->BuildPublisher(
-      initial_scene, core::CollisionWorldMutationSource::kDeploymentApply,
+      projection->projector_, initial_scene,
+      core::CollisionWorldMutationSource::kDeploymentApply,
       "native_projection_initialize");
   if (!publisher.ok()) {
     return projection_error<std::shared_ptr<RetainedPlannerSceneProjection>>(
@@ -183,8 +182,53 @@ RetainedPlannerSceneProjection::CreateInitialized(
   return result;
 }
 
+core::Result<void> RetainedPlannerSceneProjection::PrepareCandidateProjection(
+    RetainedCollisionWorldProjector candidate_projector,
+    core::RetainedProductDTO candidate_planning_collision_model) {
+  std::lock_guard lock(mutex_);
+  const auto rejected = [](std::string message, std::string reason) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
+        std::move(message), {{"reason", std::move(reason)}}});
+  };
+  const auto &candidate_map = candidate_projector.model_map();
+  if (candidate_planning_collision_model.product_kind !=
+          core::RetainedProductKind::kPlanningCollisionModel ||
+      candidate_planning_collision_model.product_id.empty() ||
+      candidate_planning_collision_model.product_contract_id.empty() ||
+      candidate_planning_collision_model.product_contract_revision.empty() ||
+      candidate_map.retained_bundle_id.empty() ||
+      candidate_map.graph_revision.empty() || candidate_map.cell_id.empty() ||
+      candidate_map.cell_id != projector_.model_map().cell_id) {
+    return rejected("prepared native candidate model is invalid or belongs "
+                    "to another cell",
+                    "native_projection_candidate_model_invalid");
+  }
+  if (stage_record_.has_value() && !stage_record_->activated &&
+      !stage_record_->discarded) {
+    return rejected("a nonterminal native projection stage already owns this "
+                    "runtime",
+                    "native_projection_candidate_stage_active");
+  }
+  if (stage_record_.has_value()) {
+    stage_record_.reset();
+  }
+  if (candidate_map.retained_bundle_id ==
+          projector_.model_map().retained_bundle_id &&
+      candidate_map.graph_revision == projector_.model_map().graph_revision &&
+      candidate_planning_collision_model == planning_collision_model_) {
+    prepared_candidate_model_.reset();
+    return core::Result<void>::Ok();
+  }
+  prepared_candidate_model_ = PreparedCandidateModel{
+      std::move(candidate_projector),
+      std::move(candidate_planning_collision_model)};
+  return core::Result<void>::Ok();
+}
+
 core::Result<std::shared_ptr<RetainedCollisionWorldPublisher>>
 RetainedPlannerSceneProjection::BuildPublisher(
+    const RetainedCollisionWorldProjector &projector,
     const core::LogicalSceneSnapshotDTO &snapshot,
     const core::CollisionWorldMutationSource source,
     std::string source_label) const {
@@ -205,7 +249,7 @@ RetainedPlannerSceneProjection::BuildPublisher(
         "native_projection_clock_invalid");
   }
   return RetainedCollisionWorldPublisher::create(
-      projector_, config_.publisher_id, snapshot,
+      projector, config_.publisher_id, snapshot,
       RetainedCollisionWorldPublicationContext{
           source, {}, observed_at, {}, std::move(source_label), std::nullopt},
       config_.collision_ledger_capacity);
@@ -525,6 +569,12 @@ core::ProjectionCommitResultDTO
 RetainedPlannerSceneProjection::RebuildProjection(
     const core::NativeProjectionRebuildDTO &request) {
   std::lock_guard lock(mutex_);
+  return RebuildProjectionLocked(request);
+}
+
+core::ProjectionCommitResultDTO
+RetainedPlannerSceneProjection::RebuildProjectionLocked(
+    const core::NativeProjectionRebuildDTO &request) {
   const auto invalid = [&](std::string message, std::string reason) {
     return RollbackProven(std::nullopt, request.target_projection_revision,
                           error(std::string(core::to_string(
@@ -577,7 +627,7 @@ RetainedPlannerSceneProjection::RebuildProjection(
   active_publisher_.store(nullptr, std::memory_order_release);
 
   auto rebuilt =
-      BuildPublisher(*request.logical_scene,
+      BuildPublisher(projector_, *request.logical_scene,
                      core::CollisionWorldMutationSource::kDeploymentApply,
                      "native_projection_rebuild");
   if (!rebuilt.ok()) {
@@ -625,14 +675,714 @@ RetainedPlannerSceneProjection::RebuildProjection(
   return success;
 }
 
+core::NativeProjectionBootstrapRebuildResultDTO
+RetainedPlannerSceneProjection::RebuildBootstrapProjection(
+    const core::NativeProjectionBootstrapRebuildDTO &request) {
+  std::lock_guard lock(mutex_);
+  if (!request.valid() ||
+      request.native_runtime_binding != native_runtime_binding_ ||
+      request.planning_collision_model != planning_collision_model_) {
+    throw std::invalid_argument(
+        "native bootstrap rebuild request is invalid for this runtime");
+  }
+  const bool already_exact =
+      HealthyAt(request.canonical_empty_target) && logical_snapshot_ &&
+      *logical_snapshot_ == *request.initialized_logical_scene.shared();
+  const core::NativeProjectionRebuildDTO rebuild{
+      request.native_runtime_binding,
+      request.canonical_empty_target,
+      request.planning_collision_model,
+      request.initialized_logical_scene.shared(),
+  };
+  auto result = RebuildProjectionLocked(rebuild);
+  if (result.result == core::ProjectionCommitResultStateDTO::kCommitted &&
+      result.acknowledged_projection_revision ==
+          std::optional<core::ProjectionRevisionDTO>{
+              request.canonical_empty_target}) {
+    bootstrap_record_ =
+        BootstrapRecord{request.bootstrap_id, request.bootstrap_generation,
+                        request.canonical_empty_target};
+    core::NativeProjectionBootstrapRebuildResultDTO success{
+        request.bootstrap_id,
+        request.bootstrap_generation,
+        request.native_runtime_binding,
+        request.canonical_empty_target,
+        request.planning_collision_model,
+        request.initialized_logical_scene,
+        already_exact
+            ? core::NativeProjectionBootstrapRebuildState::kAlreadyExact
+            : core::NativeProjectionBootstrapRebuildState::kRebuilt,
+        request.canonical_empty_target,
+        result.native_projection_generation,
+        result.resulting_health.projection_content_digest,
+        result.resulting_health,
+        std::nullopt,
+    };
+    if (!success.presence_valid()) {
+      throw std::logic_error(
+          "native bootstrap rebuild produced an invalid success result");
+    }
+    return success;
+  }
+  core::NativeProjectionBootstrapRebuildResultDTO failed{
+      request.bootstrap_id,
+      request.bootstrap_generation,
+      request.native_runtime_binding,
+      request.canonical_empty_target,
+      request.planning_collision_model,
+      request.initialized_logical_scene,
+      core::NativeProjectionBootstrapRebuildState::kFailedProjectionUncertain,
+      std::nullopt,
+      result.native_projection_generation,
+      result.resulting_health.projection_content_digest,
+      result.resulting_health,
+      result.error.has_value()
+          ? result.error
+          : std::optional<core::ErrorDTO>{error(
+                "projection_state_uncertain",
+                "native bootstrap rebuild did not acknowledge its target",
+                "native_projection_bootstrap_rebuild_unacknowledged")},
+  };
+  if (!failed.presence_valid()) {
+    throw std::logic_error(
+        "native bootstrap rebuild produced an invalid failure result");
+  }
+  return failed;
+}
+
+core::NativeProjectionBootstrapStatusDTO
+RetainedPlannerSceneProjection::BootstrapProjectionStatus(
+    const core::NativeProjectionBootstrapStatusQueryDTO &query) const {
+  std::lock_guard lock(mutex_);
+  if (!query.valid() ||
+      query.native_runtime_binding != native_runtime_binding_) {
+    throw std::invalid_argument(
+        "native bootstrap status query does not match this runtime binding");
+  }
+  if (bootstrap_record_.has_value() &&
+      bootstrap_record_->bootstrap_id == query.bootstrap_id &&
+      bootstrap_record_->bootstrap_generation == query.bootstrap_generation &&
+      bootstrap_record_->target == query.canonical_empty_target &&
+      HealthyAt(query.canonical_empty_target)) {
+    core::NativeProjectionBootstrapStatusDTO rebuilt{
+        query.bootstrap_id,
+        query.bootstrap_generation,
+        query.native_runtime_binding,
+        query.canonical_empty_target,
+        core::NativeProjectionBootstrapStatusState::kRebuilt,
+        query.canonical_empty_target,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        std::nullopt,
+    };
+    if (!rebuilt.presence_valid()) {
+      throw std::logic_error(
+          "native bootstrap status cannot represent rebuilt state");
+    }
+    return rebuilt;
+  }
+  if (!bootstrap_record_.has_value() &&
+      health_.state == core::ProjectionHealthState::kUninitialized &&
+      !health_.active_projection_revision.has_value()) {
+    core::NativeProjectionBootstrapStatusDTO absent{
+        query.bootstrap_id,
+        query.bootstrap_generation,
+        query.native_runtime_binding,
+        query.canonical_empty_target,
+        core::NativeProjectionBootstrapStatusState::kAbsent,
+        std::nullopt,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        std::nullopt,
+    };
+    if (!absent.presence_valid()) {
+      throw std::logic_error(
+          "native bootstrap status cannot represent absent state");
+    }
+    return absent;
+  }
+  if (health_.state == core::ProjectionHealthState::kRebuilding &&
+      !health_.active_projection_revision.has_value()) {
+    core::NativeProjectionBootstrapStatusDTO rebuilding{
+        query.bootstrap_id,
+        query.bootstrap_generation,
+        query.native_runtime_binding,
+        query.canonical_empty_target,
+        core::NativeProjectionBootstrapStatusState::kRebuilding,
+        std::nullopt,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        std::nullopt,
+    };
+    if (!rebuilding.presence_valid()) {
+      throw std::logic_error(
+          "native bootstrap status cannot represent rebuilding state");
+    }
+    return rebuilding;
+  }
+  const auto status_error =
+      error("projection_state_uncertain",
+            "native bootstrap status cannot prove the exact requested state",
+            "native_projection_bootstrap_status_uncertain");
+  auto failed_health = health_;
+  if (failed_health.state != core::ProjectionHealthState::kDesynchronized &&
+      failed_health.state != core::ProjectionHealthState::kUnavailable) {
+    failed_health.state = core::ProjectionHealthState::kUnavailable;
+    failed_health.error = status_error;
+  }
+  core::NativeProjectionBootstrapStatusDTO failed{
+      query.bootstrap_id,
+      query.bootstrap_generation,
+      query.native_runtime_binding,
+      query.canonical_empty_target,
+      core::NativeProjectionBootstrapStatusState::kFailedProjectionUncertain,
+      std::nullopt,
+      failed_health.native_projection_generation,
+      failed_health.projection_content_digest,
+      failed_health,
+      status_error,
+  };
+  if (!failed.presence_valid()) {
+    throw std::logic_error(
+        "native bootstrap status cannot represent uncertain state");
+  }
+  return failed;
+}
+
+core::NativeProjectionStageResultDTO
+RetainedPlannerSceneProjection::StageProjection(
+    const core::NativeProjectionStageDTO &request) {
+  std::lock_guard lock(mutex_);
+  if (!request.valid()) {
+    throw std::invalid_argument("native projection stage request is invalid");
+  }
+  const auto rejected = [&](std::string message, std::string reason) {
+    core::NativeProjectionStageResultDTO result{
+        request.apply_id,
+        request.apply_generation,
+        request.projection_stage_generation,
+        request.transition_row,
+        request.expected_predecessor_projection_revision,
+        request.candidate_projection_revision,
+        core::NativeProjectionStageResultState::kRejected,
+        std::nullopt,
+        health_.active_projection_revision,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        error(
+            std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
+            std::move(message), std::move(reason)),
+    };
+    return result;
+  };
+  if (request.transition_row.native_runtime_binding !=
+          native_runtime_binding_ ||
+      !exact_scene_content(*request.frozen_logical_scene.shared())) {
+    return rejected("native stage does not match its exact verified product, "
+                    "runtime binding, and frozen scene",
+                    "native_projection_stage_mismatch");
+  }
+  if (stage_record_.has_value()) {
+    if (stage_record_->request == request) {
+      return stage_record_->stage_result;
+    }
+    if (!stage_record_->activated && !stage_record_->discarded) {
+      return rejected("another exact native stage already owns this runtime",
+                      "native_projection_stage_conflict");
+    }
+  }
+  if (retire_record_.has_value()) {
+    if (health_.state != core::ProjectionHealthState::kUninitialized ||
+        health_.active_projection_revision.has_value()) {
+      return rejected("a nonterminal native retirement still owns this "
+                      "runtime",
+                      "native_projection_retire_stage_conflict");
+    }
+  }
+  const bool expected_present =
+      request.transition_row.expected_local_active.has_value();
+  if ((expected_present &&
+       !HealthyAt(request.expected_predecessor_projection_revision)) ||
+      (!expected_present &&
+       (health_.state != core::ProjectionHealthState::kUninitialized ||
+        health_.active_projection_revision.has_value())) ||
+      health_.staged_candidate.has_value()) {
+    return rejected("native stage observed a different local predecessor",
+                    "native_projection_stage_predecessor_mismatch");
+  }
+  if (health_.source_sequence == std::numeric_limits<std::uint64_t>::max()) {
+    return rejected("native stage health sequence is exhausted",
+                    "native_projection_stage_sequence_exhausted");
+  }
+  const RetainedCollisionWorldProjector *candidate_projector = &projector_;
+  const core::RetainedProductDTO *candidate_product =
+      &planning_collision_model_;
+  const auto matches_request = [&](const auto &projector,
+                                   const auto &product) {
+    const auto &map = projector.model_map();
+    return request.planning_collision_model == product &&
+           request.candidate_projection_revision.retained_bundle_id ==
+               map.retained_bundle_id &&
+           request.candidate_projection_revision.graph_revision ==
+               map.graph_revision &&
+           request.frozen_logical_scene.shared()->cell_id == map.cell_id;
+  };
+  if (!matches_request(*candidate_projector, *candidate_product)) {
+    if (!prepared_candidate_model_.has_value() ||
+        !matches_request(prepared_candidate_model_->projector,
+                         prepared_candidate_model_->planning_collision_model)) {
+      return rejected("native candidate model was not prepared during "
+                      "staged-ready convergence",
+                      "native_projection_candidate_model_not_prepared");
+    }
+    candidate_projector = &prepared_candidate_model_->projector;
+    candidate_product =
+        &prepared_candidate_model_->planning_collision_model;
+  }
+  auto candidate =
+      BuildPublisher(*candidate_projector, *request.frozen_logical_scene.shared(),
+                     core::CollisionWorldMutationSource::kDeploymentApply,
+                     "native_projection_stage");
+  if (!candidate.ok()) {
+    return rejected(candidate.error().message,
+                    "native_projection_stage_publication_rejected");
+  }
+  const auto digest = publisher_digest(candidate.value());
+  if (!digest.has_value()) {
+    return rejected("staged native projection has no immutable digest",
+                    "native_projection_stage_digest_missing");
+  }
+  auto next_health = health_;
+  ++next_health.source_sequence;
+  next_health.staged_candidate = core::ProjectionStagedCandidateDTO{
+      request.apply_id, request.apply_generation,
+      request.projection_stage_generation,
+      request.candidate_projection_revision};
+  next_health.error = std::nullopt;
+  core::NativeProjectionStageResultDTO result{
+      request.apply_id,
+      request.apply_generation,
+      request.projection_stage_generation,
+      request.transition_row,
+      request.expected_predecessor_projection_revision,
+      request.candidate_projection_revision,
+      core::NativeProjectionStageResultState::kStaged,
+      request.candidate_projection_revision,
+      next_health.active_projection_revision,
+      next_health.native_projection_generation,
+      *digest,
+      next_health,
+      std::nullopt,
+  };
+  if (!result.presence_valid()) {
+    throw std::logic_error("native stage produced an invalid success result");
+  }
+  StageRecord record{request,
+                     *candidate_projector,
+                     *candidate_product,
+                     std::move(candidate.value()),
+                     result,
+                     false,
+                     false};
+  health_ = std::move(next_health);
+  retire_record_.reset();
+  stage_record_ = std::move(record);
+  return result;
+}
+
+core::NativeProjectionActivationResultDTO
+RetainedPlannerSceneProjection::ActivateStagedProjection(
+    const core::NativeProjectionActivationDTO &request) {
+  std::lock_guard lock(mutex_);
+  const auto stale = [&](std::string message, std::string reason) {
+    core::NativeProjectionActivationResultDTO result{
+        request,
+        core::NativeProjectionActivationResultState::kStale,
+        std::nullopt,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        error(
+            std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
+            std::move(message), std::move(reason)),
+    };
+    return result;
+  };
+  if (!request.valid() || request.transition_row.native_runtime_binding !=
+                              native_runtime_binding_) {
+    return stale("native activation request is invalid for this runtime",
+                 "native_projection_activation_mismatch");
+  }
+  if (!stage_record_.has_value() ||
+      stage_record_->request.apply_id != request.apply_id ||
+      stage_record_->request.apply_generation != request.apply_generation ||
+      stage_record_->request.projection_stage_generation !=
+          request.projection_stage_generation ||
+      stage_record_->request.transition_row != request.transition_row ||
+      stage_record_->request.expected_predecessor_projection_revision !=
+          request.expected_predecessor_projection_revision ||
+      stage_record_->request.candidate_projection_revision !=
+          request.candidate_projection_revision) {
+    return stale("native activation has no exact staged candidate",
+                 "native_projection_activation_stage_absent");
+  }
+  if (stage_record_->discarded) {
+    return stale("native candidate stage was already discarded",
+                 "native_projection_activation_stage_discarded");
+  }
+  if (stage_record_->activated &&
+      HealthyAt(request.candidate_projection_revision)) {
+    core::NativeProjectionActivationResultDTO replay{
+        request,
+        core::NativeProjectionActivationResultState::kActivated,
+        request.candidate_projection_revision,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        std::nullopt,
+    };
+    return replay;
+  }
+  const core::ProjectionStagedCandidateDTO expected_stage{
+      request.apply_id, request.apply_generation,
+      request.projection_stage_generation,
+      request.candidate_projection_revision};
+  if (health_.staged_candidate !=
+          std::optional<core::ProjectionStagedCandidateDTO>{expected_stage} ||
+      health_.active_projection_revision !=
+          request.transition_row.expected_local_active ||
+      !stage_record_->candidate_publisher) {
+    return stale("native staged state no longer matches activation",
+                 "native_projection_activation_state_stale");
+  }
+  if (health_.source_sequence == std::numeric_limits<std::uint64_t>::max() ||
+      (health_.native_projection_generation.has_value() &&
+       *health_.native_projection_generation ==
+           std::numeric_limits<std::uint64_t>::max())) {
+    return stale("native activation counters are exhausted",
+                 "native_projection_activation_counter_exhausted");
+  }
+  const auto digest = publisher_digest(stage_record_->candidate_publisher);
+  if (!digest.has_value()) {
+    return stale("native staged projection has no immutable digest",
+                 "native_projection_activation_digest_missing");
+  }
+  auto next_health = health_;
+  ++next_health.source_sequence;
+  next_health.state = core::ProjectionHealthState::kHealthy;
+  next_health.active_projection_revision =
+      request.candidate_projection_revision;
+  next_health.staged_candidate = std::nullopt;
+  next_health.native_projection_generation =
+      health_.native_projection_generation.has_value()
+          ? std::optional<std::uint64_t>(*health_.native_projection_generation +
+                                         1U)
+          : std::optional<std::uint64_t>(1U);
+  next_health.projection_content_digest = *digest;
+  next_health.error = std::nullopt;
+  logical_snapshot_ = stage_record_->request.frozen_logical_scene.shared();
+  transaction_records_.clear();
+  projector_ = stage_record_->candidate_projector;
+  planning_collision_model_ =
+      stage_record_->candidate_planning_collision_model;
+  prepared_candidate_model_.reset();
+  active_publisher_.store(stage_record_->candidate_publisher,
+                          std::memory_order_release);
+  health_ = std::move(next_health);
+  stage_record_->activated = true;
+  core::NativeProjectionActivationResultDTO result{
+      request,
+      core::NativeProjectionActivationResultState::kActivated,
+      request.candidate_projection_revision,
+      health_.native_projection_generation,
+      health_.projection_content_digest,
+      health_,
+      std::nullopt,
+  };
+  if (!result.presence_valid()) {
+    throw std::logic_error(
+        "native activation produced an invalid success result");
+  }
+  return result;
+}
+
+core::NativeProjectionRetireResultDTO
+RetainedPlannerSceneProjection::RetireProjection(
+    const core::NativeProjectionRetireDTO &request) {
+  std::lock_guard lock(mutex_);
+  const auto stale = [&](std::string message, std::string reason) {
+    return core::NativeProjectionRetireResultDTO{
+        request,
+        core::NativeProjectionRetireResultState::kStale,
+        health_.active_projection_revision,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        error(
+            std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
+            std::move(message), std::move(reason)),
+    };
+  };
+  if (!request.valid() || request.transition_row.native_runtime_binding !=
+                              native_runtime_binding_) {
+    return stale("native retirement request is invalid for this runtime",
+                 "native_projection_retire_mismatch");
+  }
+  if (retire_record_.has_value()) {
+    if (retire_record_->request.apply_id == request.apply_id &&
+        retire_record_->request.apply_generation == request.apply_generation &&
+        retire_record_->request.projection_stage_generation ==
+            request.projection_stage_generation &&
+        retire_record_->request.transition_row == request.transition_row &&
+        retire_record_->request.expected_predecessor_projection_revision ==
+            request.expected_predecessor_projection_revision &&
+        retire_record_->request.candidate_projection_revision ==
+            request.candidate_projection_revision) {
+      return retire_record_->result;
+    }
+    return stale("another exact retirement already owns this runtime",
+                 "native_projection_retire_conflict");
+  }
+  if (!health_.active_projection_revision.has_value() &&
+      health_.state == core::ProjectionHealthState::kUninitialized) {
+    core::NativeProjectionRetireResultDTO result{
+        request,
+        core::NativeProjectionRetireResultState::kAlreadyAbsent,
+        std::nullopt,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        std::nullopt,
+    };
+    retire_record_ = RetireRecord{request, result};
+    return result;
+  }
+  if (!HealthyAt(request.expected_predecessor_projection_revision) ||
+      (stage_record_.has_value() && !stage_record_->activated &&
+       !stage_record_->discarded) ||
+      !retained_lease_publishers_.empty()) {
+    return stale("native retirement cannot prove an exact drained predecessor",
+                 "native_projection_retire_predecessor_unavailable");
+  }
+  if (health_.source_sequence == std::numeric_limits<std::uint64_t>::max() ||
+      !health_.native_projection_generation.has_value() ||
+      *health_.native_projection_generation ==
+          std::numeric_limits<std::uint64_t>::max()) {
+    return stale("native retirement counters are exhausted",
+                 "native_projection_retire_counter_exhausted");
+  }
+  auto next_health = health_;
+  ++next_health.source_sequence;
+  ++*next_health.native_projection_generation;
+  next_health.state = core::ProjectionHealthState::kUninitialized;
+  next_health.active_projection_revision = std::nullopt;
+  next_health.staged_candidate = std::nullopt;
+  next_health.projection_content_digest = std::nullopt;
+  next_health.error = std::nullopt;
+  active_publisher_.store(nullptr, std::memory_order_release);
+  logical_snapshot_.reset();
+  transaction_records_.clear();
+  stage_record_.reset();
+  prepared_candidate_model_.reset();
+  health_ = std::move(next_health);
+  core::NativeProjectionRetireResultDTO result{
+      request,      core::NativeProjectionRetireResultState::kRetired,
+      std::nullopt, health_.native_projection_generation,
+      std::nullopt, health_,
+      std::nullopt,
+  };
+  if (!result.presence_valid()) {
+    throw std::logic_error(
+        "native retirement produced an invalid success result");
+  }
+  retire_record_ = RetireRecord{request, result};
+  return result;
+}
+
+core::NativeProjectionRetireStatusDTO
+RetainedPlannerSceneProjection::ProjectionRetireStatus(
+    const core::NativeProjectionRetireStatusQueryDTO &query) const {
+  std::lock_guard lock(mutex_);
+  if (!query.valid() || query.request.transition_row.native_runtime_binding !=
+                            native_runtime_binding_) {
+    throw std::invalid_argument(
+        "native retirement status query is invalid for this runtime");
+  }
+  auto state = core::NativeProjectionRetireStatusState::kPending;
+  std::optional<core::ErrorDTO> status_error;
+  if (retire_record_.has_value()) {
+    if (retire_record_->request.apply_id != query.request.apply_id ||
+        retire_record_->request.apply_generation !=
+            query.request.apply_generation ||
+        retire_record_->request.projection_stage_generation !=
+            query.request.projection_stage_generation ||
+        retire_record_->request.transition_row !=
+            query.request.transition_row ||
+        retire_record_->request.expected_predecessor_projection_revision !=
+            query.request.expected_predecessor_projection_revision ||
+        retire_record_->request.candidate_projection_revision !=
+            query.request.candidate_projection_revision) {
+      state = core::NativeProjectionRetireStatusState::kStale;
+      status_error = error("invariant_violation",
+                           "another retirement owns this native runtime",
+                           "native_projection_retire_status_conflict");
+    } else {
+      state = retire_record_->result.state ==
+                      core::NativeProjectionRetireResultState::kAlreadyAbsent
+                  ? core::NativeProjectionRetireStatusState::kAlreadyAbsent
+                  : core::NativeProjectionRetireStatusState::kRetired;
+    }
+  } else if (health_.active_projection_revision !=
+             query.request.transition_row.expected_local_active) {
+    state = core::NativeProjectionRetireStatusState::kStale;
+    status_error = error("invariant_violation",
+                         "native retirement predecessor is no longer exact",
+                         "native_projection_retire_status_stale");
+  }
+  core::NativeProjectionRetireStatusDTO result{
+      query.request,
+      state,
+      health_.active_projection_revision,
+      health_.native_projection_generation,
+      health_.projection_content_digest,
+      health_,
+      std::move(status_error),
+  };
+  if (!result.presence_valid()) {
+    throw std::logic_error("native retirement status result is invalid");
+  }
+  return result;
+}
+
+core::NativeProjectionDiscardResultDTO
+RetainedPlannerSceneProjection::DiscardStagedProjection(
+    const core::NativeProjectionDiscardDTO &request) {
+  std::lock_guard lock(mutex_);
+  const auto failed = [&](std::string message, std::string reason) {
+    return core::NativeProjectionDiscardResultDTO{
+        request,
+        core::NativeProjectionDiscardResultState::kFailedProjectionUncertain,
+        health_.active_projection_revision,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        error("projection_state_uncertain", std::move(message),
+              std::move(reason)),
+    };
+  };
+  if (!request.valid() || request.transition_row.native_runtime_binding !=
+                              native_runtime_binding_) {
+    return failed("native discard request is invalid for this runtime",
+                  "native_projection_discard_mismatch");
+  }
+  if (!stage_record_.has_value()) {
+    core::NativeProjectionDiscardResultDTO result{
+        request,
+        core::NativeProjectionDiscardResultState::kAlreadyAbsent,
+        health_.active_projection_revision,
+        health_.native_projection_generation,
+        health_.projection_content_digest,
+        health_,
+        std::nullopt,
+    };
+    return result;
+  }
+  if (stage_record_->request.apply_id != request.apply_id ||
+      stage_record_->request.apply_generation != request.apply_generation ||
+      stage_record_->request.projection_stage_generation !=
+          request.projection_stage_generation ||
+      stage_record_->request.transition_row != request.transition_row ||
+      stage_record_->request.candidate_projection_revision !=
+          request.candidate_projection_revision ||
+      stage_record_->activated) {
+    return failed("native candidate stage cannot be discarded exactly",
+                  "native_projection_discard_conflict");
+  }
+  if (!stage_record_->discarded) {
+    stage_record_->candidate_publisher.reset();
+    stage_record_->discarded = true;
+    health_.staged_candidate = std::nullopt;
+    if (health_.source_sequence != std::numeric_limits<std::uint64_t>::max()) {
+      ++health_.source_sequence;
+    }
+  }
+  core::NativeProjectionDiscardResultDTO result{
+      request,
+      core::NativeProjectionDiscardResultState::kDiscarded,
+      health_.active_projection_revision,
+      health_.native_projection_generation,
+      health_.projection_content_digest,
+      health_,
+      std::nullopt,
+  };
+  if (!result.presence_valid()) {
+    throw std::logic_error("native discard produced an invalid success result");
+  }
+  return result;
+}
+
+core::NativeProjectionStatusDTO
+RetainedPlannerSceneProjection::ProjectionStageStatus(
+    const core::NativeProjectionStatusQueryDTO &query) const {
+  std::lock_guard lock(mutex_);
+  if (!query.valid() ||
+      query.transition_row.native_runtime_binding != native_runtime_binding_) {
+    throw std::invalid_argument(
+        "native stage status query is invalid for this runtime");
+  }
+  auto state = core::NativeProjectionStatusState::kAbsent;
+  std::optional<core::ProjectionRevisionDTO> candidate;
+  std::optional<core::ErrorDTO> status_error;
+  if (stage_record_.has_value()) {
+    const bool exact =
+        stage_record_->request.apply_id == query.apply_id &&
+        stage_record_->request.apply_generation == query.apply_generation &&
+        stage_record_->request.projection_stage_generation ==
+            query.projection_stage_generation &&
+        stage_record_->request.transition_row == query.transition_row;
+    if (!exact) {
+      state = core::NativeProjectionStatusState::kFailedProjectionUncertain;
+      status_error = error("projection_state_uncertain",
+                           "another stage owns this native runtime",
+                           "native_projection_stage_status_conflict");
+    } else if (stage_record_->discarded) {
+      state = core::NativeProjectionStatusState::kDiscarded;
+    } else {
+      candidate = stage_record_->request.candidate_projection_revision;
+      state = stage_record_->activated
+                  ? core::NativeProjectionStatusState::kActivated
+                  : core::NativeProjectionStatusState::kStaged;
+    }
+  }
+  core::NativeProjectionStatusDTO result{
+      query,
+      state,
+      std::move(candidate),
+      health_.active_projection_revision,
+      health_.native_projection_generation,
+      health_.projection_content_digest,
+      health_,
+      std::move(status_error),
+  };
+  if (!result.presence_valid()) {
+    throw std::logic_error("native stage status result is invalid");
+  }
+  return result;
+}
+
 std::shared_ptr<const core::LogicalSceneSnapshotDTO>
 RetainedPlannerSceneProjection::logical_snapshot() const {
   std::lock_guard lock(mutex_);
   return logical_snapshot_;
 }
 
-const collision::ManyForgeCollisionEngine::SharedModelPtr &
-RetainedPlannerSceneProjection::collision_shared_model() const noexcept {
+collision::ManyForgeCollisionEngine::SharedModelPtr
+RetainedPlannerSceneProjection::collision_shared_model() const {
+  std::lock_guard lock(mutex_);
   return projector_.shared_model();
 }
 

@@ -288,6 +288,8 @@ target_link_libraries(manyforge_roboplan_candidate_worker PRIVATE
 # headless API; it is not a second public execution contract.
 add_executable(manyforge_native_execution_host
   src/native_execution_host_main.cpp)
+target_include_directories(manyforge_native_execution_host PRIVATE
+  "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
 target_compile_definitions(manyforge_native_execution_host PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_native_execution_host PRIVATE

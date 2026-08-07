@@ -1,5 +1,7 @@
 #include "manyforge_component_manager/retained_native_runtime_unit_adapter.hpp"
 
+#include "native_projection_rpc_internal.hpp"
+
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -21,11 +23,13 @@
 #include <cstring>
 #include <limits>
 #include <manyforge_component_manager/native_execution_runtime_unit_admission.hpp>
+#include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -43,10 +47,15 @@ namespace contract = manyforge::deployment::native_execution_runtime_contract;
 using manyforge::core::RuntimeEpoch;
 using manyforge::deployment::RetainedBundle;
 
+using ProjectionBindingKey =
+    std::pair<manyforge::core::CapabilityProviderBindingId,
+              manyforge::core::CapabilityProviderBindingRevision>;
+
 constexpr int kChildChannelFd = 3;
 constexpr int kChildExecErrorFd = 4;
 constexpr int kChildExecutableFd = 5;
-constexpr std::size_t kMaximumControlPacketBytes = 4096U;
+constexpr std::size_t kMaximumControlPacketBytes =
+    detail::kMaximumNativeProjectionRpcPacketBytes;
 constexpr auto kExecTimeout = std::chrono::seconds(10);
 constexpr auto kReadyTimeout = std::chrono::seconds(10);
 constexpr auto kStatusTimeout = std::chrono::milliseconds(750);
@@ -60,6 +69,25 @@ constexpr auto kTermStopTimeout = std::chrono::seconds(1);
 [[nodiscard]] std::string ErrnoDetail(const std::string_view operation,
                                       const int error) {
   return std::string(operation) + ": " + std::strerror(error);
+}
+
+[[nodiscard]] std::filesystem::path
+NormalizedPlainDirectory(std::filesystem::path path,
+                         const std::string_view label) {
+  if (path.empty()) {
+    Fail(std::string(label) + " is empty");
+  }
+  std::error_code error;
+  path = std::filesystem::absolute(path, error).lexically_normal();
+  if (error) {
+    Fail(std::string(label) + " could not be resolved: " + error.message());
+  }
+  const auto status = std::filesystem::symlink_status(path, error);
+  if (error || !std::filesystem::is_directory(status) ||
+      std::filesystem::is_symlink(status)) {
+    Fail(std::string(label) + " is not one existing plain directory");
+  }
+  return path;
 }
 
 class UniqueFd final {
@@ -185,10 +213,10 @@ ReceivePacket(const int fd, const std::chrono::milliseconds timeout) {
   if (!WaitForEvent(fd, POLLIN, timeout)) {
     return std::nullopt;
   }
-  std::array<char, kMaximumControlPacketBytes + 1U> bytes{};
+  char probe = '\0';
   ssize_t count = -1;
   do {
-    count = ::recv(fd, bytes.data(), bytes.size(), MSG_TRUNC);
+    count = ::recv(fd, &probe, 1U, MSG_PEEK | MSG_TRUNC);
   } while (count < 0 && errno == EINTR);
   if (count < 0) {
     Fail(ErrnoDetail("native runtime control read failed", errno));
@@ -199,7 +227,18 @@ ReceivePacket(const int fd, const std::chrono::milliseconds timeout) {
   if (static_cast<std::size_t>(count) > kMaximumControlPacketBytes) {
     Fail("native runtime control response exceeds its byte bound");
   }
-  return std::string(bytes.data(), static_cast<std::size_t>(count));
+  std::string bytes(static_cast<std::size_t>(count), '\0');
+  ssize_t received = -1;
+  do {
+    received = ::recv(fd, bytes.data(), bytes.size(), 0);
+  } while (received < 0 && errno == EINTR);
+  if (received != count) {
+    if (received < 0) {
+      Fail(ErrnoDetail("native runtime control read failed", errno));
+    }
+    Fail("native runtime control response changed while being received");
+  }
+  return bytes;
 }
 
 [[nodiscard]] std::uint64_t
@@ -234,6 +273,47 @@ FindRuntimeUnit(const RetainedBundle &bundle,
     Fail("native runtime candidate bundle lacks the queried runtime unit");
   }
   return *found;
+}
+
+[[nodiscard]] std::set<ProjectionBindingKey>
+NativeProjectionBindingsForRuntime(
+    const RetainedBundle &bundle,
+    const manyforge::core::RuntimeUnitId &runtime_unit_id) {
+  std::set<ProjectionBindingKey> result;
+  for (const auto &binding :
+       bundle.value().capability_provider_bindings) {
+    if (!manyforge::core::RequiresNativeSceneProjection(
+            binding.capability_id,
+            binding.capability_definition_revision)) {
+      continue;
+    }
+    std::set<manyforge::core::RuntimeUnitId> runtime_sources;
+    for (const auto &endpoint : binding.endpoint_bindings) {
+      if (endpoint.source_kind !=
+          manyforge::core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+        continue;
+      }
+      const auto *source =
+          std::get_if<manyforge::core::RuntimeUnitId>(&endpoint.source_id);
+      if (source == nullptr || source->empty()) {
+        Fail("native projection endpoint has a mismatched runtime source");
+      }
+      runtime_sources.insert(*source);
+    }
+    if (runtime_sources.size() != 1U) {
+      Fail("native projection binding does not resolve one exact runtime");
+    }
+    if (*runtime_sources.begin() != runtime_unit_id) {
+      continue;
+    }
+    if (!result
+             .emplace(binding.capability_provider_binding_id,
+                      binding.capability_provider_binding_revision)
+             .second) {
+      Fail("native projection binding identity is repeated for one runtime");
+    }
+  }
+  return result;
 }
 
 void VerifyAdmissionMatchesQuery(
@@ -417,24 +497,40 @@ void ConfirmExecOrThrow(const pid_t pid, const int error_fd) {
 
 } // namespace
 
-struct RetainedNativeRuntimeUnitAdapter::Impl final {
+struct RetainedNativeRuntimeUnitAdapter::Impl final
+    : public std::enable_shared_from_this<
+          RetainedNativeRuntimeUnitAdapter::Impl> {
+  class ProjectionClient;
+
   struct Child final {
+    struct ProjectionPreparation final {
+      manyforge::core::RetainedBundleId retained_bundle_id;
+      manyforge::core::GraphRevision graph_revision;
+      manyforge::core::RetainedProductDTO planning_collision_model;
+    };
+
     pid_t pid;
     RuntimeEpoch runtime_epoch;
     UniqueFd channel;
     std::string product_identity;
     std::string configuration_identity;
     std::string implementation_revision;
+    std::set<ProjectionBindingKey> admitted_projection_bindings;
+    std::map<ProjectionBindingKey, ProjectionPreparation>
+        prepared_projection_products;
 
     Child(pid_t child_pid, RuntimeEpoch child_epoch, UniqueFd child_channel,
           std::string selected_product_identity,
           std::string selected_configuration_identity,
-          std::string selected_implementation_revision)
+          std::string selected_implementation_revision,
+          std::set<ProjectionBindingKey> selected_projection_bindings)
         : pid(child_pid), runtime_epoch(std::move(child_epoch)),
           channel(std::move(child_channel)),
           product_identity(std::move(selected_product_identity)),
           configuration_identity(std::move(selected_configuration_identity)),
-          implementation_revision(std::move(selected_implementation_revision)) {
+          implementation_revision(std::move(selected_implementation_revision)),
+          admitted_projection_bindings(
+              std::move(selected_projection_bindings)) {
     }
 
     Child(const Child &) = delete;
@@ -444,21 +540,28 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
   };
 
   Impl(std::filesystem::path trusted_installed_target_root,
+       std::filesystem::path trusted_package_root,
+       std::filesystem::path private_staging_root,
        const manyforge::deployment::IVerifiedRetainedBundleSource
            &selected_bundle_source,
        const manyforge::deployment::IVerifiedRetainedProductArtifactSource
            &selected_artifact_source,
        std::string selected_operating_system,
        std::string selected_launch_environment_contract)
-      : target_root_path(std::move(trusted_installed_target_root)),
+      : target_root_path(NormalizedPlainDirectory(
+            std::move(trusted_installed_target_root),
+            "trusted installed-target root")),
+        package_root_path(NormalizedPlainDirectory(
+            std::move(trusted_package_root), "trusted retained-package root")),
+        staging_root_path(NormalizedPlainDirectory(
+            std::move(private_staging_root), "private native staging root")),
         bundle_source(selected_bundle_source),
         artifact_source(selected_artifact_source),
         operating_system(std::move(selected_operating_system)),
         launch_environment_contract(
             std::move(selected_launch_environment_contract)),
         observer_instance_id("native-observer-" + RandomHex()) {
-    if (!target_root_path.is_absolute() || operating_system.empty() ||
-        launch_environment_contract.empty()) {
+    if (operating_system.empty() || launch_environment_contract.empty()) {
       throw std::invalid_argument(
           "retained native adapter construction input is invalid");
     }
@@ -558,6 +661,107 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
     Fail("native runtime child observation returned a foreign PID");
   }
 
+  [[nodiscard]] detail::NativeProjectionRpcResponse ExchangeProjection(
+      Child &child, const detail::NativeProjectionRpcRequest &request) {
+    const auto encoded = detail::EncodeNativeProjectionRpcRequest(request);
+    SendPacket(child.channel.get(), encoded, kStatusTimeout);
+    const auto packet = ReceivePacket(child.channel.get(), kStatusTimeout);
+    if (!packet.has_value()) {
+      Fail("native projection response timed out");
+    }
+    auto response = detail::DecodeNativeProjectionRpcResponse(*packet);
+    if (const auto *failure =
+            std::get_if<detail::NativeProjectionRpcFailure>(&response)) {
+      Fail("native projection request failed [" + failure->error.code +
+           "]: " + failure->error.message);
+    }
+    return response;
+  }
+
+  template <typename Response>
+  [[nodiscard]] Response ProjectionCall(
+      const manyforge::core::ProjectionNativeRuntimeBindingDTO &binding,
+      detail::NativeProjectionRpcRequest request) {
+    if (!binding.valid()) {
+      Fail("native projection request binding is invalid");
+    }
+    std::lock_guard lock(mutex);
+    const auto found = children.find(binding.runtime_unit_id.value());
+    if (found == children.end() ||
+        found->second.runtime_epoch != binding.runtime_epoch) {
+      Fail("native projection client no longer names the current child epoch");
+    }
+    const ProjectionBindingKey key{binding.provider_binding_id,
+                                   binding.provider_binding_revision};
+    if (!found->second.admitted_projection_bindings.contains(key)) {
+      Fail("native projection client binding is no longer admitted");
+    }
+    if (!ChildIsLive(found->second)) {
+      children.erase(found);
+      Fail("native projection child exited before its response");
+    }
+    auto response = ExchangeProjection(found->second, request);
+    const auto *typed = std::get_if<Response>(&response);
+    if (typed == nullptr) {
+      Fail("native projection child returned the wrong response kind");
+    }
+    return *typed;
+  }
+
+  void PrepareChildProjectionBindings(
+      Child &child, const RetainedBundle &bundle,
+      const manyforge::core::RuntimeUnitId &runtime_unit_id) {
+    const auto bindings =
+        NativeProjectionBindingsForRuntime(bundle, runtime_unit_id);
+    for (const auto &[provider_binding_id, provider_binding_revision] :
+         bindings) {
+      const ProjectionBindingKey key{provider_binding_id,
+                                     provider_binding_revision};
+      detail::NativeProjectionPrepareRequest request{
+          {provider_binding_id, provider_binding_revision, runtime_unit_id,
+           child.runtime_epoch},
+          bundle.retained_bundle_id(),
+          bundle.value().cell_graph.graph_revision,
+          bundle.value().compiled_products.planning_collision_model,
+      };
+      if (!request.valid()) {
+        Fail("native projection preparation request is invalid");
+      }
+      const auto previous = child.prepared_projection_products.find(key);
+      if (previous != child.prepared_projection_products.end() &&
+          previous->second.retained_bundle_id ==
+              request.candidate_retained_bundle_id &&
+          previous->second.graph_revision ==
+              request.candidate_graph_revision &&
+          previous->second.planning_collision_model ==
+              request.planning_collision_model) {
+        continue;
+      }
+      auto response = ExchangeProjection(child, request);
+      const auto *prepared =
+          std::get_if<detail::NativeProjectionPrepareResult>(&response);
+      if (prepared == nullptr ||
+          prepared->request.native_runtime_binding !=
+              request.native_runtime_binding ||
+          prepared->request.candidate_retained_bundle_id !=
+              request.candidate_retained_bundle_id ||
+          prepared->request.candidate_graph_revision !=
+              request.candidate_graph_revision ||
+          prepared->request.planning_collision_model !=
+              request.planning_collision_model) {
+        Fail("native projection child did not acknowledge the exact prepared "
+             "binding and product");
+      }
+      child.admitted_projection_bindings.emplace(provider_binding_id,
+                                                  provider_binding_revision);
+      child.prepared_projection_products.insert_or_assign(
+          key, Child::ProjectionPreparation{
+                   request.candidate_retained_bundle_id,
+                   request.candidate_graph_revision,
+                   request.planning_collision_model});
+    }
+  }
+
   [[nodiscard]] bool
   WaitForChildExit(Child &child,
                    const std::chrono::steady_clock::time_point deadline) {
@@ -625,7 +829,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
   }
 
   [[nodiscard]] Child
-  LaunchChild(const NativeExecutionRuntimeUnitAdmission &admission) {
+  LaunchChild(const NativeExecutionRuntimeUnitAdmission &admission,
+              const RetainedBundle &bundle) {
     auto target = OpenInstalledTarget();
     auto channels = MakePacketPair();
     auto exec_pipe = MakePipe();
@@ -634,10 +839,14 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
     const auto launch_arguments =
         admission.launch_arguments(kChildChannelFd, runtime_epoch);
     std::vector<std::string> arguments;
-    arguments.reserve(launch_arguments.size() + 1U);
+    arguments.reserve(launch_arguments.size() + 5U);
     arguments.emplace_back(contract::kInstalledTargetId);
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
+    arguments.emplace_back("--manyforge-managed-package-root");
+    arguments.push_back(package_root_path.string());
+    arguments.emplace_back("--manyforge-managed-staging-root");
+    arguments.push_back(staging_root_path.string());
     std::vector<char *> argv;
     argv.reserve(arguments.size() + 1U);
     for (auto &argument : arguments) {
@@ -676,10 +885,18 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
       KillAndReap(pid);
       throw;
     }
-    return Child(pid, runtime_epoch, std::move(channels[0]),
-                 admission.product().product_identity().value(),
-                 admission.product().configuration_identity().value(),
-                 admission.implementation_revision());
+    Child child(pid, runtime_epoch, std::move(channels[0]),
+                admission.product().product_identity().value(),
+                admission.product().configuration_identity().value(),
+                admission.implementation_revision(), {});
+    try {
+      PrepareChildProjectionBindings(child, bundle,
+                                     admission.product().runtime_unit_id());
+    } catch (...) {
+      StopChildNoThrow(child);
+      throw;
+    }
+    return child;
   }
 
   [[nodiscard]] ProcessPresenceObservation
@@ -711,7 +928,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
   [[nodiscard]] ProcessPresenceObservation
   EnsureRunning(const RuntimeUnitConvergenceQueryDTO &query) {
     auto [bundle, admission] = Admission(query);
-    static_cast<void>(bundle);
     std::lock_guard lock(mutex);
     const auto runtime_id = query.plan.runtime_unit_id.value();
     auto found = children.find(runtime_id);
@@ -724,6 +940,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
         }
         children.erase(found);
       } else if (ChildIsLive(found->second)) {
+        PrepareChildProjectionBindings(found->second, *bundle,
+                                       query.plan.runtime_unit_id);
         return Presence(query, ProcessPresenceState::kPresent,
                         found->second.runtime_epoch.value());
       } else {
@@ -731,7 +949,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
       }
     }
     auto [inserted, unique] =
-        children.emplace(runtime_id, LaunchChild(admission));
+        children.emplace(runtime_id, LaunchChild(admission, *bundle));
     if (!unique) {
       Fail("native runtime child registry insertion conflicted");
     }
@@ -811,7 +1029,14 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
         ManagedCommandSurfaceState::kClosedNoActiveEffect);
   }
 
+  [[nodiscard]] manyforge::core::Result<
+      std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
+  ResolveProjection(
+      const manyforge::core::ProjectionNativeRuntimeBindingDTO &binding);
+
   std::filesystem::path target_root_path;
+  std::filesystem::path package_root_path;
+  std::filesystem::path staging_root_path;
   const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source;
   const manyforge::deployment::IVerifiedRetainedProductArtifactSource
       &artifact_source;
@@ -824,13 +1049,155 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final {
   std::map<std::string, Child> children;
 };
 
+class RetainedNativeRuntimeUnitAdapter::Impl::ProjectionClient final
+    : public manyforge::core::IPlannerSceneProjection {
+public:
+  ProjectionClient(
+      std::shared_ptr<Impl> adapter,
+      manyforge::core::ProjectionNativeRuntimeBindingDTO binding)
+      : adapter_(std::move(adapter)), binding_(std::move(binding)) {}
+
+  [[noreturn]] static void Unavailable(const std::string_view operation) {
+    Fail("native projection " + std::string(operation) +
+         " is unavailable before the durable transition checkpoint");
+  }
+
+  manyforge::core::ProjectionCommitResultDTO ApplyTransaction(
+      const manyforge::core::SceneTransactionDTO &transaction) override {
+    return adapter_->ProjectionCall<manyforge::core::ProjectionCommitResultDTO>(
+        binding_, detail::NativeProjectionTransactionRequest{binding_,
+                                                              transaction});
+  }
+
+  manyforge::core::Result<manyforge::core::CollisionWorldLeaseInventory>
+  RetainProjection(const manyforge::core::ProjectionRevisionDTO &,
+                   manyforge::core::ProjectionLeaseId) override {
+    Unavailable("lease retention");
+  }
+
+  void ReleaseProjection(
+      const manyforge::core::ProjectionLeaseId &) override {
+    Unavailable("lease release");
+  }
+
+  manyforge::core::ProjectionHealthDTO ProjectionHealth() const override {
+    return adapter_->ProjectionCall<manyforge::core::ProjectionHealthDTO>(
+        binding_, detail::NativeProjectionHealthQuery{binding_});
+  }
+
+  manyforge::core::ProjectionCommitResultDTO RebuildProjection(
+      const manyforge::core::NativeProjectionRebuildDTO &request) override {
+    return adapter_->ProjectionCall<manyforge::core::ProjectionCommitResultDTO>(
+        binding_, request);
+  }
+
+  manyforge::core::NativeProjectionBootstrapRebuildResultDTO
+  RebuildBootstrapProjection(
+      const manyforge::core::NativeProjectionBootstrapRebuildDTO &request)
+      override {
+    return adapter_->ProjectionCall<
+        manyforge::core::NativeProjectionBootstrapRebuildResultDTO>(binding_,
+                                                                    request);
+  }
+
+  manyforge::core::NativeProjectionBootstrapStatusDTO BootstrapProjectionStatus(
+      const manyforge::core::NativeProjectionBootstrapStatusQueryDTO &request) const
+      override {
+    return adapter_->ProjectionCall<
+        manyforge::core::NativeProjectionBootstrapStatusDTO>(binding_,
+                                                              request);
+  }
+
+  manyforge::core::NativeProjectionStageResultDTO StageProjection(
+      const manyforge::core::NativeProjectionStageDTO &request) override {
+    return adapter_->ProjectionCall<
+        manyforge::core::NativeProjectionStageResultDTO>(binding_, request);
+  }
+
+  manyforge::core::NativeProjectionActivationResultDTO
+  ActivateStagedProjection(
+      const manyforge::core::NativeProjectionActivationDTO &request) override {
+    return adapter_->ProjectionCall<
+        manyforge::core::NativeProjectionActivationResultDTO>(binding_,
+                                                               request);
+  }
+
+  manyforge::core::NativeProjectionRetireResultDTO RetireProjection(
+      const manyforge::core::NativeProjectionRetireDTO &request) override {
+    return adapter_->ProjectionCall<
+        manyforge::core::NativeProjectionRetireResultDTO>(binding_, request);
+  }
+
+  manyforge::core::NativeProjectionRetireStatusDTO ProjectionRetireStatus(
+      const manyforge::core::NativeProjectionRetireStatusQueryDTO &request) const
+      override {
+    return adapter_->ProjectionCall<
+        manyforge::core::NativeProjectionRetireStatusDTO>(binding_, request);
+  }
+
+  manyforge::core::NativeProjectionDiscardResultDTO DiscardStagedProjection(
+      const manyforge::core::NativeProjectionDiscardDTO &request) override {
+    return adapter_->ProjectionCall<
+        manyforge::core::NativeProjectionDiscardResultDTO>(binding_, request);
+  }
+
+  manyforge::core::NativeProjectionStatusDTO ProjectionStageStatus(
+      const manyforge::core::NativeProjectionStatusQueryDTO &request) const override {
+    return adapter_->ProjectionCall<manyforge::core::NativeProjectionStatusDTO>(
+        binding_, request);
+  }
+
+private:
+  std::shared_ptr<Impl> adapter_;
+  manyforge::core::ProjectionNativeRuntimeBindingDTO binding_;
+};
+
+manyforge::core::Result<
+    std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
+RetainedNativeRuntimeUnitAdapter::Impl::ResolveProjection(
+    const manyforge::core::ProjectionNativeRuntimeBindingDTO &binding) {
+  const auto missing = [](std::string message) {
+    return manyforge::core::Result<
+        std::shared_ptr<manyforge::core::IPlannerSceneProjection>>::Err(
+        manyforge::core::ErrorDTO{"missing_reference", std::move(message), {}});
+  };
+  if (!binding.valid()) {
+    return missing("native projection binding is invalid");
+  }
+  {
+    std::lock_guard lock(mutex);
+    const auto found = children.find(binding.runtime_unit_id.value());
+    if (found == children.end() ||
+        found->second.runtime_epoch != binding.runtime_epoch) {
+      return missing("no exact Manager child owns the native runtime epoch");
+    }
+    if (!ChildIsLive(found->second)) {
+      children.erase(found);
+      return missing("the exact Manager child is no longer live");
+    }
+    const ProjectionBindingKey key{binding.provider_binding_id,
+                                   binding.provider_binding_revision};
+    if (!found->second.admitted_projection_bindings.contains(key)) {
+      return missing(
+          "the verified child product does not own the projection binding");
+    }
+  }
+  return manyforge::core::Result<
+      std::shared_ptr<manyforge::core::IPlannerSceneProjection>>::Ok(
+      std::make_shared<ProjectionClient>(shared_from_this(), binding));
+}
+
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
+    std::filesystem::path trusted_package_root,
+    std::filesystem::path private_staging_root,
     const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
     std::string operating_system, std::string launch_environment_contract)
-    : impl_(std::make_unique<Impl>(std::move(trusted_installed_target_root),
+    : impl_(std::make_shared<Impl>(std::move(trusted_installed_target_root),
+                                   std::move(trusted_package_root),
+                                   std::move(private_staging_root),
                                    bundle_source, artifact_source,
                                    std::move(operating_system),
                                    std::move(launch_environment_contract))) {}
@@ -857,6 +1224,14 @@ RetainedNativeRuntimeUnitAdapter::ObserveProgress(
     const RuntimeUnitConvergenceQueryDTO &query,
     const RuntimeEpoch &runtime_epoch) {
   return impl_->ObserveProgress(query, runtime_epoch);
+}
+
+manyforge::core::Result<
+    std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
+RetainedNativeRuntimeUnitAdapter::ResolveProjection(
+    const manyforge::core::ProjectionNativeRuntimeBindingDTO
+        &native_runtime_binding) const {
+  return impl_->ResolveProjection(native_runtime_binding);
 }
 
 } // namespace manyforge::component_manager

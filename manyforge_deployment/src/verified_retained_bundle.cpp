@@ -691,16 +691,10 @@ parse_structural_schema_artifacts(
   const auto& registry = build_qualified_closed_schema_registry();
   for (const auto& record : records) {
     const auto kind = core::catalog_record_kind(record);
-    const auto& schema_id = std::visit(
-        [](const auto& typed) -> const core::SchemaId& {
-          return typed.schema_id;
-        },
-        record);
-    const auto& schema_revision = std::visit(
-        [](const auto& typed) -> const core::SchemaRevision& {
-          return typed.schema_revision;
-        },
-        record);
+    const auto schema_id = std::visit(
+        [](const auto& typed) { return typed.schema_id; }, record);
+    const auto schema_revision = std::visit(
+        [](const auto& typed) { return typed.schema_revision; }, record);
     const auto* schema = registry.find_qualified_catalog_schema(
         kind, schema_id, schema_revision);
     if (schema == nullptr || schema->compiled_schema() == nullptr) {

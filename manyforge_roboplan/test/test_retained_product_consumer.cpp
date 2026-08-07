@@ -2220,17 +2220,15 @@ TEST(RetainedProductCrossConsumer,
             committed.native_projection_generation);
   EXPECT_EQ(projection->snapshot(), current_world);
 
-  const auto refused_healthy_rebuild = projection->RebuildProjection(
-      core::NativeProjectionRebuildDTO{
-          native_binding,
-          initial_revision,
-          products.planning_collision_model,
+  const auto refused_healthy_rebuild =
+      projection->RebuildProjection(core::NativeProjectionRebuildDTO{
+          native_binding, initial_revision, products.planning_collision_model,
           std::make_shared<const core::LogicalSceneSnapshotDTO>(
               initial_scene)});
   EXPECT_EQ(refused_healthy_rebuild.result,
             core::ProjectionCommitResultStateDTO::kRejectedRollbackProven);
-  EXPECT_TRUE(projection->ProjectionHealth().healthy_for_target(
-      candidate_revision));
+  EXPECT_TRUE(
+      projection->ProjectionHealth().healthy_for_target(candidate_revision));
   EXPECT_EQ(projection->snapshot(), current_world);
 
   auto conflicting = transaction;
@@ -2319,16 +2317,14 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_FALSE(
       projection->RetainProjection(initial_revision, predecessor_lease).ok());
 
-  const auto recovered = projection->RebuildProjection(
-      core::NativeProjectionRebuildDTO{
-          native_binding,
-          candidate_revision,
-          products.planning_collision_model,
+  const auto recovered =
+      projection->RebuildProjection(core::NativeProjectionRebuildDTO{
+          native_binding, candidate_revision, products.planning_collision_model,
           std::make_shared<const core::LogicalSceneSnapshotDTO>(
               candidate_scene)});
   ASSERT_TRUE(recovered.presence_valid());
-  EXPECT_TRUE(recovered.resulting_health.healthy_for_target(
-      candidate_revision));
+  EXPECT_TRUE(
+      recovered.resulting_health.healthy_for_target(candidate_revision));
   EXPECT_EQ(projection->scene_snapshot_lease_retention_stats().retained_count,
             2U);
   const auto recovered_predecessor =
@@ -2359,8 +2355,7 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_FALSE(uninitialized->collision_policy_snapshot().has_value());
   EXPECT_FALSE(
       uninitialized->current_scene_snapshot_lease_inventory().has_value());
-  EXPECT_EQ(uninitialized->published_runtime_collision_query_bundle(),
-            nullptr);
+  EXPECT_EQ(uninitialized->published_runtime_collision_query_bundle(), nullptr);
   EXPECT_FALSE(
       uninitialized
           ->RetainProjection(candidate_revision,
@@ -2384,8 +2379,7 @@ TEST(RetainedProductCrossConsumer,
           std::make_shared<const core::LogicalSceneSnapshotDTO>(
               candidate_scene)});
   ASSERT_TRUE(rebuilt_replay.presence_valid());
-  EXPECT_EQ(rebuilt_replay.native_projection_generation,
-            rebuilt_generation);
+  EXPECT_EQ(rebuilt_replay.native_projection_generation, rebuilt_generation);
   EXPECT_EQ(uninitialized->snapshot(), rebuilt_world);
 
   auto mismatched_product = products.planning_collision_model;
@@ -2400,6 +2394,281 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_TRUE(rejected_rebuild.rollback_proven);
   EXPECT_TRUE(
       uninitialized->ProjectionHealth().healthy_for_target(candidate_revision));
+
+  std::int64_t bootstrap_clock = 200;
+  auto bootstrap_projection_result =
+      RetainedPlannerSceneProjection::CreateUninitialized(
+          collision_projector, products.planning_collision_model,
+          native_binding,
+          RetainedPlannerSceneProjectionConfig{
+              "retained-lite6-bootstrap-projection", 8U, 8U},
+          [&bootstrap_clock] { return bootstrap_clock++; });
+  ASSERT_TRUE(bootstrap_projection_result.ok())
+      << bootstrap_projection_result.error().message;
+  auto bootstrap_projection = bootstrap_projection_result.value();
+  const core::NativeProjectionBootstrapStatusQueryDTO bootstrap_query{
+      core::BootstrapId("native-bootstrap"), core::BootstrapGeneration(3U),
+      native_binding, candidate_revision};
+  const auto bootstrap_absent =
+      bootstrap_projection->BootstrapProjectionStatus(bootstrap_query);
+  EXPECT_EQ(bootstrap_absent.state,
+            core::NativeProjectionBootstrapStatusState::kAbsent);
+  const core::NativeProjectionBootstrapRebuildDTO bootstrap_request{
+      bootstrap_query.bootstrap_id,
+      bootstrap_query.bootstrap_generation,
+      native_binding,
+      candidate_revision,
+      products.planning_collision_model,
+      core::LogicalSceneSnapshotRoot(
+          std::make_shared<const core::LogicalSceneSnapshotDTO>(
+              candidate_scene))};
+  const auto bootstrap_rebuilt =
+      bootstrap_projection->RebuildBootstrapProjection(bootstrap_request);
+  ASSERT_TRUE(bootstrap_rebuilt.presence_valid());
+  EXPECT_EQ(bootstrap_rebuilt.state,
+            core::NativeProjectionBootstrapRebuildState::kRebuilt);
+  EXPECT_TRUE(bootstrap_rebuilt.resulting_health.healthy_for_target(
+      candidate_revision));
+  const auto bootstrap_replay =
+      bootstrap_projection->RebuildBootstrapProjection(bootstrap_request);
+  EXPECT_EQ(bootstrap_replay.state,
+            core::NativeProjectionBootstrapRebuildState::kAlreadyExact);
+  EXPECT_EQ(bootstrap_replay.native_projection_generation,
+            bootstrap_rebuilt.native_projection_generation);
+  const auto bootstrap_status =
+      bootstrap_projection->BootstrapProjectionStatus(bootstrap_query);
+  EXPECT_EQ(bootstrap_status.state,
+            core::NativeProjectionBootstrapStatusState::kRebuilt);
+
+  const core::NativeProjectionRetireDTO retire_request{
+      core::ApplyId("remove-native-host"),
+      core::ApplyGeneration(4U),
+      core::ProjectionStageGeneration(1U),
+      core::ProjectionTransitionRowDTO{
+          native_binding, core::ProjectionTransitionDisposition::kRemoved,
+          candidate_revision},
+      candidate_revision,
+      candidate_revision};
+  const auto retire_pending = bootstrap_projection->ProjectionRetireStatus(
+      core::NativeProjectionRetireStatusQueryDTO{retire_request});
+  EXPECT_EQ(retire_pending.state,
+            core::NativeProjectionRetireStatusState::kPending);
+  const auto retired = bootstrap_projection->RetireProjection(retire_request);
+  ASSERT_TRUE(retired.presence_valid());
+  EXPECT_EQ(retired.state, core::NativeProjectionRetireResultState::kRetired);
+  EXPECT_EQ(bootstrap_projection->snapshot(), nullptr);
+  const auto retired_replay =
+      bootstrap_projection->RetireProjection(retire_request);
+  EXPECT_EQ(retired_replay.state,
+            core::NativeProjectionRetireResultState::kRetired);
+  const auto retired_status = bootstrap_projection->ProjectionRetireStatus(
+      core::NativeProjectionRetireStatusQueryDTO{retire_request});
+  EXPECT_EQ(retired_status.state,
+            core::NativeProjectionRetireStatusState::kRetired);
+
+  const core::ProjectionNativeRuntimeBindingDTO added_binding{
+      core::CapabilityProviderBindingId("lite6_added_planner_binding"),
+      core::CapabilityProviderBindingRevision("added-binding-revision"),
+      core::RuntimeUnitId("added-native-execution-host"),
+      core::RuntimeEpoch("added-native-execution-host-epoch-1")};
+  std::int64_t stage_clock = 300;
+  auto added_projection_result =
+      RetainedPlannerSceneProjection::CreateUninitialized(
+          collision_projector, products.planning_collision_model, added_binding,
+          RetainedPlannerSceneProjectionConfig{
+              "retained-lite6-added-projection", 8U, 8U},
+          [&stage_clock] { return stage_clock++; });
+  ASSERT_TRUE(added_projection_result.ok())
+      << added_projection_result.error().message;
+  auto added_projection = added_projection_result.value();
+  const core::NativeProjectionStageDTO stage_request{
+      core::ApplyId("add-native-host"),
+      core::ApplyGeneration(5U),
+      core::ProjectionStageGeneration(2U),
+      core::ProjectionTransitionRowDTO{
+          added_binding, core::ProjectionTransitionDisposition::kAdded,
+          std::nullopt},
+      candidate_revision,
+      candidate_revision,
+      products.planning_collision_model,
+      core::LogicalSceneSnapshotRoot(
+          std::make_shared<const core::LogicalSceneSnapshotDTO>(
+              candidate_scene))};
+  const auto staged = added_projection->StageProjection(stage_request);
+  ASSERT_TRUE(staged.presence_valid());
+  EXPECT_EQ(staged.state, core::NativeProjectionStageResultState::kStaged);
+  EXPECT_EQ(added_projection->snapshot(), nullptr);
+  const core::NativeProjectionStatusQueryDTO stage_query{
+      stage_request.apply_id, stage_request.apply_generation,
+      stage_request.projection_stage_generation, stage_request.transition_row};
+  const auto staged_status =
+      added_projection->ProjectionStageStatus(stage_query);
+  EXPECT_EQ(staged_status.state, core::NativeProjectionStatusState::kStaged);
+  const core::NativeProjectionActivationDTO activation_request{
+      stage_request.apply_id,
+      stage_request.apply_generation,
+      stage_request.projection_stage_generation,
+      stage_request.transition_row,
+      stage_request.expected_predecessor_projection_revision,
+      stage_request.candidate_projection_revision};
+  const auto activated =
+      added_projection->ActivateStagedProjection(activation_request);
+  ASSERT_TRUE(activated.presence_valid());
+  EXPECT_EQ(activated.state,
+            core::NativeProjectionActivationResultState::kActivated);
+  EXPECT_TRUE(added_projection->ProjectionHealth().healthy_for_target(
+      candidate_revision));
+  EXPECT_NE(added_projection->snapshot(), nullptr);
+  const auto activated_replay =
+      added_projection->ActivateStagedProjection(activation_request);
+  EXPECT_EQ(activated_replay.state,
+            core::NativeProjectionActivationResultState::kActivated);
+  const auto activated_status =
+      added_projection->ProjectionStageStatus(stage_query);
+  EXPECT_EQ(activated_status.state,
+            core::NativeProjectionStatusState::kActivated);
+}
+
+TEST(RetainedProductCrossConsumer,
+     PlannerSceneProjectionPreparesCrossBundleCandidateBeforeStage) {
+  ScopedTemporaryRoot temporary;
+  const std::filesystem::path package_root =
+      temporary.path() / "retained-package";
+  const std::filesystem::path staging_parent =
+      temporary.path() / "private-stages";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
+
+  constexpr std::string_view cell_id = "i6_projection_transition_cell";
+  const auto predecessor = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, cell_id);
+  const auto candidate = deployment::test::
+      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+          package_root, cell_id);
+  ASSERT_NE(predecessor.bundle, nullptr);
+  ASSERT_NE(candidate.bundle, nullptr);
+  ASSERT_NE(predecessor.bundle->retained_bundle_id(),
+            candidate.bundle->retained_bundle_id());
+
+  const auto load_projector =
+      [&](const deployment::test::DurableLite6RetainedConsumerFixture &fixture,
+          std::string model_name) {
+        const auto &products = fixture.bundle->value().compiled_products;
+        EXPECT_EQ(products.symbol_role_maps.size(), 1U);
+        const auto retained = load_lite6_planning_model(
+            package_root,
+            {fixture.bundle->retained_bundle_id(),
+             products.planning_collision_model.product_id});
+        const auto model_map = load_lite6_model_map(
+            package_root,
+            {fixture.bundle->retained_bundle_id(),
+             products.symbol_role_maps.front().product_id});
+        auto model_stage = RetainedPlanningModelStage::create_verified(
+            retained, staging_parent);
+        const auto *target = model_map.find_target(
+            core::ControllableComponentId(
+                std::string(deployment::test::kLite6ControllableComponentId)),
+            core::CommandTargetId(
+                std::string(deployment::test::kLite6ArmTargetId)));
+        EXPECT_NE(target, nullptr);
+        if (target == nullptr || target->model_groups.empty()) {
+          throw std::logic_error(
+              "cross-bundle fixture has no Lite6 arm model group");
+        }
+        auto shared_model = ManyForgeCollisionEngine::load_shared_model(
+            std::move(model_name), model_stage.loader_urdf_path(),
+            model_stage.srdf_path(), model_stage.package_paths(),
+            target->model_groups.front().compiled_group_name);
+        return std::pair{
+            RetainedCollisionWorldProjector::create_verified(
+                shared_model, *fixture.bundle, model_map, retained),
+            std::move(shared_model)};
+      };
+
+  auto [predecessor_projector, predecessor_shared_model] =
+      load_projector(predecessor, "i6_projection_predecessor");
+  auto [candidate_projector, candidate_shared_model] =
+      load_projector(candidate, "i6_projection_candidate");
+  const auto initial_scene = make_collision_scene_snapshot(
+      core::CellId(std::string(cell_id)), 2U,
+      core::SceneResourceId("cross-bundle-object"), 2.0, 0.1);
+  const core::ProjectionRevisionDTO predecessor_revision{
+      predecessor.bundle->retained_bundle_id(),
+      predecessor.bundle->value().cell_graph.graph_revision,
+      initial_scene.revision};
+  const core::ProjectionRevisionDTO candidate_revision{
+      candidate.bundle->retained_bundle_id(),
+      candidate.bundle->value().cell_graph.graph_revision,
+      initial_scene.revision};
+  const core::ProjectionNativeRuntimeBindingDTO binding{
+      core::CapabilityProviderBindingId("cross_bundle_planner_binding"),
+      core::CapabilityProviderBindingRevision(
+          "cross-bundle-binding-revision"),
+      core::RuntimeUnitId("cross_bundle_native_execution"),
+      core::RuntimeEpoch("cross-bundle-native-epoch-1")};
+  std::int64_t clock = 400;
+  auto projection_result = RetainedPlannerSceneProjection::CreateInitialized(
+      std::move(predecessor_projector),
+      predecessor.bundle->value().compiled_products.planning_collision_model,
+      binding, initial_scene,
+      RetainedPlannerSceneProjectionConfig{
+          "cross-bundle-transactional-projection", 8U, 8U},
+      [&clock] { return clock++; });
+  ASSERT_TRUE(projection_result.ok()) << projection_result.error().message;
+  auto projection = std::move(projection_result.value());
+  EXPECT_EQ(projection->collision_shared_model(), predecessor_shared_model);
+  const auto predecessor_world = projection->snapshot();
+  ASSERT_NE(predecessor_world, nullptr);
+
+  const core::NativeProjectionStageDTO request{
+      core::ApplyId("cross-bundle-apply"),
+      core::ApplyGeneration(8U),
+      core::ProjectionStageGeneration(3U),
+      core::ProjectionTransitionRowDTO{
+          binding, core::ProjectionTransitionDisposition::kRetained,
+          predecessor_revision},
+      predecessor_revision,
+      candidate_revision,
+      candidate.bundle->value().compiled_products.planning_collision_model,
+      core::LogicalSceneSnapshotRoot(
+          std::make_shared<const core::LogicalSceneSnapshotDTO>(
+              initial_scene))};
+  const auto unprepared = projection->StageProjection(request);
+  EXPECT_EQ(unprepared.state,
+            core::NativeProjectionStageResultState::kRejected);
+  ASSERT_TRUE(unprepared.error.has_value());
+  EXPECT_EQ(unprepared.error->details.at("reason"),
+            "native_projection_candidate_model_not_prepared");
+  EXPECT_EQ(projection->snapshot(), predecessor_world);
+
+  const auto prepared = projection->PrepareCandidateProjection(
+      std::move(candidate_projector), request.planning_collision_model);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  const auto staged = projection->StageProjection(request);
+  ASSERT_TRUE(staged.presence_valid());
+  EXPECT_EQ(staged.state, core::NativeProjectionStageResultState::kStaged);
+  EXPECT_EQ(projection->snapshot(), predecessor_world);
+  const auto staged_health = projection->ProjectionHealth();
+  EXPECT_EQ(staged_health.state, core::ProjectionHealthState::kHealthy);
+  EXPECT_EQ(staged_health.active_projection_revision, predecessor_revision);
+  EXPECT_TRUE(staged_health.staged_candidate.has_value());
+
+  const core::NativeProjectionActivationDTO activation{
+      request.apply_id,
+      request.apply_generation,
+      request.projection_stage_generation,
+      request.transition_row,
+      request.expected_predecessor_projection_revision,
+      request.candidate_projection_revision};
+  const auto activated = projection->ActivateStagedProjection(activation);
+  ASSERT_TRUE(activated.presence_valid());
+  EXPECT_EQ(activated.state,
+            core::NativeProjectionActivationResultState::kActivated);
+  EXPECT_TRUE(
+      projection->ProjectionHealth().healthy_for_target(candidate_revision));
+  EXPECT_EQ(projection->collision_shared_model(), candidate_shared_model);
+  EXPECT_NE(projection->snapshot(), predecessor_world);
 }
 
 } // namespace
