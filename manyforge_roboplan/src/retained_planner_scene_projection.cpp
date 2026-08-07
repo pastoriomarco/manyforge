@@ -76,9 +76,11 @@ RetainedPlannerSceneProjection::RetainedPlannerSceneProjection(
     RetainedCollisionWorldProjector projector,
     core::RetainedProductDTO planning_collision_model,
     core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
-    RetainedPlannerSceneProjectionConfig config, Clock clock)
+    RetainedPlannerSceneProjectionConfig config, Clock clock,
+    std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver)
     : projector_(std::move(projector)),
       planning_collision_model_(std::move(planning_collision_model)),
+      frame_resolver_(std::move(frame_resolver)),
       native_runtime_binding_(std::move(native_runtime_binding)),
       config_(std::move(config)), clock_(std::move(clock)),
       health_{native_runtime_binding_,
@@ -95,7 +97,8 @@ RetainedPlannerSceneProjection::CreateUninitialized(
     RetainedCollisionWorldProjector projector,
     core::RetainedProductDTO planning_collision_model,
     core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
-    RetainedPlannerSceneProjectionConfig config, Clock clock) {
+    RetainedPlannerSceneProjectionConfig config, Clock clock,
+    std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver) {
   if (planning_collision_model.product_kind !=
           core::RetainedProductKind::kPlanningCollisionModel ||
       planning_collision_model.product_id.empty() ||
@@ -117,7 +120,7 @@ RetainedPlannerSceneProjection::CreateUninitialized(
             new RetainedPlannerSceneProjection(
                 std::move(projector), std::move(planning_collision_model),
                 std::move(native_runtime_binding), std::move(config),
-                std::move(clock))));
+                std::move(clock), std::move(frame_resolver))));
   } catch (const std::exception &exception) {
     return projection_error<std::shared_ptr<RetainedPlannerSceneProjection>>(
         "retained planner projection construction failed: " +
@@ -132,10 +135,12 @@ RetainedPlannerSceneProjection::CreateInitialized(
     core::RetainedProductDTO planning_collision_model,
     core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
     core::LogicalSceneSnapshotDTO initial_scene,
-    RetainedPlannerSceneProjectionConfig config, Clock clock) {
+    RetainedPlannerSceneProjectionConfig config, Clock clock,
+    std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver) {
   auto result = CreateUninitialized(
       std::move(projector), std::move(planning_collision_model),
-      std::move(native_runtime_binding), std::move(config), std::move(clock));
+      std::move(native_runtime_binding), std::move(config), std::move(clock),
+      std::move(frame_resolver));
   if (!result.ok()) {
     return result;
   }
@@ -184,7 +189,9 @@ RetainedPlannerSceneProjection::CreateInitialized(
 
 core::Result<void> RetainedPlannerSceneProjection::PrepareCandidateProjection(
     RetainedCollisionWorldProjector candidate_projector,
-    core::RetainedProductDTO candidate_planning_collision_model) {
+    core::RetainedProductDTO candidate_planning_collision_model,
+    std::shared_ptr<const RetainedSceneFrameResolver>
+        candidate_frame_resolver) {
   std::lock_guard lock(mutex_);
   const auto rejected = [](std::string message, std::string reason) {
     return core::Result<void>::Err(core::ErrorDTO{
@@ -217,12 +224,16 @@ core::Result<void> RetainedPlannerSceneProjection::PrepareCandidateProjection(
           projector_.model_map().retained_bundle_id &&
       candidate_map.graph_revision == projector_.model_map().graph_revision &&
       candidate_planning_collision_model == planning_collision_model_) {
+    if (candidate_frame_resolver) {
+      frame_resolver_ = std::move(candidate_frame_resolver);
+    }
     prepared_candidate_model_.reset();
     return core::Result<void>::Ok();
   }
   prepared_candidate_model_ = PreparedCandidateModel{
       std::move(candidate_projector),
-      std::move(candidate_planning_collision_model)};
+      std::move(candidate_planning_collision_model),
+      std::move(candidate_frame_resolver)};
   return core::Result<void>::Ok();
 }
 
@@ -921,6 +932,8 @@ RetainedPlannerSceneProjection::StageProjection(
   const RetainedCollisionWorldProjector *candidate_projector = &projector_;
   const core::RetainedProductDTO *candidate_product =
       &planning_collision_model_;
+  std::shared_ptr<const RetainedSceneFrameResolver> candidate_frame_resolver =
+      frame_resolver_;
   const auto matches_request = [&](const auto &projector,
                                    const auto &product) {
     const auto &map = projector.model_map();
@@ -942,6 +955,7 @@ RetainedPlannerSceneProjection::StageProjection(
     candidate_projector = &prepared_candidate_model_->projector;
     candidate_product =
         &prepared_candidate_model_->planning_collision_model;
+    candidate_frame_resolver = prepared_candidate_model_->frame_resolver;
   }
   auto candidate =
       BuildPublisher(*candidate_projector, *request.frozen_logical_scene.shared(),
@@ -984,6 +998,7 @@ RetainedPlannerSceneProjection::StageProjection(
   StageRecord record{request,
                      *candidate_projector,
                      *candidate_product,
+                     std::move(candidate_frame_resolver),
                      std::move(candidate.value()),
                      result,
                      false,
@@ -1089,6 +1104,7 @@ RetainedPlannerSceneProjection::ActivateStagedProjection(
   projector_ = stage_record_->candidate_projector;
   planning_collision_model_ =
       stage_record_->candidate_planning_collision_model;
+  frame_resolver_ = stage_record_->candidate_frame_resolver;
   prepared_candidate_model_.reset();
   active_publisher_.store(stage_record_->candidate_publisher,
                           std::memory_order_release);
@@ -1372,6 +1388,78 @@ RetainedPlannerSceneProjection::ProjectionStageStatus(
     throw std::logic_error("native stage status result is invalid");
   }
   return result;
+}
+
+core::Result<core::SceneFrameResolutionReceiptDTO>
+RetainedPlannerSceneProjection::ResolveSceneFrame(
+    const core::SceneFrameResolutionQueryDTO &query) const {
+  std::lock_guard lock(mutex_);
+  if (!query.valid() || !frame_resolver_ ||
+      !HealthyAt(query.projection_binding.projection_revision) ||
+      retained_lease_publishers_.find(
+          query.projection_binding.projection_lease_id) ==
+          retained_lease_publishers_.end()) {
+    return projection_error<core::SceneFrameResolutionReceiptDTO>(
+        "scene-frame query does not name one retained healthy native "
+        "projection",
+        "native_scene_frame_lease_unavailable");
+  }
+  std::int64_t now_ns = 0;
+  try {
+    now_ns = clock_();
+  } catch (const std::exception &exception) {
+    return projection_error<core::SceneFrameResolutionReceiptDTO>(
+        "scene-frame resolution clock failed: " +
+            std::string(exception.what()),
+        "native_scene_frame_clock_failed");
+  } catch (...) {
+    return projection_error<core::SceneFrameResolutionReceiptDTO>(
+        "scene-frame resolution clock failed",
+        "native_scene_frame_clock_failed");
+  }
+  auto resolved =
+      frame_resolver_->Resolve(query, logical_snapshot_, now_ns);
+  if (!resolved.ok()) {
+    return core::Result<core::SceneFrameResolutionReceiptDTO>::Err(
+        resolved.error());
+  }
+  try {
+    auto receipt = core::MakeSceneFrameResolutionReceipt(resolved.value());
+    if (!receipt.valid() ||
+        receipt.projection_binding != query.projection_binding) {
+      return projection_error<core::SceneFrameResolutionReceiptDTO>(
+          "scene-frame resolver returned a foreign or invalid receipt",
+          "native_scene_frame_receipt_invalid");
+    }
+    return core::Result<core::SceneFrameResolutionReceiptDTO>::Ok(
+        std::move(receipt));
+  } catch (const std::exception &exception) {
+    return projection_error<core::SceneFrameResolutionReceiptDTO>(
+        "scene-frame receipt construction failed: " +
+            std::string(exception.what()),
+        "native_scene_frame_receipt_invalid");
+  }
+}
+
+core::Result<core::CollisionPolicySnapshot>
+RetainedPlannerSceneProjection::ProjectEffectiveCollisionPolicy(
+    const core::LogicalSceneSnapshotDTO &logical_scene,
+    const std::uint64_t effective_policy_revision_id) const {
+  std::lock_guard lock(mutex_);
+  if (health_.state != core::ProjectionHealthState::kHealthy ||
+      !health_.active_projection_revision.has_value() ||
+      !logical_snapshot_ ||
+      health_.active_projection_revision->retained_bundle_id !=
+          projector_.model_map().retained_bundle_id ||
+      health_.active_projection_revision->graph_revision !=
+          projector_.model_map().graph_revision ||
+      logical_scene.cell_id != projector_.model_map().cell_id) {
+    return projection_error<core::CollisionPolicySnapshot>(
+        "effective policy requires one healthy exact retained projection",
+        "native_collision_policy_projection_unavailable");
+  }
+  return projector_.project_effective_policy(logical_scene,
+                                              effective_policy_revision_id);
 }
 
 std::shared_ptr<const core::LogicalSceneSnapshotDTO>

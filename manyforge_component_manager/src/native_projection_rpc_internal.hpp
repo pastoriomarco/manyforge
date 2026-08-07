@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <string>
 #include <string_view>
@@ -51,6 +52,54 @@ struct NativeProjectionTransactionRequest final {
   }
 };
 
+struct NativeProjectionRetainRequest final {
+  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::ProjectionRevisionDTO projection_revision;
+  manyforge::core::ProjectionLeaseId projection_lease_id;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return native_runtime_binding.valid() && projection_revision.valid() &&
+           !projection_lease_id.empty();
+  }
+};
+
+struct NativeProjectionReleaseRequest final {
+  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::ProjectionLeaseId projection_lease_id;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return native_runtime_binding.valid() && !projection_lease_id.empty();
+  }
+};
+
+struct NativeProjectionSceneFrameRequest final {
+  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::SceneFrameResolutionQueryDTO query;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return native_runtime_binding.valid() && query.valid();
+  }
+};
+
+struct NativeProjectionEffectivePolicyRequest final {
+  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::LogicalSceneSnapshotDTO logical_scene;
+  std::uint64_t effective_policy_revision_id{};
+
+  [[nodiscard]] bool valid() const noexcept {
+    return native_runtime_binding.valid() && logical_scene.locally_valid() &&
+           effective_policy_revision_id != 0U;
+  }
+};
+
+struct NativeProjectionRetainResult final {
+  manyforge::core::ProjectionLeaseBindingDTO projection_binding;
+};
+
+struct NativeProjectionReleaseResult final {
+  manyforge::core::ProjectionLeaseId projection_lease_id;
+};
+
 using NativeProjectionRpcRequest =
     std::variant<NativeProjectionPrepareRequest, NativeProjectionHealthQuery,
                  NativeProjectionTransactionRequest,
@@ -62,7 +111,11 @@ using NativeProjectionRpcRequest =
                  manyforge::core::NativeProjectionRetireDTO,
                  manyforge::core::NativeProjectionRetireStatusQueryDTO,
                  manyforge::core::NativeProjectionDiscardDTO,
-                 manyforge::core::NativeProjectionStatusQueryDTO>;
+                 manyforge::core::NativeProjectionStatusQueryDTO,
+                 NativeProjectionRetainRequest,
+                 NativeProjectionReleaseRequest,
+                 NativeProjectionSceneFrameRequest,
+                 NativeProjectionEffectivePolicyRequest>;
 
 struct NativeProjectionRpcFailure final {
   manyforge::core::ErrorDTO error;
@@ -79,7 +132,11 @@ using NativeProjectionRpcResponse =
                  manyforge::core::NativeProjectionRetireResultDTO,
                  manyforge::core::NativeProjectionRetireStatusDTO,
                  manyforge::core::NativeProjectionDiscardResultDTO,
-                 manyforge::core::NativeProjectionStatusDTO>;
+                 manyforge::core::NativeProjectionStatusDTO,
+                 NativeProjectionRetainResult,
+                 NativeProjectionReleaseResult,
+                 manyforge::core::SceneFrameResolutionReceiptDTO,
+                 manyforge::core::CollisionPolicySnapshot>;
 
 [[nodiscard]] std::string
 EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request);

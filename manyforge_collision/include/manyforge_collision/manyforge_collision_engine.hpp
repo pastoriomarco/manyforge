@@ -65,6 +65,12 @@ struct RetainedCarriedObjectParentProjection final {
   core::Pose3DTO parent_frame_from_carrier;
 };
 
+/// One exact scalar compiled-model coordinate supplied to immutable FK.
+struct RetainedKinematicCoordinateValue final {
+  std::string compiled_joint_name;
+  double position_si{};
+};
+
 namespace detail {
 
 /// Aggregate selected colliding geometry-pair distance evidence for one
@@ -173,6 +179,32 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
       const std::string& compiled_carrier_frame_name,
       std::span<const RetainedComponentCollisionBodyProjectionInput>
           target_bodies);
+
+  /// Evaluate one compiler-resolved frame against a fresh neutral scratch
+  /// configuration plus exact supplied scalar coordinates. No mutable planner
+  /// or collision-engine state is read or changed.
+  [[nodiscard]] static core::Result<core::Pose3DTO> resolve_retained_frame_pose(
+      SharedModelPtr shared_model, const std::string& compiled_cell_frame_name,
+      const std::string& compiled_target_frame_name,
+      std::span<const RetainedKinematicCoordinateValue> coordinates);
+
+  /// Read exact scalar joint values from the immutable model's neutral
+  /// configuration, preserving caller order.
+  [[nodiscard]] static core::Result<std::vector<double>> retained_neutral_scalar_joint_positions(
+      SharedModelPtr shared_model, std::span<const std::string> compiled_joint_names);
+
+  /// Test whether one compiler-produced frame name exists in the immutable
+  /// retained model without exposing the model implementation to adapters.
+  [[nodiscard]] static bool retained_frame_exists(SharedModelPtr shared_model,
+                                                  const std::string& compiled_frame_name) noexcept;
+
+  /// Select component collision bodies that are rigid with respect to every
+  /// compiler-declared commandable model coordinate in the cell.
+  [[nodiscard]] static core::Result<std::vector<core::CollisionBodyId>>
+  select_retained_static_component_bodies(
+      SharedModelPtr shared_model,
+      std::span<const RetainedComponentCollisionBodyProjectionInput> bodies,
+      std::span<const std::string> dynamic_compiled_joint_names);
 
   /// Construct an independent collision query engine from a ManyForge-owned
   /// model descriptor: URDF/SRDF paths, package-resolution paths, and the

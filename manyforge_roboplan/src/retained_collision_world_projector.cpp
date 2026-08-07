@@ -182,6 +182,17 @@ RetainedCollisionWorldProjector RetainedCollisionWorldProjector::create(
                      std::tie(right.controllable_component_id,
                               right.command_target_id);
             });
+  std::sort(model_map.dynamic_compiled_joint_names.begin(),
+            model_map.dynamic_compiled_joint_names.end());
+  if (std::any_of(model_map.dynamic_compiled_joint_names.begin(),
+                  model_map.dynamic_compiled_joint_names.end(),
+                  [](const auto& name) { return name.empty(); }) ||
+      std::adjacent_find(model_map.dynamic_compiled_joint_names.begin(),
+                         model_map.dynamic_compiled_joint_names.end()) !=
+          model_map.dynamic_compiled_joint_names.end()) {
+    throw RetainedCollisionWorldProjectionError(
+        "retained collision dynamic-coordinate inventory is invalid");
+  }
   for (std::size_t target_index = 0U; target_index < model_map.targets.size();
        ++target_index) {
     const auto& target = model_map.targets[target_index];
@@ -216,27 +227,41 @@ RetainedCollisionWorldProjector RetainedCollisionWorldProjector::create(
   if (!projected.ok()) {
     throw RetainedCollisionWorldProjectionError(projected.error().message);
   }
+  auto static_bodies =
+      collision::ManyForgeCollisionEngine::select_retained_static_component_bodies(
+          shared_model, model_map.component_bodies,
+          model_map.dynamic_compiled_joint_names);
+  if (!static_bodies.ok()) {
+    throw RetainedCollisionWorldProjectionError(static_bodies.error().message);
+  }
   return RetainedCollisionWorldProjector(std::move(shared_model),
                                          std::move(model_map),
-                                         std::move(projected.value()));
+                                         std::move(projected.value()),
+                                         std::move(static_bodies.value()));
 }
 
 core::Result<core::CollisionPolicySnapshot>
 RetainedCollisionWorldProjector::project_effective_policy(
     const core::LogicalSceneSnapshotDTO& logical_scene,
-    const std::uint64_t collision_policy_revision_id) const {
+    const std::uint64_t effective_policy_revision_id) const {
   if (!logical_scene.locally_valid()) {
     return policy_projection_error(
         "logical scene is not a valid immutable policy projection input");
   }
   if (logical_scene.cell_id != model_map_.cell_id ||
-      collision_policy_revision_id == 0U) {
+      effective_policy_revision_id == 0U) {
     return policy_projection_error(
         "effective collision policy has invalid cell or revision identity");
   }
 
   core::CollisionPolicySnapshot effective =
       logical_scene.configured_collision_policy;
+  if (!effective.allowed_static_static_pairs.empty() ||
+      !effective.allowed_touch_link_pairs.empty() ||
+      !effective.support_contacts.empty()) {
+    return policy_projection_error(
+        "configured collision policy contains authority-derived body pairs");
+  }
   try {
     const auto configured_digest =
         core::logical_scene_identity::ComputeCollisionPolicyContentDigest(
@@ -259,6 +284,36 @@ RetainedCollisionWorldProjector::project_effective_policy(
     for (std::size_t shape_index = 0U;
          shape_index < object.collision_shapes.size(); ++shape_index) {
       body_ids.insert(scene_body_id(object.scene_resource_id, shape_index));
+    }
+  }
+
+  std::vector<const core::SceneObjectSnapshotDTO*> fixed_objects;
+  for (const auto& object : logical_scene.objects) {
+    if (std::holds_alternative<core::CellFixedSceneObjectPlacementDTO>(
+            object.placement)) {
+      fixed_objects.push_back(&object);
+    }
+  }
+  for (std::size_t left = 0U; left < fixed_objects.size(); ++left) {
+    const auto& first = *fixed_objects[left];
+    for (std::size_t right = left + 1U; right < fixed_objects.size(); ++right) {
+      const auto& second = *fixed_objects[right];
+      for (std::size_t first_shape = 0U;
+           first_shape < first.collision_shapes.size(); ++first_shape) {
+        for (std::size_t second_shape = 0U;
+             second_shape < second.collision_shapes.size(); ++second_shape) {
+          effective.allowed_static_static_pairs.push_back(canonical_pair(
+              scene_body_id(first.scene_resource_id, first_shape),
+              scene_body_id(second.scene_resource_id, second_shape)));
+        }
+      }
+    }
+    for (const auto& component_body : static_component_body_ids_) {
+      for (std::size_t shape = 0U; shape < first.collision_shapes.size();
+           ++shape) {
+        effective.allowed_static_static_pairs.push_back(canonical_pair(
+            component_body, scene_body_id(first.scene_resource_id, shape)));
+      }
     }
   }
 
@@ -354,6 +409,12 @@ RetainedCollisionWorldProjector::project_effective_policy(
       std::unique(effective.allowed_touch_link_pairs.begin(),
                   effective.allowed_touch_link_pairs.end()),
       effective.allowed_touch_link_pairs.end());
+  std::sort(effective.allowed_static_static_pairs.begin(),
+            effective.allowed_static_static_pairs.end());
+  effective.allowed_static_static_pairs.erase(
+      std::unique(effective.allowed_static_static_pairs.begin(),
+                  effective.allowed_static_static_pairs.end()),
+      effective.allowed_static_static_pairs.end());
   std::sort(effective.support_contacts.begin(),
             effective.support_contacts.end(),
             [](const auto& left, const auto& right) {
@@ -386,7 +447,7 @@ RetainedCollisionWorldProjector::project_effective_policy(
         "collision world");
   }
 
-  effective.revision.revision_id = collision_policy_revision_id;
+  effective.revision.revision_id = effective_policy_revision_id;
   try {
     effective.revision.content_hash =
         core::logical_scene_identity::ComputeCollisionPolicyContentDigest(

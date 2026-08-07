@@ -41,6 +41,7 @@
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
+#include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
 #include <map>
 #include <memory>
 #include <optional>
@@ -541,9 +542,50 @@ class ManagedProjectionRegistry final {
                                    T, core::NativeProjectionDiscardDTO>) {
             return Projection(value.transition_row.native_runtime_binding)
                 .DiscardStagedProjection(value);
-          } else {
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionStatusQueryDTO>) {
             return Projection(value.transition_row.native_runtime_binding)
                 .ProjectionStageStatus(value);
+          } else if constexpr (std::is_same_v<
+                                   T, component_manager::detail::
+                                          NativeProjectionRetainRequest>) {
+            auto retained = Projection(value.native_runtime_binding)
+                                .RetainProjectionBinding(
+                                    value.projection_revision,
+                                    value.projection_lease_id);
+            if (!retained.ok()) {
+              return component_manager::detail::NativeProjectionRpcFailure{
+                  retained.error()};
+            }
+            return component_manager::detail::NativeProjectionRetainResult{
+                std::move(retained.value())};
+          } else if constexpr (std::is_same_v<
+                                   T, component_manager::detail::
+                                          NativeProjectionReleaseRequest>) {
+            Projection(value.native_runtime_binding)
+                .ReleaseProjection(value.projection_lease_id);
+            return component_manager::detail::NativeProjectionReleaseResult{
+                value.projection_lease_id};
+          } else if constexpr (std::is_same_v<
+                                   T, component_manager::detail::
+                                          NativeProjectionSceneFrameRequest>) {
+            auto resolved = Projection(value.native_runtime_binding)
+                                .ResolveSceneFrame(value.query);
+            if (!resolved.ok()) {
+              return component_manager::detail::NativeProjectionRpcFailure{
+                  resolved.error()};
+            }
+            return std::move(resolved.value());
+          } else {
+            auto projected = Projection(value.native_runtime_binding)
+                                 .ProjectEffectiveCollisionPolicy(
+                                     value.logical_scene,
+                                     value.effective_policy_revision_id);
+            if (!projected.ok()) {
+              return component_manager::detail::NativeProjectionRpcFailure{
+                  projected.error()};
+            }
+            return std::move(projected.value());
           }
         },
         request);
@@ -647,7 +689,18 @@ class ManagedProjectionRegistry final {
     return groups.front();
   }
 
-  [[nodiscard]] RetainedCollisionWorldProjector BuildProjector(
+  struct ProjectionAssets final {
+    RetainedCollisionWorldProjector projector;
+    std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver;
+  };
+
+  [[nodiscard]] static std::int64_t MonotonicNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  [[nodiscard]] ProjectionAssets BuildProjectionAssets(
       const component_manager::detail::NativeProjectionPrepareRequest
           &request) {
     auto bundle =
@@ -674,8 +727,8 @@ class ManagedProjectionRegistry final {
     const auto cache_key = std::make_tuple(
         request.candidate_retained_bundle_id.value(),
         request.candidate_graph_revision.value(), group);
-    if (const auto cached = projector_cache_.find(cache_key);
-        cached != projector_cache_.end()) {
+    if (const auto cached = projection_asset_cache_.find(cache_key);
+        cached != projection_asset_cache_.end()) {
       return cached->second;
     }
 
@@ -691,9 +744,17 @@ class ManagedProjectionRegistry final {
         "manyforge_managed_native_projection", stage.loader_urdf_path(),
         stage.srdf_path(), stage.package_paths(), group);
     auto projector = RetainedCollisionWorldProjector::create_verified(
-        std::move(shared_model), *bundle, *model_map, *planning_model);
+        shared_model, *bundle, *model_map, *planning_model);
+    auto frame_resolver = RetainedSceneFrameResolver::create_verified(
+        std::move(shared_model), *bundle, *model_map, *planning_model,
+        core::RuntimeUnitId(config_.runtime_unit_id),
+        core::RuntimeEpoch(config_.runtime_epoch),
+        RetainedSceneFrameLocalStateMode::kCommandFencedNeutralBootstrap,
+        {}, MonotonicNowNs());
+    ProjectionAssets assets{std::move(projector),
+                            std::move(frame_resolver)};
     const auto [inserted, unique] =
-        projector_cache_.emplace(cache_key, projector);
+        projection_asset_cache_.emplace(cache_key, std::move(assets));
     Require(unique, "native projection model cache insertion conflicted");
     return inserted->second;
   }
@@ -714,22 +775,18 @@ class ManagedProjectionRegistry final {
       return;
     }
 
-    auto projector = BuildProjector(request);
+    auto assets = BuildProjectionAssets(request);
     const auto found = projections_.find(key);
     if (found == projections_.end()) {
       auto created = RetainedPlannerSceneProjection::CreateUninitialized(
-          std::move(projector), request.planning_collision_model,
+          std::move(assets.projector), request.planning_collision_model,
           request.native_runtime_binding,
           RetainedPlannerSceneProjectionConfig{
               "managed-native-projection-" +
                   request.native_runtime_binding.provider_binding_id.value(),
               256U,
               RetainedCollisionWorldPublisher::kDefaultLedgerCapacity},
-          [] {
-            return std::chrono::duration_cast<std::chrono::nanoseconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                .count();
-          });
+          MonotonicNowNs, std::move(assets.frame_resolver));
       if (!created.ok()) {
         Fail("native projection construction failed: " +
              created.error().message);
@@ -742,7 +799,8 @@ class ManagedProjectionRegistry final {
       Require(found->second != nullptr,
               "native projection registry contains an empty participant");
       auto prepared = found->second->PrepareCandidateProjection(
-          std::move(projector), request.planning_collision_model);
+          std::move(assets.projector), request.planning_collision_model,
+          std::move(assets.frame_resolver));
       if (!prepared.ok()) {
         Fail("native projection candidate preparation failed: " +
              prepared.error().message);
@@ -759,8 +817,8 @@ class ManagedProjectionRegistry final {
   deployment::FilesystemVerifiedRetainedModelMapSource map_source_;
   deployment::FilesystemVerifiedRetainedPlanningModelSource planning_source_;
   std::map<std::tuple<std::string, std::string, std::string>,
-           RetainedCollisionWorldProjector>
-      projector_cache_;
+           ProjectionAssets>
+      projection_asset_cache_;
   std::map<ManagedProjectionKey,
            std::shared_ptr<RetainedPlannerSceneProjection>>
       projections_;

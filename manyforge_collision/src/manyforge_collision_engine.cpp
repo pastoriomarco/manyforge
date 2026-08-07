@@ -766,6 +766,153 @@ ManyForgeCollisionEngine::make_shared_scene_cache(SharedModelPtr shared_model) {
   return std::make_shared<SharedSceneCache>(std::move(shared_model));
 }
 
+core::Result<core::Pose3DTO> ManyForgeCollisionEngine::resolve_retained_frame_pose(
+    SharedModelPtr shared_model, const std::string& compiled_cell_frame_name,
+    const std::string& compiled_target_frame_name,
+    const std::span<const RetainedKinematicCoordinateValue> coordinates) {
+  const auto fail = [](std::string message) {
+    return core::Result<core::Pose3DTO>::Err(
+        core::ErrorDTO{std::string(core::to_string(core::ErrorCode::kMissingReference)),
+                       std::move(message),
+                       {{"reason", "retained_frame_resolution_failed"}}});
+  };
+  if (!shared_model || compiled_cell_frame_name.empty() || compiled_target_frame_name.empty() ||
+      !shared_model->model.existFrame(compiled_cell_frame_name) ||
+      !shared_model->model.existFrame(compiled_target_frame_name)) {
+    return fail("retained frame resolution names an unknown model frame");
+  }
+
+  Eigen::VectorXd q = pinocchio::neutral(shared_model->model);
+  std::set<pinocchio::JointIndex> assigned;
+  for (const auto& coordinate : coordinates) {
+    if (coordinate.compiled_joint_name.empty() || !std::isfinite(coordinate.position_si) ||
+        !shared_model->model.existJointName(coordinate.compiled_joint_name)) {
+      return fail("retained frame state names an invalid scalar coordinate");
+    }
+    const auto joint = shared_model->model.getJointId(coordinate.compiled_joint_name);
+    if (joint >= shared_model->model.idx_qs.size() || joint >= shared_model->model.nqs.size() ||
+        shared_model->model.nqs[joint] != 1 || !assigned.insert(joint).second) {
+      return fail("retained frame state is non-scalar or duplicated");
+    }
+    const auto index = shared_model->model.idx_qs[joint];
+    if (index < 0 || index >= q.size()) {
+      return fail("retained frame state has an invalid model index");
+    }
+    q[index] = coordinate.position_si;
+  }
+
+  try {
+    pinocchio::Data data(shared_model->model);
+    pinocchio::framesForwardKinematics(shared_model->model, data, q);
+    const auto cell = shared_model->model.getFrameId(compiled_cell_frame_name);
+    const auto target = shared_model->model.getFrameId(compiled_target_frame_name);
+    if (cell >= data.oMf.size() || target >= data.oMf.size()) {
+      return fail("retained frame resolution index is out of range");
+    }
+    return core::Result<core::Pose3DTO>::Ok(
+        pose_from_se3(data.oMf[cell].inverse() * data.oMf[target]));
+  } catch (const std::exception& error) {
+    return fail("retained frame FK failed: " + std::string(error.what()));
+  } catch (...) {
+    return fail("retained frame FK failed");
+  }
+}
+
+core::Result<std::vector<double>> ManyForgeCollisionEngine::retained_neutral_scalar_joint_positions(
+    SharedModelPtr shared_model, const std::span<const std::string> compiled_joint_names) {
+  const auto fail = [](std::string message) {
+    return core::Result<std::vector<double>>::Err(
+        core::ErrorDTO{std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
+                       std::move(message),
+                       {{"reason", "retained_neutral_state_projection_failed"}}});
+  };
+  if (!shared_model) {
+    return fail("retained neutral state requires a loaded model");
+  }
+  const Eigen::VectorXd neutral = pinocchio::neutral(shared_model->model);
+  std::set<pinocchio::JointIndex> selected;
+  std::vector<double> values;
+  values.reserve(compiled_joint_names.size());
+  for (const auto& name : compiled_joint_names) {
+    if (name.empty() || !shared_model->model.existJointName(name)) {
+      return fail("retained neutral state names an unknown joint");
+    }
+    const auto joint = shared_model->model.getJointId(name);
+    if (joint >= shared_model->model.idx_qs.size() || joint >= shared_model->model.nqs.size() ||
+        shared_model->model.nqs[joint] != 1 || !selected.insert(joint).second) {
+      return fail("retained neutral state names a duplicate or non-scalar joint");
+    }
+    const auto index = shared_model->model.idx_qs[joint];
+    if (index < 0 || index >= neutral.size() || !std::isfinite(neutral[index])) {
+      return fail("retained neutral state has an invalid model index");
+    }
+    values.push_back(neutral[index]);
+  }
+  return core::Result<std::vector<double>>::Ok(std::move(values));
+}
+
+bool ManyForgeCollisionEngine::retained_frame_exists(
+    SharedModelPtr shared_model, const std::string& compiled_frame_name) noexcept {
+  return shared_model && !compiled_frame_name.empty() &&
+         shared_model->model.existFrame(compiled_frame_name);
+}
+
+core::Result<std::vector<core::CollisionBodyId>>
+ManyForgeCollisionEngine::select_retained_static_component_bodies(
+    SharedModelPtr shared_model,
+    const std::span<const RetainedComponentCollisionBodyProjectionInput> bodies,
+    const std::span<const std::string> dynamic_compiled_joint_names) {
+  const auto fail = [](std::string message) {
+    return core::Result<std::vector<core::CollisionBodyId>>::Err(
+        core::ErrorDTO{std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
+                       std::move(message),
+                       {{"reason", "retained_static_body_projection_failed"}}});
+  };
+  if (!shared_model) {
+    return fail("retained static-body selection requires a loaded model");
+  }
+  std::set<pinocchio::JointIndex> dynamic_joints;
+  for (const auto& name : dynamic_compiled_joint_names) {
+    if (name.empty() || !shared_model->model.existJointName(name) ||
+        !dynamic_joints.insert(shared_model->model.getJointId(name)).second) {
+      return fail("retained dynamic-coordinate inventory is invalid");
+    }
+  }
+
+  std::vector<core::CollisionBodyId> result;
+  std::set<core::CollisionBodyId> ids;
+  for (const auto& body : bodies) {
+    if (body.compiled_frame_name.empty() ||
+        !shared_model->model.existFrame(body.compiled_frame_name)) {
+      return fail("retained component body names an unknown frame");
+    }
+    auto joint =
+        shared_model->model.frames[shared_model->model.getFrameId(body.compiled_frame_name)]
+            .parentJoint;
+    bool dynamic = false;
+    while (joint != 0U) {
+      if (dynamic_joints.contains(joint)) {
+        dynamic = true;
+        break;
+      }
+      if (joint >= shared_model->model.parents.size() ||
+          shared_model->model.parents[joint] == joint) {
+        return fail("retained component-body kinematic ancestry is invalid");
+      }
+      joint = shared_model->model.parents[joint];
+    }
+    if (!dynamic) {
+      core::CollisionBodyId id(component_collision_body_id(body));
+      if (!ids.insert(id).second) {
+        return fail("retained static component body identity is duplicated");
+      }
+      result.push_back(std::move(id));
+    }
+  }
+  std::sort(result.begin(), result.end());
+  return core::Result<std::vector<core::CollisionBodyId>>::Ok(std::move(result));
+}
+
 core::Result<RetainedComponentCollisionProjection>
 ManyForgeCollisionEngine::project_retained_component_collision(
     SharedModelPtr shared_model,

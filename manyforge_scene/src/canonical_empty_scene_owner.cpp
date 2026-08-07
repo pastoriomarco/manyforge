@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/logical_scene_projection.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
@@ -1520,11 +1521,8 @@ const core::CellSceneFrameRefDTO &
 RequireCellFrame(const core::SceneFrameRefDTO &frame, const CellId &cell_id) {
   const auto *cell = std::get_if<core::CellSceneFrameRefDTO>(&frame);
   if (cell == nullptr) {
-    throw SceneRequestRejectionError(
-        "scene_frame_resolution_unavailable",
-        "component and passive-model scene-frame resolution is installed by "
-        "N5c",
-        {{"reason", "scene_frame_resolver_not_installed"}});
+    throw CanonicalEmptySceneOwnerIntegrityError(
+        "cell-frame normalizer received another frame-reference kind");
   }
   if (cell->cell_id != cell_id) {
     throw SceneRequestRejectionError(
@@ -1534,6 +1532,73 @@ RequireCellFrame(const core::SceneFrameRefDTO &frame, const CellId &cell_id) {
          {"reference_id", cell->cell_id.value()}});
   }
   return *cell;
+}
+
+[[nodiscard]] bool FrameReferenceMatchesResolved(
+    const core::SceneFrameRefDTO &reference,
+    const core::ResolvedFrameDTO &resolved) noexcept {
+  return std::visit(
+      [&](const auto &selected) {
+        using T = std::remove_cvref_t<decltype(selected)>;
+        if constexpr (std::is_same_v<T, core::CellSceneFrameRefDTO>) {
+          const auto *frame =
+              std::get_if<core::ResolvedCellFrameDTO>(&resolved);
+          return frame != nullptr && frame->cell_id == selected.cell_id;
+        } else if constexpr (std::is_same_v<
+                                 T, core::ComponentSceneFrameRefDTO>) {
+          const auto *frame =
+              std::get_if<core::ResolvedComponentModelFrameDTO>(&resolved);
+          return frame != nullptr &&
+                 frame->controllable_component_id ==
+                     selected.controllable_component_id &&
+                 frame->model_instance_id == selected.model_instance_id &&
+                 frame->frame_role_id == selected.frame_role_id;
+        } else {
+          const auto *frame =
+              std::get_if<core::ResolvedPassiveModelFrameDTO>(&resolved);
+          return frame != nullptr &&
+                 frame->model_instance_id == selected.model_instance_id &&
+                 frame->frame_role_id == selected.frame_role_id;
+        }
+      },
+      reference);
+}
+
+struct NormalizedScenePose final {
+  core::Pose3DTO pose_in_cell;
+  ContentDigest resolution_evidence_digest;
+};
+
+[[nodiscard]] NormalizedScenePose NormalizeScenePose(
+    const core::SceneFrameRefDTO &frame_ref,
+    const core::Pose3DTO &pose_in_frame,
+    const LogicalSceneSnapshotDTO &current,
+    const ProjectionRevisionDTO &expected_projection,
+    const ContentDigest &request_digest,
+    const std::optional<core::SceneFrameResolutionReceiptDTO>
+        &frame_resolution) {
+  if (std::holds_alternative<core::CellSceneFrameRefDTO>(frame_ref)) {
+    static_cast<void>(RequireCellFrame(frame_ref, current.cell_id));
+    if (frame_resolution.has_value()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "cell-frame normalization unexpectedly carries native evidence");
+    }
+    return {pose_in_frame,
+            CellResolutionEvidence(request_digest, expected_projection)};
+  }
+  if (!frame_resolution.has_value() || !frame_resolution->valid() ||
+      frame_resolution->projection_binding.projection_revision !=
+          expected_projection ||
+      !FrameReferenceMatchesResolved(frame_ref,
+                                     frame_resolution->resolved_frame)) {
+    throw SceneRequestRejectionError(
+        "missing_reference",
+        "scene frame has no exact immutable retained resolution",
+        {{"reason", "scene_frame_resolution_missing_or_foreign"}});
+  }
+  return {core::multiply_poses(frame_resolution->frame_pose_in_cell,
+                               pose_in_frame),
+          frame_resolution->resolution_evidence_digest};
 }
 
 std::string CurrentFrameId(const LogicalSceneSnapshotDTO &snapshot,
@@ -1573,7 +1638,9 @@ ResolvedSceneCandidate
 ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                       const LogicalSceneSnapshotDTO &current,
                       const std::uint64_t transaction_sequence,
-                      const ContentDigest &request_digest) {
+                      const ContentDigest &request_digest,
+                      const std::optional<core::SceneFrameResolutionReceiptDTO>
+                          &frame_resolution) {
   ResolvedSceneCandidate candidate{
       current,
       core::ResolvedRemoveSceneObjectDTO{SceneResourceId(std::string{})},
@@ -1591,8 +1658,10 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
         if constexpr (std::is_same_v<T, core::AddObjectRequestDTO>) {
           ValidateBoundedIdentity(operation.scene_resource_id.value(),
                                   "scene_resource_id");
-          static_cast<void>(
-              RequireCellFrame(operation.frame_ref, current.cell_id));
+          const auto normalized = NormalizeScenePose(
+              operation.frame_ref, operation.pose, current,
+              request.expected_projection_revision, request_digest,
+              frame_resolution);
           const auto found = std::lower_bound(
               candidate.snapshot.objects.begin(),
               candidate.snapshot.objects.end(), operation.scene_resource_id,
@@ -1652,14 +1721,14 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
               operation.scene_resource_id,
               {operation.shape},
               core::CellFixedSceneObjectPlacementDTO{current.cell_id,
-                                                     operation.pose},
+                                                     normalized.pose_in_cell},
               std::nullopt,
               std::move(support_contacts),
           };
           candidate.snapshot.objects.insert(found, object);
           candidate.operation = core::ResolvedUpsertSceneObjectDTO{object};
-          candidate.resolution_evidence_digest = CellResolutionEvidence(
-              request_digest, request.expected_projection_revision);
+          candidate.resolution_evidence_digest =
+              normalized.resolution_evidence_digest;
         } else if constexpr (std::is_same_v<T, core::RemoveObjectRequestDTO>) {
           ValidateBoundedIdentity(operation.scene_resource_id.value(),
                                   "scene_resource_id");
@@ -1708,8 +1777,10 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                                             core::UpdateObjectPoseRequestDTO>) {
           ValidateBoundedIdentity(operation.scene_resource_id.value(),
                                   "scene_resource_id");
-          static_cast<void>(
-              RequireCellFrame(operation.frame_ref, current.cell_id));
+          const auto normalized = NormalizeScenePose(
+              operation.frame_ref, operation.pose, current,
+              request.expected_projection_revision, request_digest,
+              frame_resolution);
           auto found = std::lower_bound(candidate.snapshot.objects.begin(),
                                         candidate.snapshot.objects.end(),
                                         operation.scene_resource_id,
@@ -1773,15 +1844,16 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
           const auto previous_pose =
               std::get<core::CellFixedSceneObjectPlacementDTO>(found->placement)
                   .pose_in_cell;
-          const bool pose_changed = !SamePose(previous_pose, operation.pose);
+          const bool pose_changed =
+              !SamePose(previous_pose, normalized.pose_in_cell);
           const bool evidence_changed = !SameProviderEvidence(
               found->provider_evidence, operation.provider_evidence);
           found->placement = core::CellFixedSceneObjectPlacementDTO{
-              current.cell_id, operation.pose};
+              current.cell_id, normalized.pose_in_cell};
           found->provider_evidence = operation.provider_evidence;
           candidate.operation = core::ResolvedUpsertSceneObjectDTO{*found};
-          candidate.resolution_evidence_digest = CellResolutionEvidence(
-              request_digest, request.expected_projection_revision);
+          candidate.resolution_evidence_digest =
+              normalized.resolution_evidence_digest;
           if (!pose_changed && !evidence_changed) {
             candidate.update_status = SceneUpdateStatusDTO::kNoOp;
             content_expected_to_change = false;
@@ -1792,15 +1864,130 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
           }
         } else if constexpr (std::is_same_v<
                                  T, core::AttachCarriedObjectRequestDTO>) {
-          throw SceneRequestRejectionError(
-              "scene_frame_resolution_unavailable",
-              "carried-object attach requires the N5c immutable component "
-              "frame resolver",
-              {{"reason", "scene_frame_resolver_not_installed"}});
+          ValidateBoundedIdentity(
+              operation.carried_object_attachment_id.value(),
+              "carried_object_attachment_id");
+          ValidateBoundedIdentity(operation.scene_resource_id.value(),
+                                  "scene_resource_id");
+          if (!frame_resolution.has_value() ||
+              !frame_resolution->valid() ||
+              frame_resolution->projection_binding.projection_revision !=
+                  request.expected_projection_revision) {
+            throw SceneRequestRejectionError(
+                "missing_reference",
+                "carried-object attach has no exact carrier-frame resolution",
+                {{"reason", "carrier_frame_resolution_missing"}});
+          }
+          const auto *carrier =
+              std::get_if<core::ResolvedComponentModelFrameDTO>(
+                  &frame_resolution->resolved_frame);
+          if (carrier == nullptr ||
+              carrier->controllable_component_id !=
+                  operation.controllable_component_id ||
+              carrier->frame_role_id != operation.frame_role_id) {
+            throw SceneRequestRejectionError(
+                "missing_reference",
+                "carrier target resolved to another component or frame role",
+                {{"reason", "carrier_frame_resolution_foreign"}});
+          }
+          auto expected_revisions =
+              operation.expected_component_attachment_revisions;
+          if (!std::is_sorted(expected_revisions.begin(),
+                              expected_revisions.end()) ||
+              std::adjacent_find(expected_revisions.begin(),
+                                 expected_revisions.end()) !=
+                  expected_revisions.end() ||
+              expected_revisions !=
+                  frame_resolution->component_attachment_revisions) {
+            throw SceneRequestRejectionError(
+                "stale_revision",
+                "carrier structural-attachment precondition failed",
+                {{"reason", "carrier_attachment_revision_mismatch"}});
+          }
+          auto touch_roles = operation.touch_body_roles;
+          if (std::any_of(touch_roles.begin(), touch_roles.end(),
+                          [](const auto &role) { return role.empty(); }) ||
+              !std::is_sorted(touch_roles.begin(), touch_roles.end()) ||
+              std::adjacent_find(touch_roles.begin(), touch_roles.end()) !=
+                  touch_roles.end()) {
+            throw std::invalid_argument(
+                "touch_body_roles must be sorted, unique, and non-empty "
+                "when present");
+          }
+          const auto duplicate_attachment = std::lower_bound(
+              candidate.snapshot.carried_object_attachments.begin(),
+              candidate.snapshot.carried_object_attachments.end(),
+              operation.carried_object_attachment_id,
+              [](const core::CarriedObjectAttachmentDTO &entry,
+                 const core::CarriedObjectAttachmentId &id) {
+                return entry.carried_object_attachment_id < id;
+              });
+          if (duplicate_attachment !=
+                  candidate.snapshot.carried_object_attachments.end() &&
+              duplicate_attachment->carried_object_attachment_id ==
+                  operation.carried_object_attachment_id) {
+            throw SceneRequestRejectionError(
+                "scene_object_state_conflict",
+                "carried-object attachment ID already exists",
+                {{"reason", "carried_attachment_already_exists"}});
+          }
+          auto object = std::lower_bound(
+              candidate.snapshot.objects.begin(),
+              candidate.snapshot.objects.end(), operation.scene_resource_id,
+              [](const SceneObjectSnapshotDTO &entry,
+                 const SceneResourceId &id) {
+                return entry.scene_resource_id < id;
+              });
+          if (object == candidate.snapshot.objects.end() ||
+              object->scene_resource_id != operation.scene_resource_id) {
+            throw SceneRequestRejectionError(
+                "object_not_found", "scene resource does not exist",
+                {{"scene_resource_id", operation.scene_resource_id.value()}});
+          }
+          const auto *fixed =
+              std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+                  &object->placement);
+          if (fixed == nullptr) {
+            throw SceneRequestRejectionError(
+                "scene_object_state_conflict",
+                "scene resource is already carried",
+                {{"reason", "scene_object_is_attached"},
+                 {"scene_resource_id", operation.scene_resource_id.value()}});
+          }
+          core::CarriedObjectAttachmentDTO attachment{
+              operation.carried_object_attachment_id,
+              core::CarriedObjectAttachmentRevision(std::string{}),
+              operation.scene_resource_id,
+              operation.controllable_component_id,
+              operation.command_target_id,
+              core::ComponentSceneFrameRefDTO{
+                  carrier->controllable_component_id,
+                  carrier->model_instance_id, carrier->frame_role_id},
+              core::multiply_poses(
+                  core::inverse_pose(
+                      frame_resolution->frame_pose_in_cell),
+                  fixed->pose_in_cell),
+              std::move(touch_roles)};
+          attachment.carried_object_attachment_revision =
+              core::logical_scene_identity::
+                  ComputeCarriedObjectAttachmentRevision(attachment);
+          object->placement = core::CarriedSceneObjectPlacementDTO{
+              attachment.carried_object_attachment_id,
+              attachment.carried_object_attachment_revision};
+          object->provider_evidence = std::nullopt;
+          candidate.snapshot.carried_object_attachments.insert(
+              duplicate_attachment, attachment);
+          candidate.operation = core::ResolvedAttachCarriedObjectDTO{
+              *object, std::move(attachment)};
+          candidate.resolution_evidence_digest =
+              frame_resolution->resolution_evidence_digest;
+          policy_changed = true;
         } else if constexpr (std::is_same_v<
                                  T, core::DetachCarriedObjectRequestDTO>) {
-          static_cast<void>(
-              RequireCellFrame(operation.frame_ref, current.cell_id));
+          const auto normalized = NormalizeScenePose(
+              operation.frame_ref, operation.pose, current,
+              request.expected_projection_revision, request_digest,
+              frame_resolution);
           const auto attachment = std::lower_bound(
               candidate.snapshot.carried_object_attachments.begin(),
               candidate.snapshot.carried_object_attachments.end(),
@@ -1834,12 +2021,13 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
           const auto removed_revision =
               attachment->carried_object_attachment_revision;
           object->placement = core::CellFixedSceneObjectPlacementDTO{
-              current.cell_id, operation.pose};
+              current.cell_id, normalized.pose_in_cell};
           candidate.snapshot.carried_object_attachments.erase(attachment);
           candidate.operation = core::ResolvedDetachCarriedObjectDTO{
               *object, removed_id, removed_revision};
-          candidate.resolution_evidence_digest = CellResolutionEvidence(
-              request_digest, request.expected_projection_revision);
+          candidate.resolution_evidence_digest =
+              normalized.resolution_evidence_digest;
+          policy_changed = true;
         } else {
           topology_changed = false;
           const auto &current_policy = current.configured_collision_policy;
@@ -1860,10 +2048,10 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
               !operation.configured_policy.allowed_touch_link_pairs.empty() ||
               !operation.configured_policy.support_contacts.empty()) {
             throw SceneRequestRejectionError(
-                "scene_policy_derivation_unavailable",
-                "derived collision-policy allowances require the N5c retained "
-                "world and attachment resolver",
-                {{"reason", "collision_policy_resolver_not_installed"}});
+                "invalid_request",
+                "configured collision policy cannot contain owner-derived "
+                "static, touch, or support allowances",
+                {{"reason", "derived_collision_policy_fields_are_read_only"}});
           }
           auto next_policy = operation.configured_policy;
           const auto digest =
@@ -2412,6 +2600,255 @@ struct NativeTransitionParticipant final {
         "incarnation");
   }
   return {std::move(projection), std::move(health)};
+}
+
+class ScopedProjectionLease final {
+public:
+  ScopedProjectionLease(
+      std::shared_ptr<core::IPlannerSceneProjection> projection,
+      core::ProjectionLeaseId lease_id)
+      : projection_(std::move(projection)), lease_id_(std::move(lease_id)) {}
+
+  ScopedProjectionLease(const ScopedProjectionLease &) = delete;
+  ScopedProjectionLease &operator=(const ScopedProjectionLease &) = delete;
+  ScopedProjectionLease(ScopedProjectionLease &&other) noexcept
+      : projection_(std::move(other.projection_)),
+        lease_id_(std::move(other.lease_id_)) {}
+  ScopedProjectionLease &operator=(ScopedProjectionLease &&) = delete;
+
+  void Release() {
+    if (!projection_ || lease_id_.empty()) {
+      return;
+    }
+    projection_->ReleaseProjection(lease_id_);
+    projection_.reset();
+    lease_id_ = core::ProjectionLeaseId(std::string{});
+  }
+
+  ~ScopedProjectionLease() {
+    if (!projection_ || lease_id_.empty()) {
+      return;
+    }
+    try {
+      projection_->ReleaseProjection(lease_id_);
+    } catch (...) {
+      // Resolution already captured an immutable receipt. Release failure is
+      // bounded native cleanup and must not forge a different scene result.
+    }
+  }
+
+private:
+  std::shared_ptr<core::IPlannerSceneProjection> projection_;
+  core::ProjectionLeaseId lease_id_;
+};
+
+[[nodiscard]] std::optional<core::SceneFrameResolutionSelectorDTO>
+FrameSelectorForRequest(const SceneTransactionRequestDTO &request) {
+  return std::visit(
+      [](const auto &operation)
+          -> std::optional<core::SceneFrameResolutionSelectorDTO> {
+        using T = std::remove_cvref_t<decltype(operation)>;
+        if constexpr (std::is_same_v<T, core::AddObjectRequestDTO> ||
+                      std::is_same_v<T, core::UpdateObjectPoseRequestDTO> ||
+                      std::is_same_v<T,
+                                     core::DetachCarriedObjectRequestDTO>) {
+          if (std::holds_alternative<core::CellSceneFrameRefDTO>(
+                  operation.frame_ref)) {
+            return std::nullopt;
+          }
+          return core::SceneFrameResolutionSelectorDTO{operation.frame_ref};
+        } else if constexpr (std::is_same_v<
+                                 T, core::AttachCarriedObjectRequestDTO>) {
+          return core::SceneFrameResolutionSelectorDTO{
+              core::TargetCarrierSceneFrameRefDTO{
+                  operation.controllable_component_id,
+                  operation.command_target_id, operation.frame_role_id}};
+        } else {
+          return std::nullopt;
+        }
+      },
+      request.operation);
+}
+
+[[nodiscard]] bool SameResolutionMeaning(
+    const core::SceneFrameResolutionReceiptDTO &left,
+    const core::SceneFrameResolutionReceiptDTO &right) noexcept {
+  return left.resolved_frame == right.resolved_frame &&
+         SamePose(left.frame_pose_in_cell, right.frame_pose_in_cell) &&
+         left.component_attachment_revisions ==
+             right.component_attachment_revisions;
+}
+
+[[nodiscard]] bool ProjectionDoesNotOwnFrame(
+    const ErrorDTO &error) noexcept {
+  if (error.code != "missing_reference") {
+    return false;
+  }
+  const auto reason = error.details.find("reason");
+  return reason != error.details.end() &&
+         (reason->second == "scene_frame_reference_missing" ||
+          reason->second == "kinematic_state_source_unavailable");
+}
+
+[[nodiscard]] std::optional<core::SceneFrameResolutionReceiptDTO>
+ResolveFrameAcrossProjections(
+    const core::SceneFrameResolutionSelectorDTO &selector,
+    const ProjectionRevisionDTO &projection_revision,
+    const std::vector<RequiredSceneProjection> &projections,
+    const std::string_view lease_scope) {
+  if (projections.empty()) {
+    throw SceneRequestRejectionError(
+        "missing_reference",
+        "scene-frame resolution has no active native projection",
+        {{"reason", "scene_frame_projection_unavailable"}});
+  }
+
+  std::vector<ScopedProjectionLease> leases;
+  leases.reserve(projections.size());
+  std::vector<core::SceneFrameResolutionReceiptDTO> resolutions;
+  resolutions.reserve(projections.size());
+  std::optional<ErrorDTO> first_missing;
+  for (std::size_t ordinal = 0U; ordinal < projections.size(); ++ordinal) {
+    const auto &projection = projections[ordinal];
+    core::ProjectionLeaseId lease_id(
+        "scene-resolve-" + std::string(lease_scope) + "-" +
+        std::to_string(ordinal));
+    auto retained = projection.projection->RetainProjectionBinding(
+        projection_revision, lease_id);
+    if (!retained.ok()) {
+      throw SceneRequestRejectionError(
+          retained.error().code, retained.error().message,
+          retained.error().details);
+    }
+    const core::ProjectionLeaseBindingDTO expected_binding{
+        projection_revision, lease_id};
+    if (retained.value() != expected_binding) {
+      projection.projection->ReleaseProjection(lease_id);
+      throw SceneRequestRejectionError(
+          "live_scene_snapshot_unavailable",
+          "native projection retained a different scene revision",
+          {{"reason", "scene_frame_lease_binding_mismatch"}});
+    }
+    leases.emplace_back(projection.projection, lease_id);
+    auto resolved = projection.projection->ResolveSceneFrame(
+        core::SceneFrameResolutionQueryDTO{selector, expected_binding});
+    if (!resolved.ok()) {
+      if (!ProjectionDoesNotOwnFrame(resolved.error())) {
+        throw SceneRequestRejectionError(
+            resolved.error().code, resolved.error().message,
+            resolved.error().details);
+      }
+      if (!first_missing.has_value()) {
+        first_missing = resolved.error();
+      }
+      continue;
+    }
+    if (!resolved.value().valid() ||
+        resolved.value().projection_binding != expected_binding) {
+      throw SceneRequestRejectionError(
+          "live_scene_snapshot_unavailable",
+          "native projection returned a malformed frame receipt",
+          {{"reason", "scene_frame_receipt_mismatch"}});
+    }
+    resolutions.push_back(std::move(resolved.value()));
+  }
+  if (resolutions.empty()) {
+    if (first_missing.has_value()) {
+      throw SceneRequestRejectionError(
+          first_missing->code, first_missing->message,
+          first_missing->details);
+    }
+    throw SceneRequestRejectionError(
+        "missing_reference", "scene frame has no retained resolution",
+        {{"reason", "scene_frame_reference_missing"}});
+  }
+  for (std::size_t index = 1U; index < resolutions.size(); ++index) {
+    if (!SameResolutionMeaning(resolutions.front(), resolutions[index])) {
+      throw SceneRequestRejectionError(
+          "missing_reference",
+          "active native projections disagree on scene-frame meaning",
+          {{"reason", "scene_frame_resolution_ambiguous"}});
+    }
+  }
+  for (auto &lease : leases) {
+    lease.Release();
+  }
+  return resolutions.front();
+}
+
+[[nodiscard]] std::optional<core::SceneFrameResolutionReceiptDTO>
+ResolveFrameForRequest(
+    const SceneTransactionRequestDTO &request,
+    const std::vector<RequiredSceneProjection> &projections) {
+  const auto selector = FrameSelectorForRequest(request);
+  if (!selector.has_value()) {
+    return std::nullopt;
+  }
+  return ResolveFrameAcrossProjections(
+      *selector, request.expected_projection_revision, projections,
+      request.request_context.request_id.value());
+}
+
+[[nodiscard]] core::CollisionPolicySnapshot ProjectEffectivePolicy(
+    const LogicalSceneSnapshotDTO &candidate,
+    const std::vector<RequiredSceneProjection> &projections) {
+  if (projections.empty()) {
+    return candidate.configured_collision_policy;
+  }
+  // The owner-side resolved policy is evidence for this exact immutable scene
+  // candidate, so its nonzero monotonic publisher counter follows the scene
+  // revision. The separately retained policy_epoch remains the semantic gate
+  // used by operation leases when derived pairs change with stable intent.
+  const auto effective_policy_revision_id =
+      candidate.revision.revision_id;
+  std::optional<core::CollisionPolicySnapshot> selected;
+  for (const auto &projection : projections) {
+    auto projected = projection.projection->ProjectEffectiveCollisionPolicy(
+        candidate, effective_policy_revision_id);
+    if (!projected.ok()) {
+      throw SceneRequestRejectionError(
+          projected.error().code, projected.error().message,
+          projected.error().details);
+    }
+    const auto &effective = projected.value();
+    if (effective.revision.revision_id != effective_policy_revision_id ||
+        effective.policy_id !=
+            candidate.configured_collision_policy.policy_id ||
+        effective.contact_grasps !=
+            candidate.configured_collision_policy.contact_grasps ||
+        effective.require_full_diagnostics !=
+            candidate.configured_collision_policy.require_full_diagnostics) {
+      throw SceneRequestRejectionError(
+          "scene_policy_projection_invalid",
+          "native projection changed configured collision-policy semantics",
+          {{"reason", "effective_collision_policy_contract_mismatch"}});
+    }
+    try {
+      if (core::logical_scene_identity::
+              ComputeCollisionPolicyContentDigest(effective)
+              .value() != effective.revision.content_hash) {
+        throw SceneRequestRejectionError(
+            "scene_policy_projection_invalid",
+            "native projection returned an inexact collision-policy digest",
+            {{"reason", "effective_collision_policy_digest_mismatch"}});
+      }
+    } catch (const SceneRequestRejectionError &) {
+      throw;
+    } catch (const std::exception &error) {
+      throw SceneRequestRejectionError(
+          "scene_policy_projection_invalid", error.what(),
+          {{"reason", "effective_collision_policy_not_canonical"}});
+    }
+    if (!selected.has_value()) {
+      selected = std::move(projected.value());
+    } else if (*selected != projected.value()) {
+      throw SceneRequestRejectionError(
+          "scene_policy_projection_ambiguous",
+          "active native projections disagree on effective collision policy",
+          {{"reason", "effective_collision_policy_mismatch"}});
+    }
+  }
+  return std::move(*selected);
 }
 
 [[nodiscard]] std::vector<NativeTransitionParticipant>
@@ -8069,25 +8506,63 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                     "request_ledger_full",
                     "logical-scene request ledger reached its fixed bound");
     }
-    try {
-      candidate = ResolveSceneCandidate(
-          request, *observed_state.active_scene_snapshot,
-          observed_transactions->next_transaction_sequence, request_digest);
-    } catch (const SceneRequestRejectionError &error) {
-      return reject(core::RequestReplayStatusDTO::kAcceptedNew, error.code(),
-                    error.what(), error.details());
-    } catch (const CanonicalEmptySceneOwnerConflictError &error) {
-      std::string_view code = "scene_object_state_conflict";
-      return reject(core::RequestReplayStatusDTO::kAcceptedNew, code,
-                    error.what());
-    } catch (const CanonicalEmptySceneOwnerLimitError &error) {
-      return reject(core::RequestReplayStatusDTO::kRequestLedgerFull,
-                    "request_ledger_full", error.what());
-    } catch (const std::invalid_argument &error) {
-      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                    "invalid_request", error.what());
-    }
     read.Commit();
+  }
+
+  std::vector<RequiredSceneProjection> projections;
+  const auto required_bindings = ActiveNativeRuntimeBindings(observed_state);
+  projections.reserve(required_bindings.size());
+  for (const auto &binding : required_bindings) {
+    try {
+      auto projection =
+          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+      if (!projection.preflight_health.healthy_for_target(
+              *observed_state.active_projection)) {
+        return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                      "live_scene_snapshot_unavailable",
+                      "a required native scene projection is not healthy at "
+                      "the exact predecessor revision");
+      }
+      projections.push_back(std::move(projection));
+    } catch (const std::exception &error) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "live_scene_snapshot_unavailable", error.what());
+    } catch (...) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "live_scene_snapshot_unavailable",
+                    "native scene projection health threw a non-standard "
+                    "exception");
+    }
+  }
+
+  try {
+    const auto frame_resolution =
+        ResolveFrameForRequest(request, projections);
+    candidate = ResolveSceneCandidate(
+        request, *observed_state.active_scene_snapshot,
+        observed_transactions->next_transaction_sequence, request_digest,
+        frame_resolution);
+    auto effective_policy =
+        ProjectEffectivePolicy(candidate->snapshot, projections);
+    if (auto *policy = std::get_if<core::ResolvedCollisionPolicyDTO>(
+            &candidate->operation)) {
+      policy->effective_policy = std::move(effective_policy);
+    }
+  } catch (const SceneRequestRejectionError &error) {
+    return reject(core::RequestReplayStatusDTO::kAcceptedNew, error.code(),
+                  error.what(), error.details());
+  } catch (const CanonicalEmptySceneOwnerConflictError &error) {
+    return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                  "scene_object_state_conflict", error.what());
+  } catch (const CanonicalEmptySceneOwnerLimitError &error) {
+    return reject(core::RequestReplayStatusDTO::kRequestLedgerFull,
+                  "request_ledger_full", error.what());
+  } catch (const std::invalid_argument &error) {
+    return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                  "invalid_request", error.what());
+  } catch (const std::exception &error) {
+    return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                  "live_scene_snapshot_unavailable", error.what());
   }
 
   core::SceneTransactionDTO scene_transaction{
@@ -8113,31 +8588,6 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
         "candidate snapshot");
   }
 
-  std::vector<RequiredSceneProjection> projections;
-  const auto required_bindings = ActiveNativeRuntimeBindings(observed_state);
-  projections.reserve(required_bindings.size());
-  for (const auto &binding : required_bindings) {
-    try {
-      auto projection =
-          ResolveRequiredProjection(binding, impl_->projection_resolver_);
-      if (!projection.preflight_health.healthy_for_target(
-              scene_transaction.prior_projection_revision)) {
-        return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                      "live_scene_snapshot_unavailable",
-                      "a required native scene projection is not healthy at "
-                      "the exact predecessor revision");
-      }
-      projections.push_back(std::move(projection));
-    } catch (const std::exception &error) {
-      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                    "live_scene_snapshot_unavailable", error.what());
-    } catch (...) {
-      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                    "live_scene_snapshot_unavailable",
-                    "native scene projection health threw a non-standard "
-                    "exception");
-    }
-  }
   {
     Transaction write(database, "BEGIN IMMEDIATE");
     const auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
@@ -8336,7 +8786,17 @@ SceneObjectStateDTO CanonicalEmptySceneOwner::GetObjectState(
 core::Result<core::Pose3DTO> CanonicalEmptySceneOwner::GetObjectPose(
     const core::SceneResourceId &scene_resource_id) const {
   ValidateBoundedIdentity(scene_resource_id.value(), "scene_resource_id");
-  const auto snapshot = LogicalSnapshot();
+  std::lock_guard lock(impl_->mutex_);
+  const auto state = impl_->ReadStateTransaction();
+  if (!AccessStatus(state).projection_leases_open ||
+      !state.active_projection.has_value() ||
+      !state.active_scene_snapshot.has_value()) {
+    return core::Result<core::Pose3DTO>::Err(
+        SceneError("live_scene_snapshot_unavailable",
+                   "logical-scene projection is unavailable"));
+  }
+  const auto snapshot = std::make_shared<const LogicalSceneSnapshotDTO>(
+      *state.active_scene_snapshot);
   const auto found = std::lower_bound(
       snapshot->objects.begin(), snapshot->objects.end(), scene_resource_id,
       [](const SceneObjectSnapshotDTO &object,
@@ -8351,14 +8811,70 @@ core::Result<core::Pose3DTO> CanonicalEmptySceneOwner::GetObjectPose(
   }
   const auto *fixed =
       std::get_if<core::CellFixedSceneObjectPlacementDTO>(&found->placement);
-  if (fixed == nullptr) {
+  if (fixed != nullptr) {
+    return core::Result<core::Pose3DTO>::Ok(fixed->pose_in_cell);
+  }
+  const auto *carried =
+      std::get_if<core::CarriedSceneObjectPlacementDTO>(&found->placement);
+  if (carried == nullptr) {
     return core::Result<core::Pose3DTO>::Err(
-        SceneError("live_scene_snapshot_unavailable",
-                   "carried-object cell pose requires the N5c immutable frame "
-                   "projection",
+        SceneError("scene_object_state_conflict",
+                   "scene resource has an unknown placement state",
                    {{"scene_resource_id", scene_resource_id.value()}}));
   }
-  return core::Result<core::Pose3DTO>::Ok(fixed->pose_in_cell);
+  const auto attachment = std::lower_bound(
+      snapshot->carried_object_attachments.begin(),
+      snapshot->carried_object_attachments.end(),
+      carried->carried_object_attachment_id,
+      [](const core::CarriedObjectAttachmentDTO &candidate,
+         const core::CarriedObjectAttachmentId &id) {
+        return candidate.carried_object_attachment_id < id;
+      });
+  if (attachment == snapshot->carried_object_attachments.end() ||
+      attachment->carried_object_attachment_id !=
+          carried->carried_object_attachment_id ||
+      attachment->carried_object_attachment_revision !=
+          carried->carried_object_attachment_revision) {
+    return core::Result<core::Pose3DTO>::Err(
+        SceneError("scene_object_state_conflict",
+                   "carried scene resource has no exact attachment row",
+                   {{"scene_resource_id", scene_resource_id.value()}}));
+  }
+
+  std::vector<RequiredSceneProjection> projections;
+  try {
+    const auto bindings = ActiveNativeRuntimeBindings(state);
+    projections.reserve(bindings.size());
+    for (const auto &binding : bindings) {
+      auto projection =
+          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+      if (!projection.preflight_health.healthy_for_target(
+              *state.active_projection)) {
+        throw CanonicalEmptySceneOwnerConflictError(
+            "native projection is not healthy at the carried-object "
+            "revision");
+      }
+      projections.push_back(std::move(projection));
+    }
+    const auto resolution = ResolveFrameAcrossProjections(
+        core::SceneFrameResolutionSelectorDTO{attachment->carrier_frame_ref},
+        *state.active_projection, projections,
+        "object-pose-" + scene_resource_id.value());
+    if (!resolution.has_value()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "carried-object frame resolution returned no receipt");
+    }
+    return core::Result<core::Pose3DTO>::Ok(core::multiply_poses(
+        resolution->frame_pose_in_cell,
+        attachment->pose_in_carrier_frame));
+  } catch (const SceneRequestRejectionError &error) {
+    return core::Result<core::Pose3DTO>::Err(
+        SceneError(error.code(), error.what(), error.details()));
+  } catch (const std::exception &error) {
+    return core::Result<core::Pose3DTO>::Err(
+        SceneError("live_scene_snapshot_unavailable", error.what(),
+                   {{"scene_resource_id", scene_resource_id.value()}}));
+  }
 }
 
 CanonicalEmptySceneAccessStatus

@@ -72,6 +72,7 @@ add_library(manyforge_core
   src/runtime_collision_query_session.cpp
   src/runtime_collision_lookahead_session.cpp
   src/scene_snapshot_lease.cpp
+  src/scene_frame_resolution.cpp
   src/stop_policy.cpp
   src/trajectory_cache.cpp
   src/trajectory_cache_intent.cpp

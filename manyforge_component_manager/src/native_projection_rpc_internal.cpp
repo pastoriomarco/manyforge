@@ -1,6 +1,8 @@
 #include "native_projection_rpc_internal.hpp"
 
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -53,6 +55,13 @@ public:
     for (int shift = 56; shift >= 0; shift -= 8) {
       Byte(static_cast<std::uint8_t>((value >> shift) & 0xffU));
     }
+  }
+
+  void Double(const double value) {
+    if (!std::isfinite(value)) {
+      Fail("floating-point field is non-finite");
+    }
+    U64(std::bit_cast<std::uint64_t>(value));
   }
 
   void String(const std::string_view value) {
@@ -120,6 +129,14 @@ public:
     std::uint64_t value = 0U;
     for (std::size_t index = 0U; index < 8U; ++index) {
       value = (value << 8U) | Byte();
+    }
+    return value;
+  }
+
+  [[nodiscard]] double Double() {
+    const double value = std::bit_cast<double>(U64());
+    if (!std::isfinite(value)) {
+      Fail("floating-point field is non-finite");
     }
     return value;
   }
@@ -295,6 +312,328 @@ ReadBinding(Reader &reader) {
     Fail("native runtime binding is invalid");
   }
   return binding;
+}
+
+void WriteLeaseBinding(Writer &writer,
+                       const core::ProjectionLeaseBindingDTO &binding) {
+  if (!binding.valid()) {
+    Fail("cannot encode invalid projection lease binding");
+  }
+  WriteProjectionRevision(writer, binding.projection_revision);
+  WriteStrong(writer, binding.projection_lease_id);
+}
+
+[[nodiscard]] core::ProjectionLeaseBindingDTO
+ReadLeaseBinding(Reader &reader) {
+  core::ProjectionLeaseBindingDTO binding{
+      ReadProjectionRevision(reader),
+      ReadStrong<core::ProjectionLeaseId>(reader)};
+  if (!binding.valid()) {
+    Fail("decoded projection lease binding is invalid");
+  }
+  return binding;
+}
+
+void WritePose(Writer &writer, const core::Pose3DTO &pose) {
+  writer.Double(pose.position_m.x_m);
+  writer.Double(pose.position_m.y_m);
+  writer.Double(pose.position_m.z_m);
+  writer.Double(pose.orientation.x);
+  writer.Double(pose.orientation.y);
+  writer.Double(pose.orientation.z);
+  writer.Double(pose.orientation.w);
+}
+
+[[nodiscard]] core::Pose3DTO ReadPose(Reader &reader) {
+  return {{reader.Double(), reader.Double(), reader.Double()},
+          {reader.Double(), reader.Double(), reader.Double(),
+           reader.Double()}};
+}
+
+void WriteSceneFrameRef(Writer &writer,
+                        const core::SceneFrameRefDTO &reference) {
+  std::visit(
+      [&](const auto &value) {
+        using T = std::remove_cvref_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, core::CellSceneFrameRefDTO>) {
+          writer.Byte(0U);
+          WriteStrong(writer, value.cell_id);
+        } else if constexpr (std::is_same_v<
+                                 T, core::ComponentSceneFrameRefDTO>) {
+          writer.Byte(1U);
+          WriteStrong(writer, value.controllable_component_id);
+          WriteStrong(writer, value.model_instance_id);
+          WriteStrong(writer, value.frame_role_id);
+        } else {
+          writer.Byte(2U);
+          WriteStrong(writer, value.model_instance_id);
+          WriteStrong(writer, value.frame_role_id);
+        }
+      },
+      reference);
+}
+
+[[nodiscard]] core::SceneFrameRefDTO ReadSceneFrameRef(Reader &reader) {
+  switch (reader.Byte()) {
+  case 0U:
+    return core::CellSceneFrameRefDTO{ReadStrong<core::CellId>(reader)};
+  case 1U:
+    return core::ComponentSceneFrameRefDTO{
+        ReadStrong<core::ControllableComponentId>(reader),
+        ReadStrong<core::ModelInstanceId>(reader),
+        ReadStrong<core::FrameRoleId>(reader)};
+  case 2U:
+    return core::PassiveModelSceneFrameRefDTO{
+        ReadStrong<core::ModelInstanceId>(reader),
+        ReadStrong<core::FrameRoleId>(reader)};
+  default:
+    Fail("scene-frame reference kind is unknown");
+  }
+}
+
+void WriteResolvedFrame(Writer &writer,
+                        const core::ResolvedFrameDTO &resolved) {
+  std::visit(
+      [&](const auto &value) {
+        using T = std::remove_cvref_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, core::ResolvedCellFrameDTO>) {
+          writer.Byte(0U);
+          WriteStrong(writer, value.cell_id);
+          writer.String(value.compiled_frame_name);
+        } else if constexpr (std::is_same_v<
+                                 T, core::ResolvedComponentModelFrameDTO>) {
+          writer.Byte(1U);
+          WriteStrong(writer, value.controllable_component_id);
+          WriteStrong(writer, value.model_instance_id);
+          WriteStrong(writer, value.frame_role_id);
+          writer.String(value.compiled_frame_name);
+          WriteStrong(writer, value.model_revision);
+        } else {
+          writer.Byte(2U);
+          WriteStrong(writer, value.model_instance_id);
+          WriteStrong(writer, value.frame_role_id);
+          writer.String(value.compiled_frame_name);
+          WriteStrong(writer, value.model_revision);
+        }
+      },
+      resolved);
+}
+
+[[nodiscard]] core::ResolvedFrameDTO ReadResolvedFrame(Reader &reader) {
+  switch (reader.Byte()) {
+  case 0U:
+    return core::ResolvedCellFrameDTO{ReadStrong<core::CellId>(reader),
+                                      reader.String()};
+  case 1U:
+    return core::ResolvedComponentModelFrameDTO{
+        ReadStrong<core::ControllableComponentId>(reader),
+        ReadStrong<core::ModelInstanceId>(reader),
+        ReadStrong<core::FrameRoleId>(reader), reader.String(),
+        ReadStrong<core::ModelRevision>(reader)};
+  case 2U:
+    return core::ResolvedPassiveModelFrameDTO{
+        ReadStrong<core::ModelInstanceId>(reader),
+        ReadStrong<core::FrameRoleId>(reader), reader.String(),
+        ReadStrong<core::ModelRevision>(reader)};
+  default:
+    Fail("resolved scene-frame kind is unknown");
+  }
+}
+
+void WriteSceneFrameQuery(Writer &writer,
+                          const core::SceneFrameResolutionQueryDTO &query) {
+  if (!query.valid()) {
+    Fail("cannot encode invalid scene-frame resolution query");
+  }
+  std::visit(
+      [&](const auto &selector) {
+        using T = std::remove_cvref_t<decltype(selector)>;
+        if constexpr (std::is_same_v<T, core::SceneFrameRefDTO>) {
+          writer.Byte(0U);
+          WriteSceneFrameRef(writer, selector);
+        } else {
+          writer.Byte(1U);
+          WriteStrong(writer, selector.controllable_component_id);
+          WriteStrong(writer, selector.command_target_id);
+          WriteStrong(writer, selector.frame_role_id);
+        }
+      },
+      query.selector);
+  WriteLeaseBinding(writer, query.projection_binding);
+}
+
+[[nodiscard]] core::SceneFrameResolutionQueryDTO
+ReadSceneFrameQuery(Reader &reader) {
+  core::SceneFrameResolutionSelectorDTO selector = [&] {
+    switch (reader.Byte()) {
+    case 0U:
+      return core::SceneFrameResolutionSelectorDTO{
+          ReadSceneFrameRef(reader)};
+    case 1U:
+      return core::SceneFrameResolutionSelectorDTO{
+          core::TargetCarrierSceneFrameRefDTO{
+              ReadStrong<core::ControllableComponentId>(reader),
+              ReadStrong<core::CommandTargetId>(reader),
+              ReadStrong<core::FrameRoleId>(reader)}};
+    default:
+      Fail("scene-frame selector kind is unknown");
+    }
+  }();
+  core::SceneFrameResolutionQueryDTO query{std::move(selector),
+                                           ReadLeaseBinding(reader)};
+  if (!query.valid()) {
+    Fail("decoded scene-frame resolution query is invalid");
+  }
+  return query;
+}
+
+void WriteSceneFrameReceipt(
+    Writer &writer, const core::SceneFrameResolutionReceiptDTO &receipt) {
+  if (!receipt.valid()) {
+    Fail("cannot encode invalid scene-frame resolution receipt");
+  }
+  WriteResolvedFrame(writer, receipt.resolved_frame);
+  WritePose(writer, receipt.frame_pose_in_cell);
+  WriteVector(writer, receipt.component_attachment_revisions,
+              [](Writer &output,
+                 const core::ComponentAttachmentRevision &revision) {
+                WriteStrong(output, revision);
+              });
+  WriteLeaseBinding(writer, receipt.projection_binding);
+  WriteStrong(writer, receipt.resolution_evidence_digest);
+}
+
+[[nodiscard]] core::SceneFrameResolutionReceiptDTO
+ReadSceneFrameReceipt(Reader &reader) {
+  core::SceneFrameResolutionReceiptDTO receipt{
+      ReadResolvedFrame(reader),
+      ReadPose(reader),
+      ReadVector<core::ComponentAttachmentRevision>(
+          reader, [](Reader &input) {
+            return ReadStrong<core::ComponentAttachmentRevision>(input);
+          }),
+      ReadLeaseBinding(reader),
+      ReadStrong<core::ContentDigest>(reader)};
+  if (!receipt.valid()) {
+    Fail("decoded scene-frame resolution receipt is invalid");
+  }
+  return receipt;
+}
+
+void WriteCollisionPair(Writer &writer, const core::CollisionPairId &pair) {
+  writer.String(pair.body_a);
+  writer.String(pair.body_b);
+}
+
+[[nodiscard]] core::CollisionPairId ReadCollisionPair(Reader &reader) {
+  return {reader.String(), reader.String()};
+}
+
+void WriteCollisionPolicy(Writer &writer,
+                          const core::CollisionPolicySnapshot &policy) {
+  writer.String(policy.policy_id);
+  writer.U64(policy.revision.revision_id);
+  writer.String(policy.revision.content_hash);
+  WriteVector(writer, policy.allowed_static_static_pairs,
+              WriteCollisionPair);
+  WriteVector(writer, policy.allowed_touch_link_pairs, WriteCollisionPair);
+  WriteVector(
+      writer, policy.support_contacts,
+      [](Writer &output, const core::SupportContactPolicyEntry &entry) {
+        WriteCollisionPair(output, entry.pair);
+        output.Byte(static_cast<std::uint8_t>(entry.mode));
+        output.Byte(
+            static_cast<std::uint8_t>(entry.release_evidence_mode));
+        output.Boolean(entry.enforce_max_start_penetration);
+        output.Double(entry.max_start_penetration_m);
+        output.Double(entry.release_tolerance_m);
+        output.Double(entry.min_release_progress_m);
+        output.Double(entry.max_contact_penetration_m);
+        output.Boolean(entry.require_separation_by_end);
+        output.Boolean(entry.require_strictly_decreasing_penetration);
+        output.Boolean(entry.allow_recontact);
+      });
+  WriteVector(
+      writer, policy.contact_grasps,
+      [](Writer &output, const core::ContactGraspPolicyEntry &entry) {
+        output.String(entry.policy_id);
+        output.String(entry.selected_object_id);
+        WriteVector(output, entry.allowed_robot_links,
+                    [](Writer &links, const std::string &link) {
+                      links.String(link);
+                    });
+        output.Double(entry.max_penetration_m);
+        output.Double(entry.terminal_window_start_fraction);
+      });
+  writer.Boolean(policy.require_full_diagnostics);
+}
+
+[[nodiscard]] core::CollisionContactPolicyMode
+ReadContactPolicyMode(Reader &reader) {
+  switch (reader.Byte()) {
+  case 0U:
+    return core::CollisionContactPolicyMode::kContactRelease;
+  case 1U:
+    return core::CollisionContactPolicyMode::kBoundedPenetration;
+  case 2U:
+    return core::CollisionContactPolicyMode::kContactProcess;
+  default:
+    Fail("collision contact-policy mode is unknown");
+  }
+}
+
+[[nodiscard]] core::ContactReleaseEvidenceMode
+ReadReleaseEvidenceMode(Reader &reader) {
+  switch (reader.Byte()) {
+  case 0U:
+    return core::ContactReleaseEvidenceMode::kSignedPenetration;
+  case 1U:
+    return core::ContactReleaseEvidenceMode::kBinaryContact;
+  default:
+    Fail("contact release-evidence mode is unknown");
+  }
+}
+
+[[nodiscard]] core::CollisionPolicySnapshot
+ReadCollisionPolicy(Reader &reader) {
+  core::CollisionPolicySnapshot policy;
+  policy.policy_id = reader.String();
+  policy.revision = {reader.U64(), reader.String()};
+  policy.allowed_static_static_pairs =
+      ReadVector<core::CollisionPairId>(reader, ReadCollisionPair);
+  policy.allowed_touch_link_pairs =
+      ReadVector<core::CollisionPairId>(reader, ReadCollisionPair);
+  policy.support_contacts = ReadVector<core::SupportContactPolicyEntry>(
+      reader, [](Reader &input) {
+        return core::SupportContactPolicyEntry{
+            ReadCollisionPair(input),
+            ReadContactPolicyMode(input),
+            ReadReleaseEvidenceMode(input),
+            input.Boolean(),
+            input.Double(),
+            input.Double(),
+            input.Double(),
+            input.Double(),
+            input.Boolean(),
+            input.Boolean(),
+            input.Boolean()};
+      });
+  policy.contact_grasps = ReadVector<core::ContactGraspPolicyEntry>(
+      reader, [](Reader &input) {
+        return core::ContactGraspPolicyEntry{
+            input.String(), input.String(),
+            ReadVector<std::string>(input,
+                                    [](Reader &links) {
+                                      return links.String();
+                                    }),
+            input.Double(), input.Double()};
+      });
+  policy.require_full_diagnostics = reader.Boolean();
+  if (policy.policy_id.empty() || policy.revision.revision_id == 0U ||
+      policy.revision.content_hash.empty()) {
+    Fail("decoded collision policy is incomplete");
+  }
+  return policy;
 }
 
 void WriteArtifact(Writer &writer,
@@ -1244,6 +1583,10 @@ enum class RequestKind : std::uint8_t {
   kRetireStatus = 10U,
   kDiscard = 11U,
   kStageStatus = 12U,
+  kRetain = 13U,
+  kRelease = 14U,
+  kSceneFrame = 15U,
+  kEffectivePolicy = 16U,
 };
 
 enum class ResponseKind : std::uint8_t {
@@ -1259,6 +1602,10 @@ enum class ResponseKind : std::uint8_t {
   kRetireStatus = 10U,
   kDiscard = 11U,
   kStageStatus = 12U,
+  kRetained = 13U,
+  kReleased = 14U,
+  kSceneFrame = 15U,
+  kEffectivePolicy = 16U,
 };
 
 } // namespace
@@ -1321,9 +1668,45 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
                                             core::NativeProjectionDiscardDTO>) {
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kDiscard));
           WriteDiscard(writer, value);
-        } else {
+        } else if constexpr (std::is_same_v<
+                                 T, core::NativeProjectionStatusQueryDTO>) {
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kStageStatus));
           WriteStatusQuery(writer, value);
+        } else if constexpr (std::is_same_v<
+                                 T, NativeProjectionRetainRequest>) {
+          if (!value.valid()) {
+            Fail("cannot encode invalid projection retain request");
+          }
+          writer.Byte(static_cast<std::uint8_t>(RequestKind::kRetain));
+          WriteBinding(writer, value.native_runtime_binding);
+          WriteProjectionRevision(writer, value.projection_revision);
+          WriteStrong(writer, value.projection_lease_id);
+        } else if constexpr (std::is_same_v<
+                                 T, NativeProjectionReleaseRequest>) {
+          if (!value.valid()) {
+            Fail("cannot encode invalid projection release request");
+          }
+          writer.Byte(static_cast<std::uint8_t>(RequestKind::kRelease));
+          WriteBinding(writer, value.native_runtime_binding);
+          WriteStrong(writer, value.projection_lease_id);
+        } else if constexpr (std::is_same_v<
+                                 T, NativeProjectionSceneFrameRequest>) {
+          if (!value.valid()) {
+            Fail("cannot encode invalid projection scene-frame request");
+          }
+          writer.Byte(static_cast<std::uint8_t>(RequestKind::kSceneFrame));
+          WriteBinding(writer, value.native_runtime_binding);
+          WriteSceneFrameQuery(writer, value.query);
+        } else {
+          if (!value.valid()) {
+            Fail("cannot encode invalid effective-policy request");
+          }
+          writer.Byte(
+              static_cast<std::uint8_t>(RequestKind::kEffectivePolicy));
+          WriteBinding(writer, value.native_runtime_binding);
+          writer.String(scene::EncodeLogicalSceneSnapshot(
+              value.logical_scene));
+          writer.U64(value.effective_policy_revision_id);
         }
       },
       request);
@@ -1360,6 +1743,20 @@ DecodeNativeProjectionRpcRequest(const std::string_view bytes) {
       return ReadDiscard(reader);
     case RequestKind::kStageStatus:
       return ReadStatusQuery(reader);
+    case RequestKind::kRetain:
+      return NativeProjectionRetainRequest{
+          ReadBinding(reader), ReadProjectionRevision(reader),
+          ReadStrong<core::ProjectionLeaseId>(reader)};
+    case RequestKind::kRelease:
+      return NativeProjectionReleaseRequest{
+          ReadBinding(reader), ReadStrong<core::ProjectionLeaseId>(reader)};
+    case RequestKind::kSceneFrame:
+      return NativeProjectionSceneFrameRequest{ReadBinding(reader),
+                                               ReadSceneFrameQuery(reader)};
+    case RequestKind::kEffectivePolicy:
+      return NativeProjectionEffectivePolicyRequest{
+          ReadBinding(reader),
+          scene::DecodeLogicalSceneSnapshot(reader.String()), reader.U64()};
     }
     Fail("request kind is unknown");
   }();
@@ -1424,9 +1821,29 @@ EncodeNativeProjectionRpcResponse(const NativeProjectionRpcResponse &response) {
                                  T, core::NativeProjectionDiscardResultDTO>) {
           writer.Byte(static_cast<std::uint8_t>(ResponseKind::kDiscard));
           WriteDiscardResult(writer, value);
-        } else {
+        } else if constexpr (std::is_same_v<
+                                 T, core::NativeProjectionStatusDTO>) {
           writer.Byte(static_cast<std::uint8_t>(ResponseKind::kStageStatus));
           WriteStatus(writer, value);
+        } else if constexpr (std::is_same_v<
+                                 T, NativeProjectionRetainResult>) {
+          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kRetained));
+          WriteLeaseBinding(writer, value.projection_binding);
+        } else if constexpr (std::is_same_v<
+                                 T, NativeProjectionReleaseResult>) {
+          if (value.projection_lease_id.empty()) {
+            Fail("cannot encode empty projection release result");
+          }
+          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kReleased));
+          WriteStrong(writer, value.projection_lease_id);
+        } else if constexpr (std::is_same_v<
+                                 T, core::SceneFrameResolutionReceiptDTO>) {
+          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kSceneFrame));
+          WriteSceneFrameReceipt(writer, value);
+        } else {
+          writer.Byte(
+              static_cast<std::uint8_t>(ResponseKind::kEffectivePolicy));
+          WriteCollisionPolicy(writer, value);
         }
       },
       response);
@@ -1462,6 +1879,15 @@ DecodeNativeProjectionRpcResponse(const std::string_view bytes) {
       return ReadDiscardResult(reader);
     case ResponseKind::kStageStatus:
       return ReadStatus(reader);
+    case ResponseKind::kRetained:
+      return NativeProjectionRetainResult{ReadLeaseBinding(reader)};
+    case ResponseKind::kReleased:
+      return NativeProjectionReleaseResult{
+          ReadStrong<core::ProjectionLeaseId>(reader)};
+    case ResponseKind::kSceneFrame:
+      return ReadSceneFrameReceipt(reader);
+    case ResponseKind::kEffectivePolicy:
+      return ReadCollisionPolicy(reader);
     }
     Fail("response kind is unknown");
   }();

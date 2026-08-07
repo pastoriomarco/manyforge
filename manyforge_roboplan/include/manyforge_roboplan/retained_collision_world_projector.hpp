@@ -37,6 +37,7 @@ struct RetainedCollisionModelMapInput final {
       component_bodies;
   std::vector<collision::RetainedComponentModelFrameProjectionInput>
       component_frames;
+  std::vector<std::string> dynamic_compiled_joint_names;
   struct Target final {
     core::ControllableComponentId controllable_component_id;
     core::CommandTargetId command_target_id;
@@ -91,6 +92,7 @@ class RetainedCollisionWorldProjector final {
         {},
         {},
         {},
+        {},
     };
 
     for (const auto& role : model_map.model_collision_bodies()) {
@@ -109,6 +111,14 @@ class RetainedCollisionWorldProjector final {
             index,
             role.compiled_link_names[index],
         });
+      }
+    }
+
+    for (const auto& coordinate : model_map.coordinates()) {
+      using Kind = std::remove_cvref_t<decltype(coordinate.coordinate_kind)>;
+      if (coordinate.coordinate_kind != Kind::kNone) {
+        input.dynamic_compiled_joint_names.push_back(
+            coordinate.compiled_joint_name);
       }
     }
 
@@ -210,7 +220,7 @@ class RetainedCollisionWorldProjector final {
   [[nodiscard]] core::Result<core::CollisionPolicySnapshot>
   project_effective_policy(
       const core::LogicalSceneSnapshotDTO& logical_scene,
-      std::uint64_t collision_policy_revision_id) const;
+      std::uint64_t effective_policy_revision_id) const;
 
   [[nodiscard]] const RetainedCollisionModelMapInput& model_map()
       const noexcept {
@@ -229,14 +239,17 @@ class RetainedCollisionWorldProjector final {
   RetainedCollisionWorldProjector(
       collision::ManyForgeCollisionEngine::SharedModelPtr shared_model,
       RetainedCollisionModelMapInput model_map,
-      collision::RetainedComponentCollisionProjection component_projection)
+      collision::RetainedComponentCollisionProjection component_projection,
+      std::vector<core::CollisionBodyId> static_component_body_ids)
       : shared_model_(std::move(shared_model)),
         model_map_(std::move(model_map)),
-        component_projection_(std::move(component_projection)) {}
+        component_projection_(std::move(component_projection)),
+        static_component_body_ids_(std::move(static_component_body_ids)) {}
 
   collision::ManyForgeCollisionEngine::SharedModelPtr shared_model_;
   RetainedCollisionModelMapInput model_map_;
   collision::RetainedComponentCollisionProjection component_projection_;
+  std::vector<core::CollisionBodyId> static_component_body_ids_;
 };
 
 }  // namespace manyforge::roboplan_backend

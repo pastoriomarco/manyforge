@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/geometry/pose_math.hpp>
+#include <manyforge_core/types/scene_frame_resolution.hpp>
 
 #include <cmath>
 
@@ -45,6 +46,45 @@ TEST(PoseMathTest, MultiplyPosesComposesTranslationInParentFrame) {
   EXPECT_NEAR(out.position_m.z_m, 0.0, 1e-12);
   EXPECT_NEAR(std::abs(out.orientation.z), 1.0, 1e-12);
   EXPECT_NEAR(out.orientation.w, 0.0, 1e-12);
+}
+
+TEST(PoseMathTest, InversePoseRoundTripsTranslationAndRotation) {
+  const Pose3DTO pose{{1.25, -2.0, 0.75}, yaw_quaternion(kPi / 3.0)};
+
+  const auto identity = multiply_poses(pose, inverse_pose(pose));
+
+  EXPECT_NEAR(identity.position_m.x_m, 0.0, 1e-12);
+  EXPECT_NEAR(identity.position_m.y_m, 0.0, 1e-12);
+  EXPECT_NEAR(identity.position_m.z_m, 0.0, 1e-12);
+  EXPECT_NEAR(identity.orientation.x, 0.0, 1e-12);
+  EXPECT_NEAR(identity.orientation.y, 0.0, 1e-12);
+  EXPECT_NEAR(identity.orientation.z, 0.0, 1e-12);
+  EXPECT_NEAR(std::abs(identity.orientation.w), 1.0, 1e-12);
+}
+
+TEST(SceneFrameResolutionTest, CompactReceiptRejectsIncompleteFrameIdentity) {
+  constexpr std::string_view digest =
+      "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+  SceneFrameResolutionReceiptDTO receipt{
+      ResolvedComponentModelFrameDTO{
+          ControllableComponentId("component.1"),
+          ModelInstanceId("model.1"), FrameRoleId("tcp"), "compiled_tcp",
+          ModelRevision("model-revision-1")},
+      {},
+      {},
+      ProjectionLeaseBindingDTO{
+          ProjectionRevisionDTO{
+              RetainedBundleId(std::string(digest)),
+              GraphRevision(std::string(digest)),
+              SceneRevision{SceneId(std::string(digest)), 1U,
+                            ContentDigest(std::string(digest))}},
+          ProjectionLeaseId("lease.1")},
+      ContentDigest(std::string(digest))};
+  ASSERT_TRUE(receipt.valid());
+
+  std::get<ResolvedComponentModelFrameDTO>(receipt.resolved_frame)
+      .compiled_frame_name.clear();
+  EXPECT_FALSE(receipt.valid());
 }
 
 }  // namespace

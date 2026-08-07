@@ -661,7 +661,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     Fail("native runtime child observation returned a foreign PID");
   }
 
-  [[nodiscard]] detail::NativeProjectionRpcResponse ExchangeProjection(
+  [[nodiscard]] detail::NativeProjectionRpcResponse ExchangeProjectionRaw(
       Child &child, const detail::NativeProjectionRpcRequest &request) {
     const auto encoded = detail::EncodeNativeProjectionRpcRequest(request);
     SendPacket(child.channel.get(), encoded, kStatusTimeout);
@@ -670,6 +670,12 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("native projection response timed out");
     }
     auto response = detail::DecodeNativeProjectionRpcResponse(*packet);
+    return response;
+  }
+
+  [[nodiscard]] detail::NativeProjectionRpcResponse ExchangeProjection(
+      Child &child, const detail::NativeProjectionRpcRequest &request) {
+    auto response = ExchangeProjectionRaw(child, request);
     if (const auto *failure =
             std::get_if<detail::NativeProjectionRpcFailure>(&response)) {
       Fail("native projection request failed [" + failure->error.code +
@@ -706,6 +712,40 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("native projection child returned the wrong response kind");
     }
     return *typed;
+  }
+
+  template <typename Response>
+  [[nodiscard]] manyforge::core::Result<Response> ProjectionResultCall(
+      const manyforge::core::ProjectionNativeRuntimeBindingDTO &binding,
+      detail::NativeProjectionRpcRequest request) {
+    if (!binding.valid()) {
+      Fail("native projection request binding is invalid");
+    }
+    std::lock_guard lock(mutex);
+    const auto found = children.find(binding.runtime_unit_id.value());
+    if (found == children.end() ||
+        found->second.runtime_epoch != binding.runtime_epoch) {
+      Fail("native projection client no longer names the current child epoch");
+    }
+    const ProjectionBindingKey key{binding.provider_binding_id,
+                                   binding.provider_binding_revision};
+    if (!found->second.admitted_projection_bindings.contains(key)) {
+      Fail("native projection client binding is no longer admitted");
+    }
+    if (!ChildIsLive(found->second)) {
+      children.erase(found);
+      Fail("native projection child exited before its response");
+    }
+    auto response = ExchangeProjectionRaw(found->second, request);
+    if (const auto *failure =
+            std::get_if<detail::NativeProjectionRpcFailure>(&response)) {
+      return manyforge::core::Result<Response>::Err(failure->error);
+    }
+    const auto *typed = std::get_if<Response>(&response);
+    if (typed == nullptr) {
+      Fail("native projection child returned the wrong response kind");
+    }
+    return manyforge::core::Result<Response>::Ok(*typed);
   }
 
   void PrepareChildProjectionBindings(
@@ -1075,9 +1115,31 @@ public:
     Unavailable("lease retention");
   }
 
+  manyforge::core::Result<manyforge::core::ProjectionLeaseBindingDTO>
+  RetainProjectionBinding(
+      const manyforge::core::ProjectionRevisionDTO &revision,
+      manyforge::core::ProjectionLeaseId lease_id) override {
+    auto result = adapter_->ProjectionResultCall<
+        detail::NativeProjectionRetainResult>(
+        binding_, detail::NativeProjectionRetainRequest{
+                      binding_, revision, std::move(lease_id)});
+    if (!result.ok()) {
+      return manyforge::core::Result<
+          manyforge::core::ProjectionLeaseBindingDTO>::Err(result.error());
+    }
+    return manyforge::core::Result<
+        manyforge::core::ProjectionLeaseBindingDTO>::Ok(
+        std::move(result.value().projection_binding));
+  }
+
   void ReleaseProjection(
-      const manyforge::core::ProjectionLeaseId &) override {
-    Unavailable("lease release");
+      const manyforge::core::ProjectionLeaseId &lease_id) override {
+    const auto released = adapter_->ProjectionCall<
+        detail::NativeProjectionReleaseResult>(
+        binding_, detail::NativeProjectionReleaseRequest{binding_, lease_id});
+    if (released.projection_lease_id != lease_id) {
+      Fail("native projection released a different lease");
+    }
   }
 
   manyforge::core::ProjectionHealthDTO ProjectionHealth() const override {
@@ -1145,6 +1207,25 @@ public:
       const manyforge::core::NativeProjectionStatusQueryDTO &request) const override {
     return adapter_->ProjectionCall<manyforge::core::NativeProjectionStatusDTO>(
         binding_, request);
+  }
+
+  manyforge::core::Result<manyforge::core::SceneFrameResolutionReceiptDTO>
+  ResolveSceneFrame(
+      const manyforge::core::SceneFrameResolutionQueryDTO &query) const override {
+    return adapter_->ProjectionResultCall<
+        manyforge::core::SceneFrameResolutionReceiptDTO>(
+        binding_, detail::NativeProjectionSceneFrameRequest{binding_, query});
+  }
+
+  manyforge::core::Result<manyforge::core::CollisionPolicySnapshot>
+  ProjectEffectiveCollisionPolicy(
+      const manyforge::core::LogicalSceneSnapshotDTO &logical_scene,
+      const std::uint64_t effective_policy_revision_id) const override {
+    return adapter_->ProjectionResultCall<
+        manyforge::core::CollisionPolicySnapshot>(
+        binding_, detail::NativeProjectionEffectivePolicyRequest{
+                      binding_, logical_scene,
+                      effective_policy_revision_id});
   }
 
 private:

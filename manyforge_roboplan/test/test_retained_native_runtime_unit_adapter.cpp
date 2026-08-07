@@ -419,6 +419,63 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_TRUE(bootstrapped.resulting_health.healthy_for_target(
       initial_revision));
 
+  ASSERT_FALSE(fixture.bundle->value().cell_graph.control_bindings.empty());
+  const auto &control_binding =
+      fixture.bundle->value().cell_graph.control_bindings.front();
+  const core::ProjectionLeaseId frame_lease_id(
+      "native-adapter-frame-lease");
+  const auto retained_binding = resolved.value()->RetainProjectionBinding(
+      initial_revision, frame_lease_id);
+  ASSERT_TRUE(retained_binding.ok()) << retained_binding.error().message;
+  EXPECT_EQ(retained_binding.value(),
+            (core::ProjectionLeaseBindingDTO{initial_revision,
+                                             frame_lease_id}));
+  const auto frame = resolved.value()->ResolveSceneFrame(
+      core::SceneFrameResolutionQueryDTO{
+          core::TargetCarrierSceneFrameRefDTO{
+              control_binding.controllable_component_id,
+              control_binding.command_target_id, core::FrameRoleId("tcp")},
+          retained_binding.value()});
+  ASSERT_TRUE(frame.ok()) << frame.error().message;
+  ASSERT_TRUE(frame.value().valid());
+  EXPECT_EQ(frame.value().projection_binding, retained_binding.value());
+  const auto *component_frame =
+      std::get_if<core::ResolvedComponentModelFrameDTO>(
+          &frame.value().resolved_frame);
+  ASSERT_NE(component_frame, nullptr);
+  EXPECT_EQ(component_frame->controllable_component_id,
+            control_binding.controllable_component_id);
+  EXPECT_EQ(component_frame->frame_role_id, core::FrameRoleId("tcp"));
+
+  const auto missing_frame = resolved.value()->ResolveSceneFrame(
+      core::SceneFrameResolutionQueryDTO{
+          core::TargetCarrierSceneFrameRefDTO{
+              control_binding.controllable_component_id,
+              control_binding.command_target_id,
+              core::FrameRoleId("missing-frame-role")},
+          retained_binding.value()});
+  ASSERT_FALSE(missing_frame.ok());
+  EXPECT_EQ(missing_frame.error().details.at("reason"),
+            "scene_frame_reference_missing");
+  resolved.value()->ReleaseProjection(frame_lease_id);
+  const auto released_frame = resolved.value()->ResolveSceneFrame(
+      core::SceneFrameResolutionQueryDTO{
+          core::TargetCarrierSceneFrameRefDTO{
+              control_binding.controllable_component_id,
+              control_binding.command_target_id, core::FrameRoleId("tcp")},
+          retained_binding.value()});
+  ASSERT_FALSE(released_frame.ok());
+  EXPECT_EQ(released_frame.error().details.at("reason"),
+            "native_scene_frame_lease_unavailable");
+
+  const auto effective_policy =
+      resolved.value()->ProjectEffectiveCollisionPolicy(
+          *initial_scene.shared(),
+          initial_scene.shared()->revision.revision_id);
+  ASSERT_TRUE(effective_policy.ok()) << effective_policy.error().message;
+  EXPECT_EQ(effective_policy.value(),
+            initial_scene.shared()->configured_collision_policy);
+
   auto candidate_scene = std::make_shared<core::LogicalSceneSnapshotDTO>(
       *initial_scene.shared());
   candidate_scene->revision.revision_id = 2U;

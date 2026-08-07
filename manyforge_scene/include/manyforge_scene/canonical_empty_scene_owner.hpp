@@ -158,12 +158,14 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
 /// handoff, and appends current-binding recovery evidence when a finalized
 /// Manager-managed host is replaced. N5b supplies durable compare-and-commit
 /// logical-scene transactions, immutable reads, exact replay, and projection
-/// acknowledgement. Cell-frame operations are active here; component/passive-
-/// frame resolution, derived collision-policy allowances, carried-object
-/// attachment, the end-to-end projection-lease consumer, and remote/ROS
-/// adapters remain fail-closed until their later N5c slices. This owner
-/// implements no compatibility wrapper, robot command, authorization layer,
-/// or legacy SceneAuthority fallback.
+/// acknowledgement. N5c-c3 activates retained component/passive-frame
+/// resolution, owner-normalized carried-object attachment/detachment, focused
+/// immutable projection leases, and configured-versus-derived collision
+/// policy projection. Program-operation leases, dynamic start-contact
+/// discovery, sustained state updates, and remote/ROS adapters remain gated
+/// to their named later slices. This owner implements no compatibility
+/// wrapper, robot command, authorization layer, or legacy SceneAuthority
+/// fallback.
 class CanonicalEmptySceneOwner final
     : public manyforge::core::IManagerSceneProjectionBootstrapPort,
       public manyforge::core::IManagerSceneProjectionHandoffPort,

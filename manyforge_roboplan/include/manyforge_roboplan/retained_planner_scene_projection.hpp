@@ -9,6 +9,7 @@
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
+#include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -45,7 +46,9 @@ public:
       core::RetainedProductDTO planning_collision_model,
       core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
       core::LogicalSceneSnapshotDTO initial_scene,
-      RetainedPlannerSceneProjectionConfig config, Clock clock);
+      RetainedPlannerSceneProjectionConfig config, Clock clock,
+      std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver =
+          nullptr);
 
   [[nodiscard]] static core::Result<
       std::shared_ptr<RetainedPlannerSceneProjection>>
@@ -53,7 +56,9 @@ public:
       RetainedCollisionWorldProjector projector,
       core::RetainedProductDTO planning_collision_model,
       core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
-      RetainedPlannerSceneProjectionConfig config, Clock clock);
+      RetainedPlannerSceneProjectionConfig config, Clock clock,
+      std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver =
+          nullptr);
 
   /// Preload one exact candidate structural model while the current
   /// projection remains active. This is a host-internal staged-ready step,
@@ -62,7 +67,9 @@ public:
   /// identity and never resolves deployment artifacts itself.
   [[nodiscard]] core::Result<void> PrepareCandidateProjection(
       RetainedCollisionWorldProjector candidate_projector,
-      core::RetainedProductDTO candidate_planning_collision_model);
+      core::RetainedProductDTO candidate_planning_collision_model,
+      std::shared_ptr<const RetainedSceneFrameResolver>
+          candidate_frame_resolver = nullptr);
 
   [[nodiscard]] core::ProjectionCommitResultDTO
   ApplyTransaction(const core::SceneTransactionDTO &transaction) override;
@@ -93,6 +100,13 @@ public:
       const core::NativeProjectionDiscardDTO &request) override;
   [[nodiscard]] core::NativeProjectionStatusDTO ProjectionStageStatus(
       const core::NativeProjectionStatusQueryDTO &query) const override;
+  [[nodiscard]] core::Result<core::SceneFrameResolutionReceiptDTO>
+  ResolveSceneFrame(
+      const core::SceneFrameResolutionQueryDTO &query) const override;
+  [[nodiscard]] core::Result<core::CollisionPolicySnapshot>
+  ProjectEffectiveCollisionPolicy(
+      const core::LogicalSceneSnapshotDTO &logical_scene,
+      std::uint64_t effective_policy_revision_id) const override;
 
   [[nodiscard]] std::shared_ptr<const core::LogicalSceneSnapshotDTO>
   logical_snapshot() const;
@@ -135,6 +149,8 @@ private:
     core::NativeProjectionStageDTO request;
     RetainedCollisionWorldProjector candidate_projector;
     core::RetainedProductDTO candidate_planning_collision_model;
+    std::shared_ptr<const RetainedSceneFrameResolver>
+        candidate_frame_resolver;
     std::shared_ptr<RetainedCollisionWorldPublisher> candidate_publisher;
     core::NativeProjectionStageResultDTO stage_result;
     bool activated{};
@@ -150,7 +166,8 @@ private:
       RetainedCollisionWorldProjector projector,
       core::RetainedProductDTO planning_collision_model,
       core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
-      RetainedPlannerSceneProjectionConfig config, Clock clock);
+      RetainedPlannerSceneProjectionConfig config, Clock clock,
+      std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver);
 
   [[nodiscard]] core::Result<std::shared_ptr<RetainedCollisionWorldPublisher>>
   BuildPublisher(const RetainedCollisionWorldProjector &projector,
@@ -172,9 +189,11 @@ private:
 
   RetainedCollisionWorldProjector projector_;
   core::RetainedProductDTO planning_collision_model_;
+  std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver_;
   struct PreparedCandidateModel final {
     RetainedCollisionWorldProjector projector;
     core::RetainedProductDTO planning_collision_model;
+    std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver;
   };
   std::optional<PreparedCandidateModel> prepared_candidate_model_;
   core::ProjectionNativeRuntimeBindingDTO native_runtime_binding_;

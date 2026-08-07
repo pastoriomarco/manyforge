@@ -20,8 +20,10 @@
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_kinematic_state_projector.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
+#include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
+#include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
 #include <map>
 #include <memory>
 #include <optional>
@@ -217,6 +219,8 @@ require_fixture_one(const Range &values, Predicate predicate,
     std::optional<core::StateAuthorityClass> state_authority_override =
         std::nullopt,
     std::optional<core::ProgramCommandSchemaRefDTO> command_schema =
+        std::nullopt,
+    std::optional<core::RuntimeEpoch> provider_runtime_epoch =
         std::nullopt) {
   const auto &graph = bundle.value().cell_graph;
   const auto &component = require_fixture_one(
@@ -411,8 +415,9 @@ require_fixture_one(const Range &values, Predicate predicate,
           control_binding.provider_instance_id,
           control_binding.provider_manifest_id,
           control_binding.provider_manifest_revision,
-          core::RuntimeEpoch("epoch." +
-                             control_binding.provider_instance_id.value()),
+          provider_runtime_epoch.value_or(
+              core::RuntimeEpoch("epoch." +
+                                 control_binding.provider_instance_id.value())),
           control_binding.state_authority_id,
           state_authority_override.value_or(
               control_binding.state_authority_class),
@@ -1443,6 +1448,188 @@ TEST(RetainedProductCrossConsumer,
 }
 
 TEST(RetainedProductCrossConsumer,
+     SceneFrameResolverReadsDirectOrExternalOwnerPublicationNotMutablePlannerState) {
+  ScopedTemporaryRoot temporary;
+  const std::filesystem::path package_root =
+      temporary.path() / "retained-package";
+  const std::filesystem::path staging_parent =
+      temporary.path() / "private-stages";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
+
+  const auto materialized = deployment::test::
+      materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
+          package_root);
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &products = materialized.bundle->value().compiled_products;
+  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
+  const auto retained = load_lite6_planning_model(
+      package_root,
+      {materialized.bundle->retained_bundle_id(),
+       products.planning_collision_model.product_id});
+  const auto model_map = load_lite6_model_map(
+      package_root,
+      {materialized.bundle->retained_bundle_id(),
+       products.symbol_role_maps.front().product_id});
+
+  const core::ControllableComponentId component_id(
+      std::string(deployment::test::kLite6ControllableComponentId));
+  const core::CommandTargetId arm_target_id(
+      std::string(deployment::test::kLite6ArmTargetId));
+  const core::CommandTargetId gripper_target_id(
+      std::string(deployment::test::kLite6GripperTargetId));
+  const auto &component = require_fixture_one(
+      materialized.bundle->value().cell_graph.controllable_components,
+      [&](const auto &candidate) {
+        return candidate.controllable_component_id == component_id;
+      },
+      "scene-frame controllable component");
+  const auto &arm_graph_binding = require_fixture_one(
+      materialized.bundle->value().cell_graph.control_bindings,
+      [&](const auto &candidate) {
+        return candidate.controllable_component_id == component_id &&
+               candidate.command_target_id == arm_target_id;
+      },
+      "scene-frame arm control binding");
+  const auto &control_domain = require_fixture_one(
+      materialized.bundle->value().cell_graph.control_domains,
+      [&](const auto &candidate) {
+        return candidate.control_domain_id ==
+               arm_graph_binding.control_domain_id;
+      },
+      "scene-frame control domain");
+  std::set<core::RuntimeUnitId> local_runtime_units(
+      component.runtime_unit_ids.begin(), component.runtime_unit_ids.end());
+  local_runtime_units.insert(control_domain.runtime_unit_ids.begin(),
+                             control_domain.runtime_unit_ids.end());
+  ASSERT_EQ(local_runtime_units.size(), 1U);
+  const auto local_runtime_unit_id = *local_runtime_units.begin();
+  const core::RuntimeEpoch local_runtime_epoch(
+      "scene-frame-direct-owner-epoch");
+  const auto arm_binding = make_fixture_runtime_participant(
+      *materialized.bundle, model_map, component_id, arm_target_id,
+      core::StateAuthorityClass::kPredicted, std::nullopt,
+      local_runtime_epoch);
+  const auto gripper_binding = make_fixture_runtime_participant(
+      *materialized.bundle, model_map, component_id, gripper_target_id,
+      core::StateAuthorityClass::kPredicted, std::nullopt,
+      local_runtime_epoch);
+
+  auto stage =
+      RetainedPlanningModelStage::create_verified(retained, staging_parent);
+  auto scene = std::make_shared<roboplan::Scene>(
+      "retained_lite6_direct_frame_state",
+      std::string(stage.loader_urdf_bytes()),
+      std::string(stage.srdf_bytes()), stage.package_paths());
+  auto scene_mutex = std::make_shared<std::mutex>();
+  auto state_projector = std::make_shared<RetainedKinematicStateProjector>(
+      RetainedKinematicStateProjector::create_verified(
+          scene, scene_mutex, *materialized.bundle, model_map, retained,
+          std::vector<core::RuntimeParticipantBinding>{arm_binding,
+                                                       gripper_binding},
+          0));
+  auto arm_channel = std::make_shared<RetainedObservedStateChannel>(
+      arm_binding, state_projector,
+      RetainedObservedStateChannelConfig{
+          core::ObservedStateSourceKind::kPredictedState,
+          "test/direct-owner/arm", 0, 1U});
+  auto gripper_channel = std::make_shared<RetainedObservedStateChannel>(
+      gripper_binding, state_projector,
+      RetainedObservedStateChannelConfig{
+          core::ObservedStateSourceKind::kPredictedState,
+          "test/direct-owner/gripper", 0, 1U});
+  ASSERT_TRUE(arm_channel->initialize_from_projection(10).applied());
+  ASSERT_TRUE(gripper_channel->initialize_from_projection(10).applied());
+
+  const auto *arm_target = model_map.find_target(component_id, arm_target_id);
+  ASSERT_NE(arm_target, nullptr);
+  ASSERT_FALSE(arm_target->model_groups.empty());
+  auto collision_model = ManyForgeCollisionEngine::load_shared_model(
+      "retained_lite6_direct_frame_state", stage.loader_urdf_path(),
+      stage.srdf_path(), stage.package_paths(),
+      arm_target->model_groups.front().compiled_group_name);
+
+  EXPECT_THROW(
+      static_cast<void>(RetainedSceneFrameResolver::create_verified(
+          collision_model, *materialized.bundle, model_map, retained,
+          local_runtime_unit_id, local_runtime_epoch,
+          RetainedSceneFrameLocalStateMode::kRequireDirectProviders, {},
+          10)),
+      std::invalid_argument);
+
+  const std::shared_ptr<const core::IObservedStateProvider> arm_provider(
+      arm_channel, arm_channel->addressed_publication());
+  const std::shared_ptr<const core::IObservedStateProvider> gripper_provider(
+      gripper_channel, gripper_channel->addressed_publication());
+  const std::vector<RetainedSceneFrameStateSourceInput> provided_state_sources{
+      {arm_channel->query_context(),
+       core::ObservedStateSourceKind::kPredictedState,
+       arm_provider,
+       {}},
+      {gripper_channel->query_context(),
+       core::ObservedStateSourceKind::kPredictedState,
+       gripper_provider,
+       {}}};
+  auto resolver = RetainedSceneFrameResolver::create_verified(
+      collision_model, *materialized.bundle, model_map, retained,
+      local_runtime_unit_id, local_runtime_epoch,
+      RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
+      provided_state_sources, 10);
+  ASSERT_NE(resolver, nullptr);
+
+  auto external_resolver = RetainedSceneFrameResolver::create_verified(
+      collision_model, *materialized.bundle, model_map, retained,
+      core::RuntimeUnitId("scene-frame-external-consumer"),
+      core::RuntimeEpoch("scene-frame-external-receiver-epoch"),
+      RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
+      provided_state_sources, 10);
+  ASSERT_NE(external_resolver, nullptr);
+
+  const auto logical_scene = make_projection_runtime_shadow_snapshot(
+      materialized.bundle->value().cell_graph.cell_id);
+  const core::ProjectionLeaseBindingDTO projection_binding{
+      {materialized.bundle->retained_bundle_id(),
+       materialized.bundle->value().cell_graph.graph_revision,
+       logical_scene.shared()->revision},
+      core::ProjectionLeaseId("direct-owner-frame-lease")};
+  const core::SceneFrameResolutionQueryDTO query{
+      core::TargetCarrierSceneFrameRefDTO{
+          component_id, arm_target_id, core::FrameRoleId("tcp")},
+      projection_binding};
+  const auto neutral = resolver->Resolve(query, logical_scene.shared(), 10);
+  ASSERT_TRUE(neutral.ok()) << neutral.error().message;
+  const auto external_neutral =
+      external_resolver->Resolve(query, logical_scene.shared(), 10);
+  ASSERT_TRUE(external_neutral.ok()) << external_neutral.error().message;
+  EXPECT_EQ(external_neutral.value(), neutral.value());
+
+  const Eigen::VectorXd planner_state_before =
+      scene->getCurrentJointPositions();
+  const std::vector<double> moved_positions{0.0, -0.785, 0.785,
+                                             0.0, 1.57,   0.0};
+  const std::vector<double> zero_velocities(moved_positions.size(), 0.0);
+  const auto published = arm_channel->publish_state(
+      moved_positions, zero_velocities, 20, 20);
+  ASSERT_TRUE(published.applied())
+      << (published.error.has_value() ? published.error->message : "");
+  EXPECT_TRUE(scene->getCurrentJointPositions().isApprox(planner_state_before));
+
+  const auto moved = resolver->Resolve(query, logical_scene.shared(), 20);
+  ASSERT_TRUE(moved.ok()) << moved.error().message;
+  const auto external_moved =
+      external_resolver->Resolve(query, logical_scene.shared(), 20);
+  ASSERT_TRUE(external_moved.ok()) << external_moved.error().message;
+  EXPECT_EQ(external_moved.value(), moved.value());
+  EXPECT_FALSE(moved.value().frame_pose_in_cell ==
+               neutral.value().frame_pose_in_cell);
+  EXPECT_NE(moved.value().resolution_evidence_digest,
+            neutral.value().resolution_evidence_digest);
+  ASSERT_EQ(moved.value().kinematic_state_path_view.model_states.size(), 1U);
+  EXPECT_FALSE(
+      moved.value().kinematic_state_path_view.resource_states.empty());
+}
+
+TEST(RetainedProductCrossConsumer,
      PredictedLite6AggregateComposesAndExecutesAddressedGripperCommand) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
@@ -1883,6 +2070,27 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(detached_policy_result.ok())
       << detached_policy_result.error().message;
   EXPECT_TRUE(detached_policy_result.value().support_contacts.empty());
+  EXPECT_NE(std::find(detached_policy_result.value()
+                          .allowed_static_static_pairs.begin(),
+                      detached_policy_result.value()
+                          .allowed_static_static_pairs.end(),
+                      (core::CollisionPairId{
+                          "scene/carried-part/shape/0",
+                          "scene/support-table/shape/0"})),
+            detached_policy_result.value()
+                .allowed_static_static_pairs.end());
+  EXPECT_TRUE(std::any_of(
+      detached_policy_result.value().allowed_static_static_pairs.begin(),
+      detached_policy_result.value().allowed_static_static_pairs.end(),
+      [&](const auto &pair) {
+        const bool names_fixed_scene =
+            pair.body_a == "scene/carried-part/shape/0" ||
+            pair.body_b == "scene/carried-part/shape/0";
+        const auto &other =
+            pair.body_a == "scene/carried-part/shape/0" ? pair.body_b
+                                                        : pair.body_a;
+        return names_fixed_scene && component_body_ids.count(other) == 1U;
+      }));
   core::CarriedObjectAttachmentDTO attachment{
       core::CarriedObjectAttachmentId("carried-part-attachment"),
       core::CarriedObjectAttachmentRevision(std::string(kZeroDigest)),

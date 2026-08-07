@@ -3,7 +3,9 @@
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/types/native_projection_handoff.hpp>
 #include <manyforge_core/types/scene_transaction.hpp>
+#include <manyforge_core/types/scene_frame_resolution.hpp>
 #include <memory>
+#include <utility>
 
 namespace manyforge::core {
 
@@ -22,6 +24,22 @@ public:
   [[nodiscard]] virtual Result<CollisionWorldLeaseInventory>
   RetainProjection(const ProjectionRevisionDTO &projection_revision,
                    ProjectionLeaseId projection_lease_id) = 0;
+
+  /// Retain the exact native projection for an owner-side resolution and
+  /// return only its binding receipt. Local implementations reuse the full
+  /// inventory operation; process proxies keep the inventory native and do
+  /// not serialize collision-world internals across the Manager channel.
+  [[nodiscard]] virtual Result<ProjectionLeaseBindingDTO>
+  RetainProjectionBinding(const ProjectionRevisionDTO &projection_revision,
+                          ProjectionLeaseId projection_lease_id) {
+    auto retained = RetainProjection(projection_revision,
+                                     std::move(projection_lease_id));
+    if (!retained.ok()) {
+      return Result<ProjectionLeaseBindingDTO>::Err(retained.error());
+    }
+    return Result<ProjectionLeaseBindingDTO>::Ok(
+        retained.value().projection_binding);
+  }
 
   virtual void
   ReleaseProjection(const ProjectionLeaseId &projection_lease_id) = 0;
@@ -56,6 +74,23 @@ public:
 
   [[nodiscard]] virtual NativeProjectionStatusDTO
   ProjectionStageStatus(const NativeProjectionStatusQueryDTO &query) const = 0;
+
+  [[nodiscard]] virtual Result<SceneFrameResolutionReceiptDTO>
+  ResolveSceneFrame(const SceneFrameResolutionQueryDTO &) const {
+    return Result<SceneFrameResolutionReceiptDTO>::Err(ErrorDTO{
+        "missing_reference", "native scene-frame resolution is unavailable",
+        {{"reason", "scene_frame_resolver_not_installed"}}});
+  }
+
+  [[nodiscard]] virtual Result<CollisionPolicySnapshot>
+  ProjectEffectiveCollisionPolicy(
+      const LogicalSceneSnapshotDTO &,
+      std::uint64_t effective_policy_revision_id) const {
+    static_cast<void>(effective_policy_revision_id);
+    return Result<CollisionPolicySnapshot>::Err(ErrorDTO{
+        "invalid_request", "native collision-policy projection is unavailable",
+        {{"reason", "collision_policy_resolver_not_installed"}}});
+  }
 };
 
 /// Resolves one exact native projection client selected by retained/durable

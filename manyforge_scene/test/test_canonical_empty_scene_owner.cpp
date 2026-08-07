@@ -1827,7 +1827,12 @@ public:
     mode_ = mode;
     calls_ = 0U;
     rebuild_calls_ = 0U;
+    frame_resolution_calls_ = 0U;
+    policy_projection_calls_ = 0U;
     throw_after_next_rebuild_effect_ = false;
+    frame_resolution_error_.reset();
+    resolved_model_instance_override_.reset();
+    retained_leases_.clear();
     transactions_.clear();
     health_ = core::ProjectionHealthDTO{
         binding_,    1U,           core::ProjectionHealthState::kHealthy,
@@ -1847,6 +1852,34 @@ public:
   [[nodiscard]] const std::vector<core::SceneTransactionDTO> &
   transactions() const noexcept {
     return transactions_;
+  }
+
+  void SetFrameResolution(core::Pose3DTO pose,
+                          std::vector<core::ComponentAttachmentRevision>
+                              attachment_revisions = {}) {
+    frame_pose_in_cell_ = std::move(pose);
+    attachment_revisions_ = std::move(attachment_revisions);
+  }
+
+  void RejectFrameResolution(core::ErrorDTO error) {
+    frame_resolution_error_ = std::move(error);
+  }
+
+  void SetResolvedModelInstanceOverride(
+      std::optional<core::ModelInstanceId> model_instance_id) {
+    resolved_model_instance_override_ = std::move(model_instance_id);
+  }
+
+  [[nodiscard]] std::size_t frame_resolution_calls() const noexcept {
+    return frame_resolution_calls_;
+  }
+
+  [[nodiscard]] std::size_t policy_projection_calls() const noexcept {
+    return policy_projection_calls_;
+  }
+
+  [[nodiscard]] std::size_t retained_lease_count() const noexcept {
+    return retained_leases_.size();
   }
 
   void ThrowAfterNextRebuildEffect() noexcept {
@@ -1938,7 +1971,110 @@ public:
                  {}});
   }
 
-  void ReleaseProjection(const core::ProjectionLeaseId &) override {}
+  core::Result<core::ProjectionLeaseBindingDTO>
+  RetainProjectionBinding(const ProjectionRevisionDTO &revision,
+                          core::ProjectionLeaseId lease_id) override {
+    if (!health_.healthy_for_target(revision) || lease_id.empty() ||
+        !retained_leases_.insert(lease_id).second) {
+      return core::Result<core::ProjectionLeaseBindingDTO>::Err(
+          ErrorDTO{"live_scene_snapshot_unavailable",
+                   "test projection cannot retain the requested revision",
+                   {{"reason", "test_projection_lease_rejected"}}});
+    }
+    return core::Result<core::ProjectionLeaseBindingDTO>::Ok(
+        core::ProjectionLeaseBindingDTO{revision, std::move(lease_id)});
+  }
+
+  void ReleaseProjection(const core::ProjectionLeaseId &lease_id) override {
+    retained_leases_.erase(lease_id);
+  }
+
+  core::Result<core::SceneFrameResolutionReceiptDTO>
+  ResolveSceneFrame(
+      const core::SceneFrameResolutionQueryDTO &query) const override {
+    ++frame_resolution_calls_;
+    if (!query.valid() ||
+        !retained_leases_.contains(
+            query.projection_binding.projection_lease_id)) {
+      return core::Result<core::SceneFrameResolutionReceiptDTO>::Err(
+          ErrorDTO{"live_scene_snapshot_unavailable",
+                   "test frame query has no retained projection",
+                   {{"reason", "test_projection_lease_missing"}}});
+    }
+    if (frame_resolution_error_.has_value()) {
+      return core::Result<core::SceneFrameResolutionReceiptDTO>::Err(
+          *frame_resolution_error_);
+    }
+    const auto frame = std::visit(
+        [&](const auto &selector) -> core::ResolvedFrameDTO {
+          using Selector = std::remove_cvref_t<decltype(selector)>;
+          if constexpr (std::is_same_v<Selector,
+                                       core::TargetCarrierSceneFrameRefDTO>) {
+            return core::ResolvedComponentModelFrameDTO{
+                selector.controllable_component_id,
+                resolved_model_instance_override_.value_or(
+                    core::ModelInstanceId("model.1")),
+                selector.frame_role_id,
+                "compiled_" + selector.frame_role_id.value(),
+                core::ModelRevision("model-revision-1")};
+          } else {
+            return std::visit(
+                [&](const auto &reference) -> core::ResolvedFrameDTO {
+                  using Reference =
+                      std::remove_cvref_t<decltype(reference)>;
+                  if constexpr (std::is_same_v<
+                                    Reference,
+                                    core::CellSceneFrameRefDTO>) {
+                    return core::ResolvedCellFrameDTO{
+                        reference.cell_id, "compiled_cell"};
+                  } else if constexpr (std::is_same_v<
+                                           Reference,
+                                           core::ComponentSceneFrameRefDTO>) {
+                    return core::ResolvedComponentModelFrameDTO{
+                        reference.controllable_component_id,
+                        resolved_model_instance_override_.value_or(
+                            reference.model_instance_id),
+                        reference.frame_role_id,
+                        "compiled_" + reference.frame_role_id.value(),
+                        core::ModelRevision("model-revision-1")};
+                  } else {
+                    return core::ResolvedPassiveModelFrameDTO{
+                        reference.model_instance_id,
+                        reference.frame_role_id,
+                        "compiled_" + reference.frame_role_id.value(),
+                        core::ModelRevision("model-revision-1")};
+                  }
+                },
+                selector);
+          }
+        },
+        query.selector);
+    return core::Result<core::SceneFrameResolutionReceiptDTO>::Ok(
+        core::SceneFrameResolutionReceiptDTO{
+            frame, frame_pose_in_cell_, attachment_revisions_,
+            query.projection_binding, Digest('9')});
+  }
+
+  core::Result<core::CollisionPolicySnapshot>
+  ProjectEffectiveCollisionPolicy(
+      const core::LogicalSceneSnapshotDTO &snapshot,
+      const std::uint64_t effective_policy_revision_id) const override {
+    ++policy_projection_calls_;
+    if (!snapshot.locally_valid() ||
+        effective_policy_revision_id != snapshot.revision.revision_id) {
+      return core::Result<core::CollisionPolicySnapshot>::Err(
+          ErrorDTO{"invalid_request",
+                   "test collision-policy query is malformed", {}});
+    }
+    auto effective = snapshot.configured_collision_policy;
+    effective.revision.revision_id = effective_policy_revision_id;
+    effective.revision.content_hash =
+        core::logical_scene_identity::
+            ComputeCollisionPolicyContentDigest(effective)
+                .value();
+    return core::Result<core::CollisionPolicySnapshot>::Ok(
+        std::move(effective));
+  }
 
   core::ProjectionHealthDTO ProjectionHealth() const override {
     return health_;
@@ -2146,6 +2282,13 @@ private:
   std::size_t calls_{};
   std::size_t rebuild_calls_{};
   std::vector<core::SceneTransactionDTO> transactions_;
+  core::Pose3DTO frame_pose_in_cell_{};
+  std::vector<core::ComponentAttachmentRevision> attachment_revisions_;
+  std::optional<core::ErrorDTO> frame_resolution_error_;
+  std::optional<core::ModelInstanceId> resolved_model_instance_override_;
+  mutable std::size_t frame_resolution_calls_{};
+  mutable std::size_t policy_projection_calls_{};
+  std::set<core::ProjectionLeaseId> retained_leases_;
 };
 
 /// Deliberately return a distinct forwarding client from the resolver so the
@@ -2167,6 +2310,13 @@ public:
   RetainProjection(const ProjectionRevisionDTO &revision,
                    core::ProjectionLeaseId lease_id) override {
     return projection_.RetainProjection(revision, std::move(lease_id));
+  }
+
+  core::Result<core::ProjectionLeaseBindingDTO>
+  RetainProjectionBinding(const ProjectionRevisionDTO &revision,
+                          core::ProjectionLeaseId lease_id) override {
+    return projection_.RetainProjectionBinding(revision,
+                                               std::move(lease_id));
   }
 
   void ReleaseProjection(const core::ProjectionLeaseId &lease_id) override {
@@ -2221,6 +2371,20 @@ public:
   core::NativeProjectionStatusDTO ProjectionStageStatus(
       const core::NativeProjectionStatusQueryDTO &query) const override {
     return projection_.ProjectionStageStatus(query);
+  }
+
+  core::Result<core::SceneFrameResolutionReceiptDTO>
+  ResolveSceneFrame(
+      const core::SceneFrameResolutionQueryDTO &query) const override {
+    return projection_.ResolveSceneFrame(query);
+  }
+
+  core::Result<core::CollisionPolicySnapshot>
+  ProjectEffectiveCollisionPolicy(
+      const core::LogicalSceneSnapshotDTO &snapshot,
+      const std::uint64_t effective_policy_revision_id) const override {
+    return projection_.ProjectEffectiveCollisionPolicy(snapshot,
+                                                       effective_policy_revision_id);
   }
 
 private:
@@ -2539,7 +2703,7 @@ TEST(CanonicalEmptySceneOwner,
 }
 
 TEST(CanonicalEmptySceneOwner,
-     ResolutionDependentRequestsFailBeforeJournalOrProjection) {
+     MissingResolutionAndCallerAuthoredDerivedPolicyFailBeforeEffects) {
   TemporaryDirectory directory("scene-resolution-gate");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
@@ -2565,9 +2729,9 @@ TEST(CanonicalEmptySceneOwner,
   const auto unresolved = owner.Commit(component_frame);
   ASSERT_FALSE(unresolved.success);
   ASSERT_TRUE(unresolved.error.has_value());
-  EXPECT_EQ(unresolved.error->code, "scene_frame_resolution_unavailable");
+  EXPECT_EQ(unresolved.error->code, "missing_reference");
   EXPECT_EQ(unresolved.error->details.at("reason"),
-            "scene_frame_resolver_not_installed");
+            "scene_frame_projection_unavailable");
 
   auto foreign_cell =
       AddBoxRequest(accepted.canonical_empty_target, admission.cell_id(),
@@ -2599,8 +2763,9 @@ TEST(CanonicalEmptySceneOwner,
   const auto attach_unavailable = owner.Commit(attach);
   ASSERT_FALSE(attach_unavailable.success);
   ASSERT_TRUE(attach_unavailable.error.has_value());
-  EXPECT_EQ(attach_unavailable.error->code,
-            "scene_frame_resolution_unavailable");
+  EXPECT_EQ(attach_unavailable.error->code, "missing_reference");
+  EXPECT_EQ(attach_unavailable.error->details.at("reason"),
+            "scene_frame_projection_unavailable");
 
   auto policy = owner.LogicalSnapshot()->configured_collision_policy;
   policy.allowed_static_static_pairs.push_back(
@@ -2617,16 +2782,195 @@ TEST(CanonicalEmptySceneOwner,
   const auto policy_unavailable = owner.Commit(derived_policy);
   ASSERT_FALSE(policy_unavailable.success);
   ASSERT_TRUE(policy_unavailable.error.has_value());
-  EXPECT_EQ(policy_unavailable.error->code,
-            "scene_policy_derivation_unavailable");
+  EXPECT_EQ(policy_unavailable.error->code, "invalid_request");
   EXPECT_EQ(policy_unavailable.error->details.at("reason"),
-            "collision_policy_resolver_not_installed");
+            "derived_collision_policy_fields_are_read_only");
 
   EXPECT_EQ(projection.calls(), 0U);
   const auto integrity = owner.VerifyIntegrity();
   EXPECT_EQ(integrity.transaction_intent_count, 0);
   EXPECT_EQ(integrity.request_outcome_count, 0);
   EXPECT_EQ(integrity.projection_attempt_count, 0);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     ResolvesPortableFramesAndCarriesThenDetachesAnObjectBeforeEffects) {
+  TemporaryDirectory directory("scene-frame-carried-object");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto native_bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-frame-resolution");
+  ASSERT_EQ(native_bindings.size(), 1U);
+
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  FakePlannerSceneProjection projection(native_bindings.front());
+  FakePlannerSceneProjectionResolver projection_resolver(projection);
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader, bundle_source,
+                                 projection_resolver);
+  auto active = FinalizeNativeCandidate(
+      owner, publication_reader, admission, *candidate.bundle,
+      native_bindings, "apply-frame-resolution-native");
+  projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+
+  const core::ComponentAttachmentRevision structural_revision(
+      "component-attachment-revision-1");
+  projection.SetFrameResolution(
+      core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
+      {structural_revision});
+  auto add = AddBoxRequest(active, admission.cell_id(),
+                           "scene-request-component-add");
+  std::get<core::AddObjectRequestDTO>(add.operation).frame_ref =
+      core::ComponentSceneFrameRefDTO{
+          core::ControllableComponentId("component.1"),
+          core::ModelInstanceId("model.1"),
+          core::FrameRoleId("tool_frame")};
+  const auto added = owner.Commit(add);
+  ASSERT_TRUE(added.success)
+      << (added.error.has_value() ? added.error->message : "missing error");
+  ASSERT_TRUE(added.committed_projection_revision.has_value());
+  active = *added.committed_projection_revision;
+  auto snapshot = owner.LogicalSnapshot();
+  ASSERT_EQ(snapshot->objects.size(), 1U);
+  const auto *fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+      &snapshot->objects.front().placement);
+  ASSERT_NE(fixed, nullptr);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.x_m, 1.25);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.y_m, 1.5);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.z_m, 3.75);
+  EXPECT_EQ(projection.retained_lease_count(), 0U);
+
+  core::SceneTransactionRequestDTO attach{
+      SceneRequestContext("scene-request-attach-resolved", active),
+      {},
+      active,
+      core::AttachCarriedObjectRequestDTO{
+          core::CarriedObjectAttachmentId("attachment.1"),
+          core::SceneResourceId("scene-box"),
+          core::ControllableComponentId("component.1"),
+          core::CommandTargetId("arm"),
+          core::FrameRoleId("tool_frame"),
+          {core::CollisionBodyRoleId("finger")},
+          {structural_revision},
+      },
+  };
+  const auto attached = owner.Commit(attach);
+  ASSERT_TRUE(attached.success)
+      << (attached.error.has_value() ? attached.error->message
+                                     : "missing error");
+  ASSERT_TRUE(attached.committed_projection_revision.has_value());
+  active = *attached.committed_projection_revision;
+  snapshot = owner.LogicalSnapshot();
+  ASSERT_EQ(snapshot->carried_object_attachments.size(), 1U);
+  EXPECT_EQ(snapshot->carried_object_attachments.front()
+                .carrier_frame_ref,
+            core::SceneFrameRefDTO(core::ComponentSceneFrameRefDTO{
+                core::ControllableComponentId("component.1"),
+                core::ModelInstanceId("model.1"),
+                core::FrameRoleId("tool_frame")}));
+
+  projection.SetFrameResolution(
+      core::Pose3DTO{{2.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
+      {structural_revision});
+  const auto carried_pose =
+      owner.GetObjectPose(core::SceneResourceId("scene-box"));
+  ASSERT_TRUE(carried_pose.ok()) << carried_pose.error().message;
+  EXPECT_DOUBLE_EQ(carried_pose.value().position_m.x_m, 2.25);
+  EXPECT_DOUBLE_EQ(carried_pose.value().position_m.y_m, 1.5);
+  EXPECT_DOUBLE_EQ(carried_pose.value().position_m.z_m, 3.75);
+  EXPECT_EQ(projection.retained_lease_count(), 0U);
+
+  const auto attachment = snapshot->carried_object_attachments.front();
+  core::SceneTransactionRequestDTO detach{
+      SceneRequestContext("scene-request-detach-resolved", active),
+      {},
+      active,
+      core::DetachCarriedObjectRequestDTO{
+          attachment.carried_object_attachment_id,
+          attachment.carried_object_attachment_revision,
+          core::Pose3DTO{{0.5, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}},
+          core::PassiveModelSceneFrameRefDTO{
+              core::ModelInstanceId("fixture.1"),
+              core::FrameRoleId("origin")},
+      },
+  };
+  const auto detached = owner.Commit(detach);
+  ASSERT_TRUE(detached.success)
+      << (detached.error.has_value() ? detached.error->message
+                                     : "missing error");
+  ASSERT_TRUE(detached.committed_projection_revision.has_value());
+  active = *detached.committed_projection_revision;
+  snapshot = owner.LogicalSnapshot();
+  ASSERT_TRUE(snapshot->carried_object_attachments.empty());
+  fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+      &snapshot->objects.front().placement);
+  ASSERT_NE(fixed, nullptr);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.x_m, 2.5);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.y_m, 2.0);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.z_m, 3.0);
+
+  auto stale_attach = attach;
+  stale_attach.request_context =
+      SceneRequestContext("scene-request-stale-attach", active);
+  stale_attach.expected_projection_revision = active;
+  auto &stale_operation =
+      std::get<core::AttachCarriedObjectRequestDTO>(stale_attach.operation);
+  stale_operation.expected_component_attachment_revisions = {
+      core::ComponentAttachmentRevision("stale-revision")};
+  const auto stale = owner.Commit(stale_attach);
+  ASSERT_FALSE(stale.success);
+  ASSERT_TRUE(stale.error.has_value());
+  EXPECT_EQ(stale.error->code, "stale_revision");
+  EXPECT_EQ(stale.error->details.at("reason"),
+            "carrier_attachment_revision_mismatch");
+
+  projection.SetResolvedModelInstanceOverride(
+      core::ModelInstanceId("model.foreign"));
+  auto cross_instance = AddBoxRequest(
+      active, admission.cell_id(), "scene-request-cross-instance-frame");
+  std::get<core::AddObjectRequestDTO>(cross_instance.operation).frame_ref =
+      core::ComponentSceneFrameRefDTO{
+          core::ControllableComponentId("component.1"),
+          core::ModelInstanceId("model.1"),
+          core::FrameRoleId("tool_frame")};
+  const auto crossed = owner.Commit(cross_instance);
+  ASSERT_FALSE(crossed.success);
+  ASSERT_TRUE(crossed.error.has_value());
+  EXPECT_EQ(crossed.error->code, "missing_reference");
+  EXPECT_EQ(crossed.error->details.at("reason"),
+            "scene_frame_resolution_missing_or_foreign");
+
+  projection.SetResolvedModelInstanceOverride(std::nullopt);
+  projection.RejectFrameResolution(core::ErrorDTO{
+      "missing_reference", "test retained frame is ambiguous",
+      {{"reason", "scene_frame_reference_ambiguous"}}});
+  auto ambiguous = AddBoxRequest(
+      active, admission.cell_id(), "scene-request-ambiguous-frame");
+  std::get<core::AddObjectRequestDTO>(ambiguous.operation).frame_ref =
+      core::PassiveModelSceneFrameRefDTO{
+          core::ModelInstanceId("fixture.1"),
+          core::FrameRoleId("origin")};
+  const auto ambiguity = owner.Commit(ambiguous);
+  ASSERT_FALSE(ambiguity.success);
+  ASSERT_TRUE(ambiguity.error.has_value());
+  EXPECT_EQ(ambiguity.error->code, "missing_reference");
+  EXPECT_EQ(ambiguity.error->details.at("reason"),
+            "scene_frame_reference_ambiguous");
+
+  EXPECT_EQ(projection.calls(), 3U);
+  EXPECT_EQ(projection.frame_resolution_calls(), 7U);
+  EXPECT_EQ(projection.policy_projection_calls(), 3U);
+  EXPECT_EQ(projection.retained_lease_count(), 0U);
+  const auto integrity = owner.VerifyIntegrity();
+  EXPECT_EQ(integrity.transaction_intent_count, 3);
+  EXPECT_EQ(integrity.request_outcome_count, 3);
+  EXPECT_EQ(integrity.projection_attempt_count, 3);
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -2990,6 +3334,66 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_EQ(integrity.projection_attempt_count, 2);
     EXPECT_EQ(integrity.projection_result_count, 2);
     EXPECT_TRUE(integrity.projection_desynchronized);
+  }
+
+  {
+    TemporaryDirectory directory("scene-frame-multi-projection-errors");
+    ControlledPublicationReader publication_reader;
+    FakePlannerSceneProjection first_projection(
+        two_robot_native_bindings.front());
+    FakePlannerSceneProjection second_projection(
+        two_robot_native_bindings.back());
+    FakePlannerSceneProjectionResolver projection_resolver{
+        &first_projection, &second_projection};
+    CanonicalEmptySceneOwner owner(
+        directory.path() / "logical-scene.sqlite3", admission,
+        publication_reader, bundle_source, projection_resolver);
+    const auto active = FinalizeNativeCandidate(
+        owner, publication_reader, admission, *two_robot_candidate.bundle,
+        two_robot_native_bindings, "apply-frame-multi-projection-errors");
+    first_projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+    second_projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+
+    auto request = AddBoxRequest(active, admission.cell_id(),
+                                 "scene-request-stale-frame-owner");
+    std::get<core::AddObjectRequestDTO>(request.operation).frame_ref =
+        core::ComponentSceneFrameRefDTO{
+            two_robot_candidate.bundle->value()
+                .cell_graph.control_bindings.front()
+                .controllable_component_id,
+            core::ModelInstanceId("model.owner"),
+            core::FrameRoleId("tool_frame")};
+    first_projection.RejectFrameResolution(core::ErrorDTO{
+        "stale_revision", "test owner state is stale",
+        {{"reason", "kinematic_state_view_stale"}}});
+    const auto stale = owner.Commit(request);
+    ASSERT_FALSE(stale.success);
+    ASSERT_TRUE(stale.error.has_value());
+    EXPECT_EQ(stale.error->code, "stale_revision");
+    EXPECT_EQ(stale.error->details.at("reason"),
+              "kinematic_state_view_stale");
+    EXPECT_EQ(first_projection.calls(), 0U);
+    EXPECT_EQ(second_projection.calls(), 0U);
+    EXPECT_EQ(first_projection.retained_lease_count(), 0U);
+    EXPECT_EQ(second_projection.retained_lease_count(), 0U);
+    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 0);
+
+    first_projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+    second_projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+    first_projection.RejectFrameResolution(core::ErrorDTO{
+        "missing_reference", "test projection does not own this frame",
+        {{"reason", "scene_frame_reference_missing"}}});
+    request.request_context = SceneRequestContext(
+        "scene-request-one-frame-owner", active);
+    const auto resolved_by_owner = owner.Commit(request);
+    ASSERT_TRUE(resolved_by_owner.success)
+        << (resolved_by_owner.error.has_value()
+                ? resolved_by_owner.error->message
+                : "missing error");
+    EXPECT_EQ(first_projection.calls(), 1U);
+    EXPECT_EQ(second_projection.calls(), 1U);
+    EXPECT_EQ(first_projection.retained_lease_count(), 0U);
+    EXPECT_EQ(second_projection.retained_lease_count(), 0U);
   }
 }
 
