@@ -2713,7 +2713,7 @@ TEST(RetainedProductCrossConsumer,
       collision_projector, products.planning_collision_model, native_binding,
       initial_scene,
       RetainedPlannerSceneProjectionConfig{
-          "retained-lite6-transactional-projection", 8U, 8U},
+          "retained-lite6-transactional-projection", 2U, 8U},
       [&clock_value, &fail_clock] {
         if (fail_clock) {
           throw std::runtime_error("injected projection clock failure");
@@ -2897,6 +2897,39 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(recovered.presence_valid());
   EXPECT_TRUE(
       recovered.resulting_health.healthy_for_target(candidate_revision));
+  std::optional<core::SceneTransactionDTO> oldest_retained_transaction;
+  for (std::uint64_t sequence = 3U; sequence <= 5U; ++sequence) {
+    const core::SceneTransactionDTO no_op{
+        core::RequestId("projection-bounded-replay-" +
+                        std::to_string(sequence)),
+        {},
+        sequence,
+        candidate_revision,
+        candidate_revision,
+        core::ContentDigest(std::string(kZeroDigest)),
+        core::ResolvedUpsertSceneObjectDTO{second_object},
+        core::ContentDigest(std::string(kZeroDigest))};
+    const auto result = projection->ApplyTransaction(no_op);
+    ASSERT_TRUE(result.presence_valid());
+    EXPECT_EQ(result.result, core::ProjectionCommitResultStateDTO::kCommitted);
+    if (sequence == 3U) {
+      oldest_retained_transaction = no_op;
+      const auto replayed = projection->ApplyTransaction(no_op);
+      EXPECT_EQ(replayed.transaction_sequence, sequence);
+      EXPECT_EQ(replayed.result,
+                core::ProjectionCommitResultStateDTO::kCommitted);
+    }
+  }
+  ASSERT_TRUE(oldest_retained_transaction.has_value());
+  const auto compacted_replay =
+      projection->ApplyTransaction(*oldest_retained_transaction);
+  EXPECT_EQ(compacted_replay.result,
+            core::ProjectionCommitResultStateDTO::kRejectedRollbackProven);
+  ASSERT_TRUE(compacted_replay.error.has_value());
+  EXPECT_EQ(compacted_replay.error->details.at("reason"),
+            "native_projection_resolved_delta_mismatch");
+  ASSERT_NE(projection->logical_snapshot(), nullptr);
+  EXPECT_EQ(projection->logical_snapshot()->transaction_sequence, 5U);
   EXPECT_EQ(projection->scene_snapshot_lease_retention_stats().retained_count,
             2U);
   const auto recovered_predecessor =

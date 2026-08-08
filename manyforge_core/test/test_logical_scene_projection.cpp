@@ -95,6 +95,33 @@ TEST(LogicalSceneProjection, ReconstructsUpsertAndExactNoOp) {
   EXPECT_EQ(repeated.value().topology_epoch, added.topology_epoch);
 }
 
+TEST(LogicalSceneProjection,
+     AcceptsAForwardSequenceGapAfterAClosedFailedWrite) {
+  const auto empty = EmptyScene();
+  auto added = empty;
+  // Sequence 1 was assigned to an accepted write whose native effect failed
+  // and was recovered back to this exact predecessor.
+  added.transaction_sequence = 2U;
+  added.topology_epoch = 1U;
+  added.objects.push_back(DetachedObject());
+  SealSuccessor(added, 2U);
+
+  const auto advanced = ApplyResolvedSceneTransaction(
+      empty,
+      Transaction(empty, added,
+                  ResolvedUpsertSceneObjectDTO{added.objects.front()}));
+  ASSERT_TRUE(advanced.ok()) << advanced.error().message;
+  EXPECT_EQ(advanced.value(), added);
+
+  auto old_sequence = added;
+  old_sequence.transaction_sequence = 1U;
+  const auto rejected = ApplyResolvedSceneTransaction(
+      added,
+      Transaction(added, old_sequence,
+                  ResolvedUpsertSceneObjectDTO{added.objects.front()}));
+  EXPECT_FALSE(rejected.ok());
+}
+
 TEST(LogicalSceneProjection, DistinguishesFreshnessFromTopology) {
   auto current = EmptyScene();
   current.objects.push_back(DetachedObject());

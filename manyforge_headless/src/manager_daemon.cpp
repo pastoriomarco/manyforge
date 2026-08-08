@@ -789,7 +789,7 @@ private:
     const auto snapshot = scene_owner_.ReadActiveSnapshot();
     Require(snapshot.has_value(),
             "Manager daemon cannot publish an absent post-bootstrap scene");
-    const auto scene_epoch = snapshot->shared()->revision.scene_id.value();
+    const auto scene_epoch = scene_owner_.CurrentRequestOwnerEpoch().value();
     return scene_channel_
         .Publish("logical_scene", scene_owner_id_, scene_epoch, observed_at,
                  BuildLogicalSceneSourcePayload(access, snapshot))

@@ -21,14 +21,15 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "logical_scene_codec_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#include "logical_scene_codec_internal.hpp"
 #include "manyforge_scene/canonical_empty_scene_owner.hpp"
 #include "manyforge_scene/scene_transaction_codec.hpp"
 #include "sqlite_scene_lifecycle_internal.hpp"
@@ -75,6 +76,7 @@ using core::ProjectionBootstrapStatusQueryDTO;
 using core::ProjectionBootstrapStatusState;
 using core::ProjectionNativeRuntimeBindingDTO;
 using core::ProjectionRevisionDTO;
+using core::RequestOwnerEpoch;
 using core::Result;
 
 constexpr std::string_view kExpectedSceneId =
@@ -398,6 +400,112 @@ void ExecuteSql(const std::filesystem::path &database_path,
   if (result != SQLITE_OK) {
     throw std::runtime_error("test SQL failed: " + detail);
   }
+}
+
+std::string ReadSqlResource(const std::string_view name) {
+  std::ifstream input(
+      std::filesystem::path(MANYFORGE_SCENE_TEST_RESOURCE_ROOT) /
+          std::string(name),
+      std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open scene SQL test resource");
+  }
+  std::ostringstream content;
+  content << input.rdbuf();
+  if (input.bad()) {
+    throw std::runtime_error("cannot read scene SQL test resource");
+  }
+  return content.str();
+}
+
+void DowngradeBoundedHistoryStoreToV5ForMigrationTest(
+    const std::filesystem::path &database_path) {
+  std::string sql = R"sql(
+PRAGMA foreign_keys=OFF;
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE test_recovery_intents AS
+SELECT recovery_generation,structural_lineage_generation,
+       target_retained_bundle_id,target_graph_revision,target_scene_id,
+       target_scene_revision_id,target_scene_content_hash,native_binding_count
+FROM logical_scene_native_runtime_recovery_intents;
+CREATE TEMP TABLE test_recovery_bindings AS
+SELECT recovery_generation,binding_ordinal,provider_binding_id,
+       provider_binding_revision,runtime_unit_id,runtime_epoch
+FROM logical_scene_native_runtime_recovery_bindings;
+CREATE TEMP TABLE test_recovery_results AS
+SELECT recovery_generation,binding_ordinal,source_sequence,
+       native_projection_generation,projection_content_digest
+FROM logical_scene_native_runtime_recovery_results;
+CREATE TEMP TABLE test_recovery_completions AS
+SELECT recovery_generation,result_count
+FROM logical_scene_native_runtime_recovery_completions;
+
+DROP TRIGGER logical_scene_bounded_history_migrations_no_update;
+DROP TRIGGER logical_scene_bounded_history_migrations_no_delete;
+DROP TRIGGER logical_scene_history_state_no_delete;
+DROP TRIGGER logical_scene_transaction_intents_no_delete;
+DROP TRIGGER logical_scene_request_outcomes_no_delete;
+DROP TRIGGER logical_scene_projection_attempts_no_delete;
+DROP TRIGGER logical_scene_projection_results_no_delete;
+DROP TRIGGER logical_scene_owner_events_no_delete;
+DROP TRIGGER logical_scene_native_runtime_recovery_intents_no_update;
+DROP TRIGGER logical_scene_native_runtime_recovery_intents_no_delete;
+DROP TRIGGER logical_scene_native_runtime_recovery_bindings_no_update;
+DROP TRIGGER logical_scene_native_runtime_recovery_bindings_no_delete;
+DROP TRIGGER logical_scene_native_runtime_recovery_results_no_update;
+DROP TRIGGER logical_scene_native_runtime_recovery_results_no_delete;
+DROP TRIGGER logical_scene_native_runtime_recovery_completions_no_update;
+DROP TRIGGER logical_scene_native_runtime_recovery_completions_no_delete;
+DROP TABLE logical_scene_native_runtime_recovery_results;
+DROP TABLE logical_scene_native_runtime_recovery_completions;
+DROP TABLE logical_scene_native_runtime_recovery_bindings;
+DROP TABLE logical_scene_native_runtime_recovery_intents;
+DROP TABLE logical_scene_bounded_history_migrations;
+DROP TABLE logical_scene_history_state;
+
+CREATE TRIGGER logical_scene_transaction_intents_no_delete
+BEFORE DELETE ON logical_scene_transaction_intents
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_transaction_intents is immutable');
+END;
+CREATE TRIGGER logical_scene_request_outcomes_no_delete
+BEFORE DELETE ON logical_scene_request_outcomes
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_request_outcomes is immutable');
+END;
+CREATE TRIGGER logical_scene_projection_attempts_no_delete
+BEFORE DELETE ON logical_scene_projection_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_projection_attempts is immutable');
+END;
+CREATE TRIGGER logical_scene_projection_results_no_delete
+BEFORE DELETE ON logical_scene_projection_results
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_projection_results is immutable');
+END;
+CREATE TRIGGER logical_scene_owner_events_no_delete
+BEFORE DELETE ON logical_scene_owner_events
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_owner_events is immutable');
+END;
+)sql";
+  sql += ReadSqlResource("003_native_projection_handoff.sql");
+  sql += R"sql(
+INSERT INTO logical_scene_native_runtime_recovery_intents
+SELECT * FROM test_recovery_intents;
+INSERT INTO logical_scene_native_runtime_recovery_bindings
+SELECT * FROM test_recovery_bindings;
+INSERT INTO logical_scene_native_runtime_recovery_results
+SELECT * FROM test_recovery_results;
+INSERT INTO logical_scene_native_runtime_recovery_completions
+SELECT * FROM test_recovery_completions;
+DROP TABLE test_recovery_completions;
+DROP TABLE test_recovery_results;
+DROP TABLE test_recovery_bindings;
+DROP TABLE test_recovery_intents;
+COMMIT;
+)sql";
+  ExecuteSql(database_path, sql);
 }
 
 void Require(const bool condition, const std::string_view message) {
@@ -1882,6 +1990,8 @@ public:
     return retained_leases_.size();
   }
 
+  void SetMode(const Mode mode) noexcept { mode_ = mode; }
+
   void ThrowAfterNextRebuildEffect() noexcept {
     throw_after_next_rebuild_effect_ = true;
   }
@@ -2521,6 +2631,142 @@ NativeRuntimeBindings(const core::RetainedBundleDTO &bundle,
 }
 
 TEST(CanonicalEmptySceneOwner,
+     SustainedSceneUpdatesCheckpointAndRotateOnlyTheRequestEpoch) {
+  TemporaryDirectory directory("scene-sustained-history");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto native_bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-sustained-history");
+  ASSERT_EQ(native_bindings.size(), 1U);
+
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  FakePlannerSceneProjection native_projection(native_bindings.front());
+  FakePlannerSceneProjectionResolver resolver(native_projection);
+  std::optional<ProjectionRevisionDTO> projection;
+  RequestOwnerEpoch original_epoch(std::string{});
+  RequestOwnerEpoch rotated_epoch(std::string{});
+  std::optional<core::SceneTransactionRequestDTO> most_recent_request;
+  {
+    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
+                                   bundle_source, resolver);
+    projection = FinalizeNativeCandidate(
+        owner, publication_reader, admission, *candidate.bundle,
+        native_bindings, "apply-native-sustained-history");
+    const auto added = owner.Commit(AddBoxRequest(
+        *projection, admission.cell_id(), "scene-sustained-1"));
+    ASSERT_TRUE(added.success);
+    projection = *added.committed_projection_revision;
+    original_epoch = owner.CurrentRequestOwnerEpoch();
+    EXPECT_EQ(original_epoch.value(),
+              projection->scene_revision.scene_id.value());
+    const auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
+    ASSERT_TRUE(pose.ok());
+
+    for (std::size_t sequence = 2U;
+         sequence < kMaximumLogicalSceneTransactions; ++sequence) {
+      core::SceneTransactionRequestDTO request{
+          SceneRequestContext("scene-sustained-" + std::to_string(sequence),
+                              *projection),
+          {},
+          *projection,
+          core::UpdateObjectPoseRequestDTO{
+              core::SceneResourceId("scene-box"), pose.value(),
+              core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
+              false}};
+      const auto committed = owner.Commit(request);
+      ASSERT_TRUE(committed.success)
+          << (committed.error.has_value() ? committed.error->message
+                                          : "missing error");
+      EXPECT_EQ(committed.transaction_sequence, sequence);
+      EXPECT_EQ(committed.update_status, core::SceneUpdateStatusDTO::kNoOp);
+      projection = *committed.committed_projection_revision;
+    }
+
+    native_projection.SetMode(
+        FakePlannerSceneProjection::Mode::kRollbackProven);
+    core::SceneTransactionRequestDTO closed_failure{
+        SceneRequestContext("scene-sustained-256-rollback", *projection),
+        {},
+        *projection,
+        core::UpdateObjectPoseRequestDTO{
+            core::SceneResourceId("scene-box"), pose.value(),
+            core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
+            false}};
+    const auto failed = owner.Commit(closed_failure);
+    ASSERT_FALSE(failed.success);
+    EXPECT_EQ(failed.projection_status,
+              core::SceneProjectionCommitStatusDTO::kRejectedRollbackProven);
+    EXPECT_EQ(owner.LogicalSnapshot()->transaction_sequence,
+              kMaximumLogicalSceneTransactions - 1U);
+
+    most_recent_request = core::SceneTransactionRequestDTO{
+        SceneRequestContext("scene-sustained-after-compaction", *projection),
+        {},
+        *projection,
+        core::UpdateObjectPoseRequestDTO{
+            core::SceneResourceId("scene-box"), pose.value(),
+            core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
+            false}};
+    const auto rotated = owner.Commit(*most_recent_request);
+    ASSERT_FALSE(rotated.success);
+    EXPECT_EQ(rotated.replay_status,
+              core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch);
+    ASSERT_TRUE(rotated.error.has_value());
+    EXPECT_EQ(rotated.error->code, "stale_request_owner_epoch");
+    rotated_epoch = owner.CurrentRequestOwnerEpoch();
+    EXPECT_NE(rotated_epoch, original_epoch);
+    EXPECT_EQ(rotated.error->details.at("expected_request_owner_epoch"),
+              rotated_epoch.value());
+
+    native_projection.SetMode(FakePlannerSceneProjection::Mode::kCommit);
+    most_recent_request->request_context.request_owner_epoch = rotated_epoch;
+    const auto resumed = owner.Commit(*most_recent_request);
+    ASSERT_TRUE(resumed.success)
+        << (resumed.error.has_value() ? resumed.error->message
+                                     : "missing error");
+    EXPECT_EQ(resumed.transaction_sequence,
+              kMaximumLogicalSceneTransactions + 1U);
+    EXPECT_EQ(resumed.committed_projection_revision, projection);
+    const auto replay = owner.Commit(*most_recent_request);
+    ASSERT_TRUE(replay.success);
+    EXPECT_EQ(replay.replay_status,
+              core::RequestReplayStatusDTO::kReplayedExact);
+    EXPECT_EQ(replay.transaction_sequence, resumed.transaction_sequence);
+
+    auto old_epoch_request = *most_recent_request;
+    old_epoch_request.request_context.request_id =
+        core::RequestId("scene-sustained-old-epoch");
+    old_epoch_request.request_context.request_owner_epoch = original_epoch;
+    const auto stale = owner.Commit(old_epoch_request);
+    EXPECT_FALSE(stale.success);
+    EXPECT_EQ(stale.replay_status,
+              core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch);
+    const auto integrity = owner.VerifyIntegrity();
+    EXPECT_EQ(integrity.transaction_intent_count, 1);
+    EXPECT_EQ(integrity.request_outcome_count, 1);
+    EXPECT_EQ(integrity.owner_event_count, 1);
+  }
+
+  CanonicalEmptySceneOwner reopened(database_path, admission,
+                                    publication_reader, bundle_source,
+                                    resolver);
+  EXPECT_EQ(reopened.CurrentRequestOwnerEpoch(), rotated_epoch);
+  EXPECT_EQ(reopened.LogicalSnapshot()->transaction_sequence,
+            kMaximumLogicalSceneTransactions + 1U);
+  ASSERT_TRUE(most_recent_request.has_value());
+  const auto replay = reopened.Commit(*most_recent_request);
+  ASSERT_TRUE(replay.success);
+  EXPECT_EQ(replay.replay_status, core::RequestReplayStatusDTO::kReplayedExact);
+}
+
+TEST(CanonicalEmptySceneOwner,
      ManagedNativeHostReplacementRebuildsAndPersistsTheCurrentEpochSet) {
   TemporaryDirectory directory("scene-native-runtime-recovery");
   const auto package_root = directory.path() / "packages";
@@ -2695,11 +2941,265 @@ TEST(CanonicalEmptySceneOwner,
                 .native_runtime_binding,
             final_binding);
   integrity = reopened.VerifyIntegrity();
-  EXPECT_EQ(integrity.native_recovery_intent_count, 3);
+  EXPECT_EQ(integrity.native_recovery_intent_count, 2);
   EXPECT_EQ(integrity.native_recovery_completion_count, 2);
-  EXPECT_EQ(integrity.native_recovery_binding_count, 3);
+  EXPECT_EQ(integrity.native_recovery_binding_count, 2);
   EXPECT_EQ(integrity.native_recovery_result_count, 2);
   EXPECT_FALSE(integrity.projection_desynchronized);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     RepeatedNativeHostReplacementKeepsOnlyBoundedCurrentRecoveryHistory) {
+  TemporaryDirectory directory("scene-native-runtime-recovery-bounded");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto original_bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-bounded-original");
+  ASSERT_EQ(original_bindings.size(), 1U);
+
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  FakePlannerSceneProjection original(original_bindings.front());
+  FakePlannerSceneProjectionResolver resolver(original);
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
+                                 bundle_source, resolver);
+  const auto active = FinalizeNativeCandidate(
+      owner, publication_reader, admission, *candidate.bundle,
+      original_bindings, "apply-native-runtime-recovery-bounded");
+
+  std::vector<std::unique_ptr<FakePlannerSceneProjection>> replacements;
+  replacements.reserve(8U);
+  for (std::uint64_t generation = 1U; generation <= 8U; ++generation) {
+    auto binding = original_bindings.front();
+    binding.runtime_epoch = core::RuntimeEpoch("runtime-epoch-bounded-" +
+                                               std::to_string(generation));
+    replacements.push_back(
+        std::make_unique<FakePlannerSceneProjection>(binding));
+    resolver.ReplaceWith(*replacements.back());
+    const auto recovered = owner.ReconcileActiveProjectionRuntimes(
+        ActiveProjectionRuntimeSetDTO{active, {binding}});
+    ASSERT_TRUE(recovered.valid());
+    ASSERT_TRUE(recovered.recovery_generation.has_value());
+    EXPECT_EQ(recovered.recovery_generation->value(), generation);
+    EXPECT_EQ(replacements.back()->rebuild_calls(), 1U);
+    const auto integrity = owner.VerifyIntegrity();
+    EXPECT_LE(
+        integrity.native_recovery_intent_count,
+        static_cast<std::int64_t>(kMaximumRetainedNativeProjectionRecoveries));
+    EXPECT_EQ(integrity.native_recovery_intent_count, generation == 1U ? 1 : 2);
+    EXPECT_EQ(integrity.native_recovery_completion_count,
+              integrity.native_recovery_intent_count);
+  }
+  owner.Close();
+
+  CanonicalEmptySceneOwner reopened(
+      database_path, admission, publication_reader, bundle_source, resolver);
+  EXPECT_TRUE(reopened.ActiveProjectionHealth().healthy_for_target(active));
+  const auto replay = reopened.ReconcileActiveProjectionRuntimes(
+      ActiveProjectionRuntimeSetDTO{active, {replacements.back()->binding()}});
+  EXPECT_EQ(replay.state, ActiveProjectionRuntimeRecoveryState::kCurrent);
+  EXPECT_EQ(replay.recovery_generation->value(), 8U);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     V5RecoveryMigrationPrunesHistoryAndPreservesMonotonicGeneration) {
+  TemporaryDirectory directory("scene-native-runtime-recovery-v5-migration");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto original_bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-v5-original");
+  ASSERT_EQ(original_bindings.size(), 1U);
+
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  FakePlannerSceneProjection original(original_bindings.front());
+  FakePlannerSceneProjectionResolver resolver(original);
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  ProjectionRevisionDTO active;
+  auto migrated_binding = original_bindings.front();
+  migrated_binding.runtime_epoch = core::RuntimeEpoch("runtime-epoch-v5-1");
+  FakePlannerSceneProjection migrated_projection(migrated_binding);
+  {
+    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
+                                   bundle_source, resolver);
+    active = FinalizeNativeCandidate(
+        owner, publication_reader, admission, *candidate.bundle,
+        original_bindings, "apply-native-runtime-recovery-v5-migration");
+    resolver.ReplaceWith(migrated_projection);
+    const auto recovered = owner.ReconcileActiveProjectionRuntimes(
+        ActiveProjectionRuntimeSetDTO{active, {migrated_binding}});
+    ASSERT_EQ(recovered.recovery_generation->value(), 1U);
+  }
+
+  // Form a valid append-only v5 history with eight completed generations.
+  // The rows are intentionally equivalent: this test isolates migration,
+  // retention, and monotonic identity rather than native rebuild behavior.
+  ExecuteSql(database_path, R"sql(
+BEGIN IMMEDIATE;
+WITH RECURSIVE generations(value) AS (
+    SELECT 2 UNION ALL SELECT value + 1 FROM generations WHERE value < 8
+)
+INSERT INTO logical_scene_native_runtime_recovery_intents(
+    recovery_generation,structural_lineage_generation,
+    target_retained_bundle_id,target_graph_revision,target_scene_id,
+    target_scene_revision_id,target_scene_content_hash,native_binding_count,
+    recovered_transaction_sequence
+)
+SELECT generations.value,intents.structural_lineage_generation,
+       intents.target_retained_bundle_id,intents.target_graph_revision,
+       intents.target_scene_id,intents.target_scene_revision_id,
+       intents.target_scene_content_hash,intents.native_binding_count,NULL
+FROM generations
+CROSS JOIN logical_scene_native_runtime_recovery_intents AS intents
+WHERE intents.recovery_generation = 1;
+WITH RECURSIVE generations(value) AS (
+    SELECT 2 UNION ALL SELECT value + 1 FROM generations WHERE value < 8
+)
+INSERT INTO logical_scene_native_runtime_recovery_bindings
+SELECT generations.value,bindings.binding_ordinal,
+       bindings.provider_binding_id,bindings.provider_binding_revision,
+       bindings.runtime_unit_id,bindings.runtime_epoch
+FROM generations
+CROSS JOIN logical_scene_native_runtime_recovery_bindings AS bindings
+WHERE bindings.recovery_generation = 1;
+WITH RECURSIVE generations(value) AS (
+    SELECT 2 UNION ALL SELECT value + 1 FROM generations WHERE value < 8
+)
+INSERT INTO logical_scene_native_runtime_recovery_results
+SELECT generations.value,results.binding_ordinal,results.source_sequence,
+       results.native_projection_generation,results.projection_content_digest
+FROM generations
+CROSS JOIN logical_scene_native_runtime_recovery_results AS results
+WHERE results.recovery_generation = 1;
+WITH RECURSIVE generations(value) AS (
+    SELECT 2 UNION ALL SELECT value + 1 FROM generations WHERE value < 8
+)
+INSERT INTO logical_scene_native_runtime_recovery_completions
+SELECT generations.value,completions.result_count
+FROM generations
+CROSS JOIN logical_scene_native_runtime_recovery_completions AS completions
+WHERE completions.recovery_generation = 1;
+UPDATE logical_scene_history_state
+SET native_recovery_generation_watermark = 8
+WHERE singleton = 1;
+COMMIT;
+)sql");
+  DowngradeBoundedHistoryStoreToV5ForMigrationTest(database_path);
+
+  CanonicalEmptySceneOwner migrated(
+      database_path, admission, publication_reader, bundle_source, resolver);
+  auto integrity = migrated.VerifyIntegrity();
+  EXPECT_EQ(integrity.native_recovery_intent_count, 1);
+  EXPECT_EQ(integrity.native_recovery_completion_count, 1);
+  EXPECT_TRUE(migrated.ActiveProjectionHealth().healthy_for_target(active));
+
+  auto next_binding = migrated_binding;
+  next_binding.runtime_epoch = core::RuntimeEpoch("runtime-epoch-v5-9");
+  FakePlannerSceneProjection next_projection(next_binding);
+  resolver.ReplaceWith(next_projection);
+  const auto recovered = migrated.ReconcileActiveProjectionRuntimes(
+      ActiveProjectionRuntimeSetDTO{active, {next_binding}});
+  ASSERT_TRUE(recovered.recovery_generation.has_value());
+  EXPECT_EQ(recovered.recovery_generation->value(), 9U);
+  integrity = migrated.VerifyIntegrity();
+  EXPECT_EQ(integrity.native_recovery_intent_count, 2);
+  EXPECT_EQ(integrity.native_recovery_completion_count, 2);
+}
+
+TEST(
+    CanonicalEmptySceneOwner,
+    HostLossDuringSceneCommitRebuildsTheAuthoritativePredecessorWithOldLeasePinned) {
+  TemporaryDirectory directory("scene-native-transaction-host-loss");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto original_bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-transaction-original");
+  ASSERT_EQ(original_bindings.size(), 1U);
+
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  FakePlannerSceneProjection original(original_bindings.front());
+  FakePlannerSceneProjectionResolver resolver(original);
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
+                                 bundle_source, resolver);
+  const auto active = FinalizeNativeCandidate(
+      owner, publication_reader, admission, *candidate.bundle,
+      original_bindings, "apply-native-transaction-host-loss");
+
+  const core::ProjectionLeaseId old_lease("operation-before-host-loss");
+  const auto retained = original.RetainProjectionBinding(active, old_lease);
+  ASSERT_TRUE(retained.ok());
+  EXPECT_EQ(original.retained_lease_count(), 1U);
+  original.SetMode(FakePlannerSceneProjection::Mode::kUncertain);
+  const auto failed_request = AddBoxRequest(
+      active, admission.cell_id(), "scene-request-interrupted-by-host-loss");
+  const auto failed = owner.Commit(failed_request);
+  ASSERT_FALSE(failed.success);
+  EXPECT_EQ(failed.projection_status,
+            core::SceneProjectionCommitStatusDTO::kFailedProjectionUncertain);
+  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
+
+  auto replacement_binding = original_bindings.front();
+  replacement_binding.runtime_epoch =
+      core::RuntimeEpoch("runtime-epoch-transaction-replacement");
+  FakePlannerSceneProjection replacement(replacement_binding);
+  resolver.ReplaceWith(replacement);
+  const auto recovered = owner.ReconcileActiveProjectionRuntimes(
+      ActiveProjectionRuntimeSetDTO{active, {replacement_binding}});
+  ASSERT_TRUE(recovered.valid());
+  EXPECT_EQ(recovered.state, ActiveProjectionRuntimeRecoveryState::kRecovered);
+  EXPECT_EQ(replacement.rebuild_calls(), 1U);
+  EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_TRUE(owner.ReadAccessStatus().projection_leases_open);
+  EXPECT_EQ(owner.CurrentProjectionRevision(), active);
+  EXPECT_TRUE(owner.GetSceneObjects().empty());
+
+  // The lease belongs to the dead predecessor host and remains exact there;
+  // rebuilding the replacement neither adopts nor mutates it.
+  EXPECT_EQ(original.retained_lease_count(), 1U);
+  EXPECT_EQ(replacement.retained_lease_count(), 0U);
+  original.ReleaseProjection(old_lease);
+  EXPECT_EQ(original.retained_lease_count(), 0U);
+
+  const auto failed_replay = owner.Commit(failed_request);
+  EXPECT_FALSE(failed_replay.success);
+  EXPECT_EQ(failed_replay.replay_status,
+            core::RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replacement.calls(), 0U);
+  auto retry = failed_request;
+  retry.request_context.request_id =
+      core::RequestId("scene-request-after-host-loss-recovery");
+  const auto committed = owner.Commit(retry);
+  ASSERT_TRUE(committed.success)
+      << (committed.error.has_value() ? committed.error->message
+                                      : "missing error");
+  EXPECT_EQ(replacement.calls(), 1U);
+  EXPECT_FALSE(owner.VerifyIntegrity().projection_desynchronized);
+  owner.Close();
+
+  CanonicalEmptySceneOwner reopened(
+      database_path, admission, publication_reader, bundle_source, resolver);
+  EXPECT_EQ(reopened.CurrentProjectionRevision(),
+            *committed.committed_projection_revision);
+  EXPECT_FALSE(reopened.VerifyIntegrity().projection_desynchronized);
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -3425,7 +3925,9 @@ TEST(CanonicalEmptySceneOwner,
                "DELETE FROM logical_scene_request_outcomes;"
                "CREATE TRIGGER IF NOT EXISTS "
                "logical_scene_request_outcomes_no_delete BEFORE DELETE ON "
-               "logical_scene_request_outcomes BEGIN SELECT RAISE(ABORT, "
+               "logical_scene_request_outcomes WHEN (SELECT "
+               "compaction_in_progress FROM logical_scene_history_state "
+               "WHERE singleton = 1) != 1 BEGIN SELECT RAISE(ABORT, "
                "'logical_scene_request_outcomes is immutable'); END;");
 
     CanonicalEmptySceneOwner recovered(database_path, admission,
@@ -3478,11 +3980,15 @@ TEST(CanonicalEmptySceneOwner,
                "DELETE FROM logical_scene_projection_results;"
                "CREATE TRIGGER IF NOT EXISTS "
                "logical_scene_request_outcomes_no_delete BEFORE DELETE ON "
-               "logical_scene_request_outcomes BEGIN SELECT RAISE(ABORT, "
+               "logical_scene_request_outcomes WHEN (SELECT "
+               "compaction_in_progress FROM logical_scene_history_state "
+               "WHERE singleton = 1) != 1 BEGIN SELECT RAISE(ABORT, "
                "'logical_scene_request_outcomes is immutable'); END;"
                "CREATE TRIGGER IF NOT EXISTS "
                "logical_scene_projection_results_no_delete BEFORE DELETE ON "
-               "logical_scene_projection_results BEGIN SELECT RAISE(ABORT, "
+               "logical_scene_projection_results WHEN (SELECT "
+               "compaction_in_progress FROM logical_scene_history_state "
+               "WHERE singleton = 1) != 1 BEGIN SELECT RAISE(ABORT, "
                "'logical_scene_projection_results is immutable'); END;");
 
     CanonicalEmptySceneOwner recovered(database_path, native_admission,

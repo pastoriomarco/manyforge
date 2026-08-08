@@ -339,12 +339,6 @@ RetainedPlannerSceneProjection::ApplyTransaction(
                    "transaction predecessor",
                    "native_projection_predecessor_unavailable");
   }
-  if (transaction_records_.size() >= config_.transaction_replay_capacity) {
-    return invalid("native projection transaction history reached its "
-                   "bounded pre-compaction capacity",
-                   "native_projection_transaction_history_full");
-  }
-
   const auto candidate =
       core::ApplyResolvedSceneTransaction(*logical_snapshot_, transaction);
   if (!candidate.ok()) {
@@ -406,6 +400,9 @@ RetainedPlannerSceneProjection::ApplyTransaction(
       std::nullopt,
   };
   auto next_records = transaction_records_;
+  if (next_records.size() >= config_.transaction_replay_capacity) {
+    next_records.erase(next_records.begin());
+  }
   next_records.emplace(transaction.transaction_sequence,
                        TransactionRecord{transaction, success});
 

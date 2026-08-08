@@ -12,6 +12,7 @@ class ISceneAuthority {
   virtual ~ISceneAuthority() = default;
 
   [[nodiscard]] virtual SceneCommitResultDTO Commit(const SceneTransactionRequestDTO& request) = 0;
+  [[nodiscard]] virtual RequestOwnerEpoch CurrentRequestOwnerEpoch() const = 0;
   [[nodiscard]] virtual ProjectionRevisionDTO CurrentProjectionRevision() const = 0;
   [[nodiscard]] virtual std::shared_ptr<const LogicalSceneSnapshotDTO> LogicalSnapshot() const = 0;
   [[nodiscard]] virtual std::vector<SceneObjectSnapshotDTO> GetSceneObjects() const = 0;

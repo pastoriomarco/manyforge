@@ -25,8 +25,8 @@ inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
     "manyforge.internal.logical-scene.i4.v2";
 inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
 inline constexpr std::string_view kLogicalSceneStoreSchemaId =
-    "manyforge.internal.logical-scene.n5c.v5";
-inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 5;
+    "manyforge.internal.logical-scene.n5c.v6";
+inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 6;
 inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
     1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;
@@ -37,6 +37,7 @@ inline constexpr std::int64_t kMaximumSceneStoreWalBytes =
 inline constexpr std::size_t kMaximumNamedApplySceneStages = 256U;
 inline constexpr std::size_t kMaximumNativeProjectionTransitionRows = 256U;
 inline constexpr std::size_t kMaximumNativeProjectionRecoveries = 256U;
+inline constexpr std::size_t kMaximumRetainedNativeProjectionRecoveries = 2U;
 inline constexpr std::size_t kMaximumLogicalSceneTransactions = 256U;
 inline constexpr std::size_t kMaximumLogicalSceneTransactionBytes =
     128U * 1024U;
@@ -161,11 +162,12 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
 /// acknowledgement. N5c-c3 activates retained component/passive-frame
 /// resolution, owner-normalized carried-object attachment/detachment, focused
 /// immutable projection leases, and configured-versus-derived collision
-/// policy projection. Program-operation leases, dynamic start-contact
-/// discovery, sustained state updates, and remote/ROS adapters remain gated
-/// to their named later slices. This owner implements no compatibility
-/// wrapper, robot command, authorization layer, or legacy SceneAuthority
-/// fallback.
+/// policy projection. N5c-d adds bounded sustained scene transactions and
+/// runtime-replacement recovery without transferring an old host's immutable
+/// leases to its replacement. Remote/ROS adapters and broader Program
+/// workflows remain gated to their named later slices. This owner implements
+/// no compatibility wrapper, robot command, authorization layer, or legacy
+/// SceneAuthority fallback.
 class CanonicalEmptySceneOwner final
     : public manyforge::core::IManagerSceneProjectionBootstrapPort,
       public manyforge::core::IManagerSceneProjectionHandoffPort,
@@ -253,6 +255,8 @@ public:
   [[nodiscard]] CanonicalEmptySceneAccessStatus ReadAccessStatus() const;
   [[nodiscard]] manyforge::core::SceneCommitResultDTO
   Commit(const manyforge::core::SceneTransactionRequestDTO &request) override;
+  [[nodiscard]] manyforge::core::RequestOwnerEpoch
+  CurrentRequestOwnerEpoch() const override;
   [[nodiscard]] manyforge::core::ProjectionRevisionDTO
   CurrentProjectionRevision() const override;
   [[nodiscard]] std::shared_ptr<const manyforge::core::LogicalSceneSnapshotDTO>
