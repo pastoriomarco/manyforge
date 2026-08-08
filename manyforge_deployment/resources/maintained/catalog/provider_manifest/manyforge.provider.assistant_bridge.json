@@ -1,0 +1,15 @@
+{
+  "api_version": "manyforge.provider_manifest.v1",
+  "offered_capabilities": [
+    {
+      "capability_definition_revision": "sha256:221f74e397dcae43f8122e30f78cd1e11923b755abf51e70085bc30257f3def9",
+      "capability_id": "assistant.bridge.request",
+      "required_endpoint_role_ids": [
+        "assistant_request"
+      ]
+    }
+  ],
+  "provider_contracts": [],
+  "provider_manifest_id": "manyforge.provider.assistant_bridge",
+  "provider_manifest_revision": "sha256:62f7c3239954e34cc9ea7ded4bdd87f68d99525e77f3603e0f439d0c2a12a027"
+}

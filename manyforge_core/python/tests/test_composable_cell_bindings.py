@@ -1688,10 +1688,27 @@ def test_graph_revision_trust_surface_is_staged_narrow_and_immutable():
 
 def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
     assistant = {
+        "audit_policy": {
+            "redact_argument_values": True,
+            "store_full_prompts": False,
+            "store_full_responses": False,
+        },
         "model_endpoint_aliases": {
             "primary_model": {
                 "external_resource_alias": "assistant_model",
                 "model_id": "i5-python-test-model",
+                "request_contract": {
+                    "default_timeout_s": 30.0,
+                    "max_output_tokens": 512,
+                    "supported_image_transports": [
+                        "http_url",
+                        "inline_data_url",
+                    ],
+                    "supports_image_input": True,
+                    "supports_json_object": True,
+                    "supports_response_tools": True,
+                    "tool_call_family": "openai_chat_tools",
+                },
             }
         },
         "modes": {
@@ -1712,6 +1729,7 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
                 "provider_alias": "direct_local",
             }
         },
+        "prompt_templates": {},
         "provider_aliases": {
             "direct_local": {
                 "bridge_external_resource_alias": "assistant_bridge",
@@ -1768,6 +1786,15 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
     assert qualified.projection_digest.value == projection["projection_digest"]
     assert qualified.instrument_registry_digest == registry.registry_digest
     assert projection["instruments"] == registry_projection
+    assert projection["model_endpoint_aliases"][0]["request_contract"] == {
+        "default_timeout_s": 30,
+        "max_output_tokens": 512,
+        "supported_image_transports": ["http_url", "inline_data_url"],
+        "supports_image_input": True,
+        "supports_json_object": True,
+        "supports_response_tools": True,
+        "tool_call_family": "openai_chat_tools",
+    }
     assert [mode["mode_id"] for mode in projection["modes"]] == ["query"]
     assert [tool["tool_id"] for tool in projection["instruments"]["tools"]] == [
         "alarms_read",

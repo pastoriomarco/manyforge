@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
+  "capability_id": "planning.motion.cartesian_path",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "target_binding"
+}

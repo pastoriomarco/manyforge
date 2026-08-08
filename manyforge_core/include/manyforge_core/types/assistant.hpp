@@ -25,6 +25,57 @@ enum class AssistantProviderKind : std::uint8_t {
   return {};
 }
 
+enum class AssistantImageTransport : std::uint8_t {
+  kHttpUrl = 0,
+  kInlineDataUrl,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    AssistantImageTransport value) noexcept {
+  switch (value) {
+    case AssistantImageTransport::kHttpUrl:
+      return "http_url";
+    case AssistantImageTransport::kInlineDataUrl:
+      return "inline_data_url";
+  }
+  return {};
+}
+
+enum class AssistantToolCallFamily : std::uint8_t {
+  kOpenAiChatTools = 0,
+  kQwen3Coder,
+  kQwen3Xml,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    AssistantToolCallFamily value) noexcept {
+  switch (value) {
+    case AssistantToolCallFamily::kOpenAiChatTools:
+      return "openai_chat_tools";
+    case AssistantToolCallFamily::kQwen3Coder:
+      return "qwen3_coder";
+    case AssistantToolCallFamily::kQwen3Xml:
+      return "qwen3_xml";
+  }
+  return {};
+}
+
+enum class AssistantPromptResponseMode : std::uint8_t {
+  kJsonObject = 0,
+  kToolCall,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    AssistantPromptResponseMode value) noexcept {
+  switch (value) {
+    case AssistantPromptResponseMode::kJsonObject:
+      return "json_object";
+    case AssistantPromptResponseMode::kToolCall:
+      return "tool_call";
+  }
+  return {};
+}
+
 enum class AssistantToolEffect : std::uint8_t {
   kReadOnly = 0,
   kProposal,
@@ -98,10 +149,25 @@ enum class AssistantReviewPolicy : std::uint8_t {
   return {};
 }
 
+struct AssistantModelEndpointRequestContractDTO final {
+  double default_timeout_s;
+  std::uint32_t max_output_tokens;
+  bool supports_response_tools{false};
+  bool supports_json_object{false};
+  bool supports_image_input{false};
+  std::vector<AssistantImageTransport> supported_image_transports;
+  AssistantToolCallFamily tool_call_family;
+
+  friend bool operator==(const AssistantModelEndpointRequestContractDTO&,
+                         const AssistantModelEndpointRequestContractDTO&) =
+      default;
+};
+
 struct AssistantModelEndpointAliasDTO final {
   std::string model_endpoint_alias;
   ExternalResourceAlias external_resource_alias;
   std::string model_id;
+  AssistantModelEndpointRequestContractDTO request_contract;
 
   friend bool operator==(const AssistantModelEndpointAliasDTO&,
                          const AssistantModelEndpointAliasDTO&) = default;
@@ -116,11 +182,21 @@ struct AssistantModelAuditPolicyDTO final {
                          const AssistantModelAuditPolicyDTO&) = default;
 };
 
+struct AssistantPromptResponseContractDTO final {
+  AssistantPromptResponseMode response_mode;
+  std::optional<std::string> tool_name;
+  std::optional<std::string> tool_description;
+
+  friend bool operator==(const AssistantPromptResponseContractDTO&,
+                         const AssistantPromptResponseContractDTO&) = default;
+};
+
 struct AssistantPromptTemplateDTO final {
   std::string prompt_template_id;
   std::string version;
   std::string template_text;
   std::vector<std::string> variable_ids;
+  AssistantPromptResponseContractDTO response_contract;
   ContentDigest content_digest;
 
   friend bool operator==(const AssistantPromptTemplateDTO&,
@@ -174,7 +250,10 @@ struct AssistantSettingsDTO final {
   std::vector<AssistantProviderAliasDTO> provider_aliases;
   std::vector<AssistantModeDTO> modes;
 
-  [[nodiscard]] bool enabled() const noexcept { return !modes.empty(); }
+  [[nodiscard]] bool enabled() const noexcept {
+    return !prompt_templates.empty() || !model_endpoint_aliases.empty() ||
+           !provider_aliases.empty() || !modes.empty();
+  }
 
   friend bool operator==(const AssistantSettingsDTO&,
                          const AssistantSettingsDTO&) = default;

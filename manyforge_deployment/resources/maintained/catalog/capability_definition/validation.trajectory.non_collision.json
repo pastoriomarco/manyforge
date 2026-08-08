@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
+  "capability_id": "validation.trajectory.non_collision",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "target_binding"
+}

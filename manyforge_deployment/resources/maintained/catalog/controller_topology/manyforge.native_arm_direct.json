@@ -1,0 +1,45 @@
+{
+  "activation_sets": [
+    {
+      "activation_set_id": "arm_direct",
+      "active_chain_edges": [],
+      "active_controller_role_ids": [
+        "native_execution"
+      ]
+    }
+  ],
+  "api_version": "manyforge.controller_topology.v1",
+  "chain_edges": [],
+  "controller_topology_id": "manyforge.native_arm_direct",
+  "controllers": [
+    {
+      "control_interface_claims": [
+        {
+          "claimed_directions": [
+            "command",
+            "state"
+          ],
+          "control_interface_contract_id": "manyforge.native_arm_position",
+          "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3"
+        }
+      ],
+      "controller_role_id": "native_execution",
+      "exported_reference_interfaces": [],
+      "exported_state_interfaces": []
+    }
+  ],
+  "legal_routes": [
+    {
+      "compatible_activation_set_ids": [
+        "arm_direct"
+      ],
+      "control_interface_contract_id": "manyforge.native_arm_position",
+      "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
+      "control_route_id": "arm_position",
+      "ordered_controller_role_ids": [
+        "native_execution"
+      ]
+    }
+  ],
+  "topology_revision": "sha256:3145691725146de20d4ffdb1a595e471519f3bcff188603ee844a75a6b9f2f4f"
+}

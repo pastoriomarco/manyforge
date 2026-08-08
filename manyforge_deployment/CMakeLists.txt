@@ -39,11 +39,19 @@ set(
 set(
   MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/maintained_deployment_sources.v1.json")
+set(
+  MANYFORGE_MAINTAINED_ASSISTANT_PROFILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/maintained_assistant_profiles.v1.json")
+set(
+  MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_maintained_deployment_occurrences.py")
 if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
    NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_CHECK}" OR
    NOT EXISTS "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}" OR
    NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_CHECK}" OR
-   NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}")
+   NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}" OR
+   NOT EXISTS "${MANYFORGE_MAINTAINED_ASSISTANT_PROFILES}" OR
+   NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}")
   message(FATAL_ERROR
     "manyforge_deployment production retention requires the node-environment "
     "closure, structural-model preparation tool, and maintained N6 source "
@@ -69,7 +77,9 @@ set_property(
   "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
   "${MANYFORGE_NODE_ENVIRONMENT_CHECK}"
   "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_CHECK}"
-  "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}")
+  "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
+  "${MANYFORGE_MAINTAINED_ASSISTANT_PROFILES}"
+  "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}")
 
 file(READ
   "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
@@ -626,6 +636,13 @@ target_link_libraries(
   manyforge_maintained_model_catalog PRIVATE
   manyforge::deployment)
 
+add_executable(
+  manyforge_maintained_deployment_occurrences
+  tools/maintained_deployment_occurrences.cpp)
+target_link_libraries(
+  manyforge_maintained_deployment_occurrences PRIVATE
+  manyforge::deployment)
+
 set(
   MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER
   "${CMAKE_CURRENT_BINARY_DIR}/generated/build_qualified_admission_profile_generated.hpp")
@@ -756,6 +773,26 @@ if(BUILD_TESTING)
       "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_CHECK}"
       --check
       --input "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
+      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}")
+
+  add_test(
+    NAME MaintainedDeploymentOccurrenceSources
+    COMMAND
+      "${Python3_EXECUTABLE}"
+      "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}"
+      --check
+      --description "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
+      --assistant-profiles "${MANYFORGE_MAINTAINED_ASSISTANT_PROFILES}"
+      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
+      --revision-tool "$<TARGET_FILE:manyforge_deployment_revision>")
+  set_tests_properties(
+    MaintainedDeploymentOccurrenceSources PROPERTIES TIMEOUT 60)
+
+  add_test(
+    NAME MaintainedDeploymentOccurrenceQualification
+    COMMAND
+      "$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
+      --check
       --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}")
 
   function(manyforge_try_public_header result_variable source_file)

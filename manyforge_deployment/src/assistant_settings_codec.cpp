@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <initializer_list>
 #include <map>
 #include <optional>
@@ -68,6 +70,8 @@ constexpr std::string_view kZeroDigest =
 constexpr std::size_t kMaximumAssistantRows = 4096U;
 constexpr std::size_t kMaximumAssistantTextBytes = 1024U;
 constexpr std::size_t kMaximumPromptTemplateBytes = 16384U;
+constexpr double kMaximumModelRequestTimeoutSeconds = 3600.0;
+constexpr std::uint32_t kMaximumModelOutputTokens = 1U << 20U;
 
 const detail::ContentIdentitySpec kInstrumentRegistryIdentitySpec{
     "assistant-instrument-registry-digest",
@@ -131,6 +135,27 @@ const detail::ContentIdentitySpec kAssistantProjectionIdentitySpec{
     fail(path, "expected boolean");
   }
   return *boolean;
+}
+
+[[nodiscard]] double require_bounded_positive_number(
+    const CanonicalValue& value, std::string_view path, double maximum) {
+  const auto* number = std::get_if<double>(&value.storage());
+  if (number == nullptr || !std::isfinite(*number) || *number <= 0.0 ||
+      *number > maximum) {
+    fail(path, "expected a positive finite number within its fixed bound");
+  }
+  return *number;
+}
+
+[[nodiscard]] std::uint32_t require_bounded_positive_integer(
+    const CanonicalValue& value, std::string_view path,
+    std::uint32_t maximum) {
+  const double number =
+      require_bounded_positive_number(value, path, maximum);
+  if (std::floor(number) != number) {
+    fail(path, "expected an integer");
+  }
+  return static_cast<std::uint32_t>(number);
 }
 
 [[nodiscard]] const CanonicalValue* find_member(
@@ -302,6 +327,45 @@ template <typename Enum, typename Parser>
   fail(path, "review_policy is outside the closed v1 enum");
 }
 
+[[nodiscard]] core::AssistantImageTransport parse_image_transport(
+    const CanonicalValue& value, std::string_view path) {
+  const std::string& text = require_string(value, path);
+  if (text == "http_url") {
+    return core::AssistantImageTransport::kHttpUrl;
+  }
+  if (text == "inline_data_url") {
+    return core::AssistantImageTransport::kInlineDataUrl;
+  }
+  fail(path, "image transport is outside the closed v1 enum");
+}
+
+[[nodiscard]] core::AssistantToolCallFamily parse_tool_call_family(
+    const CanonicalValue& value, std::string_view path) {
+  const std::string& text = require_string(value, path);
+  if (text == "openai_chat_tools") {
+    return core::AssistantToolCallFamily::kOpenAiChatTools;
+  }
+  if (text == "qwen3_coder") {
+    return core::AssistantToolCallFamily::kQwen3Coder;
+  }
+  if (text == "qwen3_xml") {
+    return core::AssistantToolCallFamily::kQwen3Xml;
+  }
+  fail(path, "tool_call_family is outside the closed v1 enum");
+}
+
+[[nodiscard]] core::AssistantPromptResponseMode parse_prompt_response_mode(
+    const CanonicalValue& value, std::string_view path) {
+  const std::string& text = require_string(value, path);
+  if (text == "json_object") {
+    return core::AssistantPromptResponseMode::kJsonObject;
+  }
+  if (text == "tool_call") {
+    return core::AssistantPromptResponseMode::kToolCall;
+  }
+  fail(path, "response_mode is outside the closed v1 enum");
+}
+
 enum class InstrumentIdKind { kPortable, kTool };
 
 [[nodiscard]] std::vector<std::string> parse_id_list(
@@ -336,6 +400,35 @@ enum class InstrumentIdKind { kPortable, kTool };
   return CanonicalValue(std::move(result));
 }
 
+[[nodiscard]] CanonicalValue encode_image_transports(
+    const std::vector<core::AssistantImageTransport>& transports) {
+  CanonicalValue::Array result;
+  result.reserve(transports.size());
+  for (const auto transport : transports) {
+    result.emplace_back(std::string(core::to_string(transport)));
+  }
+  return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] CanonicalValue encode_model_request_contract(
+    const core::AssistantModelEndpointRequestContractDTO& contract) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"default_timeout_s", CanonicalValue(contract.default_timeout_s)},
+      {"max_output_tokens",
+       CanonicalValue(static_cast<double>(contract.max_output_tokens))},
+      {"supported_image_transports",
+       encode_image_transports(contract.supported_image_transports)},
+      {"supports_image_input",
+       CanonicalValue(contract.supports_image_input)},
+      {"supports_json_object",
+       CanonicalValue(contract.supports_json_object)},
+      {"supports_response_tools",
+       CanonicalValue(contract.supports_response_tools)},
+      {"tool_call_family",
+       CanonicalValue(std::string(core::to_string(contract.tool_call_family)))},
+  });
+}
+
 [[nodiscard]] std::string parse_prompt_template_text(const CanonicalValue& value,
                                                      std::string_view path) {
   const std::string& text = require_string(value, path);
@@ -350,11 +443,36 @@ enum class InstrumentIdKind { kPortable, kTool };
   return text;
 }
 
+[[nodiscard]] CanonicalValue encode_prompt_response_contract(
+    const core::AssistantPromptResponseContractDTO& contract) {
+  CanonicalValue::Object result{
+      {"response_mode",
+       CanonicalValue(std::string(core::to_string(contract.response_mode)))},
+  };
+  if (contract.response_mode == core::AssistantPromptResponseMode::kToolCall) {
+    if (!contract.tool_name.has_value() ||
+        !contract.tool_description.has_value()) {
+      fail("assistant.prompt_templates.response_contract",
+           "tool_call response contract is incomplete");
+    }
+    result.emplace_back("tool_description",
+                        CanonicalValue(*contract.tool_description));
+    result.emplace_back("tool_name", CanonicalValue(*contract.tool_name));
+  } else if (contract.tool_name.has_value() ||
+             contract.tool_description.has_value()) {
+    fail("assistant.prompt_templates.response_contract",
+         "json_object response contract carries tool metadata");
+  }
+  return CanonicalValue(std::move(result));
+}
+
 [[nodiscard]] core::ContentDigest prompt_template_content_digest(
     std::string_view prompt_template_id, std::string_view version, std::string_view template_text,
-    const std::vector<std::string>& variable_ids) {
+    const std::vector<std::string>& variable_ids,
+    const core::AssistantPromptResponseContractDTO& response_contract) {
   const CanonicalValue content(CanonicalValue::Object{
       {"prompt_template_id", CanonicalValue(std::string(prompt_template_id))},
+      {"response_contract", encode_prompt_response_contract(response_contract)},
       {"template_text", CanonicalValue(std::string(template_text))},
       {"variable_ids", encode_string_array(variable_ids)},
       {"version", CanonicalValue(std::string(version))},
@@ -553,10 +671,73 @@ make_registry_value() {
   return {std::move(value), std::move(normalized)};
 }
 
+[[nodiscard]] core::AssistantModelEndpointRequestContractDTO
+parse_model_request_contract(const CanonicalValue& value,
+                             std::string_view path) {
+  const auto& object = require_object(value, path);
+  require_exact_fields(
+      object,
+      {"default_timeout_s", "max_output_tokens",
+       "supports_response_tools", "supports_json_object",
+       "supports_image_input", "supported_image_transports",
+       "tool_call_family"},
+      path);
+  const auto& source_transports = require_array(
+      require_member(object, "supported_image_transports", path),
+      child_path(path, "supported_image_transports"));
+  if (source_transports.size() > 2U) {
+    fail(child_path(path, "supported_image_transports"),
+         "image transport list exceeds the closed v1 registry");
+  }
+  std::vector<core::AssistantImageTransport> transports;
+  transports.reserve(source_transports.size());
+  for (std::size_t index = 0U; index < source_transports.size(); ++index) {
+    transports.push_back(parse_image_transport(
+        source_transports[index],
+        index_path(child_path(path, "supported_image_transports"), index)));
+  }
+  std::sort(transports.begin(), transports.end(),
+            [](const auto left, const auto right) {
+              return core::to_string(left) < core::to_string(right);
+            });
+  if (std::adjacent_find(transports.begin(), transports.end()) !=
+      transports.end()) {
+    fail(child_path(path, "supported_image_transports"),
+         "duplicate image transport");
+  }
+  const bool supports_image_input = require_bool(
+      require_member(object, "supports_image_input", path),
+      child_path(path, "supports_image_input"));
+  if (supports_image_input != !transports.empty()) {
+    fail(path,
+         "supports_image_input must match the presence of a supported image "
+         "transport");
+  }
+  return {
+      require_bounded_positive_number(
+          require_member(object, "default_timeout_s", path),
+          child_path(path, "default_timeout_s"),
+          kMaximumModelRequestTimeoutSeconds),
+      require_bounded_positive_integer(
+          require_member(object, "max_output_tokens", path),
+          child_path(path, "max_output_tokens"), kMaximumModelOutputTokens),
+      require_bool(require_member(object, "supports_response_tools", path),
+                   child_path(path, "supports_response_tools")),
+      require_bool(require_member(object, "supports_json_object", path),
+                   child_path(path, "supports_json_object")),
+      supports_image_input,
+      std::move(transports),
+      parse_tool_call_family(require_member(object, "tool_call_family", path),
+                             child_path(path, "tool_call_family")),
+  };
+}
+
 [[nodiscard]] core::AssistantModelEndpointAliasDTO parse_model_alias(
     std::string alias, const CanonicalValue& value, std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(object, {"external_resource_alias", "model_id"}, path);
+  require_exact_fields(
+      object, {"external_resource_alias", "model_id", "request_contract"},
+      path);
   return {
       std::move(alias),
       core::ExternalResourceAlias(parse_portable_token(
@@ -564,6 +745,9 @@ make_registry_value() {
           child_path(path, "external_resource_alias"))),
       parse_bounded_text(require_member(object, "model_id", path),
                          child_path(path, "model_id"), false),
+      parse_model_request_contract(
+          require_member(object, "request_contract", path),
+          child_path(path, "request_contract")),
   };
 }
 
@@ -582,11 +766,36 @@ make_registry_value() {
   };
 }
 
+[[nodiscard]] core::AssistantPromptResponseContractDTO
+parse_prompt_response_contract(const CanonicalValue& value,
+                               std::string_view path) {
+  const auto& object = require_object(value, path);
+  const auto mode = parse_prompt_response_mode(
+      require_member(object, "response_mode", path),
+      child_path(path, "response_mode"));
+  if (mode == core::AssistantPromptResponseMode::kJsonObject) {
+    require_exact_fields(object, {"response_mode"}, path);
+    return {mode, std::nullopt, std::nullopt};
+  }
+  require_exact_fields(
+      object, {"response_mode", "tool_name", "tool_description"}, path);
+  return {
+      mode,
+      parse_tool_id(require_member(object, "tool_name", path),
+                    child_path(path, "tool_name")),
+      parse_bounded_text(require_member(object, "tool_description", path),
+                         child_path(path, "tool_description"), false),
+  };
+}
+
 [[nodiscard]] core::AssistantPromptTemplateDTO parse_prompt_template(std::string prompt_template_id,
                                                                      const CanonicalValue& value,
                                                                      std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(object, {"version", "template_text", "variable_ids"}, path);
+  require_exact_fields(
+      object,
+      {"version", "template_text", "variable_ids", "response_contract"},
+      path);
   const std::string version =
       parse_portable_token(require_member(object, "version", path), child_path(path, "version"));
   const std::string template_text = parse_prompt_template_text(
@@ -594,10 +803,15 @@ make_registry_value() {
   std::vector<std::string> variable_ids =
       parse_id_list(require_member(object, "variable_ids", path), child_path(path, "variable_ids"),
                     InstrumentIdKind::kPortable);
+  const auto response_contract = parse_prompt_response_contract(
+      require_member(object, "response_contract", path),
+      child_path(path, "response_contract"));
   const core::ContentDigest digest =
-      prompt_template_content_digest(prompt_template_id, version, template_text, variable_ids);
+      prompt_template_content_digest(prompt_template_id, version, template_text,
+                                     variable_ids, response_contract);
   return {
-      std::move(prompt_template_id), version, template_text, std::move(variable_ids), digest,
+      std::move(prompt_template_id), version, template_text,
+      std::move(variable_ids), response_contract, digest,
   };
 }
 
@@ -715,6 +929,9 @@ template <typename DTO, typename Parser>
   for (const auto& prompt : settings.prompt_templates) {
     prompt_templates.emplace_back(prompt.prompt_template_id,
                                   CanonicalValue(CanonicalValue::Object{
+                                      {"response_contract",
+                                       encode_prompt_response_contract(
+                                           prompt.response_contract)},
                                       {"template_text", CanonicalValue(prompt.template_text)},
                                       {"variable_ids", encode_string_array(prompt.variable_ids)},
                                       {"version", CanonicalValue(prompt.version)},
@@ -729,6 +946,8 @@ template <typename DTO, typename Parser>
             {"external_resource_alias",
              CanonicalValue(alias.external_resource_alias.value())},
             {"model_id", CanonicalValue(alias.model_id)},
+            {"request_contract",
+             encode_model_request_contract(alias.request_contract)},
         }));
   }
 
@@ -805,6 +1024,8 @@ template <typename DTO, typename Parser>
     prompt_templates.emplace_back(CanonicalValue::Object{
         {"content_digest", CanonicalValue(prompt.content_digest.value())},
         {"prompt_template_id", CanonicalValue(prompt.prompt_template_id)},
+        {"response_contract",
+         encode_prompt_response_contract(prompt.response_contract)},
         {"template_text", CanonicalValue(prompt.template_text)},
         {"variable_ids", encode_string_array(prompt.variable_ids)},
         {"version", CanonicalValue(prompt.version)},
@@ -817,6 +1038,8 @@ template <typename DTO, typename Parser>
          CanonicalValue(alias.external_resource_alias.value())},
         {"model_endpoint_alias", CanonicalValue(alias.model_endpoint_alias)},
         {"model_id", CanonicalValue(alias.model_id)},
+        {"request_contract",
+         encode_model_request_contract(alias.request_contract)},
     });
   }
   CanonicalValue::Array provider_aliases;
@@ -1103,12 +1326,16 @@ void require_mode_semantics(
     const auto& object = require_object(prompt_templates[index], path);
     require_exact_fields(
         object,
-        {"prompt_template_id", "version", "template_text", "variable_ids", "content_digest"}, path);
+        {"prompt_template_id", "version", "template_text", "variable_ids",
+         "response_contract", "content_digest"},
+        path);
     const std::string prompt_template_id = parse_portable_token(
         require_member(object, "prompt_template_id", path), child_path(path, "prompt_template_id"));
     const core::ContentDigest declared_digest = parse_digest(
         require_member(object, "content_digest", path), child_path(path, "content_digest"));
     CanonicalValue::Object source_template{
+        {"response_contract",
+         require_member(object, "response_contract", path)},
         {"template_text", require_member(object, "template_text", path)},
         {"variable_ids", require_member(object, "variable_ids", path)},
         {"version", require_member(object, "version", path)},
@@ -1133,7 +1360,7 @@ void require_mode_semantics(
     const auto& object = require_object(model_aliases[index], path);
     require_exact_fields(object,
                          {"model_endpoint_alias", "external_resource_alias",
-                          "model_id"},
+                          "model_id", "request_contract"},
                          path);
     const std::string alias = parse_portable_token(
         require_member(object, "model_endpoint_alias", path),
@@ -1144,6 +1371,8 @@ void require_mode_semantics(
             {"external_resource_alias",
              require_member(object, "external_resource_alias", path)},
             {"model_id", require_member(object, "model_id", path)},
+            {"request_contract",
+             require_member(object, "request_contract", path)},
         }));
   }
 
@@ -1315,9 +1544,25 @@ TypedAssistantSettingsCandidate decode_assistant_settings_candidate(
           "$.assistant.modes", parse_mode),
   };
   if (value.modes.empty()) {
-    fail("$.assistant.modes",
-         "a non-empty assistant block must declare at least one mode; use "
-         "the exact empty object to disable assistants");
+    if (value.prompt_templates.empty() &&
+        value.model_endpoint_aliases.empty() &&
+        value.provider_aliases.empty()) {
+      fail("$.assistant",
+           "a non-empty assistant block must configure an interactive mode "
+           "or a bounded model-query endpoint and prompt; use the exact "
+           "empty object to disable assistant facilities");
+    }
+    if (value.prompt_templates.empty() ||
+        value.model_endpoint_aliases.empty()) {
+      fail("$.assistant",
+           "model-query-only assistant settings require at least one prompt "
+           "template and model endpoint alias");
+    }
+    if (!value.provider_aliases.empty()) {
+      fail("$.assistant.provider_aliases",
+           "provider aliases require at least one interactive assistant "
+           "mode");
+    }
   }
   return TypedAssistantSettingsCandidate(
       std::make_shared<const TypedAssistantSettingsCandidate::Data>(

@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
+  "capability_id": "planning.motion.pose_goal",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "target_binding"
+}

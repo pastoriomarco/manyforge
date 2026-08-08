@@ -1,0 +1,44 @@
+{
+  "api_version": "manyforge.stop_evidence_policy.v1",
+  "containment_command": {
+    "command": {
+      "command_kind": "controller_goal_cancel"
+    },
+    "command_phase_id": "command"
+  },
+  "containment_granularity": "resource",
+  "deadline_budget": {
+    "kernel_completion_reserve_ns": 100000000,
+    "outer_duration_ns": 2000000000,
+    "phases": [
+      {
+        "deadline_offset_ns": 500000000,
+        "phase_id": "command"
+      },
+      {
+        "deadline_offset_ns": 1900000000,
+        "phase_id": "terminal"
+      }
+    ]
+  },
+  "disposition": "stoppable",
+  "evidence_conjunction": "all_of",
+  "evidence_requirements": [
+    {
+      "evidence": {
+        "evidence_kind": "controller_goal_terminal"
+      },
+      "evidence_item_id": "goal_terminal",
+      "observation_semantics": {
+        "observation_kind": "post_command_sample"
+      },
+      "phase_id": "terminal",
+      "source_requirement": {
+        "freshness_budget_ns": 100000000,
+        "source_kind": "controller_goal_status"
+      }
+    }
+  ],
+  "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
+  "stop_evidence_policy_revision": "sha256:fa956386a53ba6a502c7288d1a6ea10c42bf1224eaf603e762ff51292a1c4fb4"
+}

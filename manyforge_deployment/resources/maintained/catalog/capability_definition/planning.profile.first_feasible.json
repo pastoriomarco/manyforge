@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
+  "capability_id": "planning.profile.first_feasible",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "target_binding"
+}

@@ -48,6 +48,30 @@ static_assert(
          "\"nodes\":[" + std::string(nodes) + "]}}";
 }
 
+[[nodiscard]] std::string model_request_contract(
+    std::string_view supports_image_input = "true",
+    std::string_view supported_image_transports =
+        "\"http_url\",\"inline_data_url\"") {
+  return "{\"default_timeout_s\":30.0,"
+         "\"max_output_tokens\":512,"
+         "\"supports_response_tools\":true,"
+         "\"supports_json_object\":true,"
+         "\"supports_image_input\":" +
+         std::string(supports_image_input) +
+         ",\"supported_image_transports\":[" +
+         std::string(supported_image_transports) +
+         "],\"tool_call_family\":\"openai_chat_tools\"}";
+}
+
+[[nodiscard]] std::string model_alias(
+    std::string request_contract = model_request_contract()) {
+  return "\"primary_model\":{"
+         "\"external_resource_alias\":\"local_model\","
+         "\"model_id\":\"deployment-model\","
+         "\"request_contract\":" +
+         std::move(request_contract) + "}";
+}
+
 [[nodiscard]] std::string assistant_document(std::string modes = mode(),
                                              std::string_view provider_kind = "direct",
                                              std::string_view assistant_extra = "",
@@ -55,19 +79,43 @@ static_assert(
                                                  "\"choose_object_v1\":{"
                                                  "\"version\":\"1\","
                                                  "\"template_text\":\"Choose {{object_id}}\","
-                                                 "\"variable_ids\":[\"object_id\"]}") {
+                                                 "\"variable_ids\":[\"object_id\"],"
+                                                 "\"response_contract\":{"
+                                                 "\"response_mode\":\"json_object\"}}") {
   return std::string("{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{") +
          "\"audit_policy\":{"
          "\"store_full_prompts\":false,"
          "\"store_full_responses\":false,"
          "\"redact_argument_values\":true}," +
          "\"prompt_templates\":{" + std::string(prompt_templates) + "}," +
-         "\"model_endpoint_aliases\":{" + "\"primary_model\":{" +
-         "\"external_resource_alias\":\"local_model\"," + "\"model_id\":\"deployment-model\"}}," +
+         "\"model_endpoint_aliases\":{" + model_alias() + "}," +
          "\"provider_aliases\":{" + "\"direct_local\":{" + "\"provider_kind\":\"" +
          std::string(provider_kind) + "\"," +
          "\"bridge_external_resource_alias\":\"assistant_bridge\"}}," + "\"modes\":{" +
          std::move(modes) + "}" + std::string(assistant_extra) + "}}";
+}
+
+[[nodiscard]] std::string model_query_document(
+    std::string_view prompt_templates =
+        "\"choose_object_v1\":{"
+        "\"version\":\"1\","
+        "\"template_text\":\"Choose {{object_id}}\","
+        "\"variable_ids\":[\"object_id\"],"
+        "\"response_contract\":{"
+        "\"response_mode\":\"json_object\"}}",
+    std::string model_endpoint_aliases = model_alias(),
+    std::string_view provider_aliases = "") {
+  return std::string(
+             "{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{") +
+         "\"audit_policy\":{"
+         "\"store_full_prompts\":false,"
+         "\"store_full_responses\":false,"
+         "\"redact_argument_values\":true}," +
+         "\"prompt_templates\":{" + std::string(prompt_templates) + "}," +
+         "\"model_endpoint_aliases\":{" +
+         std::string(model_endpoint_aliases) + "}," +
+         "\"provider_aliases\":{" + std::string(provider_aliases) + "}," +
+         "\"modes\":{}}}";
 }
 
 [[nodiscard]] core::ExternalResourceDTO external_resource(
@@ -192,6 +240,43 @@ TEST(AssistantSettingsCodec,
 }
 
 TEST(AssistantSettingsCodec,
+     ModelQueryOnlySettingsAreEnabledAndRetainedWithoutInteractiveModes) {
+  const auto ext = resources();
+  const auto qualified = qualify_assistant_settings(
+      decode(model_query_document()),
+      std::span<const core::ExternalResourceDTO>(ext).subspan(1U));
+
+  ASSERT_TRUE(qualified.enabled());
+  EXPECT_TRUE(qualified.value().modes.empty());
+  ASSERT_EQ(qualified.value().prompt_templates.size(), 1U);
+  EXPECT_EQ(qualified.value().prompt_templates.front()
+                .response_contract.response_mode,
+            core::AssistantPromptResponseMode::kJsonObject);
+  EXPECT_FALSE(qualified.value().prompt_templates.front()
+                   .response_contract.tool_name.has_value());
+  ASSERT_EQ(qualified.value().model_endpoint_aliases.size(), 1U);
+  const auto& request_contract =
+      qualified.value().model_endpoint_aliases.front().request_contract;
+  EXPECT_DOUBLE_EQ(request_contract.default_timeout_s, 30.0);
+  EXPECT_EQ(request_contract.max_output_tokens, 512U);
+  EXPECT_TRUE(request_contract.supports_response_tools);
+  EXPECT_TRUE(request_contract.supports_json_object);
+  EXPECT_TRUE(request_contract.supports_image_input);
+  EXPECT_EQ(request_contract.supported_image_transports.size(), 2U);
+  EXPECT_EQ(request_contract.tool_call_family,
+            core::AssistantToolCallFamily::kOpenAiChatTools);
+  EXPECT_TRUE(qualified.value().provider_aliases.empty());
+  EXPECT_TRUE(is_sha256_digest(qualified.projection_digest().value()));
+
+  const auto verified = verify_retained_assistant_projection(
+      qualified.normalized_projection(),
+      std::span<const core::ExternalResourceDTO>(ext).subspan(1U));
+  EXPECT_TRUE(verified.enabled());
+  EXPECT_EQ(verified.value(), qualified.value());
+  EXPECT_EQ(verified.projection_digest(), qualified.projection_digest());
+}
+
+TEST(AssistantSettingsCodec,
      ReorderedSourceMappingsAndListsHaveOneProjectionIdentity) {
   const auto ext = resources();
   const std::string left_modes =
@@ -246,12 +331,51 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
                       "duplicate instrument ID");
   expect_decode_error(assistant_document(mode("query", "\"status.read\"")),
                       "canonical lowercase underscore tool ID");
-  expect_decode_error(assistant_document(""), "must declare at least one mode");
+  expect_decode_error(model_query_document("", ""),
+                      "must configure an interactive mode or a bounded "
+                      "model-query endpoint and prompt");
+  expect_decode_error(model_query_document("", model_alias()),
+                      "require at least one prompt template and model endpoint");
+  expect_decode_error(model_query_document(
+                          "\"choose_object_v1\":{"
+                          "\"version\":\"1\","
+                          "\"template_text\":\"Choose\","
+                          "\"variable_ids\":[],"
+                          "\"response_contract\":{"
+                          "\"response_mode\":\"json_object\"}}",
+                          model_alias(),
+                          "\"direct_local\":{"
+                          "\"provider_kind\":\"direct\","
+                          "\"bridge_external_resource_alias\":"
+                          "\"assistant_bridge\"}"),
+                      "provider aliases require at least one interactive "
+                      "assistant mode");
+  expect_decode_error(
+      model_query_document(
+          "\"choose_object_v1\":{"
+          "\"version\":\"1\","
+          "\"template_text\":\"Choose\","
+          "\"variable_ids\":[],"
+          "\"response_contract\":{"
+          "\"response_mode\":\"json_object\"}}",
+          model_alias(model_request_contract("false", "\"http_url\""))),
+      "supports_image_input must match the presence of a supported image "
+      "transport");
+  expect_decode_error(
+      model_query_document(
+          "\"choose_object_v1\":{"
+          "\"version\":\"1\","
+          "\"template_text\":\"Choose\","
+          "\"variable_ids\":[],"
+          "\"response_contract\":{\"response_mode\":\"tool_call\"}}"),
+      "missing required field 'tool_name'");
   expect_decode_error(assistant_document(mode(), "direct", "",
                                          "\"choose_object_v1\":{"
                                          "\"version\":\"1\","
                                          "\"template_text\":\"Choose\","
-                                         "\"variable_ids\":[\"object_id\",\"object_id\"]}"),
+                                         "\"variable_ids\":[\"object_id\",\"object_id\"],"
+                                         "\"response_contract\":{"
+                                         "\"response_mode\":\"json_object\"}}"),
                       "duplicate instrument ID");
 }
 

@@ -1,0 +1,166 @@
+{
+  "api_version": "manyforge.maintained_program_role_assignments.v1",
+  "assignments": [
+    {
+      "component_roles": {
+        "robot": "ur10e_robot",
+        "tool": "ur10e_robot"
+      },
+      "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
+      "deployment_revision": "sha256:823e6698af602ada735fa963f88e9bc50b28321c2a5fdded7fd5cf585647e02e",
+      "deployment_source": "examples/assistant_modes_scene_authoring.deployment.yaml",
+      "program_id": "pick_and_place_ur10e_robotiq_demo",
+      "program_revision": "sha256:385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a",
+      "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "lite6_robot",
+        "tool": "lite6_robot"
+      },
+      "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
+      "deployment_revision": "sha256:3957994c6de09ecf9d74d03e065dd7bbd72bccfaf6047b85ef23fb7ab6771fb3",
+      "deployment_source": "examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
+      "program_id": "lite6_lite_gripper_pick_and_place",
+      "program_revision": "sha256:3569bdaa98278af447084b31f2e2f920e4b760e8c60ce803de1a18aac78ee7f2",
+      "program_source": "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "ur5_robot"
+      },
+      "deployment_artifact_id": "ur5_roboplan_local_pick_place",
+      "deployment_revision": "sha256:1384980e6e3903c0dafc95ba9ef0463bc70f36f37332e2fa4b2f3c4ae470c952",
+      "deployment_source": "examples/pick_and_place.deployment.yaml",
+      "program_id": "pick_and_place_demo",
+      "program_revision": "sha256:622bb486587b1c47e2f0dfcace01ad702b21431de8e91601468dd445adba694b",
+      "program_source": "examples/pick_and_place.program.yaml",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "ur5_robot"
+      },
+      "deployment_artifact_id": "ur5_roboplan_local_pick_place",
+      "deployment_revision": "sha256:1384980e6e3903c0dafc95ba9ef0463bc70f36f37332e2fa4b2f3c4ae470c952",
+      "deployment_source": "examples/pick_and_place.deployment.yaml",
+      "program_id": "pick_and_place_minimal",
+      "program_revision": "sha256:5c5cbd7051b279456fc74b387fd37e77bc8e2f475b41e0224bd09518ba749143",
+      "program_source": "examples/pick_and_place_minimal.program.yaml",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "ur10e_robot",
+        "tool": "ur10e_robot"
+      },
+      "deployment_artifact_id": "ur10e_robotiq_pick_place_preview",
+      "deployment_revision": "sha256:5d23d155ecf1f4c705dd2427a4f47e560bee1636b643564c934a4a1be867babf",
+      "deployment_source": "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
+      "program_id": "pick_and_place_ur10e_robotiq_demo",
+      "program_revision": "sha256:385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a",
+      "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "ur5_robot",
+        "tool": "ur5_robot"
+      },
+      "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
+      "deployment_revision": "sha256:cf1a4e49d1df16cf0f4ecac319da2bfe75514fe4bb66b45d94c513279756d8df",
+      "deployment_source": "examples/semantic_shape_pick.deployment.yaml",
+      "program_id": "semantic_shape_pick",
+      "program_revision": "sha256:116c69affc4855cf9a30df6fc4001f7f75da0dfc26f0f088d2feaccc0f8684c3",
+      "program_source": "examples/semantic_shape_pick.program.yaml",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "ur5_robot",
+        "tool": "ur5_robot"
+      },
+      "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
+      "deployment_revision": "sha256:e0ed9534bf9bee0fc1319f1d602a84841f872762388e0ecb42ce558270837246",
+      "deployment_source": "examples/vision_guided_bin_pick.deployment.yaml",
+      "program_id": "vision_guided_bin_pick",
+      "program_revision": "sha256:24cce46731d8581b5c91c32cdfaf31c1bd0fd8f6ae4145b2aaefc13d54d429b3",
+      "program_source": "examples/vision_guided_bin_pick.program.yaml",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        },
+        "gripper": {
+          "command_target_id": "gripper",
+          "component_role": "tool"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "robot": "ur5_robot"
+      },
+      "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
+      "deployment_revision": "sha256:9be5e16886d3823136bce4ed61d52b8045295ac798b7feb467edb8031ffd8d4a",
+      "deployment_source": "examples/vision_guided_pose_pick.deployment.yaml",
+      "program_id": "vision_guided_pose_pick",
+      "program_revision": "sha256:78c9a4523c0d2d15558b5cb730c2f6a017831c3bdafb5a7d6cb63b6000477de8",
+      "program_source": "examples/vision_guided_pose_pick.program.yaml",
+      "target_roles": {
+        "arm": {
+          "command_target_id": "arm",
+          "component_role": "robot"
+        }
+      }
+    }
+  ]
+}

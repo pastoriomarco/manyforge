@@ -1,6 +1,7 @@
 {
   "api_version": "manyforge.maintained_deployment_sources.v1",
   "historical_source_commit": "c4b075fa6dfb69e463c61f3efa8cfce8de681e8a",
+  "assistant_profiles_source": "manyforge_deployment/resources/maintained/maintained_assistant_profiles.v1.json",
   "model_families": [
     {
       "catalog_source": "manyforge_deployment/resources/maintained/model_assets/lite6_lite_gripper.model_asset.json",
@@ -150,6 +151,21 @@
       "deployment_source": "examples/assistant_modes_scene_authoring.deployment.yaml",
       "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
       "cell_id": "ur10e_assistant_authoring_cell",
+      "name": "ur10e_robotiq_assistant_modes_scene_authoring",
+      "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
+      "compatibility": {
+        "lane": "manyforge-only",
+        "provides": [
+          "robotiq_2f_140_gripper",
+          "scene_authoring_tools"
+        ],
+        "tags": [
+          "robotiq",
+          "scene-authoring",
+          "ur10e"
+        ]
+      },
+      "assistant_profile_id": "assistant_scene_authoring",
       "historical_blob": "7149aba89619f3f1c426148ef2f2972cd0c730f0",
       "model_family_id": "ur10e_robotiq_2f_140",
       "component_occurrence_id": "ur10e_robot",
@@ -189,6 +205,19 @@
       "deployment_source": "examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
       "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
       "cell_id": "lite6_pick_place_cell",
+      "name": "lite6_lite_gripper_pick_and_place",
+      "description": "Native ManyForge pick-and-place deployment for UFACTORY Lite6 with the lite pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a generation-time and real-robot runtime dependency only.",
+      "compatibility": {
+        "lane": "manyforge-only",
+        "provides": [
+          "lite_gripper"
+        ],
+        "tags": [
+          "lite6",
+          "pick-and-place"
+        ]
+      },
+      "assistant_profile_id": null,
       "historical_blob": "d0141f0042f3b7af5850e651befb3e2550d907c0",
       "model_family_id": "lite6_lite_gripper",
       "component_occurrence_id": "lite6_robot",
@@ -228,6 +257,17 @@
       "deployment_source": "examples/pick_and_place.deployment.yaml",
       "deployment_artifact_id": "ur5_roboplan_local_pick_place",
       "cell_id": "ur5_pick_place_cell",
+      "name": "ur5_roboplan_local_pick_place",
+      "description": "Local deployment with native in-process RoboPlan planning and simulated execution for the backend-authoritative pick-and-place demo.",
+      "compatibility": {
+        "lane": "manyforge-only",
+        "provides": [],
+        "tags": [
+          "pick-and-place",
+          "ur5"
+        ]
+      },
+      "assistant_profile_id": null,
       "historical_blob": "bee699e23c42a7b8810dbf27b1f8bd261f514834",
       "model_family_id": "ur5_roboplan",
       "component_occurrence_id": "ur5_robot",
@@ -262,6 +302,20 @@
       "deployment_source": "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
       "deployment_artifact_id": "ur10e_robotiq_pick_place_preview",
       "cell_id": "ur10e_pick_place_cell",
+      "name": "ur10e_robotiq_pick_place_preview",
+      "description": "Preview deployment for UR10e + Robotiq 2F-140 native RoboPlan pick-and-place demo.",
+      "compatibility": {
+        "lane": "manyforge-only",
+        "provides": [
+          "robotiq_2f_140_gripper"
+        ],
+        "tags": [
+          "pick-and-place",
+          "robotiq",
+          "ur10e"
+        ]
+      },
+      "assistant_profile_id": null,
       "historical_blob": "f31c1af91814b9da7a1d121531c0c3c814001781",
       "model_family_id": "ur10e_robotiq_2f_140",
       "component_occurrence_id": "ur10e_robot",
@@ -301,6 +355,19 @@
       "deployment_source": "examples/semantic_shape_pick.deployment.yaml",
       "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
       "cell_id": "ur5_semantic_shape_pick_cell",
+      "name": "ur5_roboplan_local_semantic_shape_pick",
+      "description": "Local deployment for the semantic object-selection demo. A model selects one backend-authoritative scene object from a deterministic manifest plus an auxiliary viewer snapshot, and the backend computes the actual pick sequence deterministically from backend scene state.",
+      "compatibility": {
+        "lane": "manyforge-only",
+        "provides": [
+          "semantic_shape_inference"
+        ],
+        "tags": [
+          "semantic-pick",
+          "ur5"
+        ]
+      },
+      "assistant_profile_id": "semantic_shape_selection",
       "historical_blob": "115ab078116696847a9c037f0b20d5b3e39b1741",
       "model_family_id": "ur5_roboplan",
       "component_occurrence_id": "ur5_robot",
@@ -329,6 +396,20 @@
       "deployment_source": "examples/vision_guided_bin_pick.deployment.yaml",
       "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
       "cell_id": "ur5_vision_bin_pick_cell",
+      "name": "ur5_roboplan_local_vision_guided_pick",
+      "description": "Local deployment for the vision-guided bin-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
+      "compatibility": {
+        "lane": "manyforge-only",
+        "provides": [
+          "vision_pose_inference"
+        ],
+        "tags": [
+          "bin-pick",
+          "ur5",
+          "vision-pick"
+        ]
+      },
+      "assistant_profile_id": "vision_bin_selection",
       "historical_blob": "332b8b6daa93cf4b0533e93a42736fd67b8654c5",
       "model_family_id": "ur5_roboplan",
       "component_occurrence_id": "ur5_robot",
@@ -357,6 +438,19 @@
       "deployment_source": "examples/vision_guided_pose_pick.deployment.yaml",
       "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
       "cell_id": "ur5_vision_pose_pick_cell",
+      "name": "ur5_roboplan_local_vision_guided_pose_pick",
+      "description": "Local deployment for the vision-guided pose-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
+      "compatibility": {
+        "lane": "manyforge-only",
+        "provides": [
+          "vision_pose_inference"
+        ],
+        "tags": [
+          "ur5",
+          "vision-pick"
+        ]
+      },
+      "assistant_profile_id": "vision_pose_selection",
       "historical_blob": "a65a0011ee0247cb3bb0281360fa4c46073bbf9d",
       "model_family_id": "ur5_roboplan",
       "component_occurrence_id": "ur5_robot",

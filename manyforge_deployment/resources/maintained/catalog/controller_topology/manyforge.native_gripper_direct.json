@@ -1,0 +1,45 @@
+{
+  "activation_sets": [
+    {
+      "activation_set_id": "gripper_direct",
+      "active_chain_edges": [],
+      "active_controller_role_ids": [
+        "native_execution"
+      ]
+    }
+  ],
+  "api_version": "manyforge.controller_topology.v1",
+  "chain_edges": [],
+  "controller_topology_id": "manyforge.native_gripper_direct",
+  "controllers": [
+    {
+      "control_interface_claims": [
+        {
+          "claimed_directions": [
+            "command",
+            "state"
+          ],
+          "control_interface_contract_id": "manyforge.native_gripper_position",
+          "control_interface_revision": "sha256:865d6a1fa8ecd0de6bf1a7a88ea683f63120616d9355faf33535c7a55ec4b2db"
+        }
+      ],
+      "controller_role_id": "native_execution",
+      "exported_reference_interfaces": [],
+      "exported_state_interfaces": []
+    }
+  ],
+  "legal_routes": [
+    {
+      "compatible_activation_set_ids": [
+        "gripper_direct"
+      ],
+      "control_interface_contract_id": "manyforge.native_gripper_position",
+      "control_interface_revision": "sha256:865d6a1fa8ecd0de6bf1a7a88ea683f63120616d9355faf33535c7a55ec4b2db",
+      "control_route_id": "gripper_position",
+      "ordered_controller_role_ids": [
+        "native_execution"
+      ]
+    }
+  ],
+  "topology_revision": "sha256:1a7d97854724f63090cf8d1adb293e9633f4d7644094aae095f277a53fdfd0d0"
+}

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -55,6 +56,181 @@ _EXPECTED_OPEN_LOOP_SOURCES: Final = frozenset(
         "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
     }
 )
+_EXPECTED_ASSISTANT_PROFILES_SOURCE: Final = (
+    "manyforge_deployment/resources/maintained/maintained_assistant_profiles.v1.json"
+)
+_EXPECTED_ASSISTANT_PROFILE_IDS: Final = {
+    "examples/assistant_modes_scene_authoring.deployment.yaml": (
+        "assistant_scene_authoring"
+    ),
+    "examples/lite6_lite_gripper_pick_and_place.deployment.yaml": None,
+    "examples/pick_and_place.deployment.yaml": None,
+    "examples/pick_and_place_ur10e_robotiq.deployment.yaml": None,
+    "examples/semantic_shape_pick.deployment.yaml": "semantic_shape_selection",
+    "examples/vision_guided_bin_pick.deployment.yaml": "vision_bin_selection",
+    "examples/vision_guided_pose_pick.deployment.yaml": "vision_pose_selection",
+}
+_EXPECTED_COMPATIBILITY: Final = {
+    "examples/assistant_modes_scene_authoring.deployment.yaml": {
+        "lane": "manyforge-only",
+        "provides": ["robotiq_2f_140_gripper", "scene_authoring_tools"],
+        "tags": ["robotiq", "scene-authoring", "ur10e"],
+    },
+    "examples/lite6_lite_gripper_pick_and_place.deployment.yaml": {
+        "lane": "manyforge-only",
+        "provides": ["lite_gripper"],
+        "tags": ["lite6", "pick-and-place"],
+    },
+    "examples/pick_and_place.deployment.yaml": {
+        "lane": "manyforge-only",
+        "provides": [],
+        "tags": ["pick-and-place", "ur5"],
+    },
+    "examples/pick_and_place_ur10e_robotiq.deployment.yaml": {
+        "lane": "manyforge-only",
+        "provides": ["robotiq_2f_140_gripper"],
+        "tags": ["pick-and-place", "robotiq", "ur10e"],
+    },
+    "examples/semantic_shape_pick.deployment.yaml": {
+        "lane": "manyforge-only",
+        "provides": ["semantic_shape_inference"],
+        "tags": ["semantic-pick", "ur5"],
+    },
+    "examples/vision_guided_bin_pick.deployment.yaml": {
+        "lane": "manyforge-only",
+        "provides": ["vision_pose_inference"],
+        "tags": ["bin-pick", "ur5", "vision-pick"],
+    },
+    "examples/vision_guided_pose_pick.deployment.yaml": {
+        "lane": "manyforge-only",
+        "provides": ["vision_pose_inference"],
+        "tags": ["ur5", "vision-pick"],
+    },
+}
+_EXPECTED_ASSISTANT_PROFILE_CONTRACTS: Final = {
+    "assistant_scene_authoring": {
+        "mode_profile_id": "scene_authoring",
+        "endpoint_aliases": ("assistant_model",),
+        "historical_profiles": ("thor_gemma4_12b_gguf",),
+        "provider_kind": "nemoclaw",
+    },
+    "semantic_shape_selection": {
+        "mode_profile_id": "scene_authoring",
+        "endpoint_aliases": ("assistant_model", "selection_model"),
+        "historical_profiles": (
+            "thor_cosmos_reason2_8b",
+            "thor_manyforge_qwen36",
+        ),
+        "provider_kind": "direct",
+    },
+    "vision_bin_selection": {
+        "mode_profile_id": None,
+        "endpoint_aliases": ("vision_model",),
+        "historical_profiles": ("thor_manyforge_qwen36",),
+        "provider_kind": None,
+    },
+    "vision_pose_selection": {
+        "mode_profile_id": "scene_authoring",
+        "endpoint_aliases": ("assistant_model", "vision_model"),
+        "historical_profiles": (
+            "thor_cosmos_reason2_8b",
+            "thor_cosmos_reason2_8b",
+        ),
+        "provider_kind": "direct",
+    },
+}
+_EXPECTED_ASSISTANT_REQUEST_CONTRACTS: Final = {
+    ("assistant_scene_authoring", "assistant_model"): {
+        "default_timeout_s": 180.0,
+        "max_output_tokens": 8192,
+        "supports_response_tools": True,
+        "supports_json_object": True,
+        "supports_image_input": False,
+        "supported_image_transports": [],
+        "tool_call_family": "openai_chat_tools",
+    },
+    ("semantic_shape_selection", "assistant_model"): {
+        "default_timeout_s": 180.0,
+        "max_output_tokens": 8192,
+        "supports_response_tools": True,
+        "supports_json_object": True,
+        "supports_image_input": True,
+        "supported_image_transports": ["http_url", "inline_data_url"],
+        "tool_call_family": "openai_chat_tools",
+    },
+    ("semantic_shape_selection", "selection_model"): {
+        "default_timeout_s": 30.0,
+        "max_output_tokens": 384,
+        "supports_response_tools": True,
+        "supports_json_object": True,
+        "supports_image_input": False,
+        "supported_image_transports": [],
+        "tool_call_family": "openai_chat_tools",
+    },
+    ("vision_bin_selection", "vision_model"): {
+        "default_timeout_s": 30.0,
+        "max_output_tokens": 512,
+        "supports_response_tools": True,
+        "supports_json_object": True,
+        "supports_image_input": True,
+        "supported_image_transports": ["http_url", "inline_data_url"],
+        "tool_call_family": "openai_chat_tools",
+    },
+    ("vision_pose_selection", "assistant_model"): {
+        "default_timeout_s": 180.0,
+        "max_output_tokens": 8192,
+        "supports_response_tools": True,
+        "supports_json_object": True,
+        "supports_image_input": True,
+        "supported_image_transports": ["http_url", "inline_data_url"],
+        "tool_call_family": "openai_chat_tools",
+    },
+    ("vision_pose_selection", "vision_model"): {
+        "default_timeout_s": 120.0,
+        "max_output_tokens": 512,
+        "supports_response_tools": True,
+        "supports_json_object": True,
+        "supports_image_input": True,
+        "supported_image_transports": ["http_url", "inline_data_url"],
+        "tool_call_family": "openai_chat_tools",
+    },
+}
+_EXPECTED_ASSISTANT_PROMPT_CONTRACTS: Final = {
+    ("semantic_shape_selection", "select_scene_object_v1"): {
+        "version": "1",
+        "template_text_sha256": (
+            "f5acfe169fa25ab07f94ec2711cf8872a96a869def7275a9b3be8f46418d83ef"
+        ),
+        "variable_ids": (
+            "candidate_object_ids",
+            "scene_context_json",
+            "selection_request_text",
+        ),
+        "response_contract": {
+            "response_mode": "tool_call",
+            "tool_name": "select_scene_object",
+            "tool_description": (
+                "Choose one candidate object from the current runtime scene context."
+            ),
+        },
+    },
+    ("vision_bin_selection", "choose_bin_target_v1"): {
+        "version": "1",
+        "template_text_sha256": (
+            "8a1f6703c7aadaa2c427c43932a4b7c6bfe45468a02a221f130917a90f5e6314"
+        ),
+        "variable_ids": (),
+        "response_contract": {"response_mode": "json_object"},
+    },
+    ("vision_pose_selection", "infer_grasp_pose_v1"): {
+        "version": "1",
+        "template_text_sha256": (
+            "29888cd8ca46c597e6fae283d3f7e2512092fe9f1a9874781c46da5754516c49"
+        ),
+        "variable_ids": (),
+        "response_contract": {"response_mode": "json_object"},
+    },
+}
 _EXPECTED_MODEL_FAMILIES: Final = {
     "lite6_lite_gripper": {
         "frames": {
@@ -285,6 +461,446 @@ def _source_symbol(value: object, *, path: str) -> str:
 def _canonical_unique(values: list[str], *, path: str, sort_values: bool = True) -> None:
     if len(values) != len(set(values)) or (sort_values and values != sorted(values)):
         raise SourceDescriptionError(f"{path} must be unique and canonical-sorted")
+
+
+def _validate_assistant_profiles(source: Path) -> set[str]:
+    try:
+        value = json.loads(
+            source.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise SourceDescriptionError(
+            f"cannot read maintained assistant profiles: {error}"
+        ) from error
+    top = _exact(
+        value,
+        required=frozenset({"api_version", "mode_profiles", "profiles"}),
+        path="assistant_profiles",
+    )
+    if top["api_version"] != "manyforge.maintained_assistant_profiles.v1":
+        raise SourceDescriptionError(
+            "assistant_profiles.api_version is not the maintained v1 contract"
+        )
+
+    mode_profiles = _object(
+        top["mode_profiles"], path="assistant_profiles.mode_profiles"
+    )
+    if set(mode_profiles) != {"scene_authoring"}:
+        raise SourceDescriptionError(
+            "assistant_profiles.mode_profiles changes the exact maintained set"
+        )
+    modes = _object(
+        mode_profiles["scene_authoring"],
+        path="assistant_profiles.mode_profiles.scene_authoring",
+    )
+    if set(modes) != {"query", "composer-assistant"}:
+        raise SourceDescriptionError(
+            "assistant scene-authoring profile changes the reserved mode set"
+        )
+    for mode_id, raw_mode in modes.items():
+        mode_path = f"assistant_profiles.mode_profiles.scene_authoring.{mode_id}"
+        mode = _exact(
+            raw_mode,
+            required=frozenset(
+                {"enabled", "description", "grant_policy", "catalog"}
+            ),
+            path=mode_path,
+        )
+        if mode["enabled"] is not True:
+            raise SourceDescriptionError(f"{mode_path}.enabled must remain true")
+        _text(mode["description"], path=f"{mode_path}.description")
+        grant = _exact(
+            mode["grant_policy"],
+            required=frozenset(
+                {"session_kind", "approval_mode", "review_policy"}
+            ),
+            path=f"{mode_path}.grant_policy",
+        )
+        expected_review = "not_required" if mode_id == "query" else "required"
+        if (
+            grant["session_kind"] is not None
+            or grant["approval_mode"] is not None
+            or grant["review_policy"] != expected_review
+        ):
+            raise SourceDescriptionError(
+                f"{mode_path}.grant_policy changes reserved offline semantics"
+            )
+        catalog = _exact(
+            mode["catalog"],
+            required=frozenset({"skills", "tools", "nodes"}),
+            path=f"{mode_path}.catalog",
+        )
+        for kind in ("skills", "tools", "nodes"):
+            ids = [
+                _identifier(item, path=f"{mode_path}.catalog.{kind}[{index}]")
+                for index, item in enumerate(
+                    _array(catalog[kind], path=f"{mode_path}.catalog.{kind}")
+                )
+            ]
+            _canonical_unique(ids, path=f"{mode_path}.catalog.{kind}")
+
+    profile_ids: list[str] = []
+    site_overlay_value_refs: set[str] = set()
+    for index, raw_profile in enumerate(
+        _array(top["profiles"], path="assistant_profiles.profiles")
+    ):
+        profile_path = f"assistant_profiles.profiles[{index}]"
+        profile = _exact(
+            raw_profile,
+            required=frozenset(
+                {
+                    "profile_id",
+                    "audit_policy",
+                    "prompt_templates",
+                    "model_endpoints",
+                    "provider_alias",
+                    "mode_profile_id",
+                }
+            ),
+            path=profile_path,
+        )
+        profile_id = _identifier(
+            profile["profile_id"], path=f"{profile_path}.profile_id"
+        )
+        profile_ids.append(profile_id)
+        expected = _EXPECTED_ASSISTANT_PROFILE_CONTRACTS.get(profile_id)
+        if expected is None:
+            raise SourceDescriptionError(
+                f"{profile_path}.profile_id is outside the maintained set"
+            )
+        audit = _exact(
+            profile["audit_policy"],
+            required=frozenset(
+                {
+                    "store_full_prompts",
+                    "store_full_responses",
+                    "redact_argument_values",
+                }
+            ),
+            path=f"{profile_path}.audit_policy",
+        )
+        if audit != {
+            "store_full_prompts": False,
+            "store_full_responses": False,
+            "redact_argument_values": True,
+        }:
+            raise SourceDescriptionError(
+                f"{profile_path}.audit_policy weakens the historical redaction policy"
+            )
+        templates = _object(
+            profile["prompt_templates"],
+            path=f"{profile_path}.prompt_templates",
+        )
+        for template_id, raw_template in templates.items():
+            _identifier(template_id, path=f"{profile_path}.prompt_templates key")
+            template = _exact(
+                raw_template,
+                required=frozenset(
+                    {
+                        "version",
+                        "template_text",
+                        "variable_ids",
+                        "response_contract",
+                    }
+                ),
+                path=f"{profile_path}.prompt_templates.{template_id}",
+            )
+            expected_template = _EXPECTED_ASSISTANT_PROMPT_CONTRACTS.get(
+                (profile_id, template_id)
+            )
+            if expected_template is None:
+                raise SourceDescriptionError(
+                    f"{profile_path}.prompt_templates.{template_id} is outside "
+                    "the maintained historical set"
+                )
+            version = _text(
+                template["version"],
+                path=f"{profile_path}.prompt_templates.{template_id}.version",
+            )
+            if not version.isascii() or any(
+                not (character.isalnum() or character in "_.-")
+                for character in version
+            ):
+                raise SourceDescriptionError(
+                    f"{profile_path}.prompt_templates.{template_id}.version "
+                    "must be a portable token"
+                )
+            template_text = _text(
+                template["template_text"],
+                path=f"{profile_path}.prompt_templates.{template_id}.template_text",
+            )
+            variables = [
+                _identifier(
+                    item,
+                    path=(
+                        f"{profile_path}.prompt_templates.{template_id}"
+                        f".variable_ids[{variable_index}]"
+                    ),
+                )
+                for variable_index, item in enumerate(
+                    _array(
+                        template["variable_ids"],
+                        path=(
+                            f"{profile_path}.prompt_templates.{template_id}"
+                            ".variable_ids"
+                        ),
+                    )
+                )
+            ]
+            _canonical_unique(
+                variables,
+                path=f"{profile_path}.prompt_templates.{template_id}.variable_ids",
+            )
+            response_path = (
+                f"{profile_path}.prompt_templates.{template_id}.response_contract"
+            )
+            raw_response = _object(
+                template["response_contract"], path=response_path
+            )
+            response_mode = _text(
+                raw_response.get("response_mode"),
+                path=f"{response_path}.response_mode",
+            )
+            if response_mode == "json_object":
+                response = _exact(
+                    raw_response,
+                    required=frozenset({"response_mode"}),
+                    path=response_path,
+                )
+            elif response_mode == "tool_call":
+                response = _exact(
+                    raw_response,
+                    required=frozenset(
+                        {"response_mode", "tool_name", "tool_description"}
+                    ),
+                    path=response_path,
+                )
+                _identifier(
+                    response["tool_name"], path=f"{response_path}.tool_name"
+                )
+                _text(
+                    response["tool_description"],
+                    path=f"{response_path}.tool_description",
+                )
+            else:
+                raise SourceDescriptionError(
+                    f"{response_path}.response_mode is outside the closed set"
+                )
+            if (
+                version != expected_template["version"]
+                or hashlib.sha256(template_text.encode("utf-8")).hexdigest()
+                != expected_template["template_text_sha256"]
+                or tuple(variables) != expected_template["variable_ids"]
+                or response != expected_template["response_contract"]
+            ):
+                raise SourceDescriptionError(
+                    f"{profile_path}.prompt_templates.{template_id} changes "
+                    "the exact maintained prompt/response contract"
+                )
+
+        expected_template_ids = {
+            template_id
+            for (expected_profile_id, template_id) in (
+                _EXPECTED_ASSISTANT_PROMPT_CONTRACTS
+            )
+            if expected_profile_id == profile_id
+        }
+        if set(templates) != expected_template_ids:
+            raise SourceDescriptionError(
+                f"{profile_path}.prompt_templates changes the maintained set"
+            )
+
+        endpoint_aliases: list[str] = []
+        historical_profiles: list[str] = []
+        for endpoint_index, raw_endpoint in enumerate(
+            _array(profile["model_endpoints"], path=f"{profile_path}.model_endpoints")
+        ):
+            endpoint_path = f"{profile_path}.model_endpoints[{endpoint_index}]"
+            endpoint = _exact(
+                raw_endpoint,
+                required=frozenset(
+                    {
+                        "model_endpoint_alias",
+                        "model_id",
+                        "site_overlay_value_ref",
+                        "endpoint_value",
+                        "historical_profile_ref",
+                        "request_contract",
+                    }
+                ),
+                path=endpoint_path,
+            )
+            endpoint_alias = _identifier(
+                endpoint["model_endpoint_alias"],
+                path=f"{endpoint_path}.model_endpoint_alias",
+            )
+            endpoint_aliases.append(endpoint_alias)
+            _identifier(endpoint["model_id"], path=f"{endpoint_path}.model_id")
+            site_overlay_value_ref = _identifier(
+                endpoint["site_overlay_value_ref"],
+                path=f"{endpoint_path}.site_overlay_value_ref",
+            )
+            if site_overlay_value_ref in site_overlay_value_refs:
+                raise SourceDescriptionError(
+                    f"{endpoint_path}.site_overlay_value_ref is duplicated"
+                )
+            site_overlay_value_refs.add(site_overlay_value_ref)
+            endpoint_value = _text(
+                endpoint["endpoint_value"], path=f"{endpoint_path}.endpoint_value"
+            )
+            if not endpoint_value.startswith("http://127.0.0.1:"):
+                raise SourceDescriptionError(
+                    f"{endpoint_path}.endpoint_value is not the maintained local endpoint"
+                )
+            historical_profiles.append(
+                _identifier(
+                    endpoint["historical_profile_ref"],
+                    path=f"{endpoint_path}.historical_profile_ref",
+                )
+            )
+            request_path = f"{endpoint_path}.request_contract"
+            request = _exact(
+                endpoint["request_contract"],
+                required=frozenset(
+                    {
+                        "default_timeout_s",
+                        "max_output_tokens",
+                        "supports_response_tools",
+                        "supports_json_object",
+                        "supports_image_input",
+                        "supported_image_transports",
+                        "tool_call_family",
+                    }
+                ),
+                path=request_path,
+            )
+            timeout = request["default_timeout_s"]
+            tokens = request["max_output_tokens"]
+            if (
+                type(timeout) not in {int, float}
+                or not math.isfinite(timeout)
+                or timeout <= 0.0
+                or type(tokens) is not int
+                or not 0 < tokens <= 1_048_576
+            ):
+                raise SourceDescriptionError(
+                    f"{request_path} has invalid bounded request limits"
+                )
+            for field in (
+                "supports_response_tools",
+                "supports_json_object",
+                "supports_image_input",
+            ):
+                if type(request[field]) is not bool:
+                    raise SourceDescriptionError(
+                        f"{request_path}.{field} must be boolean"
+                    )
+            transports = [
+                _identifier(
+                    item,
+                    path=(
+                        f"{request_path}.supported_image_transports"
+                        f"[{transport_index}]"
+                    ),
+                )
+                for transport_index, item in enumerate(
+                    _array(
+                        request["supported_image_transports"],
+                        path=f"{request_path}.supported_image_transports",
+                    )
+                )
+            ]
+            _canonical_unique(
+                transports,
+                path=f"{request_path}.supported_image_transports",
+            )
+            if any(
+                transport not in {"http_url", "inline_data_url"}
+                for transport in transports
+            ):
+                raise SourceDescriptionError(
+                    f"{request_path}.supported_image_transports is outside the closed set"
+                )
+            if request["supports_image_input"] != bool(transports):
+                raise SourceDescriptionError(
+                    f"{request_path}.supports_image_input contradicts its transports"
+                )
+            _identifier(
+                request["tool_call_family"],
+                path=f"{request_path}.tool_call_family",
+            )
+            normalized_request = dict(request)
+            normalized_request["supported_image_transports"] = transports
+            if normalized_request != _EXPECTED_ASSISTANT_REQUEST_CONTRACTS.get(
+                (profile_id, endpoint_alias)
+            ):
+                raise SourceDescriptionError(
+                    f"{request_path} changes the exact maintained request contract"
+                )
+        _canonical_unique(endpoint_aliases, path=f"{profile_path}.model_endpoints")
+        if (
+            tuple(endpoint_aliases) != expected["endpoint_aliases"]
+            or tuple(historical_profiles) != expected["historical_profiles"]
+            or profile["mode_profile_id"] != expected["mode_profile_id"]
+        ):
+            raise SourceDescriptionError(
+                f"{profile_path} changes the maintained endpoint/mode mapping"
+            )
+
+        provider = profile["provider_alias"]
+        if provider is None:
+            provider_kind = None
+        else:
+            provider_path = f"{profile_path}.provider_alias"
+            provider_row = _exact(
+                provider,
+                required=frozenset(
+                    {
+                        "provider_alias_id",
+                        "provider_kind",
+                        "bridge_external_resource_alias",
+                        "site_overlay_value_ref",
+                        "endpoint_value",
+                    }
+                ),
+                path=provider_path,
+            )
+            _identifier(
+                provider_row["provider_alias_id"],
+                path=f"{provider_path}.provider_alias_id",
+            )
+            _identifier(
+                provider_row["bridge_external_resource_alias"],
+                path=f"{provider_path}.bridge_external_resource_alias",
+            )
+            site_overlay_value_ref = _identifier(
+                provider_row["site_overlay_value_ref"],
+                path=f"{provider_path}.site_overlay_value_ref",
+            )
+            if site_overlay_value_ref in site_overlay_value_refs:
+                raise SourceDescriptionError(
+                    f"{provider_path}.site_overlay_value_ref is duplicated"
+                )
+            site_overlay_value_refs.add(site_overlay_value_ref)
+            _text(provider_row["endpoint_value"], path=f"{provider_path}.endpoint_value")
+            provider_kind = provider_row["provider_kind"]
+            if provider_kind not in {"direct", "nemoclaw"}:
+                raise SourceDescriptionError(
+                    f"{provider_path}.provider_kind is outside the closed v1 set"
+                )
+        if provider_kind != expected["provider_kind"]:
+            raise SourceDescriptionError(
+                f"{profile_path}.provider_alias changes the maintained provider kind"
+            )
+
+    if profile_ids != sorted(profile_ids) or set(profile_ids) != set(
+        _EXPECTED_ASSISTANT_PROFILE_CONTRACTS
+    ):
+        raise SourceDescriptionError(
+            "assistant_profiles.profiles must contain the canonical maintained set"
+        )
+    return set(profile_ids)
 
 
 def _validate_model_semantics(
@@ -594,7 +1210,13 @@ def validate(source: Path, root: Path) -> None:
     top = _exact(
         value,
         required=frozenset(
-            {"api_version", "historical_source_commit", "model_families", "deployments"}
+            {
+                "api_version",
+                "historical_source_commit",
+                "assistant_profiles_source",
+                "model_families",
+                "deployments",
+            }
         ),
         path="$",
     )
@@ -605,6 +1227,18 @@ def validate(source: Path, root: Path) -> None:
         or _HEX40.fullmatch(top["historical_source_commit"]) is None
     ):
         raise SourceDescriptionError("$.historical_source_commit must be a full Git object ID")
+    assistant_profiles_source = _source_path(
+        top["assistant_profiles_source"],
+        root=root,
+        path="$.assistant_profiles_source",
+    )
+    if assistant_profiles_source != _EXPECTED_ASSISTANT_PROFILES_SOURCE:
+        raise SourceDescriptionError(
+            "$.assistant_profiles_source changes the maintained profile closure"
+        )
+    assistant_profile_ids = _validate_assistant_profiles(
+        root / assistant_profiles_source
+    )
 
     family_ids: list[str] = []
     for index, raw_family in enumerate(_array(top["model_families"], path="$.model_families")):
@@ -744,6 +1378,10 @@ def validate(source: Path, root: Path) -> None:
                     "deployment_source",
                     "deployment_artifact_id",
                     "cell_id",
+                    "name",
+                    "description",
+                    "compatibility",
+                    "assistant_profile_id",
                     "historical_blob",
                     "model_family_id",
                     "component_occurrence_id",
@@ -757,8 +1395,52 @@ def validate(source: Path, root: Path) -> None:
             row["deployment_source"], root=root, path=f"{path}.deployment_source"
         )
         deployment_sources.append(deployment_source)
-        _identifier(row["deployment_artifact_id"], path=f"{path}.deployment_artifact_id")
+        deployment_artifact_id = _identifier(
+            row["deployment_artifact_id"], path=f"{path}.deployment_artifact_id"
+        )
         _identifier(row["cell_id"], path=f"{path}.cell_id")
+        name = _text(row["name"], path=f"{path}.name")
+        if name != deployment_artifact_id:
+            raise SourceDescriptionError(
+                f"{path}.name must retain the deployment artifact name"
+            )
+        _text(row["description"], path=f"{path}.description")
+        compatibility = _exact(
+            row["compatibility"],
+            required=frozenset({"lane", "provides", "tags"}),
+            path=f"{path}.compatibility",
+        )
+        for field in ("provides", "tags"):
+            values = [
+                _identifier(
+                    item,
+                    path=f"{path}.compatibility.{field}[{value_index}]",
+                )
+                for value_index, item in enumerate(
+                    _array(
+                        compatibility[field],
+                        path=f"{path}.compatibility.{field}",
+                    )
+                )
+            ]
+            _canonical_unique(values, path=f"{path}.compatibility.{field}")
+        if compatibility != _EXPECTED_COMPATIBILITY[deployment_source]:
+            raise SourceDescriptionError(
+                f"{path}.compatibility changes the maintained lane/capability facts"
+            )
+        assistant_profile_id = row["assistant_profile_id"]
+        if assistant_profile_id is not None:
+            assistant_profile_id = _identifier(
+                assistant_profile_id, path=f"{path}.assistant_profile_id"
+            )
+            if assistant_profile_id not in assistant_profile_ids:
+                raise SourceDescriptionError(
+                    f"{path}.assistant_profile_id is absent from the maintained closure"
+                )
+        if assistant_profile_id != _EXPECTED_ASSISTANT_PROFILE_IDS[deployment_source]:
+            raise SourceDescriptionError(
+                f"{path}.assistant_profile_id changes the historical assistant mapping"
+            )
         if row["historical_blob"] != _EXPECTED_HISTORICAL_BLOBS[deployment_source]:
             raise SourceDescriptionError(
                 f"{path}.historical_blob changes the pinned I0 source"

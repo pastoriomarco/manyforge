@@ -258,6 +258,18 @@ struct AssistantOverlayFixture final {
             CanonicalValue(CanonicalValue::Object{
                 {"external_resource_alias", CanonicalValue("assistant_model")},
                 {"model_id", CanonicalValue("i5-test-model")},
+                {"request_contract",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"default_timeout_s", CanonicalValue(30.0)},
+                     {"max_output_tokens", CanonicalValue(512.0)},
+                     {"supported_image_transports",
+                      text_array({"http_url", "inline_data_url"})},
+                     {"supports_image_input", CanonicalValue(true)},
+                     {"supports_json_object", CanonicalValue(true)},
+                     {"supports_response_tools", CanonicalValue(true)},
+                     {"tool_call_family",
+                      CanonicalValue("openai_chat_tools")},
+                 })},
             })},
        })},
       {"modes",

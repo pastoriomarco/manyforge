@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:221f74e397dcae43f8122e30f78cd1e11923b755abf51e70085bc30257f3def9",
+  "capability_id": "assistant.bridge.request",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

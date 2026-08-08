@@ -1,0 +1,48 @@
+{
+  "api_version": "manyforge.provider_manifest.v1",
+  "offered_capabilities": [
+    {
+      "capability_definition_revision": "sha256:37a4b6d145a96b0336ad03680c3222a63da28168764663cee7f5185fcbd467da",
+      "capability_id": "execution.feedback.phase_events",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:7e5958db0906b84cb4e5c68ab0ef896f74dc0ba49a9ceb4d918b386abaf9f28c",
+      "capability_id": "execution.trajectory.execute",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:c1ec4dacead10e33176830d634e9b2287e4b96322a54700c1c3910bcba461c02",
+      "capability_id": "state.observed.current",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:a24b841e7c0323815a3576869d5819340bc6a98f1c2ffd5b47131e26698e9392",
+      "capability_id": "tool.gripper.command",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:53cebcf32900bf3fab41aeb490a9176d3130ae53c1a289c954f1eb8d07738e23",
+      "capability_id": "tool.gripper.feedback",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    }
+  ],
+  "provider_contracts": [],
+  "provider_manifest_id": "manyforge.provider.native_control",
+  "provider_manifest_revision": "sha256:6f8567a91c622419a69105777db5cfb2dd19502aa970978b6c8463e72eb96d95"
+}

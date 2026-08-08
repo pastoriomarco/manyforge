@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:c1ec4dacead10e33176830d634e9b2287e4b96322a54700c1c3910bcba461c02",
+  "capability_id": "state.observed.current",
+  "provider_binding_kind": "control_binding",
+  "scope": "target_binding"
+}

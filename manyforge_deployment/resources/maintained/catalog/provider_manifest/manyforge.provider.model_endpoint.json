@@ -1,0 +1,15 @@
+{
+  "api_version": "manyforge.provider_manifest.v1",
+  "offered_capabilities": [
+    {
+      "capability_definition_revision": "sha256:f900f43ad7bbc61f49c09295a2a63e5fabe93eb57bc9c5f44c26e3c4eeeac158",
+      "capability_id": "assistant.model.invoke",
+      "required_endpoint_role_ids": [
+        "model_inference"
+      ]
+    }
+  ],
+  "provider_contracts": [],
+  "provider_manifest_id": "manyforge.provider.model_endpoint",
+  "provider_manifest_revision": "sha256:77a7fcfc389eb55a271b30f99013ee4ad8a01e1e713a54944a28b939e88a99d2"
+}
