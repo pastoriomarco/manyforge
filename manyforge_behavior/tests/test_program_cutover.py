@@ -1,17 +1,22 @@
-"""Active Program cutover fence and pure tree-artifact coverage."""
+"""Strict v1 Program authoring plus retained pure tree-artifact coverage."""
 
 from collections.abc import Iterator, Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from manyforge_behavior.node_environment import build_node_environment
+from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.canonical_artifact import (
+    compute_content_identity,
+    load_strict_json_yaml,
+)
 from manyforge_behavior.program import (
     BlackboardKey,
     Program,
-    ProgramArtifactUnavailableError,
     ProgramValidationError,
+    ProgramTreeNode,
     TreeNode,
     apply_tree_param_overrides,
     compute_program_tree_hash,
@@ -19,6 +24,36 @@ from manyforge_behavior.program import (
     merge_param_patch,
     tree_node_from_dict,
 )
+
+
+_ROOT = Path(__file__).resolve().parents[2]
+_MAINTAINED_PROGRAMS = (
+    "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+    "examples/pick_and_place.program.yaml",
+    "examples/pick_and_place_minimal.program.yaml",
+    "examples/pick_and_place_ur10e_robotiq.program.yaml",
+    "examples/semantic_shape_pick.program.yaml",
+    "examples/vision_guided_bin_pick.program.yaml",
+    "examples/vision_guided_pose_pick.program.yaml",
+)
+
+
+def _catalog() -> NodeCatalog:
+    # The executable-environment manifest deliberately remains frozen until
+    # the complete N6-b source batch; this focused loader test consumes the
+    # same exact build-owned catalog directly.
+    return NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
+
+
+def _identified(document: dict[str, Any]) -> dict[str, Any]:
+    result = deepcopy(document)
+    result["program_revision"] = compute_content_identity(
+        result,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v1",
+    )
+    return result
 
 
 class _PoisonMapping(Mapping[str, Any]):
@@ -42,25 +77,226 @@ class _PoisonKey:
         raise AssertionError("unsafe field-name stringification")
 
 
-def test_program_construction_is_fenced_before_artifact_io(tmp_path: Path) -> None:
-    environment = build_node_environment()
+def test_program_construction_reports_missing_source(tmp_path: Path) -> None:
+    catalog = _catalog()
     missing = tmp_path / "not-read.program.yaml"
 
-    with pytest.raises(
-        ProgramArtifactUnavailableError,
-        match="composable_cell_program_artifact_unavailable",
-    ):
-        Program(missing, environment.catalog)
+    with pytest.raises(ProgramValidationError, match="cannot read"):
+        Program(missing, catalog)
 
 
-def test_program_mapping_construction_is_fenced() -> None:
-    environment = build_node_environment()
+def test_program_mapping_construction_rejects_non_v1_document() -> None:
+    catalog = _catalog()
 
-    with pytest.raises(
-        ProgramArtifactUnavailableError,
-        match="composable_cell_program_artifact_unavailable",
-    ):
-        Program.from_dict({}, environment.catalog)
+    with pytest.raises(ProgramValidationError, match="missing required fields"):
+        Program.from_dict({}, catalog)
+
+
+@pytest.mark.parametrize("relative_path", _MAINTAINED_PROGRAMS)
+def test_maintained_v1_programs_validate_against_active_catalog(
+    relative_path: str,
+) -> None:
+    catalog = _catalog()
+    program = Program(_ROOT / relative_path, catalog)
+
+    assert program.program_revision.startswith("sha256:")
+    assert isinstance(program.tree, ProgramTreeNode)
+    assert program.catalog_content_version == catalog.content_version
+    assert program.to_dict() == load_strict_json_yaml(_ROOT / relative_path)
+
+
+def test_program_document_copy_is_detached() -> None:
+    catalog = _catalog()
+    program = Program(_ROOT / _MAINTAINED_PROGRAMS[2], catalog)
+
+    first = program.to_dict()
+    first["tree"]["parameters"]["unexpected"] = True
+
+    assert "unexpected" not in program.to_dict()["tree"]["parameters"]
+
+
+def test_program_rejects_stale_revision_before_semantic_use() -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document["name"] = "changed without updating identity"
+
+    with pytest.raises(ProgramValidationError, match="content identity mismatch"):
+        Program.from_dict(document, catalog)
+
+
+def test_program_rejects_removed_singleton_surface() -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document["robot"] = {"robot_id": "ur5", "group_id": "manipulator"}
+
+    with pytest.raises(ProgramValidationError, match="unknown fields.*robot"):
+        Program.from_dict(_identified(document), catalog)
+
+
+def test_program_rejects_dynamic_target_selection() -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document["parameters"].append(
+        {
+            "parameter_id": "selected_target",
+            "type": "string",
+            "default": "arm",
+            "constraints": {},
+            "runtime_mutability": "before_run",
+        }
+    )
+    move = document["tree"]["children"][0]
+    del move["parameters"]["target_role"]
+    move["value_sources"]["target_role"] = {
+        "kind": "program_parameter",
+        "reference": "selected_target",
+    }
+    move["value_sources"] = dict(sorted(move["value_sources"].items()))
+
+    with pytest.raises(ProgramValidationError, match="dynamically select"):
+        Program.from_dict(_identified(document), catalog)
+
+
+def test_program_rejects_value_source_type_mismatch() -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    declaration = document["parameters"][0]
+    declaration["type"] = "bool"
+    declaration["default"] = True
+    declaration["constraints"] = {}
+
+    with pytest.raises(ProgramValidationError, match="incompatible"):
+        Program.from_dict(_identified(document), catalog)
+
+
+def test_program_rejects_duplicate_source_joint_goal() -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    goal = document["tree"]["children"][0]["parameters"]["goal"]
+    goal.append(deepcopy(goal[0]))
+
+    with pytest.raises(ProgramValidationError, match="duplicate.*joint"):
+        Program.from_dict(_identified(document), catalog)
+
+
+def test_program_accepts_ordered_free_text_parameter_defaults() -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    document["parameters"] = [
+        {
+            "parameter_id": "labels",
+            "type": "string_list",
+            "default": ["red workpiece", "red workpiece", "Bin A"],
+            "constraints": {"min_length": 1},
+            "runtime_mutability": "immutable",
+        },
+        {
+            "parameter_id": "operator_note",
+            "type": "string",
+            "default": "Select the red workpiece from Bin A.",
+            "constraints": {"min_length": 1},
+            "runtime_mutability": "before_run",
+        },
+        *document["parameters"],
+    ]
+
+    program = Program.from_dict(_identified(document), catalog)
+
+    assert program.parameters["operator_note"].default.endswith("Bin A.")
+    assert program.parameters["labels"].default[0] == "red workpiece"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("catalog_version", "exact active v2 catalog"),
+        ("duplicate_scene", "unique.*scene_resource_id"),
+        ("non_unit_quaternion", "unit quaternion"),
+        ("unknown_node", "absent from the active v2 catalog"),
+        ("leaf_with_child", "must contain 0-0 children"),
+        ("missing_required_parameter", "missing required catalog parameter"),
+        ("invalid_parameter_default", "default violates max_inclusive"),
+        ("unexpanded_interpolation", "must be a number"),
+        ("undeclared_value_source", "names no Program parameter"),
+        ("empty_blackboard_fields", "must not be empty"),
+        ("unknown_viewer_role", "does not name a declared role"),
+        ("unknown_scene_policy", "undeclared collision policies"),
+        ("inapplicable_constraint", "numeric constraints are unsupported"),
+    ),
+)
+def test_translated_historical_program_negative_corpus(
+    mutation: str,
+    message: str,
+) -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[2])
+    move = document["tree"]["children"][0]
+
+    if mutation == "catalog_version":
+        document["catalog"]["content_version"] = "99.0.0"
+    elif mutation == "duplicate_scene":
+        document["scene"].append(deepcopy(document["scene"][0]))
+    elif mutation == "non_unit_quaternion":
+        document["scene"][0]["pose"]["orientation"]["xyzw"][-1] = 2.0
+    elif mutation == "unknown_node":
+        move["node_id"] = "motion.missing"
+    elif mutation == "leaf_with_child":
+        nested = deepcopy(document["tree"]["children"][1])
+        nested["instance_id"] = "nested_remove"
+        move["children"] = [nested]
+    elif mutation == "missing_required_parameter":
+        del move["parameters"]["target_role"]
+    elif mutation == "invalid_parameter_default":
+        document["parameters"][0]["default"] = 2.0
+    elif mutation == "unexpanded_interpolation":
+        del move["value_sources"]
+        move["parameters"]["velocity_scale"] = "${param:pick_velocity_scale}"
+    elif mutation == "undeclared_value_source":
+        move["value_sources"]["velocity_scale"]["reference"] = "missing"
+    elif mutation == "empty_blackboard_fields":
+        document["blackboard"] = {
+            "namespaces": [],
+            "keys": [
+                {
+                    "key": "result",
+                    "type": "model_response",
+                    "access": "read_write",
+                    "persistence": "run",
+                    "fields": [],
+                }
+            ],
+        }
+    elif mutation == "unknown_viewer_role":
+        document["viewer"] = {"frame_role_visibility": {"unknown": True}}
+    elif mutation == "unknown_scene_policy":
+        document["scene"][0]["collision_policy_ids"] = ["missing_policy"]
+    elif mutation == "inapplicable_constraint":
+        document["parameters"].insert(
+            0,
+            {
+                "parameter_id": "operator_note",
+                "type": "string",
+                "default": "ready",
+                "constraints": {"min_inclusive": 0.0},
+                "runtime_mutability": "immutable",
+            },
+        )
+    else:  # pragma: no cover - keeps the mutation table closed.
+        raise AssertionError(f"unhandled mutation {mutation}")
+
+    with pytest.raises(ProgramValidationError, match=message):
+        Program.from_dict(_identified(document), catalog)
+
+
+def test_contact_selector_must_resolve_to_one_declared_target() -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(_ROOT / _MAINTAINED_PROGRAMS[4])
+    document["target_roles"]["gripper_secondary"] = deepcopy(
+        document["target_roles"]["gripper"]
+    )
+
+    with pytest.raises(ProgramValidationError, match="exactly one.*target role"):
+        Program.from_dict(_identified(document), catalog)
 
 
 def test_pure_tree_helpers_remain_available_during_the_port() -> None:
