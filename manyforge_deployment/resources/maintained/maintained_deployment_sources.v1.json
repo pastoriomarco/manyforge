@@ -3,33 +3,145 @@
   "historical_source_commit": "c4b075fa6dfb69e463c61f3efa8cfce8de681e8a",
   "model_families": [
     {
+      "catalog_source": "manyforge_deployment/resources/maintained/model_assets/lite6_lite_gripper.model_asset.json",
       "model_family_id": "lite6_lite_gripper",
       "model_asset_id": "lite6_lite_gripper",
+      "semantics": {
+        "collision_body_role_bindings": [
+          {
+            "collision_body_role_id": "arm_collision",
+            "source_link_names": ["link1", "link2", "link3", "link4", "link5", "link6", "link_base"]
+          },
+          {
+            "collision_body_role_id": "gripper_collision",
+            "source_link_names": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"]
+          }
+        ],
+        "frame_role_bindings": [
+          {"frame_role_id": "base", "source_link_name": "link_base"},
+          {"frame_role_id": "flange", "source_link_name": "link_eef"},
+          {"frame_role_id": "gripper_tcp", "source_link_name": "link_tcp"},
+          {"frame_role_id": "root", "source_link_name": "world"},
+          {"frame_role_id": "tcp", "source_link_name": "link_tcp"}
+        ],
+        "instance_cardinality": "multiple_per_cell",
+        "model_group_role_bindings": [
+          {"model_group_role_id": "arm", "source_group_name": "lite6"},
+          {"model_group_role_id": "gripper", "source_group_name": "lite_gripper"}
+        ],
+        "resource_role_bindings": [
+          {
+            "resource_role_id": "arm_joints",
+            "source_joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+          },
+          {"resource_role_id": "fingers", "source_joint_names": ["right_finger_joint"]}
+        ],
+        "root_frame_role_id": "root"
+      },
       "source": {
         "accepted_package_uri_prefix": "package://manyforge_example_models/models/lite6_lite_gripper/",
+        "historical_srdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf",
+        "historical_urdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf",
         "resource_root": "manyforge_example_models/models/lite6_lite_gripper",
         "srdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf",
-        "urdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"
+        "srdf_projection_kind": "identity",
+        "urdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf",
+        "urdf_projection_kind": "identity"
       }
     },
     {
+      "catalog_source": "manyforge_deployment/resources/maintained/model_assets/ur10e_robotiq_2f_140.model_asset.json",
       "model_family_id": "ur10e_robotiq_2f_140",
       "model_asset_id": "ur10e_robotiq_2f_140",
+      "semantics": {
+        "collision_body_role_bindings": [
+          {
+            "collision_body_role_id": "arm_collision",
+            "source_link_names": ["base_link_inertia", "forearm_link", "shoulder_link", "upper_arm_link", "wrist_1_link", "wrist_2_link", "wrist_3_link"]
+          },
+          {
+            "collision_body_role_id": "gripper_collision",
+            "source_link_names": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]
+          }
+        ],
+        "frame_role_bindings": [
+          {"frame_role_id": "base", "source_link_name": "base_link"},
+          {"frame_role_id": "flange", "source_link_name": "flange"},
+          {"frame_role_id": "gripper_tcp", "source_link_name": "grasp_frame"},
+          {"frame_role_id": "tcp", "source_link_name": "tool0"}
+        ],
+        "instance_cardinality": "multiple_per_cell",
+        "model_group_role_bindings": [
+          {"model_group_role_id": "arm", "source_group_name": "arm"},
+          {"model_group_role_id": "gripper", "source_group_name": "gripper"}
+        ],
+        "resource_role_bindings": [
+          {
+            "resource_role_id": "arm_joints",
+            "source_joint_names": ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
+          },
+          {"resource_role_id": "fingers", "source_joint_names": ["finger_joint"]}
+        ],
+        "root_frame_role_id": "base"
+      },
       "source": {
         "accepted_package_uri_prefix": "package://manyforge_example_models/models/ur10e_robotiq_2f_140/",
+        "historical_srdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.srdf",
+        "historical_urdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.urdf",
         "resource_root": "manyforge_example_models/models/ur10e_robotiq_2f_140",
         "srdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.structural.srdf",
-        "urdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.structural.urdf"
+        "srdf_projection_kind": "remove_hpp_gripper_extension",
+        "urdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.structural.urdf",
+        "urdf_projection_kind": "remove_unsupported_collision_materials"
       }
     },
     {
+      "catalog_source": "manyforge_deployment/resources/maintained/model_assets/ur5_roboplan.model_asset.json",
       "model_family_id": "ur5_roboplan",
       "model_asset_id": "ur5_roboplan",
+      "semantics": {
+        "collision_body_role_bindings": [
+          {
+            "collision_body_role_id": "arm_collision",
+            "source_link_names": ["base_link", "forearm_link", "shoulder_link", "upper_arm_link", "wrist_1_link", "wrist_2_link", "wrist_3_link"]
+          },
+          {
+            "collision_body_role_id": "gripper_collision",
+            "source_link_names": ["ee_link", "tool0"]
+          },
+          {
+            "collision_body_role_id": "tool_collision",
+            "source_link_names": ["ee_link", "tool0"]
+          }
+        ],
+        "frame_role_bindings": [
+          {"frame_role_id": "base", "source_link_name": "base_link"},
+          {"frame_role_id": "flange", "source_link_name": "ee_link"},
+          {"frame_role_id": "gripper_tcp", "source_link_name": "tool0"},
+          {"frame_role_id": "root", "source_link_name": "world"},
+          {"frame_role_id": "tcp", "source_link_name": "tool0"}
+        ],
+        "instance_cardinality": "multiple_per_cell",
+        "model_group_role_bindings": [
+          {"model_group_role_id": "arm", "source_group_name": "arm"}
+        ],
+        "resource_role_bindings": [
+          {
+            "resource_role_id": "arm_joints",
+            "source_joint_names": ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
+          }
+        ],
+        "root_frame_role_id": "root"
+      },
       "source": {
         "accepted_package_uri_prefix": "package://roboplan_example_models/models/ur_robot_model/",
+        "historical_srdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf",
+        "historical_urdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf",
         "resource_root": ".docker/roboplan/roboplan_example_models/models/ur_robot_model",
-        "srdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf",
-        "urdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf"
+        "srdf_path": "manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.srdf",
+        "srdf_projection_kind": "remove_hpp_gripper_extension",
+        "urdf_path": "manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.urdf",
+        "urdf_projection_kind": "remove_unused_xacro_namespace"
       }
     }
   ],

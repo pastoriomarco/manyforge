@@ -55,6 +55,148 @@ _EXPECTED_OPEN_LOOP_SOURCES: Final = frozenset(
         "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
     }
 )
+_EXPECTED_MODEL_FAMILIES: Final = {
+    "lite6_lite_gripper": {
+        "frames": {
+            "base": "link_base",
+            "flange": "link_eef",
+            "gripper_tcp": "link_tcp",
+            "root": "world",
+            "tcp": "link_tcp",
+        },
+        "groups": {"arm": "lite6", "gripper": "lite_gripper"},
+        "resources": {
+            "arm_joints": ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6"),
+            "fingers": ("right_finger_joint",),
+        },
+        "collisions": {
+            "arm_collision": (
+                "link1",
+                "link2",
+                "link3",
+                "link4",
+                "link5",
+                "link6",
+                "link_base",
+            ),
+            "gripper_collision": (
+                "lite_gripper_base_link",
+                "lite_gripper_left_finger",
+                "lite_gripper_right_finger",
+            ),
+        },
+        "root": "root",
+        "source": {
+            "accepted_package_uri_prefix": "package://manyforge_example_models/models/lite6_lite_gripper/",
+            "historical_srdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf",
+            "historical_urdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf",
+            "resource_root": "manyforge_example_models/models/lite6_lite_gripper",
+            "srdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf",
+            "srdf_projection_kind": "identity",
+            "urdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf",
+            "urdf_projection_kind": "identity",
+        },
+    },
+    "ur10e_robotiq_2f_140": {
+        "frames": {
+            "base": "base_link",
+            "flange": "flange",
+            "gripper_tcp": "grasp_frame",
+            "tcp": "tool0",
+        },
+        "groups": {"arm": "arm", "gripper": "gripper"},
+        "resources": {
+            "arm_joints": (
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ),
+            "fingers": ("finger_joint",),
+        },
+        "collisions": {
+            "arm_collision": (
+                "base_link_inertia",
+                "forearm_link",
+                "shoulder_link",
+                "upper_arm_link",
+                "wrist_1_link",
+                "wrist_2_link",
+                "wrist_3_link",
+            ),
+            "gripper_collision": (
+                "left_inner_finger",
+                "left_inner_finger_pad",
+                "left_inner_knuckle",
+                "left_outer_finger",
+                "left_outer_knuckle",
+                "right_inner_finger",
+                "right_inner_finger_pad",
+                "right_inner_knuckle",
+                "right_outer_finger",
+                "right_outer_knuckle",
+                "robotiq_base_link",
+            ),
+        },
+        "root": "base",
+        "source": {
+            "accepted_package_uri_prefix": "package://manyforge_example_models/models/ur10e_robotiq_2f_140/",
+            "historical_srdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.srdf",
+            "historical_urdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.urdf",
+            "resource_root": "manyforge_example_models/models/ur10e_robotiq_2f_140",
+            "srdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.structural.srdf",
+            "srdf_projection_kind": "remove_hpp_gripper_extension",
+            "urdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.structural.urdf",
+            "urdf_projection_kind": "remove_unsupported_collision_materials",
+        },
+    },
+    "ur5_roboplan": {
+        "frames": {
+            "base": "base_link",
+            "flange": "ee_link",
+            "gripper_tcp": "tool0",
+            "root": "world",
+            "tcp": "tool0",
+        },
+        "groups": {"arm": "arm"},
+        "resources": {
+            "arm_joints": (
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            )
+        },
+        "collisions": {
+            "arm_collision": (
+                "base_link",
+                "forearm_link",
+                "shoulder_link",
+                "upper_arm_link",
+                "wrist_1_link",
+                "wrist_2_link",
+                "wrist_3_link",
+            ),
+            "gripper_collision": ("ee_link", "tool0"),
+            "tool_collision": ("ee_link", "tool0"),
+        },
+        "root": "root",
+        "source": {
+            "accepted_package_uri_prefix": "package://roboplan_example_models/models/ur_robot_model/",
+            "historical_srdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf",
+            "historical_urdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf",
+            "resource_root": ".docker/roboplan/roboplan_example_models/models/ur_robot_model",
+            "srdf_path": "manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.srdf",
+            "srdf_projection_kind": "remove_hpp_gripper_extension",
+            "urdf_path": "manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.urdf",
+            "urdf_projection_kind": "remove_unused_xacro_namespace",
+        },
+    },
+}
 
 
 class SourceDescriptionError(ValueError):
@@ -131,6 +273,172 @@ def _directory_path(value: object, *, root: Path, path: str) -> str:
     if resolved.is_symlink() or not resolved.is_dir():
         raise SourceDescriptionError(f"{path} does not select a plain source directory")
     return text
+
+
+def _source_symbol(value: object, *, path: str) -> str:
+    text = _text(value, path=path)
+    if len(text) > 1024 or any(character.isspace() or not character.isprintable() for character in text):
+        raise SourceDescriptionError(f"{path} must be one bounded source symbol")
+    return text
+
+
+def _canonical_unique(values: list[str], *, path: str, sort_values: bool = True) -> None:
+    if len(values) != len(set(values)) or (sort_values and values != sorted(values)):
+        raise SourceDescriptionError(f"{path} must be unique and canonical-sorted")
+
+
+def _validate_model_semantics(
+    value: object,
+    *,
+    family_id: str,
+    path: str,
+) -> None:
+    semantics = _exact(
+        value,
+        required=frozenset(
+            {
+                "collision_body_role_bindings",
+                "frame_role_bindings",
+                "instance_cardinality",
+                "model_group_role_bindings",
+                "resource_role_bindings",
+                "root_frame_role_id",
+            }
+        ),
+        path=path,
+    )
+    if semantics["instance_cardinality"] != "multiple_per_cell":
+        raise SourceDescriptionError(
+            f"{path}.instance_cardinality must preserve multi-instance model use"
+        )
+
+    frame_roles: list[str] = []
+    frame_bindings: dict[str, str] = {}
+    for index, raw_binding in enumerate(
+        _array(semantics["frame_role_bindings"], path=f"{path}.frame_role_bindings")
+    ):
+        binding_path = f"{path}.frame_role_bindings[{index}]"
+        binding = _exact(
+            raw_binding,
+            required=frozenset({"frame_role_id", "source_link_name"}),
+            path=binding_path,
+        )
+        frame_role = _identifier(
+            binding["frame_role_id"], path=f"{binding_path}.frame_role_id"
+        )
+        frame_roles.append(frame_role)
+        frame_bindings[frame_role] = _source_symbol(
+            binding["source_link_name"], path=f"{binding_path}.source_link_name"
+        )
+    _canonical_unique(frame_roles, path=f"{path}.frame_role_bindings")
+
+    group_roles: list[str] = []
+    group_bindings: dict[str, str] = {}
+    for index, raw_binding in enumerate(
+        _array(
+            semantics["model_group_role_bindings"],
+            path=f"{path}.model_group_role_bindings",
+        )
+    ):
+        binding_path = f"{path}.model_group_role_bindings[{index}]"
+        binding = _exact(
+            raw_binding,
+            required=frozenset({"model_group_role_id", "source_group_name"}),
+            path=binding_path,
+        )
+        group_role = _identifier(
+            binding["model_group_role_id"],
+            path=f"{binding_path}.model_group_role_id",
+        )
+        group_roles.append(group_role)
+        group_bindings[group_role] = _source_symbol(
+            binding["source_group_name"], path=f"{binding_path}.source_group_name"
+        )
+    _canonical_unique(group_roles, path=f"{path}.model_group_role_bindings")
+
+    resource_roles: list[str] = []
+    resource_bindings: dict[str, tuple[str, ...]] = {}
+    for index, raw_binding in enumerate(
+        _array(
+            semantics["resource_role_bindings"],
+            path=f"{path}.resource_role_bindings",
+        )
+    ):
+        binding_path = f"{path}.resource_role_bindings[{index}]"
+        binding = _exact(
+            raw_binding,
+            required=frozenset({"resource_role_id", "source_joint_names"}),
+            path=binding_path,
+        )
+        resource_role = _identifier(
+            binding["resource_role_id"], path=f"{binding_path}.resource_role_id"
+        )
+        resource_roles.append(resource_role)
+        joint_names = [
+            _source_symbol(joint, path=f"{binding_path}.source_joint_names[{joint_index}]")
+            for joint_index, joint in enumerate(
+                _array(
+                    binding["source_joint_names"],
+                    path=f"{binding_path}.source_joint_names",
+                )
+            )
+        ]
+        if not joint_names or len(joint_names) != len(set(joint_names)):
+            raise SourceDescriptionError(
+                f"{binding_path}.source_joint_names must be non-empty and unique"
+            )
+        resource_bindings[resource_role] = tuple(joint_names)
+    _canonical_unique(resource_roles, path=f"{path}.resource_role_bindings")
+
+    collision_roles: list[str] = []
+    collision_bindings: dict[str, tuple[str, ...]] = {}
+    for index, raw_binding in enumerate(
+        _array(
+            semantics["collision_body_role_bindings"],
+            path=f"{path}.collision_body_role_bindings",
+        )
+    ):
+        binding_path = f"{path}.collision_body_role_bindings[{index}]"
+        binding = _exact(
+            raw_binding,
+            required=frozenset({"collision_body_role_id", "source_link_names"}),
+            path=binding_path,
+        )
+        collision_role = _identifier(
+            binding["collision_body_role_id"],
+            path=f"{binding_path}.collision_body_role_id",
+        )
+        collision_roles.append(collision_role)
+        link_names = [
+            _source_symbol(link, path=f"{binding_path}.source_link_names[{link_index}]")
+            for link_index, link in enumerate(
+                _array(
+                    binding["source_link_names"],
+                    path=f"{binding_path}.source_link_names",
+                )
+            )
+        ]
+        if not link_names:
+            raise SourceDescriptionError(f"{binding_path}.source_link_names must not be empty")
+        _canonical_unique(link_names, path=f"{binding_path}.source_link_names")
+        collision_bindings[collision_role] = tuple(link_names)
+    _canonical_unique(collision_roles, path=f"{path}.collision_body_role_bindings")
+
+    expected = _EXPECTED_MODEL_FAMILIES[family_id]
+    root_frame_role = _identifier(
+        semantics["root_frame_role_id"], path=f"{path}.root_frame_role_id"
+    )
+    if (
+        frame_bindings != expected["frames"]
+        or group_bindings != expected["groups"]
+        or resource_bindings != expected["resources"]
+        or collision_bindings != expected["collisions"]
+        or root_frame_role != expected["root"]
+        or root_frame_role not in frame_roles
+    ):
+        raise SourceDescriptionError(
+            f"{path} changes the accepted source-local family role contract"
+        )
 
 
 def _program_roles(program_path: Path) -> tuple[set[str], dict[str, str]]:
@@ -303,15 +611,47 @@ def validate(source: Path, root: Path) -> None:
         path = f"$.model_families[{index}]"
         family = _exact(
             raw_family,
-            required=frozenset({"model_family_id", "model_asset_id", "source"}),
+            required=frozenset(
+                {
+                    "catalog_source",
+                    "model_family_id",
+                    "model_asset_id",
+                    "semantics",
+                    "source",
+                }
+            ),
             path=path,
         )
-        family_ids.append(_identifier(family["model_family_id"], path=f"{path}.model_family_id"))
-        _identifier(family["model_asset_id"], path=f"{path}.model_asset_id")
+        family_id = _identifier(family["model_family_id"], path=f"{path}.model_family_id")
+        family_ids.append(family_id)
+        model_asset_id = _identifier(family["model_asset_id"], path=f"{path}.model_asset_id")
+        if model_asset_id != family_id or family_id not in _EXPECTED_MODEL_FAMILIES:
+            raise SourceDescriptionError(f"{path} changes the exact maintained model-family set")
+        expected_catalog_source = (
+            f"manyforge_deployment/resources/maintained/model_assets/"
+            f"{model_asset_id}.model_asset.json"
+        )
+        catalog_source = _source_path(
+            family["catalog_source"], root=root, path=f"{path}.catalog_source"
+        )
+        if catalog_source != expected_catalog_source:
+            raise SourceDescriptionError(f"{path}.catalog_source is not the shared family source")
+        _validate_model_semantics(
+            family["semantics"], family_id=family_id, path=f"{path}.semantics"
+        )
         model_source = _exact(
             family["source"],
             required=frozenset(
-                {"accepted_package_uri_prefix", "resource_root", "srdf_path", "urdf_path"}
+                {
+                    "accepted_package_uri_prefix",
+                    "historical_srdf_path",
+                    "historical_urdf_path",
+                    "resource_root",
+                    "srdf_path",
+                    "srdf_projection_kind",
+                    "urdf_path",
+                    "urdf_projection_kind",
+                }
             ),
             path=f"{path}.source",
         )
@@ -321,13 +661,68 @@ def validate(source: Path, root: Path) -> None:
         )
         if not prefix.startswith("package://") or not prefix.endswith("/"):
             raise SourceDescriptionError(f"{path}.source.accepted_package_uri_prefix is invalid")
-        _directory_path(
+        resource_root = _directory_path(
             model_source["resource_root"],
             root=root,
             path=f"{path}.source.resource_root",
         )
-        _source_path(model_source["srdf_path"], root=root, path=f"{path}.source.srdf_path")
-        _source_path(model_source["urdf_path"], root=root, path=f"{path}.source.urdf_path")
+        srdf_path = _source_path(
+            model_source["srdf_path"], root=root, path=f"{path}.source.srdf_path"
+        )
+        historical_srdf_path = _source_path(
+            model_source["historical_srdf_path"],
+            root=root,
+            path=f"{path}.source.historical_srdf_path",
+        )
+        projection_kind = _text(
+            model_source["srdf_projection_kind"],
+            path=f"{path}.source.srdf_projection_kind",
+        )
+        expected_source = _EXPECTED_MODEL_FAMILIES[family_id]["source"]
+        if projection_kind != expected_source["srdf_projection_kind"]:
+            raise SourceDescriptionError(
+                f"{path}.source.srdf_projection_kind changes the accepted projection"
+            )
+        if (projection_kind == "identity") != (srdf_path == historical_srdf_path):
+            raise SourceDescriptionError(
+                f"{path}.source SRDF projection paths contradict their declared kind"
+            )
+        urdf_path = _source_path(
+            model_source["urdf_path"], root=root, path=f"{path}.source.urdf_path"
+        )
+        historical_urdf_path = _source_path(
+            model_source["historical_urdf_path"],
+            root=root,
+            path=f"{path}.source.historical_urdf_path",
+        )
+        urdf_projection_kind = _text(
+            model_source["urdf_projection_kind"],
+            path=f"{path}.source.urdf_projection_kind",
+        )
+        if urdf_projection_kind != expected_source["urdf_projection_kind"]:
+            raise SourceDescriptionError(
+                f"{path}.source.urdf_projection_kind changes the accepted projection"
+            )
+        if (urdf_projection_kind == "identity") != (
+            urdf_path == historical_urdf_path
+        ):
+            raise SourceDescriptionError(
+                f"{path}.source URDF projection paths contradict their declared kind"
+            )
+        actual_source = {
+            "accepted_package_uri_prefix": prefix,
+            "historical_srdf_path": historical_srdf_path,
+            "historical_urdf_path": historical_urdf_path,
+            "resource_root": resource_root,
+            "srdf_path": srdf_path,
+            "srdf_projection_kind": projection_kind,
+            "urdf_path": urdf_path,
+            "urdf_projection_kind": urdf_projection_kind,
+        }
+        if actual_source != expected_source:
+            raise SourceDescriptionError(
+                f"{path}.source changes the accepted model-family source closure"
+            )
     if (
         family_ids != sorted(family_ids)
         or len(set(family_ids)) != len(family_ids)

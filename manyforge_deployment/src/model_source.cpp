@@ -302,6 +302,8 @@ struct ColladaParseState final {
   std::size_t depth = 0U;
   bool saw_root = false;
   std::string document_namespace;
+  std::vector<std::string> element_stack;
+  std::optional<std::size_t> safe_blender_camera_extra_depth;
   std::string error;
 };
 
@@ -384,13 +386,54 @@ void XMLCALL start_collada_element(
       return;
     }
 
-    // A retained Collada mesh is admitted as one exact, self-contained
-    // source artifact. Image/init_from/source_data elements and non-fragment
-    // URI attributes can cause a downstream loader to consult files or
-    // documents outside that retained closure, so reject them here.
+    // A retained Collada mesh is admitted as one exact, self-contained source
+    // artifact. One closed Blender camera-metadata extension used by the
+    // maintained UR5 visuals is harmless to robot geometry and is admitted
+    // below. All other extension containers remain rejected.
+    if (local_name == "extra") {
+      if (state.safe_blender_camera_extra_depth.has_value() ||
+          state.element_stack.empty() ||
+          state.element_stack.back() != "camera" ||
+          raw_attributes[0] != nullptr) {
+        stop_collada_with_error(
+            state, "Collada mesh contains an unsupported extension");
+        return;
+      }
+      state.safe_blender_camera_extra_depth = state.depth;
+    } else if (state.safe_blender_camera_extra_depth.has_value()) {
+      const auto relative_depth =
+          state.depth - *state.safe_blender_camera_extra_depth;
+      if (relative_depth == 1U) {
+        if (local_name != "technique" || raw_attributes[0] == nullptr ||
+            raw_attributes[1] == nullptr || raw_attributes[2] != nullptr ||
+            xml_local_name(raw_attributes[0]) != "profile" ||
+            !xml_namespace_name(raw_attributes[0]).empty() ||
+            std::string_view(raw_attributes[1]) != "blender") {
+          stop_collada_with_error(
+              state, "Collada camera metadata has an unsupported technique");
+          return;
+        }
+      } else if (relative_depth == 2U) {
+        const bool safe_scalar = local_name == "YF_dofdist" ||
+                                 local_name == "shiftx" ||
+                                 local_name == "shifty";
+        if (!safe_scalar || raw_attributes[0] != nullptr) {
+          stop_collada_with_error(
+              state, "Collada camera metadata has an unsupported field");
+          return;
+        }
+      } else {
+        stop_collada_with_error(
+            state, "Collada camera metadata exceeds its closed shape");
+        return;
+      }
+    }
+
+    // Image/init_from/source_data elements and non-fragment URI attributes can
+    // cause a downstream loader to consult files or documents outside the
+    // retained closure, so reject them independently of the extension shape.
     if (local_name == "image" || local_name == "init_from" ||
-        local_name == "source_data" || local_name == "skeleton" ||
-        local_name == "extra") {
+        local_name == "source_data" || local_name == "skeleton") {
       stop_collada_with_error(
           state, "Collada mesh contains an external-resource construct");
       return;
@@ -434,6 +477,7 @@ void XMLCALL start_collada_element(
         return;
       }
     }
+    state.element_stack.emplace_back(local_name);
     ++state.depth;
   } catch (const std::exception& error) {
     stop_collada_with_error(
@@ -448,6 +492,41 @@ void XMLCALL end_collada_element(void* user_data,
   auto& state = *static_cast<ColladaParseState*>(user_data);
   if (state.depth > 0U) {
     --state.depth;
+  }
+  if (!state.element_stack.empty()) {
+    if (state.element_stack.back() == "extra" &&
+        state.safe_blender_camera_extra_depth.has_value() &&
+        *state.safe_blender_camera_extra_depth == state.depth) {
+      state.safe_blender_camera_extra_depth.reset();
+    }
+    state.element_stack.pop_back();
+  }
+}
+
+void XMLCALL validate_collada_character_data(void* user_data,
+                                             const XML_Char* bytes,
+                                             int byte_count) noexcept {
+  auto& state = *static_cast<ColladaParseState*>(user_data);
+  if (!state.safe_blender_camera_extra_depth.has_value() ||
+      state.element_stack.empty() || byte_count <= 0) {
+    return;
+  }
+  const auto& element = state.element_stack.back();
+  const bool scalar =
+      element == "YF_dofdist" || element == "shiftx" || element == "shifty";
+  const std::string_view text(bytes, static_cast<std::size_t>(byte_count));
+  const bool valid =
+      std::all_of(text.begin(), text.end(), [scalar](unsigned char byte) {
+        const bool whitespace =
+            byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n';
+        return whitespace ||
+               (scalar &&
+                ((byte >= '0' && byte <= '9') || byte == '+' || byte == '-' ||
+                 byte == '.' || byte == 'e' || byte == 'E'));
+      });
+  if (!valid) {
+    stop_collada_with_error(
+        state, "Collada camera metadata contains unsupported text");
   }
 }
 
@@ -515,6 +594,7 @@ void validate_self_contained_collada(std::string_view bytes,
   XML_SetUserData(parser.get(), &state);
   XML_SetElementHandler(parser.get(), start_collada_element,
                         end_collada_element);
+  XML_SetCharacterDataHandler(parser.get(), validate_collada_character_data);
   XML_SetStartDoctypeDeclHandler(parser.get(),
                                  reject_collada_doctype);
   XML_SetEntityDeclHandler(parser.get(), reject_collada_entity);
@@ -536,7 +616,8 @@ void validate_self_contained_collada(std::string_view bytes,
             << XML_ErrorString(XML_GetErrorCode(parser.get()));
     fail(message.str());
   }
-  if (!state.saw_root || state.depth != 0U) {
+  if (!state.saw_root || state.depth != 0U || !state.element_stack.empty() ||
+      state.safe_blender_camera_extra_depth.has_value()) {
     fail("Collada mesh does not contain one complete root element");
   }
 }

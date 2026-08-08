@@ -2063,6 +2063,40 @@ TEST(ModelSource, EnforcesReferenceKindSpecificMediaTypes) {
 
   collada_blob.bytes =
       "<COLLADA xmlns=\"http://www.collada.org/2005/11/"
+      "COLLADASchema\" version=\"1.4.1\"><library_cameras>"
+      "<camera id=\"camera\"><extra><technique profile=\"blender\">"
+      "<YF_dofdist>0</YF_dofdist><shiftx>-0.5</shiftx>"
+      "<shifty>1e-2</shifty></technique></extra></camera>"
+      "</library_cameras></COLLADA>";
+  EXPECT_NO_THROW(
+      verify_model_source_closure(
+          preflight_model_source_declaration(qualify(collada)),
+          candidates(collada)));
+
+  collada_blob.bytes =
+      "<COLLADA xmlns=\"http://www.collada.org/2005/11/"
+      "COLLADASchema\" version=\"1.4.1\"><library_cameras>"
+      "<camera id=\"camera\"><extra><technique profile=\"blender\">"
+      "<external_path>other.dae</external_path>"
+      "</technique></extra></camera></library_cameras></COLLADA>";
+  EXPECT_THROW(
+      verify_model_source_closure(
+          preflight_model_source_declaration(qualify(collada)),
+          candidates(collada)),
+      ModelSourceError);
+
+  collada_blob.bytes =
+      "<COLLADA xmlns=\"http://www.collada.org/2005/11/"
+      "COLLADASchema\" version=\"1.4.1\">"
+      "<library_geometries><extra/></library_geometries></COLLADA>";
+  EXPECT_THROW(
+      verify_model_source_closure(
+          preflight_model_source_declaration(qualify(collada)),
+          candidates(collada)),
+      ModelSourceError);
+
+  collada_blob.bytes =
+      "<COLLADA xmlns=\"http://www.collada.org/2005/11/"
       "COLLADASchema\" version=\"1.4.1\">"
       "<library_images><image id=\"texture\"><init_from>"
       "file:///tmp/undeclared.png"

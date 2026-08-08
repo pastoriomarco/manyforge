@@ -616,6 +616,16 @@ target_link_libraries(
   manyforge_deployment_revision PRIVATE
   manyforge::deployment_verification_core)
 
+add_executable(
+  manyforge_maintained_model_catalog
+  tools/maintained_model_catalog.cpp)
+target_include_directories(
+  manyforge_maintained_model_catalog PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(
+  manyforge_maintained_model_catalog PRIVATE
+  manyforge::deployment)
+
 set(
   MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER
   "${CMAKE_CURRENT_BINARY_DIR}/generated/build_qualified_admission_profile_generated.hpp")
@@ -1152,11 +1162,79 @@ if(BUILD_TESTING)
     "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.structural.srdf"
     ${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_RESOURCE_INPUTS})
 
+  set(
+    MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/model_sources/ur5_roboplan")
+  set(
+    MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../.docker/roboplan/roboplan_example_models/models/ur_robot_model")
+  set(
+    MANYFORGE_UR5_ROBOPLAN_RESOURCE_ROOT
+    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}")
+  set(
+    MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/ur5_roboplan_structural")
+  file(
+    GLOB_RECURSE
+    MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_RESOURCE_INPUTS
+    CONFIGURE_DEPENDS
+    LIST_DIRECTORIES false
+    "${MANYFORGE_UR5_ROBOPLAN_RESOURCE_ROOT}/meshes/*")
+  file(MAKE_DIRECTORY
+    "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}")
+  execute_process(
+    COMMAND
+      "${Python3_EXECUTABLE}"
+      "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+      --urdf
+      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.urdf"
+      --srdf
+      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.srdf"
+      --model-asset-id
+      ur5_roboplan
+      --accepted-package-uri-prefix
+      "package://roboplan_example_models/models/ur_robot_model/"
+      --resource-root
+      "${MANYFORGE_UR5_ROBOPLAN_RESOURCE_ROOT}"
+      --output-directory
+      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}"
+    RESULT_VARIABLE MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_RESULT
+    OUTPUT_VARIABLE MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_OUTPUT
+    ERROR_VARIABLE MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_ERROR)
+  if(NOT MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "UR5/RoboPlan structural-model qualification preparation failed:\n"
+      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_OUTPUT}"
+      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_ERROR}")
+  endif()
+  set_property(
+    DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.urdf"
+    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.srdf"
+    "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.urdf"
+    "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.srdf"
+    ${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_RESOURCE_INPUTS})
+
   target_compile_definitions(test_cell_structure PRIVATE
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
     MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}"
     MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
     MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}")
+
+  add_test(
+    NAME MaintainedModelCatalogSources
+    COMMAND
+      "$<TARGET_FILE:manyforge_maintained_model_catalog>"
+      --check
+      --description "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
+      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
+      --prepared
+      "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "ur10e_robotiq_2f_140=${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}")
 
   add_executable(test_model_source
     test/test_model_source.cpp)

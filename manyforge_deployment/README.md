@@ -156,11 +156,29 @@ deployment to runtime.
 
 The one human/LLM authoring input for the seven N6 deployments is
 `resources/maintained/maintained_deployment_sources.v1.json`. Its strict check
-pins the three shared model-family sources, seven historical deployment blobs,
-Program-to-component/target role assignments, and the exact speed/grasp
+pins the three shared model-family sources and their exact frame, group, joint,
+collision-body, root, and source-path meanings; seven historical deployment
+blobs; Program-to-component/target role assignments; and the exact speed/grasp
 restoration records. Those policy records are obligations for I8/I11, not an
-alternative runtime policy source and not a claim that N6 accepts the
-top-level deployment `policies` block.
+alternative runtime policy source and not a claim that N6 accepts the top-level
+deployment `policies` block.
+
+The build target `manyforge_maintained_model_catalog` derives the three shared
+`resources/maintained/model_assets/*.model_asset.json` referents from that one
+description and the CMake-prepared source closures. `--check` qualifies every
+source artifact through the production ModelAsset/source-verification path and
+rejects a stale checked-in referent. `--update` first qualifies the complete
+selected family set, then atomically replaces each derived catalog source; it
+never repairs or changes the authored source-role map. Run the CTest
+`MaintainedModelCatalogSources` after configuring the repository container to
+check the exact CMake-prepared Lite6, UR5, and UR10e/Robotiq closures.
+
+The tracked UR5 structural projection removes only RoboPlan's unused xacro
+namespace and unsupported HPP `<gripper>` extension. The original dependency
+URDF/SRDF remain the comparison inputs, and the catalog checker rejects any
+other byte difference. All source joints, links, groups, frames, collision
+pairs, mesh references, and tool geometry therefore retain their original
+meaning.
 
 The implementation intentionally uses dedicated, qualified libraries for
 strict YAML events, Unicode NFC, ECMAScript-compatible binary64 formatting,
