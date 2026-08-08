@@ -284,20 +284,76 @@ template <typename T>
   return failure_stage != error.details.end() && failure_stage->second == "start_state";
 }
 
-void set_absolute_pose(ExecuteRequestDTO& request, const Pose3DTO& pose) {
-  request.target_mode = MotionTargetModeDTO::kAbsolute;
-  request.target_reference.reset();
-  request.offset_reference.reset();
-  request.motion = PoseGoalDTO{pose};
-  request.cache_mode = CacheMode::kDisable;
+[[nodiscard]] MotionParticipantIntentDTO* motion_payload(
+    OperationIntentDTO& operation) noexcept {
+  if (operation.participants.size() != 1U) {
+    return nullptr;
+  }
+  return std::get_if<MotionParticipantIntentDTO>(
+      &operation.participants.front().payload);
 }
 
-void set_absolute_path(ExecuteRequestDTO& request, const CartesianPathDTO& path) {
-  request.target_mode = MotionTargetModeDTO::kAbsolute;
-  request.target_reference.reset();
-  request.offset_reference.reset();
-  request.motion = path;
-  request.cache_mode = CacheMode::kDisable;
+[[nodiscard]] const MotionParticipantIntentDTO* motion_payload(
+    const OperationIntentDTO& operation) noexcept {
+  if (operation.participants.size() != 1U) {
+    return nullptr;
+  }
+  return std::get_if<MotionParticipantIntentDTO>(
+      &operation.participants.front().payload);
+}
+
+[[nodiscard]] bool same_program_context(const OperationIntentDTO& left,
+                                        const OperationIntentDTO& right) {
+  return left.program_id == right.program_id &&
+         left.program_revision == right.program_revision &&
+         left.program_binding_id == right.program_binding_id &&
+         left.program_run_id == right.program_run_id &&
+         left.expected_graph_revision == right.expected_graph_revision &&
+         left.expected_retained_bundle_id ==
+             right.expected_retained_bundle_id &&
+         left.expected_scene_revision == right.expected_scene_revision;
+}
+
+[[nodiscard]] bool same_motion_participant(
+    const OperationIntentDTO& left, const OperationIntentDTO& right) {
+  if (left.participants.size() != 1U || right.participants.size() != 1U) {
+    return false;
+  }
+  const auto& lhs = left.participants.front();
+  const auto& rhs = right.participants.front();
+  const auto* lhs_motion = motion_payload(left);
+  const auto* rhs_motion = motion_payload(right);
+  return lhs_motion != nullptr && rhs_motion != nullptr &&
+         lhs.component_role_id == rhs.component_role_id &&
+         lhs.target_role_id == rhs.target_role_id &&
+         lhs.required_capability_id == rhs.required_capability_id &&
+         lhs_motion->base_frame_role_id == rhs_motion->base_frame_role_id &&
+         lhs_motion->tcp_frame_role_id == rhs_motion->tcp_frame_role_id;
+}
+
+void set_absolute_pose(OperationIntentDTO& operation, const Pose3DTO& pose) {
+  auto* request = motion_payload(operation);
+  if (request == nullptr) {
+    throw std::logic_error("pick candidate motion payload disappeared");
+  }
+  request->target_mode = MotionTargetModeDTO::kAbsolute;
+  request->target_reference.reset();
+  request->offset_reference.reset();
+  request->motion = PoseGoalDTO{pose};
+  request->cache_mode = CacheMode::kDisable;
+}
+
+void set_absolute_path(OperationIntentDTO& operation,
+                       const CartesianPathDTO& path) {
+  auto* request = motion_payload(operation);
+  if (request == nullptr) {
+    throw std::logic_error("pick candidate motion payload disappeared");
+  }
+  request->target_mode = MotionTargetModeDTO::kAbsolute;
+  request->target_reference.reset();
+  request->offset_reference.reset();
+  request->motion = path;
+  request->cache_mode = CacheMode::kDisable;
 }
 
 [[nodiscard]] PickCandidateStageReportDTO successful_stage(const PickCandidateStageDTO stage,
@@ -309,23 +365,6 @@ void set_absolute_path(ExecuteRequestDTO& request, const CartesianPathDTO& path)
 [[nodiscard]] PickCandidateStageReportDTO failed_stage(const PickCandidateStageDTO stage,
                                                        ErrorDTO error) {
   return {stage, false, std::move(error), 0.0, 0U};
-}
-
-[[nodiscard]] Result<MotionSpecDTO> portable_motion_for_sequence(
-    const ResolvedMotionSpecDTO& motion) {
-  if (const auto* value = std::get_if<PoseGoalDTO>(&motion)) {
-    return Result<MotionSpecDTO>::Ok(*value);
-  }
-  if (const auto* value = std::get_if<NamedTargetDTO>(&motion)) {
-    return Result<MotionSpecDTO>::Ok(*value);
-  }
-  if (const auto* value = std::get_if<CartesianPathDTO>(&motion)) {
-    return Result<MotionSpecDTO>::Ok(*value);
-  }
-  return candidate_error<MotionSpecDTO>(
-      "place_sequence_motion_not_portable",
-      "place sequencing cannot reconstruct a portable joint goal from "
-      "adapter-private resolved resource identities");
 }
 
 }  // namespace
@@ -473,6 +512,9 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
   const auto& predecessor = request.predecessor_projection;
   const auto* attach =
       std::get_if<AttachCarriedObjectRequestDTO>(&request.attach_preview_request.request.operation);
+  const auto* approach_motion = motion_payload(request.approach_operation);
+  const auto* descend_motion = motion_payload(request.descend_operation);
+  const auto* retreat_motion = motion_payload(request.retreat_operation);
   if (request.grid.size() == 0U || request.start_state.joint_names.empty() ||
       !predecessor.projection_binding.valid() || !predecessor.logical_scene ||
       !predecessor.logical_scene->locally_valid() || !predecessor.bundle.world ||
@@ -486,20 +528,36 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
           request.carrier_frame_selector.controllable_component_id ||
       attach->command_target_id != request.carrier_frame_selector.command_target_id ||
       attach->frame_role_id != request.carrier_frame_selector.frame_role_id ||
-      request.approach_request.binding != request.descend_request.binding ||
-      request.approach_request.binding != request.retreat_request.binding ||
-      !request.descend_request.resolved_contact_grasp.has_value() ||
-      request.descend_request.resolved_contact_grasp->selected_object_id !=
-          request.grid.selected_object_id()) {
+      approach_motion == nullptr || descend_motion == nullptr ||
+      retreat_motion == nullptr ||
+      !same_program_context(request.approach_operation,
+                            request.descend_operation) ||
+      !same_program_context(request.approach_operation,
+                            request.retreat_operation) ||
+      !same_motion_participant(request.approach_operation,
+                               request.descend_operation) ||
+      !same_motion_participant(request.approach_operation,
+                               request.retreat_operation) ||
+      request.approach_operation.expected_scene_revision !=
+          std::optional(predecessor.projection_binding.projection_revision
+                            .scene_revision) ||
+      approach_motion->contact_policy_id.has_value() ||
+      !approach_motion->runtime_object_bindings.empty() ||
+      !descend_motion->contact_policy_id.has_value() ||
+      std::count_if(
+          descend_motion->runtime_object_bindings.begin(),
+          descend_motion->runtime_object_bindings.end(),
+          [&](const RuntimeObjectReferenceBindingDTO& binding) {
+            return binding.scene_resource_id ==
+                   request.grid.selected_object_id();
+          }) != 1 ||
+      retreat_motion->contact_policy_id.has_value() ||
+      !retreat_motion->runtime_object_bindings.empty()) {
     return reject("pick_candidate_planning_request_invalid",
                   "pick candidate planning request is incomplete or crosses "
                   "binding, object, carrier, or projection identity");
   }
 
-  request.approach_request.resolved_contact_grasp.reset();
-  request.approach_request.contact_policy_id.clear();
-  request.retreat_request.resolved_contact_grasp.reset();
-  request.retreat_request.contact_policy_id.clear();
   PickCandidateSearchOutcomeDTO outcome;
   outcome.reports.reserve(request.grid.size());
   std::optional<PlannedPickCandidateDTO> best;
@@ -520,9 +578,9 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
     report.stages.reserve(4U);
     const auto attempt = static_cast<std::uint32_t>(index);
 
-    auto approach_request = request.approach_request;
-    set_absolute_pose(approach_request, synthesized.value().approach_pose);
-    auto approach = motion_.preview_motion(std::move(approach_request), predecessor,
+    auto approach_operation = request.approach_operation;
+    set_absolute_pose(approach_operation, synthesized.value().approach_pose);
+    auto approach = motion_.preview_motion(std::move(approach_operation), predecessor,
                                            request.start_state, attempt, stop_token);
     if (!approach.ok()) {
       const bool invariant = start_collision(approach.error());
@@ -536,9 +594,9 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
     }
     report.stages.push_back(successful_stage(PickCandidateStageDTO::kApproach, approach.value()));
 
-    auto descend_request = request.descend_request;
-    set_absolute_path(descend_request, synthesized.value().descend_path);
-    auto descend = motion_.preview_motion(std::move(descend_request), predecessor,
+    auto descend_operation = request.descend_operation;
+    set_absolute_path(descend_operation, synthesized.value().descend_path);
+    auto descend = motion_.preview_motion(std::move(descend_operation), predecessor,
                                           approach.value().final_state, attempt, stop_token);
     if (!descend.ok()) {
       report.stages.push_back(failed_stage(PickCandidateStageDTO::kDescend, descend.error()));
@@ -579,10 +637,11 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
     }
     report.stages.push_back({PickCandidateStageDTO::kCandidateAttach, true, std::nullopt, 0.0, 0U});
 
-    auto retreat_request = request.retreat_request;
-    set_absolute_path(retreat_request, synthesized.value().retreat_path);
+    auto retreat_operation = request.retreat_operation;
+    set_absolute_path(retreat_operation, synthesized.value().retreat_path);
     auto retreat =
-        motion_.preview_motion(std::move(retreat_request), std::move(candidate_projection.value()),
+        motion_.preview_motion(std::move(retreat_operation),
+                               std::move(candidate_projection.value()),
                                descend.value().final_state, attempt, stop_token);
     if (!retreat.ok()) {
       report.stages.push_back(failed_stage(PickCandidateStageDTO::kRetreat, retreat.error()));
@@ -625,6 +684,9 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
   const auto& predecessor = request.predecessor_projection;
   const auto* requested_detach =
       std::get_if<DetachCarriedObjectRequestDTO>(&request.detach_preview_request.request.operation);
+  const auto* approach_motion = motion_payload(request.approach_operation);
+  const auto* descend_motion = motion_payload(request.descend_operation);
+  const auto* retreat_motion = motion_payload(request.retreat_operation);
   if (request.selected_object_id.empty() || request.start_state.joint_names.empty() ||
       !predecessor.projection_binding.valid() || !predecessor.logical_scene ||
       !predecessor.logical_scene->locally_valid() || !predecessor.bundle.world ||
@@ -633,14 +695,25 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
       request.detach_preview_request.frame_resolution.has_value() ||
       request.detach_preview_request.request.expected_projection_revision !=
           predecessor.projection_binding.projection_revision ||
-      request.approach_request.binding != request.descend_request.binding ||
-      request.approach_request.binding != request.retreat_request.binding ||
-      request.approach_request.resolved_contact_grasp.has_value() ||
-      request.descend_request.resolved_contact_grasp.has_value() ||
-      request.retreat_request.resolved_contact_grasp.has_value() ||
-      !request.approach_request.contact_policy_id.empty() ||
-      !request.descend_request.contact_policy_id.empty() ||
-      !request.retreat_request.contact_policy_id.empty()) {
+      approach_motion == nullptr || descend_motion == nullptr ||
+      retreat_motion == nullptr ||
+      !same_program_context(request.approach_operation,
+                            request.descend_operation) ||
+      !same_program_context(request.approach_operation,
+                            request.retreat_operation) ||
+      !same_motion_participant(request.approach_operation,
+                               request.descend_operation) ||
+      !same_motion_participant(request.approach_operation,
+                               request.retreat_operation) ||
+      request.approach_operation.expected_scene_revision !=
+          std::optional(predecessor.projection_binding.projection_revision
+                            .scene_revision) ||
+      approach_motion->contact_policy_id.has_value() ||
+      descend_motion->contact_policy_id.has_value() ||
+      retreat_motion->contact_policy_id.has_value() ||
+      !approach_motion->runtime_object_bindings.empty() ||
+      !descend_motion->runtime_object_bindings.empty() ||
+      !retreat_motion->runtime_object_bindings.empty()) {
     return reject("place_planning_request_invalid",
                   "place planning request is incomplete or crosses binding, "
                   "carrier, contact-policy, or projection identity");
@@ -686,19 +759,13 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
 
   PickCandidateReportDTO report{1U, {}};
   report.stages.reserve(4U);
-  auto approach_motion = portable_motion_for_sequence(request.approach_request.motion);
-  auto descend_motion = portable_motion_for_sequence(request.descend_request.motion);
-  auto retreat_motion = portable_motion_for_sequence(request.retreat_request.motion);
-  if (!approach_motion.ok()) {
-    return Result<PlacePlanningOutcomeDTO>::Err(approach_motion.error());
-  }
-  if (!descend_motion.ok()) {
-    return Result<PlacePlanningOutcomeDTO>::Err(descend_motion.error());
-  }
-  if (!retreat_motion.ok()) {
-    return Result<PlacePlanningOutcomeDTO>::Err(retreat_motion.error());
-  }
-  auto approach = motion_.preview_motion(std::move(request.approach_request), predecessor,
+  auto approach_operation = request.approach_operation;
+  auto descend_operation = request.descend_operation;
+  auto retreat_operation = request.retreat_operation;
+  const MotionSpecDTO portable_approach = approach_motion->motion;
+  const MotionSpecDTO portable_descend = descend_motion->motion;
+  const MotionSpecDTO portable_retreat = retreat_motion->motion;
+  auto approach = motion_.preview_motion(std::move(approach_operation), predecessor,
                                          request.start_state, 0U, stop_token);
   if (!approach.ok()) {
     report.stages.push_back(failed_stage(PickCandidateStageDTO::kApproach, approach.error()));
@@ -707,7 +774,7 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
   }
   report.stages.push_back(successful_stage(PickCandidateStageDTO::kApproach, approach.value()));
 
-  auto descend = motion_.preview_motion(std::move(request.descend_request), predecessor,
+  auto descend = motion_.preview_motion(std::move(descend_operation), predecessor,
                                         approach.value().final_state, 0U, stop_token);
   if (!descend.ok()) {
     report.stages.push_back(failed_stage(PickCandidateStageDTO::kDescend, descend.error()));
@@ -748,7 +815,7 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
   }
   report.stages.push_back({PickCandidateStageDTO::kCandidateDetach, true, std::nullopt, 0.0, 0U});
 
-  auto retreat = motion_.preview_motion(std::move(request.retreat_request),
+  auto retreat = motion_.preview_motion(std::move(retreat_operation),
                                         std::move(candidate_projection.value()),
                                         descend.value().final_state, 0U, stop_token);
   if (!retreat.ok()) {
@@ -758,8 +825,8 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
   }
   report.stages.push_back(successful_stage(PickCandidateStageDTO::kRetreat, retreat.value()));
   auto selected =
-      PlannedPlaceDTO{std::move(approach_motion.value()), std::move(descend_motion.value()),
-                      std::move(retreat_motion.value()),  std::move(approach.value()),
+      PlannedPlaceDTO{portable_approach,                 portable_descend,
+                      portable_retreat,                  std::move(approach.value()),
                       std::move(descend.value()),         std::move(candidate_request.request),
                       std::move(detached.value()),        std::move(retreat.value())};
   return Result<PlacePlanningOutcomeDTO>::Ok(PlacePlanningOutcomeDTO{

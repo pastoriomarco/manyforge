@@ -2,11 +2,11 @@
 
 #include <array>
 #include <cstddef>
-#include <manyforge_core/ports/imotion_preview.hpp>
+#include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iscene_candidate_preview.hpp>
 #include <manyforge_core/ports/iscene_candidate_projection.hpp>
-#include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/motion_preview.hpp>
+#include <manyforge_core/types/operation_intent.hpp>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -139,9 +139,9 @@ struct PickCandidateSearchOutcomeDTO final {
 
 struct PickCandidatePlanningRequestDTO final {
   PickCandidateGrid grid;
-  ExecuteRequestDTO approach_request;
-  ExecuteRequestDTO descend_request;
-  ExecuteRequestDTO retreat_request;
+  OperationIntentDTO approach_operation;
+  OperationIntentDTO descend_operation;
+  OperationIntentDTO retreat_operation;
   RobotStateDTO start_state;
   CollisionWorldLeaseInventory predecessor_projection;
   ResolvedSceneCandidatePreviewRequestDTO attach_preview_request;
@@ -154,7 +154,8 @@ struct PickCandidatePlanningRequestDTO final {
 /// projector for the carried retreat. It never dispatches or commits effects.
 class AddressedPickCandidatePlanner final {
  public:
-  AddressedPickCandidatePlanner(IMotionPreview& motion, ISceneCandidatePreview& scene,
+  AddressedPickCandidatePlanner(IAddressedMotionPreviewSession& motion,
+                                ISceneCandidatePreview& scene,
                                 ISceneCandidateProjection& projection)
       : motion_(motion), scene_(scene), projection_(projection) {}
 
@@ -162,16 +163,16 @@ class AddressedPickCandidatePlanner final {
       PickCandidatePlanningRequestDTO request, std::stop_token stop_token = {});
 
  private:
-  IMotionPreview& motion_;
+  IAddressedMotionPreviewSession& motion_;
   ISceneCandidatePreview& scene_;
   ISceneCandidateProjection& projection_;
 };
 
 struct PlacePlanningRequestDTO final {
   SceneResourceId selected_object_id;
-  ExecuteRequestDTO approach_request;
-  ExecuteRequestDTO descend_request;
-  ExecuteRequestDTO retreat_request;
+  OperationIntentDTO approach_operation;
+  OperationIntentDTO descend_operation;
+  OperationIntentDTO retreat_operation;
   RobotStateDTO start_state;
   CollisionWorldLeaseInventory predecessor_projection;
   ResolvedSceneCandidatePreviewRequestDTO detach_preview_request;
@@ -201,7 +202,8 @@ struct PlacePlanningOutcomeDTO final {
 /// the predicted release state, and retreats against that detached successor.
 class AddressedPlacePlanner final {
  public:
-  AddressedPlacePlanner(IMotionPreview& motion, ISceneCandidatePreview& scene,
+  AddressedPlacePlanner(IAddressedMotionPreviewSession& motion,
+                        ISceneCandidatePreview& scene,
                         ISceneCandidateProjection& projection)
       : motion_(motion), scene_(scene), projection_(projection) {}
 
@@ -209,7 +211,7 @@ class AddressedPlacePlanner final {
                                                      std::stop_token stop_token = {});
 
  private:
-  IMotionPreview& motion_;
+  IAddressedMotionPreviewSession& motion_;
   ISceneCandidatePreview& scene_;
   ISceneCandidateProjection& projection_;
 };

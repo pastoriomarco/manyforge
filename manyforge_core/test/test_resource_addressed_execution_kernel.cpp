@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <map>
@@ -14,7 +15,8 @@ namespace {
 
 using namespace manyforge::core;
 
-class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
+class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
+                                    public IMotionPreview {
  public:
   FakeParticipantEngine() {
     gripper_status.state = GripperCommandState::kExecuting;
@@ -38,6 +40,43 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
     status.state = ExecutionState::kPlanning;
     status.execution_id = next_execution_id;
     return next_execute_result;
+  }
+
+  Result<RobotStateDTO> current_preview_state(
+      std::int64_t) const override {
+    return Result<RobotStateDTO>::Ok(
+        RobotStateDTO{{"mf2_joint_1"}, {0.0}, {}});
+  }
+
+  Result<MotionPreviewResultDTO> preview_motion(
+      ExecuteRequestDTO request,
+      CollisionWorldLeaseInventory projection_inventory,
+      RobotStateDTO start_state, std::uint32_t,
+      std::stop_token) override {
+    ++preview_calls;
+    last_preview = request;
+    const RobotStateDTO final_state{start_state.joint_names,
+                                    start_state.positions_rad, {}};
+    return Result<MotionPreviewResultDTO>::Ok(MotionPreviewResultDTO{
+        TrajectoryDTO{request.binding.resources, start_state.joint_names,
+                      {{0.0, start_state.positions_rad, {}, {}}}},
+        start_state, final_state,
+        ControlledStateDTO{
+            request.binding.controllable_component_id,
+            request.binding.command_target_id,
+            request.binding.control_domain_id,
+            request.binding.control_domain_revision,
+            request.binding.control_binding_id,
+            request.binding.control_binding_revision,
+            request.binding.controller_topology_id,
+            request.binding.topology_revision,
+            request.binding.control_route_id,
+            request.binding.active_control_configuration_id,
+            request.binding.active_control_configuration_generation,
+            request.binding.resources, start_state.joint_names,
+            {AngularPositionDTO{0.0}}, std::nullopt},
+        Pose3DTO{}, projection_inventory.projection_binding,
+        projection_inventory.bundle.world->revision, 0U});
   }
 
   StopResultDTO stop() override {
@@ -261,6 +300,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
   }
 
   int execute_calls{};
+  int preview_calls{};
   int command_calls{};
   mutable int validate_command_calls{};
   int stop_gripper_calls{};
@@ -285,6 +325,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine {
   ExecutionStatus status{};
   GripperCommandStatusDTO gripper_status{};
   std::optional<ExecuteRequestDTO> last_execute;
+  std::optional<ExecuteRequestDTO> last_preview;
   std::optional<ResolvedRuntimeScaleCommandDTO> last_runtime_scale_command;
   std::optional<GripperCommandRequestDTO> last_command;
   std::vector<std::string>* timeline{};
@@ -634,6 +675,70 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(resolved.allowed_robot_body_ids.size(), 1U);
   EXPECT_EQ(engine.last_execute->runtime_object_bindings,
             motion.runtime_object_bindings);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreviewSessionUsesTheExecutionBuilderWithoutDispatchOrJournalEffects) {
+  FakeClock clock;
+  clock.set(1234);
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding(
+            "arm", "arm", "execution.trajectory.execute",
+            CoordinateKind::kAngular, std::nullopt, false,
+            "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
+            true),
+        &engine}},
+      clock, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+  auto intent = motion_operation("request.preview.1");
+  auto& motion =
+      std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+  motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
+  motion.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
+      RuntimeObjectId("selected_object"), SceneResourceId("part.7")}};
+
+  auto session = kernel.begin_motion_preview_session(intent);
+  ASSERT_TRUE(session.ok()) << session.error().message;
+  auto prepared = session.value()->prepare_motion(intent);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(prepared.value().resolved_contact_grasp.has_value());
+  EXPECT_EQ(prepared.value().resolved_contact_grasp->selected_object_id.value(),
+            "part.7");
+  EXPECT_EQ(prepared.value().binding.controllable_component_id.value(),
+            "robot.1");
+  auto state = session.value()->current_state();
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().joint_names,
+            std::vector<std::string>{"mf2_joint_1"});
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(engine.preview_calls, 0);
+  EXPECT_EQ(journal.calls, std::vector<std::string>{"begin"});
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreviewSessionRejectsAStaleOwnerBeforePrivateResolution) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding("arm", "arm", "execution.trajectory.execute",
+                     CoordinateKind::kAngular),
+        &engine}},
+      clock, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+  auto intent = motion_operation("request.preview.stale");
+  intent.request_context.request_owner_epoch =
+      RequestOwnerEpoch("kernel.epoch.old");
+
+  auto session = kernel.begin_motion_preview_session(intent);
+  ASSERT_FALSE(session.ok());
+  EXPECT_EQ(session.error().details.at("reason"),
+            "stale_request_owner_epoch");
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(engine.preview_calls, 0);
+  EXPECT_EQ(journal.calls, std::vector<std::string>{"begin"});
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

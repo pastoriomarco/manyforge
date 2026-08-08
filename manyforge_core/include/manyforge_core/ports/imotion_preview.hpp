@@ -15,6 +15,12 @@ class IMotionPreview {
  public:
   virtual ~IMotionPreview() = default;
 
+  /// Capture the authoritative state selected by this exact participant.
+  /// Candidate owners use this instead of accepting caller-supplied joint
+  /// arrays or reaching around the participant to a second state source.
+  [[nodiscard]] virtual Result<RobotStateDTO> current_preview_state(
+      std::int64_t now_ns) const = 0;
+
   [[nodiscard]] virtual Result<MotionPreviewResultDTO> preview_motion(
       ExecuteRequestDTO request, CollisionWorldLeaseInventory projection_inventory,
       RobotStateDTO start_state, std::uint32_t planning_attempt_index = 0U,

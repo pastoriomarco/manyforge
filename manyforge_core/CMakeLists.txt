@@ -59,6 +59,7 @@ add_library(manyforge_core
   src/operator_stop_worker.cpp
   src/operation_intent.cpp
   src/pick_place_candidate.cpp
+  src/pick_place_planning_owner.cpp
   src/pick_place_sequence.cpp
   src/observed_robot_state_publication.cpp
   src/observed_state.cpp

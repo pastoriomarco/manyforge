@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/ports/iaddressed_operation_owner.hpp>
+#include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
@@ -36,7 +37,8 @@ struct ResourceAddressedExecutionKernelConfig final {
 /// participant. Existing ExecutionKernel instances remain private subordinate
 /// planning/execution mechanisms. I8 later expands operation coordination and
 /// concurrency without changing the public component/target/resource identity.
-class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner {
+class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
+                                               public IAddressedMotionPreviewOwner {
  public:
   ResourceAddressedExecutionKernel(
       std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
@@ -52,6 +54,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner {
   /// the original owner-minted identities and performs no subordinate call.
   [[nodiscard]] Result<OperationAcceptedDTO> execute(
       const OperationIntentDTO& intent) override;
+
+  [[nodiscard]] Result<std::unique_ptr<IAddressedMotionPreviewSession>>
+  begin_motion_preview_session(
+      const OperationIntentDTO& primary_motion) override;
 
   [[nodiscard]] Result<OperationControlAcceptedDTO> pause(
       const OperationControlRequestDTO& request);
@@ -92,6 +98,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner {
   struct RuntimeScaleReplayEntry;
   struct ActiveOperation;
   struct EngineSubscription;
+  struct PreviewSession;
 
   [[nodiscard]] IResolvedParticipantExecutionEngine* engine_for(
       const RuntimeParticipantBinding& binding) const noexcept;

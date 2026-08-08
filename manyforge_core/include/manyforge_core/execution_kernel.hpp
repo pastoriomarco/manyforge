@@ -295,6 +295,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// serialized by the ordinary lifecycle boundary. Cancellation requests
   /// the same planner and collision-validation cancellation paths used by
   /// execution.
+  Result<RobotStateDTO> current_preview_state(
+      std::int64_t now_ns) const override;
+
   Result<MotionPreviewResultDTO> preview_motion(
       ExecuteRequestDTO request,
       CollisionWorldLeaseInventory projection_inventory,

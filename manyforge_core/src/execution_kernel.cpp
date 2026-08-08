@@ -7588,6 +7588,11 @@ void ExecutionKernel::async_execute_worker(
   }
 }
 
+Result<RobotStateDTO> ExecutionKernel::current_preview_state(
+    const std::int64_t now_ns) const {
+  return observed_state_.current_state(now_ns);
+}
+
 Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
     ExecuteRequestDTO request,
     CollisionWorldLeaseInventory projection_inventory,

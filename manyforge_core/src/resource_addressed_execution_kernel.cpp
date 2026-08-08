@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <set>
@@ -634,6 +635,174 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
   for (const auto& subscription : engine_subscriptions_) {
     subscription.engine->unsubscribe_events(subscription.handle);
   }
+}
+
+struct ResourceAddressedExecutionKernel::PreviewSession final
+    : IAddressedMotionPreviewSession {
+  PreviewSession(ResourceAddressedExecutionKernel& owner,
+                 RuntimeParticipantBinding primary_binding,
+                 IMotionPreview& motion,
+                 std::unique_lock<std::mutex> submission_lock)
+      : owner_(owner),
+        primary_binding_(std::move(primary_binding)),
+        motion_(motion),
+        submission_lock_(std::move(submission_lock)) {}
+
+  [[nodiscard]] Result<RuntimeParticipantBindingDTO> resolve_binding(
+      const OperationIntentDTO& intent) const override {
+    auto validation = validate_operation_intent(intent);
+    if (!validation.ok()) {
+      return Result<RuntimeParticipantBindingDTO>::Err(validation.error());
+    }
+    if (intent.request_context.request_owner_epoch !=
+        owner_.config_.request_owner_epoch) {
+      return Result<RuntimeParticipantBindingDTO>::Err(error(
+          "stale_request_owner_epoch",
+          "preview request names a stale Kernel owner epoch",
+          "stale_request_owner_epoch"));
+    }
+    if (intent.participants.size() != 1U ||
+        intent.coordination_policy !=
+            OperationCoordinationPolicy::kIndependent) {
+      return reject<RuntimeParticipantBindingDTO>(
+          "I6 preview admits one independent participant",
+          "i6_preview_single_participant_only");
+    }
+    auto resolved = owner_.registry_.resolve(intent, 0U);
+    if (!resolved.ok()) {
+      return Result<RuntimeParticipantBindingDTO>::Err(resolved.error());
+    }
+    return Result<RuntimeParticipantBindingDTO>::Ok(resolved.value().value());
+  }
+
+  [[nodiscard]] Result<ExecuteRequestDTO> prepare_motion(
+      const OperationIntentDTO& intent) override {
+    auto resolved = resolve_binding(intent);
+    if (!resolved.ok()) {
+      return Result<ExecuteRequestDTO>::Err(resolved.error());
+    }
+    if (resolved.value() != primary_binding_.value()) {
+      return reject<ExecuteRequestDTO>(
+          "linked preview motions cross their exact runtime participant",
+          "motion_preview_binding_changed");
+    }
+    if (!std::holds_alternative<MotionParticipantIntentDTO>(
+            intent.participants.front().payload)) {
+      return reject<ExecuteRequestDTO>(
+          "preview preparation requires a motion participant",
+          "motion_preview_payload_not_motion", ErrorCode::kInvalidRequest);
+    }
+    if (next_preview_id_ == 0U ||
+        next_preview_id_ == std::numeric_limits<std::uint64_t>::max()) {
+      return reject<ExecuteRequestDTO>(
+          "preview identity space is exhausted", "motion_preview_id_exhausted",
+          ErrorCode::kInternalError);
+    }
+
+    const std::string prefix =
+        "preview:" + owner_.config_.request_owner_epoch.value() + ":" +
+        std::to_string(next_preview_id_++);
+    const OperationId operation_id(prefix);
+    const OperationParticipantId participant_id(prefix + ":participant:1");
+    const ControllerGoalId controller_goal_id(prefix + ":controller-goal:1");
+    return build_motion_request(
+        intent, intent.participants.front(),
+        std::get<MotionParticipantIntentDTO>(
+            intent.participants.front().payload),
+        resolved.value(), operation_id, OperationRevision(1U), participant_id,
+        controller_goal_id, ControllerGoalGeneration(1U));
+  }
+
+  [[nodiscard]] Result<RobotStateDTO> current_state() const override {
+    return motion_.current_preview_state(owner_.clock_.now());
+  }
+
+  [[nodiscard]] Result<MotionPreviewResultDTO> preview_motion(
+      OperationIntentDTO intent,
+      CollisionWorldLeaseInventory projection_inventory,
+      RobotStateDTO start_state,
+      const std::uint32_t planning_attempt_index,
+      const std::stop_token stop_token) override {
+    if (!intent.expected_scene_revision.has_value() ||
+        *intent.expected_scene_revision !=
+            projection_inventory.projection_binding.projection_revision
+                .scene_revision) {
+      return reject<MotionPreviewResultDTO>(
+          "preview intent does not name the exact retained scene revision",
+          "motion_preview_scene_revision_mismatch",
+          ErrorCode::kSceneChangedDuringValidation);
+    }
+    auto prepared = prepare_motion(intent);
+    if (!prepared.ok()) {
+      return Result<MotionPreviewResultDTO>::Err(prepared.error());
+    }
+    return motion_.preview_motion(
+        std::move(prepared.value()), std::move(projection_inventory),
+        std::move(start_state), planning_attempt_index, stop_token);
+  }
+
+ private:
+  ResourceAddressedExecutionKernel& owner_;
+  RuntimeParticipantBinding primary_binding_;
+  IMotionPreview& motion_;
+  // This is intentionally retained for the complete multi-leg candidate
+  // transaction. The independent control path never takes this mutex.
+  [[maybe_unused]] std::unique_lock<std::mutex> submission_lock_;
+  std::uint64_t next_preview_id_{1U};
+};
+
+Result<std::unique_ptr<IAddressedMotionPreviewSession>>
+ResourceAddressedExecutionKernel::begin_motion_preview_session(
+    const OperationIntentDTO& primary_motion) {
+  std::unique_lock submission_lock(submission_mutex_);
+  auto validation = validate_operation_intent(primary_motion);
+  if (!validation.ok()) {
+    return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Err(
+        validation.error());
+  }
+  if (primary_motion.request_context.request_owner_epoch !=
+      config_.request_owner_epoch) {
+    return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Err(error(
+        "stale_request_owner_epoch",
+        "preview request names a stale Kernel owner epoch",
+        "stale_request_owner_epoch"));
+  }
+  if (primary_motion.participants.size() != 1U ||
+      primary_motion.coordination_policy !=
+          OperationCoordinationPolicy::kIndependent ||
+      !std::holds_alternative<MotionParticipantIntentDTO>(
+          primary_motion.participants.front().payload)) {
+    return reject<std::unique_ptr<IAddressedMotionPreviewSession>>(
+        "I6 preview requires one independent motion participant",
+        "i6_preview_primary_motion_invalid", ErrorCode::kInvalidRequest);
+  }
+  {
+    std::lock_guard state_lock(state_mutex_);
+    if (active_operation_ != nullptr) {
+      return reject<std::unique_ptr<IAddressedMotionPreviewSession>>(
+          "motion preview cannot begin while an operation is unsettled",
+          "motion_preview_operation_busy");
+    }
+  }
+  auto resolved = registry_.resolve(primary_motion, 0U);
+  if (!resolved.ok()) {
+    return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Err(
+        resolved.error());
+  }
+  auto* engine = engine_for(resolved.value());
+  auto* motion = dynamic_cast<IMotionPreview*>(engine);
+  if (motion == nullptr) {
+    return reject<std::unique_ptr<IAddressedMotionPreviewSession>>(
+        "resolved participant has no non-dispatching motion preview",
+        "motion_preview_engine_unavailable",
+        ErrorCode::kUnsupportedCapability);
+  }
+  std::unique_ptr<IAddressedMotionPreviewSession> session =
+      std::make_unique<PreviewSession>(*this, std::move(resolved.value()),
+                                       *motion,
+                                       std::move(submission_lock));
+  return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(
+      std::move(session));
 }
 
 IResolvedParticipantExecutionEngine* ResourceAddressedExecutionKernel::engine_for(
