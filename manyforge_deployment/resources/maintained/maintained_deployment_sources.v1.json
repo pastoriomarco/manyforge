@@ -2,6 +2,322 @@
   "api_version": "manyforge.maintained_deployment_sources.v1",
   "historical_source_commit": "c4b075fa6dfb69e463c61f3efa8cfce8de681e8a",
   "assistant_profiles_source": "manyforge_deployment/resources/maintained/maintained_assistant_profiles.v1.json",
+  "historical_program_sources": [
+    {
+      "program_source": "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+      "historical_blob": "a1966be7d0b655ff852a71c45ff6a8dfbc279e20"
+    },
+    {
+      "program_source": "examples/pick_and_place.program.yaml",
+      "historical_blob": "2ec800075c5373ccb0b4ac50b34eb56289b82fdc"
+    },
+    {
+      "program_source": "examples/pick_and_place_minimal.program.yaml",
+      "historical_blob": "bedd3b63135d5156ac729e8e2f3346aa267c26ef"
+    },
+    {
+      "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+      "historical_blob": "4892381f2eb75ead0f8ffdfbacc74504214a3db4"
+    },
+    {
+      "program_source": "examples/semantic_shape_pick.program.yaml",
+      "historical_blob": "82aaf828329c3d3f9acb5524358a827b57fd636b"
+    },
+    {
+      "program_source": "examples/vision_guided_bin_pick.program.yaml",
+      "historical_blob": "c9ac59881ff64f5d9572281c4251655b2f4d3dfa"
+    },
+    {
+      "program_source": "examples/vision_guided_pose_pick.program.yaml",
+      "historical_blob": "4e18c00ae08d74effd89d88c37be2f2b9e5d0b2d"
+    }
+  ],
+  "runtime_restoration_profiles": [
+    {
+      "runtime_restoration_profile_id": "lite6_native_simulated_v0",
+      "model_family_id": "lite6_lite_gripper",
+      "source_fields": {
+        "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
+        "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
+        "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
+        "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
+        "mode": "adapters.execution.config.mode",
+        "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
+        "planner_rng_seed": "adapters.planning.config.rng_seed"
+      },
+      "native_runtime": {
+        "collision_monitor_period_ms": 50.0,
+        "execution_tick_hz": 100,
+        "initial_joint_positions_rad": [0.0, 0.0, 1.57, 0.0, 0.0, 0.0],
+        "mode": "simulated",
+        "planner_rng_seed": 12345
+      },
+      "stop_profiles": {
+        "default_fault_stop_profile": {
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "joint1": 4.0,
+            "joint2": 4.0,
+            "joint3": 4.0,
+            "joint4": 4.0,
+            "joint5": 4.0,
+            "joint6": 4.0
+          },
+          "profile_id": "fault_spring_back_hold",
+          "require_backend_confirmation": true,
+          "stop_mode": "spring_back_hold"
+        },
+        "operator_stop_profile": {
+          "allow_natural_completion_on_short_path": true,
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "joint1": 4.0,
+            "joint2": 4.0,
+            "joint3": 4.0,
+            "joint4": 4.0,
+            "joint5": 4.0,
+            "joint6": 4.0
+          },
+          "profile_id": "operator_soft_on_path",
+          "require_backend_confirmation": true,
+          "stop_mode": "soft_on_path"
+        }
+      },
+      "acceptance_obligations": [
+        {
+          "obligation_id": "retained_native_initial_state_and_execution_cadence",
+          "acceptance_steps": ["N6-a3", "N7"]
+        },
+        {
+          "obligation_id": "retained_native_planner_seed",
+          "acceptance_steps": ["N6-a3", "N7"]
+        },
+        {
+          "obligation_id": "retained_native_stop_profiles",
+          "acceptance_steps": ["I8/P5"]
+        },
+        {
+          "obligation_id": "retained_runtime_collision_monitor_period",
+          "acceptance_steps": ["N6-a3", "N7", "I8/P5"]
+        }
+      ]
+    },
+    {
+      "runtime_restoration_profile_id": "ur10e_robotiq_assistant_native_simulated_v0",
+      "model_family_id": "ur10e_robotiq_2f_140",
+      "source_fields": {
+        "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
+        "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
+        "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
+        "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
+        "mode": "adapters.execution.config.mode",
+        "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
+        "planner_rng_seed": "adapters.planning.config.rng_seed"
+      },
+      "native_runtime": {
+        "collision_monitor_period_ms": 50.0,
+        "execution_tick_hz": 100,
+        "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
+        "mode": "simulated",
+        "planner_rng_seed": 12345
+      },
+      "stop_profiles": {
+        "default_fault_stop_profile": {
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "elbow_joint": 10.0,
+            "shoulder_lift_joint": 10.0,
+            "shoulder_pan_joint": 10.0,
+            "wrist_1_joint": 10.0,
+            "wrist_2_joint": 10.0,
+            "wrist_3_joint": 10.0
+          },
+          "profile_id": "default_fault_spring_back",
+          "stop_mode": "spring_back_hold"
+        },
+        "operator_stop_profile": {
+          "allow_natural_completion_on_short_path": true,
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "elbow_joint": 10.0,
+            "shoulder_lift_joint": 10.0,
+            "shoulder_pan_joint": 10.0,
+            "wrist_1_joint": 10.0,
+            "wrist_2_joint": 10.0,
+            "wrist_3_joint": 10.0
+          },
+          "profile_id": "operator_soft_on_path",
+          "stop_mode": "soft_on_path"
+        }
+      },
+      "acceptance_obligations": [
+        {
+          "obligation_id": "retained_native_initial_state_and_execution_cadence",
+          "acceptance_steps": ["N6-a3", "N7"]
+        },
+        {
+          "obligation_id": "retained_native_planner_seed",
+          "acceptance_steps": ["N6-a3", "N7"]
+        },
+        {
+          "obligation_id": "retained_native_stop_profiles",
+          "acceptance_steps": ["I8/P5"]
+        },
+        {
+          "obligation_id": "retained_runtime_collision_monitor_period",
+          "acceptance_steps": ["N6-a3", "N7", "I8/P5"]
+        }
+      ]
+    },
+    {
+      "runtime_restoration_profile_id": "ur10e_robotiq_native_simulated_v0",
+      "model_family_id": "ur10e_robotiq_2f_140",
+      "source_fields": {
+        "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
+        "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
+        "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
+        "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
+        "mode": "adapters.execution.config.mode",
+        "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
+        "planner_rng_seed": "adapters.planning.config.rng_seed"
+      },
+      "native_runtime": {
+        "collision_monitor_period_ms": 50.0,
+        "execution_tick_hz": 100,
+        "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
+        "mode": "simulated",
+        "planner_rng_seed": 12345
+      },
+      "stop_profiles": {
+        "default_fault_stop_profile": {
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "elbow_joint": 10.0,
+            "finger_joint": 10.0,
+            "left_inner_finger_joint": 10.0,
+            "left_inner_knuckle_joint": 10.0,
+            "right_inner_finger_joint": 10.0,
+            "right_inner_knuckle_joint": 10.0,
+            "right_outer_knuckle_joint": 10.0,
+            "shoulder_lift_joint": 10.0,
+            "shoulder_pan_joint": 10.0,
+            "wrist_1_joint": 10.0,
+            "wrist_2_joint": 10.0,
+            "wrist_3_joint": 10.0
+          },
+          "profile_id": "fault_spring_back_hold",
+          "require_backend_confirmation": true,
+          "stop_mode": "spring_back_hold"
+        },
+        "operator_stop_profile": {
+          "allow_natural_completion_on_short_path": true,
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "elbow_joint": 10.0,
+            "finger_joint": 10.0,
+            "left_inner_finger_joint": 10.0,
+            "left_inner_knuckle_joint": 10.0,
+            "right_inner_finger_joint": 10.0,
+            "right_inner_knuckle_joint": 10.0,
+            "right_outer_knuckle_joint": 10.0,
+            "shoulder_lift_joint": 10.0,
+            "shoulder_pan_joint": 10.0,
+            "wrist_1_joint": 10.0,
+            "wrist_2_joint": 10.0,
+            "wrist_3_joint": 10.0
+          },
+          "profile_id": "operator_soft_on_path",
+          "require_backend_confirmation": true,
+          "stop_mode": "soft_on_path"
+        }
+      },
+      "acceptance_obligations": [
+        {
+          "obligation_id": "retained_native_initial_state_and_execution_cadence",
+          "acceptance_steps": ["N6-a3", "N7"]
+        },
+        {
+          "obligation_id": "retained_native_planner_seed",
+          "acceptance_steps": ["N6-a3", "N7"]
+        },
+        {
+          "obligation_id": "retained_native_stop_profiles",
+          "acceptance_steps": ["I8/P5"]
+        },
+        {
+          "obligation_id": "retained_runtime_collision_monitor_period",
+          "acceptance_steps": ["N6-a3", "N7", "I8/P5"]
+        }
+      ]
+    },
+    {
+      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
+      "model_family_id": "ur5_roboplan",
+      "source_fields": {
+        "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
+        "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
+        "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
+        "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
+        "mode": "adapters.execution.config.mode",
+        "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
+        "planner_rng_seed": "adapters.planning.config.rng_seed"
+      },
+      "native_runtime": {
+        "collision_monitor_period_ms": 50.0,
+        "execution_tick_hz": 100,
+        "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
+        "mode": "simulated",
+        "planner_rng_seed": 12345
+      },
+      "stop_profiles": {
+        "default_fault_stop_profile": {
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "elbow_joint": 10.0,
+            "shoulder_lift_joint": 10.0,
+            "shoulder_pan_joint": 10.0,
+            "wrist_1_joint": 10.0,
+            "wrist_2_joint": 10.0,
+            "wrist_3_joint": 10.0
+          },
+          "profile_id": "default_fault_spring_back",
+          "stop_mode": "spring_back_hold"
+        },
+        "operator_stop_profile": {
+          "allow_natural_completion_on_short_path": true,
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "elbow_joint": 10.0,
+            "shoulder_lift_joint": 10.0,
+            "shoulder_pan_joint": 10.0,
+            "wrist_1_joint": 10.0,
+            "wrist_2_joint": 10.0,
+            "wrist_3_joint": 10.0
+          },
+          "profile_id": "operator_soft_on_path",
+          "stop_mode": "soft_on_path"
+        }
+      },
+      "acceptance_obligations": [
+        {
+          "obligation_id": "retained_native_initial_state_and_execution_cadence",
+          "acceptance_steps": ["N6-a3", "N7"]
+        },
+        {
+          "obligation_id": "retained_native_planner_seed",
+          "acceptance_steps": ["N6-a3", "N7"]
+        },
+        {
+          "obligation_id": "retained_native_stop_profiles",
+          "acceptance_steps": ["I8/P5"]
+        },
+        {
+          "obligation_id": "retained_runtime_collision_monitor_period",
+          "acceptance_steps": ["N6-a3", "N7", "I8/P5"]
+        }
+      ]
+    }
+  ],
   "model_families": [
     {
       "catalog_source": "manyforge_deployment/resources/maintained/model_assets/lite6_lite_gripper.model_asset.json",
@@ -168,6 +484,7 @@
       "assistant_profile_id": "assistant_scene_authoring",
       "historical_blob": "7149aba89619f3f1c426148ef2f2972cd0c730f0",
       "model_family_id": "ur10e_robotiq_2f_140",
+      "runtime_restoration_profile_id": "ur10e_robotiq_assistant_native_simulated_v0",
       "component_occurrence_id": "ur10e_robot",
       "program_role_assignments": [
         {
@@ -220,6 +537,7 @@
       "assistant_profile_id": null,
       "historical_blob": "d0141f0042f3b7af5850e651befb3e2550d907c0",
       "model_family_id": "lite6_lite_gripper",
+      "runtime_restoration_profile_id": "lite6_native_simulated_v0",
       "component_occurrence_id": "lite6_robot",
       "program_role_assignments": [
         {
@@ -270,6 +588,7 @@
       "assistant_profile_id": null,
       "historical_blob": "bee699e23c42a7b8810dbf27b1f8bd261f514834",
       "model_family_id": "ur5_roboplan",
+      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
@@ -318,6 +637,7 @@
       "assistant_profile_id": null,
       "historical_blob": "f31c1af91814b9da7a1d121531c0c3c814001781",
       "model_family_id": "ur10e_robotiq_2f_140",
+      "runtime_restoration_profile_id": "ur10e_robotiq_native_simulated_v0",
       "component_occurrence_id": "ur10e_robot",
       "program_role_assignments": [
         {
@@ -370,6 +690,7 @@
       "assistant_profile_id": "semantic_shape_selection",
       "historical_blob": "115ab078116696847a9c037f0b20d5b3e39b1741",
       "model_family_id": "ur5_roboplan",
+      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
@@ -412,6 +733,7 @@
       "assistant_profile_id": "vision_bin_selection",
       "historical_blob": "332b8b6daa93cf4b0533e93a42736fd67b8654c5",
       "model_family_id": "ur5_roboplan",
+      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
@@ -453,6 +775,7 @@
       "assistant_profile_id": "vision_pose_selection",
       "historical_blob": "a65a0011ee0247cb3bb0281360fa4c46073bbf9d",
       "model_family_id": "ur5_roboplan",
+      "runtime_restoration_profile_id": "ur5_native_simulated_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {

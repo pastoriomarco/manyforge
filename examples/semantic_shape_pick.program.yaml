@@ -1,6 +1,6 @@
 api_version: manyforge.program.v1
 program_id: semantic_shape_pick
-program_revision: sha256:116c69affc4855cf9a30df6fc4001f7f75da0dfc26f0f088d2feaccc0f8684c3
+program_revision: sha256:05679a1dd482e05553e91d3c9f5286ef6890cf30cdc7c3bc592beb80555345b2
 program_profile: composable-cell-v1
 name: semantic_shape_pick
 description: >-
@@ -156,6 +156,7 @@ blackboard:
       fields:
         - {field: confidence, type: float64}
         - {field: matched_attributes, type: string_list}
+        - {field: outcome, type: string}
         - {field: reason, type: string}
         - {field: selected_object_id, type: scene_resource}
     - key: selection.validated
@@ -165,6 +166,7 @@ blackboard:
       fields:
         - {field: confidence, type: float64}
         - {field: matched_attributes, type: string_list}
+        - {field: outcome, type: string}
         - {field: reason, type: string}
         - {field: selected_object_id, type: scene_resource}
 contact_policies:

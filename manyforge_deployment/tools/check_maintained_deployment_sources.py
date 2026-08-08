@@ -14,9 +14,9 @@ from typing import Any, Final
 
 import yaml
 
-
 API_VERSION: Final = "manyforge.maintained_deployment_sources.v1"
 PROGRAM_API_VERSION: Final = "manyforge.program.v1"
+_EXPECTED_HISTORICAL_SOURCE_COMMIT: Final = "c4b075fa6dfb69e463c61f3efa8cfce8de681e8a"
 _ID = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _EXPECTED_DEPLOYMENT_SOURCES: Final = frozenset(
@@ -44,6 +44,94 @@ _EXPECTED_HISTORICAL_BLOBS: Final = {
     "examples/semantic_shape_pick.deployment.yaml": "115ab078116696847a9c037f0b20d5b3e39b1741",
     "examples/vision_guided_bin_pick.deployment.yaml": "332b8b6daa93cf4b0533e93a42736fd67b8654c5",
     "examples/vision_guided_pose_pick.deployment.yaml": "a65a0011ee0247cb3bb0281360fa4c46073bbf9d",
+}
+_EXPECTED_HISTORICAL_PROGRAM_BLOBS: Final = {
+    "examples/lite6_lite_gripper_pick_and_place.program.yaml": (
+        "a1966be7d0b655ff852a71c45ff6a8dfbc279e20"
+    ),
+    "examples/pick_and_place.program.yaml": "2ec800075c5373ccb0b4ac50b34eb56289b82fdc",
+    "examples/pick_and_place_minimal.program.yaml": (
+        "bedd3b63135d5156ac729e8e2f3346aa267c26ef"
+    ),
+    "examples/pick_and_place_ur10e_robotiq.program.yaml": (
+        "4892381f2eb75ead0f8ffdfbacc74504214a3db4"
+    ),
+    "examples/semantic_shape_pick.program.yaml": (
+        "82aaf828329c3d3f9acb5524358a827b57fd636b"
+    ),
+    "examples/vision_guided_bin_pick.program.yaml": (
+        "c9ac59881ff64f5d9572281c4251655b2f4d3dfa"
+    ),
+    "examples/vision_guided_pose_pick.program.yaml": (
+        "4e18c00ae08d74effd89d88c37be2f2b9e5d0b2d"
+    ),
+}
+
+_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
+    "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
+    "default_fault_stop_profile": (
+        "adapters.execution.config.default_fault_stop_profile"
+    ),
+    "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
+    "initial_joint_positions_rad": (
+        "adapters.execution.config.initial_joint_positions_rad"
+    ),
+    "mode": "adapters.execution.config.mode",
+    "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
+    "planner_rng_seed": "adapters.planning.config.rng_seed",
+}
+_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
+    {
+        "obligation_id": "retained_native_initial_state_and_execution_cadence",
+        "acceptance_steps": ["N6-a3", "N7"],
+    },
+    {
+        "obligation_id": "retained_native_planner_seed",
+        "acceptance_steps": ["N6-a3", "N7"],
+    },
+    {
+        "obligation_id": "retained_native_stop_profiles",
+        "acceptance_steps": ["I8/P5"],
+    },
+    {
+        "obligation_id": "retained_runtime_collision_monitor_period",
+        "acceptance_steps": ["N6-a3", "N7", "I8/P5"],
+    },
+]
+_EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
+    "lite6_native_simulated_v0": (
+        "35e27129b5cf16c680c8722c93524d9d83d8b9ec0b8a9baf5735df5449e1a611"
+    ),
+    "ur10e_robotiq_assistant_native_simulated_v0": (
+        "61ec7a2ea3346234e83d457a1ba24833d729de141750c15214c4997657842f69"
+    ),
+    "ur10e_robotiq_native_simulated_v0": (
+        "acdbd2176ce72be69ab0d995aab56eb0b43a23f105d65920e5463d3bc42ab43b"
+    ),
+    "ur5_native_simulated_v0": (
+        "5fa7f58a5abc5f9bc22a1f48dae3e8c8006b44c24140ab9954321a50b9b73f55"
+    ),
+}
+_EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
+    "lite6_native_simulated_v0": "lite6_lite_gripper",
+    "ur10e_robotiq_assistant_native_simulated_v0": "ur10e_robotiq_2f_140",
+    "ur10e_robotiq_native_simulated_v0": "ur10e_robotiq_2f_140",
+    "ur5_native_simulated_v0": "ur5_roboplan",
+}
+_EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
+    "examples/assistant_modes_scene_authoring.deployment.yaml": (
+        "ur10e_robotiq_assistant_native_simulated_v0"
+    ),
+    "examples/lite6_lite_gripper_pick_and_place.deployment.yaml": (
+        "lite6_native_simulated_v0"
+    ),
+    "examples/pick_and_place.deployment.yaml": "ur5_native_simulated_v0",
+    "examples/pick_and_place_ur10e_robotiq.deployment.yaml": (
+        "ur10e_robotiq_native_simulated_v0"
+    ),
+    "examples/semantic_shape_pick.deployment.yaml": "ur5_native_simulated_v0",
+    "examples/vision_guided_bin_pick.deployment.yaml": "ur5_native_simulated_v0",
+    "examples/vision_guided_pose_pick.deployment.yaml": "ur5_native_simulated_v0",
 }
 _EXPECTED_SPEED_MPS: Final = {
     source: 0.15 if "lite6_" in source else 0.25
@@ -432,7 +520,11 @@ def _identifier(value: object, *, path: str) -> str:
 def _source_path(value: object, *, root: Path, path: str) -> str:
     text = _text(value, path=path)
     candidate = Path(text)
-    if candidate.is_absolute() or ".." in candidate.parts or text != candidate.as_posix():
+    if (
+        candidate.is_absolute()
+        or ".." in candidate.parts
+        or text != candidate.as_posix()
+    ):
         raise SourceDescriptionError(f"{path} must be a root-local normalized path")
     resolved = root / candidate
     if resolved.is_symlink() or not resolved.is_file():
@@ -443,7 +535,11 @@ def _source_path(value: object, *, root: Path, path: str) -> str:
 def _directory_path(value: object, *, root: Path, path: str) -> str:
     text = _text(value, path=path)
     candidate = Path(text)
-    if candidate.is_absolute() or ".." in candidate.parts or text != candidate.as_posix():
+    if (
+        candidate.is_absolute()
+        or ".." in candidate.parts
+        or text != candidate.as_posix()
+    ):
         raise SourceDescriptionError(f"{path} must be a root-local normalized path")
     resolved = root / candidate
     if resolved.is_symlink() or not resolved.is_dir():
@@ -453,12 +549,16 @@ def _directory_path(value: object, *, root: Path, path: str) -> str:
 
 def _source_symbol(value: object, *, path: str) -> str:
     text = _text(value, path=path)
-    if len(text) > 1024 or any(character.isspace() or not character.isprintable() for character in text):
+    if len(text) > 1024 or any(
+        character.isspace() or not character.isprintable() for character in text
+    ):
         raise SourceDescriptionError(f"{path} must be one bounded source symbol")
     return text
 
 
-def _canonical_unique(values: list[str], *, path: str, sort_values: bool = True) -> None:
+def _canonical_unique(
+    values: list[str], *, path: str, sort_values: bool = True
+) -> None:
     if len(values) != len(set(values)) or (sort_values and values != sorted(values)):
         raise SourceDescriptionError(f"{path} must be unique and canonical-sorted")
 
@@ -502,9 +602,7 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
         mode_path = f"assistant_profiles.mode_profiles.scene_authoring.{mode_id}"
         mode = _exact(
             raw_mode,
-            required=frozenset(
-                {"enabled", "description", "grant_policy", "catalog"}
-            ),
+            required=frozenset({"enabled", "description", "grant_policy", "catalog"}),
             path=mode_path,
         )
         if mode["enabled"] is not True:
@@ -512,9 +610,7 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
         _text(mode["description"], path=f"{mode_path}.description")
         grant = _exact(
             mode["grant_policy"],
-            required=frozenset(
-                {"session_kind", "approval_mode", "review_policy"}
-            ),
+            required=frozenset({"session_kind", "approval_mode", "review_policy"}),
             path=f"{mode_path}.grant_policy",
         )
         expected_review = "not_required" if mode_id == "query" else "required"
@@ -619,8 +715,7 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                 path=f"{profile_path}.prompt_templates.{template_id}.version",
             )
             if not version.isascii() or any(
-                not (character.isalnum() or character in "_.-")
-                for character in version
+                not (character.isalnum() or character in "_.-") for character in version
             ):
                 raise SourceDescriptionError(
                     f"{profile_path}.prompt_templates.{template_id}.version "
@@ -655,9 +750,7 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
             response_path = (
                 f"{profile_path}.prompt_templates.{template_id}.response_contract"
             )
-            raw_response = _object(
-                template["response_contract"], path=response_path
-            )
+            raw_response = _object(template["response_contract"], path=response_path)
             response_mode = _text(
                 raw_response.get("response_mode"),
                 path=f"{response_path}.response_mode",
@@ -676,9 +769,7 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                     ),
                     path=response_path,
                 )
-                _identifier(
-                    response["tool_name"], path=f"{response_path}.tool_name"
-                )
+                _identifier(response["tool_name"], path=f"{response_path}.tool_name")
                 _text(
                     response["tool_description"],
                     path=f"{response_path}.tool_description",
@@ -883,7 +974,9 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                     f"{provider_path}.site_overlay_value_ref is duplicated"
                 )
             site_overlay_value_refs.add(site_overlay_value_ref)
-            _text(provider_row["endpoint_value"], path=f"{provider_path}.endpoint_value")
+            _text(
+                provider_row["endpoint_value"], path=f"{provider_path}.endpoint_value"
+            )
             provider_kind = provider_row["provider_kind"]
             if provider_kind not in {"direct", "nemoclaw"}:
                 raise SourceDescriptionError(
@@ -991,7 +1084,9 @@ def _validate_model_semantics(
         )
         resource_roles.append(resource_role)
         joint_names = [
-            _source_symbol(joint, path=f"{binding_path}.source_joint_names[{joint_index}]")
+            _source_symbol(
+                joint, path=f"{binding_path}.source_joint_names[{joint_index}]"
+            )
             for joint_index, joint in enumerate(
                 _array(
                     binding["source_joint_names"],
@@ -1035,7 +1130,9 @@ def _validate_model_semantics(
             )
         ]
         if not link_names:
-            raise SourceDescriptionError(f"{binding_path}.source_link_names must not be empty")
+            raise SourceDescriptionError(
+                f"{binding_path}.source_link_names must not be empty"
+            )
         _canonical_unique(link_names, path=f"{binding_path}.source_link_names")
         collision_bindings[collision_role] = tuple(link_names)
     _canonical_unique(collision_roles, path=f"{path}.collision_body_role_bindings")
@@ -1067,7 +1164,9 @@ def _program_roles(program_path: Path) -> tuple[set[str], dict[str, str]]:
     root = _object(value, path=str(program_path))
     if root.get("api_version") != PROGRAM_API_VERSION:
         raise SourceDescriptionError(f"{program_path} is not a direct v1 Program")
-    component_roles = _object(root.get("component_roles"), path=f"{program_path}.component_roles")
+    component_roles = _object(
+        root.get("component_roles"), path=f"{program_path}.component_roles"
+    )
     target_rows = _object(root.get("target_roles"), path=f"{program_path}.target_roles")
     target_roles: dict[str, str] = {}
     for name, raw_target in target_rows.items():
@@ -1091,11 +1190,15 @@ def _validate_role_assignment(
         required=frozenset({"program_source", "component_roles", "target_roles"}),
         path=path,
     )
-    program_source = _source_path(row["program_source"], root=root, path=f"{path}.program_source")
+    program_source = _source_path(
+        row["program_source"], root=root, path=f"{path}.program_source"
+    )
     declared_components, declared_targets = _program_roles(root / program_source)
     components = _object(row["component_roles"], path=f"{path}.component_roles")
     if set(components) != declared_components:
-        raise SourceDescriptionError(f"{path}.component_roles does not exactly cover the Program")
+        raise SourceDescriptionError(
+            f"{path}.component_roles does not exactly cover the Program"
+        )
     for role, occurrence in components.items():
         _identifier(role, path=f"{path}.component_roles key")
         if occurrence != component_occurrence_id:
@@ -1105,7 +1208,9 @@ def _validate_role_assignment(
 
     targets = _object(row["target_roles"], path=f"{path}.target_roles")
     if set(targets) != set(declared_targets):
-        raise SourceDescriptionError(f"{path}.target_roles does not exactly cover the Program")
+        raise SourceDescriptionError(
+            f"{path}.target_roles does not exactly cover the Program"
+        )
     for role, raw_target in targets.items():
         target = _exact(
             raw_target,
@@ -1145,14 +1250,17 @@ def _validate_policy(value: object, *, target_roles: set[str], path: str) -> str
             path=path,
         )
         if row["source_field"] != "robot_config.global_max_tcp_linear_speed_mps":
-            raise SourceDescriptionError(f"{path}.source_field is not the historical speed field")
+            raise SourceDescriptionError(
+                f"{path}.source_field is not the historical speed field"
+            )
         speed = row["maximum_speed_mps"]
         if type(speed) not in {int, float} or not math.isfinite(speed) or speed <= 0.0:
-            raise SourceDescriptionError(f"{path}.maximum_speed_mps must be positive and finite")
+            raise SourceDescriptionError(
+                f"{path}.maximum_speed_mps must be positive and finite"
+            )
         if (
             row["runtime_acceptance_step"] != "I8/P5"
-            or row["acceptance_obligation_id"]
-            != "retained_native_tcp_speed_limit"
+            or row["acceptance_obligation_id"] != "retained_native_tcp_speed_limit"
         ):
             raise SourceDescriptionError(
                 f"{path} changes the deferred speed owner/acceptance obligation"
@@ -1176,9 +1284,13 @@ def _validate_policy(value: object, *, target_roles: set[str], path: str) -> str
             path=path,
         )
         if row["source_field"] != "grasp_risk_policy.open_loop_grasp":
-            raise SourceDescriptionError(f"{path}.source_field is not the historical grasp field")
+            raise SourceDescriptionError(
+                f"{path}.source_field is not the historical grasp field"
+            )
         if row["allowed"] is not True or row["scope"] != "simulation":
-            raise SourceDescriptionError(f"{path} changes the historical open-loop scope")
+            raise SourceDescriptionError(
+                f"{path} changes the historical open-loop scope"
+            )
         _text(row["rationale"], path=f"{path}.rationale")
         if (
             row["runtime_acceptance_step"] != "I8/P5"
@@ -1189,7 +1301,9 @@ def _validate_policy(value: object, *, target_roles: set[str], path: str) -> str
                 f"{path} changes the deferred grasp owner/acceptance obligation"
             )
     else:
-        raise SourceDescriptionError(f"{path}.kind is outside the closed restoration union")
+        raise SourceDescriptionError(
+            f"{path}.kind is outside the closed restoration union"
+        )
     target_role = _identifier(row["target_role_id"], path=f"{path}.target_role_id")
     if target_role not in target_roles:
         raise SourceDescriptionError(
@@ -1201,7 +1315,8 @@ def _validate_policy(value: object, *, target_roles: set[str], path: str) -> str
 def validate(source: Path, root: Path) -> None:
     try:
         value = json.loads(
-            source.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_pairs
+            source.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
         )
     except (OSError, json.JSONDecodeError) as error:
         raise SourceDescriptionError(
@@ -1214,6 +1329,8 @@ def validate(source: Path, root: Path) -> None:
                 "api_version",
                 "historical_source_commit",
                 "assistant_profiles_source",
+                "historical_program_sources",
+                "runtime_restoration_profiles",
                 "model_families",
                 "deployments",
             }
@@ -1225,8 +1342,11 @@ def validate(source: Path, root: Path) -> None:
     if (
         type(top["historical_source_commit"]) is not str
         or _HEX40.fullmatch(top["historical_source_commit"]) is None
+        or top["historical_source_commit"] != _EXPECTED_HISTORICAL_SOURCE_COMMIT
     ):
-        raise SourceDescriptionError("$.historical_source_commit must be a full Git object ID")
+        raise SourceDescriptionError(
+            "$.historical_source_commit must be the exact pinned I0 source commit"
+        )
     assistant_profiles_source = _source_path(
         top["assistant_profiles_source"],
         root=root,
@@ -1240,8 +1360,39 @@ def validate(source: Path, root: Path) -> None:
         root / assistant_profiles_source
     )
 
+    historical_program_sources: list[str] = []
+    for index, raw_program in enumerate(
+        _array(top["historical_program_sources"], path="$.historical_program_sources")
+    ):
+        path = f"$.historical_program_sources[{index}]"
+        program = _exact(
+            raw_program,
+            required=frozenset({"program_source", "historical_blob"}),
+            path=path,
+        )
+        program_source = _source_path(
+            program["program_source"], root=root, path=f"{path}.program_source"
+        )
+        historical_program_sources.append(program_source)
+        if (
+            program_source not in _EXPECTED_HISTORICAL_PROGRAM_BLOBS
+            or program["historical_blob"]
+            != _EXPECTED_HISTORICAL_PROGRAM_BLOBS[program_source]
+        ):
+            raise SourceDescriptionError(
+                f"{path} changes the exact pinned I0 Program source"
+            )
+    if historical_program_sources != sorted(historical_program_sources) or set(
+        historical_program_sources
+    ) != set(_EXPECTED_HISTORICAL_PROGRAM_BLOBS):
+        raise SourceDescriptionError(
+            "$.historical_program_sources must exactly cover the seven canonical-sorted Programs"
+        )
+
     family_ids: list[str] = []
-    for index, raw_family in enumerate(_array(top["model_families"], path="$.model_families")):
+    for index, raw_family in enumerate(
+        _array(top["model_families"], path="$.model_families")
+    ):
         path = f"$.model_families[{index}]"
         family = _exact(
             raw_family,
@@ -1256,11 +1407,17 @@ def validate(source: Path, root: Path) -> None:
             ),
             path=path,
         )
-        family_id = _identifier(family["model_family_id"], path=f"{path}.model_family_id")
+        family_id = _identifier(
+            family["model_family_id"], path=f"{path}.model_family_id"
+        )
         family_ids.append(family_id)
-        model_asset_id = _identifier(family["model_asset_id"], path=f"{path}.model_asset_id")
+        model_asset_id = _identifier(
+            family["model_asset_id"], path=f"{path}.model_asset_id"
+        )
         if model_asset_id != family_id or family_id not in _EXPECTED_MODEL_FAMILIES:
-            raise SourceDescriptionError(f"{path} changes the exact maintained model-family set")
+            raise SourceDescriptionError(
+                f"{path} changes the exact maintained model-family set"
+            )
         expected_catalog_source = (
             f"manyforge_deployment/resources/maintained/model_assets/"
             f"{model_asset_id}.model_asset.json"
@@ -1269,7 +1426,9 @@ def validate(source: Path, root: Path) -> None:
             family["catalog_source"], root=root, path=f"{path}.catalog_source"
         )
         if catalog_source != expected_catalog_source:
-            raise SourceDescriptionError(f"{path}.catalog_source is not the shared family source")
+            raise SourceDescriptionError(
+                f"{path}.catalog_source is not the shared family source"
+            )
         _validate_model_semantics(
             family["semantics"], family_id=family_id, path=f"{path}.semantics"
         )
@@ -1294,7 +1453,9 @@ def validate(source: Path, root: Path) -> None:
             path=f"{path}.source.accepted_package_uri_prefix",
         )
         if not prefix.startswith("package://") or not prefix.endswith("/"):
-            raise SourceDescriptionError(f"{path}.source.accepted_package_uri_prefix is invalid")
+            raise SourceDescriptionError(
+                f"{path}.source.accepted_package_uri_prefix is invalid"
+            )
         resource_root = _directory_path(
             model_source["resource_root"],
             root=root,
@@ -1337,9 +1498,7 @@ def validate(source: Path, root: Path) -> None:
             raise SourceDescriptionError(
                 f"{path}.source.urdf_projection_kind changes the accepted projection"
             )
-        if (urdf_projection_kind == "identity") != (
-            urdf_path == historical_urdf_path
-        ):
+        if (urdf_projection_kind == "identity") != (urdf_path == historical_urdf_path):
             raise SourceDescriptionError(
                 f"{path}.source URDF projection paths contradict their declared kind"
             )
@@ -1366,10 +1525,81 @@ def validate(source: Path, root: Path) -> None:
             "$.model_families must contain the three canonical-sorted families"
         )
 
+    runtime_profile_ids: list[str] = []
+    runtime_profile_families: dict[str, str] = {}
+    for index, raw_profile in enumerate(
+        _array(
+            top["runtime_restoration_profiles"],
+            path="$.runtime_restoration_profiles",
+        )
+    ):
+        path = f"$.runtime_restoration_profiles[{index}]"
+        profile = _exact(
+            raw_profile,
+            required=frozenset(
+                {
+                    "runtime_restoration_profile_id",
+                    "model_family_id",
+                    "source_fields",
+                    "native_runtime",
+                    "stop_profiles",
+                    "acceptance_obligations",
+                }
+            ),
+            path=path,
+        )
+        profile_id = _identifier(
+            profile.get("runtime_restoration_profile_id"),
+            path=f"{path}.runtime_restoration_profile_id",
+        )
+        runtime_profile_ids.append(profile_id)
+        expected_digest = _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS.get(profile_id)
+        profile_digest = hashlib.sha256(
+            json.dumps(
+                profile,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if expected_digest is None or profile_digest != expected_digest:
+            raise SourceDescriptionError(
+                f"{path} changes the exact historical runtime restoration input"
+            )
+        if profile["source_fields"] != _RUNTIME_RESTORATION_SOURCE_FIELDS:
+            raise SourceDescriptionError(
+                f"{path}.source_fields changes the pinned I0 field mapping"
+            )
+        if profile["acceptance_obligations"] != _RUNTIME_RESTORATION_ACCEPTANCE:
+            raise SourceDescriptionError(
+                f"{path}.acceptance_obligations changes the deferred owner gates"
+            )
+        family_id = _identifier(
+            profile.get("model_family_id"), path=f"{path}.model_family_id"
+        )
+        if (
+            family_id not in family_ids
+            or family_id
+            != _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES.get(profile_id)
+        ):
+            raise SourceDescriptionError(
+                f"{path}.model_family_id is absent from the maintained model closure"
+            )
+        runtime_profile_families[profile_id] = family_id
+    if runtime_profile_ids != sorted(runtime_profile_ids) or set(
+        runtime_profile_ids
+    ) != set(_EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS):
+        raise SourceDescriptionError(
+            "$.runtime_restoration_profiles must exactly cover the four "
+            "canonical-sorted historical profiles"
+        )
+
     deployment_sources: list[str] = []
     open_loop_sources: set[str] = set()
     speed_sources: set[str] = set()
-    for index, raw_deployment in enumerate(_array(top["deployments"], path="$.deployments")):
+    for index, raw_deployment in enumerate(
+        _array(top["deployments"], path="$.deployments")
+    ):
         path = f"$.deployments[{index}]"
         row = _exact(
             raw_deployment,
@@ -1384,6 +1614,7 @@ def validate(source: Path, root: Path) -> None:
                     "assistant_profile_id",
                     "historical_blob",
                     "model_family_id",
+                    "runtime_restoration_profile_id",
                     "component_occurrence_id",
                     "program_role_assignments",
                     "policy_restoration_inputs",
@@ -1447,6 +1678,19 @@ def validate(source: Path, root: Path) -> None:
             )
         if row["model_family_id"] not in family_ids:
             raise SourceDescriptionError(f"{path}.model_family_id is unavailable")
+        runtime_profile_id = _identifier(
+            row["runtime_restoration_profile_id"],
+            path=f"{path}.runtime_restoration_profile_id",
+        )
+        if (
+            runtime_profile_id
+            != _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS[deployment_source]
+            or runtime_profile_families.get(runtime_profile_id)
+            != row["model_family_id"]
+        ):
+            raise SourceDescriptionError(
+                f"{path}.runtime_restoration_profile_id changes the historical runtime family"
+            )
         occurrence = _identifier(
             row["component_occurrence_id"], path=f"{path}.component_occurrence_id"
         )
@@ -1454,7 +1698,9 @@ def validate(source: Path, root: Path) -> None:
             row["program_role_assignments"], path=f"{path}.program_role_assignments"
         )
         if not assignment_rows:
-            raise SourceDescriptionError(f"{path}.program_role_assignments must not be empty")
+            raise SourceDescriptionError(
+                f"{path}.program_role_assignments must not be empty"
+            )
         all_target_roles: set[str] = set()
         for assignment_index, assignment in enumerate(assignment_rows):
             all_target_roles.update(
@@ -1485,7 +1731,9 @@ def validate(source: Path, root: Path) -> None:
                     f"{path}.policy_restoration_inputs[{policy_index}] "
                     "changes the historical speed"
                 )
-        if kinds.count("target_tcp_linear_speed_limit") != 1 or len(kinds) != len(set(kinds)):
+        if kinds.count("target_tcp_linear_speed_limit") != 1 or len(kinds) != len(
+            set(kinds)
+        ):
             raise SourceDescriptionError(
                 f"{path} must retain one speed input and no duplicate policy kind"
             )
@@ -1496,7 +1744,9 @@ def validate(source: Path, root: Path) -> None:
     if deployment_sources != sorted(deployment_sources) or len(
         set(deployment_sources)
     ) != len(deployment_sources):
-        raise SourceDescriptionError("$.deployments must be unique and canonical-sorted")
+        raise SourceDescriptionError(
+            "$.deployments must be unique and canonical-sorted"
+        )
     if (
         set(deployment_sources) != _EXPECTED_DEPLOYMENT_SOURCES
         or speed_sources != _EXPECTED_DEPLOYMENT_SOURCES
@@ -1505,7 +1755,9 @@ def validate(source: Path, root: Path) -> None:
             "the exact seven maintained deployment/speed inputs are incomplete"
         )
     if open_loop_sources != _EXPECTED_OPEN_LOOP_SOURCES:
-        raise SourceDescriptionError("the exact three historical open-loop inputs are incomplete")
+        raise SourceDescriptionError(
+            "the exact three historical open-loop inputs are incomplete"
+        )
 
 
 def main() -> int:

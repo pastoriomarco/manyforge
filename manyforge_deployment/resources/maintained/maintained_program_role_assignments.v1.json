@@ -110,7 +110,7 @@
       "deployment_revision": "sha256:cf1a4e49d1df16cf0f4ecac319da2bfe75514fe4bb66b45d94c513279756d8df",
       "deployment_source": "examples/semantic_shape_pick.deployment.yaml",
       "program_id": "semantic_shape_pick",
-      "program_revision": "sha256:116c69affc4855cf9a30df6fc4001f7f75da0dfc26f0f088d2feaccc0f8684c3",
+      "program_revision": "sha256:05679a1dd482e05553e91d3c9f5286ef6890cf30cdc7c3bc592beb80555345b2",
       "program_source": "examples/semantic_shape_pick.program.yaml",
       "target_roles": {
         "arm": {
