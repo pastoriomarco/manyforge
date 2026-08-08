@@ -51,6 +51,7 @@ _SEMANTIC_TYPES = {
     "frame_role",
     "parameter_ref",
     "resource_role",
+    "scene_resource",
     "source_joint",
     "target_role",
 }
@@ -203,13 +204,27 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
         raise CatalogSchemaError(f"{path}: $ref is forbidden; use schema_ref")
     ref = raw_schema.get("schema_ref")
     if ref is not None:
-        if set(raw_schema.keys()) - {"schema_ref"}:
+        if set(raw_schema.keys()) - {
+            "schema_ref",
+            "required_when",
+            "allowed_when",
+        }:
             raise CatalogSchemaError(
-                f"{path}: schema_ref form cannot declare other fields"
+                f"{path}: schema_ref form permits only conditional annotations"
             )
         if not isinstance(ref, str) or not ref.strip():
             raise CatalogSchemaError(f"{path}: schema reference must be a non-empty string")
-        return CatalogSchema(ref=ref, description=_optional_string(raw_schema, "description", path))
+        required_when = raw_schema.get("required_when", {})
+        allowed_when = raw_schema.get("allowed_when", {})
+        if not isinstance(required_when, Mapping):
+            raise CatalogSchemaError(f"{path}.required_when must be a mapping")
+        if not isinstance(allowed_when, Mapping):
+            raise CatalogSchemaError(f"{path}.allowed_when must be a mapping")
+        return CatalogSchema(
+            ref=ref,
+            required_when=_freeze_json_value(required_when),
+            allowed_when=_freeze_json_value(allowed_when),
+        )
 
     unknown_keys = sorted(set(raw_schema) - _ALLOWED_INLINE_SCHEMA_KEYS)
     if unknown_keys:
@@ -301,11 +316,26 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
 
     raw_additional_properties = raw_schema.get("additional_properties", False)
     additional_property_schema = None
-    if not isinstance(raw_additional_properties, bool):
+    if raw_additional_properties is True:
         raise CatalogSchemaError(
-            f"{path}.additional_properties must be a boolean"
+            f"{path}.additional_properties=true is forbidden; declare one schema"
         )
-    additional_properties = raw_additional_properties
+    if raw_additional_properties is False:
+        additional_properties = False
+    elif isinstance(raw_additional_properties, Mapping):
+        if schema_type != "object":
+            raise CatalogSchemaError(
+                f"{path}.additional_properties schema requires type=object"
+            )
+        additional_property_schema = parse_schema(
+            raw_additional_properties,
+            path=f"{path}.additional_properties",
+        )
+        additional_properties = True
+    else:
+        raise CatalogSchemaError(
+            f"{path}.additional_properties must be false or a schema"
+        )
 
     resolves_to = raw_schema.get("resolves_to")
     if resolves_to is not None and (not isinstance(resolves_to, str) or not resolves_to.strip()):
@@ -420,6 +450,13 @@ def _validate_schema(
                 prop_schema,
                 registry,
                 path=f"{path}.properties.{prop_name}",
+                stack=stack,
+            )
+        if schema.additional_property_schema is not None:
+            _validate_schema(
+                schema.additional_property_schema,
+                registry,
+                path=f"{path}.additional_properties",
                 stack=stack,
             )
     elif schema.schema_type == "array":

@@ -48,21 +48,26 @@ static_assert(
          "\"nodes\":[" + std::string(nodes) + "]}}";
 }
 
-[[nodiscard]] std::string assistant_document(
-    std::string modes = mode(), std::string_view provider_kind = "direct",
-    std::string_view assistant_extra = "") {
-  return std::string(
-             "{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{") +
-         "\"model_endpoint_aliases\":{" +
-         "\"primary_model\":{" +
-         "\"external_resource_alias\":\"local_model\"," +
-         "\"model_id\":\"deployment-model\"}}," +
-         "\"provider_aliases\":{" +
-         "\"direct_local\":{" +
-         "\"provider_kind\":\"" + std::string(provider_kind) + "\"," +
-         "\"bridge_external_resource_alias\":\"assistant_bridge\"}}," +
-         "\"modes\":{" + std::move(modes) + "}" +
-         std::string(assistant_extra) + "}}";
+[[nodiscard]] std::string assistant_document(std::string modes = mode(),
+                                             std::string_view provider_kind = "direct",
+                                             std::string_view assistant_extra = "",
+                                             std::string_view prompt_templates =
+                                                 "\"choose_object_v1\":{"
+                                                 "\"version\":\"1\","
+                                                 "\"template_text\":\"Choose {{object_id}}\","
+                                                 "\"variable_ids\":[\"object_id\"]}") {
+  return std::string("{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{") +
+         "\"audit_policy\":{"
+         "\"store_full_prompts\":false,"
+         "\"store_full_responses\":false,"
+         "\"redact_argument_values\":true}," +
+         "\"prompt_templates\":{" + std::string(prompt_templates) + "}," +
+         "\"model_endpoint_aliases\":{" + "\"primary_model\":{" +
+         "\"external_resource_alias\":\"local_model\"," + "\"model_id\":\"deployment-model\"}}," +
+         "\"provider_aliases\":{" + "\"direct_local\":{" + "\"provider_kind\":\"" +
+         std::string(provider_kind) + "\"," +
+         "\"bridge_external_resource_alias\":\"assistant_bridge\"}}," + "\"modes\":{" +
+         std::move(modes) + "}" + std::string(assistant_extra) + "}}";
 }
 
 [[nodiscard]] core::ExternalResourceDTO external_resource(
@@ -166,6 +171,10 @@ TEST(AssistantSettingsCodec,
       ext);
 
   ASSERT_TRUE(left.enabled());
+  ASSERT_EQ(left.value().prompt_templates.size(), 1U);
+  EXPECT_TRUE(is_sha256_digest(left.value().prompt_templates.front().content_digest.value()));
+  EXPECT_TRUE(left.value().audit_policy.redact_argument_values);
+  EXPECT_FALSE(left.value().audit_policy.store_full_prompts);
   ASSERT_EQ(left.value().modes.size(), 1U);
   EXPECT_EQ(left.value().modes.front().catalog.tool_ids,
             (std::vector<std::string>{"alarms_read", "scene_inspect",
@@ -231,18 +240,19 @@ TEST(AssistantSettingsCodec,
 }
 
 TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
-  expect_decode_error(
-      assistant_document(mode(), "direct", ",\"unexpected\":true"),
-      "unknown field 'unexpected'");
-  expect_decode_error(
-      assistant_document(mode("query", "\"status_read\",\"status_read\"")),
-      "duplicate instrument ID");
-  expect_decode_error(
-      assistant_document(mode("query", "\"status.read\"")),
-      "canonical lowercase underscore tool ID");
-  expect_decode_error(
-      assistant_document(""),
-      "must declare at least one mode");
+  expect_decode_error(assistant_document(mode(), "direct", ",\"unexpected\":true"),
+                      "unknown field 'unexpected'");
+  expect_decode_error(assistant_document(mode("query", "\"status_read\",\"status_read\"")),
+                      "duplicate instrument ID");
+  expect_decode_error(assistant_document(mode("query", "\"status.read\"")),
+                      "canonical lowercase underscore tool ID");
+  expect_decode_error(assistant_document(""), "must declare at least one mode");
+  expect_decode_error(assistant_document(mode(), "direct", "",
+                                         "\"choose_object_v1\":{"
+                                         "\"version\":\"1\","
+                                         "\"template_text\":\"Choose\","
+                                         "\"variable_ids\":[\"object_id\",\"object_id\"]}"),
+                      "duplicate instrument ID");
 }
 
 TEST(AssistantSettingsCodec, RejectsUnresolvedOrWrongKindExternalAliases) {

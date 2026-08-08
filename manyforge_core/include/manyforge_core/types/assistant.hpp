@@ -107,6 +107,26 @@ struct AssistantModelEndpointAliasDTO final {
                          const AssistantModelEndpointAliasDTO&) = default;
 };
 
+struct AssistantModelAuditPolicyDTO final {
+  bool store_full_prompts{false};
+  bool store_full_responses{false};
+  bool redact_argument_values{true};
+
+  friend bool operator==(const AssistantModelAuditPolicyDTO&,
+                         const AssistantModelAuditPolicyDTO&) = default;
+};
+
+struct AssistantPromptTemplateDTO final {
+  std::string prompt_template_id;
+  std::string version;
+  std::string template_text;
+  std::vector<std::string> variable_ids;
+  ContentDigest content_digest;
+
+  friend bool operator==(const AssistantPromptTemplateDTO&,
+                         const AssistantPromptTemplateDTO&) = default;
+};
+
 struct AssistantProviderAliasDTO final {
   std::string provider_alias;
   AssistantProviderKind provider_kind;
@@ -148,6 +168,8 @@ struct AssistantModeDTO final {
 };
 
 struct AssistantSettingsDTO final {
+  AssistantModelAuditPolicyDTO audit_policy;
+  std::vector<AssistantPromptTemplateDTO> prompt_templates;
   std::vector<AssistantModelEndpointAliasDTO> model_endpoint_aliases;
   std::vector<AssistantProviderAliasDTO> provider_aliases;
   std::vector<AssistantModeDTO> modes;

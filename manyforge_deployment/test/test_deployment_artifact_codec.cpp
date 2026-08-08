@@ -473,14 +473,22 @@ TEST(DeploymentArtifactCodec,
       document(empty_graph(), "[]", "{\"records\":[]}",
                ",\"assistant\":{\"enabled\":false}"),
       "$.assistant: unknown field 'enabled'");
-  expect_compute_error(
-      document(empty_graph(), "[]", "{\"records\":[]}",
-               ",\"policies\":{}"),
-      "policy block is not qualified");
-  expect_compute_error(
-      document(empty_graph(), "[]", "{\"records\":[]}",
-               ",\"compatibility\":{}"),
-      "compatibility admission is not qualified");
+  expect_compute_error(document(empty_graph(), "[]", "{\"records\":[]}", ",\"policies\":{}"),
+                       "policy block is not qualified");
+  const auto compatible = produce(document(empty_graph(), "[]", "{\"records\":[]}",
+                                           ",\"compatibility\":{\"lane\":\"manyforge-only\","
+                                           "\"provides\":[],\"tags\":[\"pick-and-place\"]}"));
+  EXPECT_NE(compatible.normalized_authored_root().find_object_member("compatibility"), nullptr);
+  expect_compute_error(document(empty_graph(), "[]", "{\"records\":[]}", ",\"compatibility\":{}"),
+                       "missing required field 'lane'");
+  expect_compute_error(document(empty_graph(), "[]", "{\"records\":[]}",
+                                ",\"compatibility\":{\"lane\":\"cloud\","
+                                "\"provides\":[],\"tags\":[]}"),
+                       "unsupported runtime lane");
+  expect_compute_error(document(empty_graph(), "[]", "{\"records\":[]}",
+                                ",\"compatibility\":{\"lane\":\"manyforge-only\","
+                                "\"provides\":[],\"tags\":[\"z\",\"a\"]}"),
+                       "canonical-sorted");
 }
 
 TEST(DeploymentArtifactCodec,

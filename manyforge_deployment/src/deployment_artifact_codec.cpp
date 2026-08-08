@@ -43,6 +43,15 @@ const detail::ContentIdentitySpec kDeploymentIdentitySpec{
   return *object;
 }
 
+[[nodiscard]] const CanonicalValue::Array& require_array(const CanonicalValue& value,
+                                                         std::string_view path) {
+  const auto* array = std::get_if<CanonicalValue::Array>(&value.storage());
+  if (array == nullptr) {
+    fail(path, "expected array");
+  }
+  return *array;
+}
+
 [[nodiscard]] const std::string& require_string(
     const CanonicalValue& value, std::string_view path) {
   const auto* text = std::get_if<std::string>(&value.storage());
@@ -165,6 +174,50 @@ template <typename StrongType>
   return StrongType(text);
 }
 
+void validate_compatibility_set(const CanonicalValue& value, std::string_view path) {
+  const auto& items = require_array(value, path);
+  if (items.size() > detail::kMaximumCompilerContractRows) {
+    fail(path, "exceeds fixed compatibility metadata bound");
+  }
+  std::vector<std::string> parsed;
+  parsed.reserve(items.size());
+  for (std::size_t index = 0U; index < items.size(); ++index) {
+    const std::string item_path = std::string(path) + "[" + std::to_string(index) + "]";
+    const std::string& item = require_string(items[index], item_path);
+    if (!is_portable_token(item)) {
+      fail(item_path, "expected stable portable compatibility ID");
+    }
+    parsed.push_back(item);
+  }
+  if (!std::is_sorted(parsed.begin(), parsed.end()) ||
+      std::adjacent_find(parsed.begin(), parsed.end()) != parsed.end()) {
+    fail(path, "must be duplicate-free and canonical-sorted");
+  }
+}
+
+void validate_compatibility(const CanonicalValue& value) {
+  const auto& compatibility = require_object(value, "$.compatibility");
+  const std::initializer_list<std::string_view> kFields{"lane", "provides", "tags"};
+  for (const auto& [name, unused] : compatibility) {
+    (void)unused;
+    if (!contains(kFields, name)) {
+      fail("$.compatibility", "unknown field '" + name + "'");
+    }
+  }
+  for (const std::string_view field : kFields) {
+    (void)require_member(compatibility, field, "$.compatibility");
+  }
+  const std::string& lane = require_string(require_member(compatibility, "lane", "$.compatibility"),
+                                           "$.compatibility.lane");
+  if (!contains({"manyforge-only", "isaac-sim", "real-robot"}, lane)) {
+    fail("$.compatibility.lane", "unsupported runtime lane");
+  }
+  validate_compatibility_set(require_member(compatibility, "provides", "$.compatibility"),
+                             "$.compatibility.provides");
+  validate_compatibility_set(require_member(compatibility, "tags", "$.compatibility"),
+                             "$.compatibility.tags");
+}
+
 [[nodiscard]] CanonicalValue make_synthetic_graph_root(
     const CanonicalValue::Object& authored_graph,
     const core::CellId& cell_id) {
@@ -213,6 +266,7 @@ struct DecodedDeployment final {
   core::CellId cell_id;
   std::string name;
   std::optional<std::string> description;
+  std::optional<CanonicalValue> compatibility;
   std::vector<core::CatalogRecordRefDTO> catalog_records;
   GraphIdentityReadyCellGraphCandidate graph_candidate;
   CanonicalValue normalized_authored_graph;
@@ -236,10 +290,10 @@ struct DecodedDeployment final {
     fail("$.policies",
          "the policy block is not qualified by the current compiler subset");
   }
-  if (find_member(root, "compatibility") != nullptr) {
-    fail("$.compatibility",
-         "compatibility admission is not qualified by the current compiler "
-         "subset");
+  std::optional<CanonicalValue> compatibility;
+  if (const CanonicalValue* authored = find_member(root, "compatibility"); authored != nullptr) {
+    validate_compatibility(*authored);
+    compatibility = *authored;
   }
 
   std::optional<std::string> description;
@@ -318,6 +372,7 @@ struct DecodedDeployment final {
       cell_id,
       name,
       std::move(description),
+      std::move(compatibility),
       std::move(catalog_records),
       identity_ready_graph,
       normalized_authored_graph,
@@ -349,6 +404,9 @@ struct DecodedDeployment final {
   if (decoded.description.has_value()) {
     root.emplace_back("description",
                       CanonicalValue(*decoded.description));
+  }
+  if (decoded.compatibility.has_value()) {
+    root.emplace_back("compatibility", *decoded.compatibility);
   }
 
   switch (applicability.site_overlay_ref_presence()) {

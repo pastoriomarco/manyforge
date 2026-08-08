@@ -62,7 +62,7 @@ constexpr std::string_view kExecutablePackageIdentityDomain =
 constexpr std::string_view kBuiltinCatalogApiVersion =
     "manyforge.node_catalog.v2";
 constexpr std::string_view kBuiltinCatalogId = "manyforge_builtin";
-constexpr std::string_view kBuiltinCatalogContentVersion = "1.0.0";
+constexpr std::string_view kBuiltinCatalogContentVersion = "1.1.0";
 constexpr std::string_view kPythonSourcePackageFormat =
     "manyforge.python-source-package.v1";
 constexpr std::string_view kCompositionNamingScheme =
@@ -836,9 +836,11 @@ struct IdentityContractRow final {
                 "contact_policy",
                 "runtime_policy",
             }))},
-           {"assistant", CanonicalValue("absent-or-explicit-empty-object")},
+           {"assistant",
+            CanonicalValue("absent-empty-or-closed-audit-prompt-endpoint-provider-mode-"
+                           "projection")},
            {"policies", CanonicalValue("reject-if-present")},
-           {"compatibility", CanonicalValue("reject-if-present")},
+           {"compatibility", CanonicalValue("closed-lane-provides-tags-metadata")},
            {"i3_retention_subset",
             CanonicalValue(
                 "passive-or-one-bounded-controllable-component-or-exact-"

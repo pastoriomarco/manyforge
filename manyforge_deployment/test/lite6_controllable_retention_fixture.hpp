@@ -247,6 +247,11 @@ struct AssistantOverlayFixture final {
 
 [[nodiscard]] inline CanonicalValue assistant_source() {
   return CanonicalValue(CanonicalValue::Object{
+      {"audit_policy", CanonicalValue(CanonicalValue::Object{
+                           {"redact_argument_values", CanonicalValue(true)},
+                           {"store_full_prompts", CanonicalValue(false)},
+                           {"store_full_responses", CanonicalValue(false)},
+                       })},
       {"model_endpoint_aliases",
        CanonicalValue(CanonicalValue::Object{
            {"primary_model",
@@ -284,7 +289,8 @@ struct AssistantOverlayFixture final {
                                  CanonicalValue("assistant_bridge")},
                                 {"provider_kind", CanonicalValue("direct")},
                             })},
-       })},
+      })},
+      {"prompt_templates", CanonicalValue(CanonicalValue::Object{})},
   });
 }
 

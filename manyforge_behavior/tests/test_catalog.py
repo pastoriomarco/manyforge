@@ -24,7 +24,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 EXPECTED_CATALOG_DIGEST = (
-    "sha256:6ec8e6ffad4f128fb299bbd0a898751f1b04cba38abc6591ffd67842104a0aa9"
+    "sha256:41f95ac4449ab61aac6e1648c7429a667ea09679f94e12ace502bed59d622fdf"
 )
 
 
@@ -55,14 +55,14 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
     assert catalog.content_version == EXPECTED_CONTENT_VERSION
     assert catalog.catalog_id == "manyforge_builtin"
     assert catalog.catalog_digest == EXPECTED_CATALOG_DIGEST
-    assert len(catalog.entries) == 49
+    assert len(catalog.entries) == 50
     assert len(
         {
             (entry.id, engine_id, implementation_id)
             for entry in catalog.entries
             for engine_id, implementation_id in entry.runner_implementation_ids.items()
         }
-    ) == 49
+    ) == 50
 
 
 def test_catalog_exposes_structured_v2_semantics() -> None:
@@ -77,11 +77,25 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "py_trees": "motion_move_to_pose_v1"
     }
     assert {parameter.id for parameter in move.parameters} == {
-        "target_role",
-        "goal",
-        "planning_profile",
-        "target_mode",
+        "acceleration_scale",
+        "base_frame_role",
+        "cache_mode",
         "contact_policy_id",
+        "execution_timeout_s",
+        "goal",
+        "joint_position_tol_rad",
+        "max_tcp_linear_speed_mps",
+        "offset_reference",
+        "per_joint_dynamics_limits",
+        "planning_profile",
+        "planning_timeout_s",
+        "rotation_tol_rad",
+        "target_reference",
+        "target_mode",
+        "target_role",
+        "tcp_frame_role",
+        "translation_tol_m",
+        "velocity_scale",
     }
     assert {
         (requirement.capability_id, requirement.scope)
@@ -130,6 +144,54 @@ def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
         )
         == []
     )
+
+    dynamics = catalog.schema_registry.types["per_joint_dynamics_limits"]
+    assert validate_value(
+        dynamics,
+        {"shoulder_pan_joint": {"max_velocity_rad_s": 1.0}},
+        registry=catalog.schema_registry,
+    ) == []
+    assert validate_value(
+        dynamics,
+        {"shoulder_pan_joint": {"max_velocity_rad_s": 0.0}},
+        registry=catalog.schema_registry,
+    )
+
+
+def test_translation_catalog_preserves_assistant_and_cpp_pick_place_contracts() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+
+    query = catalog.get("assistant.query_model")
+    assert {
+        "model_endpoint_alias",
+        "prompt_template_id",
+        "template_variables",
+        "scene_attachment",
+        "output_key",
+        "timeout_s",
+        "min_confidence",
+    } <= {parameter.id for parameter in query.parameters}
+
+    preview = catalog.get("planning.plan_pick_sequence")
+    assert preview.execution.owner_api == "planning.pick_sequence"
+    assert preview.blackboard_writes[0].value_type == "pick_planning_result"
+    selected_object = next(
+        parameter
+        for parameter in preview.parameters
+        if parameter.id == "selected_object_id"
+    )
+    assert (
+        catalog.schema_registry.resolve(selected_object.schema).semantic_type
+        == "scene_resource"
+    )
+
+    for node_id in ("motion.pick_object", "motion.place_object"):
+        node = catalog.get(node_id)
+        assert node.execution.owner_api == "kernel.pick_place_sequence"
+        assert node.execution.cancellable is True
+
+    with pytest.raises(KeyError):
+        catalog.get("motion.invalidate_cached_plans")
 
 
 @pytest.mark.parametrize(
@@ -315,11 +377,11 @@ def test_recomputed_catalog_rejects_blackboard_control_protocol(
     tmp_path: Path,
 ) -> None:
     def mutate(data: dict[str, object]) -> None:
-        check = next(
-            entry for entry in data["entries"] if entry["id"] == "logic.check_bool"
+        setter = next(
+            entry for entry in data["entries"] if entry["id"] == "logic.set_bool"
         )
-        check["parameters"][0]["id"] = "stop_requested"
-        check["blackboard"]["reads"][0]["key_parameter"] = "stop_requested"
+        setter["parameters"][0]["id"] = "stop_requested"
+        setter["blackboard"]["writes"][0]["key_parameter"] = "stop_requested"
 
     path = _write_recomputed(tmp_path, mutate)
     with pytest.raises(

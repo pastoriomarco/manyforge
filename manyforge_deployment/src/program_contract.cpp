@@ -244,6 +244,30 @@ require_capability_definition(const core::RetainedBundleDTO& bundle,
   fail(std::string(path) + ": expected required or optional");
 }
 
+void verify_value_source(const CanonicalValue& value, std::string_view path) {
+  const auto& source = require_object(value, path);
+  const std::string& kind =
+      require_string(require_member(source, "kind", path), child_path(path, "kind"));
+  if (kind == "program_parameter" || kind == "blackboard_key") {
+    require_exact_fields(source, {"kind", "reference"}, path);
+    require_program_local_identity(
+        require_string(require_member(source, "reference", path), child_path(path, "reference")),
+        child_path(path, "reference"));
+    return;
+  }
+  if (kind == "blackboard_field") {
+    require_exact_fields(source, {"kind", "reference", "field"}, path);
+    require_program_local_identity(
+        require_string(require_member(source, "reference", path), child_path(path, "reference")),
+        child_path(path, "reference"));
+    require_program_local_identity(
+        require_string(require_member(source, "field", path), child_path(path, "field")),
+        child_path(path, "field"));
+    return;
+  }
+  fail(std::string(path) + ": unsupported Program value-source kind");
+}
+
 void verify_tree(const CanonicalValue& value, std::string_view path,
                  std::size_t depth, std::size_t& count,
                  std::set<std::string>& instance_ids) {
@@ -252,21 +276,36 @@ void verify_tree(const CanonicalValue& value, std::string_view path,
   }
   const auto& node = require_object(value, path);
   require_fields(node, {"node_id", "instance_id", "parameters", "children"},
-                 {"metadata"}, path);
-  const std::string& node_id = require_string(
-      require_member(node, "node_id", path), child_path(path, "node_id"));
-  const std::string& instance_id = require_string(
-      require_member(node, "instance_id", path),
-      child_path(path, "instance_id"));
+                 {"metadata", "value_sources"}, path);
+  const std::string& node_id =
+      require_string(require_member(node, "node_id", path), child_path(path, "node_id"));
+  const std::string& instance_id =
+      require_string(require_member(node, "instance_id", path), child_path(path, "instance_id"));
   require_program_local_identity(node_id, child_path(path, "node_id"));
   require_program_local_identity(instance_id, child_path(path, "instance_id"));
   if (!instance_ids.insert(instance_id).second) {
     fail(std::string(path) + ": duplicate tree instance_id");
   }
-  (void)require_object(require_member(node, "parameters", path),
-                       child_path(path, "parameters"));
-  if (const auto* metadata = find_member(node, "metadata");
-      metadata != nullptr) {
+  const auto& parameters =
+      require_object(require_member(node, "parameters", path), child_path(path, "parameters"));
+  if (parameters.size() > core::kMaxProgramRoleRequirements) {
+    fail(std::string(path) + ".parameters: exceeds fixed bound");
+  }
+  if (const auto* value_sources = find_member(node, "value_sources"); value_sources != nullptr) {
+    const auto& sources = require_object(*value_sources, child_path(path, "value_sources"));
+    if (sources.empty() || sources.size() > core::kMaxProgramRoleRequirements) {
+      fail(std::string(path) + ".value_sources: violates fixed non-empty bound");
+    }
+    for (const auto& [parameter_id, source] : sources) {
+      require_program_local_identity(parameter_id, child_path(path, "value_sources") + " key");
+      if (find_member(parameters, parameter_id) != nullptr) {
+        fail(std::string(path) + ": parameter '" + parameter_id +
+             "' is supplied by both parameters and value_sources");
+      }
+      verify_value_source(source, child_path(child_path(path, "value_sources"), parameter_id));
+    }
+  }
+  if (const auto* metadata = find_member(node, "metadata"); metadata != nullptr) {
     (void)require_object(*metadata, child_path(path, "metadata"));
   }
   const auto& children = require_array(require_member(node, "children", path),

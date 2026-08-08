@@ -114,13 +114,13 @@ namespace {
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::string_view kExpectedNodeEnvironmentDigest =
-    "sha256:d03008211e60650070ec4794f36b86747e535c96873bfb0e28d03a51e029d63f";
+    "sha256:7772e11ba7a3c713825884d79db65f7eac8e712bc9ee7ffae9eea1ba89678c71";
 constexpr std::string_view kExpectedCompilerContractDigest =
-    "sha256:1610112fcf9156733aab76ba7caeb59925f05405ee787d2fa1efc8471964b7b5";
+    "sha256:e8017f5d52f3b06defa5cd3d45c799b9a4823d676c1135726340101636c0568b";
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:703d00c291d88043d729e40d96525a8b8789fa173c404f8e0d52db51d4c8db8e";
+    "sha256:3f80fc03391739732a166d47e2c99db90eb3c478ca3219c408623a6083cab298";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:5329834212051d51587494147ca663ce7c553e84bbcdeef47873378f83bdc214";
+    "sha256:b87efef1b0781bee6c2ce705dae1fef1305a3b77cf1fb6fa45a4b679e6d12747";
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);
 static_assert(!std::is_aggregate_v<BuildQualifiedManifest>);

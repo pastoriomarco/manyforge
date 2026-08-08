@@ -76,6 +76,8 @@ struct ProgramOptions final {
   bool include_legacy_robot{false};
   bool duplicate_tree_instance{false};
   bool include_contact_grasp{false};
+  std::string value_source_kind;
+  bool duplicate_value_source_parameter{false};
 };
 
 [[nodiscard]] CanonicalValue text_array(
@@ -161,6 +163,36 @@ struct ProgramOptions final {
     });
   }
 
+  CanonicalValue::Object tree_parameters;
+  CanonicalValue::Object tree{
+      {"node_id", CanonicalValue("sequence")},
+      {"instance_id", CanonicalValue("root")},
+      {"parameters", CanonicalValue(tree_parameters)},
+      {"children", CanonicalValue(std::move(children))},
+  };
+  if (!options.value_source_kind.empty()) {
+    if (options.duplicate_value_source_parameter) {
+      tree_parameters.emplace_back("velocity_scale", CanonicalValue(0.5));
+      for (auto& [name, value] : tree) {
+        if (name == "parameters") {
+          value = CanonicalValue(tree_parameters);
+          break;
+        }
+      }
+    }
+    CanonicalValue::Object source{{"kind", CanonicalValue(options.value_source_kind)}};
+    if (options.value_source_kind == "program_parameter") {
+      source.emplace_back("reference", CanonicalValue("velocity_scale"));
+    } else if (options.value_source_kind == "blackboard_key") {
+      source.emplace_back("reference", CanonicalValue("cycle.velocity_scale"));
+    } else if (options.value_source_kind == "blackboard_field") {
+      source.emplace_back("reference", CanonicalValue("perception.grasp_plan"));
+      source.emplace_back("field", CanonicalValue("approach_pose"));
+    }
+    tree.emplace_back("value_sources", CanonicalValue(CanonicalValue::Object{
+                                           {"velocity_scale", CanonicalValue(std::move(source))}}));
+  }
+
   CanonicalValue::Object root{
       {"api_version", CanonicalValue("manyforge.program.v1")},
       {"program_id", CanonicalValue("i6_contract_program")},
@@ -203,13 +235,7 @@ struct ProgramOptions final {
                      CanonicalValue::Array{CanonicalValue("arm_model")})},
             })},
        })},
-      {"tree",
-       CanonicalValue(CanonicalValue::Object{
-           {"node_id", CanonicalValue("sequence")},
-           {"instance_id", CanonicalValue("root")},
-           {"parameters", CanonicalValue(CanonicalValue::Object{})},
-           {"children", CanonicalValue(std::move(children))},
-       })},
+      {"tree", CanonicalValue(std::move(tree))},
   };
   if (options.include_legacy_robot) {
     root.emplace_back(
@@ -271,10 +297,9 @@ struct ProgramOptions final {
 }
 
 [[nodiscard]] ProgramOptions valid_options(const RetainedBundle& bundle) {
-  return ProgramOptions{
-      .catalog_content_version =
-          bundle.value().catalogs.node_environment.content_version,
-  };
+  ProgramOptions options;
+  options.catalog_content_version = bundle.value().catalogs.node_environment.content_version;
+  return options;
 }
 
 TEST(ProgramContractTest, SealsExactCanonicalProgramAndRetainedCatalogContract) {
@@ -420,6 +445,35 @@ TEST(ProgramContractTest, RejectsDuplicateTreeInstanceIdentity) {
           canonical_json(with_program_revision(make_program_root(options))),
           *bundle)),
       ProgramContractError);
+}
+
+TEST(ProgramContractTest, SealsClosedProgramValueSourceForms) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  for (const std::string kind : {"program_parameter", "blackboard_key", "blackboard_field"}) {
+    ProgramOptions options = valid_options(*bundle);
+    options.value_source_kind = kind;
+    EXPECT_NO_THROW(static_cast<void>(verify_program_binding_contract(
+        canonical_json(with_program_revision(make_program_root(options))), *bundle)));
+  }
+}
+
+TEST(ProgramContractTest, RejectsMalformedOrMultiplySuppliedValueSource) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+
+  ProgramOptions unknown = valid_options(*bundle);
+  unknown.value_source_kind = "environment_variable";
+  EXPECT_THROW(static_cast<void>(verify_program_binding_contract(
+                   canonical_json(with_program_revision(make_program_root(unknown))), *bundle)),
+               ProgramContractError);
+
+  ProgramOptions duplicate = valid_options(*bundle);
+  duplicate.value_source_kind = "program_parameter";
+  duplicate.duplicate_value_source_parameter = true;
+  EXPECT_THROW(static_cast<void>(verify_program_binding_contract(
+                   canonical_json(with_program_revision(make_program_root(duplicate))), *bundle)),
+               ProgramContractError);
 }
 
 }  // namespace

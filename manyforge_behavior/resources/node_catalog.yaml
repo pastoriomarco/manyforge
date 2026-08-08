@@ -6,9 +6,9 @@
 # This is the complete built-in catalog contract for the atomic v2 cutover.
 
 api_version: manyforge.node_catalog.v2
-content_version: 1.0.0
+content_version: 1.1.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:6ec8e6ffad4f128fb299bbd0a898751f1b04cba38abc6591ffd67842104a0aa9
+catalog_digest: sha256:41f95ac4449ab61aac6e1648c7429a667ea09679f94e12ace502bed59d622fdf
 
 schema_types:
   coordinate_position:
@@ -57,6 +57,7 @@ schema_types:
         values: [current_pose, scene_resource, target_frame]
       scene_resource_id:
         type: string
+        semantic_type: scene_resource
         required_when: {source: scene_resource}
         allowed_when: {source: scene_resource}
       target_role:
@@ -90,6 +91,7 @@ schema_types:
         allowed_when: {kind: target_frame}
       scene_resource_id:
         type: string
+        semantic_type: scene_resource
         required_when: {kind: scene_resource}
         allowed_when: {kind: scene_resource}
 
@@ -118,6 +120,64 @@ schema_types:
             length: 3
         exactly_one:
           - [xyzw, rpy_deg]
+
+  motion_pose:
+    type: object
+    additional_properties: false
+    required: [position_m, orientation]
+    properties:
+      frame_ref:
+        schema_ref: "#/schema_types/pose_frame_ref"
+      position_m:
+        type: array
+        items: {type: float}
+        length: 3
+      orientation:
+        type: object
+        additional_properties: false
+        properties:
+          xyzw:
+            type: array
+            items: {type: float}
+            length: 4
+          rpy_deg:
+            type: array
+            items: {type: float}
+            length: 3
+        exactly_one:
+          - [xyzw, rpy_deg]
+
+  motion_reference:
+    type: object
+    additional_properties: false
+    required: [type]
+    properties:
+      type:
+        type: enum
+        values: [frame_role, component_body_role, scene_resource, runtime_object, pose]
+      frame_role_id:
+        type: string
+        semantic_type: frame_role
+        required_when: {type: frame_role}
+        allowed_when: {type: frame_role}
+      collision_body_role_id:
+        type: string
+        semantic_type: collision_body_role
+        required_when: {type: component_body_role}
+        allowed_when: {type: component_body_role}
+      scene_resource_id:
+        type: string
+        semantic_type: scene_resource
+        required_when: {type: scene_resource}
+        allowed_when: {type: scene_resource}
+      runtime_object_id:
+        type: string
+        required_when: {type: runtime_object}
+        allowed_when: {type: runtime_object}
+      pose:
+        schema_ref: "#/schema_types/motion_pose"
+        required_when: {type: pose}
+        allowed_when: {type: pose}
 
   pose_authoring_input:
     type: object
@@ -184,12 +244,143 @@ schema_types:
     items:
       schema_ref: "#/schema_types/joint_target"
 
+  joint_dynamics_limit:
+    type: object
+    additional_properties: false
+    properties:
+      max_velocity_rad_s:
+        type: float
+        constraints: {min_exclusive: 0.0}
+      max_acceleration_rad_s2:
+        type: float
+        constraints: {min_exclusive: 0.0}
+      max_jerk_rad_s3:
+        type: float
+        constraints: {min_exclusive: 0.0}
+
+  per_joint_dynamics_limits:
+    type: object
+    additional_properties:
+      schema_ref: "#/schema_types/joint_dynamics_limit"
+
   cartesian_path:
     type: array
     min_items: 2
     max_items: 4096
     items:
-      schema_ref: "#/schema_types/stored_pose"
+      schema_ref: "#/schema_types/motion_pose"
+
+  pose_offset_envelope:
+    type: object
+    additional_properties: false
+    required: [position_min_m, position_max_m, orientation_rpy_min_deg, orientation_rpy_max_deg]
+    properties:
+      position_min_m: {type: array, items: {type: float}, length: 3}
+      position_max_m: {type: array, items: {type: float}, length: 3}
+      orientation_rpy_min_deg: {type: array, items: {type: float}, length: 3}
+      orientation_rpy_max_deg: {type: array, items: {type: float}, length: 3}
+
+  value_source:
+    type: object
+    additional_properties: false
+    required: [kind, reference]
+    properties:
+      kind:
+        type: enum
+        values: [program_parameter, blackboard_key, blackboard_field]
+      reference:
+        type: string
+      field:
+        type: string
+        required_when: {kind: blackboard_field}
+        allowed_when: {kind: blackboard_field}
+
+  template_variable_binding:
+    type: object
+    additional_properties: false
+    required: [variable_id, source]
+    properties:
+      variable_id: {type: string}
+      source:
+        schema_ref: "#/schema_types/value_source"
+
+  template_variable_bindings:
+    type: array
+    max_items: 256
+    items:
+      schema_ref: "#/schema_types/template_variable_binding"
+
+  pick_synthesis:
+    type: object
+    additional_properties: false
+    required: [pick_offset_envelope, approach_offset_envelope]
+    properties:
+      pick_offset_envelope:
+        schema_ref: "#/schema_types/pose_offset_envelope"
+      approach_offset_envelope:
+        schema_ref: "#/schema_types/pose_offset_envelope"
+      pick_offset_reference:
+        schema_ref: "#/schema_types/motion_reference"
+      approach_offset_reference:
+        schema_ref: "#/schema_types/motion_reference"
+      base_tool_orientation_rpy_deg:
+        type: array
+        items: {type: float}
+        length: 3
+      translation_step_m:
+        type: float
+        constraints: {min_exclusive: 0.0}
+      rotation_step_deg:
+        type: float
+        constraints: {min_exclusive: 0.0}
+      force_vertical_pick: {type: bool}
+      min_tcp_z_m:
+        type: float
+        constraints: {min_inclusive: 0.0}
+      maximum_candidate_count:
+        type: int
+        constraints: {min_inclusive: 1, max_inclusive: 4096}
+      search_strategy:
+        type: enum
+        values: [first_feasible, best_cost]
+
+  pick_motion_options:
+    type: object
+    additional_properties: false
+    properties:
+      approach_velocity_scale:
+        type: float
+        constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+      descend_velocity_scale:
+        type: float
+        constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+      retreat_velocity_scale:
+        type: float
+        constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+      acceleration_scale:
+        type: float
+        constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+      max_tcp_linear_speed_mps:
+        type: float
+        constraints: {min_exclusive: 0.0}
+      joint_position_tol_rad:
+        type: float
+        constraints: {min_inclusive: 0.0}
+      translation_tol_m:
+        type: float
+        constraints: {min_inclusive: 0.0}
+      rotation_tol_rad:
+        type: float
+        constraints: {min_inclusive: 0.0}
+      planning_timeout_s:
+        type: float
+        constraints: {min_exclusive: 0.0}
+      execution_timeout_s:
+        type: float
+        constraints: {min_exclusive: 0.0}
+      cache_mode:
+        type: enum
+        values: [default, disable]
 
   shape:
     type: object
@@ -404,18 +595,64 @@ entries:
       - id: target_role
         required: true
         schema: {type: string, semantic_type: target_role}
+      - id: base_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: tcp_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
       - id: goal
         required: true
         schema_ref: "#/schema_types/joint_target_list"
+      - id: target_mode
+        required: false
+        default: absolute
+        schema: {type: enum, values: [absolute, relative]}
       - id: planning_profile
         required: false
         default: balanced
         schema:
           type: enum
           values: [first_feasible, balanced, quality_bounded]
-      - id: contact_policy_id
+      - id: velocity_scale
         required: false
-        schema: {type: string}
+        default: 1.0
+        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
+      - id: acceleration_scale
+        required: false
+        default: 1.0
+        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
+      - id: max_tcp_linear_speed_mps
+        required: false
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: per_joint_dynamics_limits
+        required: false
+        default: {}
+        schema_ref: "#/schema_types/per_joint_dynamics_limits"
+      - id: joint_position_tol_rad
+        required: false
+        default: 0.05
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: translation_tol_m
+        required: false
+        default: 0.005
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: rotation_tol_rad
+        required: false
+        default: 0.05
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: planning_timeout_s
+        required: false
+        default: 2.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: execution_timeout_s
+        required: false
+        default: 10.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: cache_mode
+        required: false
+        default: default
+        schema: {type: enum, values: [default, disable]}
     required_capabilities:
       - capability_id: planning.motion.joint_goal
         scope: target_binding
@@ -474,19 +711,70 @@ entries:
       - id: target_role
         required: true
         schema: {type: string, semantic_type: target_role}
+      - id: base_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: tcp_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
       - id: goal
         required: true
-        schema_ref: "#/schema_types/stored_pose"
+        schema_ref: "#/schema_types/motion_pose"
       - id: target_mode
         required: false
         default: absolute
         schema: {type: enum, values: [absolute, relative]}
+      - id: target_reference
+        required: false
+        schema_ref: "#/schema_types/motion_reference"
+      - id: offset_reference
+        required: false
+        schema_ref: "#/schema_types/motion_reference"
       - id: planning_profile
         required: false
         default: balanced
         schema:
           type: enum
           values: [first_feasible, balanced, quality_bounded]
+      - id: velocity_scale
+        required: false
+        default: 1.0
+        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
+      - id: acceleration_scale
+        required: false
+        default: 1.0
+        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
+      - id: max_tcp_linear_speed_mps
+        required: false
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: per_joint_dynamics_limits
+        required: false
+        default: {}
+        schema_ref: "#/schema_types/per_joint_dynamics_limits"
+      - id: joint_position_tol_rad
+        required: false
+        default: 0.05
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: translation_tol_m
+        required: false
+        default: 0.005
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: rotation_tol_rad
+        required: false
+        default: 0.05
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: planning_timeout_s
+        required: false
+        default: 2.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: execution_timeout_s
+        required: false
+        default: 10.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: cache_mode
+        required: false
+        default: default
+        schema: {type: enum, values: [default, disable]}
       - id: contact_policy_id
         required: false
         schema: {type: string}
@@ -548,15 +836,98 @@ entries:
       - id: target_role
         required: true
         schema: {type: string, semantic_type: target_role}
+      - id: base_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: tcp_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
       - id: path
         required: true
         schema_ref: "#/schema_types/cartesian_path"
+      - id: target_mode
+        required: false
+        default: absolute
+        schema: {type: enum, values: [absolute, relative]}
+      - id: target_reference
+        required: false
+        schema_ref: "#/schema_types/motion_reference"
+      - id: offset_reference
+        required: false
+        schema_ref: "#/schema_types/motion_reference"
       - id: planning_profile
         required: false
         default: balanced
         schema:
           type: enum
           values: [first_feasible, balanced, quality_bounded]
+      - id: max_translation_step_m
+        required: false
+        default: 0.005
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: max_rotation_step_rad
+        required: false
+        default: 0.05
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: max_linear_speed_mps
+        required: false
+        default: 0.1
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: max_angular_speed_rad_s
+        required: false
+        default: 0.5
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: max_linear_acceleration_mps2
+        required: false
+        default: 0.5
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: max_angular_acceleration_rad_s2
+        required: false
+        default: 2.5
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: fallback_policy
+        required: false
+        default: fail_closed
+        schema: {type: enum, values: [fail_closed, allow_joint_space_fallback]}
+      - id: velocity_scale
+        required: false
+        default: 1.0
+        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
+      - id: acceleration_scale
+        required: false
+        default: 1.0
+        schema: {type: float, constraints: {min_exclusive: 0.0, max_inclusive: 1.0}}
+      - id: max_tcp_linear_speed_mps
+        required: false
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: per_joint_dynamics_limits
+        required: false
+        default: {}
+        schema_ref: "#/schema_types/per_joint_dynamics_limits"
+      - id: joint_position_tol_rad
+        required: false
+        default: 0.05
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: translation_tol_m
+        required: false
+        default: 0.005
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: rotation_tol_rad
+        required: false
+        default: 0.05
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: planning_timeout_s
+        required: false
+        default: 2.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: execution_timeout_s
+        required: false
+        default: 10.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: cache_mode
+        required: false
+        default: default
+        schema: {type: enum, values: [default, disable]}
       - id: contact_policy_id
         required: false
         schema: {type: string}
@@ -770,28 +1141,6 @@ entries:
       py_trees: {implementation_id: motion_probe_search_v1}
     observability: {event_family: manyforge.program.node}
 
-  - id: motion.invalidate_cached_plans
-    name: Invalidate cached plans
-    category: motion
-    description: Invalidate cached plans for the selected program-run scope.
-    stability: stable
-    tags: [motion, cache]
-    profiles: {min_program_profile: composable-cell-v1}
-    kind: leaf
-    children: {min: 0, max: 0}
-    parameters: []
-    required_capabilities: []
-    execution:
-      blocking: false
-      cancellable: false
-      owner_api: kernel.plan_cache
-    outcomes:
-      success: cache_invalidated
-      failure: cache_request_rejected
-    runners:
-      py_trees: {implementation_id: motion_invalidate_cached_plans_v1}
-    observability: {event_family: manyforge.program.node}
-
   - id: scene.add_object
     name: Add scene object
     category: scene
@@ -804,7 +1153,7 @@ entries:
     parameters:
       - id: scene_resource_id
         required: true
-        schema: {type: string}
+        schema: {type: string, semantic_type: scene_resource}
       - id: shape
         required: true
         schema_ref: "#/schema_types/shape"
@@ -845,7 +1194,7 @@ entries:
     parameters:
       - id: scene_resource_id
         required: true
-        schema: {type: string}
+        schema: {type: string, semantic_type: scene_resource}
       - id: shape
         required: true
         schema_ref: "#/schema_types/shape"
@@ -886,7 +1235,7 @@ entries:
     parameters:
       - id: scene_resource_id
         required: true
-        schema: {type: string}
+        schema: {type: string, semantic_type: scene_resource}
     required_capabilities:
       - capability_id: scene.edit.remove
         scope: cell_global
@@ -913,7 +1262,7 @@ entries:
     parameters:
       - id: scene_resource_id
         required: true
-        schema: {type: string}
+        schema: {type: string, semantic_type: scene_resource}
       - id: pose
         required: true
         schema_ref: "#/schema_types/stored_pose"
@@ -943,7 +1292,7 @@ entries:
     parameters:
       - id: scene_resource_id
         required: true
-        schema: {type: string}
+        schema: {type: string, semantic_type: scene_resource}
       - id: target_role
         required: true
         schema: {type: string, semantic_type: target_role}
@@ -986,7 +1335,7 @@ entries:
     parameters:
       - id: scene_resource_id
         required: true
-        schema: {type: string}
+        schema: {type: string, semantic_type: scene_resource}
       - id: target_role
         required: true
         schema: {type: string, semantic_type: target_role}
@@ -1007,23 +1356,22 @@ entries:
   - id: logic.check_bool
     name: Check boolean
     category: logic
-    description: Compare one declared blackboard boolean with an expected value.
+    description: Compare one literal or typed-source boolean with an expected value.
     stability: stable
     tags: [logic, blackboard]
     profiles: {min_program_profile: composable-cell-v1}
     kind: leaf
     children: {min: 0, max: 0}
     parameters:
-      - id: key
+      - id: actual_value
         required: true
-        schema: {type: string, semantic_type: blackboard_key}
+        schema: {type: bool}
       - id: expected_value
         required: true
         schema: {type: bool}
     required_capabilities: []
     blackboard:
-      reads:
-        - {key_parameter: key, value_type: bool, missing_key: failure}
+      reads: []
       writes: []
     execution:
       blocking: false
@@ -1235,6 +1583,10 @@ entries:
       - id: command_duration_s
         required: false
         schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: completion_timeout_s
+        required: false
+        default: 30.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
     required_capabilities:
       - capability_id: tool.gripper.command
         scope: target_binding
@@ -1804,7 +2156,7 @@ entries:
     parameters:
       - id: scene_resource_id
         required: true
-        schema: {type: string}
+        schema: {type: string, semantic_type: scene_resource}
       - id: pose
         required: true
         schema_ref: "#/schema_types/stored_pose"
@@ -1833,19 +2185,66 @@ entries:
     kind: leaf
     children: {min: 0, max: 0}
     parameters:
+      - id: model_endpoint_alias
+        required: true
+        schema: {type: string}
       - id: prompt_template_id
         required: true
         schema: {type: string}
+      - id: template_variables
+        required: false
+        default: []
+        schema_ref: "#/schema_types/template_variable_bindings"
+      - id: scene_attachment
+        required: false
+        default: none
+        schema: {type: enum, values: [none, state_json, snapshot_image]}
       - id: output_key
         required: true
         schema: {type: string, semantic_type: blackboard_key}
+      - id: timeout_s
+        required: false
+        default: 30.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: min_confidence
+        required: false
+        default: 0.0
+        schema: {type: float, constraints: {min_inclusive: 0.0, max_inclusive: 1.0}}
+      - id: model_runtime_failure_policy
+        required: false
+        default: pause_for_operator
+        schema: {type: enum, values: [pause_for_operator, condition_failure]}
+      - id: model_low_confidence_policy
+        required: false
+        default: pause_for_operator
+        schema: {type: enum, values: [pause_for_operator, condition_failure]}
+      - id: retry_on_parse_failure
+        required: false
+        default: false
+        schema: {type: bool}
+      - id: scene_snapshot_transport
+        required: false
+        default: inline_data_url
+        schema: {type: enum, values: [inline_data_url, http_url]}
+      - id: scene_snapshot_width
+        required: false
+        default: 640
+        schema: {type: int, constraints: {min_inclusive: 64, max_inclusive: 1920}}
+      - id: scene_snapshot_height
+        required: false
+        default: 480
+        schema: {type: int, constraints: {min_inclusive: 64, max_inclusive: 1080}}
+      - id: scene_snapshot_format
+        required: false
+        default: jpeg
+        schema: {type: enum, values: [jpeg, png]}
     required_capabilities: []
     blackboard:
       reads: []
       writes:
         - {key_parameter: output_key, value_type: model_response}
     execution:
-      blocking: true
+      blocking: false
       cancellable: true
       owner_api: assistant.model_request
     outcomes:
@@ -1866,12 +2265,43 @@ entries:
     kind: leaf
     children: {min: 0, max: 0}
     parameters:
-      - id: request_text
+      - id: selection_request_text
         required: true
         schema: {type: string}
       - id: output_key
         required: true
         schema: {type: string, semantic_type: blackboard_key}
+      - id: object_source
+        required: false
+        default: backend_scene
+        schema: {type: enum, values: [backend_scene]}
+      - id: candidate_object_ids
+        required: false
+        default: []
+        schema:
+          type: array
+          max_items: 4096
+          items: {type: string, semantic_type: scene_resource}
+      - id: image_source
+        required: false
+        default: none
+        schema: {type: enum, values: [none, viewer_snapshot]}
+      - id: image_snapshot_width
+        required: false
+        default: 640
+        schema: {type: int, constraints: {min_inclusive: 64, max_inclusive: 1920}}
+      - id: image_snapshot_height
+        required: false
+        default: 480
+        schema: {type: int, constraints: {min_inclusive: 64, max_inclusive: 1080}}
+      - id: image_snapshot_format
+        required: false
+        default: jpeg
+        schema: {type: enum, values: [jpeg, png]}
+      - id: unavailable_policy
+        required: false
+        default: pause_for_operator
+        schema: {type: enum, values: [pause_for_operator, condition_failure]}
     required_capabilities: []
     blackboard:
       reads: []
@@ -1899,20 +2329,28 @@ entries:
     kind: leaf
     children: {min: 0, max: 0}
     parameters:
-      - id: context_key
+      - id: selection_context_key
         required: true
         schema: {type: string, semantic_type: blackboard_key}
-      - id: response_key
+      - id: selection_response_key
         required: true
         schema: {type: string, semantic_type: blackboard_key}
       - id: output_key
         required: true
         schema: {type: string, semantic_type: blackboard_key}
+      - id: allow_no_match
+        required: false
+        default: false
+        schema: {type: bool}
+      - id: allow_ambiguous
+        required: false
+        default: false
+        schema: {type: bool}
     required_capabilities: []
     blackboard:
       reads:
-        - {key_parameter: context_key, value_type: scene_selection_context, missing_key: failure}
-        - {key_parameter: response_key, value_type: model_response, missing_key: failure}
+        - {key_parameter: selection_context_key, value_type: scene_selection_context, missing_key: failure}
+        - {key_parameter: selection_response_key, value_type: model_response, missing_key: failure}
       writes:
         - {key_parameter: output_key, value_type: scene_selection_result}
     execution:
@@ -1940,20 +2378,89 @@ entries:
       - id: target_role
         required: true
         schema: {type: string, semantic_type: target_role}
-      - id: selected_object_key
+      - id: tool_target_role
         required: true
-        schema: {type: string, semantic_type: blackboard_key}
+        schema: {type: string, semantic_type: target_role}
+      - id: base_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: tcp_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: carrier_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: selected_object_id
+        required: true
+        schema: {type: string, semantic_type: scene_resource}
+      - id: synthesis
+        required: false
+        default:
+          pick_offset_envelope:
+            position_min_m: [0.0, 0.0, 0.0]
+            position_max_m: [0.0, 0.0, 0.0]
+            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+          approach_offset_envelope:
+            position_min_m: [0.0, 0.0, 0.05]
+            position_max_m: [0.0, 0.0, 0.10]
+            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+        schema_ref: "#/schema_types/pick_synthesis"
+      - id: planning_profile
+        required: false
+        default: first_feasible
+        schema:
+          type: enum
+          values: [first_feasible, balanced, quality_bounded]
+      - id: motion_options
+        required: false
+        default: {}
+        schema_ref: "#/schema_types/pick_motion_options"
+      - id: tool_position
+        required: true
+        schema_ref: "#/schema_types/coordinate_position"
+      - id: tool_max_effort
+        required: false
+        schema_ref: "#/schema_types/coordinate_effort_limit"
+      - id: tool_command_duration_s
+        required: false
+        default: 0.0
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: tool_completion_timeout_s
+        required: false
+        default: 30.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
       - id: output_key
         required: true
         schema: {type: string, semantic_type: blackboard_key}
       - id: contact_policy_id
-        required: false
+        required: true
         schema: {type: string}
+      - id: no_feasible_plan_policy
+        required: false
+        default: pause_for_operator
+        schema: {type: enum, values: [pause_for_operator, condition_failure]}
     required_capabilities:
       - capability_id: planning.motion.pose_goal
         scope: target_binding
         target_parameter: target_role
+      - capability_id: planning.motion.cartesian_path
+        scope: target_binding
+        target_parameter: target_role
       - capability_id: planning.profile.first_feasible
+        scope: target_binding
+        target_parameter: target_role
+        when: {parameter: planning_profile, equals: first_feasible}
+      - capability_id: planning.profile.balanced
+        scope: target_binding
+        target_parameter: target_role
+        when: {parameter: planning_profile, equals: balanced}
+      - capability_id: planning.profile.quality_bounded
+        scope: target_binding
+        target_parameter: target_role
+        when: {parameter: planning_profile, equals: quality_bounded}
+      - capability_id: planning.trajectory.time_parameterized
         scope: target_binding
         target_parameter: target_role
       - capability_id: state.observed.current
@@ -1967,11 +2474,18 @@ entries:
       - capability_id: model.kinematics.fk
         scope: target_binding
         target_parameter: target_role
+      - capability_id: tool.gripper.command
+        scope: target_binding
+        target_parameter: tool_target_role
+      - capability_id: tool.gripper.feedback
+        scope: target_binding
+        target_parameter: tool_target_role
+      - capability_id: scene.edit.attach_detach
+        scope: cell_global
     blackboard:
-      reads:
-        - {key_parameter: selected_object_key, value_type: scene_resource, missing_key: failure}
+      reads: []
       writes:
-        - {key_parameter: output_key, value_type: planned_sequence}
+        - {key_parameter: output_key, value_type: pick_planning_result}
     execution:
       blocking: true
       cancellable: true
@@ -1982,6 +2496,256 @@ entries:
       interrupted: cancelled
     runners:
       py_trees: {implementation_id: planning_plan_pick_sequence_v1}
+    observability: {event_family: manyforge.program.node}
+
+  - id: motion.pick_object
+    name: Pick object
+    category: motion
+    description: Plan and execute one owner-coordinated pick sequence from portable intent.
+    stability: stable
+    tags: [motion, planning, execution, pick]
+    profiles: {min_program_profile: composable-cell-v1}
+    kind: leaf
+    children: {min: 0, max: 0}
+    parameters:
+      - id: target_role
+        required: true
+        schema: {type: string, semantic_type: target_role}
+      - id: tool_target_role
+        required: true
+        schema: {type: string, semantic_type: target_role}
+      - id: base_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: tcp_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: carrier_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: selected_object_id
+        required: true
+        schema: {type: string, semantic_type: scene_resource}
+      - id: synthesis
+        required: false
+        default:
+          pick_offset_envelope:
+            position_min_m: [0.0, 0.0, 0.0]
+            position_max_m: [0.0, 0.0, 0.0]
+            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+          approach_offset_envelope:
+            position_min_m: [0.0, 0.0, 0.05]
+            position_max_m: [0.0, 0.0, 0.10]
+            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+        schema_ref: "#/schema_types/pick_synthesis"
+      - id: planning_profile
+        required: false
+        default: first_feasible
+        schema:
+          type: enum
+          values: [first_feasible, balanced, quality_bounded]
+      - id: motion_options
+        required: false
+        default: {}
+        schema_ref: "#/schema_types/pick_motion_options"
+      - id: tool_position
+        required: true
+        schema_ref: "#/schema_types/coordinate_position"
+      - id: tool_max_effort
+        required: false
+        schema_ref: "#/schema_types/coordinate_effort_limit"
+      - id: tool_command_duration_s
+        required: false
+        default: 0.0
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: tool_completion_timeout_s
+        required: false
+        default: 30.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+      - id: contact_policy_id
+        required: true
+        schema: {type: string}
+      - id: no_feasible_plan_policy
+        required: false
+        default: pause_for_operator
+        schema: {type: enum, values: [pause_for_operator, condition_failure]}
+    required_capabilities:
+      - capability_id: planning.motion.pose_goal
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: planning.motion.cartesian_path
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: planning.profile.first_feasible
+        scope: target_binding
+        target_parameter: target_role
+        when: {parameter: planning_profile, equals: first_feasible}
+      - capability_id: planning.profile.balanced
+        scope: target_binding
+        target_parameter: target_role
+        when: {parameter: planning_profile, equals: balanced}
+      - capability_id: planning.profile.quality_bounded
+        scope: target_binding
+        target_parameter: target_role
+        when: {parameter: planning_profile, equals: quality_bounded}
+      - capability_id: planning.trajectory.time_parameterized
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: state.observed.current
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: validation.trajectory.non_collision
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: collision.query.pre_execution
+        scope: cell_global
+      - capability_id: execution.trajectory.execute
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: execution.feedback.phase_events
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: model.kinematics.fk
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: tool.gripper.command
+        scope: target_binding
+        target_parameter: tool_target_role
+      - capability_id: tool.gripper.feedback
+        scope: target_binding
+        target_parameter: tool_target_role
+      - capability_id: scene.edit.attach_detach
+        scope: cell_global
+    execution:
+      blocking: true
+      cancellable: true
+      owner_api: kernel.pick_place_sequence
+    outcomes:
+      success: sequence_completed
+      failure: sequence_failed_or_intervention_required
+      interrupted: sequence_terminal
+    runners:
+      py_trees: {implementation_id: motion_pick_object_v1}
+    observability: {event_family: manyforge.program.node}
+
+  - id: motion.place_object
+    name: Place object
+    category: motion
+    description: Plan and execute one owner-coordinated place sequence from portable intent.
+    stability: stable
+    tags: [motion, planning, execution, place]
+    profiles: {min_program_profile: composable-cell-v1}
+    kind: leaf
+    children: {min: 0, max: 0}
+    parameters:
+      - id: target_role
+        required: true
+        schema: {type: string, semantic_type: target_role}
+      - id: tool_target_role
+        required: true
+        schema: {type: string, semantic_type: target_role}
+      - id: base_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: tcp_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: carrier_frame_role
+        required: true
+        schema: {type: string, semantic_type: frame_role}
+      - id: selected_object_id
+        required: true
+        schema: {type: string, semantic_type: scene_resource}
+      - id: place_pose
+        required: true
+        schema_ref: "#/schema_types/motion_pose"
+      - id: approach_offset_m
+        required: false
+        default: [0.0, 0.0, 0.05]
+        schema: {type: array, items: {type: float}, length: 3}
+      - id: planning_profile
+        required: false
+        default: first_feasible
+        schema:
+          type: enum
+          values: [first_feasible, balanced, quality_bounded]
+      - id: motion_options
+        required: false
+        default: {}
+        schema_ref: "#/schema_types/pick_motion_options"
+      - id: tool_position
+        required: true
+        schema_ref: "#/schema_types/coordinate_position"
+      - id: tool_max_effort
+        required: false
+        schema_ref: "#/schema_types/coordinate_effort_limit"
+      - id: tool_command_duration_s
+        required: false
+        default: 0.0
+        schema: {type: float, constraints: {min_inclusive: 0.0}}
+      - id: tool_completion_timeout_s
+        required: false
+        default: 30.0
+        schema: {type: float, constraints: {min_exclusive: 0.0}}
+    required_capabilities:
+      - capability_id: planning.motion.pose_goal
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: planning.motion.cartesian_path
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: planning.profile.first_feasible
+        scope: target_binding
+        target_parameter: target_role
+        when: {parameter: planning_profile, equals: first_feasible}
+      - capability_id: planning.profile.balanced
+        scope: target_binding
+        target_parameter: target_role
+        when: {parameter: planning_profile, equals: balanced}
+      - capability_id: planning.profile.quality_bounded
+        scope: target_binding
+        target_parameter: target_role
+        when: {parameter: planning_profile, equals: quality_bounded}
+      - capability_id: planning.trajectory.time_parameterized
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: state.observed.current
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: validation.trajectory.non_collision
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: collision.query.pre_execution
+        scope: cell_global
+      - capability_id: execution.trajectory.execute
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: execution.feedback.phase_events
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: model.kinematics.fk
+        scope: target_binding
+        target_parameter: target_role
+      - capability_id: tool.gripper.command
+        scope: target_binding
+        target_parameter: tool_target_role
+      - capability_id: tool.gripper.feedback
+        scope: target_binding
+        target_parameter: tool_target_role
+      - capability_id: scene.edit.attach_detach
+        scope: cell_global
+    execution:
+      blocking: true
+      cancellable: true
+      owner_api: kernel.pick_place_sequence
+    outcomes:
+      success: sequence_completed
+      failure: sequence_failed_or_intervention_required
+      interrupted: sequence_terminal
+    runners:
+      py_trees: {implementation_id: motion_place_object_v1}
     observability: {event_family: manyforge.program.node}
 
   - id: recovery.apply_offered_action

@@ -30,10 +30,10 @@ from manyforge_behavior.catalog_schema import (
 
 
 EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
-EXPECTED_CONTENT_VERSION = "1.0.0"
+EXPECTED_CONTENT_VERSION = "1.1.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:6ec8e6ffad4f128fb299bbd0a898751f1b04cba38abc6591ffd67842104a0aa9"
+    "sha256:41f95ac4449ab61aac6e1648c7429a667ea09679f94e12ace502bed59d622fdf"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -69,7 +69,7 @@ _OWNER_APIS = {
     "kernel.full_stop",
     "kernel.operation",
     "kernel.pause",
-    "kernel.plan_cache",
+    "kernel.pick_place_sequence",
     "kernel.recovery",
     "kernel.reset",
     "kernel.resume",
@@ -445,6 +445,14 @@ def _schema_contains_semantic_type(
             for nested in resolved.properties.values()
         )
         or (
+            resolved.additional_property_schema is not None
+            and _schema_contains_semantic_type(
+                resolved.additional_property_schema,
+                registry,
+                semantic_type,
+            )
+        )
+        or (
             resolved.items is not None
             and _schema_contains_semantic_type(
                 resolved.items, registry, semantic_type
@@ -531,6 +539,13 @@ def _schema_references_authoring(
             stack=stack,
         )
         for child in schema.properties.values()
+    ):
+        return True
+    if schema.additional_property_schema is not None and _schema_references_authoring(
+        schema.additional_property_schema,
+        registry,
+        authoring_names,
+        stack=stack,
     ):
         return True
     return (
@@ -628,7 +643,7 @@ class NodeCatalog:
             or self._catalog_digest != EXPECTED_BUILTIN_CATALOG_DIGEST
         ):
             raise CatalogValidationError(
-                "catalog does not match the frozen built-in v2/1.0.0 packet"
+                "catalog does not match the frozen built-in v2/1.1.0 packet"
             )
 
         self._entries = MappingProxyType(entries)

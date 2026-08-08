@@ -67,6 +67,7 @@ constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::size_t kMaximumAssistantRows = 4096U;
 constexpr std::size_t kMaximumAssistantTextBytes = 1024U;
+constexpr std::size_t kMaximumPromptTemplateBytes = 16384U;
 
 const detail::ContentIdentitySpec kInstrumentRegistryIdentitySpec{
     "assistant-instrument-registry-digest",
@@ -335,6 +336,32 @@ enum class InstrumentIdKind { kPortable, kTool };
   return CanonicalValue(std::move(result));
 }
 
+[[nodiscard]] std::string parse_prompt_template_text(const CanonicalValue& value,
+                                                     std::string_view path) {
+  const std::string& text = require_string(value, path);
+  if (text.empty() || text.size() > kMaximumPromptTemplateBytes ||
+      std::any_of(text.begin(), text.end(), [](unsigned char byte) {
+        return byte == 0U || byte == 0x7fU || (byte < 0x20U && byte != '\n' && byte != '\t');
+      })) {
+    fail(path,
+         "expected a non-empty prompt template within the 16 KiB bound "
+         "without unsupported control characters");
+  }
+  return text;
+}
+
+[[nodiscard]] core::ContentDigest prompt_template_content_digest(
+    std::string_view prompt_template_id, std::string_view version, std::string_view template_text,
+    const std::vector<std::string>& variable_ids) {
+  const CanonicalValue content(CanonicalValue::Object{
+      {"prompt_template_id", CanonicalValue(std::string(prompt_template_id))},
+      {"template_text", CanonicalValue(std::string(template_text))},
+      {"variable_ids", encode_string_array(variable_ids)},
+      {"version", CanonicalValue(std::string(version))},
+  });
+  return core::ContentDigest(sha256_digest(canonical_json(content)));
+}
+
 [[nodiscard]] CanonicalValue replace_member(const CanonicalValue& value,
                                             std::string_view member_name,
                                             CanonicalValue replacement) {
@@ -540,6 +567,40 @@ make_registry_value() {
   };
 }
 
+[[nodiscard]] core::AssistantModelAuditPolicyDTO parse_audit_policy(const CanonicalValue& value,
+                                                                    std::string_view path) {
+  const auto& object = require_object(value, path);
+  require_exact_fields(
+      object, {"store_full_prompts", "store_full_responses", "redact_argument_values"}, path);
+  return {
+      require_bool(require_member(object, "store_full_prompts", path),
+                   child_path(path, "store_full_prompts")),
+      require_bool(require_member(object, "store_full_responses", path),
+                   child_path(path, "store_full_responses")),
+      require_bool(require_member(object, "redact_argument_values", path),
+                   child_path(path, "redact_argument_values")),
+  };
+}
+
+[[nodiscard]] core::AssistantPromptTemplateDTO parse_prompt_template(std::string prompt_template_id,
+                                                                     const CanonicalValue& value,
+                                                                     std::string_view path) {
+  const auto& object = require_object(value, path);
+  require_exact_fields(object, {"version", "template_text", "variable_ids"}, path);
+  const std::string version =
+      parse_portable_token(require_member(object, "version", path), child_path(path, "version"));
+  const std::string template_text = parse_prompt_template_text(
+      require_member(object, "template_text", path), child_path(path, "template_text"));
+  std::vector<std::string> variable_ids =
+      parse_id_list(require_member(object, "variable_ids", path), child_path(path, "variable_ids"),
+                    InstrumentIdKind::kPortable);
+  const core::ContentDigest digest =
+      prompt_template_content_digest(prompt_template_id, version, template_text, variable_ids);
+  return {
+      std::move(prompt_template_id), version, template_text, std::move(variable_ids), digest,
+  };
+}
+
 [[nodiscard]] core::AssistantProviderAliasDTO parse_provider_alias(
     std::string alias, const CanonicalValue& value, std::string_view path) {
   const auto& object = require_object(value, path);
@@ -628,7 +689,9 @@ template <typename DTO, typename Parser>
     result.push_back(parser(key, item, child_path(path, key)));
   }
   std::sort(result.begin(), result.end(), [](const DTO& left, const DTO& right) {
-    if constexpr (std::is_same_v<DTO, core::AssistantModelEndpointAliasDTO>) {
+    if constexpr (std::is_same_v<DTO, core::AssistantPromptTemplateDTO>) {
+      return left.prompt_template_id < right.prompt_template_id;
+    } else if constexpr (std::is_same_v<DTO, core::AssistantModelEndpointAliasDTO>) {
       return left.model_endpoint_alias < right.model_endpoint_alias;
     } else if constexpr (std::is_same_v<DTO,
                                         core::AssistantProviderAliasDTO>) {
@@ -642,6 +705,22 @@ template <typename DTO, typename Parser>
 
 [[nodiscard]] CanonicalValue encode_source_settings(
     const core::AssistantSettingsDTO& settings) {
+  const CanonicalValue audit_policy(CanonicalValue::Object{
+      {"redact_argument_values", CanonicalValue(settings.audit_policy.redact_argument_values)},
+      {"store_full_prompts", CanonicalValue(settings.audit_policy.store_full_prompts)},
+      {"store_full_responses", CanonicalValue(settings.audit_policy.store_full_responses)},
+  });
+
+  CanonicalValue::Object prompt_templates;
+  for (const auto& prompt : settings.prompt_templates) {
+    prompt_templates.emplace_back(prompt.prompt_template_id,
+                                  CanonicalValue(CanonicalValue::Object{
+                                      {"template_text", CanonicalValue(prompt.template_text)},
+                                      {"variable_ids", encode_string_array(prompt.variable_ids)},
+                                      {"version", CanonicalValue(prompt.version)},
+                                  }));
+  }
+
   CanonicalValue::Object model_aliases;
   for (const auto& alias : settings.model_endpoint_aliases) {
     model_aliases.emplace_back(
@@ -703,8 +782,10 @@ template <typename DTO, typename Parser>
   }
 
   return CanonicalValue(CanonicalValue::Object{
+      {"audit_policy", audit_policy},
       {"model_endpoint_aliases", CanonicalValue(std::move(model_aliases))},
       {"modes", CanonicalValue(std::move(modes))},
+      {"prompt_templates", CanonicalValue(std::move(prompt_templates))},
       {"provider_aliases", CanonicalValue(std::move(provider_aliases))},
   });
 }
@@ -713,6 +794,22 @@ template <typename DTO, typename Parser>
     const core::AssistantSettingsDTO& settings,
     const BuildQualifiedAssistantInstrumentRegistry& registry,
     std::string_view projection_digest) {
+  const CanonicalValue audit_policy(CanonicalValue::Object{
+      {"redact_argument_values", CanonicalValue(settings.audit_policy.redact_argument_values)},
+      {"store_full_prompts", CanonicalValue(settings.audit_policy.store_full_prompts)},
+      {"store_full_responses", CanonicalValue(settings.audit_policy.store_full_responses)},
+  });
+  CanonicalValue::Array prompt_templates;
+  prompt_templates.reserve(settings.prompt_templates.size());
+  for (const auto& prompt : settings.prompt_templates) {
+    prompt_templates.emplace_back(CanonicalValue::Object{
+        {"content_digest", CanonicalValue(prompt.content_digest.value())},
+        {"prompt_template_id", CanonicalValue(prompt.prompt_template_id)},
+        {"template_text", CanonicalValue(prompt.template_text)},
+        {"variable_ids", encode_string_array(prompt.variable_ids)},
+        {"version", CanonicalValue(prompt.version)},
+    });
+  }
   CanonicalValue::Array model_aliases;
   for (const auto& alias : settings.model_endpoint_aliases) {
     model_aliases.emplace_back(CanonicalValue::Object{
@@ -769,9 +866,11 @@ template <typename DTO, typename Parser>
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kRetainedAssistantProjectionApiVersion))},
+      {"audit_policy", audit_policy},
       {"instruments", registry.normalized_root()},
       {"model_endpoint_aliases", CanonicalValue(std::move(model_aliases))},
       {"modes", CanonicalValue(std::move(modes))},
+      {"prompt_templates", CanonicalValue(std::move(prompt_templates))},
       {"projection_digest", CanonicalValue(std::string(projection_digest))},
       {"provider_aliases", CanonicalValue(std::move(provider_aliases))},
   });
@@ -967,14 +1066,13 @@ void require_mode_semantics(
 [[nodiscard]] CanonicalValue projection_to_source(
     const CanonicalValue& projection) {
   const auto& root = require_object(projection, "$.assistant");
-  require_exact_fields(root,
-                       {"api_version", "projection_digest",
-                        "model_endpoint_aliases", "provider_aliases", "modes",
-                        "instruments"},
-                       "$.assistant");
-  const std::string& api_version = require_string(
-      require_member(root, "api_version", "$.assistant"),
-      "$.assistant.api_version");
+  require_exact_fields(
+      root,
+      {"api_version", "projection_digest", "audit_policy", "model_endpoint_aliases",
+       "provider_aliases", "modes", "prompt_templates", "instruments"},
+      "$.assistant");
+  const std::string& api_version =
+      require_string(require_member(root, "api_version", "$.assistant"), "$.assistant.api_version");
   if (api_version != kRetainedAssistantProjectionApiVersion) {
     fail("$.assistant.api_version", "unsupported retained assistant version");
   }
@@ -992,6 +1090,37 @@ void require_mode_semantics(
       expected_registry.normalized_root()) {
     fail("$.assistant.instruments",
          "retained registry differs from the build-qualified registry");
+  }
+
+  const CanonicalValue& audit_policy = require_member(root, "audit_policy", "$.assistant");
+  (void)parse_audit_policy(audit_policy, "$.assistant.audit_policy");
+
+  CanonicalValue::Object prompt_template_map;
+  const auto& prompt_templates = require_array(
+      require_member(root, "prompt_templates", "$.assistant"), "$.assistant.prompt_templates");
+  for (std::size_t index = 0; index < prompt_templates.size(); ++index) {
+    const std::string path = index_path("$.assistant.prompt_templates", index);
+    const auto& object = require_object(prompt_templates[index], path);
+    require_exact_fields(
+        object,
+        {"prompt_template_id", "version", "template_text", "variable_ids", "content_digest"}, path);
+    const std::string prompt_template_id = parse_portable_token(
+        require_member(object, "prompt_template_id", path), child_path(path, "prompt_template_id"));
+    const core::ContentDigest declared_digest = parse_digest(
+        require_member(object, "content_digest", path), child_path(path, "content_digest"));
+    CanonicalValue::Object source_template{
+        {"template_text", require_member(object, "template_text", path)},
+        {"variable_ids", require_member(object, "variable_ids", path)},
+        {"version", require_member(object, "version", path)},
+    };
+    const auto parsed =
+        parse_prompt_template(prompt_template_id, CanonicalValue(source_template), path);
+    if (parsed.content_digest != declared_digest) {
+      fail(child_path(path, "content_digest"),
+           "does not match the normalized prompt-template content");
+    }
+    prompt_template_map.emplace_back(prompt_template_id,
+                                     CanonicalValue(std::move(source_template)));
   }
 
   CanonicalValue::Object model_alias_map;
@@ -1064,8 +1193,10 @@ void require_mode_semantics(
   }
 
   return CanonicalValue(CanonicalValue::Object{
+      {"audit_policy", audit_policy},
       {"model_endpoint_aliases", CanonicalValue(std::move(model_alias_map))},
       {"modes", CanonicalValue(std::move(mode_map))},
+      {"prompt_templates", CanonicalValue(std::move(prompt_template_map))},
       {"provider_aliases", CanonicalValue(std::move(provider_alias_map))},
   });
 }
@@ -1163,10 +1294,16 @@ TypedAssistantSettingsCandidate decode_assistant_settings_candidate(
             CanonicalValue(CanonicalValue::Object{})));
   }
   require_exact_fields(
-      object, {"model_endpoint_aliases", "provider_aliases", "modes"},
+      object,
+      {"audit_policy", "prompt_templates", "model_endpoint_aliases", "provider_aliases", "modes"},
       "$.assistant");
 
   core::AssistantSettingsDTO value{
+      parse_audit_policy(require_member(object, "audit_policy", "$.assistant"),
+                         "$.assistant.audit_policy"),
+      parse_alias_map<core::AssistantPromptTemplateDTO>(
+          require_member(object, "prompt_templates", "$.assistant"), "$.assistant.prompt_templates",
+          parse_prompt_template),
       parse_alias_map<core::AssistantModelEndpointAliasDTO>(
           require_member(object, "model_endpoint_aliases", "$.assistant"),
           "$.assistant.model_endpoint_aliases", parse_model_alias),
