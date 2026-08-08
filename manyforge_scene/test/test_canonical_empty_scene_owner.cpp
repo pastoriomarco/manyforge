@@ -83,6 +83,18 @@ constexpr std::string_view kExpectedSceneId =
     "sha256:b6edf7957c79f97cabefc2c61056f0bb09e00d1cac1ff3080ed540b650346dad";
 constexpr std::string_view kExpectedEmptySceneContentHash =
     "sha256:bb42a1086f1fc8a45d1bcee2edc2bfce5ee2494029fdeeb5b2066717420cdfe5";
+constexpr std::int64_t kSustainedNoOpCommitP95BudgetNs = 50'000'000;
+
+std::int64_t NearestRankPercentileNs(std::vector<std::int64_t> samples,
+                                     const std::size_t percentile) {
+  if (samples.empty() || percentile == 0U || percentile > 100U) {
+    throw std::invalid_argument("invalid scene-owner percentile input");
+  }
+  std::sort(samples.begin(), samples.end());
+  const auto rank =
+      (samples.size() * percentile + 99U) / 100U;
+  return samples[std::min(rank, samples.size()) - 1U];
+}
 
 static_assert(
     !std::is_constructible_v<CanonicalEmptySceneOwner, std::filesystem::path,
@@ -1728,6 +1740,56 @@ TEST(CanonicalEmptySceneOwner,
 }
 
 TEST(CanonicalEmptySceneOwner,
+     LiveStateCacheReconstructsAfterAnotherOwnerConnectionCommits) {
+  TemporaryDirectory directory("scene-external-owner-write");
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  CanonicalEmptySceneOwner first(database_path, admission, publication_reader);
+  const auto initial =
+      FinalizeCanonicalBootstrap(first, publication_reader, admission)
+          .canonical_empty_target;
+  CanonicalEmptySceneOwner second(database_path, admission,
+                                  publication_reader);
+
+  // Warm both process-local views before either connection advances the scene.
+  EXPECT_EQ(first.CurrentProjectionRevision(), initial);
+  EXPECT_EQ(second.CurrentProjectionRevision(), initial);
+
+  const auto first_result = first.Commit(AddBoxRequest(
+      initial, admission.cell_id(), "scene-request-first-owner"));
+  ASSERT_TRUE(first_result.success);
+  ASSERT_TRUE(first_result.committed_projection_revision.has_value());
+
+  // The other connection must observe the committed revision rather than use
+  // its stale cached predecessor. Its stale request still fails before effect.
+  auto stale_request = AddBoxRequest(
+      initial, admission.cell_id(), "scene-request-stale-second-owner");
+  std::get<core::AddObjectRequestDTO>(stale_request.operation)
+      .scene_resource_id = core::SceneResourceId("scene-box-stale");
+  const auto stale_result = second.Commit(stale_request);
+  ASSERT_FALSE(stale_result.success);
+  ASSERT_TRUE(stale_result.error.has_value());
+  EXPECT_EQ(stale_result.error->code, "stale_revision");
+  EXPECT_EQ(second.CurrentProjectionRevision(),
+            *first_result.committed_projection_revision);
+
+  auto second_request = AddBoxRequest(
+      *first_result.committed_projection_revision, admission.cell_id(),
+      "scene-request-second-owner");
+  std::get<core::AddObjectRequestDTO>(second_request.operation)
+      .scene_resource_id = core::SceneResourceId("scene-box-second");
+  const auto second_result = second.Commit(second_request);
+  ASSERT_TRUE(second_result.success);
+  ASSERT_TRUE(second_result.committed_projection_revision.has_value());
+
+  EXPECT_EQ(first.CurrentProjectionRevision(),
+            *second_result.committed_projection_revision);
+  EXPECT_EQ(first.LogicalSnapshot()->objects.size(), 2U);
+  EXPECT_EQ(first.VerifyIntegrity().transaction_intent_count, 2);
+}
+
+TEST(CanonicalEmptySceneOwner,
      PortableSupportDeclarationsNormalizePersistAndProtectReferences) {
   TemporaryDirectory directory("scene-support-declarations");
   const auto database_path = directory.path() / "logical-scene.sqlite3";
@@ -2653,6 +2715,8 @@ TEST(CanonicalEmptySceneOwner,
   RequestOwnerEpoch original_epoch(std::string{});
   RequestOwnerEpoch rotated_epoch(std::string{});
   std::optional<core::SceneTransactionRequestDTO> most_recent_request;
+  std::vector<std::int64_t> steady_commit_duration_ns;
+  steady_commit_duration_ns.reserve(kMaximumLogicalSceneTransactions - 2U);
   {
     CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
                                    bundle_source, resolver);
@@ -2680,7 +2744,12 @@ TEST(CanonicalEmptySceneOwner,
               core::SceneResourceId("scene-box"), pose.value(),
               core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
               false}};
+      const auto started = std::chrono::steady_clock::now();
       const auto committed = owner.Commit(request);
+      steady_commit_duration_ns.push_back(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - started)
+              .count());
       ASSERT_TRUE(committed.success)
           << (committed.error.has_value() ? committed.error->message
                                           : "missing error");
@@ -2753,6 +2822,16 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_EQ(integrity.request_outcome_count, 1);
     EXPECT_EQ(integrity.owner_event_count, 1);
   }
+
+  const auto p50_ns = NearestRankPercentileNs(steady_commit_duration_ns, 50U);
+  const auto p95_ns = NearestRankPercentileNs(steady_commit_duration_ns, 95U);
+  const auto p99_ns = NearestRankPercentileNs(steady_commit_duration_ns, 99U);
+  RecordProperty("steady_noop_commit_samples",
+                 std::to_string(steady_commit_duration_ns.size()));
+  RecordProperty("steady_noop_commit_p50_ns", std::to_string(p50_ns));
+  RecordProperty("steady_noop_commit_p95_ns", std::to_string(p95_ns));
+  RecordProperty("steady_noop_commit_p99_ns", std::to_string(p99_ns));
+  EXPECT_LT(p95_ns, kSustainedNoOpCommitP95BudgetNs);
 
   CanonicalEmptySceneOwner reopened(database_path, admission,
                                     publication_reader, bundle_source,

@@ -749,6 +749,20 @@ struct SceneTransactionStoreState final {
   std::optional<std::uint64_t> latest_uncertain_transaction_sequence;
 };
 
+/// Process-local acceleration for the ordinary scene-commit path.
+///
+/// Startup and every structural/recovery mutation still reconstruct and
+/// validate the complete durable history. Between those boundaries this owner
+/// is the sole writer and holds `Impl::mutex_`, so replaying all resident
+/// transaction JSON before every edit is both redundant and quadratic. The
+/// SQLite `data_version` value fences writes made through another connection;
+/// any such change discards this cache and forces a complete reconstruction.
+struct SceneCommitStateCache final {
+  DurableState durable_state;
+  std::optional<SceneTransactionStoreState> transaction_state;
+  std::int64_t external_data_version{};
+};
+
 struct BoundedHistoryState final {
   std::uint64_t compaction_generation{};
   std::uint64_t request_epoch_generation{};
@@ -6904,6 +6918,7 @@ public:
 
   void Close() {
     std::lock_guard lock(mutex_);
+    InvalidateSceneCommitState();
     auto lifecycle_lock = sqlite_lifecycle_internal::
         AcquireCanonicalEmptySceneStoreLifecycleLockForClose();
     if (database_ == nullptr) {
@@ -6938,6 +6953,54 @@ public:
     return state;
   }
 
+  [[nodiscard]] const SceneCommitStateCache &ReadSceneCommitState() const {
+    auto *value = database();
+    const auto data_version = ScalarInteger(value, "PRAGMA data_version");
+    if (scene_commit_state_cache_.has_value() &&
+        scene_commit_state_cache_->external_data_version == data_version) {
+      return *scene_commit_state_cache_;
+    }
+
+    Transaction transaction(value, "BEGIN");
+    auto durable_state = ReadCompleteDurableState(value, fixed_query_);
+    std::optional<SceneTransactionStoreState> transaction_state;
+    if (durable_state.accepted.has_value() &&
+        durable_state.finalization_receipt.has_value()) {
+      transaction_state =
+          ReadSceneTransactionStoreState(value, durable_state);
+    }
+    const auto stable_data_version =
+        ScalarInteger(value, "PRAGMA data_version");
+    transaction.Commit();
+    if (stable_data_version != data_version) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "logical-scene database changed while rebuilding the live commit "
+          "state");
+    }
+    scene_commit_state_cache_ = SceneCommitStateCache{
+        std::move(durable_state), std::move(transaction_state), data_version};
+    return *scene_commit_state_cache_;
+  }
+
+  [[nodiscard]] bool SceneCommitStateStillCurrent(
+      const std::int64_t expected_external_data_version) const {
+    return ScalarInteger(database(), "PRAGMA data_version") ==
+           expected_external_data_version;
+  }
+
+  void StoreSceneCommitState(
+      DurableState durable_state,
+      std::optional<SceneTransactionStoreState> transaction_state,
+      const std::int64_t external_data_version) {
+    scene_commit_state_cache_ = SceneCommitStateCache{
+        std::move(durable_state), std::move(transaction_state),
+        external_data_version};
+  }
+
+  void InvalidateSceneCommitState() noexcept {
+    scene_commit_state_cache_.reset();
+  }
+
   std::filesystem::path database_path_;
   ProjectionBootstrapPrerequisiteQueryDTO fixed_query_;
   ContentDigest admission_digest_;
@@ -6947,6 +7010,7 @@ public:
   const core::IPlannerSceneProjectionResolver *projection_resolver_;
   mutable std::mutex mutex_;
   sqlite3 *database_{};
+  mutable std::optional<SceneCommitStateCache> scene_commit_state_cache_;
 };
 
 CanonicalEmptySceneOwner::CanonicalEmptySceneOwner(
@@ -7047,6 +7111,7 @@ CanonicalEmptySceneOwner::BeginProjectionBootstrap(
   ValidateCanonicalEmptyIntent(intent, impl_->fixed_query_,
                                impl_->admitted_bundle_);
   std::lock_guard lock(impl_->mutex_);
+  impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
   auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
@@ -7088,6 +7153,7 @@ CanonicalEmptySceneOwner::RebuildProjectionBootstrap(
     throw std::invalid_argument("bootstrap Rebuild request is invalid");
   }
   std::lock_guard lock(impl_->mutex_);
+  impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
   Transaction transaction(database, "BEGIN IMMEDIATE");
   auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
@@ -7134,7 +7200,8 @@ CanonicalEmptySceneOwner::ProjectionBootstrapStatus(
   static_cast<void>(CheckedSafeCounter(query.bootstrap_generation.value(),
                                        "bootstrap_generation"));
   std::lock_guard lock(impl_->mutex_);
-  auto result = StatusResult(impl_->ReadStateTransaction(), query);
+  auto result = StatusResult(impl_->ReadSceneCommitState().durable_state,
+                             query);
   if (!result.presence_valid()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "durable state cannot form a valid bootstrap status");
@@ -7149,6 +7216,7 @@ CanonicalEmptySceneOwner::FinalizeProjectionBootstrap(
     throw std::invalid_argument("bootstrap Finalize request is invalid");
   }
   std::lock_guard lock(impl_->mutex_);
+  impl_->InvalidateSceneCommitState();
   auto state = impl_->ReadStateTransaction();
   if (!state.accepted.has_value() || !state.rebuilt) {
     throw CanonicalEmptySceneOwnerConflictError(
@@ -7315,6 +7383,7 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
   }
 
   std::lock_guard lock(impl_->mutex_);
+  impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
   auto state = impl_->ReadStateTransaction();
   std::optional<NamedApplyStageState> stage;
@@ -7727,6 +7796,7 @@ CanonicalEmptySceneOwner::ActivateStagedProjection(
   static_cast<void>(CheckedSafeCounter(
       request.projection_stage_generation.value(), "stage generation"));
   std::lock_guard lock(impl_->mutex_);
+  impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
   auto state = impl_->ReadStateTransaction();
   const auto *stored =
@@ -8010,6 +8080,7 @@ CanonicalEmptySceneOwner::DiscardStagedProjection(
   static_cast<void>(CheckedSafeCounter(
       request.projection_stage_generation.value(), "stage generation"));
   std::lock_guard lock(impl_->mutex_);
+  impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
   auto state = impl_->ReadStateTransaction();
   const auto *stored =
@@ -8241,6 +8312,7 @@ CanonicalEmptySceneOwner::FinalizeProjectionTransition(
   static_cast<void>(CheckedSafeCounter(
       request.projection_stage_generation.value(), "stage generation"));
   std::lock_guard lock(impl_->mutex_);
+  impl_->InvalidateSceneCommitState();
   auto state = impl_->ReadStateTransaction();
   const auto *stored =
       state.FindNamedApply(request.apply_id, request.apply_generation);
@@ -8665,6 +8737,7 @@ CanonicalEmptySceneOwner::ReconcileActiveProjectionRuntimes(
   }
 
   std::lock_guard lock(impl_->mutex_);
+  impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
   auto state = impl_->ReadStateTransaction();
   if (!state.active_projection.has_value() ||
@@ -8894,7 +8967,7 @@ CanonicalEmptySceneOwner::ReconcileActiveProjectionRuntimes(
 ProjectionAggregateHealthDTO
 CanonicalEmptySceneOwner::ActiveProjectionHealth() const {
   std::lock_guard lock(impl_->mutex_);
-  const auto state = impl_->ReadStateTransaction();
+  const auto state = impl_->ReadSceneCommitState().durable_state;
   if (!state.active_projection.has_value() ||
       !state.active_scene_snapshot.has_value() || !state.accepted.has_value()) {
     throw CanonicalEmptySceneOwnerConflictError(
@@ -9041,18 +9114,23 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   DurableState observed_state;
   std::optional<SceneTransactionStoreState> observed_transactions;
   std::optional<ResolvedSceneCandidate> candidate;
+  std::int64_t external_data_version = 0;
 
   {
-    Transaction read(database, "BEGIN");
-    observed_state = ReadCompleteDurableState(database, impl_->fixed_query_);
+    const auto &cached = impl_->ReadSceneCommitState();
+    observed_state = cached.durable_state;
+    observed_transactions = cached.transaction_state;
+    external_data_version = cached.external_data_version;
     if (!observed_state.active_projection.has_value() ||
         !observed_state.active_scene_snapshot.has_value()) {
       return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                     "live_scene_snapshot_unavailable",
                     "logical-scene bootstrap is not finalized");
     }
-    observed_transactions =
-        ReadSceneTransactionStoreState(database, observed_state);
+    if (!observed_transactions.has_value()) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "finalized logical scene has no reconstructed transaction state");
+    }
     const auto &owner_epoch =
         observed_transactions->request_owner_epoch.value();
     if (request.request_context.request_owner_epoch.value() != owner_epoch) {
@@ -9094,26 +9172,22 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     }
     if (observed_transactions->resident_transaction_count >=
         kMaximumLogicalSceneTransactions) {
-      read.Commit();
       Transaction compaction(database, "BEGIN IMMEDIATE");
-      const auto current =
-          ReadCompleteDurableState(database, impl_->fixed_query_);
-      const auto current_transactions =
-          ReadSceneTransactionStoreState(database, current);
-      if (!current.active_projection.has_value() ||
-          *current.active_projection != *observed_state.active_projection ||
-          current_transactions.request_owner_epoch !=
-              observed_transactions->request_owner_epoch ||
-          current_transactions.next_transaction_sequence !=
-              observed_transactions->next_transaction_sequence ||
-          current_transactions.next_owner_event_sequence !=
-              observed_transactions->next_owner_event_sequence) {
-        throw CanonicalEmptySceneOwnerConflictError(
-            "logical-scene state changed before history compaction");
+      if (!impl_->SceneCommitStateStillCurrent(external_data_version)) {
+        impl_->InvalidateSceneCommitState();
+        return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                      "stale_revision",
+                      "logical-scene state changed before history compaction");
       }
+      impl_->InvalidateSceneCommitState();
       const auto next_epoch = CompactSceneTransactionHistory(
-          database, current, current_transactions);
+          database, observed_state, *observed_transactions);
       compaction.Commit();
+      observed_transactions->request_owner_epoch = next_epoch;
+      observed_transactions->resident_transaction_count = 0U;
+      impl_->StoreSceneCommitState(observed_state,
+                                   std::move(observed_transactions),
+                                   external_data_version);
       return reject(
           core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch,
           "stale_request_owner_epoch",
@@ -9121,7 +9195,6 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
           "compaction",
           {{"expected_request_owner_epoch", next_epoch.value()}});
     }
-    read.Commit();
   }
 
   std::vector<RequiredSceneProjection> projections;
@@ -9211,45 +9284,35 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
 
   {
     Transaction write(database, "BEGIN IMMEDIATE");
-    const auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
-    const auto transactions = ReadSceneTransactionStoreState(database, state);
-    const auto access = AccessStatus(state);
-    if (!access.scene_writes_open || !state.active_projection.has_value() ||
-        *state.active_projection !=
-            scene_transaction.prior_projection_revision ||
-        transactions.next_transaction_sequence !=
-            scene_transaction.transaction_sequence ||
-        transactions.next_owner_event_sequence !=
-            observed_transactions->next_owner_event_sequence ||
+    if (!impl_->SceneCommitStateStillCurrent(external_data_version) ||
         NextSceneOwnerEventSequence(database) !=
             observed_transactions->next_owner_event_sequence ||
         ReadOutcomeForRequest(
             database, request.request_context.request_owner_epoch.value(),
             request.request_context.request_id)
             .has_value()) {
+      impl_->InvalidateSceneCommitState();
       return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                     "stale_revision",
                     "logical-scene state changed before durable acceptance");
     }
+    impl_->InvalidateSceneCommitState();
     InsertSceneIntent(database, request, request_digest, request_json,
                       scene_transaction, *candidate, projections.size());
     InsertSceneTransactionOwnerEvent(
         database, observed_transactions->next_owner_event_sequence,
         scene_transaction.transaction_sequence);
+    if (!projections.empty()) {
+      InsertProjectionAttempt(
+          database, scene_transaction.transaction_sequence, 0U,
+          projections.front().preflight_health.native_runtime_binding);
+    }
     write.Commit();
   }
 
   bool every_attempt_rolled_back = true;
   for (std::size_t ordinal = 0U; ordinal < projections.size(); ++ordinal) {
     const auto &projection = projections[ordinal];
-    {
-      Transaction attempt(database, "BEGIN IMMEDIATE");
-      InsertProjectionAttempt(
-          database, scene_transaction.transaction_sequence, ordinal,
-          projection.preflight_health.native_runtime_binding);
-      attempt.Commit();
-    }
-
     core::ProjectionCommitResultDTO projection_result = [&] {
       try {
         return NormalizeProjectionResult(
@@ -9294,23 +9357,46 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                          request.request_context.request_id, request_digest,
                          scene_transaction.transaction_sequence, false, status,
                          ordinal + 1U, error);
-      const auto failed_state =
-          ReadCompleteDurableState(database, impl_->fixed_query_);
       if (status ==
-              SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
-          AccessStatus(failed_state).projection_leases_open) {
-        throw CanonicalEmptySceneOwnerIntegrityError(
-            "uncertain projection result did not close projection leases");
+          SceneProjectionCommitStatusDTO::kFailedProjectionUncertain) {
+        const auto failed_state =
+            ReadCompleteDurableState(database, impl_->fixed_query_);
+        if (AccessStatus(failed_state).projection_leases_open) {
+          throw CanonicalEmptySceneOwnerIntegrityError(
+              "uncertain projection result did not close projection leases");
+        }
       }
       result_write.Commit();
+      if (status == SceneProjectionCommitStatusDTO::kRejectedRollbackProven) {
+        ++observed_transactions->next_transaction_sequence;
+        ++observed_transactions->next_owner_event_sequence;
+        ++observed_transactions->resident_transaction_count;
+        if (impl_->SceneCommitStateStillCurrent(external_data_version)) {
+          impl_->StoreSceneCommitState(observed_state, observed_transactions,
+                                       external_data_version);
+        }
+      }
       return FailedSceneResult(request.request_context.request_id,
                                core::RequestReplayStatusDTO::kAcceptedNew,
                                std::move(error), status);
     }
+    if (ordinal + 1U < projections.size()) {
+      InsertProjectionAttempt(
+          database, scene_transaction.transaction_sequence, ordinal + 1U,
+          projections[ordinal + 1U]
+              .preflight_health.native_runtime_binding);
+    } else {
+      InsertSceneOutcome(database,
+                         request.request_context.request_owner_epoch.value(),
+                         request.request_context.request_id, request_digest,
+                         scene_transaction.transaction_sequence, true,
+                         SceneProjectionCommitStatusDTO::kCommitted,
+                         projections.size(), std::nullopt);
+    }
     result_write.Commit();
   }
 
-  {
+  if (projections.empty()) {
     Transaction outcome(database, "BEGIN IMMEDIATE");
     InsertSceneOutcome(database,
                        request.request_context.request_owner_epoch.value(),
@@ -9318,17 +9404,31 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                        scene_transaction.transaction_sequence, true,
                        SceneProjectionCommitStatusDTO::kCommitted,
                        projections.size(), std::nullopt);
-    const auto committed_state =
-        ReadCompleteDurableState(database, impl_->fixed_query_);
-    if (!committed_state.active_projection.has_value() ||
-        *committed_state.active_projection !=
-            scene_transaction.proposed_projection_revision ||
-        !AccessStatus(committed_state).scene_writes_open) {
-      throw CanonicalEmptySceneOwnerIntegrityError(
-          "successful scene outcome did not publish the exact composite");
-    }
     outcome.Commit();
   }
+
+  observed_state.active_projection =
+      scene_transaction.proposed_projection_revision;
+  observed_state.active_scene_snapshot = candidate->snapshot;
+  observed_state.projection_desynchronized = false;
+  observed_state.unresolved_scene_transaction = false;
+  observed_state.latest_uncertain_transaction_sequence.reset();
+  observed_transactions->active_projection =
+      scene_transaction.proposed_projection_revision;
+  observed_transactions->active_snapshot = candidate->snapshot;
+  ++observed_transactions->next_transaction_sequence;
+  ++observed_transactions->next_owner_event_sequence;
+  ++observed_transactions->resident_transaction_count;
+  observed_transactions->projection_desynchronized = false;
+  observed_transactions->unresolved_native_attempt = false;
+  observed_transactions->unresolved_transaction_sequence.reset();
+  observed_transactions->latest_uncertain_transaction_sequence.reset();
+  if (!impl_->SceneCommitStateStillCurrent(external_data_version)) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "logical-scene database changed while completing a scene commit");
+  }
+  impl_->StoreSceneCommitState(observed_state, observed_transactions,
+                               external_data_version);
 
   SceneCommitResultDTO result{
       request.request_context.request_id,
@@ -9349,20 +9449,21 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
 
 RequestOwnerEpoch CanonicalEmptySceneOwner::CurrentRequestOwnerEpoch() const {
   std::lock_guard lock(impl_->mutex_);
-  const auto state = impl_->ReadStateTransaction();
+  const auto &cached = impl_->ReadSceneCommitState();
+  const auto &state = cached.durable_state;
   if (!state.active_projection.has_value() ||
-      !state.active_scene_snapshot.has_value()) {
+      !state.active_scene_snapshot.has_value() ||
+      !cached.transaction_state.has_value()) {
     throw CanonicalEmptySceneOwnerConflictError(
         "logical-scene request owner epoch requires finalized bootstrap");
   }
-  return ReadSceneTransactionStoreState(impl_->database(), state)
-      .request_owner_epoch;
+  return cached.transaction_state->request_owner_epoch;
 }
 
 ProjectionRevisionDTO
 CanonicalEmptySceneOwner::CurrentProjectionRevision() const {
   std::lock_guard lock(impl_->mutex_);
-  const auto state = impl_->ReadStateTransaction();
+  const auto state = impl_->ReadSceneCommitState().durable_state;
   if (!AccessStatus(state).projection_leases_open ||
       !state.active_projection.has_value()) {
     throw CanonicalEmptySceneOwnerConflictError(
@@ -9374,7 +9475,7 @@ CanonicalEmptySceneOwner::CurrentProjectionRevision() const {
 std::shared_ptr<const LogicalSceneSnapshotDTO>
 CanonicalEmptySceneOwner::LogicalSnapshot() const {
   std::lock_guard lock(impl_->mutex_);
-  const auto state = impl_->ReadStateTransaction();
+  const auto state = impl_->ReadSceneCommitState().durable_state;
   if (!AccessStatus(state).projection_leases_open ||
       !state.active_scene_snapshot.has_value()) {
     throw CanonicalEmptySceneOwnerConflictError(
@@ -9420,7 +9521,7 @@ core::Result<core::Pose3DTO> CanonicalEmptySceneOwner::GetObjectPose(
     const core::SceneResourceId &scene_resource_id) const {
   ValidateBoundedIdentity(scene_resource_id.value(), "scene_resource_id");
   std::lock_guard lock(impl_->mutex_);
-  const auto state = impl_->ReadStateTransaction();
+  const auto state = impl_->ReadSceneCommitState().durable_state;
   if (!AccessStatus(state).projection_leases_open ||
       !state.active_projection.has_value() ||
       !state.active_scene_snapshot.has_value()) {
@@ -9513,7 +9614,7 @@ core::Result<core::Pose3DTO> CanonicalEmptySceneOwner::GetObjectPose(
 CanonicalEmptySceneAccessStatus
 CanonicalEmptySceneOwner::ReadAccessStatus() const {
   std::lock_guard lock(impl_->mutex_);
-  auto status = AccessStatus(impl_->ReadStateTransaction());
+  auto status = AccessStatus(impl_->ReadSceneCommitState().durable_state);
   if (!status.valid()) {
     throw CanonicalEmptySceneOwnerIntegrityError(
         "durable state cannot form a valid access-gate status");
@@ -9524,7 +9625,7 @@ CanonicalEmptySceneOwner::ReadAccessStatus() const {
 std::optional<LogicalSceneSnapshotRoot>
 CanonicalEmptySceneOwner::ReadActiveSnapshot() const {
   std::lock_guard lock(impl_->mutex_);
-  const auto state = impl_->ReadStateTransaction();
+  const auto state = impl_->ReadSceneCommitState().durable_state;
   if (!state.active_projection.has_value() ||
       !state.active_scene_snapshot.has_value()) {
     return std::nullopt;
