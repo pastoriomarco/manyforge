@@ -105,7 +105,7 @@ TEST(OperationIntentTest, RejectsUnknownAdapterAttributionEnum) {
 TEST(OperationIntentTest, RejectsAbsoluteMotionWithRelativeReference) {
   auto operation = valid_motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
-  motion.target_reference = ReferenceDTO{ReferenceDTO::Type::kFrame, "fixture", std::nullopt};
+  motion.target_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "fixture");
 
   const auto result = validate_operation_intent(operation);
   ASSERT_FALSE(result.ok());

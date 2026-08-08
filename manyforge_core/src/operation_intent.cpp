@@ -23,9 +23,10 @@ namespace {
 
 [[nodiscard]] bool valid_reference(const ReferenceDTO& reference) noexcept {
   if (reference.type == ReferenceDTO::Type::kPose) {
-    return reference.id.empty() && reference.pose.has_value() && finite_pose(*reference.pose);
+    return reference_identity_matches_type(reference) && reference.pose.has_value() &&
+           finite_pose(*reference.pose);
   }
-  return !reference.id.empty() && !reference.pose.has_value();
+  return reference_identity_matches_type(reference) && !reference.pose.has_value();
 }
 
 [[nodiscard]] bool valid_action_span(const ActionSpanDTO& span) noexcept {

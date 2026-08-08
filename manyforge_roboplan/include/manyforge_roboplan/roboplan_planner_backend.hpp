@@ -1,12 +1,17 @@
 #pragma once
 
+#include <manyforge_core/ports/iplanner_backend.hpp>
+#include <manyforge_roboplan/roboplan_candidate_computer.hpp>
 #include <memory>
 #include <vector>
 
-#include <manyforge_core/ports/iplanner_backend.hpp>
-#include <manyforge_roboplan/roboplan_candidate_computer.hpp>
-
 namespace manyforge::roboplan_backend {
+
+struct RoboPlanCandidateProjectionDTO final {
+  core::ProjectionLeaseBindingDTO projection_binding;
+  core::CollisionWorldSnapshotPtr world;
+  std::shared_ptr<const core::CollisionPolicySnapshot> policy;
+};
 
 /// Private candidate-computation transport used by the addressed planner
 /// adapter. The production implementation is a supervised worker process;
@@ -16,18 +21,27 @@ class IRoboPlanCandidateClient {
  public:
   virtual ~IRoboPlanCandidateClient() = default;
 
-  [[nodiscard]] virtual const RoboPlanCandidateBindingDTO& binding()
-      const noexcept = 0;
+  [[nodiscard]] virtual const RoboPlanCandidateBindingDTO& binding() const noexcept = 0;
 
   [[nodiscard]] virtual core::Result<core::TrajectoryDTO> compute(
       const RoboPlanCandidateRequestDTO& request) = 0;
 
   [[nodiscard]] virtual core::Result<std::vector<double>> solve_ik(
-      const core::Pose3DTO& goal,
-      const core::ResolvedFrameDTO& base_frame,
-      const core::ResolvedFrameDTO& tcp_frame,
-      const core::ControlledStateDTO& seed_state,
+      const core::Pose3DTO& goal, const core::ResolvedFrameDTO& base_frame,
+      const core::ResolvedFrameDTO& tcp_frame, const core::ControlledStateDTO& seed_state,
       double timeout_s) = 0;
+
+  /// True only for production clients whose worker scene is selected from the
+  /// exact Kernel-retained projection before planning or IK.
+  [[nodiscard]] virtual bool requires_retained_projection() const noexcept { return false; }
+
+  /// Select one immutable retained projection. Fixed-model test clients keep
+  /// this no-op; a client reporting `true` above must replace its worker
+  /// generation whenever the selected identity changes.
+  [[nodiscard]] virtual core::Result<void> select_retained_projection(
+      const RoboPlanCandidateProjectionDTO&) {
+    return core::Result<void>::Ok();
+  }
 
   /// Non-blocking cancellation of only the currently active request.
   virtual void request_cancel() noexcept = 0;
@@ -47,28 +61,26 @@ struct RoboPlanPlannerBackendConfig final {
 /// wedged worker without depending on RoboPlan cooperative cancellation.
 class RoboPlanPlannerBackend final : public core::IPlannerBackend {
  public:
-  RoboPlanPlannerBackend(
-      core::ProjectionLeaseBindingDTO projection_binding,
-      RoboPlanCandidateBindingDTO candidate_binding,
-      std::unique_ptr<IRoboPlanCandidateClient> candidate_client,
-      RoboPlanPlannerBackendConfig config = {});
+  RoboPlanPlannerBackend(core::ProjectionLeaseBindingDTO projection_binding,
+                         RoboPlanCandidateBindingDTO candidate_binding,
+                         std::unique_ptr<IRoboPlanCandidateClient> candidate_client,
+                         RoboPlanPlannerBackendConfig config = {});
 
   RoboPlanPlannerBackend(const RoboPlanPlannerBackend&) = delete;
   RoboPlanPlannerBackend& operator=(const RoboPlanPlannerBackend&) = delete;
 
-  [[nodiscard]] core::PlanResultDTO plan(
-      const core::PlanRequestDTO& request) override;
+  [[nodiscard]] core::PlanResultDTO plan(const core::PlanRequestDTO& request) override;
   void request_cancel() override;
-  [[nodiscard]] core::IkResultDTO solve_ik(
-      const core::IkRequestDTO& request) override;
+  [[nodiscard]] core::IkResultDTO solve_ik(const core::IkRequestDTO& request) override;
 
-  [[nodiscard]] const core::ProjectionLeaseBindingDTO& projection_binding()
-      const noexcept {
+  /// Construction-time structural/scene-lineage anchor. Individual planning
+  /// calls carry their own exact current projection lease; the adapter must
+  /// not freeze the logical-scene revision at process startup.
+  [[nodiscard]] const core::ProjectionLeaseBindingDTO& projection_binding() const noexcept {
     return projection_binding_;
   }
 
-  [[nodiscard]] const RoboPlanCandidateBindingDTO& candidate_binding()
-      const noexcept {
+  [[nodiscard]] const RoboPlanCandidateBindingDTO& candidate_binding() const noexcept {
     return candidate_binding_;
   }
 

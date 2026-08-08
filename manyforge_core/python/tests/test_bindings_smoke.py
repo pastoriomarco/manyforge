@@ -303,9 +303,11 @@ def test_reference_dto():
     """Test ReferenceDTO creation and attributes."""
     import manyforge_core_py
     
-    r = manyforge_core_py.ReferenceDTO(manyforge_core_py.ReferenceType.kFrame, "base_link")
-    assert r.type == manyforge_core_py.ReferenceType.kFrame
-    assert r.id == "base_link"
+    r = manyforge_core_py.ReferenceDTO(
+        manyforge_core_py.ReferenceType.kFrameRole, "base"
+    )
+    assert r.type == manyforge_core_py.ReferenceType.kFrameRole
+    assert r.id == "base"
     assert r.pose is None
 
 
@@ -313,12 +315,10 @@ def test_reference_dto_pose():
     """ReferenceDTO can carry an inline pose reference."""
     import manyforge_core_py
 
-    r = manyforge_core_py.ReferenceDTO()
-    r.type = manyforge_core_py.ReferenceType.kPose
-    r.pose = manyforge_core_py.Pose3DTO(
+    r = manyforge_core_py.ReferenceDTO(manyforge_core_py.Pose3DTO(
         manyforge_core_py.Vector3DTO(0.3, -0.2, 0.1),
         manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0),
-    )
+    ))
     assert r.type == manyforge_core_py.ReferenceType.kPose
     assert r.pose.position_m.x_m == 0.3
 
@@ -327,13 +327,15 @@ def test_relative_motion_authoring_types_remain_available():
     """Python authors intent, while C++ resolves and mints execution requests."""
     import manyforge_core_py
 
-    ref = manyforge_core_py.ReferenceDTO(manyforge_core_py.ReferenceType.kFrame, "base_link")
+    ref = manyforge_core_py.ReferenceDTO(
+        manyforge_core_py.ReferenceType.kFrameRole, "base"
+    )
     motion = manyforge_core_py.PoseGoalDTO(manyforge_core_py.Pose3DTO(
         manyforge_core_py.Vector3DTO(0.1, 0.0, 0.0),
         manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0)
     ))
 
-    assert ref.id == "base_link"
+    assert ref.id == "base"
     assert motion.goal.position_m.x_m == 0.1
     assert manyforge_core_py.MotionTargetMode.kRelative is not None
     assert manyforge_core_py.PlanningProfile.kBalanced is not None

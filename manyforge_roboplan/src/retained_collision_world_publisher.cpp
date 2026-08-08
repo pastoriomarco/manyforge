@@ -1,18 +1,15 @@
-#include <manyforge_roboplan/retained_collision_world_publisher.hpp>
-
 #include <algorithm>
 #include <limits>
-#include <set>
-#include <utility>
-
 #include <manyforge_core/execution_collision_support.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_roboplan/retained_collision_world_publisher.hpp>
+#include <set>
+#include <utility>
 
 namespace manyforge::roboplan_backend {
 namespace {
 
-template <typename T>
-core::Result<T> publication_error(std::string message) {
+template <typename T> core::Result<T> publication_error(std::string message) {
   return core::Result<T>::Err(core::ErrorDTO{
       std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
       std::move(message),
@@ -26,12 +23,11 @@ bool initial_mutation_source(
          source == core::CollisionWorldMutationSource::kDeploymentApply;
 }
 
-std::vector<core::CollisionWorldBodyFreshness> body_freshness(
-    const core::CollisionWorldSnapshot& world) {
+std::vector<core::CollisionWorldBodyFreshness>
+body_freshness(const core::CollisionWorldSnapshot &world) {
   std::vector<core::CollisionWorldBodyFreshness> result;
-  for (const auto& body : world.bodies) {
-    if (!body.source_id.has_value() &&
-        !body.source_timestamp_ns.has_value() &&
+  for (const auto &body : world.bodies) {
+    if (!body.source_id.has_value() && !body.source_timestamp_ns.has_value() &&
         !body.source_freshness_budget_ns.has_value()) {
       continue;
     }
@@ -45,40 +41,37 @@ std::vector<core::CollisionWorldBodyFreshness> body_freshness(
   return result;
 }
 
-std::vector<core::SceneSnapshotLiveObject> live_objects(
-    const core::LogicalSceneSnapshotDTO& logical_scene,
-    const core::CollisionWorldSnapshot& world) {
+std::vector<core::SceneSnapshotLiveObject>
+live_objects(const core::LogicalSceneSnapshotDTO &logical_scene,
+             const core::CollisionWorldSnapshot &world) {
   std::vector<core::SceneSnapshotLiveObject> result;
   result.reserve(logical_scene.objects.size());
-  for (const auto& object : logical_scene.objects) {
+  for (const auto &object : logical_scene.objects) {
     core::SceneSnapshotLiveObject live;
     live.object_id = object.scene_resource_id.value();
     const std::string body_prefix =
         "scene/" + object.scene_resource_id.value() + "/shape/";
-    for (const auto& body : world.bodies) {
+    for (const auto &body : world.bodies) {
       if (body.body_id.starts_with(body_prefix)) {
         live.collision_body_ids.push_back(body.body_id);
-        live.body_content_hashes.emplace(body.body_id,
-                                         body.body_content_hash);
+        live.body_content_hashes.emplace(body.body_id, body.body_content_hash);
       }
     }
     live.object_revision_token =
         logical_scene.revision.content_hash.value() + "/" + live.object_id;
-    if (const auto* fixed =
-            std::get_if<core::CellFixedSceneObjectPlacementDTO>(
-                &object.placement)) {
+    if (const auto *fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+            &object.placement)) {
       live.pose = fixed->pose_in_cell;
       live.declared_role = core::ObservedSceneObjectRole::kStaticObstacle;
     } else {
       live.declared_role = core::ObservedSceneObjectRole::kAttachedObject;
     }
     if (object.provider_evidence.has_value()) {
-      const auto& evidence = *object.provider_evidence;
+      const auto &evidence = *object.provider_evidence;
       live.source_id = evidence.provider_instance_id.value() + "@" +
                        evidence.provider_source_epoch;
       live.source_timestamp_ns = evidence.source_timestamp_ns;
-      live.source_freshness_budget_ns =
-          evidence.source_freshness_budget_ns;
+      live.source_freshness_budget_ns = evidence.source_freshness_budget_ns;
       // Leave the declared role contextual: the operation may identify this
       // exact object as its observed target; otherwise the Kernel treats it as
       // a snapshot obstacle and still enforces its source freshness.
@@ -89,36 +82,30 @@ std::vector<core::SceneSnapshotLiveObject> live_objects(
   return result;
 }
 
-}  // namespace
+} // namespace
 
 RetainedCollisionWorldPublisher::RetainedCollisionWorldPublisher(
-    RetainedCollisionWorldProjector projector,
-    std::string publisher_id,
+    RetainedCollisionWorldProjector projector, std::string publisher_id,
     const std::size_t ledger_capacity)
-    : projector_(std::move(projector)),
-      publisher_id_(std::move(publisher_id)),
+    : projector_(std::move(projector)), publisher_id_(std::move(publisher_id)),
       ledger_capacity_(ledger_capacity) {}
 
 core::Result<std::shared_ptr<RetainedCollisionWorldPublisher>>
 RetainedCollisionWorldPublisher::create(
-    RetainedCollisionWorldProjector projector,
-    std::string publisher_id,
-    const core::LogicalSceneSnapshotDTO& initial_scene,
+    RetainedCollisionWorldProjector projector, std::string publisher_id,
+    const core::LogicalSceneSnapshotDTO &initial_scene,
     RetainedCollisionWorldPublicationContext initial_context,
     const std::size_t ledger_capacity) {
   if (publisher_id.empty()) {
-    return publication_error<
-        std::shared_ptr<RetainedCollisionWorldPublisher>>(
+    return publication_error<std::shared_ptr<RetainedCollisionWorldPublisher>>(
         "collision-world publisher id must be non-empty");
   }
   if (ledger_capacity == 0U || ledger_capacity > 4096U) {
-    return publication_error<
-        std::shared_ptr<RetainedCollisionWorldPublisher>>(
+    return publication_error<std::shared_ptr<RetainedCollisionWorldPublisher>>(
         "collision-world ledger capacity is outside the supported bound");
   }
   if (!initial_mutation_source(initial_context.mutation_source)) {
-    return publication_error<
-        std::shared_ptr<RetainedCollisionWorldPublisher>>(
+    return publication_error<std::shared_ptr<RetainedCollisionWorldPublisher>>(
         "first collision-world publication must initialize a scene or "
         "deployment");
   }
@@ -129,18 +116,16 @@ RetainedCollisionWorldPublisher::create(
   auto initialized =
       publisher->publish(initial_scene, std::move(initial_context));
   if (!initialized.ok()) {
-    return publication_error<
-        std::shared_ptr<RetainedCollisionWorldPublisher>>(
+    return publication_error<std::shared_ptr<RetainedCollisionWorldPublisher>>(
         initialized.error().message);
   }
-  return core::Result<
-      std::shared_ptr<RetainedCollisionWorldPublisher>>::Ok(
+  return core::Result<std::shared_ptr<RetainedCollisionWorldPublisher>>::Ok(
       std::move(publisher));
 }
 
 core::Result<core::CollisionWorldRevision>
 RetainedCollisionWorldPublisher::publish(
-    const core::LogicalSceneSnapshotDTO& logical_scene,
+    const core::LogicalSceneSnapshotDTO &logical_scene,
     RetainedCollisionWorldPublicationContext context) {
   std::lock_guard<std::mutex> lock(writer_mutex_);
   return publish_locked(logical_scene, std::move(context));
@@ -148,12 +133,11 @@ RetainedCollisionWorldPublisher::publish(
 
 core::Result<core::CollisionWorldRevision>
 RetainedCollisionWorldPublisher::publish_locked(
-    const core::LogicalSceneSnapshotDTO& logical_scene,
+    const core::LogicalSceneSnapshotDTO &logical_scene,
     RetainedCollisionWorldPublicationContext context) {
   if (!context.attribution.locally_valid() || context.source_label.empty() ||
       context.observed_timestamp_ns < 0 ||
-      (context.correlation_id.has_value() &&
-       context.correlation_id->empty())) {
+      (context.correlation_id.has_value() && context.correlation_id->empty())) {
     return publication_error<core::CollisionWorldRevision>(
         "collision-world publication provenance is incomplete or invalid");
   }
@@ -180,7 +164,7 @@ RetainedCollisionWorldPublisher::publish_locked(
     logical_content =
         core::logical_scene_identity::ComputeLogicalSceneContentHash(
             logical_scene);
-  } catch (const std::exception& error) {
+  } catch (const std::exception &error) {
     return publication_error<core::CollisionWorldRevision>(
         "logical-scene content cannot be verified: " +
         std::string(error.what()));
@@ -191,8 +175,8 @@ RetainedCollisionWorldPublisher::publish_locked(
   }
 
   if (last_scene_identity_.has_value()) {
-    const auto& previous = last_scene_identity_->revision;
-    const auto& next = logical_scene.revision;
+    const auto &previous = last_scene_identity_->revision;
+    const auto &next = logical_scene.revision;
     if (previous.scene_id == next.scene_id) {
       if (next.revision_id <= previous.revision_id) {
         return publication_error<core::CollisionWorldRevision>(
@@ -210,8 +194,8 @@ RetainedCollisionWorldPublisher::publish_locked(
         "collision-policy publication counter is exhausted");
   }
   const std::uint64_t proposed_policy_revision = policy_revision_id_ + 1U;
-  auto policy = projector_.project_effective_policy(
-      logical_scene, proposed_policy_revision);
+  auto policy = projector_.project_effective_policy(logical_scene,
+                                                    proposed_policy_revision);
   if (!policy.ok()) {
     return publication_error<core::CollisionWorldRevision>(
         "effective collision-policy projection failed: " +
@@ -225,9 +209,8 @@ RetainedCollisionWorldPublisher::publish_locked(
   }
 
   const std::uint64_t proposed_world_revision = world_revision_id_ + 1U;
-  auto world = projector_.project(
-      logical_scene, proposed_world_revision,
-      context.observed_timestamp_ns, publisher_id_);
+  auto world = projector_.project(logical_scene, proposed_world_revision,
+                                  context.observed_timestamp_ns, publisher_id_);
   if (!world.ok()) {
     return publication_error<core::CollisionWorldRevision>(
         "collision-world projection failed: " + world.error().message);
@@ -235,13 +218,18 @@ RetainedCollisionWorldPublisher::publish_locked(
 
   auto world_ptr = std::make_shared<const core::CollisionWorldSnapshot>(
       std::move(world.value()));
+  const core::ProjectionRevisionDTO projection_revision{
+      projector_.model_map().retained_bundle_id,
+      projector_.model_map().graph_revision, logical_scene.revision};
+  auto logical_scene_ptr =
+      std::make_shared<const core::LogicalSceneSnapshotDTO>(logical_scene);
   core::CollisionWorldPolicySnapshotBundle coherent{
       world_ptr,
       std::move(policy.value()),
       body_freshness(*world_ptr),
   };
   auto runtime = core::build_runtime_collision_query_bundle(
-      std::move(coherent), runtime_epoch_ + 1U);
+      std::move(coherent), runtime_epoch_ + 1U, projection_revision);
   if (!runtime || !runtime->world || !runtime->policy ||
       !runtime->policy_index || !runtime->lookup_order_valid ||
       !runtime->distance_selection_order_valid) {
@@ -252,36 +240,31 @@ RetainedCollisionWorldPublisher::publish_locked(
   std::set<core::CollisionBodyId> accepted_body_ids;
   if (auto current = runtime_bundle_.load(std::memory_order_acquire);
       current && current->world) {
-    for (const auto& body : current->world->bodies) {
+    for (const auto &body : current->world->bodies) {
       accepted_body_ids.insert(body.body_id);
     }
   }
-  for (const auto& body : runtime->world->bodies) {
+  for (const auto &body : runtime->world->bodies) {
     accepted_body_ids.insert(body.body_id);
   }
-  for (const auto& affected : context.affected_body_ids) {
+  for (const auto &affected : context.affected_body_ids) {
     if (affected.empty() || !accepted_body_ids.contains(affected)) {
       return publication_error<core::CollisionWorldRevision>(
           "collision-world ledger names an unknown affected body");
     }
   }
-  std::sort(context.affected_body_ids.begin(),
-            context.affected_body_ids.end());
-  context.affected_body_ids.erase(
-      std::unique(context.affected_body_ids.begin(),
-                  context.affected_body_ids.end()),
-      context.affected_body_ids.end());
+  std::sort(context.affected_body_ids.begin(), context.affected_body_ids.end());
+  context.affected_body_ids.erase(std::unique(context.affected_body_ids.begin(),
+                                              context.affected_body_ids.end()),
+                                  context.affected_body_ids.end());
 
   const std::uint64_t previous_revision_id = world_revision_id_;
   const std::uint64_t next_owner_sequence = owner_sequence_ + 1U;
   auto published_revision = runtime->world->revision;
   core::CollisionWorldLeaseInventory next_inventory;
   next_inventory.projection_binding = core::ProjectionLeaseBindingDTO{
-      core::ProjectionRevisionDTO{
-          projector_.model_map().retained_bundle_id,
-          projector_.model_map().graph_revision,
-          logical_scene.revision},
-      core::ProjectionLeaseId{publisher_id_ + ".current"}};
+      projection_revision, core::ProjectionLeaseId{publisher_id_ + ".current"}};
+  next_inventory.logical_scene = std::move(logical_scene_ptr);
   next_inventory.captured_at_ns = context.observed_timestamp_ns;
   next_inventory.bundle = core::CollisionWorldPolicySnapshotBundle{
       runtime->world, *runtime->policy, runtime->body_freshness};
@@ -329,7 +312,7 @@ RetainedCollisionWorldPublisher::publish_locked(
 
 bool RetainedCollisionWorldPublisher::retire_and_swap_locked(
     core::RuntimeCollisionQueryBundlePtr next) {
-  for (auto& retired : retired_runtime_bundles_) {
+  for (auto &retired : retired_runtime_bundles_) {
     if (retired && retired.use_count() == 1) {
       retired.reset();
     }
@@ -345,8 +328,8 @@ bool RetainedCollisionWorldPublisher::retire_and_swap_locked(
     }
   }
 
-  auto previous = runtime_bundle_.exchange(
-      std::move(next), std::memory_order_acq_rel);
+  auto previous =
+      runtime_bundle_.exchange(std::move(next), std::memory_order_acq_rel);
   current.reset();
   if (previous && previous.use_count() > 1) {
     *available = std::move(previous);
@@ -441,13 +424,13 @@ RetainedCollisionWorldPublisher::retain_scene_snapshot_lease_inventory(
 }
 
 void RetainedCollisionWorldPublisher::release_scene_snapshot_lease_inventory(
-    const core::ProjectionLeaseId& projection_lease_id) {
+    const core::ProjectionLeaseId &projection_lease_id) {
   std::lock_guard<std::mutex> lock(writer_mutex_);
   retained_inventories_.erase(projection_lease_id);
-  retained_inventory_order_.erase(
-      std::remove(retained_inventory_order_.begin(),
-                  retained_inventory_order_.end(), projection_lease_id),
-      retained_inventory_order_.end());
+  retained_inventory_order_.erase(std::remove(retained_inventory_order_.begin(),
+                                              retained_inventory_order_.end(),
+                                              projection_lease_id),
+                                  retained_inventory_order_.end());
 }
 
 core::CollisionWorldLeaseRetentionStats
@@ -467,4 +450,4 @@ RetainedCollisionWorldPublisher::published_runtime_collision_query_bundle()
   return runtime_bundle_.load(std::memory_order_acquire);
 }
 
-}  // namespace manyforge::roboplan_backend
+} // namespace manyforge::roboplan_backend

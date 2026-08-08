@@ -5,12 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
 #include <manyforge_core/execution_progress_publication.hpp>
 #include <manyforge_core/runtime_collision_query_session.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -31,8 +31,7 @@ enum class RuntimeCollisionLookaheadTermination {
 const char* runtime_collision_lookahead_termination_name(
     RuntimeCollisionLookaheadTermination termination) noexcept;
 
-const char* runtime_collision_lookahead_error_message(
-    std::string_view reason) noexcept;
+const char* runtime_collision_lookahead_error_message(std::string_view reason) noexcept;
 
 struct RuntimeCollisionLookaheadSelection {
   TrajectoryDTO trajectory;
@@ -61,10 +60,10 @@ struct RuntimeCollisionLookaheadSelection {
 RuntimeCollisionLookaheadSelection select_runtime_collision_lookahead_samples(
     const TrajectoryDTO& trajectory, std::int64_t cursor_time_ns, std::int64_t horizon_ns,
     std::size_t max_samples);
-void select_runtime_collision_lookahead_samples(
-    const TrajectoryDTO& trajectory, std::int64_t cursor_time_ns,
-    std::int64_t horizon_ns, std::size_t max_samples,
-    RuntimeCollisionLookaheadSelection& output);
+void select_runtime_collision_lookahead_samples(const TrajectoryDTO& trajectory,
+                                                std::int64_t cursor_time_ns,
+                                                std::int64_t horizon_ns, std::size_t max_samples,
+                                                RuntimeCollisionLookaheadSelection& output);
 
 enum class RuntimeCollisionLookaheadResultStatus {
   kClear,
@@ -88,6 +87,7 @@ struct RuntimeCollisionLookaheadResult {
   std::uint64_t arm_generation = 0;
   std::uint64_t permit_generation = 0;
   std::uint64_t runtime_bundle_epoch = 0;
+  std::optional<ProjectionRevisionDTO> projection_revision;
   CollisionWorldRevision collision_world_revision;
   std::int64_t requested_at_ns = 0;
   std::int64_t cycle_deadline_ns = 0;
@@ -192,15 +192,15 @@ class RuntimeCollisionLookaheadSession final {
                                    ICollisionWorldSnapshotPublisher& publisher,
                                    const ExecutionProgressPublication& progress_publication,
                                    std::vector<std::shared_ptr<ICollisionQueryEngine>> engines,
-                                   ResultCallback callback,
-                                   AuthorityCallback authority_callback);
+                                   ResultCallback callback, AuthorityCallback authority_callback);
   ~RuntimeCollisionLookaheadSession();
 
   RuntimeCollisionLookaheadSession(const RuntimeCollisionLookaheadSession&) = delete;
   RuntimeCollisionLookaheadSession& operator=(const RuntimeCollisionLookaheadSession&) = delete;
 
   void arm(std::uint64_t execution_id, std::uint64_t execution_generation,
-           std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id);
+           std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id,
+           std::optional<ProjectionRevisionDTO> admission_projection_revision = std::nullopt);
   void disarm() noexcept;
 
   /// Called only after a clear immediate current-state tick. It never waits:
@@ -230,6 +230,8 @@ class RuntimeCollisionLookaheadSession final {
     std::uint64_t arm_generation = 0;
     std::shared_ptr<const TrajectoryDTO> trajectory;
     std::string contact_policy_id;
+    std::optional<ProjectionRevisionDTO> admission_projection_revision;
+    std::optional<ProjectionRevisionDTO> latest_projection_revision;
   };
 
   struct Job {

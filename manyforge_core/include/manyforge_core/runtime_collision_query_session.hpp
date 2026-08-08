@@ -2,16 +2,15 @@
 
 #include <array>
 #include <cstdint>
+#include <manyforge_core/collision/i_collision_query_engine.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
+#include <manyforge_core/types/error_code.hpp>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <manyforge_core/collision/i_collision_query_engine.hpp>
-#include <manyforge_core/execution_collision_support.hpp>
-#include <manyforge_core/types/error_code.hpp>
 
 namespace manyforge::core {
 
@@ -26,6 +25,7 @@ enum class RuntimeCollisionTickReason {
   kBundleUnavailable,
   kBundleCapacityExceeded,
   kBundleLookupOrderInvalid,
+  kProjectionMismatch,
   kPolicyUnavailable,
   kPolicyIndexMismatch,
   kPolicyCapacityExceeded,
@@ -55,23 +55,19 @@ enum class RuntimeContactGraspViolation {
   kPenetrationExceeded,
 };
 
-const char* runtime_collision_tick_reason_name(
-    RuntimeCollisionTickReason reason) noexcept;
+const char* runtime_collision_tick_reason_name(RuntimeCollisionTickReason reason) noexcept;
 const char* runtime_collision_query_failure_reason_name(
     RuntimeCollisionQueryFailureReason reason) noexcept;
 const char* runtime_collision_query_prepare_status_name(
     RuntimeCollisionQueryPrepareStatus status) noexcept;
-const char* runtime_collision_engine_status_name(
-    CollisionEngineStatus status) noexcept;
+const char* runtime_collision_engine_status_name(CollisionEngineStatus status) noexcept;
 
 struct RuntimeCollisionTickOutcome {
   RuntimeCollisionTickStatus status = RuntimeCollisionTickStatus::kInconclusive;
-  RuntimeCollisionTickReason reason =
-      RuntimeCollisionTickReason::kBundleUnavailable;
+  RuntimeCollisionTickReason reason = RuntimeCollisionTickReason::kBundleUnavailable;
   RuntimeCollisionQueryFailureReason engine_failure_reason =
       RuntimeCollisionQueryFailureReason::kNone;
-  CollisionEngineStatus engine_status =
-      CollisionEngineStatus::kDiagnosticIncomplete;
+  CollisionEngineStatus engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
   std::int64_t query_duration_ns = 0;
   bool query_executed = false;
   const CollisionPairId* pair = nullptr;
@@ -87,11 +83,9 @@ struct RuntimeCollisionTickOutcome {
   bool contact_present = false;
   std::size_t initial_contact_pair_count = 0;
   std::size_t current_contact_pair_count = 0;
-  CollisionDistanceRequestMode distance_request_mode =
-      CollisionDistanceRequestMode::kNone;
+  CollisionDistanceRequestMode distance_request_mode = CollisionDistanceRequestMode::kNone;
   std::size_t evaluated_distance_pair_count = 0;
-  RuntimeContactGraspViolation contact_grasp_violation =
-      RuntimeContactGraspViolation::kNone;
+  RuntimeContactGraspViolation contact_grasp_violation = RuntimeContactGraspViolation::kNone;
 };
 
 struct RuntimeContactReleaseStateEntry {
@@ -120,21 +114,18 @@ class RuntimeCollisionQuerySession final {
   static constexpr std::size_t kMaxSupportContacts = 64;
 
   RuntimeCollisionQuerySession(
-      RuntimeCollisionStateProjection projection,
-      ICollisionWorldSnapshotPublisher& publisher,
-      std::shared_ptr<ICollisionQueryEngine> engine,
-      std::string active_contact_policy_id,
-      std::int64_t query_timeout_ns);
+      RuntimeCollisionStateProjection projection, ICollisionWorldSnapshotPublisher& publisher,
+      std::shared_ptr<ICollisionQueryEngine> engine, std::string active_contact_policy_id,
+      std::int64_t query_timeout_ns,
+      std::optional<ProjectionRevisionDTO> admission_projection_revision = std::nullopt);
 
   [[nodiscard]] std::optional<ErrorDTO> prepare(
       const RuntimeCollisionQueryBundlePtr& initial_bundle);
-  [[nodiscard]] RuntimeCollisionTickOutcome tick(
-      const RuntimeCollisionQueryBundlePtr& bundle,
-      std::span<const double> observed_positions_rad,
-      std::int64_t state_time_ns) noexcept;
+  [[nodiscard]] RuntimeCollisionTickOutcome tick(const RuntimeCollisionQueryBundlePtr& bundle,
+                                                 std::span<const double> observed_positions_rad,
+                                                 std::int64_t state_time_ns) noexcept;
   [[nodiscard]] RuntimeCollisionQueryBundlePtr acquire_bundle() const;
-  [[nodiscard]] const CollisionEngineCapabilityDescriptor& engine_capability()
-      const noexcept {
+  [[nodiscard]] const CollisionEngineCapabilityDescriptor& engine_capability() const noexcept {
     return *capability_;
   }
   [[nodiscard]] const std::string& active_contact_policy_id() const noexcept {
@@ -155,8 +146,7 @@ class RuntimeCollisionQuerySession final {
   };
 
   bool bind_policy(const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
-  bool bind_distance_selection(
-      const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
+  bool bind_distance_selection(const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
   RuntimeCollisionTickOutcome project_observed_state(
       std::span<const double> observed_positions_rad) noexcept;
   RuntimeCollisionTickOutcome classify(
@@ -172,6 +162,8 @@ class RuntimeCollisionQuerySession final {
   const CollisionEngineCapabilityDescriptor* capability_ = nullptr;
   std::string active_contact_policy_id_;
   std::int64_t query_timeout_ns_ = 0;
+  std::optional<ProjectionRevisionDTO> admission_projection_revision_;
+  std::optional<ProjectionRevisionDTO> latest_projection_revision_;
   std::vector<double> query_positions_rad_;
   // Pin the publisher's complete reclamation unit. Keeping only policy/index
   // sub-handles would hide their last-owner transition from NRT bundle
@@ -185,8 +177,7 @@ class RuntimeCollisionQuerySession final {
   std::size_t initial_contact_pair_count_ = 0;
   bool initial_contact_pair_count_initialized_ = false;
   bool policy_binding_valid_ = false;
-  RuntimeCollisionTickReason policy_binding_error_ =
-      RuntimeCollisionTickReason::kPolicyUnavailable;
+  RuntimeCollisionTickReason policy_binding_error_ = RuntimeCollisionTickReason::kPolicyUnavailable;
   const char* policy_binding_required_capability_ = nullptr;
 };
 

@@ -557,21 +557,24 @@ template <typename StrongId>
   }
   std::string_view type;
   switch (reference->type) {
-    case ReferenceDTO::Type::kFrame:
-      type = "frame";
+    case ReferenceDTO::Type::kFrameRole:
+      type = "frame_role";
       break;
-    case ReferenceDTO::Type::kObject:
-      type = "object";
+    case ReferenceDTO::Type::kComponentBodyRole:
+      type = "component_body_role";
       break;
-    case ReferenceDTO::Type::kRobotLink:
-      type = "robot_link";
+    case ReferenceDTO::Type::kSceneResource:
+      type = "scene_resource";
+      break;
+    case ReferenceDTO::Type::kRuntimeObject:
+      type = "runtime_object";
       break;
     case ReferenceDTO::Type::kPose:
       type = "pose";
       break;
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"id", CanonicalValue(reference->id)},
+      {"id", CanonicalValue(std::string(reference_identity_value(*reference)))},
       {"pose", reference->pose.has_value() ? PoseValue(*reference->pose) : CanonicalValue(nullptr)},
       {"type", CanonicalValue(std::string(type))},
   });

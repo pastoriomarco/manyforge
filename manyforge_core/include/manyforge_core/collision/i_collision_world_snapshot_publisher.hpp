@@ -1,18 +1,18 @@
 #pragma once
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
+#include <manyforge_core/collision/scene_snapshot_lease.hpp>
+#include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
+#include <manyforge_core/types/logical_scene_snapshot.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <manyforge_core/collision/scene_snapshot_lease.hpp>
-#include <manyforge_core/types/collision.hpp>
-#include <manyforge_core/types/collision_world_snapshot.hpp>
-#include <manyforge_core/types/projection_common.hpp>
 
 namespace manyforge::core {
 
@@ -31,8 +31,7 @@ struct CollisionWorldPolicySnapshotBundle {
       CollisionWorldSnapshotPtr world_snapshot,
       std::optional<CollisionPolicySnapshot> policy_snapshot = std::nullopt,
       std::vector<CollisionWorldBodyFreshness> freshness = {})
-      : world(std::move(world_snapshot)),
-        policy(std::move(policy_snapshot)),
+      : world(std::move(world_snapshot)), policy(std::move(policy_snapshot)),
         body_freshness(std::move(freshness)) {}
 
   CollisionWorldSnapshotPtr world;
@@ -55,6 +54,10 @@ struct CollisionWorldPolicySnapshotBundle {
 /// single shared handle. Freshness-only publications may retain world/policy/
 /// index handles while replacing the sorted sidecar and advancing epoch.
 struct RuntimeCollisionQueryBundle {
+  /// Exact retained-bundle/graph/logical-scene projection that produced this
+  /// publication. Legacy/test-only publishers may omit it; a command-capable
+  /// retained runtime must provide it and the Kernel validates its lineage.
+  std::optional<ProjectionRevisionDTO> projection_revision;
   CollisionWorldSnapshotPtr world;
   std::shared_ptr<const CollisionPolicySnapshot> policy;
   std::shared_ptr<const CollisionPolicyIndex> policy_index;
@@ -79,6 +82,10 @@ using RuntimeCollisionQueryBundlePtr =
 
 struct CollisionWorldLeaseInventory {
   ProjectionLeaseBindingDTO projection_binding;
+  /// Exact immutable logical snapshot retained with the native/collision
+  /// projection. Reference resolution must consume this value rather than a
+  /// later mutable scene-owner read.
+  std::shared_ptr<const LogicalSceneSnapshotDTO> logical_scene;
   std::int64_t captured_at_ns = 0;
   CollisionWorldPolicySnapshotBundle bundle;
   std::uint64_t topology_epoch = 0;
@@ -140,7 +147,7 @@ struct CollisionWorldLeaseRetentionStats {
 /// MUST return `std::nullopt` for `collision_policy_snapshot()` so the
 /// kernel can fail closed or use an explicitly installed static policy.
 class ICollisionWorldSnapshotPublisher {
- public:
+public:
   virtual ~ICollisionWorldSnapshotPublisher() = default;
 
   /// Return the current immutable snapshot. Returning `nullptr` is
@@ -153,8 +160,8 @@ class ICollisionWorldSnapshotPublisher {
   /// to borrow or rebuild the full snapshot. Admission and diagnostics use this
   /// as a cheap revision probe; runtime ticks consume the coherent immutable
   /// query bundle below instead. Implementations should override this with a
-  /// leaf/atomic revision read; the default is correct but may be more expensive
-  /// because it borrows `snapshot()`.
+  /// leaf/atomic revision read; the default is correct but may be more
+  /// expensive because it borrows `snapshot()`.
   [[nodiscard]] virtual CollisionWorldRevision
   published_collision_world_revision() const {
     auto current = snapshot();
@@ -202,9 +209,8 @@ class ICollisionWorldSnapshotPublisher {
   /// returned shared pointers remain valid even after release; release only
   /// removes this publisher's lookup/retention entry.
   [[nodiscard]] virtual std::optional<CollisionWorldLeaseInventory>
-  retain_scene_snapshot_lease_inventory(
-      ProjectionLeaseId projection_lease_id =
-          ProjectionLeaseId{std::string{}}) {
+  retain_scene_snapshot_lease_inventory(ProjectionLeaseId projection_lease_id =
+                                            ProjectionLeaseId{std::string{}}) {
     (void)projection_lease_id;
     return std::nullopt;
   }
@@ -213,7 +219,7 @@ class ICollisionWorldSnapshotPublisher {
   /// callers may race cancellation/timeout cleanup without turning cleanup into
   /// a new failure source.
   virtual void release_scene_snapshot_lease_inventory(
-      const ProjectionLeaseId& projection_lease_id) {
+      const ProjectionLeaseId &projection_lease_id) {
     (void)projection_lease_id;
   }
 
@@ -234,4 +240,4 @@ class ICollisionWorldSnapshotPublisher {
   published_runtime_collision_query_bundle() const = 0;
 };
 
-}  // namespace manyforge::core
+} // namespace manyforge::core

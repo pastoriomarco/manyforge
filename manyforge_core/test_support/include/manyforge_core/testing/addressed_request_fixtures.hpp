@@ -28,7 +28,7 @@ inline ResolvedExecutionBindingDTO make_test_execution_binding(
   const ControllableComponentId component_id("component:test");
   const ModelInstanceId model_id("model:test");
   const ModelRevision model_revision("model-revision:test");
-  return ResolvedExecutionBindingDTO{
+  ResolvedExecutionBindingDTO binding{
       OperationId("operation:test"),
       OperationParticipantId("participant:test"),
       ControllerGoalId("controller-goal:test"),
@@ -81,7 +81,15 @@ inline ResolvedExecutionBindingDTO make_test_execution_binding(
                                      model_revision},
       {},
       {},
-      std::nullopt};
+      std::nullopt,
+      RetainedBundleId("bundle:test"),
+      GraphRevision("graph:test"),
+      TargetRoleId("target-role:test"),
+      {ProgramFrameRoleBindingDTO{FrameRoleId("frame-role:base"), model_id, model_revision, "base"},
+       ProgramFrameRoleBindingDTO{FrameRoleId("frame-role:tcp"), model_id, model_revision, "tcp"}},
+      {ProgramCollisionBodyRoleBindingDTO{
+          CollisionBodyRoleId("collision-body-role:tool"), model_id, model_revision, {"tcp"}}}};
+  return binding;
 }
 
 inline ExecuteRequestDTO make_test_execute_request(
@@ -121,6 +129,94 @@ inline ControlledStateDTO make_test_controlled_state(
                             binding.model_group_binding.compiled_joint_names,
                             std::move(positions),
                             std::move(velocities)};
+}
+
+inline ObservedStatePublicationDTO make_test_observed_state_publication(
+    const ResolvedExecutionBindingDTO& binding, const ControlledStateDTO& state,
+    std::int64_t timestamp_ns = 100) {
+  ObservedStateSnapshotDTO snapshot{binding.controllable_component_id,
+                                    binding.command_target_id,
+                                    binding.control_domain_id,
+                                    binding.control_domain_revision,
+                                    binding.control_binding_id,
+                                    binding.control_binding_revision,
+                                    binding.provider_instance_id,
+                                    binding.provider_manifest_id,
+                                    binding.provider_manifest_revision,
+                                    binding.controller_topology_id,
+                                    binding.topology_revision,
+                                    binding.control_route_id,
+                                    binding.active_control_configuration_id,
+                                    binding.active_control_configuration_generation,
+                                    state.resources,
+                                    1U,
+                                    state.joint_names,
+                                    state.positions,
+                                    state.velocities,
+                                    "test-observed-state",
+                                    binding.provider_runtime_epoch,
+                                    ObservedStateSourceKind::kJointState,
+                                    timestamp_ns,
+                                    timestamp_ns,
+                                    StateAuthorityId("state-authority:test"),
+                                    StateAuthorityClass::kMeasured,
+                                    1U,
+                                    1'000'000'000,
+                                    true};
+  return ObservedStatePublicationDTO{binding.controllable_component_id,
+                                     binding.command_target_id,
+                                     binding.control_domain_id,
+                                     binding.control_domain_revision,
+                                     binding.control_binding_id,
+                                     binding.control_binding_revision,
+                                     binding.controller_topology_id,
+                                     binding.topology_revision,
+                                     binding.control_route_id,
+                                     binding.active_control_configuration_id,
+                                     binding.active_control_configuration_generation,
+                                     binding.provider_instance_id,
+                                     binding.provider_manifest_id,
+                                     binding.provider_manifest_revision,
+                                     StateAuthorityId("state-authority:test"),
+                                     StateAuthorityClass::kMeasured,
+                                     binding.provider_runtime_epoch,
+                                     1U,
+                                     1U,
+                                     std::move(snapshot),
+                                     timestamp_ns};
+}
+
+inline std::shared_ptr<const LogicalSceneSnapshotDTO> make_test_logical_scene(
+    const ProjectionLeaseBindingDTO& projection_binding) {
+  CollisionPolicySnapshot policy;
+  policy.policy_id = "free_space";
+  policy.revision = {1U, std::string(kCanonicalEmptyCollisionPolicyDigest)};
+  return std::make_shared<const LogicalSceneSnapshotDTO>(
+      LogicalSceneSnapshotDTO{projection_binding.projection_revision.scene_revision,
+                              CellId("cell:test"),
+                              0U,
+                              0U,
+                              0U,
+                              std::move(policy),
+                              {},
+                              {}});
+}
+
+inline ProgramFrameResolutionContextDTO make_test_program_frame_context(
+    const ResolvedExecutionBindingDTO& binding, std::vector<double> positions_rad = {0.0, 0.0},
+    std::int64_t timestamp_ns = 100) {
+  auto start = make_test_controlled_state(binding, positions_rad);
+  auto publication = make_test_observed_state_publication(binding, start, timestamp_ns);
+  auto projection = make_test_projection_binding();
+  return ProgramFrameResolutionContextDTO{binding,
+                                          std::move(start),
+                                          std::move(publication),
+                                          projection,
+                                          make_test_logical_scene(projection),
+                                          {},
+                                          {},
+                                          {},
+                                          timestamp_ns};
 }
 
 inline PlanRequestDTO make_test_plan_request(std::string move_id, ResolvedMotionSpecDTO motion,

@@ -4,6 +4,9 @@
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -54,19 +57,82 @@ struct NamedTargetDTO {
   friend bool operator==(const NamedTargetDTO&, const NamedTargetDTO&) = default;
 };
 
-/// Reference to a frame, object, robot link, or inline pose (spec §4.4)
+using ReferenceIdentityDTO = std::variant<std::monostate, FrameRoleId, CollisionBodyRoleId,
+                                          SceneResourceId, RuntimeObjectId>;
+
+/// Portable, target-scoped reference or inline base-frame pose (spec §4.4).
+/// The enum and strong identity are deliberately redundant so malformed wire
+/// values cannot reinterpret a frame role as a scene resource.
 struct ReferenceDTO {
   enum class Type {
-    kFrame,
-    kObject,
-    kRobotLink,
+    kFrameRole,
+    kComponentBodyRole,
+    kSceneResource,
+    kRuntimeObject,
     kPose,
   };
-  Type type;
-  std::string id;
+  Type type{Type::kPose};
+  ReferenceIdentityDTO id;
   std::optional<Pose3DTO> pose;
+
+  ReferenceDTO() = default;
+  ReferenceDTO(Type selected_type, std::string selected_id) : type(selected_type) {
+    switch (type) {
+      case Type::kFrameRole:
+        id = FrameRoleId(std::move(selected_id));
+        break;
+      case Type::kComponentBodyRole:
+        id = CollisionBodyRoleId(std::move(selected_id));
+        break;
+      case Type::kSceneResource:
+        id = SceneResourceId(std::move(selected_id));
+        break;
+      case Type::kRuntimeObject:
+        id = RuntimeObjectId(std::move(selected_id));
+        break;
+      case Type::kPose:
+        id = std::monostate{};
+        break;
+    }
+  }
+  explicit ReferenceDTO(Pose3DTO inline_pose)
+      : type(Type::kPose), id(std::monostate{}), pose(std::move(inline_pose)) {}
   friend bool operator==(const ReferenceDTO&, const ReferenceDTO&) = default;
 };
+
+[[nodiscard]] inline bool reference_identity_matches_type(const ReferenceDTO& reference) noexcept {
+  switch (reference.type) {
+    case ReferenceDTO::Type::kFrameRole:
+      return std::holds_alternative<FrameRoleId>(reference.id) &&
+             !std::get<FrameRoleId>(reference.id).empty();
+    case ReferenceDTO::Type::kComponentBodyRole:
+      return std::holds_alternative<CollisionBodyRoleId>(reference.id) &&
+             !std::get<CollisionBodyRoleId>(reference.id).empty();
+    case ReferenceDTO::Type::kSceneResource:
+      return std::holds_alternative<SceneResourceId>(reference.id) &&
+             !std::get<SceneResourceId>(reference.id).empty();
+    case ReferenceDTO::Type::kRuntimeObject:
+      return std::holds_alternative<RuntimeObjectId>(reference.id) &&
+             !std::get<RuntimeObjectId>(reference.id).empty();
+    case ReferenceDTO::Type::kPose:
+      return std::holds_alternative<std::monostate>(reference.id);
+  }
+  return false;
+}
+
+[[nodiscard]] inline std::string_view reference_identity_value(
+    const ReferenceDTO& reference) noexcept {
+  return std::visit(
+      [](const auto& value) -> std::string_view {
+        using Value = std::remove_cvref_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, std::monostate>) {
+          return {};
+        } else {
+          return value.value();
+        }
+      },
+      reference.id);
+}
 
 /// Cartesian path goal (spec §4.5)
 enum class CartesianSpeedModeDTO {

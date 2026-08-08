@@ -476,10 +476,13 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
 
  private:
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request,
-                                        const ProjectionLeaseBindingDTO& projection_binding,
+                                        const CollisionWorldLeaseInventory& projection_inventory,
                                         std::uint32_t planning_attempt_index = 0);
   Result<TrajectoryDTO> plan_resume_trajectory(const ExecuteRequestDTO& request,
-                                               const ProjectionLeaseBindingDTO& projection_binding);
+                                               const CollisionWorldLeaseInventory& projection_inventory);
+  Result<std::size_t> discover_dynamic_carried_start_contacts(
+      CollisionWorldLeaseInventory& projection_inventory,
+      const RobotStateDTO& observed_start, std::uint64_t execution_id);
 
   /// Move-only ownership of one retained scene/projection revision. Destruction
   /// releases the publisher lookup entry on every success, rejection,
@@ -497,6 +500,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
     RetainedSceneSnapshotLease& operator=(RetainedSceneSnapshotLease&& other) noexcept;
 
     [[nodiscard]] const CollisionWorldLeaseInventory& inventory() const { return inventory_; }
+    [[nodiscard]] CollisionWorldLeaseInventory& mutable_inventory() { return inventory_; }
     [[nodiscard]] ProjectionLeaseBindingDTO binding() const;
 
    private:
@@ -510,11 +514,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
     TrajectoryDTO collision_trajectory;
     std::optional<SceneSnapshotLease> scene_snapshot_lease;
     ParallelValidationTelemetry telemetry;
+    std::size_t dynamically_discovered_start_contact_count = 0;
   };
 
   Result<CollisionValidationSuccess> validate_trajectory(
       const TrajectoryDTO& trajectory, const ExecuteRequestDTO& request,
-      const std::optional<CollisionWorldLeaseInventory>& scene_snapshot_lease_inventory,
+      CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease);
 
   /// Async execution worker function.
@@ -551,14 +556,16 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   };
   std::uint64_t start_collision_monitoring(
       std::string reason,
-      RuntimeCollisionProtectionPurpose purpose = RuntimeCollisionProtectionPurpose::kMotion);
+      RuntimeCollisionProtectionPurpose purpose = RuntimeCollisionProtectionPurpose::kMotion,
+      const CollisionWorldLeaseInventory* admission_inventory = nullptr);
   void stop_collision_monitoring(RuntimeCollisionMonitorRelease release,
                                  std::optional<std::uint64_t> expected_generation = std::nullopt,
                                  bool drain_callbacks = false);
   void arm_runtime_collision_lookahead(std::uint64_t execution_id,
                                        std::uint64_t execution_generation,
                                        std::shared_ptr<const TrajectoryDTO> collision_trajectory,
-                                       const std::string& contact_policy_id);
+                                       const std::string& contact_policy_id,
+                                       const CollisionWorldLeaseInventory& admission_inventory);
   void revoke_runtime_collision_lookahead_clear_permits() noexcept;
   void apply_runtime_collision_lookahead_result(
       RuntimeCollisionLookaheadResult result,
@@ -743,7 +750,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
 
   ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
       std::stop_token st, const ExecuteRequestDTO& request,
-      const ProjectionLeaseBindingDTO& projection_binding, std::uint64_t exec_id,
+      const CollisionWorldLeaseInventory& projection_inventory, std::uint64_t exec_id,
       std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
       ExecutionState worker_entry_state, ActiveMotionExecution& motion_state);
 
@@ -751,14 +758,15 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
       std::stop_token st, const ExecuteRequestDTO& request, std::uint64_t exec_id,
       TrajectoryDTO& trajectory, bool& active_trajectory_from_cache,
       bool& cache_revalidation_candidate,
-      const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-      const ProjectionLeaseBindingDTO& projection_binding,
+      CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       ActiveMotionExecution& motion_state);
 
   ExecuteWorkerDispatchPhaseResult execute_worker_dispatch_phase(
       const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
       bool active_trajectory_from_cache, bool cache_revalidation_candidate,
+      const ProjectionLeaseBindingDTO& projection_binding,
+      const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const CollisionWorldRevision& validation_world_revision,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       std::shared_ptr<const TrajectoryDTO> collision_trajectory,

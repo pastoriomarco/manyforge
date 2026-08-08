@@ -43,18 +43,13 @@ std::ostream& operator<<(std::ostream& stream, const StrongString<Tag>& value) {
 template <typename Tag>
 class StrongCounter {
  public:
-  explicit constexpr StrongCounter(std::uint64_t value) noexcept
-      : value_(value) {}
+  explicit constexpr StrongCounter(std::uint64_t value) noexcept : value_(value) {}
 
-  [[nodiscard]] constexpr std::uint64_t value() const noexcept {
-    return value_;
-  }
+  [[nodiscard]] constexpr std::uint64_t value() const noexcept { return value_; }
   [[nodiscard]] constexpr bool nonzero() const noexcept { return value_ != 0U; }
 
-  friend constexpr bool operator==(const StrongCounter&,
-                                   const StrongCounter&) = default;
-  friend constexpr auto operator<=>(const StrongCounter&,
-                                    const StrongCounter&) = default;
+  friend constexpr bool operator==(const StrongCounter&, const StrongCounter&) = default;
+  friend constexpr auto operator<=>(const StrongCounter&, const StrongCounter&) = default;
 
  private:
   std::uint64_t value_;
@@ -153,6 +148,7 @@ MANYFORGE_DECLARE_STRONG_STRING(ComponentAttachmentRevision);
 MANYFORGE_DECLARE_STRONG_STRING(RetainedBundleId);
 MANYFORGE_DECLARE_STRONG_STRING(SceneId);
 MANYFORGE_DECLARE_STRONG_STRING(SceneResourceId);
+MANYFORGE_DECLARE_STRONG_STRING(RuntimeObjectId);
 MANYFORGE_DECLARE_STRONG_STRING(CarriedObjectAttachmentId);
 MANYFORGE_DECLARE_STRONG_STRING(CarriedObjectAttachmentRevision);
 MANYFORGE_DECLARE_STRONG_STRING(ProjectionLeaseId);

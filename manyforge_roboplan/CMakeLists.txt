@@ -648,14 +648,16 @@ if(BUILD_TESTING)
     add_dependencies(
       test_retained_product_consumer
       generate_canonical_empty_product_package
-      generate_lite6_retained_consumer_product)
+      generate_lite6_retained_consumer_product
+      manyforge_roboplan_candidate_worker)
     target_compile_definitions(
       test_retained_product_consumer PRIVATE
       COAL_DISABLE_HPP_FCL_WARNINGS
       MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT="${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}"
       MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}"
       MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}"
-      MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT="${_MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT}")
+      MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT="${_MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT}"
+      MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH="$<TARGET_FILE:manyforge_roboplan_candidate_worker>")
     target_include_directories(test_retained_product_consumer PRIVATE
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/src"
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
@@ -664,6 +666,7 @@ if(BUILD_TESTING)
       manyforge_roboplan_collision_projection
       manyforge_roboplan_native_state_projection
       manyforge_roboplan_native_runtime
+      manyforge_roboplan_process_candidate_client
       manyforge_collision
       manyforge_core
       manyforge_deployment

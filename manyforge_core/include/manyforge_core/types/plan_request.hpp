@@ -1,20 +1,22 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/types/action_span.hpp>
+#include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
+#include <manyforge_core/types/coordinate_state.hpp>
+#include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/joint_dynamics_limits.hpp>
+#include <manyforge_core/types/motion_spec.hpp>
+#include <manyforge_core/types/projection_common.hpp>
+#include <manyforge_core/types/resolved_frame.hpp>
+#include <manyforge_core/types/speed_profile.hpp>
+#include <manyforge_core/types/tolerances.hpp>
+#include <manyforge_core/types/trajectory_dto.hpp>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <manyforge_core/types/error_code.hpp>
-#include <manyforge_core/types/coordinate_state.hpp>
-#include <manyforge_core/types/motion_spec.hpp>
-#include <manyforge_core/types/action_span.hpp>
-#include <manyforge_core/types/resolved_frame.hpp>
-#include <manyforge_core/types/tolerances.hpp>
-#include <manyforge_core/types/speed_profile.hpp>
-#include <manyforge_core/types/joint_dynamics_limits.hpp>
-#include <manyforge_core/types/projection_common.hpp>
-#include <manyforge_core/types/trajectory_dto.hpp>
 
 namespace manyforge::core {
 
@@ -22,8 +24,7 @@ struct PlannerModelBindingDTO final {
   ModelInstanceId model_instance_id;
   ModelRevision model_revision;
 
-  friend bool operator==(const PlannerModelBindingDTO&,
-                         const PlannerModelBindingDTO&) = default;
+  friend bool operator==(const PlannerModelBindingDTO&, const PlannerModelBindingDTO&) = default;
 };
 
 struct PlannerModelGroupBindingDTO final {
@@ -129,14 +130,21 @@ struct PlanRequestDTO final {
   /// class. These ordered revisions plus the projection content hash prevent
   /// a candidate computed for a different attachment set from being admitted.
   std::vector<ComponentAttachmentRevision> component_attachment_revisions;
-  std::vector<CarriedObjectAttachmentRevision>
-      carried_object_attachment_revisions;
+  std::vector<CarriedObjectAttachmentRevision> carried_object_attachment_revisions;
+
+  /// Immutable world/policy handles retained by `projection_binding` for this
+  /// exact planning call. These are private in-process owner projections, not
+  /// public wire fields. A scene-aware production planner consumes them when
+  /// constructing its native candidate scene; authoritative collision
+  /// validation remains Kernel-owned.
+  CollisionWorldSnapshotPtr retained_collision_world{};
+  std::shared_ptr<const CollisionPolicySnapshot> retained_collision_policy{};
 };
 
 /// Planning result (spec §3.6)
 struct PlanResultDTO {
   std::optional<TrajectoryDTO> trajectory;  // present on success
-  std::optional<ErrorDTO> error;             // present on failure; absent on success
+  std::optional<ErrorDTO> error;            // present on failure; absent on success
   /// Exact composite projection consumed by the planner. Required whenever
   /// `trajectory` is present and must equal the request projection revision.
   ProjectionRevisionDTO projection_revision;

@@ -310,6 +310,27 @@ RuntimeCollisionStateProjection make_projection() {
   return projection;
 }
 
+ProjectionRevisionDTO make_projection_revision(std::uint64_t revision,
+                                                char content_digit) {
+  return ProjectionRevisionDTO{
+      RetainedBundleId(
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+      GraphRevision(
+          "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+      SceneRevision{
+          SceneId(
+              "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+          revision,
+          ContentDigest("sha256:" + std::string(64U, content_digit))}};
+}
+
+RuntimeCollisionQueryBundlePtr with_projection_revision(
+    RuntimeCollisionQueryBundlePtr source, ProjectionRevisionDTO revision) {
+  auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*source);
+  bundle->projection_revision = std::move(revision);
+  return bundle;
+}
+
 TEST(RuntimeCollisionQueryBundleTest,
      PreservesAuthoredContactReleaseTerminalAndProgressFlags) {
   const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
@@ -1151,6 +1172,46 @@ TEST(RuntimeCollisionQuerySessionTest,
   EXPECT_EQ(blocked.status, RuntimeCollisionTickStatus::kCollision);
   EXPECT_EQ(blocked.reason,
             RuntimeCollisionTickReason::kContactReleasePenetrationIncreased);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     CommandCapableSessionPinsAdmissionContactPolicyAcrossLiveSceneUpdates) {
+  const CollisionPairId pair{
+      "component/robot1/model/robot1_model/body/finger_left/collision/0",
+      "scene/part/shape/0"};
+  CollisionPolicySnapshot admission_policy;
+  admission_policy.revision = {5, "admission-contact-release-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.max_start_penetration_m = 0.01;
+  admission_policy.support_contacts.push_back(release);
+  const auto admission_revision = make_projection_revision(1U, 'd');
+  const auto admission_bundle = with_projection_revision(
+      make_bundle(std::move(admission_policy)), admission_revision);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = admission_bundle;
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(
+      make_projection(), publisher, engine, {}, 10'000'000,
+      admission_revision);
+  ASSERT_FALSE(session.prepare(admission_bundle).has_value());
+
+  CollisionPolicySnapshot unrelated_live_policy;
+  unrelated_live_policy.revision = {6, "later-base-policy"};
+  publisher.bundle = with_projection_revision(
+      make_bundle(std::move(unrelated_live_policy), 2U),
+      make_projection_revision(2U, 'e'));
+  engine->collide(pair, -0.001);
+  const std::array<double, 2> positions{0.0, 0.0};
+  const auto outcome = session.tick(publisher.bundle, positions, 1);
+
+  EXPECT_EQ(outcome.status, RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kSelectedCollidingPairs);
+  ASSERT_EQ(engine->last_selected_distance_pair_count_, 1U);
+  EXPECT_EQ(engine->last_selected_distance_pair_, pair);
+  const auto state = session.contact_release_state_snapshot();
+  EXPECT_EQ(state.binding_owner, admission_bundle);
 }
 
 TEST(RuntimeCollisionQuerySessionTest,

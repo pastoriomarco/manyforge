@@ -10,9 +10,7 @@ namespace manyforge::core {
 /// This is the only policy implementation shared by kernel admission and
 /// non-dispatching preview/plan surfaces.
 Result<ResolvedMotionSpecDTO> resolve_motion_target(
-    const ExecuteRequestDTO& request,
-    const ProjectionLeaseBindingDTO& projection_binding,
-    const RobotStateDTO* observed_start_state,
+    const ExecuteRequestDTO& request, const ProgramFrameResolutionContextDTO* resolution_context,
     const IReferencePoseResolver& reference_resolver);
 
 }  // namespace manyforge::core

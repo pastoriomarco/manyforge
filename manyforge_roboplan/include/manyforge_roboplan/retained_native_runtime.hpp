@@ -2,14 +2,7 @@
 
 #include <cstddef>
 #include <filesystem>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <utility>
-#include <vector>
-
-#include <roboplan/core/scene.hpp>
-
+#include <functional>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/cache/trajectory_cache.hpp>
 #include <manyforge_core/execution_kernel.hpp>
@@ -22,6 +15,12 @@
 #include <manyforge_roboplan/retained_gripper_command_backend.hpp>
 #include <manyforge_roboplan/roboplan_execution_backend.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <roboplan/core/scene.hpp>
+#include <utility>
+#include <vector>
 
 namespace manyforge::roboplan_backend {
 
@@ -37,6 +36,10 @@ struct RetainedNativeRuntimeConfig final {
   core::Duration gripper_update_period_ns{10'000'000};
 };
 
+using RetainedReferenceResolverFactory =
+    std::function<std::shared_ptr<core::IReferencePoseResolver>(
+        const std::vector<std::shared_ptr<RetainedObservedStateChannel>> &)>;
+
 /// Already-verified inputs to one native runtime composition.
 ///
 /// Deployment/product readers and the logical-scene owner remain outside this
@@ -50,23 +53,23 @@ struct RetainedNativeRuntimeInput final {
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<std::mutex> scene_mutex;
   std::shared_ptr<RetainedKinematicStateProjector> state_projector;
-  std::shared_ptr<RetainedCollisionWorldPublisher> collision_publisher;
+  std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
+  collision::ManyForgeCollisionEngine::SharedModelPtr collision_shared_model;
   std::unique_ptr<RoboPlanPlannerBackend> planner;
-  std::unique_ptr<core::IReferencePoseResolver> reference_resolver;
+  RetainedReferenceResolverFactory reference_resolver_factory;
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public
 /// addressed owner unsubscribes first, then the subordinate Kernel quiesces,
 /// then backends/scheduler/state/model resources retire.
 struct RetainedNativeRuntime final {
-  RetainedNativeRuntime(
-      core::RuntimeParticipantBinding motion,
-      std::optional<core::RuntimeParticipantBinding> gripper)
-      : motion_binding(std::move(motion)),
-        gripper_binding(std::move(gripper)) {}
+  RetainedNativeRuntime(core::RuntimeParticipantBinding motion,
+                        std::optional<core::RuntimeParticipantBinding> gripper)
+      : motion_binding(std::move(motion)), gripper_binding(std::move(gripper)) {
+  }
 
-  RetainedNativeRuntime(const RetainedNativeRuntime&) = delete;
-  RetainedNativeRuntime& operator=(const RetainedNativeRuntime&) = delete;
+  RetainedNativeRuntime(const RetainedNativeRuntime &) = delete;
+  RetainedNativeRuntime &operator=(const RetainedNativeRuntime &) = delete;
 
   core::RuntimeParticipantBinding motion_binding;
   std::optional<core::RuntimeParticipantBinding> gripper_binding;
@@ -80,7 +83,7 @@ struct RetainedNativeRuntime final {
   std::unique_ptr<SimpleScheduler> scheduler;
   std::unique_ptr<core::TrajectoryCache> cache;
   std::unique_ptr<RoboPlanPlannerBackend> planner;
-  std::unique_ptr<core::IReferencePoseResolver> reference_resolver;
+  std::shared_ptr<core::IReferencePoseResolver> reference_resolver;
   std::unique_ptr<core::AddressedAngularObservedRobotStateAdapter>
       angular_observed_state;
   std::unique_ptr<RetainedRoboPlanKinematicsAdapter> kinematics;
@@ -90,7 +93,7 @@ struct RetainedNativeRuntime final {
   std::unique_ptr<RoboPlanExecutionBackend> execution;
   std::unique_ptr<RetainedGripperCommandBackend> gripper;
 
-  std::shared_ptr<RetainedCollisionWorldPublisher> collision_publisher;
+  std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
   std::shared_ptr<core::ICollisionQueryEngine> runtime_collision_engine;
   std::vector<std::shared_ptr<core::ICollisionQueryEngine>>
       validation_collision_engines;
@@ -109,4 +112,4 @@ struct RetainedNativeRuntime final {
 create_retained_native_runtime(RetainedNativeRuntimeInput input,
                                RetainedNativeRuntimeConfig config);
 
-}  // namespace manyforge::roboplan_backend
+} // namespace manyforge::roboplan_backend

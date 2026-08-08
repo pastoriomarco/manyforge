@@ -1,10 +1,8 @@
-#include <manyforge_core/execution_collision_support.hpp>
-
-#include <manyforge_core/types/reason_codes.hpp>
-
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <manyforge_core/execution_collision_support.hpp>
+#include <manyforge_core/types/reason_codes.hpp>
 #include <sstream>
 
 namespace manyforge::core {
@@ -52,8 +50,7 @@ std::string collision_decision_result_name(CollisionDecisionResult decision) {
   return "unknown";
 }
 
-std::string collision_pair_classification_name(
-    CollisionPairClassification classification) {
+std::string collision_pair_classification_name(CollisionPairClassification classification) {
   switch (classification) {
     case CollisionPairClassification::kBlockingCollision:
       return "blocking_collision";
@@ -77,8 +74,7 @@ std::string collision_pair_classification_name(
   return "unknown";
 }
 
-bool collision_pair_classification_blocks_dispatch(
-    CollisionPairClassification classification) {
+bool collision_pair_classification_blocks_dispatch(CollisionPairClassification classification) {
   switch (classification) {
     case CollisionPairClassification::kBlockingCollision:
     case CollisionPairClassification::kSupportContactRecontactViolation:
@@ -117,8 +113,7 @@ const CollisionValidationWaypointRecord* select_collision_failure_record(
   return nullptr;
 }
 
-std::string_view native_contact_grasp_violation_reason(
-    std::string_view raw_reason) noexcept {
+std::string_view native_contact_grasp_violation_reason(std::string_view raw_reason) noexcept {
   if (raw_reason == reason_codes::kMissingSignedClearance) {
     return reason_codes::kMissingGraspContactClearance;
   }
@@ -224,13 +219,9 @@ const char* runtime_collision_unavailable_reason_name(
   return "other";
 }
 
-bool snapshot_too_old(std::int64_t now_ns,
-                      std::int64_t timestamp_ns,
-                      std::int64_t max_age_ns,
-                      std::map<std::string, std::string>& details,
-                      const std::string& timestamp_key,
-                      const std::string& age_key,
-                      const std::string& budget_key) {
+bool snapshot_too_old(std::int64_t now_ns, std::int64_t timestamp_ns, std::int64_t max_age_ns,
+                      std::map<std::string, std::string>& details, const std::string& timestamp_key,
+                      const std::string& age_key, const std::string& budget_key) {
   if (max_age_ns <= 0) {
     return false;
   }
@@ -252,12 +243,10 @@ bool snapshot_too_old(std::int64_t now_ns,
 
 std::optional<std::string> validate_dynamic_body_freshness(
     const CollisionWorldSnapshot& snapshot,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness,
-    std::int64_t now_ns,
-    std::int64_t runtime_cap_ns,
-    std::map<std::string, std::string>& details) {
-  const auto check = check_runtime_dynamic_body_freshness(
-      snapshot, body_freshness, now_ns, runtime_cap_ns);
+    const std::vector<CollisionWorldBodyFreshness>& body_freshness, std::int64_t now_ns,
+    std::int64_t runtime_cap_ns, std::map<std::string, std::string>& details) {
+  const auto check =
+      check_runtime_dynamic_body_freshness(snapshot, body_freshness, now_ns, runtime_cap_ns);
   if (check.status == RuntimeDynamicBodyFreshnessStatus::kSidecarUnsorted) {
     details["dynamic_body_freshness_sidecar_status"] = "unsorted";
     return runtime_dynamic_body_freshness_reason(check.status);
@@ -265,27 +254,21 @@ std::optional<std::string> validate_dynamic_body_freshness(
   if (check.body != nullptr) {
     details["dynamic_body_id"] = check.body->body_id;
     const auto& source_id =
-        check.freshness != nullptr ? check.freshness->source_id
-                                   : check.body->source_id;
-    const auto& timestamp =
-        check.freshness != nullptr ? check.freshness->source_timestamp_ns
-                                   : check.body->source_timestamp_ns;
-    const auto& budget =
-        check.freshness != nullptr
-            ? check.freshness->source_freshness_budget_ns
-            : check.body->source_freshness_budget_ns;
+        check.freshness != nullptr ? check.freshness->source_id : check.body->source_id;
+    const auto& timestamp = check.freshness != nullptr ? check.freshness->source_timestamp_ns
+                                                       : check.body->source_timestamp_ns;
+    const auto& budget = check.freshness != nullptr ? check.freshness->source_freshness_budget_ns
+                                                    : check.body->source_freshness_budget_ns;
     if (source_id) {
       details["dynamic_body_source_id"] = *source_id;
     }
     if (budget) {
-      details["dynamic_body_declared_freshness_budget_ns"] =
-          std::to_string(*budget);
+      details["dynamic_body_declared_freshness_budget_ns"] = std::to_string(*budget);
     }
     details["dynamic_body_effective_freshness_budget_ns"] =
         std::to_string(check.effective_budget_ns);
     if (timestamp) {
-      details["dynamic_body_source_timestamp_ns"] =
-          std::to_string(*timestamp);
+      details["dynamic_body_source_timestamp_ns"] = std::to_string(*timestamp);
     }
     details["dynamic_body_age_ns"] = std::to_string(check.age_ns);
   }
@@ -297,10 +280,8 @@ std::optional<std::string> validate_dynamic_body_freshness(
 
 RuntimeDynamicBodyFreshnessCheck check_runtime_dynamic_body_freshness(
     const CollisionWorldSnapshot& snapshot,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness,
-    std::int64_t now_ns,
-    std::int64_t runtime_cap_ns,
-    bool lookup_order_prevalidated) noexcept {
+    const std::vector<CollisionWorldBodyFreshness>& body_freshness, std::int64_t now_ns,
+    std::int64_t runtime_cap_ns, bool lookup_order_prevalidated) noexcept {
   RuntimeDynamicBodyFreshnessCheck out;
   if (!lookup_order_prevalidated &&
       !runtime_collision_lookup_order_is_valid(snapshot, body_freshness)) {
@@ -314,24 +295,19 @@ RuntimeDynamicBodyFreshnessCheck check_runtime_dynamic_body_freshness(
            body_freshness[freshness_index].body_id < body.body_id) {
       ++freshness_index;
     }
-    const auto* freshness =
-        freshness_index < body_freshness.size() &&
-                body_freshness[freshness_index].body_id == body.body_id
-            ? &body_freshness[freshness_index]
-            : nullptr;
-    const auto& freshness_budget =
-        freshness != nullptr ? freshness->source_freshness_budget_ns
-                             : body.source_freshness_budget_ns;
+    const auto* freshness = freshness_index < body_freshness.size() &&
+                                    body_freshness[freshness_index].body_id == body.body_id
+                                ? &body_freshness[freshness_index]
+                                : nullptr;
+    const auto& freshness_budget = freshness != nullptr ? freshness->source_freshness_budget_ns
+                                                        : body.source_freshness_budget_ns;
     const auto& source_timestamp =
-        freshness != nullptr ? freshness->source_timestamp_ns
-                             : body.source_timestamp_ns;
+        freshness != nullptr ? freshness->source_timestamp_ns : body.source_timestamp_ns;
     if (!freshness_budget.has_value()) {
       continue;
     }
     const auto effective_budget_ns =
-        runtime_cap_ns > 0
-            ? std::min(*freshness_budget, runtime_cap_ns)
-            : *freshness_budget;
+        runtime_cap_ns > 0 ? std::min(*freshness_budget, runtime_cap_ns) : *freshness_budget;
     out.body = &body;
     out.freshness = freshness;
     out.effective_budget_ns = effective_budget_ns;
@@ -377,31 +353,27 @@ const char* runtime_dynamic_body_freshness_reason(
 }
 
 Result<RuntimeCollisionStateProjection> build_runtime_collision_state_projection(
-    const TrajectoryDTO& source_trajectory,
-    const TrajectoryDTO& collision_trajectory) {
+    const TrajectoryDTO& source_trajectory, const TrajectoryDTO& collision_trajectory) {
   if (collision_trajectory.joint_names.empty()) {
-    return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
-        kErrorValidationCollision,
-        "Runtime collision state projection cannot be built without collision joint names",
-        {{"reason", "runtime_collision_projection_missing_query_joint_names"}}});
+    return Result<RuntimeCollisionStateProjection>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Runtime collision state projection cannot be built without collision joint names",
+                 {{"reason", "runtime_collision_projection_missing_query_joint_names"}}});
   }
   if (collision_trajectory.waypoints.empty()) {
-    return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
-        kErrorValidationCollision,
-        "Runtime collision state projection cannot be built without a template waypoint",
-        {{"reason", "runtime_collision_projection_missing_template_waypoint"}}});
+    return Result<RuntimeCollisionStateProjection>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Runtime collision state projection cannot be built without a template waypoint",
+                 {{"reason", "runtime_collision_projection_missing_template_waypoint"}}});
   }
-  const auto& template_positions =
-      collision_trajectory.waypoints.front().positions_rad;
+  const auto& template_positions = collision_trajectory.waypoints.front().positions_rad;
   if (template_positions.size() != collision_trajectory.joint_names.size()) {
-    return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
-        kErrorValidationCollision,
-        "Runtime collision state projection template shape is invalid",
-        {{"reason", "runtime_collision_projection_template_shape_mismatch"},
-         {"query_joint_count",
-          std::to_string(collision_trajectory.joint_names.size())},
-         {"template_position_count",
-          std::to_string(template_positions.size())}}});
+    return Result<RuntimeCollisionStateProjection>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Runtime collision state projection template shape is invalid",
+                 {{"reason", "runtime_collision_projection_template_shape_mismatch"},
+                  {"query_joint_count", std::to_string(collision_trajectory.joint_names.size())},
+                  {"template_position_count", std::to_string(template_positions.size())}}});
   }
 
   RuntimeCollisionStateProjection projection;
@@ -415,58 +387,50 @@ Result<RuntimeCollisionStateProjection> build_runtime_collision_state_projection
             projection.query_joint_names.size()) {
       projection.source_joint_names = projection.query_joint_names;
     } else {
-      return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
-          kErrorValidationCollision,
-          "Runtime collision state projection cannot map unnamed observed positions",
-          {{"reason", "runtime_collision_projection_missing_source_joint_names"}}});
+      return Result<RuntimeCollisionStateProjection>::Err(
+          ErrorDTO{kErrorValidationCollision,
+                   "Runtime collision state projection cannot map unnamed observed positions",
+                   {{"reason", "runtime_collision_projection_missing_source_joint_names"}}});
     }
   }
   if (!source_trajectory.waypoints.empty() &&
       source_trajectory.waypoints.front().positions_rad.size() !=
           projection.source_joint_names.size()) {
-    return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
-        kErrorValidationCollision,
-        "Runtime collision state projection source shape is invalid",
-        {{"reason", "runtime_collision_projection_source_shape_mismatch"},
-         {"source_joint_count",
-          std::to_string(projection.source_joint_names.size())},
-         {"source_position_count",
-          std::to_string(source_trajectory.waypoints.front()
-                             .positions_rad.size())}}});
+    return Result<RuntimeCollisionStateProjection>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Runtime collision state projection source shape is invalid",
+                 {{"reason", "runtime_collision_projection_source_shape_mismatch"},
+                  {"source_joint_count", std::to_string(projection.source_joint_names.size())},
+                  {"source_position_count",
+                   std::to_string(source_trajectory.waypoints.front().positions_rad.size())}}});
   }
 
-  projection.source_to_query_indices.reserve(
-      projection.source_joint_names.size());
+  projection.source_to_query_indices.reserve(projection.source_joint_names.size());
   for (const auto& source_joint : projection.source_joint_names) {
     const auto it = std::find(projection.query_joint_names.begin(),
-                              projection.query_joint_names.end(),
-                              source_joint);
+                              projection.query_joint_names.end(), source_joint);
     if (it == projection.query_joint_names.end()) {
-      return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
-          kErrorValidationCollision,
-          "Runtime collision state projection source joint is absent from collision query",
-          {{"reason", "runtime_collision_projection_joint_not_in_query"},
-           {"joint", source_joint}}});
+      return Result<RuntimeCollisionStateProjection>::Err(
+          ErrorDTO{kErrorValidationCollision,
+                   "Runtime collision state projection source joint is absent from collision query",
+                   {{"reason", "runtime_collision_projection_joint_not_in_query"},
+                    {"joint", source_joint}}});
     }
     projection.source_to_query_indices.push_back(
-        static_cast<std::size_t>(
-            std::distance(projection.query_joint_names.begin(), it)));
+        static_cast<std::size_t>(std::distance(projection.query_joint_names.begin(), it)));
   }
   return Result<RuntimeCollisionStateProjection>::Ok(std::move(projection));
 }
 
-void RuntimeCollisionStopCoverageTracker::update_max(
-    std::atomic<std::uint64_t>& target, std::uint64_t value) noexcept {
+void RuntimeCollisionStopCoverageTracker::update_max(std::atomic<std::uint64_t>& target,
+                                                     std::uint64_t value) noexcept {
   auto current = target.load(std::memory_order_relaxed);
-  while (current < value &&
-         !target.compare_exchange_weak(current, value,
-                                       std::memory_order_relaxed,
-                                       std::memory_order_relaxed)) {
+  while (current < value && !target.compare_exchange_weak(current, value, std::memory_order_relaxed,
+                                                          std::memory_order_relaxed)) {
   }
 }
 
-void RuntimeCollisionStopCoverageTracker::start(
-    std::uint64_t generation) noexcept {
+void RuntimeCollisionStopCoverageTracker::start(std::uint64_t generation) noexcept {
   current_ticks_.store(0, std::memory_order_relaxed);
   current_queries_.store(0, std::memory_order_relaxed);
   current_unavailable_.store(0, std::memory_order_relaxed);
@@ -481,8 +445,7 @@ void RuntimeCollisionStopCoverageTracker::start(
   windows_started_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void RuntimeCollisionStopCoverageTracker::record_tick(
-    std::uint64_t generation) noexcept {
+void RuntimeCollisionStopCoverageTracker::record_tick(std::uint64_t generation) noexcept {
   if (generation == 0 || active_generation() != generation) {
     return;
   }
@@ -491,33 +454,28 @@ void RuntimeCollisionStopCoverageTracker::record_tick(
 }
 
 void RuntimeCollisionStopCoverageTracker::record_observed_source(
-    ObservedRobotStateSourceKind source_kind,
-    std::uint64_t source_age_ns) noexcept {
+    ObservedRobotStateSourceKind source_kind, std::uint64_t source_age_ns) noexcept {
   freshest_source_age_ns_.store(source_age_ns, std::memory_order_relaxed);
-  freshest_source_kind_.store(static_cast<int>(source_kind),
-                              std::memory_order_relaxed);
+  freshest_source_kind_.store(static_cast<int>(source_kind), std::memory_order_relaxed);
 }
 
-void RuntimeCollisionStopCoverageTracker::record_query(
-    std::uint64_t generation, std::int64_t now_ns) noexcept {
+void RuntimeCollisionStopCoverageTracker::record_query(std::uint64_t generation,
+                                                       std::int64_t now_ns) noexcept {
   if (generation == 0 || active_generation() != generation) {
     return;
   }
   current_queries_.fetch_add(1, std::memory_order_relaxed);
   total_queries_.fetch_add(1, std::memory_order_relaxed);
-  const auto unavailable_since =
-      unavailable_since_ns_.exchange(-1, std::memory_order_acq_rel);
+  const auto unavailable_since = unavailable_since_ns_.exchange(-1, std::memory_order_acq_rel);
   if (unavailable_since >= 0 && now_ns > unavailable_since) {
-    const auto duration =
-        static_cast<std::uint64_t>(now_ns - unavailable_since);
+    const auto duration = static_cast<std::uint64_t>(now_ns - unavailable_since);
     update_max(current_max_unavailable_ns_, duration);
     update_max(longest_unavailable_ns_, duration);
   }
 }
 
 void RuntimeCollisionStopCoverageTracker::record_unavailable(
-    std::uint64_t generation,
-    RuntimeCollisionUnavailableReason reason,
+    std::uint64_t generation, RuntimeCollisionUnavailableReason reason,
     std::int64_t now_ns) noexcept {
   if (generation == 0 || active_generation() != generation) {
     return;
@@ -525,22 +483,19 @@ void RuntimeCollisionStopCoverageTracker::record_unavailable(
   current_unavailable_.fetch_add(1, std::memory_order_relaxed);
   const auto reason_index = static_cast<std::size_t>(reason);
   if (reason_index < current_unavailable_by_reason_.size()) {
-    current_unavailable_by_reason_[reason_index].fetch_add(
-        1, std::memory_order_relaxed);
+    current_unavailable_by_reason_[reason_index].fetch_add(1, std::memory_order_relaxed);
   }
   total_unavailable_.fetch_add(1, std::memory_order_relaxed);
   std::int64_t no_interval = -1;
   (void)unavailable_since_ns_.compare_exchange_strong(
-      no_interval, now_ns, std::memory_order_acq_rel,
-      std::memory_order_relaxed);
+      no_interval, now_ns, std::memory_order_acq_rel, std::memory_order_relaxed);
 }
 
-bool RuntimeCollisionStopCoverageTracker::should_emit_unavailable(
-    std::uint64_t reason_hash, std::int64_t now_ns) noexcept {
-  const auto previous_hash = unavailable_reason_hash_.exchange(
-      reason_hash, std::memory_order_acq_rel);
-  const auto previous_event_ns =
-      unavailable_last_event_ns_.load(std::memory_order_acquire);
+bool RuntimeCollisionStopCoverageTracker::should_emit_unavailable(std::uint64_t reason_hash,
+                                                                  std::int64_t now_ns) noexcept {
+  const auto previous_hash =
+      unavailable_reason_hash_.exchange(reason_hash, std::memory_order_acq_rel);
+  const auto previous_event_ns = unavailable_last_event_ns_.load(std::memory_order_acquire);
   constexpr std::int64_t kEventPeriodNs = 1'000'000'000;
   if (previous_hash == reason_hash && previous_event_ns >= 0 &&
       now_ns - previous_event_ns < kEventPeriodNs) {
@@ -551,23 +506,19 @@ bool RuntimeCollisionStopCoverageTracker::should_emit_unavailable(
   return true;
 }
 
-std::optional<RuntimeCollisionStopCoverageSummary>
-RuntimeCollisionStopCoverageTracker::complete(std::uint64_t generation,
-                                              std::int64_t now_ns) noexcept {
+std::optional<RuntimeCollisionStopCoverageSummary> RuntimeCollisionStopCoverageTracker::complete(
+    std::uint64_t generation, std::int64_t now_ns) noexcept {
   if (generation == 0) {
     return std::nullopt;
   }
   std::uint64_t expected = generation;
-  if (!generation_.compare_exchange_strong(expected, 0,
-                                           std::memory_order_acq_rel,
+  if (!generation_.compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
                                            std::memory_order_acquire)) {
     return std::nullopt;
   }
-  const auto unavailable_since =
-      unavailable_since_ns_.exchange(-1, std::memory_order_acq_rel);
+  const auto unavailable_since = unavailable_since_ns_.exchange(-1, std::memory_order_acq_rel);
   if (unavailable_since >= 0 && now_ns > unavailable_since) {
-    const auto duration =
-        static_cast<std::uint64_t>(now_ns - unavailable_since);
+    const auto duration = static_cast<std::uint64_t>(now_ns - unavailable_since);
     update_max(current_max_unavailable_ns_, duration);
     update_max(longest_unavailable_ns_, duration);
   }
@@ -575,10 +526,8 @@ RuntimeCollisionStopCoverageTracker::complete(std::uint64_t generation,
   summary.generation = generation;
   summary.ticks_attempted = current_ticks_.load(std::memory_order_acquire);
   summary.queries_executed = current_queries_.load(std::memory_order_acquire);
-  summary.unavailable_ticks =
-      current_unavailable_.load(std::memory_order_acquire);
-  summary.longest_unavailable_ns =
-      current_max_unavailable_ns_.load(std::memory_order_acquire);
+  summary.unavailable_ticks = current_unavailable_.load(std::memory_order_acquire);
+  summary.longest_unavailable_ns = current_max_unavailable_ns_.load(std::memory_order_acquire);
   for (std::size_t i = 0; i < summary.unavailable_by_reason.size(); ++i) {
     summary.unavailable_by_reason[i] =
         current_unavailable_by_reason_[i].load(std::memory_order_acquire);
@@ -586,10 +535,8 @@ RuntimeCollisionStopCoverageTracker::complete(std::uint64_t generation,
   last_generation_.store(generation, std::memory_order_relaxed);
   last_ticks_.store(summary.ticks_attempted, std::memory_order_relaxed);
   last_queries_.store(summary.queries_executed, std::memory_order_relaxed);
-  last_unavailable_.store(summary.unavailable_ticks,
-                          std::memory_order_relaxed);
-  last_max_unavailable_ns_.store(summary.longest_unavailable_ns,
-                                 std::memory_order_relaxed);
+  last_unavailable_.store(summary.unavailable_ticks, std::memory_order_relaxed);
+  last_max_unavailable_ns_.store(summary.longest_unavailable_ns, std::memory_order_relaxed);
   windows_completed_.fetch_add(1, std::memory_order_relaxed);
   if (summary.ticks_attempted == 0 || summary.queries_executed == 0) {
     zero_check_windows_.fetch_add(1, std::memory_order_relaxed);
@@ -597,25 +544,19 @@ RuntimeCollisionStopCoverageTracker::complete(std::uint64_t generation,
   return summary;
 }
 
-std::uint64_t RuntimeCollisionStopCoverageTracker::active_generation() const
-    noexcept {
+std::uint64_t RuntimeCollisionStopCoverageTracker::active_generation() const noexcept {
   return generation_.load(std::memory_order_acquire);
 }
 
-RuntimeCollisionStopCoverageMetrics
-RuntimeCollisionStopCoverageTracker::metrics() const noexcept {
+RuntimeCollisionStopCoverageMetrics RuntimeCollisionStopCoverageTracker::metrics() const noexcept {
   RuntimeCollisionStopCoverageMetrics result;
   result.windows_started = windows_started_.load(std::memory_order_relaxed);
-  result.windows_completed =
-      windows_completed_.load(std::memory_order_relaxed);
+  result.windows_completed = windows_completed_.load(std::memory_order_relaxed);
   result.ticks_attempted = total_ticks_.load(std::memory_order_relaxed);
   result.queries_executed = total_queries_.load(std::memory_order_relaxed);
-  result.unavailable_ticks =
-      total_unavailable_.load(std::memory_order_relaxed);
-  result.longest_unavailable_ns =
-      longest_unavailable_ns_.load(std::memory_order_relaxed);
-  result.zero_check_windows =
-      zero_check_windows_.load(std::memory_order_relaxed);
+  result.unavailable_ticks = total_unavailable_.load(std::memory_order_relaxed);
+  result.longest_unavailable_ns = longest_unavailable_ns_.load(std::memory_order_relaxed);
+  result.zero_check_windows = zero_check_windows_.load(std::memory_order_relaxed);
   result.last_window = {
       last_generation_.load(std::memory_order_relaxed),
       last_ticks_.load(std::memory_order_relaxed),
@@ -623,17 +564,14 @@ RuntimeCollisionStopCoverageTracker::metrics() const noexcept {
       last_unavailable_.load(std::memory_order_relaxed),
       last_max_unavailable_ns_.load(std::memory_order_relaxed),
   };
-  result.freshest_source_age_ns =
-      freshest_source_age_ns_.load(std::memory_order_relaxed);
-  result.freshest_source_kind =
-      freshest_source_kind_.load(std::memory_order_relaxed);
+  result.freshest_source_age_ns = freshest_source_age_ns_.load(std::memory_order_relaxed);
+  result.freshest_source_kind = freshest_source_kind_.load(std::memory_order_relaxed);
   result.unavailable_events_suppressed =
       unavailable_events_suppressed_.load(std::memory_order_relaxed);
   return result;
 }
 
-Result<CollisionWorldPolicySnapshotBundle>
-load_collision_world_policy_snapshot_bundle(
+Result<CollisionWorldPolicySnapshotBundle> load_collision_world_policy_snapshot_bundle(
     const ICollisionWorldSnapshotPublisher& publisher) {
   CollisionWorldPolicySnapshotBundle bundle;
   try {
@@ -642,26 +580,24 @@ load_collision_world_policy_snapshot_bundle(
     return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
         kErrorValidationCollision,
         "Collision world snapshot publisher failed",
-        {{"reason", "collision_world_snapshot_publisher_exception"},
-         {"exception", e.what()}}});
+        {{"reason", "collision_world_snapshot_publisher_exception"}, {"exception", e.what()}}});
   } catch (...) {
-    return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
-        kErrorValidationCollision,
-        "Collision world snapshot publisher failed",
-        {{"reason", "collision_world_snapshot_publisher_exception"},
-         {"exception", reason_codes::kUnknownNonStdException}}});
+    return Result<CollisionWorldPolicySnapshotBundle>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Collision world snapshot publisher failed",
+                 {{"reason", "collision_world_snapshot_publisher_exception"},
+                  {"exception", reason_codes::kUnknownNonStdException}}});
   }
   if (!bundle.world) {
-    return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
-        kErrorValidationCollision,
-        "Collision world snapshot unavailable",
-        {{"reason", "collision_world_snapshot_unavailable"}}});
+    return Result<CollisionWorldPolicySnapshotBundle>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Collision world snapshot unavailable",
+                 {{"reason", "collision_world_snapshot_unavailable"}}});
   }
   return Result<CollisionWorldPolicySnapshotBundle>::Ok(std::move(bundle));
 }
 
-Result<RuntimeCollisionQueryBundlePtr>
-load_published_runtime_collision_query_bundle(
+Result<RuntimeCollisionQueryBundlePtr> load_published_runtime_collision_query_bundle(
     const ICollisionWorldSnapshotPublisher& publisher) {
   RuntimeCollisionQueryBundlePtr bundle;
   try {
@@ -670,52 +606,45 @@ load_published_runtime_collision_query_bundle(
     return Result<RuntimeCollisionQueryBundlePtr>::Err(ErrorDTO{
         kErrorValidationCollision,
         "Published runtime collision snapshot unavailable",
-        {{"reason", "published_runtime_collision_snapshot_exception"},
-         {"exception", e.what()}}});
+        {{"reason", "published_runtime_collision_snapshot_exception"}, {"exception", e.what()}}});
   } catch (...) {
-    return Result<RuntimeCollisionQueryBundlePtr>::Err(ErrorDTO{
-        kErrorValidationCollision,
-        "Published runtime collision snapshot unavailable",
-        {{"reason", "published_runtime_collision_snapshot_exception"},
-         {"exception", reason_codes::kUnknownNonStdException}}});
+    return Result<RuntimeCollisionQueryBundlePtr>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Published runtime collision snapshot unavailable",
+                 {{"reason", "published_runtime_collision_snapshot_exception"},
+                  {"exception", reason_codes::kUnknownNonStdException}}});
   }
   return Result<RuntimeCollisionQueryBundlePtr>::Ok(std::move(bundle));
 }
 
 RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
-    CollisionWorldPolicySnapshotBundle bundle, std::uint64_t epoch) {
+    CollisionWorldPolicySnapshotBundle bundle, std::uint64_t epoch,
+    std::optional<ProjectionRevisionDTO> projection_revision) {
   auto runtime_bundle = std::make_shared<RuntimeCollisionQueryBundle>();
+  runtime_bundle->projection_revision = std::move(projection_revision);
   runtime_bundle->distance_selection_order_valid = true;
   runtime_bundle->world = std::move(bundle.world);
   runtime_bundle->body_freshness = std::move(bundle.body_freshness);
-  std::sort(runtime_bundle->body_freshness.begin(),
-            runtime_bundle->body_freshness.end(),
-            [](const auto& lhs, const auto& rhs) {
-              return lhs.body_id < rhs.body_id;
-            });
+  std::sort(runtime_bundle->body_freshness.begin(), runtime_bundle->body_freshness.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.body_id < rhs.body_id; });
   runtime_bundle->lookup_order_valid =
-      runtime_bundle->world &&
-      runtime_collision_lookup_order_is_valid(
-          *runtime_bundle->world, runtime_bundle->body_freshness);
+      runtime_bundle->world && runtime_collision_lookup_order_is_valid(
+                                   *runtime_bundle->world, runtime_bundle->body_freshness);
   runtime_bundle->epoch = epoch;
   if (bundle.policy) {
-    auto policy =
-        std::make_shared<CollisionPolicySnapshot>(std::move(*bundle.policy));
+    auto policy = std::make_shared<CollisionPolicySnapshot>(std::move(*bundle.policy));
     if (runtime_bundle->world) {
       runtime_bundle->selected_distance_pairs =
-          build_selected_collision_distance_pairs(
-              *policy, *runtime_bundle->world);
+          build_selected_collision_distance_pairs(*policy, *runtime_bundle->world);
       for (const auto& grasp : policy->contact_grasps) {
         runtime_bundle->contact_grasp_selected_distance_pairs.emplace(
-            grasp.policy_id,
-            build_selected_collision_distance_pairs(
-                *policy, *runtime_bundle->world, grasp.policy_id));
+            grasp.policy_id, build_selected_collision_distance_pairs(
+                                 *policy, *runtime_bundle->world, grasp.policy_id));
       }
       auto selection_valid = [](const std::vector<CollisionPairId>& pairs) {
         for (std::size_t i = 0; i < pairs.size(); ++i) {
           const auto& pair = pairs[i];
-          if (pair.body_a.empty() || pair.body_b.empty() ||
-              !(pair.body_a < pair.body_b) ||
+          if (pair.body_a.empty() || pair.body_b.empty() || !(pair.body_a < pair.body_b) ||
               (i > 0 && !(pairs[i - 1] < pair))) {
             return false;
           }
@@ -724,12 +653,9 @@ RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
       };
       runtime_bundle->distance_selection_order_valid =
           selection_valid(runtime_bundle->selected_distance_pairs) &&
-          std::all_of(
-              runtime_bundle->contact_grasp_selected_distance_pairs.begin(),
-              runtime_bundle->contact_grasp_selected_distance_pairs.end(),
-              [&](const auto& entry) {
-                return selection_valid(entry.second);
-              });
+          std::all_of(runtime_bundle->contact_grasp_selected_distance_pairs.begin(),
+                      runtime_bundle->contact_grasp_selected_distance_pairs.end(),
+                      [&](const auto& entry) { return selection_valid(entry.second); });
     }
     runtime_bundle->policy_index = build_collision_policy_index(*policy);
     runtime_bundle->policy = std::move(policy);
@@ -741,23 +667,19 @@ bool runtime_collision_lookup_order_is_valid(
     const CollisionWorldSnapshot& world,
     const std::vector<CollisionWorldBodyFreshness>& body_freshness) noexcept {
   const auto bodies_ordered = std::adjacent_find(
-      world.bodies.begin(), world.bodies.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.body_id >= rhs.body_id;
-      });
+      world.bodies.begin(), world.bodies.end(),
+      [](const auto& lhs, const auto& rhs) { return lhs.body_id >= rhs.body_id; });
   if (bodies_ordered != world.bodies.end()) {
     return false;
   }
   const auto freshness_ordered = std::adjacent_find(
       body_freshness.begin(), body_freshness.end(),
-      [](const auto& lhs, const auto& rhs) {
-        return lhs.body_id >= rhs.body_id;
-      });
+      [](const auto& lhs, const auto& rhs) { return lhs.body_id >= rhs.body_id; });
   return freshness_ordered == body_freshness.end();
 }
 
-void append_collision_failure_diagnostics(
-    std::map<std::string, std::string>& details,
-    const CollisionValidationDecisionBundle& bundle) {
+void append_collision_failure_diagnostics(std::map<std::string, std::string>& details,
+                                          const CollisionValidationDecisionBundle& bundle) {
   const CollisionValidationWaypointRecord* selected = nullptr;
   if (bundle.decision.first_failing_waypoint) {
     for (const auto& record : bundle.waypoint_records) {
@@ -781,24 +703,19 @@ void append_collision_failure_diagnostics(
   }
 
   const auto& result = selected->result;
-  details["collision_result_waypoint_index"] =
-      std::to_string(selected->waypoint_index);
+  details["collision_result_waypoint_index"] = std::to_string(selected->waypoint_index);
   if (result.query_id) {
     details["collision_result_query_id"] = *result.query_id;
   }
   details["collision_result_engine_id"] = result.engine_id;
   details["collision_result_engine_version"] = result.engine_version;
-  details["collision_result_engine_status"] =
-      collision_engine_status_name(result.engine_status);
-  details["collision_result_decision"] =
-      collision_decision_result_name(result.decision);
-  details["collision_result_in_collision"] =
-      result.in_collision ? "true" : "false";
+  details["collision_result_engine_status"] = collision_engine_status_name(result.engine_status);
+  details["collision_result_decision"] = collision_decision_result_name(result.decision);
+  details["collision_result_in_collision"] = result.in_collision ? "true" : "false";
   details["collision_result_normalized_pair_count"] =
       std::to_string(result.normalized_pairs.size());
   if (!result.normalized_pairs.empty()) {
-    details["collision_result_first_pair"] =
-        collision_pair_name(result.normalized_pairs.front());
+    details["collision_result_first_pair"] = collision_pair_name(result.normalized_pairs.front());
   }
   details["collision_result_classified_pair_count"] =
       std::to_string(result.normalized_pairs_classified.size());
@@ -811,21 +728,18 @@ void append_collision_failure_diagnostics(
   }
   if (first_failure_pair == nullptr) {
     for (const auto& classified : result.normalized_pairs_classified) {
-      if (collision_pair_classification_blocks_dispatch(
-              classified.classification)) {
+      if (collision_pair_classification_blocks_dispatch(classified.classification)) {
         first_failure_pair = &classified;
         break;
       }
     }
   }
   if (first_failure_pair != nullptr) {
-    details["collision_result_first_failure_pair"] =
-        collision_pair_name(first_failure_pair->pair);
+    details["collision_result_first_failure_pair"] = collision_pair_name(first_failure_pair->pair);
     details["collision_result_first_failure_classification"] =
         collision_pair_classification_name(first_failure_pair->classification);
   }
-  if (const auto violation =
-          result.raw_diagnostics.find("contact_release_violation");
+  if (const auto violation = result.raw_diagnostics.find("contact_release_violation");
       violation != result.raw_diagnostics.end()) {
     details["collision_result_contact_release_violation"] = violation->second;
   }
@@ -844,25 +758,18 @@ void append_collision_failure_diagnostics(
   }
 }
 
-std::optional<std::map<std::string, std::string>>
-contact_policy_violation_details(
-    const CollisionValidationDecisionBundle& bundle,
-    const CollisionPolicySnapshot& policy,
-    std::string_view response,
-    std::optional<std::size_t> initial_contact_pair_count) {
+std::optional<std::map<std::string, std::string>> contact_policy_violation_details(
+    const CollisionValidationDecisionBundle& bundle, const CollisionPolicySnapshot& policy,
+    std::string_view response, std::optional<std::size_t> initial_contact_pair_count) {
   const auto* selected = select_collision_failure_record(bundle);
   if (selected == nullptr) {
     return std::nullopt;
   }
-  const auto violation =
-      selected->result.raw_diagnostics.find("contact_release_violation");
+  const auto violation = selected->result.raw_diagnostics.find("contact_release_violation");
   if (violation == selected->result.raw_diagnostics.end()) {
-    const auto grasp_violation =
-        selected->result.raw_diagnostics.find("contact_grasp_violation");
-    const auto grasp_policy_id =
-        selected->result.raw_diagnostics.find("contact_grasp_policy_id");
-    const auto grasp_pair =
-        selected->result.raw_diagnostics.find("contact_grasp_pair");
+    const auto grasp_violation = selected->result.raw_diagnostics.find("contact_grasp_violation");
+    const auto grasp_policy_id = selected->result.raw_diagnostics.find("contact_grasp_policy_id");
+    const auto grasp_pair = selected->result.raw_diagnostics.find("contact_grasp_pair");
     if (grasp_violation == selected->result.raw_diagnostics.end() ||
         grasp_policy_id == selected->result.raw_diagnostics.end() ||
         grasp_pair == selected->result.raw_diagnostics.end()) {
@@ -894,71 +801,57 @@ contact_policy_violation_details(
     }
 
     std::string classification =
-        selected->result.decision ==
-                CollisionDecisionResult::kInconclusiveFail
+        selected->result.decision == CollisionDecisionResult::kInconclusiveFail
             ? "diagnostic_incomplete"
             : "blocking_collision";
-    for (const auto& classified :
-         selected->result.normalized_pairs_classified) {
+    for (const auto& classified : selected->result.normalized_pairs_classified) {
       if (canonical_collision_pair(classified.pair) == *matched_pair) {
-        classification =
-            collision_pair_classification_name(classified.classification);
+        classification = collision_pair_classification_name(classified.classification);
         break;
       }
     }
 
     std::map<std::string, std::string> details{
         {"contact_policy_violation",
-         std::string(native_contact_grasp_violation_reason(
-             grasp_violation->second))},
+         std::string(native_contact_grasp_violation_reason(grasp_violation->second))},
         {"contact_policy_id", matched_policy->policy_id},
         {"policy_id", matched_policy->policy_id},
         {"policy_mode", "contact_grasp"},
-        {"zone_id",
-         "contact_grasp_pair:" + matched_pair->body_a + "<->" +
-             matched_pair->body_b},
+        {"zone_id", "contact_grasp_pair:" + matched_pair->body_a + "<->" + matched_pair->body_b},
         {"contact_body_a", matched_pair->body_a},
         {"contact_body_b", matched_pair->body_b},
         {"contact_present", "true"},
         {"selected_object_id", matched_policy->selected_object_id},
         {"terminal_window_start_fraction",
          format_double(matched_policy->terminal_window_start_fraction)},
-        {"max_penetration_m",
-         format_double(matched_policy->max_penetration_m)},
+        {"max_penetration_m", format_double(matched_policy->max_penetration_m)},
         {"distance_request_mode",
-         collision_distance_request_mode_name(
-             selected->result.distance_request_mode)},
+         collision_distance_request_mode_name(selected->result.distance_request_mode)},
         {"evaluated_distance_pair_count",
-         std::to_string(
-             selected->result.evaluated_distance_pair_count)},
+         std::to_string(selected->result.evaluated_distance_pair_count)},
         {"allowed_contact_grasp", "false"},
         {"response", std::string(response)},
         {"classification", std::move(classification)}};
 
-    const auto copy_diagnostic = [&](const char* source,
-                                     const char* destination) {
+    const auto copy_diagnostic = [&](const char* source, const char* destination) {
       const auto it = selected->result.raw_diagnostics.find(source);
       if (it != selected->result.raw_diagnostics.end()) {
         details[destination] = it->second;
       }
     };
     copy_diagnostic("contact_grasp_sample_fraction", "sample_fraction");
-    copy_diagnostic("contact_grasp_inside_terminal_window",
-                    "inside_terminal_window");
+    copy_diagnostic("contact_grasp_inside_terminal_window", "inside_terminal_window");
 
     std::optional<double> signed_clearance;
     for (const auto& clearance : selected->result.pair_clearances) {
       if (canonical_collision_pair(clearance.pair) == *matched_pair &&
-          std::isfinite(clearance.signed_clearance_m) &&
-          clearance.signed_clearance_m <= 0.0) {
+          std::isfinite(clearance.signed_clearance_m) && clearance.signed_clearance_m <= 0.0) {
         signed_clearance = clearance.signed_clearance_m;
         break;
       }
     }
-    if (!signed_clearance.has_value() &&
-        selected->result.min_clearance_pair.has_value() &&
-        canonical_collision_pair(
-            *selected->result.min_clearance_pair) == *matched_pair &&
+    if (!signed_clearance.has_value() && selected->result.min_clearance_pair.has_value() &&
+        canonical_collision_pair(*selected->result.min_clearance_pair) == *matched_pair &&
         selected->result.min_clearance_m.has_value() &&
         std::isfinite(*selected->result.min_clearance_m) &&
         *selected->result.min_clearance_m <= 0.0) {
@@ -973,12 +866,10 @@ contact_policy_violation_details(
   }
 
   const SupportContactPolicyEntry* matched = nullptr;
-  const auto diagnostic_pair =
-      selected->result.raw_diagnostics.find("contact_release_pair");
+  const auto diagnostic_pair = selected->result.raw_diagnostics.find("contact_release_pair");
   if (diagnostic_pair != selected->result.raw_diagnostics.end()) {
     for (const auto& entry : policy.support_contacts) {
-      if (collision_pair_name(canonical_collision_pair(entry.pair)) ==
-          diagnostic_pair->second) {
+      if (collision_pair_name(canonical_collision_pair(entry.pair)) == diagnostic_pair->second) {
         matched = &entry;
         break;
       }
@@ -990,23 +881,19 @@ contact_policy_violation_details(
 
   const auto pair = canonical_collision_pair(matched->pair);
   const auto pair_is_present = [&](const CollisionValidationWaypointRecord& record) {
-    return std::any_of(
-        record.result.normalized_pairs.begin(),
-        record.result.normalized_pairs.end(),
-        [&](const CollisionPairId& observed) {
-          return canonical_collision_pair(observed) == pair;
-        });
+    return std::any_of(record.result.normalized_pairs.begin(), record.result.normalized_pairs.end(),
+                       [&](const CollisionPairId& observed) {
+                         return canonical_collision_pair(observed) == pair;
+                       });
   };
   const auto contact_pair_count = [&](const CollisionValidationWaypointRecord& record) {
     std::size_t count = 0;
     for (const auto& observed : record.result.normalized_pairs) {
       const auto canonical_observed = canonical_collision_pair(observed);
-      if (std::any_of(
-              policy.support_contacts.begin(), policy.support_contacts.end(),
-              [&](const SupportContactPolicyEntry& entry) {
-                return canonical_collision_pair(entry.pair) ==
-                       canonical_observed;
-              })) {
+      if (std::any_of(policy.support_contacts.begin(), policy.support_contacts.end(),
+                      [&](const SupportContactPolicyEntry& entry) {
+                        return canonical_collision_pair(entry.pair) == canonical_observed;
+                      })) {
         ++count;
       }
     }
@@ -1016,8 +903,7 @@ contact_policy_violation_details(
   if (!initial_contact_pair_count.has_value()) {
     initial_contact_pair_count = bundle.waypoint_records.empty()
                                      ? std::size_t{0}
-                                     : contact_pair_count(
-                                           bundle.waypoint_records.front());
+                                     : contact_pair_count(bundle.waypoint_records.front());
   }
   const bool contact_present = pair_is_present(*selected);
 
@@ -1025,26 +911,20 @@ contact_policy_violation_details(
       selected->result.decision == CollisionDecisionResult::kInconclusiveFail
           ? "diagnostic_incomplete"
           : "blocking_collision";
-  for (const auto& classified :
-       selected->result.normalized_pairs_classified) {
+  for (const auto& classified : selected->result.normalized_pairs_classified) {
     if (canonical_collision_pair(classified.pair) == pair) {
-      classification =
-          collision_pair_classification_name(classified.classification);
+      classification = collision_pair_classification_name(classified.classification);
       break;
     }
   }
 
   const auto policy_mode =
-      matched->mode == CollisionContactPolicyMode::kBoundedPenetration
-          ? "bounded_penetration"
-          : matched->mode == CollisionContactPolicyMode::kContactProcess
-                ? "contact_process"
-                : "contact_release";
+      matched->mode == CollisionContactPolicyMode::kBoundedPenetration ? "bounded_penetration"
+      : matched->mode == CollisionContactPolicyMode::kContactProcess   ? "contact_process"
+                                                                       : "contact_release";
   const std::string policy_id =
-      policy.policy_id.empty()
-          ? "support_contacts@" +
-                std::to_string(policy.revision.revision_id)
-          : policy.policy_id;
+      policy.policy_id.empty() ? "support_contacts@" + std::to_string(policy.revision.revision_id)
+                               : policy.policy_id;
   std::map<std::string, std::string> details{
       {"contact_policy_violation", violation->second},
       {"contact_policy_id", policy_id},
@@ -1054,36 +934,27 @@ contact_policy_violation_details(
       {"contact_body_a", pair.body_a},
       {"contact_body_b", pair.body_b},
       {"contact_present", contact_present ? "true" : "false"},
-      {"initial_contact_pair_count",
-       std::to_string(*initial_contact_pair_count)},
-      {"current_contact_pair_count",
-       std::to_string(contact_pair_count(*selected))},
+      {"initial_contact_pair_count", std::to_string(*initial_contact_pair_count)},
+      {"current_contact_pair_count", std::to_string(contact_pair_count(*selected))},
       {"distance_request_mode",
-       collision_distance_request_mode_name(
-           selected->result.distance_request_mode)},
+       collision_distance_request_mode_name(selected->result.distance_request_mode)},
       {"evaluated_distance_pair_count",
-       std::to_string(
-           selected->result.evaluated_distance_pair_count)},
+       std::to_string(selected->result.evaluated_distance_pair_count)},
       {"response", std::string(response)},
       {"classification", std::move(classification)}};
 
   if (matched->mode == CollisionContactPolicyMode::kContactRelease) {
     details["release_evidence_mode"] =
-        matched->release_evidence_mode ==
-                ContactReleaseEvidenceMode::kBinaryContact
+        matched->release_evidence_mode == ContactReleaseEvidenceMode::kBinaryContact
             ? "binary_contact"
             : "signed_penetration";
     if (violation->second == "initial_penetration_exceeds_policy" &&
-        matched->release_evidence_mode ==
-            ContactReleaseEvidenceMode::kSignedPenetration &&
+        matched->release_evidence_mode == ContactReleaseEvidenceMode::kSignedPenetration &&
         matched->enforce_max_start_penetration) {
-      details["max_penetration_m"] =
-          format_double(matched->max_start_penetration_m);
+      details["max_penetration_m"] = format_double(matched->max_start_penetration_m);
     }
-  } else if (matched->mode ==
-             CollisionContactPolicyMode::kBoundedPenetration) {
-    details["max_contact_penetration_m"] =
-        format_double(matched->max_contact_penetration_m);
+  } else if (matched->mode == CollisionContactPolicyMode::kBoundedPenetration) {
+    details["max_contact_penetration_m"] = format_double(matched->max_contact_penetration_m);
     if (violation->second == "contact_penetration_exceeds_policy") {
       details["within_penetration_bound"] = "false";
     }
@@ -1096,14 +967,11 @@ contact_policy_violation_details(
   if (contact_present &&
       (matched->mode == CollisionContactPolicyMode::kBoundedPenetration ||
        (matched->mode == CollisionContactPolicyMode::kContactRelease &&
-        matched->release_evidence_mode ==
-            ContactReleaseEvidenceMode::kSignedPenetration))) {
+        matched->release_evidence_mode == ContactReleaseEvidenceMode::kSignedPenetration))) {
     for (const auto& clearance : selected->result.pair_clearances) {
       if (canonical_collision_pair(clearance.pair) == pair &&
-          std::isfinite(clearance.signed_clearance_m) &&
-          clearance.signed_clearance_m <= 0.0) {
-        details["penetration_depth_m"] =
-            format_double(-clearance.signed_clearance_m);
+          std::isfinite(clearance.signed_clearance_m) && clearance.signed_clearance_m <= 0.0) {
+        details["penetration_depth_m"] = format_double(-clearance.signed_clearance_m);
         break;
       }
     }
@@ -1112,8 +980,7 @@ contact_policy_violation_details(
 }
 
 std::string pre_dispatch_collision_validation_message(
-    const std::map<std::string, std::string>& details,
-    CollisionDecisionAction action) {
+    const std::map<std::string, std::string>& details, CollisionDecisionAction action) {
   const auto value = [&details](const char* key) -> std::string_view {
     const auto it = details.find(key);
     return it == details.end() ? std::string_view{} : it->second;
@@ -1127,10 +994,8 @@ std::string pre_dispatch_collision_validation_message(
     return "Pre-dispatch collision validation deferred";
   }
 
-  const auto contact_release_violation =
-      value("collision_result_contact_release_violation");
-  const auto contact_release_pair =
-      value("collision_result_contact_release_pair");
+  const auto contact_release_violation = value("collision_result_contact_release_violation");
+  const auto contact_release_pair = value("collision_result_contact_release_pair");
   const auto with_contact_pair = [&](std::string message) {
     if (!contact_release_pair.empty()) {
       message += ": " + std::string(contact_release_pair);
@@ -1138,42 +1003,33 @@ std::string pre_dispatch_collision_validation_message(
     return message;
   };
   if (contact_release_violation == "final_sample_not_separated") {
-    return with_contact_pair(
-        "Support-contact pair did not separate by final waypoint");
+    return with_contact_pair("Support-contact pair did not separate by final waypoint");
   }
   if (contact_release_violation == "initial_penetration_exceeds_policy") {
-    return with_contact_pair(
-        "Support-contact initial penetration exceeds the permitted envelope");
+    return with_contact_pair("Support-contact initial penetration exceeds the permitted envelope");
   }
   if (contact_release_violation == "missing_contact_release_clearance") {
-    return with_contact_pair(
-        "Support-contact clearance diagnostics are unavailable");
+    return with_contact_pair("Support-contact clearance diagnostics are unavailable");
   }
   if (contact_release_violation == "penetration_increased") {
-    return with_contact_pair(
-        "Support-contact penetration increased during release");
+    return with_contact_pair("Support-contact penetration increased during release");
   }
   if (contact_release_violation == "contact_penetration_exceeds_policy") {
     return with_contact_pair(
         "Support-contact penetration exceeds the configured bounded-contact envelope");
   }
   if (contact_release_violation == "insufficient_release_progress") {
-    return with_contact_pair(
-        "Support-contact release made insufficient progress");
+    return with_contact_pair("Support-contact release made insufficient progress");
   }
   if (contact_release_violation == "new_active_contact_after_clear_start") {
-    return with_contact_pair(
-        "Support-contact appeared after the trajectory started clear");
+    return with_contact_pair("Support-contact appeared after the trajectory started clear");
   }
   if (contact_release_violation == "recontact_after_release" ||
-      contact_release_violation ==
-          "recontact_penetration_exceeds_policy") {
-    return with_contact_pair(
-        "Support-contact pair re-contacted after release");
+      contact_release_violation == "recontact_penetration_exceeds_policy") {
+    return with_contact_pair("Support-contact pair re-contacted after release");
   }
   if (contact_release_violation == "contact_process_policy_not_implemented") {
-    return with_contact_pair(
-        "Contact-process collision policy is not implemented");
+    return with_contact_pair("Contact-process collision policy is not implemented");
   }
 
   const auto status = value("collision_result_engine_status");
@@ -1198,11 +1054,10 @@ std::string pre_dispatch_collision_validation_message(
   return "Collision validation rejected trajectory";
 }
 
-void append_collision_compare_diagnostics(
-    std::map<std::string, std::string>& details,
-    const CollisionValidationDecisionBundle& bundle,
-    const TrajectoryDTO& trajectory,
-    const ICollisionDiagnosticComparator& comparator) {
+void append_collision_compare_diagnostics(std::map<std::string, std::string>& details,
+                                          const CollisionValidationDecisionBundle& bundle,
+                                          const TrajectoryDTO& trajectory,
+                                          const ICollisionDiagnosticComparator& comparator) {
   const auto* selected = select_collision_failure_record(bundle);
   if (selected == nullptr || selected->waypoint_index < 0) {
     return;
@@ -1214,10 +1069,9 @@ void append_collision_compare_diagnostics(
 
   const auto& waypoint = trajectory.waypoints[waypoint_index];
   CollisionQuery query;
-  query.query_id = "diagnostic_compare_" +
-                   (selected->result.query_id
-                        ? *selected->result.query_id
-                        : std::to_string(selected->waypoint_index));
+  query.query_id = "diagnostic_compare_" + (selected->result.query_id
+                                                ? *selected->result.query_id
+                                                : std::to_string(selected->waypoint_index));
   query.surface = CollisionSurface::kDiagnosticCompare;
   query.collision_world_revision = bundle.borrowed_world_revision;
   query.policy_revision = selected->result.policy_revision_used;
@@ -1235,18 +1089,15 @@ void append_collision_compare_diagnostics(
         collision_engine_status_name(compared.engine_status);
     details["collision_diagnostic_compare_decision"] =
         collision_decision_result_name(compared.decision);
-    details["collision_diagnostic_compare_in_collision"] =
-        compared.in_collision ? "true" : "false";
+    details["collision_diagnostic_compare_in_collision"] = compared.in_collision ? "true" : "false";
     details["collision_diagnostic_compare_normalized_pair_count"] =
         std::to_string(compared.normalized_pairs.size());
     details["collision_diagnostic_compare_in_collision_match"] =
-        compared.in_collision == selected->result.in_collision ? "true"
-                                                               : "false";
+        compared.in_collision == selected->result.in_collision ? "true" : "false";
     details["collision_diagnostic_compare_decision_match"] =
         compared.decision == selected->result.decision ? "true" : "false";
     details["collision_diagnostic_compare_normalized_pairs_match"] =
-        compared.normalized_pairs == selected->result.normalized_pairs ? "true"
-                                                                       : "false";
+        compared.normalized_pairs == selected->result.normalized_pairs ? "true" : "false";
     if (compared.collision_world_revision.has_value()) {
       details["collision_diagnostic_compare_world_revision_id"] =
           std::to_string(compared.collision_world_revision->revision_id);
@@ -1266,8 +1117,7 @@ void append_collision_compare_diagnostics(
     }
     if (compared_failure == nullptr) {
       for (const auto& classified : compared.normalized_pairs_classified) {
-        if (collision_pair_classification_blocks_dispatch(
-                classified.classification)) {
+        if (collision_pair_classification_blocks_dispatch(classified.classification)) {
           compared_failure = &classified;
           break;
         }
@@ -1282,8 +1132,7 @@ void append_collision_compare_diagnostics(
   } catch (const std::exception& e) {
     details["collision_diagnostic_compare_error"] = e.what();
   } catch (...) {
-    details["collision_diagnostic_compare_error"] =
-        reason_codes::kUnknownNonStdException;
+    details["collision_diagnostic_compare_error"] = reason_codes::kUnknownNonStdException;
   }
 }
 
@@ -1301,16 +1150,14 @@ CollisionCheckResultDTO collision_check_result_from_bundle(
     check.contact_body_b = record->result.normalized_pairs.front().body_b;
   }
   for (const auto& classified : record->result.normalized_pairs_classified) {
-    if (!collision_pair_classification_blocks_dispatch(
-            classified.classification)) {
+    if (!collision_pair_classification_blocks_dispatch(classified.classification)) {
       continue;
     }
     check.contact_body_a = classified.pair.body_a;
     check.contact_body_b = classified.pair.body_b;
     break;
   }
-  if (record->result.min_clearance_m &&
-      *record->result.min_clearance_m < 0.0) {
+  if (record->result.min_clearance_m && *record->result.min_clearance_m < 0.0) {
     check.penetration_depth_m = -*record->result.min_clearance_m;
   }
   return check;
@@ -1322,16 +1169,14 @@ bool collision_world_revision_is_set(const CollisionWorldRevision& revision) {
 
 bool collision_world_revisions_equal(const CollisionWorldRevision& lhs,
                                      const CollisionWorldRevision& rhs) {
-  return lhs.revision_id == rhs.revision_id &&
-         lhs.content_hash == rhs.content_hash;
+  return lhs.revision_id == rhs.revision_id && lhs.content_hash == rhs.content_hash;
 }
 
 bool engines_require_single_context_exclusivity(
     const std::vector<std::shared_ptr<ICollisionQueryEngine>>& engines) {
   for (const auto& engine : engines) {
-    if (engine &&
-        engine->capability().thread_safety ==
-            CollisionEngineThreadSafetyClass::kSingleContextExclusive) {
+    if (engine && engine->capability().thread_safety ==
+                      CollisionEngineThreadSafetyClass::kSingleContextExclusive) {
       return true;
     }
   }
@@ -1339,8 +1184,7 @@ bool engines_require_single_context_exclusivity(
 }
 
 bool runtime_monitor_may_hold_collision_engine(ExecutionState state) {
-  return state == ExecutionState::kExecuting ||
-         state == ExecutionState::kPaused ||
+  return state == ExecutionState::kExecuting || state == ExecutionState::kPaused ||
          state == ExecutionState::kStopping;
 }
 

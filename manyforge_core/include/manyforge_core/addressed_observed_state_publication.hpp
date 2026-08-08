@@ -2,13 +2,12 @@
 
 #include <atomic>
 #include <cstdint>
-#include <memory>
-#include <span>
-#include <vector>
-
 #include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/ports/iobserved_robot_state_provider.hpp>
 #include <manyforge_core/ports/iobserved_state_provider.hpp>
+#include <memory>
+#include <span>
+#include <vector>
 
 namespace manyforge::core {
 
@@ -22,42 +21,32 @@ struct AddressedObservedStatePublicationConfig final {
 /// Addressed, unit-tagged facade over the already-qualified bounded native
 /// publication channel. Raw doubles are interpreted only through the exact
 /// retained coordinate-kind vector captured at construction.
-class AddressedObservedStatePublication final
-    : public IObservedStateProvider {
+class AddressedObservedStatePublication final : public IObservedStateProvider {
  public:
-  explicit AddressedObservedStatePublication(
-      AddressedObservedStatePublicationConfig config);
+  explicit AddressedObservedStatePublication(AddressedObservedStatePublicationConfig config);
 
-  AddressedObservedStatePublication(
-      const AddressedObservedStatePublication&) = delete;
-  AddressedObservedStatePublication& operator=(
-      const AddressedObservedStatePublication&) = delete;
+  AddressedObservedStatePublication(const AddressedObservedStatePublication&) = delete;
+  AddressedObservedStatePublication& operator=(const AddressedObservedStatePublication&) = delete;
 
   [[nodiscard]] ObservedRobotStatePublishResult publish(
-      ObservedStateSourceKind source,
-      std::span<const std::string> source_joint_names,
-      std::span<const double> positions_si,
-      std::span<const double> velocities_si,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns) noexcept;
+      ObservedStateSourceKind source, std::span<const std::string> source_joint_names,
+      std::span<const double> positions_si, std::span<const double> velocities_si,
+      std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns) noexcept;
 
   [[nodiscard]] Result<ObservedStateSnapshotDTO> current_state(
-      const ObservedStateQueryContextDTO& context,
-      std::int64_t now_ns) const override;
+      const ObservedStateQueryContextDTO& context, std::int64_t now_ns) const override;
 
   [[nodiscard]] Result<ObservedStatePublicationDTO> publication(
       const ControlBindingId& control_binding_id,
       const ControlBindingRevision& control_binding_revision) const override;
 
-  [[nodiscard]] const ObservedStateQueryContextDTO& query_context()
-      const noexcept {
+  [[nodiscard]] const ObservedStateQueryContextDTO& query_context() const noexcept {
     return config_.query_context;
   }
   [[nodiscard]] std::uint64_t authority_generation() const noexcept {
     return config_.authority_generation;
   }
-  [[nodiscard]] const ObservedRobotStatePublication& numeric_publication()
-      const noexcept {
+  [[nodiscard]] const ObservedRobotStatePublication& numeric_publication() const noexcept {
     return publication_;
   }
 
@@ -72,16 +61,16 @@ class AddressedObservedStatePublication final
 /// Explicit compatibility adapter for the existing all-angular subordinate
 /// execution engine. Construction fails for a mixed or prismatic target, so
 /// metres can never enter RobotStateDTO's historical angular fields.
-class AddressedAngularObservedRobotStateAdapter final
-    : public IObservedRobotStateProvider {
+class AddressedAngularObservedRobotStateAdapter final : public IObservedRobotStateProvider {
  public:
   explicit AddressedAngularObservedRobotStateAdapter(
       const AddressedObservedStatePublication& publication);
 
-  [[nodiscard]] Result<RobotStateDTO> current_state(
-      std::int64_t now_ns) const override;
-  [[nodiscard]] const ObservedRobotStatePublication* publication()
-      const noexcept override;
+  [[nodiscard]] Result<RobotStateDTO> current_state(std::int64_t now_ns) const override;
+  [[nodiscard]] const ObservedRobotStatePublication* publication() const noexcept override;
+  [[nodiscard]] Result<ObservedStatePublicationDTO> addressed_publication(
+      const ControlBindingId& control_binding_id,
+      const ControlBindingRevision& control_binding_revision) const override;
 
  private:
   const AddressedObservedStatePublication* publication_;

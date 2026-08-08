@@ -1,11 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <manyforge_core/cache/trajectory_cache.hpp>
+#include <manyforge_core/cache/trajectory_cache_intent.hpp>
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <optional>
 #include <utility>
-
-#include <manyforge_core/cache/trajectory_cache_intent.hpp>
-#include <manyforge_core/cache/trajectory_cache.hpp>
-#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 
 namespace manyforge::core {
 namespace {
@@ -17,7 +16,7 @@ CollisionWorldRevision make_revision(uint64_t id = 1) {
   return revision;
 }
 
-TrajectoryDTO make_trajectory(const std::string& label) {
+TrajectoryDTO make_trajectory(const std::string &label) {
   TrajectoryDTO t;
   t.joint_names = {label};
   TrajectoryWaypointDTO wp;
@@ -43,44 +42,57 @@ ExecuteRequestDTO make_cartesian_request() {
   request.speed_profile = {0.5, 0.5, 0.2};
   request.contact_policy_id = "free_space";
   CartesianPathDTO path;
-  path.waypoints = {make_pose(0.0, 0.0, 0.0),
-                    make_pose(0.1, 0.0, 0.0),
+  path.waypoints = {make_pose(0.0, 0.0, 0.0), make_pose(0.1, 0.0, 0.0),
                     make_pose(0.2, 0.0, 0.0)};
   request.motion = std::move(path);
   return request;
 }
 
 class TrajectoryCacheTest : public ::testing::Test {
- protected:
-  void store(const std::string& move_id, TrajectoryDTO trajectory,
-             CollisionWorldRevision revision,
-             std::string intent_fingerprint = "intent-a") {
-    cache.store(move_id, std::move(trajectory), std::move(revision),
-                std::move(intent_fingerprint));
+protected:
+  static TrajectoryCacheKey key(const std::string &move_id) {
+    auto request = testing::make_test_execute_request({"joint1", "joint2"},
+                                                      "run:cache-test");
+    request.move_id = move_id;
+    return trajectory_cache_key(request);
   }
 
-  std::optional<TrajectoryDTO> lookup(
-      const std::string& move_id, const CollisionWorldRevision& revision,
-      const std::string& intent_fingerprint = "intent-a") {
+  static TrajectoryCacheRevisionEvidence
+  evidence(CollisionWorldRevision revision) {
+    return {testing::make_test_projection_binding().projection_revision,
+            std::move(revision)};
+  }
+
+  void store(const std::string &move_id, TrajectoryDTO trajectory,
+             CollisionWorldRevision revision,
+             std::string intent_fingerprint = "intent-a") {
+    cache.store(key(move_id), std::move(trajectory),
+                evidence(std::move(revision)), std::move(intent_fingerprint));
+  }
+
+  std::optional<TrajectoryDTO>
+  lookup(const std::string &move_id, const CollisionWorldRevision &revision,
+         const std::string &intent_fingerprint = "intent-a") {
     return cache
-        .lookup_with_revision(move_id, revision, intent_fingerprint)
+        .lookup_with_revision(key(move_id), evidence(revision),
+                              intent_fingerprint)
         .trajectory;
   }
 
-  TrajectoryCache cache{CacheConfig{3}};  // max 3 entries
+  TrajectoryCache cache{CacheConfig{3}}; // max 3 entries
 };
 
 // --- Store and lookup ---
 TEST_F(TrajectoryCacheTest, StoreAndLookup) {
   store("move_1", make_trajectory("t1"), make_revision());
-  auto result = cache.peek_unvalidated("move_1");
+  auto result = cache.peek_unvalidated(key("move_1"));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->joint_names[0], "t1");
   EXPECT_EQ(result->waypoints.size(), 1u);
 }
 
 TEST_F(TrajectoryCacheTest, LookupMiss_ReturnsNullopt) {
-  auto result = cache.peek_unvalidated("nonexistent");
+  auto result = cache.peek_unvalidated(key("nonexistent"));
   EXPECT_FALSE(result.has_value());
 }
 
@@ -88,7 +100,7 @@ TEST_F(TrajectoryCacheTest, LookupMiss_ReturnsNullopt) {
 TEST_F(TrajectoryCacheTest, StoreOverwritesExisting) {
   store("move_1", make_trajectory("v1"), make_revision());
   store("move_1", make_trajectory("v2"), make_revision());
-  auto result = cache.peek_unvalidated("move_1");
+  auto result = cache.peek_unvalidated(key("move_1"));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->joint_names[0], "v2");
   EXPECT_EQ(cache.size(), 1u);
@@ -98,15 +110,15 @@ TEST_F(TrajectoryCacheTest, StoreOverwritesExisting) {
 TEST_F(TrajectoryCacheTest, InvalidateSpecificMoveId) {
   store("move_1", make_trajectory("t1"), make_revision());
   store("move_2", make_trajectory("t2"), make_revision());
-  cache.invalidate("move_1");
-  EXPECT_FALSE(cache.peek_unvalidated("move_1").has_value());
-  EXPECT_TRUE(cache.peek_unvalidated("move_2").has_value());
+  cache.invalidate(key("move_1"));
+  EXPECT_FALSE(cache.peek_unvalidated(key("move_1")).has_value());
+  EXPECT_TRUE(cache.peek_unvalidated(key("move_2")).has_value());
   EXPECT_EQ(cache.size(), 1u);
 }
 
 TEST_F(TrajectoryCacheTest, InvalidateNonExistent_NoOp) {
   store("move_1", make_trajectory("t1"), make_revision());
-  cache.invalidate("nonexistent");
+  cache.invalidate(key("nonexistent"));
   EXPECT_EQ(cache.size(), 1u);
 }
 
@@ -115,8 +127,8 @@ TEST_F(TrajectoryCacheTest, InvalidateAll) {
   store("move_2", make_trajectory("t2"), make_revision());
   cache.invalidate_all();
   EXPECT_EQ(cache.size(), 0u);
-  EXPECT_FALSE(cache.peek_unvalidated("move_1").has_value());
-  EXPECT_FALSE(cache.peek_unvalidated("move_2").has_value());
+  EXPECT_FALSE(cache.peek_unvalidated(key("move_1")).has_value());
+  EXPECT_FALSE(cache.peek_unvalidated(key("move_2")).has_value());
 }
 
 // --- Multiple independent entries ---
@@ -126,9 +138,56 @@ TEST_F(TrajectoryCacheTest, MultipleMovesIndependent) {
   store("move_3", make_trajectory("t3"), make_revision());
 
   EXPECT_EQ(cache.size(), 3u);
-  EXPECT_EQ(cache.peek_unvalidated("move_1")->joint_names[0], "t1");
-  EXPECT_EQ(cache.peek_unvalidated("move_2")->joint_names[0], "t2");
-  EXPECT_EQ(cache.peek_unvalidated("move_3")->joint_names[0], "t3");
+  EXPECT_EQ(cache.peek_unvalidated(key("move_1"))->joint_names[0], "t1");
+  EXPECT_EQ(cache.peek_unvalidated(key("move_2"))->joint_names[0], "t2");
+  EXPECT_EQ(cache.peek_unvalidated(key("move_3"))->joint_names[0], "t3");
+}
+
+TEST_F(TrajectoryCacheTest, EveryCompositeSlotDimensionPreventsAliasing) {
+  auto baseline =
+      testing::make_test_execute_request({"joint1", "joint2"}, "run:slot-a");
+  baseline.move_id = "move";
+  std::vector<ExecuteRequestDTO> requests{baseline};
+
+  auto changed = baseline;
+  changed.binding.program_revision = ProgramRevision("program-revision:other");
+  requests.push_back(changed);
+  changed = baseline;
+  changed.binding.program_binding_id =
+      ProgramBindingId("program-binding:other");
+  requests.push_back(changed);
+  changed = baseline;
+  changed.binding.program_run_id = ProgramRunId("run:slot-b");
+  requests.push_back(changed);
+  changed = baseline;
+  changed.move_id = "move-other";
+  requests.push_back(changed);
+  changed = baseline;
+  changed.binding.controllable_component_id =
+      ControllableComponentId("component:other");
+  requests.push_back(changed);
+  changed = baseline;
+  changed.binding.command_target_id = CommandTargetId("target:other");
+  requests.push_back(changed);
+  changed = baseline;
+  changed.binding.capability_id = CapabilityId("execution.trajectory.other");
+  requests.push_back(changed);
+
+  TrajectoryCache slot_cache{CacheConfig{requests.size()}};
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    slot_cache.store(trajectory_cache_key(requests[index]),
+                     make_trajectory("slot-" + std::to_string(index)),
+                     evidence(make_revision()),
+                     "intent-" + std::to_string(index));
+  }
+
+  ASSERT_EQ(slot_cache.size(), requests.size());
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    const auto stored =
+        slot_cache.peek_unvalidated(trajectory_cache_key(requests[index]));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->joint_names.front(), "slot-" + std::to_string(index));
+  }
 }
 
 // --- Size and capacity ---
@@ -161,10 +220,10 @@ TEST_F(TrajectoryCacheTest, EvictsOldestWhenFull) {
   // 4th entry evicts oldest (move_1).
   store("move_4", make_trajectory("t4"), make_revision());
   EXPECT_EQ(cache.size(), 3u);
-  EXPECT_FALSE(cache.peek_unvalidated("move_1").has_value());
-  EXPECT_TRUE(cache.peek_unvalidated("move_2").has_value());
-  EXPECT_TRUE(cache.peek_unvalidated("move_3").has_value());
-  EXPECT_TRUE(cache.peek_unvalidated("move_4").has_value());
+  EXPECT_FALSE(cache.peek_unvalidated(key("move_1")).has_value());
+  EXPECT_TRUE(cache.peek_unvalidated(key("move_2")).has_value());
+  EXPECT_TRUE(cache.peek_unvalidated(key("move_3")).has_value());
+  EXPECT_TRUE(cache.peek_unvalidated(key("move_4")).has_value());
 }
 
 TEST_F(TrajectoryCacheTest, OverwriteDoesNotEvict) {
@@ -175,9 +234,10 @@ TEST_F(TrajectoryCacheTest, OverwriteDoesNotEvict) {
   // Overwrite move_1 — should not evict anything.
   store("move_1", make_trajectory("t1_updated"), make_revision());
   EXPECT_EQ(cache.size(), 3u);
-  EXPECT_EQ(cache.peek_unvalidated("move_1")->joint_names[0], "t1_updated");
-  EXPECT_TRUE(cache.peek_unvalidated("move_2").has_value());
-  EXPECT_TRUE(cache.peek_unvalidated("move_3").has_value());
+  EXPECT_EQ(cache.peek_unvalidated(key("move_1"))->joint_names[0],
+            "t1_updated");
+  EXPECT_TRUE(cache.peek_unvalidated(key("move_2")).has_value());
+  EXPECT_TRUE(cache.peek_unvalidated(key("move_3")).has_value());
 }
 
 // --- Empty trajectory ---
@@ -196,12 +256,12 @@ TEST_F(TrajectoryCacheTest, RevisionAware_MismatchRevisionReturnsCandidate) {
   store("move_1", make_trajectory("t1"), rev_old);
 
   const auto candidate =
-      cache.lookup_with_revision("move_1", rev_new, "intent-a");
+      cache.lookup_with_revision(key("move_1"), evidence(rev_new), "intent-a");
   EXPECT_EQ(candidate.disposition,
             TrajectoryCacheLookupDisposition::kRevalidationCandidate);
   ASSERT_TRUE(candidate.trajectory.has_value());
   EXPECT_EQ(candidate.trajectory->joint_names[0], "t1");
-  EXPECT_TRUE(cache.peek_unvalidated("move_1").has_value());
+  EXPECT_TRUE(cache.peek_unvalidated(key("move_1")).has_value());
   EXPECT_EQ(cache.size(), 1u);
 }
 
@@ -211,7 +271,7 @@ TEST_F(TrajectoryCacheTest, RevisionAware_DifferentHashSameIdEvictsFailClosed) {
   store("move_1", make_trajectory("t1"), rev_a);
 
   const auto result =
-      cache.lookup_with_revision("move_1", rev_b, "intent-a");
+      cache.lookup_with_revision(key("move_1"), evidence(rev_b), "intent-a");
   EXPECT_EQ(result.disposition,
             TrajectoryCacheLookupDisposition::kRevisionMismatch);
   EXPECT_FALSE(result.trajectory.has_value());
@@ -223,12 +283,74 @@ TEST_F(TrajectoryCacheTest, RevisionAware_RevisionRollbackEvictsFailClosed) {
   const CollisionWorldRevision rev_older{7, "abc"};
   store("move_1", make_trajectory("t1"), rev_newer);
 
-  const auto result =
-      cache.lookup_with_revision("move_1", rev_older, "intent-a");
+  const auto result = cache.lookup_with_revision(
+      key("move_1"), evidence(rev_older), "intent-a");
   EXPECT_EQ(result.disposition,
             TrajectoryCacheLookupDisposition::kRevisionMismatch);
   EXPECT_FALSE(result.trajectory.has_value());
   EXPECT_EQ(cache.size(), 0u);
+}
+
+TEST_F(TrajectoryCacheTest,
+       RevisionAware_ForwardProjectionRevisionIsRevalidationCandidate) {
+  const CollisionWorldRevision world{7, "abc"};
+  const auto stored_evidence = evidence(world);
+  auto advanced_evidence = stored_evidence;
+  advanced_evidence.projection_revision.scene_revision.revision_id += 1U;
+  advanced_evidence.projection_revision.scene_revision.content_hash =
+      ContentDigest("sha256:" + std::string(64U, '3'));
+  cache.store(key("move_1"), make_trajectory("t1"), stored_evidence,
+              "intent-a");
+
+  const auto result =
+      cache.lookup_with_revision(key("move_1"), advanced_evidence, "intent-a");
+
+  EXPECT_EQ(result.disposition,
+            TrajectoryCacheLookupDisposition::kRevalidationCandidate);
+  ASSERT_TRUE(result.trajectory.has_value());
+  EXPECT_EQ(result.trajectory->joint_names.front(), "t1");
+  EXPECT_EQ(cache.size(), 1U);
+}
+
+TEST_F(TrajectoryCacheTest,
+       RevisionAware_ConflictingProjectionContentEvictsFailClosed) {
+  const CollisionWorldRevision world{7, "abc"};
+  const auto stored_evidence = evidence(world);
+  auto conflicting_evidence = stored_evidence;
+  conflicting_evidence.projection_revision.scene_revision.content_hash =
+      ContentDigest("sha256:" + std::string(64U, '4'));
+  cache.store(key("move_1"), make_trajectory("t1"), stored_evidence,
+              "intent-a");
+
+  const auto result = cache.lookup_with_revision(
+      key("move_1"), conflicting_evidence, "intent-a");
+
+  EXPECT_EQ(result.disposition,
+            TrajectoryCacheLookupDisposition::kRevisionMismatch);
+  EXPECT_FALSE(result.trajectory.has_value());
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(TrajectoryCacheTest,
+       RevisionAware_ForeignProjectionLineageEvictsFailClosed) {
+  const CollisionWorldRevision world{7, "abc"};
+  const auto stored_evidence = evidence(world);
+  auto foreign_evidence = stored_evidence;
+  foreign_evidence.projection_revision.graph_revision =
+      GraphRevision("graph:foreign");
+  foreign_evidence.projection_revision.scene_revision.revision_id += 1U;
+  foreign_evidence.projection_revision.scene_revision.content_hash =
+      ContentDigest("sha256:" + std::string(64U, '5'));
+  cache.store(key("move_1"), make_trajectory("t1"), stored_evidence,
+              "intent-a");
+
+  const auto result =
+      cache.lookup_with_revision(key("move_1"), foreign_evidence, "intent-a");
+
+  EXPECT_EQ(result.disposition,
+            TrajectoryCacheLookupDisposition::kRevisionMismatch);
+  EXPECT_FALSE(result.trajectory.has_value());
+  EXPECT_EQ(cache.size(), 0U);
 }
 
 TEST_F(TrajectoryCacheTest, IntentMismatchMissesAndEvicts) {
@@ -236,7 +358,7 @@ TEST_F(TrajectoryCacheTest, IntentMismatchMissesAndEvicts) {
   store("move_1", make_trajectory("t1"), revision, "intent-a");
 
   const auto result =
-      cache.lookup_with_revision("move_1", revision, "intent-b");
+      cache.lookup_with_revision(key("move_1"), evidence(revision), "intent-b");
   EXPECT_EQ(result.disposition,
             TrajectoryCacheLookupDisposition::kIntentMismatch);
   EXPECT_FALSE(result.trajectory.has_value());
@@ -252,13 +374,15 @@ TEST(TrajectoryCacheIntentTest, EqualResolvedRequestsAreStable) {
 
 TEST(TrajectoryCacheIntentTest, JointGoalOrderingRemainsPartOfIdentity) {
   auto lhs = make_cartesian_request();
-  lhs.motion = ResolvedJointGoalDTO{
-      {ResourceId("resource_a"), ResourceId("resource_b")},
-      {"joint_a", "joint_b"}, {0.2, -0.4}};
+  lhs.motion =
+      ResolvedJointGoalDTO{{ResourceId("resource_a"), ResourceId("resource_b")},
+                           {"joint_a", "joint_b"},
+                           {0.2, -0.4}};
   auto rhs = lhs;
-  rhs.motion = ResolvedJointGoalDTO{
-      {ResourceId("resource_b"), ResourceId("resource_a")},
-      {"joint_b", "joint_a"}, {-0.4, 0.2}};
+  rhs.motion =
+      ResolvedJointGoalDTO{{ResourceId("resource_b"), ResourceId("resource_a")},
+                           {"joint_b", "joint_a"},
+                           {-0.4, 0.2}};
 
   EXPECT_NE(trajectory_cache_intent_identity(lhs),
             trajectory_cache_intent_identity(rhs));
@@ -267,8 +391,8 @@ TEST(TrajectoryCacheIntentTest, JointGoalOrderingRemainsPartOfIdentity) {
 TEST(TrajectoryCacheIntentTest,
      MalformedJointGoalExtraPositionCannotAliasAnotherRequest) {
   auto lhs = make_cartesian_request();
-  lhs.motion = ResolvedJointGoalDTO{{ResourceId("resource_a")},
-                                    {"joint_a"}, {0.2, 1.0}};
+  lhs.motion =
+      ResolvedJointGoalDTO{{ResourceId("resource_a")}, {"joint_a"}, {0.2, 1.0}};
   auto rhs = lhs;
   std::get<ResolvedJointGoalDTO>(rhs.motion).positions_rad[1] = 2.0;
 
@@ -283,8 +407,9 @@ TEST(TrajectoryCacheIntentTest,
   std::get<CartesianPathDTO>(rhs.motion).waypoints[1] =
       make_pose(0.1, 0.05, 0.0);
 
-  ASSERT_EQ(std::get<CartesianPathDTO>(lhs.motion).waypoints.back().position_m.x_m,
-            std::get<CartesianPathDTO>(rhs.motion).waypoints.back().position_m.x_m);
+  ASSERT_EQ(
+      std::get<CartesianPathDTO>(lhs.motion).waypoints.back().position_m.x_m,
+      std::get<CartesianPathDTO>(rhs.motion).waypoints.back().position_m.x_m);
   EXPECT_NE(trajectory_cache_intent_identity(lhs),
             trajectory_cache_intent_identity(rhs));
 }
@@ -302,7 +427,7 @@ TEST(TrajectoryCacheIntentTest, CanonicalModelBindingChangesIdentity) {
   const auto baseline = make_cartesian_request();
   const auto baseline_identity = trajectory_cache_intent_identity(baseline);
 
-  for (const auto& changed : {
+  for (const auto &changed : {
            [&] {
              auto request = baseline;
              request.binding.controllable_component_id =
@@ -324,8 +449,7 @@ TEST(TrajectoryCacheIntentTest, CanonicalModelBindingChangesIdentity) {
            }(),
            [&] {
              auto request = baseline;
-             std::get<ResolvedComponentModelFrameDTO>(
-                 request.binding.tcp_frame)
+             std::get<ResolvedComponentModelFrameDTO>(request.binding.tcp_frame)
                  .compiled_frame_name = "alternate_tcp";
              return request;
            }(),
@@ -338,15 +462,30 @@ TEST(TrajectoryCacheIntentTest, TargetModeReferenceAndProfileChangeIdentity) {
   auto baseline = make_cartesian_request();
   auto relative = baseline;
   relative.target_mode = MotionTargetModeDTO::kRelative;
-  relative.target_reference = ReferenceDTO{};
-  relative.target_reference->type = ReferenceDTO::Type::kFrame;
-  relative.target_reference->id = "fixture";
+  relative.target_reference =
+      ReferenceDTO(ReferenceDTO::Type::kFrameRole, "fixture");
   auto balanced = baseline;
   balanced.planning_profile = PlanningProfileDTO::kBalanced;
 
   const auto baseline_identity = trajectory_cache_intent_identity(baseline);
   EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(relative));
   EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(balanced));
+}
+
+TEST(TrajectoryCacheIntentTest,
+     RuntimeObjectAdmissionBindingChangesRelativeMotionIdentity) {
+  auto baseline = make_cartesian_request();
+  baseline.target_mode = MotionTargetModeDTO::kRelative;
+  baseline.target_reference =
+      ReferenceDTO(ReferenceDTO::Type::kRuntimeObject, "selected-part");
+  baseline.runtime_object_bindings = {
+      {RuntimeObjectId("selected-part"), SceneResourceId("part-a")}};
+  auto rebound = baseline;
+  rebound.runtime_object_bindings.front().scene_resource_id =
+      SceneResourceId("part-b");
+
+  EXPECT_NE(trajectory_cache_intent_identity(baseline),
+            trajectory_cache_intent_identity(rebound));
 }
 
 TEST(TrajectoryCacheIntentTest, DynamicsAndCartesianOptionsChangeIdentity) {
@@ -363,10 +502,8 @@ TEST(TrajectoryCacheIntentTest, DynamicsAndCartesianOptionsChangeIdentity) {
   std::get<CartesianPathDTO>(slower_cartesian.motion).max_linear_speed_mps =
       0.05;
 
-  const auto baseline_identity =
-      trajectory_cache_intent_identity(baseline);
-  EXPECT_NE(baseline_identity,
-            trajectory_cache_intent_identity(capped));
+  const auto baseline_identity = trajectory_cache_intent_identity(baseline);
+  EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(capped));
   EXPECT_NE(baseline_identity,
             trajectory_cache_intent_identity(slower_cartesian));
 }
@@ -380,22 +517,17 @@ TEST(TrajectoryCacheIntentTest,
   auto execution_budget = baseline;
   execution_budget.timeouts.execution_timeout_s = 30.0;
 
-  const auto baseline_identity =
-      trajectory_cache_intent_identity(baseline);
+  const auto baseline_identity = trajectory_cache_intent_identity(baseline);
   EXPECT_NE(baseline_identity,
             trajectory_cache_intent_identity(planning_budget));
   EXPECT_EQ(baseline_identity,
             trajectory_cache_intent_identity(execution_budget));
 }
 
-TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetMissesEvenWhenStoredUnset) {
-  // Revision-aware lookup fails closed when the caller cannot identify the
-  // authoritative collision-world revision.
-  store("move_1", make_trajectory("t1"), CollisionWorldRevision{});
-  auto miss =
-      lookup("move_1", CollisionWorldRevision{});
-  EXPECT_FALSE(miss.has_value());
-  EXPECT_TRUE(cache.peek_unvalidated("move_1").has_value());
+TEST_F(TrajectoryCacheTest, StoreRejectsIncompleteProjectionEvidence) {
+  EXPECT_THROW(store("move_1", make_trajectory("t1"), CollisionWorldRevision{}),
+               std::invalid_argument);
+  EXPECT_EQ(cache.size(), 0U);
 }
 
 TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetButStoredTaggedMisses) {
@@ -403,9 +535,7 @@ TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetButStoredTaggedMisses) {
   store("move_1", make_trajectory("t1"), rev);
 
   // Caller without an authoritative revision MUST NOT see the tagged hit.
-  EXPECT_FALSE(
-      lookup("move_1", CollisionWorldRevision{})
-          .has_value());
+  EXPECT_FALSE(lookup("move_1", CollisionWorldRevision{}).has_value());
 
   // Entry NOT evicted: it remains valid for a future caller that does
   // supply the correct revision.
@@ -414,27 +544,15 @@ TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetButStoredTaggedMisses) {
   ASSERT_TRUE(subsequent.has_value());
 }
 
-TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedTaggedButStoredUnsetEvicts) {
-  // Adapter promoted to publishing revisions after this entry was stored
-  // with an unset tag. The pre-promotion entry can no longer be trusted.
-  store("move_1", make_trajectory("t1"), CollisionWorldRevision{});
-  CollisionWorldRevision rev{7, "abc"};
-  EXPECT_FALSE(lookup("move_1", rev).has_value());
-  EXPECT_EQ(cache.size(), 0u);
-}
-
 TEST_F(TrajectoryCacheTest, RevisionAware_RevisionOfReturnsTaggedValue) {
   CollisionWorldRevision rev{7, "abc"};
   store("move_1", make_trajectory("t1"), rev);
-  auto stored = cache.revision_of("move_1");
+  auto stored = cache.revision_of(key("move_1"));
   ASSERT_TRUE(stored.has_value());
-  EXPECT_EQ(stored->revision_id, 7u);
-  EXPECT_EQ(stored->content_hash, "abc");
-}
-
-TEST_F(TrajectoryCacheTest, RevisionAware_RevisionOfReturnsNulloptForUntagged) {
-  store("move_1", make_trajectory("t1"), CollisionWorldRevision{});
-  EXPECT_FALSE(cache.revision_of("move_1").has_value());
+  EXPECT_EQ(stored->collision_world_revision.revision_id, 7u);
+  EXPECT_EQ(stored->collision_world_revision.content_hash, "abc");
+  EXPECT_EQ(stored->projection_revision,
+            testing::make_test_projection_binding().projection_revision);
 }
 
 TEST_F(TrajectoryCacheTest, RevisionAware_OverwriteUpdatesRevision) {
@@ -444,13 +562,13 @@ TEST_F(TrajectoryCacheTest, RevisionAware_OverwriteUpdatesRevision) {
   store("move_1", make_trajectory("t1_updated"), rev_b);
 
   const auto exact =
-      cache.lookup_with_revision("move_1", rev_b, "intent-a");
+      cache.lookup_with_revision(key("move_1"), evidence(rev_b), "intent-a");
   EXPECT_EQ(exact.disposition, TrajectoryCacheLookupDisposition::kHit);
   ASSERT_TRUE(exact.trajectory.has_value());
   EXPECT_EQ(exact.trajectory->joint_names[0], "t1_updated");
 
   const auto rollback =
-      cache.lookup_with_revision("move_1", rev_a, "intent-a");
+      cache.lookup_with_revision(key("move_1"), evidence(rev_a), "intent-a");
   EXPECT_EQ(rollback.disposition,
             TrajectoryCacheLookupDisposition::kRevisionMismatch);
   EXPECT_FALSE(rollback.trajectory.has_value());
@@ -461,10 +579,10 @@ TEST_F(TrajectoryCacheTest, StoreEmptyTrajectory) {
   TrajectoryDTO empty;
   EXPECT_TRUE(empty.empty());
   store("move_empty", empty, make_revision());
-  auto result = cache.peek_unvalidated("move_empty");
+  auto result = cache.peek_unvalidated(key("move_empty"));
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->empty());
 }
 
-}  // namespace
-}  // namespace manyforge::core
+} // namespace
+} // namespace manyforge::core

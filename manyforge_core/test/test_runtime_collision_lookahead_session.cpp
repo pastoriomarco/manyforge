@@ -162,6 +162,26 @@ RuntimeCollisionQueryBundlePtr make_bundle(std::uint64_t epoch, std::uint64_t re
   return make_bundle(epoch, revision, std::move(policy));
 }
 
+ProjectionRevisionDTO make_projection_revision(
+    std::uint64_t revision, char content_digit = '2',
+    std::string retained_bundle_id = "bundle:lookahead",
+    std::string graph_revision = "graph:lookahead",
+    char scene_digit = '1') {
+  return ProjectionRevisionDTO{
+      RetainedBundleId(std::move(retained_bundle_id)),
+      GraphRevision(std::move(graph_revision)),
+      SceneRevision{SceneId("sha256:" + std::string(64U, scene_digit)), revision,
+                    ContentDigest("sha256:" +
+                                  std::string(64U, content_digit))}};
+}
+
+RuntimeCollisionQueryBundlePtr with_projection_revision(
+    RuntimeCollisionQueryBundlePtr source, ProjectionRevisionDTO revision) {
+  auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*source);
+  bundle->projection_revision = std::move(revision);
+  return bundle;
+}
+
 RuntimeCollisionQueryBundlePtr with_contact_grasp_world_bodies(
     RuntimeCollisionQueryBundlePtr source) {
   auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*source);
@@ -1230,6 +1250,148 @@ TEST(RuntimeCollisionLookaheadSessionTest, ClearResultCannotCertifyARevisionPubl
   const auto result = sink.wait();
   EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kSupersededRevision);
   EXPECT_EQ(result.reason, "runtime_lookahead_revision_superseded");
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     AcceptsSameLineageForwardProjectionAndStampsTheExactResult) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  const auto admission = make_projection_revision(10U, '2');
+  const auto forward = make_projection_revision(11U, '3');
+  publisher.bundle = with_projection_revision(make_bundle(1, 10), forward);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
+  auto engine =
+      std::make_shared<TestLookaheadEngine>("lookahead-projection-forward");
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*,
+              RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      },
+      accept_test_authority());
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "",
+              admission);
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+  const auto result = sink.wait();
+  EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kClear);
+  ASSERT_TRUE(result.projection_revision.has_value());
+  EXPECT_EQ(*result.projection_revision, forward);
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     RejectsMissingForeignRollbackAndConflictingProjectionLineage) {
+  const auto admission = make_projection_revision(10U, '2');
+  const std::vector<std::pair<std::string, RuntimeCollisionQueryBundlePtr>>
+      invalid_bundles{
+          {"missing", make_bundle(1, 10)},
+          {"foreign_bundle",
+           with_projection_revision(
+               make_bundle(1, 10),
+               make_projection_revision(10U, '2', "bundle:foreign"))},
+          {"foreign_graph",
+           with_projection_revision(
+               make_bundle(1, 10),
+               make_projection_revision(10U, '2', "bundle:lookahead",
+                                        "graph:foreign"))},
+          {"foreign_scene",
+           with_projection_revision(
+               make_bundle(1, 10),
+               make_projection_revision(10U, '2', "bundle:lookahead",
+                                        "graph:lookahead", '4'))},
+          {"rollback",
+           with_projection_revision(make_bundle(1, 10),
+                                    make_projection_revision(9U, '5'))},
+          {"same_revision_conflict",
+           with_projection_revision(make_bundle(1, 10),
+                                    make_projection_revision(10U, '6'))},
+      };
+
+  for (const auto &[label, invalid_bundle] : invalid_bundles) {
+    SCOPED_TRACE(label);
+    FakeClock clock;
+    clock.set(1'000'000'000);
+    ManualScheduler scheduler;
+    TestPublisher publisher;
+    publisher.bundle = invalid_bundle;
+    ExecutionProgressPublication progress(
+        ExecutionProgressSourceKind::kBackendCommanded,
+        ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+    ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
+    auto engine = std::make_shared<TestLookaheadEngine>(
+        "lookahead-projection-invalid-" + label);
+    ResultSink sink;
+    RuntimeCollisionLookaheadSession::Config config;
+    config.workers = 1;
+    RuntimeCollisionLookaheadSession session(
+        config, clock, scheduler, publisher, progress, {engine},
+        [&sink](const RuntimeCollisionLookaheadSession*,
+                RuntimeCollisionLookaheadResult result) {
+          sink.push(std::move(result));
+        },
+        accept_test_authority());
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "",
+                admission);
+    ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+    const auto result = sink.wait();
+    EXPECT_EQ(result.status,
+              RuntimeCollisionLookaheadResultStatus::kInconclusive);
+    EXPECT_EQ(result.reason, "runtime_lookahead_projection_revision_mismatch");
+    EXPECT_FALSE(result.projection_revision.has_value());
+  }
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     ClearResultCannotCertifyAProjectionSupersededDuringTheJob) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  const auto admission = make_projection_revision(10U, '2');
+  publisher.bundle =
+      with_projection_revision(make_bundle(1, 10), admission);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>(
+      "lookahead-projection-superseded");
+  std::atomic<bool> replaced{false};
+  engine->on_check = [&]() {
+    if (!replaced.exchange(true)) {
+      std::lock_guard<std::mutex> lock(publisher.mutex);
+      publisher.bundle = with_projection_revision(
+          publisher.bundle, make_projection_revision(11U, '3'));
+    }
+  };
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*,
+              RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      },
+      accept_test_authority());
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "",
+              admission);
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+  const auto result = sink.wait();
+  EXPECT_EQ(result.status,
+            RuntimeCollisionLookaheadResultStatus::kSupersededRevision);
+  EXPECT_EQ(result.reason,
+            "runtime_lookahead_projection_revision_superseded");
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest,

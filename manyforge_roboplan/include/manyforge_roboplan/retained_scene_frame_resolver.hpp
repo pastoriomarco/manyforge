@@ -315,9 +315,13 @@ class RetainedSceneFrameResolver final : public core::IReferencePoseResolver {
 
   ~RetainedSceneFrameResolver() override;
 
+  [[nodiscard]] core::Result<core::ProgramFrameResolutionContextDTO>
+  capture_program_frame_resolution_context(
+      core::ProgramFrameResolutionCaptureDTO capture) const override;
+
   [[nodiscard]] core::Result<core::Pose3DTO> resolve_reference_pose(
-      const core::ReferenceDTO& reference, const std::string& base_frame,
-      const core::ProjectionLeaseBindingDTO& projection_binding) const override;
+      const core::ReferenceDTO& reference,
+      const core::ProgramFrameResolutionContextDTO& context) const override;
 
   [[nodiscard]] core::Result<core::ResolvedSceneFramePoseDTO> resolve_scene_frame(
       const core::SceneFrameRefDTO& reference,

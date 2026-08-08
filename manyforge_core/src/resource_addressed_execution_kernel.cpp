@@ -211,7 +211,12 @@ template <typename T>
       resolved_component_frame(binding, *tcp),
       {},
       {},
-      control.runtime_scale_qualification};
+      control.runtime_scale_qualification,
+      binding.retained_bundle_id,
+      binding.graph_revision,
+      binding.target_role_id,
+      binding.frame_bindings,
+      binding.collision_body_bindings};
 
   ExecuteRequestDTO request(std::move(exact_binding));
   request.move_id = motion.move_id.value();

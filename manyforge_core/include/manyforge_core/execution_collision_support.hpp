@@ -1,5 +1,8 @@
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <cstdint>
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/collision/i_collision_diagnostic_comparator.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
@@ -11,10 +14,6 @@
 #include <manyforge_core/types/robot_state.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 #include <manyforge_core/types/validation.hpp>
-
-#include <array>
-#include <atomic>
-#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -29,19 +28,13 @@ std::string comma_join_strings(const std::vector<std::string>& values);
 std::string comma_join_doubles(const std::vector<double>& values);
 std::string format_double(double value);
 
-bool snapshot_too_old(std::int64_t now_ns,
-                      std::int64_t timestamp_ns,
-                      std::int64_t max_age_ns,
-                      std::map<std::string, std::string>& details,
-                      const std::string& timestamp_key,
-                      const std::string& age_key,
-                      const std::string& budget_key);
+bool snapshot_too_old(std::int64_t now_ns, std::int64_t timestamp_ns, std::int64_t max_age_ns,
+                      std::map<std::string, std::string>& details, const std::string& timestamp_key,
+                      const std::string& age_key, const std::string& budget_key);
 std::optional<std::string> validate_dynamic_body_freshness(
     const CollisionWorldSnapshot& snapshot,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness,
-    std::int64_t now_ns,
-    std::int64_t runtime_cap_ns,
-    std::map<std::string, std::string>& details);
+    const std::vector<CollisionWorldBodyFreshness>& body_freshness, std::int64_t now_ns,
+    std::int64_t runtime_cap_ns, std::map<std::string, std::string>& details);
 
 enum class RuntimeDynamicBodyFreshnessStatus {
   kFresh,
@@ -52,8 +45,7 @@ enum class RuntimeDynamicBodyFreshnessStatus {
 };
 
 struct RuntimeDynamicBodyFreshnessCheck {
-  RuntimeDynamicBodyFreshnessStatus status =
-      RuntimeDynamicBodyFreshnessStatus::kFresh;
+  RuntimeDynamicBodyFreshnessStatus status = RuntimeDynamicBodyFreshnessStatus::kFresh;
   const CollisionWorldBody* body = nullptr;
   const CollisionWorldBodyFreshness* freshness = nullptr;
   std::int64_t effective_budget_ns = 0;
@@ -62,10 +54,8 @@ struct RuntimeDynamicBodyFreshnessCheck {
 
 RuntimeDynamicBodyFreshnessCheck check_runtime_dynamic_body_freshness(
     const CollisionWorldSnapshot& snapshot,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness,
-    std::int64_t now_ns,
-    std::int64_t runtime_cap_ns,
-    bool lookup_order_prevalidated = false) noexcept;
+    const std::vector<CollisionWorldBodyFreshness>& body_freshness, std::int64_t now_ns,
+    std::int64_t runtime_cap_ns, bool lookup_order_prevalidated = false) noexcept;
 const char* runtime_dynamic_body_freshness_reason(
     RuntimeDynamicBodyFreshnessStatus status) noexcept;
 
@@ -77,8 +67,7 @@ struct RuntimeCollisionStateProjection {
 };
 
 Result<RuntimeCollisionStateProjection> build_runtime_collision_state_projection(
-    const TrajectoryDTO& source_trajectory,
-    const TrajectoryDTO& collision_trajectory);
+    const TrajectoryDTO& source_trajectory, const TrajectoryDTO& collision_trajectory);
 
 struct RuntimeCollisionStopCoverageSummary {
   static constexpr std::size_t kUnavailableReasonCount = 9;
@@ -87,8 +76,7 @@ struct RuntimeCollisionStopCoverageSummary {
   std::uint64_t queries_executed = 0;
   std::uint64_t unavailable_ticks = 0;
   std::uint64_t longest_unavailable_ns = 0;
-  std::array<std::uint64_t, kUnavailableReasonCount>
-      unavailable_by_reason{};
+  std::array<std::uint64_t, kUnavailableReasonCount> unavailable_by_reason{};
 };
 
 enum class RuntimeCollisionUnavailableReason : std::size_t {
@@ -102,9 +90,8 @@ enum class RuntimeCollisionUnavailableReason : std::size_t {
   kCollisionQuery,
   kOther,
 };
-static_assert(
-    static_cast<std::size_t>(RuntimeCollisionUnavailableReason::kOther) + 1 ==
-    RuntimeCollisionStopCoverageSummary::kUnavailableReasonCount);
+static_assert(static_cast<std::size_t>(RuntimeCollisionUnavailableReason::kOther) + 1 ==
+              RuntimeCollisionStopCoverageSummary::kUnavailableReasonCount);
 
 RuntimeCollisionUnavailableReason classify_runtime_collision_unavailable_reason(
     std::string_view reason) noexcept;
@@ -134,21 +121,17 @@ class RuntimeCollisionStopCoverageTracker final {
   void record_tick(std::uint64_t generation) noexcept;
   void record_observed_source(ObservedRobotStateSourceKind source_kind,
                               std::uint64_t source_age_ns) noexcept;
-  void record_query(std::uint64_t generation,
-                    std::int64_t now_ns) noexcept;
-  void record_unavailable(std::uint64_t generation,
-                          RuntimeCollisionUnavailableReason reason,
+  void record_query(std::uint64_t generation, std::int64_t now_ns) noexcept;
+  void record_unavailable(std::uint64_t generation, RuntimeCollisionUnavailableReason reason,
                           std::int64_t now_ns) noexcept;
-  bool should_emit_unavailable(std::uint64_t reason_hash,
-                               std::int64_t now_ns) noexcept;
-  std::optional<RuntimeCollisionStopCoverageSummary> complete(
-      std::uint64_t generation, std::int64_t now_ns) noexcept;
+  bool should_emit_unavailable(std::uint64_t reason_hash, std::int64_t now_ns) noexcept;
+  std::optional<RuntimeCollisionStopCoverageSummary> complete(std::uint64_t generation,
+                                                              std::int64_t now_ns) noexcept;
   [[nodiscard]] std::uint64_t active_generation() const noexcept;
   [[nodiscard]] RuntimeCollisionStopCoverageMetrics metrics() const noexcept;
 
  private:
-  static void update_max(std::atomic<std::uint64_t>& target,
-                         std::uint64_t value) noexcept;
+  static void update_max(std::atomic<std::uint64_t>& target, std::uint64_t value) noexcept;
 
   std::atomic<std::uint64_t> generation_{0};
   std::atomic<std::uint64_t> windows_started_{0};
@@ -178,39 +161,33 @@ class RuntimeCollisionStopCoverageTracker final {
   std::atomic<std::uint64_t> unavailable_events_suppressed_{0};
 };
 
-Result<CollisionWorldPolicySnapshotBundle>
-load_collision_world_policy_snapshot_bundle(
+Result<CollisionWorldPolicySnapshotBundle> load_collision_world_policy_snapshot_bundle(
     const ICollisionWorldSnapshotPublisher& publisher);
-Result<RuntimeCollisionQueryBundlePtr>
-load_published_runtime_collision_query_bundle(
+Result<RuntimeCollisionQueryBundlePtr> load_published_runtime_collision_query_bundle(
     const ICollisionWorldSnapshotPublisher& publisher);
 
 RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
-    CollisionWorldPolicySnapshotBundle bundle, std::uint64_t epoch);
+    CollisionWorldPolicySnapshotBundle bundle, std::uint64_t epoch,
+    std::optional<ProjectionRevisionDTO> projection_revision = std::nullopt);
 bool runtime_collision_lookup_order_is_valid(
     const CollisionWorldSnapshot& world,
     const std::vector<CollisionWorldBodyFreshness>& body_freshness) noexcept;
 
-void append_collision_failure_diagnostics(
-    std::map<std::string, std::string>& details,
-    const CollisionValidationDecisionBundle& bundle);
+void append_collision_failure_diagnostics(std::map<std::string, std::string>& details,
+                                          const CollisionValidationDecisionBundle& bundle);
 /// Build the native contact-policy violation payload for the selected failing
 /// support-contact record. Returns nullopt for ordinary collisions and for
 /// contact-grasp failures, which retain their existing event taxonomy.
-std::optional<std::map<std::string, std::string>>
-contact_policy_violation_details(
-    const CollisionValidationDecisionBundle& bundle,
-    const CollisionPolicySnapshot& policy,
+std::optional<std::map<std::string, std::string>> contact_policy_violation_details(
+    const CollisionValidationDecisionBundle& bundle, const CollisionPolicySnapshot& policy,
     std::string_view response,
     std::optional<std::size_t> initial_contact_pair_count = std::nullopt);
 std::string pre_dispatch_collision_validation_message(
-    const std::map<std::string, std::string>& details,
-    CollisionDecisionAction action);
-void append_collision_compare_diagnostics(
-    std::map<std::string, std::string>& details,
-    const CollisionValidationDecisionBundle& bundle,
-    const TrajectoryDTO& trajectory,
-    const ICollisionDiagnosticComparator& comparator);
+    const std::map<std::string, std::string>& details, CollisionDecisionAction action);
+void append_collision_compare_diagnostics(std::map<std::string, std::string>& details,
+                                          const CollisionValidationDecisionBundle& bundle,
+                                          const TrajectoryDTO& trajectory,
+                                          const ICollisionDiagnosticComparator& comparator);
 CollisionCheckResultDTO collision_check_result_from_bundle(
     const CollisionValidationDecisionBundle& bundle);
 
