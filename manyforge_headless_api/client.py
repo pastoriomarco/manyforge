@@ -174,6 +174,16 @@ class HeadlessHttpClient:
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/operations", body=body)
 
+    def plan_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/execution/pick-place/plans/pick", body=body
+        )
+
+    def plan_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/execution/pick-place/plans/place", body=body
+        )
+
     @staticmethod
     def _operation_path(operation_id: str) -> str:
         if not operation_id or len(operation_id.encode("utf-8")) > 256:

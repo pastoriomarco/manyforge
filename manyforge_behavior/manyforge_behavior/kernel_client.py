@@ -41,6 +41,14 @@ class HeadlessExecutionTransport(Protocol):
     def operation_runtime_scale(self, operation_id: str) -> dict[str, Any]: ...
 
 
+class HeadlessPickPlacePlanningTransport(Protocol):
+    """Optional stateless planning extension over the base execution client."""
+
+    def plan_pick(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def plan_place(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+
 class KernelClientResponseError(RuntimeError):
     """Raised when a transport returns a successful but malformed projection."""
 
@@ -147,6 +155,22 @@ class KernelClient:
     def execute(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         return self._successful(
             self._transport.execute(intent), label="submission"
+        )
+
+    def plan_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        method = getattr(self._transport, "plan_pick", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable plan_pick")
+        return self._successful(
+            method(intent), label="pick planning"
+        )
+
+    def plan_place(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        method = getattr(self._transport, "plan_place", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable plan_place")
+        return self._successful(
+            method(intent), label="place planning"
         )
 
     def operation(self, operation_id: str) -> dict[str, Any]:

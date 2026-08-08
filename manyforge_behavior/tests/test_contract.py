@@ -5,7 +5,7 @@ import pytest
 from manyforge_behavior.kernel_client import KernelClient
 
 
-def test_contract_requires_only_the_three_headless_transport_calls() -> None:
+def test_contract_requires_the_base_headless_transport_calls() -> None:
     class IncompleteTransport:
         def execution_status(self):
             return {"ok": True}
@@ -31,4 +31,6 @@ def test_contract_constructor_does_not_call_the_transport() -> None:
         set_operation_runtime_scale = PoisonCallable()
         operation_runtime_scale = PoisonCallable()
 
-    KernelClient(Transport())
+    client = KernelClient(Transport())
+    with pytest.raises(TypeError, match="plan_pick"):
+        client.plan_pick({"sequence_id": "pick-1"})

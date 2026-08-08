@@ -28,6 +28,20 @@ class FakeTransport:
         self.submitted = body
         return {"ok": True, "accepted": {"operation_id": "operation-1"}}
 
+    def plan_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.submitted = body
+        return {
+            "ok": True,
+            "planning_result": {"kind": "pick", "sequence_id": "pick-1"},
+        }
+
+    def plan_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.submitted = body
+        return {
+            "ok": True,
+            "planning_result": {"kind": "place", "sequence_id": "place-1"},
+        }
+
     def operation(self, operation_id: str) -> dict[str, Any]:
         return {
             "ok": True,
@@ -113,6 +127,12 @@ def test_kernel_client_only_forwards_bounded_headless_operations() -> None:
         "operation_id"
     ] == "operation-1"
     assert transport.submitted == {"program_id": "program-1"}
+    assert client.plan_pick({"sequence_id": "pick-1"})["planning_result"][
+        "kind"
+    ] == "pick"
+    assert client.plan_place({"sequence_id": "place-1"})["planning_result"][
+        "kind"
+    ] == "place"
     assert client.operation("operation-1")["operation"]["state"] == "completed"
     request = {"expected_operation_revision": 1}
     stop_request = {

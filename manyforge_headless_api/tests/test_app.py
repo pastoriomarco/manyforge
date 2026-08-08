@@ -228,6 +228,26 @@ class FakeExecution:
             "operation": {"operation_id": operation_id},
         }
 
+    def plan_pick(
+        self,
+        request: object,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.requests.append(("plan_pick", request))
+        self.principals.append(("plan_pick", trusted_principal_id))
+        return {"ok": True, "command": "plan_pick", "planning_result": {}}
+
+    def plan_place(
+        self,
+        request: object,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.requests.append(("plan_place", request))
+        self.principals.append(("plan_place", trusted_principal_id))
+        return {"ok": True, "command": "plan_place", "planning_result": {}}
+
     def _control(
         self,
         kind: str,
@@ -611,6 +631,8 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/operations/{operation_id}/acknowledge-completed",
         "/api/execution/operations/{operation_id}/runtime-scale",
         "/api/execution/stops",
+        "/api/execution/pick-place/plans/pick",
+        "/api/execution/pick-place/plans/place",
     }.issubset(paths)
     assert "/api/kernel/stop" not in paths
     assert "/api/cycle/stop" not in paths

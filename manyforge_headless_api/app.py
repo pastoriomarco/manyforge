@@ -21,6 +21,8 @@ from .models import (
     ManagerApplyRequest,
     OperationControlRequest,
     OperationIntentRequest,
+    PickSequencePlanningRequest,
+    PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
     SceneTransactionRequest,
     StopIntentRequest,
@@ -343,6 +345,28 @@ def create_app(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
     ) -> JSONResponse:
         return execution_response(service.execution_read(operation_id))
+
+    @app.post("/api/execution/pick-place/plans/pick")
+    def execution_plan_pick(
+        body: PickSequencePlanningRequest,
+        request: Request,
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_plan_pick(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.post("/api/execution/pick-place/plans/place")
+    def execution_plan_place(
+        body: PlaceSequencePlanningRequest,
+        request: Request,
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_plan_place(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
 
     def require_matching_operation(
         path_operation_id: str,

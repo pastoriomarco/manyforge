@@ -832,6 +832,42 @@ class JointGoalRequest(StrictRequest):
         return self
 
 
+class PoseGoalRequest(StrictRequest):
+    kind: Literal["pose_goal"]
+    goal: Pose3Request
+
+
+class CartesianPathRequest(StrictRequest):
+    kind: Literal["cartesian_path"]
+    waypoints: Annotated[list[Pose3Request], Field(min_length=1, max_length=4096)]
+    max_translation_step_m: Annotated[
+        float, Field(gt=0, allow_inf_nan=False)
+    ]
+    max_rotation_step_rad: Annotated[
+        float, Field(gt=0, allow_inf_nan=False)
+    ]
+    speed_mode: Literal["bounded"]
+    max_linear_speed_mps: Annotated[
+        float, Field(gt=0, allow_inf_nan=False)
+    ]
+    max_angular_speed_rad_s: Annotated[
+        float, Field(gt=0, allow_inf_nan=False)
+    ]
+    max_linear_acceleration_mps2: Annotated[
+        float, Field(gt=0, allow_inf_nan=False)
+    ]
+    max_angular_acceleration_rad_s2: Annotated[
+        float, Field(gt=0, allow_inf_nan=False)
+    ]
+    fallback_policy: Literal["fail_closed", "allow_joint_space_fallback"]
+
+
+MotionSpecRequest = Annotated[
+    JointGoalRequest | PoseGoalRequest | CartesianPathRequest,
+    Field(discriminator="kind"),
+]
+
+
 class AngularPositionRequest(StrictRequest):
     kind: Literal["angular_rad"]
     value_rad: Annotated[float, Field(allow_inf_nan=False)]
@@ -921,6 +957,20 @@ class CapabilityCommandParticipantRequest(StrictRequest):
         return self
 
 
+class RuntimeObjectReferenceBindingRequest(StrictRequest):
+    runtime_object_id: str
+    scene_resource_id: str
+
+    @field_validator("runtime_object_id", "scene_resource_id")
+    @classmethod
+    def validate_runtime_object_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
 class MotionParticipantRequest(StrictRequest):
     kind: Literal["motion"]
     move_id: str
@@ -934,14 +984,21 @@ class MotionParticipantRequest(StrictRequest):
     target_mode: Literal["absolute"]
     target_reference: None = None
     offset_reference: None = None
-    motion: JointGoalRequest
-    contact_policy_id: None = None
+    motion: MotionSpecRequest
+    contact_policy_id: str | None = None
     per_joint_dynamics_limits: dict[str, JointDynamicsLimitRequest]
     motion_interrupt_scopes: Annotated[list[None], Field(max_length=0)]
+    runtime_object_bindings: list[RuntimeObjectReferenceBindingRequest] = Field(
+        default_factory=list, max_length=4096
+    )
 
-    @field_validator("move_id", "base_frame_role_id", "tcp_frame_role_id")
+    @field_validator(
+        "move_id", "base_frame_role_id", "tcp_frame_role_id", "contact_policy_id"
+    )
     @classmethod
-    def validate_motion_identity(cls, value: str, info) -> str:
+    def validate_motion_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return _bounded_nfc(
             value,
             label=info.field_name,
@@ -962,6 +1019,23 @@ class MotionParticipantRequest(StrictRequest):
                 maximum_bytes=MAX_IDENTITY_BYTES,
             )
         return values
+
+    @model_validator(mode="after")
+    def validate_motion_scoped_fields(self) -> "MotionParticipantRequest":
+        runtime_objects = [
+            value.runtime_object_id for value in self.runtime_object_bindings
+        ]
+        if len(runtime_objects) != len(set(runtime_objects)):
+            raise ValueError(
+                "runtime_object_bindings must have unique runtime_object_id values"
+            )
+        if isinstance(self.motion, JointGoalRequest) and (
+            self.contact_policy_id is not None or self.runtime_object_bindings
+        ):
+            raise ValueError(
+                "joint_goal cannot carry contact-policy or runtime-object bindings"
+            )
+        return self
 
 
 class OperationParticipantRequest(StrictRequest):
@@ -1025,6 +1099,240 @@ class OperationIntentRequest(StrictRequest):
             and span.program_run_id != self.program_run_id
         ):
             raise ValueError("action span program_run_id must match the operation")
+        return self
+
+
+class PickOffsetEnvelopeRequest(StrictRequest):
+    position_min_m: Annotated[
+        list[Annotated[float, Field(allow_inf_nan=False)]],
+        Field(min_length=3, max_length=3),
+    ]
+    position_max_m: Annotated[
+        list[Annotated[float, Field(allow_inf_nan=False)]],
+        Field(min_length=3, max_length=3),
+    ]
+    orientation_rpy_min_deg: Annotated[
+        list[Annotated[float, Field(allow_inf_nan=False)]],
+        Field(min_length=3, max_length=3),
+    ]
+    orientation_rpy_max_deg: Annotated[
+        list[Annotated[float, Field(allow_inf_nan=False)]],
+        Field(min_length=3, max_length=3),
+    ]
+
+    @model_validator(mode="after")
+    def validate_ordered_envelope(self) -> "PickOffsetEnvelopeRequest":
+        if any(
+            minimum > maximum
+            for minimum, maximum in zip(
+                self.position_min_m, self.position_max_m, strict=True
+            )
+        ) or any(
+            minimum > maximum
+            for minimum, maximum in zip(
+                self.orientation_rpy_min_deg,
+                self.orientation_rpy_max_deg,
+                strict=True,
+            )
+        ):
+            raise ValueError("pick envelope minima cannot exceed maxima")
+        return self
+
+
+class PickCandidateSynthesisRequest(StrictRequest):
+    pick_offset_envelope: PickOffsetEnvelopeRequest = Field(
+        default_factory=lambda: PickOffsetEnvelopeRequest(
+            position_min_m=[0.0, 0.0, 0.0],
+            position_max_m=[0.0, 0.0, 0.0],
+            orientation_rpy_min_deg=[0.0, 0.0, 0.0],
+            orientation_rpy_max_deg=[0.0, 0.0, 0.0],
+        )
+    )
+    approach_offset_envelope: PickOffsetEnvelopeRequest = Field(
+        default_factory=lambda: PickOffsetEnvelopeRequest(
+            position_min_m=[0.0, 0.0, 0.05],
+            position_max_m=[0.0, 0.0, 0.1],
+            orientation_rpy_min_deg=[0.0, 0.0, 0.0],
+            orientation_rpy_max_deg=[0.0, 0.0, 0.0],
+        )
+    )
+    pick_offset_uses_candidate_tcp: bool = False
+    approach_offset_uses_candidate_tcp: bool = False
+    base_tool_orientation_rpy_deg: Annotated[
+        list[Annotated[float, Field(allow_inf_nan=False)]],
+        Field(min_length=3, max_length=3),
+    ] = Field(default_factory=lambda: [180.0, 0.0, 0.0])
+    translation_step_m: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 0.01
+    rotation_step_deg: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 15.0
+    force_vertical_pick: bool = False
+    min_tcp_z_m: Annotated[float | None, Field(ge=0, allow_inf_nan=False)] = None
+    maximum_candidate_count: Annotated[int, Field(ge=1, le=4096)] = 4096
+    search_strategy: Literal["first_feasible", "best_cost"] = "first_feasible"
+
+
+def _validate_pick_place_operations(
+    approach: OperationIntentRequest,
+    descend: OperationIntentRequest,
+    tool: OperationIntentRequest,
+    retreat: OperationIntentRequest,
+) -> None:
+    operations = (approach, descend, tool, retreat)
+    request_ids = [operation.request_context.request_id for operation in operations]
+    if len(request_ids) != len(set(request_ids)):
+        raise ValueError("pick/place phase request_id values must be distinct")
+    contexts = {
+        (
+            operation.program_id,
+            operation.program_revision,
+            operation.program_binding_id,
+            operation.program_run_id,
+            operation.expected_graph_revision,
+            operation.expected_retained_bundle_id,
+            operation.expected_scene_revision,
+            operation.request_context.request_owner_epoch,
+        )
+        for operation in operations
+    }
+    if len(contexts) != 1:
+        raise ValueError("pick/place phases must share one Program and owner context")
+    if approach.expected_scene_revision is None:
+        raise ValueError("pick/place planning requires one exact scene revision")
+    if not isinstance(approach.participants[0].payload, MotionParticipantRequest):
+        raise ValueError("pick/place approach must be a motion operation")
+    if not isinstance(descend.participants[0].payload, MotionParticipantRequest):
+        raise ValueError("pick/place descend must be a motion operation")
+    if not isinstance(tool.participants[0].payload, CapabilityCommandParticipantRequest):
+        raise ValueError("pick/place tool phase must be a capability command")
+    if not isinstance(retreat.participants[0].payload, MotionParticipantRequest):
+        raise ValueError("pick/place retreat must be a motion operation")
+    motion_participants = (
+        approach.participants[0],
+        descend.participants[0],
+        retreat.participants[0],
+    )
+    motion_targets = {
+        (
+            participant.component_role_id,
+            participant.target_role_id,
+            participant.required_capability_id,
+            participant.payload.base_frame_role_id,
+            participant.payload.tcp_frame_role_id,
+        )
+        for participant in motion_participants
+        if isinstance(participant.payload, MotionParticipantRequest)
+    }
+    if len(motion_targets) != 1:
+        raise ValueError("pick/place motion phases must share one target and frame set")
+
+
+class PickSequencePlanningRequest(StrictRequest):
+    sequence_id: str
+    selected_object_id: str
+    selected_runtime_object_id: str
+    carrier_frame_role_id: str
+    synthesis: PickCandidateSynthesisRequest = Field(
+        default_factory=PickCandidateSynthesisRequest
+    )
+    approach_operation: OperationIntentRequest
+    descend_operation: OperationIntentRequest
+    tool_operation: OperationIntentRequest
+    retreat_operation: OperationIntentRequest
+
+    @field_validator("sequence_id")
+    @classmethod
+    def validate_sequence_id(cls, value: str) -> str:
+        return _bounded_nfc(value, label="sequence_id", maximum_bytes=96)
+
+    @field_validator(
+        "selected_object_id", "selected_runtime_object_id", "carrier_frame_role_id"
+    )
+    @classmethod
+    def validate_pick_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def validate_pick_phases(self) -> "PickSequencePlanningRequest":
+        _validate_pick_place_operations(
+            self.approach_operation,
+            self.descend_operation,
+            self.tool_operation,
+            self.retreat_operation,
+        )
+        approach = self.approach_operation.participants[0].payload
+        descend = self.descend_operation.participants[0].payload
+        retreat = self.retreat_operation.participants[0].payload
+        if not all(
+            isinstance(value, MotionParticipantRequest)
+            for value in (approach, descend, retreat)
+        ):
+            return self
+        if approach.contact_policy_id is not None or approach.runtime_object_bindings:
+            raise ValueError("pick approach cannot carry contact-policy state")
+        if (
+            descend.contact_policy_id is None
+            or len(descend.runtime_object_bindings) != 1
+            or descend.runtime_object_bindings[0].runtime_object_id
+            != self.selected_runtime_object_id
+            or descend.runtime_object_bindings[0].scene_resource_id
+            != self.selected_object_id
+        ):
+            raise ValueError(
+                "pick descend requires one exact selected-object contact binding"
+            )
+        if retreat.contact_policy_id is not None or retreat.runtime_object_bindings:
+            raise ValueError("pick retreat cannot carry contact-policy state")
+        return self
+
+
+class PlaceSequencePlanningRequest(StrictRequest):
+    sequence_id: str
+    selected_object_id: str
+    carrier_frame_role_id: str
+    approach_operation: OperationIntentRequest
+    descend_operation: OperationIntentRequest
+    tool_operation: OperationIntentRequest
+    retreat_operation: OperationIntentRequest
+
+    @field_validator("sequence_id")
+    @classmethod
+    def validate_sequence_id(cls, value: str) -> str:
+        return _bounded_nfc(value, label="sequence_id", maximum_bytes=96)
+
+    @field_validator("selected_object_id", "carrier_frame_role_id")
+    @classmethod
+    def validate_place_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def validate_place_phases(self) -> "PlaceSequencePlanningRequest":
+        _validate_pick_place_operations(
+            self.approach_operation,
+            self.descend_operation,
+            self.tool_operation,
+            self.retreat_operation,
+        )
+        motions = (
+            self.approach_operation.participants[0].payload,
+            self.descend_operation.participants[0].payload,
+            self.retreat_operation.participants[0].payload,
+        )
+        if any(
+            not isinstance(value, MotionParticipantRequest)
+            or value.contact_policy_id is not None
+            or bool(value.runtime_object_bindings)
+            for value in motions
+        ):
+            raise ValueError(
+                "place motion phases cannot carry contact-policy state"
+            )
         return self
 
 

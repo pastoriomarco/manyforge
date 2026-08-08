@@ -14,6 +14,8 @@ from .models import (
     ManagerApplyRequest,
     OperationControlRequest,
     OperationIntentRequest,
+    PickSequencePlanningRequest,
+    PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
     SceneTransactionRequest,
     StopIntentRequest,
@@ -66,6 +68,24 @@ class HeadlessService:
 
     def execution_read(self, operation_id: str) -> dict[str, Any]:
         return self._execution().read(operation_id)
+
+    def execution_plan_pick(
+        self,
+        request: PickSequencePlanningRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().plan_pick(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
+    def execution_plan_place(
+        self,
+        request: PlaceSequencePlanningRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().plan_place(
+            request, trusted_principal_id=attribution.principal_id
+        )
 
     def execution_pause(
         self,

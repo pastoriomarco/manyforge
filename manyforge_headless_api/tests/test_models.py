@@ -7,8 +7,11 @@ from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ManagerApplyRequest,
+    MotionParticipantRequest,
     OperationControlRequest,
     OperationParticipantRequest,
+    PickSequencePlanningRequest,
+    PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
     SceneTransactionRequest,
     StopIntentRequest,
@@ -22,6 +25,248 @@ def _caller() -> dict[str, object]:
         "source_label": "operator_ui",
         "correlation_id": None,
     }
+
+
+def _planning_pose(z_m: float = 0.0) -> dict[str, object]:
+    return {
+        "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": z_m},
+        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+    }
+
+
+def _planning_motion(
+    move_id: str,
+    motion: dict[str, object],
+    *,
+    contact_policy_id: str | None = None,
+    selected_object_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "kind": "motion",
+        "move_id": move_id,
+        "base_frame_role_id": "frame-role:base",
+        "tcp_frame_role_id": "frame-role:tcp",
+        "tolerances": {
+            "joint_position_tol_rad": 0.01,
+            "translation_tol_m": 0.001,
+            "rotation_tol_rad": 0.01,
+        },
+        "speed_profile": {
+            "velocity_scale": 0.5,
+            "acceleration_scale": 0.5,
+            "max_tcp_linear_speed_mps": None,
+        },
+        "timeouts": {"planning_timeout_s": 1.0, "execution_timeout_s": 2.0},
+        "cache_mode": "default",
+        "planning_profile": "first_feasible",
+        "target_mode": "absolute",
+        "target_reference": None,
+        "offset_reference": None,
+        "motion": motion,
+        "contact_policy_id": contact_policy_id,
+        "per_joint_dynamics_limits": {},
+        "motion_interrupt_scopes": [],
+        "runtime_object_bindings": (
+            [
+                {
+                    "runtime_object_id": "selected_object",
+                    "scene_resource_id": selected_object_id,
+                }
+            ]
+            if selected_object_id is not None
+            else []
+        ),
+    }
+
+
+def _planning_operation(
+    request_id: str, payload: dict[str, object], *, tool: bool = False
+) -> dict[str, object]:
+    return {
+        "request_context": {**_caller(), "request_id": request_id},
+        "program_id": "program:test",
+        "program_revision": "program-revision:test",
+        "program_binding_id": "program-binding:test",
+        "program_run_id": "run:test",
+        "expected_graph_revision": "graph:test",
+        "expected_retained_bundle_id": "bundle:test",
+        "expected_scene_revision": {
+            "scene_id": "sha256:" + "1" * 64,
+            "revision_id": 1,
+            "content_hash": "sha256:" + "2" * 64,
+        },
+        "participants": [
+            {
+                "component_role_id": "tool" if tool else "arm",
+                "target_role_id": "gripper" if tool else "arm",
+                "required_capability_id": (
+                    "tool.gripper.command"
+                    if tool
+                    else "execution.trajectory.execute"
+                ),
+                "action_span": None,
+                "payload": payload,
+            }
+        ],
+        "coordination_policy": "independent",
+    }
+
+
+def _tool_payload() -> dict[str, object]:
+    return {
+        "kind": "capability_command",
+        "command_schema_id": "gripper.command_position",
+        "command_schema_revision": "gripper-command-revision:test",
+        "command_value": {
+            "kind": "gripper_position",
+            "position": {"kind": "linear_m", "value_m": 0.0},
+            "max_effort": None,
+        },
+        "completion_timeout_s": 2.0,
+        "caller_options": [],
+    }
+
+
+def _cartesian_path() -> dict[str, object]:
+    return {
+        "kind": "cartesian_path",
+        "waypoints": [_planning_pose(0.1), _planning_pose(0.0)],
+        "max_translation_step_m": 0.01,
+        "max_rotation_step_rad": 0.1,
+        "speed_mode": "bounded",
+        "max_linear_speed_mps": 0.1,
+        "max_angular_speed_rad_s": 0.2,
+        "max_linear_acceleration_mps2": 0.3,
+        "max_angular_acceleration_rad_s2": 0.4,
+        "fallback_policy": "fail_closed",
+    }
+
+
+def _pick_request() -> dict[str, object]:
+    return {
+        "sequence_id": "pick.1",
+        "selected_object_id": "workpiece",
+        "selected_runtime_object_id": "selected_object",
+        "carrier_frame_role_id": "frame-role:tcp",
+        "approach_operation": _planning_operation(
+            "pick.approach",
+            _planning_motion(
+                "approach",
+                {"kind": "pose_goal", "goal": _planning_pose(0.1)},
+            ),
+        ),
+        "descend_operation": _planning_operation(
+            "pick.descend",
+            _planning_motion(
+                "descend",
+                _cartesian_path(),
+                contact_policy_id="pick.contact",
+                selected_object_id="workpiece",
+            ),
+        ),
+        "tool_operation": _planning_operation(
+            "pick.tool", _tool_payload(), tool=True
+        ),
+        "retreat_operation": _planning_operation(
+            "pick.retreat", _planning_motion("retreat", _cartesian_path())
+        ),
+    }
+
+
+def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
+    parsed = PickSequencePlanningRequest.model_validate(_pick_request())
+    assert parsed.synthesis.approach_offset_envelope.position_min_m == [
+        0.0,
+        0.0,
+        0.05,
+    ]
+    assert parsed.synthesis.approach_offset_envelope.position_max_m == [
+        0.0,
+        0.0,
+        0.1,
+    ]
+    assert parsed.descend_operation.participants[0].payload.contact_policy_id == (
+        "pick.contact"
+    )
+
+    invalid_contact = _pick_request()
+    invalid_contact["retreat_operation"] = _planning_operation(
+        "pick.retreat",
+        _planning_motion(
+            "retreat", _cartesian_path(), contact_policy_id="pick.contact"
+        ),
+    )
+    with pytest.raises(ValidationError, match="retreat cannot carry"):
+        PickSequencePlanningRequest.model_validate(invalid_contact)
+
+    missing_scene = _pick_request()
+    for phase in (
+        "approach_operation",
+        "descend_operation",
+        "tool_operation",
+        "retreat_operation",
+    ):
+        operation = missing_scene[phase]
+        assert isinstance(operation, dict)
+        operation["expected_scene_revision"] = None
+    with pytest.raises(ValidationError, match="requires one exact scene revision"):
+        PickSequencePlanningRequest.model_validate(missing_scene)
+
+    place = {
+        "sequence_id": "place.1",
+        "selected_object_id": "workpiece",
+        "carrier_frame_role_id": "frame-role:tcp",
+        "approach_operation": _planning_operation(
+            "place.approach",
+            _planning_motion(
+                "approach",
+                {"kind": "pose_goal", "goal": _planning_pose(0.1)},
+            ),
+        ),
+        "descend_operation": _planning_operation(
+            "place.descend", _planning_motion("descend", _cartesian_path())
+        ),
+        "tool_operation": _planning_operation(
+            "place.tool", _tool_payload(), tool=True
+        ),
+        "retreat_operation": _planning_operation(
+            "place.retreat", _planning_motion("retreat", _cartesian_path())
+        ),
+    }
+    assert PlaceSequencePlanningRequest.model_validate(place).sequence_id == "place.1"
+    place["descend_operation"] = _planning_operation(
+        "place.descend",
+        _planning_motion(
+            "descend", _cartesian_path(), contact_policy_id="pick.contact"
+        ),
+    )
+    with pytest.raises(ValidationError, match="place motion phases"):
+        PlaceSequencePlanningRequest.model_validate(place)
+
+
+def test_motion_payload_accepts_pose_and_cartesian_but_not_joint_contact() -> None:
+    pose = MotionParticipantRequest.model_validate(
+        _planning_motion(
+            "pose", {"kind": "pose_goal", "goal": _planning_pose()}
+        )
+    )
+    assert pose.motion.kind == "pose_goal"
+    path = MotionParticipantRequest.model_validate(
+        _planning_motion("path", _cartesian_path())
+    )
+    assert path.motion.kind == "cartesian_path"
+    with pytest.raises(ValidationError, match="joint_goal cannot carry"):
+        MotionParticipantRequest.model_validate(
+            _planning_motion(
+                "joint",
+                {
+                    "kind": "joint_goal",
+                    "joint_names": ["joint1"],
+                    "positions_rad": [0.0],
+                },
+                contact_policy_id="pick.contact",
+            )
+        )
 
 
 def test_bulk_acknowledgement_requires_exact_sorted_unique_membership() -> None:

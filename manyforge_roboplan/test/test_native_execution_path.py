@@ -61,6 +61,12 @@ class RecordingTransport:
         self.last_submission = copy.deepcopy(dict(body))
         return self.client.execute(body)
 
+    def plan_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.client.plan_pick(body)
+
+    def plan_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.client.plan_place(body)
+
     def operation(self, operation_id: str) -> dict[str, Any]:
         return self.client.operation(operation_id)
 
@@ -114,13 +120,14 @@ def _start_host(
     *,
     candidate_worker: Path | None = None,
     fake_worker_marker: Path | None = None,
+    host_environment: str = "MANYFORGE_NATIVE_EXECUTION_HOST",
 ) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     if fake_worker_marker is not None:
         environment["MANYFORGE_FAKE_WORKER_MARKER"] = str(fake_worker_marker)
     process = subprocess.Popen(
         [
-            str(_required_path("MANYFORGE_NATIVE_EXECUTION_HOST")),
+            str(_required_path(host_environment)),
             "--package-root",
             str(fixture_root / "retained-package"),
             "--manager-state-root",
@@ -279,6 +286,288 @@ def _wait_runtime_scale_applied(
             return last
         time.sleep(0.005)
     raise RuntimeError(f"runtime scale was not applied: {last}")
+
+
+_PLANNING_SCENE_REVISION = {
+    "scene_id": "sha256:" + "1" * 64,
+    "revision_id": 1,
+    "content_hash": "sha256:" + "2" * 64,
+}
+
+
+def _pose(x_m: float = 0.0, y_m: float = 0.0, z_m: float = 0.0) -> dict[str, Any]:
+    return {
+        "position_m": {"x_m": x_m, "y_m": y_m, "z_m": z_m},
+        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+    }
+
+
+def _planning_motion(
+    move_id: str,
+    motion: dict[str, Any],
+    *,
+    contact_policy_id: str | None = None,
+    selected_object_id: str | None = None,
+) -> dict[str, Any]:
+    runtime_objects = (
+        [
+            {
+                "runtime_object_id": "selected_object",
+                "scene_resource_id": selected_object_id,
+            }
+        ]
+        if selected_object_id is not None
+        else []
+    )
+    return {
+        "kind": "motion",
+        "move_id": move_id,
+        "base_frame_role_id": "frame-role:base",
+        "tcp_frame_role_id": "frame-role:tcp",
+        "tolerances": {
+            "joint_position_tol_rad": 0.01,
+            "translation_tol_m": 0.001,
+            "rotation_tol_rad": 0.01,
+        },
+        "speed_profile": {
+            "velocity_scale": 0.5,
+            "acceleration_scale": 0.5,
+            "max_tcp_linear_speed_mps": 0.1,
+        },
+        "timeouts": {"planning_timeout_s": 1.0, "execution_timeout_s": 2.0},
+        "cache_mode": "default",
+        "planning_profile": "first_feasible",
+        "target_mode": "absolute",
+        "target_reference": None,
+        "offset_reference": None,
+        "motion": motion,
+        "contact_policy_id": contact_policy_id,
+        "per_joint_dynamics_limits": {},
+        "motion_interrupt_scopes": [],
+        "runtime_object_bindings": runtime_objects,
+    }
+
+
+def _planning_operation(
+    request_id: str,
+    payload: dict[str, Any],
+    *,
+    tool: bool = False,
+) -> dict[str, Any]:
+    return {
+        "request_context": {
+            "request_id": request_id,
+            "request_owner_epoch": "kernel.epoch:test",
+            "source_label": "n5d-process-test",
+            "correlation_id": "n5d-process-correlation",
+        },
+        "program_id": "program:test",
+        "program_revision": "program-revision:test",
+        "program_binding_id": "program-binding:test",
+        "program_run_id": "run:test",
+        "expected_graph_revision": "graph:test",
+        "expected_retained_bundle_id": "bundle:test",
+        "expected_scene_revision": _PLANNING_SCENE_REVISION,
+        "participants": [
+            {
+                "component_role_id": (
+                    "component-role:tool" if tool else "component-role:arm"
+                ),
+                "target_role_id": (
+                    "target-role:tool" if tool else "target-role:test"
+                ),
+                "required_capability_id": (
+                    "tool.gripper.command"
+                    if tool
+                    else "execution.trajectory.execute"
+                ),
+                "action_span": None,
+                "payload": payload,
+            }
+        ],
+        "coordination_policy": "independent",
+    }
+
+
+def _tool_payload(position_m: float) -> dict[str, Any]:
+    return {
+        "kind": "capability_command",
+        "command_schema_id": "gripper.command_position",
+        "command_schema_revision": "gripper-command-revision:test",
+        "command_value": {
+            "kind": "gripper_position",
+            "position": {"kind": "linear_m", "value_m": position_m},
+            "max_effort": {"kind": "linear_newton", "value_n": 8.0},
+        },
+        "completion_timeout_s": 2.0,
+        "caller_options": [],
+    }
+
+
+def _cartesian_path(start_z_m: float, end_z_m: float) -> dict[str, Any]:
+    return {
+        "kind": "cartesian_path",
+        "waypoints": [_pose(z_m=start_z_m), _pose(z_m=end_z_m)],
+        "max_translation_step_m": 0.01,
+        "max_rotation_step_rad": 0.1,
+        "speed_mode": "bounded",
+        "max_linear_speed_mps": 0.1,
+        "max_angular_speed_rad_s": 0.2,
+        "max_linear_acceleration_mps2": 0.3,
+        "max_angular_acceleration_rad_s2": 0.4,
+        "fallback_policy": "fail_closed",
+    }
+
+
+def _pick_planning_request() -> dict[str, Any]:
+    return {
+        "sequence_id": "process-pick-1",
+        "selected_object_id": "workpiece",
+        "selected_runtime_object_id": "selected_object",
+        "carrier_frame_role_id": "frame-role:tcp",
+        "synthesis": {
+            "pick_offset_envelope": {
+                "position_min_m": [0.0, 0.0, 0.0],
+                "position_max_m": [0.0, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            "approach_offset_envelope": {
+                "position_min_m": [0.0, 0.0, 0.05],
+                "position_max_m": [0.0, 0.0, 0.05],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            "pick_offset_uses_candidate_tcp": False,
+            "approach_offset_uses_candidate_tcp": False,
+            "base_tool_orientation_rpy_deg": [180.0, 0.0, 0.0],
+            "translation_step_m": 0.01,
+            "rotation_step_deg": 15.0,
+            "force_vertical_pick": False,
+            "min_tcp_z_m": None,
+            "maximum_candidate_count": 8,
+            "search_strategy": "first_feasible",
+        },
+        "approach_operation": _planning_operation(
+            "process-pick-approach",
+            _planning_motion(
+                "pick.approach", {"kind": "pose_goal", "goal": _pose()}
+            ),
+        ),
+        "descend_operation": _planning_operation(
+            "process-pick-descend",
+            _planning_motion(
+                "pick.descend",
+                _cartesian_path(0.05, 0.0),
+                contact_policy_id="pick.contact",
+                selected_object_id="workpiece",
+            ),
+        ),
+        "tool_operation": _planning_operation(
+            "process-pick-tool", _tool_payload(0.0), tool=True
+        ),
+        "retreat_operation": _planning_operation(
+            "process-pick-retreat",
+            _planning_motion("pick.retreat", _cartesian_path(0.0, 0.05)),
+        ),
+    }
+
+
+def _place_planning_request() -> dict[str, Any]:
+    return {
+        "sequence_id": "process-place-1",
+        "selected_object_id": "carried-workpiece",
+        "carrier_frame_role_id": "frame-role:tcp",
+        "approach_operation": _planning_operation(
+            "process-place-approach",
+            _planning_motion(
+                "place.approach",
+                {"kind": "pose_goal", "goal": _pose(z_m=0.3)},
+            ),
+        ),
+        "descend_operation": _planning_operation(
+            "process-place-descend",
+            _planning_motion("place.descend", _cartesian_path(0.3, 0.2)),
+        ),
+        "tool_operation": _planning_operation(
+            "process-place-tool", _tool_payload(0.04), tool=True
+        ),
+        "retreat_operation": _planning_operation(
+            "process-place-retreat",
+            _planning_motion("place.retreat", _cartesian_path(0.2, 0.3)),
+        ),
+    }
+
+
+def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
+    tmp_path: Path,
+) -> None:
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_root = tmp_path / "execution"
+    staging_root = tmp_path / "staging"
+    execution_root.mkdir()
+    staging_root.mkdir()
+
+    process = _start_host(
+        fixture_root,
+        execution_root,
+        staging_root,
+        manifest,
+        host_environment="MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST",
+    )
+    native = ExecutionCommandClient(execution_root, timeout_seconds=10.0)
+    raw_api = TestClient(
+        create_app(
+            service=HeadlessService(
+                UnusedCore(),  # type: ignore[arg-type]
+                UnusedManager(),  # type: ignore[arg-type]
+                native,
+            ),
+            trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
+        )
+    )
+    headless = HeadlessHttpClient("http://headless.test", client=raw_api)
+    behavior = KernelClient(RecordingTransport(headless))
+    composer_app = FastAPI()
+    composer_app.include_router(create_headless_router(headless))
+    raw_composer = TestClient(composer_app)
+    composer = HeadlessHttpClient("http://composer.test", client=raw_composer)
+
+    try:
+        owner_epoch = native.status()["status"]["owner_epoch"]
+        before = native.events(owner_epoch, 0)["events"]
+
+        pick = behavior.plan_pick(_pick_planning_request())["planning_result"]
+        assert pick["schema_version"] == "manyforge.pick_place_planning_result.v1"
+        assert pick["sequence_id"] == "process-pick-1"
+        assert pick["kind"] == "pick"
+        assert pick["selected_object_id"] == "workpiece"
+        assert pick["status"] == "planned"
+        assert pick["attempted_candidate_count"] == 1
+        assert pick["plan"]["approach_motion"]["kind"] == "pose_goal"
+        assert pick["plan"]["descend_motion"]["kind"] == "cartesian_path"
+        assert pick["plan"]["retreat_motion"]["kind"] == "cartesian_path"
+
+        place = composer.plan_place(_place_planning_request())[
+            "planning_result"
+        ]
+        assert place["sequence_id"] == "process-place-1"
+        assert place["kind"] == "place"
+        assert place["selected_object_id"] == "carried-workpiece"
+        assert place["status"] == "planned"
+        assert place["attempted_candidate_count"] == 1
+        assert place["plan"]["approach_motion"]["kind"] == "pose_goal"
+        assert place["plan"]["descend_motion"]["kind"] == "cartesian_path"
+        assert place["plan"]["retreat_motion"]["kind"] == "cartesian_path"
+
+        assert native.events(owner_epoch, 0)["events"] == before
+    finally:
+        _stop_host(process)
+        raw_composer.close()
+        raw_api.close()
 
 
 def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:

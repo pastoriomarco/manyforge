@@ -24,6 +24,7 @@
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/pick_place_planning_owner.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -59,6 +60,10 @@
 
 #include "native_projection_rpc_internal.hpp"
 
+#if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
+#include "focused_pick_place_planning_fixture.hpp"
+#endif
+
 namespace manyforge::roboplan_backend {
 namespace {
 
@@ -74,6 +79,7 @@ constexpr std::string_view kResponseApiVersion = "manyforge.execution_command_re
 constexpr std::string_view kSocketFileName = "execution-command.sock";
 constexpr std::string_view kLockFileName = ".execution-host.lock";
 constexpr std::size_t kMaximumPacketBytes = 1024U * 1024U;
+constexpr std::size_t kMaximumResponseBytes = 4U * 1024U * 1024U;
 constexpr std::size_t kMaximumProgramBytes = 16U * 1024U * 1024U;
 constexpr std::size_t kMaximumIdentityBytes = 2048U;
 constexpr std::size_t kMaximumReasonBytes = 4096U;
@@ -274,6 +280,11 @@ class CommandSocket final {
         FileDescriptor(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
     if (!descriptor_) {
       FailErrno("create execution command socket");
+    }
+    const int send_buffer_bytes = static_cast<int>(kMaximumResponseBytes);
+    if (::setsockopt(descriptor_.get(), SOL_SOCKET, SO_SNDBUF, &send_buffer_bytes,
+                     sizeof(send_buffer_bytes)) != 0) {
+      FailErrno("set execution command response buffer");
     }
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
@@ -832,6 +843,12 @@ double Number(const CanonicalValue& root, std::string_view name) {
   return *value;
 }
 
+bool Boolean(const CanonicalValue& root, std::string_view name) {
+  const auto* value = std::get_if<bool>(&Member(root, name).storage());
+  Require(value != nullptr, "command field " + std::string(name) + " must be boolean");
+  return *value;
+}
+
 std::uint64_t Counter(const CanonicalValue& root, std::string_view name, std::uint64_t minimum) {
   const double value = Number(root, name);
   Require(value >= static_cast<double>(minimum) && std::floor(value) == value &&
@@ -911,6 +928,63 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   return result;
 }
 
+[[nodiscard]] core::Pose3DTO DecodePose(const CanonicalValue& value) {
+  RequireExactObjectSize(value, 2U, "pose");
+  const auto& position = Member(value, "position_m");
+  const auto& orientation = Member(value, "orientation");
+  RequireExactObjectSize(position, 3U, "pose position");
+  RequireExactObjectSize(orientation, 4U, "pose orientation");
+  return core::Pose3DTO{
+      core::Vector3DTO{Number(position, "x_m"), Number(position, "y_m"), Number(position, "z_m")},
+      core::QuaternionDTO{Number(orientation, "x"), Number(orientation, "y"),
+                          Number(orientation, "z"), Number(orientation, "w")}};
+}
+
+[[nodiscard]] core::MotionSpecDTO DecodeMotionSpec(const CanonicalValue& value) {
+  const auto kind = Text(value, "kind");
+  if (kind == "joint_goal") {
+    RequireExactObjectSize(value, 3U, "joint goal");
+    return core::JointGoalDTO{TextArray(value, "joint_names", core::kMaxOperationParticipants),
+                              NumberArray(value, "positions_rad", core::kMaxOperationParticipants)};
+  }
+  if (kind == "pose_goal") {
+    RequireExactObjectSize(value, 2U, "pose goal");
+    return core::PoseGoalDTO{DecodePose(Member(value, "goal"))};
+  }
+  if (kind == "cartesian_path") {
+    RequireExactObjectSize(value, 10U, "Cartesian path");
+    const auto& encoded_waypoints = Array(value, "waypoints");
+    Require(
+        !encoded_waypoints.empty() && encoded_waypoints.size() <= core::kMaxOperationParticipants,
+        "Cartesian path waypoint count is outside its fixed bound");
+    std::vector<core::Pose3DTO> waypoints;
+    waypoints.reserve(encoded_waypoints.size());
+    for (const auto& waypoint : encoded_waypoints) {
+      waypoints.push_back(DecodePose(waypoint));
+    }
+    Require(Text(value, "speed_mode") == "bounded", "Cartesian speed mode is unsupported");
+    core::CartesianFallbackPolicyDTO fallback;
+    const auto fallback_name = Text(value, "fallback_policy");
+    if (fallback_name == "fail_closed") {
+      fallback = core::CartesianFallbackPolicyDTO::kFailClosed;
+    } else if (fallback_name == "allow_joint_space_fallback") {
+      fallback = core::CartesianFallbackPolicyDTO::kAllowJointSpaceFallback;
+    } else {
+      Fail("Cartesian fallback policy is unsupported");
+    }
+    return core::CartesianPathDTO{std::move(waypoints),
+                                  Number(value, "max_translation_step_m"),
+                                  Number(value, "max_rotation_step_rad"),
+                                  core::CartesianSpeedModeDTO::kBounded,
+                                  Number(value, "max_linear_speed_mps"),
+                                  Number(value, "max_angular_speed_rad_s"),
+                                  Number(value, "max_linear_acceleration_mps2"),
+                                  Number(value, "max_angular_acceleration_rad_s2"),
+                                  fallback};
+  }
+  Fail("motion specification kind is unsupported");
+}
+
 [[nodiscard]] core::SceneRevision DecodeSceneRevision(const CanonicalValue& value) {
   RequireExactObjectSize(value, 3U, "scene revision");
   const double revision = Number(value, "revision_id");
@@ -981,7 +1055,11 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
 }
 
 [[nodiscard]] core::MotionParticipantIntentDTO DecodeMotionPayload(const CanonicalValue& value) {
-  RequireExactObjectSize(value, 16U, "motion payload");
+  const bool has_runtime_object_bindings =
+      value.is_object() && value.find_object_member("runtime_object_bindings") != nullptr;
+  Require(value.is_object() && ((value.as_object().size() == 16U && !has_runtime_object_bindings) ||
+                                (value.as_object().size() == 17U && has_runtime_object_bindings)),
+          "motion payload has an unknown or missing field");
   Require(Text(value, "kind") == "motion", "operation payload kind is unsupported");
 
   const auto& tolerances = Member(value, "tolerances");
@@ -1011,20 +1089,38 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   } else {
     Fail("motion planning profile is unsupported");
   }
-  Require(Text(value, "target_mode") == "absolute", "N3 admits only absolute motion");
+  Require(Text(value, "target_mode") == "absolute", "native execution admits only absolute motion");
   Require(std::holds_alternative<std::nullptr_t>(Member(value, "target_reference").storage()) &&
               std::holds_alternative<std::nullptr_t>(Member(value, "offset_reference").storage()),
-          "N3 joint motion cannot carry references");
-  Require(std::holds_alternative<std::nullptr_t>(Member(value, "contact_policy_id").storage()),
-          "N3 joint motion cannot carry a contact policy");
+          "native absolute motion cannot carry references");
   Require(Array(value, "motion_interrupt_scopes").empty(),
-          "N3 joint motion cannot carry interrupt scopes");
+          "native absolute motion cannot carry interrupt scopes");
 
   const auto& motion = Member(value, "motion");
-  RequireExactObjectSize(motion, 3U, "joint goal");
-  Require(Text(motion, "kind") == "joint_goal", "N3 admits only joint-goal motion");
-  auto joint_names = TextArray(motion, "joint_names", core::kMaxOperationParticipants);
-  auto positions = NumberArray(motion, "positions_rad", core::kMaxOperationParticipants);
+  auto decoded_motion = DecodeMotionSpec(motion);
+
+  std::optional<core::ContactPolicyId> contact_policy;
+  if (const auto contact_name = OptionalText(value, "contact_policy_id");
+      contact_name.has_value()) {
+    contact_policy = core::ContactPolicyId(*contact_name);
+  }
+  std::vector<core::RuntimeObjectReferenceBindingDTO> runtime_objects;
+  if (has_runtime_object_bindings) {
+    const auto& encoded_runtime_objects = Array(value, "runtime_object_bindings");
+    Require(encoded_runtime_objects.size() <= core::kMaxOperationRuntimeObjectBindings,
+            "runtime-object binding count exceeds its fixed bound");
+    runtime_objects.reserve(encoded_runtime_objects.size());
+    for (const auto& encoded : encoded_runtime_objects) {
+      RequireExactObjectSize(encoded, 2U, "runtime-object binding");
+      runtime_objects.push_back(core::RuntimeObjectReferenceBindingDTO{
+          core::RuntimeObjectId(Text(encoded, "runtime_object_id")),
+          core::SceneResourceId(Text(encoded, "scene_resource_id"))});
+    }
+  }
+  if (std::holds_alternative<core::JointGoalDTO>(decoded_motion)) {
+    Require(!contact_policy.has_value() && runtime_objects.empty(),
+            "joint motion cannot carry contact-policy or runtime-object bindings");
+  }
 
   const auto& dynamics = Member(value, "per_joint_dynamics_limits");
   Require(dynamics.is_object() && dynamics.as_object().size() <= core::kMaxOperationParticipants,
@@ -1054,10 +1150,11 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       core::MotionTargetModeDTO::kAbsolute,
       std::nullopt,
       std::nullopt,
-      core::JointGoalDTO{std::move(joint_names), std::move(positions)},
-      std::nullopt,
+      std::move(decoded_motion),
+      std::move(contact_policy),
       std::move(limits),
-      {}};
+      {},
+      std::move(runtime_objects)};
 }
 
 [[nodiscard]] core::CoordinatePositionDTO DecodeCoordinatePosition(const CanonicalValue& value) {
@@ -1168,6 +1265,90 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       attribution};
 }
 
+[[nodiscard]] std::array<double, 3U> DecodeTriple(const CanonicalValue& root,
+                                                  const std::string_view name) {
+  const auto values = NumberArray(root, name, 3U);
+  Require(values.size() == 3U,
+          "command field " + std::string(name) + " must contain exactly three numbers");
+  return {values[0], values[1], values[2]};
+}
+
+[[nodiscard]] core::PickOffsetEnvelopeDTO DecodePickEnvelope(const CanonicalValue& value) {
+  RequireExactObjectSize(value, 4U, "pick offset envelope");
+  const auto position_min = DecodeTriple(value, "position_min_m");
+  const auto position_max = DecodeTriple(value, "position_max_m");
+  const auto orientation_min = DecodeTriple(value, "orientation_rpy_min_deg");
+  const auto orientation_max = DecodeTriple(value, "orientation_rpy_max_deg");
+  for (std::size_t index = 0U; index < 3U; ++index) {
+    Require(position_min[index] <= position_max[index] &&
+                orientation_min[index] <= orientation_max[index],
+            "pick offset envelope minimum exceeds its maximum");
+  }
+  return {position_min, position_max, orientation_min, orientation_max};
+}
+
+[[nodiscard]] core::PickCandidateSynthesisIntentDTO DecodePickSynthesis(
+    const CanonicalValue& value) {
+  RequireExactObjectSize(value, 11U, "pick synthesis intent");
+  core::PickCandidateSearchStrategyDTO strategy;
+  const auto strategy_name = Text(value, "search_strategy");
+  if (strategy_name == "first_feasible") {
+    strategy = core::PickCandidateSearchStrategyDTO::kFirstFeasible;
+  } else if (strategy_name == "best_cost") {
+    strategy = core::PickCandidateSearchStrategyDTO::kBestCost;
+  } else {
+    Fail("pick search strategy is unsupported");
+  }
+  const auto maximum = Counter(value, "maximum_candidate_count", 1U);
+  Require(maximum <= 4096U, "pick maximum candidate count exceeds its fixed bound");
+  const auto translation_step = Number(value, "translation_step_m");
+  const auto rotation_step = Number(value, "rotation_step_deg");
+  const auto min_tcp_z = OptionalNumber(value, "min_tcp_z_m");
+  Require(translation_step > 0.0 && rotation_step > 0.0 &&
+              (!min_tcp_z.has_value() || *min_tcp_z >= 0.0),
+          "pick synthesis step or minimum TCP height is invalid");
+  return core::PickCandidateSynthesisIntentDTO{
+      DecodePickEnvelope(Member(value, "pick_offset_envelope")),
+      DecodePickEnvelope(Member(value, "approach_offset_envelope")),
+      Boolean(value, "pick_offset_uses_candidate_tcp"),
+      Boolean(value, "approach_offset_uses_candidate_tcp"),
+      DecodeTriple(value, "base_tool_orientation_rpy_deg"),
+      translation_step,
+      rotation_step,
+      Boolean(value, "force_vertical_pick"),
+      min_tcp_z,
+      static_cast<std::size_t>(maximum),
+      strategy};
+}
+
+[[nodiscard]] core::PickSequencePlanningIntentDTO DecodePickPlanningIntent(
+    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
+  RequireExactObjectSize(value, 9U, "pick planning intent");
+  return core::PickSequencePlanningIntentDTO{
+      Text(value, "sequence_id"),
+      core::SceneResourceId(Text(value, "selected_object_id")),
+      core::RuntimeObjectId(Text(value, "selected_runtime_object_id")),
+      core::FrameRoleId(Text(value, "carrier_frame_role_id")),
+      DecodePickSynthesis(Member(value, "synthesis")),
+      DecodeOperation(Member(value, "approach_operation"), attribution),
+      DecodeOperation(Member(value, "descend_operation"), attribution),
+      DecodeOperation(Member(value, "tool_operation"), attribution),
+      DecodeOperation(Member(value, "retreat_operation"), attribution)};
+}
+
+[[nodiscard]] core::PlaceSequencePlanningIntentDTO DecodePlacePlanningIntent(
+    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
+  RequireExactObjectSize(value, 7U, "place planning intent");
+  return core::PlaceSequencePlanningIntentDTO{
+      Text(value, "sequence_id"),
+      core::SceneResourceId(Text(value, "selected_object_id")),
+      core::FrameRoleId(Text(value, "carrier_frame_role_id")),
+      DecodeOperation(Member(value, "approach_operation"), attribution),
+      DecodeOperation(Member(value, "descend_operation"), attribution),
+      DecodeOperation(Member(value, "tool_operation"), attribution),
+      DecodeOperation(Member(value, "retreat_operation"), attribution)};
+}
+
 [[nodiscard]] core::OperationControlRequestDTO DecodeOperationControlRequest(
     const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
   RequireExactObjectSize(value, 4U, "operation control request");
@@ -1221,9 +1402,13 @@ enum class CommandKind {
   kStop,
   kSetRuntimeScale,
   kGetRuntimeScale,
+  kPlanPick,
+  kPlanPlace,
 };
 
 struct Command final {
+  explicit Command(CommandKind command_kind) : kind(command_kind) {}
+
   CommandKind kind;
   std::optional<core::OperationIntentDTO> operation;
   std::optional<core::OperationId> operation_id;
@@ -1233,6 +1418,8 @@ struct Command final {
   std::optional<core::RequestOwnerEpoch> event_owner_epoch{};
   std::uint64_t after_sequence{};
   std::size_t event_limit{};
+  std::optional<core::PickSequencePlanningIntentDTO> pick_planning;
+  std::optional<core::PlaceSequencePlanningIntentDTO> place_planning;
 };
 
 [[nodiscard]] Command DecodeCommand(std::string_view bytes) {
@@ -1252,63 +1439,64 @@ struct Command final {
   const auto command = Text(root, "command");
   if (command == "status") {
     RequireExactObjectSize(root, 2U, "status command");
-    return {CommandKind::kStatus, std::nullopt, std::nullopt,
-            std::nullopt,         std::nullopt, std::nullopt};
+    return Command{CommandKind::kStatus};
   }
   if (command == "events") {
     RequireExactObjectSize(root, 5U, "events command");
     const auto limit = Counter(root, "limit", 1U);
     Require(limit <= kMaximumEventPage, "events command exceeds its page bound");
-    return {CommandKind::kEvents,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            core::RequestOwnerEpoch(Text(root, "owner_epoch")),
-            Counter(root, "after_sequence", 0U),
-            static_cast<std::size_t>(limit)};
+    Command decoded{CommandKind::kEvents};
+    decoded.event_owner_epoch = core::RequestOwnerEpoch(Text(root, "owner_epoch"));
+    decoded.after_sequence = Counter(root, "after_sequence", 0U);
+    decoded.event_limit = static_cast<std::size_t>(limit);
+    return decoded;
   }
   if (command == "read") {
     RequireExactObjectSize(root, 3U, "read command");
-    return {CommandKind::kRead, std::nullopt, core::OperationId(Text(root, "operation_id")),
-            std::nullopt,       std::nullopt, std::nullopt};
+    Command decoded{CommandKind::kRead};
+    decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+    return decoded;
   }
   if (command == "get_runtime_scale") {
     RequireExactObjectSize(root, 3U, "runtime-scale read command");
-    return {CommandKind::kGetRuntimeScale,
-            std::nullopt,
-            core::OperationId(Text(root, "operation_id")),
-            std::nullopt,
-            std::nullopt,
-            std::nullopt};
+    Command decoded{CommandKind::kGetRuntimeScale};
+    decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+    return decoded;
   }
   if (command == "submit") {
     RequireExactObjectSize(root, 4U, "submit command");
     const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
-    return {CommandKind::kSubmit, DecodeOperation(Member(root, "operation"), attribution),
-            std::nullopt,         std::nullopt,
-            std::nullopt,         std::nullopt};
+    Command decoded{CommandKind::kSubmit};
+    decoded.operation = DecodeOperation(Member(root, "operation"), attribution);
+    return decoded;
+  }
+  if (command == "plan_pick") {
+    RequireExactObjectSize(root, 4U, "pick planning command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    Command decoded{CommandKind::kPlanPick};
+    decoded.pick_planning = DecodePickPlanningIntent(Member(root, "intent"), attribution);
+    return decoded;
+  }
+  if (command == "plan_place") {
+    RequireExactObjectSize(root, 4U, "place planning command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    Command decoded{CommandKind::kPlanPlace};
+    decoded.place_planning = DecodePlacePlanningIntent(Member(root, "intent"), attribution);
+    return decoded;
   }
   if (command == "stop") {
     RequireExactObjectSize(root, 4U, "Stop command");
     const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
-    return {CommandKind::kStop,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            DecodeStopIntent(Member(root, "request"), attribution),
-            std::nullopt};
+    Command decoded{CommandKind::kStop};
+    decoded.stop = DecodeStopIntent(Member(root, "request"), attribution);
+    return decoded;
   }
   if (command == "set_runtime_scale") {
     RequireExactObjectSize(root, 4U, "runtime-scale command");
     const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
-    return {CommandKind::kSetRuntimeScale,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            DecodeRuntimeScaleRequest(Member(root, "request"), attribution)};
+    Command decoded{CommandKind::kSetRuntimeScale};
+    decoded.runtime_scale = DecodeRuntimeScaleRequest(Member(root, "request"), attribution);
+    return decoded;
   }
   CommandKind kind;
   if (command == "pause") {
@@ -1324,9 +1512,9 @@ struct Command final {
   }
   RequireExactObjectSize(root, 4U, "operation control command");
   const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
-  return {kind,         std::nullopt,
-          std::nullopt, DecodeOperationControlRequest(Member(root, "request"), attribution),
-          std::nullopt, std::nullopt};
+  Command decoded{kind};
+  decoded.control = DecodeOperationControlRequest(Member(root, "request"), attribution);
+  return decoded;
 }
 
 [[nodiscard]] CanonicalValue ErrorValue(const core::ErrorDTO& error) {
@@ -1347,6 +1535,141 @@ struct Command final {
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
       {"error", ErrorValue(core::ErrorDTO{std::move(code), std::move(message), {}})},
       {"ok", CanonicalValue(false)},
+  });
+}
+
+[[nodiscard]] CanonicalValue PoseValue(const core::Pose3DTO& value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"orientation", CanonicalValue(CanonicalValue::Object{
+                          {"w", CanonicalValue(value.orientation.w)},
+                          {"x", CanonicalValue(value.orientation.x)},
+                          {"y", CanonicalValue(value.orientation.y)},
+                          {"z", CanonicalValue(value.orientation.z)},
+                      })},
+      {"position_m", CanonicalValue(CanonicalValue::Object{
+                         {"x_m", CanonicalValue(value.position_m.x_m)},
+                         {"y_m", CanonicalValue(value.position_m.y_m)},
+                         {"z_m", CanonicalValue(value.position_m.z_m)},
+                     })},
+  });
+}
+
+[[nodiscard]] CanonicalValue MotionSpecValue(const core::MotionSpecDTO& motion) {
+  return std::visit(
+      [](const auto& value) -> CanonicalValue {
+        using Motion = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Motion, core::JointGoalDTO>) {
+          CanonicalValue::Array joint_names;
+          CanonicalValue::Array positions;
+          joint_names.reserve(value.joint_names.size());
+          positions.reserve(value.positions_rad.size());
+          for (const auto& name : value.joint_names) {
+            joint_names.emplace_back(name);
+          }
+          for (const auto position : value.positions_rad) {
+            positions.emplace_back(position);
+          }
+          return CanonicalValue(CanonicalValue::Object{
+              {"joint_names", CanonicalValue(std::move(joint_names))},
+              {"kind", CanonicalValue("joint_goal")},
+              {"positions_rad", CanonicalValue(std::move(positions))},
+          });
+        } else if constexpr (std::is_same_v<Motion, core::PoseGoalDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"goal", PoseValue(value.goal)},
+              {"kind", CanonicalValue("pose_goal")},
+          });
+        } else if constexpr (std::is_same_v<Motion, core::NamedTargetDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("named_target")},
+              {"name", CanonicalValue(value.name)},
+          });
+        } else {
+          CanonicalValue::Array waypoints;
+          waypoints.reserve(value.waypoints.size());
+          for (const auto& waypoint : value.waypoints) {
+            waypoints.push_back(PoseValue(waypoint));
+          }
+          return CanonicalValue(CanonicalValue::Object{
+              {"fallback_policy",
+               CanonicalValue(value.fallback_policy == core::CartesianFallbackPolicyDTO::kFailClosed
+                                  ? "fail_closed"
+                                  : "allow_joint_space_fallback")},
+              {"kind", CanonicalValue("cartesian_path")},
+              {"max_angular_acceleration_rad_s2",
+               CanonicalValue(value.max_angular_acceleration_rad_s2)},
+              {"max_angular_speed_rad_s", CanonicalValue(value.max_angular_speed_rad_s)},
+              {"max_linear_acceleration_mps2", CanonicalValue(value.max_linear_acceleration_mps2)},
+              {"max_linear_speed_mps", CanonicalValue(value.max_linear_speed_mps)},
+              {"max_rotation_step_rad", CanonicalValue(value.max_rotation_step_rad)},
+              {"max_translation_step_m", CanonicalValue(value.max_translation_step_m)},
+              {"speed_mode", CanonicalValue("bounded")},
+              {"waypoints", CanonicalValue(std::move(waypoints))},
+          });
+        }
+      },
+      motion);
+}
+
+[[nodiscard]] CanonicalValue ProjectionRevisionValue(const core::ProjectionRevisionDTO& value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"graph_revision", CanonicalValue(value.graph_revision.value())},
+      {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
+      {"scene_revision",
+       CanonicalValue(CanonicalValue::Object{
+           {"content_hash", CanonicalValue(value.scene_revision.content_hash.value())},
+           {"revision_id", CanonicalValue(static_cast<double>(value.scene_revision.revision_id))},
+           {"scene_id", CanonicalValue(value.scene_revision.scene_id.value())},
+       })},
+  });
+}
+
+[[nodiscard]] CanonicalValue PickPlacePlanningResultValue(
+    const std::string_view sequence_id, const core::PickPlaceExecutionKindDTO kind,
+    const core::PickPlacePlanningResultDTO& value) {
+  CanonicalValue::Array reports;
+  reports.reserve(value.reports.size());
+  for (const auto& report : value.reports) {
+    CanonicalValue::Array stages;
+    stages.reserve(report.stages.size());
+    for (const auto& stage : report.stages) {
+      stages.emplace_back(CanonicalValue::Object{
+          {"error", stage.error.has_value() ? ErrorValue(*stage.error) : CanonicalValue(nullptr)},
+          {"stage", CanonicalValue(std::string(core::to_string(stage.stage)))},
+          {"succeeded", CanonicalValue(stage.succeeded)},
+          {"trajectory_duration_s", CanonicalValue(stage.trajectory_duration_s)},
+          {"trajectory_waypoint_count",
+           CanonicalValue(static_cast<double>(stage.trajectory_waypoint_count))},
+      });
+    }
+    reports.emplace_back(CanonicalValue::Object{
+        {"candidate_index", CanonicalValue(static_cast<double>(report.candidate_index))},
+        {"stages", CanonicalValue(std::move(stages))},
+    });
+  }
+  CanonicalValue plan(nullptr);
+  if (value.sequence_request.has_value()) {
+    const auto& request = *value.sequence_request;
+    plan = CanonicalValue(CanonicalValue::Object{
+        {"approach_motion", MotionSpecValue(request.plan.approach_motion)},
+        {"descend_motion", MotionSpecValue(request.plan.descend_motion)},
+        {"predecessor_projection_revision",
+         ProjectionRevisionValue(request.plan.predecessor_projection_revision)},
+        {"preview_successor_projection_revision",
+         ProjectionRevisionValue(request.plan.preview_successor_projection_revision)},
+        {"retreat_motion", MotionSpecValue(request.plan.retreat_motion)},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"attempted_candidate_count",
+       CanonicalValue(static_cast<double>(value.attempted_candidate_count))},
+      {"kind", CanonicalValue(kind == core::PickPlaceExecutionKindDTO::kPick ? "pick" : "place")},
+      {"plan", std::move(plan)},
+      {"reports", CanonicalValue(std::move(reports))},
+      {"schema_version", CanonicalValue("manyforge.pick_place_planning_result.v1")},
+      {"selected_object_id", CanonicalValue(value.selected_object_id.value())},
+      {"sequence_id", CanonicalValue(std::string(sequence_id))},
+      {"status", CanonicalValue(std::string(core::to_string(value.status)))},
   });
 }
 
@@ -1817,6 +2140,10 @@ struct Composition final {
   std::shared_ptr<RetainedNativeRuntime> runtime;
   core::ProjectionRevisionDTO projection_revision;
   core::ActiveBundlePublicationGeneration publication_generation;
+#if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
+  std::shared_ptr<void> pick_place_planning_fixture_lifetime;
+#endif
+  std::unique_ptr<core::AddressedPickPlacePlanningOwner> pick_place_planning_owner;
 
   Composition(std::shared_ptr<const deployment::RetainedBundle> selected_bundle,
               std::shared_ptr<const deployment::ProgramBindingContract> selected_program,
@@ -1974,10 +2301,16 @@ struct Composition final {
           config.execution_state_root / std::string(core::kOperationJournalFilename), 1024U,
           core::CacheConfig{}, core::ExecutionKernelConfig{}, RoboPlanExecutionBackendConfig{},
           SimpleSchedulerConfig::from_environment(), 10'000'000});
-  return std::make_unique<Composition>(
+  auto composition = std::make_unique<Composition>(
       std::move(bundle), std::move(program), std::move(program_binding), std::move(stage),
       std::move(runtime), receipt.request.candidate_projection_revision,
       receipt.publication_generation);
+#if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
+  auto fixture = process_fixture::MakeFocusedPickPlacePlanningFixture();
+  composition->pick_place_planning_fixture_lifetime = std::move(fixture.lifetime);
+  composition->pick_place_planning_owner = std::move(fixture.owner);
+#endif
+  return composition;
 }
 
 class NativeExecutionHost final {
@@ -2109,6 +2442,37 @@ class NativeExecutionHost final {
           {"ok", CanonicalValue(false)},
       });
     }
+    if (command.kind == CommandKind::kPlanPick || command.kind == CommandKind::kPlanPlace) {
+      if (!composition_->pick_place_planning_owner) {
+        return ErrorResponse("pick_place_planning_owner_unavailable",
+                             "the selected native process has no joined logical-scene "
+                             "planning owner");
+      }
+      const auto sequence_id = command.kind == CommandKind::kPlanPick
+                                   ? command.pick_planning->sequence_id
+                                   : command.place_planning->sequence_id;
+      const auto result =
+          command.kind == CommandKind::kPlanPick
+              ? composition_->pick_place_planning_owner->PlanPick(*command.pick_planning)
+              : composition_->pick_place_planning_owner->PlanPlace(*command.place_planning);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      const auto command_name = command.kind == CommandKind::kPlanPick ? "plan_pick" : "plan_place";
+      const auto kind = command.kind == CommandKind::kPlanPick
+                            ? core::PickPlaceExecutionKindDTO::kPick
+                            : core::PickPlaceExecutionKindDTO::kPlace;
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue(command_name)},
+          {"ok", CanonicalValue(true)},
+          {"planning_result", PickPlacePlanningResultValue(sequence_id, kind, result.value())},
+      });
+    }
     if (command.kind == CommandKind::kSubmit) {
       const auto result = composition_->runtime->addressed_kernel->execute(*command.operation);
       if (!result.ok()) {
@@ -2217,6 +2581,8 @@ class NativeExecutionHost final {
         case CommandKind::kStop:
         case CommandKind::kSetRuntimeScale:
         case CommandKind::kGetRuntimeScale:
+        case CommandKind::kPlanPick:
+        case CommandKind::kPlanPlace:
           Fail("execution command dispatch is inconsistent");
       }
       Fail("execution command dispatch is unreachable");
@@ -2279,9 +2645,12 @@ class NativeExecutionHost final {
           response = ErrorResponse("execution_command_invalid", error.what());
         }
       }
-      const auto bytes = content_identity::canonical_json(response);
-      Require(!bytes.empty() && bytes.size() <= kMaximumPacketBytes,
-              "execution command response is empty or oversized");
+      auto bytes = content_identity::canonical_json(response);
+      if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
+        bytes = content_identity::canonical_json(
+            ErrorResponse("execution_command_response_oversized",
+                          "execution owner result exceeds the bounded private transport"));
+      }
       pollfd outbound{client.get(), POLLOUT, 0};
       int response_ready = -1;
       do {

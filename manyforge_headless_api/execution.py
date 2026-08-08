@@ -15,6 +15,8 @@ import rfc8785
 from .models import (
     OperationControlRequest,
     OperationIntentRequest,
+    PickSequencePlanningRequest,
+    PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
     StopIntentRequest,
 )
@@ -36,7 +38,7 @@ OPERATION_EVENT_KINDS = frozenset(
     }
 )
 MAX_EXECUTION_PACKET_BYTES = 1024 * 1024
-MAX_EXECUTION_RESPONSE_BYTES = 1024 * 1024
+MAX_EXECUTION_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 class ExecutionPort(Protocol):
@@ -50,6 +52,20 @@ class ExecutionPort(Protocol):
     ) -> dict[str, Any]: ...
 
     def read(self, operation_id: str) -> dict[str, Any]: ...
+
+    def plan_pick(
+        self,
+        request: PickSequencePlanningRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
+    def plan_place(
+        self,
+        request: PlaceSequencePlanningRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
 
     def pause(
         self,
@@ -147,6 +163,11 @@ class ExecutionCommandClient:
         self._validate_socket()
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                client.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_RCVBUF,
+                    MAX_EXECUTION_RESPONSE_BYTES,
+                )
                 client.settimeout(self._timeout_seconds)
                 client.connect(str(self._socket_path))
                 sent = client.send(encoded)
@@ -384,6 +405,80 @@ class ExecutionCommandClient:
                 "execution observation does not match the requested operation",
             )
         return response
+
+    def _plan_pick_place(
+        self,
+        command: str,
+        request: PickSequencePlanningRequest | PlaceSequencePlanningRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._http_attribution(trusted_principal_id),
+                "command": command,
+                "intent": request.model_dump(mode="json"),
+            }
+        )
+        result = response.get("planning_result")
+        expected_kind = "pick" if command == "plan_pick" else "place"
+        if response.get("ok") is True:
+            if (
+                response.get("command") != command
+                or not isinstance(result, dict)
+                or result.get("schema_version")
+                != "manyforge.pick_place_planning_result.v1"
+                or result.get("sequence_id") != request.sequence_id
+                or result.get("kind") != expected_kind
+                or result.get("selected_object_id") != request.selected_object_id
+                or result.get("status")
+                not in {"planned", "no_feasible_candidate"}
+                or type(result.get("attempted_candidate_count")) is not int
+                or not 0
+                <= result["attempted_candidate_count"]
+                <= 4096
+                or not isinstance(result.get("reports"), list)
+                or len(result["reports"])
+                > result["attempted_candidate_count"]
+                or (
+                    result["status"] == "planned"
+                    and not isinstance(result.get("plan"), dict)
+                )
+                or (
+                    result["status"] == "no_feasible_candidate"
+                    and result.get("plan") is not None
+                )
+            ):
+                raise HeadlessApiError(
+                    "execution_command_response_identity_mismatch",
+                    "pick/place planning result does not match its submitted intent",
+                )
+        return response
+
+    def plan_pick(
+        self,
+        request: PickSequencePlanningRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        return self._plan_pick_place(
+            "plan_pick",
+            request,
+            trusted_principal_id=trusted_principal_id,
+        )
+
+    def plan_place(
+        self,
+        request: PlaceSequencePlanningRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        return self._plan_pick_place(
+            "plan_place",
+            request,
+            trusted_principal_id=trusted_principal_id,
+        )
 
     def _control(
         self,

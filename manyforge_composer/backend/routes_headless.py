@@ -15,6 +15,8 @@ from manyforge_headless_api.models import (
     ManagerApplyRequest,
     OperationControlRequest,
     OperationIntentRequest,
+    PickSequencePlanningRequest,
+    PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
     SceneTransactionRequest,
     StopIntentRequest,
@@ -117,6 +119,18 @@ def create_headless_router(client: HeadlessHttpClient) -> APIRouter:
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
     ) -> dict[str, Any]:
         return _call(lambda: client.operation(operation_id))
+
+    @router.post("/api/execution/pick-place/plans/pick")
+    def execution_plan_pick(
+        body: PickSequencePlanningRequest,
+    ) -> dict[str, Any]:
+        return _call(lambda: client.plan_pick(body.model_dump(mode="json")))
+
+    @router.post("/api/execution/pick-place/plans/place")
+    def execution_plan_place(
+        body: PlaceSequencePlanningRequest,
+    ) -> dict[str, Any]:
+        return _call(lambda: client.plan_place(body.model_dump(mode="json")))
 
     def require_matching_operation(
         path_operation_id: str,
