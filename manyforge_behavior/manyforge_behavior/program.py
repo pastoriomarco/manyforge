@@ -27,7 +27,6 @@ from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.catalog_schema import CatalogSchema, validate_value
 from manyforge_behavior.skill_loader import SkillCatalog
 
-
 _MAX_TREE_DEPTH: Final = 256
 _MAX_TREE_NODES: Final = 100_000
 _MAX_CHILDREN_PER_NODE: Final = 10_000
@@ -341,9 +340,7 @@ _MODIFICATION_POLICY_ALLOWED_VALUES: Final = {
         {"forbidden", "human_only", "llm_allowed", "program_only"}
     ),
 }
-_MODIFICATION_POLICY_FIELDS: Final = frozenset(
-    _MODIFICATION_POLICY_ALLOWED_VALUES
-)
+_MODIFICATION_POLICY_FIELDS: Final = frozenset(_MODIFICATION_POLICY_ALLOWED_VALUES)
 OPERATOR_STOP_POLICY_VALUES: Final = frozenset({"inherit", "hold", "continue"})
 _RECOVERY_POLICY_ALLOWED_ACTIONS: Final = frozenset(
     {"runtime_override", "intervention"}
@@ -437,11 +434,7 @@ def _parse_recovery_policy(raw_policy: Any, *, path: str) -> dict[str, Any]:
         parsed["allowed_recovery_actions"] = list(actions)
     if "max_retries" in policy:
         retries = policy["max_retries"]
-        if (
-            type(retries) is not int
-            or retries < 0
-            or retries > _MAX_RECOVERY_RETRIES
-        ):
+        if type(retries) is not int or retries < 0 or retries > _MAX_RECOVERY_RETRIES:
             raise ProgramValidationError(
                 f"{path}.recovery_policy.max_retries must be bounded"
             )
@@ -617,9 +610,7 @@ def tree_node_from_dict(
 
     def parse(value: Any, current_path: str, depth: int) -> TreeNode:
         if type(value) is not dict:
-            raise ProgramValidationError(
-                f"{current_path} must be a built-in mapping"
-            )
+            raise ProgramValidationError(f"{current_path} must be a built-in mapping")
         if depth > _MAX_TREE_DEPTH:
             raise ProgramValidationError("tree depth exceeds bounded maximum")
         identity = id(value)
@@ -1104,9 +1095,7 @@ def _schema_semantic_types(
     for child in concrete.properties.values():
         result.update(_schema_semantic_types(child, catalog, stack=next_stack))
     if concrete.items is not None:
-        result.update(
-            _schema_semantic_types(concrete.items, catalog, stack=next_stack)
-        )
+        result.update(_schema_semantic_types(concrete.items, catalog, stack=next_stack))
     if concrete.additional_property_schema is not None:
         result.update(
             _schema_semantic_types(
@@ -1208,14 +1197,10 @@ def _validate_compatibility(value: Any, *, path: str) -> None:
         "optional",
         "forbidden",
     }:
-        _program_error(
-            f"{path}.assistant", "must be required, optional, or forbidden"
-        )
+        _program_error(f"{path}.assistant", "must be required, optional, or forbidden")
     for field_name in ("requires", "tags"):
         if field_name in row:
-            _canonical_identifier_list(
-                row[field_name], path=f"{path}.{field_name}"
-            )
+            _canonical_identifier_list(row[field_name], path=f"{path}.{field_name}")
 
 
 def _validate_viewer(value: Any, *, path: str) -> None:
@@ -1241,9 +1226,10 @@ def _validate_viewer(value: Any, *, path: str) -> None:
         if any(type(item) is not bool for item in visibility.values()):
             _program_error(f"{path}.{field_name}", "values must be booleans")
     for field_name in ("frame_gizmo_size_m", "object_axes_gizmo_size_m"):
-        if field_name in row and _program_number(
-            row[field_name], path=f"{path}.{field_name}"
-        ) <= 0.0:
+        if (
+            field_name in row
+            and _program_number(row[field_name], path=f"{path}.{field_name}") <= 0.0
+        ):
             _program_error(f"{path}.{field_name}", "must be positive")
 
 
@@ -1350,9 +1336,7 @@ def _validate_target_roles(
             path=f"{role_path}.required_capabilities",
         )
         if not raw_capabilities:
-            _program_error(
-                f"{role_path}.required_capabilities", "must not be empty"
-            )
+            _program_error(f"{role_path}.required_capabilities", "must not be empty")
         capabilities: list[dict[str, Any]] = []
         capability_ids: list[str] = []
         for index, raw_capability in enumerate(raw_capabilities):
@@ -1360,9 +1344,7 @@ def _validate_target_roles(
             capability = _program_mapping(raw_capability, path=capability_path)
             _program_closed(
                 capability,
-                required=frozenset(
-                    {"capability_id", "parameters", "disposition"}
-                ),
+                required=frozenset({"capability_id", "parameters", "disposition"}),
                 path=capability_path,
             )
             capability_id = _program_identifier(
@@ -1455,9 +1437,7 @@ def _validate_initial_scene_pose(
         )
     _program_closed(
         frame,
-        required=frozenset(
-            {"kind", "component_role", "model_role", "frame_role"}
-        ),
+        required=frozenset({"kind", "component_role", "model_role", "frame_role"}),
         path=f"{path}.frame_ref",
     )
     component_role = _program_identifier(
@@ -1498,9 +1478,7 @@ def _validate_scene(
         _program_closed(
             row,
             required=frozenset({"scene_resource_id", "shape", "pose"}),
-            optional=frozenset(
-                {"resource_roles", "metadata", "collision_policy_ids"}
-            ),
+            optional=frozenset({"resource_roles", "metadata", "collision_policy_ids"}),
             path=row_path,
         )
         scene_id = _program_identifier(
@@ -1576,12 +1554,8 @@ def _validate_pose_frame_ref(
         required=frozenset({"kind", "target_role", "frame_role"}),
         path=path,
     )
-    target_role = _program_identifier(
-        frame["target_role"], path=f"{path}.target_role"
-    )
-    frame_role = _program_identifier(
-        frame["frame_role"], path=f"{path}.frame_role"
-    )
+    target_role = _program_identifier(frame["target_role"], path=f"{path}.target_role")
+    frame_role = _program_identifier(frame["frame_role"], path=f"{path}.frame_role")
     target = target_roles.get(target_role)
     if target is None:
         _program_error(f"{path}.target_role", "does not name a declared target role")
@@ -1777,9 +1751,7 @@ def _validate_parameters(
             row["runtime_mutability"], path=f"{row_path}.runtime_mutability"
         )
         if runtime_mutability not in _RUNTIME_MUTABILITY_VALUES:
-            _program_error(
-                f"{row_path}.runtime_mutability", "has an unsupported value"
-            )
+            _program_error(f"{row_path}.runtime_mutability", "has an unsupported value")
         default = deepcopy(row["default"])
         _validate_declared_type_value(
             declared_type,
@@ -1886,9 +1858,7 @@ def _validate_blackboard(
             row["persistence"], path=f"{row_path}.persistence"
         )
         if persistence not in _BLACKBOARD_PERSISTENCE_VALUES:
-            _program_error(
-                f"{row_path}.persistence", "has an unsupported value"
-            )
+            _program_error(f"{row_path}.persistence", "has an unsupported value")
         fields: dict[str, BlackboardFieldDeclaration] = {}
         field_ids: list[str] = []
         for field_index, raw_field in enumerate(
@@ -1960,9 +1930,7 @@ def _validate_contact_selector(
     if kind == "component_model_body":
         _program_closed(
             row,
-            required=frozenset(
-                {"kind", "component_role_id", "collision_body_role_id"}
-            ),
+            required=frozenset({"kind", "component_role_id", "collision_body_role_id"}),
             optional=frozenset({"model_role_id"}),
             path=path,
         )
@@ -2108,12 +2076,13 @@ def _validate_contact_policies(
             zone_id = _program_identifier(zone["zone_id"], path=f"{zone_path}.zone_id")
             zone_ids.append(zone_id)
             if zone["violation_response"] != "hard_stop":
-                _program_error(
-                    f"{zone_path}.violation_response", "must be hard_stop"
+                _program_error(f"{zone_path}.violation_response", "must be hard_stop")
+            if (
+                _program_number(
+                    zone["max_penetration_m"], path=f"{zone_path}.max_penetration_m"
                 )
-            if _program_number(
-                zone["max_penetration_m"], path=f"{zone_path}.max_penetration_m"
-            ) <= 0.0:
+                <= 0.0
+            ):
                 _program_error(f"{zone_path}.max_penetration_m", "must be positive")
             terminal_fraction = _program_number(
                 zone["terminal_window_start_fraction"],
@@ -2205,11 +2174,20 @@ def _validate_semantic_value(
             identity = _program_identifier(value, path=path)
             if semantic_type == "target_role" and identity not in context.target_roles:
                 _program_error(path, "does not name a declared target role")
-            if semantic_type == "component_role" and identity not in context.component_roles:
+            if (
+                semantic_type == "component_role"
+                and identity not in context.component_roles
+            ):
                 _program_error(path, "does not name a declared component role")
-            if semantic_type == "scene_resource" and identity not in context.scene_resource_ids:
+            if (
+                semantic_type == "scene_resource"
+                and identity not in context.scene_resource_ids
+            ):
                 _program_error(path, "does not name a declared scene resource")
-            if semantic_type == "blackboard_key" and identity not in context.blackboard_keys:
+            if (
+                semantic_type == "blackboard_key"
+                and identity not in context.blackboard_keys
+            ):
                 _program_error(path, "does not name a declared blackboard key")
             if semantic_type in {
                 "frame_role",
@@ -2256,7 +2234,11 @@ def _validate_semantic_value(
                     f"{path}.runtime_object_id",
                     "must name a scene_resource blackboard key",
                 )
-    if concrete.schema_type == "array" and type(value) is list and concrete.items is not None:
+    if (
+        concrete.schema_type == "array"
+        and type(value) is list
+        and concrete.items is not None
+    ):
         source_joints: list[str] = []
         for index, item in enumerate(value):
             _validate_semantic_value(
@@ -2393,7 +2375,11 @@ def _validate_nested_value_sources(
                     path=f"{path}.{name}",
                     context=context,
                 )
-    elif concrete.schema_type == "array" and type(value) is list and concrete.items is not None:
+    elif (
+        concrete.schema_type == "array"
+        and type(value) is list
+        and concrete.items is not None
+    ):
         for index, nested in enumerate(value):
             _validate_nested_value_sources(
                 concrete.items,
@@ -2403,7 +2389,9 @@ def _validate_nested_value_sources(
             )
 
 
-def _effective_parameter_value(entry_parameter: Any, parameters: Mapping[str, Any]) -> Any:
+def _effective_parameter_value(
+    entry_parameter: Any, parameters: Mapping[str, Any]
+) -> Any:
     if entry_parameter.id in parameters:
         return parameters[entry_parameter.id]
     return entry_parameter.default if entry_parameter.has_default else None
@@ -2556,9 +2544,7 @@ def _validate_program_tree(
         path=path,
     )
     node_id = _program_identifier(node["node_id"], path=f"{path}.node_id")
-    instance_id = _program_identifier(
-        node["instance_id"], path=f"{path}.instance_id"
-    )
+    instance_id = _program_identifier(node["instance_id"], path=f"{path}.instance_id")
     if instance_id in context.tree_instance_ids:
         _program_error(f"{path}.instance_id", "duplicates another tree instance")
     context.tree_instance_ids.add(instance_id)
@@ -2606,7 +2592,9 @@ def _validate_program_tree(
         for requirement in entry.required_capabilities
         if requirement.component_parameter is not None
     }
-    selector_parameters = condition_parameters | target_parameters | component_parameters
+    selector_parameters = (
+        condition_parameters | target_parameters | component_parameters
+    )
 
     for parameter_id, catalog_parameter in catalog_parameters.items():
         supplied_literal = parameter_id in parameters
@@ -2667,12 +2655,8 @@ def _validate_program_tree(
             )
 
     _validate_node_capabilities(entry, parameters, path=path, context=context)
-    _validate_catalog_blackboard_bindings(
-        entry, parameters, path=path, context=context
-    )
-    _validate_node_cross_fields(
-        node_id, parameters, path=path, context=context
-    )
+    _validate_catalog_blackboard_bindings(entry, parameters, path=path, context=context)
+    _validate_node_cross_fields(node_id, parameters, path=path, context=context)
 
     raw_children = _program_list(node["children"], path=f"{path}.children")
     if len(raw_children) < entry.children_min or len(raw_children) > entry.children_max:
@@ -2701,7 +2685,9 @@ def _validate_program_tree(
         parameters=_freeze_mapping(parameters),
         value_sources=MappingProxyType(
             {
-                key: _freeze_mapping(_program_mapping(value, path=f"{path}.value_sources.{key}"))
+                key: _freeze_mapping(
+                    _program_mapping(value, path=f"{path}.value_sources.{key}")
+                )
                 for key, value in value_sources.items()
             }
         ),
@@ -2741,14 +2727,10 @@ def _validate_program_document(
         path=source,
     )
     if root["api_version"] != _PROGRAM_API_VERSION:
-        _program_error(
-            f"{source}.api_version", f"must be {_PROGRAM_API_VERSION}"
-        )
+        _program_error(f"{source}.api_version", f"must be {_PROGRAM_API_VERSION}")
     _program_identifier(root["program_id"], path=f"{source}.program_id")
     if root["program_profile"] != _PROGRAM_PROFILE:
-        _program_error(
-            f"{source}.program_profile", f"must be {_PROGRAM_PROFILE}"
-        )
+        _program_error(f"{source}.program_profile", f"must be {_PROGRAM_PROFILE}")
     _program_text(
         root["name"],
         path=f"{source}.name",
@@ -2950,6 +2932,7 @@ class Program:
         self.description = str(normalized.get("description", ""))
         self.catalog_api_version = str(normalized["catalog"]["api_version"])
         self.catalog_content_version = str(normalized["catalog"]["content_version"])
+        self.validated_catalog_digest = catalog.catalog_digest
         self.tree = tree
         self.parameters = MappingProxyType(dict(parameters))
         self.blackboard_keys = MappingProxyType(dict(blackboard_keys))

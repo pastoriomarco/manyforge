@@ -4,14 +4,15 @@ import asyncio
 import json
 from typing import Any, Iterator
 
-from fastapi.testclient import TestClient
-from fastapi import WebSocketDisconnect
 import httpx
 import pytest
+from fastapi import WebSocketDisconnect
+from fastapi.testclient import TestClient
 
+from manyforge_behavior.executable_node_resolver import build_executable_node_resolver
 from manyforge_behavior.node_environment import build_node_environment
-from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend import headless_ws
+from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.headless_ws import serve_headless_state
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
@@ -67,12 +68,16 @@ def _scene_body(
 
 
 @pytest.fixture
-def headless_client() -> Iterator[
-    tuple[HeadlessHttpClient, list[dict[str, Any]], dict[str, Any]]
-]:
+def headless_client() -> (
+    Iterator[tuple[HeadlessHttpClient, list[dict[str, Any]], dict[str, Any]]]
+):
     requests: list[dict[str, Any]] = []
     environment = build_node_environment()
     manifest = environment.manifest
+    dispositions = {
+        item.row: item
+        for item in build_executable_node_resolver(environment).dispositions
+    }
     node_environment = {
         "schema_version": "manyforge.node_environment_projection.v1",
         "retained_bundle_id": "bundle.1",
@@ -88,17 +93,38 @@ def headless_client() -> Iterator[
             "execution_available": False,
             "implementations": [
                 {
+                    "adapter_build_qualified": dispositions[
+                        row
+                    ].adapter_build_qualified,
                     "authoring_available": True,
+                    "binding_available": False,
                     "engine_id": row.engine_id,
                     "executable_package_id": row.executable_package_id,
                     "execution_available": False,
                     "implementation_id": row.implementation_id,
                     "implementation_identity_resolved": True,
                     "node_id": row.node_id,
-                    "reason_codes": [
-                        "program_binding_unselected",
-                        "program_runtime_owner_unavailable",
-                    ],
+                    "owner_health_available": (
+                        dispositions[row].adapter_build_qualified
+                        and dispositions[row].owner_port_name is None
+                    ),
+                    "reason_codes": sorted(
+                        {
+                            "program_binding_unselected",
+                            *(
+                                [dispositions[row].unavailable_reason_code]
+                                if dispositions[row].unavailable_reason_code is not None
+                                else []
+                            ),
+                            *(
+                                ["program_runtime_owner_unavailable"]
+                                if dispositions[row].owner_port_name is not None
+                                or not dispositions[row].adapter_build_qualified
+                                else []
+                            ),
+                        }
+                    ),
+                    "restoration_gates": list(dispositions[row].restoration_gates),
                 }
                 for row in manifest.executable_registry
             ],
@@ -227,9 +253,7 @@ def headless_client() -> Iterator[
         elif path == "/api/execution/alarms/metrics":
             payload = {"schema_version": "manyforge.operator_alarm_metrics.v1"}
         elif path.endswith("/acknowledge") or path.endswith("/acknowledge-all"):
-            payload = {
-                "schema_version": "manyforge.headless_api_mutation_response.v1"
-            }
+            payload = {"schema_version": "manyforge.headless_api_mutation_response.v1"}
         elif path == "/api/execution/history":
             payload = {"schema_version": "manyforge.historian_page.v1", "events": []}
         elif path == "/api/execution/history/health":
@@ -295,9 +319,12 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         }
         assert projected["availability"]["execution_available"] is False
         assert composer.get("/api/scene").status_code == 200
-        assert composer.get(
-            "/api/execution/alarms?limit=3&ordering=attention_newest"
-        ).json() == _alarms()
+        assert (
+            composer.get(
+                "/api/execution/alarms?limit=3&ordering=attention_newest"
+            ).json()
+            == _alarms()
+        )
         assert composer.get("/api/execution/history").status_code == 200
 
     assert all(item["method"] == "GET" for item in requests)
@@ -378,12 +405,18 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
             )
             assert response.status_code == 200, response.text
         assert composer.post("/api/execution/stops", json=stop).status_code == 200
-        assert composer.post(
-            "/api/execution/operations/operation-1/runtime-scale", json=scale
-        ).status_code == 200
-        assert composer.get(
-            "/api/execution/operations/operation-1/runtime-scale"
-        ).status_code == 200
+        assert (
+            composer.post(
+                "/api/execution/operations/operation-1/runtime-scale", json=scale
+            ).status_code
+            == 200
+        )
+        assert (
+            composer.get(
+                "/api/execution/operations/operation-1/runtime-scale"
+            ).status_code
+            == 200
+        )
         mismatch = composer.post(
             "/api/execution/operations/operation-2/pause", json=control
         )
@@ -424,9 +457,7 @@ def test_composer_scene_transaction_is_a_strict_stateless_forwarder(
     assert response.status_code == 200
     assert response.json()["projection_status"] == "committed"
     assert forged.status_code == 422
-    forwarded = [
-        item for item in requests if item["path"] == "/api/scene/transactions"
-    ]
+    forwarded = [item for item in requests if item["path"] == "/api/scene/transactions"]
     assert forwarded == [
         {
             "method": "POST",
@@ -625,9 +656,44 @@ def test_composer_rejects_a_mismatched_active_environment_without_local_fallback
         environment = composer.get("/api/nodes/environment")
     assert catalog.status_code == 503
     assert environment.status_code == 503
-    assert catalog.json()["detail"]["code"] == (
-        "node_environment_projection_invalid"
+    assert catalog.json()["detail"]["code"] == ("node_environment_projection_invalid")
+
+
+def test_composer_rejects_a_mismatched_local_adapter_disposition(
+    headless_client,
+) -> None:
+    client, _requests, node_environment = headless_client
+    row = next(
+        item
+        for item in node_environment["availability"]["implementations"]
+        if item["node_id"] == "simulation.reset"
     )
+    row["restoration_gates"] = ["I9", "N"]
+
+    with _composer(client) as composer:
+        response = composer.get("/api/catalog")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == ("node_environment_projection_invalid")
+
+
+def test_composer_rejects_false_owner_health_for_an_owner_neutral_adapter(
+    headless_client,
+) -> None:
+    client, _requests, node_environment = headless_client
+    row = next(
+        item
+        for item in node_environment["availability"]["implementations"]
+        if item["node_id"] == "sequence"
+    )
+    row["owner_health_available"] = False
+    row["reason_codes"].append("program_runtime_owner_unavailable")
+
+    with _composer(client) as composer:
+        response = composer.get("/api/catalog")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == ("node_environment_projection_invalid")
 
 
 def test_composer_does_not_fall_back_when_the_headless_environment_is_lost() -> None:

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from manyforge_behavior.catalog import CatalogValidationError, NodeCatalog
+from manyforge_behavior.executable_node_resolver import build_executable_node_resolver
 
 if TYPE_CHECKING:
-    from manyforge_behavior.node_environment import NodeEnvironmentManifest
+    from manyforge_behavior.node_environment import (
+        NodeEnvironment,
+        NodeEnvironmentManifest,
+    )
 
     from .state import ComposerState
 
@@ -37,14 +41,18 @@ _AVAILABILITY_FIELDS = {
     "restoration_gates",
 }
 _IMPLEMENTATION_FIELDS = {
+    "adapter_build_qualified",
     "authoring_available",
+    "binding_available",
     "engine_id",
     "executable_package_id",
     "execution_available",
     "implementation_id",
     "implementation_identity_resolved",
     "node_id",
+    "owner_health_available",
     "reason_codes",
+    "restoration_gates",
 }
 
 
@@ -134,7 +142,7 @@ def _validate_source(value: Any) -> None:
 
 def _validate_availability(
     value: Any,
-    manifest: "NodeEnvironmentManifest",
+    environment: "NodeEnvironment",
 ) -> None:
     availability = _object(value, "node environment availability")
     _closed(availability, _AVAILABILITY_FIELDS, "node environment availability")
@@ -152,7 +160,11 @@ def _validate_availability(
     implementations = availability["implementations"]
     if not isinstance(implementations, list):
         raise _invalid("availability.implementations must be an array")
-    expected = manifest.executable_registry
+    expected = environment.manifest.executable_registry
+    dispositions = {
+        item.row: item
+        for item in build_executable_node_resolver(environment).dispositions
+    }
     if len(implementations) != len(expected):
         raise _invalid("availability does not cover the complete executable registry")
     for index, (raw, registry_row) in enumerate(zip(implementations, expected)):
@@ -163,9 +175,12 @@ def _validate_availability(
             f"availability.implementations[{index}]",
         )
         for field in (
+            "adapter_build_qualified",
             "authoring_available",
+            "binding_available",
             "execution_available",
             "implementation_identity_resolved",
+            "owner_health_available",
         ):
             if not isinstance(row[field], bool):
                 raise _invalid(
@@ -183,10 +198,51 @@ def _validate_availability(
             registry_row.executable_package_id,
         ):
             raise _invalid("availability implementation identity is not registry-bound")
-        _text_list(
+        reasons = _text_list(
             row["reason_codes"],
             f"availability.implementations[{index}].reason_codes",
         )
+        gates = _text_list(
+            row["restoration_gates"],
+            f"availability.implementations[{index}].restoration_gates",
+        )
+        if row["execution_available"] and not all(
+            row[field]
+            for field in (
+                "adapter_build_qualified",
+                "binding_available",
+                "implementation_identity_resolved",
+                "owner_health_available",
+            )
+        ):
+            raise _invalid("availability execution claim lacks a required dimension")
+        if row["adapter_build_qualified"] == bool(gates):
+            raise _invalid(
+                "availability adapter disposition and restoration gates disagree"
+            )
+        disposition = dispositions[registry_row]
+        if row[
+            "adapter_build_qualified"
+        ] is not disposition.adapter_build_qualified or gates != list(
+            disposition.restoration_gates
+        ):
+            raise _invalid(
+                "availability adapter disposition does not match the local "
+                "build-qualified resolver"
+            )
+        if (
+            disposition.unavailable_reason_code is not None
+            and disposition.unavailable_reason_code not in reasons
+        ):
+            raise _invalid("availability omits the build-qualified adapter reason")
+        if (
+            disposition.adapter_build_qualified
+            and disposition.owner_port_name is None
+            and row["owner_health_available"] is not True
+        ):
+            raise _invalid(
+                "owner-neutral adapter cannot report an unavailable semantic owner"
+            )
 
 
 def verify_active_node_environment(
@@ -226,7 +282,7 @@ def verify_active_node_environment(
         raise _invalid("active node environment identities disagree")
     _text(projection["retained_bundle_id"], "retained_bundle_id")
     _text(projection["graph_revision"], "graph_revision")
-    _validate_availability(projection["availability"], local_manifest)
+    _validate_availability(projection["availability"], local_environment)
     return VerifiedActiveNodeEnvironment(
         payload=projection,
         catalog=catalog,

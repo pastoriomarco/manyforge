@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <map>
@@ -190,7 +191,15 @@ struct CatalogIdentity final {
   std::string catalog_id;
   std::string content_version;
   std::string catalog_digest;
+  std::set<std::string> owner_neutral_node_ids;
 };
+
+bool IsOwnerNeutralOwnerApi(const std::string_view owner_api) noexcept {
+  return owner_api == "geometry.compare" ||
+         owner_api == "orchestration.blackboard" ||
+         owner_api == "orchestration.clock" ||
+         owner_api == "orchestration.control_flow";
+}
 
 CatalogIdentity VerifyCatalog(const CanonicalValue &catalog) {
   RequireClosedObject(catalog,
@@ -204,7 +213,19 @@ CatalogIdentity VerifyCatalog(const CanonicalValue &catalog) {
   const auto content_version = RequiredString(catalog, "content_version");
   const auto declared_digest = RequiredDigest(catalog, "catalog_digest");
   static_cast<void>(RequiredMember(catalog, "schema_types").as_object());
-  static_cast<void>(RequiredArray(catalog, "entries", kMaximumRegistryRows));
+  std::set<std::string> node_ids;
+  std::set<std::string> owner_neutral_node_ids;
+  for (const auto &entry :
+       RequiredArray(catalog, "entries", kMaximumRegistryRows)) {
+    const auto node_id = RequiredIdentifier(entry, "id");
+    Require(node_ids.insert(node_id).second,
+            "node catalog contains a duplicate node ID");
+    const auto &execution = RequiredMember(entry, "execution");
+    const auto owner_api = RequiredIdentifier(execution, "owner_api");
+    if (IsOwnerNeutralOwnerApi(owner_api)) {
+      owner_neutral_node_ids.insert(node_id);
+    }
+  }
   const auto *cross_references = std::get_if<CanonicalValue::Array>(
       &RequiredMember(catalog, "skill_cross_references").storage());
   Require(cross_references != nullptr,
@@ -214,7 +235,8 @@ CatalogIdentity VerifyCatalog(const CanonicalValue &catalog) {
           WithoutMember(catalog, "catalog_digest")));
   Require(content_identity::digest_equal(computed, declared_digest),
           "node catalog descriptor digest verification failed");
-  return {catalog_id, content_version, declared_digest};
+  return {catalog_id, content_version, declared_digest,
+          std::move(owner_neutral_node_ids)};
 }
 
 struct RegistryRow final {
@@ -254,6 +276,7 @@ ManifestIdentity VerifyManifest(const CanonicalValue &manifest) {
       RequiredIdentifier(catalog, "catalog_id"),
       RequiredString(catalog, "content_version"),
       RequiredDigest(catalog, "catalog_digest"),
+      {},
   };
 
   std::vector<RegistryRow> registry;
@@ -345,21 +368,102 @@ StringArray(const std::initializer_list<std::string_view> values) {
   return CanonicalValue(std::move(result));
 }
 
+CanonicalValue StringArray(std::vector<std::string> values) {
+  std::sort(values.begin(), values.end());
+  values.erase(std::unique(values.begin(), values.end()), values.end());
+  CanonicalValue::Array result;
+  result.reserve(values.size());
+  for (auto &value : values) {
+    result.emplace_back(CanonicalValue(std::move(value)));
+  }
+  return CanonicalValue(std::move(result));
+}
+
+struct DeferredAdapter final {
+  std::string_view node_id;
+  std::string_view reason_code;
+  std::string_view milestone;
+  std::string_view gate;
+};
+
+constexpr std::array<DeferredAdapter, 16U> kDeferredAdapters{{
+    {"controller.select_route", "cclc_node_adapter_unavailable_until_i7", "I7",
+     "L0"},
+    {"io.get_input", "semantic_io_node_adapter_unavailable_until_i11", "I11",
+     "T"},
+    {"io.set_output", "semantic_io_node_adapter_unavailable_until_i11", "I11",
+     "T"},
+    {"io.wait_for_input", "semantic_io_node_adapter_unavailable_until_i11",
+     "I11", "T"},
+    {"kernel.full_stop", "kernel_policy_node_adapter_unavailable_until_i8",
+     "I8", "P5"},
+    {"lifecycle.disable_component", "cclc_node_adapter_unavailable_until_i7",
+     "I7", "L0"},
+    {"lifecycle.enable_component", "cclc_node_adapter_unavailable_until_i7",
+     "I7", "L0"},
+    {"lifecycle.prepare_component", "cclc_node_adapter_unavailable_until_i7",
+     "I7", "L0"},
+    {"lifecycle.recover_component", "cclc_node_adapter_unavailable_until_i7",
+     "I7", "L0"},
+    {"motion.move_until_signal",
+     "kernel_policy_node_adapter_unavailable_until_i8", "I8", "P5"},
+    {"motion.probe_search", "kernel_policy_node_adapter_unavailable_until_i8",
+     "I8", "P5"},
+    {"recovery.apply_offered_action",
+     "kernel_policy_node_adapter_unavailable_until_i8", "I8", "P5"},
+    {"simulation.reset", "simulation_node_adapter_unavailable_until_i9", "I9",
+     "I"},
+    {"simulation.set_entity_pose",
+     "simulation_node_adapter_unavailable_until_i9", "I9", "I"},
+    {"simulation.set_state", "simulation_node_adapter_unavailable_until_i9",
+     "I9", "I"},
+    {"simulation.step", "simulation_node_adapter_unavailable_until_i9", "I9",
+     "I"},
+}};
+
+const DeferredAdapter *DeferredDisposition(const std::string_view node_id) {
+  const auto found = std::lower_bound(
+      kDeferredAdapters.begin(), kDeferredAdapters.end(), node_id,
+      [](const DeferredAdapter &row, const std::string_view candidate) {
+        return row.node_id < candidate;
+      });
+  if (found == kDeferredAdapters.end() || found->node_id != node_id) {
+    return nullptr;
+  }
+  return &*found;
+}
+
 CanonicalValue Availability(const std::vector<RegistryRow> &registry,
+                            const std::set<std::string> &owner_neutral_node_ids,
                             const bool manager_runtime_converged) {
   CanonicalValue::Array implementations;
   implementations.reserve(registry.size());
   for (const auto &row : registry) {
+    const auto *deferred = DeferredDisposition(row.node_id);
+    const bool owner_health_available =
+        deferred == nullptr && owner_neutral_node_ids.contains(row.node_id);
+    std::vector<std::string> reason_codes{"program_binding_unselected"};
+    if (!owner_health_available) {
+      reason_codes.emplace_back("program_runtime_owner_unavailable");
+    }
+    CanonicalValue restoration_gates(CanonicalValue::Array{});
+    if (deferred != nullptr) {
+      reason_codes.emplace_back(deferred->reason_code);
+      restoration_gates = StringArray({deferred->milestone, deferred->gate});
+    }
     implementations.emplace_back(CanonicalValue(CanonicalValue::Object{
+        {"adapter_build_qualified", CanonicalValue(deferred == nullptr)},
         {"authoring_available", CanonicalValue(true)},
+        {"binding_available", CanonicalValue(false)},
         {"engine_id", CanonicalValue(row.engine_id)},
         {"executable_package_id", CanonicalValue(row.executable_package_id)},
         {"execution_available", CanonicalValue(false)},
         {"implementation_id", CanonicalValue(row.implementation_id)},
         {"implementation_identity_resolved", CanonicalValue(true)},
         {"node_id", CanonicalValue(row.node_id)},
-        {"reason_codes", StringArray({"program_binding_unselected",
-                                      "program_runtime_owner_unavailable"})},
+        {"owner_health_available", CanonicalValue(owner_health_available)},
+        {"reason_codes", StringArray(std::move(reason_codes))},
+        {"restoration_gates", std::move(restoration_gates)},
     }));
   }
   CanonicalValue::Array reason_codes;
@@ -462,7 +566,9 @@ CanonicalValue ActiveNodeEnvironmentProjection::Project(
 
   return CanonicalValue(CanonicalValue::Object{
       {"availability",
-       Availability(manifest_identity.registry, manager_runtime_converged)},
+       Availability(manifest_identity.registry,
+                    storage_->catalog_identity.owner_neutral_node_ids,
+                    manager_runtime_converged)},
       {"catalog", storage_->catalog},
       {"catalog_digest", CanonicalValue(environment.catalog_digest.value())},
       {"catalog_id", CanonicalValue(environment.catalog_id)},

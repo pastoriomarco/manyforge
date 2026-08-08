@@ -82,6 +82,16 @@ void ReplaceOnce(std::string &bytes, const std::string &before,
   bytes.replace(offset, before.size(), after);
 }
 
+std::size_t Count(const std::string &bytes, const std::string &needle) {
+  std::size_t result = 0U;
+  for (std::size_t offset = 0U;
+       (offset = bytes.find(needle, offset)) != std::string::npos;
+       offset += needle.size()) {
+    ++result;
+  }
+  return result;
+}
+
 std::filesystem::path CopyPackage(const TemporaryDirectory &directory) {
   const auto copy = directory.path() / "package";
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
@@ -106,6 +116,22 @@ TEST(NodeEnvironmentProjection,
             std::string::npos);
   EXPECT_NE(bytes.find("\"execution_available\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"implementation_identity_resolved\":true"),
+            std::string::npos);
+  EXPECT_NE(bytes.find("\"adapter_build_qualified\":true"), std::string::npos);
+  EXPECT_NE(bytes.find("\"adapter_build_qualified\":false"), std::string::npos);
+  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 34U);
+  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":false"), 16U);
+  EXPECT_NE(bytes.find("\"binding_available\":false"), std::string::npos);
+  EXPECT_NE(bytes.find("\"owner_health_available\":false"), std::string::npos);
+  EXPECT_EQ(Count(bytes, "\"owner_health_available\":true"), 11U);
+  EXPECT_EQ(Count(bytes, "\"owner_health_available\":false"), 39U);
+  EXPECT_NE(bytes.find("\"cclc_node_adapter_unavailable_until_i7\""),
+            std::string::npos);
+  EXPECT_NE(bytes.find("\"kernel_policy_node_adapter_unavailable_until_i8\""),
+            std::string::npos);
+  EXPECT_NE(bytes.find("\"simulation_node_adapter_unavailable_until_i9\""),
+            std::string::npos);
+  EXPECT_NE(bytes.find("\"semantic_io_node_adapter_unavailable_until_i11\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"manager_runtime_converged\":true"),
             std::string::npos);

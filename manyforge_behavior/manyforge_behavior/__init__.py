@@ -1,6 +1,6 @@
-"""Structural and offline Behavior artifacts during the runtime cutover.
+"""Behavior authoring plus the closed I6 executable-node source package.
 
-Runtime node implementations are intentionally not re-exported from the
-package root.  Production resolution remains unavailable until the headless
-implementation registry is restored and qualified.
+Runtime adapters are intentionally not re-exported from the package root.
+Exact v2 rows resolve only through :mod:`executable_node_resolver`; product
+launch remains unavailable until the later I6 binding and N7 topology gates.
 """

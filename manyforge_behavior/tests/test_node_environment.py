@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from manyforge_behavior import node_environment
 import manyforge_behavior.node_registry as node_registry_module
+from manyforge_behavior import node_environment
 from manyforge_behavior.node_environment import (
     AUTHORITATIVE_PROJECT_PATH,
     BUILTIN_ENVIRONMENT_MANIFEST_PATH,
@@ -21,10 +21,7 @@ from manyforge_behavior.node_environment import (
     generate_builtin_node_environment_manifest,
     load_builtin_node_environment_manifest,
 )
-from manyforge_behavior.node_registry import (
-    NodeRegistry,
-    NodeRegistryError,
-)
+from manyforge_behavior.node_registry import NodeRegistry, NodeRegistryError
 
 
 def test_retained_environment_manifest_is_fresh_and_build_owned() -> None:
@@ -79,9 +76,7 @@ def test_manifest_rejects_unknown_root_and_row_members() -> None:
             "forbidden.runtime.import",
         ),
     ):
-        raw = node_environment.load_strict_json_yaml(
-            BUILTIN_ENVIRONMENT_MANIFEST_PATH
-        )
+        raw = node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
         forged = copy.deepcopy(raw)
         mutate(forged)
         forged["environment_digest"] = "sha256:" + ("0" * 64)
@@ -97,13 +92,11 @@ def test_manifest_rejects_unknown_root_and_row_members() -> None:
 
 
 def test_manifest_accepts_shared_implementation_id_for_distinct_nodes() -> None:
-    raw = node_environment.load_strict_json_yaml(
-        BUILTIN_ENVIRONMENT_MANIFEST_PATH
-    )
+    raw = node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
     forged = copy.deepcopy(raw)
-    forged["executable_registry"][1]["implementation_id"] = (
-        forged["executable_registry"][0]["implementation_id"]
-    )
+    forged["executable_registry"][1]["implementation_id"] = forged[
+        "executable_registry"
+    ][0]["implementation_id"]
     forged["environment_digest"] = "sha256:" + ("0" * 64)
     forged["environment_digest"] = node_environment.compute_content_identity(
         forged,
@@ -120,9 +113,7 @@ def test_manifest_accepts_shared_implementation_id_for_distinct_nodes() -> None:
 
 
 def test_manifest_rejects_noncanonical_and_duplicate_registry_rows() -> None:
-    raw = node_environment.load_strict_json_yaml(
-        BUILTIN_ENVIRONMENT_MANIFEST_PATH
-    )
+    raw = node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
     noncanonical = copy.deepcopy(raw)
     noncanonical["executable_registry"][0:2] = reversed(
         noncanonical["executable_registry"][0:2]
@@ -156,8 +147,7 @@ def test_manifest_rejects_noncanonical_and_duplicate_registry_rows() -> None:
 def test_registry_and_package_joins_are_exact_and_total() -> None:
     manifest = generate_builtin_node_environment_manifest()
     package_ids = {
-        package.executable_package_id
-        for package in manifest.executable_packages
+        package.executable_package_id for package in manifest.executable_packages
     }
 
     assert {
@@ -198,17 +188,18 @@ def test_environment_digest_changes_when_covered_source_changes(
         load_builtin_node_environment_manifest()
     assert generated.environment_digest != (
         node_environment._parse_manifest(  # noqa: SLF001
-            node_environment.load_strict_json_yaml(
-                BUILTIN_ENVIRONMENT_MANIFEST_PATH
-            )
+            node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
         ).environment_digest
     )
 
 
 def test_source_package_version_comes_from_project_metadata() -> None:
-    assert generate_builtin_node_environment_manifest().executable_packages[
-        0
-    ].package_version == "0.1.0"
+    assert (
+        generate_builtin_node_environment_manifest()
+        .executable_packages[0]
+        .package_version
+        == "0.1.0"
+    )
 
 
 def test_packaged_project_snapshot_is_exact_build_evidence() -> None:
@@ -219,9 +210,7 @@ def test_packaged_project_snapshot_is_exact_build_evidence() -> None:
 
 
 def test_manifest_rejects_c1_control_characters() -> None:
-    raw = node_environment.load_strict_json_yaml(
-        BUILTIN_ENVIRONMENT_MANIFEST_PATH
-    )
+    raw = node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
     forged = copy.deepcopy(raw)
     forged["executable_packages"][0]["package_version"] = "0.1.0\u0085"
     forged["environment_digest"] = "sha256:" + ("0" * 64)
@@ -251,12 +240,19 @@ def test_registry_rejects_duplicate_node_engine_rows() -> None:
         )
 
 
-def test_runtime_resolver_surface_is_absent_until_headless_i5_owner() -> None:
+def test_registry_identity_remains_separate_from_closed_runtime_resolution() -> None:
     environment = build_node_environment()
 
     assert not hasattr(environment.registry, "instantiate")
     assert not hasattr(node_registry_module, "NodeFactoryContext")
     assert not hasattr(node_registry_module, "NodeRuntimeUnavailableError")
+    from manyforge_behavior.executable_node_resolver import (
+        build_executable_node_resolver,
+    )
+
+    resolver = build_executable_node_resolver(environment)
+    assert resolver.environment_digest == environment.environment_digest
+    assert len(resolver.dispositions) == len(environment.registry.rows)
 
 
 def test_caller_cannot_choose_a_catalog_path() -> None:
@@ -272,15 +268,11 @@ def test_removed_strict_compatibility_keyword_is_not_accepted() -> None:
 def test_path_based_extension_loading_surface_is_removed(tmp_path: Path) -> None:
     assert not hasattr(node_environment, "configured_node_roots")
     with pytest.raises(TypeError):
-        build_node_environment(  # type: ignore[call-arg]
-            external_roots=[tmp_path]
-        )
+        build_node_environment(external_roots=[tmp_path])  # type: ignore[call-arg]
 
 
 def test_manifest_field_splice_fails_identity_verification() -> None:
-    raw = node_environment.load_strict_json_yaml(
-        BUILTIN_ENVIRONMENT_MANIFEST_PATH
-    )
+    raw = node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
     spliced = copy.deepcopy(raw)
     spliced["catalog"]["catalog_digest"] = "sha256:" + ("f" * 64)
 
@@ -289,13 +281,9 @@ def test_manifest_field_splice_fails_identity_verification() -> None:
 
 
 def test_manifest_package_digest_must_cover_exact_source_rows() -> None:
-    raw = node_environment.load_strict_json_yaml(
-        BUILTIN_ENVIRONMENT_MANIFEST_PATH
-    )
+    raw = node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
     forged = copy.deepcopy(raw)
-    forged["executable_packages"][0]["content_digest"] = (
-        "sha256:" + ("f" * 64)
-    )
+    forged["executable_packages"][0]["content_digest"] = "sha256:" + ("f" * 64)
     forged["environment_digest"] = "sha256:" + ("0" * 64)
     forged["environment_digest"] = node_environment.compute_content_identity(
         forged,
@@ -312,9 +300,7 @@ def test_manifest_package_digest_must_cover_exact_source_rows() -> None:
 
 
 def test_manifest_rejects_path_like_source_identity() -> None:
-    raw = node_environment.load_strict_json_yaml(
-        BUILTIN_ENVIRONMENT_MANIFEST_PATH
-    )
+    raw = node_environment.load_strict_json_yaml(BUILTIN_ENVIRONMENT_MANIFEST_PATH)
     forged = copy.deepcopy(raw)
     forged["source_coverage"][0]["source_id"] = "/tmp/forged.py"
     forged["environment_digest"] = "sha256:" + ("0" * 64)

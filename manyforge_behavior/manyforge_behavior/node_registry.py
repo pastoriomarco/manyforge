@@ -2,8 +2,9 @@
 
 The v2 catalog deliberately carries stable implementation IDs, not import
 paths.  This module therefore builds the exact immutable registry projection
-without inventing a parallel Python factory table.  Runtime resolution belongs
-to the later headless environment/availability owner.
+without inventing a parallel Python factory table.  The build-qualified closed
+resolver consumes these rows separately; callable bindings never enter the
+retained identity manifest.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from manyforge_behavior.catalog import NodeCatalog
-
 
 BUILTIN_EXECUTABLE_PACKAGE_ID = "manyforge_behavior"
 _BUILD_TOKEN = object()
@@ -55,10 +55,7 @@ class NodeRegistry:
             raise NodeRegistryError("executable registry must not be empty")
         if rows != tuple(sorted(rows)):
             raise NodeRegistryError("executable registry rows must be canonical")
-        identities = {
-            (row.node_id, row.engine_id)
-            for row in rows
-        }
+        identities = {(row.node_id, row.engine_id) for row in rows}
         if len(identities) != len(rows):
             raise NodeRegistryError(
                 "executable registry contains duplicate node/engine rows"
@@ -89,14 +86,11 @@ class NodeRegistry:
 
     @property
     def node_ids(self) -> tuple[str, ...]:
-        return tuple(
-            row.node_id
-            for row in self._rows
-            if row.engine_id == "py_trees"
-        )
+        return tuple(row.node_id for row in self._rows if row.engine_id == "py_trees")
 
     def canonical_projection(self) -> list[dict[str, str]]:
         return [row.to_dict() for row in self._rows]
+
 
 def build_node_registry(catalog: NodeCatalog) -> NodeRegistry:
     """Derive the total canonical built-in registry from catalog runner rows."""
@@ -118,10 +112,7 @@ def build_node_registry(catalog: NodeCatalog) -> NodeRegistry:
         for entry in catalog.entries
         for engine_id, implementation_id in entry.runner_implementation_ids.items()
     }
-    observed = {
-        (row.node_id, row.engine_id, row.implementation_id)
-        for row in rows
-    }
+    observed = {(row.node_id, row.engine_id, row.implementation_id) for row in rows}
     if observed != expected:
         raise NodeRegistryError(
             "executable registry does not exactly cover catalog runner metadata"

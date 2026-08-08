@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -14,6 +15,16 @@ from .node_environment_client import (
 from .state import ComposerState
 
 
+def _json_response_value(value: Any) -> Any:
+    """Thaw immutable catalog values at the HTTP serialization boundary."""
+
+    if isinstance(value, Mapping):
+        return {key: _json_response_value(nested) for key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_response_value(nested) for nested in value]
+    return value
+
+
 def _parameter_response(param: Any, *, catalog: Any) -> dict[str, Any]:
     response = {
         "id": param.id,
@@ -23,7 +34,7 @@ def _parameter_response(param: Any, *, catalog: Any) -> dict[str, Any]:
         "hasDefault": param.has_default,
     }
     if param.has_default:
-        response["default"] = param.default
+        response["default"] = _json_response_value(param.default)
     return response
 
 
@@ -82,12 +93,10 @@ def _entry_response(entry: Any, *, catalog: Any) -> dict[str, Any]:
         "minProgramProfile": entry.min_program_profile,
         "blackboard": {
             "reads": [
-                _blackboard_response(binding)
-                for binding in entry.blackboard_reads
+                _blackboard_response(binding) for binding in entry.blackboard_reads
             ],
             "writes": [
-                _blackboard_response(binding)
-                for binding in entry.blackboard_writes
+                _blackboard_response(binding) for binding in entry.blackboard_writes
             ],
         },
         "ownerContext": (
@@ -108,7 +117,10 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
 
     def active_catalog() -> tuple[Any, str]:
         if state.headless_client is None:
-            return state.node_environment.catalog, state.node_environment.environment_digest
+            return (
+                state.node_environment.catalog,
+                state.node_environment.environment_digest,
+            )
         try:
             projection = read_active_node_environment(state)
         except ActiveNodeEnvironmentProjectionError as error:
@@ -131,8 +143,7 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
             "contentVersion": catalog.content_version,
             "catalogId": catalog.catalog_id,
             "entries": [
-                _entry_response(entry, catalog=catalog)
-                for entry in catalog.entries
+                _entry_response(entry, catalog=catalog) for entry in catalog.entries
             ],
             "catalogDigest": catalog.catalog_digest,
             "environmentDigest": environment_digest,
