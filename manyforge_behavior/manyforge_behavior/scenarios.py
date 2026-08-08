@@ -1,46 +1,58 @@
-"""Pure scenario metadata plus the fenced I6/N discovery client."""
+"""Bounded discovery of exact v1 scenario artifact closures.
+
+Discovery is an authoring/client operation.  It validates immutable artifact
+identities and their cross-references, but it does not activate a deployment,
+select runtime truth, compile a Program Binding, or dispatch robot work.
+"""
 
 from __future__ import annotations
 
 import os
-import sys
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, NoReturn, Final
+from typing import Any, Final, Iterable, Protocol
 
+from manyforge_behavior.canonical_artifact import (
+    StrictArtifactError,
+    canonical_json_bytes,
+    load_strict_json_yaml,
+    require_sha256_digest,
+    verify_content_identity,
+)
 from manyforge_behavior.node_environment import NodeEnvironment
 
+SCENARIO_CATALOG_API: Final = "manyforge.scenario_catalog.v1"
+SCENARIO_CATALOG_IDENTITY_DOMAIN: Final = "scenario-catalog-revision"
+PROGRAM_API: Final = "manyforge.program.v1"
+DEPLOYMENT_API: Final = "manyforge.deployment.v1"
+PROGRAM_BINDING_API: Final = "manyforge.program_binding.v1"
+PROGRAM_BINDING_IDENTITY_DOMAIN: Final = "program-binding-id"
+RETAINED_BUNDLE_API: Final = "manyforge.retained_bundle.v1"
+RETAINED_BUNDLE_IDENTITY_DOMAIN: Final = "retained-bundle-id"
 
-SCENARIO_DISCOVERY_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_scenario_discovery_unavailable"
-)
-SCENARIO_DISCOVERY_RESTORATION_GATES: Final = ("I6", "N")
+_MAX_ROOTS: Final = 128
+_MAX_SOURCE_ARTIFACTS: Final = 4096
+_MAX_SCENARIOS: Final = 4096
+_MAX_ALIASES_PER_SCENARIO: Final = 64
+_MAX_TEXT_CHARACTERS: Final = 4096
+_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 
 
 class ScenarioDiscoveryError(ValueError):
-    """Scenario metadata is malformed or mutually incompatible."""
-
-
-class ScenarioDiscoveryUnavailableError(ScenarioDiscoveryError):
-    """Scenario artifact discovery awaits native Program/addressing."""
-
-
-def _raise_scenario_discovery_unavailable() -> NoReturn:
-    raise ScenarioDiscoveryUnavailableError(
-        f"{SCENARIO_DISCOVERY_UNAVAILABLE_REASON_CODE}: scenario discovery "
-        "depends on the fenced Program client and returns at I6/N"
-    )
+    """Scenario artifacts are malformed, stale, missing, or ambiguous."""
 
 
 def configured_scenario_root_values(value: str | None = None) -> tuple[str, ...]:
     """Return the one process-level scenario-root setting without defaults."""
+
     raw = os.environ.get("MANYFORGE_SCENARIO_ROOTS", "") if value is None else value
     return tuple(item for item in raw.split(os.pathsep) if item)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Scenario:
-    """Presentation metadata; paths are not opened or validated here."""
+    """One exact named artifact closure plus source-local authoring paths."""
 
     name: str
     lane: str
@@ -51,15 +63,66 @@ class Scenario:
     aliases: tuple[str, ...] = ()
     runtime_resolver: str = ""
     cell_path: Path | None = None
+    deployment_artifact_id: str = ""
+    deployment_revision: str = ""
+    retained_bundle_id: str = ""
+    program_binding_id: str = ""
+    program_id: str = ""
+    program_revision: str = ""
+    typed_parameter_overrides_json: str = "{}"
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioArtifactClosure:
+    """Exact files and identities presented to the native closure verifier.
+
+    Python discovery owns bounded enumeration and presentation metadata only.
+    The verifier must reuse the qualified deployment, retained-bundle,
+    Program, Program-Binding, and node-environment owners before returning.
+    """
+
+    scenario_id: str
+    scenario_catalog_revision: str
+    repository_root: Path
+    scenario_catalog_path: Path
+    deployment_path: Path
+    retained_bundle_path: Path
+    program_binding_path: Path
+    program_path: Path
+    deployment_artifact_id: str
+    deployment_revision: str
+    retained_bundle_id: str
+    program_binding_id: str
+    graph_revision: str
+    program_id: str
+    program_revision: str
+    node_environment_digest: str
+    assistant_mode: str
+    typed_parameter_overrides_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedScenarioMetadata:
+    """Presentation facts returned by the qualified semantic verifier."""
+
+    lane: str
+    assistant_enabled: bool
+
+
+class ScenarioArtifactClosureVerifier(Protocol):
+    """Qualified semantic verifier required by scenario discovery."""
+
+    def verify(self, closure: ScenarioArtifactClosure, /) -> VerifiedScenarioMetadata:
+        """Reject or return facts from the complete verified closure."""
 
 
 class ScenarioCatalog:
-    """Small deterministic name/alias index with no filesystem ownership."""
+    """Small deterministic name/alias index with no runtime ownership."""
 
     def __init__(self, scenarios: Iterable[Scenario]):
         by_name: dict[str, Scenario] = {}
         aliases: dict[str, str] = {}
-        for scenario in scenarios:
+        for scenario in sorted(scenarios, key=lambda item: item.name):
             if scenario.name in by_name or scenario.name in aliases:
                 raise ScenarioDiscoveryError(
                     f"duplicate scenario identifier '{scenario.name}'"
@@ -86,24 +149,472 @@ class ScenarioCatalog:
             raise KeyError(name) from exc
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceArtifact:
+    path: Path
+    value: dict[str, Any]
+
+
+def _require_exact_fields(
+    value: object,
+    *,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+    path: str,
+) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise ScenarioDiscoveryError(f"{path} must be a mapping")
+    missing = sorted(required - set(value))
+    unknown = sorted(set(value) - required - optional)
+    if missing or unknown:
+        raise ScenarioDiscoveryError(
+            f"{path} has wrong fields; missing={missing}, unknown={unknown}"
+        )
+    return value
+
+
+def _require_id(value: object, *, path: str) -> str:
+    if type(value) is not str or _ID_RE.fullmatch(value) is None:
+        raise ScenarioDiscoveryError(f"{path} must be a bounded lowercase identifier")
+    return value
+
+
+def _require_text(value: object, *, path: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise ScenarioDiscoveryError(f"{path} must be non-empty text")
+    if len(value) > _MAX_TEXT_CHARACTERS:
+        raise ScenarioDiscoveryError(
+            f"{path} exceeds {_MAX_TEXT_CHARACTERS} characters"
+        )
+    return value.strip()
+
+
+def _require_digest(value: object, *, path: str) -> str:
+    try:
+        return require_sha256_digest(value, path)
+    except StrictArtifactError as exc:
+        raise ScenarioDiscoveryError(str(exc)) from exc
+
+
+def _load(path: Path, *, label: str) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ScenarioDiscoveryError(f"{label} must not be a symbolic link: {path}")
+    try:
+        return load_strict_json_yaml(path)
+    except StrictArtifactError as exc:
+        raise ScenarioDiscoveryError(f"{label} is invalid: {exc}") from exc
+
+
+def _verify_identity(
+    value: dict[str, Any],
+    *,
+    own_field: str,
+    identity_domain: str,
+    api_version: str,
+    label: str,
+) -> str:
+    if value.get("api_version") != api_version:
+        raise ScenarioDiscoveryError(f"{label}.api_version must be {api_version}")
+    try:
+        return verify_content_identity(
+            value,
+            own_field=own_field,
+            identity_domain=identity_domain,
+            api_version=api_version,
+            label=label,
+        )
+    except StrictArtifactError as exc:
+        raise ScenarioDiscoveryError(str(exc)) from exc
+
+
+def _resolve_roots(roots: Iterable[str | Path]) -> tuple[Path, ...]:
+    resolved: list[Path] = []
+    for root_value in roots:
+        if len(resolved) == _MAX_ROOTS:
+            raise ScenarioDiscoveryError(f"scenario root count exceeds {_MAX_ROOTS}")
+        try:
+            root = Path(root_value).resolve(strict=True)
+        except OSError as exc:
+            raise ScenarioDiscoveryError(
+                f"scenario root does not exist: {root_value}"
+            ) from exc
+        if not root.is_dir():
+            raise ScenarioDiscoveryError(f"scenario root is not a directory: {root}")
+        if root in resolved:
+            raise ScenarioDiscoveryError(f"duplicate scenario root: {root}")
+        resolved.append(root)
+    return tuple(resolved)
+
+
+def _index_sources(
+    root: Path,
+    *,
+    suffix: str,
+    api_version: str,
+    own_id: str,
+    own_revision: str,
+    source_count: list[int],
+) -> dict[tuple[str, str], _SourceArtifact]:
+    result: dict[tuple[str, str], _SourceArtifact] = {}
+    for path in sorted(root.glob(f"*{suffix}")):
+        source_count[0] += 1
+        if source_count[0] > _MAX_SOURCE_ARTIFACTS:
+            raise ScenarioDiscoveryError(
+                f"{suffix} source count exceeds {_MAX_SOURCE_ARTIFACTS}"
+            )
+        value = _load(path, label=f"source artifact {path}")
+        # Other schema generations may share an authoring root. They are not
+        # accepted or interpreted by this v1 index.
+        if value.get("api_version") != api_version:
+            continue
+        # Full source identity is schema-normalized by the qualified native
+        # verifier. Recomputing it here without that schema would create a
+        # second, subtly different Program/deployment validator.
+        revision = _require_digest(
+            value.get(own_revision), path=f"{path}.{own_revision}"
+        )
+        key = (
+            _require_id(value.get(own_id), path=f"{path}.{own_id}"),
+            revision,
+        )
+        if key in result:
+            raise ScenarioDiscoveryError(
+                f"duplicate exact {api_version} source {key}: "
+                f"{result[key].path} and {path}"
+            )
+        result[key] = _SourceArtifact(path=path.resolve(), value=value)
+    return result
+
+
+def _repository_path(root: Path, collection: str, digest: str) -> Path:
+    return root / collection / "sha256" / f"{digest.removeprefix('sha256:')}.json"
+
+
+def _load_repository_artifact(
+    root: Path,
+    *,
+    collection: str,
+    digest: str,
+    api_version: str,
+    own_field: str,
+    identity_domain: str,
+    cache: dict[tuple[str, str], _SourceArtifact],
+) -> _SourceArtifact:
+    key = (collection, digest)
+    if key in cache:
+        return cache[key]
+    namespace = root / collection
+    data_directory = namespace / "sha256"
+    if namespace.is_symlink() or data_directory.is_symlink():
+        raise ScenarioDiscoveryError(
+            f"{collection} repository namespaces must not be symbolic links"
+        )
+    path = _repository_path(root, collection, digest)
+    if not path.is_file():
+        raise ScenarioDiscoveryError(
+            f"{collection} artifact is unavailable for {digest} below {root}"
+        )
+    value = _load(path, label=f"{collection} artifact {digest}")
+    verified = _verify_identity(
+        value,
+        own_field=own_field,
+        identity_domain=identity_domain,
+        api_version=api_version,
+        label=str(path),
+    )
+    if verified != digest:
+        raise ScenarioDiscoveryError(f"{path}: repository key and {own_field} differ")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ScenarioDiscoveryError(
+            f"cannot reread repository artifact: {path}"
+        ) from exc
+    if raw != canonical_json_bytes(value):
+        raise ScenarioDiscoveryError(
+            f"{path}: durable repository artifact is not canonical JSON"
+        )
+    artifact = _SourceArtifact(path=path.resolve(), value=value)
+    cache[key] = artifact
+    return artifact
+
+
+def _scenario_from_row(
+    row: dict[str, Any],
+    *,
+    row_path: str,
+    repository_root: Path,
+    scenario_catalog_path: Path,
+    scenario_catalog_revision: str,
+    deployments: dict[tuple[str, str], _SourceArtifact],
+    programs: dict[tuple[str, str], _SourceArtifact],
+    node_environment: NodeEnvironment,
+    closure_verifier: ScenarioArtifactClosureVerifier,
+    repository_cache: dict[tuple[str, str], _SourceArtifact],
+) -> Scenario:
+    scenario_id = _require_id(row.get("scenario_id"), path=f"{row_path}.scenario_id")
+    deployment_id = _require_id(
+        row.get("deployment_artifact_id"),
+        path=f"{row_path}.deployment_artifact_id",
+    )
+    deployment_revision = _require_digest(
+        row.get("deployment_revision"), path=f"{row_path}.deployment_revision"
+    )
+    retained_bundle_id = _require_digest(
+        row.get("retained_bundle_id"), path=f"{row_path}.retained_bundle_id"
+    )
+    program_binding_id = _require_digest(
+        row.get("program_binding_id"), path=f"{row_path}.program_binding_id"
+    )
+    assistant_mode = row.get("assistant_mode")
+    if assistant_mode not in {"required", "optional", "forbidden"}:
+        raise ScenarioDiscoveryError(f"{row_path}.assistant_mode is invalid")
+    overrides = row.get("typed_parameter_overrides")
+    if type(overrides) is not dict:
+        raise ScenarioDiscoveryError(
+            f"{row_path}.typed_parameter_overrides must be a mapping"
+        )
+
+    try:
+        deployment = deployments[(deployment_id, deployment_revision)]
+    except KeyError as exc:
+        raise ScenarioDiscoveryError(
+            f"{row_path}: exact deployment source is unavailable"
+        ) from exc
+    bundle = _load_repository_artifact(
+        repository_root,
+        collection="retained-bundles",
+        digest=retained_bundle_id,
+        api_version=RETAINED_BUNDLE_API,
+        own_field="retained_bundle_id",
+        identity_domain=RETAINED_BUNDLE_IDENTITY_DOMAIN,
+        cache=repository_cache,
+    )
+    binding = _load_repository_artifact(
+        repository_root,
+        collection="program-bindings",
+        digest=program_binding_id,
+        api_version=PROGRAM_BINDING_API,
+        own_field="program_binding_id",
+        identity_domain=PROGRAM_BINDING_IDENTITY_DOMAIN,
+        cache=repository_cache,
+    )
+    if (
+        bundle.value.get("deployment_artifact_id") != deployment_id
+        or bundle.value.get("deployment_revision") != deployment_revision
+    ):
+        raise ScenarioDiscoveryError(
+            f"{row_path}: retained bundle selects another deployment"
+        )
+    if binding.value.get("retained_bundle_id") != retained_bundle_id:
+        raise ScenarioDiscoveryError(
+            f"{row_path}: Program Binding selects another retained bundle"
+        )
+    bundle_graph = bundle.value.get("cell_graph")
+    if type(bundle_graph) is not dict:
+        raise ScenarioDiscoveryError(f"{row_path}: retained bundle has no cell graph")
+    graph_revision = _require_digest(
+        bundle_graph.get("graph_revision"),
+        path=f"{bundle.path}.cell_graph.graph_revision",
+    )
+    if binding.value.get("graph_revision") != graph_revision:
+        raise ScenarioDiscoveryError(
+            f"{row_path}: Program Binding graph revision is stale"
+        )
+
+    program_id = _require_id(
+        binding.value.get("program_id"), path=f"{binding.path}.program_id"
+    )
+    program_revision = _require_digest(
+        binding.value.get("program_revision"),
+        path=f"{binding.path}.program_revision",
+    )
+    try:
+        program = programs[(program_id, program_revision)]
+    except KeyError as exc:
+        raise ScenarioDiscoveryError(
+            f"{row_path}: exact Program source is unavailable"
+        ) from exc
+
+    aliases_raw = row.get("aliases", [])
+    if type(aliases_raw) is not list or len(aliases_raw) > _MAX_ALIASES_PER_SCENARIO:
+        raise ScenarioDiscoveryError(f"{row_path}.aliases violates its bound")
+    aliases = tuple(
+        _require_id(alias, path=f"{row_path}.aliases[]") for alias in aliases_raw
+    )
+    if tuple(sorted(aliases)) != aliases or len(set(aliases)) != len(aliases):
+        raise ScenarioDiscoveryError(
+            f"{row_path}.aliases must be duplicate-free and canonical-sorted"
+        )
+    description = _require_text(
+        row.get("description", scenario_id), path=f"{row_path}.description"
+    )
+    overrides_json = canonical_json_bytes(overrides).decode("utf-8")
+    closure = ScenarioArtifactClosure(
+        scenario_id=scenario_id,
+        scenario_catalog_revision=scenario_catalog_revision,
+        repository_root=repository_root,
+        scenario_catalog_path=scenario_catalog_path,
+        deployment_path=deployment.path,
+        retained_bundle_path=bundle.path,
+        program_binding_path=binding.path,
+        program_path=program.path,
+        deployment_artifact_id=deployment_id,
+        deployment_revision=deployment_revision,
+        retained_bundle_id=retained_bundle_id,
+        program_binding_id=program_binding_id,
+        graph_revision=graph_revision,
+        program_id=program_id,
+        program_revision=program_revision,
+        node_environment_digest=node_environment.environment_digest,
+        assistant_mode=assistant_mode,
+        typed_parameter_overrides_json=overrides_json,
+    )
+    try:
+        verified = closure_verifier.verify(closure)
+    except ScenarioDiscoveryError:
+        raise
+    except ValueError as exc:
+        raise ScenarioDiscoveryError(
+            f"{row_path}: exact artifact closure is invalid: {exc}"
+        ) from exc
+    if type(verified) is not VerifiedScenarioMetadata:
+        raise ScenarioDiscoveryError(
+            f"{row_path}: closure verifier returned an invalid result"
+        )
+    if verified.lane not in {"manyforge-only", "isaac-sim", "real-robot"}:
+        raise ScenarioDiscoveryError(
+            f"{row_path}: closure verifier returned an invalid lane"
+        )
+    if type(verified.assistant_enabled) is not bool:
+        raise ScenarioDiscoveryError(
+            f"{row_path}: closure verifier returned invalid assistant state"
+        )
+    return Scenario(
+        name=scenario_id,
+        lane=verified.lane,
+        assistant="on" if verified.assistant_enabled else "off",
+        program_path=program.path,
+        deployment_path=deployment.path,
+        description=description,
+        aliases=aliases,
+        deployment_artifact_id=deployment_id,
+        deployment_revision=deployment_revision,
+        retained_bundle_id=retained_bundle_id,
+        program_binding_id=program_binding_id,
+        program_id=program_id,
+        program_revision=program_revision,
+        typed_parameter_overrides_json=overrides_json,
+    )
+
+
 def discover_scenarios(
     roots: Iterable[str | Path],
     *,
     node_environment: NodeEnvironment,
+    closure_verifier: ScenarioArtifactClosureVerifier,
 ) -> ScenarioCatalog:
-    """Fail before reading roots or consulting environment availability."""
-    del roots, node_environment
-    _raise_scenario_discovery_unavailable()
+    """Discover exact v1 closures after qualified semantic verification."""
+
+    resolved_roots = _resolve_roots(roots)
+    scenarios: list[Scenario] = []
+    deployment_source_count = [0]
+    program_source_count = [0]
+    for root in resolved_roots:
+        deployments = _index_sources(
+            root,
+            suffix=".deployment.yaml",
+            api_version=DEPLOYMENT_API,
+            own_id="deployment_artifact_id",
+            own_revision="deployment_revision",
+            source_count=deployment_source_count,
+        )
+        programs = _index_sources(
+            root,
+            suffix=".program.yaml",
+            api_version=PROGRAM_API,
+            own_id="program_id",
+            own_revision="program_revision",
+            source_count=program_source_count,
+        )
+        repository_cache: dict[tuple[str, str], _SourceArtifact] = {}
+        for raw_catalog_path in sorted(root.glob("*.scenario-catalog.yaml")):
+            catalog = _load(raw_catalog_path, label="scenario catalog")
+            catalog_path = raw_catalog_path.resolve()
+            _require_exact_fields(
+                catalog,
+                required=frozenset(
+                    {"api_version", "scenario_catalog_revision", "scenarios"}
+                ),
+                path=str(catalog_path),
+            )
+            scenario_catalog_revision = _verify_identity(
+                catalog,
+                own_field="scenario_catalog_revision",
+                identity_domain=SCENARIO_CATALOG_IDENTITY_DOMAIN,
+                api_version=SCENARIO_CATALOG_API,
+                label=str(catalog_path),
+            )
+            rows = catalog.get("scenarios")
+            if type(rows) is not list:
+                raise ScenarioDiscoveryError(f"{catalog_path}.scenarios must be a list")
+            if len(scenarios) + len(rows) > _MAX_SCENARIOS:
+                raise ScenarioDiscoveryError(
+                    f"aggregate scenario count exceeds {_MAX_SCENARIOS}"
+                )
+            identifiers: list[str] = []
+            for index, raw_row in enumerate(rows):
+                row_path = f"{catalog_path}.scenarios[{index}]"
+                row = _require_exact_fields(
+                    raw_row,
+                    required=frozenset(
+                        {
+                            "scenario_id",
+                            "deployment_artifact_id",
+                            "deployment_revision",
+                            "retained_bundle_id",
+                            "program_binding_id",
+                            "assistant_mode",
+                            "typed_parameter_overrides",
+                        }
+                    ),
+                    optional=frozenset({"description", "aliases"}),
+                    path=row_path,
+                )
+                scenario = _scenario_from_row(
+                    row,
+                    row_path=row_path,
+                    repository_root=root,
+                    scenario_catalog_path=catalog_path,
+                    scenario_catalog_revision=scenario_catalog_revision,
+                    deployments=deployments,
+                    programs=programs,
+                    node_environment=node_environment,
+                    closure_verifier=closure_verifier,
+                    repository_cache=repository_cache,
+                )
+                identifiers.append(scenario.name)
+                scenarios.append(scenario)
+            if identifiers != sorted(identifiers) or len(set(identifiers)) != len(
+                identifiers
+            ):
+                raise ScenarioDiscoveryError(
+                    f"{catalog_path}.scenarios must be unique and canonical-sorted"
+                )
+    return ScenarioCatalog(scenarios)
 
 
-def _main() -> int:
-    print(
-        f"{SCENARIO_DISCOVERY_UNAVAILABLE_REASON_CODE}: scenario discovery "
-        "returns at I6/N",
-        file=sys.stderr,
-    )
-    return 78
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())
+__all__ = [
+    "DEPLOYMENT_API",
+    "PROGRAM_API",
+    "RETAINED_BUNDLE_API",
+    "SCENARIO_CATALOG_API",
+    "Scenario",
+    "ScenarioArtifactClosure",
+    "ScenarioArtifactClosureVerifier",
+    "ScenarioCatalog",
+    "ScenarioDiscoveryError",
+    "VerifiedScenarioMetadata",
+    "configured_scenario_root_values",
+    "discover_scenarios",
+]

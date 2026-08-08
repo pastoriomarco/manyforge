@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from manyforge_behavior.scenarios import (
-    SCENARIO_DISCOVERY_UNAVAILABLE_REASON_CODE,
-)
-
 from .state import ComposerState
+
+SCENARIO_ROUTE_UNAVAILABLE_REASON_CODE = "composable_cell_scenario_route_unavailable"
 
 
 def create_scenarios_router(state: ComposerState) -> APIRouter:
@@ -20,7 +18,7 @@ def create_scenarios_router(state: ComposerState) -> APIRouter:
         raise HTTPException(
             status_code=503,
             detail={
-                "code": SCENARIO_DISCOVERY_UNAVAILABLE_REASON_CODE,
+                "code": SCENARIO_ROUTE_UNAVAILABLE_REASON_CODE,
                 "message": (
                     "scenario discovery returns with native Program/addressing "
                     "at I6/N"
