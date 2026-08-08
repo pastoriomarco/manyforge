@@ -18,17 +18,17 @@ namespace manyforge::core {
 inline constexpr std::size_t kMaxPickPlaceSequenceIdBytes = 96U;
 
 /// Public, portable subset of deterministic candidate synthesis. Translation
-/// offsets are expressed in the selected arm's logical planning-base frame,
-/// unless the corresponding candidate-TCP flag is true. Resolved frame poses
-/// never enter this caller-owned value.
+/// offsets are expressed in the selected arm's logical planning-base frame
+/// when the corresponding reference is absent. A frame-role reference equal
+/// to the selected TCP role follows each synthesized candidate TCP; every
+/// other reference is resolved once from exact immutable Program/scene/state
+/// evidence. Resolved frame poses never enter this caller-owned value.
 struct PickCandidateSynthesisIntentDTO final {
   PickOffsetEnvelopeDTO pick_offset_envelope{};
-  PickOffsetEnvelopeDTO approach_offset_envelope{{0.0, 0.0, 0.05},
-                                                  {0.0, 0.0, 0.1}, {}, {}};
-  bool pick_offset_uses_candidate_tcp{};
-  bool approach_offset_uses_candidate_tcp{};
-  std::array<double, 3U> base_tool_orientation_rpy_deg{180.0, 0.0,
-                                                       0.0};
+  PickOffsetEnvelopeDTO approach_offset_envelope{{0.0, 0.0, 0.05}, {0.0, 0.0, 0.1}, {}, {}};
+  std::optional<ReferenceDTO> pick_offset_reference;
+  std::optional<ReferenceDTO> approach_offset_reference;
+  std::array<double, 3U> base_tool_orientation_rpy_deg{180.0, 0.0, 0.0};
   double translation_step_m{0.01};
   double rotation_step_deg{15.0};
   bool force_vertical_pick{};
@@ -77,6 +77,10 @@ struct PickPlacePlanningResultDTO final {
   SceneResourceId selected_object_id{std::string{}};
   std::size_t attempted_candidate_count{};
   std::vector<PickCandidateReportDTO> reports;
+  /// Bounded diagnostic geometry for the final attempted pick candidate.
+  /// This remains non-executable; a successful plan is carried only by
+  /// sequence_request with its exact owner-private evidence.
+  std::optional<PickPoseCandidateDTO> last_attempted_pick_candidate;
   std::optional<PickPlaceSequenceRequestDTO> sequence_request;
 };
 
@@ -112,8 +116,40 @@ class AddressedPickPlacePlanningOwner final {
   IPlannerSceneProjection& projection_;
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    PickPlacePlanningStatusDTO status) noexcept {
+/// Public admission result for one addressed pick/place execution request.
+/// A no-feasible-candidate result has no sequence status and performs no
+/// effect. A planned result begins only through the existing C++ sequence
+/// coordinator; the planning result remains a bounded diagnostic projection.
+struct PickPlaceSequenceAdmissionResultDTO final {
+  PickPlacePlanningResultDTO planning_result;
+  std::optional<PickPlaceSequenceStatusDTO> sequence_status;
+};
+
+/// Thin effectful join over the stateless planning owner and the sole C++
+/// pick/place sequence coordinator. It adds no phase, operation, gripper, or
+/// scene truth of its own.
+class AddressedPickPlaceExecutionOwner final {
+ public:
+  AddressedPickPlaceExecutionOwner(AddressedPickPlacePlanningOwner& planning,
+                                   PickPlaceSequenceCoordinator& sequences)
+      : planning_(planning), sequences_(sequences) {}
+
+  [[nodiscard]] Result<PickPlaceSequenceAdmissionResultDTO> BeginPick(
+      PickSequencePlanningIntentDTO intent, std::stop_token stop_token = {});
+  [[nodiscard]] Result<PickPlaceSequenceAdmissionResultDTO> BeginPlace(
+      PlaceSequencePlanningIntentDTO intent, std::stop_token stop_token = {});
+  [[nodiscard]] Result<PickPlaceSequenceStatusDTO> Reconcile();
+  [[nodiscard]] Result<PickPlaceSequenceStatusDTO> GetStatus(std::string_view sequence_id) const;
+
+ private:
+  [[nodiscard]] Result<PickPlaceSequenceAdmissionResultDTO> BeginPlanned(
+      Result<PickPlacePlanningResultDTO> planned);
+
+  AddressedPickPlacePlanningOwner& planning_;
+  PickPlaceSequenceCoordinator& sequences_;
+};
+
+[[nodiscard]] constexpr std::string_view to_string(PickPlacePlanningStatusDTO status) noexcept {
   switch (status) {
     case PickPlacePlanningStatusDTO::kPlanned:
       return "planned";

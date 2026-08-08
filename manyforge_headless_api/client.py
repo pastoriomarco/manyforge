@@ -184,6 +184,27 @@ class HeadlessHttpClient:
             "POST", "/api/execution/pick-place/plans/place", body=body
         )
 
+    def start_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/execution/pick-place/sequences/pick", body=body
+        )
+
+    def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/execution/pick-place/sequences/place", body=body
+        )
+
+    @staticmethod
+    def _pick_place_sequence_path(sequence_id: str) -> str:
+        if not sequence_id or len(sequence_id.encode("utf-8")) > 96:
+            raise ValueError("sequence_id must be bounded non-empty text")
+        if "/" in sequence_id or ".." in sequence_id:
+            raise ValueError("sequence_id is invalid for an HTTP path")
+        return f"/api/execution/pick-place/sequences/{sequence_id}"
+
+    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
+        return self.request("GET", self._pick_place_sequence_path(sequence_id))
+
     @staticmethod
     def _operation_path(operation_id: str) -> str:
         if not operation_id or len(operation_id.encode("utf-8")) > 256:

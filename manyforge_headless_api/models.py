@@ -1139,6 +1139,77 @@ class PickOffsetEnvelopeRequest(StrictRequest):
         return self
 
 
+class PickFrameRoleReferenceRequest(StrictRequest):
+    type: Literal["frame_role"]
+    frame_role_id: str
+
+    @field_validator("frame_role_id")
+    @classmethod
+    def validate_frame_role_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="frame_role_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class PickComponentBodyRoleReferenceRequest(StrictRequest):
+    type: Literal["component_body_role"]
+    collision_body_role_id: str
+
+    @field_validator("collision_body_role_id")
+    @classmethod
+    def validate_collision_body_role_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="collision_body_role_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class PickSceneResourceReferenceRequest(StrictRequest):
+    type: Literal["scene_resource"]
+    scene_resource_id: str
+
+    @field_validator("scene_resource_id")
+    @classmethod
+    def validate_scene_resource_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="scene_resource_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class PickRuntimeObjectReferenceRequest(StrictRequest):
+    type: Literal["runtime_object"]
+    runtime_object_id: str
+
+    @field_validator("runtime_object_id")
+    @classmethod
+    def validate_runtime_object_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="runtime_object_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class PickInlinePoseReferenceRequest(StrictRequest):
+    type: Literal["pose"]
+    pose: Pose3Request
+
+
+PickOffsetReferenceRequest = Annotated[
+    PickFrameRoleReferenceRequest
+    | PickComponentBodyRoleReferenceRequest
+    | PickSceneResourceReferenceRequest
+    | PickRuntimeObjectReferenceRequest
+    | PickInlinePoseReferenceRequest,
+    Field(discriminator="type"),
+]
+
+
 class PickCandidateSynthesisRequest(StrictRequest):
     pick_offset_envelope: PickOffsetEnvelopeRequest = Field(
         default_factory=lambda: PickOffsetEnvelopeRequest(
@@ -1156,8 +1227,8 @@ class PickCandidateSynthesisRequest(StrictRequest):
             orientation_rpy_max_deg=[0.0, 0.0, 0.0],
         )
     )
-    pick_offset_uses_candidate_tcp: bool = False
-    approach_offset_uses_candidate_tcp: bool = False
+    pick_offset_reference: PickOffsetReferenceRequest | None = None
+    approach_offset_reference: PickOffsetReferenceRequest | None = None
     base_tool_orientation_rpy_deg: Annotated[
         list[Annotated[float, Field(allow_inf_nan=False)]],
         Field(min_length=3, max_length=3),

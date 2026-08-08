@@ -42,6 +42,26 @@ class FakeTransport:
             "planning_result": {"kind": "place", "sequence_id": "place-1"},
         }
 
+    def start_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.submitted = body
+        return {
+            "ok": True,
+            "sequence_status": {"kind": "pick", "sequence_id": "pick-1"},
+        }
+
+    def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.submitted = body
+        return {
+            "ok": True,
+            "sequence_status": {"kind": "place", "sequence_id": "place-1"},
+        }
+
+    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "sequence_status": {"sequence_id": sequence_id, "phase": "completed"},
+        }
+
     def operation(self, operation_id: str) -> dict[str, Any]:
         return {
             "ok": True,
@@ -133,6 +153,15 @@ def test_kernel_client_only_forwards_bounded_headless_operations() -> None:
     assert client.plan_place({"sequence_id": "place-1"})["planning_result"][
         "kind"
     ] == "place"
+    assert client.start_pick({"sequence_id": "pick-1"})["sequence_status"][
+        "kind"
+    ] == "pick"
+    assert client.start_place({"sequence_id": "place-1"})["sequence_status"][
+        "kind"
+    ] == "place"
+    assert client.pick_place_sequence("pick-1")["sequence_status"][
+        "phase"
+    ] == "completed"
     assert client.operation("operation-1")["operation"]["state"] == "completed"
     request = {"expected_operation_revision": 1}
     stop_request = {

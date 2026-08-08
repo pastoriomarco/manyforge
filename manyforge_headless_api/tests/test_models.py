@@ -148,6 +148,16 @@ def _pick_request() -> dict[str, object]:
         "selected_object_id": "workpiece",
         "selected_runtime_object_id": "selected_object",
         "carrier_frame_role_id": "frame-role:tcp",
+        "synthesis": {
+            "pick_offset_reference": {
+                "type": "runtime_object",
+                "runtime_object_id": "selected_object",
+            },
+            "approach_offset_reference": {
+                "type": "frame_role",
+                "frame_role_id": "frame-role:tcp",
+            },
+        },
         "approach_operation": _planning_operation(
             "pick.approach",
             _planning_motion(
@@ -173,6 +183,35 @@ def _pick_request() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        {"type": "frame_role", "frame_role_id": "frame-role:wrist"},
+        {
+            "type": "component_body_role",
+            "collision_body_role_id": "body-role:wrist",
+        },
+        {"type": "scene_resource", "scene_resource_id": "workpiece"},
+        {"type": "runtime_object", "runtime_object_id": "selected_object"},
+        {"type": "pose", "pose": _planning_pose()},
+    ],
+)
+def test_pick_offset_reference_uses_closed_portable_forms(
+    reference: dict[str, object],
+) -> None:
+    request = _pick_request()
+    synthesis = request["synthesis"]
+    assert isinstance(synthesis, dict)
+    synthesis["pick_offset_reference"] = reference
+
+    parsed = PickSequencePlanningRequest.model_validate(request)
+
+    assert parsed.synthesis.pick_offset_reference is not None
+    assert parsed.synthesis.pick_offset_reference.model_dump(mode="json") == (
+        reference
+    )
+
+
 def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
     parsed = PickSequencePlanningRequest.model_validate(_pick_request())
     assert parsed.synthesis.approach_offset_envelope.position_min_m == [
@@ -185,6 +224,10 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
         0.0,
         0.1,
     ]
+    assert parsed.synthesis.pick_offset_reference is not None
+    assert parsed.synthesis.pick_offset_reference.type == "runtime_object"
+    assert parsed.synthesis.approach_offset_reference is not None
+    assert parsed.synthesis.approach_offset_reference.type == "frame_role"
     assert parsed.descend_operation.participants[0].payload.contact_policy_id == (
         "pick.contact"
     )
@@ -211,6 +254,16 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
         operation["expected_scene_revision"] = None
     with pytest.raises(ValidationError, match="requires one exact scene revision"):
         PickSequencePlanningRequest.model_validate(missing_scene)
+
+    untyped_reference = _pick_request()
+    synthesis = untyped_reference["synthesis"]
+    assert isinstance(synthesis, dict)
+    synthesis["pick_offset_reference"] = {
+        "type": "scene_resource",
+        "id": "workpiece",
+    }
+    with pytest.raises(ValidationError):
+        PickSequencePlanningRequest.model_validate(untyped_reference)
 
     place = {
         "sequence_id": "place.1",

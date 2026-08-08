@@ -368,6 +368,36 @@ def create_app(
             )
         )
 
+    @app.post("/api/execution/pick-place/sequences/pick")
+    def execution_start_pick(
+        body: PickSequencePlanningRequest,
+        request: Request,
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_start_pick(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.post("/api/execution/pick-place/sequences/place")
+    def execution_start_place(
+        body: PlaceSequencePlanningRequest,
+        request: Request,
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_start_place(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
+    @app.get("/api/execution/pick-place/sequences/{sequence_id}")
+    def execution_pick_place_sequence(
+        sequence_id: Annotated[str, Path(min_length=1, max_length=96)],
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_pick_place_sequence(sequence_id)
+        )
+
     def require_matching_operation(
         path_operation_id: str,
         body_operation_id: str,

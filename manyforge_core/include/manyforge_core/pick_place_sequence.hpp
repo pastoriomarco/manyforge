@@ -99,8 +99,17 @@ class PickPlaceSequenceCoordinator final {
   PickPlaceSequenceStatusDTO status_;
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    PickPlaceSequencePhaseDTO phase) noexcept {
+[[nodiscard]] constexpr std::string_view to_string(PickPlaceExecutionKindDTO kind) noexcept {
+  switch (kind) {
+    case PickPlaceExecutionKindDTO::kPick:
+      return "pick";
+    case PickPlaceExecutionKindDTO::kPlace:
+      return "place";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr std::string_view to_string(PickPlaceSequencePhaseDTO phase) noexcept {
   switch (phase) {
     case PickPlaceSequencePhaseDTO::kIdle:
       return "idle";

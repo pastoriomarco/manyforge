@@ -134,6 +134,7 @@ struct PickCandidateSearchOutcomeDTO final {
   std::optional<PlannedPickCandidateDTO> selected;
   std::size_t attempted_candidate_count{};
   std::vector<PickCandidateReportDTO> reports;
+  std::optional<PickPoseCandidateDTO> last_attempted_candidate;
   bool stopped_on_invariant_failure{};
 };
 

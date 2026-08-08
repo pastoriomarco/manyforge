@@ -7593,6 +7593,97 @@ Result<RobotStateDTO> ExecutionKernel::current_preview_state(
   return observed_state_.current_state(now_ns);
 }
 
+Result<std::vector<Pose3DTO>> ExecutionKernel::resolve_preview_reference_poses(
+    ExecuteRequestDTO request, std::vector<ReferenceDTO> references,
+    const CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& start_state) {
+  std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  const auto reject = [](const ErrorCode code, std::string message, std::string reason) {
+    return Result<std::vector<Pose3DTO>>::Err(ErrorDTO{
+        std::string(to_string(code)), std::move(message), {{"reason", std::move(reason)}}});
+  };
+  if (sm_.status().state != ExecutionState::kIdle) {
+    return reject(ErrorCode::kExecutionRejected,
+                  "Reference resolution requires an idle participant",
+                  "motion_preview_reference_participant_not_idle");
+  }
+  if (references.empty() || references.size() > 2U ||
+      std::any_of(references.begin(), references.end(), [](const auto& reference) {
+        return !reference_identity_matches_type(reference) ||
+               (reference.type == ReferenceDTO::Type::kPose) != reference.pose.has_value();
+      })) {
+    return reject(ErrorCode::kInvalidRequest,
+                  "Reference resolution received an invalid portable reference",
+                  "motion_preview_reference_invalid");
+  }
+  if (!projection_inventory.projection_binding.valid() || !projection_inventory.logical_scene ||
+      !projection_inventory.logical_scene->locally_valid() ||
+      projection_inventory.logical_scene->revision !=
+          projection_inventory.projection_binding.projection_revision.scene_revision ||
+      projection_inventory.projection_binding.projection_revision.retained_bundle_id !=
+          request.binding.retained_bundle_id ||
+      projection_inventory.projection_binding.projection_revision.graph_revision !=
+          request.binding.graph_revision) {
+    return reject(ErrorCode::kExecutionRejected,
+                  "Reference resolution requires one exact retained scene projection",
+                  "motion_preview_reference_projection_invalid");
+  }
+
+  auto selected_start = controlled_state_for_binding(request, start_state);
+  if (!selected_start.ok()) {
+    return Result<std::vector<Pose3DTO>>::Err(selected_start.error());
+  }
+  const auto capture_time_ns = clock_.now();
+  auto observed_publication = observed_state_.addressed_publication(
+      request.binding.control_binding_id, request.binding.control_binding_revision);
+  if (!observed_publication.ok()) {
+    return Result<std::vector<Pose3DTO>>::Err(observed_publication.error());
+  }
+  auto published_start =
+      controlled_state_for_publication(request, observed_publication.value(), capture_time_ns);
+  if (!published_start.ok()) {
+    return Result<std::vector<Pose3DTO>>::Err(published_start.error());
+  }
+  if (published_start.value() != selected_start.value()) {
+    return reject(ErrorCode::kStartStateMismatch,
+                  "Reference state changed after the linked preview state was captured",
+                  "motion_preview_reference_start_state_changed");
+  }
+
+  ProgramFrameResolutionCaptureDTO capture{request.binding,
+                                           published_start.value(),
+                                           observed_publication.value(),
+                                           projection_inventory.projection_binding,
+                                           projection_inventory.logical_scene,
+                                           request.runtime_object_bindings,
+                                           references,
+                                           capture_time_ns};
+  auto context = reference_resolver_.capture_program_frame_resolution_context(capture);
+  if (!context.ok()) {
+    return Result<std::vector<Pose3DTO>>::Err(context.error());
+  }
+  if (!context.value().valid() || context.value().binding != capture.binding ||
+      context.value().start_state != capture.start_state ||
+      context.value().observed_start_publication != capture.observed_start_publication ||
+      context.value().projection_binding != capture.projection_binding ||
+      context.value().logical_scene != capture.logical_scene ||
+      context.value().runtime_object_bindings != capture.runtime_object_bindings ||
+      context.value().captured_at_ns != capture.captured_at_ns) {
+    return reject(ErrorCode::kExecutionRejected,
+                  "Reference context differs from its retained preview admission",
+                  "motion_preview_reference_context_invalid");
+  }
+  std::vector<Pose3DTO> resolved;
+  resolved.reserve(references.size());
+  for (const auto& reference : references) {
+    auto pose = reference_resolver_.resolve_reference_pose(reference, context.value());
+    if (!pose.ok()) {
+      return Result<std::vector<Pose3DTO>>::Err(pose.error());
+    }
+    resolved.push_back(std::move(pose.value()));
+  }
+  return Result<std::vector<Pose3DTO>>::Ok(std::move(resolved));
+}
+
 Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
     ExecuteRequestDTO request,
     CollisionWorldLeaseInventory projection_inventory,

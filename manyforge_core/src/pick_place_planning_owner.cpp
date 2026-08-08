@@ -241,6 +241,94 @@ struct ProjectionLeaseGuard final {
   ~ProjectionLeaseGuard() { projection.ReleaseProjection(lease_id); }
 };
 
+struct ResolvedPickOffsetBases final {
+  PickOffsetBasisDTO pick;
+  PickOffsetBasisDTO approach;
+};
+
+[[nodiscard]] Result<ResolvedPickOffsetBases> resolve_pick_offset_bases(
+    IAddressedMotionPreviewSession& session, const PickSequencePlanningIntentDTO& intent,
+    const CollisionWorldLeaseInventory& predecessor, const RobotStateDTO& start_state,
+    const FrameRoleId& tcp_frame_role_id) {
+  ResolvedPickOffsetBases bases;
+  std::vector<ReferenceDTO> references;
+  std::optional<std::size_t> pick_index;
+  std::optional<std::size_t> approach_index;
+  bool requires_runtime_object_binding = false;
+
+  const auto collect = [&](const std::optional<ReferenceDTO>& selected, PickOffsetBasisDTO& basis,
+                           std::optional<std::size_t>& index) -> Result<void> {
+    if (!selected.has_value()) {
+      return Result<void>::Ok();
+    }
+    if (!reference_identity_matches_type(*selected) ||
+        (selected->type == ReferenceDTO::Type::kPose) != selected->pose.has_value()) {
+      return planning_error<void>(
+          "pick_offset_reference_invalid",
+          "pick offset reference is malformed or has mismatched typed identity");
+    }
+    if (selected->type == ReferenceDTO::Type::kFrameRole &&
+        std::get<FrameRoleId>(selected->id) == tcp_frame_role_id) {
+      basis.use_candidate_tcp_orientation = true;
+      return Result<void>::Ok();
+    }
+    if (selected->type == ReferenceDTO::Type::kRuntimeObject) {
+      if (std::get<RuntimeObjectId>(selected->id) != intent.selected_runtime_object_id) {
+        return planning_error<void>(
+            "pick_offset_runtime_object_unbound",
+            "pick offset reference names a runtime object other than the exact selected object",
+            ErrorCode::kMissingReference);
+      }
+      requires_runtime_object_binding = true;
+    }
+    index = references.size();
+    references.push_back(*selected);
+    return Result<void>::Ok();
+  };
+
+  auto pick = collect(intent.synthesis.pick_offset_reference, bases.pick, pick_index);
+  if (!pick.ok()) {
+    return Result<ResolvedPickOffsetBases>::Err(pick.error());
+  }
+  auto approach =
+      collect(intent.synthesis.approach_offset_reference, bases.approach, approach_index);
+  if (!approach.ok()) {
+    return Result<ResolvedPickOffsetBases>::Err(approach.error());
+  }
+  if (references.empty()) {
+    return Result<ResolvedPickOffsetBases>::Ok(std::move(bases));
+  }
+
+  std::vector<RuntimeObjectReferenceBindingDTO> runtime_objects;
+  if (requires_runtime_object_binding) {
+    runtime_objects.push_back({intent.selected_runtime_object_id, intent.selected_object_id});
+  }
+  auto resolved =
+      session.resolve_reference_poses(intent.approach_operation, std::move(references), predecessor,
+                                      start_state, std::move(runtime_objects));
+  if (!resolved.ok()) {
+    return Result<ResolvedPickOffsetBases>::Err(resolved.error());
+  }
+  const auto apply = [&](const std::optional<std::size_t> index,
+                         PickOffsetBasisDTO& basis) -> bool {
+    if (!index.has_value()) {
+      return true;
+    }
+    if (*index >= resolved.value().size()) {
+      return false;
+    }
+    basis.resolved_orientation_in_base = resolved.value()[*index].orientation;
+    return true;
+  };
+  if (!apply(pick_index, bases.pick) || !apply(approach_index, bases.approach)) {
+    return planning_error<ResolvedPickOffsetBases>(
+        "pick_offset_reference_result_incomplete",
+        "pick offset resolver returned an incomplete ordered result",
+        ErrorCode::kInvariantViolation);
+  }
+  return Result<ResolvedPickOffsetBases>::Ok(std::move(bases));
+}
+
 [[nodiscard]] SceneTransactionRequestDTO attach_request(
     const PickSequencePlanningIntentDTO& intent,
     const ProjectionRevisionDTO& projection_revision,
@@ -412,28 +500,30 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
   const Pose3DTO object_in_base = multiply_poses(
       inverse_pose(base.value().frame_pose_in_cell), fixed.pose_in_cell);
 
-  PickCandidateSynthesisConfigDTO synthesis{
-      intent.synthesis.pick_offset_envelope,
-      intent.synthesis.approach_offset_envelope,
-      PickOffsetBasisDTO{intent.synthesis.pick_offset_uses_candidate_tcp,
-                         QuaternionDTO{}},
-      PickOffsetBasisDTO{intent.synthesis.approach_offset_uses_candidate_tcp,
-                         QuaternionDTO{}},
-      intent.synthesis.base_tool_orientation_rpy_deg,
-      intent.synthesis.translation_step_m,
-      intent.synthesis.rotation_step_deg,
-      intent.synthesis.force_vertical_pick,
-      intent.synthesis.min_tcp_z_m,
-      intent.synthesis.maximum_candidate_count,
-      intent.synthesis.search_strategy};
-  auto grid = PickCandidateGrid::Create(*selected, object_in_base,
-                                        std::move(synthesis));
-  if (!grid.ok()) {
-    return Result<PickPlacePlanningResultDTO>::Err(grid.error());
-  }
   auto state = session.value()->current_state();
   if (!state.ok()) {
     return Result<PickPlacePlanningResultDTO>::Err(state.error());
+  }
+  auto offset_bases = resolve_pick_offset_bases(*session.value(), intent, predecessor.value(),
+                                                state.value(), approach_motion->tcp_frame_role_id);
+  if (!offset_bases.ok()) {
+    return Result<PickPlacePlanningResultDTO>::Err(offset_bases.error());
+  }
+
+  PickCandidateSynthesisConfigDTO synthesis{intent.synthesis.pick_offset_envelope,
+                                            intent.synthesis.approach_offset_envelope,
+                                            offset_bases.value().pick,
+                                            offset_bases.value().approach,
+                                            intent.synthesis.base_tool_orientation_rpy_deg,
+                                            intent.synthesis.translation_step_m,
+                                            intent.synthesis.rotation_step_deg,
+                                            intent.synthesis.force_vertical_pick,
+                                            intent.synthesis.min_tcp_z_m,
+                                            intent.synthesis.maximum_candidate_count,
+                                            intent.synthesis.search_strategy};
+  auto grid = PickCandidateGrid::Create(*selected, object_in_base, std::move(synthesis));
+  if (!grid.ok()) {
+    return Result<PickPlacePlanningResultDTO>::Err(grid.error());
   }
   auto attach = attach_request(
       intent, current_projection, carrier.value(), std::move(roles.value()),
@@ -454,10 +544,9 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
     return Result<PickPlacePlanningResultDTO>::Err(outcome.error());
   }
   PickPlacePlanningResultDTO result{
-      PickPlacePlanningStatusDTO::kNoFeasibleCandidate,
-      intent.selected_object_id,
-      outcome.value().attempted_candidate_count,
-      std::move(outcome.value().reports), std::nullopt};
+      PickPlacePlanningStatusDTO::kNoFeasibleCandidate,    intent.selected_object_id,
+      outcome.value().attempted_candidate_count,           std::move(outcome.value().reports),
+      std::move(outcome.value().last_attempted_candidate), std::nullopt};
   if (!outcome.value().selected.has_value()) {
     return Result<PickPlacePlanningResultDTO>::Ok(std::move(result));
   }
@@ -579,10 +668,12 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
   if (!outcome.ok()) {
     return Result<PickPlacePlanningResultDTO>::Err(outcome.error());
   }
-  PickPlacePlanningResultDTO result{
-      PickPlacePlanningStatusDTO::kNoFeasibleCandidate,
-      intent.selected_object_id, 1U, {std::move(outcome.value().report)},
-      std::nullopt};
+  PickPlacePlanningResultDTO result{PickPlacePlanningStatusDTO::kNoFeasibleCandidate,
+                                    intent.selected_object_id,
+                                    1U,
+                                    {std::move(outcome.value().report)},
+                                    std::nullopt,
+                                    std::nullopt};
   if (!outcome.value().selected.has_value()) {
     return Result<PickPlacePlanningResultDTO>::Ok(std::move(result));
   }
@@ -598,6 +689,72 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
       std::move(intent.descend_operation), std::move(intent.tool_operation),
       std::move(intent.retreat_operation)};
   return Result<PickPlacePlanningResultDTO>::Ok(std::move(result));
+}
+
+Result<PickPlaceSequenceAdmissionResultDTO> AddressedPickPlaceExecutionOwner::BeginPick(
+    PickSequencePlanningIntentDTO intent, const std::stop_token stop_token) {
+  return BeginPlanned(planning_.PlanPick(std::move(intent), stop_token));
+}
+
+Result<PickPlaceSequenceAdmissionResultDTO> AddressedPickPlaceExecutionOwner::BeginPlace(
+    PlaceSequencePlanningIntentDTO intent, const std::stop_token stop_token) {
+  return BeginPlanned(planning_.PlanPlace(std::move(intent), stop_token));
+}
+
+Result<PickPlaceSequenceAdmissionResultDTO> AddressedPickPlaceExecutionOwner::BeginPlanned(
+    Result<PickPlacePlanningResultDTO> planned) {
+  if (!planned.ok()) {
+    return Result<PickPlaceSequenceAdmissionResultDTO>::Err(planned.error());
+  }
+  PickPlaceSequenceAdmissionResultDTO admitted{std::move(planned.value()), std::nullopt};
+  if (admitted.planning_result.status == PickPlacePlanningStatusDTO::kNoFeasibleCandidate) {
+    if (admitted.planning_result.sequence_request.has_value()) {
+      return planning_error<PickPlaceSequenceAdmissionResultDTO>(
+          "pick_place_no_feasible_plan_has_sequence",
+          "no-feasible pick/place planning result carried an execution sequence",
+          ErrorCode::kInvariantViolation);
+    }
+    return Result<PickPlaceSequenceAdmissionResultDTO>::Ok(std::move(admitted));
+  }
+  if (!admitted.planning_result.sequence_request.has_value()) {
+    return planning_error<PickPlaceSequenceAdmissionResultDTO>(
+        "pick_place_planned_sequence_missing",
+        "planned pick/place result has no owner-issued execution sequence",
+        ErrorCode::kInvariantViolation);
+  }
+  auto begun = sequences_.Begin(*admitted.planning_result.sequence_request);
+  if (!begun.ok()) {
+    return Result<PickPlaceSequenceAdmissionResultDTO>::Err(begun.error());
+  }
+  admitted.sequence_status = std::move(begun.value());
+  return Result<PickPlaceSequenceAdmissionResultDTO>::Ok(std::move(admitted));
+}
+
+Result<PickPlaceSequenceStatusDTO> AddressedPickPlaceExecutionOwner::Reconcile() {
+  const auto current = sequences_.status();
+  if (current.phase == PickPlaceSequencePhaseDTO::kIdle ||
+      current.phase == PickPlaceSequencePhaseDTO::kCompleted ||
+      current.phase == PickPlaceSequencePhaseDTO::kFailed ||
+      current.phase == PickPlaceSequencePhaseDTO::kInterventionRequired) {
+    return Result<PickPlaceSequenceStatusDTO>::Ok(current);
+  }
+  return sequences_.Reconcile();
+}
+
+Result<PickPlaceSequenceStatusDTO> AddressedPickPlaceExecutionOwner::GetStatus(
+    const std::string_view sequence_id) const {
+  if (sequence_id.empty() || sequence_id.size() > kMaxPickPlaceSequenceIdBytes) {
+    return planning_error<PickPlaceSequenceStatusDTO>(
+        "pick_place_sequence_identity_invalid",
+        "pick/place sequence identity must be bounded non-empty text");
+  }
+  const auto status = sequences_.status();
+  if (status.sequence_id != sequence_id || status.phase == PickPlaceSequencePhaseDTO::kIdle) {
+    return planning_error<PickPlaceSequenceStatusDTO>(
+        "pick_place_sequence_absent", "no pick/place sequence matches the requested identity",
+        ErrorCode::kMissingReference);
+  }
+  return Result<PickPlaceSequenceStatusDTO>::Ok(status);
 }
 
 }  // namespace manyforge::core

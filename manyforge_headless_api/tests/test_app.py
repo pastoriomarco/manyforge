@@ -248,6 +248,43 @@ class FakeExecution:
         self.principals.append(("plan_place", trusted_principal_id))
         return {"ok": True, "command": "plan_place", "planning_result": {}}
 
+    def start_pick(
+        self,
+        request: object,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.requests.append(("start_pick", request))
+        self.principals.append(("start_pick", trusted_principal_id))
+        return {
+            "ok": True,
+            "command": "start_pick",
+            "planning_result": {},
+            "sequence_status": {},
+        }
+
+    def start_place(
+        self,
+        request: object,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.requests.append(("start_place", request))
+        self.principals.append(("start_place", trusted_principal_id))
+        return {
+            "ok": True,
+            "command": "start_place",
+            "planning_result": {},
+            "sequence_status": {},
+        }
+
+    def read_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "command": "read_pick_place_sequence",
+            "sequence_status": {"sequence_id": sequence_id},
+        }
+
     def _control(
         self,
         kind: str,
@@ -633,6 +670,9 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/stops",
         "/api/execution/pick-place/plans/pick",
         "/api/execution/pick-place/plans/place",
+        "/api/execution/pick-place/sequences/pick",
+        "/api/execution/pick-place/sequences/place",
+        "/api/execution/pick-place/sequences/{sequence_id}",
     }.issubset(paths)
     assert "/api/kernel/stop" not in paths
     assert "/api/cycle/stop" not in paths

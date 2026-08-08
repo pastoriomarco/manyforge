@@ -48,6 +48,12 @@ class HeadlessPickPlacePlanningTransport(Protocol):
 
     def plan_place(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
+    def start_pick(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]: ...
+
 
 class KernelClientResponseError(RuntimeError):
     """Raised when a transport returns a successful but malformed projection."""
@@ -171,6 +177,28 @@ class KernelClient:
             raise TypeError("execution transport has no callable plan_place")
         return self._successful(
             method(intent), label="place planning"
+        )
+
+    def start_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        method = getattr(self._transport, "start_pick", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable start_pick")
+        return self._successful(method(intent), label="pick sequence start")
+
+    def start_place(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        method = getattr(self._transport, "start_place", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable start_place")
+        return self._successful(method(intent), label="place sequence start")
+
+    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
+        method = getattr(self._transport, "pick_place_sequence", None)
+        if not callable(method):
+            raise TypeError(
+                "execution transport has no callable pick_place_sequence"
+            )
+        return self._successful(
+            method(sequence_id), label="pick/place sequence observation"
         )
 
     def operation(self, operation_id: str) -> dict[str, Any]:

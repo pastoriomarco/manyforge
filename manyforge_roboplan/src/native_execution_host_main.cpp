@@ -1287,6 +1287,35 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   return {position_min, position_max, orientation_min, orientation_max};
 }
 
+[[nodiscard]] std::optional<core::ReferenceDTO> DecodePickOffsetReference(
+    const CanonicalValue& root, const std::string_view name) {
+  const auto& value = Member(root, name);
+  if (std::holds_alternative<std::nullptr_t>(value.storage())) {
+    return std::nullopt;
+  }
+  RequireExactObjectSize(value, 2U, "pick offset reference");
+  const auto type = Text(value, "type");
+  if (type == "frame_role") {
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole, Text(value, "frame_role_id"));
+  }
+  if (type == "component_body_role") {
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kComponentBodyRole,
+                              Text(value, "collision_body_role_id"));
+  }
+  if (type == "scene_resource") {
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kSceneResource,
+                              Text(value, "scene_resource_id"));
+  }
+  if (type == "runtime_object") {
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kRuntimeObject,
+                              Text(value, "runtime_object_id"));
+  }
+  if (type == "pose") {
+    return core::ReferenceDTO(DecodePose(Member(value, "pose")));
+  }
+  Fail("pick offset reference type is unsupported");
+}
+
 [[nodiscard]] core::PickCandidateSynthesisIntentDTO DecodePickSynthesis(
     const CanonicalValue& value) {
   RequireExactObjectSize(value, 11U, "pick synthesis intent");
@@ -1310,8 +1339,8 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   return core::PickCandidateSynthesisIntentDTO{
       DecodePickEnvelope(Member(value, "pick_offset_envelope")),
       DecodePickEnvelope(Member(value, "approach_offset_envelope")),
-      Boolean(value, "pick_offset_uses_candidate_tcp"),
-      Boolean(value, "approach_offset_uses_candidate_tcp"),
+      DecodePickOffsetReference(value, "pick_offset_reference"),
+      DecodePickOffsetReference(value, "approach_offset_reference"),
       DecodeTriple(value, "base_tool_orientation_rpy_deg"),
       translation_step,
       rotation_step,
@@ -1404,6 +1433,9 @@ enum class CommandKind {
   kGetRuntimeScale,
   kPlanPick,
   kPlanPlace,
+  kStartPick,
+  kStartPlace,
+  kReadPickPlaceSequence,
 };
 
 struct Command final {
@@ -1420,6 +1452,7 @@ struct Command final {
   std::size_t event_limit{};
   std::optional<core::PickSequencePlanningIntentDTO> pick_planning;
   std::optional<core::PlaceSequencePlanningIntentDTO> place_planning;
+  std::optional<std::string> pick_place_sequence_id;
 };
 
 [[nodiscard]] Command DecodeCommand(std::string_view bytes) {
@@ -1482,6 +1515,26 @@ struct Command final {
     const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kPlanPlace};
     decoded.place_planning = DecodePlacePlanningIntent(Member(root, "intent"), attribution);
+    return decoded;
+  }
+  if (command == "start_pick") {
+    RequireExactObjectSize(root, 4U, "pick sequence start command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    Command decoded{CommandKind::kStartPick};
+    decoded.pick_planning = DecodePickPlanningIntent(Member(root, "intent"), attribution);
+    return decoded;
+  }
+  if (command == "start_place") {
+    RequireExactObjectSize(root, 4U, "place sequence start command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    Command decoded{CommandKind::kStartPlace};
+    decoded.place_planning = DecodePlacePlanningIntent(Member(root, "intent"), attribution);
+    return decoded;
+  }
+  if (command == "read_pick_place_sequence") {
+    RequireExactObjectSize(root, 3U, "pick/place sequence read command");
+    Command decoded{CommandKind::kReadPickPlaceSequence};
+    decoded.pick_place_sequence_id = Text(root, "sequence_id");
     return decoded;
   }
   if (command == "stop") {
@@ -1624,6 +1677,18 @@ struct Command final {
   });
 }
 
+[[nodiscard]] CanonicalValue PickCandidateValue(const core::PickPoseCandidateDTO& value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"approach_pose", PoseValue(value.approach_pose)},
+      {"candidate_index", CanonicalValue(static_cast<double>(value.candidate_index))},
+      {"min_tcp_z_applied", CanonicalValue(value.min_tcp_z_applied)},
+      {"pick_cartesian_path", MotionSpecValue(core::MotionSpecDTO{value.descend_path})},
+      {"pick_pose", PoseValue(value.pick_pose)},
+      {"retreat_cartesian_path", MotionSpecValue(core::MotionSpecDTO{value.retreat_path})},
+      {"retreat_pose", PoseValue(value.retreat_pose)},
+  });
+}
+
 [[nodiscard]] CanonicalValue PickPlacePlanningResultValue(
     const std::string_view sequence_id, const core::PickPlaceExecutionKindDTO kind,
     const core::PickPlacePlanningResultDTO& value) {
@@ -1660,16 +1725,53 @@ struct Command final {
         {"retreat_motion", MotionSpecValue(request.plan.retreat_motion)},
     });
   }
+  CanonicalValue last_attempted_candidate(nullptr);
+  if (value.last_attempted_pick_candidate.has_value()) {
+    last_attempted_candidate = PickCandidateValue(*value.last_attempted_pick_candidate);
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"attempted_candidate_count",
        CanonicalValue(static_cast<double>(value.attempted_candidate_count))},
       {"kind", CanonicalValue(kind == core::PickPlaceExecutionKindDTO::kPick ? "pick" : "place")},
+      {"last_attempted_candidate", std::move(last_attempted_candidate)},
       {"plan", std::move(plan)},
       {"reports", CanonicalValue(std::move(reports))},
       {"schema_version", CanonicalValue("manyforge.pick_place_planning_result.v1")},
       {"selected_object_id", CanonicalValue(value.selected_object_id.value())},
       {"sequence_id", CanonicalValue(std::string(sequence_id))},
       {"status", CanonicalValue(std::string(core::to_string(value.status)))},
+  });
+}
+
+[[nodiscard]] CanonicalValue PickPlaceSequenceStatusValue(
+    const core::PickPlaceSequenceStatusDTO& value) {
+  CanonicalValue::Array completed_operations;
+  completed_operations.reserve(value.completed_operations.size());
+  for (const auto& operation_id : value.completed_operations) {
+    completed_operations.emplace_back(operation_id.value());
+  }
+  CanonicalValue active_operation_id(nullptr);
+  if (value.active_operation_id.has_value()) {
+    active_operation_id = CanonicalValue(value.active_operation_id->value());
+  }
+  CanonicalValue committed_projection_revision(nullptr);
+  if (value.committed_projection_revision.has_value()) {
+    committed_projection_revision = ProjectionRevisionValue(*value.committed_projection_revision);
+  }
+  CanonicalValue terminal_error(nullptr);
+  if (value.terminal_error.has_value()) {
+    terminal_error = ErrorValue(*value.terminal_error);
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"active_operation_id", std::move(active_operation_id)},
+      {"committed_projection_revision", std::move(committed_projection_revision)},
+      {"completed_operation_ids", CanonicalValue(std::move(completed_operations))},
+      {"kind", CanonicalValue(std::string(core::to_string(value.kind)))},
+      {"phase", CanonicalValue(std::string(core::to_string(value.phase)))},
+      {"schema_version", CanonicalValue("manyforge.pick_place_sequence_status.v1")},
+      {"selected_object_id", CanonicalValue(value.selected_object_id.value())},
+      {"sequence_id", CanonicalValue(value.sequence_id)},
+      {"terminal_error", std::move(terminal_error)},
   });
 }
 
@@ -2144,6 +2246,8 @@ struct Composition final {
   std::shared_ptr<void> pick_place_planning_fixture_lifetime;
 #endif
   std::unique_ptr<core::AddressedPickPlacePlanningOwner> pick_place_planning_owner;
+  std::unique_ptr<core::PickPlaceSequenceCoordinator> pick_place_sequence_coordinator;
+  std::unique_ptr<core::AddressedPickPlaceExecutionOwner> pick_place_execution_owner;
 
   Composition(std::shared_ptr<const deployment::RetainedBundle> selected_bundle,
               std::shared_ptr<const deployment::ProgramBindingContract> selected_program,
@@ -2309,6 +2413,8 @@ struct Composition final {
   auto fixture = process_fixture::MakeFocusedPickPlacePlanningFixture();
   composition->pick_place_planning_fixture_lifetime = std::move(fixture.lifetime);
   composition->pick_place_planning_owner = std::move(fixture.owner);
+  composition->pick_place_sequence_coordinator = std::move(fixture.sequence_coordinator);
+  composition->pick_place_execution_owner = std::move(fixture.execution_owner);
 #endif
   return composition;
 }
@@ -2329,6 +2435,12 @@ class NativeExecutionHost final {
           composition_->runtime->addressed_kernel->reconcile_subordinate_state();
       if (!reconciled.ok()) {
         last_reconcile_error_ = reconciled.error();
+      }
+      if (composition_->pick_place_execution_owner) {
+        const auto pick_place_reconciled = composition_->pick_place_execution_owner->Reconcile();
+        if (!pick_place_reconciled.ok()) {
+          last_reconcile_error_ = pick_place_reconciled.error();
+        }
       }
       pollfd descriptor{command_socket_.get(), POLLIN, 0};
       int ready = -1;
@@ -2440,6 +2552,64 @@ class NativeExecutionHost final {
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"error", ErrorValue(*last_reconcile_error_)},
           {"ok", CanonicalValue(false)},
+      });
+    }
+    if (command.kind == CommandKind::kReadPickPlaceSequence) {
+      if (!composition_->pick_place_execution_owner) {
+        return ErrorResponse("pick_place_execution_owner_unavailable",
+                             "the selected native process has no joined pick/place sequence owner");
+      }
+      const auto result =
+          composition_->pick_place_execution_owner->GetStatus(*command.pick_place_sequence_id);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("read_pick_place_sequence")},
+          {"ok", CanonicalValue(true)},
+          {"sequence_status", PickPlaceSequenceStatusValue(result.value())},
+      });
+    }
+    if (command.kind == CommandKind::kStartPick || command.kind == CommandKind::kStartPlace) {
+      if (!composition_->pick_place_execution_owner) {
+        return ErrorResponse("pick_place_execution_owner_unavailable",
+                             "the selected native process has no joined pick/place sequence owner");
+      }
+      const auto sequence_id = command.kind == CommandKind::kStartPick
+                                   ? command.pick_planning->sequence_id
+                                   : command.place_planning->sequence_id;
+      const auto result =
+          command.kind == CommandKind::kStartPick
+              ? composition_->pick_place_execution_owner->BeginPick(*command.pick_planning)
+              : composition_->pick_place_execution_owner->BeginPlace(*command.place_planning);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      const auto command_name =
+          command.kind == CommandKind::kStartPick ? "start_pick" : "start_place";
+      const auto kind = command.kind == CommandKind::kStartPick
+                            ? core::PickPlaceExecutionKindDTO::kPick
+                            : core::PickPlaceExecutionKindDTO::kPlace;
+      CanonicalValue sequence_status(nullptr);
+      if (result.value().sequence_status.has_value()) {
+        sequence_status = PickPlaceSequenceStatusValue(*result.value().sequence_status);
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue(command_name)},
+          {"ok", CanonicalValue(true)},
+          {"planning_result",
+           PickPlacePlanningResultValue(sequence_id, kind, result.value().planning_result)},
+          {"sequence_status", std::move(sequence_status)},
       });
     }
     if (command.kind == CommandKind::kPlanPick || command.kind == CommandKind::kPlanPlace) {
@@ -2583,6 +2753,9 @@ class NativeExecutionHost final {
         case CommandKind::kGetRuntimeScale:
         case CommandKind::kPlanPick:
         case CommandKind::kPlanPlace:
+        case CommandKind::kStartPick:
+        case CommandKind::kStartPlace:
+        case CommandKind::kReadPickPlaceSequence:
           Fail("execution command dispatch is inconsistent");
       }
       Fail("execution command dispatch is unreachable");

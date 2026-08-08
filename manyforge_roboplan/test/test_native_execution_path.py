@@ -67,6 +67,15 @@ class RecordingTransport:
     def plan_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.client.plan_place(body)
 
+    def start_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.client.start_pick(body)
+
+    def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.client.start_place(body)
+
+    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
+        return self.client.pick_place_sequence(sequence_id)
+
     def operation(self, operation_id: str) -> dict[str, Any]:
         return self.client.operation(operation_id)
 
@@ -438,8 +447,14 @@ def _pick_planning_request() -> dict[str, Any]:
                 "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
                 "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
             },
-            "pick_offset_uses_candidate_tcp": False,
-            "approach_offset_uses_candidate_tcp": False,
+            "pick_offset_reference": {
+                "type": "scene_resource",
+                "scene_resource_id": "workpiece",
+            },
+            "approach_offset_reference": {
+                "type": "frame_role",
+                "frame_role_id": "frame-role:tcp",
+            },
             "base_tool_orientation_rpy_deg": [180.0, 0.0, 0.0],
             "translation_step_m": 0.01,
             "rotation_step_deg": 15.0,
@@ -547,6 +562,10 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
         assert pick["selected_object_id"] == "workpiece"
         assert pick["status"] == "planned"
         assert pick["attempted_candidate_count"] == 1
+        assert pick["last_attempted_candidate"]["candidate_index"] == 1
+        assert pick["last_attempted_candidate"]["pick_cartesian_path"][
+            "kind"
+        ] == "cartesian_path"
         assert pick["plan"]["approach_motion"]["kind"] == "pose_goal"
         assert pick["plan"]["descend_motion"]["kind"] == "cartesian_path"
         assert pick["plan"]["retreat_motion"]["kind"] == "cartesian_path"
@@ -559,9 +578,55 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
         assert place["selected_object_id"] == "carried-workpiece"
         assert place["status"] == "planned"
         assert place["attempted_candidate_count"] == 1
+        assert place["last_attempted_candidate"] is None
         assert place["plan"]["approach_motion"]["kind"] == "pose_goal"
         assert place["plan"]["descend_motion"]["kind"] == "cartesian_path"
         assert place["plan"]["retreat_motion"]["kind"] == "cartesian_path"
+
+        infeasible_request = _pick_planning_request()
+        infeasible_request["approach_operation"]["participants"][0][
+            "payload"
+        ]["move_id"] = "pick.fixture_no_feasible.approach"
+        infeasible = behavior.start_pick(infeasible_request)
+        assert infeasible["planning_result"]["status"] == (
+            "no_feasible_candidate"
+        )
+        assert infeasible["planning_result"]["attempted_candidate_count"] > 0
+        assert infeasible["planning_result"]["last_attempted_candidate"]
+        assert infeasible["sequence_status"] is None
+        assert native.events(owner_epoch, 0)["events"] == before
+
+        execution_request = _pick_planning_request()
+        execution_request["retreat_operation"]["participants"][0]["payload"][
+            "move_id"
+        ] = "pick.fixture_fail.retreat"
+        started = behavior.start_pick(execution_request)
+        assert started["planning_result"]["status"] == "planned"
+        assert started["sequence_status"]["phase"] == "approach"
+
+        deadline = time.monotonic() + 5.0
+        observed = started
+        while observed["sequence_status"]["phase"] not in {
+            "completed",
+            "failed",
+            "intervention_required",
+        }:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+            observed = behavior.pick_place_sequence("process-pick-1")
+        status = observed["sequence_status"]
+        # The retreat operation failed after the attach was durably committed.
+        # Scene truth is therefore known (the object remains attached), so this
+        # is an ordinary failed sequence rather than an uncertainty that needs
+        # intervention.
+        assert status["phase"] == "failed"
+        assert status["committed_projection_revision"] is not None
+        assert status["terminal_error"]["details"]["reason"] == (
+            "pick_place_phase_operation_failed"
+        )
+        assert composer.pick_place_sequence("process-pick-1")[
+            "sequence_status"
+        ] == status
 
         assert native.events(owner_epoch, 0)["events"] == before
     finally:
@@ -614,6 +679,17 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
     composer = HeadlessHttpClient("http://composer.test", client=raw_composer)
 
     try:
+        with pytest.raises(HeadlessClientError) as unavailable_start:
+            headless.start_pick(_pick_planning_request())
+        assert unavailable_start.value.code == (
+            "pick_place_execution_owner_unavailable"
+        )
+        with pytest.raises(HeadlessClientError) as unavailable_status:
+            composer.pick_place_sequence("not-started")
+        assert unavailable_status.value.code == (
+            "pick_place_execution_owner_unavailable"
+        )
+
         first_status = headless.execution_status()["status"]
         assert first_status["program_binding_id"] == manifest["program_binding_id"]
         assert first_status["retained_bundle_id"] == manifest["retained_bundle_id"]

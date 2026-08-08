@@ -135,6 +135,11 @@ constexpr char kDigest5[] =
 
 class FakeMotionPreview final : public IAddressedMotionPreviewSession {
  public:
+  explicit FakeMotionPreview(const bool fail_first = false,
+                             std::size_t* reference_resolution_count = nullptr)
+      : fail_first_with_start_collision(fail_first),
+        reference_resolution_count_(reference_resolution_count) {}
+
   Result<RuntimeParticipantBindingDTO> resolve_binding(
       const OperationIntentDTO& operation) const override {
     if (operation.participants.size() != 1U) {
@@ -142,26 +147,24 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
           ErrorDTO{"invalid_request", "fixture requires one participant", {}});
     }
     return Result<RuntimeParticipantBindingDTO>::Ok(
-        std::holds_alternative<CapabilityCommandIntentDTO>(
-            operation.participants.front().payload)
+        std::holds_alternative<CapabilityCommandIntentDTO>(operation.participants.front().payload)
             ? carrier_runtime_binding()
             : arm_runtime_binding());
   }
 
-  Result<ExecuteRequestDTO> prepare_motion(
-      const OperationIntentDTO& operation) override {
+  Result<ExecuteRequestDTO> prepare_motion(const OperationIntentDTO& operation) override {
     if (operation.participants.size() != 1U) {
       return Result<ExecuteRequestDTO>::Err(
           ErrorDTO{"invalid_request", "fixture requires one participant", {}});
     }
-    const auto* motion = std::get_if<MotionParticipantIntentDTO>(
-        &operation.participants.front().payload);
+    const auto* motion =
+        std::get_if<MotionParticipantIntentDTO>(&operation.participants.front().payload);
     if (motion == nullptr) {
       return Result<ExecuteRequestDTO>::Err(
           ErrorDTO{"invalid_request", "fixture requires motion", {}});
     }
-    auto request = testing::make_test_execute_request(
-        {"joint1", "joint2"}, operation.program_run_id.value());
+    auto request =
+        testing::make_test_execute_request({"joint1", "joint2"}, operation.program_run_id.value());
     request.move_id = motion->move_id.value();
     request.tolerances = motion->tolerances;
     request.speed_profile = motion->speed_profile;
@@ -171,34 +174,48 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
     request.target_mode = motion->target_mode;
     request.target_reference = motion->target_reference;
     request.offset_reference = motion->offset_reference;
-    request.contact_policy_id = motion->contact_policy_id.has_value()
-                                    ? motion->contact_policy_id->value()
-                                    : std::string{};
+    request.contact_policy_id =
+        motion->contact_policy_id.has_value() ? motion->contact_policy_id->value() : std::string{};
     request.runtime_object_bindings = motion->runtime_object_bindings;
     if (const auto* pose = std::get_if<PoseGoalDTO>(&motion->motion)) {
       request.motion = *pose;
-    } else if (const auto* path =
-                   std::get_if<CartesianPathDTO>(&motion->motion)) {
+    } else if (const auto* path = std::get_if<CartesianPathDTO>(&motion->motion)) {
       request.motion = *path;
     } else {
       return Result<ExecuteRequestDTO>::Err(
           ErrorDTO{"invalid_request", "fixture motion is unsupported", {}});
     }
-    if (motion->contact_policy_id.has_value() &&
-        !motion->runtime_object_bindings.empty()) {
-      request.resolved_contact_grasp = ResolvedContactGraspBindingDTO{
-          *motion->contact_policy_id,
-          ContactPolicyRevision("contact-policy-revision:1"),
-          motion->runtime_object_bindings.front().runtime_object_id,
-          motion->runtime_object_bindings.front().scene_resource_id,
-          {CollisionBodyId("body:tool")}, 0.001, 0.8};
+    if (motion->contact_policy_id.has_value() && !motion->runtime_object_bindings.empty()) {
+      request.resolved_contact_grasp =
+          ResolvedContactGraspBindingDTO{*motion->contact_policy_id,
+                                         ContactPolicyRevision("contact-policy-revision:1"),
+                                         motion->runtime_object_bindings.front().runtime_object_id,
+                                         motion->runtime_object_bindings.front().scene_resource_id,
+                                         {CollisionBodyId("body:tool")},
+                                         0.001,
+                                         0.8};
     }
     return Result<ExecuteRequestDTO>::Ok(std::move(request));
   }
 
   Result<RobotStateDTO> current_state() const override {
-    return Result<RobotStateDTO>::Ok(
-        RobotStateDTO{{"joint1", "joint2"}, {0.0, 0.0}, {}});
+    return Result<RobotStateDTO>::Ok(RobotStateDTO{{"joint1", "joint2"}, {0.0, 0.0}, {}});
+  }
+
+  Result<std::vector<Pose3DTO>> resolve_reference_poses(
+      const OperationIntentDTO&, std::vector<ReferenceDTO> references,
+      const CollisionWorldLeaseInventory&, const RobotStateDTO&,
+      std::vector<RuntimeObjectReferenceBindingDTO>) override {
+    if (reference_resolution_count_ != nullptr) {
+      ++*reference_resolution_count_;
+    }
+    std::vector<Pose3DTO> resolved;
+    resolved.reserve(references.size());
+    for (const auto& reference : references) {
+      resolved.push_back(reference.pose.value_or(
+          Pose3DTO{{}, QuaternionDTO{0.0, 0.0, 0.7071067811865475, 0.7071067811865476}}));
+    }
+    return Result<std::vector<Pose3DTO>>::Ok(std::move(resolved));
   }
 
   Result<MotionPreviewResultDTO> preview_motion(OperationIntentDTO operation,
@@ -239,20 +256,24 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
   std::vector<RobotStateDTO> start_states;
   std::vector<ProjectionLeaseBindingDTO> projection_bindings;
   std::vector<std::uint32_t> planning_attempt_indices;
+
+ private:
+  std::size_t* reference_resolution_count_{};
 };
 
 class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
  public:
-  Result<std::unique_ptr<IAddressedMotionPreviewSession>>
-  begin_motion_preview_session(const OperationIntentDTO&) override {
+  Result<std::unique_ptr<IAddressedMotionPreviewSession>> begin_motion_preview_session(
+      const OperationIntentDTO&) override {
     ++begin_count;
-    std::unique_ptr<IAddressedMotionPreviewSession> session =
-        std::make_unique<FakeMotionPreview>();
-    return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(
-        std::move(session));
+    std::unique_ptr<IAddressedMotionPreviewSession> session = std::make_unique<FakeMotionPreview>(
+        fail_first_with_start_collision, &reference_resolution_count);
+    return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(std::move(session));
   }
 
   std::size_t begin_count{};
+  bool fail_first_with_start_collision{};
+  std::size_t reference_resolution_count{};
 };
 
 [[nodiscard]] OperationIntentDTO motion_operation(
@@ -997,8 +1018,103 @@ TEST(AddressedPickPlacePlanningOwner,
       result.value().sequence_request->plan.retreat_motion));
 }
 
-TEST(AddressedPickPlacePlanningOwner,
-     RejectsStaleOrCancelledPickBeforeRetainingAProjection) {
+TEST(AddressedPickPlacePlanningOwner, PreservesPortableAndCandidateTcpOffsetReferenceSemantics) {
+  auto predecessor = predecessor_projection();
+  FakeMotionPreviewOwner motion;
+  FakeSceneCandidatePreview scene(predecessor);
+  FakeSceneCandidateProjection projection(predecessor);
+  AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
+  auto synthesis = PickCandidateSynthesisIntentDTO{};
+  synthesis.pick_offset_envelope.position_min_m = {0.02, 0.0, 0.0};
+  synthesis.pick_offset_envelope.position_max_m = {0.02, 0.0, 0.0};
+  synthesis.approach_offset_envelope.position_min_m = {0.05, 0.0, 0.0};
+  synthesis.approach_offset_envelope.position_max_m = {0.05, 0.0, 0.0};
+  synthesis.pick_offset_reference = ReferenceDTO(ReferenceDTO::Type::kSceneResource, "workpiece");
+  synthesis.approach_offset_reference =
+      ReferenceDTO(ReferenceDTO::Type::kFrameRole, "frame-role:tcp");
+  auto result = owner.PlanPick(PickSequencePlanningIntentDTO{
+      "public-pick-reference", SceneResourceId("workpiece"), RuntimeObjectId("selected_object"),
+      FrameRoleId("frame-role:tcp"), synthesis,
+      motion_operation("reference.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
+      motion_operation("reference.descend", "descend", CartesianPathDTO{},
+                       ContactPolicyId("pick.contact"),
+                       {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
+                                                         SceneResourceId("workpiece")}}),
+      tool_operation("reference.tool", 0.0),
+      motion_operation("reference.retreat", "retreat", CartesianPathDTO{})});
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(motion.reference_resolution_count, 1U);
+  ASSERT_TRUE(result.value().last_attempted_pick_candidate.has_value());
+  const auto& candidate = *result.value().last_attempted_pick_candidate;
+  EXPECT_NEAR(candidate.pick_pose.position_m.x_m, 0.0, 1.0e-9);
+  EXPECT_NEAR(candidate.pick_pose.position_m.y_m, 0.02, 1.0e-9);
+  EXPECT_NEAR(candidate.pick_pose.position_m.z_m, 0.2, 1.0e-9);
+  EXPECT_NEAR(candidate.approach_pose.position_m.x_m, 0.05, 1.0e-9);
+  EXPECT_NEAR(candidate.approach_pose.position_m.y_m, 0.02, 1.0e-9);
+
+  synthesis.pick_offset_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "frame-role:tcp");
+  synthesis.approach_offset_reference =
+      ReferenceDTO(ReferenceDTO::Type::kComponentBodyRole, "body-role:wrist");
+  auto inverse_result = owner.PlanPick(PickSequencePlanningIntentDTO{
+      "public-pick-reference-inverse", SceneResourceId("workpiece"),
+      RuntimeObjectId("selected_object"), FrameRoleId("frame-role:tcp"), synthesis,
+      motion_operation("reference.inverse.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
+      motion_operation("reference.inverse.descend", "descend", CartesianPathDTO{},
+                       ContactPolicyId("pick.contact"),
+                       {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
+                                                         SceneResourceId("workpiece")}}),
+      tool_operation("reference.inverse.tool", 0.0),
+      motion_operation("reference.inverse.retreat", "retreat", CartesianPathDTO{})});
+
+  ASSERT_TRUE(inverse_result.ok()) << inverse_result.error().message;
+  EXPECT_EQ(motion.reference_resolution_count, 2U);
+  ASSERT_TRUE(inverse_result.value().last_attempted_pick_candidate.has_value());
+  const auto& inverse_candidate = *inverse_result.value().last_attempted_pick_candidate;
+  EXPECT_NEAR(inverse_candidate.pick_pose.position_m.x_m, 0.02, 1.0e-9);
+  EXPECT_NEAR(inverse_candidate.pick_pose.position_m.y_m, 0.0, 1.0e-9);
+  EXPECT_NEAR(inverse_candidate.approach_pose.position_m.x_m, 0.02, 1.0e-9);
+  EXPECT_NEAR(inverse_candidate.approach_pose.position_m.y_m, 0.05, 1.0e-9);
+}
+
+TEST(AddressedPickPlacePlanningOwner, FailedPlanningRetainsOneBoundedLinkedMotionDiagnostic) {
+  auto predecessor = predecessor_projection();
+  FakeMotionPreviewOwner motion;
+  motion.fail_first_with_start_collision = true;
+  FakeSceneCandidatePreview scene(predecessor);
+  FakeSceneCandidateProjection projection(predecessor);
+  AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
+  auto synthesis = PickCandidateSynthesisIntentDTO{};
+  synthesis.approach_offset_envelope.position_min_m = {0.0, 0.0, 0.05};
+  synthesis.approach_offset_envelope.position_max_m = {0.0, 0.0, 0.05};
+  auto result = owner.PlanPick(PickSequencePlanningIntentDTO{
+      "public-pick-failed", SceneResourceId("workpiece"), RuntimeObjectId("selected_object"),
+      FrameRoleId("frame-role:tcp"), synthesis,
+      motion_operation("failed.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
+      motion_operation("failed.descend", "descend", CartesianPathDTO{},
+                       ContactPolicyId("pick.contact"),
+                       {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
+                                                         SceneResourceId("workpiece")}}),
+      tool_operation("failed.tool", 0.0),
+      motion_operation("failed.retreat", "retreat", CartesianPathDTO{})});
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().status, PickPlacePlanningStatusDTO::kNoFeasibleCandidate);
+  EXPECT_FALSE(result.value().sequence_request.has_value());
+  ASSERT_TRUE(result.value().last_attempted_pick_candidate.has_value());
+  const auto& candidate = *result.value().last_attempted_pick_candidate;
+  ASSERT_EQ(candidate.descend_path.waypoints.size(), 2U);
+  ASSERT_EQ(candidate.retreat_path.waypoints.size(), 2U);
+  EXPECT_EQ(candidate.descend_path.waypoints.front(), candidate.approach_pose);
+  EXPECT_EQ(candidate.descend_path.waypoints.back(), candidate.pick_pose);
+  EXPECT_EQ(candidate.retreat_path.waypoints.front(), candidate.pick_pose);
+  EXPECT_EQ(candidate.retreat_path.waypoints.back(), candidate.retreat_pose);
+  ASSERT_EQ(result.value().reports.size(), 1U);
+  ASSERT_EQ(result.value().reports.front().stages.size(), 1U);
+  EXPECT_FALSE(result.value().reports.front().stages.front().succeeded);
+}
+
+TEST(AddressedPickPlacePlanningOwner, RejectsStaleOrCancelledPickBeforeRetainingAProjection) {
   auto predecessor = predecessor_projection();
   FakeMotionPreviewOwner motion;
   FakeSceneCandidatePreview scene(predecessor);

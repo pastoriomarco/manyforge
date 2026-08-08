@@ -295,15 +295,18 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// serialized by the ordinary lifecycle boundary. Cancellation requests
   /// the same planner and collision-validation cancellation paths used by
   /// execution.
-  Result<RobotStateDTO> current_preview_state(
-      std::int64_t now_ns) const override;
+  Result<RobotStateDTO> current_preview_state(std::int64_t now_ns) const override;
 
-  Result<MotionPreviewResultDTO> preview_motion(
-      ExecuteRequestDTO request,
-      CollisionWorldLeaseInventory projection_inventory,
-      RobotStateDTO start_state,
-      std::uint32_t planning_attempt_index = 0U,
-      std::stop_token stop_token = {}) override;
+  Result<std::vector<Pose3DTO>> resolve_preview_reference_poses(
+      ExecuteRequestDTO request, std::vector<ReferenceDTO> references,
+      const CollisionWorldLeaseInventory& projection_inventory,
+      const RobotStateDTO& start_state) override;
+
+  Result<MotionPreviewResultDTO> preview_motion(ExecuteRequestDTO request,
+                                                CollisionWorldLeaseInventory projection_inventory,
+                                                RobotStateDTO start_state,
+                                                std::uint32_t planning_attempt_index = 0U,
+                                                std::stop_token stop_token = {}) override;
 
   /// Non-blocking stop from any non-terminal state.
   /// Accepted stop invalidates older lifecycle/recovery commands by bumping

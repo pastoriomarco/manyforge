@@ -184,6 +184,19 @@ class MotionPreviewSession final : public IAddressedMotionPreviewSession {
     return Result<RobotStateDTO>::Ok(RobotStateDTO{{"joint1", "joint2"}, {0.0, 0.0}, {}});
   }
 
+  Result<std::vector<Pose3DTO>> resolve_reference_poses(
+      const OperationIntentDTO&, std::vector<ReferenceDTO> references,
+      const CollisionWorldLeaseInventory&, const RobotStateDTO&,
+      std::vector<RuntimeObjectReferenceBindingDTO>) override {
+    std::vector<Pose3DTO> resolved;
+    resolved.reserve(references.size());
+    for (const auto& reference : references) {
+      resolved.push_back(reference.pose.value_or(
+          Pose3DTO{{}, QuaternionDTO{0.0, 0.0, 0.7071067811865475, 0.7071067811865476}}));
+    }
+    return Result<std::vector<Pose3DTO>>::Ok(std::move(resolved));
+  }
+
   Result<MotionPreviewResultDTO> preview_motion(OperationIntentDTO operation,
                                                 CollisionWorldLeaseInventory projection_inventory,
                                                 RobotStateDTO start_state, std::uint32_t,
@@ -194,6 +207,12 @@ class MotionPreviewSession final : public IAddressedMotionPreviewSession {
     }
     const auto ordinal = ++preview_count_;
     auto request = std::move(prepared.value());
+    if (request.move_id.find("fixture_no_feasible") != std::string::npos) {
+      return Result<MotionPreviewResultDTO>::Err(
+          ErrorDTO{"planning_failed",
+                   "fixture candidate is intentionally infeasible",
+                   {{"failure_stage", "planning"}, {"reason", "fixture_no_feasible_candidate"}}});
+    }
     std::vector<double> final_positions(start_state.positions_rad.size(),
                                         static_cast<double>(ordinal));
     RobotStateDTO final_state{start_state.joint_names, final_positions, {}};
@@ -220,6 +239,90 @@ class MotionPreviewOwner final : public IAddressedMotionPreviewOwner {
         std::make_unique<MotionPreviewSession>();
     return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(std::move(session));
   }
+};
+
+class OperationOwner final : public IAddressedOperationOwner {
+ public:
+  Result<OperationAcceptedDTO> execute(const OperationIntentDTO& intent) override {
+    if (active_.has_value()) {
+      return Result<OperationAcceptedDTO>::Err(ErrorDTO{"execution_rejected",
+                                                        "fixture operation owner is busy",
+                                                        {{"reason", "fixture_operation_busy"}}});
+    }
+    const auto id = OperationId("fixture.operation." + std::to_string(++next_id_));
+    fail_active_ = false;
+    if (intent.participants.size() == 1U) {
+      if (const auto* motion =
+              std::get_if<MotionParticipantIntentDTO>(&intent.participants.front().payload)) {
+        fail_active_ = motion->move_id.value().find("fixture_fail") != std::string::npos;
+      }
+    }
+    active_ = OperationStateDTO{id,
+                                OperationRevision(1U),
+                                intent.program_binding_id,
+                                intent.program_run_id,
+                                OperationCoordinationPolicy::kIndependent,
+                                OperationStateKind::kExecuting,
+                                {},
+                                1,
+                                std::nullopt,
+                                std::nullopt,
+                                std::nullopt};
+    return Result<OperationAcceptedDTO>::Ok(
+        OperationAcceptedDTO{intent.request_context.request_id,
+                             RequestReplayStatusDTO::kAcceptedNew,
+                             id,
+                             OperationRevision(1U),
+                             {},
+                             1});
+  }
+
+  Result<OperationControlAcceptedDTO> acknowledge_completed(
+      const OperationControlRequestDTO& request) override {
+    if (!active_.has_value() || active_->operation_id != request.operation_id ||
+        active_->operation_revision != request.expected_operation_revision ||
+        active_->state != OperationStateKind::kCompleted) {
+      return Result<OperationControlAcceptedDTO>::Err(
+          ErrorDTO{"invalid_state_transition",
+                   "fixture completion acknowledgement does not match",
+                   {{"reason", "fixture_completion_mismatch"}}});
+    }
+    const auto accepted = OperationControlAcceptedDTO{
+        request.request_context.request_id,
+        RequestReplayStatusDTO::kAcceptedNew,
+        request.operation_id,
+        request.expected_operation_revision,
+        OperationControlKind::kAcknowledgeCompleted,
+        OperationRevision(request.expected_operation_revision.value() + 1U),
+        2};
+    active_.reset();
+    return Result<OperationControlAcceptedDTO>::Ok(accepted);
+  }
+
+  Result<OperationStateDTO> get_operation_state(const OperationId& operation_id) const override {
+    if (!active_.has_value() || active_->operation_id != operation_id) {
+      return Result<OperationStateDTO>::Err(ErrorDTO{"missing_reference",
+                                                     "fixture operation is absent",
+                                                     {{"reason", "fixture_operation_absent"}}});
+    }
+    return Result<OperationStateDTO>::Ok(*active_);
+  }
+
+  Result<void> reconcile_subordinate_state() override {
+    if (active_.has_value() && active_->state == OperationStateKind::kExecuting) {
+      active_->state = fail_active_ ? OperationStateKind::kFailed : OperationStateKind::kCompleted;
+      active_->operation_revision = OperationRevision(2U);
+    }
+    return Result<void>::Ok();
+  }
+
+  const RequestOwnerEpoch& request_owner_epoch() const noexcept override { return owner_epoch_; }
+
+ private:
+  RequestOwnerEpoch owner_epoch_{"kernel.epoch:test"};
+  std::uint64_t next_id_{};
+  bool fail_active_{};
+  std::optional<OperationStateDTO> active_;
 };
 
 class SceneOwner final : public ISceneCandidatePreview, public ISceneAuthority {
@@ -314,11 +417,40 @@ class SceneOwner final : public ISceneCandidatePreview, public ISceneAuthority {
       return Result<SceneCandidatePreviewDTO>::Err(
           ErrorDTO{"invariant_violation", "fixture candidate is invalid", {}});
     }
+    last_preview_ = candidate;
     return Result<SceneCandidatePreviewDTO>::Ok(std::move(candidate));
   }
 
-  SceneCommitResultDTO Commit(const SceneTransactionRequestDTO&) override {
-    throw std::logic_error("fixture scene commit must not be called");
+  SceneCommitResultDTO Commit(const SceneTransactionRequestDTO& request) override {
+    if (!last_preview_.has_value() ||
+        request.expected_projection_revision !=
+            predecessor_.projection_binding.projection_revision ||
+        last_preview_->prior_projection_revision != request.expected_projection_revision) {
+      return {request.request_context.request_id,
+              RequestReplayStatusDTO::kAcceptedNew,
+              false,
+              ErrorDTO{"scene_commit_failed",
+                       "fixture scene preview is stale",
+                       {{"reason", "fixture_scene_preview_stale"}}},
+              std::nullopt,
+              std::nullopt,
+              SceneProjectionCommitStatusDTO::kFailedProjectionUncertain,
+              std::nullopt};
+    }
+    predecessor_.projection_binding.projection_revision =
+        last_preview_->proposed_projection_revision;
+    predecessor_.logical_scene = last_preview_->logical_scene;
+    predecessor_.bundle.policy = last_preview_->effective_collision_policy;
+    const auto committed = last_preview_->proposed_projection_revision;
+    last_preview_.reset();
+    return {request.request_context.request_id,
+            RequestReplayStatusDTO::kAcceptedNew,
+            true,
+            std::nullopt,
+            1U,
+            committed,
+            SceneProjectionCommitStatusDTO::kCommitted,
+            SceneUpdateStatusDTO::kGeometryChanged};
   }
 
   RequestOwnerEpoch CurrentRequestOwnerEpoch() const override {
@@ -370,7 +502,8 @@ class SceneOwner final : public ISceneCandidatePreview, public ISceneAuthority {
   }
 
  private:
-  CollisionWorldLeaseInventory predecessor_;
+  mutable CollisionWorldLeaseInventory predecessor_;
+  mutable std::optional<SceneCandidatePreviewDTO> last_preview_;
 };
 
 class SceneProjection final : public IPlannerSceneProjection {
@@ -502,6 +635,7 @@ struct Ports final {
 
   CollisionWorldLeaseInventory predecessor;
   MotionPreviewOwner motion;
+  OperationOwner operations;
   SceneOwner scene;
   SceneProjection projection;
 };
@@ -512,7 +646,12 @@ FocusedPickPlacePlanningFixture MakeFocusedPickPlacePlanningFixture() {
   auto ports = std::make_shared<Ports>();
   auto owner = std::make_unique<AddressedPickPlacePlanningOwner>(ports->motion, ports->scene,
                                                                  ports->scene, ports->projection);
-  return {std::move(ports), std::move(owner)};
+  auto sequence_coordinator =
+      std::make_unique<PickPlaceSequenceCoordinator>(ports->operations, ports->scene);
+  auto execution_owner =
+      std::make_unique<AddressedPickPlaceExecutionOwner>(*owner, *sequence_coordinator);
+  return {std::move(ports), std::move(owner), std::move(sequence_coordinator),
+          std::move(execution_owner)};
 }
 
 }  // namespace manyforge::roboplan_backend::process_fixture

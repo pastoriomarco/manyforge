@@ -37,6 +37,15 @@ class IAddressedMotionPreviewSession {
   /// Read from the state authority owned by the exact selected participant.
   [[nodiscard]] virtual Result<RobotStateDTO> current_state() const = 0;
 
+  /// Resolve one bounded set of caller-portable references through the exact
+  /// participant and immutable preview state. Runtime-object bindings are
+  /// supplied by the composite owner, never inferred by the transport or
+  /// planner adapter.
+  [[nodiscard]] virtual Result<std::vector<Pose3DTO>> resolve_reference_poses(
+      const OperationIntentDTO& motion_context, std::vector<ReferenceDTO> references,
+      const CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& start_state,
+      std::vector<RuntimeObjectReferenceBindingDTO> runtime_object_bindings) = 0;
+
   /// Plan and validate without dispatch, journaling, scene publication, or
   /// operation-state publication.
   [[nodiscard]] virtual Result<MotionPreviewResultDTO> preview_motion(

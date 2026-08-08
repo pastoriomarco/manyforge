@@ -717,6 +717,19 @@ struct ResourceAddressedExecutionKernel::PreviewSession final
     return motion_.current_preview_state(owner_.clock_.now());
   }
 
+  [[nodiscard]] Result<std::vector<Pose3DTO>> resolve_reference_poses(
+      const OperationIntentDTO& motion_context, std::vector<ReferenceDTO> references,
+      const CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& start_state,
+      std::vector<RuntimeObjectReferenceBindingDTO> runtime_object_bindings) override {
+    auto prepared = prepare_motion(motion_context);
+    if (!prepared.ok()) {
+      return Result<std::vector<Pose3DTO>>::Err(prepared.error());
+    }
+    prepared.value().runtime_object_bindings = std::move(runtime_object_bindings);
+    return motion_.resolve_preview_reference_poses(
+        std::move(prepared.value()), std::move(references), projection_inventory, start_state);
+  }
+
   [[nodiscard]] Result<MotionPreviewResultDTO> preview_motion(
       OperationIntentDTO intent,
       CollisionWorldLeaseInventory projection_inventory,

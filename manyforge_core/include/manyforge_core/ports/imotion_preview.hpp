@@ -21,6 +21,23 @@ class IMotionPreview {
   [[nodiscard]] virtual Result<RobotStateDTO> current_preview_state(
       std::int64_t now_ns) const = 0;
 
+  /// Resolve one bounded set of portable spatial references against the same
+  /// immutable Program, state, and retained-scene evidence used by motion admission.
+  /// Composite planners use this only to capture an offset basis before a
+  /// linked preview; it performs no planning, dispatch, or publication.
+  [[nodiscard]] virtual Result<std::vector<Pose3DTO>> resolve_preview_reference_poses(
+      ExecuteRequestDTO request, std::vector<ReferenceDTO> references,
+      const CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& start_state) {
+    static_cast<void>(request);
+    static_cast<void>(references);
+    static_cast<void>(projection_inventory);
+    static_cast<void>(start_state);
+    return Result<std::vector<Pose3DTO>>::Err(
+        ErrorDTO{"missing_reference",
+                 "motion preview reference resolution is unavailable",
+                 {{"reason", "motion_preview_reference_resolver_unavailable"}}});
+  }
+
   [[nodiscard]] virtual Result<MotionPreviewResultDTO> preview_motion(
       ExecuteRequestDTO request, CollisionWorldLeaseInventory projection_inventory,
       RobotStateDTO start_state, std::uint32_t planning_attempt_index = 0U,

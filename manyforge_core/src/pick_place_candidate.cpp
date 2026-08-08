@@ -574,12 +574,14 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
       return Result<PickCandidateSearchOutcomeDTO>::Err(synthesized.error());
     }
     ++outcome.attempted_candidate_count;
-    PickCandidateReportDTO report{synthesized.value().candidate_index, {}};
+    outcome.last_attempted_candidate.emplace(std::move(synthesized.value()));
+    const auto& candidate = *outcome.last_attempted_candidate;
+    PickCandidateReportDTO report{candidate.candidate_index, {}};
     report.stages.reserve(4U);
     const auto attempt = static_cast<std::uint32_t>(index);
 
     auto approach_operation = request.approach_operation;
-    set_absolute_pose(approach_operation, synthesized.value().approach_pose);
+    set_absolute_pose(approach_operation, candidate.approach_pose);
     auto approach = motion_.preview_motion(std::move(approach_operation), predecessor,
                                            request.start_state, attempt, stop_token);
     if (!approach.ok()) {
@@ -595,7 +597,7 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
     report.stages.push_back(successful_stage(PickCandidateStageDTO::kApproach, approach.value()));
 
     auto descend_operation = request.descend_operation;
-    set_absolute_path(descend_operation, synthesized.value().descend_path);
+    set_absolute_path(descend_operation, candidate.descend_path);
     auto descend = motion_.preview_motion(std::move(descend_operation), predecessor,
                                           approach.value().final_state, attempt, stop_token);
     if (!descend.ok()) {
@@ -627,7 +629,7 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
     auto candidate_projection = projection_.ProjectSceneCandidate(
         attached.value(), predecessor.projection_binding,
         ProjectionLeaseId(request.candidate_lease_scope + "." +
-                          std::to_string(synthesized.value().candidate_index)));
+                          std::to_string(candidate.candidate_index)));
     if (!candidate_projection.ok()) {
       report.stages.push_back(
           failed_stage(PickCandidateStageDTO::kCandidateAttach, candidate_projection.error()));
@@ -638,11 +640,10 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
     report.stages.push_back({PickCandidateStageDTO::kCandidateAttach, true, std::nullopt, 0.0, 0U});
 
     auto retreat_operation = request.retreat_operation;
-    set_absolute_path(retreat_operation, synthesized.value().retreat_path);
-    auto retreat =
-        motion_.preview_motion(std::move(retreat_operation),
-                               std::move(candidate_projection.value()),
-                               descend.value().final_state, attempt, stop_token);
+    set_absolute_path(retreat_operation, candidate.retreat_path);
+    auto retreat = motion_.preview_motion(std::move(retreat_operation),
+                                          std::move(candidate_projection.value()),
+                                          descend.value().final_state, attempt, stop_token);
     if (!retreat.ok()) {
       report.stages.push_back(failed_stage(PickCandidateStageDTO::kRetreat, retreat.error()));
       outcome.reports.push_back(std::move(report));
@@ -656,7 +657,7 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
                          0.01 * static_cast<double>(approach.value().trajectory.waypoints.size() +
                                                     descend.value().trajectory.waypoints.size() +
                                                     retreat.value().trajectory.waypoints.size());
-    PlannedPickCandidateDTO planned{std::move(synthesized.value()),
+    PlannedPickCandidateDTO planned{candidate,
                                     std::move(approach.value()),
                                     std::move(descend.value()),
                                     std::move(candidate_request.request),
