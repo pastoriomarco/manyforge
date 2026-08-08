@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/types/logical_scene_snapshot.hpp>
 
 namespace manyforge::roboplan_backend {
@@ -221,6 +222,17 @@ class RetainedCollisionWorldProjector final {
   project_effective_policy(
       const core::LogicalSceneSnapshotDTO& logical_scene,
       std::uint64_t effective_policy_revision_id) const;
+
+  /// Build the exact lease sidecars for an already projected immutable world.
+  /// Durable publication and candidate-local projection share these helpers so
+  /// scene-object freshness and body identities cannot drift.
+  [[nodiscard]] std::vector<core::CollisionWorldBodyFreshness>
+  project_body_freshness(
+      const core::CollisionWorldSnapshot& world) const;
+  [[nodiscard]] std::vector<core::SceneSnapshotLiveObject>
+  project_live_objects(
+      const core::LogicalSceneSnapshotDTO& logical_scene,
+      const core::CollisionWorldSnapshot& world) const;
 
   [[nodiscard]] const RetainedCollisionModelMapInput& model_map()
       const noexcept {

@@ -122,12 +122,6 @@ core::SupportContactPolicyEntry support_policy_entry(
   };
 }
 
-std::string scene_body_id(const core::SceneResourceId& resource_id,
-                          const std::size_t shape_index) {
-  return "scene/" + resource_id.value() + "/shape/" +
-         std::to_string(shape_index);
-}
-
 core::CollisionGeometryDescriptor scene_geometry_descriptor(
     const core::CollisionBodyId& body_id,
     const core::CollisionShapeDTO& shape) {
@@ -283,7 +277,8 @@ RetainedCollisionWorldProjector::project_effective_policy(
   for (const auto& object : logical_scene.objects) {
     for (std::size_t shape_index = 0U;
          shape_index < object.collision_shapes.size(); ++shape_index) {
-      body_ids.insert(scene_body_id(object.scene_resource_id, shape_index));
+      body_ids.insert(core::make_scene_collision_body_id(
+          object.scene_resource_id, shape_index));
     }
   }
 
@@ -303,8 +298,10 @@ RetainedCollisionWorldProjector::project_effective_policy(
         for (std::size_t second_shape = 0U;
              second_shape < second.collision_shapes.size(); ++second_shape) {
           effective.allowed_static_static_pairs.push_back(canonical_pair(
-              scene_body_id(first.scene_resource_id, first_shape),
-              scene_body_id(second.scene_resource_id, second_shape)));
+              core::make_scene_collision_body_id(first.scene_resource_id,
+                                                  first_shape),
+              core::make_scene_collision_body_id(second.scene_resource_id,
+                                                  second_shape)));
         }
       }
     }
@@ -312,7 +309,8 @@ RetainedCollisionWorldProjector::project_effective_policy(
       for (std::size_t shape = 0U; shape < first.collision_shapes.size();
            ++shape) {
         effective.allowed_static_static_pairs.push_back(canonical_pair(
-            component_body, scene_body_id(first.scene_resource_id, shape)));
+            component_body, core::make_scene_collision_body_id(
+                                first.scene_resource_id, shape)));
       }
     }
   }
@@ -352,16 +350,18 @@ RetainedCollisionWorldProjector::project_effective_policy(
           continue;
         }
         role_found = true;
-        const std::string component_body_id =
-            "component/" + target_body.controllable_component_id.value() +
-            "/model/" + target_body.model_instance_id.value() + "/body/" +
-            target_body.collision_body_role_id.value() + "/collision/" +
-            std::to_string(target_body.collision_index);
+        const core::CollisionBodyId component_body_id =
+            core::make_component_collision_body_id(
+                target_body.controllable_component_id,
+                target_body.model_instance_id,
+                target_body.collision_body_role_id,
+                target_body.collision_index);
         for (std::size_t shape_index = 0U;
              shape_index < object.collision_shapes.size(); ++shape_index) {
           effective.allowed_touch_link_pairs.push_back(canonical_pair(
               component_body_id,
-              scene_body_id(object.scene_resource_id, shape_index)));
+              core::make_scene_collision_body_id(object.scene_resource_id,
+                                                  shape_index)));
         }
       }
       if (!role_found) {
@@ -394,9 +394,10 @@ RetainedCollisionWorldProjector::project_effective_policy(
              ++support_shape_index) {
           effective.support_contacts.push_back(support_policy_entry(
               canonical_pair(
-                  scene_body_id(object.scene_resource_id, object_shape_index),
-                  scene_body_id(support->scene_resource_id,
-                                support_shape_index)),
+                  core::make_scene_collision_body_id(
+                      object.scene_resource_id, object_shape_index),
+                  core::make_scene_collision_body_id(
+                      support->scene_resource_id, support_shape_index)),
               declaration));
         }
       }
@@ -560,7 +561,8 @@ RetainedCollisionWorldProjector::project(
     for (std::size_t shape_index = 0U;
          shape_index < object.collision_shapes.size(); ++shape_index) {
       core::CollisionWorldBody body;
-      body.body_id = scene_body_id(object.scene_resource_id, shape_index);
+      body.body_id = core::make_scene_collision_body_id(
+          object.scene_resource_id, shape_index);
       body.owner_kind = core::CollisionOwnerKind::kSceneResource;
       if (carried_parent.has_value()) {
         body.parent_body_id = carried_parent->parent_body_id;
@@ -583,6 +585,67 @@ RetainedCollisionWorldProjector::project(
     }
   }
   return builder.build();
+}
+
+std::vector<core::CollisionWorldBodyFreshness>
+RetainedCollisionWorldProjector::project_body_freshness(
+    const core::CollisionWorldSnapshot& world) const {
+  std::vector<core::CollisionWorldBodyFreshness> result;
+  for (const auto& body : world.bodies) {
+    if (!body.source_id.has_value() &&
+        !body.source_timestamp_ns.has_value() &&
+        !body.source_freshness_budget_ns.has_value()) {
+      continue;
+    }
+    result.push_back({body.body_id, body.source_id, body.source_timestamp_ns,
+                      body.source_freshness_budget_ns});
+  }
+  return result;
+}
+
+std::vector<core::SceneSnapshotLiveObject>
+RetainedCollisionWorldProjector::project_live_objects(
+    const core::LogicalSceneSnapshotDTO& logical_scene,
+    const core::CollisionWorldSnapshot& world) const {
+  std::vector<core::SceneSnapshotLiveObject> result;
+  result.reserve(logical_scene.objects.size());
+  for (const auto& object : logical_scene.objects) {
+    core::SceneSnapshotLiveObject live;
+    live.object_id = object.scene_resource_id.value();
+    const std::string body_prefix =
+        "scene/" + object.scene_resource_id.value() + "/shape/";
+    for (const auto& body : world.bodies) {
+      if (body.body_id.starts_with(body_prefix)) {
+        live.collision_body_ids.push_back(body.body_id);
+        live.body_content_hashes.emplace(body.body_id,
+                                         body.body_content_hash);
+      }
+    }
+    live.object_revision_token =
+        logical_scene.revision.content_hash.value() + "/" + live.object_id;
+    if (const auto* fixed =
+            std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+                &object.placement)) {
+      live.pose = fixed->pose_in_cell;
+      live.declared_role = core::ObservedSceneObjectRole::kStaticObstacle;
+    } else {
+      live.declared_role = core::ObservedSceneObjectRole::kAttachedObject;
+    }
+    if (object.provider_evidence.has_value()) {
+      const auto& evidence = *object.provider_evidence;
+      live.source_id = evidence.provider_instance_id.value() + "@" +
+                       evidence.provider_source_epoch;
+      live.source_timestamp_ns = evidence.source_timestamp_ns;
+      live.source_freshness_budget_ns =
+          evidence.source_freshness_budget_ns;
+      // The operation may identify this exact object as its observed target;
+      // otherwise the Kernel treats it as a snapshot obstacle and enforces
+      // freshness. Do not hard-code either role here.
+      live.declared_role.reset();
+    }
+    result.push_back(std::move(live));
+  }
+  return result;
 }
 
 }  // namespace manyforge::roboplan_backend

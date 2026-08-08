@@ -713,6 +713,16 @@ template <typename StrongId>
   }
   const auto target_mode =
       motion.target_mode == MotionTargetModeDTO::kAbsolute ? "absolute" : "relative";
+  CanonicalValue::Array runtime_objects;
+  runtime_objects.reserve(motion.runtime_object_bindings.size());
+  for (const auto& binding : motion.runtime_object_bindings) {
+    runtime_objects.emplace_back(CanonicalValue::Object{
+        {"runtime_object_id",
+         CanonicalValue(binding.runtime_object_id.value())},
+        {"scene_resource_id",
+         CanonicalValue(binding.scene_resource_id.value())},
+    });
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"base_frame_role_id", CanonicalValue(motion.base_frame_role_id.value())},
       {"cache_mode", CanonicalValue(cache_mode)},
@@ -724,6 +734,7 @@ template <typename StrongId>
       {"offset_reference", ReferenceValue(motion.offset_reference)},
       {"per_joint_dynamics_limits", CanonicalValue(std::move(dynamics))},
       {"planning_profile", CanonicalValue(std::string(planning_profile))},
+      {"runtime_object_bindings", CanonicalValue(std::move(runtime_objects))},
       {"speed_profile",
        CanonicalValue(CanonicalValue::Object{
            {"acceleration_scale", CanonicalValue(motion.speed_profile.acceleration_scale)},

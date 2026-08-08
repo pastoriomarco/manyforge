@@ -79,6 +79,7 @@ TEST(SceneFrameResolutionTest, CompactReceiptRejectsIncompleteFrameIdentity) {
               SceneRevision{SceneId(std::string(digest)), 1U,
                             ContentDigest(std::string(digest))}},
           ProjectionLeaseId("lease.1")},
+      std::nullopt,
       ContentDigest(std::string(digest))};
   ASSERT_TRUE(receipt.valid());
 

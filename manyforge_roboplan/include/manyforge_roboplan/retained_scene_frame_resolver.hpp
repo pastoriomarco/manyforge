@@ -332,9 +332,30 @@ class RetainedSceneFrameResolver final : public core::IReferencePoseResolver {
       std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
       std::int64_t now_ns) const;
 
+  /// Resolve one carrier frame against the exact retained predecessor while
+  /// replacing only the selected control binding with a predicted terminal
+  /// state. All other path state remains owner-issued and immutable.
+  [[nodiscard]] core::Result<core::ResolvedSceneFramePoseDTO>
+  ResolveCandidate(
+      const core::CandidateSceneFrameResolutionQueryDTO& query,
+      std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
+      std::int64_t now_ns) const;
+
  private:
   class Impl;
   explicit RetainedSceneFrameResolver(std::shared_ptr<Impl> impl);
+  [[nodiscard]] core::Result<core::ResolvedSceneFramePoseDTO>
+  ResolveWithCandidateState(
+      const core::SceneFrameResolutionSelectorDTO& selector,
+      const core::ProjectionLeaseBindingDTO& projection_binding,
+      std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
+      std::int64_t now_ns,
+      const core::ControlledStateDTO* predicted_state) const;
+  [[nodiscard]] core::Result<core::ResolvedSceneFramePoseDTO>
+  ResolveFrameWithCandidateState(
+      const core::SceneFrameRefDTO& reference,
+      const core::SceneFrameResolutionContextDTO& context,
+      const core::ControlledStateDTO* predicted_state) const;
   std::shared_ptr<Impl> impl_;
 };
 

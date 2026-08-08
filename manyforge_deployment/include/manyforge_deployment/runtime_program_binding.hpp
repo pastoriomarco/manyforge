@@ -96,6 +96,10 @@ class RuntimeProgramTargetBinding final {
   capability_provider_binding() const noexcept {
     return capability_provider_binding_;
   }
+  [[nodiscard]] const std::vector<core::ProgramContactGraspBindingDTO>&
+  contact_grasp_bindings() const noexcept {
+    return contact_grasp_bindings_;
+  }
 
  private:
   RuntimeProgramTargetBinding(
@@ -115,7 +119,9 @@ class RuntimeProgramTargetBinding final {
       std::optional<core::ControlRouteId> desired_route,
       std::optional<CompositionControlBindingCoordinateMap> coordinate_map,
       std::optional<core::CapabilityProviderBindingDTO>
-          capability_provider_binding)
+          capability_provider_binding,
+      std::vector<core::ProgramContactGraspBindingDTO>
+          contact_grasp_bindings)
       : program_id_(std::move(program_id)),
         program_revision_(std::move(program_revision)),
         program_binding_id_(std::move(program_binding_id)),
@@ -133,7 +139,8 @@ class RuntimeProgramTargetBinding final {
         desired_route_(std::move(desired_route)),
         coordinate_map_(std::move(coordinate_map)),
         capability_provider_binding_(
-            std::move(capability_provider_binding)) {}
+            std::move(capability_provider_binding)),
+        contact_grasp_bindings_(std::move(contact_grasp_bindings)) {}
 
   core::ProgramId program_id_;
   core::ProgramRevision program_revision_;
@@ -153,6 +160,7 @@ class RuntimeProgramTargetBinding final {
   std::optional<CompositionControlBindingCoordinateMap> coordinate_map_;
   std::optional<core::CapabilityProviderBindingDTO>
       capability_provider_binding_;
+  std::vector<core::ProgramContactGraspBindingDTO> contact_grasp_bindings_;
 
   friend RuntimeProgramTargetBinding resolve_runtime_program_target(
       const ProgramBinding&, const core::TargetRoleId&,

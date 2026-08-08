@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
+#include <manyforge_core/ports/iscene_candidate_projection.hpp>
 #include <manyforge_core/types/native_projection_handoff.hpp>
 #include <manyforge_core/types/scene_transaction.hpp>
 #include <manyforge_core/types/scene_frame_resolution.hpp>
@@ -14,7 +15,7 @@ namespace manyforge::core {
 /// N5b establishes transaction acknowledgement and health. Revision-bound
 /// leases, rebuild, structural stage/activation, and native query projection
 /// are added through this same focused boundary in N5c.
-class IPlannerSceneProjection {
+class IPlannerSceneProjection : public ISceneCandidateProjection {
 public:
   virtual ~IPlannerSceneProjection() = default;
 
@@ -80,6 +81,28 @@ public:
     return Result<SceneFrameResolutionReceiptDTO>::Err(ErrorDTO{
         "missing_reference", "native scene-frame resolution is unavailable",
         {{"reason", "scene_frame_resolver_not_installed"}}});
+  }
+
+  [[nodiscard]] virtual Result<SceneFrameResolutionReceiptDTO>
+  ResolveCandidateSceneFrame(
+      const CandidateSceneFrameResolutionQueryDTO &) const override {
+    return Result<SceneFrameResolutionReceiptDTO>::Err(ErrorDTO{
+        "missing_reference",
+        "native candidate scene-frame resolution is unavailable",
+        {{"reason", "candidate_scene_frame_resolver_not_installed"}}});
+  }
+
+  /// Project one owner-issued non-durable scene successor into a private
+  /// collision inventory. The predecessor lease remains exact; this call does
+  /// not publish, retain, or mutate native scene truth.
+  [[nodiscard]] virtual Result<CollisionWorldLeaseInventory>
+  ProjectSceneCandidate(
+      const SceneCandidatePreviewDTO &,
+      const ProjectionLeaseBindingDTO &,
+      ProjectionLeaseId) const override {
+    return Result<CollisionWorldLeaseInventory>::Err(ErrorDTO{
+        "invalid_request", "native scene-candidate projection is unavailable",
+        {{"reason", "scene_candidate_projector_not_installed"}}});
   }
 
   [[nodiscard]] virtual Result<CollisionPolicySnapshot>

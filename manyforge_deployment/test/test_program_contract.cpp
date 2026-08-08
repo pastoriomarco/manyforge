@@ -75,6 +75,7 @@ struct ProgramOptions final {
   std::vector<std::string> capability_ids{"state.observed.current"};
   bool include_legacy_robot{false};
   bool duplicate_tree_instance{false};
+  bool include_contact_grasp{false};
 };
 
 [[nodiscard]] CanonicalValue text_array(
@@ -85,6 +86,58 @@ struct ProgramOptions final {
     result.emplace_back(value);
   }
   return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] CanonicalValue make_contact_grasp_policy() {
+  CanonicalValue policy(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.contact_policy.v1")},
+      {"policy_id", CanonicalValue("selected_object_grasp")},
+      {"version", CanonicalValue(std::string(kZeroDigest))},
+      {"mode", CanonicalValue("contact_grasp")},
+      {"sensing_mode", CanonicalValue("geometry_only")},
+      {"default_unmatched_response", CanonicalValue("hard_stop")},
+      {"zones",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(
+           CanonicalValue::Object{
+               {"zone_id", CanonicalValue("tool_contact")},
+               {"body_pairs",
+                CanonicalValue(CanonicalValue::Array{CanonicalValue(
+                    CanonicalValue::Object{
+                        {"body_a",
+                         CanonicalValue(CanonicalValue::Object{
+                             {"kind", CanonicalValue("component_model_body")},
+                             {"component_role_id", CanonicalValue("robot")},
+                             {"model_role_id", CanonicalValue("arm_model")},
+                             {"collision_body_role_id",
+                              CanonicalValue("arm_collision")},
+                         })},
+                        {"body_b",
+                         CanonicalValue(CanonicalValue::Object{
+                             {"kind", CanonicalValue("runtime_object")},
+                             {"runtime_object_id",
+                              CanonicalValue("selected_object")},
+                         })},
+                    })})},
+               {"violation_response", CanonicalValue("hard_stop")},
+               {"max_penetration_m", CanonicalValue(0.002)},
+               {"terminal_window_start_fraction", CanonicalValue(0.8)},
+           })})},
+  });
+  const std::string revision = compute_content_identity(
+      policy,
+      ContentIdentitySpec{
+          .identity_domain = "catalog-record-revision/contact_policy",
+          .api_version = "manyforge.contact_policy.v1",
+          .own_field = "version",
+      });
+  auto members = policy.as_object();
+  for (auto& [name, value] : members) {
+    if (name == "version") {
+      value = CanonicalValue(revision);
+      return CanonicalValue(std::move(members));
+    }
+  }
+  throw std::logic_error("test contact policy omitted version");
 }
 
 [[nodiscard]] CanonicalValue make_program_root(const ProgramOptions& options) {
@@ -166,6 +219,25 @@ struct ProgramOptions final {
             {"group_id", CanonicalValue("legacy_group")},
         }));
   }
+  if (options.include_contact_grasp) {
+    root.emplace_back(
+        "blackboard",
+        CanonicalValue(CanonicalValue::Object{
+            {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+            {"keys",
+             CanonicalValue(CanonicalValue::Array{CanonicalValue(
+                 CanonicalValue::Object{
+                     {"key", CanonicalValue("selected_object")},
+                     {"type", CanonicalValue("scene_resource")},
+                     {"access", CanonicalValue("read_write")},
+                     {"persistence", CanonicalValue("run")},
+                 })})},
+        }));
+    root.emplace_back(
+        "contact_policies",
+        CanonicalValue(
+            CanonicalValue::Array{make_contact_grasp_policy()}));
+  }
   return CanonicalValue(std::move(root));
 }
 
@@ -237,6 +309,30 @@ TEST(ProgramContractTest, SealsExactCanonicalProgramAndRetainedCatalogContract) 
             CapabilityId("state.observed.current"));
   EXPECT_EQ(target.required_capabilities.front().disposition,
             ProgramCapabilityDisposition::kRequired);
+}
+
+TEST(ProgramContractTest,
+     ExtractsRevisionVerifiedPortableContactGraspTemplate) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  ProgramOptions options = valid_options(*bundle);
+  options.include_contact_grasp = true;
+  const auto contract = verify_program_binding_contract(
+      canonical_json(with_program_revision(make_program_root(options))),
+      *bundle);
+
+  ASSERT_EQ(contract->value().contact_grasp_templates.size(), 1U);
+  const auto& policy = contract->value().contact_grasp_templates.front();
+  EXPECT_EQ(policy.contact_policy_id.value(), "selected_object_grasp");
+  EXPECT_EQ(policy.runtime_object_id.value(), "selected_object");
+  ASSERT_EQ(policy.allowed_body_selectors.size(), 1U);
+  EXPECT_EQ(policy.allowed_body_selectors.front().component_role_id.value(),
+            "robot");
+  EXPECT_EQ(
+      policy.allowed_body_selectors.front().collision_body_role_id.value(),
+      "arm_collision");
+  EXPECT_DOUBLE_EQ(policy.max_penetration_m, 0.002);
+  EXPECT_DOUBLE_EQ(policy.terminal_window_start_fraction, 0.8);
 }
 
 TEST(ProgramContractTest, RejectsLegacySingletonRobotSurface) {

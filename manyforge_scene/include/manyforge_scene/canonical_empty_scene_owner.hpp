@@ -7,6 +7,7 @@
 #include <manyforge_core/ports/imanager_scene_projection.hpp>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <manyforge_core/ports/iscene_authority.hpp>
+#include <manyforge_core/ports/iscene_candidate_preview.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -171,7 +172,8 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
 class CanonicalEmptySceneOwner final
     : public manyforge::core::IManagerSceneProjectionBootstrapPort,
       public manyforge::core::IManagerSceneProjectionHandoffPort,
-      public manyforge::core::ISceneAuthority {
+      public manyforge::core::ISceneAuthority,
+      public manyforge::core::ISceneCandidatePreview {
 public:
   CanonicalEmptySceneOwner(
       std::filesystem::path database_path,
@@ -255,6 +257,10 @@ public:
   [[nodiscard]] CanonicalEmptySceneAccessStatus ReadAccessStatus() const;
   [[nodiscard]] manyforge::core::SceneCommitResultDTO
   Commit(const manyforge::core::SceneTransactionRequestDTO &request) override;
+  [[nodiscard]] manyforge::core::Result<manyforge::core::SceneCandidatePreviewDTO>
+  PreviewResolvedSceneCandidate(
+      const manyforge::core::ResolvedSceneCandidatePreviewRequestDTO &request)
+      const override;
   [[nodiscard]] manyforge::core::RequestOwnerEpoch
   CurrentRequestOwnerEpoch() const override;
   [[nodiscard]] manyforge::core::ProjectionRevisionDTO

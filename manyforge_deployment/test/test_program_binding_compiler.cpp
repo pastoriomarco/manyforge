@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <manyforge_core/types/program_contract.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
@@ -215,6 +216,70 @@ make_aggregate_program_root(const RetainedBundle &bundle) {
       value = CanonicalValue(std::move(targets));
     }
   }
+  CanonicalValue contact_policy(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.contact_policy.v1")},
+      {"policy_id", CanonicalValue("selected_object_grasp")},
+      {"version", CanonicalValue(std::string(kZeroDigest))},
+      {"mode", CanonicalValue("contact_grasp")},
+      {"sensing_mode", CanonicalValue("geometry_only")},
+      {"default_unmatched_response", CanonicalValue("hard_stop")},
+      {"zones",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(
+           CanonicalValue::Object{
+               {"zone_id", CanonicalValue("tool_contact")},
+               {"body_pairs",
+                CanonicalValue(CanonicalValue::Array{CanonicalValue(
+                    CanonicalValue::Object{
+                        {"body_a",
+                         CanonicalValue(CanonicalValue::Object{
+                             {"kind", CanonicalValue("component_model_body")},
+                             {"component_role_id", CanonicalValue("robot")},
+                             {"model_role_id", CanonicalValue("arm_model")},
+                             {"collision_body_role_id",
+                              CanonicalValue("gripper_collision")},
+                         })},
+                        {"body_b",
+                         CanonicalValue(CanonicalValue::Object{
+                             {"kind", CanonicalValue("runtime_object")},
+                             {"runtime_object_id",
+                              CanonicalValue("selected_object")},
+                         })},
+                    })})},
+               {"violation_response", CanonicalValue("hard_stop")},
+               {"max_penetration_m", CanonicalValue(0.002)},
+               {"terminal_window_start_fraction", CanonicalValue(0.8)},
+           })})},
+  });
+  const std::string policy_revision = compute_content_identity(
+      contact_policy,
+      ContentIdentitySpec{
+          .identity_domain = "catalog-record-revision/contact_policy",
+          .api_version = "manyforge.contact_policy.v1",
+          .own_field = "version",
+      });
+  auto policy_members = contact_policy.as_object();
+  for (auto &[name, value] : policy_members) {
+    if (name == "version") {
+      value = CanonicalValue(policy_revision);
+    }
+  }
+  root.emplace_back(
+      "blackboard",
+      CanonicalValue(CanonicalValue::Object{
+          {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+          {"keys",
+           CanonicalValue(CanonicalValue::Array{CanonicalValue(
+               CanonicalValue::Object{
+                   {"key", CanonicalValue("selected_object")},
+                   {"type", CanonicalValue("scene_resource")},
+                   {"access", CanonicalValue("read_write")},
+                   {"persistence", CanonicalValue("run")},
+               })})},
+      }));
+  root.emplace_back(
+      "contact_policies",
+      CanonicalValue(CanonicalValue::Array{
+          CanonicalValue(std::move(policy_members))}));
   return CanonicalValue(std::move(root));
 }
 
@@ -389,6 +454,20 @@ TEST(ProgramBindingCompilerTest,
   ASSERT_TRUE(capability.command_schema.has_value());
   EXPECT_EQ(capability.command_schema->command_schema_id.value(),
             manyforge::core::kGripperPositionCommandSchemaId);
+  ASSERT_EQ(binding->value().contact_grasp_bindings.size(), 1U);
+  const auto &contact = binding->value().contact_grasp_bindings.front();
+  EXPECT_EQ(contact.contact_policy_id.value(), "selected_object_grasp");
+  EXPECT_EQ(contact.runtime_object_id.value(), "selected_object");
+  ASSERT_EQ(contact.allowed_body_bindings.size(), 1U);
+  const auto &body = contact.allowed_body_bindings.front();
+  EXPECT_EQ(body.target_role_id, TargetRoleId("gripper"));
+  EXPECT_EQ(body.command_target_id.value(), kLite6GripperTargetId);
+  EXPECT_EQ(body.collision_body_role_id.value(), "gripper_collision");
+  ASSERT_FALSE(body.collision_body_ids.empty());
+  EXPECT_EQ(body.collision_body_ids.front(),
+            manyforge::core::make_component_collision_body_id(
+                body.controllable_component_id, body.model_instance_id,
+                body.collision_body_role_id, 0U));
   EXPECT_EQ(capability.command_schema->command_schema_revision.value(),
             manyforge::core::kGripperPositionCommandSchemaRevision);
 
@@ -554,6 +633,11 @@ TEST(ProgramBindingCompilerTest,
   EXPECT_TRUE(
       gripper.control_path->active_control_configuration_generation.nonzero());
   EXPECT_FALSE(gripper.control_path->provider_runtime_epoch.empty());
+  ASSERT_EQ(arm.contact_grasp_bindings.size(), 1U);
+  EXPECT_EQ(arm.contact_grasp_bindings,
+            gripper.contact_grasp_bindings);
+  EXPECT_EQ(arm.contact_grasp_bindings.front().runtime_object_id.value(),
+            "selected_object");
 }
 
 TEST(ProgramBindingCompilerTest,

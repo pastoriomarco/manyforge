@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cmath>
 #include <map>
 #include <optional>
 #include <set>
@@ -17,6 +18,7 @@
 
 #include "content_identity_internal.hpp"
 #include "manyforge_core/types/command_schema.hpp"
+#include "manyforge_core/types/collision_world_snapshot.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "program_binding_internal.hpp"
@@ -58,6 +60,15 @@ constexpr std::size_t kMaximumCompiledNameBytes = 4096U;
     fail(std::string(path) + ": expected string");
   }
   return *string;
+}
+
+[[nodiscard]] double require_number(const CanonicalValue& value,
+                                    std::string_view path) {
+  const auto* number = std::get_if<double>(&value.storage());
+  if (number == nullptr || !std::isfinite(*number)) {
+    fail(std::string(path) + ": expected finite number");
+  }
+  return *number;
 }
 
 [[nodiscard]] const CanonicalValue& require_member(
@@ -386,6 +397,126 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
     }
   }
 
+  if (value.contact_grasp_bindings.size() >
+      core::kMaxProgramRoleBindings) {
+    fail("contact-grasp binding table exceeds fixed bound");
+  }
+  for (auto& policy : value.contact_grasp_bindings) {
+    require_identity(policy.contact_policy_id.value(),
+                     "contact_grasp_bindings.contact_policy_id");
+    require_digest(policy.contact_policy_revision.value(),
+                   "contact_grasp_bindings.contact_policy_revision");
+    require_identity(policy.runtime_object_id.value(),
+                     "contact_grasp_bindings.runtime_object_id");
+    if (policy.allowed_body_bindings.empty() ||
+        policy.allowed_body_bindings.size() >
+            core::kMaxProgramNestedRoleBindings ||
+        !std::isfinite(policy.max_penetration_m) ||
+        policy.max_penetration_m <= 0.0 ||
+        !std::isfinite(policy.terminal_window_start_fraction) ||
+        policy.terminal_window_start_fraction < 0.0 ||
+        policy.terminal_window_start_fraction > 1.0) {
+      fail("contact-grasp binding envelope is empty, oversized, or invalid");
+    }
+    for (const auto& body : policy.allowed_body_bindings) {
+      require_identity(body.component_role_id.value(),
+                       "contact_grasp_body_bindings.component_role_id");
+      require_identity(body.target_role_id.value(),
+                       "contact_grasp_body_bindings.target_role_id");
+      require_identity(body.controllable_component_id.value(),
+                       "contact_grasp_body_bindings.controllable_component_id");
+      require_identity(body.command_target_id.value(),
+                       "contact_grasp_body_bindings.command_target_id");
+      if (body.model_role_id.has_value()) {
+        require_identity(body.model_role_id->value(),
+                         "contact_grasp_body_bindings.model_role_id");
+      }
+      require_identity(body.collision_body_role_id.value(),
+                       "contact_grasp_body_bindings.collision_body_role_id");
+      require_identity(body.model_instance_id.value(),
+                       "contact_grasp_body_bindings.model_instance_id");
+      require_digest(body.model_revision.value(),
+                     "contact_grasp_body_bindings.model_revision");
+      if (body.collision_body_ids.empty() ||
+          body.collision_body_ids.size() >
+              core::kMaxProgramNestedRoleBindings) {
+        fail("contact-grasp body binding has an invalid body-id count");
+      }
+      for (std::size_t index = 0U; index < body.collision_body_ids.size();
+           ++index) {
+        require_text(body.collision_body_ids[index],
+                     "contact_grasp_body_bindings.collision_body_ids");
+        if (body.collision_body_ids[index] !=
+            core::make_component_collision_body_id(
+                body.controllable_component_id, body.model_instance_id,
+                body.collision_body_role_id, index)) {
+          fail("contact-grasp body id differs from its exact resolved scope");
+        }
+      }
+
+      const auto target = std::lower_bound(
+          value.target_role_bindings.begin(),
+          value.target_role_bindings.end(), body.target_role_id,
+          [](const auto& candidate, const core::TargetRoleId& role) {
+            return candidate.target_role_id < role;
+          });
+      if (target == value.target_role_bindings.end() ||
+          target->target_role_id != body.target_role_id ||
+          target->component_role_id != body.component_role_id ||
+          target->controllable_component_id !=
+              body.controllable_component_id ||
+          target->command_target_id != body.command_target_id) {
+        fail("contact-grasp body binding has no exact target-role binding");
+      }
+      const auto collision = std::lower_bound(
+          target->collision_body_role_bindings.begin(),
+          target->collision_body_role_bindings.end(),
+          body.collision_body_role_id,
+          [](const auto& candidate, const core::CollisionBodyRoleId& role) {
+            return candidate.collision_body_role_id < role;
+          });
+      if (collision == target->collision_body_role_bindings.end() ||
+          collision->collision_body_role_id != body.collision_body_role_id ||
+          collision->model_instance_id != body.model_instance_id ||
+          collision->model_revision != body.model_revision ||
+          collision->compiled_collision_body_names.size() !=
+              body.collision_body_ids.size()) {
+        fail("contact-grasp body binding differs from its collision-body "
+             "role binding");
+      }
+      if (body.model_role_id.has_value()) {
+        const auto component = std::lower_bound(
+            value.component_role_bindings.begin(),
+            value.component_role_bindings.end(), body.component_role_id,
+            [](const auto& candidate, const core::ComponentRoleId& role) {
+              return candidate.component_role_id < role;
+            });
+        if (component == value.component_role_bindings.end() ||
+            component->component_role_id != body.component_role_id ||
+            std::count_if(component->model_role_bindings.begin(),
+                          component->model_role_bindings.end(),
+                          [&](const auto& model) {
+                            return model.model_role_id == *body.model_role_id &&
+                                   model.model_instance_id ==
+                                       body.model_instance_id &&
+                                   model.model_revision == body.model_revision;
+                          }) != 1) {
+          fail("contact-grasp model role differs from the component binding");
+        }
+      }
+    }
+    sort_unique(
+        policy.allowed_body_bindings,
+        [](const auto& body) {
+          return std::tie(body.component_role_id, body.target_role_id,
+                          body.model_role_id, body.collision_body_role_id);
+        },
+        "contact_grasp_bindings.allowed_body_bindings");
+  }
+  sort_unique(value.contact_grasp_bindings,
+              [](const auto& policy) { return policy.contact_policy_id; },
+              "contact_grasp_bindings");
+
   require_digest(
       value.provenance.binding_compiler_contract_digest.value(),
       "program_binding.provenance.binding_compiler_contract_digest");
@@ -600,7 +731,7 @@ template <typename StrongType>
       {"api_version", "program_binding_id", "program_id",
        "program_revision", "retained_bundle_id", "graph_revision",
        "node_environment", "component_role_bindings",
-       "target_role_bindings", "provenance"},
+       "target_role_bindings", "contact_grasp_bindings", "provenance"},
       "program_binding");
 
   const auto& node_environment = require_object(
@@ -921,6 +1052,108 @@ template <typename StrongType>
     });
   }
 
+  const auto& contact_values = require_array(
+      require_member(root, "contact_grasp_bindings", "program_binding"),
+      "program_binding.contact_grasp_bindings");
+  if (contact_values.size() > core::kMaxProgramRoleBindings) {
+    fail("program_binding.contact_grasp_bindings: exceeds fixed bound");
+  }
+  std::vector<core::ProgramContactGraspBindingDTO> contact_bindings;
+  contact_bindings.reserve(contact_values.size());
+  for (std::size_t policy_index = 0U;
+       policy_index < contact_values.size(); ++policy_index) {
+    const std::string policy_path =
+        index_path("program_binding.contact_grasp_bindings", policy_index);
+    const auto& policy = require_object(contact_values[policy_index],
+                                        policy_path);
+    require_exact_fields(
+        policy,
+        {"contact_policy_id", "contact_policy_revision",
+         "runtime_object_id", "allowed_body_bindings",
+         "max_penetration_m", "terminal_window_start_fraction"},
+        policy_path);
+    const std::string bodies_path =
+        child_path(policy_path, "allowed_body_bindings");
+    const auto& body_values = require_array(
+        require_member(policy, "allowed_body_bindings", policy_path),
+        bodies_path);
+    if (body_values.empty() ||
+        body_values.size() > core::kMaxProgramNestedRoleBindings) {
+      fail(bodies_path + ": violates fixed non-empty bound");
+    }
+    std::vector<core::ProgramContactGraspBodyBindingDTO> bodies;
+    bodies.reserve(body_values.size());
+    for (std::size_t body_index = 0U; body_index < body_values.size();
+         ++body_index) {
+      const std::string body_path = index_path(bodies_path, body_index);
+      const auto& body = require_object(body_values[body_index], body_path);
+      require_exact_fields(
+          body,
+          {"component_role_id", "target_role_id",
+           "controllable_component_id", "command_target_id",
+           "model_role_id", "collision_body_role_id", "model_instance_id",
+           "model_revision", "collision_body_ids"},
+          body_path);
+      std::optional<core::ModelRoleId> model_role;
+      const auto& model_role_value =
+          require_member(body, "model_role_id", body_path);
+      if (!std::holds_alternative<std::nullptr_t>(
+              model_role_value.storage())) {
+        model_role = parse_identity<core::ModelRoleId>(
+            model_role_value, child_path(body_path, "model_role_id"));
+      }
+      const auto body_id_values = parse_string_array(
+          require_member(body, "collision_body_ids", body_path),
+          child_path(body_path, "collision_body_ids"), true);
+      std::vector<core::CollisionBodyId> body_ids;
+      body_ids.reserve(body_id_values.size());
+      for (const auto& body_id : body_id_values) {
+        body_ids.emplace_back(body_id);
+      }
+      bodies.push_back(core::ProgramContactGraspBodyBindingDTO{
+          parse_identity<core::ComponentRoleId>(
+              require_member(body, "component_role_id", body_path),
+              child_path(body_path, "component_role_id")),
+          parse_identity<core::TargetRoleId>(
+              require_member(body, "target_role_id", body_path),
+              child_path(body_path, "target_role_id")),
+          parse_identity<core::ControllableComponentId>(
+              require_member(body, "controllable_component_id", body_path),
+              child_path(body_path, "controllable_component_id")),
+          parse_identity<core::CommandTargetId>(
+              require_member(body, "command_target_id", body_path),
+              child_path(body_path, "command_target_id")),
+          std::move(model_role),
+          parse_identity<core::CollisionBodyRoleId>(
+              require_member(body, "collision_body_role_id", body_path),
+              child_path(body_path, "collision_body_role_id")),
+          parse_identity<core::ModelInstanceId>(
+              require_member(body, "model_instance_id", body_path),
+              child_path(body_path, "model_instance_id")),
+          parse_digest<core::ModelRevision>(
+              require_member(body, "model_revision", body_path),
+              child_path(body_path, "model_revision")),
+          std::move(body_ids)});
+    }
+    contact_bindings.push_back(core::ProgramContactGraspBindingDTO{
+        parse_identity<core::ContactPolicyId>(
+            require_member(policy, "contact_policy_id", policy_path),
+            child_path(policy_path, "contact_policy_id")),
+        parse_digest<core::ContactPolicyRevision>(
+            require_member(policy, "contact_policy_revision", policy_path),
+            child_path(policy_path, "contact_policy_revision")),
+        parse_identity<core::RuntimeObjectId>(
+            require_member(policy, "runtime_object_id", policy_path),
+            child_path(policy_path, "runtime_object_id")),
+        std::move(bodies),
+        require_number(require_member(policy, "max_penetration_m", policy_path),
+                       child_path(policy_path, "max_penetration_m")),
+        require_number(
+            require_member(policy, "terminal_window_start_fraction",
+                           policy_path),
+            child_path(policy_path, "terminal_window_start_fraction"))});
+  }
+
   const auto& provenance = require_object(
       require_member(root, "provenance", "program_binding"),
       "program_binding.provenance");
@@ -988,6 +1221,7 @@ template <typename StrongType>
                              "program_binding.provenance"),
               "program_binding.provenance.resolved_output_records"),
       },
+      std::move(contact_bindings),
   };
   core::ProgramBindingDTO normalized = result;
   normalize_and_validate(normalized);
@@ -1433,6 +1667,47 @@ CanonicalValue program_binding_projection(
     });
   }
 
+  CanonicalValue::Array contact_grasps;
+  contact_grasps.reserve(value.contact_grasp_bindings.size());
+  for (const auto& policy : value.contact_grasp_bindings) {
+    CanonicalValue::Array bodies;
+    bodies.reserve(policy.allowed_body_bindings.size());
+    for (const auto& body : policy.allowed_body_bindings) {
+      bodies.emplace_back(CanonicalValue::Object{
+          {"component_role_id",
+           CanonicalValue(body.component_role_id.value())},
+          {"target_role_id", CanonicalValue(body.target_role_id.value())},
+          {"controllable_component_id",
+           CanonicalValue(body.controllable_component_id.value())},
+          {"command_target_id",
+           CanonicalValue(body.command_target_id.value())},
+          {"model_role_id",
+           body.model_role_id.has_value()
+               ? CanonicalValue(body.model_role_id->value())
+               : CanonicalValue(nullptr)},
+          {"collision_body_role_id",
+           CanonicalValue(body.collision_body_role_id.value())},
+          {"model_instance_id",
+           CanonicalValue(body.model_instance_id.value())},
+          {"model_revision", CanonicalValue(body.model_revision.value())},
+          {"collision_body_ids",
+           string_array(body.collision_body_ids)},
+      });
+    }
+    contact_grasps.emplace_back(CanonicalValue::Object{
+        {"contact_policy_id",
+         CanonicalValue(policy.contact_policy_id.value())},
+        {"contact_policy_revision",
+         CanonicalValue(policy.contact_policy_revision.value())},
+        {"runtime_object_id",
+         CanonicalValue(policy.runtime_object_id.value())},
+        {"allowed_body_bindings", CanonicalValue(std::move(bodies))},
+        {"max_penetration_m", CanonicalValue(policy.max_penetration_m)},
+        {"terminal_window_start_fraction",
+         CanonicalValue(policy.terminal_window_start_fraction)},
+    });
+  }
+
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue(value.api_version)},
       {"program_binding_id",
@@ -1455,6 +1730,8 @@ CanonicalValue program_binding_projection(
        })},
       {"component_role_bindings", CanonicalValue(std::move(components))},
       {"target_role_bindings", CanonicalValue(std::move(targets))},
+      {"contact_grasp_bindings",
+       CanonicalValue(std::move(contact_grasps))},
       {"provenance",
        CanonicalValue(CanonicalValue::Object{
            {"binding_compiler_contract_digest",

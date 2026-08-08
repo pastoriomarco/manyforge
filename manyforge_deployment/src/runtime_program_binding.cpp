@@ -216,7 +216,7 @@ RuntimeProgramTargetBinding resolve_runtime_program_target(
       component, *model_target, std::move(control_binding),
       std::move(control_domain), std::move(desired_configuration),
       std::move(desired_route), std::move(coordinate_map),
-      std::move(provider_binding));
+      std::move(provider_binding), binding_value.contact_grasp_bindings);
 }
 
 core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
@@ -457,7 +457,8 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
       std::move(control_path),
       std::move(provider_path),
       std::move(supporting_paths),
-      std::move(runtime_epochs)};
+      std::move(runtime_epochs),
+      target.contact_grasp_bindings()};
 }
 
 } // namespace manyforge::deployment

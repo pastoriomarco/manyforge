@@ -374,7 +374,8 @@ FakeOperationJournal default_journal;
     CoordinateKind kind, std::optional<ProgramCommandSchemaRefDTO> command_schema = std::nullopt,
     bool include_second_angular_resource = false,
     std::string planner_capability_revision =
-        "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce") {
+        "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
+    bool include_contact_grasp = false) {
   std::vector<std::string> compiled_group_joint_names{
       kind == CoordinateKind::kAngular ? "mf2_joint_1" : "mf2_finger_joint"};
   std::vector<RuntimeResourceBindingDTO> resources{RuntimeResourceBindingDTO{
@@ -398,6 +399,23 @@ FakeOperationJournal default_journal;
         ProviderInstanceId("planner-provider"), ProviderManifestId("planner-provider-manifest"),
         ProviderManifestRevision("planner-provider-revision"),
         RuntimeEpoch("planner-provider-epoch")});
+  }
+  std::vector<ProgramContactGraspBindingDTO> contact_grasps;
+  if (include_contact_grasp) {
+    const CollisionBodyRoleId body_role("gripper_collision");
+    contact_grasps.push_back(ProgramContactGraspBindingDTO{
+        ContactPolicyId("selected_object_grasp"),
+        ContactPolicyRevision("contact-policy-revision"),
+        RuntimeObjectId("selected_object"),
+        {ProgramContactGraspBodyBindingDTO{
+            ComponentRoleId("robot"), TargetRoleId("gripper"),
+            ControllableComponentId("robot.1"),
+            CommandTargetId("gripper"), ModelRoleId("body"), body_role,
+            ModelInstanceId("robot.model"), ModelRevision("model-revision"),
+            {make_component_collision_body_id(
+                ControllableComponentId("robot.1"),
+                ModelInstanceId("robot.model"), body_role, 0U)}}},
+        0.002, 0.8});
   }
   RuntimeParticipantBindingDTO value{
       ProgramId("program.pick"),
@@ -456,7 +474,8 @@ FakeOperationJournal default_journal;
               : std::nullopt},
       std::nullopt,
       std::move(supporting_paths),
-      {}};
+      {},
+      std::move(contact_grasps)};
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
     throw std::logic_error(sealed.error().message);
@@ -582,6 +601,63 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
   ASSERT_TRUE(state.ok()) << state.error().message;
   EXPECT_EQ(state.value().state, OperationStateKind::kPlanning);
   EXPECT_EQ(state.value().participants.front().command_target_id.value(), "arm");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ResolvesProgramContactGraspAndSelectedRuntimeObjectBeforeSubordinateCall) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding(
+            "arm", "arm", "execution.trajectory.execute",
+            CoordinateKind::kAngular, std::nullopt, false,
+            "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
+            true),
+        &engine}},
+      clock, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+  auto intent = motion_operation();
+  auto& motion =
+      std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+  motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
+  motion.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
+      RuntimeObjectId("selected_object"), SceneResourceId("part.7")}};
+
+  const auto result = kernel.execute(intent);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(engine.last_execute.has_value());
+  ASSERT_TRUE(engine.last_execute->resolved_contact_grasp.has_value());
+  const auto& resolved = *engine.last_execute->resolved_contact_grasp;
+  EXPECT_EQ(resolved.contact_policy_id.value(), "selected_object_grasp");
+  EXPECT_EQ(resolved.runtime_object_id.value(), "selected_object");
+  EXPECT_EQ(resolved.selected_object_id.value(), "part.7");
+  EXPECT_EQ(resolved.allowed_robot_body_ids.size(), 1U);
+  EXPECT_EQ(engine.last_execute->runtime_object_bindings,
+            motion.runtime_object_bindings);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RejectsProgramContactGraspWithoutItsRuntimeObjectBeforeEffect) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding(
+            "arm", "arm", "execution.trajectory.execute",
+            CoordinateKind::kAngular, std::nullopt, false,
+            "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
+            true),
+        &engine}},
+      clock, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+  auto intent = motion_operation();
+  std::get<MotionParticipantIntentDTO>(intent.participants.front().payload)
+      .contact_policy_id = ContactPolicyId("selected_object_grasp");
+
+  const auto result = kernel.execute(intent);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "contact_grasp_runtime_object_unresolved");
+  EXPECT_EQ(engine.execute_calls, 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest, RejectsResourceRoleSpellingUsedAsASourceJointName) {

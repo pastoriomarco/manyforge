@@ -552,9 +552,9 @@ TEST(DeploymentArtifactCodec,
 }
 
 TEST(DeploymentArtifactCodec,
-     RetainsTheEightCurrentlyQualifiedCatalogReferenceVariants) {
-  constexpr std::array<std::size_t, 8> kQualifiedIndices{
-      0U, 1U, 2U, 3U, 4U, 5U, 7U, 9U};
+     RetainsTheNineCurrentlyQualifiedCatalogReferenceVariants) {
+  constexpr std::array<std::size_t, 9> kQualifiedIndices{
+      0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 9U};
   std::string records;
   for (const std::size_t index : kQualifiedIndices) {
     const auto& row = kAllCatalogKinds[index];
@@ -593,8 +593,8 @@ TEST(DeploymentArtifactCodec,
 }
 
 TEST(DeploymentArtifactCodec,
-     RejectsTheThreeCatalogFamiliesOwnedByLaterSlices) {
-  constexpr std::array<std::size_t, 3> kDeferredIndices{6U, 8U, 10U};
+     RejectsTheTwoCatalogFamiliesOwnedByLaterSlices) {
+  constexpr std::array<std::size_t, 2> kDeferredIndices{8U, 10U};
   for (const std::size_t index : kDeferredIndices) {
     const auto& row = kAllCatalogKinds[index];
     const char digit = "123456789ab"[index];

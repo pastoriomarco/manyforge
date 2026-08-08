@@ -23,6 +23,7 @@
 #include <manyforge_core/ports/icollision_trajectory_projector.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
+#include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/ports/iobserved_robot_state_provider.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
@@ -43,6 +44,7 @@
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/metrics.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/motion_preview.hpp>
 #include <manyforge_core/types/recovery.hpp>
 #include <map>
 #include <memory>
@@ -269,7 +271,8 @@ struct ExecutionKernelPorts {
 ///
 /// Spec 230: all operations are ROS-free. This is an async v0.1
 /// implementation with event subscription.
-class ExecutionKernel : public IResolvedParticipantExecutionEngine {
+class ExecutionKernel : public IResolvedParticipantExecutionEngine,
+                        public IMotionPreview {
  public:
   ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts ports,
                   IExecutionBackend& execution_backend, IClock& clock, IScheduler& scheduler,
@@ -281,6 +284,23 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   /// Returns execution_id immediately; plan → validate → dispatch runs
   /// on a worker thread. Callers observe progress via get_status() and events.
   Result<uint64_t> execute(const ExecuteRequestDTO& request) override;
+
+  /// Plan and authoritatively validate one already-resolved motion without
+  /// dispatching, journaling, caching, publishing execution state, or
+  /// mutating the retained scene. The caller supplies both the exact start
+  /// state and retained projection so chained candidate legs cannot reread a
+  /// newer mutable state or scene between phases.
+  ///
+  /// Preview is admitted only while this participant is Idle and is
+  /// serialized by the ordinary lifecycle boundary. Cancellation requests
+  /// the same planner and collision-validation cancellation paths used by
+  /// execution.
+  Result<MotionPreviewResultDTO> preview_motion(
+      ExecuteRequestDTO request,
+      CollisionWorldLeaseInventory projection_inventory,
+      RobotStateDTO start_state,
+      std::uint32_t planning_attempt_index = 0U,
+      std::stop_token stop_token = {}) override;
 
   /// Non-blocking stop from any non-terminal state.
   /// Accepted stop invalidates older lifecycle/recovery commands by bumping
@@ -477,12 +497,13 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
  private:
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request,
                                         const CollisionWorldLeaseInventory& projection_inventory,
-                                        std::uint32_t planning_attempt_index = 0);
-  Result<TrajectoryDTO> plan_resume_trajectory(const ExecuteRequestDTO& request,
-                                               const CollisionWorldLeaseInventory& projection_inventory);
+                                        std::uint32_t planning_attempt_index = 0,
+                                        const RobotStateDTO* start_state_override = nullptr);
+  Result<TrajectoryDTO> plan_resume_trajectory(
+      const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory);
   Result<std::size_t> discover_dynamic_carried_start_contacts(
-      CollisionWorldLeaseInventory& projection_inventory,
-      const RobotStateDTO& observed_start, std::uint64_t execution_id);
+      CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& observed_start,
+      std::uint64_t execution_id);
 
   /// Move-only ownership of one retained scene/projection revision. Destruction
   /// releases the publisher lookup entry on every success, rejection,
@@ -520,7 +541,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine {
   Result<CollisionValidationSuccess> validate_trajectory(
       const TrajectoryDTO& trajectory, const ExecuteRequestDTO& request,
       CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-      const std::optional<SceneSnapshotLease>& scene_snapshot_lease);
+      const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
+      const RobotStateDTO* start_state_override = nullptr,
+      std::stop_token external_stop_token = {});
 
   /// Async execution worker function.
   void async_execute_worker(std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,

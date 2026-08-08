@@ -500,6 +500,10 @@ void WriteSceneFrameReceipt(
                 WriteStrong(output, revision);
               });
   WriteLeaseBinding(writer, receipt.projection_binding);
+  WriteOptional(writer, receipt.predicted_state_digest,
+                [](Writer &output, const core::ContentDigest &digest) {
+                  WriteStrong(output, digest);
+                });
   WriteStrong(writer, receipt.resolution_evidence_digest);
 }
 
@@ -511,8 +515,12 @@ ReadSceneFrameReceipt(Reader &reader) {
       ReadVector<core::ComponentAttachmentRevision>(
           reader, [](Reader &input) {
             return ReadStrong<core::ComponentAttachmentRevision>(input);
-          }),
+      }),
       ReadLeaseBinding(reader),
+      ReadOptional<core::ContentDigest>(
+          reader, [](Reader &input) {
+            return ReadStrong<core::ContentDigest>(input);
+          }),
       ReadStrong<core::ContentDigest>(reader)};
   if (!receipt.valid()) {
     Fail("decoded scene-frame resolution receipt is invalid");

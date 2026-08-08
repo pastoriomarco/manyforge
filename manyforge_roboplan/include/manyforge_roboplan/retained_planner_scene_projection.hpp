@@ -103,6 +103,14 @@ public:
   [[nodiscard]] core::Result<core::SceneFrameResolutionReceiptDTO>
   ResolveSceneFrame(
       const core::SceneFrameResolutionQueryDTO &query) const override;
+  [[nodiscard]] core::Result<core::SceneFrameResolutionReceiptDTO>
+  ResolveCandidateSceneFrame(
+      const core::CandidateSceneFrameResolutionQueryDTO &query) const override;
+  [[nodiscard]] core::Result<core::CollisionWorldLeaseInventory>
+  ProjectSceneCandidate(
+      const core::SceneCandidatePreviewDTO &candidate,
+      const core::ProjectionLeaseBindingDTO &predecessor_binding,
+      core::ProjectionLeaseId candidate_lease_id) const override;
   [[nodiscard]] core::Result<core::CollisionPolicySnapshot>
   ProjectEffectiveCollisionPolicy(
       const core::LogicalSceneSnapshotDTO &logical_scene,

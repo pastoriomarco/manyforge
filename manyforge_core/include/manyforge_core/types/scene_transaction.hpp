@@ -6,6 +6,7 @@
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/logical_scene_snapshot.hpp>
 #include <manyforge_core/types/projection_common.hpp>
+#include <manyforge_core/types/scene_frame_resolution.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -72,6 +73,16 @@ struct SceneTransactionRequestDTO final {
   RequestAttributionDTO attribution{};
   ProjectionRevisionDTO expected_projection_revision;
   SceneOperationRequestDTO operation;
+};
+
+/// Owner-private, non-durable scene-successor request used by deterministic
+/// motion candidate search. The public scene operation remains unchanged; the
+/// trusted candidate owner additionally supplies the exact immutable frame
+/// receipt evaluated at its candidate terminal state. No replay-ledger,
+/// journal, projection publication, or physical-effect meaning is implied.
+struct ResolvedSceneCandidatePreviewRequestDTO final {
+  SceneTransactionRequestDTO request;
+  std::optional<SceneFrameResolutionReceiptDTO> frame_resolution;
 };
 
 /// Projection-ready add/update/detach value. The object placement is already
@@ -164,6 +175,41 @@ enum class SceneUpdateStatusDTO {
   kGeometryChanged,
   kFreshnessOnly,
   kNoOp,
+};
+
+/// Immutable, non-durable logical-scene successor produced by the same
+/// reducer and effective-policy projector used by Commit(). Candidate search
+/// may project this value into a private collision world, but it cannot publish
+/// it as scene truth or use it as evidence that a grasp/release occurred.
+struct SceneCandidatePreviewDTO final {
+  ContentDigest request_digest;
+  ProjectionRevisionDTO prior_projection_revision;
+  ProjectionRevisionDTO proposed_projection_revision;
+  std::shared_ptr<const LogicalSceneSnapshotDTO> logical_scene;
+  ResolvedSceneOperationDTO resolved_operation;
+  CollisionPolicySnapshot effective_collision_policy;
+  SceneUpdateStatusDTO update_status{SceneUpdateStatusDTO::kGeometryChanged};
+  std::optional<ContentDigest> resolution_evidence_digest;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return IsExactLowercaseSha256Digest(request_digest.value()) &&
+           prior_projection_revision.valid() &&
+           proposed_projection_revision.valid() && logical_scene &&
+           logical_scene->locally_valid() &&
+           logical_scene->revision ==
+               proposed_projection_revision.scene_revision &&
+           prior_projection_revision.retained_bundle_id ==
+               proposed_projection_revision.retained_bundle_id &&
+           prior_projection_revision.graph_revision ==
+               proposed_projection_revision.graph_revision &&
+           prior_projection_revision.scene_revision.scene_id ==
+               proposed_projection_revision.scene_revision.scene_id &&
+           effective_collision_policy.revision.revision_id != 0U &&
+           !effective_collision_policy.revision.content_hash.empty() &&
+           (!resolution_evidence_digest.has_value() ||
+            IsExactLowercaseSha256Digest(
+                resolution_evidence_digest->value()));
+  }
 };
 
 [[nodiscard]] constexpr std::string_view to_string(SceneUpdateStatusDTO status) noexcept {

@@ -220,6 +220,56 @@ class RetainedSceneFrameResolver::Impl final {
                : &*found;
   }
 
+  [[nodiscard]] core::Result<void> ValidateCandidateState(
+      const core::ControlledStateDTO& state) const {
+    if (auto valid = core::validate_controlled_state(state); !valid.ok()) {
+      return valid;
+    }
+    const auto* source =
+        FindSource({state.control_binding_id, state.control_binding_revision});
+    if (source == nullptr) {
+      return core::Result<void>::Err(
+          resolution_error<core::ResolvedSceneFramePoseDTO>(
+              "candidate_state_binding_unavailable",
+              "predicted candidate state has no exact retained path source")
+              .error());
+    }
+    const auto& expected = source->context;
+    if (state.controllable_component_id != expected.controllable_component_id ||
+        state.command_target_id != expected.command_target_id ||
+        state.control_domain_id != expected.control_domain_id ||
+        state.control_domain_revision != expected.control_domain_revision ||
+        state.controller_topology_id != expected.controller_topology_id ||
+        state.topology_revision != expected.topology_revision ||
+        state.control_route_id != expected.control_route_id ||
+        state.active_control_configuration_id !=
+            expected.active_control_configuration_id ||
+        state.active_control_configuration_generation !=
+            expected.active_control_configuration_generation ||
+        state.resources != expected.resources ||
+        state.joint_names != expected.joint_names ||
+        state.positions.size() != expected.coordinate_kinds.size()) {
+      return core::Result<void>::Err(
+          resolution_error<core::ResolvedSceneFramePoseDTO>(
+              "candidate_state_binding_mismatch",
+              "predicted candidate state differs from its exact retained "
+              "control binding")
+              .error());
+    }
+    for (std::size_t index = 0U; index < state.positions.size(); ++index) {
+      if (core::coordinate_kind(state.positions[index]) !=
+          expected.coordinate_kinds[index]) {
+        return core::Result<void>::Err(
+            resolution_error<core::ResolvedSceneFramePoseDTO>(
+                "candidate_state_coordinate_mismatch",
+                "predicted candidate state changes a retained coordinate "
+                "kind")
+                .error());
+      }
+    }
+    return core::Result<void>::Ok();
+  }
+
   [[nodiscard]] core::Result<core::KinematicStatePathQueryDTO> BuildQuery(
       const core::KinematicFramePathDTO& path) const {
     std::map<core::ResourceId, const Source*> selected_sources;
@@ -924,6 +974,14 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
 core::Result<core::ResolvedSceneFramePoseDTO> RetainedSceneFrameResolver::resolve_scene_frame(
     const core::SceneFrameRefDTO& reference,
     const core::SceneFrameResolutionContextDTO& context) const {
+  return ResolveFrameWithCandidateState(reference, context, nullptr);
+}
+
+core::Result<core::ResolvedSceneFramePoseDTO>
+RetainedSceneFrameResolver::ResolveFrameWithCandidateState(
+    const core::SceneFrameRefDTO& reference,
+    const core::SceneFrameResolutionContextDTO& context,
+    const core::ControlledStateDTO* predicted_state) const {
   if (!context.valid() ||
       !reference_matches_frame(reference, context.kinematic_path.terminal_frame)) {
     return resolution_error<core::ResolvedSceneFramePoseDTO>(
@@ -931,6 +989,14 @@ core::Result<core::ResolvedSceneFramePoseDTO> RetainedSceneFrameResolver::resolv
         "scene-frame reference differs from its immutable retained context");
   }
 
+  if (predicted_state != nullptr) {
+    auto valid = impl_->ValidateCandidateState(*predicted_state);
+    if (!valid.ok()) {
+      return core::Result<core::ResolvedSceneFramePoseDTO>::Err(valid.error());
+    }
+  }
+
+  std::set<core::ResourceId> predicted_resources_used;
   std::vector<collision::RetainedKinematicCoordinateValue> coordinates;
   for (const auto& model_state : context.kinematic_state_path_view.model_states) {
     if (model_state.coordinate_projection.size() != model_state.positions.size()) {
@@ -964,9 +1030,71 @@ core::Result<core::ResolvedSceneFramePoseDTO> RetainedSceneFrameResolver::resolv
         return resolution_error<core::ResolvedSceneFramePoseDTO>(
             "kinematic_coordinate_missing", "state-view coordinate has no retained path joint");
       }
+      auto projected_position = model_state.positions[index];
+      if (predicted_state != nullptr) {
+        const auto candidate_resource = std::find(
+            predicted_state->resources.begin(), predicted_state->resources.end(),
+            projection.resource_id);
+        if (candidate_resource != predicted_state->resources.end()) {
+          const auto candidate_index = static_cast<std::size_t>(std::distance(
+              predicted_state->resources.begin(), candidate_resource));
+          const auto dependency = std::find_if(
+              selected->eligible_resource_dependencies.begin(),
+              selected->eligible_resource_dependencies.end(),
+              [&](const auto& value) {
+                return value.resource_id == projection.resource_id &&
+                       value.control_binding_id ==
+                           predicted_state->control_binding_id &&
+                       value.control_binding_revision ==
+                           predicted_state->control_binding_revision &&
+                       value.coordinate_kind == projection.coordinate_kind &&
+                       value.multiplier == projection.multiplier &&
+                       value.offset == projection.offset &&
+                       value.derived_mimic == projection.derived_mimic;
+              });
+          if (model_state.controllable_component_id !=
+                  predicted_state->controllable_component_id ||
+              dependency == selected->eligible_resource_dependencies.end() ||
+              candidate_index >= predicted_state->positions.size() ||
+              candidate_index >= predicted_state->joint_names.size() ||
+              predicted_state->joint_names[candidate_index] !=
+                  selected->compiled_joint_name ||
+              core::coordinate_kind(
+                  predicted_state->positions[candidate_index]) !=
+                  projection.coordinate_kind) {
+            return resolution_error<core::ResolvedSceneFramePoseDTO>(
+                "candidate_state_path_mismatch",
+                "predicted candidate state does not exactly map to the "
+                "retained carrier-frame path");
+          }
+          const double projected =
+              position_value(predicted_state->positions[candidate_index]) *
+                  projection.multiplier +
+              projection.offset;
+          if (!std::isfinite(projected)) {
+            return resolution_error<core::ResolvedSceneFramePoseDTO>(
+                "candidate_state_projection_nonfinite",
+                "predicted candidate state produced a non-finite model "
+                "coordinate");
+          }
+          projected_position = [&]() -> core::CoordinatePositionDTO {
+            if (projection.coordinate_kind == core::CoordinateKind::kAngular) {
+              return core::AngularPositionDTO{projected};
+            }
+            return core::LinearPositionDTO{projected};
+          }();
+          predicted_resources_used.insert(projection.resource_id);
+        }
+      }
       coordinates.push_back(
-          {selected->compiled_joint_name, position_value(model_state.positions[index])});
+          {selected->compiled_joint_name, position_value(projected_position)});
     }
+  }
+  if (predicted_state != nullptr && predicted_resources_used.empty()) {
+    return resolution_error<core::ResolvedSceneFramePoseDTO>(
+        "candidate_state_path_disjoint",
+        "predicted candidate state does not influence the selected carrier "
+        "frame");
   }
   auto pose = collision::ManyForgeCollisionEngine::resolve_retained_frame_pose(
       impl_->model_, impl_->input_.compiled_cell_frame_name,
@@ -980,8 +1108,13 @@ core::Result<core::ResolvedSceneFramePoseDTO> RetainedSceneFrameResolver::resolv
                                          context.projection_binding,
                                          context.kinematic_path,
                                          context.kinematic_state_path_view,
+                                         std::nullopt,
                                          core::ContentDigest(std::string{})};
   try {
+    if (predicted_state != nullptr) {
+      result.predicted_state_digest =
+          core::ComputeCandidateStateEvidenceDigest(*predicted_state);
+    }
     result.resolution_evidence_digest = core::ComputeSceneFrameResolutionEvidenceDigest(result);
   } catch (const std::exception& error) {
     return resolution_error<core::ResolvedSceneFramePoseDTO>("scene_frame_evidence_failed",
@@ -998,11 +1131,44 @@ core::Result<core::ResolvedSceneFramePoseDTO> RetainedSceneFrameResolver::Resolv
     const core::SceneFrameResolutionQueryDTO& query,
     std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
     const std::int64_t now_ns) const {
-  if (!query.valid() || !logical_scene || !logical_scene->locally_valid() ||
-      logical_scene->revision != query.projection_binding.projection_revision.scene_revision ||
-      query.projection_binding.projection_revision.retained_bundle_id !=
+  if (!query.valid()) {
+    return resolution_error<core::ResolvedSceneFramePoseDTO>(
+        "scene_frame_query_mismatch", "scene-frame query is invalid");
+  }
+  return ResolveWithCandidateState(query.selector, query.projection_binding,
+                                   std::move(logical_scene), now_ns, nullptr);
+}
+
+core::Result<core::ResolvedSceneFramePoseDTO>
+RetainedSceneFrameResolver::ResolveCandidate(
+    const core::CandidateSceneFrameResolutionQueryDTO& query,
+    std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
+    const std::int64_t now_ns) const {
+  if (!query.valid()) {
+    return resolution_error<core::ResolvedSceneFramePoseDTO>(
+        "candidate_scene_frame_query_mismatch",
+        "candidate scene-frame query is invalid");
+  }
+  return ResolveWithCandidateState(
+      query.selector, query.projection_binding, std::move(logical_scene),
+      now_ns, &query.predicted_state);
+}
+
+core::Result<core::ResolvedSceneFramePoseDTO>
+RetainedSceneFrameResolver::ResolveWithCandidateState(
+    const core::SceneFrameResolutionSelectorDTO& selector,
+    const core::ProjectionLeaseBindingDTO& projection_binding,
+    std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene,
+    const std::int64_t now_ns,
+    const core::ControlledStateDTO* predicted_state) const {
+  if (!core::SceneFrameResolutionQueryDTO{selector, projection_binding}.valid() ||
+      !logical_scene || !logical_scene->locally_valid() ||
+      logical_scene->revision !=
+          projection_binding.projection_revision.scene_revision ||
+      projection_binding.projection_revision.retained_bundle_id !=
           impl_->input_.retained_bundle_id ||
-      query.projection_binding.projection_revision.graph_revision != impl_->input_.graph_revision ||
+      projection_binding.projection_revision.graph_revision !=
+          impl_->input_.graph_revision ||
       logical_scene->cell_id != impl_->input_.cell_id || now_ns < 0) {
     return resolution_error<core::ResolvedSceneFramePoseDTO>(
         "scene_frame_query_mismatch",
@@ -1039,7 +1205,7 @@ core::Result<core::ResolvedSceneFramePoseDTO> RetainedSceneFrameResolver::Resolv
               selected->frame.frame_role_id});
         }
       },
-      query.selector);
+      selector);
   if (!selected_reference.ok()) {
     return core::Result<core::ResolvedSceneFramePoseDTO>::Err(selected_reference.error());
   }
@@ -1094,10 +1260,12 @@ core::Result<core::ResolvedSceneFramePoseDTO> RetainedSceneFrameResolver::Resolv
   if (!state_view.ok()) {
     return core::Result<core::ResolvedSceneFramePoseDTO>::Err(state_view.error());
   }
-  auto result = resolve_scene_frame(
+  auto result = ResolveFrameWithCandidateState(
       reference,
-      core::SceneFrameResolutionContextDTO{query.projection_binding, std::move(logical_scene),
-                                           *path, std::move(state_view.value())});
+      core::SceneFrameResolutionContextDTO{projection_binding,
+                                           std::move(logical_scene), *path,
+                                           std::move(state_view.value())},
+      predicted_state);
   if (!result.ok()) {
     return result;
   }

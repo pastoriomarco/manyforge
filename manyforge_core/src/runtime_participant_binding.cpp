@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <set>
 #include <string>
 #include <tuple>
@@ -194,6 +195,64 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
                                            value.command_schema->command_schema_revision.empty())) {
     return invalid("runtime participant command schema is incomplete",
                    "runtime_command_schema_invalid");
+  }
+  if (!sorted_unique(value.contact_grasp_bindings,
+                     [](const auto& policy) {
+                       return policy.contact_policy_id;
+                     }) ||
+      std::any_of(
+          value.contact_grasp_bindings.begin(),
+          value.contact_grasp_bindings.end(), [&](const auto& policy) {
+            if (policy.contact_policy_id.empty() ||
+                policy.contact_policy_revision.empty() ||
+                policy.runtime_object_id.empty() ||
+                policy.allowed_body_bindings.empty() ||
+                !std::isfinite(policy.max_penetration_m) ||
+                policy.max_penetration_m <= 0.0 ||
+                !std::isfinite(policy.terminal_window_start_fraction) ||
+                policy.terminal_window_start_fraction < 0.0 ||
+                policy.terminal_window_start_fraction > 1.0 ||
+                !sorted_unique(policy.allowed_body_bindings,
+                               [](const auto& body) {
+                                 return std::tie(
+                                     body.component_role_id,
+                                     body.target_role_id,
+                                     body.model_role_id,
+                                     body.collision_body_role_id);
+                               })) {
+              return true;
+            }
+            return std::any_of(
+                policy.allowed_body_bindings.begin(),
+                policy.allowed_body_bindings.end(), [&](const auto& body) {
+                  if (body.component_role_id.empty() ||
+                      body.target_role_id.empty() ||
+                      body.controllable_component_id.empty() ||
+                      body.command_target_id.empty() ||
+                      (body.model_role_id.has_value() &&
+                       body.model_role_id->empty()) ||
+                      body.collision_body_role_id.empty() ||
+                      body.model_instance_id.empty() ||
+                      body.model_revision.empty() ||
+                      body.collision_body_ids.empty()) {
+                    return true;
+                  }
+                  for (std::size_t index = 0U;
+                       index < body.collision_body_ids.size(); ++index) {
+                    if (body.collision_body_ids[index] !=
+                        make_component_collision_body_id(
+                            body.controllable_component_id,
+                            body.model_instance_id,
+                            body.collision_body_role_id, index)) {
+                      return true;
+                    }
+                  }
+                  return false;
+                });
+          })) {
+    return invalid("runtime contact-grasp bindings are incomplete, unsorted, "
+                   "or inconsistent",
+                   "runtime_contact_grasp_binding_invalid");
   }
   return Result<RuntimeParticipantBinding>::Ok(RuntimeParticipantBinding(std::move(value)));
 }

@@ -15,6 +15,7 @@
 
 #include "build_manifest_internal.hpp"
 #include "manyforge_core/types/capability_definition.hpp"
+#include "manyforge_core/types/collision_world_snapshot.hpp"
 #include "manyforge_core/types/command_schema.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/capability_definition_codec.hpp"
@@ -896,6 +897,93 @@ void add_capability_provenance(
   }
 }
 
+[[nodiscard]] std::vector<core::ProgramContactGraspBindingDTO>
+resolve_contact_grasp_bindings(
+    const core::ProgramBindingContractDTO& contract,
+    const std::vector<core::ProgramComponentRoleBindingDTO>& components,
+    const std::vector<core::ProgramTargetRoleBindingDTO>& targets) {
+  std::vector<core::ProgramContactGraspBindingDTO> resolved;
+  resolved.reserve(contract.contact_grasp_templates.size());
+  for (const auto& policy : contract.contact_grasp_templates) {
+    std::vector<core::ProgramContactGraspBodyBindingDTO> bodies;
+    bodies.reserve(policy.allowed_body_selectors.size());
+    for (const auto& selector : policy.allowed_body_selectors) {
+      const auto component = std::find_if(
+          components.begin(), components.end(), [&](const auto& candidate) {
+            return candidate.component_role_id == selector.component_role_id;
+          });
+      if (component == components.end()) {
+        fail("contact-grasp selector has no resolved component role");
+      }
+      const core::ProgramTargetRoleBindingDTO* selected_target = nullptr;
+      const core::ProgramCollisionBodyRoleBindingDTO* selected_body = nullptr;
+      for (const auto& target : targets) {
+        if (target.component_role_id != selector.component_role_id) {
+          continue;
+        }
+        const auto collision = std::find_if(
+            target.collision_body_role_bindings.begin(),
+            target.collision_body_role_bindings.end(),
+            [&](const auto& candidate) {
+              return candidate.collision_body_role_id ==
+                     selector.collision_body_role_id;
+            });
+        if (collision == target.collision_body_role_bindings.end()) {
+          continue;
+        }
+        if (selector.model_role_id.has_value()) {
+          const auto model = std::find_if(
+              component->model_role_bindings.begin(),
+              component->model_role_bindings.end(), [&](const auto& candidate) {
+                return candidate.model_role_id == *selector.model_role_id;
+              });
+          if (model == component->model_role_bindings.end() ||
+              model->model_instance_id != collision->model_instance_id ||
+              model->model_revision != collision->model_revision) {
+            continue;
+          }
+        }
+        if (selected_target != nullptr) {
+          fail("contact-grasp selector resolves to more than one Program "
+               "target");
+        }
+        selected_target = &target;
+        selected_body = &*collision;
+      }
+      if (selected_target == nullptr || selected_body == nullptr) {
+        fail("contact-grasp selector has no exact Program target/body "
+             "resolution");
+      }
+      std::vector<core::CollisionBodyId> body_ids;
+      body_ids.reserve(selected_body->compiled_collision_body_names.size());
+      for (std::size_t collision_index = 0U;
+           collision_index <
+           selected_body->compiled_collision_body_names.size();
+           ++collision_index) {
+        body_ids.push_back(core::make_component_collision_body_id(
+            selected_target->controllable_component_id,
+            selected_body->model_instance_id,
+            selected_body->collision_body_role_id, collision_index));
+      }
+      bodies.push_back(core::ProgramContactGraspBodyBindingDTO{
+          selector.component_role_id,
+          selected_target->target_role_id,
+          selected_target->controllable_component_id,
+          selected_target->command_target_id,
+          selector.model_role_id,
+          selector.collision_body_role_id,
+          selected_body->model_instance_id,
+          selected_body->model_revision,
+          std::move(body_ids)});
+    }
+    resolved.push_back(core::ProgramContactGraspBindingDTO{
+        policy.contact_policy_id, policy.contact_policy_revision,
+        policy.runtime_object_id, std::move(bodies), policy.max_penetration_m,
+        policy.terminal_window_start_fraction});
+  }
+  return resolved;
+}
+
 }  // namespace
 
 std::shared_ptr<const ProgramBinding> compile_program_binding(
@@ -1077,8 +1165,7 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
       }
     }
 
-    auto sealed = detail::ProgramBindingConstructionAuthority::seal(
-        core::ProgramBindingDTO{
+    core::ProgramBindingDTO binding_value{
             std::string(core::kProgramBindingApiVersion),
             core::ProgramBindingId(std::string(kZeroDigest)),
             program_contract.value().program_id,
@@ -1092,7 +1179,12 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
                 current.compiler_build_digest(),
                 role_assignment_digest(role_assignment),
                 bundle.provenance.source_records,
-                std::move(resolved_records)}});
+                std::move(resolved_records)}};
+    binding_value.contact_grasp_bindings = resolve_contact_grasp_bindings(
+        program_contract.value(), binding_value.component_role_bindings,
+        binding_value.target_role_bindings);
+    auto sealed = detail::ProgramBindingConstructionAuthority::seal(
+        std::move(binding_value));
     return reload_verified_program_binding(sealed->canonical_bytes(),
                                            retained_bundle,
                                            retained_model_map);

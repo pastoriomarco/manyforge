@@ -33,6 +33,10 @@ Result<ResolvedMotionSpecDTO> resolve_motion_target(
   };
   collect_runtime_object(request.target_reference);
   collect_runtime_object(request.offset_reference);
+  if (request.resolved_contact_grasp.has_value()) {
+    referenced_runtime_objects.insert(
+        request.resolved_contact_grasp->runtime_object_id);
+  }
   std::set<RuntimeObjectId> bound_runtime_objects;
   for (const auto &binding : request.runtime_object_bindings) {
     if (binding.runtime_object_id.empty() ||

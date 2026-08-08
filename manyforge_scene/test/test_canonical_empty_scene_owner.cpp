@@ -2224,7 +2224,7 @@ public:
     return core::Result<core::SceneFrameResolutionReceiptDTO>::Ok(
         core::SceneFrameResolutionReceiptDTO{
             frame, frame_pose_in_cell_, attachment_revisions_,
-            query.projection_binding, Digest('9')});
+            query.projection_binding, std::nullopt, Digest('9')});
   }
 
   core::Result<core::CollisionPolicySnapshot>
@@ -3439,6 +3439,43 @@ TEST(CanonicalEmptySceneOwner,
           {structural_revision},
       },
   };
+  const auto integrity_before_preview = owner.VerifyIntegrity();
+  const auto projection_calls_before_preview = projection.calls();
+  const auto preview_policy_calls_before =
+      projection.policy_projection_calls();
+  const core::SceneFrameResolutionReceiptDTO candidate_frame{
+      core::ResolvedComponentModelFrameDTO{
+          core::ControllableComponentId("component.1"),
+          core::ModelInstanceId("model.1"),
+          core::FrameRoleId("tool_frame"), "compiled_tool_frame",
+          core::ModelRevision("model-revision-1")},
+      core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
+      {structural_revision},
+      core::ProjectionLeaseBindingDTO{
+          active, core::ProjectionLeaseId("candidate-terminal-frame")},
+      Digest('8'),
+      Digest('9')};
+  const auto preview = owner.PreviewResolvedSceneCandidate(
+      core::ResolvedSceneCandidatePreviewRequestDTO{attach, candidate_frame});
+  ASSERT_TRUE(preview.ok()) << preview.error().message;
+  ASSERT_TRUE(preview.value().valid());
+  ASSERT_EQ(preview.value().logical_scene->objects.size(), 1U);
+  ASSERT_EQ(preview.value().logical_scene->carried_object_attachments.size(),
+            1U);
+  EXPECT_TRUE(std::holds_alternative<core::CarriedSceneObjectPlacementDTO>(
+      preview.value().logical_scene->objects.front().placement));
+  EXPECT_EQ(owner.LogicalSnapshot()->carried_object_attachments.size(), 0U);
+  EXPECT_EQ(projection.calls(), projection_calls_before_preview);
+  EXPECT_EQ(projection.policy_projection_calls(),
+            preview_policy_calls_before + 1U);
+  const auto integrity_after_preview = owner.VerifyIntegrity();
+  EXPECT_EQ(integrity_after_preview.transaction_intent_count,
+            integrity_before_preview.transaction_intent_count);
+  EXPECT_EQ(integrity_after_preview.request_outcome_count,
+            integrity_before_preview.request_outcome_count);
+  EXPECT_EQ(integrity_after_preview.projection_attempt_count,
+            integrity_before_preview.projection_attempt_count);
+
   const auto attached = owner.Commit(attach);
   ASSERT_TRUE(attached.success)
       << (attached.error.has_value() ? attached.error->message
@@ -3446,6 +3483,12 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_TRUE(attached.committed_projection_revision.has_value());
   active = *attached.committed_projection_revision;
   snapshot = owner.LogicalSnapshot();
+  EXPECT_EQ(*snapshot, *preview.value().logical_scene);
+  ASSERT_FALSE(projection.transactions().empty());
+  EXPECT_EQ(projection.transactions().back().resolved_operation,
+            preview.value().resolved_operation);
+  EXPECT_EQ(projection.transactions().back().original_request_digest,
+            preview.value().request_digest);
   ASSERT_EQ(snapshot->carried_object_attachments.size(), 1U);
   EXPECT_EQ(snapshot->carried_object_attachments.front()
                 .carrier_frame_ref,
@@ -3544,7 +3587,7 @@ TEST(CanonicalEmptySceneOwner,
 
   EXPECT_EQ(projection.calls(), 3U);
   EXPECT_EQ(projection.frame_resolution_calls(), 7U);
-  EXPECT_EQ(projection.policy_projection_calls(), 3U);
+  EXPECT_EQ(projection.policy_projection_calls(), 4U);
   EXPECT_EQ(projection.retained_lease_count(), 0U);
   const auto integrity = owner.VerifyIntegrity();
   EXPECT_EQ(integrity.transaction_intent_count, 3);

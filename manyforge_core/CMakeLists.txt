@@ -58,6 +58,8 @@ add_library(manyforge_core
   src/motion_target_resolution.cpp
   src/operator_stop_worker.cpp
   src/operation_intent.cpp
+  src/pick_place_candidate.cpp
+  src/pick_place_sequence.cpp
   src/observed_robot_state_publication.cpp
   src/observed_state.cpp
   src/execution_progress_publication.cpp
@@ -396,6 +398,20 @@ if(BUILD_TESTING)
   target_link_libraries(test_pose_math PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_pose_math
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_pick_place_candidate
+    test/test_pick_place_candidate.cpp)
+  target_link_libraries(test_pick_place_candidate PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_pick_place_candidate
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_pick_place_sequence
+    test/test_pick_place_sequence.cpp)
+  target_link_libraries(test_pick_place_sequence PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_pick_place_sequence
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_motion_target_resolution

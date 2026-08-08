@@ -124,6 +124,32 @@ namespace {
       (motion.offset_reference.has_value() && !valid_reference(*motion.offset_reference))) {
     return invalid("motion reference is malformed", "motion_reference_invalid");
   }
+  if ((motion.contact_policy_id.has_value() &&
+       motion.contact_policy_id->empty()) ||
+      motion.runtime_object_bindings.size() >
+          kMaxOperationRuntimeObjectBindings ||
+      !std::is_sorted(
+          motion.runtime_object_bindings.begin(),
+          motion.runtime_object_bindings.end(),
+          [](const auto& left, const auto& right) {
+            return left.runtime_object_id < right.runtime_object_id;
+          }) ||
+      std::adjacent_find(
+          motion.runtime_object_bindings.begin(),
+          motion.runtime_object_bindings.end(),
+          [](const auto& left, const auto& right) {
+            return left.runtime_object_id == right.runtime_object_id;
+          }) != motion.runtime_object_bindings.end() ||
+      std::any_of(motion.runtime_object_bindings.begin(),
+                  motion.runtime_object_bindings.end(),
+                  [](const auto& binding) {
+                    return binding.runtime_object_id.empty() ||
+                           binding.scene_resource_id.empty();
+                  })) {
+    return invalid("motion runtime-object bindings are malformed, duplicate, "
+                   "or unsorted",
+                   "motion_runtime_object_binding_invalid");
+  }
   if (motion.target_mode == MotionTargetModeDTO::kAbsolute &&
       (motion.target_reference.has_value() || motion.offset_reference.has_value())) {
     return invalid("absolute motion cannot carry relative references",

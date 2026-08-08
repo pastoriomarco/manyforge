@@ -95,6 +95,7 @@ Binding(std::string id, std::string revision, std::string component,
       core::StopEvidencePolicyId("stop-policy"),
       core::StopEvidencePolicyRevision("stop-policy-r1"),
       core::ContainmentGranularity::kResource,
+      {},
   };
 }
 

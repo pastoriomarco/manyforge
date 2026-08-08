@@ -19,6 +19,7 @@
 #include <manyforge_core/types/error_code_mapping.hpp>
 #include <manyforge_core/types/kernel_event_factories.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -274,6 +275,155 @@ body_hashes_by_id(const CollisionWorldSnapshotPtr &snapshot) {
                     : body.body_content_hash);
   }
   return out;
+}
+
+[[nodiscard]] const CollisionWorldBody *
+find_collision_body(const CollisionWorldSnapshot &world,
+                    const CollisionBodyId &body_id) noexcept;
+
+[[nodiscard]] std::string resolved_contact_grasp_policy_id(
+    const ExecuteRequestDTO& request,
+    const ProjectionRevisionDTO& projection,
+    const ResolvedContactGraspBindingDTO& binding) {
+  std::string material;
+  const auto append = [&](std::string_view value) {
+    material += std::to_string(value.size());
+    material.push_back(':');
+    material.append(value);
+    material.push_back(';');
+  };
+  append(binding.contact_policy_id.value());
+  append(binding.contact_policy_revision.value());
+  append(request.binding.program_binding_id.value());
+  append(request.binding.program_run_id.value());
+  append(request.binding.operation_id.value());
+  append(request.binding.participant_id.value());
+  append(binding.runtime_object_id.value());
+  append(binding.selected_object_id.value());
+  append(projection.retained_bundle_id.value());
+  append(projection.graph_revision.value());
+  append(projection.scene_revision.content_hash.value());
+  for (const auto& body_id : binding.allowed_robot_body_ids) {
+    append(body_id);
+  }
+  const std::string digest = content_identity::sha256_digest(material);
+  return "contact_grasp.bound." + digest.substr(std::string("sha256:").size());
+}
+
+[[nodiscard]] Result<void> install_resolved_contact_grasp_policy(
+    ExecuteRequestDTO& request,
+    CollisionWorldLeaseInventory& inventory) {
+  if (!request.resolved_contact_grasp.has_value()) {
+    return Result<void>::Ok();
+  }
+  const auto& binding = *request.resolved_contact_grasp;
+  if (request.contact_policy_id != binding.contact_policy_id.value() ||
+      binding.contact_policy_revision.empty() ||
+      binding.runtime_object_id.empty() || binding.selected_object_id.empty() ||
+      binding.allowed_robot_body_ids.empty() ||
+      !std::is_sorted(binding.allowed_robot_body_ids.begin(),
+                      binding.allowed_robot_body_ids.end()) ||
+      std::adjacent_find(binding.allowed_robot_body_ids.begin(),
+                         binding.allowed_robot_body_ids.end()) !=
+          binding.allowed_robot_body_ids.end() ||
+      !std::isfinite(binding.max_penetration_m) ||
+      binding.max_penetration_m <= 0.0 ||
+      !std::isfinite(binding.terminal_window_start_fraction) ||
+      binding.terminal_window_start_fraction < 0.0 ||
+      binding.terminal_window_start_fraction > 1.0 ||
+      !inventory.logical_scene || !inventory.bundle.world ||
+      !inventory.bundle.policy.has_value()) {
+    return Result<void>::Err(ErrorDTO{
+        kErrorInvalidContactPolicy,
+        "Resolved contact-grasp binding is incomplete",
+        {{"reason", "resolved_contact_grasp_binding_invalid"}}});
+  }
+  const auto runtime_binding = std::lower_bound(
+      request.runtime_object_bindings.begin(),
+      request.runtime_object_bindings.end(), binding.runtime_object_id,
+      [](const auto& candidate, const RuntimeObjectId& id) {
+        return candidate.runtime_object_id < id;
+      });
+  if (runtime_binding == request.runtime_object_bindings.end() ||
+      runtime_binding->runtime_object_id != binding.runtime_object_id ||
+      runtime_binding->scene_resource_id != binding.selected_object_id) {
+    return Result<void>::Err(ErrorDTO{
+        kErrorInvalidContactPolicy,
+        "Resolved contact-grasp object differs from operation intent",
+        {{"reason", "contact_grasp_runtime_object_mismatch"}}});
+  }
+  const auto object = std::lower_bound(
+      inventory.logical_scene->objects.begin(),
+      inventory.logical_scene->objects.end(), binding.selected_object_id,
+      [](const SceneObjectSnapshotDTO& candidate,
+         const SceneResourceId& id) {
+        return candidate.scene_resource_id < id;
+      });
+  if (object == inventory.logical_scene->objects.end() ||
+      object->scene_resource_id != binding.selected_object_id ||
+      !std::holds_alternative<CellFixedSceneObjectPlacementDTO>(
+          object->placement) ||
+      object->collision_shapes.empty()) {
+    return Result<void>::Err(ErrorDTO{
+        kErrorInvalidContactPolicy,
+        "Contact-grasp selected object is missing, carried, or shapeless",
+        {{"reason", "contact_grasp_selected_object_not_detached"},
+         {"selected_object_id", binding.selected_object_id.value()}}});
+  }
+  for (std::size_t shape_index = 0U;
+       shape_index < object->collision_shapes.size(); ++shape_index) {
+    const auto* body = find_collision_body(
+        *inventory.bundle.world,
+        make_scene_collision_body_id(binding.selected_object_id,
+                                     shape_index));
+    if (body == nullptr ||
+        body->owner_kind != CollisionOwnerKind::kSceneResource ||
+        body->parent_body_id.has_value()) {
+      return Result<void>::Err(ErrorDTO{
+          kErrorInvalidContactPolicy,
+          "Contact-grasp selected object differs from the retained world",
+          {{"reason", "contact_grasp_selected_object_projection_mismatch"},
+           {"selected_object_id", binding.selected_object_id.value()}}});
+    }
+  }
+  std::vector<std::string> allowed_body_ids;
+  allowed_body_ids.reserve(binding.allowed_robot_body_ids.size());
+  for (const auto& body_id : binding.allowed_robot_body_ids) {
+    const auto* body = find_collision_body(*inventory.bundle.world, body_id);
+    if (body == nullptr ||
+        body->owner_kind != CollisionOwnerKind::kComponentModelBody) {
+      return Result<void>::Err(ErrorDTO{
+          kErrorInvalidContactPolicy,
+          "Contact-grasp robot body differs from the retained world",
+          {{"reason", "contact_grasp_robot_body_projection_mismatch"},
+           {"collision_body_id", body_id}}});
+    }
+    allowed_body_ids.push_back(body_id);
+  }
+
+  const std::string effective_id = resolved_contact_grasp_policy_id(
+      request, inventory.projection_binding.projection_revision, binding);
+  CollisionPolicySnapshot effective = *inventory.bundle.policy;
+  effective.contact_grasps.clear();
+  effective.contact_grasps.push_back(ContactGraspPolicyEntry{
+      effective_id, binding.selected_object_id.value(),
+      std::move(allowed_body_ids), binding.max_penetration_m,
+      binding.terminal_window_start_fraction});
+  effective.require_full_diagnostics = true;
+  try {
+    effective.revision.content_hash =
+        logical_scene_identity::ComputeCollisionPolicyContentDigest(effective)
+            .value();
+  } catch (const std::exception& error) {
+    return Result<void>::Err(ErrorDTO{
+        kErrorInvariantViolation,
+        "Resolved contact-grasp policy could not be identified",
+        {{"reason", "resolved_contact_grasp_identity_failed"},
+         {"exception", error.what()}}});
+  }
+  inventory.bundle.policy = std::move(effective);
+  request.contact_policy_id = effective_id;
+  return Result<void>::Ok();
 }
 
 [[nodiscard]] const CollisionWorldBody *
@@ -7438,6 +7588,174 @@ void ExecutionKernel::async_execute_worker(
   }
 }
 
+Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
+    ExecuteRequestDTO request,
+    CollisionWorldLeaseInventory projection_inventory,
+    RobotStateDTO start_state, const std::uint32_t planning_attempt_index,
+    const std::stop_token stop_token) {
+  std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  const auto reject = [](const ErrorCode code, std::string message,
+                         std::string reason) {
+    return Result<MotionPreviewResultDTO>::Err(
+        ErrorDTO{std::string(to_string(code)), std::move(message),
+                 {{"reason", std::move(reason)}}});
+  };
+  if (sm_.status().state != ExecutionState::kIdle) {
+    return reject(ErrorCode::kExecutionRejected,
+                  "Motion preview requires an idle participant",
+                  "motion_preview_participant_not_idle");
+  }
+  if (auto admission_error = collision_validation_admission_error();
+      admission_error.has_value()) {
+    return Result<MotionPreviewResultDTO>::Err(
+        std::move(*admission_error));
+  }
+  if (!std::isfinite(request.timeouts.planning_timeout_s) ||
+      request.timeouts.planning_timeout_s <= 0.0) {
+    return reject(ErrorCode::kInvalidRequest,
+                  "Motion preview planning timeout must be finite and "
+                  "strictly positive",
+                  "motion_preview_planning_timeout_invalid");
+  }
+  if (request.target_mode != MotionTargetModeDTO::kAbsolute ||
+      request.target_reference.has_value() ||
+      request.offset_reference.has_value()) {
+    return reject(ErrorCode::kInvalidRequest,
+                  "Motion preview requires an already-resolved absolute "
+                  "motion target",
+                  "motion_preview_target_not_resolved");
+  }
+  if (!projection_inventory.projection_binding.valid() ||
+      !projection_inventory.logical_scene ||
+      !projection_inventory.logical_scene->locally_valid() ||
+      !projection_inventory.bundle.world ||
+      !projection_inventory.bundle.policy.has_value() ||
+      projection_inventory.logical_scene->revision !=
+          projection_inventory.projection_binding.projection_revision
+              .scene_revision ||
+      projection_inventory.projection_binding.projection_revision
+              .retained_bundle_id != request.binding.retained_bundle_id ||
+      projection_inventory.projection_binding.projection_revision
+              .graph_revision != request.binding.graph_revision) {
+    return reject(ErrorCode::kExecutionRejected,
+                  "Motion preview requires one exact retained scene "
+                  "projection",
+                  "motion_preview_projection_invalid");
+  }
+  if (auto controlled = controlled_state_for_binding(request, start_state);
+      !controlled.ok()) {
+    return Result<MotionPreviewResultDTO>::Err(controlled.error());
+  }
+  if (stop_token.stop_requested()) {
+    return reject(ErrorCode::kExecutionAborted,
+                  "Motion preview was cancelled before planning",
+                  "motion_preview_cancelled");
+  }
+
+  auto grasp =
+      install_resolved_contact_grasp_policy(request, projection_inventory);
+  if (!grasp.ok()) {
+    return Result<MotionPreviewResultDTO>::Err(grasp.error());
+  }
+  auto dynamic_contacts = discover_dynamic_carried_start_contacts(
+      projection_inventory, start_state, 0U);
+  if (!dynamic_contacts.ok()) {
+    return Result<MotionPreviewResultDTO>::Err(dynamic_contacts.error());
+  }
+  request.dynamically_discovered_start_contact_count =
+      dynamic_contacts.value();
+
+  std::stop_callback cancellation(stop_token,
+                                  [this]() { planner_.request_cancel(); });
+  const auto planning_start_ns = clock_.now();
+  const auto planning_timeout_ns = static_cast<std::int64_t>(
+      request.timeouts.planning_timeout_s * 1.0e9);
+  const auto planning_timeout_handle = scheduler_.schedule(
+      planning_start_ns + planning_timeout_ns,
+      [this]() { planner_.request_cancel(); }, SchedulerPriority::Monitoring);
+  struct ScheduleCancelGuard final {
+    IScheduler &scheduler;
+    ScheduleHandle handle;
+    ~ScheduleCancelGuard() {
+      if (handle != 0U) {
+        scheduler.cancel(handle);
+      }
+    }
+  } timeout_guard{scheduler_, planning_timeout_handle};
+
+  try {
+    auto planned = plan_trajectory(request, projection_inventory,
+                                   planning_attempt_index, &start_state);
+    const bool planning_timed_out =
+        clock_.now() - planning_start_ns >= planning_timeout_ns;
+    if (planning_timed_out) {
+      return reject(ErrorCode::kPlanningTimeout,
+                    "Motion preview planning timed out",
+                    "motion_preview_planning_timeout");
+    }
+    if (stop_token.stop_requested()) {
+      return reject(ErrorCode::kExecutionAborted,
+                    "Motion preview was cancelled during planning",
+                    "motion_preview_cancelled");
+    }
+    if (!planned.ok()) {
+      return Result<MotionPreviewResultDTO>::Err(planned.error());
+    }
+
+    auto trajectory = std::move(planned.value());
+    auto validated = validate_trajectory(
+        trajectory, request, projection_inventory, std::nullopt,
+        &start_state, stop_token);
+    if (stop_token.stop_requested()) {
+      return reject(ErrorCode::kExecutionAborted,
+                    "Motion preview was cancelled during validation",
+                    "motion_preview_cancelled");
+    }
+    if (!validated.ok()) {
+      return Result<MotionPreviewResultDTO>::Err(validated.error());
+    }
+
+    RobotStateDTO final_state = start_state;
+    if (!trajectory.waypoints.empty()) {
+      const auto &final_waypoint = trajectory.waypoints.back();
+      final_state = RobotStateDTO{trajectory.joint_names,
+                                  final_waypoint.positions_rad,
+                                  final_waypoint.velocities_rad_s};
+    }
+    auto final_controlled_state =
+        controlled_state_for_binding(request, final_state);
+    if (!final_controlled_state.ok()) {
+      return Result<MotionPreviewResultDTO>::Err(
+          final_controlled_state.error());
+    }
+    auto final_tcp_pose = kinematics_.forward_kinematics(FkRequestDTO{
+        final_state, compiled_frame_name(request.binding.tcp_frame),
+        compiled_frame_name(request.binding.base_frame)});
+    if (!final_tcp_pose.ok()) {
+      return Result<MotionPreviewResultDTO>::Err(final_tcp_pose.error());
+    }
+    return Result<MotionPreviewResultDTO>::Ok(MotionPreviewResultDTO{
+        std::move(trajectory), std::move(start_state), std::move(final_state),
+        std::move(final_controlled_state.value()),
+        std::move(final_tcp_pose.value()),
+        projection_inventory.projection_binding,
+        validated.value().collision_world_revision,
+        validated.value().dynamically_discovered_start_contact_count});
+  } catch (const std::exception &error) {
+    return Result<MotionPreviewResultDTO>::Err(ErrorDTO{
+        kErrorPlanningFailed,
+        "Motion preview raised while planning or validating",
+        {{"reason", "motion_preview_exception"},
+         {"exception", error.what()}}});
+  } catch (...) {
+    return Result<MotionPreviewResultDTO>::Err(ErrorDTO{
+        kErrorPlanningFailed,
+        "Motion preview raised a non-standard exception",
+        {{"reason", "motion_preview_exception"},
+         {"exception", reason_codes::kUnknownNonStdException}}});
+  }
+}
+
 Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO &request) {
   EventDeferralScope event_scope(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -7599,6 +7917,8 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO &request) {
     finish_execute_worker();
   };
 
+  std::string admitted_contact_policy_id = request.contact_policy_id;
+
   const auto finalize_admitted_without_worker =
       [&](MotionExecutionTerminalCause terminal_cause,
           std::string reap_reason) {
@@ -7608,7 +7928,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO &request) {
         motion_state.had_scopes = !request.motion_interrupt_scopes.empty();
         motion_state.correlation_captured = true;
         motion_state.action_span = request.action_span;
-        motion_state.contact_policy_id = request.contact_policy_id;
+        motion_state.contact_policy_id = admitted_contact_policy_id;
         finalize_motion_execution_outcome(motion_state, terminal_cause,
                                           std::nullopt, std::nullopt,
                                           std::move(reap_reason));
@@ -7692,9 +8012,18 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO &request) {
                  "Retained planner projection binding is invalid",
                  {{"reason", "planner_projection_binding_invalid"}}});
   }
+  ExecuteRequestDTO resolved_request(request);
+  auto contact_grasp_binding = install_resolved_contact_grasp_policy(
+      resolved_request, retained_scene.mutable_inventory());
+  if (!contact_grasp_binding.ok()) {
+    return reject_admission(contact_grasp_binding.error());
+  }
+  admitted_contact_policy_id = resolved_request.contact_policy_id;
+  set_active_request_correlation(resolved_request);
   std::optional<SceneSnapshotLease> scene_snapshot_lease;
   scene_snapshot_lease =
-      build_scene_snapshot_lease(retained_scene.inventory(), request, exec_id);
+      build_scene_snapshot_lease(retained_scene.inventory(), resolved_request,
+                                 exec_id);
 
   std::optional<RobotStateDTO> synced_state;
   auto observed_start = observed_state_.current_state(clock_.now());
@@ -7702,7 +8031,6 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO &request) {
     synced_state = std::move(observed_start.value());
   }
 
-  ExecuteRequestDTO resolved_request(request);
   std::optional<ProgramFrameResolutionContextDTO> resolution_context;
   if (request.target_mode == MotionTargetModeDTO::kRelative) {
     if (!synced_state.has_value()) {
@@ -10699,7 +11027,8 @@ Result<std::size_t> ExecutionKernel::discover_dynamic_carried_start_contacts(
 Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
     const ExecuteRequestDTO &request,
     const CollisionWorldLeaseInventory &projection_inventory,
-    std::uint32_t planning_attempt_index) {
+    std::uint32_t planning_attempt_index,
+    const RobotStateDTO *start_state_override) {
   const auto &projection_binding = projection_inventory.projection_binding;
   if (!projection_binding.valid()) {
     return Result<TrajectoryDTO>::Err(
@@ -10707,11 +11036,16 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
                  "Planning requires a valid retained scene projection binding",
                  {{"reason", "planner_projection_binding_invalid"}}});
   }
-  auto current_state_result = observed_state_.current_state(clock_.now());
-  if (!current_state_result.ok()) {
-    return Result<TrajectoryDTO>::Err(current_state_result.error());
+  RobotStateDTO current_state;
+  if (start_state_override != nullptr) {
+    current_state = *start_state_override;
+  } else {
+    auto current_state_result = observed_state_.current_state(clock_.now());
+    if (!current_state_result.ok()) {
+      return Result<TrajectoryDTO>::Err(current_state_result.error());
+    }
+    current_state = std::move(current_state_result.value());
   }
-  auto current_state = std::move(current_state_result.value());
   auto controlled_state = controlled_state_for_binding(request, current_state);
   if (!controlled_state.ok()) {
     return Result<TrajectoryDTO>::Err(controlled_state.error());
@@ -10848,14 +11182,21 @@ Result<ExecutionKernel::CollisionValidationSuccess>
 ExecutionKernel::validate_trajectory(
     const TrajectoryDTO &trajectory, const ExecuteRequestDTO &request,
     CollisionWorldLeaseInventory &scene_snapshot_lease_inventory,
-    const std::optional<SceneSnapshotLease> &scene_snapshot_lease) {
+    const std::optional<SceneSnapshotLease> &scene_snapshot_lease,
+    const RobotStateDTO *start_state_override,
+    const std::stop_token external_stop_token) {
   // Start-state gate
-  auto current_state_result = observed_state_.current_state(clock_.now());
-  if (!current_state_result.ok()) {
-    return Result<CollisionValidationSuccess>::Err(
-        current_state_result.error());
+  RobotStateDTO current_state;
+  if (start_state_override != nullptr) {
+    current_state = *start_state_override;
+  } else {
+    auto current_state_result = observed_state_.current_state(clock_.now());
+    if (!current_state_result.ok()) {
+      return Result<CollisionValidationSuccess>::Err(
+          current_state_result.error());
+    }
+    current_state = std::move(current_state_result.value());
   }
-  auto current_state = std::move(current_state_result.value());
   if (!trajectory.waypoints.empty()) {
     const auto start_match = cached_trajectory_matches_current_start(
         trajectory, current_state, request.tolerances.joint_position_tol_rad);
@@ -10898,6 +11239,13 @@ ExecutionKernel::validate_trajectory(
   }
 
   auto cancel = install_validation_cancel_token();
+  std::stop_callback external_cancel(
+      external_stop_token, [cancel]() {
+        cancel->request_cancel("motion_preview_cancelled");
+      });
+  if (external_stop_token.stop_requested()) {
+    cancel->request_cancel("motion_preview_cancelled");
+  }
   struct ValidationCancelTokenGuard {
     ExecutionKernel *kernel = nullptr;
     std::shared_ptr<CollisionCancellationToken> token;

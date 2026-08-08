@@ -118,6 +118,39 @@ struct ProgramTargetRoleBindingDTO final {
                          const ProgramTargetRoleBindingDTO&) = default;
 };
 
+/// One portable body selector resolved through an exact Program target and
+/// retained model map. `collision_body_ids` use the immutable component/model/
+/// role/index identity consumed by the retained collision-world projector.
+struct ProgramContactGraspBodyBindingDTO final {
+  ComponentRoleId component_role_id;
+  TargetRoleId target_role_id;
+  ControllableComponentId controllable_component_id;
+  CommandTargetId command_target_id;
+  std::optional<ModelRoleId> model_role_id;
+  CollisionBodyRoleId collision_body_role_id;
+  ModelInstanceId model_instance_id;
+  ModelRevision model_revision;
+  std::vector<std::string> collision_body_ids;
+
+  friend bool operator==(const ProgramContactGraspBodyBindingDTO&,
+                         const ProgramContactGraspBodyBindingDTO&) = default;
+};
+
+/// Closed Program-Binding form of one geometry-only contact-grasp template.
+/// The runtime object remains portable until an operation binds it to one
+/// current logical-scene resource.
+struct ProgramContactGraspBindingDTO final {
+  ContactPolicyId contact_policy_id;
+  ContactPolicyRevision contact_policy_revision;
+  RuntimeObjectId runtime_object_id;
+  std::vector<ProgramContactGraspBodyBindingDTO> allowed_body_bindings;
+  double max_penetration_m{};
+  double terminal_window_start_fraction{};
+
+  friend bool operator==(const ProgramContactGraspBindingDTO&,
+                         const ProgramContactGraspBindingDTO&) = default;
+};
+
 struct ProgramBindingProvenanceDTO final {
   ContentDigest binding_compiler_contract_digest;
   ContentDigest binding_compiler_build_digest;
@@ -145,6 +178,7 @@ struct ProgramBindingDTO final {
   std::vector<ProgramComponentRoleBindingDTO> component_role_bindings;
   std::vector<ProgramTargetRoleBindingDTO> target_role_bindings;
   ProgramBindingProvenanceDTO provenance;
+  std::vector<ProgramContactGraspBindingDTO> contact_grasp_bindings{};
 
   friend bool operator==(const ProgramBindingDTO&,
                          const ProgramBindingDTO&) = default;

@@ -9,6 +9,7 @@
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
 #include <manyforge_core/types/projection_common.hpp>
+#include <manyforge_core/types/runtime_object_binding.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
 #include <manyforge_core/types/timeouts.hpp>
 #include <manyforge_core/types/tolerances.hpp>
@@ -22,6 +23,7 @@ namespace manyforge::core {
 
 inline constexpr std::size_t kMaxOperationParticipants = 4096U;
 inline constexpr std::size_t kMaxOperationCommandOptions = 64U;
+inline constexpr std::size_t kMaxOperationRuntimeObjectBindings = 4096U;
 
 enum class OperationCoordinationPolicy {
   kIndependent,
@@ -71,6 +73,10 @@ struct MotionParticipantIntentDTO final {
   /// Source-local URDF joint names scoped by `target_role_id`.
   std::map<std::string, JointDynamicsLimitDTO> per_joint_dynamics_limits;
   std::vector<MotionInterruptScopeDTO> motion_interrupt_scopes;
+  /// Public selection of one declared Program runtime-object key. Admission
+  /// resolves and validates these rows against the exact Program Binding and
+  /// retained logical scene; equal spelling is never treated as proof.
+  std::vector<RuntimeObjectReferenceBindingDTO> runtime_object_bindings{};
   friend bool operator==(const MotionParticipantIntentDTO&,
                          const MotionParticipantIntentDTO&) = default;
 };

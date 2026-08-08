@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -64,6 +65,34 @@ struct ProgramTargetRoleRequirementDTO final {
                          const ProgramTargetRoleRequirementDTO&) = default;
 };
 
+/// Portable component-model side of one Program-owned contact-grasp pair.
+/// The selected object remains a typed runtime-object binding until operation
+/// admission; generated collision-body names are never authored here.
+struct ProgramContactGraspBodySelectorDTO final {
+  ComponentRoleId component_role_id;
+  std::optional<ModelRoleId> model_role_id;
+  CollisionBodyRoleId collision_body_role_id;
+
+  friend bool operator==(const ProgramContactGraspBodySelectorDTO&,
+                         const ProgramContactGraspBodySelectorDTO&) = default;
+};
+
+/// Binding-relevant projection of the currently qualified geometry-only
+/// `contact_grasp` policy subset. The complete canonical policy remains in the
+/// sealed Program; this value contains only what the binding compiler must
+/// resolve before a selected scene resource is known.
+struct ProgramContactGraspTemplateDTO final {
+  ContactPolicyId contact_policy_id;
+  ContactPolicyRevision contact_policy_revision;
+  RuntimeObjectId runtime_object_id;
+  std::vector<ProgramContactGraspBodySelectorDTO> allowed_body_selectors;
+  double max_penetration_m{};
+  double terminal_window_start_fraction{};
+
+  friend bool operator==(const ProgramContactGraspTemplateDTO&,
+                         const ProgramContactGraspTemplateDTO&) = default;
+};
+
 /// Binding-relevant projection of one complete, revision-verified Program.
 ///
 /// This DTO remains an untrusted representation. The deployment package's
@@ -75,6 +104,7 @@ struct ProgramBindingContractDTO final {
   RetainedNodeEnvironmentDTO node_environment;
   std::vector<ProgramComponentRoleRequirementDTO> component_roles;
   std::vector<ProgramTargetRoleRequirementDTO> target_roles;
+  std::vector<ProgramContactGraspTemplateDTO> contact_grasp_templates{};
 
   friend bool operator==(const ProgramBindingContractDTO&,
                          const ProgramBindingContractDTO&) = default;

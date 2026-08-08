@@ -80,6 +80,64 @@ template <typename T>
       motion);
 }
 
+[[nodiscard]] Result<std::optional<ResolvedContactGraspBindingDTO>>
+resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
+                              const RuntimeParticipantBindingDTO& binding) {
+  if (!motion.contact_policy_id.has_value()) {
+    return Result<std::optional<ResolvedContactGraspBindingDTO>>::Ok(
+        std::nullopt);
+  }
+  const auto policy = std::lower_bound(
+      binding.contact_grasp_bindings.begin(),
+      binding.contact_grasp_bindings.end(), *motion.contact_policy_id,
+      [](const auto& candidate, const ContactPolicyId& id) {
+        return candidate.contact_policy_id < id;
+      });
+  if (policy == binding.contact_grasp_bindings.end() ||
+      policy->contact_policy_id != *motion.contact_policy_id) {
+    // Other contact-policy modes remain selected from the retained scene
+    // policy. Only Program-owned contact_grasp requires this late binding.
+    return Result<std::optional<ResolvedContactGraspBindingDTO>>::Ok(
+        std::nullopt);
+  }
+  const auto object = std::lower_bound(
+      motion.runtime_object_bindings.begin(),
+      motion.runtime_object_bindings.end(), policy->runtime_object_id,
+      [](const auto& candidate, const RuntimeObjectId& id) {
+        return candidate.runtime_object_id < id;
+      });
+  if (object == motion.runtime_object_bindings.end() ||
+      object->runtime_object_id != policy->runtime_object_id) {
+    return reject<std::optional<ResolvedContactGraspBindingDTO>>(
+        "contact-grasp policy has no selected runtime object",
+        "contact_grasp_runtime_object_unresolved",
+        ErrorCode::kMissingReference);
+  }
+  std::vector<CollisionBodyId> body_ids;
+  for (const auto& body : policy->allowed_body_bindings) {
+    body_ids.insert(body_ids.end(), body.collision_body_ids.begin(),
+                    body.collision_body_ids.end());
+  }
+  std::sort(body_ids.begin(), body_ids.end());
+  body_ids.erase(std::unique(body_ids.begin(), body_ids.end()),
+                 body_ids.end());
+  if (body_ids.empty()) {
+    return reject<std::optional<ResolvedContactGraspBindingDTO>>(
+        "contact-grasp policy resolved no robot collision bodies",
+        "contact_grasp_body_binding_empty", ErrorCode::kInvariantViolation);
+  }
+  return Result<std::optional<ResolvedContactGraspBindingDTO>>::Ok(
+      std::optional<ResolvedContactGraspBindingDTO>{
+          ResolvedContactGraspBindingDTO{
+          policy->contact_policy_id,
+          policy->contact_policy_revision,
+          policy->runtime_object_id,
+          object->scene_resource_id,
+          std::move(body_ids),
+          policy->max_penetration_m,
+          policy->terminal_window_start_fraction}});
+}
+
 [[nodiscard]] ResolvedFrameDTO resolved_component_frame(const RuntimeParticipantBindingDTO& binding,
                                                         const ProgramFrameRoleBindingDTO& frame) {
   return ResolvedComponentModelFrameDTO{binding.controllable_component_id, frame.model_instance_id,
@@ -232,6 +290,12 @@ template <typename T>
   request.action_span = participant.action_span;
   request.contact_policy_id =
       motion.contact_policy_id.has_value() ? motion.contact_policy_id->value() : std::string{};
+  request.runtime_object_bindings = motion.runtime_object_bindings;
+  auto contact_grasp = resolve_contact_grasp_binding(motion, binding);
+  if (!contact_grasp.ok()) {
+    return Result<ExecuteRequestDTO>::Err(contact_grasp.error());
+  }
+  request.resolved_contact_grasp = std::move(contact_grasp.value());
   if (control.runtime_scale_qualification.has_value()) {
     const auto& qualification = *control.runtime_scale_qualification;
     request.initial_runtime_scale =

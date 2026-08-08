@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/ports/ioperation_journal.hpp>
+#include <manyforge_core/ports/iaddressed_operation_owner.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
@@ -35,7 +36,7 @@ struct ResourceAddressedExecutionKernelConfig final {
 /// participant. Existing ExecutionKernel instances remain private subordinate
 /// planning/execution mechanisms. I8 later expands operation coordination and
 /// concurrency without changing the public component/target/resource identity.
-class ResourceAddressedExecutionKernel final {
+class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner {
  public:
   ResourceAddressedExecutionKernel(
       std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
@@ -50,7 +51,7 @@ class ResourceAddressedExecutionKernel final {
   /// Resolve, reserve, and submit one portable operation. Exact replay returns
   /// the original owner-minted identities and performs no subordinate call.
   [[nodiscard]] Result<OperationAcceptedDTO> execute(
-      const OperationIntentDTO& intent);
+      const OperationIntentDTO& intent) override;
 
   [[nodiscard]] Result<OperationControlAcceptedDTO> pause(
       const OperationControlRequestDTO& request);
@@ -59,7 +60,7 @@ class ResourceAddressedExecutionKernel final {
   [[nodiscard]] Result<OperationControlAcceptedDTO> reset(
       const OperationControlRequestDTO& request);
   [[nodiscard]] Result<OperationControlAcceptedDTO> acknowledge_completed(
-      const OperationControlRequestDTO& request);
+      const OperationControlRequestDTO& request) override;
 
   [[nodiscard]] Result<StopAcceptedDTO> stop(const StopIntentDTO& intent);
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale(
@@ -70,16 +71,17 @@ class ResourceAddressedExecutionKernel final {
   /// Read-only owner projection. Subordinate polling and state advancement are
   /// performed only by reconcile_subordinate_state(), never by this method.
   [[nodiscard]] Result<OperationStateDTO> get_operation_state(
-      const OperationId& operation_id) const;
+      const OperationId& operation_id) const override;
 
   /// NRT owner-scheduler reconciliation point. This closes event-loss windows
   /// and advances capability-command completion without making public reads
   /// effectful.
-  [[nodiscard]] Result<void> reconcile_subordinate_state();
+  [[nodiscard]] Result<void> reconcile_subordinate_state() override;
 
   [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> resource_snapshot()
       const;
-  [[nodiscard]] const RequestOwnerEpoch& request_owner_epoch() const noexcept {
+  [[nodiscard]] const RequestOwnerEpoch& request_owner_epoch()
+      const noexcept override {
     return config_.request_owner_epoch;
   }
 

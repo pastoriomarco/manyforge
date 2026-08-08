@@ -4,6 +4,7 @@
 #include <manyforge_core/types/kinematic_state_view.hpp>
 #include <manyforge_core/types/logical_scene_snapshot.hpp>
 #include <memory>
+#include <optional>
 #include <variant>
 #include <vector>
 
@@ -38,6 +39,18 @@ struct SceneFrameResolutionQueryDTO final {
   [[nodiscard]] bool valid() const noexcept;
 };
 
+/// Candidate-only carrier-frame query. The predicted state is the exact
+/// terminal state returned by the shared non-dispatching motion primitive; it
+/// overrides only its own retained control binding while all other path state
+/// remains owner-issued. It is never an observed-state publication.
+struct CandidateSceneFrameResolutionQueryDTO final {
+  SceneFrameResolutionSelectorDTO selector;
+  ProjectionLeaseBindingDTO projection_binding;
+  ControlledStateDTO predicted_state;
+
+  [[nodiscard]] bool valid() const noexcept;
+};
+
 /// Pure resolver input. The verified compiler map remains adapter-private;
 /// its selected terminal identity and path are carried here explicitly.
 struct SceneFrameResolutionContextDTO final {
@@ -59,6 +72,10 @@ struct ResolvedSceneFramePoseDTO final {
   ProjectionLeaseBindingDTO projection_binding;
   KinematicFramePathDTO kinematic_path;
   KinematicStatePathViewDTO kinematic_state_path_view;
+  /// Present only when one exact candidate terminal state replaced its own
+  /// retained control-binding rows during FK. The digest is evidence of a
+  /// prediction and must not be interpreted as measured runtime truth.
+  std::optional<ContentDigest> predicted_state_digest;
   ContentDigest resolution_evidence_digest;
 
   [[nodiscard]] bool valid() const noexcept;
@@ -76,6 +93,7 @@ struct SceneFrameResolutionReceiptDTO final {
   Pose3DTO frame_pose_in_cell;
   std::vector<ComponentAttachmentRevision> component_attachment_revisions;
   ProjectionLeaseBindingDTO projection_binding;
+  std::optional<ContentDigest> predicted_state_digest;
   ContentDigest resolution_evidence_digest;
 
   [[nodiscard]] bool valid() const noexcept;
@@ -91,5 +109,11 @@ struct SceneFrameResolutionReceiptDTO final {
 /// result except for its own digest field.
 [[nodiscard]] ContentDigest ComputeSceneFrameResolutionEvidenceDigest(
     const ResolvedSceneFramePoseDTO& resolution);
+
+/// Deterministic identity for one exact typed candidate state. This is used
+/// only as evidence inside candidate frame receipts; it does not publish or
+/// confer observed-state authority.
+[[nodiscard]] ContentDigest ComputeCandidateStateEvidenceDigest(
+    const ControlledStateDTO& state);
 
 }  // namespace manyforge::core

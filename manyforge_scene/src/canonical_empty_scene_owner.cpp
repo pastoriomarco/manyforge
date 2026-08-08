@@ -3112,7 +3112,8 @@ ResolveFrameAcrossProjections(
       continue;
     }
     if (!resolved.value().valid() ||
-        resolved.value().projection_binding != expected_binding) {
+        resolved.value().projection_binding != expected_binding ||
+        resolved.value().predicted_state_digest.has_value()) {
       throw SceneRequestRejectionError(
           "live_scene_snapshot_unavailable",
           "native projection returned a malformed frame receipt",
@@ -9049,6 +9050,170 @@ CanonicalEmptySceneOwner::ActiveProjectionHealth() const {
         "active native projection set cannot form aggregate health");
   }
   return aggregate;
+}
+
+core::Result<core::SceneCandidatePreviewDTO>
+CanonicalEmptySceneOwner::PreviewResolvedSceneCandidate(
+    const core::ResolvedSceneCandidatePreviewRequestDTO &preview) const {
+  const auto reject = [](std::string code, std::string message,
+                         std::map<std::string, std::string> details = {}) {
+    return core::Result<core::SceneCandidatePreviewDTO>::Err(
+        SceneError(code, message, std::move(details)));
+  };
+  const auto &request = preview.request;
+  if (!std::holds_alternative<core::AttachCarriedObjectRequestDTO>(
+          request.operation) &&
+      !std::holds_alternative<core::DetachCarriedObjectRequestDTO>(
+          request.operation)) {
+    return reject("invalid_request",
+                  "Candidate scene preview currently admits only carried-"
+                  "object attach or detach",
+                  {{"reason", "scene_candidate_operation_unsupported"}});
+  }
+  try {
+    ValidateBoundedIdentity(request.request_context.request_id.value(),
+                            "request_id");
+    ValidateBoundedIdentity(
+        request.request_context.request_owner_epoch.value(),
+        "request_owner_epoch");
+    ValidateBoundedText(request.request_context.source_label, "source_label");
+    if (request.request_context.correlation_id.has_value()) {
+      ValidateBoundedText(*request.request_context.correlation_id,
+                          "correlation_id");
+    }
+    if (!request.attribution.locally_valid() ||
+        !request.expected_projection_revision.valid() ||
+        !preview.frame_resolution.has_value() ||
+        !preview.frame_resolution->valid() ||
+        !preview.frame_resolution->predicted_state_digest.has_value() ||
+        preview.frame_resolution->projection_binding.projection_revision !=
+            request.expected_projection_revision) {
+      throw std::invalid_argument(
+          "candidate scene request or frame resolution is invalid");
+    }
+  } catch (const std::exception &error) {
+    return reject("invalid_request", error.what(),
+                  {{"reason", "scene_candidate_request_invalid"}});
+  }
+
+  std::string request_digest_input;
+  ContentDigest request_digest(std::string{});
+  try {
+    request_digest_input =
+        logical_scene_codec_internal::EncodeRequestDigestInput(request);
+    request_digest = ContentDigest(
+        manyforge::content_identity::sha256_digest(request_digest_input));
+  } catch (const std::exception &error) {
+    return reject("invalid_request", error.what(),
+                  {{"reason", "scene_candidate_request_not_canonical"}});
+  }
+
+  DurableState observed_state;
+  std::optional<SceneTransactionStoreState> observed_transactions;
+  {
+    std::lock_guard lock(impl_->mutex_);
+    const auto &cached = impl_->ReadSceneCommitState();
+    observed_state = cached.durable_state;
+    observed_transactions = cached.transaction_state;
+    if (!observed_state.active_projection.has_value() ||
+        !observed_state.active_scene_snapshot.has_value() ||
+        !observed_transactions.has_value()) {
+      return reject("live_scene_snapshot_unavailable",
+                    "Logical-scene bootstrap is not finalized",
+                    {{"reason", "scene_candidate_snapshot_unavailable"}});
+    }
+    if (request.request_context.request_owner_epoch !=
+        observed_transactions->request_owner_epoch) {
+      return reject("stale_request_owner_epoch",
+                    "Candidate scene request names a stale owner epoch",
+                    {{"expected_request_owner_epoch",
+                      observed_transactions->request_owner_epoch.value()}});
+    }
+    const auto access = AccessStatus(observed_state);
+    if (!access.scene_writes_open) {
+      return reject("live_scene_snapshot_unavailable",
+                    "Logical-scene projection is unavailable or changing",
+                    {{"reason", "scene_candidate_writes_fenced"}});
+    }
+    if (request.expected_projection_revision !=
+        *observed_state.active_projection) {
+      return reject("stale_revision",
+                    "Candidate scene request does not name the active "
+                    "projection",
+                    {{"reason", "scene_candidate_projection_stale"}});
+    }
+  }
+
+  std::vector<RequiredSceneProjection> projections;
+  const auto required_bindings = ActiveNativeRuntimeBindings(observed_state);
+  projections.reserve(required_bindings.size());
+  for (const auto &binding : required_bindings) {
+    try {
+      auto projection =
+          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+      if (!projection.preflight_health.healthy_for_target(
+              *observed_state.active_projection)) {
+        return reject(
+            "live_scene_snapshot_unavailable",
+            "A required native projection is not healthy at the candidate "
+            "predecessor",
+            {{"reason", "scene_candidate_native_projection_unhealthy"}});
+      }
+      projections.push_back(std::move(projection));
+    } catch (const std::exception &error) {
+      return reject("live_scene_snapshot_unavailable", error.what(),
+                    {{"reason",
+                      "scene_candidate_native_projection_unavailable"}});
+    } catch (...) {
+      return reject(
+          "live_scene_snapshot_unavailable",
+          "Native scene projection raised a non-standard exception",
+          {{"reason", "scene_candidate_native_projection_unavailable"}});
+    }
+  }
+
+  try {
+    auto candidate = ResolveSceneCandidate(
+        request, *observed_state.active_scene_snapshot,
+        observed_transactions->next_transaction_sequence, request_digest,
+        preview.frame_resolution);
+    auto effective_policy =
+        ProjectEffectivePolicy(candidate.snapshot, projections);
+    const core::ProjectionRevisionDTO proposed{
+        observed_state.active_projection->retained_bundle_id,
+        observed_state.active_projection->graph_revision,
+        candidate.snapshot.revision};
+    auto result = core::SceneCandidatePreviewDTO{
+        request_digest,
+        *observed_state.active_projection,
+        proposed,
+        std::make_shared<const LogicalSceneSnapshotDTO>(
+            std::move(candidate.snapshot)),
+        std::move(candidate.operation),
+        std::move(effective_policy),
+        candidate.update_status,
+        candidate.resolution_evidence_digest};
+    if (!result.valid()) {
+      return reject("invariant_violation",
+                    "Scene candidate reducer produced an invalid successor",
+                    {{"reason", "scene_candidate_result_invalid"}});
+    }
+    return core::Result<core::SceneCandidatePreviewDTO>::Ok(
+        std::move(result));
+  } catch (const SceneRequestRejectionError &error) {
+    return reject(error.code(), error.what(), error.details());
+  } catch (const CanonicalEmptySceneOwnerConflictError &error) {
+    return reject("scene_object_state_conflict", error.what());
+  } catch (const CanonicalEmptySceneOwnerLimitError &error) {
+    return reject("request_ledger_full", error.what());
+  } catch (const std::invalid_argument &error) {
+    return reject("invalid_request", error.what());
+  } catch (const std::exception &error) {
+    return reject("live_scene_snapshot_unavailable", error.what());
+  } catch (...) {
+    return reject("live_scene_snapshot_unavailable",
+                  "Scene candidate preview raised a non-standard exception");
+  }
 }
 
 SceneCommitResultDTO

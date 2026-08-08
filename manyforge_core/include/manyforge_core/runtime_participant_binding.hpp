@@ -120,6 +120,9 @@ struct RuntimeParticipantBindingDTO final {
   /// bound provider. Public callers cannot add or select these paths.
   std::vector<RuntimeCapabilityProviderPathDTO> supporting_capability_provider_paths;
   std::vector<RuntimeUnitEpochBindingDTO> runtime_unit_epochs;
+  /// Exact Program-owned templates copied from the sealed Program Binding.
+  /// Runtime object selection remains unresolved until operation admission.
+  std::vector<ProgramContactGraspBindingDTO> contact_grasp_bindings{};
 
   friend bool operator==(const RuntimeParticipantBindingDTO&,
                          const RuntimeParticipantBindingDTO&) = default;

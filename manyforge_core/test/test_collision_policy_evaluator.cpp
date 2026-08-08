@@ -148,6 +148,26 @@ TEST(CollisionPolicyEvaluator,
   EXPECT_FALSE(out.decision.accepted);
 }
 
+TEST(ContactGraspPolicy,
+     ExactOwnerResolvedBodyDoesNotMatchSameRoleOnAnotherComponent) {
+  ContactGraspPolicyEntry policy;
+  policy.policy_id = "contact_grasp.bound.test";
+  policy.selected_object_id = "part";
+  policy.allowed_robot_links = {
+      "component/tool_a/model/gripper/body/finger_left/collision/0"};
+  policy.max_penetration_m = 0.002;
+  policy.terminal_window_start_fraction = 0.75;
+
+  EXPECT_TRUE(contact_grasp_pair_matches(
+      pair("component/tool_a/model/gripper/body/finger_left/collision/0",
+           "scene/part/shape/0"),
+      policy));
+  EXPECT_FALSE(contact_grasp_pair_matches(
+      pair("component/tool_b/model/gripper/body/finger_left/collision/0",
+           "scene/part/shape/0"),
+      policy));
+}
+
 // --- Support-contact state machine -----------------------------------------
 
 CollisionPolicySnapshot make_support_contact_policy(

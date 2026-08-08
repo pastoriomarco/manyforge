@@ -12,6 +12,7 @@
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
 #include <manyforge_core/execution_kernel.hpp>
+#include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
@@ -531,6 +532,8 @@ public:
   std::int64_t lease_inventory_captured_at_ns = 0;
   std::uint64_t lease_topology_epoch = 1;
   std::uint64_t lease_policy_epoch = 1;
+  ProjectionRevisionDTO lease_projection_revision = test_projection_revision();
+  std::shared_ptr<const LogicalSceneSnapshotDTO> current_logical_scene;
   std::vector<SceneSnapshotLiveObject> lease_live_objects;
   mutable std::atomic<int> lease_inventory_call_count{0};
   mutable std::atomic<int> lease_retain_call_count{0};
@@ -618,9 +621,11 @@ private:
   make_lease_inventory(ProjectionLeaseId projection_lease_id) const {
     CollisionWorldLeaseInventory inventory;
     inventory.projection_binding = ProjectionLeaseBindingDTO{
-        test_projection_revision(), std::move(projection_lease_id)};
-    inventory.logical_scene =
-        testing::make_test_logical_scene(inventory.projection_binding);
+        lease_projection_revision, std::move(projection_lease_id)};
+    inventory.logical_scene = current_logical_scene
+                                  ? current_logical_scene
+                                  : testing::make_test_logical_scene(
+                                        inventory.projection_binding);
     inventory.captured_at_ns = lease_inventory_captured_at_ns;
     inventory.bundle = {snapshot(), current_policy};
     inventory.topology_epoch = lease_topology_epoch;
@@ -2096,6 +2101,25 @@ void install_mock_contact_grasp_world(
       std::make_shared<const CollisionWorldSnapshot>(std::move(snapshot));
 }
 
+void install_mock_detached_logical_object(
+    MockCollisionWorldPublisher &publisher, const std::string &object_id) {
+  const ProjectionLeaseBindingDTO binding{
+      publisher.lease_projection_revision,
+      ProjectionLeaseId("mock_contact_grasp_lease")};
+  auto scene = *testing::make_test_logical_scene(binding);
+  scene.objects = {SceneObjectSnapshotDTO{
+      SceneResourceId(object_id),
+      {BoxShapeDTO{Vector3DTO{0.1, 0.1, 0.1}}},
+      CellFixedSceneObjectPlacementDTO{scene.cell_id, make_test_pose()},
+      std::nullopt,
+      {}}};
+  scene.revision.content_hash =
+      logical_scene_identity::ComputeLogicalSceneContentHash(scene);
+  publisher.lease_projection_revision.scene_revision = scene.revision;
+  publisher.current_logical_scene =
+      std::make_shared<const LogicalSceneSnapshotDTO>(std::move(scene));
+}
+
 CollisionWorldBody make_dynamic_test_body(std::int64_t source_timestamp_ns,
                                           std::int64_t freshness_budget_ns) {
   CollisionWorldBody body;
@@ -2600,6 +2624,54 @@ TEST_F(ExecutionKernelTest, Execute_RejectsNonPositivePlanningTimeout) {
             "invalid_planning_timeout");
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
   EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       MotionPreviewUsesExplicitStartAndDoesNotDispatchOrMutateLifecycle) {
+  auto inventory =
+      collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory.has_value());
+  RobotStateDTO explicit_start{{"j1", "j2"}, {0.0, 0.0}, {}};
+  context.current_state_value.positions_rad = {0.4, 0.5};
+  context.next_fk = make_pose(0.1, 0.2, 0.3);
+
+  auto result = kernel.preview_motion(
+      make_test_request("non_dispatch_preview"), std::move(*inventory),
+      explicit_start, 7U);
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(planner.last_request.planning_attempt_index, 7U);
+  EXPECT_EQ(planner.last_request.start_state.positions[0],
+            CoordinatePositionDTO{AngularPositionDTO{0.0}});
+  EXPECT_EQ(planner.last_request.start_state.positions[1],
+            CoordinatePositionDTO{AngularPositionDTO{0.0}});
+  EXPECT_EQ(context.last_expand_trajectory.resources,
+            make_test_trajectory().resources);
+  EXPECT_EQ(context.last_expand_trajectory.joint_names,
+            make_test_trajectory().joint_names);
+  ASSERT_EQ(context.last_expand_trajectory.waypoints.size(), 2U);
+  EXPECT_EQ(context.last_expand_trajectory.waypoints.front().positions_rad,
+            std::vector<double>({0.0, 0.0}));
+  EXPECT_EQ(context.last_expand_trajectory.waypoints.back().positions_rad,
+            std::vector<double>({1.0, 1.0}));
+  EXPECT_EQ(result.value().start_state.joint_names,
+            explicit_start.joint_names);
+  EXPECT_EQ(result.value().start_state.positions_rad,
+            explicit_start.positions_rad);
+  EXPECT_EQ(result.value().start_state.velocities_rad_s,
+            explicit_start.velocities_rad_s);
+  EXPECT_EQ(result.value().final_state.joint_names,
+            std::vector<std::string>({"j1", "j2"}));
+  EXPECT_EQ(result.value().final_state.positions_rad,
+            std::vector<double>({1.0, 1.0}));
+  EXPECT_EQ(result.value().final_tcp_pose, context.next_fk);
+  const ProjectionLeaseBindingDTO expected_projection_binding{
+      test_projection_revision(), ProjectionLeaseId("mock_current_lease")};
+  EXPECT_EQ(result.value().projection_binding, expected_projection_binding);
+  EXPECT_EQ(cache.size(), 0U);
 }
 
 TEST_F(ExecutionKernelTest, Execute_RejectsNonPositiveExecutionTimeout) {
@@ -10614,6 +10686,58 @@ TEST_F(
             violation->details.end());
   EXPECT_EQ(violation->details.find("current_penetration_m"),
             violation->details.end());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ResolvedContactGraspInstallsExactEphemeralPolicy) {
+  configure_authoritative_collision_validation(
+      kernel, collision_world_publisher, collision_engine);
+  install_mock_contact_grasp_world(collision_world_publisher, "graspable",
+                                   {"right_finger", "left_finger"});
+  install_mock_detached_logical_object(collision_world_publisher,
+                                       "graspable");
+
+  const CollisionBodyId allowed_body(
+      "component/arm/model/arm_model/body/right_finger/collision/0");
+  auto request = make_test_request("resolved_contact_grasp");
+  request.contact_policy_id = "pick_grasp";
+  request.runtime_object_bindings = {
+      RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
+                                       SceneResourceId("graspable")}};
+  request.resolved_contact_grasp = ResolvedContactGraspBindingDTO{
+      ContactPolicyId("pick_grasp"), ContactPolicyRevision(kTestDigestA),
+      RuntimeObjectId("selected_object"), SceneResourceId("graspable"),
+      {allowed_body}, 0.002, 0.75};
+
+  const auto result = execute_sync(request);
+  ASSERT_TRUE(result.ok())
+      << result.error().code << ": " << result.error().message;
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  ASSERT_TRUE(planner.last_request.contact_policy_id.has_value());
+  EXPECT_EQ(planner.last_request.contact_policy_id->rfind(
+                "contact_grasp.bound.", 0),
+            0U);
+  ASSERT_TRUE(planner.last_request.retained_collision_policy);
+  const auto &effective_policy =
+      *planner.last_request.retained_collision_policy;
+  ASSERT_EQ(effective_policy.contact_grasps.size(), 1U);
+  const auto &grasp = effective_policy.contact_grasps.front();
+  EXPECT_EQ(grasp.policy_id, *planner.last_request.contact_policy_id);
+  EXPECT_EQ(grasp.selected_object_id, "graspable");
+  EXPECT_EQ(grasp.allowed_robot_links,
+            std::vector<std::string>{allowed_body});
+  EXPECT_DOUBLE_EQ(grasp.max_penetration_m, 0.002);
+  EXPECT_DOUBLE_EQ(grasp.terminal_window_start_fraction, 0.75);
+
+  ASSERT_TRUE(collision_world_publisher.current_policy.has_value());
+  EXPECT_TRUE(collision_world_publisher.current_policy->contact_grasps.empty())
+      << "operation-local binding must not mutate configured policy";
+  ASSERT_TRUE(collision_world_publisher.current_logical_scene);
+  ASSERT_EQ(collision_world_publisher.current_logical_scene->objects.size(),
+            1U);
+  EXPECT_TRUE(std::holds_alternative<CellFixedSceneObjectPlacementDTO>(
+      collision_world_publisher.current_logical_scene->objects.front()
+          .placement));
 }
 
 TEST_F(ExecutionKernelTest,

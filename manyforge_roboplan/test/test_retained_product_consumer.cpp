@@ -1780,6 +1780,37 @@ TEST(
       start_snapshot.joint_names,
       start_snapshot.positions,
       start_snapshot.velocities};
+  auto predicted_terminal = controlled_start;
+  ASSERT_FALSE(predicted_terminal.positions.empty());
+  predicted_terminal.positions.front() = core::AngularPositionDTO{0.35};
+  const core::CandidateSceneFrameResolutionQueryDTO candidate_query{
+      query.selector, projection_binding, predicted_terminal};
+  const auto predicted =
+      resolver->ResolveCandidate(candidate_query, logical_scene.shared(), 20);
+  ASSERT_TRUE(predicted.ok()) << predicted.error().message;
+  ASSERT_TRUE(predicted.value().predicted_state_digest.has_value());
+  EXPECT_EQ(*predicted.value().predicted_state_digest,
+            core::ComputeCandidateStateEvidenceDigest(predicted_terminal));
+  EXPECT_EQ(predicted.value().kinematic_state_path_view.view_digest,
+            moved.value().kinematic_state_path_view.view_digest);
+  EXPECT_FALSE(predicted.value().frame_pose_in_cell ==
+               moved.value().frame_pose_in_cell);
+  const auto unchanged_after_candidate =
+      resolver->Resolve(query, logical_scene.shared(), 20);
+  ASSERT_TRUE(unchanged_after_candidate.ok())
+      << unchanged_after_candidate.error().message;
+  EXPECT_EQ(unchanged_after_candidate.value(), moved.value());
+
+  auto foreign_predicted = predicted_terminal;
+  foreign_predicted.control_binding_id =
+      core::ControlBindingId("foreign-binding");
+  const auto rejected_foreign = resolver->ResolveCandidate(
+      core::CandidateSceneFrameResolutionQueryDTO{
+          query.selector, projection_binding, foreign_predicted},
+      logical_scene.shared(), 20);
+  ASSERT_FALSE(rejected_foreign.ok());
+  EXPECT_EQ(rejected_foreign.error().details.at("reason"),
+            "candidate_state_binding_unavailable");
   auto reference_scene = make_collision_scene_snapshot(
       materialized.bundle->value().cell_graph.cell_id, 2U,
       core::SceneResourceId("reference-object"), 0.4, 0.05);
@@ -2771,6 +2802,37 @@ TEST(RetainedProductCrossConsumer,
       core::ContentDigest(std::string(kZeroDigest)),
       core::ResolvedUpsertSceneObjectDTO{second_object},
       core::ContentDigest(std::string(kZeroDigest))};
+
+  const auto candidate_policy = projection->ProjectEffectiveCollisionPolicy(
+      candidate_scene, candidate_scene.revision.revision_id);
+  ASSERT_TRUE(candidate_policy.ok()) << candidate_policy.error().message;
+  const core::SceneCandidatePreviewDTO candidate_preview{
+      core::ContentDigest(std::string(kZeroDigest)),
+      initial_revision,
+      candidate_revision,
+      std::make_shared<const core::LogicalSceneSnapshotDTO>(candidate_scene),
+      core::ResolvedUpsertSceneObjectDTO{second_object},
+      candidate_policy.value(),
+      core::SceneUpdateStatusDTO::kGeometryChanged,
+      core::ContentDigest(std::string(kZeroDigest))};
+  ASSERT_TRUE(candidate_preview.valid());
+  const auto private_candidate = projection->ProjectSceneCandidate(
+      candidate_preview,
+      retained_predecessor.value().projection_binding,
+      core::ProjectionLeaseId("pick-candidate.attach"));
+  ASSERT_TRUE(private_candidate.ok())
+      << private_candidate.error().message;
+  EXPECT_EQ(private_candidate.value().projection_binding.projection_revision,
+            candidate_revision);
+  EXPECT_EQ(private_candidate.value().logical_scene,
+            candidate_preview.logical_scene);
+  ASSERT_NE(private_candidate.value().bundle.world, nullptr);
+  EXPECT_NE(private_candidate.value().bundle.world, predecessor_world);
+  EXPECT_EQ(private_candidate.value().bundle.policy,
+            candidate_policy.value());
+  EXPECT_EQ(private_candidate.value().live_objects.size(), 2U);
+  EXPECT_EQ(*projection->logical_snapshot(), initial_scene);
+  EXPECT_EQ(projection->snapshot(), predecessor_world);
 
   const auto committed = projection->ApplyTransaction(transaction);
   ASSERT_TRUE(committed.presence_valid());

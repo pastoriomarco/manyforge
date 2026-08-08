@@ -12,6 +12,7 @@
 #include <manyforge_core/types/observed_state.hpp>
 #include <manyforge_core/types/plan_request.hpp>
 #include <manyforge_core/types/program_binding.hpp>
+#include <manyforge_core/types/runtime_object_binding.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
 #include <manyforge_core/types/timeouts.hpp>
@@ -82,15 +83,22 @@ struct ResolvedExecutionBindingDTO final {
                          const ResolvedExecutionBindingDTO&) = default;
 };
 
-/// Admission-owned resolution of one Program runtime-object key to the
-/// concrete logical-scene resource selected for this run. Runtime-object keys
-/// are never interpreted as scene-resource ids by convention.
-struct RuntimeObjectReferenceBindingDTO final {
+/// Owner-resolved contact-grasp template plus one public runtime-object
+/// selection. Together with the enclosing `ResolvedExecutionBindingDTO` this
+/// is the complete immutable effective binding; the execution engine validates
+/// it against one retained scene projection before installing an ephemeral
+/// collision-policy entry.
+struct ResolvedContactGraspBindingDTO final {
+  ContactPolicyId contact_policy_id;
+  ContactPolicyRevision contact_policy_revision;
   RuntimeObjectId runtime_object_id;
-  SceneResourceId scene_resource_id;
+  SceneResourceId selected_object_id;
+  std::vector<CollisionBodyId> allowed_robot_body_ids;
+  double max_penetration_m{};
+  double terminal_window_start_fraction{};
 
-  friend bool operator==(const RuntimeObjectReferenceBindingDTO&,
-                         const RuntimeObjectReferenceBindingDTO&) = default;
+  friend bool operator==(const ResolvedContactGraspBindingDTO&,
+                         const ResolvedContactGraspBindingDTO&) = default;
 };
 
 /// Immutable input used by the focused reference resolver to capture all
@@ -209,6 +217,10 @@ struct ExecuteRequestDTO {
   /// `ReferenceDTO::kRuntimeObject`. Empty unless this request names a runtime
   /// object; callers cannot rely on string equality with SceneResourceId.
   std::vector<RuntimeObjectReferenceBindingDTO> runtime_object_bindings;
+  /// Present only when `contact_policy_id` selected a Program-Binding-owned
+  /// geometry-only contact-grasp template. Public callers cannot populate the
+  /// compiled body ids carried by this value.
+  std::optional<ResolvedContactGraspBindingDTO> resolved_contact_grasp;
   /// Per-move bindings that arm `scope_kind == kMove` interrupt
   /// policies for exactly this execute request (spec/260 §2.6 +
   /// spec/210 §3.10). Atomic with dispatch: the kernel arms scopes

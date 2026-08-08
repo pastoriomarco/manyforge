@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -11,6 +12,25 @@
 #include <manyforge_core/types/strong_id.hpp>
 
 namespace manyforge::core {
+
+/// Shared spelling authority for collision-body identities projected from the
+/// retained model map and logical scene. Program Binding, scene projection,
+/// and operation-local policy code must not reproduce these strings.
+[[nodiscard]] inline CollisionBodyId make_component_collision_body_id(
+    const ControllableComponentId& component_id,
+    const ModelInstanceId& model_instance_id,
+    const CollisionBodyRoleId& body_role_id, std::size_t collision_index) {
+  return CollisionBodyId("component/" + component_id.value() + "/model/" +
+                         model_instance_id.value() + "/body/" +
+                         body_role_id.value() + "/collision/" +
+                         std::to_string(collision_index));
+}
+
+[[nodiscard]] inline CollisionBodyId make_scene_collision_body_id(
+    const SceneResourceId& scene_resource_id, std::size_t shape_index) {
+  return CollisionBodyId("scene/" + scene_resource_id.value() + "/shape/" +
+                         std::to_string(shape_index));
+}
 
 /// One collision body present in a `CollisionWorldSnapshot` (spec
 /// §3.8.1, defined by the kernel-architecture sprint

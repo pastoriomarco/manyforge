@@ -23,65 +23,6 @@ bool initial_mutation_source(
          source == core::CollisionWorldMutationSource::kDeploymentApply;
 }
 
-std::vector<core::CollisionWorldBodyFreshness>
-body_freshness(const core::CollisionWorldSnapshot &world) {
-  std::vector<core::CollisionWorldBodyFreshness> result;
-  for (const auto &body : world.bodies) {
-    if (!body.source_id.has_value() && !body.source_timestamp_ns.has_value() &&
-        !body.source_freshness_budget_ns.has_value()) {
-      continue;
-    }
-    result.push_back({
-        body.body_id,
-        body.source_id,
-        body.source_timestamp_ns,
-        body.source_freshness_budget_ns,
-    });
-  }
-  return result;
-}
-
-std::vector<core::SceneSnapshotLiveObject>
-live_objects(const core::LogicalSceneSnapshotDTO &logical_scene,
-             const core::CollisionWorldSnapshot &world) {
-  std::vector<core::SceneSnapshotLiveObject> result;
-  result.reserve(logical_scene.objects.size());
-  for (const auto &object : logical_scene.objects) {
-    core::SceneSnapshotLiveObject live;
-    live.object_id = object.scene_resource_id.value();
-    const std::string body_prefix =
-        "scene/" + object.scene_resource_id.value() + "/shape/";
-    for (const auto &body : world.bodies) {
-      if (body.body_id.starts_with(body_prefix)) {
-        live.collision_body_ids.push_back(body.body_id);
-        live.body_content_hashes.emplace(body.body_id, body.body_content_hash);
-      }
-    }
-    live.object_revision_token =
-        logical_scene.revision.content_hash.value() + "/" + live.object_id;
-    if (const auto *fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
-            &object.placement)) {
-      live.pose = fixed->pose_in_cell;
-      live.declared_role = core::ObservedSceneObjectRole::kStaticObstacle;
-    } else {
-      live.declared_role = core::ObservedSceneObjectRole::kAttachedObject;
-    }
-    if (object.provider_evidence.has_value()) {
-      const auto &evidence = *object.provider_evidence;
-      live.source_id = evidence.provider_instance_id.value() + "@" +
-                       evidence.provider_source_epoch;
-      live.source_timestamp_ns = evidence.source_timestamp_ns;
-      live.source_freshness_budget_ns = evidence.source_freshness_budget_ns;
-      // Leave the declared role contextual: the operation may identify this
-      // exact object as its observed target; otherwise the Kernel treats it as
-      // a snapshot obstacle and still enforces its source freshness.
-      live.declared_role.reset();
-    }
-    result.push_back(std::move(live));
-  }
-  return result;
-}
-
 } // namespace
 
 RetainedCollisionWorldPublisher::RetainedCollisionWorldPublisher(
@@ -226,7 +167,7 @@ RetainedCollisionWorldPublisher::publish_locked(
   core::CollisionWorldPolicySnapshotBundle coherent{
       world_ptr,
       std::move(policy.value()),
-      body_freshness(*world_ptr),
+      projector_.project_body_freshness(*world_ptr),
   };
   auto runtime = core::build_runtime_collision_query_bundle(
       std::move(coherent), runtime_epoch_ + 1U, projection_revision);
@@ -270,7 +211,8 @@ RetainedCollisionWorldPublisher::publish_locked(
       runtime->world, *runtime->policy, runtime->body_freshness};
   next_inventory.topology_epoch = logical_scene.topology_epoch;
   next_inventory.policy_epoch = logical_scene.policy_epoch;
-  next_inventory.live_objects = live_objects(logical_scene, *runtime->world);
+  next_inventory.live_objects =
+      projector_.project_live_objects(logical_scene, *runtime->world);
   auto next_scene_identity = logical_scene.identity();
   std::string next_policy_content_hash =
       policy_changed ? runtime->policy->revision.content_hash

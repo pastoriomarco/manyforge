@@ -1438,6 +1438,138 @@ RetainedPlannerSceneProjection::ResolveSceneFrame(
   }
 }
 
+core::Result<core::SceneFrameResolutionReceiptDTO>
+RetainedPlannerSceneProjection::ResolveCandidateSceneFrame(
+    const core::CandidateSceneFrameResolutionQueryDTO &query) const {
+  std::lock_guard lock(mutex_);
+  if (!query.valid() || !frame_resolver_ ||
+      !HealthyAt(query.projection_binding.projection_revision) ||
+      retained_lease_publishers_.find(
+          query.projection_binding.projection_lease_id) ==
+          retained_lease_publishers_.end()) {
+    return projection_error<core::SceneFrameResolutionReceiptDTO>(
+        "candidate scene-frame query does not name one retained healthy "
+        "native projection",
+        "native_candidate_scene_frame_lease_unavailable");
+  }
+  std::int64_t now_ns = 0;
+  try {
+    now_ns = clock_();
+  } catch (const std::exception &exception) {
+    return projection_error<core::SceneFrameResolutionReceiptDTO>(
+        "candidate scene-frame resolution clock failed: " +
+            std::string(exception.what()),
+        "native_candidate_scene_frame_clock_failed");
+  } catch (...) {
+    return projection_error<core::SceneFrameResolutionReceiptDTO>(
+        "candidate scene-frame resolution clock failed",
+        "native_candidate_scene_frame_clock_failed");
+  }
+  auto resolved =
+      frame_resolver_->ResolveCandidate(query, logical_snapshot_, now_ns);
+  if (!resolved.ok()) {
+    return core::Result<core::SceneFrameResolutionReceiptDTO>::Err(
+        resolved.error());
+  }
+  try {
+    auto receipt = core::MakeSceneFrameResolutionReceipt(resolved.value());
+    if (!receipt.valid() ||
+        receipt.projection_binding != query.projection_binding ||
+        !receipt.predicted_state_digest.has_value()) {
+      return projection_error<core::SceneFrameResolutionReceiptDTO>(
+          "candidate scene-frame resolver returned foreign, observed, or "
+          "invalid evidence",
+          "native_candidate_scene_frame_receipt_invalid");
+    }
+    return core::Result<core::SceneFrameResolutionReceiptDTO>::Ok(
+        std::move(receipt));
+  } catch (const std::exception &exception) {
+    return projection_error<core::SceneFrameResolutionReceiptDTO>(
+        "candidate scene-frame receipt construction failed: " +
+            std::string(exception.what()),
+        "native_candidate_scene_frame_receipt_invalid");
+  }
+}
+
+core::Result<core::CollisionWorldLeaseInventory>
+RetainedPlannerSceneProjection::ProjectSceneCandidate(
+    const core::SceneCandidatePreviewDTO &candidate,
+    const core::ProjectionLeaseBindingDTO &predecessor_binding,
+    core::ProjectionLeaseId candidate_lease_id) const {
+  std::lock_guard lock(mutex_);
+  if (!candidate.valid() || !predecessor_binding.valid() ||
+      candidate_lease_id.empty() ||
+      candidate.prior_projection_revision !=
+          predecessor_binding.projection_revision ||
+      !HealthyAt(candidate.prior_projection_revision) ||
+      retained_lease_publishers_.find(
+          predecessor_binding.projection_lease_id) ==
+          retained_lease_publishers_.end()) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "scene candidate does not descend from one retained healthy native "
+        "projection",
+        "native_scene_candidate_predecessor_unavailable");
+  }
+
+  std::int64_t now_ns = 0;
+  try {
+    now_ns = clock_();
+  } catch (const std::exception &exception) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "scene-candidate projection clock failed: " +
+            std::string(exception.what()),
+        "native_scene_candidate_clock_failed");
+  } catch (...) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "scene-candidate projection clock failed",
+        "native_scene_candidate_clock_failed");
+  }
+
+  auto policy = projector_.project_effective_policy(
+      *candidate.logical_scene,
+      candidate.effective_collision_policy.revision.revision_id);
+  if (!policy.ok() ||
+      policy.value() != candidate.effective_collision_policy) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "scene candidate effective policy differs from the exact retained "
+        "projector",
+        "native_scene_candidate_policy_mismatch");
+  }
+  const std::string publisher_id =
+      "candidate-" +
+      candidate.proposed_projection_revision.scene_revision.content_hash
+          .value()
+          .substr(0U, 23U) +
+      "-" + candidate.request_digest.value().substr(7U, 8U);
+  auto world = projector_.project(
+      *candidate.logical_scene,
+      candidate.proposed_projection_revision.scene_revision.revision_id,
+      now_ns, publisher_id);
+  if (!world.ok()) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "scene-candidate collision projection failed: " +
+            world.error().message,
+        "native_scene_candidate_projection_failed");
+  }
+  auto world_snapshot =
+      std::make_shared<const core::CollisionWorldSnapshot>(
+          std::move(world.value()));
+  core::CollisionWorldLeaseInventory inventory;
+  inventory.projection_binding = {
+      candidate.proposed_projection_revision, std::move(candidate_lease_id)};
+  inventory.logical_scene = candidate.logical_scene;
+  inventory.captured_at_ns = now_ns;
+  inventory.bundle = {
+      world_snapshot, std::move(policy.value()),
+      projector_.project_body_freshness(*world_snapshot)};
+  inventory.topology_epoch = candidate.logical_scene->topology_epoch;
+  inventory.policy_epoch = candidate.logical_scene->policy_epoch;
+  inventory.live_objects = projector_.project_live_objects(
+      *candidate.logical_scene, *world_snapshot);
+  return core::Result<core::CollisionWorldLeaseInventory>::Ok(
+      std::move(inventory));
+}
+
 core::Result<core::CollisionPolicySnapshot>
 RetainedPlannerSceneProjection::ProjectEffectiveCollisionPolicy(
     const core::LogicalSceneSnapshotDTO &logical_scene,

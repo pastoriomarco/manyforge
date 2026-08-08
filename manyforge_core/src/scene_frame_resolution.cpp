@@ -94,6 +94,79 @@ template <typename Id>
                                                           CanonicalValue(pose.position_m.z_m)})}});
 }
 
+[[nodiscard]] CanonicalValue coordinate_position_value(
+    const CoordinatePositionDTO& position) {
+  if (const auto* angular = std::get_if<AngularPositionDTO>(&position)) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"kind", text("angular_rad")},
+        {"value_rad", CanonicalValue(angular->value_rad)}});
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"kind", text("linear_m")},
+      {"value_m",
+       CanonicalValue(std::get<LinearPositionDTO>(position).value_m)}});
+}
+
+[[nodiscard]] CanonicalValue coordinate_velocity_value(
+    const CoordinateVelocityDTO& velocity) {
+  if (const auto* angular = std::get_if<AngularVelocityDTO>(&velocity)) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"kind", text("angular_rad_s")},
+        {"value_rad_s", CanonicalValue(angular->value_rad_s)}});
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"kind", text("linear_m_s")},
+      {"value_m_s",
+       CanonicalValue(std::get<LinearVelocityDTO>(velocity).value_m_s)}});
+}
+
+[[nodiscard]] CanonicalValue controlled_state_value(
+    const ControlledStateDTO& state) {
+  CanonicalValue::Array resources;
+  resources.reserve(state.resources.size());
+  for (const auto& resource : state.resources) {
+    resources.push_back(id(resource));
+  }
+  CanonicalValue::Array joint_names;
+  joint_names.reserve(state.joint_names.size());
+  for (const auto& joint_name : state.joint_names) {
+    joint_names.push_back(text(joint_name));
+  }
+  CanonicalValue::Array positions;
+  positions.reserve(state.positions.size());
+  for (const auto& position : state.positions) {
+    positions.push_back(coordinate_position_value(position));
+  }
+  CanonicalValue velocities(nullptr);
+  if (state.velocities.has_value()) {
+    CanonicalValue::Array values;
+    values.reserve(state.velocities->size());
+    for (const auto& velocity : *state.velocities) {
+      values.push_back(coordinate_velocity_value(velocity));
+    }
+    velocities = CanonicalValue(std::move(values));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"active_control_configuration_generation",
+       text(std::to_string(
+           state.active_control_configuration_generation.value()))},
+      {"active_control_configuration_id",
+       id(state.active_control_configuration_id)},
+      {"command_target_id", id(state.command_target_id)},
+      {"controllable_component_id", id(state.controllable_component_id)},
+      {"control_binding_id", id(state.control_binding_id)},
+      {"control_binding_revision", id(state.control_binding_revision)},
+      {"control_domain_id", id(state.control_domain_id)},
+      {"control_domain_revision", id(state.control_domain_revision)},
+      {"controller_topology_id", id(state.controller_topology_id)},
+      {"control_route_id", id(state.control_route_id)},
+      {"joint_names", CanonicalValue(std::move(joint_names))},
+      {"positions", CanonicalValue(std::move(positions))},
+      {"resources", CanonicalValue(std::move(resources))},
+      {"topology_revision", id(state.topology_revision)},
+      {"velocities", std::move(velocities)}});
+}
+
 [[nodiscard]] CanonicalValue projection_binding_value(const ProjectionLeaseBindingDTO& binding) {
   return CanonicalValue(CanonicalValue::Object{
       {"graph_revision", id(binding.projection_revision.graph_revision)},
@@ -133,6 +206,15 @@ bool SceneFrameResolutionQueryDTO::valid() const noexcept {
   return selector_valid(selector) && projection_binding.valid();
 }
 
+bool CandidateSceneFrameResolutionQueryDTO::valid() const noexcept {
+  try {
+    return selector_valid(selector) && projection_binding.valid() &&
+           validate_controlled_state(predicted_state).ok();
+  } catch (...) {
+    return false;
+  }
+}
+
 bool SceneFrameResolutionContextDTO::valid() const noexcept {
   return projection_binding.valid() && logical_scene != nullptr && logical_scene->locally_valid() &&
          logical_scene->revision == projection_binding.projection_revision.scene_revision &&
@@ -155,6 +237,8 @@ bool ResolvedSceneFramePoseDTO::valid() const noexcept {
       kinematic_state_path_view.query.graph_revision !=
           projection_binding.projection_revision.graph_revision ||
       !IsExactLowercaseSha256Digest(kinematic_state_path_view.view_digest.value()) ||
+      (predicted_state_digest.has_value() &&
+       !IsExactLowercaseSha256Digest(predicted_state_digest->value())) ||
       !IsExactLowercaseSha256Digest(resolution_evidence_digest.value())) {
     return false;
   }
@@ -169,6 +253,8 @@ bool SceneFrameResolutionReceiptDTO::valid() const noexcept {
   return projection_binding.valid() && resolved_frame_valid(resolved_frame) &&
          finite_pose(frame_pose_in_cell) &&
          canonical_attachment_revisions(component_attachment_revisions) &&
+         (!predicted_state_digest.has_value() ||
+          IsExactLowercaseSha256Digest(predicted_state_digest->value())) &&
          IsExactLowercaseSha256Digest(resolution_evidence_digest.value());
 }
 
@@ -179,7 +265,19 @@ SceneFrameResolutionReceiptDTO MakeSceneFrameResolutionReceipt(
   }
   return {resolution.resolved_frame, resolution.frame_pose_in_cell,
           resolution.component_attachment_revisions, resolution.projection_binding,
+          resolution.predicted_state_digest,
           resolution.resolution_evidence_digest};
+}
+
+ContentDigest ComputeCandidateStateEvidenceDigest(
+    const ControlledStateDTO& state) {
+  if (!validate_controlled_state(state).ok()) {
+    throw std::invalid_argument(
+        "candidate controlled-state evidence is invalid");
+  }
+  return ContentDigest(content_identity::framed_sha256(
+      "manyforge.candidate_controlled_state",
+      "manyforge.candidate_controlled_state.v1", controlled_state_value(state)));
 }
 
 ContentDigest ComputeSceneFrameResolutionEvidenceDigest(
@@ -189,10 +287,12 @@ ContentDigest ComputeSceneFrameResolutionEvidenceDigest(
       !canonical_attachment_revisions(resolution.component_attachment_revisions) ||
       resolution.kinematic_path.terminal_frame != resolution.resolved_frame ||
       resolution.kinematic_state_path_view.query.frame_path != resolution.kinematic_path ||
-      !IsExactLowercaseSha256Digest(resolution.kinematic_state_path_view.view_digest.value())) {
+      !IsExactLowercaseSha256Digest(resolution.kinematic_state_path_view.view_digest.value()) ||
+      (resolution.predicted_state_digest.has_value() &&
+       !IsExactLowercaseSha256Digest(resolution.predicted_state_digest->value()))) {
     throw std::invalid_argument("scene-frame resolution evidence input is incomplete");
   }
-  const CanonicalValue value(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"component_attachment_revisions",
        [&] {
          CanonicalValue::Array revisions;
@@ -201,11 +301,16 @@ ContentDigest ComputeSceneFrameResolutionEvidenceDigest(
            revisions.push_back(id(revision));
          }
          return CanonicalValue(std::move(revisions));
-       }()},
+      }()},
       {"frame_pose_in_cell", pose_value(resolution.frame_pose_in_cell)},
       {"kinematic_state_view_digest", id(resolution.kinematic_state_path_view.view_digest)},
       {"projection_binding", projection_binding_value(resolution.projection_binding)},
-      {"resolved_frame", resolved_frame_value(resolution.resolved_frame)}});
+      {"resolved_frame", resolved_frame_value(resolution.resolved_frame)}};
+  if (resolution.predicted_state_digest.has_value()) {
+    fields.emplace_back("predicted_state_digest",
+                        id(*resolution.predicted_state_digest));
+  }
+  const CanonicalValue value(std::move(fields));
   return ContentDigest(content_identity::framed_sha256(
       "manyforge.scene_frame_resolution", "manyforge.scene_frame_resolution.v1", value));
 }
