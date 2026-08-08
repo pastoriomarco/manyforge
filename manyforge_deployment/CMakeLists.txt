@@ -585,6 +585,16 @@ target_link_libraries(
   manyforge_emit_build_qualified_admission_profile PRIVATE
   manyforge::deployment)
 
+add_executable(
+  manyforge_program_revision
+  tools/program_revision.cpp)
+target_include_directories(
+  manyforge_program_revision PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(
+  manyforge_program_revision PRIVATE
+  manyforge::deployment_verification_core)
+
 set(
   MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER
   "${CMAKE_CURRENT_BINARY_DIR}/generated/build_qualified_admission_profile_generated.hpp")
@@ -678,6 +688,24 @@ if(BUILD_TESTING)
       "-DMANYFORGE_TEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/multi_config_rejection"
       -P
       "${CMAKE_CURRENT_SOURCE_DIR}/test/reject_multi_config.cmake")
+
+  add_test(
+    NAME ProgramRevisionAuthoringTool
+    COMMAND
+      "${CMAKE_COMMAND}"
+      "-DMANYFORGE_PROGRAM_REVISION_TOOL=$<TARGET_FILE:manyforge_program_revision>"
+      "-DMANYFORGE_TEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/program_revision_tool"
+      -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/program_revision_tool.cmake")
+
+  add_test(
+    NAME MaintainedProgramSourceRevisions
+    COMMAND
+      "${CMAKE_COMMAND}"
+      "-DMANYFORGE_PROGRAM_REVISION_TOOL=$<TARGET_FILE:manyforge_program_revision>"
+      "-DMANYFORGE_WORKSPACE_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/.."
+      -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/maintained_program_source_revisions.cmake")
 
   function(manyforge_try_public_header result_variable source_file)
     unset(${result_variable} CACHE)

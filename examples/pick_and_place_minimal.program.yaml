@@ -1,59 +1,100 @@
-api_version: manyforge.program.v0
-program_profile: v0.1
+api_version: manyforge.program.v1
+program_id: pick_and_place_minimal
+program_revision: sha256:5c5cbd7051b279456fc74b387fd37e77bc8e2f475b41e0224bd09518ba749143
+program_profile: composable-cell-v1
 name: pick_and_place_minimal
 description: >-
-  Minimal smoke program for the ur5-simple-pick-place launcher scenario: one
-  joint-goal move plus a scene edit. Owned by examples/ so the launcher does
-  not depend on test fixtures (which stay pinned to v0.0 for the behavior
-  suite, while shipped deployments declare v0.1 and profile match is exact).
+  Minimal smoke Program for the ur5-simple-pick-place scenario: one
+  target-scoped source-joint move followed by removal of one declared scene
+  resource.
+catalog:
+  api_version: manyforge.node_catalog.v2
+  content_version: 1.1.0
 compatibility:
   lanes: [manyforge-only]
   assistant: forbidden
   requires: []
-  tags: [smoke, pick-and-place, ur5]
-catalog_version: "0.5.0"
-
-robot:
-  robot_id: ur5
-  group_id: arm
-  base_frame: base_link
-  tcp_frame: tool0
-
+  tags: [pick-and-place, smoke, ur5]
+component_roles:
+  robot:
+    required_component_type_tags: [articulated-arm]
+    required_model_roles: [arm_model]
+target_roles:
+  arm:
+    component_role: robot
+    required_capabilities:
+      - capability_id: execution.feedback.phase_events
+        parameters: {}
+        disposition: required
+      - capability_id: execution.trajectory.execute
+        parameters: {}
+        disposition: required
+      - capability_id: planning.motion.joint_goal
+        parameters: {}
+        disposition: required
+      - capability_id: planning.profile.balanced
+        parameters: {}
+        disposition: required
+      - capability_id: planning.trajectory.time_parameterized
+        parameters: {}
+        disposition: required
+      - capability_id: state.observed.current
+        parameters: {}
+        disposition: required
+      - capability_id: validation.trajectory.non_collision
+        parameters: {}
+        disposition: required
+    required_frame_roles: [base, tcp]
+    required_resource_roles: [arm_joints]
+    required_collision_body_roles: [arm_collision]
+    required_model_roles: [arm_model]
 scene:
-  - object_id: table
+  - scene_resource_id: table
     shape:
       type: box
       box_dimensions_m: [1.0, 0.6, 0.02]
     pose:
-      frame_id: base_link
+      frame_ref:
+        kind: component_frame
+        component_role: robot
+        model_role: arm_model
+        frame_role: base
       position_m: [0.5, 0.0, 0.4]
-      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
-
+      orientation: {xyzw: [0.0, 0.0, 0.0, 1.0]}
 parameters:
-  - name: pick_velocity_scale
-    type: float
+  - parameter_id: pick_velocity_scale
+    type: float64
     default: 0.5
-    constraints:
-      min_exclusive: 0.0
-      max_inclusive: 1.0
-    description: Velocity scale for pick moves.
-
+    constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+    runtime_mutability: before_run
+    description: Velocity scale for the pick move.
 tree:
-  id: sequence
-  name: main_sequence
+  node_id: sequence
+  instance_id: main_sequence
+  parameters: {}
   children:
-    - id: move_manipulator_action
-      name: move_to_pick
-      params:
-        move_id: pick_approach
-        motion_type: joint
-        joint_goal_names: [j1, j2, j3, j4, j5, j6]
-        joint_goal_positions_rad: [0.2, -1.2, 1.0, -1.5, -1.3, 0.4]
-        velocity_scale: "${param:pick_velocity_scale}"
+    - node_id: motion.move_to_joint_target
+      instance_id: move_to_pick
+      parameters:
+        target_role: arm
+        base_frame_role: base
+        tcp_frame_role: tcp
+        goal:
+          - {joint_name: shoulder_pan_joint, position_rad: 0.2}
+          - {joint_name: shoulder_lift_joint, position_rad: -1.2}
+          - {joint_name: elbow_joint, position_rad: 1.0}
+          - {joint_name: wrist_1_joint, position_rad: -1.5}
+          - {joint_name: wrist_2_joint, position_rad: -1.3}
+          - {joint_name: wrist_3_joint, position_rad: 0.4}
         planning_timeout_s: 2.0
         execution_timeout_s: 10.0
-
-    - id: remove_collision_object
-      name: remove_table
-      params:
-        object_id: table
+      value_sources:
+        velocity_scale:
+          kind: program_parameter
+          reference: pick_velocity_scale
+      children: []
+    - node_id: scene.remove_object
+      instance_id: remove_table
+      parameters:
+        scene_resource_id: table
+      children: []

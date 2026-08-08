@@ -1,313 +1,393 @@
-api_version: manyforge.program.v0
-program_profile: v0.1
+api_version: manyforge.program.v1
+program_id: semantic_shape_pick
+program_revision: sha256:116c69affc4855cf9a30df6fc4001f7f75da0dfc26f0f088d2feaccc0f8684c3
+program_profile: composable-cell-v1
 name: semantic_shape_pick
 description: >-
-  Semantic object-selection demo. A deterministic node builds an
-  authoritative scene-selection context from backend scene data, the model
-  selects one candidate using that manifest, and a deterministic validation
-  node confirms the selection before planning a pick sequence. The planner
-  validates current->approach, approach->pick, and pick->approach; later
-  place logic stays outside the planner.
+  Semantic object-selection demo. Deterministic nodes build and validate a
+  retained scene-selection context around one bounded model request. A C++
+  planning preview supplies portable approach, pick, and retreat poses; the
+  original explicit motion, logical gripper, carried-object, and place sequence
+  remains visible in the Program.
+catalog:
+  api_version: manyforge.node_catalog.v2
+  content_version: 1.1.0
 compatibility:
   lanes: [manyforge-only]
   assistant: required
   requires: [semantic_shape_inference]
   tags: [semantic-pick, ur5]
-catalog_version: "0.5.0"
-
-robot:
-  robot_id: ur5
-  group_id: arm
-  base_frame: base_link
-  tcp_frame: tool0
-
+component_roles:
+  robot:
+    required_component_type_tags: [articulated-arm]
+    required_model_roles: [arm_model]
+  tool:
+    required_component_type_tags: [gripper]
+target_roles:
+  arm:
+    component_role: robot
+    required_capabilities:
+      - capability_id: execution.feedback.phase_events
+        parameters: {}
+        disposition: required
+      - capability_id: execution.trajectory.execute
+        parameters: {}
+        disposition: required
+      - capability_id: model.kinematics.fk
+        parameters: {}
+        disposition: required
+      - capability_id: planning.motion.cartesian_path
+        parameters: {}
+        disposition: required
+      - capability_id: planning.motion.pose_goal
+        parameters: {}
+        disposition: required
+      - capability_id: planning.profile.balanced
+        parameters: {}
+        disposition: required
+      - capability_id: planning.profile.first_feasible
+        parameters: {}
+        disposition: required
+      - capability_id: planning.trajectory.time_parameterized
+        parameters: {}
+        disposition: required
+      - capability_id: state.observed.current
+        parameters: {}
+        disposition: required
+      - capability_id: validation.trajectory.non_collision
+        parameters: {}
+        disposition: required
+    required_frame_roles: [base, tcp]
+    required_resource_roles: [arm_joints]
+    required_collision_body_roles: [arm_collision]
+    required_model_roles: [arm_model]
+  gripper:
+    component_role: tool
+    required_capabilities:
+      - capability_id: model.kinematics.fk
+        parameters: {}
+        disposition: required
+      - capability_id: tool.gripper.command
+        parameters: {}
+        disposition: required
+      - capability_id: tool.gripper.feedback
+        parameters: {}
+        disposition: required
+    required_frame_roles: [tcp]
+    required_resource_roles: [fingers]
+    required_collision_body_roles: [gripper_collision]
 scene:
-  - object_id: table
-    shape:
-      type: box
-      box_dimensions_m: [0.8, 0.6, 0.04]
-    pose:
-      frame_id: base_link
-      position_m: [0.45, 0.0, -0.121]
-      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
-
-  - object_id: sphere_part
-    shape:
-      type: sphere
-      sphere_radius_m: 0.01
-    pose:
-      frame_id: base_link
-      position_m: [0.40, -0.14, 0.009]
-      orientation_rpy_deg: [0.0, 0.0, 0.0]
-
-  - object_id: cube_part
+  - scene_resource_id: cube_part
     shape:
       type: box
       box_dimensions_m: [0.02, 0.02, 0.02]
     pose:
-      frame_id: base_link
-      position_m: [0.40, 0.14, 0.009]
-      orientation_rpy_deg: [0.0, 0.0, 0.0]
-
+      frame_ref:
+        kind: component_frame
+        component_role: robot
+        model_role: arm_model
+        frame_role: base
+      position_m: [0.4, 0.14, 0.009]
+      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
+    resource_roles: [pick_candidate]
+  - scene_resource_id: sphere_part
+    shape:
+      type: sphere
+      sphere_radius_m: 0.01
+    pose:
+      frame_ref:
+        kind: component_frame
+        component_role: robot
+        model_role: arm_model
+        frame_role: base
+      position_m: [0.4, -0.14, 0.009]
+      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
+    resource_roles: [pick_candidate]
+  - scene_resource_id: table
+    shape:
+      type: box
+      box_dimensions_m: [0.8, 0.6, 0.04]
+    pose:
+      frame_ref:
+        kind: component_frame
+        component_role: robot
+        model_role: arm_model
+        frame_role: base
+      position_m: [0.45, 0.0, -0.121]
+      orientation: {xyzw: [0.0, 0.0, 0.0, 1.0]}
 blackboard:
   namespaces:
-    - id: selection_context
-      contract: selection_context_v1
-      prefix: selection/context
-      description: Structured scene-selection context bundle.
-      fields:
-        - name: selection_request_text
-          type: string
-        - name: candidate_object_ids
-          type: string_list
-        - name: scene_context_json
-          type: string
-    - id: object_selection
-      contract: query_model_output_v1
-      prefix: perception/object_selection
-      description: QueryModel response namespace for object selection.
-      fields:
-        - name: outcome
-          type: string
-        - name: selected_object_id
-          type: string
-        - name: matched_attributes
-          type: string_list
-        - name: confidence
-          type: float
-        - name: reason
-          type: string
-    - id: validated_selection
-      contract: validated_selection_v1
-      prefix: selection/validated
-      description: Deterministically validated selection bundle.
-      fields:
-        - name: outcome
-          type: string
-        - name: selected_object_id
-          type: string
-        - name: matched_attributes
-          type: string_list
-        - name: confidence
-          type: float
-        - name: reason
-          type: string
-    - id: pick_plan
-      contract: pick_plan_v1
-      prefix: planning/pick_plan
-      description: Planned pick approach and pick poses.
-      fields:
-        - name: selected_object_id
-          type: string
-        - name: approach_pose
-          type: pose
-        - name: pick_pose
-          type: pose
-        - name: retreat_pose
-          type: pose
+    - namespace_id: planning
+      owner: program
+    - namespace_id: selection
+      owner: program
   keys:
-    - id: gripper_closed
+    - key: gripper_closed
       type: bool
-      key: gripper_closed
-      description: Simulated gripper closed/open flag.
-
+      access: read_write
+      persistence: run
+      description: Intentionally simulated gripper closed/open state.
+    - key: planning.pick_plan
+      type: pick_planning_result
+      access: read_write
+      persistence: run
+      fields:
+        - {field: approach_pose, type: stored_pose}
+        - {field: pick_pose, type: stored_pose}
+        - {field: retreat_pose, type: stored_pose}
+        - {field: selected_object_id, type: scene_resource}
+    - key: selected_object
+      type: scene_resource
+      access: read_write
+      persistence: run
+      description: Operation-scoped selected-object binding for contact policy resolution.
+    - key: selection.context
+      type: scene_selection_context
+      access: read_write
+      persistence: run
+      fields:
+        - {field: candidate_object_ids, type: string_list}
+        - {field: scene_context_json, type: string}
+        - {field: selection_request_text, type: string}
+    - key: selection.response
+      type: model_response
+      access: read_write
+      persistence: run
+      fields:
+        - {field: confidence, type: float64}
+        - {field: matched_attributes, type: string_list}
+        - {field: reason, type: string}
+        - {field: selected_object_id, type: scene_resource}
+    - key: selection.validated
+      type: scene_selection_result
+      access: read_write
+      persistence: run
+      fields:
+        - {field: confidence, type: float64}
+        - {field: matched_attributes, type: string_list}
+        - {field: reason, type: string}
+        - {field: selected_object_id, type: scene_resource}
+contact_policies:
+  - api_version: manyforge.contact_policy.v1
+    policy_id: selected_object_grasp
+    version: sha256:13cce018403acdc3768ed8f1e86656fa482cf40aa3a1eb7984cd6c93e9acc47c
+    mode: contact_grasp
+    sensing_mode: geometry_only
+    default_unmatched_response: hard_stop
+    zones:
+      - zone_id: tool_contact
+        body_pairs:
+          - body_a:
+              kind: component_model_body
+              component_role_id: tool
+              collision_body_role_id: gripper_collision
+            body_b:
+              kind: runtime_object
+              runtime_object_id: selected_object
+        violation_response: hard_stop
+        max_penetration_m: 0.002
+        terminal_window_start_fraction: 0.8
 tree:
-  id: sequence
-  name: semantic_shape_pick_cycle
+  node_id: sequence
+  instance_id: semantic_shape_pick_cycle
+  parameters: {}
   children:
-    - id: build_scene_selection_context
-      name: build_selection_context
-      params:
+    - node_id: assistant.build_scene_selection
+      instance_id: build_selection_context
+      parameters:
         selection_request_text: Select the sphere object.
-        output_key_prefix:
-          namespace_ref: selection_context
+        output_key: selection.context
         object_source: backend_scene
         candidate_object_ids: [sphere_part, cube_part]
         image_source: none
-
-    - id: query_model
-      name: choose_scene_object
-      params:
+      children: []
+    - node_id: assistant.query_model
+      instance_id: choose_scene_object
+      parameters:
         model_endpoint_alias: selection_model
         prompt_template_id: select_scene_object_v1
         template_variables:
-          selection_request_text:
-            field_ref:
-              namespace: selection_context
-              field: selection_request_text
-          scene_context_json:
-            field_ref:
-              namespace: selection_context
-              field: scene_context_json
-          candidate_object_ids:
-            field_ref:
-              namespace: selection_context
+          - variable_id: candidate_object_ids
+            source:
+              kind: blackboard_field
+              reference: selection.context
               field: candidate_object_ids
-        output_key_prefix:
-          namespace_ref: object_selection
-        include_scene_snapshot: false
+          - variable_id: scene_context_json
+            source:
+              kind: blackboard_field
+              reference: selection.context
+              field: scene_context_json
+          - variable_id: selection_request_text
+            source:
+              kind: blackboard_field
+              reference: selection.context
+              field: selection_request_text
+        scene_attachment: none
+        output_key: selection.response
         timeout_s: 20.0
-        min_confidence: 0.70
-
-    - id: validate_scene_selection
-      name: validate_selected_object
-      params:
-        selection_context_prefix:
-          namespace_ref: selection_context
-        selection_response_prefix:
-          namespace_ref: object_selection
-        output_key_prefix:
-          namespace_ref: validated_selection
+        min_confidence: 0.7
+      children: []
+    - node_id: assistant.validate_scene_selection
+      instance_id: validate_selected_object
+      parameters:
+        selection_context_key: selection.context
+        selection_response_key: selection.response
+        output_key: selection.validated
         allow_no_match: false
         allow_ambiguous: false
-
-    - id: plan_pick_sequence
-      name: plan_selected_object_pick
-      params:
+      children: []
+    - node_id: planning.plan_pick_sequence
+      instance_id: plan_selected_object_pick
+      parameters:
+        target_role: arm
+        tool_target_role: gripper
+        base_frame_role: base
+        tcp_frame_role: tcp
+        carrier_frame_role: tcp
+        synthesis:
+          pick_offset_envelope:
+            position_min_m: [0.0, 0.0, 0.04]
+            position_max_m: [0.0, 0.0, 0.04]
+            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+          approach_offset_envelope:
+            position_min_m: [0.0, 0.0, 0.05]
+            position_max_m: [0.0, 0.0, 0.1]
+            orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+            orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+          translation_step_m: 0.025
+          rotation_step_deg: 15.0
+          search_strategy: best_cost
+        motion_options:
+          approach_velocity_scale: 0.3
+          descend_velocity_scale: 0.3
+          retreat_velocity_scale: 0.3
+          planning_timeout_s: 5.0
+        tool_position: {kind: linear_m, value_m: 0.0}
+        output_key: planning.pick_plan
+        contact_policy_id: selected_object_grasp
+      value_sources:
         selected_object_id:
-          field_ref:
-            namespace: validated_selection
-            field: selected_object_id
-        output_key_prefix:
-          namespace_ref: pick_plan
-        object_source: backend_scene
-        image_source: none
-        tcp_frame: tool0
-        pick_offset_envelope:
-          position_min_m: [0.0, 0.0, 0.04]
-          position_max_m: [0.0, 0.0, 0.04]
-          orientation_rpy_min_deg: [0.0, 0.0, 0.0]
-          orientation_rpy_max_deg: [0.0, 0.0, 0.0]
-        approach_offset_envelope:
-          position_min_m: [0.0, 0.0, 0.05]
-          position_max_m: [0.0, 0.0, 0.10]
-          orientation_rpy_min_deg: [0.0, 0.0, 0.0]
-          orientation_rpy_max_deg: [0.0, 0.0, 0.0]
-        search_strategy: best_cost_grid
-        translation_step_m: 0.025
-        rotation_step_deg: 15.0
-        planning_timeout_s: 5.0
-        velocity_scale: 0.30
-        approach_move_node_name: move_to_planned_approach_pose
-        pick_move_node_name: move_to_planned_pick_pose
-        retreat_move_node_name: retreat_after_pick
-
-    - id: move_manipulator_action
-      name: move_to_planned_approach_pose
-      params:
-        move_id: planned_pick_approach
-        motion_type: pose
-        pose_goal:
-          field_ref:
-            namespace: pick_plan
-            field: approach_pose
-        velocity_scale: 0.30
-
-    - id: move_manipulator_action
-      name: move_to_planned_pick_pose
-      params:
-        move_id: planned_pick_descend
-        motion_type: pose
-        pose_goal:
-          field_ref:
-            namespace: pick_plan
-            field: pick_pose
-        velocity_scale: 0.20
-
-    - id: set_gripper_state
-      name: close_gripper
-      params:
-        state_key:
-          key_ref: gripper_closed
-        state: closed
-
-    - id: attach_object_to_link
-      name: attach_selected_object
-      params:
-        object_id:
-          field_ref:
-            namespace: pick_plan
-            field: selected_object_id
-        link_frame: tool0
-
-    - id: reset_trajectories
-      name: invalidate_after_attach
-
-    - id: move_manipulator_action
-      name: retreat_after_pick
-      params:
-        move_id: planned_pick_exit
-        motion_type: pose
-        pose_goal:
-          field_ref:
-            namespace: pick_plan
-            field: retreat_pose
-        velocity_scale: 0.30
-
-    - id: move_manipulator_action
-      name: move_to_place_approach
-      params:
-        move_id: planned_place_approach
-        motion_type: pose
+          kind: blackboard_field
+          reference: selection.validated
+          field: selected_object_id
+      children: []
+    - node_id: motion.move_to_pose
+      instance_id: move_to_planned_approach_pose
+      parameters:
+        target_role: arm
+        base_frame_role: base
+        tcp_frame_role: tcp
+        velocity_scale: 0.3
+      value_sources:
+        goal:
+          kind: blackboard_field
+          reference: planning.pick_plan
+          field: approach_pose
+      children: []
+    - node_id: motion.move_to_pose
+      instance_id: move_to_planned_pick_pose
+      parameters:
+        target_role: arm
+        base_frame_role: base
+        tcp_frame_role: tcp
+        velocity_scale: 0.2
+      value_sources:
+        goal:
+          kind: blackboard_field
+          reference: planning.pick_plan
+          field: pick_pose
+      children: []
+    - node_id: logic.set_bool
+      instance_id: close_gripper
+      parameters: {key: gripper_closed, value: true}
+      children: []
+    - node_id: scene.attach_carried_object
+      instance_id: attach_selected_object
+      parameters:
+        target_role: gripper
+        carrier_frame_role: tcp
+        touch_body_roles: [gripper_collision]
+      value_sources:
+        scene_resource_id:
+          kind: blackboard_field
+          reference: planning.pick_plan
+          field: selected_object_id
+      children: []
+    - node_id: motion.move_to_pose
+      instance_id: retreat_after_pick
+      parameters:
+        target_role: arm
+        base_frame_role: base
+        tcp_frame_role: tcp
+        velocity_scale: 0.3
+      value_sources:
+        goal:
+          kind: blackboard_field
+          reference: planning.pick_plan
+          field: retreat_pose
+      children: []
+    - node_id: motion.move_to_pose
+      instance_id: move_to_place_approach
+      parameters:
+        target_role: arm
+        base_frame_role: base
+        tcp_frame_role: tcp
         target_mode: relative
         target_reference:
           type: pose
           pose:
-            position_m: [0.22, 0.0, 0.30]
-            orientation_rpy_deg: [180.0, 0.0, 0.0]
-        offset_reference:
-          type: frame
-          id: base_link
-        pose_goal:
+            frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
+            position_m: [0.22, 0.0, 0.3]
+            orientation: {rpy_deg: [180.0, 0.0, 0.0]}
+        offset_reference: {type: frame_role, frame_role_id: base}
+        goal:
           position_m: [0.0, 0.0, 0.08]
-          orientation_rpy_deg: [180.0, 0.0, 0.0]
-        velocity_scale: 0.30
-
-    - id: move_manipulator_action
-      name: move_to_place_pose
-      params:
-        move_id: planned_place_descend
-        motion_type: pose
-        pose_goal:
-          frame_id: base_link
-          position_m: [0.22, 0.0, 0.30]
-          orientation_rpy_deg: [180.0, 0.0, 0.0]
-        velocity_scale: 0.20
-
-    - id: set_gripper_state
-      name: open_gripper
-      params:
-        state_key:
-          key_ref: gripper_closed
-        state: open
-
-    - id: detach_object_from_link
-      name: detach_selected_object
-      params:
-        object_id:
-          field_ref:
-            namespace: pick_plan
-            field: selected_object_id
-        link_frame: tool0
-
-    - id: reset_trajectories
-      name: invalidate_after_detach
-
-    - id: move_manipulator_action
-      name: retreat_after_place
-      params:
-        move_id: planned_place_retreat
-        motion_type: pose
+          orientation: {rpy_deg: [180.0, 0.0, 0.0]}
+        velocity_scale: 0.3
+      children: []
+    - node_id: motion.move_to_pose
+      instance_id: move_to_place_pose
+      parameters:
+        target_role: arm
+        base_frame_role: base
+        tcp_frame_role: tcp
+        goal:
+          frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
+          position_m: [0.22, 0.0, 0.3]
+          orientation: {rpy_deg: [180.0, 0.0, 0.0]}
+        velocity_scale: 0.2
+      children: []
+    - node_id: logic.set_bool
+      instance_id: open_gripper
+      parameters: {key: gripper_closed, value: false}
+      children: []
+    - node_id: scene.detach_carried_object
+      instance_id: detach_selected_object
+      parameters:
+        target_role: gripper
+      value_sources:
+        scene_resource_id:
+          kind: blackboard_field
+          reference: planning.pick_plan
+          field: selected_object_id
+      children: []
+    - node_id: motion.move_to_pose
+      instance_id: retreat_after_place
+      parameters:
+        target_role: arm
+        base_frame_role: base
+        tcp_frame_role: tcp
         target_mode: relative
         target_reference:
           type: pose
           pose:
-            position_m: [0.22, 0.0, 0.30]
-            orientation_rpy_deg: [180.0, 0.0, 0.0]
-        offset_reference:
-          type: frame
-          id: base_link
-        pose_goal:
+            frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
+            position_m: [0.22, 0.0, 0.3]
+            orientation: {rpy_deg: [180.0, 0.0, 0.0]}
+        offset_reference: {type: frame_role, frame_role_id: base}
+        goal:
           position_m: [0.0, 0.0, 0.08]
-          orientation_rpy_deg: [180.0, 0.0, 0.0]
-        velocity_scale: 0.30
+          orientation: {rpy_deg: [180.0, 0.0, 0.0]}
+        velocity_scale: 0.3
+      children: []

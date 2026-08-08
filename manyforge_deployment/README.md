@@ -122,6 +122,21 @@ build-qualified identity; deterministic and closure verification still run.
 Maintainers reproducing the repository golden directly must configure Release
 with `-DMANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN=ON`.
 
+Maintained `manyforge.program.v1` sources use the C++ authoring target
+`manyforge_program_revision` for their opaque identities. After editing one
+Program, run:
+
+```bash
+manyforge_program_revision --update --input examples/example.program.yaml
+manyforge_program_revision --check --input examples/example.program.yaml
+```
+
+`--update` regenerates embedded contact-policy revisions first and then the
+enclosing `program_revision`, while preserving the human-authored YAML apart
+from those plain digest fields. This command computes and checks identities; it
+does not replace the qualified Program/catalog validator or grant runtime
+admission to a merely parseable source.
+
 The implementation intentionally uses dedicated, qualified libraries for
 strict YAML events, Unicode NFC, ECMAScript-compatible binary64 formatting,
 and SHA-256. Those dependencies remain here rather than entering

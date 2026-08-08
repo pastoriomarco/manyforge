@@ -1,155 +1,297 @@
-api_version: manyforge.program.v0
-program_profile: v0.1
+api_version: manyforge.program.v1
+program_id: vision_guided_bin_pick
+program_revision: sha256:24cce46731d8581b5c91c32cdfaf31c1bd0fd8f6ae4145b2aaefc13d54d429b3
+program_profile: composable-cell-v1
 name: vision_guided_bin_pick
 description: >-
-  Vision-guided pick-and-place example. A `query_model` node captures the live
-  native viewer scene snapshot, asks the configured vision model which of two candidate
-  objects should be picked next, and mirrors the validated decision onto the
-  blackboard. The tree then routes into one of two fixed pick/place sequences.
-catalog_version: "0.5.0"
-
-robot:
-  robot_id: ur5
-  group_id: arm
-  base_frame: base_link
-  tcp_frame: tool0
-
+  Vision-guided pick-and-place Program. A bounded model request selects one of
+  two declared scene resources, an ordered fallback chooses the matching
+  branch, and the C++ pick/place sequence owner receives portable intent for
+  the selected object and a simulated non-model tool target.
+catalog:
+  api_version: manyforge.node_catalog.v2
+  content_version: 1.1.0
+compatibility:
+  lanes: [manyforge-only]
+  assistant: required
+  requires: [vision_pose_inference]
+  tags: [bin-pick, ur5, vision-pick]
+component_roles:
+  robot:
+    required_component_type_tags: [articulated-arm]
+    required_model_roles: [arm_model]
+  tool:
+    required_component_type_tags: [gripper]
+target_roles:
+  arm:
+    component_role: robot
+    required_capabilities:
+      - capability_id: execution.feedback.phase_events
+        parameters: {}
+        disposition: required
+      - capability_id: execution.trajectory.execute
+        parameters: {}
+        disposition: required
+      - capability_id: model.kinematics.fk
+        parameters: {}
+        disposition: required
+      - capability_id: planning.motion.cartesian_path
+        parameters: {}
+        disposition: required
+      - capability_id: planning.motion.pose_goal
+        parameters: {}
+        disposition: required
+      - capability_id: planning.profile.first_feasible
+        parameters: {}
+        disposition: required
+      - capability_id: planning.trajectory.time_parameterized
+        parameters: {}
+        disposition: required
+      - capability_id: state.observed.current
+        parameters: {}
+        disposition: required
+      - capability_id: validation.trajectory.non_collision
+        parameters: {}
+        disposition: required
+    required_frame_roles: [base, tcp]
+    required_resource_roles: [arm_joints]
+    required_collision_body_roles: [arm_collision]
+    required_model_roles: [arm_model]
+  gripper:
+    component_role: tool
+    required_capabilities:
+      - capability_id: tool.gripper.command
+        parameters: {}
+        disposition: required
+      - capability_id: tool.gripper.feedback
+        parameters: {}
+        disposition: required
+    required_frame_roles: [tcp]
+    required_resource_roles: [fingers]
+    required_collision_body_roles: [gripper_collision]
 scene:
-  - object_id: table
+  - scene_resource_id: left_part
+    shape:
+      type: box
+      box_dimensions_m: [0.02, 0.02, 0.02]
+    pose:
+      frame_ref:
+        kind: component_frame
+        component_role: robot
+        model_role: arm_model
+        frame_role: base
+      position_m: [0.4, -0.14, 0.009]
+      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
+    resource_roles: [pick_candidate]
+  - scene_resource_id: right_part
+    shape:
+      type: box
+      box_dimensions_m: [0.02, 0.02, 0.02]
+    pose:
+      frame_ref:
+        kind: component_frame
+        component_role: robot
+        model_role: arm_model
+        frame_role: base
+      position_m: [0.4, 0.14, 0.009]
+      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
+    resource_roles: [pick_candidate]
+  - scene_resource_id: table
     shape:
       type: box
       box_dimensions_m: [0.8, 0.6, 0.04]
     pose:
-      frame_id: base_link
+      frame_ref:
+        kind: component_frame
+        component_role: robot
+        model_role: arm_model
+        frame_role: base
       position_m: [0.45, 0.0, -0.021]
-      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
-
-  - object_id: left_part
-    shape:
-      type: box
-      box_dimensions_m: [0.02, 0.02, 0.02]
-    pose:
-      frame_id: base_link
-      position_m: [0.40, -0.14, 0.009]
-      orientation_rpy_deg: [0.0, 0.0, 0.0]
-
-  - object_id: right_part
-    shape:
-      type: box
-      box_dimensions_m: [0.02, 0.02, 0.02]
-    pose:
-      frame_id: base_link
-      position_m: [0.40, 0.14, 0.009]
-      orientation_rpy_deg: [0.0, 0.0, 0.0]
-
+      orientation: {xyzw: [0.0, 0.0, 0.0, 1.0]}
 blackboard:
   namespaces:
-    - id: pick_target
-      contract: query_model_output_v1
-      prefix: perception/pick_target
-      description: QueryModel target-selection response namespace.
-      fields:
-        - name: pick_left_bin
-          type: bool
-        - name: selected_object_id
-          type: string
-        - name: confidence
-          type: float
-        - name: reason
-          type: string
+    - namespace_id: perception
+      owner: program
   keys:
-    - id: gripper_closed
-      type: bool
-      key: gripper_closed
-      description: Simulated gripper closed/open flag.
-
+    - key: perception.pick_target
+      type: model_response
+      access: read_write
+      persistence: run
+      fields:
+        - {field: confidence, type: float64}
+        - {field: pick_left_bin, type: bool}
+        - {field: reason, type: string}
+        - {field: selected_object_id, type: scene_resource}
+    - key: selected_object
+      type: scene_resource
+      access: read_write
+      persistence: run
+      description: Operation-scoped selected-object binding for contact policy resolution.
+contact_policies:
+  - api_version: manyforge.contact_policy.v1
+    policy_id: selected_object_grasp
+    version: sha256:13cce018403acdc3768ed8f1e86656fa482cf40aa3a1eb7984cd6c93e9acc47c
+    mode: contact_grasp
+    sensing_mode: geometry_only
+    default_unmatched_response: hard_stop
+    zones:
+      - zone_id: tool_contact
+        body_pairs:
+          - body_a:
+              kind: component_model_body
+              component_role_id: tool
+              collision_body_role_id: gripper_collision
+            body_b:
+              kind: runtime_object
+              runtime_object_id: selected_object
+        violation_response: hard_stop
+        max_penetration_m: 0.002
+        terminal_window_start_fraction: 0.8
 tree:
-  id: sequence
-  name: vision_guided_pick_cycle
+  node_id: sequence
+  instance_id: vision_guided_pick_cycle
+  parameters: {}
   children:
-    - id: query_model
-      name: choose_pick_target
-      params:
+    - node_id: assistant.query_model
+      instance_id: choose_pick_target
+      parameters:
         model_endpoint_alias: vision_model
         prompt_template_id: choose_bin_target_v1
-        output_key_prefix:
-          namespace_ref: pick_target
-        include_scene_snapshot: true
+        scene_attachment: snapshot_image
+        output_key: perception.pick_target
+        timeout_s: 5.0
+        min_confidence: 0.7
         scene_snapshot_width: 640
         scene_snapshot_height: 480
         scene_snapshot_format: jpeg
-        timeout_s: 5.0
-        min_confidence: 0.70
-
-    - id: fallback
-      name: execute_selected_pick
+      children: []
+    - node_id: fallback
+      instance_id: execute_selected_pick
+      parameters: {}
       children:
-        - id: sequence
-          name: pick_left_branch
+        - node_id: sequence
+          instance_id: pick_left_branch
+          parameters: {}
           children:
-            - id: check_key_bool_value
-              name: left_was_selected
-              params:
-                key:
-                  field_ref:
-                    namespace: pick_target
-                    field: pick_left_bin
-                expected_value: true
-
-            - id: pick_object
-              name: pick_left_part
-              params:
-                object_id: left_part
-                approach_height_m: 0.08
-                grasp_offset_z_m: 0.0
-                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
-                velocity_scale: 0.4
-                tcp_frame: tool0
-
-            - id: place_object
-              name: place_left_part
-              params:
-                object_id: left_part
+            - node_id: logic.check_bool
+              instance_id: left_was_selected
+              parameters: {expected_value: true}
+              value_sources:
+                actual_value:
+                  kind: blackboard_field
+                  reference: perception.pick_target
+                  field: pick_left_bin
+              children: []
+            - node_id: motion.pick_object
+              instance_id: pick_left_part
+              parameters:
+                target_role: arm
+                tool_target_role: gripper
+                base_frame_role: base
+                tcp_frame_role: tcp
+                carrier_frame_role: tcp
+                selected_object_id: left_part
+                synthesis:
+                  pick_offset_envelope:
+                    position_min_m: [0.0, 0.0, 0.0]
+                    position_max_m: [0.0, 0.0, 0.0]
+                    orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+                    orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+                  approach_offset_envelope:
+                    position_min_m: [0.0, 0.0, 0.08]
+                    position_max_m: [0.0, 0.0, 0.08]
+                    orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+                    orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+                  base_tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
+                  maximum_candidate_count: 1
+                  search_strategy: first_feasible
+                motion_options:
+                  approach_velocity_scale: 0.4
+                  descend_velocity_scale: 0.4
+                  retreat_velocity_scale: 0.4
+                tool_position: {kind: linear_m, value_m: 0.0}
+                contact_policy_id: selected_object_grasp
+              children: []
+            - node_id: motion.place_object
+              instance_id: place_left_part
+              parameters:
+                target_role: arm
+                tool_target_role: gripper
+                base_frame_role: base
+                tcp_frame_role: tcp
+                carrier_frame_role: tcp
+                selected_object_id: left_part
                 place_pose:
-                  frame_id: base_link
+                  frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
                   position_m: [0.22, 0.26, 0.28]
-                  orientation_rpy_deg: [180.0, 0.0, -90.0]
-                approach_height_m: 0.08
-                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
-                velocity_scale: 0.4
-                tcp_frame: tool0
-
-        - id: sequence
-          name: pick_right_branch
+                  orientation: {rpy_deg: [180.0, 0.0, -90.0]}
+                approach_offset_m: [0.0, 0.0, 0.08]
+                motion_options:
+                  approach_velocity_scale: 0.4
+                  descend_velocity_scale: 0.4
+                  retreat_velocity_scale: 0.4
+                tool_position: {kind: linear_m, value_m: 0.01}
+              children: []
+        - node_id: sequence
+          instance_id: pick_right_branch
+          parameters: {}
           children:
-            - id: check_key_bool_value
-              name: right_was_selected
-              params:
-                key:
-                  field_ref:
-                    namespace: pick_target
-                    field: pick_left_bin
-                expected_value: false
-
-            - id: pick_object
-              name: pick_right_part
-              params:
-                object_id: right_part
-                approach_height_m: 0.08
-                grasp_offset_z_m: 0.0
-                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
-                velocity_scale: 0.4
-                tcp_frame: tool0
-
-            - id: place_object
-              name: place_right_part
-              params:
-                object_id: right_part
+            - node_id: logic.check_bool
+              instance_id: right_was_selected
+              parameters: {expected_value: false}
+              value_sources:
+                actual_value:
+                  kind: blackboard_field
+                  reference: perception.pick_target
+                  field: pick_left_bin
+              children: []
+            - node_id: motion.pick_object
+              instance_id: pick_right_part
+              parameters:
+                target_role: arm
+                tool_target_role: gripper
+                base_frame_role: base
+                tcp_frame_role: tcp
+                carrier_frame_role: tcp
+                selected_object_id: right_part
+                synthesis:
+                  pick_offset_envelope:
+                    position_min_m: [0.0, 0.0, 0.0]
+                    position_max_m: [0.0, 0.0, 0.0]
+                    orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+                    orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+                  approach_offset_envelope:
+                    position_min_m: [0.0, 0.0, 0.08]
+                    position_max_m: [0.0, 0.0, 0.08]
+                    orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+                    orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+                  base_tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
+                  maximum_candidate_count: 1
+                  search_strategy: first_feasible
+                motion_options:
+                  approach_velocity_scale: 0.4
+                  descend_velocity_scale: 0.4
+                  retreat_velocity_scale: 0.4
+                tool_position: {kind: linear_m, value_m: 0.0}
+                contact_policy_id: selected_object_grasp
+              children: []
+            - node_id: motion.place_object
+              instance_id: place_right_part
+              parameters:
+                target_role: arm
+                tool_target_role: gripper
+                base_frame_role: base
+                tcp_frame_role: tcp
+                carrier_frame_role: tcp
+                selected_object_id: right_part
                 place_pose:
-                  frame_id: base_link
+                  frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
                   position_m: [0.22, -0.26, 0.28]
-                  orientation_rpy_deg: [180.0, 0.0, -90.0]
-                approach_height_m: 0.08
-                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
-                velocity_scale: 0.4
-                tcp_frame: tool0
+                  orientation: {rpy_deg: [180.0, 0.0, -90.0]}
+                approach_offset_m: [0.0, 0.0, 0.08]
+                motion_options:
+                  approach_velocity_scale: 0.4
+                  descend_velocity_scale: 0.4
+                  retreat_velocity_scale: 0.4
+                tool_position: {kind: linear_m, value_m: 0.01}
+              children: []
