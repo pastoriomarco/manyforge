@@ -44,23 +44,25 @@
       "composer-assistant": {
         "catalog": {
           "nodes": [
-            "add_collision_object",
-            "attach_object_to_link",
-            "command_gripper",
-            "detach_object_from_link",
             "fallback",
+            "gripper.command_position",
             "inverter",
-            "move_manipulator_action",
+            "logic.set_bool",
+            "logic.wait_for_bool",
+            "motion.follow_cartesian_path",
+            "motion.move_to_joint_target",
+            "motion.move_to_pose",
             "parallel",
-            "remove_collision_object",
             "repeat",
             "retry",
+            "scene.add_object",
+            "scene.attach_carried_object",
+            "scene.detach_carried_object",
+            "scene.remove_object",
+            "scene.update_object_pose",
+            "scene.upsert_object",
             "sequence",
-            "set_key_bool_value",
-            "timer",
-            "update_collision_object_pose",
-            "upsert_collision_object",
-            "wait_for_signal_bool"
+            "timer"
           ],
           "skills": [],
           "tools": [
@@ -634,7 +636,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
-  "deployment_revision": "sha256:9be5e16886d3823136bce4ed61d52b8045295ac798b7feb467edb8031ffd8d4a",
+  "deployment_revision": "sha256:ac26b03fe1af5b2ae6370976c784528dba82da9979a2cf48a36b7b253643ce65",
   "description": "Local deployment for the vision-guided pose-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "desired_control_configurations": [
     {

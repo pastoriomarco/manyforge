@@ -25,23 +25,25 @@
       "composer-assistant": {
         "catalog": {
           "nodes": [
-            "add_collision_object",
-            "attach_object_to_link",
-            "command_gripper",
-            "detach_object_from_link",
             "fallback",
+            "gripper.command_position",
             "inverter",
-            "move_manipulator_action",
+            "logic.set_bool",
+            "logic.wait_for_bool",
+            "motion.follow_cartesian_path",
+            "motion.move_to_joint_target",
+            "motion.move_to_pose",
             "parallel",
-            "remove_collision_object",
             "repeat",
             "retry",
+            "scene.add_object",
+            "scene.attach_carried_object",
+            "scene.detach_carried_object",
+            "scene.remove_object",
+            "scene.update_object_pose",
+            "scene.upsert_object",
             "sequence",
-            "set_key_bool_value",
-            "timer",
-            "update_collision_object_pose",
-            "upsert_collision_object",
-            "wait_for_signal_bool"
+            "timer"
           ],
           "skills": [],
           "tools": [
@@ -608,7 +610,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "deployment_revision": "sha256:823e6698af602ada735fa963f88e9bc50b28321c2a5fdded7fd5cf585647e02e",
+  "deployment_revision": "sha256:21dbd32535da7f8618a8e84c4cb85170f39a216b6fdbf29bbab91cf62f16dcaa",
   "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
   "desired_control_configurations": [
     {

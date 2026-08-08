@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <manyforge_core/types/assistant.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -297,31 +298,103 @@ TEST(AssistantSettingsCodec,
 }
 
 TEST(AssistantSettingsCodec,
-     BuildRegistryRetainsHistoricalReadsAndBindsEveryInputSchema) {
+     BuildRegistryRetainsReadsAndStrictV1AuthoringInstruments) {
   const auto& registry = build_qualified_assistant_instrument_registry();
   EXPECT_EQ(registry.value().api_version,
             kAssistantInstrumentRegistryApiVersion);
   EXPECT_TRUE(is_sha256_digest(registry.value().registry_digest.value()));
   EXPECT_TRUE(registry.value().skills.empty());
-  EXPECT_TRUE(registry.value().nodes.empty());
-
   std::vector<std::string> ids;
+  std::vector<std::string> read_only;
+  std::vector<std::string> proposals;
+  std::vector<std::string> draft_mutations;
+  std::size_t total_canonical_schema_bytes = 0U;
   for (const auto& tool : registry.value().tools) {
     ids.push_back(tool.tool_id);
-    EXPECT_EQ(tool.effect, core::AssistantToolEffect::kReadOnly);
+    total_canonical_schema_bytes += tool.canonical_input_schema.size();
     EXPECT_EQ(tool.input_schema_digest.value(),
               sha256_digest(tool.canonical_input_schema));
-    EXPECT_EQ(canonical_json(parse_strict_json_model_yaml(
-                                 tool.canonical_input_schema)
-                                 .root()),
-              tool.canonical_input_schema);
+    EXPECT_EQ(
+        canonical_json(
+            parse_strict_json_model_yaml(tool.canonical_input_schema).root()),
+        tool.canonical_input_schema);
+    switch (tool.effect) {
+      case core::AssistantToolEffect::kReadOnly:
+        read_only.push_back(tool.tool_id);
+        break;
+      case core::AssistantToolEffect::kProposal:
+        proposals.push_back(tool.tool_id);
+        break;
+      case core::AssistantToolEffect::kComposerDraftMutating:
+        draft_mutations.push_back(tool.tool_id);
+        break;
+      case core::AssistantToolEffect::kRuntimeMutating:
+        FAIL() << "N6-b2 must not restore runtime-mutating assistant tools";
+    }
   }
-  EXPECT_EQ(ids,
-            (std::vector<std::string>{
-                "alarms_read", "catalog_read",
-                "deployment_capabilities_read", "history_read",
-                "program_read", "scene_inspect", "skills_read",
-                "status_read"}));
+  EXPECT_LT(total_canonical_schema_bytes, 512U * 1024U);
+  EXPECT_EQ(ids, (std::vector<std::string>{"alarms_read",
+                                           "blackboard_draft_remove_keys",
+                                           "blackboard_draft_remove_namespaces",
+                                           "blackboard_draft_upsert_keys",
+                                           "blackboard_draft_upsert_namespaces",
+                                           "catalog_read",
+                                           "deployment_capabilities_read",
+                                           "history_read",
+                                           "inspect_isaac_scene",
+                                           "program_draft_remove_parameters",
+                                           "program_draft_upsert_parameters",
+                                           "program_read",
+                                           "program_validate",
+                                           "propose_scene_object_nodes",
+                                           "propose_scene_objects",
+                                           "scene_draft_add_object",
+                                           "scene_draft_remove_objects",
+                                           "scene_draft_update_object",
+                                           "scene_draft_upsert_objects",
+                                           "scene_inspect",
+                                           "skills_read",
+                                           "status_read",
+                                           "tree_draft_change_node_kind",
+                                           "tree_draft_delete_node",
+                                           "tree_draft_insert_node",
+                                           "tree_draft_move_node",
+                                           "tree_draft_replace_subtree",
+                                           "tree_draft_update_node_params",
+                                           "tree_draft_wrap_node"}));
+  EXPECT_EQ(
+      read_only,
+      (std::vector<std::string>{
+          "alarms_read", "catalog_read", "deployment_capabilities_read",
+          "history_read", "inspect_isaac_scene", "program_read",
+          "program_validate", "scene_inspect", "skills_read", "status_read"}));
+  EXPECT_EQ(proposals, (std::vector<std::string>{"propose_scene_object_nodes",
+                                                 "propose_scene_objects"}));
+  EXPECT_EQ(draft_mutations.size(), 17U);
+
+  std::vector<std::string> node_ids;
+  for (const auto& node : registry.value().nodes) {
+    node_ids.push_back(node.node_id);
+  }
+  EXPECT_EQ(
+      node_ids,
+      (std::vector<std::string>{
+          "fallback", "gripper.command_position", "inverter", "logic.set_bool",
+          "logic.wait_for_bool", "motion.follow_cartesian_path",
+          "motion.move_to_joint_target", "motion.move_to_pose", "parallel",
+          "repeat", "retry", "scene.add_object", "scene.attach_carried_object",
+          "scene.detach_carried_object", "scene.remove_object",
+          "scene.update_object_pose", "scene.upsert_object", "sequence",
+          "timer"}));
+
+  const auto catalog = std::find_if(
+      registry.value().tools.begin(), registry.value().tools.end(),
+      [](const auto& tool) { return tool.tool_id == "catalog_read"; });
+  ASSERT_NE(catalog, registry.value().tools.end());
+  EXPECT_NE(catalog->canonical_input_schema.find("\"entry_ids\""),
+            std::string::npos);
+  EXPECT_EQ(catalog->canonical_input_schema.find("entryIds"),
+            std::string::npos);
 }
 
 TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
@@ -401,25 +474,29 @@ TEST(AssistantSettingsCodec, RejectsUnresolvedOrWrongKindExternalAliases) {
 TEST(AssistantSettingsCodec, EnforcesExactReservedModePolicies) {
   const auto ext = resources();
   expect_qualification_error(
-      assistant_document(mode("query", "\"status_read\"", "", "", "null",
-                              "null", "required")),
+      assistant_document(
+          mode("query", "\"status_read\"", "", "", "null", "null", "required")),
       ext, "reserved mode grant/review policy is not exact");
   expect_qualification_error(
       assistant_document(mode("query", "\"unknown_read\"")), ext,
       "unresolved tool ID");
 
   const auto composer = qualify_assistant_settings(
-      decode(assistant_document(mode("composer-assistant",
-                                     "\"program_read\",\"catalog_read\"",
-                                     "", "", "null", "null", "required"))),
+      decode(assistant_document(
+          mode("composer-assistant", "\"program_read\",\"catalog_read\"", "",
+               "\"scene.add_object\"", "null", "null", "required"))),
       ext);
   EXPECT_TRUE(composer.enabled());
+  expect_qualification_error(
+      assistant_document(mode("composer-assistant", "\"program_read\"", "",
+                              "\"add_collision_object\"", "null", "null",
+                              "required")),
+      ext, "unresolved node ID 'add_collision_object'");
 
   const auto recovery = qualify_assistant_settings(
       decode(assistant_document(mode(
-          "error-recovery", "\"status_read\"", "", "",
-          "\"delegated_recovery\"", "\"policy_granted\"",
-          "bounded_by_recovery_profile"))),
+          "error-recovery", "\"status_read\"", "", "", "\"delegated_recovery\"",
+          "\"policy_granted\"", "bounded_by_recovery_profile"))),
       ext);
   EXPECT_TRUE(recovery.enabled());
 }

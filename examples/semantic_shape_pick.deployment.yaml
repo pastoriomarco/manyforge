@@ -41,23 +41,25 @@
       "composer-assistant": {
         "catalog": {
           "nodes": [
-            "add_collision_object",
-            "attach_object_to_link",
-            "command_gripper",
-            "detach_object_from_link",
             "fallback",
+            "gripper.command_position",
             "inverter",
-            "move_manipulator_action",
+            "logic.set_bool",
+            "logic.wait_for_bool",
+            "motion.follow_cartesian_path",
+            "motion.move_to_joint_target",
+            "motion.move_to_pose",
             "parallel",
-            "remove_collision_object",
             "repeat",
             "retry",
+            "scene.add_object",
+            "scene.attach_carried_object",
+            "scene.detach_carried_object",
+            "scene.remove_object",
+            "scene.update_object_pose",
+            "scene.upsert_object",
             "sequence",
-            "set_key_bool_value",
-            "timer",
-            "update_collision_object_pose",
-            "upsert_collision_object",
-            "wait_for_signal_bool"
+            "timer"
           ],
           "skills": [],
           "tools": [
@@ -637,7 +639,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
-  "deployment_revision": "sha256:cf1a4e49d1df16cf0f4ecac319da2bfe75514fe4bb66b45d94c513279756d8df",
+  "deployment_revision": "sha256:71397e04c13f2fafd5a2c4be0359e419e5d8e36cd2a6e720b722687e5dcc4981",
   "description": "Local deployment for the semantic object-selection demo. A model selects one backend-authoritative scene object from a deterministic manifest plus an auxiliary viewer snapshot, and the backend computes the actual pick sequence deterministically from backend scene state.",
   "desired_control_configurations": [
     {

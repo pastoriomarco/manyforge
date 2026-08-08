@@ -19,6 +19,7 @@
 
 #include "compiler_semantic_limits_internal.hpp"
 #include "content_identity_internal.hpp"
+#include "embedded_assistant_instrument_registry_source_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 
 namespace manyforge::deployment {
@@ -72,6 +73,8 @@ constexpr std::size_t kMaximumAssistantTextBytes = 1024U;
 constexpr std::size_t kMaximumPromptTemplateBytes = 16384U;
 constexpr double kMaximumModelRequestTimeoutSeconds = 3600.0;
 constexpr std::uint32_t kMaximumModelOutputTokens = 1U << 20U;
+constexpr std::string_view kAssistantInstrumentRegistrySourceApiVersion =
+    "manyforge.assistant_instrument_registry_source.v1";
 
 const detail::ContentIdentitySpec kInstrumentRegistryIdentitySpec{
     "assistant-instrument-registry-digest",
@@ -495,102 +498,198 @@ enum class InstrumentIdKind { kPortable, kTool };
   return CanonicalValue(std::move(object));
 }
 
-[[nodiscard]] CanonicalValue no_argument_schema() {
-  return CanonicalValue(CanonicalValue::Object{
-      {"additionalProperties", CanonicalValue(false)},
-      {"properties", CanonicalValue(CanonicalValue::Object{})},
-      {"type", CanonicalValue("object")},
-  });
-}
-
-[[nodiscard]] CanonicalValue catalog_read_schema(std::string_view ids_name,
-                                                 bool include_bodies) {
-  CanonicalValue::Object properties{
-      {std::string(ids_name),
-       CanonicalValue(CanonicalValue::Object{
-           {"items", CanonicalValue(CanonicalValue::Object{
-                         {"minLength", CanonicalValue(1.0)},
-                         {"type", CanonicalValue("string")},
-                     })},
-           {"type", CanonicalValue("array")},
-       })},
-  };
-  if (include_bodies) {
-    properties.emplace_back(
-        "includeBodies",
-        CanonicalValue(CanonicalValue::Object{{"type", CanonicalValue("boolean")}}));
-  } else {
-    properties.emplace_back(
-        "category",
-        CanonicalValue(CanonicalValue::Object{
-            {"minLength", CanonicalValue(1.0)},
-            {"type", CanonicalValue("string")},
-        }));
-    properties.emplace_back(
-        "includeParameters",
-        CanonicalValue(CanonicalValue::Object{{"type", CanonicalValue("boolean")}}));
-    properties.emplace_back(
-        "kind",
-        CanonicalValue(CanonicalValue::Object{
-            {"minLength", CanonicalValue(1.0)},
-            {"type", CanonicalValue("string")},
-        }));
+[[nodiscard]] core::AssistantToolEffect parse_tool_effect(
+    const CanonicalValue& value, std::string_view path) {
+  const std::string& text = require_string(value, path);
+  if (text == "read_only") {
+    return core::AssistantToolEffect::kReadOnly;
   }
-  return CanonicalValue(CanonicalValue::Object{
-      {"additionalProperties", CanonicalValue(false)},
-      {"properties", CanonicalValue(std::move(properties))},
-      {"type", CanonicalValue("object")},
-  });
+  if (text == "proposal") {
+    return core::AssistantToolEffect::kProposal;
+  }
+  if (text == "composer_draft_mutating") {
+    return core::AssistantToolEffect::kComposerDraftMutating;
+  }
+  if (text == "runtime_mutating") {
+    return core::AssistantToolEffect::kRuntimeMutating;
+  }
+  fail(path, "effect is outside the closed assistant-tool enum");
 }
 
-[[nodiscard]] CanonicalValue history_read_schema() {
-  return CanonicalValue(CanonicalValue::Object{
-      {"additionalProperties", CanonicalValue(false)},
-      {"properties",
-       CanonicalValue(CanonicalValue::Object{
-           {"cursor",
-            CanonicalValue(CanonicalValue::Object{
-                {"minLength", CanonicalValue(1.0)},
-                {"type", CanonicalValue("string")},
-            })},
-           {"limit",
-            CanonicalValue(CanonicalValue::Object{
-                {"maximum", CanonicalValue(1000.0)},
-                {"minimum", CanonicalValue(1.0)},
-                {"type", CanonicalValue("integer")},
-            })},
-       })},
-      {"type", CanonicalValue("object")},
-  });
+void require_closed_input_schema(const CanonicalValue& value,
+                                 std::string_view path) {
+  const auto& object = require_object(value, path);
+  const CanonicalValue* variants = find_member(object, "oneOf");
+  if (variants != nullptr && find_member(object, "type") == nullptr) {
+    const CanonicalValue* definitions = find_member(object, "$defs");
+    if (object.size() != (definitions == nullptr ? 1U : 2U)) {
+      fail(path, "root oneOf schema may carry only local $defs");
+    }
+    if (definitions != nullptr) {
+      const auto& definition_object =
+          require_object(*definitions, child_path(path, "$defs"));
+      if (definition_object.empty() ||
+          definition_object.size() > kMaximumAssistantRows) {
+        fail(child_path(path, "$defs"),
+             "local definitions are empty or exceed the fixed bound");
+      }
+    }
+    const auto& array = require_array(*variants, child_path(path, "oneOf"));
+    if (array.empty() || array.size() > kMaximumAssistantRows) {
+      fail(child_path(path, "oneOf"),
+           "root schema variants are empty or exceed the fixed bound");
+    }
+    for (std::size_t index = 0U; index < array.size(); ++index) {
+      require_closed_input_schema(array[index],
+                                  index_path(child_path(path, "oneOf"), index));
+    }
+    return;
+  }
+  if (require_string(require_member(object, "type", path),
+                     child_path(path, "type")) != "object") {
+    fail(child_path(path, "type"), "tool input root must be an object");
+  }
+  if (require_bool(require_member(object, "additionalProperties", path),
+                   child_path(path, "additionalProperties"))) {
+    fail(child_path(path, "additionalProperties"),
+         "tool input root must reject unknown fields");
+  }
+  (void)require_object(require_member(object, "properties", path),
+                       child_path(path, "properties"));
 }
 
-struct BuiltinToolSpec final {
-  std::string_view tool_id;
-  std::string_view description;
-  CanonicalValue input_schema;
+struct ParsedInstrumentRegistrySource final {
+  std::vector<core::AssistantSkillDescriptorDTO> skills;
+  std::vector<core::AssistantToolDescriptorDTO> tools;
+  std::vector<core::AssistantNodeDescriptorDTO> nodes;
 };
 
-[[nodiscard]] std::vector<BuiltinToolSpec> builtin_tools() {
-  return {
-      {"alarms_read", "Read the active headless alarm snapshot.",
-       no_argument_schema()},
-      {"catalog_read",
-       "Read allowed behavior-node catalog metadata without mutation.",
-       catalog_read_schema("entryIds", false)},
-      {"deployment_capabilities_read",
-       "Read capabilities of the active retained deployment.",
-       no_argument_schema()},
-      {"history_read", "Read one bounded page from the headless historian.",
-       history_read_schema()},
-      {"program_read", "Read the current Composer draft program.",
-       no_argument_schema()},
-      {"scene_inspect", "Read the active logical-scene snapshot.",
-       no_argument_schema()},
-      {"skills_read", "Read allowed skill catalog metadata without mutation.",
-       catalog_read_schema("skillIds", true)},
-      {"status_read", "Read the active headless runtime status snapshot.",
-       no_argument_schema()},
-  };
+[[nodiscard]] ParsedInstrumentRegistrySource
+parse_instrument_registry_source() {
+  const CanonicalValue source =
+      parse_strict_json_model_yaml(
+          detail::kEmbeddedAssistantInstrumentRegistrySource)
+          .root();
+  const auto& root = require_object(source, "$.assistant_instrument_source");
+  require_exact_fields(root, {"api_version", "skills", "tools", "nodes"},
+                       "$.assistant_instrument_source");
+  if (require_string(
+          require_member(root, "api_version", "$.assistant_instrument_source"),
+          "$.assistant_instrument_source.api_version") !=
+      kAssistantInstrumentRegistrySourceApiVersion) {
+    fail("$.assistant_instrument_source.api_version",
+         "unsupported build-owned registry source version");
+  }
+
+  ParsedInstrumentRegistrySource result;
+  std::set<std::string> all_ids;
+  std::string previous_id;
+
+  const auto& source_skills = require_array(
+      require_member(root, "skills", "$.assistant_instrument_source"),
+      "$.assistant_instrument_source.skills");
+  if (source_skills.size() > kMaximumAssistantRows) {
+    fail("$.assistant_instrument_source.skills",
+         "skill table exceeds the fixed bound");
+  }
+  for (std::size_t index = 0U; index < source_skills.size(); ++index) {
+    const std::string path =
+        index_path("$.assistant_instrument_source.skills", index);
+    const auto& row = require_object(source_skills[index], path);
+    require_exact_fields(row, {"skill_id", "requires_tools"}, path);
+    std::string skill_id = parse_portable_token(
+        require_member(row, "skill_id", path), child_path(path, "skill_id"));
+    if (!previous_id.empty() && skill_id <= previous_id) {
+      fail(path, "skill table must be unique and canonical-sorted");
+    }
+    previous_id = skill_id;
+    if (!all_ids.insert(skill_id).second) {
+      fail(path, "instrument namespaces overlap");
+    }
+    result.skills.push_back({
+        std::move(skill_id),
+        parse_id_list(require_member(row, "requires_tools", path),
+                      child_path(path, "requires_tools"),
+                      InstrumentIdKind::kTool),
+    });
+  }
+
+  previous_id.clear();
+  const auto& source_tools = require_array(
+      require_member(root, "tools", "$.assistant_instrument_source"),
+      "$.assistant_instrument_source.tools");
+  if (source_tools.empty() || source_tools.size() > kMaximumAssistantRows) {
+    fail("$.assistant_instrument_source.tools",
+         "tool table is empty or exceeds the fixed bound");
+  }
+  for (std::size_t index = 0U; index < source_tools.size(); ++index) {
+    const std::string path =
+        index_path("$.assistant_instrument_source.tools", index);
+    const auto& row = require_object(source_tools[index], path);
+    require_exact_fields(
+        row, {"tool_id", "effect", "description", "input_schema"}, path);
+    std::string tool_id = parse_tool_id(require_member(row, "tool_id", path),
+                                        child_path(path, "tool_id"));
+    if (!previous_id.empty() && tool_id <= previous_id) {
+      fail(path, "tool table must be unique and canonical-sorted");
+    }
+    previous_id = tool_id;
+    if (!all_ids.insert(tool_id).second) {
+      fail(path, "instrument namespaces overlap");
+    }
+    const CanonicalValue& schema = require_member(row, "input_schema", path);
+    require_closed_input_schema(schema, child_path(path, "input_schema"));
+    const std::string canonical_schema = canonical_json(schema);
+    result.tools.push_back({
+        std::move(tool_id),
+        parse_tool_effect(require_member(row, "effect", path),
+                          child_path(path, "effect")),
+        parse_bounded_text(require_member(row, "description", path),
+                           child_path(path, "description"), false),
+        canonical_schema,
+        core::ContentDigest(sha256_digest(canonical_schema)),
+    });
+  }
+
+  previous_id.clear();
+  const auto& source_nodes = require_array(
+      require_member(root, "nodes", "$.assistant_instrument_source"),
+      "$.assistant_instrument_source.nodes");
+  if (source_nodes.size() > kMaximumAssistantRows) {
+    fail("$.assistant_instrument_source.nodes",
+         "node table exceeds the fixed bound");
+  }
+  for (std::size_t index = 0U; index < source_nodes.size(); ++index) {
+    const std::string path =
+        index_path("$.assistant_instrument_source.nodes", index);
+    const auto& row = require_object(source_nodes[index], path);
+    require_exact_fields(row, {"node_id"}, path);
+    std::string node_id = parse_portable_token(
+        require_member(row, "node_id", path), child_path(path, "node_id"));
+    if (!previous_id.empty() && node_id <= previous_id) {
+      fail(path, "node table must be unique and canonical-sorted");
+    }
+    previous_id = node_id;
+    if (!all_ids.insert(node_id).second) {
+      fail(path, "instrument namespaces overlap");
+    }
+    result.nodes.push_back({std::move(node_id)});
+  }
+
+  for (const auto& skill : result.skills) {
+    for (const auto& required_tool : skill.requires_tools) {
+      const auto iterator = std::lower_bound(
+          result.tools.begin(), result.tools.end(), required_tool,
+          [](const core::AssistantToolDescriptorDTO& tool,
+             std::string_view id) { return tool.tool_id < id; });
+      if (iterator == result.tools.end() ||
+          iterator->tool_id != required_tool) {
+        fail("$.assistant_instrument_source.skills",
+             "skill requires a tool absent from the same build source");
+      }
+    }
+  }
+  return result;
 }
 
 [[nodiscard]] CanonicalValue encode_registry(
@@ -638,36 +737,21 @@ struct BuiltinToolSpec final {
 
 [[nodiscard]] std::pair<core::AssistantInstrumentRegistryDTO, CanonicalValue>
 make_registry_value() {
-  std::vector<core::AssistantToolDescriptorDTO> tools;
-  for (auto&& spec : builtin_tools()) {
-    const std::string schema = canonical_json(spec.input_schema);
-    tools.push_back({
-        std::string(spec.tool_id),
-        core::AssistantToolEffect::kReadOnly,
-        std::string(spec.description),
-        schema,
-        core::ContentDigest(sha256_digest(schema)),
-    });
-  }
-  std::sort(tools.begin(), tools.end(),
-            [](const auto& left, const auto& right) {
-              return left.tool_id < right.tool_id;
-            });
+  ParsedInstrumentRegistrySource source = parse_instrument_registry_source();
 
   core::AssistantInstrumentRegistryDTO value{
       std::string(kAssistantInstrumentRegistryApiVersion),
       core::ContentDigest(std::string(kZeroDigest)),
-      {},
-      std::move(tools),
-      {},
+      std::move(source.skills),
+      std::move(source.tools),
+      std::move(source.nodes),
   };
   CanonicalValue normalized = encode_registry(value);
-  const std::string digest =
-      detail::compute_content_identity(normalized,
-                                       kInstrumentRegistryIdentitySpec);
+  const std::string digest = detail::compute_content_identity(
+      normalized, kInstrumentRegistryIdentitySpec);
   value.registry_digest = core::ContentDigest(digest);
-  normalized = replace_member(normalized, "registry_digest",
-                              CanonicalValue(digest));
+  normalized =
+      replace_member(normalized, "registry_digest", CanonicalValue(digest));
   return {std::move(value), std::move(normalized)};
 }
 
