@@ -13,9 +13,9 @@ The implemented offline boundary owns:
 - immutable `manyforge.closed_schema.v1` descriptor compilation, declared
   `SchemaRevision` verification, bounded default materialization, and
   schema-directed instance normalization;
-- one code-owned build registry with eight exact qualified catalog families
+- one code-owned build registry with nine exact qualified catalog families
   (`capability_definition`, `component_type`, `control_interface_contract`,
-  `controller_topology`, `model_asset`, `provider_manifest`,
+  `controller_topology`, `command_schema`, `model_asset`, `provider_manifest`,
   `runtime_profile`, and `stop_evidence_policy`), two exact qualified value
   schemas, and explicit rejection of every remaining unqualified family;
 - intrinsic `CellGraphDTO` decoding and validation, exact runtime-profile
@@ -102,8 +102,10 @@ Current limits are explicit:
   per-domain control products, one reference manager-managed runtime-unit
   manifest/artifact pair, complete retained provenance, cross-consumer
   equivalence, and a sealed logical-snapshot projection input. Optional
-  assistant, policy, command-schema, contact, tool, and gripper semantics stay
-  rejected until their named owner slices extend both compiler and envelope.
+  policy, contact, tool, and gripper semantics stay rejected until their named
+  owner slices extend both compiler and envelope. Assistant source and retained
+  projection are qualified, while complete assistant instrument/node
+  resolution remains N6-b.
   Runtime selection and active publication belong to I4; and
 - Apply, active publication, process ownership, runtime convergence,
   simulation, controllers, execution, and lane restoration belong to later
@@ -136,6 +138,29 @@ enclosing `program_revision`, while preserving the human-authored YAML apart
 from those plain digest fields. This command computes and checks identities; it
 does not replace the qualified Program/catalog validator or grant runtime
 admission to a merely parseable source.
+
+Maintained `manyforge.deployment.v1` sources use the corresponding C++
+producer/verifier command:
+
+```bash
+manyforge_deployment_revision --update --input examples/example.deployment.yaml
+manyforge_deployment_revision --check --input examples/example.deployment.yaml
+```
+
+The update path seals graph-owned nested revisions, capability-provider-binding
+revisions, and the enclosing `deployment_revision`, then independently verifies
+the pretty JSON source before replacing it atomically. It supplies the exact
+build-owned native runtime profile only when the graph selects that profile.
+It does not qualify catalog referents, compile retained products, or admit a
+deployment to runtime.
+
+The one human/LLM authoring input for the seven N6 deployments is
+`resources/maintained/maintained_deployment_sources.v1.json`. Its strict check
+pins the three shared model-family sources, seven historical deployment blobs,
+Program-to-component/target role assignments, and the exact speed/grasp
+restoration records. Those policy records are obligations for I8/I11, not an
+alternative runtime policy source and not a claim that N6 accepts the
+top-level deployment `policies` block.
 
 The implementation intentionally uses dedicated, qualified libraries for
 strict YAML events, Unicode NFC, ECMAScript-compatible binary64 formatting,

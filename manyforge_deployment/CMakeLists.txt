@@ -33,12 +33,21 @@ set(
 set(
   MANYFORGE_STRUCTURAL_PREPARATION_TOOL
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_structural_model.py")
+set(
+  MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_CHECK
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_maintained_deployment_sources.py")
+set(
+  MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/maintained_deployment_sources.v1.json")
 if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
    NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_CHECK}" OR
-   NOT EXISTS "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}")
+   NOT EXISTS "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}" OR
+   NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_CHECK}" OR
+   NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}")
   message(FATAL_ERROR
     "manyforge_deployment production retention requires the node-environment "
-    "closure and the structural-model preparation tool")
+    "closure, structural-model preparation tool, and maintained N6 source "
+    "description")
 endif()
 execute_process(
   COMMAND
@@ -58,7 +67,9 @@ endif()
 set_property(
   DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
-  "${MANYFORGE_NODE_ENVIRONMENT_CHECK}")
+  "${MANYFORGE_NODE_ENVIRONMENT_CHECK}"
+  "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_CHECK}"
+  "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}")
 
 file(READ
   "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
@@ -595,6 +606,16 @@ target_link_libraries(
   manyforge_program_revision PRIVATE
   manyforge::deployment_verification_core)
 
+add_executable(
+  manyforge_deployment_revision
+  tools/deployment_revision.cpp)
+target_include_directories(
+  manyforge_deployment_revision PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(
+  manyforge_deployment_revision PRIVATE
+  manyforge::deployment_verification_core)
+
 set(
   MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER
   "${CMAKE_CURRENT_BINARY_DIR}/generated/build_qualified_admission_profile_generated.hpp")
@@ -706,6 +727,26 @@ if(BUILD_TESTING)
       "-DMANYFORGE_WORKSPACE_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/.."
       -P
       "${CMAKE_CURRENT_SOURCE_DIR}/test/maintained_program_source_revisions.cmake")
+
+  add_test(
+    NAME DeploymentRevisionAuthoringTool
+    COMMAND
+      "${CMAKE_COMMAND}"
+      "-DMANYFORGE_DEPLOYMENT_REVISION_TOOL=$<TARGET_FILE:manyforge_deployment_revision>"
+      "-DMANYFORGE_TEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/deployment_revision_tool"
+      -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/deployment_revision_tool.cmake")
+
+  add_test(
+    NAME MaintainedDeploymentSourceDescription
+    COMMAND
+      "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior"
+      "${Python3_EXECUTABLE}"
+      "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_CHECK}"
+      --check
+      --input "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
+      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}")
 
   function(manyforge_try_public_header result_variable source_file)
     unset(${result_variable} CACHE)

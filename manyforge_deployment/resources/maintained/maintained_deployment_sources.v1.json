@@ -1,0 +1,272 @@
+{
+  "api_version": "manyforge.maintained_deployment_sources.v1",
+  "historical_source_commit": "c4b075fa6dfb69e463c61f3efa8cfce8de681e8a",
+  "model_families": [
+    {
+      "model_family_id": "lite6_lite_gripper",
+      "model_asset_id": "lite6_lite_gripper",
+      "source": {
+        "accepted_package_uri_prefix": "package://manyforge_example_models/models/lite6_lite_gripper/",
+        "resource_root": "manyforge_example_models/models/lite6_lite_gripper",
+        "srdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf",
+        "urdf_path": "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"
+      }
+    },
+    {
+      "model_family_id": "ur10e_robotiq_2f_140",
+      "model_asset_id": "ur10e_robotiq_2f_140",
+      "source": {
+        "accepted_package_uri_prefix": "package://manyforge_example_models/models/ur10e_robotiq_2f_140/",
+        "resource_root": "manyforge_example_models/models/ur10e_robotiq_2f_140",
+        "srdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.structural.srdf",
+        "urdf_path": "manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.structural.urdf"
+      }
+    },
+    {
+      "model_family_id": "ur5_roboplan",
+      "model_asset_id": "ur5_roboplan",
+      "source": {
+        "accepted_package_uri_prefix": "package://roboplan_example_models/models/ur_robot_model/",
+        "resource_root": ".docker/roboplan/roboplan_example_models/models/ur_robot_model",
+        "srdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf",
+        "urdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf"
+      }
+    }
+  ],
+  "deployments": [
+    {
+      "deployment_source": "examples/assistant_modes_scene_authoring.deployment.yaml",
+      "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
+      "cell_id": "ur10e_assistant_authoring_cell",
+      "historical_blob": "7149aba89619f3f1c426148ef2f2972cd0c730f0",
+      "model_family_id": "ur10e_robotiq_2f_140",
+      "component_occurrence_id": "ur10e_robot",
+      "program_role_assignments": [
+        {
+          "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+          "component_roles": {"robot": "ur10e_robot", "tool": "ur10e_robot"},
+          "target_roles": {
+            "arm": {"component_role": "robot", "command_target_id": "arm"},
+            "gripper": {"component_role": "tool", "command_target_id": "gripper"}
+          }
+        }
+      ],
+      "policy_restoration_inputs": [
+        {
+          "kind": "open_loop_grasp_acknowledgement",
+          "source_field": "grasp_risk_policy.open_loop_grasp",
+          "target_role_id": "gripper",
+          "allowed": true,
+          "scope": "simulation",
+          "rationale": "Local scene-authoring fixture uses simulated attach actions without an independent grasp confirmation source.",
+          "runtime_acceptance_step": "I8/P5",
+          "tool_acceptance_step": "I11/T",
+          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
+        },
+        {
+          "kind": "target_tcp_linear_speed_limit",
+          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
+          "target_role_id": "arm",
+          "maximum_speed_mps": 0.25,
+          "runtime_acceptance_step": "I8/P5",
+          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
+        }
+      ]
+    },
+    {
+      "deployment_source": "examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
+      "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
+      "cell_id": "lite6_pick_place_cell",
+      "historical_blob": "d0141f0042f3b7af5850e651befb3e2550d907c0",
+      "model_family_id": "lite6_lite_gripper",
+      "component_occurrence_id": "lite6_robot",
+      "program_role_assignments": [
+        {
+          "program_source": "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+          "component_roles": {"robot": "lite6_robot", "tool": "lite6_robot"},
+          "target_roles": {
+            "arm": {"component_role": "robot", "command_target_id": "arm"},
+            "gripper": {"component_role": "tool", "command_target_id": "gripper"}
+          }
+        }
+      ],
+      "policy_restoration_inputs": [
+        {
+          "kind": "open_loop_grasp_acknowledgement",
+          "source_field": "grasp_risk_policy.open_loop_grasp",
+          "target_role_id": "gripper",
+          "allowed": true,
+          "scope": "simulation",
+          "rationale": "Native Lite6 preview uses backend-authored gripper state and simulated attach actions without an independent grasp confirmation source.",
+          "runtime_acceptance_step": "I8/P5",
+          "tool_acceptance_step": "I11/T",
+          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
+        },
+        {
+          "kind": "target_tcp_linear_speed_limit",
+          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
+          "target_role_id": "arm",
+          "maximum_speed_mps": 0.15,
+          "runtime_acceptance_step": "I8/P5",
+          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
+        }
+      ]
+    },
+    {
+      "deployment_source": "examples/pick_and_place.deployment.yaml",
+      "deployment_artifact_id": "ur5_roboplan_local_pick_place",
+      "cell_id": "ur5_pick_place_cell",
+      "historical_blob": "bee699e23c42a7b8810dbf27b1f8bd261f514834",
+      "model_family_id": "ur5_roboplan",
+      "component_occurrence_id": "ur5_robot",
+      "program_role_assignments": [
+        {
+          "program_source": "examples/pick_and_place.program.yaml",
+          "component_roles": {"robot": "ur5_robot"},
+          "target_roles": {
+            "arm": {"component_role": "robot", "command_target_id": "arm"}
+          }
+        },
+        {
+          "program_source": "examples/pick_and_place_minimal.program.yaml",
+          "component_roles": {"robot": "ur5_robot"},
+          "target_roles": {
+            "arm": {"component_role": "robot", "command_target_id": "arm"}
+          }
+        }
+      ],
+      "policy_restoration_inputs": [
+        {
+          "kind": "target_tcp_linear_speed_limit",
+          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
+          "target_role_id": "arm",
+          "maximum_speed_mps": 0.25,
+          "runtime_acceptance_step": "I8/P5",
+          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
+        }
+      ]
+    },
+    {
+      "deployment_source": "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
+      "deployment_artifact_id": "ur10e_robotiq_pick_place_preview",
+      "cell_id": "ur10e_pick_place_cell",
+      "historical_blob": "f31c1af91814b9da7a1d121531c0c3c814001781",
+      "model_family_id": "ur10e_robotiq_2f_140",
+      "component_occurrence_id": "ur10e_robot",
+      "program_role_assignments": [
+        {
+          "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
+          "component_roles": {"robot": "ur10e_robot", "tool": "ur10e_robot"},
+          "target_roles": {
+            "arm": {"component_role": "robot", "command_target_id": "arm"},
+            "gripper": {"component_role": "tool", "command_target_id": "gripper"}
+          }
+        }
+      ],
+      "policy_restoration_inputs": [
+        {
+          "kind": "open_loop_grasp_acknowledgement",
+          "source_field": "grasp_risk_policy.open_loop_grasp",
+          "target_role_id": "gripper",
+          "allowed": true,
+          "scope": "simulation",
+          "rationale": "Native Robotiq preview uses simulated gripper state and attach actions without an independent grasp confirmation source.",
+          "runtime_acceptance_step": "I8/P5",
+          "tool_acceptance_step": "I11/T",
+          "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
+        },
+        {
+          "kind": "target_tcp_linear_speed_limit",
+          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
+          "target_role_id": "arm",
+          "maximum_speed_mps": 0.25,
+          "runtime_acceptance_step": "I8/P5",
+          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
+        }
+      ]
+    },
+    {
+      "deployment_source": "examples/semantic_shape_pick.deployment.yaml",
+      "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
+      "cell_id": "ur5_semantic_shape_pick_cell",
+      "historical_blob": "115ab078116696847a9c037f0b20d5b3e39b1741",
+      "model_family_id": "ur5_roboplan",
+      "component_occurrence_id": "ur5_robot",
+      "program_role_assignments": [
+        {
+          "program_source": "examples/semantic_shape_pick.program.yaml",
+          "component_roles": {"robot": "ur5_robot", "tool": "ur5_robot"},
+          "target_roles": {
+            "arm": {"component_role": "robot", "command_target_id": "arm"},
+            "gripper": {"component_role": "tool", "command_target_id": "gripper"}
+          }
+        }
+      ],
+      "policy_restoration_inputs": [
+        {
+          "kind": "target_tcp_linear_speed_limit",
+          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
+          "target_role_id": "arm",
+          "maximum_speed_mps": 0.25,
+          "runtime_acceptance_step": "I8/P5",
+          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
+        }
+      ]
+    },
+    {
+      "deployment_source": "examples/vision_guided_bin_pick.deployment.yaml",
+      "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
+      "cell_id": "ur5_vision_bin_pick_cell",
+      "historical_blob": "332b8b6daa93cf4b0533e93a42736fd67b8654c5",
+      "model_family_id": "ur5_roboplan",
+      "component_occurrence_id": "ur5_robot",
+      "program_role_assignments": [
+        {
+          "program_source": "examples/vision_guided_bin_pick.program.yaml",
+          "component_roles": {"robot": "ur5_robot", "tool": "ur5_robot"},
+          "target_roles": {
+            "arm": {"component_role": "robot", "command_target_id": "arm"},
+            "gripper": {"component_role": "tool", "command_target_id": "gripper"}
+          }
+        }
+      ],
+      "policy_restoration_inputs": [
+        {
+          "kind": "target_tcp_linear_speed_limit",
+          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
+          "target_role_id": "arm",
+          "maximum_speed_mps": 0.25,
+          "runtime_acceptance_step": "I8/P5",
+          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
+        }
+      ]
+    },
+    {
+      "deployment_source": "examples/vision_guided_pose_pick.deployment.yaml",
+      "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
+      "cell_id": "ur5_vision_pose_pick_cell",
+      "historical_blob": "a65a0011ee0247cb3bb0281360fa4c46073bbf9d",
+      "model_family_id": "ur5_roboplan",
+      "component_occurrence_id": "ur5_robot",
+      "program_role_assignments": [
+        {
+          "program_source": "examples/vision_guided_pose_pick.program.yaml",
+          "component_roles": {"robot": "ur5_robot"},
+          "target_roles": {
+            "arm": {"component_role": "robot", "command_target_id": "arm"}
+          }
+        }
+      ],
+      "policy_restoration_inputs": [
+        {
+          "kind": "target_tcp_linear_speed_limit",
+          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
+          "target_role_id": "arm",
+          "maximum_speed_mps": 0.25,
+          "runtime_acceptance_step": "I8/P5",
+          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
+        }
+      ]
+    }
+  ]
+}
