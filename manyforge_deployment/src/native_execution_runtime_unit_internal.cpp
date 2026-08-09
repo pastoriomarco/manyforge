@@ -408,7 +408,9 @@ std::string native_execution_runtime_implementation_revision() {
       "native-execution-host;deployment-bound-startup;operation-bound-program;"
       "projection-handoff-v1;private-rpc-v1;retained-runtime-config-v1;"
       "logical-scene-services-v1;manager-managed-product-composition;"
-      "build-owned-candidate-worker;sha256-projection-content");
+      "build-owned-candidate-worker;sha256-projection-content;"
+      "atomic-resource-table-admission;"
+      "resource-derived-active-configurations");
 }
 
 std::string native_execution_runtime_process_adapter_revision() {

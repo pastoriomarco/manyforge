@@ -36,6 +36,46 @@ template <typename T>
   return bindings;
 }
 
+[[nodiscard]] std::vector<DomainActiveControlConfigurationDTO>
+extract_active_control_configurations(
+    const std::vector<RuntimeParticipantExecutionRegistration>& registrations) {
+  std::vector<DomainActiveControlConfigurationDTO> configurations;
+  for (const auto& registration : registrations) {
+    const auto& binding = registration.binding.value();
+    if (!binding.control_path.has_value()) {
+      continue;
+    }
+    const auto& control = *binding.control_path;
+    configurations.push_back(DomainActiveControlConfigurationDTO{
+        control.control_domain_id, control.active_control_configuration_id,
+        control.active_control_configuration_generation});
+  }
+  std::sort(configurations.begin(), configurations.end(),
+            [](const auto& left, const auto& right) {
+              if (left.control_domain_id != right.control_domain_id) {
+                return left.control_domain_id < right.control_domain_id;
+              }
+              if (left.active_control_configuration_id !=
+                  right.active_control_configuration_id) {
+                return left.active_control_configuration_id <
+                       right.active_control_configuration_id;
+              }
+              return left.active_control_configuration_generation <
+                     right.active_control_configuration_generation;
+            });
+  const auto unique = std::unique(configurations.begin(), configurations.end());
+  configurations.erase(unique, configurations.end());
+  if (std::adjacent_find(
+          configurations.begin(), configurations.end(),
+          [](const auto& left, const auto& right) {
+            return left.control_domain_id == right.control_domain_id;
+          }) != configurations.end()) {
+    throw std::invalid_argument(
+        "runtime participants disagree on one active control configuration");
+  }
+  return configurations;
+}
+
 [[nodiscard]] const ProgramFrameRoleBindingDTO* find_frame(
     const RuntimeParticipantBindingDTO& binding, const FrameRoleId& role) noexcept {
   const auto found = std::find_if(
@@ -587,7 +627,12 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
     IOperationJournal& journal, ResourceAddressedExecutionKernelConfig config)
     : registry_(extract_bindings(registrations)),
-      resource_slots_(registry_.resource_inventory()),
+      resource_slots_(std::make_shared<ResourceSlotTable>(
+          registry_.resource_inventory(),
+          extract_active_control_configurations(registrations),
+          config.operation_admission_gate != nullptr
+              ? config.operation_admission_gate->shared_admission_mutex()
+              : std::shared_ptr<std::recursive_mutex>{})),
       registrations_(std::move(registrations)),
       clock_(clock),
       journal_(journal),
@@ -595,6 +640,12 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   if (config_.request_owner_epoch.empty() || config_.request_replay_capacity == 0U ||
       config_.request_replay_capacity > kMaxI6OperationReplayEntries) {
     throw std::invalid_argument("addressed Kernel request-owner epoch or replay bound is invalid");
+  }
+  if (config_.operation_admission_gate != nullptr &&
+      !resource_slots_->shares_admission_mutex(
+          config_.operation_admission_gate->shared_admission_mutex())) {
+    throw std::invalid_argument(
+        "addressed Kernel admission gate does not share its resource mutex");
   }
   replay_ledger_.reserve(config_.request_replay_capacity);
   control_replay_ledger_.reserve(config_.request_replay_capacity);
@@ -610,7 +661,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   }
   historical_operations_ = std::move(recovery.value().historical_operations);
   if (!recovery.value().unreconciled_resources.empty()) {
-    auto marked = resource_slots_.mark_unreconciled_external_or_orphan_goal(
+    auto marked = resource_slots_->mark_unreconciled_external_or_orphan_goal(
         recovery.value().unreconciled_resources);
     if (!marked.ok()) {
       throw std::runtime_error("addressed Kernel durable orphan recovery failed: " +
@@ -1110,7 +1161,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       return Result<OperationAcceptedDTO>::Err(private_validation.error());
     }
   }
-  auto reservation = resource_slots_.reserve(slot_owner, resources);
+  auto reservation = config_.operation_admission_gate != nullptr
+                         ? config_.operation_admission_gate->reserve(
+                               *resource_slots_, slot_owner, resources)
+                         : resource_slots_->reserve(slot_owner, resources);
   if (!reservation.ok()) {
     return Result<OperationAcceptedDTO>::Err(reservation.error());
   }
@@ -1203,7 +1257,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   auto durable_acceptance = journal_.RecordOperationAccepted(config_.request_owner_epoch, intent,
                                                              accepted, operation_state_dto);
   if (!durable_acceptance.ok()) {
-    const auto release = resource_slots_.release(slot_owner, resources);
+    const auto release = resource_slots_->release(slot_owner, resources);
     if (!release.ok()) {
       return Result<OperationAcceptedDTO>::Err(release.error());
     }
@@ -1287,8 +1341,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                               : nullptr,
                                           "subordinate_command_admitted");
         if (durable_state.ok()) {
-          auto transition =
-              resource_slots_.transition(slot_owner, resources, ResourceSlotState::kDispatched);
+          auto transition = resource_slots_->transition(
+              slot_owner, resources, ResourceSlotState::kDispatched);
           if (!transition.ok()) {
             dispatch_result = transition;
           } else {
@@ -1318,9 +1372,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                         "subordinate_dispatch_failed_after_acceptance");
       if (durable_failure.ok()) {
         if (active_operation_->slot_state != ResourceSlotState::kTerminal) {
-          const auto transition = resource_slots_.transition(active_operation_->slot_owner,
-                                                             active_operation_->resources,
-                                                             ResourceSlotState::kTerminal);
+          const auto transition = resource_slots_->transition(
+              active_operation_->slot_owner, active_operation_->resources,
+              ResourceSlotState::kTerminal);
           if (transition.ok()) {
             active_operation_->slot_state = ResourceSlotState::kTerminal;
           }
@@ -1490,10 +1544,10 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
 
     auto revised =
         settles_operation && active_operation_->slot_state != ResourceSlotState::kTerminal
-            ? resource_slots_.transition_and_revise_owner(
+            ? resource_slots_->transition_and_revise_owner(
                   active_operation_->slot_owner, active_operation_->resources,
                   ResourceSlotState::kTerminal, next_revision)
-            : resource_slots_.revise_owner(active_operation_->slot_owner,
+            : resource_slots_->revise_owner(active_operation_->slot_owner,
                                            active_operation_->resources, next_revision);
     control_replay_ledger_.push_back(ControlReplayEntry{request, accepted});
     if (!revised.ok()) {
@@ -1586,7 +1640,8 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
   active_operation_->pending_control.reset();
   if (settles_operation) {
     auto release =
-        resource_slots_.release(active_operation_->slot_owner, active_operation_->resources);
+        resource_slots_->release(active_operation_->slot_owner,
+                                 active_operation_->resources);
     if (!release.ok()) {
       auto intervention = active_operation_->state;
       intervention.state = OperationStateKind::kInterventionRequired;
@@ -1758,7 +1813,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::stop(const StopIntentD
     if (!durable_acceptance.ok()) {
       return Result<StopAcceptedDTO>::Err(durable_acceptance.error());
     }
-    auto revised = resource_slots_.transition_and_revise_owner(
+    auto revised = resource_slots_->transition_and_revise_owner(
         active_operation_->slot_owner, active_operation_->resources, ResourceSlotState::kStopping,
         next_revision);
     if (!revised.ok()) {
@@ -2326,8 +2381,9 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     return Result<void>::Err(durable_state.error());
   }
   if (slot_changed) {
-    auto transition = resource_slots_.transition(active_operation_->slot_owner,
-                                                 active_operation_->resources, desired_slot_value);
+    auto transition = resource_slots_->transition(
+        active_operation_->slot_owner, active_operation_->resources,
+        desired_slot_value);
     if (!transition.ok()) {
       auto intervention = observed_state;
       intervention.state = OperationStateKind::kInterventionRequired;
@@ -2485,7 +2541,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
 }
 
 std::vector<ResourceSlotSnapshotDTO> ResourceAddressedExecutionKernel::resource_snapshot() const {
-  return resource_slots_.snapshot();
+  return resource_slots_->snapshot();
 }
 
 }  // namespace manyforge::core

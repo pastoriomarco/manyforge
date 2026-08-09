@@ -36,10 +36,12 @@ struct ResourceAddressedExecutionKernelConfig final {
   ResourceAddressedExecutionKernelConfig() = default;
   ResourceAddressedExecutionKernelConfig(
       RequestOwnerEpoch owner_epoch, std::size_t replay_capacity,
-      RuntimeParticipantAdmissionResolver resolver = {})
+      RuntimeParticipantAdmissionResolver resolver = {},
+      IResourceOperationAdmissionGate* admission_gate = nullptr)
       : request_owner_epoch(std::move(owner_epoch)),
         request_replay_capacity(replay_capacity),
-        participant_resolver(std::move(resolver)) {}
+        participant_resolver(std::move(resolver)),
+        operation_admission_gate(admission_gate) {}
 
   RequestOwnerEpoch request_owner_epoch;
   std::size_t request_replay_capacity{1024U};
@@ -47,6 +49,10 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// binding against the request and accepts only a lifetime-pinned engine
   /// already present in registrations.
   RuntimeParticipantAdmissionResolver participant_resolver;
+  /// Optional process-local configuration-fence interlock. It must outlive
+  /// this Kernel. The interlock serializes the real slot-table reservation;
+  /// it owns no duplicate operation counters or resource state.
+  IResourceOperationAdmissionGate* operation_admission_gate{};
 };
 
 /// Private no-effect result used to project a capability-command preview at a
@@ -117,6 +123,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> resource_snapshot()
       const;
+  [[nodiscard]] std::shared_ptr<const ResourceSlotTable>
+  resource_admission_table() const noexcept {
+    return resource_slots_;
+  }
   [[nodiscard]] const RequestOwnerEpoch& request_owner_epoch()
       const noexcept override {
     return config_.request_owner_epoch;
@@ -150,7 +160,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ResolvedRuntimeScaleStatusDTO& resolved_status);
 
   RuntimeParticipantRegistry registry_;
-  ResourceSlotTable resource_slots_;
+  std::shared_ptr<ResourceSlotTable> resource_slots_;
   std::vector<RuntimeParticipantExecutionRegistration> registrations_;
   IClock& clock_;
   IOperationJournal& journal_;

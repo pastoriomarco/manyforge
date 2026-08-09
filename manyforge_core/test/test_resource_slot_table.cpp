@@ -104,6 +104,65 @@ TEST(ResourceSlotTableTest, KeepsI6SingleOperationRuleForDisjointResources) {
   ASSERT_TRUE(table.reserve(second, {ResourceId("robot.b.joint")}).ok());
 }
 
+TEST(ResourceSlotTableTest,
+     ProjectsExactGenerationConfigurationsAndAffectedOperationCounts) {
+  ResourceSlotTable table(
+      {ResourceId("joint.1"), ResourceId("joint.2"),
+       ResourceId("gripper.1")},
+      {DomainActiveControlConfigurationDTO{
+          ControlDomainId("domain.arm"),
+          ActiveControlConfigurationId("active.native"),
+          ActiveControlConfigurationGeneration(1U)}});
+  const auto operation = owner();
+
+  const auto initial =
+      table.admission_snapshot({ResourceId("joint.2")});
+  EXPECT_EQ(initial.operation_resource_generation, 0U);
+  ASSERT_EQ(initial.active_control_configurations.size(), 1U);
+  EXPECT_EQ(initial.active_control_configurations.front().control_domain_id,
+            ControlDomainId("domain.arm"));
+  EXPECT_EQ(initial.affected_queued_operation_count, 0U);
+  EXPECT_EQ(initial.affected_active_operation_count, 0U);
+
+  ASSERT_TRUE(table.reserve(operation, arm_resources()).ok());
+  const auto reserved =
+      table.admission_snapshot({ResourceId("joint.2")});
+  EXPECT_EQ(reserved.operation_resource_generation, 1U);
+  EXPECT_EQ(reserved.affected_queued_operation_count, 1U);
+  EXPECT_EQ(reserved.affected_active_operation_count, 0U);
+
+  ASSERT_TRUE(table
+                  .transition(operation, arm_resources(),
+                              ResourceSlotState::kDispatched)
+                  .ok());
+  const auto dispatched =
+      table.admission_snapshot({ResourceId("joint.1")});
+  EXPECT_EQ(dispatched.operation_resource_generation, 2U);
+  EXPECT_EQ(dispatched.affected_queued_operation_count, 0U);
+  EXPECT_EQ(dispatched.affected_active_operation_count, 1U);
+
+  ASSERT_TRUE(table
+                  .transition(operation, arm_resources(),
+                              ResourceSlotState::kTerminal)
+                  .ok());
+  const auto terminal = table.admission_snapshot(arm_resources());
+  EXPECT_EQ(terminal.operation_resource_generation, 3U);
+  EXPECT_EQ(terminal.affected_active_operation_count, 1U);
+
+  ASSERT_TRUE(table.release(operation, arm_resources()).ok());
+  const auto released = table.admission_snapshot(arm_resources());
+  EXPECT_EQ(released.operation_resource_generation, 4U);
+  EXPECT_EQ(released.affected_queued_operation_count, 0U);
+  EXPECT_EQ(released.affected_active_operation_count, 0U);
+
+  ASSERT_TRUE(table.mark_unreconciled_external_or_orphan_goal(
+                       {ResourceId("joint.1"), ResourceId("joint.2")})
+                  .ok());
+  const auto orphan = table.admission_snapshot(arm_resources());
+  EXPECT_EQ(orphan.operation_resource_generation, 5U);
+  EXPECT_EQ(orphan.affected_active_operation_count, 1U);
+}
+
 TEST(ResourceSlotTableTest, RejectsStaleOwnerAndIllegalTransition) {
   ResourceSlotTable table(arm_resources());
   const auto current = owner();
@@ -126,16 +185,18 @@ TEST(ResourceSlotTableTest, RejectsStaleOwnerAndIllegalTransition) {
                           }));
 }
 
-TEST(ResourceSlotTableTest, FenceBlocksAdmissionUntilExplicitlyCleared) {
+TEST(ResourceSlotTableTest,
+     AdmissionProjectionAcceptsCandidateOnlyResourcesAndRejectsDuplicates) {
   ResourceSlotTable table(arm_resources());
-  ASSERT_TRUE(table.fence({ResourceId("joint.1")}).ok());
+  const auto candidate_only = table.admission_snapshot(
+      {ResourceId("candidate.only.resource")});
+  EXPECT_EQ(candidate_only.operation_resource_generation, 0U);
+  EXPECT_EQ(candidate_only.affected_queued_operation_count, 0U);
+  EXPECT_EQ(candidate_only.affected_active_operation_count, 0U);
 
-  const auto rejected = table.reserve(owner(), arm_resources());
-  ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().details.at("reason"), "resource_scope_busy");
-
-  ASSERT_TRUE(table.unfence({ResourceId("joint.1")}).ok());
-  EXPECT_TRUE(table.reserve(owner(), arm_resources()).ok());
+  EXPECT_THROW(table.admission_snapshot(
+                   {ResourceId("joint.1"), ResourceId("joint.1")}),
+               std::invalid_argument);
 }
 
 TEST(ResourceSlotTableTest, RejectsInvalidInventoryAtConstruction) {
@@ -144,6 +205,18 @@ TEST(ResourceSlotTableTest, RejectsInvalidInventoryAtConstruction) {
                std::invalid_argument);
   EXPECT_THROW(ResourceSlotTable(std::vector<ResourceId>{}),
                std::invalid_argument);
+  EXPECT_THROW(
+      ResourceSlotTable(
+          {ResourceId("joint.1")},
+          {DomainActiveControlConfigurationDTO{
+               ControlDomainId("domain.z"),
+               ActiveControlConfigurationId("active.z"),
+               ActiveControlConfigurationGeneration(1U)},
+           DomainActiveControlConfigurationDTO{
+               ControlDomainId("domain.a"),
+               ActiveControlConfigurationId("active.a"),
+               ActiveControlConfigurationGeneration(1U)}}),
+      std::invalid_argument);
 }
 
 TEST(ResourceSlotTableTest, RevisesExactOwnerWithoutChangingSlotState) {

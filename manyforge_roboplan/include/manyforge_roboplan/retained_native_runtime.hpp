@@ -71,6 +71,9 @@ struct RetainedNativeRuntimeInput final {
   /// supplies only sealed bindings for this physical runtime; Core rechecks
   /// the request address, resource inventory, and pinned engine before use.
   RetainedRuntimeParticipantResolver participant_resolver;
+  /// Optional configuration-fence interlock owned by the surrounding managed
+  /// execution process. It must outlive this runtime composition.
+  core::IResourceOperationAdmissionGate* operation_admission_gate{};
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public

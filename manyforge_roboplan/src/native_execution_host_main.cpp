@@ -2442,6 +2442,7 @@ struct CompositionBuildInput final {
   core::ActiveBundlePublicationGeneration publication_generation;
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
   collision::ManyForgeCollisionEngine::SharedModelPtr collision_shared_model;
+  ManagedKernelAdmissionGate* operation_admission_gate{};
   std::shared_ptr<const deployment::ProgramBindingContract> status_program;
   std::shared_ptr<const deployment::ProgramBinding> status_program_binding;
   core::TargetRoleId status_motion_target_role_id;
@@ -2681,7 +2682,8 @@ struct CompositionBuildInput final {
           [product_resolver](const core::OperationIntentDTO& operation,
                              const std::size_t participant_index) {
             return product_resolver->Resolve(operation, participant_index);
-          }},
+          },
+          input.operation_admission_gate},
       RetainedNativeRuntimeConfig{
           input.owner_epoch, input.cell_id,
           input.execution_state_root /
@@ -2689,6 +2691,10 @@ struct CompositionBuildInput final {
           1024U, core::CacheConfig{}, core::ExecutionKernelConfig{},
           RoboPlanExecutionBackendConfig{},
           SimpleSchedulerConfig::from_environment(), 10'000'000});
+  if (input.operation_admission_gate != nullptr) {
+    input.operation_admission_gate->BindResourceTable(
+        runtime->addressed_kernel->resource_admission_table());
+  }
   auto direct_control_joint_limits = runtime->kinematics->joint_limits(
       direct_control_motion_binding.value()
           .value()
@@ -2786,6 +2792,7 @@ struct CompositionBuildInput final {
       receipt.publication_generation,
       {},
       {},
+      nullptr,
       std::move(program),
       std::move(program_binding),
       core::TargetRoleId(config.motion_target_role_id),
@@ -2795,7 +2802,8 @@ struct CompositionBuildInput final {
 
 [[nodiscard]] std::optional<CompositionBuildInput>
 TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
-                                const ManagedProjectionRegistry& projections) {
+                                const ManagedProjectionRegistry& projections,
+                                ManagedKernelAdmissionGate& admission_gate) {
   component_manager::SqliteActiveBundlePublicationStore publication_store(
       config.manager_state_root /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
@@ -2899,6 +2907,7 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
       receipt.publication_generation,
       std::move(projection),
       std::move(collision_model),
+      &admission_gate,
       {},
       {},
       core::TargetRoleId(
@@ -2954,7 +2963,8 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
     if (managed_composition_started) {
       return;
     }
-    auto input = TryBuildManagedCompositionInput(config, projections);
+    auto input = TryBuildManagedCompositionInput(config, projections,
+                                                 admission_gate);
     if (!input.has_value()) {
       return;
     }

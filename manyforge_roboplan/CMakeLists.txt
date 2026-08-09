@@ -286,11 +286,25 @@ target_link_libraries(manyforge_roboplan_candidate_worker PRIVATE
   manyforge_roboplan_worker_protocol
   manyforge_roboplan_native_candidate)
 
+add_library(manyforge_roboplan_managed_kernel_apply_fence
+  src/managed_kernel_apply_fence_owner.cpp)
+target_include_directories(manyforge_roboplan_managed_kernel_apply_fence
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src
+  PRIVATE
+    "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
+target_link_libraries(manyforge_roboplan_managed_kernel_apply_fence
+  PUBLIC manyforge_core
+  PRIVATE
+    manyforge_component_manager
+    manyforge::content_identity
+    manyforge_deployment
+    manyforge::persistence
+    SQLite::SQLite3)
+
 # Selected composition root for the first complete addressed native path.
 # Its same-user Unix socket is a bounded private transport consumed by the
 # headless API; it is not a second public execution contract.
 add_executable(manyforge_native_execution_host
-  src/managed_kernel_apply_fence_owner.cpp
   src/product_backed_runtime_participant_resolver.cpp
   src/native_execution_host_main.cpp)
 target_include_directories(manyforge_native_execution_host PRIVATE
@@ -298,6 +312,7 @@ target_include_directories(manyforge_native_execution_host PRIVATE
 target_compile_definitions(manyforge_native_execution_host PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_native_execution_host PRIVATE
+  manyforge_roboplan_managed_kernel_apply_fence
   manyforge_roboplan_native_runtime
   manyforge_roboplan_process_candidate_client
   manyforge_roboplan_retained_consumer
@@ -334,7 +349,6 @@ if(BUILD_TESTING)
     # qualified without introducing a second production scene or runtime
     # owner. The installed host above never compiles this fixture.
     add_executable(manyforge_native_execution_host_pick_place_fixture
-      src/managed_kernel_apply_fence_owner.cpp
       src/product_backed_runtime_participant_resolver.cpp
       src/native_execution_host_main.cpp
       test/focused_pick_place_planning_fixture.cpp)
@@ -349,6 +363,7 @@ if(BUILD_TESTING)
       MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE=1)
     target_link_libraries(
       manyforge_native_execution_host_pick_place_fixture PRIVATE
+      manyforge_roboplan_managed_kernel_apply_fence
       manyforge_roboplan_native_runtime
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_retained_consumer
@@ -441,6 +456,14 @@ if(BUILD_TESTING)
     target_link_libraries(test_retained_native_backends PRIVATE
       manyforge_roboplan_native_execution
       manyforge_roboplan_native_gripper
+      GTest::gtest_main)
+
+    add_executable(test_managed_kernel_admission_gate
+      test/test_managed_kernel_admission_gate.cpp)
+    target_include_directories(test_managed_kernel_admission_gate PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_managed_kernel_admission_gate PRIVATE
+      manyforge_roboplan_managed_kernel_apply_fence
       GTest::gtest_main)
 
     add_executable(fake_process_candidate_worker
@@ -707,6 +730,7 @@ if(BUILD_TESTING)
       manyforge_roboplan_native_state_projection
       manyforge_roboplan_native_runtime
       manyforge_roboplan_process_candidate_client
+      manyforge_roboplan_managed_kernel_apply_fence
       manyforge_collision
       manyforge_core
       manyforge_deployment
@@ -799,6 +823,10 @@ if(BUILD_TESTING)
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_retained_native_backends
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_managed_kernel_admission_gate
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

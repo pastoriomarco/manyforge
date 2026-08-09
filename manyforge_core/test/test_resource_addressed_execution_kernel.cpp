@@ -408,6 +408,38 @@ class FakeOperationJournal final : public IOperationJournal {
   std::vector<std::string>* timeline{};
 };
 
+class FakeResourceAdmissionGate final
+    : public IResourceOperationAdmissionGate {
+ public:
+  FakeResourceAdmissionGate()
+      : admission_mutex_(std::make_shared<std::recursive_mutex>()) {}
+
+  [[nodiscard]] std::shared_ptr<std::recursive_mutex>
+  shared_admission_mutex() const override {
+    return admission_mutex_;
+  }
+
+  [[nodiscard]] Result<void> reserve(
+      ResourceSlotTable& table, const ResourceSlotOwnerDTO& owner,
+      const std::vector<ResourceId>& resources) override {
+    std::lock_guard lock(*admission_mutex_);
+    ++reserve_calls;
+    if (reject_reservation) {
+      return Result<void>::Err(ErrorDTO{
+          std::string(to_string(ErrorCode::kExecutionRejected)),
+          "test configuration fence is held",
+          {{"reason", "configuration_fence_held"}}});
+    }
+    return table.reserve(owner, resources);
+  }
+
+  bool reject_reservation{true};
+  int reserve_calls{};
+
+ private:
+  std::shared_ptr<std::recursive_mutex> admission_mutex_;
+};
+
 FakeOperationJournal default_journal;
 
 [[nodiscard]] RuntimeParticipantBinding make_binding(
@@ -642,6 +674,48 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
   ASSERT_TRUE(state.ok()) << state.error().message;
   EXPECT_EQ(state.value().state, OperationStateKind::kPlanning);
   EXPECT_EQ(state.value().participants.front().command_target_id.value(), "arm");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     UsesOneInjectedGateForTheActualSlotTableReservation) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeResourceAdmissionGate gate;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding("arm", "arm", "execution.trajectory.execute",
+                     CoordinateKind::kAngular),
+        &engine}},
+      clock, default_journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), 8U, {}, &gate});
+
+  const auto blocked = kernel.execute(motion_operation());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"),
+            "configuration_fence_held");
+  EXPECT_EQ(gate.reserve_calls, 1);
+  EXPECT_EQ(engine.execute_calls, 0);
+  const auto blocked_slots = kernel.resource_snapshot();
+  ASSERT_EQ(blocked_slots.size(), 1U);
+  EXPECT_EQ(blocked_slots.front().state, ResourceSlotState::kFree);
+
+  const auto admission = kernel.resource_admission_table()->admission_snapshot(
+      {ResourceId("robot.joint_1")});
+  EXPECT_EQ(admission.operation_resource_generation, 0U);
+  ASSERT_EQ(admission.active_control_configurations.size(), 1U);
+  EXPECT_EQ(admission.affected_queued_operation_count, 0U);
+  EXPECT_EQ(admission.affected_active_operation_count, 0U);
+
+  gate.reject_reservation = false;
+  const auto accepted = kernel.execute(motion_operation());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(gate.reserve_calls, 2);
+  EXPECT_EQ(engine.execute_calls, 1);
+  const auto admitted = kernel.resource_admission_table()->admission_snapshot(
+      {ResourceId("robot.joint_1")});
+  EXPECT_EQ(admitted.operation_resource_generation, 1U);
+  EXPECT_EQ(admitted.affected_queued_operation_count, 1U);
+  EXPECT_EQ(admitted.affected_active_operation_count, 0U);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

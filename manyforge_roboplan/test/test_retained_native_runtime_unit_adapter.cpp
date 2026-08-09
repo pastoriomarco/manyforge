@@ -21,6 +21,7 @@
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -325,6 +326,52 @@ NativeProjectionBinding(const NativeFixture &fixture,
   };
 }
 
+[[nodiscard]] core::ConfigurationFenceScopeDTO
+PhysicalConfigurationScope(const NativeFixture &fixture) {
+  const auto &graph = fixture.bundle->value().cell_graph;
+  std::set<core::ControllableComponentId> components;
+  std::set<core::ControlDomainId> domain_ids;
+  std::set<core::ResourceId> resources;
+  std::vector<core::ConfigurationFenceBindingScopeDTO> bindings;
+  for (const auto &binding : graph.control_bindings) {
+    components.insert(binding.controllable_component_id);
+    domain_ids.insert(binding.control_domain_id);
+    bindings.push_back(core::ConfigurationFenceBindingScopeDTO{
+        binding.control_binding_id, binding.control_binding_revision,
+        binding.control_binding_revision});
+    for (const auto &resource : binding.resource_bindings) {
+      resources.insert(resource.resource_id);
+    }
+  }
+  std::vector<core::ConfigurationFenceDomainScopeDTO> domains;
+  for (const auto &domain_id : domain_ids) {
+    const auto found = std::find_if(
+        graph.control_domains.begin(), graph.control_domains.end(),
+        [&](const auto &domain) {
+          return domain.control_domain_id == domain_id;
+        });
+    if (found == graph.control_domains.end()) {
+      throw std::logic_error(
+          "native adapter fixture control domain is unresolved");
+    }
+    domains.push_back(core::ConfigurationFenceDomainScopeDTO{
+        domain_id, found->control_domain_revision,
+        found->control_domain_revision});
+  }
+  std::sort(bindings.begin(), bindings.end(), [](const auto &left,
+                                                 const auto &right) {
+    return left.control_binding_id < right.control_binding_id;
+  });
+  core::ConfigurationFenceScopeDTO scope{
+      {components.begin(), components.end()}, std::move(domains),
+      std::move(bindings), {resources.begin(), resources.end()}};
+  if (!scope.valid()) {
+    throw std::logic_error(
+        "native adapter physical configuration scope is invalid");
+  }
+  return scope;
+}
+
 [[nodiscard]] bool WaitForRegularFile(
     const std::filesystem::path &path,
     const std::chrono::steady_clock::duration timeout) {
@@ -615,6 +662,53 @@ TEST(RetainedNativeRuntimeUnitAdapter,
           std::string(core::kOperationJournalFilename),
       std::chrono::seconds(10)))
       << "the managed child did not compose the active physical product";
+
+  const auto physical_scope = PhysicalConfigurationScope(fixture);
+  const core::RuntimeEpoch manager_epoch(
+      "manager-runtime-physical-admission-test");
+  const core::ConfigurationFenceAdmissionQueryDTO admission_query{
+      physical_scope, manager_epoch};
+  const auto admission = adapter.ObserveAdmission(admission_query);
+  ASSERT_TRUE(admission.matches(admission_query));
+  EXPECT_EQ(admission.active_projection_revision, initial_revision);
+  EXPECT_EQ(admission.operation_resource_generation, 0U);
+  EXPECT_EQ(admission.affected_queued_operation_count, 0U);
+  EXPECT_EQ(admission.affected_active_operation_count, 0U);
+  EXPECT_EQ(admission.active_control_configurations.size(),
+            physical_scope.domains.size());
+  const core::ApplyConfigurationFenceIntentDTO physical_fence_intent{
+      core::PublicRequestContextDTO{
+          core::RequestId("native-physical-fence-request-1"),
+          core::RequestOwnerEpoch("manager-owner-physical-fence-test"),
+          "retained-native-adapter-test", std::nullopt},
+      core::ApplyFenceOwnerDTO{
+          core::ApplyId("native-physical-fence-apply-1"),
+          core::ApplyGeneration(1U)},
+      physical_scope,
+      core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      admission.operation_resource_generation,
+      admission.configuration_fence_generation,
+      admission.active_control_configurations,
+      "verify physical Kernel table and durable fence admission share one "
+      "truth"};
+  ASSERT_TRUE(physical_fence_intent.valid());
+  const auto physical_fence = adapter.Acquire(physical_fence_intent);
+  ASSERT_TRUE(physical_fence.matches(physical_fence_intent));
+  const core::ConfigurationFenceStatusQueryDTO physical_status_query{
+      physical_fence_intent.owner_transaction,
+      physical_fence.configuration_fence_id,
+      physical_fence.configuration_fence_generation,
+      physical_fence.captured_scope, manager_epoch};
+  const auto physical_held = adapter.QueryStatus(physical_status_query);
+  ASSERT_TRUE(physical_held.matches(physical_status_query));
+  EXPECT_EQ(physical_held.reconciliation_evidence
+                .active_control_configurations,
+            admission.active_control_configurations);
+  const core::ConfigurationFenceReleaseDTO physical_release{
+      physical_held.reconciliation_evidence, manager_epoch};
+  EXPECT_TRUE(adapter.Release(physical_release).valid());
 
   ASSERT_FALSE(fixture.bundle->value().cell_graph.control_bindings.empty());
   const auto &control_binding =

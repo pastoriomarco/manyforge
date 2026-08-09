@@ -459,27 +459,114 @@ struct ActivePublication final {
 
 } // namespace
 
+ManagedKernelAdmissionGate::ManagedKernelAdmissionGate()
+    : admission_mutex_(std::make_shared<std::recursive_mutex>()) {}
+
+std::shared_ptr<std::recursive_mutex>
+ManagedKernelAdmissionGate::shared_admission_mutex() const {
+  return admission_mutex_;
+}
+
+void ManagedKernelAdmissionGate::BindResourceTable(
+    std::shared_ptr<const core::ResourceSlotTable> table) {
+  Require(table != nullptr && table->shares_admission_mutex(admission_mutex_),
+          "bound Kernel resource table does not share the admission mutex");
+  std::lock_guard lock(*admission_mutex_);
+  const auto current = resource_table_.lock();
+  if (current != nullptr && current != table) {
+    Require(!held_fences_.empty(),
+            "live Kernel resource-table replacement is not fenced");
+    const auto observation =
+        current->admission_snapshot(held_fences_.front().scope.resources);
+    Require(observation.affected_queued_operation_count == 0U &&
+                observation.affected_active_operation_count == 0U,
+            "live Kernel resource-table replacement still has affected work");
+  } else if (current == nullptr && resource_table_was_bound_) {
+    Require(!held_fences_.empty(),
+            "expired Kernel resource table cannot be replaced without a "
+            "held fence");
+  }
+  resource_table_ = std::move(table);
+  resource_table_was_bound_ = true;
+}
+
+core::Result<void> ManagedKernelAdmissionGate::reserve(
+    core::ResourceSlotTable &table, const core::ResourceSlotOwnerDTO &owner,
+    const std::vector<core::ResourceId> &resources) {
+  std::lock_guard lock(*admission_mutex_);
+  const auto bound = resource_table_.lock();
+  if (bound == nullptr || bound.get() != &table ||
+      !table.shares_admission_mutex(admission_mutex_)) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+        "Kernel operation admission has no exact bound resource table",
+        {{"reason", "resource_admission_table_unbound"}}});
+  }
+  const auto blocked = std::any_of(
+      held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
+        return std::any_of(resources.begin(), resources.end(),
+                           [&](const auto &resource) {
+                             return std::binary_search(
+                                 held.scope.resources.begin(),
+                                 held.scope.resources.end(), resource);
+                           });
+      });
+  if (blocked) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+        "Kernel operation admission is closed by a configuration fence",
+        {{"reason", "configuration_fence_held"}}});
+  }
+  return table.reserve(owner, resources);
+}
+
 ManagedKernelAdmissionObservation ManagedKernelAdmissionGate::Observe(
     const core::ConfigurationFenceScopeDTO &scope) const {
   Require(scope.valid(), "admission observation scope is invalid");
-  std::lock_guard lock(mutex_);
-  return {operation_resource_generation_, active_control_configurations_, 0U,
-          0U};
+  std::lock_guard lock(*admission_mutex_);
+  const auto table = resource_table_.lock();
+  Require(table != nullptr || !resource_table_was_bound_,
+          "the bound Kernel resource table is no longer available");
+  if (table == nullptr) {
+    return {0U, {}, 0U, 0U};
+  }
+  const auto snapshot = table->admission_snapshot(scope.resources);
+  return {snapshot.operation_resource_generation,
+          snapshot.active_control_configurations,
+          snapshot.affected_queued_operation_count,
+          snapshot.affected_active_operation_count};
 }
 
 void ManagedKernelAdmissionGate::AcquireFenceDurably(
     const core::ConfigurationFenceId &fence_id,
     const core::ConfigurationFenceScopeDTO &scope,
     const std::uint64_t expected_operation_resource_generation,
+    const std::vector<core::DomainActiveControlConfigurationDTO>
+        &expected_active_control_configurations,
     const std::function<void()> &commit_durable_fence) {
   Require(!fence_id.empty() && scope.valid(),
           "fence acquisition identity or scope is invalid");
+  ValidateConfigurations(expected_active_control_configurations);
   Require(static_cast<bool>(commit_durable_fence),
           "fence acquisition durable commit is absent");
-  std::lock_guard lock(mutex_);
-  Require(operation_resource_generation_ ==
-              expected_operation_resource_generation,
-          "operation-resource generation changed before fence acquisition");
+  std::lock_guard lock(*admission_mutex_);
+  const auto table = resource_table_.lock();
+  Require(table != nullptr || !resource_table_was_bound_,
+          "the bound Kernel resource table is no longer available");
+  const auto observation =
+      table != nullptr
+          ? table->admission_snapshot(scope.resources)
+          : core::ResourceSlotAdmissionSnapshotDTO{};
+  Require(observation.operation_resource_generation ==
+                  expected_operation_resource_generation &&
+              observation.affected_queued_operation_count == 0U &&
+              observation.affected_active_operation_count == 0U,
+          "affected operation admission is busy or changed before fence "
+          "acquisition");
+  Require(SelectConfigurations(observation.active_control_configurations,
+                               scope, false) ==
+              expected_active_control_configurations,
+          "active control configuration changed before fence acquisition");
   Require(held_fences_.empty(),
           "another configuration fence already closes operation admission");
   held_fences_.push_back({fence_id, scope});
@@ -496,7 +583,7 @@ void ManagedKernelAdmissionGate::RestoreFence(
     const core::ConfigurationFenceScopeDTO &scope) {
   Require(!fence_id.empty() && scope.valid(),
           "restored fence identity or scope is invalid");
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   const auto found =
       std::find_if(held_fences_.begin(), held_fences_.end(),
                    [&](const auto &held) { return held.fence_id == fence_id; });
@@ -514,7 +601,7 @@ void ManagedKernelAdmissionGate::ReleaseFence(
     const core::ConfigurationFenceScopeDTO &scope) {
   Require(!fence_id.empty() && scope.valid(),
           "released fence identity or scope is invalid");
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   const auto found = std::find_if(
       held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
         return held.fence_id == fence_id && held.scope == scope;
@@ -522,20 +609,6 @@ void ManagedKernelAdmissionGate::ReleaseFence(
   Require(found != held_fences_.end(),
           "released fence is not held by the admission gate");
   held_fences_.erase(found);
-}
-
-void ManagedKernelAdmissionGate::ReplaceActiveControlConfigurations(
-    std::vector<core::DomainActiveControlConfigurationDTO> configurations) {
-  ValidateConfigurations(configurations);
-  std::lock_guard lock(mutex_);
-  if (active_control_configurations_ == configurations) {
-    return;
-  }
-  Require(operation_resource_generation_ !=
-              std::numeric_limits<std::uint64_t>::max(),
-          "operation-resource generation is exhausted");
-  active_control_configurations_ = std::move(configurations);
-  ++operation_resource_generation_;
 }
 
 class ManagedKernelApplyFenceOwner::Impl final {
@@ -653,7 +726,8 @@ public:
 
     admission_gate_.AcquireFenceDurably(
         accepted.configuration_fence_id, accepted.captured_scope,
-        intent.expected_operation_resource_generation, [&] {
+        intent.expected_operation_resource_generation,
+        intent.expected_active_control_configurations, [&] {
           Transaction transaction(database_);
           Statement insert(
               database_,

@@ -1,6 +1,7 @@
 #include <manyforge_core/resource_slot_table.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -31,7 +32,6 @@ namespace {
       return next == ResourceSlotState::kTerminal;
     case ResourceSlotState::kFree:
     case ResourceSlotState::kTerminal:
-    case ResourceSlotState::kFenced:
     case ResourceSlotState::kUnreconciledExternalOrOrphanGoal:
       return false;
   }
@@ -50,7 +50,16 @@ bool ResourceSlotOwnerDTO::valid() const noexcept {
          active_control_configuration_generation.nonzero();
 }
 
-ResourceSlotTable::ResourceSlotTable(std::vector<ResourceId> resources) {
+ResourceSlotTable::ResourceSlotTable(
+    std::vector<ResourceId> resources,
+    std::vector<DomainActiveControlConfigurationDTO>
+        active_control_configurations,
+    std::shared_ptr<std::recursive_mutex> admission_mutex)
+    : admission_mutex_(admission_mutex != nullptr
+                           ? std::move(admission_mutex)
+                           : std::make_shared<std::recursive_mutex>()),
+      active_control_configurations_(
+          std::move(active_control_configurations)) {
   if (resources.empty() || resources.size() > kMaxKernelResourceSlots) {
     throw std::invalid_argument(
         "Kernel resource inventory is empty or exceeds its fixed bound");
@@ -62,6 +71,23 @@ ResourceSlotTable::ResourceSlotTable(std::vector<ResourceId> resources) {
           resources.end()) {
     throw std::invalid_argument(
         "Kernel resource inventory contains an empty or duplicate identity");
+  }
+  if (!std::all_of(active_control_configurations_.begin(),
+                   active_control_configurations_.end(),
+                   [](const auto& row) { return row.valid(); }) ||
+      !std::is_sorted(active_control_configurations_.begin(),
+                      active_control_configurations_.end(),
+                      [](const auto& left, const auto& right) {
+                        return left.control_domain_id < right.control_domain_id;
+                      }) ||
+      std::adjacent_find(
+          active_control_configurations_.begin(),
+          active_control_configurations_.end(),
+          [](const auto& left, const auto& right) {
+            return left.control_domain_id == right.control_domain_id;
+          }) != active_control_configurations_.end()) {
+    throw std::invalid_argument(
+        "Kernel active-control-configuration inventory is noncanonical");
   }
   slots_.reserve(resources.size());
   for (auto& resource : resources) {
@@ -103,6 +129,20 @@ Result<void> ResourceSlotTable::validate_resource_set_locked(
   return Result<void>::Ok();
 }
 
+Result<void> ResourceSlotTable::require_generation_available_locked() const {
+  if (operation_resource_generation_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    return reject("operation-resource generation is exhausted",
+                  "operation_resource_generation_exhausted",
+                  ErrorCode::kInternalError);
+  }
+  return Result<void>::Ok();
+}
+
+void ResourceSlotTable::advance_generation_locked() noexcept {
+  ++operation_resource_generation_;
+}
+
 Result<void> ResourceSlotTable::reserve(
     const ResourceSlotOwnerDTO& owner,
     const std::vector<ResourceId>& resources) {
@@ -110,7 +150,7 @@ Result<void> ResourceSlotTable::reserve(
     return reject("resource reservation owner is invalid",
                   "resource_owner_invalid", ErrorCode::kInvalidRequest);
   }
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -126,11 +166,16 @@ Result<void> ResourceSlotTable::reserve(
                     "resource_scope_busy");
     }
   }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return generation;
+  }
   for (const auto index : indices) {
     slots_[index].state = ResourceSlotState::kReserved;
     slots_[index].owner = owner;
   }
   active_operation_id_ = owner.operation_id;
+  advance_generation_locked();
   return Result<void>::Ok();
 }
 
@@ -141,7 +186,7 @@ Result<void> ResourceSlotTable::transition(
     return reject("resource transition owner is invalid",
                   "resource_owner_invalid", ErrorCode::kInvalidRequest);
   }
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -164,9 +209,14 @@ Result<void> ResourceSlotTable::transition(
                     ErrorCode::kInvalidStateTransition);
     }
   }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return generation;
+  }
   for (const auto index : indices) {
     slots_[index].state = next_state;
   }
+  advance_generation_locked();
   return Result<void>::Ok();
 }
 
@@ -181,7 +231,7 @@ Result<ResourceSlotOwnerDTO> ResourceSlotTable::revise_owner(
         "resource owner revision must advance monotonically",
         {{"reason", "resource_owner_revision_invalid"}}});
   }
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -196,11 +246,16 @@ Result<ResourceSlotOwnerDTO> ResourceSlotTable::revise_owner(
           {{"reason", "resource_owner_mismatch"}}});
     }
   }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return Result<ResourceSlotOwnerDTO>::Err(generation.error());
+  }
   auto revised = owner;
   revised.operation_revision = next_operation_revision;
   for (const auto index : indices) {
     slots_[index].owner = revised;
   }
+  advance_generation_locked();
   return Result<ResourceSlotOwnerDTO>::Ok(std::move(revised));
 }
 
@@ -216,7 +271,7 @@ ResourceSlotTable::transition_and_revise_owner(
         "resource owner revision must advance monotonically",
         {{"reason", "resource_owner_revision_invalid"}}});
   }
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -237,12 +292,17 @@ ResourceSlotTable::transition_and_revise_owner(
           {{"reason", "resource_transition_illegal"}}});
     }
   }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return Result<ResourceSlotOwnerDTO>::Err(generation.error());
+  }
   auto revised = owner;
   revised.operation_revision = next_operation_revision;
   for (const auto index : indices) {
     slots_[index].state = next_state;
     slots_[index].owner = revised;
   }
+  advance_generation_locked();
   return Result<ResourceSlotOwnerDTO>::Ok(std::move(revised));
 }
 
@@ -263,7 +323,7 @@ void ResourceSlotTable::clear_active_operation_if_unused_locked() {
 Result<void> ResourceSlotTable::release(
     const ResourceSlotOwnerDTO& owner,
     const std::vector<ResourceId>& resources) {
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -282,58 +342,22 @@ Result<void> ResourceSlotTable::release(
                     ErrorCode::kInvalidStateTransition);
     }
   }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return generation;
+  }
   for (const auto index : indices) {
     slots_[index].state = ResourceSlotState::kFree;
     slots_[index].owner.reset();
   }
   clear_active_operation_if_unused_locked();
-  return Result<void>::Ok();
-}
-
-Result<void> ResourceSlotTable::fence(
-    const std::vector<ResourceId>& resources) {
-  std::lock_guard lock(mutex_);
-  std::vector<std::size_t> indices;
-  auto validation = validate_resource_set_locked(resources, indices);
-  if (!validation.ok()) {
-    return validation;
-  }
-  for (const auto index : indices) {
-    if (slots_[index].state != ResourceSlotState::kFree) {
-      return reject("only free resource slots can be fenced",
-                    "resource_fence_state_invalid");
-    }
-  }
-  for (const auto index : indices) {
-    slots_[index].state = ResourceSlotState::kFenced;
-  }
-  return Result<void>::Ok();
-}
-
-Result<void> ResourceSlotTable::unfence(
-    const std::vector<ResourceId>& resources) {
-  std::lock_guard lock(mutex_);
-  std::vector<std::size_t> indices;
-  auto validation = validate_resource_set_locked(resources, indices);
-  if (!validation.ok()) {
-    return validation;
-  }
-  for (const auto index : indices) {
-    if (slots_[index].state != ResourceSlotState::kFenced ||
-        slots_[index].owner.has_value()) {
-      return reject("only unowned fenced resource slots can be unfenced",
-                    "resource_unfence_state_invalid");
-    }
-  }
-  for (const auto index : indices) {
-    slots_[index].state = ResourceSlotState::kFree;
-  }
+  advance_generation_locked();
   return Result<void>::Ok();
 }
 
 Result<void> ResourceSlotTable::mark_unreconciled_external_or_orphan_goal(
     const std::vector<ResourceId>& resources) {
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   std::vector<std::size_t> indices;
   auto validation = validate_resource_set_locked(resources, indices);
   if (!validation.ok()) {
@@ -345,20 +369,70 @@ Result<void> ResourceSlotTable::mark_unreconciled_external_or_orphan_goal(
                     "resource_orphan_mark_state_invalid", ErrorCode::kInvalidStateTransition);
     }
   }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return generation;
+  }
   for (const auto index : indices) {
     slots_[index].state = ResourceSlotState::kUnreconciledExternalOrOrphanGoal;
   }
+  advance_generation_locked();
   return Result<void>::Ok();
 }
 
 std::vector<ResourceSlotSnapshotDTO> ResourceSlotTable::snapshot() const {
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   return slots_;
 }
 
+ResourceSlotAdmissionSnapshotDTO ResourceSlotTable::admission_snapshot(
+    const std::vector<ResourceId>& affected_resources) const {
+  std::lock_guard lock(*admission_mutex_);
+  std::set<ResourceId> affected;
+  for (const auto& resource : affected_resources) {
+    if (resource.empty() || !affected.insert(resource).second) {
+      throw std::invalid_argument(
+          "affected resource admission scope is noncanonical");
+    }
+  }
+  std::set<OperationId> queued;
+  std::set<OperationId> active;
+  bool unreconciled_orphan_present = false;
+  for (const auto& slot : slots_) {
+    if (!affected.contains(slot.resource_id)) {
+      continue;
+    }
+    if (slot.state == ResourceSlotState::kUnreconciledExternalOrOrphanGoal) {
+      unreconciled_orphan_present = true;
+      continue;
+    }
+    if (!slot.owner.has_value()) {
+      continue;
+    }
+    if (slot.state == ResourceSlotState::kReserved) {
+      queued.insert(slot.owner->operation_id);
+    } else if (slot.state == ResourceSlotState::kDispatched ||
+               slot.state == ResourceSlotState::kStopping ||
+               slot.state == ResourceSlotState::kTerminal) {
+      active.insert(slot.owner->operation_id);
+    }
+  }
+  return ResourceSlotAdmissionSnapshotDTO{
+      operation_resource_generation_, active_control_configurations_,
+      static_cast<std::uint64_t>(queued.size()),
+      static_cast<std::uint64_t>(active.size()) +
+          (unreconciled_orphan_present ? 1U : 0U)};
+}
+
 std::optional<OperationId> ResourceSlotTable::active_operation_id() const {
-  std::lock_guard lock(mutex_);
+  std::lock_guard lock(*admission_mutex_);
   return active_operation_id_;
+}
+
+bool ResourceSlotTable::shares_admission_mutex(
+    const std::shared_ptr<std::recursive_mutex>& admission_mutex) const
+    noexcept {
+  return admission_mutex != nullptr && admission_mutex_ == admission_mutex;
 }
 
 }  // namespace manyforge::core

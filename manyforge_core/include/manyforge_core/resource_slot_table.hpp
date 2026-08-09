@@ -1,11 +1,14 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
 
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 
@@ -19,7 +22,6 @@ enum class ResourceSlotState {
   kDispatched,
   kStopping,
   kTerminal,
-  kFenced,
   kUnreconciledExternalOrOrphanGoal,
 };
 
@@ -54,15 +56,33 @@ struct ResourceSlotSnapshotDTO final {
                          const ResourceSlotSnapshotDTO&) = default;
 };
 
+/// One atomic read of the operation/resource truth owned by a slot table.
+/// Counts are operation counts, not resource counts. Reserved operations are
+/// queued; dispatched, stopping, terminal-awaiting-acknowledgement, and
+/// unreconciled orphan work are active for Apply-admission purposes.
+struct ResourceSlotAdmissionSnapshotDTO final {
+  std::uint64_t operation_resource_generation{};
+  std::vector<DomainActiveControlConfigurationDTO>
+      active_control_configurations;
+  std::uint64_t affected_queued_operation_count{};
+  std::uint64_t affected_active_operation_count{};
+};
+
 /// Fixed-inventory I6 Kernel reservation table.
 ///
 /// I6 deliberately admits only one operation at a time while proving final
 /// resource identities. I8 can relax that admission rule without changing
 /// slot identity or owner evidence. Every mutation is atomic over the supplied
-/// resource set and no method performs I/O or waits.
+/// resource set and no method performs I/O or waits. A configuration fence is
+/// not a second slot state: the injected admission gate serializes it with the
+/// real reservation while retaining the durable fence identity separately.
 class ResourceSlotTable final {
  public:
-  explicit ResourceSlotTable(std::vector<ResourceId> resources);
+  explicit ResourceSlotTable(
+      std::vector<ResourceId> resources,
+      std::vector<DomainActiveControlConfigurationDTO>
+          active_control_configurations = {},
+      std::shared_ptr<std::recursive_mutex> admission_mutex = {});
 
   ResourceSlotTable(const ResourceSlotTable&) = delete;
   ResourceSlotTable& operator=(const ResourceSlotTable&) = delete;
@@ -96,13 +116,6 @@ class ResourceSlotTable final {
       const ResourceSlotOwnerDTO& owner,
       const std::vector<ResourceId>& resources);
 
-  /// Administrative fences are admitted only on free slots. Active work must
-  /// first settle through the owning Kernel operation.
-  [[nodiscard]] Result<void> fence(
-      const std::vector<ResourceId>& resources);
-  [[nodiscard]] Result<void> unfence(
-      const std::vector<ResourceId>& resources);
-
   /// Mark free resources conservatively unavailable after Kernel replacement.
   /// No prior operation owner is recreated and this performs no controller or
   /// transport effect. Later recovery must prove fresh quiescence before an
@@ -111,17 +124,43 @@ class ResourceSlotTable final {
       const std::vector<ResourceId>& resources);
 
   [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> snapshot() const;
+  [[nodiscard]] ResourceSlotAdmissionSnapshotDTO admission_snapshot(
+      const std::vector<ResourceId>& affected_resources) const;
   [[nodiscard]] std::optional<OperationId> active_operation_id() const;
+  [[nodiscard]] bool shares_admission_mutex(
+      const std::shared_ptr<std::recursive_mutex>& admission_mutex) const
+      noexcept;
 
  private:
   [[nodiscard]] Result<void> validate_resource_set_locked(
       const std::vector<ResourceId>& resources,
       std::vector<std::size_t>& indices) const;
   void clear_active_operation_if_unused_locked();
+  [[nodiscard]] Result<void> require_generation_available_locked() const;
+  void advance_generation_locked() noexcept;
 
-  mutable std::mutex mutex_;
+  std::shared_ptr<std::recursive_mutex> admission_mutex_;
   std::vector<ResourceSlotSnapshotDTO> slots_;
+  std::vector<DomainActiveControlConfigurationDTO>
+      active_control_configurations_;
   std::optional<OperationId> active_operation_id_;
+  std::uint64_t operation_resource_generation_{};
+};
+
+/// Optional process-local interlock used by a Kernel reservation path. The
+/// implementation owns no resource counters: it serializes the table's real
+/// reservation with other admission effects such as a durable configuration
+/// fence. It is not caller authorization or a lease/session check; a valid
+/// addressed command is blocked only when its resources overlap a held fence.
+class IResourceOperationAdmissionGate {
+ public:
+  virtual ~IResourceOperationAdmissionGate() = default;
+
+  [[nodiscard]] virtual std::shared_ptr<std::recursive_mutex>
+  shared_admission_mutex() const = 0;
+  [[nodiscard]] virtual Result<void> reserve(
+      ResourceSlotTable& table, const ResourceSlotOwnerDTO& owner,
+      const std::vector<ResourceId>& resources) = 0;
 };
 
 }  // namespace manyforge::core

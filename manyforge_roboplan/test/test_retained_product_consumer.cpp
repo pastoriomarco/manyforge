@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "lite6_retained_consumer_fixture.hpp"
+#include "managed_kernel_apply_fence_owner.hpp"
 #include "mf2_joint_name_internal.hpp"
 #include "retained_bundle_internal.hpp"
 
@@ -743,6 +744,62 @@ make_gripper_operation(const core::RuntimeParticipantBinding &binding,
               {core::CommandDurationOptionDTO{
                   core::CommandOptionId("command_duration_s"), 0.0}}}}},
       core::OperationCoordinationPolicy::kIndependent};
+}
+
+[[nodiscard]] core::ConfigurationFenceScopeDTO make_runtime_fence_scope(
+    const std::vector<const core::RuntimeParticipantBinding *> &bindings) {
+  std::set<core::ControllableComponentId> components;
+  std::map<core::ControlDomainId, core::ControlDomainRevision> domains;
+  std::map<core::ControlBindingId, core::ControlBindingRevision>
+      control_bindings;
+  std::set<core::ResourceId> resources;
+  for (const auto *binding : bindings) {
+    if (binding == nullptr || !binding->value().control_path.has_value()) {
+      throw std::logic_error(
+          "runtime fence fixture has no exact control path");
+    }
+    const auto &value = binding->value();
+    const auto &control = *value.control_path;
+    components.insert(value.controllable_component_id);
+    const auto [domain, inserted_domain] = domains.emplace(
+        control.control_domain_id, control.control_domain_revision);
+    if (!inserted_domain &&
+        domain->second != control.control_domain_revision) {
+      throw std::logic_error(
+          "runtime fence fixture has conflicting domain revisions");
+    }
+    const auto [control_binding, inserted_binding] =
+        control_bindings.emplace(control.control_binding_id,
+                                 control.control_binding_revision);
+    if (!inserted_binding &&
+        control_binding->second != control.control_binding_revision) {
+      throw std::logic_error(
+          "runtime fence fixture has conflicting binding revisions");
+    }
+    for (const auto &resource : value.resources) {
+      resources.insert(resource.resource_id);
+    }
+  }
+
+  std::vector<core::ConfigurationFenceDomainScopeDTO> domain_scope;
+  domain_scope.reserve(domains.size());
+  for (const auto &[domain_id, revision] : domains) {
+    domain_scope.push_back(
+        {domain_id, revision, revision});
+  }
+  std::vector<core::ConfigurationFenceBindingScopeDTO> binding_scope;
+  binding_scope.reserve(control_bindings.size());
+  for (const auto &[binding_id, revision] : control_bindings) {
+    binding_scope.push_back(
+        {binding_id, revision, revision});
+  }
+  core::ConfigurationFenceScopeDTO scope{
+      {components.begin(), components.end()}, std::move(domain_scope),
+      std::move(binding_scope), {resources.begin(), resources.end()}};
+  if (!scope.valid()) {
+    throw std::logic_error("runtime fence fixture scope is invalid");
+  }
+  return scope;
 }
 
 void expect_exact_planning_reopen(
@@ -2046,6 +2103,7 @@ TEST(RetainedProductCrossConsumer,
       RoboPlanExecutionBackendConfig{},
       SimpleSchedulerConfig{},
       10'000'000};
+  ManagedKernelAdmissionGate admission_gate;
   auto runtime = create_retained_native_runtime(
       RetainedNativeRuntimeInput{
           arm_binding, gripper_binding, {}, {}, scene, scene_mutex,
@@ -2069,14 +2127,20 @@ TEST(RetainedProductCrossConsumer,
                 RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
                 std::move(state_sources), 0);
           },
-          {}},
+          {},
+          &admission_gate},
       std::move(runtime_config));
 
   ASSERT_NE(runtime, nullptr);
   ASSERT_NE(runtime->addressed_kernel, nullptr);
   ASSERT_NE(runtime->participant_engine, nullptr);
+  ASSERT_TRUE(runtime->gripper_binding.has_value());
   ASSERT_NE(runtime->motion_state_channel, nullptr);
   ASSERT_NE(runtime->gripper_state_channel, nullptr);
+  admission_gate.BindResourceTable(
+      runtime->addressed_kernel->resource_admission_table());
+  const auto physical_scope = make_runtime_fence_scope(
+      {&runtime->motion_binding, &*runtime->gripper_binding});
   EXPECT_EQ(runtime->collision_publisher.get(), projection.get());
   EXPECT_TRUE(std::all_of(
       runtime->motion_state_channel->query_context().coordinate_kinds.begin(),
@@ -2149,6 +2213,19 @@ TEST(RetainedProductCrossConsumer,
           arm_binding, owner_epoch,
           inventory->projection_binding.projection_revision.scene_revision));
   ASSERT_TRUE(motion_accepted.ok()) << motion_accepted.error().message;
+  const auto operation_first = admission_gate.Observe(physical_scope);
+  EXPECT_EQ(operation_first.affected_queued_operation_count +
+                operation_first.affected_active_operation_count,
+            1U);
+  bool rejected_fence_commit_called = false;
+  EXPECT_THROW(
+      admission_gate.AcquireFenceDurably(
+          core::ConfigurationFenceId("fence.native.operation-first"),
+          physical_scope, operation_first.operation_resource_generation,
+          operation_first.active_control_configurations,
+          [&] { rejected_fence_commit_called = true; }),
+      std::runtime_error);
+  EXPECT_FALSE(rejected_fence_commit_called);
   core::OperationStateKind motion_terminal =
       core::OperationStateKind::kExecuting;
   const auto motion_deadline =
@@ -2204,8 +2281,31 @@ TEST(RetainedProductCrossConsumer,
               "release completed motion resources"});
   ASSERT_TRUE(motion_acknowledged.ok()) << motion_acknowledged.error().message;
 
-  const auto accepted = runtime->addressed_kernel->execute(
-      make_gripper_operation(gripper_binding, owner_epoch));
+  const auto idle = admission_gate.Observe(physical_scope);
+  EXPECT_EQ(idle.affected_queued_operation_count, 0U);
+  EXPECT_EQ(idle.affected_active_operation_count, 0U);
+  const core::ConfigurationFenceId held_fence("fence.native.fence-first");
+  bool durable_fence_commit_called = false;
+  admission_gate.AcquireFenceDurably(
+      held_fence, physical_scope, idle.operation_resource_generation,
+      idle.active_control_configurations,
+      [&] { durable_fence_commit_called = true; });
+  EXPECT_TRUE(durable_fence_commit_called);
+  const auto gripper_intent =
+      make_gripper_operation(gripper_binding, owner_epoch);
+  const auto fenced = runtime->addressed_kernel->execute(gripper_intent);
+  ASSERT_FALSE(fenced.ok());
+  EXPECT_EQ(fenced.error().details.at("reason"),
+            "configuration_fence_held");
+  const auto fenced_observation = admission_gate.Observe(physical_scope);
+  EXPECT_EQ(fenced_observation.operation_resource_generation,
+            idle.operation_resource_generation);
+  EXPECT_EQ(fenced_observation.affected_queued_operation_count, 0U);
+  EXPECT_EQ(fenced_observation.affected_active_operation_count, 0U);
+  admission_gate.ReleaseFence(held_fence, physical_scope);
+
+  const auto accepted =
+      runtime->addressed_kernel->execute(gripper_intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   core::OperationStateKind terminal_state =
       core::OperationStateKind::kExecuting;

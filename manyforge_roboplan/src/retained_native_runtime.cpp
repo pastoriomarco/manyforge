@@ -437,7 +437,8 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
           core::ResourceAddressedExecutionKernelConfig{
               std::move(config.request_owner_epoch),
               config.request_replay_capacity,
-              std::move(participant_resolver)});
+              std::move(participant_resolver),
+              input.operation_admission_gate});
   return runtime;
 }
 
