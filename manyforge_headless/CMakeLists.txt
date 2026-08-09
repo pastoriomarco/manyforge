@@ -385,6 +385,19 @@ if(BUILD_TESTING)
       MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST
       "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
       REALPATH)
+    get_filename_component(
+      _MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT
+      "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+      DIRECTORY)
+    set(
+      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/manyforge_roboplan_candidate_worker")
+    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}")
+      message(FATAL_ERROR
+        "the build-owned native candidate worker for the Manager Apply "
+        "process test does not exist: "
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}")
+    endif()
     add_executable(manyforge_generate_headless_manager_apply_test_package
       test/generate_manager_apply_package.cpp)
     target_compile_definitions(
@@ -532,7 +545,8 @@ if(BUILD_TESTING)
     target_compile_definitions(test_manager_daemon_process PRIVATE
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
-      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}")
+      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}")
   endif()
   target_link_libraries(test_manager_daemon_process PRIVATE
     manyforge_headless_owner_publication

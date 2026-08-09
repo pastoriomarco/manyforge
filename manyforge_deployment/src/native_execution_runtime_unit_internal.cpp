@@ -407,7 +407,8 @@ std::string native_execution_runtime_implementation_revision() {
       "runtime-implementation",
       "native-execution-host;deployment-bound-startup;operation-bound-program;"
       "projection-handoff-v1;private-rpc-v1;retained-runtime-config-v1;"
-      "logical-scene-services-v1");
+      "logical-scene-services-v1;manager-managed-product-composition;"
+      "build-owned-candidate-worker;sha256-projection-content");
 }
 
 std::string native_execution_runtime_process_adapter_revision() {
@@ -415,7 +416,7 @@ std::string native_execution_runtime_process_adapter_revision() {
       "process-adapter",
       "manager-managed;installed-target;fixed-argv;direct-child-epoch;"
       "inherited-seqpacket-channel;same-user-direct-parent;"
-      "command-fenced-readiness");
+      "command-fenced-readiness;fixed-sibling-candidate-worker");
 }
 
 std::string native_execution_runtime_retrieval_contract_revision() {
@@ -435,7 +436,8 @@ std::string native_execution_runtime_projection_endpoint_revision() {
   return contract_revision(
       "projection-endpoint",
       "planner-scene-projection-rpc-v1;exact-native-binding;bounded-framing;"
-      "request-replay;health;stage;activate;retire;discard;rebuild;lease");
+      "request-replay;health;stage;activate;retire;discard;rebuild;lease;"
+      "sha256-content-identity");
 }
 
 std::string native_execution_runtime_logical_scene_endpoint_revision() {

@@ -38,6 +38,8 @@ inline constexpr std::string_view kLaunchEnvironmentContract =
     "manyforge.native_execution_host.abi.v1";
 inline constexpr std::string_view kInstalledTargetId =
     "manyforge_native_execution_host";
+inline constexpr std::string_view kCandidateWorkerInstalledTargetId =
+    "manyforge_roboplan_candidate_worker";
 
 /// Revision embedded independently in the retained descriptor and installed
 /// host. A Manager child handshake must match this build-owned value.

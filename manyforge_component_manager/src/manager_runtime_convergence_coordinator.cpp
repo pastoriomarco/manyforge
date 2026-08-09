@@ -514,6 +514,31 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
   };
   const auto durable_intent = apply_journal_.EnsureRuntimeConvergenceIntent(
       fence.durable_intent.record.intent_digest, convergence_intent);
+  const auto prior_staged_ready = apply_journal_.ReadLatestRuntimeStagedReady(
+      apply_intent.apply_id, apply_intent.apply_generation);
+  const auto prior_proves_candidate_preparation =
+      [&](const RuntimeUnitConvergencePlanRowDTO &plan,
+          const ProcessPresenceObservation &process) {
+        if (!prior_staged_ready.has_value() ||
+            prior_staged_ready->staged_ready.runtime_convergence_intent_digest !=
+                durable_intent.record.runtime_convergence_intent_digest ||
+            process.state() != ProcessPresenceState::kPresent) {
+          return false;
+        }
+        const auto &rows = prior_staged_ready->staged_ready.runtime_units;
+        const auto found = std::lower_bound(
+            rows.begin(), rows.end(), plan.runtime_unit_id,
+            [](const auto &row, const auto &runtime_unit_id) {
+              return row.runtime_unit_id < runtime_unit_id;
+            });
+        return found != rows.end() &&
+               found->runtime_unit_id == plan.runtime_unit_id &&
+               found->runtime_epoch.value() ==
+                   process.process_incarnation() &&
+               found->observed_product_identity == plan.product_identity &&
+               found->observed_configuration_identity ==
+                   plan.configuration_identity;
+      };
 
   std::vector<std::string> declared_runtime_ids;
   std::vector<RuntimeUnitExpectation> expectations;
@@ -544,8 +569,13 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     IngestObservedPresence(reducer, query, process);
     if (plan.lifecycle_control ==
             manyforge::core::RuntimeLifecycleControl::kManagerManaged &&
-        process.state() != ProcessPresenceState::kPresent) {
+        !prior_proves_candidate_preparation(plan, process)) {
       try {
+        // A surviving exact process still has candidate-scoped staged-ready
+        // work to reconcile (for example, preparing newly retained native
+        // projection bindings). EnsureRunning is idempotent for the exact
+        // query and is the effectful convergence boundary; presence alone
+        // proves only process identity, not candidate readiness.
         const auto ensured = process_port_.EnsureRunning(query);
         IngestEnsuredPresence(reducer, query, process, ensured);
         process = ensured;

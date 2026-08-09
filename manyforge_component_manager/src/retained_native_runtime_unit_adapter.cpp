@@ -916,7 +916,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     const auto launch_arguments =
         admission.launch_arguments(kChildChannelFd, runtime_epoch);
     std::vector<std::string> arguments;
-    arguments.reserve(launch_arguments.size() + 9U);
+    arguments.reserve(launch_arguments.size() + 11U);
     arguments.emplace_back(contract::kInstalledTargetId);
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
@@ -926,6 +926,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     arguments.push_back(manager_state_root_path.string());
     arguments.emplace_back("--manyforge-managed-staging-root");
     arguments.push_back(staging_root_path.string());
+    arguments.emplace_back("--manyforge-managed-candidate-worker");
+    arguments.push_back(
+        (target_root_path /
+         std::string(contract::kCandidateWorkerInstalledTargetId))
+            .string());
     arguments.emplace_back("--manyforge-managed-cell-id");
     arguments.push_back(bundle.value().cell_graph.cell_id.value());
     std::vector<char *> argv;

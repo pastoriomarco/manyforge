@@ -9,6 +9,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace manyforge::deployment {
 
@@ -27,6 +28,14 @@ inline constexpr std::string_view kDirectControlTargetRoleId =
     "command_target";
 inline constexpr std::string_view kDirectControlBaseFrameRoleId = "base";
 inline constexpr std::string_view kDirectControlTcpFrameRoleId = "tcp";
+
+/// Deterministic physical command-target inventory derived from one exact
+/// retained cell. Entries are build-owned direct-control Program Bindings;
+/// they select physical targets without selecting an authored Program.
+struct DirectControlProgramBindingInventory final {
+  std::vector<std::shared_ptr<const ProgramBinding>> motion;
+  std::vector<std::shared_ptr<const ProgramBinding>> gripper;
+};
 
 /// Resolve one complete authored role assignment against one exact retained
 /// cell and return the sealed, context-verified Program Binding.
@@ -71,6 +80,16 @@ compile_direct_control_motion_program_binding(
 compile_direct_control_gripper_program_binding(
     const core::ControllableComponentId& controllable_component_id,
     const core::CommandTargetId& command_target_id,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactStore& catalog_artifact_store);
+
+/// Compile every complete direct-control target in deterministic retained-cell
+/// order. A target is included only when its qualified component type declares
+/// the complete required capability family; a declared family with an invalid
+/// model/resource/control closure fails rather than being silently skipped.
+[[nodiscard]] DirectControlProgramBindingInventory
+compile_direct_control_program_binding_inventory(
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
     const ICatalogArtifactStore& catalog_artifact_store);

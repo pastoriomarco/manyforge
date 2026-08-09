@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -14,6 +15,7 @@
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
@@ -22,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -265,6 +268,8 @@ PublishActiveFixture(NativeFixture &fixture) {
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
       fixture.bundle->value().cell_graph.cell_id);
   const core::ContentDigest digest{std::string(kIntentDigest)};
+  const auto active_scene =
+      MakeEmptyScene(fixture.bundle->value().cell_graph.cell_id, 1U);
   auto receipt = store.PublishActiveBundle({
       core::BootstrapPublicationTransactionDTO{
           core::BootstrapId("native-adapter-bootstrap"),
@@ -272,8 +277,7 @@ PublishActiveFixture(NativeFixture &fixture) {
       core::ProjectionRevisionDTO{
           fixture.bundle->retained_bundle_id(),
           fixture.bundle->value().cell_graph.graph_revision,
-          core::SceneRevision{core::SceneId(std::string(kIntentDigest)), 1U,
-                              digest}},
+          active_scene.shared()->revision},
       fixture.bundle->retained_bundle_id(),
       fixture.bundle->value().cell_graph.graph_revision,
       std::nullopt,
@@ -291,7 +295,9 @@ NativeProjectionBinding(const NativeFixture &fixture,
       fixture.bundle->value().capability_provider_bindings.begin(),
       fixture.bundle->value().capability_provider_bindings.end(),
       [&](const auto &binding) {
-        if (!core::RequiresNativeSceneProjection(
+        if (binding.capability_id.value() !=
+                "planning.motion.joint_goal" ||
+            !core::RequiresNativeSceneProjection(
                 binding.capability_id,
                 binding.capability_definition_revision)) {
           return false;
@@ -317,6 +323,20 @@ NativeProjectionBinding(const NativeFixture &fixture,
       fixture.query->plan.runtime_unit_id,
       runtime_epoch,
   };
+}
+
+[[nodiscard]] bool WaitForRegularFile(
+    const std::filesystem::path &path,
+    const std::chrono::steady_clock::duration timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::error_code error;
+    if (std::filesystem::is_regular_file(path, error) && !error) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
 }
 
 TEST(NativeExecutionRuntimeUnitAdmission,
@@ -546,6 +566,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
 TEST(RetainedNativeRuntimeUnitAdapter,
      ExactIdentityResolverReturnsPrivateChildProjectionClient) {
   NativeFixture fixture;
+  const auto publication = PublishActiveFixture(fixture);
   auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
   const auto started = adapter.EnsureRunning(*fixture.query);
   ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
@@ -568,6 +589,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       fixture.bundle->retained_bundle_id(),
       fixture.bundle->value().cell_graph.graph_revision,
       initial_scene.shared()->revision};
+  EXPECT_EQ(initial_revision,
+            publication.request.candidate_projection_revision);
   const core::NativeProjectionBootstrapStatusQueryDTO bootstrap_query{
       core::BootstrapId("native-adapter-bootstrap"),
       core::BootstrapGeneration(1U), binding, initial_revision};
@@ -587,6 +610,11 @@ TEST(RetainedNativeRuntimeUnitAdapter,
             core::NativeProjectionBootstrapRebuildState::kRebuilt);
   EXPECT_TRUE(
       bootstrapped.resulting_health.healthy_for_target(initial_revision));
+  EXPECT_TRUE(WaitForRegularFile(
+      fixture.staging_root.path() /
+          std::string(core::kOperationJournalFilename),
+      std::chrono::seconds(10)))
+      << "the managed child did not compose the active physical product";
 
   ASSERT_FALSE(fixture.bundle->value().cell_graph.control_bindings.empty());
   const auto &control_binding =

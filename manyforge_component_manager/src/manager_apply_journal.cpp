@@ -4270,9 +4270,10 @@ public:
                                                  ContentDigest(stored_digest)};
     } catch (const ManagerApplyJournalIntegrityError &) {
       throw;
-    } catch (const std::exception &) {
+    } catch (const std::exception &error) {
       throw ManagerApplyJournalIntegrityError(
-          "stored scene activation evidence contains an invalid value");
+          "stored scene activation evidence contains an invalid value: " +
+          std::string(error.what()));
     }
   }
 

@@ -412,7 +412,11 @@ ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
         result.apply_generation == request.apply_generation &&
         result.expected_active_projection_revision ==
             request.expected_active_projection_revision) {
-      Fail("scene owner rejected the exact durable stage request");
+      Fail("scene owner rejected the exact durable stage request" +
+           (result.error.has_value()
+                ? " [" + result.error->code + "]: " +
+                      result.error->message
+                : std::string{}));
     }
     throw ManagerSceneStageEffectUncertainError(
         "scene owner returned uncertain, malformed, or foreign Stage "

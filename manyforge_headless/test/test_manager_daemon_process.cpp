@@ -89,6 +89,7 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata() {
       RequiredText(root, "predecessor_retained_bundle_id"),
   };
 }
+
 #endif
 
 class DaemonDirectory final {
@@ -259,10 +260,15 @@ PrepareManagerApplyInstalledTargets(const DaemonDirectory &directory) {
   const auto manager = directory.installed_root() / "manyforge_manager_daemon";
   const auto native_host =
       directory.installed_root() / "manyforge_native_execution_host";
+  const auto candidate_worker =
+      directory.installed_root() / "manyforge_roboplan_candidate_worker";
   std::filesystem::copy_file(MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON, manager,
                              std::filesystem::copy_options::overwrite_existing);
   std::filesystem::copy_file(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST,
                              native_host,
+                             std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::copy_file(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER,
+                             candidate_worker,
                              std::filesystem::copy_options::overwrite_existing);
   constexpr auto protected_executable_permissions =
       std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
@@ -272,6 +278,9 @@ PrepareManagerApplyInstalledTargets(const DaemonDirectory &directory) {
   std::filesystem::permissions(manager, protected_executable_permissions,
                                std::filesystem::perm_options::replace);
   std::filesystem::permissions(native_host, protected_executable_permissions,
+                               std::filesystem::perm_options::replace);
+  std::filesystem::permissions(candidate_worker,
+                               protected_executable_permissions,
                                std::filesystem::perm_options::replace);
   return manager;
 }
@@ -695,6 +704,7 @@ TEST(ManagerDaemonProcess,
         fixture.predecessor_retained_bundle_id, "manager-runtime-only-apply.1");
 
     const auto applied = SendCommand(directory.socket_path(), request);
+    SCOPED_TRACE(applied);
     EXPECT_NE(applied.find("\"ok\":true"), std::string::npos);
     EXPECT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos);
     EXPECT_NE(applied.find("\"replay_status\":\"accepted_new\""),

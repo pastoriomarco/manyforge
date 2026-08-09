@@ -131,7 +131,8 @@ target_compile_definitions(manyforge_roboplan_collision_projection PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_roboplan_collision_projection PUBLIC
   manyforge_collision
-  manyforge_core)
+  manyforge_core
+  PRIVATE manyforge::content_identity)
 
 add_library(manyforge_roboplan_native_state_projection
   src/retained_kinematic_state_projector.cpp
@@ -306,7 +307,9 @@ target_link_libraries(manyforge_native_execution_host PRIVATE
   manyforge::persistence
   SQLite::SQLite3
   Threads::Threads)
-install(TARGETS manyforge_native_execution_host
+install(TARGETS
+  manyforge_native_execution_host
+  manyforge_roboplan_candidate_worker
   RUNTIME DESTINATION bin)
 
 message(STATUS
@@ -715,7 +718,8 @@ if(BUILD_TESTING)
       test/test_retained_native_runtime_unit_adapter.cpp)
     add_dependencies(test_retained_native_runtime_unit_adapter
       generate_lite6_native_execution_fixture
-      manyforge_native_execution_host)
+      manyforge_native_execution_host
+      manyforge_roboplan_candidate_worker)
     target_compile_definitions(
       test_retained_native_runtime_unit_adapter PRIVATE
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"

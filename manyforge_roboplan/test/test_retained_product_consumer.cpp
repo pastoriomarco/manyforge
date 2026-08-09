@@ -2068,7 +2068,8 @@ TEST(RetainedProductCrossConsumer,
                 local_runtime.runtime_epoch,
                 RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
                 std::move(state_sources), 0);
-          }},
+          },
+          {}},
       std::move(runtime_config));
 
   ASSERT_NE(runtime, nullptr);

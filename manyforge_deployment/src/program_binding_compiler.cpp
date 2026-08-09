@@ -1625,4 +1625,81 @@ compile_direct_control_gripper_program_binding(
   }
 }
 
+DirectControlProgramBindingInventory
+compile_direct_control_program_binding_inventory(
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactStore& catalog_artifact_store) {
+  try {
+    if (!verify_retained_bundle_identity(retained_bundle) ||
+        retained_model_map.query().retained_bundle_id !=
+            retained_bundle.retained_bundle_id()) {
+      fail("direct-control inventory inputs do not share one verified "
+           "retained bundle");
+    }
+    const auto& bundle = retained_bundle.value();
+    const auto catalog = load_qualified_catalog_closure(
+        bundle, catalog_artifact_store);
+    DirectControlProgramBindingInventory result;
+    for (const auto& component : bundle.cell_graph.controllable_components) {
+      const auto component_type = load_component_type(
+          bundle, component, catalog.capabilities, catalog_artifact_store);
+      for (const auto& target : component_type.value().command_targets) {
+        const bool has_execution =
+            find_target_capability(target, "execution.trajectory.execute") !=
+            nullptr;
+        const bool has_joint_planning =
+            find_target_capability(target, "planning.motion.joint_goal") !=
+            nullptr;
+        if (has_execution != has_joint_planning) {
+          fail("direct-control motion target declares an incomplete execution/"
+               "joint-planning capability family");
+        }
+        if (has_execution) {
+          auto contract = make_direct_control_motion_contract(
+              bundle.catalogs.node_environment, target);
+          result.motion.push_back(compile_program_binding_contract(
+              contract,
+              core::ProgramRoleAssignmentDTO{
+                  {core::ProgramComponentRoleAssignmentDTO{
+                      core::ComponentRoleId(
+                          std::string(kDirectControlComponentRoleId)),
+                      component.controllable_component_id}},
+                  {core::ProgramTargetRoleAssignmentDTO{
+                      core::TargetRoleId(
+                          std::string(kDirectControlTargetRoleId)),
+                      target.command_target_id}}},
+              retained_bundle, retained_model_map,
+              catalog_artifact_store));
+        }
+        if (find_target_capability(target, "tool.gripper.command") !=
+            nullptr) {
+          auto contract = make_direct_control_gripper_contract(
+              bundle.catalogs.node_environment, target);
+          result.gripper.push_back(compile_program_binding_contract(
+              contract,
+              core::ProgramRoleAssignmentDTO{
+                  {core::ProgramComponentRoleAssignmentDTO{
+                      core::ComponentRoleId(
+                          std::string(kDirectControlComponentRoleId)),
+                      component.controllable_component_id}},
+                  {core::ProgramTargetRoleAssignmentDTO{
+                      core::TargetRoleId(
+                          std::string(kDirectControlTargetRoleId)),
+                      target.command_target_id}}},
+              retained_bundle, retained_model_map,
+              catalog_artifact_store));
+        }
+      }
+    }
+    return result;
+  } catch (const ProgramBindingCompilerError&) {
+    throw;
+  } catch (const std::exception& error) {
+    fail(std::string("Direct-control Program Binding inventory compilation "
+                     "failed: ") +
+         error.what());
+  }
+}
+
 }  // namespace manyforge::deployment

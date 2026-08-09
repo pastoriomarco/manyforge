@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <limits>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/logical_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
@@ -67,7 +68,11 @@ std::optional<core::ContentDigest> publisher_digest(
   if (revision.revision_id == 0U || revision.content_hash.empty()) {
     return std::nullopt;
   }
-  return core::ContentDigest(revision.content_hash);
+  std::string preimage("manyforge.native-projection-content.v1");
+  preimage.push_back('\0');
+  preimage.append(revision.content_hash);
+  return core::ContentDigest(
+      manyforge::content_identity::sha256_digest(preimage));
 }
 
 } // namespace

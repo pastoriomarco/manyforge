@@ -666,8 +666,11 @@ public:
             query.runtime_convergence_intent_digest &&
         durable->runtime_convergence_intent.runtime_units.size() == 1U &&
         durable->runtime_convergence_intent.runtime_units.front() == query.plan;
+    if (state_ != ProcessPresenceState::kPresent) {
+      ++start_effect_calls;
+    }
     state_ = ProcessPresenceState::kPresent;
-    observation_sequence_ = 2U;
+    ++observation_sequence_;
     if (throw_after_ensure_effect) {
       throw std::runtime_error("simulated lost process-start response");
     }
@@ -708,6 +711,7 @@ public:
   bool saw_durable_intent_before_ensure{false};
   int observe_calls{0};
   int ensure_calls{0};
+  int start_effect_calls{0};
   int progress_calls{0};
   std::optional<RuntimeUnitConvergenceQueryDTO> last_query;
 
@@ -1116,6 +1120,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
             RuntimeUnitCandidateDisposition::kRetainedExact);
   EXPECT_TRUE(fixture.runtime_ports.saw_durable_intent_before_ensure);
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_EQ(fixture.kernel.acquire_calls, 1);
   EXPECT_EQ(fixture.publication.read_calls, 3);
 
@@ -1127,6 +1132,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(replay.durable_staged_ready->record,
             first.durable_staged_ready->record);
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_EQ(fixture.kernel.acquire_calls, 1);
   EXPECT_EQ(fixture.kernel.rehydrate_calls, 2);
 }
@@ -1149,6 +1155,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   }
   EXPECT_TRUE(fixture.runtime_ports.saw_durable_intent_before_ensure);
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_FALSE(
       fixture.journal
           .ReadLatestRuntimeStagedReady(ApplyId("apply-1"), ApplyGeneration(1U))
@@ -1158,7 +1165,8 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   const auto recovered = fixture.Run();
   EXPECT_EQ(recovered.state,
             ManagerRuntimeConvergenceResultState::kStagedReady);
-  EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
+  EXPECT_EQ(fixture.runtime_ports.ensure_calls, 2);
+  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_EQ(fixture.kernel.acquire_calls, 1);
 }
 

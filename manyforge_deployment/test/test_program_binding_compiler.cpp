@@ -39,6 +39,7 @@ using manyforge::deployment::canonical_json;
 using manyforge::deployment::CanonicalValue;
 using manyforge::deployment::compile_direct_control_gripper_program_binding;
 using manyforge::deployment::compile_direct_control_motion_program_binding;
+using manyforge::deployment::compile_direct_control_program_binding_inventory;
 using manyforge::deployment::compile_program_binding;
 using manyforge::deployment::FilesystemCatalogArtifactStore;
 using manyforge::deployment::FilesystemVerifiedRetainedBundleSource;
@@ -569,6 +570,47 @@ TEST(ProgramBindingCompilerTest,
           manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)),
           *context.bundle, context.model_map, catalog_store)),
       ProgramBindingCompilerError);
+}
+
+TEST(ProgramBindingCompilerTest,
+     DiscoversDirectControlTargetsWithoutAnAuthoredProgram) {
+  ScopedTrustedRoot motion_root;
+  const BindingCompilerContext motion_context =
+      make_native_motion_context(motion_root.path());
+  FilesystemCatalogArtifactStore motion_catalog_store(motion_root.path());
+  const auto first_motion =
+      compile_direct_control_program_binding_inventory(
+          *motion_context.bundle, motion_context.model_map,
+          motion_catalog_store);
+  const auto second_motion =
+      compile_direct_control_program_binding_inventory(
+          *motion_context.bundle, motion_context.model_map,
+          motion_catalog_store);
+
+  ASSERT_EQ(first_motion.motion.size(), 1U);
+  EXPECT_TRUE(first_motion.gripper.empty());
+  ASSERT_EQ(second_motion.motion.size(), 1U);
+  EXPECT_EQ(first_motion.motion.front()->canonical_bytes(),
+            second_motion.motion.front()->canonical_bytes());
+
+  ScopedTrustedRoot gripper_root;
+  const BindingCompilerContext gripper_context =
+      make_context(gripper_root.path(), true);
+  FilesystemCatalogArtifactStore gripper_catalog_store(gripper_root.path());
+  const auto first_gripper =
+      compile_direct_control_program_binding_inventory(
+          *gripper_context.bundle, gripper_context.model_map,
+          gripper_catalog_store);
+  const auto second_gripper =
+      compile_direct_control_program_binding_inventory(
+          *gripper_context.bundle, gripper_context.model_map,
+          gripper_catalog_store);
+
+  EXPECT_TRUE(first_gripper.motion.empty());
+  ASSERT_EQ(first_gripper.gripper.size(), 1U);
+  ASSERT_EQ(second_gripper.gripper.size(), 1U);
+  EXPECT_EQ(first_gripper.gripper.front()->canonical_bytes(),
+            second_gripper.gripper.front()->canonical_bytes());
 }
 
 TEST(ProgramBindingCompilerTest, RejectsIncompleteAndUnknownRoleAssignments) {
