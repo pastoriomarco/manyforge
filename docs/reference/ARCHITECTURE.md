@@ -16,8 +16,12 @@
 > readiness, complete lifecycle/controls, live scene/manipulation, provider
 > effects, and general Program execution remain unavailable until their later
 > gates. N6-c3 separately restores Composer-owned strict Program Draft/Saved
-> authoring and bounded artifact persistence. It explicitly does not infer
-> Applied identity or make the Program executable.
+> authoring and bounded artifact persistence. N6-c4 adds source-local
+> scene/viewer authoring and one exact owner-routed current-pose Commit without
+> dynamic viewer truth. N6-c5 adds strict bounded direct/`nemoclaw` mediation,
+> Draft-only callbacks, and operator conversation/reconciliation without model
+> or runtime authority. Applied identity, product launch, public MCP, external
+> agent loops, and general Program execution remain unavailable.
 > Unless a section explicitly identifies a retained foundation or target
 > design, present-tense ownership and flow descriptions below refer to the
 > captured three-lane baseline.

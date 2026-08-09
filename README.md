@@ -1,9 +1,11 @@
 # ManyForge
 
 Repository for a modular robot-execution framework built around headless C++
-semantic owners and thin authoring/operator clients. The native, Isaac, ROS
-product, assistant, and real-robot lanes described by historical material are
-not currently available on `dev`.
+semantic owners and thin authoring/operator clients. The complete native,
+Isaac, ROS, external-agent, and real-robot product lanes described by
+historical material are not currently available on `dev`; bounded native and
+direct-assistant development components are available only at their named
+checkpoints.
 
 > **`dev` migration status:** the composable-cell destructive implementation
 > window is active. I2's pure ROS-free compiler and `manyforge_core_py`
@@ -22,11 +24,17 @@ not currently available on `dev`.
 > not the complete native lane. N6-c1 and N6-c2 now add a bounded addressed
 > four-mode Robot Control workflow: joint goals, pose goals, Cartesian paths,
 > and gripper commands with source-local no-motion preview, explicit approval,
-> owner-issued progress, and operation Stop. It is not the complete manual-
-> control or product workflow. N6-c3 additionally restores the strict Program
+> owner-issued progress, and operation Stop. It is the complete maintained
+> manual-control breadth, not a runnable product lane. N6-c3 additionally
+> restores the strict Program
 > Draft/Saved workspace: environment-aware palette/tree/property/declaration
 > authoring plus bounded Open-as-Draft, Save, and Save-As. It does not Apply or
-> execute Programs. Composer Program-tree execution and all three product lanes
+> execute Programs. N6-c4 adds source-local scene/viewer authoring and one
+> exact owner-routed current-pose Commit without restoring dynamic viewer
+> truth. N6-c5 adds the strict bounded direct/`nemoclaw` assistant bridge,
+> Draft-only callbacks, and operator conversation/reconciliation surface; its
+> live model/launcher lane and external OpenClaw/Hermes adapters remain
+> unqualified. Composer Program-tree execution and all three product lanes
 > remain intentionally unavailable; the
 > full native lane closes at I6/N, and Isaac/real
 > operation at I9/I10. The launch recipes below describe the last qualified
@@ -194,7 +202,8 @@ manyforge_robot_lifecycle_msgs/  ROS IDL for same-host lifecycle admission trans
 manyforge_xarm_adapter/  Experimental xArm model/binding/observation inputs; no live lane
 manyforge_xarm_control/  Experimental xArm lifecycle adapter; no live provider wiring
 manyforge_behavior/      Build-owned v2 node environment and thin N3 joint-goal caller
-manyforge_composer/      Structural FastAPI/React shell and thin H0/N3 clients
+manyforge_composer/      Structural FastAPI/React shell and thin H0/N6 authoring/operator clients
+manyforge_assistant_bridge/ Strict bounded direct/nemoclaw provider mediation; no runtime ownership
 manyforge_ros/           Retained pure contracts and explicit unavailable runtime boundaries
 tests/                   Cutover and package contract tests
 scripts/                 Build/test/setup scripts

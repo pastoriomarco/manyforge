@@ -1,11 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { describe, expect, it, vi } from 'vitest';
 import {
+  HeadlessRuntimeSurfacesView,
   attentionAlarmsNewestFirst,
   historianEventView,
   operatorAlarmView,
   runtimeStatusView,
 } from './HeadlessRuntimeSurfaces';
 import type {
+  ComposerHeadlessState,
   HeadlessRuntimeSnapshot,
   HistorianStoredEvent,
   OperatorAlarmRecord,
@@ -130,5 +134,96 @@ describe('headless Composer presentation adapters', () => {
     expect(view.alarmPhase).toBe('acknowledgement');
     expect(view.message).toContain('condition-1');
     expect(view.details).toEqual({ condition_id: 'condition-1' });
+  });
+
+  it('presents owner status, attention and standing alarms, history access, and reconnect together', () => {
+    const attentionAlarm: OperatorAlarmRecord = {
+      conditionId: 'condition-attention',
+      activationId: 'activation-attention',
+      recordRevision: 3,
+      activatedAtNs: 300,
+      definitionId: 'manyforge.test.attention',
+      lifecycleState: 'active_unacknowledged',
+      active: true,
+      acknowledged: false,
+      priority: 'high',
+      alarmClass: 'runtime_health',
+      title: 'Planner unavailable',
+      message: 'The selected planner is unavailable.',
+      consequence: 'New planning is unavailable.',
+      operatorResponse: 'Inspect the planner provider.',
+      occurrenceCount: 1,
+      requiresMotionAttention: true,
+      subject: { subjectKind: 'component', subjectId: 'planner-1', resourceIds: [] },
+      details: {},
+    };
+    const standingAlarm: OperatorAlarmRecord = {
+      ...attentionAlarm,
+      conditionId: 'condition-standing',
+      activationId: 'activation-standing',
+      recordRevision: 5,
+      activatedAtNs: 200,
+      definitionId: 'manyforge.test.standing',
+      lifecycleState: 'active_acknowledged',
+      acknowledged: true,
+      priority: 'medium',
+      title: 'Reduced capability',
+      requiresMotionAttention: false,
+    };
+    const snapshot: ComposerHeadlessState = {
+      schemaVersion: 'manyforge.composer_headless_state.v1',
+      runtime: {
+        schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+        complete: true,
+        projectionGeneration: 7,
+        projectionOwnerEpoch: 'projection-epoch',
+        projectionOwnerId: 'headless-api',
+        reasons: [],
+        unavailableSections: [],
+        sections: {
+          manager: source(),
+          logicalScene: source(),
+          sceneRuntime: source(),
+        },
+      },
+      alarms: {
+        schemaVersion: 'manyforge.operator_alarm_snapshot.v2',
+        ownerId: 'alarm-owner',
+        ownerEpoch: 'alarm-epoch',
+        generation: 9,
+        stateRevision: 11,
+        reconciled: true,
+        healthState: 'available',
+        liveCount: 2,
+        unacknowledgedCount: 1,
+        activeCount: 2,
+        activeAcknowledgedCount: 1,
+        motionAttentionCount: 1,
+        unacknowledgedMembership: [{
+          conditionId: attentionAlarm.conditionId,
+          activationId: attentionAlarm.activationId,
+          recordRevision: attentionAlarm.recordRevision,
+        }],
+        alarms: [attentionAlarm, standingAlarm],
+        truncated: false,
+      },
+    };
+    const reconnect = vi.fn();
+
+    const html = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true,
+      headlessState: {
+        snapshot,
+        error: 'Headless projection disconnected.',
+        reconnect,
+      },
+    }));
+
+    expect(html).toContain('Planner unavailable');
+    expect(html).toContain('1 acknowledgement required');
+    expect(html).toContain('ACTIVE — ACKNOWLEDGED · Reduced capability');
+    expect(html).toContain('Messages / history');
+    expect(html).toContain('Reconnect headless projection');
+    expect(reconnect).not.toHaveBeenCalled();
   });
 });

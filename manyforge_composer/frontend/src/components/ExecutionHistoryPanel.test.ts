@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { describe, expect, it, vi } from 'vitest';
 import {
+  ExecutionHistoryPanel,
   filterExecutionHistoryEvents,
   type ExecutionHistoryEventView,
 } from './ExecutionHistoryPanel';
@@ -59,5 +62,32 @@ describe('execution history filtering', () => {
       search: '',
       conditionIdentity: 'condition-missing',
     })).toEqual([]);
+  });
+
+  it('renders the largest supported public history page within the presentation budget', () => {
+    const page = Array.from({ length: 32 }, (_, index): ExecutionHistoryEventView => ({
+      id: `event-${index + 1}`,
+      timestampNs: index + 1,
+      timestamp: `2026-08-09T12:00:${String(index).padStart(2, '0')}Z`,
+      severity: index % 5 === 0 ? 'WARN' : 'INFO',
+      channel: index % 2 === 0 ? 'execution' : 'runtime',
+      message: `Retained event ${index + 1}`,
+      executionId: 42,
+      type: index % 2 === 0 ? 'operation_progressed' : 'owner_status_refreshed',
+      details: { sequence: index + 1 },
+    }));
+    const started = performance.now();
+    const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true,
+      onClose: vi.fn(),
+      events: page,
+      currentExecutionId: 42,
+    }));
+    const elapsedMs = performance.now() - started;
+
+    expect(markup.match(/<article/g)).toHaveLength(32);
+    expect(markup).toContain('Retained event 1');
+    expect(markup).toContain('Retained event 32');
+    expect(elapsedMs).toBeLessThan(1000);
   });
 });

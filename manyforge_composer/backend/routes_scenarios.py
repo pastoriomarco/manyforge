@@ -20,10 +20,10 @@ def create_scenarios_router(state: ComposerState) -> APIRouter:
             detail={
                 "code": SCENARIO_ROUTE_UNAVAILABLE_REASON_CODE,
                 "message": (
-                    "scenario discovery returns with native Program/addressing "
-                    "at I6/N"
+                    "runnable scenario discovery returns when N7 joins native "
+                    "Program/addressing to the product launch boundary"
                 ),
-                "restorationGates": ["I6", "N"],
+                "restorationGates": ["I6", "N7"],
             },
         )
 

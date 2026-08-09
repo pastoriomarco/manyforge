@@ -37,10 +37,13 @@
 > now restores the strict Program Draft/Saved authoring workspace: exact
 > environment-aware palette/tree/property/declaration editing plus bounded
 > Open-as-Draft, Save, and Save-As. Applied identity remains explicitly
-> unavailable until N7; authoring never implies Apply or execution.
-> Full Program-tree execution, lifecycle and execution controls, live scene
-> editing, broader motion/manipulation, provider-backed assistant/public-MCP
-> operation, Isaac/ROS product launch, and real-robot operation remain
+> unavailable until N7; authoring never implies Apply or execution. N6-c4 adds
+> source-local scene/viewer authoring and one exact owner-routed current-pose
+> Commit without restoring dynamic viewer truth. N6-c5 adds strict bounded
+> direct/`nemoclaw` provider mediation, Draft-only callbacks, and the operator
+> conversation/reconciliation surface. Full Program-tree execution, lifecycle,
+> complete product launch, dynamic scene/viewer behavior, public MCP, external
+> OpenClaw/Hermes loops, Isaac/ROS launch, and real-robot operation remain
 > explicitly unavailable. Do not run the historical recipes below or recreate their
 > superseded Python semantic owners. Retain or port same-role Python/TypeScript
 > clients, authoring, presentation, safety, and evidence surfaces at their
@@ -140,6 +143,9 @@ pose goals, Cartesian paths, and gripper commands. It remains a thin client of
 the ordinary operation path, not a restored runtime product lane. N6-c3 adds
 the independently revision-fenced Program Draft/Saved owner and thin authoring
 UI without restoring Program Apply or execution.
+N6-c4 adds source-local scene/viewer authoring and N6-c5 adds the strict
+direct/`nemoclaw` assistant client/bridge; neither restores product launch,
+Applied identity, external agent loops, or runtime ownership.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
@@ -341,8 +347,8 @@ What lives where in this repo, and what it's for:
 | [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                                           |
 | [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model/binding/observation inputs; no current real-robot lane                                               |
 | [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle adapter; provider wiring unavailable until I10/R                                                 |
-| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0 and addressed Robot Control clients; runtime and command ownership unavailable     |
-| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | H0 read client plus retained protocol/supervisor logic; live provider bridge unavailable until I6/N                          |
+| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0/N6 control, authoring, scene, and assistant clients; runtime ownership unavailable |
+| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Strict bounded direct/`nemoclaw` provider mediation over owner facts and Draft callbacks; no runtime ownership                 |
 | [`manyforge_ros/`](manyforge_ros/)                                       | Retained pure mappings/contracts plus explicit unavailable runtime entry points                                              |
 | [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Non-activatable historical assistant interaction references                                                                 |
 | [`examples/`](examples/)                                                 | Reference `*.program.yaml` + `*.deployment.yaml`                                                                            |

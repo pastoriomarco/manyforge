@@ -1,12 +1,13 @@
 # Lane bring-up — direct / openclaw / hermes
 
-> **Cutover status:** retained as a restoration and behavior reference. The
-> command recipes below are not qualified on the current `dev` branch and
-> must not be executed until I6/N restores the provider/Program-operation
-> boundary and every selected execution lane's gate passes. I5/H0 supplies
-> read-only headless observation, not these provider-backed workflows. Present-tense descriptions
-> below are historical unless a section explicitly says it is retained and
-> offline.
+> **Cutover status:** retained as a restoration and behavior reference. N6-c5
+> restores the bounded in-tree `direct` (`nemoclaw` alias) provider bridge and
+> strict Composer client, but not this runbook's live model, Program-operation,
+> launcher, OpenClaw, or Hermes workflows. The command recipes below are not
+> qualified on the current `dev` branch and must not be used until N7 closes
+> the product boundary and each selected external lane reaches its named gate.
+> Present-tense descriptions below are historical unless a section explicitly
+> identifies a current bounded component or retained offline procedure.
 
 Authoritative historical reference for bringing up any of the three
 **assistant lanes** and running the smoke corpus against it. The lane was selected by the
