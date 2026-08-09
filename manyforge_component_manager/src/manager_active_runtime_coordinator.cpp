@@ -68,18 +68,33 @@ MakeQuery(const ManagerActiveRuntimePlanDTO &plan,
           const RuntimeUnitConvergencePlanRowDTO &row) {
   const auto *transaction = std::get_if<NamedApplyPublicationTransactionDTO>(
       &plan.active_publication.request.transaction_ref);
-  if (transaction == nullptr ||
-      !plan.runtime_convergence_intent_digest.has_value()) {
-    Fail("active runtime query requires a named Apply plan");
+  if (!plan.runtime_convergence_intent_digest.has_value()) {
+    Fail("active runtime query has no exact plan digest");
   }
-  RuntimeUnitConvergenceQueryDTO query{
-      transaction->apply_id,
-      transaction->apply_generation,
-      plan.active_publication.request.candidate_retained_bundle_id,
-      plan.active_publication.request.candidate_graph_revision,
-      *plan.runtime_convergence_intent_digest,
-      row,
-  };
+  const auto &request = plan.active_publication.request;
+  const auto query =
+      transaction != nullptr
+          ? RuntimeUnitConvergenceQueryDTO{transaction->apply_id,
+                                           transaction->apply_generation,
+                                           request.candidate_retained_bundle_id,
+                                           request.candidate_graph_revision,
+                                           *plan.runtime_convergence_intent_digest,
+                                           row}
+          : [&]() {
+              const auto *bootstrap = std::get_if<
+                  manyforge::core::BootstrapPublicationTransactionDTO>(
+                  &request.transaction_ref);
+              if (bootstrap == nullptr) {
+                Fail("active runtime query has an unknown owner");
+              }
+              return RuntimeUnitConvergenceQueryDTO{
+                  bootstrap->bootstrap_id,
+                  bootstrap->bootstrap_generation,
+                  request.candidate_retained_bundle_id,
+                  request.candidate_graph_revision,
+                  *plan.runtime_convergence_intent_digest,
+                  row};
+            }();
   if (!query.valid()) {
     Fail("Manager produced an invalid active runtime query");
   }
@@ -180,8 +195,9 @@ bool ManagerActiveRuntimePlanDTO::valid() const noexcept {
   const bool named =
       std::holds_alternative<NamedApplyPublicationTransactionDTO>(
           active_publication.request.transaction_ref);
-  if (named != runtime_convergence_intent_digest.has_value() ||
-      (!named && !runtime_units.empty())) {
+  if ((named && !runtime_convergence_intent_digest.has_value()) ||
+      (!named && (runtime_convergence_intent_digest.has_value() !=
+                  !runtime_units.empty()))) {
     return false;
   }
   for (std::size_t index = 0U; index < runtime_units.size(); ++index) {
@@ -206,10 +222,31 @@ bool ManagerActiveRuntimePlanDTO::valid() const noexcept {
   return true;
 }
 
+bool ManagerBootstrapRuntimePlanDTO::valid() const noexcept {
+  if (retained_bundle_id.empty() || graph_revision.empty() ||
+      admission_digest.empty() || runtime_units.empty() ||
+      runtime_units.size() > kMaximumRuntimeUnits) {
+    return false;
+  }
+  return std::all_of(runtime_units.begin(), runtime_units.end(),
+                     [](const auto &row) { return row.valid(); }) &&
+         std::adjacent_find(runtime_units.begin(), runtime_units.end(),
+                            [](const auto &left, const auto &right) {
+                              return !(left.runtime_unit_id <
+                                       right.runtime_unit_id);
+                            }) == runtime_units.end();
+}
+
 DurableManagerActiveRuntimePlanSource::DurableManagerActiveRuntimePlanSource(
     const SqliteActiveBundlePublicationStore &publication_store,
-    const SqliteManagerApplyJournal &apply_journal)
-    : publication_store_(publication_store), apply_journal_(apply_journal) {}
+    const SqliteManagerApplyJournal &apply_journal,
+    std::optional<ManagerBootstrapRuntimePlanDTO> bootstrap_plan)
+    : publication_store_(publication_store), apply_journal_(apply_journal),
+      bootstrap_plan_(std::move(bootstrap_plan)) {
+  if (bootstrap_plan_.has_value() && !bootstrap_plan_->valid()) {
+    throw std::invalid_argument("bootstrap active runtime plan is invalid");
+  }
+}
 
 ManagerActiveRuntimePlanDTO
 DurableManagerActiveRuntimePlanSource::ReadCurrentPlan() const {
@@ -226,11 +263,26 @@ DurableManagerActiveRuntimePlanSource::ReadCurrentPlan() const {
   const auto *transaction = std::get_if<NamedApplyPublicationTransactionDTO>(
       &receipt.request.transaction_ref);
   if (transaction == nullptr) {
-    ManagerActiveRuntimePlanDTO empty{receipt, std::nullopt, {}};
-    if (!empty.valid()) {
+    if (!bootstrap_plan_.has_value()) {
+      ManagerActiveRuntimePlanDTO empty{receipt, std::nullopt, {}};
+      if (!empty.valid()) {
+        Fail("bootstrap active runtime plan is invalid");
+      }
+      return empty;
+    }
+    if (bootstrap_plan_->retained_bundle_id !=
+            receipt.request.candidate_retained_bundle_id ||
+        bootstrap_plan_->graph_revision !=
+            receipt.request.candidate_graph_revision) {
+      Fail("bootstrap publication conflicts with its admitted runtime plan");
+    }
+    ManagerActiveRuntimePlanDTO active{receipt,
+                                       bootstrap_plan_->admission_digest,
+                                       bootstrap_plan_->runtime_units};
+    if (!active.valid()) {
       Fail("bootstrap active runtime plan is invalid");
     }
-    return empty;
+    return active;
   }
 
   const auto durable_publication = apply_journal_.ReadPublicationReceipt(

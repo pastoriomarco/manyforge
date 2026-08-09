@@ -454,8 +454,14 @@ public:
   [[nodiscard]] ProcessPresenceObservation
   EnsureRunning(const RuntimeUnitConvergenceQueryDTO &query) override {
     ++ensure_calls;
+    const auto *owner =
+        std::get_if<RuntimeUnitConvergenceApplyOwnerDTO>(&query.owner);
+    if (owner == nullptr) {
+      throw std::invalid_argument(
+          "named Apply fixture received a bootstrap runtime query");
+    }
     const auto durable = independent_reader_.ReadRuntimeConvergenceIntent(
-        query.apply_id, query.apply_generation);
+        owner->apply_id, owner->apply_generation);
     saw_durable_intent_before_ensure =
         durable.has_value() &&
         durable->runtime_convergence_intent_digest ==
@@ -938,7 +944,10 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
     FAIL() << "expected an effect-uncertain start result";
   } catch (const ManagerRuntimeProcessEffectUncertainError &error) {
     EXPECT_TRUE(error.recovery_query().valid());
-    EXPECT_EQ(error.recovery_query().apply_id, fixture.apply_intent.apply_id);
+    const auto *owner = std::get_if<RuntimeUnitConvergenceApplyOwnerDTO>(
+        &error.recovery_query().owner);
+    ASSERT_NE(owner, nullptr);
+    EXPECT_EQ(owner->apply_id, fixture.apply_intent.apply_id);
   }
   EXPECT_TRUE(fixture.runtime_ports.saw_durable_intent_before_ensure);
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);

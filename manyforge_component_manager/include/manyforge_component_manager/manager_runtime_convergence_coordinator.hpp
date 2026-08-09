@@ -9,15 +9,18 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace manyforge::component_manager {
 
-inline constexpr std::uint64_t kManagerRuntimeMaximumPresenceAgeNs = 5'000'000'000ULL;
-inline constexpr std::uint64_t kManagerRuntimeMaximumReportAgeNs = 5'000'000'000ULL;
+inline constexpr std::uint64_t kManagerRuntimeMaximumPresenceAgeNs =
+    5'000'000'000ULL;
+inline constexpr std::uint64_t kManagerRuntimeMaximumReportAgeNs =
+    5'000'000'000ULL;
 
 class ManagerRuntimeConvergenceCoordinatorError : public std::runtime_error {
- public:
+public:
   using std::runtime_error::runtime_error;
 };
 
@@ -28,13 +31,14 @@ class ManagerRuntimeConvergenceCoordinatorError : public std::runtime_error {
 /// Recovery is therefore observe-first and never retries from exception text.
 class ManagerRuntimeProcessEffectUncertainError final
     : public ManagerRuntimeConvergenceCoordinatorError {
- public:
-  ManagerRuntimeProcessEffectUncertainError(std::string detail,
-                                            RuntimeUnitConvergenceQueryDTO recovery_query);
+public:
+  ManagerRuntimeProcessEffectUncertainError(
+      std::string detail, RuntimeUnitConvergenceQueryDTO recovery_query);
 
-  [[nodiscard]] const RuntimeUnitConvergenceQueryDTO& recovery_query() const noexcept;
+  [[nodiscard]] const RuntimeUnitConvergenceQueryDTO &
+  recovery_query() const noexcept;
 
- private:
+private:
   RuntimeUnitConvergenceQueryDTO recovery_query_;
 };
 
@@ -50,6 +54,18 @@ struct ManagerApplyRuntimeConvergenceResult final {
   std::optional<ManagerApplyRuntimeStagedReadyWriteResult> durable_staged_ready;
   ManagerRuntimeConvergenceResultState state;
 };
+
+/// Effect-free verification and canonical plan projection for every retained
+/// runtime unit in one exact bundle. Bootstrap and named Apply use the same
+/// product/host compatibility rules; only their durable transaction owners
+/// differ.
+[[nodiscard]] std::vector<RuntimeUnitConvergencePlanRowDTO>
+BuildVerifiedRuntimeConvergencePlan(
+    const manyforge::deployment::RetainedBundle &bundle,
+    const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+        &artifact_source,
+    std::string_view operating_system,
+    std::vector<std::string> launch_environment_contracts);
 
 /// Bounded named-Apply runtime convergence coordinator.
 ///
@@ -69,48 +85,52 @@ struct ManagerApplyRuntimeConvergenceResult final {
 /// fallback, process retirement, scene mutation, activation, publication, or
 /// fence release.
 class ManagerApplyRuntimeConvergenceCoordinator final {
- public:
+public:
   ManagerApplyRuntimeConvergenceCoordinator(
-      ManagerApplyFenceCoordinator& fence_coordinator, SqliteManagerApplyJournal& apply_journal,
-      const manyforge::core::IActiveBundlePublicationReader& publication_reader,
-      const manyforge::deployment::IVerifiedRetainedProductArtifactSource& artifact_source,
-      IRuntimeUnitProcessPort& process_port, IRuntimeUnitProgressPort& progress_port,
-      std::string operating_system, std::string shell_contract,
-      RuntimeObservationReducer::Clock clock_ns);
+      ManagerApplyFenceCoordinator &fence_coordinator,
+      SqliteManagerApplyJournal &apply_journal,
+      const manyforge::core::IActiveBundlePublicationReader &publication_reader,
+      const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+          &artifact_source,
+      IRuntimeUnitProcessPort &process_port,
+      IRuntimeUnitProgressPort &progress_port, std::string operating_system,
+      std::string shell_contract, RuntimeObservationReducer::Clock clock_ns);
   ManagerApplyRuntimeConvergenceCoordinator(
-      ManagerApplyFenceCoordinator& fence_coordinator,
-      SqliteManagerApplyJournal& apply_journal,
-      const manyforge::core::IActiveBundlePublicationReader& publication_reader,
-      const manyforge::deployment::IVerifiedRetainedProductArtifactSource&
-          artifact_source,
-      IRuntimeUnitProcessPort& process_port,
-      IRuntimeUnitProgressPort& progress_port, std::string operating_system,
+      ManagerApplyFenceCoordinator &fence_coordinator,
+      SqliteManagerApplyJournal &apply_journal,
+      const manyforge::core::IActiveBundlePublicationReader &publication_reader,
+      const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+          &artifact_source,
+      IRuntimeUnitProcessPort &process_port,
+      IRuntimeUnitProgressPort &progress_port, std::string operating_system,
       std::vector<std::string> launch_environment_contracts,
       RuntimeObservationReducer::Clock clock_ns);
 
-  [[nodiscard]] ManagerApplyRuntimeConvergenceResult ConvergeOrRecover(
-      const ManagerApplyIntentDTO& apply_intent,
-      const manyforge::deployment::RetainedBundle& predecessor,
-      const manyforge::deployment::RetainedBundle& candidate,
-      const ManagerApplyFenceExpectationDTO& fence_expectation,
-      manyforge::core::ActiveBundlePublicationGeneration predecessor_publication_generation);
+  [[nodiscard]] ManagerApplyRuntimeConvergenceResult
+  ConvergeOrRecover(const ManagerApplyIntentDTO &apply_intent,
+                    const manyforge::deployment::RetainedBundle &predecessor,
+                    const manyforge::deployment::RetainedBundle &candidate,
+                    const ManagerApplyFenceExpectationDTO &fence_expectation,
+                    manyforge::core::ActiveBundlePublicationGeneration
+                        predecessor_publication_generation);
 
-  ManagerApplyRuntimeConvergenceCoordinator(const ManagerApplyRuntimeConvergenceCoordinator&) =
-      delete;
-  ManagerApplyRuntimeConvergenceCoordinator& operator=(
-      const ManagerApplyRuntimeConvergenceCoordinator&) = delete;
+  ManagerApplyRuntimeConvergenceCoordinator(
+      const ManagerApplyRuntimeConvergenceCoordinator &) = delete;
+  ManagerApplyRuntimeConvergenceCoordinator &
+  operator=(const ManagerApplyRuntimeConvergenceCoordinator &) = delete;
 
- private:
-  ManagerApplyFenceCoordinator& fence_coordinator_;
-  SqliteManagerApplyJournal& apply_journal_;
-  const manyforge::core::IActiveBundlePublicationReader& publication_reader_;
-  const manyforge::deployment::IVerifiedRetainedProductArtifactSource& artifact_source_;
-  IRuntimeUnitProcessPort& process_port_;
-  IRuntimeUnitProgressPort& progress_port_;
+private:
+  ManagerApplyFenceCoordinator &fence_coordinator_;
+  SqliteManagerApplyJournal &apply_journal_;
+  const manyforge::core::IActiveBundlePublicationReader &publication_reader_;
+  const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+      &artifact_source_;
+  IRuntimeUnitProcessPort &process_port_;
+  IRuntimeUnitProgressPort &progress_port_;
   std::string operating_system_;
   std::vector<std::string> launch_environment_contracts_;
   RuntimeObservationReducer::Clock clock_ns_;
   std::mutex operation_mutex_;
 };
 
-}  // namespace manyforge::component_manager
+} // namespace manyforge::component_manager

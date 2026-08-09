@@ -742,6 +742,9 @@ target_link_libraries(
   manyforge_deployment_canonical_package_generator PRIVATE
   manyforge::deployment
   manyforge::deployment_admission)
+target_link_libraries(
+  manyforge_maintained_deployment_occurrences PRIVATE
+  manyforge_deployment_canonical_package_generator)
 set_target_properties(
   manyforge_deployment_canonical_package_generator
   PROPERTIES POSITION_INDEPENDENT_CODE ON)

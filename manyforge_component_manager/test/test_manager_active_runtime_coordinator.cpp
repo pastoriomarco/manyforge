@@ -87,6 +87,36 @@ ManagedRow(const std::string &runtime_unit_id,
   return plan;
 }
 
+[[nodiscard]] ManagerActiveRuntimePlanDTO BootstrapHostPlan() {
+  const ProjectionRevisionDTO projection{
+      RetainedBundleId("bundle.bootstrap"), GraphRevision("graph.bootstrap"),
+      SceneRevision{SceneId(std::string(kDigestThree)), 1U,
+                    ContentDigest(std::string(kDigestOne))},
+  };
+  ManagerActiveRuntimePlanDTO plan{
+      ActiveBundlePublicationReceiptDTO{
+          ActiveBundlePublicationRequestDTO{
+              BootstrapPublicationTransactionDTO{
+                  BootstrapId("bootstrap.active"), BootstrapGeneration(1U)},
+              projection,
+              projection.retained_bundle_id,
+              projection.graph_revision,
+              std::nullopt,
+              ContentDigest(std::string(kDigestTwo)),
+              ContentDigest(std::string(kDigestThree)),
+          },
+          ActiveBundlePublicationGeneration(1U),
+          ContentDigest(std::string(kDigestOne)),
+      },
+      ContentDigest(std::string(kDigestThree)),
+      {ManagedRow("runtime.bootstrap")},
+  };
+  if (!plan.valid()) {
+    throw std::runtime_error("bootstrap runtime test plan is invalid");
+  }
+  return plan;
+}
+
 class FixedPlanSource final : public IManagerActiveRuntimePlanSource {
 public:
   explicit FixedPlanSource(ManagerActiveRuntimePlanDTO plan)
@@ -110,6 +140,7 @@ public:
   ObserveProcess(const RuntimeUnitConvergenceQueryDTO &query) override {
     const auto id = query.plan.runtime_unit_id.value();
     events.push_back("observe:" + id);
+    observed_owners.push_back(query.owner);
     return Presence(query, id);
   }
 
@@ -166,6 +197,7 @@ public:
   }
 
   std::vector<std::string> events;
+  std::vector<RuntimeUnitConvergenceOwnerDTO> observed_owners;
   std::map<std::string, int> start_calls;
   std::map<std::string, int> stop_calls;
   std::map<std::string, std::string> epochs;
@@ -189,6 +221,26 @@ private:
   std::map<std::string, std::uint64_t> report_sequences;
   std::map<std::string, std::uint64_t> epoch_generations;
 };
+
+TEST(ManagerActiveRuntimeCoordinator,
+     BootstrapPlanStartsHostUnderBootstrapIdentityWithoutFabricatedApply) {
+  FixedPlanSource source(BootstrapHostPlan());
+  ScriptedLifecyclePorts ports;
+  std::uint64_t now = 50U;
+  ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
+                                               [&now]() { return ++now; });
+
+  const auto result = coordinator.Reconcile();
+  EXPECT_EQ(result.state, ManagerActiveRuntimeConvergenceState::kConverged);
+  ASSERT_FALSE(ports.observed_owners.empty());
+  const auto *owner = std::get_if<RuntimeUnitConvergenceBootstrapOwnerDTO>(
+      &ports.observed_owners.front());
+  ASSERT_NE(owner, nullptr);
+  EXPECT_EQ(owner->bootstrap_id, BootstrapId("bootstrap.active"));
+  EXPECT_EQ(owner->bootstrap_generation, BootstrapGeneration(1U));
+  EXPECT_EQ(ports.start_calls["runtime.bootstrap"], 1);
+  static_cast<void>(coordinator.Shutdown());
+}
 
 TEST(ManagerActiveRuntimeCoordinator,
      ReconcilesDependenciesStopsInReverseAndRestartsNewEpochs) {

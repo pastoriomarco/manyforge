@@ -1,7 +1,7 @@
-#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -9,6 +9,7 @@
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
+#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/cell_applicability.hpp>
 #include <manyforge_deployment/cell_compiler.hpp>
@@ -26,10 +27,10 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
-#include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
-#include <manyforge_deployment/runtime_program_binding.hpp>
+#include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
+#include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/scenario_catalog.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
@@ -48,6 +49,7 @@
 #include <variant>
 #include <vector>
 
+#include "canonical_empty_admission_internal.hpp"
 #include "retained_bundle_internal.hpp"
 
 namespace {
@@ -68,16 +70,19 @@ struct Scenario final {
 };
 
 constexpr std::array<Scenario, 7U> kScenarios{{
-    {"examples/assistant_modes_scene_authoring.deployment.yaml", "ur10e_robotiq_2f_140", true},
-    {"examples/lite6_lite_gripper_pick_and_place.deployment.yaml", "lite6_lite_gripper", false},
+    {"examples/assistant_modes_scene_authoring.deployment.yaml",
+     "ur10e_robotiq_2f_140", true},
+    {"examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
+     "lite6_lite_gripper", false},
     {"examples/pick_and_place.deployment.yaml", "ur5_roboplan", false},
-    {"examples/pick_and_place_ur10e_robotiq.deployment.yaml", "ur10e_robotiq_2f_140", false},
+    {"examples/pick_and_place_ur10e_robotiq.deployment.yaml",
+     "ur10e_robotiq_2f_140", false},
     {"examples/semantic_shape_pick.deployment.yaml", "ur5_roboplan", true},
     {"examples/vision_guided_bin_pick.deployment.yaml", "ur5_roboplan", true},
     {"examples/vision_guided_pose_pick.deployment.yaml", "ur5_roboplan", true},
 }};
 
-[[nodiscard]] Options parse_options(int argc, char** argv) {
+[[nodiscard]] Options parse_options(int argc, char **argv) {
   if (argc < 6 || std::string_view(argv[1]) != "--check") {
     throw std::invalid_argument(
         "usage: manyforge_maintained_deployment_occurrences --check "
@@ -88,7 +93,8 @@ constexpr std::array<Scenario, 7U> kScenarios{{
   Options result;
   for (int index = 2; index < argc; index += 2) {
     if (index + 1 >= argc) {
-      throw std::invalid_argument("maintained qualification option has no value");
+      throw std::invalid_argument(
+          "maintained qualification option has no value");
     }
     const std::string_view option(argv[index]);
     const std::string value(argv[index + 1]);
@@ -111,22 +117,26 @@ constexpr std::array<Scenario, 7U> kScenarios{{
         continue;
       }
     }
-    throw std::invalid_argument("invalid or repeated maintained qualification option");
+    throw std::invalid_argument(
+        "invalid or repeated maintained qualification option");
   }
   if (result.workspace_root.empty() || result.prepared_roots.size() != 3U) {
-    throw std::invalid_argument(
-        "maintained qualification requires one workspace root and three prepared families");
+    throw std::invalid_argument("maintained qualification requires one "
+                                "workspace root and three prepared families");
   }
   return result;
 }
 
-[[nodiscard]] std::string read_file(const std::filesystem::path& path) {
-  if (std::filesystem::is_symlink(path) || !std::filesystem::is_regular_file(path)) {
-    throw std::invalid_argument("maintained source is not one plain file: " + path.string());
+[[nodiscard]] std::string read_file(const std::filesystem::path &path) {
+  if (std::filesystem::is_symlink(path) ||
+      !std::filesystem::is_regular_file(path)) {
+    throw std::invalid_argument("maintained source is not one plain file: " +
+                                path.string());
   }
   const auto size = std::filesystem::file_size(path);
   if (size > deployment::kMaxArtifactEncodedBytes) {
-    throw std::invalid_argument("maintained source exceeds the artifact bound: " + path.string());
+    throw std::invalid_argument(
+        "maintained source exceeds the artifact bound: " + path.string());
   }
   std::ifstream stream(path, std::ios::binary);
   if (!stream) {
@@ -140,10 +150,10 @@ constexpr std::array<Scenario, 7U> kScenarios{{
   return bytes;
 }
 
-[[nodiscard]] const deployment::CanonicalValue& require_member(
-    const deployment::CanonicalValue& value, std::string_view name,
-    std::string_view label) {
-  const auto* member = value.find_object_member(name);
+[[nodiscard]] const deployment::CanonicalValue &
+require_member(const deployment::CanonicalValue &value, std::string_view name,
+               std::string_view label) {
+  const auto *member = value.find_object_member(name);
   if (member == nullptr) {
     throw std::invalid_argument(std::string(label) + " is missing " +
                                 std::string(name));
@@ -151,9 +161,9 @@ constexpr std::array<Scenario, 7U> kScenarios{{
   return *member;
 }
 
-[[nodiscard]] const deployment::CanonicalValue::Array& require_array(
-    const deployment::CanonicalValue& value, std::string_view label) {
-  const auto* array =
+[[nodiscard]] const deployment::CanonicalValue::Array &
+require_array(const deployment::CanonicalValue &value, std::string_view label) {
+  const auto *array =
       std::get_if<deployment::CanonicalValue::Array>(&value.storage());
   if (array == nullptr) {
     throw std::invalid_argument(std::string(label) + " must be an array");
@@ -161,9 +171,10 @@ constexpr std::array<Scenario, 7U> kScenarios{{
   return *array;
 }
 
-[[nodiscard]] const deployment::CanonicalValue::Object& require_object(
-    const deployment::CanonicalValue& value, std::string_view label) {
-  const auto* object =
+[[nodiscard]] const deployment::CanonicalValue::Object &
+require_object(const deployment::CanonicalValue &value,
+               std::string_view label) {
+  const auto *object =
       std::get_if<deployment::CanonicalValue::Object>(&value.storage());
   if (object == nullptr) {
     throw std::invalid_argument(std::string(label) + " must be an object");
@@ -171,28 +182,29 @@ constexpr std::array<Scenario, 7U> kScenarios{{
   return *object;
 }
 
-[[nodiscard]] const std::string& require_text(
-    const deployment::CanonicalValue& value, std::string_view label) {
-  const auto* text = std::get_if<std::string>(&value.storage());
+[[nodiscard]] const std::string &
+require_text(const deployment::CanonicalValue &value, std::string_view label) {
+  const auto *text = std::get_if<std::string>(&value.storage());
   if (text == nullptr || text->empty()) {
     throw std::invalid_argument(std::string(label) + " must be non-empty text");
   }
   return *text;
 }
 
-[[nodiscard]] std::uint64_t require_size(
-    const deployment::CanonicalValue& value, std::string_view label) {
-  const auto* number = std::get_if<double>(&value.storage());
+[[nodiscard]] std::uint64_t
+require_size(const deployment::CanonicalValue &value, std::string_view label) {
+  const auto *number = std::get_if<double>(&value.storage());
   if (number == nullptr || *number < 0.0 ||
       *number > static_cast<double>(deployment::kMaxModelSourceClosureBytes) ||
       *number != static_cast<double>(static_cast<std::uint64_t>(*number))) {
-    throw std::invalid_argument(std::string(label) + " must be a bounded integer");
+    throw std::invalid_argument(std::string(label) +
+                                " must be a bounded integer");
   }
   return static_cast<std::uint64_t>(*number);
 }
 
-[[nodiscard]] std::filesystem::path require_relative_path(
-    std::string_view text, std::string_view label) {
+[[nodiscard]] std::filesystem::path
+require_relative_path(std::string_view text, std::string_view label) {
   const std::filesystem::path path(text);
   if (text.empty() || path.is_absolute() || path != path.lexically_normal() ||
       std::find(path.begin(), path.end(), std::filesystem::path("..")) !=
@@ -205,22 +217,24 @@ constexpr std::array<Scenario, 7U> kScenarios{{
 
 class ExactCompilerInputSource final
     : public deployment::detail::ICompilerInputArtifactSource {
- public:
-  void add(const core::ContentAddressedStoreKey& key,
-           const core::ContentDigest& digest, std::string bytes) {
+public:
+  void add(const core::ContentAddressedStoreKey &key,
+           const core::ContentDigest &digest, std::string bytes) {
     if (deployment::sha256_digest(bytes) != digest.value()) {
       throw std::invalid_argument("compiler input bytes have the wrong digest");
     }
-    const auto [position, inserted] = bytes_.emplace(key.value(), std::move(bytes));
-    if (!inserted && deployment::sha256_digest(position->second) != digest.value()) {
+    const auto [position, inserted] =
+        bytes_.emplace(key.value(), std::move(bytes));
+    if (!inserted &&
+        deployment::sha256_digest(position->second) != digest.value()) {
       throw std::invalid_argument("compiler input key aliases different bytes");
     }
   }
 
-  [[nodiscard]] std::optional<std::string> get_verified(
-      const core::ContentAddressedStoreKey& key,
-      const core::ContentDigest& expected_digest,
-      std::optional<std::uint64_t> expected_size) const override {
+  [[nodiscard]] std::optional<std::string>
+  get_verified(const core::ContentAddressedStoreKey &key,
+               const core::ContentDigest &expected_digest,
+               std::optional<std::uint64_t> expected_size) const override {
     const auto found = bytes_.find(key.value());
     if (found == bytes_.end() ||
         deployment::sha256_digest(found->second) != expected_digest.value() ||
@@ -230,7 +244,7 @@ class ExactCompilerInputSource final
     return found->second;
   }
 
- private:
+private:
   std::map<std::string, std::string, std::less<>> bytes_;
 };
 
@@ -244,19 +258,18 @@ struct FamilySource final {
   std::filesystem::path prepared_root;
 };
 
-[[nodiscard]] std::vector<FamilySource> load_families(
-    const Options& options) {
+[[nodiscard]] std::vector<FamilySource> load_families(const Options &options) {
   const auto root = deployment::parse_strict_json_model_yaml(read_file(
-      options.workspace_root /
-      "manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json"));
-  const auto& rows = require_array(
+      options.workspace_root / "manyforge_deployment/resources/maintained/"
+                               "maintained_deployment_sources.v1.json"));
+  const auto &rows = require_array(
       require_member(root.root(), "model_families", "maintained description"),
       "maintained description.model_families");
   std::vector<FamilySource> result;
-  for (const auto& row : rows) {
-    const std::string family_id = require_text(
-        require_member(row, "model_family_id", "model family"),
-        "model family.model_family_id");
+  for (const auto &row : rows) {
+    const std::string family_id =
+        require_text(require_member(row, "model_family_id", "model family"),
+                     "model family.model_family_id");
     const auto prepared = options.prepared_roots.find(family_id);
     if (prepared == options.prepared_roots.end() ||
         !prepared->second.is_absolute() ||
@@ -265,13 +278,13 @@ struct FamilySource final {
       throw std::invalid_argument("model family has no exact prepared root: " +
                                   family_id);
     }
-    const auto& source = require_member(row, "source", "model family");
+    const auto &source = require_member(row, "source", "model family");
     const auto rooted = [&](std::string_view field) {
       return options.workspace_root /
              require_relative_path(
-                 require_text(require_member(source, field, "model family.source"),
-                              std::string("model family.source.") +
-                                  std::string(field)),
+                 require_text(
+                     require_member(source, field, "model family.source"),
+                     std::string("model family.source.") + std::string(field)),
                  std::string("model family.source.") + std::string(field));
     };
     result.push_back(FamilySource{
@@ -280,23 +293,27 @@ struct FamilySource final {
                      "model family.model_asset_id"),
         options.workspace_root /
             require_relative_path(
-                require_text(require_member(row, "catalog_source", "model family"),
-                             "model family.catalog_source"),
+                require_text(
+                    require_member(row, "catalog_source", "model family"),
+                    "model family.catalog_source"),
                 "model family.catalog_source"),
-        rooted("urdf_path"), rooted("srdf_path"), rooted("resource_root"),
+        rooted("urdf_path"),
+        rooted("srdf_path"),
+        rooted("resource_root"),
         prepared->second.lexically_normal(),
     });
   }
   if (result.size() != 3U) {
-    throw std::invalid_argument("maintained description must contain three model families");
+    throw std::invalid_argument(
+        "maintained description must contain three model families");
   }
   return result;
 }
 
 class TemporaryPackage final {
- public:
+public:
   explicit TemporaryPackage(
-      const std::optional<std::filesystem::path>& requested_root) {
+      const std::optional<std::filesystem::path> &requested_root) {
     if (requested_root.has_value()) {
       path_ = std::filesystem::canonical(*requested_root);
       if (!std::filesystem::is_directory(path_) ||
@@ -311,7 +328,7 @@ class TemporaryPackage final {
     std::array<char, 64U> pattern{};
     const std::string seed = "/tmp/manyforge-n6-a3-XXXXXX";
     std::copy(seed.begin(), seed.end(), pattern.begin());
-    char* created = ::mkdtemp(pattern.data());
+    char *created = ::mkdtemp(pattern.data());
     if (created == nullptr) {
       throw std::runtime_error("cannot create N6-a3 temporary package");
     }
@@ -325,54 +342,60 @@ class TemporaryPackage final {
     std::error_code ignored;
     (void)std::filesystem::remove_all(path_, ignored);
   }
-  TemporaryPackage(const TemporaryPackage&) = delete;
-  TemporaryPackage& operator=(const TemporaryPackage&) = delete;
+  TemporaryPackage(const TemporaryPackage &) = delete;
+  TemporaryPackage &operator=(const TemporaryPackage &) = delete;
 
-  [[nodiscard]] const std::filesystem::path& path() const noexcept {
+  [[nodiscard]] const std::filesystem::path &path() const noexcept {
     return path_;
   }
 
- private:
+private:
   std::filesystem::path path_;
   bool remove_on_destruction_{true};
 };
 
-[[nodiscard]] const std::string& require_string_member(const deployment::CanonicalValue& root,
-                                                       std::string_view name) {
-  const auto* value = root.find_object_member(name);
+[[nodiscard]] const std::string &
+require_string_member(const deployment::CanonicalValue &root,
+                      std::string_view name) {
+  const auto *value = root.find_object_member(name);
   if (value == nullptr) {
-    throw std::invalid_argument("catalog source is missing " + std::string(name));
+    throw std::invalid_argument("catalog source is missing " +
+                                std::string(name));
   }
-  const auto* text = std::get_if<std::string>(&value->storage());
+  const auto *text = std::get_if<std::string>(&value->storage());
   if (text == nullptr) {
-    throw std::invalid_argument("catalog source member is not text: " + std::string(name));
+    throw std::invalid_argument("catalog source member is not text: " +
+                                std::string(name));
   }
   return *text;
 }
 
-[[nodiscard]] std::vector<std::filesystem::path> source_files(
-    const std::filesystem::path& directory, std::size_t expected_count) {
-  if (std::filesystem::is_symlink(directory) || !std::filesystem::is_directory(directory)) {
-    throw std::invalid_argument("maintained catalog directory is unavailable: " +
-                                directory.string());
+[[nodiscard]] std::vector<std::filesystem::path>
+source_files(const std::filesystem::path &directory,
+             std::size_t expected_count) {
+  if (std::filesystem::is_symlink(directory) ||
+      !std::filesystem::is_directory(directory)) {
+    throw std::invalid_argument(
+        "maintained catalog directory is unavailable: " + directory.string());
   }
   std::vector<std::filesystem::path> result;
-  for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+  for (const auto &entry : std::filesystem::directory_iterator(directory)) {
     if (entry.path().extension() == ".json") {
       result.push_back(entry.path());
     }
   }
   std::sort(result.begin(), result.end());
   if (result.size() != expected_count) {
-    throw std::invalid_argument("maintained catalog directory has the wrong exact source count: " +
-                                directory.string());
+    throw std::invalid_argument(
+        "maintained catalog directory has the wrong exact source count: " +
+        directory.string());
   }
   return result;
 }
 
 using CatalogKey = std::tuple<std::uint8_t, std::string, std::string>;
 
-[[nodiscard]] CatalogKey catalog_key(const core::CatalogRecordRefDTO& record) {
+[[nodiscard]] CatalogKey catalog_key(const core::CatalogRecordRefDTO &record) {
   return {static_cast<std::uint8_t>(core::catalog_record_kind(record)),
           core::catalog_record_id_value(record),
           core::catalog_record_revision_value(record)};
@@ -394,11 +417,12 @@ struct QualifiedCatalogClosure final {
 };
 
 template <typename Value, typename Selector>
-[[nodiscard]] std::vector<Value> select_catalog_values(
-    const std::vector<Value>& values,
-    const std::set<CatalogKey>& selected_records, Selector selector) {
+[[nodiscard]] std::vector<Value>
+select_catalog_values(const std::vector<Value> &values,
+                      const std::set<CatalogKey> &selected_records,
+                      Selector selector) {
   std::vector<Value> result;
-  for (const auto& value : values) {
+  for (const auto &value : values) {
     if (selected_records.contains(selector(value))) {
       result.push_back(value);
     }
@@ -411,26 +435,27 @@ struct ScenarioProduct final {
   core::DeploymentRevision deployment_revision;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   deployment::VerifiedRetainedModelMap model_map;
+  std::filesystem::path canonical_empty_admission_filename;
 };
 
 void verify_gripper_resource_semantics(
-    const Scenario& scenario, const core::CellGraphDTO& graph,
-    const deployment::VerifiedRetainedModelMap& model_map) {
+    const Scenario &scenario, const core::CellGraphDTO &graph,
+    const deployment::VerifiedRetainedModelMap &model_map) {
   if (graph.controllable_components.size() != 1U) {
     throw std::logic_error(
         "maintained gripper proof requires one controllable component");
   }
-  const auto& component_id =
+  const auto &component_id =
       graph.controllable_components.front().controllable_component_id;
-  const core::ResourceId expected_local_id(
-      component_id.value() + ".gripper.logical_position");
+  const core::ResourceId expected_local_id(component_id.value() +
+                                           ".gripper.logical_position");
   bool found = false;
-  for (const auto& binding : model_map.control_bindings()) {
+  for (const auto &binding : model_map.control_bindings()) {
     if (binding.controllable_component_id != component_id ||
         binding.command_target_id.value() != "gripper") {
       continue;
     }
-    for (const auto& resource : binding.resources) {
+    for (const auto &resource : binding.resources) {
       if (resource.resource_role_id.value() != "fingers") {
         continue;
       }
@@ -461,58 +486,62 @@ void verify_gripper_resource_semantics(
 }
 
 [[nodiscard]] std::map<std::string, ScenarioProduct, std::less<>>
-materialize_scenarios(const std::filesystem::path& root,
-                      const QualifiedCatalogClosure& catalog,
-                      const ExactCompilerInputSource& input_source,
-                      const std::filesystem::path& package_root) {
+materialize_scenarios(const std::filesystem::path &root,
+                      const QualifiedCatalogClosure &catalog,
+                      const ExactCompilerInputSource &input_source,
+                      const std::filesystem::path &package_root) {
   const std::string overlay_bytes = read_file(
       root / "manyforge_deployment/resources/maintained/site_overlays/"
              "manyforge_local_examples.site_overlay.json");
-  deployment::FilesystemBuildManifestRepository manifest_repository(package_root);
+  deployment::FilesystemBuildManifestRepository manifest_repository(
+      package_root);
   deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
   deployment::FilesystemRawArtifactStore raw_store(package_root);
-  deployment::FilesystemRetainedBundleRepository bundle_repository(package_root);
+  deployment::FilesystemRetainedBundleRepository bundle_repository(
+      package_root);
   std::map<std::string, ScenarioProduct, std::less<>> result;
 
-  for (const auto& scenario : kScenarios) {
+  for (const auto &scenario : kScenarios) {
     const auto verified = deployment::verify_deployment_artifact_revision(
-        deployment::parse_strict_json_model_yaml(read_file(root / scenario.source)),
+        deployment::parse_strict_json_model_yaml(
+            read_file(root / scenario.source)),
         catalog.runtime_profiles);
     std::set<CatalogKey> selected_records;
-    for (const auto& reference : verified.catalog_records()) {
+    for (const auto &reference : verified.catalog_records()) {
       selected_records.insert(catalog_key(reference));
     }
 
     const auto model_assets = select_catalog_values(
-        catalog.model_assets, selected_records, [](const auto& value) {
+        catalog.model_assets, selected_records, [](const auto &value) {
           return CatalogKey{
               static_cast<std::uint8_t>(core::CatalogRecordKind::kModelAsset),
               value.value().model_asset_id.value(),
               value.value().model_revision.value()};
         });
     const auto component_types = select_catalog_values(
-        catalog.component_types, selected_records, [](const auto& value) {
-          return CatalogKey{
-              static_cast<std::uint8_t>(core::CatalogRecordKind::kComponentType),
-              value.value().component_type_id.value(),
-              value.value().component_type_revision.value()};
+        catalog.component_types, selected_records, [](const auto &value) {
+          return CatalogKey{static_cast<std::uint8_t>(
+                                core::CatalogRecordKind::kComponentType),
+                            value.value().component_type_id.value(),
+                            value.value().component_type_revision.value()};
         });
     const auto command_schemas = select_catalog_values(
-        catalog.command_schemas, selected_records, [](const auto& value) {
-          return CatalogKey{
-              static_cast<std::uint8_t>(core::CatalogRecordKind::kCommandSchema),
-              value.value().command_schema_id.value(),
-              value.value().command_schema_revision.value()};
+        catalog.command_schemas, selected_records, [](const auto &value) {
+          return CatalogKey{static_cast<std::uint8_t>(
+                                core::CatalogRecordKind::kCommandSchema),
+                            value.value().command_schema_id.value(),
+                            value.value().command_schema_revision.value()};
         });
     const auto capabilities = select_catalog_values(
-        catalog.capabilities, selected_records, [](const auto& value) {
+        catalog.capabilities, selected_records, [](const auto &value) {
           return CatalogKey{
-              static_cast<std::uint8_t>(core::CatalogRecordKind::kCapabilityDefinition),
+              static_cast<std::uint8_t>(
+                  core::CatalogRecordKind::kCapabilityDefinition),
               value.value().capability_id.value(),
               value.value().capability_definition_revision.value()};
         });
     const auto contracts = select_catalog_values(
-        catalog.contracts, selected_records, [](const auto& value) {
+        catalog.contracts, selected_records, [](const auto &value) {
           return CatalogKey{
               static_cast<std::uint8_t>(
                   core::CatalogRecordKind::kControlInterfaceContract),
@@ -520,41 +549,43 @@ materialize_scenarios(const std::filesystem::path& root,
               value.value().control_interface_revision.value()};
         });
     const auto topologies = select_catalog_values(
-        catalog.topologies, selected_records, [](const auto& value) {
-          return CatalogKey{
-              static_cast<std::uint8_t>(core::CatalogRecordKind::kControllerTopology),
-              value.value().controller_topology_id.value(),
-              value.value().topology_revision.value()};
+        catalog.topologies, selected_records, [](const auto &value) {
+          return CatalogKey{static_cast<std::uint8_t>(
+                                core::CatalogRecordKind::kControllerTopology),
+                            value.value().controller_topology_id.value(),
+                            value.value().topology_revision.value()};
         });
     const auto manifests = select_catalog_values(
-        catalog.provider_manifests, selected_records, [](const auto& value) {
-          return CatalogKey{
-              static_cast<std::uint8_t>(core::CatalogRecordKind::kProviderManifest),
-              value.value().provider_manifest_id.value(),
-              value.value().provider_manifest_revision.value()};
+        catalog.provider_manifests, selected_records, [](const auto &value) {
+          return CatalogKey{static_cast<std::uint8_t>(
+                                core::CatalogRecordKind::kProviderManifest),
+                            value.value().provider_manifest_id.value(),
+                            value.value().provider_manifest_revision.value()};
         });
     const auto profiles = select_catalog_values(
-        catalog.runtime_profiles, selected_records, [](const auto& value) {
-          return CatalogKey{
-              static_cast<std::uint8_t>(core::CatalogRecordKind::kRuntimeProfile),
-              value.value().runtime_profile_id.value(),
-              value.value().runtime_profile_revision.value()};
+        catalog.runtime_profiles, selected_records, [](const auto &value) {
+          return CatalogKey{static_cast<std::uint8_t>(
+                                core::CatalogRecordKind::kRuntimeProfile),
+                            value.value().runtime_profile_id.value(),
+                            value.value().runtime_profile_revision.value()};
         });
     const auto stop_policies = select_catalog_values(
-        catalog.stop_policies, selected_records, [](const auto& value) {
+        catalog.stop_policies, selected_records, [](const auto &value) {
           return CatalogKey{
-              static_cast<std::uint8_t>(core::CatalogRecordKind::kStopEvidencePolicy),
+              static_cast<std::uint8_t>(
+                  core::CatalogRecordKind::kStopEvidencePolicy),
               value.value().stop_evidence_policy_id.value(),
               value.value().stop_evidence_policy_revision.value()};
         });
 
     if (model_assets.size() != 1U || component_types.size() != 1U ||
         profiles.size() != 1U) {
-      throw std::logic_error("scenario cannot select its exact structural/runtime closure");
+      throw std::logic_error(
+          "scenario cannot select its exact structural/runtime closure");
     }
     const auto composition = deployment::compose_cell_occurrences(
         verified.graph(), model_assets, component_types);
-    const auto& inputs = verified.applicability_inputs().value();
+    const auto &inputs = verified.applicability_inputs().value();
     const auto selected_overlay = [&] {
       if (!inputs.site_overlay_ref.has_value()) {
         return deployment::select_site_overlay_for_deployment(
@@ -575,7 +606,7 @@ materialize_scenarios(const std::filesystem::path& root,
 
     const auto preparation = std::find_if(
         catalog.structural_preparations.begin(),
-        catalog.structural_preparations.end(), [&](const auto& value) {
+        catalog.structural_preparations.end(), [&](const auto &value) {
           return value.verified_model_asset().value().model_asset_id ==
                      model_assets.front().value().model_asset_id &&
                  value.verified_model_asset().value().model_revision ==
@@ -600,15 +631,64 @@ materialize_scenarios(const std::filesystem::path& root,
         bundle->retained_bundle_id(),
         bundle->value().compiled_products.symbol_role_maps.front().product_id});
     if (!model_map.has_value()) {
-      throw std::logic_error("scenario model map cannot be independently reloaded");
+      throw std::logic_error(
+          "scenario model map cannot be independently reloaded");
     }
-    verify_gripper_resource_semantics(
-        scenario, verified.graph().graph(), *model_map);
+
+    const auto empty_deployment =
+        deployment::detail::derive_cell_scoped_canonical_empty_deployment(
+            verified, profiles);
+    const auto empty_composition = deployment::compose_cell_occurrences(
+        empty_deployment.graph(),
+        std::span<const deployment::SourceVerifiedModelAsset>{},
+        std::span<const deployment::QualifiedComponentType>{});
+    const auto empty_overlay = deployment::select_site_overlay_for_deployment(
+        empty_deployment.applicability_inputs().value().site_overlay_ref,
+        empty_deployment.applicability_inputs().value().external_resources,
+        nullptr);
+    const auto empty_applicability = deployment::qualify_cell_applicability(
+        empty_composition, empty_deployment.applicability_inputs(), profiles,
+        std::span<const deployment::QualifiedCommandSchema>{},
+        std::span<const deployment::QualifiedCapabilityDefinition>{},
+        std::span<const deployment::QualifiedControlInterfaceContract>{},
+        std::span<const deployment::QualifiedControllerTopology>{},
+        std::span<const deployment::QualifiedProviderManifest>{},
+        std::span<const deployment::QualifiedStopEvidencePolicy>{},
+        empty_overlay);
+    const auto empty_qualified = deployment::qualify_deployment_for_retention(
+        empty_deployment, deployment::compile_cell_ir(empty_applicability));
+    const auto empty_bundle = deployment::detail::RetainedBundleMaterializer::
+        materialize_store_and_reload_production(
+            empty_qualified, manifest_repository, input_source, {},
+            catalog_store, raw_store, bundle_repository);
+    if (empty_bundle == nullptr ||
+        empty_bundle->value().cell_graph.runtime_units !=
+            bundle->value().cell_graph.runtime_units ||
+        empty_bundle->value().compiled_products.runtime_unit_products !=
+            bundle->value().compiled_products.runtime_unit_products) {
+      throw std::logic_error(
+          "cell-scoped canonical predecessor does not retain the candidate's "
+          "exact execution host product");
+    }
+    const auto admission_filename =
+        deployment::cell_scoped_canonical_empty_admission_filename(
+            verified.cell_id());
+    const auto admission =
+        deployment::detail::publish_cell_scoped_canonical_empty_admission(
+            package_root, admission_filename, *empty_bundle);
+    if (admission.cell_id() != verified.cell_id() ||
+        admission.retained_bundle_id() != empty_bundle->retained_bundle_id()) {
+      throw std::logic_error(
+          "cell-scoped canonical predecessor did not reload exactly");
+    }
+    verify_gripper_resource_semantics(scenario, verified.graph().graph(),
+                                      *model_map);
     if (!result
              .emplace(std::string(scenario.source),
                       ScenarioProduct{verified.deployment_artifact_id(),
                                       verified.deployment_revision(), bundle,
-                                      std::move(*model_map)})
+                                      std::move(*model_map),
+                                      admission_filename})
              .second) {
       throw std::logic_error("scenario product source is duplicated");
     }
@@ -626,12 +706,11 @@ struct StoredProgramBinding final {
   core::ProgramRevision program_revision;
 };
 
-[[nodiscard]] const core::ProgramTargetRoleRequirementDTO&
-require_target_requirement(
-    const core::ProgramBindingContractDTO& contract,
-    const core::TargetRoleId& target_role_id) {
-  const core::ProgramTargetRoleRequirementDTO* result = nullptr;
-  for (const auto& candidate : contract.target_roles) {
+[[nodiscard]] const core::ProgramTargetRoleRequirementDTO &
+require_target_requirement(const core::ProgramBindingContractDTO &contract,
+                           const core::TargetRoleId &target_role_id) {
+  const core::ProgramTargetRoleRequirementDTO *result = nullptr;
+  for (const auto &candidate : contract.target_roles) {
     if (candidate.target_role_id != target_role_id) {
       continue;
     }
@@ -641,26 +720,28 @@ require_target_requirement(
     result = &candidate;
   }
   if (result == nullptr) {
-    throw std::invalid_argument("role assignment selects an unknown target role");
+    throw std::invalid_argument(
+        "role assignment selects an unknown target role");
   }
   return *result;
 }
 
 void verify_resolved_program_binding(
-    const deployment::ProgramBinding& binding,
-    const deployment::RetainedBundle& bundle,
-    const deployment::VerifiedRetainedModelMap& model_map) {
+    const deployment::ProgramBinding &binding,
+    const deployment::RetainedBundle &bundle,
+    const deployment::VerifiedRetainedModelMap &model_map) {
   if (binding.value().component_role_bindings.empty() ||
       binding.value().target_role_bindings.empty()) {
-    throw std::logic_error("maintained Program Binding has an empty role closure");
+    throw std::logic_error(
+        "maintained Program Binding has an empty role closure");
   }
-  for (const auto& component : binding.value().component_role_bindings) {
+  for (const auto &component : binding.value().component_role_bindings) {
     if (component.model_role_bindings.empty()) {
       throw std::logic_error(
           "maintained Program Binding loses its model-role resolution");
     }
   }
-  for (const auto& target : binding.value().target_role_bindings) {
+  for (const auto &target : binding.value().target_role_bindings) {
     if (target.frame_role_bindings.empty() ||
         target.resource_role_bindings.empty() ||
         target.collision_body_role_bindings.empty() ||
@@ -668,24 +749,24 @@ void verify_resolved_program_binding(
       throw std::logic_error(
           "maintained Program Binding loses a target resolution family");
     }
-    for (const auto& resource : target.resource_role_bindings) {
+    for (const auto &resource : target.resource_role_bindings) {
       if (resource.resource_ids.empty() ||
           resource.resource_ids.size() !=
               resource.compiled_resource_names.size() ||
           std::any_of(resource.compiled_resource_names.begin(),
                       resource.compiled_resource_names.end(),
-                      [](const auto& value) { return value.empty(); })) {
+                      [](const auto &value) { return value.empty(); })) {
         throw std::logic_error(
             "maintained Program Binding has an incomplete resource mapping");
       }
     }
-    for (const auto& frame : target.frame_role_bindings) {
+    for (const auto &frame : target.frame_role_bindings) {
       if (frame.compiled_frame_name.empty()) {
         throw std::logic_error(
             "maintained Program Binding has an empty compiled frame");
       }
     }
-    for (const auto& body : target.collision_body_role_bindings) {
+    for (const auto &body : target.collision_body_role_bindings) {
       if (body.compiled_collision_body_names.empty()) {
         throw std::logic_error(
             "maintained Program Binding has an empty collision-body mapping");
@@ -693,14 +774,15 @@ void verify_resolved_program_binding(
     }
 
     bool resolved_control_coordinates = false;
-    for (const auto& capability : target.capability_bindings) {
+    for (const auto &capability : target.capability_bindings) {
       const auto resolved = deployment::resolve_runtime_program_target(
           binding, target.target_role_id, capability.capability_id, bundle,
           model_map);
       if (resolved.program_binding_id() != binding.program_binding_id() ||
           resolved.component().controllable_component_id !=
               target.controllable_component_id ||
-          resolved.model_target().command_target_id != target.command_target_id ||
+          resolved.model_target().command_target_id !=
+              target.command_target_id ||
           resolved.capability() != capability) {
         throw std::logic_error(
             "runtime Program resolver changed an exact retained selection");
@@ -714,9 +796,9 @@ void verify_resolved_program_binding(
           throw std::logic_error(
               "control-backed Program capability has no complete runtime path");
         }
-        for (const auto& resource : resolved.coordinate_map()->resources) {
+        for (const auto &resource : resolved.coordinate_map()->resources) {
           if (std::any_of(resource.coordinates.begin(),
-                          resource.coordinates.end(), [](const auto& row) {
+                          resource.coordinates.end(), [](const auto &row) {
                             return row.source_joint_name.empty() ||
                                    row.compiled_joint_name.empty();
                           })) {
@@ -746,12 +828,12 @@ void verify_resolved_program_binding(
 }
 
 [[nodiscard]] std::vector<StoredProgramBinding> verify_program_bindings(
-    const std::filesystem::path& root,
-    const std::map<std::string, ScenarioProduct, std::less<>>& products,
-    const std::filesystem::path& package_root) {
-  const auto parsed = deployment::parse_strict_json_model_yaml(read_file(
-      root / "manyforge_deployment/resources/maintained/"
-             "maintained_program_role_assignments.v1.json"));
+    const std::filesystem::path &root,
+    const std::map<std::string, ScenarioProduct, std::less<>> &products,
+    const std::filesystem::path &package_root) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(
+      read_file(root / "manyforge_deployment/resources/maintained/"
+                       "maintained_program_role_assignments.v1.json"));
   if (require_text(require_member(parsed.root(), "api_version",
                                   "maintained role assignments"),
                    "maintained role assignments.api_version") !=
@@ -759,9 +841,10 @@ void verify_resolved_program_binding(
     throw std::invalid_argument(
         "maintained role assignments have the wrong API version");
   }
-  const auto& rows = require_array(
-      require_member(parsed.root(), "assignments", "maintained role assignments"),
-      "maintained role assignments.assignments");
+  const auto &rows =
+      require_array(require_member(parsed.root(), "assignments",
+                                   "maintained role assignments"),
+                    "maintained role assignments.assignments");
   if (rows.size() != 8U || products.size() != 7U) {
     throw std::invalid_argument(
         "maintained Program/deployment assignment set has the wrong size");
@@ -776,15 +859,15 @@ void verify_resolved_program_binding(
       program_bundles;
   {
     deployment::FilesystemProgramBindingRepository repository(package_root);
-    for (const auto& row : rows) {
-      const std::string& deployment_source = require_text(
+    for (const auto &row : rows) {
+      const std::string &deployment_source = require_text(
           require_member(row, "deployment_source", "role assignment"),
           "role assignment.deployment_source");
-      const std::string& scenario_id = require_text(
-          require_member(row, "scenario_id", "role assignment"),
-          "role assignment.scenario_id");
+      const std::string &scenario_id =
+          require_text(require_member(row, "scenario_id", "role assignment"),
+                       "role assignment.scenario_id");
       std::vector<std::string> scenario_aliases;
-      for (const auto& alias : require_array(
+      for (const auto &alias : require_array(
                require_member(row, "scenario_aliases", "role assignment"),
                "role assignment.scenario_aliases")) {
         scenario_aliases.push_back(
@@ -797,15 +880,15 @@ void verify_resolved_program_binding(
         throw std::invalid_argument(
             "role assignment has no exact materialized deployment");
       }
-      const auto& context = product->second;
+      const auto &context = product->second;
       if (context.deployment_artifact_id.value() !=
               require_text(require_member(row, "deployment_artifact_id",
                                           "role assignment"),
                            "role assignment.deployment_artifact_id") ||
           context.deployment_revision.value() !=
-              require_text(require_member(row, "deployment_revision",
-                                          "role assignment"),
-                           "role assignment.deployment_revision")) {
+              require_text(
+                  require_member(row, "deployment_revision", "role assignment"),
+                  "role assignment.deployment_revision")) {
         throw std::invalid_argument(
             "role assignment selects a stale deployment identity");
       }
@@ -824,26 +907,26 @@ void verify_resolved_program_binding(
               require_text(require_member(row, "program_id", "role assignment"),
                            "role assignment.program_id") ||
           contract->value().program_revision.value() !=
-              require_text(require_member(row, "program_revision",
-                                          "role assignment"),
-                           "role assignment.program_revision")) {
+              require_text(
+                  require_member(row, "program_revision", "role assignment"),
+                  "role assignment.program_revision")) {
         throw std::invalid_argument(
             "role assignment selects a stale Program identity");
       }
 
       core::ProgramRoleAssignmentDTO assignment;
-      for (const auto& [role, value] : require_object(
+      for (const auto &[role, value] : require_object(
                require_member(row, "component_roles", "role assignment"),
                "role assignment.component_roles")) {
         assignment.component_roles.push_back(
-            {core::ComponentRoleId(role), core::ControllableComponentId(
-                                              require_text(value, role))});
+            {core::ComponentRoleId(role),
+             core::ControllableComponentId(require_text(value, role))});
       }
-      for (const auto& [role, value] : require_object(
+      for (const auto &[role, value] : require_object(
                require_member(row, "target_roles", "role assignment"),
                "role assignment.target_roles")) {
         const auto role_id = core::TargetRoleId(role);
-        const auto& requirement =
+        const auto &requirement =
             require_target_requirement(contract->value(), role_id);
         if (requirement.component_role_id.value() !=
             require_text(require_member(value, "component_role",
@@ -854,15 +937,15 @@ void verify_resolved_program_binding(
         }
         assignment.target_roles.push_back(
             {std::move(role_id),
-             core::CommandTargetId(require_text(
-                 require_member(value, "command_target_id",
-                                "target role assignment"),
-                 "target role assignment.command_target_id"))});
+             core::CommandTargetId(
+                 require_text(require_member(value, "command_target_id",
+                                             "target role assignment"),
+                              "target role assignment.command_target_id"))});
       }
 
       const auto binding = deployment::compile_program_binding(
-          *contract, std::move(assignment), *context.bundle,
-          context.model_map, catalog_store);
+          *contract, std::move(assignment), *context.bundle, context.model_map,
+          catalog_store);
       verify_resolved_program_binding(*binding, *context.bundle,
                                       context.model_map);
       if (!repository.put_if_absent(binding, *context.bundle,
@@ -876,8 +959,7 @@ void verify_resolved_program_binding(
           binding->value().retained_bundle_id.value());
       stored.push_back(StoredProgramBinding{
           scenario_id, std::move(scenario_aliases), deployment_source,
-          program_source.generic_string(),
-          binding->program_binding_id(),
+          program_source.generic_string(), binding->program_binding_id(),
           binding->value().program_id, binding->value().program_revision});
     }
     if (repository.size() != 8U) {
@@ -887,15 +969,17 @@ void verify_resolved_program_binding(
   }
 
   deployment::FilesystemProgramBindingRepository reopened(package_root);
-  for (const auto& record : stored) {
+  for (const auto &record : stored) {
     const auto product = products.find(record.deployment_source);
     if (product == products.end()) {
-      throw std::logic_error("stored Program Binding lost its deployment context");
+      throw std::logic_error(
+          "stored Program Binding lost its deployment context");
     }
-    const auto binding = reopened.get_verified(
-        record.program_binding_id, *product->second.bundle,
-        product->second.model_map);
-    if (binding == nullptr || binding->value().program_id != record.program_id ||
+    const auto binding = reopened.get_verified(record.program_binding_id,
+                                               *product->second.bundle,
+                                               product->second.model_map);
+    if (binding == nullptr ||
+        binding->value().program_id != record.program_id ||
         binding->value().program_revision != record.program_revision) {
       throw std::logic_error(
           "durable maintained Program Binding did not reload exactly");
@@ -904,7 +988,8 @@ void verify_resolved_program_binding(
                                     product->second.model_map);
   }
   const auto reused_program = program_bundles.find(
-      "sha256:385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a");
+      "sha256:"
+      "385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a");
   if (binding_ids.size() != 8U || program_revisions.size() != 7U ||
       reopened.size() != 8U || reused_program == program_bundles.end() ||
       reused_program->second.size() != 2U) {
@@ -914,11 +999,11 @@ void verify_resolved_program_binding(
   return stored;
 }
 
-[[nodiscard]] deployment::ScenarioAssistantMode program_assistant_mode(
-    const deployment::CanonicalValue& program_root) {
-  const auto& compatibility = require_member(
-      program_root, "compatibility", "maintained Program");
-  const std::string& mode = require_text(
+[[nodiscard]] deployment::ScenarioAssistantMode
+program_assistant_mode(const deployment::CanonicalValue &program_root) {
+  const auto &compatibility =
+      require_member(program_root, "compatibility", "maintained Program");
+  const std::string &mode = require_text(
       require_member(compatibility, "assistant", "Program compatibility"),
       "Program compatibility.assistant");
   if (mode == "required") {
@@ -935,12 +1020,11 @@ void verify_resolved_program_binding(
 }
 
 [[nodiscard]] std::filesystem::path stage_scenario_source(
-    const std::filesystem::path& workspace_root,
-    const std::filesystem::path& package_root,
-    std::string_view relative_source,
-    std::map<std::string, std::filesystem::path, std::less<>>& staged) {
-  const auto relative = require_relative_path(
-      relative_source, "maintained scenario source");
+    const std::filesystem::path &workspace_root,
+    const std::filesystem::path &package_root, std::string_view relative_source,
+    std::map<std::string, std::filesystem::path, std::less<>> &staged) {
+  const auto relative =
+      require_relative_path(relative_source, "maintained scenario source");
   const std::filesystem::path source = workspace_root / relative;
   const std::filesystem::path destination = package_root / relative.filename();
   const auto [found, inserted] =
@@ -956,10 +1040,10 @@ void verify_resolved_program_binding(
 }
 
 void publish_and_verify_scenario_catalog(
-    const std::filesystem::path& workspace_root,
-    const std::map<std::string, ScenarioProduct, std::less<>>& products,
-    const std::vector<StoredProgramBinding>& bindings,
-    const std::filesystem::path& package_root) {
+    const std::filesystem::path &workspace_root,
+    const std::map<std::string, ScenarioProduct, std::less<>> &products,
+    const std::vector<StoredProgramBinding> &bindings,
+    const std::filesystem::path &package_root) {
   if (bindings.size() != 8U) {
     throw std::logic_error(
         "maintained scenario catalog requires eight Program Bindings");
@@ -967,7 +1051,7 @@ void publish_and_verify_scenario_catalog(
   std::map<std::string, std::filesystem::path, std::less<>> staged;
   std::vector<deployment::ScenarioCatalogRowDTO> rows;
   rows.reserve(bindings.size());
-  for (const auto& record : bindings) {
+  for (const auto &record : bindings) {
     const auto product = products.find(record.deployment_source);
     if (product == products.end()) {
       throw std::logic_error(
@@ -977,8 +1061,8 @@ void publish_and_verify_scenario_catalog(
         workspace_root, package_root, record.program_source, staged);
     (void)stage_scenario_source(workspace_root, package_root,
                                 record.deployment_source, staged);
-    const auto program = deployment::parse_strict_json_model_yaml(
-        read_file(program_path));
+    const auto program =
+        deployment::parse_strict_json_model_yaml(read_file(program_path));
     rows.push_back(deployment::ScenarioCatalogRowDTO{
         .scenario_id = record.scenario_id,
         .description = std::nullopt,
@@ -992,7 +1076,7 @@ void publish_and_verify_scenario_catalog(
             deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
     });
   }
-  std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+  std::sort(rows.begin(), rows.end(), [](const auto &left, const auto &right) {
     return left.scenario_id < right.scenario_id;
   });
   const auto regenerated = deployment::build_scenario_catalog(rows);
@@ -1003,8 +1087,8 @@ void publish_and_verify_scenario_catalog(
         "maintained scenario catalog regeneration is not byte-identical");
   }
   {
-    deployment::FilesystemScenarioCatalogRepository repository(
-        package_root, "maintained");
+    deployment::FilesystemScenarioCatalogRepository repository(package_root,
+                                                               "maintained");
     if (repository.compare_and_set(std::nullopt, catalog) !=
         deployment::ScenarioCatalogPublishResult::kPublished) {
       throw std::logic_error(
@@ -1012,8 +1096,8 @@ void publish_and_verify_scenario_catalog(
     }
   }
 
-  deployment::FilesystemScenarioCatalogRepository reopened(
-      package_root, "maintained");
+  deployment::FilesystemScenarioCatalogRepository reopened(package_root,
+                                                           "maintained");
   const auto reloaded = reopened.get_verified();
   if (reloaded == nullptr || reloaded->revision() != catalog->revision() ||
       reloaded->rows() != catalog->rows()) {
@@ -1023,11 +1107,11 @@ void publish_and_verify_scenario_catalog(
 
   std::vector<deployment::ScenarioArtifactClosureQuery> verified_queries;
   verified_queries.reserve(bindings.size());
-  for (const auto& record : bindings) {
+  for (const auto &record : bindings) {
     const auto product = products.find(record.deployment_source);
     const auto binding_row = std::find_if(
         reloaded->rows().begin(), reloaded->rows().end(),
-        [&](const auto& row) { return row.scenario_id == record.scenario_id; });
+        [&](const auto &row) { return row.scenario_id == record.scenario_id; });
     if (product == products.end() || binding_row == reloaded->rows().end()) {
       throw std::logic_error("maintained scenario catalog lost one closure");
     }
@@ -1048,13 +1132,11 @@ void publish_and_verify_scenario_catalog(
             std::filesystem::path(record.deployment_source).filename(),
         .retained_bundle_path = retained_bundle_path,
         .program_binding_path = binding_path,
-        .program_path =
-            package_root /
-            std::filesystem::path(record.program_source).filename(),
+        .program_path = package_root /
+                        std::filesystem::path(record.program_source).filename(),
         .deployment_artifact_id = product->second.deployment_artifact_id,
         .deployment_revision = product->second.deployment_revision,
-        .retained_bundle_id =
-            product->second.bundle->retained_bundle_id(),
+        .retained_bundle_id = product->second.bundle->retained_bundle_id(),
         .program_binding_id = record.program_binding_id,
         .graph_revision =
             product->second.bundle->value().cell_graph.graph_revision,
@@ -1066,8 +1148,7 @@ void publish_and_verify_scenario_catalog(
         .assistant_mode = binding_row->assistant_mode,
         .typed_parameter_overrides_json = "{}",
     };
-    const auto verified =
-        deployment::verify_scenario_artifact_closure(query);
+    const auto verified = deployment::verify_scenario_artifact_closure(query);
     if (verified.lane != "manyforge-only" ||
         verified.assistant_enabled !=
             product->second.bundle->value().assistant.has_value()) {
@@ -1084,7 +1165,7 @@ void publish_and_verify_scenario_catalog(
   const auto require_rejection = [](auto candidate, std::string_view label) {
     try {
       (void)deployment::verify_scenario_artifact_closure(candidate);
-    } catch (const deployment::ScenarioCatalogError&) {
+    } catch (const deployment::ScenarioCatalogError &) {
       return;
     }
     throw std::logic_error("maintained scenario verifier accepted " +
@@ -1092,8 +1173,8 @@ void publish_and_verify_scenario_catalog(
   };
 
   auto stale_catalog = verified_queries.front();
-  stale_catalog.scenario_catalog_revision = core::ScenarioCatalogRevision(
-      "sha256:" + std::string(64U, 'f'));
+  stale_catalog.scenario_catalog_revision =
+      core::ScenarioCatalogRevision("sha256:" + std::string(64U, 'f'));
   require_rejection(stale_catalog, "a stale catalog revision");
 
   auto swapped_deployment = verified_queries.front();
@@ -1114,29 +1195,33 @@ void publish_and_verify_scenario_catalog(
 template <typename Record>
 [[nodiscard]] Record make_reference(std::string_view bytes) {
   constexpr core::CatalogRecordKind kind = Record::kRecordKind;
-  const auto* descriptor = core::catalog_record_type_descriptor(kind);
+  const auto *descriptor = core::catalog_record_type_descriptor(kind);
   if (descriptor == nullptr) {
     throw std::logic_error("catalog record kind has no descriptor");
   }
-  const auto* schema =
-      deployment::build_qualified_closed_schema_registry().find_catalog_schema_family(kind);
+  const auto *schema = deployment::build_qualified_closed_schema_registry()
+                           .find_catalog_schema_family(kind);
   if (schema == nullptr ||
-      schema->qualification() != deployment::CatalogSchemaQualification::kQualified ||
+      schema->qualification() !=
+          deployment::CatalogSchemaQualification::kQualified ||
       schema->compiled_schema() == nullptr) {
     throw std::logic_error("catalog record schema is not build-qualified");
   }
 
   const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
-  const std::string& record_id = require_string_member(parsed.root(), descriptor->own_id_field);
-  const std::string& record_revision =
+  const std::string &record_id =
+      require_string_member(parsed.root(), descriptor->own_id_field);
+  const std::string &record_revision =
       require_string_member(parsed.root(), descriptor->own_revision_field);
-  if (!record_revision.starts_with("sha256:") || record_revision.size() != 71U) {
-    throw std::invalid_argument("catalog source revision is not a SHA-256 digest");
+  if (!record_revision.starts_with("sha256:") ||
+      record_revision.size() != 71U) {
+    throw std::invalid_argument(
+        "catalog source revision is not a SHA-256 digest");
   }
   const core::ContentDigest content_digest(deployment::sha256_digest(bytes));
-  const core::ContentAddressedStoreKey store_key("catalog/maintained/" +
-                                                 std::string(core::to_string(kind)) + "/" +
-                                                 record_id + "/" + record_revision.substr(7U));
+  const core::ContentAddressedStoreKey store_key(
+      "catalog/maintained/" + std::string(core::to_string(kind)) + "/" +
+      record_id + "/" + record_revision.substr(7U));
   return Record{
       typename Record::IdType(record_id),
       typename Record::RevisionType(record_revision),
@@ -1147,84 +1232,106 @@ template <typename Record>
   };
 }
 
-void insert_reference(QualifiedCatalogClosure& closure, core::CatalogRecordRefDTO reference) {
+void insert_reference(QualifiedCatalogClosure &closure,
+                      core::CatalogRecordRefDTO reference) {
   if (!closure.records.emplace(catalog_key(reference), reference).second) {
-    throw std::invalid_argument("maintained catalog contains a duplicate typed referent");
+    throw std::invalid_argument(
+        "maintained catalog contains a duplicate typed referent");
   }
 }
 
-[[nodiscard]] QualifiedCatalogClosure qualify_catalog(
-    const std::filesystem::path& root, ExactCompilerInputSource& input_source,
-    const std::vector<FamilySource>& families) {
-  const auto catalog_root = root / "manyforge_deployment/resources/maintained/catalog";
+[[nodiscard]] QualifiedCatalogClosure
+qualify_catalog(const std::filesystem::path &root,
+                ExactCompilerInputSource &input_source,
+                const std::vector<FamilySource> &families) {
+  const auto catalog_root =
+      root / "manyforge_deployment/resources/maintained/catalog";
   QualifiedCatalogClosure result;
 
-  for (const auto& path : source_files(catalog_root / "capability_definition", 38U)) {
+  for (const auto &path :
+       source_files(catalog_root / "capability_definition", 38U)) {
     const std::string bytes = read_file(path);
-    const auto reference = make_reference<core::CapabilityDefinitionCatalogRecordRefDTO>(bytes);
-    result.capabilities.push_back(deployment::resolve_and_qualify_capability_definition(
-        reference, reference.content_addressed_store_key, bytes));
+    const auto reference =
+        make_reference<core::CapabilityDefinitionCatalogRecordRefDTO>(bytes);
+    result.capabilities.push_back(
+        deployment::resolve_and_qualify_capability_definition(
+            reference, reference.content_addressed_store_key, bytes));
     input_source.add(reference.content_addressed_store_key,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
 
   std::vector<deployment::QualifiedCapabilityDefinition> target_capabilities;
-  for (const auto& capability : result.capabilities) {
+  for (const auto &capability : result.capabilities) {
     if (capability.value().scope == core::CapabilityScope::kTargetBinding) {
       target_capabilities.push_back(capability);
     }
   }
   if (target_capabilities.size() != 22U) {
-    throw std::logic_error("maintained component closure has the wrong target-capability count");
+    throw std::logic_error(
+        "maintained component closure has the wrong target-capability count");
   }
-  for (const auto& path : source_files(catalog_root / "component_type", 3U)) {
+  for (const auto &path : source_files(catalog_root / "component_type", 3U)) {
     const std::string bytes = read_file(path);
-    const auto reference = make_reference<core::ComponentTypeCatalogRecordRefDTO>(bytes);
-    result.component_types.push_back(deployment::resolve_and_qualify_component_type(
-        reference, reference.content_addressed_store_key, bytes, target_capabilities));
+    const auto reference =
+        make_reference<core::ComponentTypeCatalogRecordRefDTO>(bytes);
+    result.component_types.push_back(
+        deployment::resolve_and_qualify_component_type(
+            reference, reference.content_addressed_store_key, bytes,
+            target_capabilities));
     input_source.add(reference.content_addressed_store_key,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
 
   std::vector<deployment::QualifiedControlInterfaceContract> contracts;
-  for (const auto& path : source_files(catalog_root / "control_interface_contract", 2U)) {
+  for (const auto &path :
+       source_files(catalog_root / "control_interface_contract", 2U)) {
     const std::string bytes = read_file(path);
-    const auto reference = make_reference<core::ControlInterfaceContractCatalogRecordRefDTO>(bytes);
-    contracts.push_back(deployment::resolve_and_qualify_control_interface_contract(
-        reference, reference.content_addressed_store_key, bytes));
+    const auto reference =
+        make_reference<core::ControlInterfaceContractCatalogRecordRefDTO>(
+            bytes);
+    contracts.push_back(
+        deployment::resolve_and_qualify_control_interface_contract(
+            reference, reference.content_addressed_store_key, bytes));
     input_source.add(reference.content_addressed_store_key,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
 
-  for (const auto& path : source_files(catalog_root / "controller_topology", 2U)) {
+  for (const auto &path :
+       source_files(catalog_root / "controller_topology", 2U)) {
     const std::string bytes = read_file(path);
-    const auto reference = make_reference<core::ControllerTopologyCatalogRecordRefDTO>(bytes);
+    const auto reference =
+        make_reference<core::ControllerTopologyCatalogRecordRefDTO>(bytes);
     const std::string expected_contract_id =
         reference.record_id.value().find("_arm_") != std::string::npos
             ? "manyforge.native_arm_position"
             : "manyforge.native_gripper_position";
     std::vector<deployment::QualifiedControlInterfaceContract> selected;
-    std::copy_if(contracts.begin(), contracts.end(), std::back_inserter(selected),
-                 [&expected_contract_id](const auto& contract) {
-                   return contract.value().control_interface_contract_id.value() ==
-                          expected_contract_id;
-                 });
+    std::copy_if(
+        contracts.begin(), contracts.end(), std::back_inserter(selected),
+        [&expected_contract_id](const auto &contract) {
+          return contract.value().control_interface_contract_id.value() ==
+                 expected_contract_id;
+        });
     if (selected.size() != 1U) {
-      throw std::logic_error("maintained topology cannot select its exact contract closure");
+      throw std::logic_error(
+          "maintained topology cannot select its exact contract closure");
     }
-    result.topologies.push_back(deployment::resolve_and_qualify_controller_topology(
-        reference, reference.content_addressed_store_key, bytes, selected));
+    result.topologies.push_back(
+        deployment::resolve_and_qualify_controller_topology(
+            reference, reference.content_addressed_store_key, bytes, selected));
     input_source.add(reference.content_addressed_store_key,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
 
-  for (const auto& path : source_files(catalog_root / "provider_manifest", 5U)) {
+  for (const auto &path :
+       source_files(catalog_root / "provider_manifest", 5U)) {
     const std::string bytes = read_file(path);
-    const auto reference = make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
+    const auto reference =
+        make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
     result.provider_manifests.push_back(
         deployment::resolve_and_qualify_provider_manifest(
             reference, reference.content_addressed_store_key, bytes));
@@ -1233,19 +1340,23 @@ void insert_reference(QualifiedCatalogClosure& closure, core::CatalogRecordRefDT
     insert_reference(result, reference);
   }
 
-  for (const auto& path : source_files(catalog_root / "runtime_profile", 1U)) {
+  for (const auto &path : source_files(catalog_root / "runtime_profile", 1U)) {
     const std::string bytes = read_file(path);
-    const auto reference = make_reference<core::RuntimeProfileCatalogRecordRefDTO>(bytes);
-    result.runtime_profiles.push_back(deployment::resolve_and_qualify_runtime_profile(
-        reference, reference.content_addressed_store_key, bytes));
+    const auto reference =
+        make_reference<core::RuntimeProfileCatalogRecordRefDTO>(bytes);
+    result.runtime_profiles.push_back(
+        deployment::resolve_and_qualify_runtime_profile(
+            reference, reference.content_addressed_store_key, bytes));
     input_source.add(reference.content_addressed_store_key,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
 
-  for (const auto& path : source_files(catalog_root / "stop_evidence_policy", 1U)) {
+  for (const auto &path :
+       source_files(catalog_root / "stop_evidence_policy", 1U)) {
     const std::string bytes = read_file(path);
-    const auto reference = make_reference<core::StopEvidencePolicyCatalogRecordRefDTO>(bytes);
+    const auto reference =
+        make_reference<core::StopEvidencePolicyCatalogRecordRefDTO>(bytes);
     result.stop_policies.push_back(
         deployment::resolve_and_qualify_stop_evidence_policy(
             reference, reference.content_addressed_store_key, bytes));
@@ -1254,20 +1365,22 @@ void insert_reference(QualifiedCatalogClosure& closure, core::CatalogRecordRefDT
     insert_reference(result, reference);
   }
 
-  const std::filesystem::path command_path = root /
-                                             "manyforge_deployment/resources/catalog/"
-                                             "gripper.command_position.v1.yaml";
+  const std::filesystem::path command_path =
+      root / "manyforge_deployment/resources/catalog/"
+             "gripper.command_position.v1.yaml";
   const std::string command_bytes = read_file(command_path);
   const auto command_reference =
       make_reference<core::CommandSchemaCatalogRecordRefDTO>(command_bytes);
-  result.command_schemas.push_back(deployment::resolve_and_qualify_command_schema(
-      command_reference, command_reference.content_addressed_store_key, command_bytes));
+  result.command_schemas.push_back(
+      deployment::resolve_and_qualify_command_schema(
+          command_reference, command_reference.content_addressed_store_key,
+          command_bytes));
   input_source.add(command_reference.content_addressed_store_key,
                    command_reference.content_digest, command_bytes);
   insert_reference(result, command_reference);
 
   result.contracts = contracts;
-  for (const auto& family : families) {
+  for (const auto &family : families) {
     const std::string bytes = read_file(family.catalog_source);
     const auto reference =
         make_reference<core::ModelAssetCatalogRecordRefDTO>(bytes);
@@ -1282,64 +1395,72 @@ void insert_reference(QualifiedCatalogClosure& closure, core::CatalogRecordRefDT
     const auto manifest =
         deployment::parse_strict_json_model_yaml(manifest_bytes).root();
     if (deployment::canonical_json(manifest) != manifest_bytes) {
-      throw std::invalid_argument("structural preparation receipt is not canonical");
+      throw std::invalid_argument(
+          "structural preparation receipt is not canonical");
     }
-    const auto& prepared =
+    const auto &prepared =
         require_member(manifest, "prepared_source", "preparation receipt");
-    const std::string& urdf_uri = require_text(
+    const std::string &urdf_uri = require_text(
         require_member(prepared, "urdf_logical_uri", "prepared source"),
         "prepared source.urdf_logical_uri");
-    const std::string& srdf_uri = require_text(
+    const std::string &srdf_uri = require_text(
         require_member(prepared, "srdf_logical_uri", "prepared source"),
         "prepared source.srdf_logical_uri");
     std::map<std::string, std::filesystem::path, std::less<>> paths{
         {urdf_uri, family.prepared_root / "model.urdf"},
         {srdf_uri, family.prepared_root / "model.srdf"},
     };
-    for (const auto& rewrite : require_array(
-             require_member(manifest, "resource_rewrites", "preparation receipt"),
-             "preparation receipt.resource_rewrites")) {
-      const std::string& uri = require_text(
-          require_member(rewrite, "asset_uri", "resource rewrite"),
-          "resource rewrite.asset_uri");
+    for (const auto &rewrite :
+         require_array(require_member(manifest, "resource_rewrites",
+                                      "preparation receipt"),
+                       "preparation receipt.resource_rewrites")) {
+      const std::string &uri =
+          require_text(require_member(rewrite, "asset_uri", "resource rewrite"),
+                       "resource rewrite.asset_uri");
       const auto relative = require_relative_path(
-          require_text(require_member(rewrite, "relative_path", "resource rewrite"),
-                       "resource rewrite.relative_path"),
+          require_text(
+              require_member(rewrite, "relative_path", "resource rewrite"),
+              "resource rewrite.relative_path"),
           "resource rewrite.relative_path");
       if (!paths.emplace(uri, family.resource_root / relative).second) {
-        throw std::invalid_argument("structural preparation repeats an artifact URI");
+        throw std::invalid_argument(
+            "structural preparation repeats an artifact URI");
       }
     }
 
     std::vector<deployment::ResolvedModelSourceArtifactCandidate> candidates;
-    const auto& artifacts = require_array(
-        require_member(prepared, "artifacts", "prepared source"),
-        "prepared source.artifacts");
+    const auto &artifacts =
+        require_array(require_member(prepared, "artifacts", "prepared source"),
+                      "prepared source.artifacts");
     candidates.reserve(artifacts.size());
-    for (const auto& artifact : artifacts) {
-      const std::string& uri = require_text(
+    for (const auto &artifact : artifacts) {
+      const std::string &uri = require_text(
           require_member(artifact, "logical_uri", "prepared artifact"),
           "prepared artifact.logical_uri");
-      const std::string& digest = require_text(
+      const std::string &digest = require_text(
           require_member(artifact, "content_digest", "prepared artifact"),
           "prepared artifact.content_digest");
       const auto path = paths.find(uri);
       if (path == paths.end()) {
-        throw std::invalid_argument("prepared artifact has no exact source path");
+        throw std::invalid_argument(
+            "prepared artifact has no exact source path");
       }
       const std::string artifact_bytes = read_file(path->second);
       if (artifact_bytes.size() !=
-              require_size(require_member(artifact, "byte_size", "prepared artifact"),
-                           "prepared artifact.byte_size") ||
+              require_size(
+                  require_member(artifact, "byte_size", "prepared artifact"),
+                  "prepared artifact.byte_size") ||
           deployment::sha256_digest(artifact_bytes) != digest) {
-        throw std::invalid_argument("prepared artifact differs from its receipt");
+        throw std::invalid_argument(
+            "prepared artifact differs from its receipt");
       }
       const core::ContentAddressedStoreKey key("sha256/" + digest.substr(7U));
       input_source.add(key, core::ContentDigest(digest), artifact_bytes);
       candidates.push_back({uri, key, artifact_bytes});
     }
     if (candidates.size() != paths.size()) {
-      throw std::invalid_argument("prepared source path/declaration sets differ");
+      throw std::invalid_argument(
+          "prepared source path/declaration sets differ");
     }
     auto verified = deployment::verify_model_source_closure(
         qualified, std::move(candidates));
@@ -1356,20 +1477,24 @@ void insert_reference(QualifiedCatalogClosure& closure, core::CatalogRecordRefDT
   return result;
 }
 
-void verify_scenarios(const std::filesystem::path& root, const QualifiedCatalogClosure& catalog) {
+void verify_scenarios(const std::filesystem::path &root,
+                      const QualifiedCatalogClosure &catalog) {
   const std::string overlay_bytes = read_file(
       root / "manyforge_deployment/resources/maintained/site_overlays/"
              "manyforge_local_examples.site_overlay.json");
-  std::map<std::string, std::pair<std::string, std::string>, std::less<>> family_identities;
-  for (const auto& scenario : kScenarios) {
+  std::map<std::string, std::pair<std::string, std::string>, std::less<>>
+      family_identities;
+  for (const auto &scenario : kScenarios) {
     const std::string bytes = read_file(root / scenario.source);
     const auto verified = deployment::verify_deployment_artifact_revision(
-        deployment::parse_strict_json_model_yaml(bytes), catalog.runtime_profiles);
+        deployment::parse_strict_json_model_yaml(bytes),
+        catalog.runtime_profiles);
     if (verified.assistant_settings().enabled() != scenario.assistant_enabled) {
-      throw std::invalid_argument("maintained scenario has the wrong assistant disposition: " +
-                                  std::string(scenario.source));
+      throw std::invalid_argument(
+          "maintained scenario has the wrong assistant disposition: " +
+          std::string(scenario.source));
     }
-    const auto& applicability = verified.applicability_inputs().value();
+    const auto &applicability = verified.applicability_inputs().value();
     if (scenario.assistant_enabled) {
       if (!applicability.site_overlay_ref.has_value()) {
         throw std::invalid_argument(
@@ -1396,16 +1521,17 @@ void verify_scenarios(const std::filesystem::path& root, const QualifiedCatalogC
       }
     }
     std::set<core::ProviderManifestId> external_manifest_ids;
-    for (const auto& resource : applicability.external_resources) {
+    for (const auto &resource : applicability.external_resources) {
       external_manifest_ids.insert(resource.provider_manifest_id);
     }
     const std::size_t expected_catalog_count =
         48U + 2U * external_manifest_ids.size();
     if (verified.catalog_records().size() != expected_catalog_count) {
-      throw std::invalid_argument("maintained scenario has the wrong exact catalog closure: " +
-                                  std::string(scenario.source));
+      throw std::invalid_argument(
+          "maintained scenario has the wrong exact catalog closure: " +
+          std::string(scenario.source));
     }
-    for (const auto& reference : verified.catalog_records()) {
+    for (const auto &reference : verified.catalog_records()) {
       const auto expected = catalog.records.find(catalog_key(reference));
       if (expected == catalog.records.end() || expected->second != reference) {
         throw std::invalid_argument(
@@ -1414,27 +1540,26 @@ void verify_scenarios(const std::filesystem::path& root, const QualifiedCatalogC
       }
     }
 
-    const auto& graph = verified.graph().graph();
+    const auto &graph = verified.graph().graph();
     if (graph.controllable_components.size() != 1U ||
-        graph.model_instances.size() != 1U || graph.runtime_units.size() != 1U ||
+        graph.model_instances.size() != 1U ||
+        graph.runtime_units.size() != 1U ||
         graph.control_bindings.size() != 12U ||
         applicability.capability_provider_bindings.size() != 26U) {
-      throw std::invalid_argument(
-          "maintained scenario has an incomplete component/runtime/capability closure: " +
-          std::string(scenario.source));
+      throw std::invalid_argument("maintained scenario has an incomplete "
+                                  "component/runtime/capability closure: " +
+                                  std::string(scenario.source));
     }
-    const auto& runtime = graph.runtime_units.front();
+    const auto &runtime = graph.runtime_units.front();
     core::JsonValueDTO::Array initial_positions;
     if (scenario.family_id == std::string_view("lite6_lite_gripper")) {
-      initial_positions = {
-          core::JsonValueDTO{0.0}, core::JsonValueDTO{0.0},
-          core::JsonValueDTO{1.57}, core::JsonValueDTO{0.0},
-          core::JsonValueDTO{0.0}, core::JsonValueDTO{0.0}};
+      initial_positions = {core::JsonValueDTO{0.0},  core::JsonValueDTO{0.0},
+                           core::JsonValueDTO{1.57}, core::JsonValueDTO{0.0},
+                           core::JsonValueDTO{0.0},  core::JsonValueDTO{0.0}};
     } else {
-      initial_positions = {
-          core::JsonValueDTO{0.0}, core::JsonValueDTO{-1.57},
-          core::JsonValueDTO{1.57}, core::JsonValueDTO{-1.57},
-          core::JsonValueDTO{-1.57}, core::JsonValueDTO{0.0}};
+      initial_positions = {core::JsonValueDTO{0.0},   core::JsonValueDTO{-1.57},
+                           core::JsonValueDTO{1.57},  core::JsonValueDTO{-1.57},
+                           core::JsonValueDTO{-1.57}, core::JsonValueDTO{0.0}};
     }
     const core::JsonObjectDTO expected_runtime_configuration{
         {"collision_monitor_period_ms", core::JsonValueDTO{50.0}},
@@ -1451,20 +1576,20 @@ void verify_scenarios(const std::filesystem::path& root, const QualifiedCatalogC
     }
 
     std::set<std::string> historical_capabilities;
-    for (const auto& binding : graph.control_bindings) {
+    for (const auto &binding : graph.control_bindings) {
       historical_capabilities.insert(binding.capability_id.value());
     }
-    for (const auto& binding : applicability.capability_provider_bindings) {
+    for (const auto &binding : applicability.capability_provider_bindings) {
       if (!binding.capability_id.value().starts_with("assistant.")) {
         historical_capabilities.insert(binding.capability_id.value());
       }
       if (binding.scope == core::CapabilityScope::kCellGlobal) {
         if (binding.endpoint_bindings.size() != 1U) {
-          throw std::invalid_argument(
-              "cell-global capability does not have one logical-scene endpoint: " +
-              binding.capability_id.value());
+          throw std::invalid_argument("cell-global capability does not have "
+                                      "one logical-scene endpoint: " +
+                                      binding.capability_id.value());
         }
-        const auto& endpoint = binding.endpoint_bindings.front();
+        const auto &endpoint = binding.endpoint_bindings.front();
         if (endpoint.endpoint_role_id.value() != "logical_scene_services" ||
             endpoint.source_kind !=
                 core::CapabilityEndpointSourceKind::kRuntimeUnit ||
@@ -1473,9 +1598,9 @@ void verify_scenarios(const std::filesystem::path& root, const QualifiedCatalogC
                 runtime.runtime_unit_id ||
             endpoint.source_endpoint_role_id.value() !=
                 "logical_scene_services") {
-          throw std::invalid_argument(
-              "cell-global capability does not select the logical-scene boundary: " +
-              binding.capability_id.value());
+          throw std::invalid_argument("cell-global capability does not select "
+                                      "the logical-scene boundary: " +
+                                      binding.capability_id.value());
         }
       }
     }
@@ -1484,16 +1609,18 @@ void verify_scenarios(const std::filesystem::path& root, const QualifiedCatalogC
           "maintained scenario does not retain all 36 historical facilities: " +
           std::string(scenario.source));
     }
-    const auto& component = graph.controllable_components.front();
-    const auto& model = graph.model_instances.front();
-    const std::string expected_component_id = std::string(scenario.family_id) + ".component";
+    const auto &component = graph.controllable_components.front();
+    const auto &model = graph.model_instances.front();
+    const std::string expected_component_id =
+        std::string(scenario.family_id) + ".component";
     if (component.component_type_id.value() != expected_component_id ||
         model.model_asset_id.value() != scenario.family_id) {
-      throw std::invalid_argument("maintained scenario selects the wrong shared family closure: " +
-                                  std::string(scenario.source));
+      throw std::invalid_argument(
+          "maintained scenario selects the wrong shared family closure: " +
+          std::string(scenario.source));
     }
-    const auto identity =
-        std::pair{component.component_type_revision.value(), model.model_revision.value()};
+    const auto identity = std::pair{component.component_type_revision.value(),
+                                    model.model_revision.value()};
     const auto [position, inserted] =
         family_identities.emplace(std::string(scenario.family_id), identity);
     if (!inserted && position->second != identity) {
@@ -1506,17 +1633,17 @@ void verify_scenarios(const std::filesystem::path& root, const QualifiedCatalogC
   }
 }
 
-}  // namespace
+} // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   try {
     Options options = parse_options(argc, argv);
     options.workspace_root = std::filesystem::canonical(options.workspace_root);
-    for (auto& [family_id, prepared_root] : options.prepared_roots) {
+    for (auto &[family_id, prepared_root] : options.prepared_roots) {
       static_cast<void>(family_id);
       prepared_root = std::filesystem::canonical(prepared_root);
     }
-    const auto& root = options.workspace_root;
+    const auto &root = options.workspace_root;
     const auto families = load_families(options);
     ExactCompilerInputSource input_source;
     const QualifiedCatalogClosure catalog =
@@ -1533,8 +1660,9 @@ int main(int argc, char** argv) {
                  "56 exact catalog referents, 8 durable Program Bindings, "
                  "and 8 scenario closures qualified\n";
     return 0;
-  } catch (const std::exception& error) {
-    std::cerr << "manyforge_maintained_deployment_occurrences: " << error.what() << '\n';
+  } catch (const std::exception &error) {
+    std::cerr << "manyforge_maintained_deployment_occurrences: " << error.what()
+              << '\n';
     return 2;
   }
 }

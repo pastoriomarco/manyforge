@@ -29,6 +29,20 @@ struct ManagerActiveRuntimePlanDTO final {
                          const ManagerActiveRuntimePlanDTO &) = default;
 };
 
+/// Exact effect-free runtime plan bound to the selected canonical predecessor.
+/// Its digest is the sealed admission digest, not a fabricated Apply intent.
+struct ManagerBootstrapRuntimePlanDTO final {
+  manyforge::core::RetainedBundleId retained_bundle_id;
+  manyforge::core::GraphRevision graph_revision;
+  manyforge::core::ContentDigest admission_digest;
+  std::vector<RuntimeUnitConvergencePlanRowDTO> runtime_units;
+
+  [[nodiscard]] bool valid() const noexcept;
+
+  friend bool operator==(const ManagerBootstrapRuntimePlanDTO &,
+                         const ManagerBootstrapRuntimePlanDTO &) = default;
+};
+
 class IManagerActiveRuntimePlanSource {
 public:
   virtual ~IManagerActiveRuntimePlanSource() = default;
@@ -44,13 +58,16 @@ class DurableManagerActiveRuntimePlanSource final
 public:
   DurableManagerActiveRuntimePlanSource(
       const SqliteActiveBundlePublicationStore &publication_store,
-      const SqliteManagerApplyJournal &apply_journal);
+      const SqliteManagerApplyJournal &apply_journal,
+      std::optional<ManagerBootstrapRuntimePlanDTO> bootstrap_plan =
+          std::nullopt);
 
   [[nodiscard]] ManagerActiveRuntimePlanDTO ReadCurrentPlan() const override;
 
 private:
   const SqliteActiveBundlePublicationStore &publication_store_;
   const SqliteManagerApplyJournal &apply_journal_;
+  std::optional<ManagerBootstrapRuntimePlanDTO> bootstrap_plan_;
 };
 
 class ManagerActiveRuntimeCoordinatorError : public std::runtime_error {

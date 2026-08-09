@@ -2,10 +2,11 @@
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
 #include "manyforge_headless/source_snapshot.hpp"
 
-#include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
 #include <manyforge_component_manager/active_native_projection_runtime_set.hpp>
+#include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
+#include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
@@ -267,6 +268,8 @@ private:
 
 struct DaemonConfig final {
   std::filesystem::path package_root;
+  std::filesystem::path canonical_empty_admission_filename{
+      "canonical-empty-admission.json"};
   std::filesystem::path manager_state_root;
   std::filesystem::path runtime_state_root;
   std::filesystem::path logical_scene_database;
@@ -582,6 +585,22 @@ void TrySendResponse(const int client,
   }
 }
 
+std::optional<component_manager::ManagerBootstrapRuntimePlanDTO>
+BuildBootstrapRuntimePlan(
+    const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
+    const deployment::IVerifiedRetainedProductArtifactSource &artifacts) {
+  auto rows = component_manager::BuildVerifiedRuntimeConvergencePlan(
+      admission.retained_bundle(), artifacts, "linux",
+      {std::string(deployment::native_execution_runtime_contract::
+                       kLaunchEnvironmentContract)});
+  if (rows.empty()) {
+    return std::nullopt;
+  }
+  return component_manager::ManagerBootstrapRuntimePlanDTO{
+      admission.retained_bundle_id(), admission.graph_revision(),
+      admission.admission_digest(), std::move(rows)};
+}
+
 class ManagerDaemon final {
 public:
   explicit ManagerDaemon(DaemonConfig config)
@@ -589,13 +608,15 @@ public:
         started_at_(std::chrono::steady_clock::now()),
         daemon_lock_(config_.manager_state_root),
         admission_(deployment::FilesystemCanonicalEmptyRetainedBundleSource(
-                       config_.package_root)
+                       config_.package_root,
+                       config_.canonical_empty_admission_filename)
                        .load_verified()),
         bundle_source_(config_.package_root),
         artifact_source_(config_.package_root),
         native_runtime_adapter_(
             InstalledTargetRoot(), config_.package_root,
-            config_.runtime_state_root, bundle_source_, artifact_source_, "linux",
+            config_.runtime_state_root, bundle_source_, artifact_source_,
+            "linux",
             std::string(deployment::native_execution_runtime_contract::
                             kLaunchEnvironmentContract)),
         stores_(config_.manager_state_root, admission_),
@@ -603,12 +624,13 @@ public:
                      stores_.active_bundle_publication_store(), bundle_source_,
                      native_runtime_adapter_),
         plan_source_(stores_.active_bundle_publication_store(),
-                     stores_.apply_journal()),
+                     stores_.apply_journal(),
+                     BuildBootstrapRuntimePlan(admission_, artifact_source_)),
         reference_runtime_adapter_(config_.runtime_state_root, bundle_source_,
                                    artifact_source_, "linux", "posix.1-2017"),
         runtime_adapter_router_(
-            {{std::string(component_manager::
-                              kRetainedPosixProcessAdapterContractId),
+            {{std::string(
+                  component_manager::kRetainedPosixProcessAdapterContractId),
               &reference_runtime_adapter_, &reference_runtime_adapter_},
              {std::string(deployment::native_execution_runtime_contract::
                               kProcessAdapterContractId),
@@ -725,11 +747,11 @@ private:
     const auto active_bundle = bundle_source_.get_verified(bundle_id);
     Require(active_bundle != nullptr,
             "active publication has no independently verified retained bundle");
-    if (runtime.state == component_manager::
-                             ManagerActiveRuntimeConvergenceState::kConverged) {
-      const auto current_bindings = component_manager::
-          DeriveActiveNativeProjectionRuntimeBindings(active_bundle->value(),
-                                                       runtime.observations);
+    if (runtime.state ==
+        component_manager::ManagerActiveRuntimeConvergenceState::kConverged) {
+      const auto current_bindings =
+          component_manager::DeriveActiveNativeProjectionRuntimeBindings(
+              active_bundle->value(), runtime.observations);
       if (!last_reconciled_native_runtime_bindings_.has_value() ||
           *last_reconciled_native_runtime_bindings_ != current_bindings) {
         // Full native rebuild/recovery is a startup or process-incarnation
@@ -912,8 +934,7 @@ private:
   component_manager::ExternallyProvisionedManagerStores stores_;
   manyforge::scene::CanonicalEmptySceneOwner scene_owner_;
   component_manager::DurableManagerActiveRuntimePlanSource plan_source_;
-  component_manager::RetainedPosixRuntimeUnitAdapter
-      reference_runtime_adapter_;
+  component_manager::RetainedPosixRuntimeUnitAdapter reference_runtime_adapter_;
   component_manager::RuntimeUnitAdapterRouter runtime_adapter_router_;
   component_manager::ManagerActiveRuntimeCoordinator active_runtime_;
   SceneRuntimeStateOwner scene_runtime_owner_;
@@ -946,6 +967,7 @@ std::uint64_t ParsePeriod(const std::string_view value) {
 DaemonConfig ParseArguments(const int argc, char **argv) {
   DaemonConfig config;
   bool package = false;
+  bool admission = false;
   bool manager = false;
   bool runtime = false;
   bool scene = false;
@@ -958,6 +980,9 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     if (option == "--package-root" && !package) {
       config.package_root = value;
       package = true;
+    } else if (option == "--canonical-empty-admission-filename" && !admission) {
+      config.canonical_empty_admission_filename = value;
+      admission = true;
     } else if (option == "--manager-state-root" && !manager) {
       config.manager_state_root = value;
       manager = true;

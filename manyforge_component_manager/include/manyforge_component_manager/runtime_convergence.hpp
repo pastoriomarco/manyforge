@@ -9,6 +9,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace manyforge::component_manager {
@@ -80,14 +82,75 @@ struct ManagerApplyRuntimeConvergenceIntentDTO final {
              const ManagerApplyRuntimeConvergenceIntentDTO &) = default;
 };
 
-/// Exact adapter query bound to one durable convergence intent and plan row.
-struct RuntimeUnitConvergenceQueryDTO final {
+struct RuntimeUnitConvergenceApplyOwnerDTO final {
   manyforge::core::ApplyId apply_id;
   manyforge::core::ApplyGeneration apply_generation;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !apply_id.empty() && apply_generation.nonzero();
+  }
+
+  friend bool operator==(const RuntimeUnitConvergenceApplyOwnerDTO &,
+                         const RuntimeUnitConvergenceApplyOwnerDTO &) = default;
+};
+
+struct RuntimeUnitConvergenceBootstrapOwnerDTO final {
+  manyforge::core::BootstrapId bootstrap_id;
+  manyforge::core::BootstrapGeneration bootstrap_generation;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !bootstrap_id.empty() && bootstrap_generation.nonzero();
+  }
+
+  friend bool
+  operator==(const RuntimeUnitConvergenceBootstrapOwnerDTO &,
+             const RuntimeUnitConvergenceBootstrapOwnerDTO &) = default;
+};
+
+using RuntimeUnitConvergenceOwnerDTO =
+    std::variant<RuntimeUnitConvergenceApplyOwnerDTO,
+                 RuntimeUnitConvergenceBootstrapOwnerDTO>;
+
+/// Exact adapter query bound to one durable Apply intent or admitted bootstrap
+/// plan and one plan row.
+struct RuntimeUnitConvergenceQueryDTO final {
+  RuntimeUnitConvergenceOwnerDTO owner;
   manyforge::core::RetainedBundleId candidate_retained_bundle_id;
   manyforge::core::GraphRevision candidate_graph_revision;
   manyforge::core::ContentDigest runtime_convergence_intent_digest;
   RuntimeUnitConvergencePlanRowDTO plan;
+
+  RuntimeUnitConvergenceQueryDTO(
+      manyforge::core::ApplyId apply_id,
+      manyforge::core::ApplyGeneration apply_generation,
+      manyforge::core::RetainedBundleId candidate_retained_bundle_id_in,
+      manyforge::core::GraphRevision candidate_graph_revision_in,
+      manyforge::core::ContentDigest runtime_convergence_intent_digest_in,
+      RuntimeUnitConvergencePlanRowDTO plan_in)
+      : owner(RuntimeUnitConvergenceApplyOwnerDTO{std::move(apply_id),
+                                                  apply_generation}),
+        candidate_retained_bundle_id(
+            std::move(candidate_retained_bundle_id_in)),
+        candidate_graph_revision(std::move(candidate_graph_revision_in)),
+        runtime_convergence_intent_digest(
+            std::move(runtime_convergence_intent_digest_in)),
+        plan(std::move(plan_in)) {}
+
+  RuntimeUnitConvergenceQueryDTO(
+      manyforge::core::BootstrapId bootstrap_id,
+      manyforge::core::BootstrapGeneration bootstrap_generation,
+      manyforge::core::RetainedBundleId candidate_retained_bundle_id_in,
+      manyforge::core::GraphRevision candidate_graph_revision_in,
+      manyforge::core::ContentDigest runtime_convergence_intent_digest_in,
+      RuntimeUnitConvergencePlanRowDTO plan_in)
+      : owner(RuntimeUnitConvergenceBootstrapOwnerDTO{std::move(bootstrap_id),
+                                                      bootstrap_generation}),
+        candidate_retained_bundle_id(
+            std::move(candidate_retained_bundle_id_in)),
+        candidate_graph_revision(std::move(candidate_graph_revision_in)),
+        runtime_convergence_intent_digest(
+            std::move(runtime_convergence_intent_digest_in)),
+        plan(std::move(plan_in)) {}
 
   [[nodiscard]] bool valid() const noexcept;
 
