@@ -1,12 +1,13 @@
-"""Pure assistant observation reducer plus the fenced product supervisor.
+"""Pure assistant observation reducer plus the superseded fixed supervisor.
 
 The complete effectful supervisor is pinned at source blob
 ``8c0ecee5ad79b553063c0f171740a3ccf617e8d7`` (sha256
 ``febb08a34f5b13491cbc7675656a51135b0f360dca71c8c97be47d95eab40978``).
 Its HTTP probes (lines 77-142), Composer-v0 status envelope (164-230), status
 POST (232-256), polling/signal loop, and shutdown post (264-304) are H0
-and I6/N acceptance inputs, not a callable fallback. H0 supplies the separate
-owner-neutral read client; it does not restore assistant-product publication.
+and I6/N acceptance inputs, not a callable fallback. The Component Manager
+owns process convergence and publication; the current bridge therefore does
+not revive this second launcher.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ MAX_COMPONENTS: Final = 16
 SUPERVISOR_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_assistant_supervisor_unavailable"
 )
-SUPERVISOR_RESTORATION_GATE: Final = "I6/N"
+SUPERVISOR_DISPOSITION: Final = "superseded_by_component_manager"
 
 
 class AssistantSupervisorUnavailableError(RuntimeError):
@@ -203,8 +204,8 @@ def post_status(
     """Fail before opening a request or resolving a publication endpoint."""
     del config, payload
     raise AssistantSupervisorUnavailableError(
-        f"{SUPERVISOR_UNAVAILABLE_REASON_CODE}: status publication requires "
-        "the I6/N assistant-product status owner; H0 provides reads only"
+        f"{SUPERVISOR_UNAVAILABLE_REASON_CODE}: fixed status publication is "
+        "superseded by Component Manager-owned process convergence"
     )
 
 
@@ -212,7 +213,7 @@ def main() -> int:
     """Fail before configuration, network probes, publication, or looping."""
 
     logger.error(
-        "%s: assistant supervision requires the I6/N assistant-product owner",
+        "%s: the fixed assistant supervisor is superseded by Component Manager",
         SUPERVISOR_UNAVAILABLE_REASON_CODE,
     )
     return 78

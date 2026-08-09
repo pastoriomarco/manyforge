@@ -16,6 +16,9 @@ from manyforge_behavior.canonical_artifact import (
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.assistant_catalog_narrowing import (
+    resolve_assistant_catalog,
+)
 from manyforge_composer.backend.assistant_mode_client import (
     VerifiedActiveAssistantMode,
     verify_active_assistant_mode,
@@ -174,6 +177,15 @@ def _assistant_mode(
         "model_endpoint": {
             "model_endpoint_alias": "assistant_model",
             "model_id": "test-model",
+            "request_contract": {
+                "default_timeout_s": 30,
+                "max_output_tokens": 512,
+                "supported_image_transports": [],
+                "supports_image_input": False,
+                "supports_json_object": True,
+                "supports_response_tools": True,
+                "tool_call_family": "openai_chat_tools",
+            },
         },
         "node_environment": {
             "catalog_digest": environment["catalog_digest"],
@@ -238,6 +250,8 @@ def _body(
         "assistantProjectionDigest": _ASSISTANT_PROJECTION_DIGEST,
         "assistantModeProjectionDigest": mode["source"]["source_content_digest"],
         "catalogHash": mode["catalog_hash"],
+        "requestedTools": [],
+        "fieldPolicy": {},
         "inputSchemaHash": mode["tools"][0]["input_schema_hash"],
         "draftId": snapshot["draft_id"],
         "expectedDraftRevision": snapshot["draft_revision"],
@@ -341,6 +355,54 @@ def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(monkeypatch
     assert result["draftMutated"] is False
     assert result["result"]["kind"] == "validation_error"
     assert result["result"]["httpStatus"] == 400
+    assert state.draft_session.snapshot() == before
+
+
+def test_callback_reapplies_field_narrowing_before_draft_mutation(monkeypatch) -> None:
+    node_environment = _node_environment()
+    source_model = _source_model(node_environment)
+    assistant_mode = _assistant_mode(node_environment)
+    environment = build_node_environment()
+    state = ComposerState(
+        node_environment=environment,
+        program=Program(_PROGRAM_PATH, environment.catalog),
+        program_source_path=str(_PROGRAM_PATH),
+        headless_client=object(),  # type: ignore[arg-type]
+    )
+    from manyforge_composer.backend import routes_assistant_draft as route
+
+    monkeypatch.setattr(route, "read_active_node_environment", lambda _state: node_environment)
+    monkeypatch.setattr(
+        route,
+        "read_active_source_model",
+        lambda _state, *, node_environment: source_model,
+    )
+    monkeypatch.setattr(
+        route,
+        "read_active_assistant_mode",
+        lambda _state, *, mode, node_environment: assistant_mode,
+    )
+    body = _body(state, node_environment, source_model, assistant_mode)
+    body["fieldPolicy"] = {"allowedOrientationFields": ["rpy_deg"]}
+    narrowed = resolve_assistant_catalog(
+        assistant_mode.payload,
+        requested_tools=[],
+        field_policy=body["fieldPolicy"],
+    )
+    body["catalogHash"] = narrowed["catalogHash"]
+    body["inputSchemaHash"] = narrowed["tools"][0]["input_schema_hash"]
+    before = deepcopy(state.draft_session.snapshot())
+
+    response = TestClient(create_app(state)).post(
+        "/api/assistant/bridge/tools/scene_draft_add_object",
+        json=body,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["success"] is False
+    assert response.json()["result"]["message"].startswith(
+        "$.scene_resource.pose.orientation: value must match exactly one schema branch"
+    )
     assert state.draft_session.snapshot() == before
 
 

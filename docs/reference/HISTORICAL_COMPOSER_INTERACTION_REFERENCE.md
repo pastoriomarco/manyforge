@@ -161,7 +161,7 @@ commit and must be consulted at the named gate.
 | `manyforge_composer/backend/viewer_worker.py` | The path contains bounded envelope helpers and a typed-unavailable I9 construction fence | The former visual snapshot builder, versioned worker protocol, and process supervisor depended on Composer-owned runtime/scene state | I9 supplies an observer-owned snapshot adapter and restores qualified worker construction without restoring the old owner |
 | `manyforge_composer/frontend/src/components/{ProgramPanel,PropertyPanel,DeploymentPanel}.tsx` and their stores/tests | The named v1 panels are absent; dependency-independent authoring validators and reducers are retained separately | Their interaction intent remains required, but their compiled types and stores are coupled to v1 program/deployment/runtime identities | I6/N TypeScript authoring clients on explicit component/target identities, reusing the historical UX and validation cases |
 | `manyforge_composer/frontend/src/components/{RobotControlPanel,TransportControls,KernelErrorPanel}.tsx` and related stores/tests | N6-c1/c2 restore `RobotControlPanel` as a thin four-mode client; `TransportControls` remains absent; `KernelErrorPanel` is a generic diagnostic presentation shell | The replacement Robot Control surface keeps drafts and request-generation fencing locally, but preview, operation admission, progress, and Stop remain owner-issued; neither panel owns policy or command authority | N6-c4 owns the remaining live-viewer/manual-control composition, I7/L0 lifecycle requests, and I8/P5 final execution/Stop projection; no browser command authority or fallback selection |
-| `manyforge_assistant_bridge/bridge.py` and its live HTTP tests | `bridge.py` remains a typed-unavailable, effect-free provider entrypoint; `headless.py` is the separate bounded H0 read client, and split protocol/supervisor tests remain | The former provider loop is coupled to removed Composer callback/tool contracts | I5/H0 now supplies read-only owner observation; I6/N must restore bounded provider mediation and Program tools against the new contracts |
+| `manyforge_assistant_bridge/bridge.py` and its live HTTP tests | N6-c5 restores a bounded direct/`nemoclaw` provider loop over the exact active headless mode projection, owner reads, and revision-fenced Composer Draft callbacks; the former fixed supervisor remains fenced | The v0 loop was coupled to Composer-owned catalogs, callback contracts, endpoint selection, and runtime state | The strict v1 bridge, Composer client, overlay, and focused N6-c5 tests restore the valid mediation, cancellation, clarification, history, proposal, and audit behavior without restoring those owners; external OpenClaw/Hermes loops and I9-only Isaac inspection remain at their named gates |
 
 This table is a source-and-acceptance map, not permission to treat every file
 in the same directory alike. Dependency-independent utilities, reducers,
@@ -536,45 +536,74 @@ Each retained behavior names a future thin-client or authoring extraction;
 each deleted owner names the headless gate that must exist first. The complete
 historical blobs remain input only.
 
-The immediately owner-neutral helper audit is source-complete but unqualified:
+The immediately owner-neutral helper audit is now qualified through N6-c5:
 `backend/assistant_client_primitives.py`, `backend/schema_projection.py`, and
 `backend/mcp_client_primitives.py` contain the exact extractions identified
 above, with focused tests in `tests/test_assistant_client_primitives.py`,
 `tests/test_schema_projection.py`, and
 `tests/test_mcp_client_primitives.py`. The historical schema hash was
-deliberately not copied. Builds and tests have not run, so these files are not
-qualification evidence. The substantive history-query parsing already lives
-in `event_recorder.HistoryQuery` and `parse_wall_timestamp_ns`; a future thin
-route supplies only CSV and HTTP-error adaptation.
+deliberately not copied. Current assistant schema and catalog hashes are
+derived from retained owner inputs and independently checked by the bridge and
+Composer. The substantive history-query parsing continues to live in
+`event_recorder.HistoryQuery` and `parse_wall_timestamp_ns`; the assistant
+bridge adapts only the bounded owner read needed by its current tool contract.
 
-The following larger exact cohorts still have no current retained successor.
-They require a new contract or a clean unavailable boundary, so this is an
-explicit future extraction list rather than permission to leave them only in
-Git history:
+N6-c5 also supplies current successors for the historical bounded provider
+request/cancel/status mechanics and all registry-backed Program/scene/blackboard
+Draft transforms. They use the strict v1 provider envelope and exact generated
+instrument schemas; no v0 alias or Composer-owned registry returns.
 
-- bounded same-role clients/transports are
-  `assistant_provider.NemoClawAssistantProvider`'s HTTP request, cancel,
-  timeout, and response-normalization methods; `routes_mcp._McpSession`,
-  `_handle_jsonrpc`, and the transport/session-eviction portion of
-  `create_mcp_router`; and the catalog/read dedupe helpers at
-  `routes_assistant.py:139-334`. Those provider/session entrypoints remain
-  fenced before network or state effects until N; H0 implements only a
-  separate closed read adapter, and the bounded mechanics are not semantic
-  owners; and
-- authoring algorithms awaiting a wire-neutral document type are
-  `routes_assistant.{_find_tree_node_ref,_collect_tree_node_names,
-  _collect_node_kinds,_tree_contains_name}` and the atomic
-  `_apply_tree_draft_*` family at lines 3860–4611. The current
-  `frontend/src/utils/authoringGraph.ts` retains topology/layout, not these
-  insert/update/delete/move/replace/change-kind/wrap transforms. N must either
-  extract their still-valid behavior or record an exact replacement test for
-  every transform before retiring this marker.
+The following adjacent cohorts still have no current retained successor and
+remain explicit future work rather than being hidden by the assistant closure:
+
+- the public MCP JSON-RPC/session/gateway surface in `routes_mcp`, direct-route
+  scripts, and their security cases remains a separate thin-ingress task; the
+  assistant bridge is not an MCP compatibility endpoint;
+- external OpenClaw/Hermes agent-loop implementation remains external to the
+  built-in direct/`nemoclaw` bridge and must use the same strict envelope when
+  restored; and
+- `inspect_isaac_scene` is deliberately filtered from active modes until I9,
+  while skills remain empty until an owner-issued retained skill set exists.
 
 By contrast, old orientation/tool-field schemas, scene/pose aliases,
 Program/deployment serializers, caller identity/session fields, tool status
 enums, and `_sanitize_object_id`/`_unique_id` are contract or identity policy,
 not automatically reusable helpers. They remain acceptance input until their
 new owner freezes the corresponding type.
+
+### N6-c5 assistant operator continuity closure
+
+N6-c5 restores the historical operator intent as a thin current client: mode
+selection, free-form conversation, bounded history, progress/cancel,
+lost-response reconciliation, explicit retry, tool/result presentation,
+clarification, actionable failures, and visible Draft provenance. Headless
+owns the enabled mode and exact instrument projection; the bridge owns only
+bounded mediation and request/history records; Composer contributes one
+revision-fenced in-memory Draft and presents results. Proposal descriptors are
+review-only, and neither model output nor browser state can Apply, admit an
+operation, command a robot, or become runtime truth.
+
+The exact historical source remains the pinned commit above. The relocation
+disposition ledger records the blobs, line cohorts, definition counts, and
+digests; this table records how their behavior is consumed at N6-c5:
+
+| Historical acceptance input | N6-c5 disposition |
+| --- | --- |
+| Assistant argument normalizer (15 cases) | **Adapted.** Permissive aliases and camel/dotted rewrites stay removed; the strict v1 Composer request, canonical tool IDs, closed schemas, field-policy narrowing, and typed rejection cover the valid normalization boundary. |
+| Catalog-schema projection (8 cases) | **Reimplemented against the new owner.** Generated instrument schemas, exact schema/catalog hashes, independent bridge verification, and independent Composer callback verification replace Composer catalog authority. |
+| Lane catalog (14 cases) and external-node assistant (1 case) | **Split.** Current direct/`nemoclaw` modes and owner availability are projected and tested; Isaac is filtered until I9, while external OpenClaw/Hermes and old aliases are reference-only future inputs. |
+| Provider HTTP fixture (6 cases) | **Adapted.** Bounded submit/status/cancel, timeout/HTTP/malformed-response handling, attribution, and idempotent reconciliation use the strict v1 bridge/client tests; the v0 fake server does not return. |
+| Historical assistant routes (89 cases in five exact cohorts) | **Split by owner.** Discovery/provider/catalog, Draft schema/callback fencing, status/cancel, proposal authoring, and supported atomic Draft transforms have current focused successors. I9 inspection and public MCP/ingress cases remain at those gates; old runtime mutation and caller authority are permanently superseded. |
+| Historical bridge loop (10 cases), cancel case, audit case, and state-preparation suite (9 cases) | **Adapted and strengthened.** Current tests cover exact projection revalidation, bounded turns/history, tool sanitation, clarification, cancellation races, Draft-only callbacks, proposals, malformed/out-of-mode rejection, and durable bounded redacted audit. |
+| Historical `AssistantOverlay.tsx` and the nine-case request-recovery helper | **Adapted.** The current overlay restores the conversation/recovery interaction over strict owner-issued facts, with bounded transcript/tool summaries and explicit user retry; old deployment flags, live model probing, runtime stores, and hidden provider fallback do not return. |
+
+Intentional improvements over the historical behavior are fail-closed whole-
+response rejection for out-of-catalog tools, no prompt-keyword forced tool
+choice, canonical duplicate-free/non-finite JSON boundaries, coherent protocol
+history truncation, duplicate tool-call rejection, cancellation-safe ledger
+retention, and partial-write-safe audit persistence. These strengthen safety
+and determinism without reducing the operator workflow. The N6-c5 evidence
+record binds the exact current commit and focused Docker results.
 
 ## Current frontend disposition at the relocation checkpoint
 
@@ -1006,11 +1035,11 @@ treated as a future TypeScript authority.
 
 | Historical frontend path at `082221...` | Current disposition and restoration gate | Retained/extracted TypeScript responsibility |
 | --- | --- | --- |
-| `src/components/AssistantOverlay.tsx` | Read-only assistant observation is available through the I5/H0 headless client. The interactive provider/conversation overlay returns at I6/N; do not restore the old deployment flag/callback contract. | `src/components/assistantRequestRecovery.ts` and its test retain bounded authoritative-request reconciliation without an old assistant DTO. |
+| `src/components/AssistantOverlay.tsx` | N6-c5 restores the interactive provider/conversation overlay over owner-issued modes and the strict bridge contract. The old deployment flag, live model probe, callback contract, and runtime store do not return. | The active `AssistantOverlay.tsx`, strict assistant parsers/types/client, presentation helpers/tests, and `assistantRequestRecovery.ts` retain bounded conversation, progress/cancel, result/proposal/failure presentation, Draft provenance, reconciliation, and explicit retry without browser authority. |
 | `src/components/DeploymentPanel.tsx`; `src/components/DeploymentPanel.robotControlLimits.test.ts` | Deployment authoring returns at I6/N on explicit component/target artifacts. The singleton `robot_config`, adapter capability union, and old mutation endpoint do not return. | `src/utils/deploymentCapabilities.ts`, `src/utils/parameterAuthoring.ts`, `src/components/property/parameterCapValidation.test.ts`, and the v2 catalog/schema helpers retain capability filtering, optional omission, and cap behavior. |
 | `src/components/FileBrowserDialog.tsx` | N6-c3 now reconnects mutation-aware Program selection through separately named Open-as-Draft and Save-As actions. The old implicit Load/save endpoint shape is not retained. | `src/components/ArtifactBrowser.tsx`, `ProgramWorkspace.tsx`, the closed API client, and parser/client tests retain sandbox-root navigation, effect-free selection, explicit confirmation, and exact Draft fencing. |
 | `src/components/HeaderBar.tsx`; `src/components/HeaderBar.operatorAlarms.test.ts` | The structural header plus H0 alarm, status, and history presentation are available now. Lifecycle and command integrations return through I7/I8 projections; the old all-stores monolith does not return. | `src/App.tsx`, `src/components/OperatorAlarmPanel.tsx`, `RuntimeStatusOverlay.tsx`, `RobotLifecycleCard.tsx`, `ExecutionHistoryPanel.tsx`, and `src/utils/alarmFences.ts` retain presentation, exact-record confirmation fencing, and reannunciation behavior. |
-| `src/components/Layout.tsx` | The structural layout remains available and N6-c3 adds the Program authoring composition. Scene/deployment/provider docks remain at their named gates; the old store-coupled root component is not copied. | `src/App.tsx`, `ProgramWorkspace.tsx`, `CollapsedRail.tsx`, and `src/index.css` retain the shell and semantic styling without a runtime store. |
+| `src/components/Layout.tsx` | The structural layout, N6-c3 Program workspace, N6-c4 scene/viewer authoring, and N6-c5 assistant overlay are available. Deployment/Apply remains at N7; the old store-coupled root component is not copied. | `src/App.tsx`, the current workspaces/overlay, `CollapsedRail.tsx`, and `src/index.css` retain the shell and semantic styling without a runtime store. |
 | `src/components/NodeDiscoveryDiagnostics.tsx`; `src/components/NodeDiscoveryDiagnostics.test.tsx` | Permanently superseded as a v1 dynamic-loader/source report. I5/H0 now provides a verified retained-environment identity and runtime-availability view rather than recreating this payload; execution remains explicitly unavailable until I6/N. | `useHeadlessState.ts`, `HeadlessRuntimeSurfaces.tsx`, the immutable-v2 `CatalogPanel`, and strict parsers present only owner-issued facts. |
 | `src/components/ObjectEditPanel.tsx` | N6-c4 restores separate Program-initial-scene and current-owner object editing. Program edits use the one revision-fenced Draft; current primitive cell-fixed poses stage locally and Commit through one exact `SceneTransactionRequest`. Provider-owned, carried, mesh, stale, cross-owner, and unsupported-frame writes fail closed. Direct mutation of Composer Scene Authority does not return. | `SceneAuthoringWorkspace.tsx`, `state/sceneAuthoring.ts`, strict parsers/tests, `DraftInputs.tsx`, and the retained pose/gizmo utilities carry selection, numeric pose editing, local discard, exact Program-pose staging, and lossless live-to-Draft copying. |
 | `src/components/ProgramPanel.tsx`; `src/components/ProgramPanel.binding.test.ts` | N6-c3 restores strict Program Draft/Saved authoring and exact v1 value-source editing. Runtime Program Binding selection/Apply remains N7-owned. V1 blackboard DTOs, singleton robot/group fields, and Pick-Plan artifact shapes do not return. | `ProgramWorkspace.tsx`, `ProgramNodePalette.tsx`, `ProgramDeclarationsEditor.tsx`, `useProgramWorkspace.ts`, strict DTO parsers, and `programAuthoring.ts` now carry the same-role authoring mechanics and translated cases. |

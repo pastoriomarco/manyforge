@@ -1,10 +1,11 @@
-"""Owner-neutral primitives retained for future assistant thin clients.
+"""Owner-neutral primitives shared by bounded assistant clients.
 
 These functions preserve bounded input and response handling from the former
 Composer provider/tool modules.  They perform no provider discovery, network
 access, tool dispatch, document mutation, or runtime-state interpretation.
-H0/I5 read-only assistant observations use the separate headless client;
-provider operation and Program authoring remain gated at N/I6.
+Read-only assistant observations use the separate headless client. Provider
+mediation and Program authoring now use their strict bridge/Draft boundaries;
+these helpers still own no effects or semantic state.
 """
 
 from __future__ import annotations

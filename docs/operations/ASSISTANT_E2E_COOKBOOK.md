@@ -1,12 +1,13 @@
 # Assistant E2E Cookbook
 
-> **Cutover status:** retained as a restoration and behavior reference. The
-> command recipes below are not qualified on the current `dev` branch and
-> must not be executed until I6/N restores the provider/Program-operation
-> boundary and every workflow-dependent execution gate has passed. I5/H0
-> supplies read-only headless observation, not these workflows. Unless explicitly
-> marked as retained offline logic, present-tense wording below describes the
-> captured baseline, not a live service.
+> **Cutover status:** retained as a restoration and behavior reference. N6-c5
+> restores the strict v1 direct/`nemoclaw` bridge, Composer client, Draft-only
+> callbacks, and operator overlay, but the command recipes below still describe
+> the captured v0/v0.1 stack and are not qualified on the current `dev` branch.
+> Do not execute them until N7 restores and qualifies the runnable native
+> product lane and each workflow-dependent gate has passed. Present-tense
+> wording below describes the captured baseline unless a section explicitly
+> points to the current v1 contract.
 
 This cookbook records the former live operator recipe set for ManyForge
 assistant workflows. It covers the captured v0.1 path:
@@ -260,9 +261,10 @@ What it does (default — `openclaw` sandboxed lane):
 1. starts Composer on `http://127.0.0.1:9000` with the native Composer viewer,
    configured to use the `openclaw` provider at
    `http://127.0.0.1:8200/v1/manyforge/assistant`,
-1. starts the OpenClaw assistant bridge (`openclaw_assistant_bridge`) on
+1. at the captured baseline, starts the OpenClaw assistant bridge
+   (`openclaw_assistant_bridge`) on
    `http://127.0.0.1:8200`. The bridge translates Composer's
-   `manyforge.assistant.provider_request.v0` envelope into
+   historical `manyforge.assistant.provider_request.v0` envelope into
    `/v1/chat/completions` calls against the persistent gateway,
 1. loads `pick_and_place_ur10e_robotiq.program.yaml` with
    `assistant_modes_scene_authoring.deployment.yaml`.

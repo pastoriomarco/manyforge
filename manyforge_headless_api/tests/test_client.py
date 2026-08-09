@@ -97,6 +97,29 @@ def test_client_uses_the_selected_assistant_mode_route() -> None:
     ]
 
 
+def test_client_uses_the_owner_issued_assistant_mode_index() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"schema_version": "manyforge.assistant_mode_index.v1", "modes": []},
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        assert client.assistant_modes()["modes"] == []
+    finally:
+        raw.close()
+    assert [request.url.path for request in requests] == ["/api/assistant/modes"]
+
+
 def test_client_requests_the_bounded_attention_newest_alarm_page() -> None:
     requests: list[httpx.Request] = []
 

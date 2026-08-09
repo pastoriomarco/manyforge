@@ -73,9 +73,9 @@ ______________________________________________________________________
 | `manyforge_roboplan`                      | C++ + pybind11        | Primary planning/projection adapter (RRT + TOPP-RA), native execution, and native kernel composition.                                                                                               |
 | `manyforge_ros2_control_execution`        | C++20/ROS 2           | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, isolated ROS scene projection, and optional exact controller/lifecycle dispatch admission.                |
 | `manyforge_behavior`                      | Python                | Behavior-tree runner, node catalog, program/deployment loader, cycle orchestration, one versioned recovery offer, and Robot Model Authority.                                                        |
-| `manyforge_composer`                      | FastAPI + React       | Structural/operator shell, revision-fenced strict Program Draft/Saved authoring, and thin H0 runtime/alarm/history clients. Applied, alarm, scene, runtime, provider, and MCP authority remain headless or gated. |
+| `manyforge_composer`                      | FastAPI + React       | Structural/operator shell, revision-fenced strict Program Draft/Saved authoring, thin runtime projections, and a thin assistant-bridge operator client. Runtime/catalog/provider authority remains outside Composer. |
 | `manyforge_ros` / `manyforge_ros_bringup` | C++/Python            | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                        |
-| `manyforge_assistant_bridge`              | Python                | Retained protocol/supervisor client logic and historical direct-lane reference; live HTTP provider unavailable during the cutover.                                                                  |
+| `manyforge_assistant_bridge`              | Python                | Bounded direct/`nemoclaw` model mediation, strict active-mode enforcement, Draft/read callback routing, cancellation/reconciliation, conversation history, and redacted audit. It owns no runtime effects or catalog truth. |
 
 ### Layers
 

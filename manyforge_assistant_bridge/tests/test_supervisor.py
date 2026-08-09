@@ -107,7 +107,7 @@ def test_old_status_transport_is_fenced_before_network() -> None:
 
 
 def test_historical_effectful_supervisor_cohorts_remain_assigned_after_h0_reads() -> None:
-    assert supervisor.SUPERVISOR_RESTORATION_GATE == "I6/N"
+    assert supervisor.SUPERVISOR_DISPOSITION == "superseded_by_component_manager"
     source = inspect.getsource(supervisor)
     assert "8c0ecee5ad79b553063c0f171740a3ccf617e8d7" in source
     assert "lines 77-142" in source

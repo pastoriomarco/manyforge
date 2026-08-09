@@ -94,6 +94,8 @@ class HeadlessCorePort(Protocol):
 
     def source_model_projection(self) -> dict[str, Any]: ...
 
+    def assistant_mode_index(self) -> dict[str, Any]: ...
+
     def assistant_mode_projection(self, mode_id: str) -> dict[str, Any]: ...
 
     def alarm_snapshot(
@@ -256,6 +258,12 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("source_model_projection"),
             method="source_model_projection",
+        )
+
+    def assistant_mode_index(self) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("assistant_mode_index"),
+            method="assistant_mode_index",
         )
 
     def assistant_mode_projection(self, mode_id: str) -> dict[str, Any]:

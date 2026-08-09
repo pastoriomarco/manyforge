@@ -12,9 +12,12 @@ namespace manyforge::headless {
 
 inline constexpr std::string_view kAssistantModeProjectionApiVersion =
     "manyforge.assistant_mode_projection.v1";
+inline constexpr std::string_view kAssistantModeIndexApiVersion =
+    "manyforge.assistant_mode_index.v1";
 inline constexpr std::string_view kAssistantModeCatalogApiVersion =
     "manyforge.assistant_mode_catalog.v1";
 inline constexpr std::uint64_t kMaximumAssistantModeProjectionBytes = 64ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint64_t kMaximumAssistantModeIndexBytes = 8ULL * 1024ULL * 1024ULL;
 
 class AssistantModeProjectionError : public std::runtime_error {
  public:
@@ -33,5 +36,13 @@ class AssistantModeProjectionError : public std::runtime_error {
 /// callback or runtime availability by itself.
 [[nodiscard]] manyforge::content_identity::CanonicalValue ProjectAssistantMode(
     const manyforge::deployment::RetainedBundle& active_bundle, std::string_view mode_id);
+
+/// Build the bounded index of enabled modes from the same independently
+/// verified assistant projection used by ProjectAssistantMode.
+///
+/// The index exists for discovery only. A caller must still fetch the exact
+/// selected mode projection before offering or invoking any instrument.
+[[nodiscard]] manyforge::content_identity::CanonicalValue ProjectAssistantModeIndex(
+    const manyforge::deployment::RetainedBundle& active_bundle);
 
 }  // namespace manyforge::headless

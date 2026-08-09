@@ -68,6 +68,7 @@ public:
   NodeEnvironmentProjection();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   SourceModelProjection();
+  [[nodiscard]] manyforge::content_identity::CanonicalValue AssistantModeIndex();
   [[nodiscard]] manyforge::content_identity::CanonicalValue AssistantModeProjection(
       std::string_view mode_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue AlarmSnapshot(
@@ -135,6 +136,8 @@ private:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   SourceModelProjectionLocked(const HeadlessRuntimeSnapshot &runtime);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
+  AssistantModeIndexLocked(const HeadlessRuntimeSnapshot &runtime);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
   AssistantModeProjectionLocked(const HeadlessRuntimeSnapshot &runtime,
                                 std::string_view mode_id);
   void
@@ -175,6 +178,7 @@ private:
   ActiveSourceModelProjection source_model_projection_;
   std::shared_ptr<const manyforge::deployment::RetainedBundle> verified_active_bundle_;
   std::optional<manyforge::content_identity::CanonicalValue> source_model_projection_cache_;
+  std::optional<manyforge::content_identity::CanonicalValue> assistant_mode_index_cache_;
   std::map<std::string, manyforge::content_identity::CanonicalValue>
       assistant_mode_projection_cache_;
   std::shared_ptr<SqliteEventHistoryStore> history_store_;

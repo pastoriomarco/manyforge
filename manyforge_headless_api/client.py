@@ -169,6 +169,9 @@ class HeadlessHttpClient:
     def source_model(self) -> dict[str, Any]:
         return self.request("GET", "/api/source-model")
 
+    def assistant_modes(self) -> dict[str, Any]:
+        return self.request("GET", "/api/assistant/modes")
+
     def assistant_mode(self, mode_id: str) -> dict[str, Any]:
         if (
             not isinstance(mode_id, str)

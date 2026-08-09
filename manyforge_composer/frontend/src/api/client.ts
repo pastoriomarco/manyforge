@@ -18,6 +18,10 @@ import {
   parseSceneUrdfManifest,
   parseSourceModelProjection,
 } from './parsers';
+import {
+  parseAssistantModeIndex,
+  parseAssistantProviderStatus,
+} from './assistantParsers';
 import type {
   ArtifactKind,
   CatalogResponse,
@@ -48,6 +52,11 @@ import type {
   OperationAcceptance,
   OperationObservation,
 } from '../types/robotControl';
+import type {
+  AssistantModeIndex,
+  AssistantProviderStatus,
+  AssistantRequestInput,
+} from '../types/assistant';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -267,6 +276,36 @@ export const api = {
   runtime: {
     get: (signal?: AbortSignal): Promise<HeadlessRuntimeSnapshot> =>
       requestJson('/api/runtime', parseHeadlessRuntimeSnapshot, signal),
+  },
+  assistant: {
+    modes: (signal?: AbortSignal): Promise<AssistantModeIndex> =>
+      requestJson('/api/assistant/modes', parseAssistantModeIndex, signal),
+    submit: (
+      body: AssistantRequestInput,
+      signal?: AbortSignal,
+    ): Promise<AssistantProviderStatus> => requestJson(
+      '/api/assistant/requests',
+      parseAssistantProviderStatus,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    status: (
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<AssistantProviderStatus> => requestJson(
+      `/api/assistant/requests/${encodeURIComponent(requestId)}`,
+      parseAssistantProviderStatus,
+      signal,
+    ),
+    cancel: (
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<AssistantProviderStatus> => requestJson(
+      `/api/assistant/requests/${encodeURIComponent(requestId)}/cancel`,
+      parseAssistantProviderStatus,
+      signal,
+      { method: 'POST' },
+    ),
   },
   scene: {
     commit: (

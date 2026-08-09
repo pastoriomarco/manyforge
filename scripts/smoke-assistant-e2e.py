@@ -12,23 +12,23 @@ validators covered by the seven cases in
 Historical live responsibilities are assigned, not hidden:
 
 * ``main``, ``_parse_args``, ``_run_profile`` and ``_run_negative_cases``:
-  future bounded qualification orchestration;
+  N7 bounded live-stack qualification orchestration;
 * ``_bridge_process``, ``_bridge_python``, ``_wait_for_bridge``,
   ``_stop_existing_bridge`` and ``_direct_vllm_probe``: future
-  assistant/provider clients with explicit process and timeout bounds;
+  N7 launcher/model lifecycle around the current bounded assistant client;
 * ``_query_read_only_case``, ``_composer_draft_add_case``,
   ``_operator_composer_flow_case``, ``_golden_scene_upsert_case``,
   ``_golden_tree_insert_case``, ``_golden_parameter_upsert_case``,
   ``_golden_blackboard_upsert_case`` and ``_draft_tool_surface_case``:
-  future headless query and authoring clients;
+  current headless query and Draft authoring clients, joined live at N7;
 * ``_cancel_proxy_case``, ``_composer_cancelled_error_case``, the four
   ``_discard_*_by_reload`` functions, ``_load_baseline``, ``_request_status``,
   ``_viewer_status``, ``_scene_diagnostic_for_object``,
   ``_wait_for_request_status``, ``_active_mode_tools`` and
   ``_active_mode_catalog_hash``: future cancellation, status, mode-catalog,
-  viewer-status, and diagnostic clients;
+  current cancellation/status/catalog clients plus I9 viewer diagnostics;
 * prompt/tool/request-status helpers not retained below: acceptance input for
-  the future public assistant contract; and
+  the current strict v1 contract and N7 live-model behavior; and
 * the retained validators below: effect-free acceptance projections only.
 
 No retained helper performs network I/O, starts a process, reads a runtime,
@@ -68,7 +68,7 @@ MAX_VALIDATION_ERRORS: Final = 256
 
 @dataclass(frozen=True)
 class Profile:
-    """Effect-free sampling configuration for a future assistant client."""
+    """Effect-free captured sampling input for the N7 live assistant lane."""
 
     name: str
     bridge_env: dict[str, str]
@@ -288,7 +288,7 @@ class RestorationAssignment(NamedTuple):
 RESTORATION_ASSIGNMENTS: Final = (
     RestorationAssignment(
         "main, _parse_args, _run_profile, _run_negative_cases",
-        "bounded qualification orchestration over the future assistant client",
+        "bounded N7 live-stack qualification over the strict v1 client",
     ),
     RestorationAssignment(
         "_bridge_process, _bridge_python, _wait_for_bridge, "
@@ -331,7 +331,7 @@ RESTORATION_ASSIGNMENTS: Final = (
         "_blackboard_namespace_argument_errors, "
         "_blackboard_key_argument_errors, _single_item_errors, "
         "_scene_resource_matches, _slug, _strict_success, _repo_root",
-        "acceptance cases for the future public assistant contract",
+        "acceptance cases for the strict v1 contract and N7 live-model lane",
     ),
 )
 

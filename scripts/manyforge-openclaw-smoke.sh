@@ -15,7 +15,7 @@
 #   verify_productized_plugin
 #                            plugin identity/provenance verification;
 #   mux_smoke                historical MCP/mux tool workflow; and
-#   run_requested_smoke      future qualified orchestration.
+#   run_requested_smoke      external-loop restoration plus N7 orchestration.
 # The pure decoding and provenance intent returns in focused offline tooling;
 # the old provider, mux, plugin, Composer, and sandbox wires are not dormant.
 
@@ -24,5 +24,5 @@ set -euo pipefail
 _manyforge_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/composable-cell-runtime-availability.sh
 source "${_manyforge_script_dir}/lib/composable-cell-runtime-availability.sh"
-MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: the OpenClaw assistant smoke returns with the qualified headless assistant client."
+MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: the OpenClaw smoke requires a strict-v1 external adapter and N7 live-product qualification."
 manyforge_fail_composable_cell_runtime_unavailable

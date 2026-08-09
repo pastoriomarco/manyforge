@@ -1,4 +1,4 @@
-"""Bounded H0 observation client; provider and authoring loops remain gated."""
+"""Bounded owner-neutral observation client used by assistant adapters."""
 
 from __future__ import annotations
 
@@ -38,8 +38,8 @@ class AssistantHeadlessReadClient:
     ) -> dict[str, Any]:
         if operation not in ASSISTANT_H0_READ_OPERATIONS:
             raise AssistantHeadlessReadError(
-                f"assistant operation {operation!r} is unavailable at H0; "
-                "Program authoring and runtime mutation return at their later gates"
+                f"assistant operation {operation!r} is outside the closed "
+                "owner-neutral read surface"
             )
         return self._reader.invoke(operation, arguments)
 

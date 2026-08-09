@@ -68,6 +68,9 @@ def _parser() -> argparse.ArgumentParser:
         command = subcommands.add_parser(name)
         command.add_argument("--url", default="http://127.0.0.1:9010")
 
+    subcommands.add_parser("assistant-modes").add_argument(
+        "--url", default="http://127.0.0.1:9010"
+    )
     assistant_mode = subcommands.add_parser("assistant-mode")
     assistant_mode.add_argument("--url", default="http://127.0.0.1:9010")
     assistant_mode.add_argument("mode_id")
@@ -163,6 +166,8 @@ def _request(args: argparse.Namespace) -> int:
             value = client.node_environment()
         elif args.command == "source-model":
             value = client.source_model()
+        elif args.command == "assistant-modes":
+            value = client.assistant_modes()
         elif args.command == "assistant-mode":
             value = client.assistant_mode(args.mode_id)
         elif args.command == "alarm-metrics":

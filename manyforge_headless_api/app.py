@@ -305,6 +305,10 @@ def create_app(
     def source_model() -> dict[str, Any]:
         return service.source_model()
 
+    @app.get("/api/assistant/modes")
+    def assistant_modes() -> dict[str, Any]:
+        return service.assistant_modes()
+
     @app.get("/api/assistant/modes/{mode_id}")
     def assistant_mode(
         mode_id: Annotated[

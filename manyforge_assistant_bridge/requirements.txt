@@ -1,2 +1,2 @@
-# No assistant-specific third-party runtime dependencies. The first-party
-# manyforge_headless_api H0 read client is declared in pyproject.toml.
+# Runtime dependencies are declared and pinned through pyproject.toml. This
+# compatibility file intentionally carries no second dependency declaration.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposition gate for the historical assistant-provider HTTP smoke.
+"""N7 gate for the historical assistant-provider live-stack smoke.
 
 The complete implementation is pinned at
 ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` (blob
@@ -10,11 +10,11 @@ The complete implementation is pinned at
 asserted the matching response/tool-call wire.  ``main`` combined those
 responsibilities into a live smoke.  None is a current public contract.
 
-The case intent remains assigned to the future assistant client: bounded tool
-catalog input, request identity, authentication/timeout behavior, malformed
-response rejection, allowed-tool enforcement, tool-call structure, and
-provider error reporting.  The old DTO is absent rather than retained behind
-an unreachable early return.
+N6-c5 now restores those valid behaviors in the strict v1 bridge/client and
+focused Docker tests.  This script stays effect-free because its historical
+body also launches against a live provider/Composer product stack; N7 owns
+that runnable native-product qualification.  The old DTO is absent rather
+than retained behind an unreachable early return.
 """
 
 from __future__ import annotations
@@ -39,19 +39,19 @@ class RestorationAssignment(NamedTuple):
 RESTORATION_ASSIGNMENTS: Final = (
     RestorationAssignment(
         "SmokeFailure, _parse_args, _parse_tool_spec, _build_request_payload",
-        "bounded configuration over the future provider request contract",
+        "strict v1 request/catalog setup for the N7 live-product smoke",
     ),
     RestorationAssignment(
         "_post_json",
-        "authenticated bounded provider client with explicit timeouts",
+        "reuse the qualified bounded v1 provider client with explicit timeouts",
     ),
     RestorationAssignment(
         "_validate_response, _require_list",
-        "strict response and allowed-tool validation",
+        "reuse strict v1 response and exact-catalog validation",
     ),
     RestorationAssignment(
         "main",
-        "focused provider smoke after the assistant client is qualified",
+        "focused live-provider smoke at the N7 runnable-product gate",
     ),
 )
 

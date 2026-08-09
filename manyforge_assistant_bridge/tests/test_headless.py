@@ -40,7 +40,10 @@ def test_assistant_rejects_later_gate_operations_before_transport(
     reader = RecordingReader()
     client = AssistantHeadlessReadClient(reader)
 
-    with pytest.raises(AssistantHeadlessReadError, match="unavailable at H0"):
+    with pytest.raises(
+        AssistantHeadlessReadError,
+        match="outside the closed owner-neutral read surface",
+    ):
         client.observe(operation, {})
 
     assert reader.calls == []

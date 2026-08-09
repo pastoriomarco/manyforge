@@ -2171,6 +2171,89 @@ code {
   line-height: 1.5;
 }
 
+.assistant-panel {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.assistant-header,
+.assistant-actions,
+.assistant-message header {
+  align-items: center;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
+}
+
+.assistant-mode-select,
+.assistant-input {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.assistant-mode-select select {
+  max-width: 24rem;
+}
+
+.assistant-mode-description,
+.assistant-status,
+.assistant-notice {
+  margin: 0;
+}
+
+.assistant-field-policy > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  padding-top: 0.65rem;
+}
+
+.assistant-field-policy label {
+  align-items: center;
+  display: flex;
+  gap: 0.35rem;
+}
+
+.assistant-transcript {
+  background: color-mix(in srgb, var(--panel-bg, #151922) 82%, black);
+  border: 1px solid var(--border-color, #343b49);
+  border-radius: 0.55rem;
+  display: grid;
+  gap: 0.65rem;
+  max-height: 30rem;
+  min-height: 7rem;
+  overflow: auto;
+  padding: 0.75rem;
+}
+
+.assistant-message {
+  border-left: 3px solid #60708c;
+  padding: 0.45rem 0.65rem;
+}
+
+.assistant-message.user {
+  border-left-color: #4f9dff;
+}
+
+.assistant-message p,
+.assistant-message ul {
+  margin-bottom: 0;
+}
+
+.assistant-error {
+  color: #ff9a9a;
+}
+
+.assistant-draft-provenance {
+  color: #f2c66d;
+  font-weight: 600;
+}
+
+.assistant-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
 .segmented-control {
   display: inline-flex;
   padding: 0.18rem;

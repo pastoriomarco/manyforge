@@ -22,12 +22,16 @@ from .draft_session import ComposerDraftSession
 if TYPE_CHECKING:
     from manyforge_headless_api.client import HeadlessHttpClient
 
+    from .assistant_provider_client import AssistantProviderHttpClient
+
 
 RUNTIME_UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
 RUNTIME_UNAVAILABLE_MESSAGE = (
     "Composer is not a runtime owner; configure the headless API for H0 status, "
     "scene, alarm, and history projections, while execution, lifecycle, Stop, "
-    "provider, simulation, and robot mutation remain gated by later plan steps"
+    "simulation, and robot mutation remain gated by later plan steps. The "
+    "assistant operator workflow is available only when an assistant bridge is "
+    "configured alongside the headless API"
 )
 
 
@@ -44,6 +48,7 @@ class ComposerState:
         program_source_path: str | None = None,
         allowed_fs_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
+        assistant_client: "AssistantProviderHttpClient | None" = None,
     ) -> None:
         if deployment is not None and deployment_source_path is None:
             raise ValueError(
@@ -92,6 +97,7 @@ class ComposerState:
         )
         self.allowed_fs_roots = list(allowed_fs_roots or [])
         self.headless_client = headless_client
+        self.assistant_client = assistant_client
 
     @classmethod
     def from_deployment_path(
@@ -100,12 +106,14 @@ class ComposerState:
         *,
         allowed_fs_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
+        assistant_client: "AssistantProviderHttpClient | None" = None,
     ) -> "ComposerState":
         return cls.from_paths(
             deployment_path=deployment_path,
             program_path=None,
             allowed_fs_roots=allowed_fs_roots,
             headless_client=headless_client,
+            assistant_client=assistant_client,
         )
 
     @classmethod
@@ -116,6 +124,7 @@ class ComposerState:
         program_path: str | None,
         allowed_fs_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
+        assistant_client: "AssistantProviderHttpClient | None" = None,
     ) -> "ComposerState":
         node_environment = build_node_environment()
         resolved_program = (
@@ -133,6 +142,7 @@ class ComposerState:
                 program_source_path=resolved_program,
                 allowed_fs_roots=allowed_fs_roots,
                 headless_client=headless_client,
+                assistant_client=assistant_client,
             )
         resolved = str(Path(deployment_path).resolve())
         return cls(
@@ -143,6 +153,7 @@ class ComposerState:
             program_source_path=resolved_program,
             allowed_fs_roots=allowed_fs_roots,
             headless_client=headless_client,
+            assistant_client=assistant_client,
         )
 
     @property

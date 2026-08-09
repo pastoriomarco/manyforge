@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import unicodedata
 from typing import TYPE_CHECKING, Any
 
@@ -275,6 +276,59 @@ def _skills(value: Any, tools: dict[str, dict]) -> list[dict]:
     return result
 
 
+def _model_request_contract(value: Any) -> dict[str, Any]:
+    contract = _object(value, "model_endpoint.request_contract")
+    _closed(
+        contract,
+        {
+            "default_timeout_s",
+            "max_output_tokens",
+            "supported_image_transports",
+            "supports_image_input",
+            "supports_json_object",
+            "supports_response_tools",
+            "tool_call_family",
+        },
+        "model_endpoint.request_contract",
+    )
+    timeout = contract["default_timeout_s"]
+    if (
+        type(timeout) not in {int, float}
+        or not math.isfinite(timeout)
+        or not 0 < timeout <= 3_600
+    ):
+        raise _invalid("model timeout is outside its bound")
+    tokens = contract["max_output_tokens"]
+    if type(tokens) is not int or not 1 <= tokens <= 1_048_576:
+        raise _invalid("model output-token limit is invalid")
+    for field in (
+        "supports_image_input",
+        "supports_json_object",
+        "supports_response_tools",
+    ):
+        if type(contract[field]) is not bool:
+            raise _invalid(f"model {field} must be boolean")
+    transports = [
+        _text(item, "model image transport", maximum_bytes=64)
+        for item in _array(
+            contract["supported_image_transports"], "model image transports"
+        )
+    ]
+    if (
+        transports != sorted(set(transports))
+        or not set(transports) <= {"http_url", "inline_data_url"}
+        or bool(transports) != contract["supports_image_input"]
+    ):
+        raise _invalid("model image transports are inconsistent")
+    if contract["tool_call_family"] not in {
+        "openai_chat_tools",
+        "qwen3_coder",
+        "qwen3_xml",
+    }:
+        raise _invalid("model tool-call family is unsupported")
+    return contract
+
+
 def verify_active_assistant_mode(
     payload: Any,
     *,
@@ -321,12 +375,21 @@ def verify_active_assistant_mode(
     _text(provider["provider_alias"], "provider.provider_alias")
     _text(provider["provider_kind"], "provider.provider_kind")
     model = _object(projection["model_endpoint"], "model_endpoint")
-    _closed(model, {"model_endpoint_alias", "model_id"}, "model_endpoint")
+    _closed(
+        model,
+        {"model_endpoint_alias", "model_id", "request_contract"},
+        "model_endpoint",
+    )
     _text(model["model_endpoint_alias"], "model_endpoint.model_endpoint_alias")
     _text(model["model_id"], "model_endpoint.model_id")
+    request_contract = _model_request_contract(model["request_contract"])
+    if request_contract["tool_call_family"] != "openai_chat_tools":
+        raise _invalid("direct bridge requires the openai_chat_tools parser family")
 
     policy = _grant_policy(projection["grant_policy"], mode)
     tools = _tools(projection["tools"], mode)
+    if tools and request_contract["supports_response_tools"] is not True:
+        raise _invalid("selected model endpoint does not support response tools")
     nodes = _nodes(projection["nodes"], node_environment)
     skills = _skills(projection["skills"], tools)
     catalog = {

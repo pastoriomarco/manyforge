@@ -13,6 +13,12 @@ from .assistant_mode_client import (
     ActiveAssistantModeProjectionError,
     read_active_assistant_mode,
 )
+from .assistant_catalog_narrowing import (
+    AssistantCatalogNarrowingError,
+    normalize_field_policy,
+    normalize_requested_tools,
+    resolve_assistant_catalog,
+)
 from .assistant_schema_validation import (
     CallbackSchemaValidationError,
     validate_callback_arguments,
@@ -73,6 +79,8 @@ class AssistantDraftCallbackRequest(BaseModel):
     catalog_hash: Annotated[
         str, Field(alias="catalogHash", pattern=_DIGEST_PATTERN)
     ]
+    requested_tools: list[str] = Field(alias="requestedTools", max_length=4096)
+    field_policy: dict[str, Any] = Field(alias="fieldPolicy")
     input_schema_hash: Annotated[
         str, Field(alias="inputSchemaHash", pattern=_DIGEST_PATTERN)
     ]
@@ -225,11 +233,30 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                 mode_source["source_content_digest"],
                 "assistantModeProjectionDigest",
             ),
-            (body.catalog_hash, mode_payload["catalog_hash"], "catalogHash"),
         ):
             _require_equal(received, expected, field=field)
 
-        tool = assistant_mode.tools.get(tool_id)
+        try:
+            requested_tools = normalize_requested_tools(body.requested_tools)
+            field_policy = normalize_field_policy(body.field_policy)
+            resolved_catalog = resolve_assistant_catalog(
+                mode_payload,
+                requested_tools=requested_tools,
+                field_policy=field_policy,
+            )
+        except AssistantCatalogNarrowingError as error:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "assistant_callback_context_invalid",
+                    "message": str(error),
+                },
+            ) from error
+        _require_equal(body.catalog_hash, resolved_catalog["catalogHash"], field="catalogHash")
+        resolved_tools = {
+            row["tool_id"]: row for row in resolved_catalog["tools"]
+        }
+        tool = resolved_tools.get(tool_id)
         if tool is None:
             raise HTTPException(
                 status_code=404,

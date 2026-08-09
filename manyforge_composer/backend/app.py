@@ -20,6 +20,7 @@ from .log_throttle import ThrottledLog
 from .models import UnavailableDetail, UnavailableResponse
 from .routes_catalog import create_catalog_router
 from .routes_assistant_draft import create_assistant_draft_router
+from .routes_assistant import create_assistant_router
 from .routes_draft import create_draft_router
 from .routes_filesystem import create_filesystem_router
 from .routes_nodes import create_nodes_router
@@ -147,6 +148,11 @@ def create_app(
         maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
         path_prefix="/api/assistant/bridge/tools/",
     )
+    app.add_middleware(
+        ComposerRequestBodyLimitMiddleware,
+        maximum_bytes=4 * _MAXIMUM_REQUEST_BODY_BYTES,
+        path_prefix="/api/assistant/requests",
+    )
     for program_authoring_prefix in (
         "/api/program/draft/",
         "/api/program/open-draft",
@@ -262,6 +268,11 @@ def create_app(
                             if headless.get("headless_projection_ready")
                             else "degraded"
                         ),
+                        "assistant_bridge": (
+                            "configured"
+                            if state.assistant_client is not None
+                            else "unconfigured"
+                        ),
                     },
                     "headless": headless,
                     "runtimeAvailability": None,
@@ -283,6 +294,11 @@ def create_app(
                             else "none"
                         ),
                         "headless_projection": "unavailable",
+                        "assistant_bridge": (
+                            "configured"
+                            if state.assistant_client is not None
+                            else "unconfigured"
+                        ),
                     },
                     "headless": {
                         "status_scope": "headless_projection",
@@ -318,6 +334,7 @@ def create_app(
                     else "none"
                 ),
                 "runtime": "unavailable",
+                "assistant_bridge": "unconfigured",
             },
             "runtimeAvailability": _UNAVAILABLE_PAYLOAD,
             "timestamp": time.time(),
@@ -351,6 +368,11 @@ def create_app(
         app.include_router(
             create_assistant_draft_router(state),
             tags=["assistant-draft-callback"],
+        )
+    if state.headless_client is not None and state.assistant_client is not None:
+        app.include_router(
+            create_assistant_router(state),
+            tags=["assistant-provider-client"],
         )
 
     if state.headless_client is not None:

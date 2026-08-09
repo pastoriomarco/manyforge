@@ -69,6 +69,61 @@ function workspaceFixture(): Record<string, unknown> {
 }
 
 describe('structural API client', () => {
+  it('uses the owner mode index and bridge-owned request status routes', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({
+        schema_version: 'manyforge.assistant_mode_index.v1',
+        retained_bundle_id: 'bundle.1',
+        graph_revision: 'graph.1',
+        assistant_projection_digest: `sha256:${'1'.repeat(64)}`,
+        instrument_registry_digest: `sha256:${'2'.repeat(64)}`,
+        node_environment: {
+          catalog_digest: `sha256:${'5'.repeat(64)}`,
+          catalog_id: 'manyforge',
+          content_version: '2',
+          environment_digest: `sha256:${'6'.repeat(64)}`,
+        },
+        modes: [],
+        source: {
+          available: true,
+          freshness: 'fresh',
+          known_gaps: [],
+          projection_generation: 1,
+          projection_owner_epoch: 'headless.1',
+          receiver_age_ns: 1,
+          selection_projection_generation: 1,
+          selection_source_content_digest: `sha256:${'3'.repeat(64)}`,
+          selection_source_generation: 1,
+          selection_source_owner_epoch: 'manager.1',
+          selection_source_owner_id: 'manager',
+          source_content_digest: `sha256:${'4'.repeat(64)}`,
+          source_generation: 1,
+          source_owner_epoch: 'headless.1',
+          source_owner_id: 'headless.assistant-mode-index',
+          source_owner_kind: 'assistant_mode_index',
+        },
+      }))
+      .mockResolvedValueOnce(response({
+        schemaVersion: 'manyforge.assistant.provider_status.v1',
+        requestId: 'request.1',
+        requestOwnerEpoch: 'page.1',
+        sourceLabel: 'composer_ui',
+        correlationId: null,
+        conversationId: 'conversation.1',
+        assistantMode: 'query',
+        state: 'running',
+        response: null,
+        error: null,
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.assistant.modes();
+    await api.assistant.status('request.1');
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/assistant/modes');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/assistant/requests/request.1');
+  });
+
   it('encodes sandbox browse parameters and validates the response', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
       currentPath: '/workspace/cells',

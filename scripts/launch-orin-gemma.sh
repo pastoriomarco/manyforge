@@ -31,5 +31,5 @@ set -euo pipefail
 _manyforge_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/composable-cell-runtime-availability.sh
 source "${_manyforge_script_dir}/lib/composable-cell-runtime-availability.sh"
-MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: the Orin assistant launcher returns with the qualified assistant and authoring clients."
+MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: the Orin assistant launcher requires N7 live-product and platform-lifecycle qualification."
 manyforge_fail_composable_cell_runtime_unavailable

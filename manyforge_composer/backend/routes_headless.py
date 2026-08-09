@@ -132,6 +132,10 @@ def create_headless_router(
                 detail={"code": error.code, "message": str(error)},
             ) from error
 
+    @router.get("/api/assistant/modes")
+    def assistant_modes() -> dict[str, Any]:
+        return _call(client.assistant_modes)
+
     @router.get("/api/assistant/modes/{mode_id}")
     def assistant_mode(
         mode_id: Annotated[

@@ -40,6 +40,8 @@ constexpr std::string_view kSourceModelProjectionIdentityDomain =
     "manyforge-source-model-projection-semantic";
 constexpr std::string_view kAssistantModeProjectionIdentityDomain =
     "manyforge-assistant-mode-projection-semantic";
+constexpr std::string_view kAssistantModeIndexIdentityDomain =
+    "manyforge-assistant-mode-index-semantic";
 constexpr std::string_view kHistorianOwnerHealthCode =
     "historian_delivery_unavailable";
 
@@ -483,6 +485,12 @@ CanonicalValue HeadlessApiCore::SourceModelProjection() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   return SourceModelProjectionLocked(RefreshLocked());
+}
+
+CanonicalValue HeadlessApiCore::AssistantModeIndex() {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  return AssistantModeIndexLocked(RefreshLocked());
 }
 
 CanonicalValue HeadlessApiCore::AssistantModeProjection(
@@ -933,6 +941,7 @@ HeadlessApiCore::VerifiedActiveBundleLocked(const std::string_view retained_bund
     // on every authoring callback.
     verified_active_bundle_ = std::move(selected);
     source_model_projection_cache_.reset();
+    assistant_mode_index_cache_.reset();
     assistant_mode_projection_cache_.clear();
   }
   Require(
@@ -1157,6 +1166,68 @@ CanonicalValue HeadlessApiCore::AssistantModeProjectionLocked(
           {"source_owner_id",
            CanonicalValue(config_.owner_id + ".assistant-mode." + std::string(mode_id))},
           {"source_owner_kind", CanonicalValue("assistant_mode_projection")},
+      }));
+  return CanonicalValue(std::move(result));
+}
+
+CanonicalValue HeadlessApiCore::AssistantModeIndexLocked(
+    const HeadlessRuntimeSnapshot& runtime) {
+  const auto& manager_section = RequiredSection(runtime.root, "manager");
+  const auto& manager_payload = RequiredMember(manager_section, "payload");
+  if (std::holds_alternative<std::nullptr_t>(manager_payload.storage())) {
+    CoreFail("assistant_mode_projection_unavailable",
+             "Manager has no current or last-valid active-bundle selection");
+  }
+  Require(manager_payload.is_object(), "assistant_mode_projection_invalid",
+          "Manager active-bundle selection is not an object");
+  const auto& active = RequiredMember(manager_payload, "active");
+  const auto retained_bundle_id = RequiredString(active, "retained_bundle_id");
+  const auto graph_revision = RequiredString(active, "graph_revision");
+  const auto manager_ready = RequiredBool(manager_payload, "manager_ready");
+  const auto& manager_runtime = RequiredMember(manager_payload, "runtime");
+  const auto manager_converged = RequiredBool(manager_runtime, "converged");
+  Require(manager_ready == manager_converged, "assistant_mode_projection_invalid",
+          "Manager readiness and runtime convergence disagree");
+
+  const auto active_bundle = VerifiedActiveBundleLocked(
+      retained_bundle_id, graph_revision, "assistant_mode_projection_invalid",
+      "assistant_mode_projection_unavailable");
+
+  CanonicalValue projection;
+  if (assistant_mode_index_cache_.has_value()) {
+    projection = *assistant_mode_index_cache_;
+  } else {
+    try {
+      projection = ProjectAssistantModeIndex(*active_bundle);
+    } catch (const AssistantModeProjectionError& error) {
+      CoreFail(error.code(), error.what());
+    }
+    assistant_mode_index_cache_ = projection;
+  }
+  const auto semantic_digest = content_identity::framed_sha256(
+      kAssistantModeIndexIdentityDomain, kAssistantModeIndexApiVersion, projection);
+  CanonicalValue::Object result = projection.as_object();
+  result.emplace_back(
+      "source",
+      CanonicalValue(CanonicalValue::Object{
+          {"available", RequiredMember(manager_section, "available")},
+          {"freshness", RequiredMember(manager_section, "freshness")},
+          {"known_gaps", RequiredMember(manager_section, "known_gaps")},
+          {"projection_generation", RequiredMember(manager_section, "projection_generation")},
+          {"projection_owner_epoch", CanonicalValue(config_.owner_epoch)},
+          {"receiver_age_ns", RequiredMember(manager_section, "receiver_age_ns")},
+          {"selection_projection_generation",
+           RequiredMember(manager_section, "projection_generation")},
+          {"selection_source_content_digest",
+           RequiredMember(manager_section, "source_content_digest")},
+          {"selection_source_generation", RequiredMember(manager_section, "source_generation")},
+          {"selection_source_owner_epoch", RequiredMember(manager_section, "source_owner_epoch")},
+          {"selection_source_owner_id", RequiredMember(manager_section, "source_owner_id")},
+          {"source_content_digest", CanonicalValue(semantic_digest)},
+          {"source_generation", RequiredMember(manager_section, "projection_generation")},
+          {"source_owner_epoch", CanonicalValue(config_.owner_epoch)},
+          {"source_owner_id", CanonicalValue(config_.owner_id + ".assistant-mode-index")},
+          {"source_owner_kind", CanonicalValue("assistant_mode_index")},
       }));
   return CanonicalValue(std::move(result));
 }

@@ -916,7 +916,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             _object(
                 {
                     "cursor": {"type": "string", "minLength": 1, "maxLength": 1024},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 32},
                 }
             ),
         ),

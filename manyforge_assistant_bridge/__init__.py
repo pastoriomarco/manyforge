@@ -1,8 +1,9 @@
-"""Retained assistant-client port inputs for the composable-cell cutover.
+"""Bounded assistant bridge plus owner-neutral client/reducer inputs.
 
-The live provider bridge is unavailable. ``headless`` exposes the closed H0
-read client, ``protocol`` and ``supervisor`` keep deterministic client/reducer
-inputs, and ``bridge`` remains a fail-before-effects provider entrypoint.
+``bridge`` is the current direct/``nemoclaw`` provider mediator. ``headless``
+exposes the closed H0 read client, ``protocol`` exports the strict current wire,
+and ``supervisor`` keeps only the pure reducer from the superseded fixed
+launcher.
 """
 
 __all__ = ["bridge", "headless", "protocol", "supervisor"]

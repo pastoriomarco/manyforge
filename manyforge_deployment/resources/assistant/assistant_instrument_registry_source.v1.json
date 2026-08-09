@@ -740,7 +740,7 @@
             "type": "string"
           },
           "limit": {
-            "maximum": 1000,
+            "maximum": 32,
             "minimum": 1,
             "type": "integer"
           }

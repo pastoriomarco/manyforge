@@ -130,6 +130,26 @@ class FakeCore:
             },
         }
 
+    def assistant_mode_index(self) -> dict[str, Any]:
+        return {
+            "schema_version": "manyforge.assistant_mode_index.v1",
+            "retained_bundle_id": "bundle.1",
+            "graph_revision": "graph.1",
+            "modes": [
+                {
+                    "mode": "composer-assistant",
+                    "description": "Draft authoring",
+                    "grant_policy": {},
+                }
+            ],
+            "source": {
+                "available": True,
+                "freshness": "fresh",
+                "known_gaps": [],
+                "source_owner_id": "headless-api.assistant-mode-index",
+            },
+        }
+
     def alarm_snapshot(
         self,
         limit: int | None = None,
@@ -442,6 +462,10 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert source_model["source"]["source_owner_id"] == (
             "headless-api.source-model"
         )
+        assistant_modes = client.get("/api/assistant/modes").json()
+        assert [row["mode"] for row in assistant_modes["modes"]] == [
+            "composer-assistant"
+        ]
         assistant_mode = client.get(
             "/api/assistant/modes/composer-assistant"
         ).json()
@@ -733,6 +757,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/execution/alarms/{condition_id}/acknowledge" in paths
     assert "/api/node-environment" in paths
     assert "/api/source-model" in paths
+    assert "/api/assistant/modes" in paths
     assert "/api/assistant/modes/{mode_id}" in paths
     assert {
         "/api/execution/operations/{operation_id}/pause",

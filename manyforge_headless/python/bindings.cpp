@@ -150,6 +150,11 @@ public:
     return Invoke([this]() { return core_->SourceModelProjection(); });
   }
 
+  std::string AssistantModeIndex() {
+    py::gil_scoped_release release;
+    return Invoke([this]() { return core_->AssistantModeIndex(); });
+  }
+
   std::string AssistantModeProjection(std::string mode_id) {
     py::gil_scoped_release release;
     return Invoke(
@@ -373,6 +378,7 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("node_environment_projection",
            &HeadlessApiBridge::NodeEnvironmentProjection)
       .def("source_model_projection", &HeadlessApiBridge::SourceModelProjection)
+      .def("assistant_mode_index", &HeadlessApiBridge::AssistantModeIndex)
       .def("assistant_mode_projection", &HeadlessApiBridge::AssistantModeProjection,
            py::arg("mode_id"))
       .def("alarm_snapshot", &HeadlessApiBridge::AlarmSnapshot,

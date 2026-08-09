@@ -237,6 +237,11 @@ def headless_client() -> (
             payload = node_environment
         elif path == "/api/source-model":
             payload = source_model
+        elif path == "/api/assistant/modes":
+            payload = {
+                "schema_version": "manyforge.assistant_mode_index.v1",
+                "modes": [{"mode": "composer-assistant"}],
+            }
         elif path == "/api/assistant/modes/composer-assistant":
             payload = {
                 "schema_version": "manyforge.assistant_mode_projection.v1",
@@ -398,6 +403,9 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         assert composer.get(
             "/api/assistant/modes/composer-assistant"
         ).json()["mode"] == "composer-assistant"
+        assert composer.get("/api/assistant/modes").json()["modes"] == [
+            {"mode": "composer-assistant"}
+        ]
         assert composer.get("/api/source-model").json()["schema_version"] == (
             "manyforge.source_model_projection.v1"
         )

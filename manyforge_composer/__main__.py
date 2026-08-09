@@ -86,6 +86,8 @@ def main() -> None:
     parser.add_argument("--static-dir")
     parser.add_argument("--headless-api-url")
     parser.add_argument("--headless-api-timeout-s", type=float, default=2.0)
+    parser.add_argument("--assistant-bridge-url")
+    parser.add_argument("--assistant-request-timeout-s", type=float, default=10.0)
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -106,6 +108,7 @@ def main() -> None:
             args.port,
         )
     headless_client = None
+    assistant_client = None
     if args.headless_api_url is not None:
         from manyforge_headless_api.client import HeadlessHttpClient
 
@@ -113,12 +116,24 @@ def main() -> None:
             args.headless_api_url,
             timeout_seconds=args.headless_api_timeout_s,
         )
+    if args.assistant_bridge_url is not None:
+        if headless_client is None:
+            parser.error("--assistant-bridge-url requires --headless-api-url")
+        from manyforge_composer.backend.assistant_provider_client import (
+            AssistantProviderHttpClient,
+        )
+
+        assistant_client = AssistantProviderHttpClient(
+            args.assistant_bridge_url,
+            timeout_seconds=args.assistant_request_timeout_s,
+        )
     try:
         state = ComposerState.from_paths(
             deployment_path=args.deployment_path,
             program_path=args.program_path,
             allowed_fs_roots=security.allowed_fs_roots,
             headless_client=headless_client,
+            assistant_client=assistant_client,
         )
         app = create_app(
             state,
@@ -127,6 +142,8 @@ def main() -> None:
         )
         uvicorn.run(app, host=args.host, port=args.port)
     finally:
+        if assistant_client is not None:
+            assistant_client.close()
         if headless_client is not None:
             headless_client.close()
 

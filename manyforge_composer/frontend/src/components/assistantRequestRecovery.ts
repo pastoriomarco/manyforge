@@ -1,9 +1,5 @@
-export interface ReconciliableRequestStatus {
-  status: string;
-}
-
 export type AssistantRequestReconciliationResult<
-  TStatus extends ReconciliableRequestStatus,
+  TStatus,
 > =
   | { kind: 'terminal'; status: TStatus }
   | { kind: 'not_found'; requestObserved: boolean }
@@ -12,7 +8,7 @@ export type AssistantRequestReconciliationResult<
   | { kind: 'aborted' };
 
 export interface AssistantRequestReconciliationOptions<
-  TStatus extends ReconciliableRequestStatus,
+  TStatus,
 > {
   readStatus: (signal?: AbortSignal) => Promise<TStatus>;
   isTerminal: (status: TStatus) => boolean;
@@ -69,7 +65,7 @@ export function shouldReconcileAssistantRequest(error: unknown): boolean {
  * than re-created here from the deleted assistant DTO.
  */
 export async function reconcileAssistantRequest<
-  TStatus extends ReconciliableRequestStatus,
+  TStatus,
 >(
   options: AssistantRequestReconciliationOptions<TStatus>,
 ): Promise<AssistantRequestReconciliationResult<TStatus>> {

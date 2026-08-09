@@ -39,8 +39,26 @@ TEST(AssistantModeProjection,
   EXPECT_NE(bytes.find("\"tool_id\":\"scene_draft_add_object\""), std::string::npos);
   EXPECT_NE(bytes.find("\"effect\":\"composer_draft_mutating\""), std::string::npos);
   EXPECT_NE(bytes.find("\"input_schema_hash\":\"sha256:"), std::string::npos);
+  EXPECT_NE(bytes.find("\"request_contract\":"), std::string::npos);
+  EXPECT_NE(bytes.find("\"tool_call_family\":\"openai_chat_tools\""),
+            std::string::npos);
   EXPECT_EQ(bytes.find("runtime_mutating"), std::string::npos);
   EXPECT_EQ(bytes.find("availability_granted"), std::string::npos);
+  EXPECT_EQ(bytes.find("inspect_isaac_scene"), std::string::npos);
+}
+
+TEST(AssistantModeProjection, IndexPublishesOnlyEnabledDiscoverableModes) {
+  const auto bundle = test::LoadAssistantAuthoringBundle();
+
+  const auto index = ProjectAssistantModeIndex(*bundle);
+  const auto bytes = content_identity::canonical_json(index);
+
+  EXPECT_NE(bytes.find("\"schema_version\":\"manyforge.assistant_mode_index.v1\""),
+            std::string::npos);
+  EXPECT_NE(bytes.find("\"mode\":\"composer-assistant\""), std::string::npos);
+  EXPECT_NE(bytes.find("\"mode\":\"query\""), std::string::npos);
+  EXPECT_EQ(bytes.find("tool_id"), std::string::npos);
+  EXPECT_EQ(bytes.find("provider_alias"), std::string::npos);
 }
 
 TEST(AssistantModeProjection, UnknownModeIsRejectedBeforePublication) {

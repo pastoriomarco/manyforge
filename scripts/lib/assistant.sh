@@ -7,7 +7,8 @@
 #
 # Historical responsibility mapping by symbol:
 #   resolve_assistant_bridge_url
-#       provider selection and old fixed endpoint map -> future client config;
+#       provider selection and old fixed endpoint map -> current strict client
+#       config plus N7 launcher integration;
 #   bridge_pid_alive, supervisor_pid_alive, ensure_log_dir, drop_caches,
 #   served_model_id, bridge_python, install_bridge_deps
 #       process/resource/deployment helpers -> future bounded operator support;
@@ -20,7 +21,7 @@
 #       platform configuration and sandbox provisioning -> deployment owner;
 #   start_bridge, bridge_logs, bridge_healthz_ready, start_bridge_nemoclaw,
 #   start_bridge_hermes, start_bridge_openclaw, wait_for_bridge
-#       provider-specific bridge lifecycle/readiness -> future assistant client;
+#       provider-specific lifecycle/readiness -> N7 product launcher; and
 #   start_assistant_supervisor
 #       old Composer status feeder -> headless status client; and
 #   stop_assistant_stack
@@ -51,7 +52,7 @@ BRIDGE_URL="${BRIDGE_URL:-}"
 
 manyforge_fail_assistant_runtime_unavailable() {
     printf '%s\n' \
-        "${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: the assistant lane returns with the qualified headless assistant client." \
+        "${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: assistant process/model lifecycle remains gated until N7 runnable-product qualification." \
         >&2
     return 78
 }

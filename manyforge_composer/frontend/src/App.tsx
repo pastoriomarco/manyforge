@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react';
 
 import { ApiError, api } from './api/client';
 import { ArtifactBrowser } from './components/ArtifactBrowser';
+import { AssistantOverlay } from './components/AssistantOverlay';
 import { CatalogPanel } from './components/CatalogPanel';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
@@ -37,6 +38,8 @@ export default function App() {
   );
   const headlessEnabled = health.status === 'ready'
     && health.data.mode === 'headless_client';
+  const assistantEnabled = headlessEnabled
+    && health.data.components.assistant_bridge === 'configured';
   const headlessState = useHeadlessState(headlessEnabled);
   const programController = useProgramWorkspace();
   const robotControl = useRobotControl(headlessEnabled);
@@ -80,6 +83,12 @@ export default function App() {
         selectedProgramPath={selectedProgramPath}
         onRetryCatalog={retryCatalog}
         onRetryEnvironment={retryNodeEnvironment}
+      />
+
+      <AssistantOverlay
+        enabled={assistantEnabled}
+        headlessConnected={headlessEnabled}
+        programController={programController}
       />
 
       <SceneAuthoringWorkspace

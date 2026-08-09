@@ -321,6 +321,21 @@ class HeadlessService:
             )
         return projection
 
+    def assistant_modes(self) -> dict[str, Any]:
+        projection = self.core.assistant_mode_index()
+        source = projection.get("source")
+        if (
+            projection.get("schema_version")
+            != "manyforge.assistant_mode_index.v1"
+            or not isinstance(projection.get("modes"), list)
+            or not isinstance(source, dict)
+        ):
+            raise HeadlessApiError(
+                "assistant_mode_projection_invalid",
+                "native core returned an unsupported assistant mode index",
+            )
+        return projection
+
     def scene(self) -> dict[str, Any]:
         runtime = self.runtime()
         sections = runtime["sections"]
