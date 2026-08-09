@@ -488,7 +488,8 @@ verify_structural_graph_projection(
         unit.runtime_profile_revision.value() !=
             detail::native_execution_runtime_profile_revision() ||
         !unit.dependency_runtime_unit_ids.empty() ||
-        !unit.configuration.empty() ||
+        !detail::native_execution_runtime_configuration_is_qualified(
+            unit.configuration) ||
         !native_runtime_units.insert(unit.runtime_unit_id).second) {
       detail::fail_retained_bundle(
           "retained native control graph has an unqualified execution "
@@ -602,6 +603,7 @@ using CatalogIdentity =
 void require_structural_catalog_closure(
     const core::CellGraphDTO& graph,
     std::span<const core::CapabilityProviderBindingDTO> provider_bindings,
+    std::span<const core::ExternalResourceDTO> external_resources,
     std::span<const core::CatalogRecordRefDTO> records) {
   std::set<CatalogIdentity> graph_records;
   for (const auto& instance : graph.model_instances) {
@@ -662,6 +664,11 @@ void require_structural_catalog_closure(
                           binding.provider_manifest_id.value(),
                           binding.provider_manifest_revision.value());
   }
+  for (const auto& resource : external_resources) {
+    graph_records.emplace(core::CatalogRecordKind::kProviderManifest,
+                          resource.provider_manifest_id.value(),
+                          resource.provider_manifest_revision.value());
+  }
 
   std::set<CatalogIdentity> catalog_records;
   for (const auto& record : records) {
@@ -674,10 +681,21 @@ void require_structural_catalog_closure(
           "retained structural catalogs contain a duplicate identity");
     }
   }
-  if (graph_records != catalog_records) {
-    detail::fail_retained_bundle(
-        "retained structural catalogs are not the exact graph-selected "
-        "model/component/control closure");
+  for (const auto& required : graph_records) {
+    if (!catalog_records.contains(required)) {
+      detail::fail_retained_bundle(
+          "retained catalogs omit a graph/applicability-selected structural "
+          "referent");
+    }
+  }
+  for (const auto& selected : catalog_records) {
+    if (!graph_records.contains(selected) &&
+        std::get<0>(selected) !=
+            core::CatalogRecordKind::kCapabilityDefinition) {
+      detail::fail_retained_bundle(
+          "retained catalogs contain a non-capability referent outside the "
+          "exact graph/applicability closure");
+    }
   }
 }
 
@@ -1282,7 +1300,9 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
       root.find_object_member("external_resources"), verified_graph.graph(),
       runtime_profiles);
   require_structural_catalog_closure(
-      verified_graph.graph(), applicability.value().capability_provider_bindings, catalog_records);
+      verified_graph.graph(),
+      applicability.value().capability_provider_bindings,
+      applicability.value().external_resources, catalog_records);
   const auto schema_artifacts = parse_structural_schema_artifacts(
       require_member(catalogs, "schema_artifacts",
                      "retained_bundle.catalogs"),
@@ -1438,9 +1458,22 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
                        path + ".runtime_unit_id");
     detail::require_retained_portable_identity(runtime_unit_id, path + ".runtime_unit_id");
     const auto& expected_unit = verified_graph.graph().runtime_units[index];
+    const bool expected_reference_unit =
+        expected_unit.runtime_profile_id.value() ==
+            detail::kReferenceRuntimeProfileId &&
+        expected_unit.runtime_profile_revision.value() ==
+            detail::reference_runtime_profile_revision() &&
+        expected_unit.configuration.empty();
+    const bool expected_native_unit =
+        expected_unit.runtime_profile_id.value() ==
+            detail::kNativeExecutionRuntimeProfileId &&
+        expected_unit.runtime_profile_revision.value() ==
+            detail::native_execution_runtime_profile_revision() &&
+        detail::native_execution_runtime_configuration_is_qualified(
+            expected_unit.configuration);
     if (runtime_unit_id != expected_unit.runtime_unit_id.value() ||
         !expected_unit.dependency_runtime_unit_ids.empty() ||
-        !expected_unit.configuration.empty()) {
+        (!expected_reference_unit && !expected_native_unit)) {
       detail::fail_retained_bundle(
           "retained runtime-unit product group differs from its graph "
           "subject");

@@ -754,12 +754,12 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     registry = core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY
     assert isinstance(registry, tuple)
-    assert len(registry) == 67
-    assert len({row.capability_id for row in registry}) == 67
+    assert len(registry) == 69
+    assert len({row.capability_id for row in registry}) == 69
     assert (
         sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 33
     )
-    assert sum(row.scope == core.CapabilityScope.kCellGlobal for row in registry) == 26
+    assert sum(row.scope == core.CapabilityScope.kCellGlobal for row in registry) == 28
     assert (
         sum(row.scope == core.CapabilityScope.kControlDomain for row in registry) == 8
     )
@@ -769,7 +769,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
             == core.CapabilityProviderBindingKind.kCapabilityProviderBinding
             for row in registry
         )
-        == 45
+        == 47
     )
     assert (
         sum(
@@ -781,7 +781,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
-        "sha256:8f61f8285d72110c040aa2bd7095545e9d3369ca6f4ba5b5e44e18afe363b9e2"
+        "sha256:f194fca190d7de357d984fc6845e5557a75285697e65ed81dbbf5eba88e8a276"
     )
     assert core.find_builtin_capability_definition("context.state.current") is None
 
@@ -1558,7 +1558,7 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kUnqualified
     )
-    assert len(registry.value_schemas) == 2
+    assert len(registry.value_schemas) == 3
     assert {
         (entry.schema_id.value, entry.schema_revision.value)
         for entry in registry.value_schemas
@@ -1571,9 +1571,13 @@ target: 0.5
             "manyforge.value_schema.runtime.empty.v1",
             "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785",
         ),
+        (
+            "manyforge.value_schema.runtime.native_execution.v1",
+            "sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e",
+        ),
     }
     assert registry.qualification_registry_digest.value == (
-        "sha256:41a0185763ccb6a7bc7704130fc25948a3f4c3fe16d2560a2f4b0b14cae46939"
+        "sha256:06b8e59ea852353aa1603898694a55175416c184ed987bb47388a4a57a26c118"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][
@@ -1796,15 +1800,40 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
         "tool_call_family": "openai_chat_tools",
     }
     assert [mode["mode_id"] for mode in projection["modes"]] == ["query"]
+    assert projection["modes"][0]["catalog"]["tools"] == [
+        "scene_inspect",
+        "status_read",
+    ]
     assert [tool["tool_id"] for tool in projection["instruments"]["tools"]] == [
         "alarms_read",
+        "blackboard_draft_remove_keys",
+        "blackboard_draft_remove_namespaces",
+        "blackboard_draft_upsert_keys",
+        "blackboard_draft_upsert_namespaces",
         "catalog_read",
         "deployment_capabilities_read",
         "history_read",
+        "inspect_isaac_scene",
+        "program_draft_remove_parameters",
+        "program_draft_upsert_parameters",
         "program_read",
+        "program_validate",
+        "propose_scene_object_nodes",
+        "propose_scene_objects",
+        "scene_draft_add_object",
+        "scene_draft_remove_objects",
+        "scene_draft_update_object",
+        "scene_draft_upsert_objects",
         "scene_inspect",
         "skills_read",
         "status_read",
+        "tree_draft_change_node_kind",
+        "tree_draft_delete_node",
+        "tree_draft_insert_node",
+        "tree_draft_move_node",
+        "tree_draft_replace_subtree",
+        "tree_draft_update_node_params",
+        "tree_draft_wrap_node",
     ]
 
     for value, field in (

@@ -9,6 +9,13 @@
       ]
     },
     {
+      "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
+      "capability_id": "model.limits.joint",
+      "required_endpoint_role_ids": [
+        "planner_scene_projection"
+      ]
+    },
+    {
       "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
       "capability_id": "planning.motion.cartesian_path",
       "required_endpoint_role_ids": [
@@ -44,6 +51,13 @@
       ]
     },
     {
+      "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
+      "capability_id": "planning.profile.quality_bounded",
+      "required_endpoint_role_ids": [
+        "planner_scene_projection"
+      ]
+    },
+    {
       "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
       "capability_id": "planning.trajectory.time_parameterized",
       "required_endpoint_role_ids": [
@@ -60,5 +74,5 @@
   ],
   "provider_contracts": [],
   "provider_manifest_id": "manyforge.provider.native_planning",
-  "provider_manifest_revision": "sha256:5abf8044827f911ef453410b432f4fe88675b36a4b88e116c6fec1ae59c0f27c"
+  "provider_manifest_revision": "sha256:89d1a1c0bedbb9db33d2eb43d62f767115b0e16011e4bb8682b04812a52788c6"
 }

@@ -82,6 +82,20 @@ inline constexpr std::string_view kZeroDigest =
   return CanonicalValue(std::move(result));
 }
 
+[[nodiscard]] inline CanonicalValue native_execution_configuration() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"mode", CanonicalValue("simulated")},
+      {"planner_rng_seed", CanonicalValue(12345.0)},
+      {"initial_joint_positions_rad",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(0.0), CanonicalValue(0.0), CanonicalValue(1.57),
+           CanonicalValue(0.0), CanonicalValue(0.0), CanonicalValue(0.0),
+       })},
+      {"execution_tick_hz", CanonicalValue(100.0)},
+      {"collision_monitor_period_ms", CanonicalValue(50.0)},
+  });
+}
+
 [[nodiscard]] inline CanonicalValue translated_pose(double x_m) {
   return CanonicalValue(CanonicalValue::Object{
       {"position_m",
@@ -1348,7 +1362,7 @@ struct AssistantOverlayFixture final {
            CanonicalValue(detail::native_execution_runtime_profile_revision())},
           {"dependency_runtime_unit_ids",
            CanonicalValue(CanonicalValue::Array{})},
-          {"configuration", CanonicalValue(CanonicalValue::Object{})},
+          {"configuration", native_execution_configuration()},
       });
     }
     components.emplace_back(CanonicalValue::Object{

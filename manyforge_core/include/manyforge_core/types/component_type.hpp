@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <manyforge_core/types/coordinate_state.hpp>
 #include <manyforge_core/types/placement_pose.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
@@ -105,6 +106,7 @@ struct ComponentTypeModelResourceRoleDTO {
 /// inventing a model role, asset role, joint, or model asset.
 struct ComponentTypeLocalResourceRoleDTO {
   ResourceRoleId resource_role_id;
+  std::optional<CoordinateKind> coordinate_kind;
 
   friend bool operator==(const ComponentTypeLocalResourceRoleDTO&,
                          const ComponentTypeLocalResourceRoleDTO&) = default;

@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:c19f72293c0b9f54b24e8f165b27112e3ad8496e1d319f0d20d74b7eee6951bc",
+  "capability_id": "scene.edit.remove",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

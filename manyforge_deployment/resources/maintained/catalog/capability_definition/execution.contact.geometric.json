@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:63a3d877d78d71a5932cce5c92d2932b740fbba6e88d00ca3b5dd94429e3eb3d",
+  "capability_id": "execution.contact.geometric",
+  "provider_binding_kind": "control_binding",
+  "scope": "target_binding"
+}

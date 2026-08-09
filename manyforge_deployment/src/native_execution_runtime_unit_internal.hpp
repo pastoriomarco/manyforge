@@ -30,6 +30,12 @@ inline constexpr std::string_view
         "application/vnd.manyforge.installed-target-launch+json";
 inline constexpr std::string_view kNativeExecutionRuntimeProfileId =
     native_execution_runtime_contract::kRuntimeProfileId;
+inline constexpr std::string_view kNativeExecutionRuntimeConfigurationSchemaId =
+    "manyforge.value_schema.runtime.native_execution.v1";
+inline constexpr std::string_view
+    kNativeExecutionRuntimeConfigurationSchemaRevision =
+        "sha256:"
+        "c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e";
 inline constexpr std::string_view kNativeExecutionRuntimeRoleId =
     native_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view kNativeExecutionRuntimeStatusEndpointRoleId =
@@ -37,6 +43,9 @@ inline constexpr std::string_view kNativeExecutionRuntimeStatusEndpointRoleId =
 inline constexpr std::string_view
     kNativeExecutionRuntimeProjectionEndpointRoleId =
         native_execution_runtime_contract::kProjectionEndpointRoleId;
+inline constexpr std::string_view
+    kNativeExecutionRuntimeLogicalSceneEndpointRoleId =
+        native_execution_runtime_contract::kLogicalSceneEndpointRoleId;
 inline constexpr std::string_view kNativeExecutionRuntimeImplementationId =
     native_execution_runtime_contract::kImplementationId;
 inline constexpr std::string_view
@@ -50,6 +59,9 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kNativeExecutionRuntimeProjectionEndpointContractId =
         native_execution_runtime_contract::kProjectionEndpointContractId;
+inline constexpr std::string_view
+    kNativeExecutionRuntimeLogicalSceneEndpointContractId =
+        native_execution_runtime_contract::kLogicalSceneEndpointContractId;
 inline constexpr std::string_view kNativeExecutionRuntimeOperatingSystem =
     native_execution_runtime_contract::kOperatingSystem;
 inline constexpr std::string_view
@@ -64,6 +76,8 @@ inline constexpr std::size_t kMaxNativeExecutionLaunchDescriptorBytes =
 
 [[nodiscard]] std::string native_execution_runtime_profile_document();
 [[nodiscard]] std::string native_execution_runtime_profile_revision();
+[[nodiscard]] bool native_execution_runtime_configuration_is_qualified(
+    const core::JsonObjectDTO &configuration) noexcept;
 [[nodiscard]] std::string native_execution_runtime_implementation_revision();
 [[nodiscard]] std::string native_execution_runtime_process_adapter_revision();
 [[nodiscard]] std::string
@@ -71,6 +85,8 @@ native_execution_runtime_retrieval_contract_revision();
 [[nodiscard]] std::string native_execution_runtime_status_endpoint_revision();
 [[nodiscard]] std::string
 native_execution_runtime_projection_endpoint_revision();
+[[nodiscard]] std::string
+native_execution_runtime_logical_scene_endpoint_revision();
 
 [[nodiscard]] std::string native_execution_runtime_launch_descriptor();
 [[nodiscard]] std::string

@@ -1201,7 +1201,8 @@ CanonicalValue parse_and_verify_composed_model_symbol_role_map(
       const auto& resource = require_object(resources[resource_index],
                                             resource_path);
       require_fields(resource,
-                     {"resource_role_id", "resource_id", "coordinates"},
+                     {"resource_role_id", "resource_id",
+                      "component_local_coordinate_kind", "coordinates"},
                      resource_path);
       const std::string& role = require_text(
           require_member(resource, "resource_role_id", resource_path),
@@ -1225,9 +1226,19 @@ CanonicalValue parse_and_verify_composed_model_symbol_role_map(
       const auto& projections = require_array(
           require_member(resource, "coordinates", resource_path),
           resource_path + ".coordinates");
+      const auto& local_kind = require_member(
+          resource, "component_local_coordinate_kind", resource_path);
       if (projections.empty()) {
-        fail_retained_bundle(resource_path +
-                             " has no coordinate projection");
+        if (!std::holds_alternative<std::nullptr_t>(local_kind.storage())) {
+          require_one_of(require_text(local_kind, resource_path),
+                         {"angular", "linear"}, resource_path);
+        }
+      } else if (!std::holds_alternative<std::nullptr_t>(
+                     local_kind.storage())) {
+        fail_retained_bundle(
+            resource_path +
+            " gives a component-local coordinate kind to a model-backed "
+            "resource");
       }
       std::set<std::tuple<std::string, std::string, std::string>>
           selected_projections;

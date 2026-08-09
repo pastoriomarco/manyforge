@@ -8,6 +8,7 @@ loader behaviour, or a private specifications checkout.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import unicodedata
@@ -360,6 +361,56 @@ def _validate_json_model(
     )
 
 
+def _json_object_without_duplicates(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate mapping key {key!r}")
+        result[key] = value
+    return result
+
+
+def _json_binary64(value: str) -> float:
+    mathematical = Decimal(value)
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError("JSON number overflows the binary64 range")
+    if numeric == 0.0 and mathematical != 0:
+        raise ValueError("JSON number underflows the binary64 range")
+    return numeric
+
+
+def _reject_json_constant(token: str) -> None:
+    raise ValueError(f"non-finite JSON number {token}")
+
+
+def _load_exact_json_mapping(text: str, label: str) -> dict[str, Any] | None:
+    """Use the linear-time JSON parser when a mapping is exact JSON.
+
+    A JSON parse failure returns ``None`` so the existing strict YAML parser
+    remains authoritative for YAML flow mappings and diagnostics. Successful
+    JSON values pass the same bounded JSON-model validation as YAML values.
+    """
+
+    if not text.lstrip().startswith("{"):
+        return None
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_json_object_without_duplicates,
+            parse_float=_json_binary64,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, InvalidOperation, OverflowError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    _validate_json_model(value, label)
+    return value
+
+
 def load_strict_json_yaml(path: str | Path) -> dict[str, Any]:
     """Load one bounded UTF-8 mapping with no YAML-only semantics."""
 
@@ -376,6 +427,9 @@ def load_strict_json_yaml(path: str | Path) -> dict[str, Any]:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise StrictArtifactError(f"{artifact_path}: document is not UTF-8") from exc
+    exact_json = _load_exact_json_mapping(text, str(artifact_path))
+    if exact_json is not None:
+        return exact_json
     try:
         if any(
             isinstance(token, DirectiveToken)

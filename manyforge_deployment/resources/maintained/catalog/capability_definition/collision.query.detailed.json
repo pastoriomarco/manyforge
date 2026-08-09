@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:59cfd352c4a08e315f95c2cb93ada8d2a16a6d2155f83b1c7603e9643088f73b",
+  "capability_id": "collision.query.detailed",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

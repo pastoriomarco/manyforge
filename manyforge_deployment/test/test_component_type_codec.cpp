@@ -23,7 +23,7 @@ namespace {
 constexpr std::string_view kCapabilitySchemaRevision =
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0";
 constexpr std::string_view kComponentTypeSchemaRevision =
-    "sha256:fdd03c397fb792d387002df453055d9ccd7d1826ae41d3b0706e5f7c27480d87";
+    "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 

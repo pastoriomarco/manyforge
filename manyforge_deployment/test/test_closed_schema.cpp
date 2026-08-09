@@ -495,7 +495,7 @@ definitions:
 TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   const auto& registry = build_qualified_closed_schema_registry();
   ASSERT_EQ(registry.catalog_schemas().size(), core::kCatalogRecordTypeRegistry.size());
-  ASSERT_EQ(registry.value_schemas().size(), 2U);
+  ASSERT_EQ(registry.value_schemas().size(), 3U);
   for (const auto& value_schema : registry.value_schemas()) {
     EXPECT_EQ(value_schema.compiled_schema().root_shape(),
               ClosedSchemaRootShape::kObject);
@@ -535,7 +535,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       ASSERT_NE(entry.compiled_schema(), nullptr);
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
-          "sha256:fdd03c397fb792d387002df453055d9ccd7d1826ae41d3b0706e5f7c27480d87");
+          "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -626,7 +626,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   }
   EXPECT_EQ(qualified_count, 9U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
-            "sha256:41a0185763ccb6a7bc7704130fc25948a3f4c3fe16d2560a2f4b0b14cae46939");
+            "sha256:06b8e59ea852353aa1603898694a55175416c184ed987bb47388a4a57a26c118");
   EXPECT_NE(registry.find_qualified_value_schema(
                 core::SchemaId(
                     "manyforge.value_schema.provider_contract.empty.v1"),
@@ -637,6 +637,12 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                 core::SchemaId("manyforge.value_schema.runtime.empty.v1"),
                 core::SchemaRevision(
                     "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785")),
+            nullptr);
+  EXPECT_NE(registry.find_qualified_value_schema(
+                core::SchemaId(
+                    "manyforge.value_schema.runtime.native_execution.v1"),
+                core::SchemaRevision(
+                    "sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e")),
             nullptr);
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
@@ -696,8 +702,58 @@ TEST(ClosedSchema,
 }
 
 TEST(ClosedSchema,
+     NativeExecutionRuntimeConfigurationIsClosedBoundedAndBuildQualified) {
+  const auto& registry = build_qualified_closed_schema_registry();
+  const auto* schema = registry.find_qualified_value_schema(
+      core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
+      core::SchemaRevision(
+          "sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e"));
+  ASSERT_NE(schema, nullptr);
+
+  const CanonicalValue valid = value_object({
+      {"mode", CanonicalValue("simulated")},
+      {"planner_rng_seed", CanonicalValue(12345.0)},
+      {"initial_joint_positions_rad",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(0.0), CanonicalValue(-1.57),
+           CanonicalValue(1.57), CanonicalValue(-1.57),
+           CanonicalValue(-1.57), CanonicalValue(0.0),
+       })},
+      {"execution_tick_hz", CanonicalValue(100.0)},
+      {"collision_monitor_period_ms", CanonicalValue(50.0)},
+  });
+  const auto normalized =
+      validate_and_normalize_build_qualified_value(*schema, valid);
+  EXPECT_EQ(normalized.normalized_value(), valid);
+
+  EXPECT_THROW(validate_and_normalize_build_qualified_value(
+                   *schema,
+                   value_object({
+                       {"mode", CanonicalValue("real")},
+                       {"planner_rng_seed", CanonicalValue(12345.0)},
+                       {"initial_joint_positions_rad",
+                        CanonicalValue(CanonicalValue::Array{
+                            CanonicalValue(0.0)})},
+                       {"execution_tick_hz", CanonicalValue(100.0)},
+                       {"collision_monitor_period_ms", CanonicalValue(50.0)},
+                   })),
+               ClosedSchemaError);
+  EXPECT_THROW(validate_and_normalize_build_qualified_value(
+                   *schema,
+                   value_object({
+                       {"mode", CanonicalValue("simulated")},
+                       {"planner_rng_seed", CanonicalValue(12345.0)},
+                       {"initial_joint_positions_rad",
+                        CanonicalValue(CanonicalValue::Array{})},
+                       {"execution_tick_hz", CanonicalValue(0.0)},
+                       {"collision_monitor_period_ms", CanonicalValue(0.0)},
+                   })),
+               ClosedSchemaError);
+}
+
+TEST(ClosedSchema,
      QualifiesEveryAndOnlyTheExactBuiltinCapabilityDefinition) {
-  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 67U);
+  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 69U);
   CanonicalValue::Array registry_projection;
   registry_projection.reserve(
       core::kBuiltinCapabilityDefinitionRegistry.size());
@@ -905,7 +961,7 @@ TEST(ClosedSchema, EveryPackagedYamlResourcePassesStrictUniqueKeyIngress) {
         << relative_path;
     ++parsed_count;
   }
-  EXPECT_EQ(parsed_count, 15U);
+  EXPECT_EQ(parsed_count, 16U);
 }
 
 TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjections) {
@@ -1074,7 +1130,7 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
       } else if (built.record_kind() ==
                  core::CatalogRecordKind::kComponentType) {
         expected_revision =
-            "sha256:fdd03c397fb792d387002df453055d9ccd7d1826ae41d3b0706e5f7c27480d87";
+            "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009";
         expected_path =
             "catalog/manyforge.component_type.v1.yaml";
       } else if (built.record_kind() ==
@@ -1155,6 +1211,7 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
       "examples/manyforge.closed_schema.example_inventory.v1.yaml",
       "value/manyforge.value_schema.provider_contract.empty.v1.yaml",
       "value/manyforge.value_schema.runtime.empty.v1.yaml",
+      "value/manyforge.value_schema.runtime.native_execution.v1.yaml",
   };
   EXPECT_EQ(source_tree_yaml, expected_source_tree_yaml);
 }

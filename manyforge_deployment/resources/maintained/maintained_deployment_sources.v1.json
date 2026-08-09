@@ -488,6 +488,8 @@
       "component_occurrence_id": "ur10e_robot",
       "program_role_assignments": [
         {
+          "scenario_id": "ur10e_assistant_scene_authoring",
+          "scenario_aliases": ["assistant-authoring", "ur10e-scene-authoring"],
           "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
           "component_roles": {"robot": "ur10e_robot", "tool": "ur10e_robot"},
           "target_roles": {
@@ -541,6 +543,8 @@
       "component_occurrence_id": "lite6_robot",
       "program_role_assignments": [
         {
+          "scenario_id": "lite6_pick_and_place",
+          "scenario_aliases": ["lite6-pick-place"],
           "program_source": "examples/lite6_lite_gripper_pick_and_place.program.yaml",
           "component_roles": {"robot": "lite6_robot", "tool": "lite6_robot"},
           "target_roles": {
@@ -592,6 +596,8 @@
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
+          "scenario_id": "ur5_pick_and_place",
+          "scenario_aliases": ["pick-place", "ur5-pick-place"],
           "program_source": "examples/pick_and_place.program.yaml",
           "component_roles": {"robot": "ur5_robot"},
           "target_roles": {
@@ -599,6 +605,8 @@
           }
         },
         {
+          "scenario_id": "ur5_pick_and_place_minimal",
+          "scenario_aliases": ["ur5-simple-pick-place"],
           "program_source": "examples/pick_and_place_minimal.program.yaml",
           "component_roles": {"robot": "ur5_robot"},
           "target_roles": {
@@ -641,6 +649,8 @@
       "component_occurrence_id": "ur10e_robot",
       "program_role_assignments": [
         {
+          "scenario_id": "ur10e_pick_and_place",
+          "scenario_aliases": ["ur10e", "ur10e-pick-place"],
           "program_source": "examples/pick_and_place_ur10e_robotiq.program.yaml",
           "component_roles": {"robot": "ur10e_robot", "tool": "ur10e_robot"},
           "target_roles": {
@@ -694,6 +704,8 @@
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
+          "scenario_id": "ur5_semantic_shape_pick",
+          "scenario_aliases": ["shape-pick", "ur5-semantic-shape-pick"],
           "program_source": "examples/semantic_shape_pick.program.yaml",
           "component_roles": {"robot": "ur5_robot", "tool": "ur5_robot"},
           "target_roles": {
@@ -737,6 +749,8 @@
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
+          "scenario_id": "ur5_vision_guided_bin_pick",
+          "scenario_aliases": [],
           "program_source": "examples/vision_guided_bin_pick.program.yaml",
           "component_roles": {"robot": "ur5_robot", "tool": "ur5_robot"},
           "target_roles": {
@@ -779,6 +793,8 @@
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
+          "scenario_id": "ur5_vision_guided_pose_pick",
+          "scenario_aliases": ["ur5-vision-pose-pick", "vision-pose"],
           "program_source": "examples/vision_guided_pose_pick.program.yaml",
           "component_roles": {"robot": "ur5_robot"},
           "target_roles": {

@@ -32,6 +32,12 @@ DESCRIPTION_API: Final = "manyforge.maintained_deployment_sources.v1"
 ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v1"
 ROLE_ASSIGNMENTS_API: Final = "manyforge.maintained_program_role_assignments.v1"
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1\0"
+NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
+    "manyforge.value_schema.runtime.native_execution.v1"
+)
+NATIVE_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
+    "sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e"
+)
 
 CAPABILITIES: Final = {
     "assistant.bridge.request": (
@@ -49,6 +55,41 @@ CAPABILITIES: Final = {
         "target_binding",
         "control_binding",
     ),
+    "execution.feedback.state_snapshots": (
+        "sha256:bdcd8c70d34d34bba3735e6e1b191cade422d9b50223afed895465e0062be85a",
+        "target_binding",
+        "control_binding",
+    ),
+    "execution.stop.soft": (
+        "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9",
+        "target_binding",
+        "control_binding",
+    ),
+    "execution.pause": (
+        "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
+        "target_binding",
+        "control_binding",
+    ),
+    "execution.resume": (
+        "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142",
+        "target_binding",
+        "control_binding",
+    ),
+    "execution.reset": (
+        "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
+        "target_binding",
+        "control_binding",
+    ),
+    "execution.contact.geometric": (
+        "sha256:63a3d877d78d71a5932cce5c92d2932b740fbba6e88d00ca3b5dd94429e3eb3d",
+        "target_binding",
+        "control_binding",
+    ),
+    "execution.contact.geometric_signed_penetration": (
+        "sha256:b2f0e892d401460c6b43b1c1b8b39a0cad5fcc130ba694c2c5e32d6cc2d8c323",
+        "target_binding",
+        "control_binding",
+    ),
     "execution.trajectory.execute": (
         "sha256:7e5958db0906b84cb4e5c68ab0ef896f74dc0ba49a9ceb4d918b386abaf9f28c",
         "target_binding",
@@ -56,6 +97,11 @@ CAPABILITIES: Final = {
     ),
     "model.kinematics.fk": (
         "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
+        "target_binding",
+        "capability_provider_binding",
+    ),
+    "model.limits.joint": (
+        "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
         "target_binding",
         "capability_provider_binding",
     ),
@@ -84,6 +130,11 @@ CAPABILITIES: Final = {
         "target_binding",
         "capability_provider_binding",
     ),
+    "planning.profile.quality_bounded": (
+        "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
+        "target_binding",
+        "capability_provider_binding",
+    ),
     "planning.trajectory.time_parameterized": (
         "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
         "target_binding",
@@ -109,19 +160,98 @@ CAPABILITIES: Final = {
         "target_binding",
         "capability_provider_binding",
     ),
+    "scene.reference.resolve": (
+        "sha256:4f66fab4656567598a11844b3b2572112b5239d9eaca4a538f90e082db7154d9",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.object.query": (
+        "sha256:59bad10b1c6eea73c493dbba88cf15befe3345d32bbebd0b7c7fce4947531109",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.shape.box": (
+        "sha256:76e9a3ca351e30e271ec75e3b6de1ea42a718f81cca35cda6bab4ee642e1e12d",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.shape.sphere": (
+        "sha256:d84d92a0e0d9592ead27340278315b3a691c18a902fec44bc99626f36d9bc8f2",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.shape.cylinder": (
+        "sha256:4ffc860d1851db9b3a7fd82f5e9bd88eb1eca624dba372852fb2912fab9e34d5",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.shape.mesh": (
+        "sha256:5ea0a60f5d788c2133419b84f110f0edc033405c7bfd7385086888f09bd2779e",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.edit.add": (
+        "sha256:9f7fbd7203abe565edfb6468d9e52fa15c028f3636615eb62a8d5e8e0c84fea5",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.edit.upsert": (
+        "sha256:01668536a12a75af7024ce6dd1248ce5fd18f25f75d1fadfb953b4b7da0ed1f2",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.edit.remove": (
+        "sha256:c19f72293c0b9f54b24e8f165b27112e3ad8496e1d319f0d20d74b7eee6951bc",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.edit.update_pose": (
+        "sha256:2289472ab0392c94e512d8bfe65406ef7a7ffafb73b40381bd36f627248de4f3",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "scene.edit.attach_detach": (
+        "sha256:444c80303025e78b49df614d71c7df35d0f40867cb0901a8bd0117e65d50eed2",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "collision.query.pre_execution": (
+        "sha256:c45cdcea2f79fbef5d1bc95db064078560c7d5d161b72667a5ce2c72a7432eca",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "collision.query.detailed": (
+        "sha256:59cfd352c4a08e315f95c2cb93ada8d2a16a6d2155f83b1c7603e9643088f73b",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "observability.trace.scene": (
+        "sha256:aa079df5821ad6ad0fdfc15f15368ca6682cd17dd1c804998e4e954fe1979180",
+        "cell_global",
+        "capability_provider_binding",
+    ),
 }
 
 ARM_CAPABILITIES: Final = tuple(
     sorted(
         {
             "execution.feedback.phase_events",
+            "execution.feedback.state_snapshots",
+            "execution.stop.soft",
+            "execution.pause",
+            "execution.resume",
+            "execution.reset",
+            "execution.contact.geometric",
+            "execution.contact.geometric_signed_penetration",
             "execution.trajectory.execute",
             "model.kinematics.fk",
+            "model.limits.joint",
             "planning.motion.cartesian_path",
             "planning.motion.joint_goal",
             "planning.motion.pose_goal",
             "planning.profile.balanced",
             "planning.profile.first_feasible",
+            "planning.profile.quality_bounded",
             "planning.trajectory.time_parameterized",
             "state.observed.current",
             "validation.trajectory.non_collision",
@@ -132,10 +262,53 @@ GRIPPER_CAPABILITIES: Final = tuple(
     sorted(
         {
             "model.kinematics.fk",
+            "model.limits.joint",
             "tool.gripper.command",
             "tool.gripper.feedback",
         }
     )
+)
+
+CELL_CAPABILITIES: Final = tuple(
+    sorted(
+        {
+            "collision.query.detailed",
+            "collision.query.pre_execution",
+            "observability.trace.scene",
+            "scene.edit.add",
+            "scene.edit.attach_detach",
+            "scene.edit.remove",
+            "scene.edit.update_pose",
+            "scene.edit.upsert",
+            "scene.object.query",
+            "scene.reference.resolve",
+            "scene.shape.box",
+            "scene.shape.cylinder",
+            "scene.shape.mesh",
+            "scene.shape.sphere",
+        }
+    )
+)
+
+LEGACY_CAPABILITY_REPLACEMENTS: Final = {
+    "collision.query.detailed": "context.collision.check.detailed",
+    "collision.query.pre_execution": "context.collision.check",
+    "model.kinematics.fk": "context.kinematics.fk",
+    "model.limits.joint": "context.limits.joint",
+    "scene.object.query": "context.scene.object_query",
+    "scene.reference.resolve": "context.pose.resolve_reference",
+    "state.observed.current": "context.state.current",
+    "validation.trajectory.non_collision": "context.validation.trajectory",
+}
+
+I8_REQUALIFIED_CAPABILITIES: Final = frozenset(
+    {
+        "collision.query.detailed",
+        "collision.query.pre_execution",
+        "execution.contact.geometric",
+        "execution.contact.geometric_signed_penetration",
+        "execution.stop.soft",
+    }
 )
 
 SCHEMA_SOURCES: Final = {
@@ -289,8 +462,9 @@ def generated_catalog_document(
     schema_id: str,
     schema_revision: str,
     value: dict[str, Any],
+    canonical_output: bool = False,
 ) -> tuple[Path, bytes, dict[str, str]]:
-    payload = pretty_bytes(value)
+    payload = canonical_bytes(value) if canonical_output else pretty_bytes(value)
     return (
         root / relative_path,
         payload,
@@ -379,6 +553,10 @@ def component_type_document(family: dict[str, Any]) -> dict[str, Any]:
                 "asset_resource_role_id": "fingers",
             }
         )
+    else:
+        # The historical simulated UR5 tool_position values are linear metres.
+        # Retain that semantic kind without inventing a URDF joint.
+        gripper_resource["coordinate_kind"] = "linear"
     value = {
         "api_version": "manyforge.component_type.v1",
         "component_type_id": f"{family_id}.component",
@@ -606,8 +784,8 @@ def native_runtime_profile() -> dict[str, Any]:
         "api_version": "manyforge.runtime_profile.v1",
         "runtime_profile_id": "manyforge.native_execution_runtime",
         "configuration_schema_ref": {
-            "schema_id": "manyforge.value_schema.runtime.empty.v1",
-            "schema_revision": "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785",
+            "schema_id": NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID,
+            "schema_revision": NATIVE_RUNTIME_CONFIGURATION_SCHEMA_REVISION,
         },
         "process_contract": {"lifecycle_control": "manager_managed"},
         "supervision_contract": {
@@ -615,6 +793,7 @@ def native_runtime_profile() -> dict[str, Any]:
         },
         "offered_runtime_role_ids": ["native_execution"],
         "source_endpoint_role_ids": [
+            "logical_scene_services",
             "native_execution_status",
             "planner_scene_projection",
         ],
@@ -709,6 +888,11 @@ def catalog_sources(
             planner_capabilities,
             ["planner_scene_projection"],
         ),
+        "logical_scene": provider_manifest(
+            "manyforge.provider.logical_scene",
+            CELL_CAPABILITIES,
+            ["logical_scene_services"],
+        ),
         "assistant_bridge": provider_manifest(
             "manyforge.provider.assistant_bridge",
             ("assistant.bridge.request",),
@@ -763,6 +947,7 @@ def catalog_sources(
         schema_id="manyforge.runtime_profile.v1",
         schema_revision=schemas["runtime_profile"],
         value=runtime,
+        canonical_output=True,
     )
 
     component_references: dict[str, dict[str, str]] = {}
@@ -839,6 +1024,7 @@ def domain_id(occurrence: str, target: str) -> str:
 def graph_and_applicability(
     deployment: dict[str, Any],
     family: dict[str, Any],
+    runtime_configuration: dict[str, Any],
     refs: dict[str, dict[str, str]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     occurrence = deployment["component_occurrence_id"]
@@ -849,23 +1035,24 @@ def graph_and_applicability(
     stop_ref = refs["stop"]
     control_ref = refs["provider:control"]
     planning_ref = refs["provider:planning"]
+    logical_scene_ref = refs["provider:logical_scene"]
     runtime_unit_id = f"{occurrence}.native_execution"
     model_instance_id = f"{occurrence}.model"
 
     arm_resources = [
         {
             "resource_role_id": "arm_joints",
-            "resource_id": f"{occurrence}.arm.{joint}",
+            "resource_id": f"{occurrence}.arm.coordinate.{index:06d}",
         }
-        for joint in source_joint_names(family, "arm_joints")
+        for index, _ in enumerate(source_joint_names(family, "arm_joints"))
     ]
     finger_joints = source_joint_names(family, "fingers")
     gripper_resources = [
         {
             "resource_role_id": "fingers",
-            "resource_id": f"{occurrence}.gripper.{joint}",
+            "resource_id": f"{occurrence}.gripper.coordinate.{index:06d}",
         }
-        for joint in finger_joints
+        for index, _ in enumerate(finger_joints)
     ] or [
         {
             "resource_role_id": "fingers",
@@ -925,7 +1112,7 @@ def graph_and_applicability(
                 "runtime_profile_id": runtime_ref["record_id"],
                 "runtime_profile_revision": runtime_ref["record_revision"],
                 "dependency_runtime_unit_ids": [],
-                "configuration": {},
+                "configuration": copy.deepcopy(runtime_configuration),
             }
         ],
         "model_instances": [
@@ -1039,6 +1226,29 @@ def graph_and_applicability(
                     ],
                 }
             )
+    for capability_id in CELL_CAPABILITIES:
+        provider_bindings.append(
+            {
+                "capability_provider_binding_id": (
+                    f"{deployment['cell_id']}.{capability_id.replace('.', '-')}.provider"
+                ),
+                "capability_provider_binding_revision": ZERO_DIGEST,
+                **capability_selector(capability_id),
+                "scope": "cell_global",
+                "target": {"cell_id": deployment["cell_id"]},
+                "provider_instance_id": f"{deployment['cell_id']}.logical_scene",
+                "provider_manifest_id": logical_scene_ref["record_id"],
+                "provider_manifest_revision": logical_scene_ref["record_revision"],
+                "endpoint_bindings": [
+                    {
+                        "endpoint_role_id": "logical_scene_services",
+                        "source_kind": "runtime_unit",
+                        "source_id": runtime_unit_id,
+                        "source_endpoint_role_id": "logical_scene_services",
+                    }
+                ],
+            }
+        )
     provider_bindings.sort(key=lambda row: row["capability_provider_binding_id"])
     return graph, desired, provider_bindings
 
@@ -1175,23 +1385,31 @@ def deployment_candidate(
     deployment: dict[str, Any],
     family: dict[str, Any],
     profiles_by_id: dict[str, dict[str, Any]],
+    runtime_profiles_by_id: dict[str, dict[str, Any]],
     profiles: dict[str, Any],
     refs: dict[str, dict[str, str]],
     overlay_ref: dict[str, str],
 ) -> dict[str, Any]:
     graph, desired, provider_bindings = graph_and_applicability(
-        deployment, family, refs
+        deployment,
+        family,
+        runtime_profiles_by_id[deployment["runtime_restoration_profile_id"]][
+            "native_runtime"
+        ],
+        refs,
     )
     family_id = family["model_family_id"]
     catalog_keys = {
         *(f"capability:{capability_id}" for capability_id in ARM_CAPABILITIES),
         *(f"capability:{capability_id}" for capability_id in GRIPPER_CAPABILITIES),
+        *(f"capability:{capability_id}" for capability_id in CELL_CAPABILITIES),
         "command_schema",
         f"component:{family_id}",
         "contract:arm",
         "contract:gripper",
         f"model:{family_id}",
         "provider:control",
+        "provider:logical_scene",
         "provider:planning",
         "runtime",
         "stop",
@@ -1200,14 +1418,21 @@ def deployment_candidate(
     }
     profile_id = deployment["assistant_profile_id"]
     if profile_id is not None:
-        catalog_keys.update(
-            {
-                "capability:assistant.bridge.request",
-                "capability:assistant.model.invoke",
-                "provider:assistant_bridge",
-                "provider:model_endpoint",
-            }
-        )
+        profile = profiles_by_id[profile_id]
+        if profile["model_endpoints"]:
+            catalog_keys.update(
+                {
+                    "capability:assistant.model.invoke",
+                    "provider:model_endpoint",
+                }
+            )
+        if profile["provider_alias"] is not None:
+            catalog_keys.update(
+                {
+                    "capability:assistant.bridge.request",
+                    "provider:assistant_bridge",
+                }
+            )
     records = [refs[key] for key in catalog_keys]
     records.sort(
         key=lambda row: (
@@ -1257,9 +1482,10 @@ def refresh_cross_revisions(path: Path) -> None:
             ]["control_binding_revision"]
     for provider in value["capability_provider_bindings"]:
         target = provider["target"]
-        target["control_binding_revision"] = bindings[target["control_binding_id"]][
-            "control_binding_revision"
-        ]
+        if provider["scope"] == "target_binding":
+            target["control_binding_revision"] = bindings[
+                target["control_binding_id"]
+            ]["control_binding_revision"]
     replace_file(path, pretty_bytes(value))
 
 
@@ -1302,6 +1528,8 @@ def role_assignments(
             program = read_yaml(root / assignment["program_source"], "maintained Program")
             rows.append(
                 {
+                    "scenario_id": assignment["scenario_id"],
+                    "scenario_aliases": copy.deepcopy(assignment["scenario_aliases"]),
                     "deployment_artifact_id": deployment["deployment_artifact_id"],
                     "deployment_revision": deployment_value["deployment_revision"],
                     "deployment_source": deployment_source,
@@ -1314,6 +1542,73 @@ def role_assignments(
             )
     rows.sort(key=lambda row: (row["deployment_source"], row["program_source"]))
     return {"api_version": ROLE_ASSIGNMENTS_API, "assignments": rows}
+
+
+def historical_capability_closure() -> dict[str, Any]:
+    active_ids = sorted(
+        set(ARM_CAPABILITIES + GRIPPER_CAPABILITIES + CELL_CAPABILITIES)
+    )
+    if len(active_ids) != 36:
+        raise GenerationError(
+            "historical capability closure must contain exactly 36 active IDs"
+        )
+    rows: list[dict[str, Any]] = []
+    for capability_id in active_ids:
+        scope = CAPABILITIES[capability_id][1]
+        binding_kind = CAPABILITIES[capability_id][2]
+        if scope == "cell_global":
+            owner_boundary = "logical_scene"
+            applicability = ["cell_global"]
+        elif binding_kind == "control_binding":
+            owner_boundary = "native_control"
+            applicability = [
+                target
+                for target, capabilities in (
+                    ("arm", ARM_CAPABILITIES),
+                    ("gripper", GRIPPER_CAPABILITIES),
+                )
+                if capability_id in capabilities
+            ]
+        else:
+            owner_boundary = "native_planning"
+            applicability = [
+                target
+                for target, capabilities in (
+                    ("arm", ARM_CAPABILITIES),
+                    ("gripper", GRIPPER_CAPABILITIES),
+                )
+                if capability_id in capabilities
+            ]
+        if not applicability:
+            raise GenerationError(
+                f"historical capability {capability_id} has no exact applicability"
+            )
+        acceptance_steps = ["N6-a3", "N7"]
+        if capability_id in I8_REQUALIFIED_CAPABILITIES:
+            acceptance_steps.append("I8/P5")
+        rows.append(
+            {
+                "historical_capability_id": LEGACY_CAPABILITY_REPLACEMENTS.get(
+                    capability_id, capability_id
+                ),
+                "active_capability_id": capability_id,
+                "capability_definition_revision": CAPABILITIES[capability_id][0],
+                "scope": scope,
+                "binding_kind": binding_kind,
+                "applicability": applicability,
+                "owner_boundary": owner_boundary,
+                "acceptance_steps": acceptance_steps,
+                "runtime_claim_gate": (
+                    "I8/P5" if capability_id == "execution.stop.soft" else "N7"
+                ),
+                "disposition": "retained_binding_only_until_runtime_claim_gate",
+            }
+        )
+    return {
+        "api_version": "manyforge.maintained_historical_capability_closure.v1",
+        "historical_source_commit": "c4b075fa6dfb69e463c61f3efa8cfce8de681e8a",
+        "capabilities": rows,
+    }
 
 
 def generate(args: argparse.Namespace) -> None:
@@ -1348,6 +1643,10 @@ def generate(args: argparse.Namespace) -> None:
     profiles_by_id = {
         profile["profile_id"]: profile for profile in profiles["profiles"]
     }
+    runtime_profiles_by_id = {
+        profile["runtime_restoration_profile_id"]: profile
+        for profile in description["runtime_restoration_profiles"]
+    }
     sealed_values: dict[str, dict[str, Any]] = {}
     with tempfile.TemporaryDirectory(prefix="manyforge-n6-deployments-") as temporary:
         temporary_root = Path(temporary)
@@ -1356,6 +1655,7 @@ def generate(args: argparse.Namespace) -> None:
                 deployment,
                 family_by_id[deployment["model_family_id"]],
                 profiles_by_id,
+                runtime_profiles_by_id,
                 profiles,
                 refs,
                 overlay_ref,
@@ -1377,6 +1677,17 @@ def generate(args: argparse.Namespace) -> None:
             assignment_path,
             pretty_bytes(assignment_value),
             "maintained Program role assignments",
+        )
+    )
+    capability_closure_path = (
+        root
+        / "manyforge_deployment/resources/maintained/maintained_historical_capability_closure.v1.json"
+    )
+    outputs.append(
+        (
+            capability_closure_path,
+            pretty_bytes(historical_capability_closure()),
+            "maintained historical capability closure",
         )
     )
     for path, payload, label in outputs:

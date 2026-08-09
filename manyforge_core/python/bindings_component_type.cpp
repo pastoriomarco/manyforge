@@ -162,13 +162,17 @@ void register_component_type_bindings(py::module_& module) {
 
   py::class_<ComponentTypeLocalResourceRoleDTO>(
       module, "ComponentTypeLocalResourceRoleDTO", py::is_final())
-      .def(py::init([](ResourceRoleId resource_role_id) {
+      .def(py::init([](ResourceRoleId resource_role_id,
+                       std::optional<CoordinateKind> coordinate_kind) {
              return ComponentTypeLocalResourceRoleDTO{
-                 std::move(resource_role_id)};
+                 std::move(resource_role_id), coordinate_kind};
            }),
-           py::arg("resource_role_id"))
+           py::arg("resource_role_id"),
+           py::arg("coordinate_kind") = py::none())
       .def_readonly("resource_role_id",
                     &ComponentTypeLocalResourceRoleDTO::resource_role_id)
+      .def_readonly("coordinate_kind",
+                    &ComponentTypeLocalResourceRoleDTO::coordinate_kind)
       .def(py::self == py::self)
       .def(py::self != py::self);
 

@@ -28,7 +28,8 @@ require_native_runtime_unit(const CompilerQualifiedCellIr &compiler_ir,
       found->runtime_profile_revision.value() !=
           native_execution_runtime_profile_revision() ||
       !found->dependency_runtime_unit_ids.empty() ||
-      !found->configuration.empty()) {
+      !native_execution_runtime_configuration_is_qualified(
+          found->configuration)) {
     fail_retained_bundle(
         "runtime unit does not select the closed native execution row");
   }
@@ -51,6 +52,8 @@ require_native_runtime_unit(const CompilerQualifiedCellIr &compiler_ir,
               std::string(kNativeExecutionRuntimeRoleId))} ||
       profile->value().source_endpoint_role_ids !=
           std::vector<core::EndpointRoleId>{
+              core::EndpointRoleId(std::string(
+                  kNativeExecutionRuntimeLogicalSceneEndpointRoleId)),
               core::EndpointRoleId(
                   std::string(kNativeExecutionRuntimeStatusEndpointRoleId)),
               core::EndpointRoleId(std::string(

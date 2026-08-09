@@ -349,9 +349,14 @@ void replace_file_atomically(const std::filesystem::path &path,
                       "maintained source description");
   const auto parsed =
       deployment::parse_strict_json_model_yaml(description_bytes);
-  constexpr std::array<std::string_view, 4U> kDescriptionFields{
-      "api_version", "deployments", "historical_source_commit",
-      "model_families"};
+  constexpr std::array<std::string_view, 7U> kDescriptionFields{
+      "api_version",
+      "assistant_profiles_source",
+      "deployments",
+      "historical_program_sources",
+      "historical_source_commit",
+      "model_families",
+      "runtime_restoration_profiles"};
   require_shape(parsed.root(), kDescriptionFields, "description");
   if (require_text(
           require_member(parsed.root(), "api_version", "description"),

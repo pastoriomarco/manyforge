@@ -23,7 +23,7 @@ catalog_schemas:
     qualification: qualified
   - record_kind: component_type
     schema_id: manyforge.component_type.v1
-    schema_revision: sha256:fdd03c397fb792d387002df453055d9ccd7d1826ae41d3b0706e5f7c27480d87
+    schema_revision: sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009
     relative_path: catalog/manyforge.component_type.v1.yaml
     qualification: qualified
   - record_kind: contact_policy
@@ -70,4 +70,8 @@ value_schemas:
   - schema_id: manyforge.value_schema.runtime.empty.v1
     schema_revision: sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785
     relative_path: value/manyforge.value_schema.runtime.empty.v1.yaml
+    qualification: qualified
+  - schema_id: manyforge.value_schema.runtime.native_execution.v1
+    schema_revision: sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e
+    relative_path: value/manyforge.value_schema.runtime.native_execution.v1.yaml
     qualification: qualified

@@ -1,0 +1,625 @@
+{
+  "api_version": "manyforge.maintained_historical_capability_closure.v1",
+  "capabilities": [
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7",
+        "I8/P5"
+      ],
+      "active_capability_id": "collision.query.detailed",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:59cfd352c4a08e315f95c2cb93ada8d2a16a6d2155f83b1c7603e9643088f73b",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "context.collision.check.detailed",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7",
+        "I8/P5"
+      ],
+      "active_capability_id": "collision.query.pre_execution",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:c45cdcea2f79fbef5d1bc95db064078560c7d5d161b72667a5ce2c72a7432eca",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "context.collision.check",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7",
+        "I8/P5"
+      ],
+      "active_capability_id": "execution.contact.geometric",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:63a3d877d78d71a5932cce5c92d2932b740fbba6e88d00ca3b5dd94429e3eb3d",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "execution.contact.geometric",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7",
+        "I8/P5"
+      ],
+      "active_capability_id": "execution.contact.geometric_signed_penetration",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:b2f0e892d401460c6b43b1c1b8b39a0cad5fcc130ba694c2c5e32d6cc2d8c323",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "execution.contact.geometric_signed_penetration",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "execution.feedback.phase_events",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:37a4b6d145a96b0336ad03680c3222a63da28168764663cee7f5185fcbd467da",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "execution.feedback.phase_events",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "execution.feedback.state_snapshots",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:bdcd8c70d34d34bba3735e6e1b191cade422d9b50223afed895465e0062be85a",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "execution.feedback.state_snapshots",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "execution.pause",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "execution.pause",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "execution.reset",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "execution.reset",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "execution.resume",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "execution.resume",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7",
+        "I8/P5"
+      ],
+      "active_capability_id": "execution.stop.soft",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "execution.stop.soft",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "I8/P5",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "execution.trajectory.execute",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:7e5958db0906b84cb4e5c68ab0ef896f74dc0ba49a9ceb4d918b386abaf9f28c",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "execution.trajectory.execute",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "model.kinematics.fk",
+      "applicability": [
+        "arm",
+        "gripper"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "context.kinematics.fk",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "model.limits.joint",
+      "applicability": [
+        "arm",
+        "gripper"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "context.limits.joint",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "observability.trace.scene",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:aa079df5821ad6ad0fdfc15f15368ca6682cd17dd1c804998e4e954fe1979180",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "observability.trace.scene",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "planning.motion.cartesian_path",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "planning.motion.cartesian_path",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "planning.motion.joint_goal",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "planning.motion.joint_goal",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "planning.motion.pose_goal",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "planning.motion.pose_goal",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "planning.profile.balanced",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "planning.profile.balanced",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "planning.profile.first_feasible",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "planning.profile.first_feasible",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "planning.profile.quality_bounded",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "planning.profile.quality_bounded",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "planning.trajectory.time_parameterized",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "planning.trajectory.time_parameterized",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.edit.add",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:9f7fbd7203abe565edfb6468d9e52fa15c028f3636615eb62a8d5e8e0c84fea5",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "scene.edit.add",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.edit.attach_detach",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:444c80303025e78b49df614d71c7df35d0f40867cb0901a8bd0117e65d50eed2",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "scene.edit.attach_detach",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.edit.remove",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:c19f72293c0b9f54b24e8f165b27112e3ad8496e1d319f0d20d74b7eee6951bc",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "scene.edit.remove",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.edit.update_pose",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:2289472ab0392c94e512d8bfe65406ef7a7ffafb73b40381bd36f627248de4f3",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "scene.edit.update_pose",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.edit.upsert",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:01668536a12a75af7024ce6dd1248ce5fd18f25f75d1fadfb953b4b7da0ed1f2",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "scene.edit.upsert",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.object.query",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:59bad10b1c6eea73c493dbba88cf15befe3345d32bbebd0b7c7fce4947531109",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "context.scene.object_query",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.reference.resolve",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:4f66fab4656567598a11844b3b2572112b5239d9eaca4a538f90e082db7154d9",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "context.pose.resolve_reference",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.shape.box",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:76e9a3ca351e30e271ec75e3b6de1ea42a718f81cca35cda6bab4ee642e1e12d",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "scene.shape.box",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.shape.cylinder",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:4ffc860d1851db9b3a7fd82f5e9bd88eb1eca624dba372852fb2912fab9e34d5",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "scene.shape.cylinder",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.shape.mesh",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:5ea0a60f5d788c2133419b84f110f0edc033405c7bfd7385086888f09bd2779e",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "scene.shape.mesh",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "scene.shape.sphere",
+      "applicability": [
+        "cell_global"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:d84d92a0e0d9592ead27340278315b3a691c18a902fec44bc99626f36d9bc8f2",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "scene.shape.sphere",
+      "owner_boundary": "logical_scene",
+      "runtime_claim_gate": "N7",
+      "scope": "cell_global"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "state.observed.current",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:c1ec4dacead10e33176830d634e9b2287e4b96322a54700c1c3910bcba461c02",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "context.state.current",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "tool.gripper.command",
+      "applicability": [
+        "gripper"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:a24b841e7c0323815a3576869d5819340bc6a98f1c2ffd5b47131e26698e9392",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "tool.gripper.command",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "tool.gripper.feedback",
+      "applicability": [
+        "gripper"
+      ],
+      "binding_kind": "control_binding",
+      "capability_definition_revision": "sha256:53cebcf32900bf3fab41aeb490a9176d3130ae53c1a289c954f1eb8d07738e23",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "tool.gripper.feedback",
+      "owner_boundary": "native_control",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    },
+    {
+      "acceptance_steps": [
+        "N6-a3",
+        "N7"
+      ],
+      "active_capability_id": "validation.trajectory.non_collision",
+      "applicability": [
+        "arm"
+      ],
+      "binding_kind": "capability_provider_binding",
+      "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
+      "disposition": "retained_binding_only_until_runtime_claim_gate",
+      "historical_capability_id": "context.validation.trajectory",
+      "owner_boundary": "native_planning",
+      "runtime_claim_gate": "N7",
+      "scope": "target_binding"
+    }
+  ],
+  "historical_source_commit": "c4b075fa6dfb69e463c61f3efa8cfce8de681e8a"
+}

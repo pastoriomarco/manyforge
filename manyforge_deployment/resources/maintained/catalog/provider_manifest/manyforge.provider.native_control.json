@@ -2,8 +2,64 @@
   "api_version": "manyforge.provider_manifest.v1",
   "offered_capabilities": [
     {
+      "capability_definition_revision": "sha256:63a3d877d78d71a5932cce5c92d2932b740fbba6e88d00ca3b5dd94429e3eb3d",
+      "capability_id": "execution.contact.geometric",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:b2f0e892d401460c6b43b1c1b8b39a0cad5fcc130ba694c2c5e32d6cc2d8c323",
+      "capability_id": "execution.contact.geometric_signed_penetration",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
       "capability_definition_revision": "sha256:37a4b6d145a96b0336ad03680c3222a63da28168764663cee7f5185fcbd467da",
       "capability_id": "execution.feedback.phase_events",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:bdcd8c70d34d34bba3735e6e1b191cade422d9b50223afed895465e0062be85a",
+      "capability_id": "execution.feedback.state_snapshots",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:20f45f87bb6ad07f4b180c2e7c781347016c64c89808ae04a41f1dff50b7085e",
+      "capability_id": "execution.pause",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
+      "capability_id": "execution.reset",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:442663e2f2283bb503f89a21e760b732150424cd44c504a55de26e621f99e142",
+      "capability_id": "execution.resume",
+      "required_endpoint_role_ids": [
+        "command",
+        "state"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9",
+      "capability_id": "execution.stop.soft",
       "required_endpoint_role_ids": [
         "command",
         "state"
@@ -44,5 +100,5 @@
   ],
   "provider_contracts": [],
   "provider_manifest_id": "manyforge.provider.native_control",
-  "provider_manifest_revision": "sha256:6f8567a91c622419a69105777db5cfb2dd19502aa970978b6c8463e72eb96d95"
+  "provider_manifest_revision": "sha256:6fa8317ddf53ae5bf1fdd164a587cfa138b637845aafdccfa1c1e82068f385d7"
 }

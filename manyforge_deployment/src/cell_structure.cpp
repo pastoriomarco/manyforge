@@ -241,7 +241,7 @@ void require_asset_root(
           } else {
             result.resources.emplace_back(
                 StructuralComponentLocalResourceResolution{
-                    selected.resource_role_id});
+                    selected.resource_role_id, selected.coordinate_kind});
           }
         },
         resource);

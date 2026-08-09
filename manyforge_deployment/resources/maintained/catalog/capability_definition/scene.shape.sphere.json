@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:d84d92a0e0d9592ead27340278315b3a691c18a902fec44bc99626f36d9bc8f2",
+  "capability_id": "scene.shape.sphere",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

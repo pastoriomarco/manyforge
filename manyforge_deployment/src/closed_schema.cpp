@@ -28,6 +28,7 @@
 #include "embedded_controller_topology_schema.hpp"
 #include "embedded_empty_runtime_configuration_schema.hpp"
 #include "embedded_empty_provider_contract_schema.hpp"
+#include "embedded_native_execution_runtime_configuration_schema.hpp"
 #include "embedded_model_asset_schema.hpp"
 #include "embedded_provider_manifest_schema.hpp"
 #include "embedded_runtime_profile_schema.hpp"
@@ -1819,11 +1820,13 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        "catalog/manyforge.stop_evidence_policy.v1.yaml",
        detail::kEmbeddedStopEvidencePolicySchema},
   }};
-  const std::array<QualifiedValueSchemaSource, 2U> qualified_value_sources{{
+  const std::array<QualifiedValueSchemaSource, 3U> qualified_value_sources{{
       {"value/manyforge.value_schema.provider_contract.empty.v1.yaml",
        detail::kEmbeddedEmptyProviderContractSchema},
       {"value/manyforge.value_schema.runtime.empty.v1.yaml",
        detail::kEmbeddedEmptyRuntimeConfigurationSchema},
+      {"value/manyforge.value_schema.runtime.native_execution.v1.yaml",
+       detail::kEmbeddedNativeExecutionRuntimeConfigurationSchema},
   }};
 
   auto storage = std::make_shared<Storage>();

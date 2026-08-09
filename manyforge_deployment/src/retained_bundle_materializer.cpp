@@ -589,6 +589,31 @@ void require_exact_requalified_catalog_record(
   }
 }
 
+[[nodiscard]] std::vector<QualifiedCapabilityDefinition>
+select_component_capability_dependencies(
+    const QualifiedComponentType& component,
+    std::span<const QualifiedCapabilityDefinition> deployment_capabilities) {
+  std::vector<QualifiedCapabilityDefinition> result;
+  for (const auto& capability : deployment_capabilities) {
+    const bool selected = std::any_of(
+        component.value().command_targets.begin(),
+        component.value().command_targets.end(), [&](const auto& target) {
+          return std::any_of(
+              target.capabilities.begin(), target.capabilities.end(),
+              [&](const auto& dependency) {
+                return dependency.capability_id ==
+                           capability.value().capability_id &&
+                       dependency.capability_definition_revision ==
+                           capability.value().capability_definition_revision;
+              });
+        });
+    if (selected) {
+      result.push_back(capability);
+    }
+  }
+  return result;
+}
+
 template <typename Record>
 [[nodiscard]] core::RetainedSourceRecordDTO retained_source_record(
     const Record& record) {
@@ -753,7 +778,8 @@ void require_qualified_structural_subset_before_store(
                  unit.runtime_profile_revision.value() ==
                      detail::native_execution_runtime_profile_revision() &&
                  unit.dependency_runtime_unit_ids.empty() &&
-                 unit.configuration.empty();
+                 detail::native_execution_runtime_configuration_is_qualified(
+                     unit.configuration);
         });
     const auto exact_runtime_owner = [&](const auto &owner) {
       return has_runtime_units ? owner.runtime_unit_ids.size() == 1U
@@ -1108,17 +1134,30 @@ prepare_planning_collision_product_before_store(
           } else if constexpr (std::is_same_v<
                                    Record,
                                    core::ComponentTypeCatalogRecordRefDTO>) {
+            const auto& compiler_components =
+                qualified.compiler_ir().applicability().composition()
+                    .component_types();
+            const auto component = std::find_if(
+                compiler_components.begin(), compiler_components.end(),
+                [&](const auto& candidate) {
+                  return candidate.reference() == typed_reference;
+                });
+            if (component == compiler_components.end()) {
+              detail::fail_retained_bundle(
+                  "component type is absent from the compiler-qualified "
+                  "closure");
+            }
+            const auto dependencies = select_component_capability_dependencies(
+                *component,
+                qualified.compiler_ir().applicability()
+                    .capability_definitions());
             const auto requalified = resolve_and_qualify_component_type(
                 typed_reference,
                 typed_reference.content_addressed_store_key,
-                catalog_bytes,
-                std::span<const QualifiedCapabilityDefinition>(
-                    qualified.compiler_ir().applicability()
-                        .capability_definitions()));
+                catalog_bytes, dependencies);
             require_exact_requalified_catalog_record(
                 requalified,
-                qualified.compiler_ir().applicability().composition()
-                    .component_types(),
+                compiler_components,
                 "component type");
           } else if constexpr (std::is_same_v<
                                    Record,

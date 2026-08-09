@@ -1444,26 +1444,44 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
       }
     }
 
-    const auto* coordinate_map = retained_model_map.find_binding(
-        target_binding.controllable_component_id,
-        target_binding.command_target_id);
     for (const auto& resource_binding : target_binding.resource_role_bindings) {
-      if (coordinate_map == nullptr) {
-        fail("resource-role binding has no unambiguous retained control binding map");
-      }
-      std::vector<core::ResourceId> expected_ids;
-      std::vector<std::string> expected_names;
-      for (const auto& row : coordinate_map->resources) {
-        if (row.resource_role_id != resource_binding.resource_role_id) {
+      std::optional<std::pair<std::vector<core::ResourceId>,
+                              std::vector<std::string>>>
+          expected;
+      for (const auto& coordinate_map : retained_model_map.control_bindings()) {
+        if (coordinate_map.controllable_component_id !=
+                target_binding.controllable_component_id ||
+            coordinate_map.command_target_id !=
+                target_binding.command_target_id) {
           continue;
         }
-        expected_ids.push_back(row.resource_id);
-        expected_names.push_back(row.coordinates.empty()
-                                     ? row.resource_id.value()
-                                     : row.coordinates.front().compiled_joint_name);
+        std::vector<core::ResourceId> candidate_ids;
+        std::vector<std::string> candidate_names;
+        for (const auto& row : coordinate_map.resources) {
+          if (row.resource_role_id != resource_binding.resource_role_id) {
+            continue;
+          }
+          candidate_ids.push_back(row.resource_id);
+          candidate_names.push_back(
+              row.coordinates.empty()
+                  ? row.resource_id.value()
+                  : row.coordinates.front().compiled_joint_name);
+        }
+        if (candidate_ids.empty()) {
+          continue;
+        }
+        auto candidate = std::pair{std::move(candidate_ids),
+                                   std::move(candidate_names)};
+        if (expected.has_value() && *expected != candidate) {
+          fail("resource-role binding has conflicting retained control maps");
+        }
+        expected = std::move(candidate);
       }
-      if (expected_ids != resource_binding.resource_ids ||
-          expected_names != resource_binding.compiled_resource_names) {
+      if (!expected.has_value()) {
+        fail("resource-role binding has no retained control map");
+      }
+      if (expected->first != resource_binding.resource_ids ||
+          expected->second != resource_binding.compiled_resource_names) {
         fail("resource-role binding differs from the retained coordinate map");
       }
     }

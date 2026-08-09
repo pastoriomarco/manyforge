@@ -472,9 +472,20 @@ struct ResolvedResourceRole final {
 
 [[nodiscard]] ResolvedResourceRole resolve_resource_role(
     const VerifiedRetainedModelMap& model_map,
+    const core::ComponentTypeCommandTargetDTO& target_type,
     const core::ControllableComponentId& component_id,
     const core::CommandTargetId& target_id,
     const core::ResourceRoleId& resource_role_id) {
+  const auto declared_role = std::find_if(
+      target_type.resource_roles.begin(), target_type.resource_roles.end(),
+      [&](const auto& value) {
+        return core::resource_role_id(value) == resource_role_id;
+      });
+  if (declared_role == target_type.resource_roles.end()) {
+    fail("target resource role is absent from the component type");
+  }
+  const auto* local_role =
+      std::get_if<core::ComponentTypeLocalResourceRoleDTO>(&*declared_role);
   std::optional<ResolvedResourceRole> result;
   for (const auto& coordinate_map : model_map.control_bindings()) {
     if (coordinate_map.controllable_component_id != component_id ||
@@ -492,11 +503,24 @@ struct ResolvedResourceRole final {
           row.coordinates.empty()
               ? row.resource_id.value()
               : row.coordinates.front().compiled_joint_name);
-      candidate.coordinate_kinds.push_back(
-          row.coordinates.empty()
-              ? std::nullopt
-              : std::optional<core::CoordinateKind>(
-                    coordinate_kind(row.coordinates.front().coordinate_kind)));
+      if (row.coordinates.empty()) {
+        if (local_role == nullptr ||
+            row.component_local_coordinate_kind !=
+                local_role->coordinate_kind) {
+          fail("component-local resource coordinate kind differs from its "
+               "component type");
+        }
+        candidate.coordinate_kinds.push_back(
+            row.component_local_coordinate_kind);
+      } else {
+        if (local_role != nullptr ||
+            row.component_local_coordinate_kind.has_value()) {
+          fail("model-backed resource carries component-local coordinate "
+               "semantics");
+        }
+        candidate.coordinate_kinds.push_back(
+            coordinate_kind(row.coordinates.front().coordinate_kind));
+      }
     }
     if (candidate.binding.resource_ids.empty()) {
       continue;
@@ -626,18 +650,27 @@ void validate_command_schema_target(
 
   std::vector<core::CoordinateKind> coordinate_kinds;
   for (const auto& role : selected_roles) {
-    if (std::none_of(target_type.resource_roles.begin(),
-                     target_type.resource_roles.end(), [&](const auto& value) {
-                       return core::resource_role_id(value) == role;
-                     })) {
+    const auto declared_role = std::find_if(
+        target_type.resource_roles.begin(), target_type.resource_roles.end(),
+        [&](const auto& value) {
+          return core::resource_role_id(value) == role;
+        });
+    if (declared_role == target_type.resource_roles.end()) {
       fail("command schema selects a role absent from the command target");
     }
+    const bool component_local =
+        std::holds_alternative<core::ComponentTypeLocalResourceRoleDTO>(
+            *declared_role);
     const auto resolved = resolve_resource_role(
-        model_map, component_id, target_type.command_target_id, role);
+        model_map, target_type, component_id,
+        target_type.command_target_id, role);
     for (const auto& kind : resolved.coordinate_kinds) {
       if (!kind.has_value()) {
-        fail("scalar command schema selects a resource without a scalar "
-             "model coordinate");
+        fail(component_local
+                 ? "scalar command schema requires an explicit "
+                   "component-local coordinate kind"
+                 : "scalar command schema has no exact model coordinate "
+                   "kind");
       }
       coordinate_kinds.push_back(*kind);
     }
@@ -1113,7 +1146,7 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
           fail("target role requires a resource absent from its component type");
         }
         resources.push_back(resolve_resource_role(
-                                retained_model_map,
+                                retained_model_map, target_type,
                                 component.controllable_component_id,
                                 target_assignment.command_target_id, role)
                                 .binding);

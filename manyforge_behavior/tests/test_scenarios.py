@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -17,6 +19,7 @@ from manyforge_behavior.scenarios import (
     PROGRAM_BINDING_API,
     RETAINED_BUNDLE_API,
     SCENARIO_CATALOG_API,
+    NativeScenarioArtifactClosureVerifier,
     Scenario,
     ScenarioArtifactClosure,
     ScenarioCatalog,
@@ -231,6 +234,116 @@ def test_exact_v1_scenario_closure_is_discovered_and_verified(
     assert closure.node_environment_digest == environment.environment_digest
 
 
+def test_native_verifier_adapter_reuses_program_values_and_forwards_exact_closure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = build_node_environment()
+    program_path = (
+        Path(__file__).resolve().parents[2] / "examples" / "pick_and_place.program.yaml"
+    )
+    captured: list[tuple[object, ...]] = []
+    returned: list[tuple[object, object]] = [("manyforge-only", False)]
+
+    def verify(*args: object) -> tuple[object, object]:
+        captured.append(args)
+        return returned[0]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "manyforge_core_py",
+        SimpleNamespace(verify_scenario_artifact_closure=verify),
+    )
+    closure = ScenarioArtifactClosure(
+        scenario_id="ur5_pick_and_place",
+        scenario_catalog_revision="sha256:" + "1" * 64,
+        repository_root=program_path.parent,
+        scenario_catalog_path=program_path,
+        deployment_path=program_path,
+        retained_bundle_path=program_path,
+        program_binding_path=program_path,
+        program_path=program_path,
+        deployment_artifact_id="ur5_roboplan_local_pick_place",
+        deployment_revision="sha256:" + "2" * 64,
+        retained_bundle_id="sha256:" + "3" * 64,
+        program_binding_id="sha256:" + "4" * 64,
+        graph_revision="sha256:" + "5" * 64,
+        program_id="pick_and_place_demo",
+        program_revision="sha256:" + "6" * 64,
+        node_environment_digest=environment.environment_digest,
+        assistant_mode="forbidden",
+        typed_parameter_overrides_json='{"velocity_scale":0.6}',
+    )
+
+    result = NativeScenarioArtifactClosureVerifier(environment).verify(closure)
+
+    assert result == VerifiedScenarioMetadata(
+        lane="manyforge-only", assistant_enabled=False
+    )
+    assert len(captured) == 1
+    assert captured[0][0] == "ur5_pick_and_place"
+    assert captured[0][-1] == '{"velocity_scale":0.6}'
+
+    returned[0] = ("manyforge-only", 0)
+    with pytest.raises(ValueError, match="invalid assistant state"):
+        NativeScenarioArtifactClosureVerifier(environment).verify(closure)
+
+
+@pytest.mark.parametrize(
+    ("overrides_json", "message"),
+    (
+        ('{"unknown":1}', "undeclared parameter"),
+        ('{"velocity_scale":"fast"}', "does not match float64"),
+        ('{"velocity_scale":0.0}', "violates min_exclusive"),
+    ),
+)
+def test_native_verifier_adapter_rejects_invalid_override_before_native_call(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides_json: str,
+    message: str,
+) -> None:
+    environment = build_node_environment()
+    program_path = (
+        Path(__file__).resolve().parents[2] / "examples" / "pick_and_place.program.yaml"
+    )
+    called = False
+
+    def verify(*args: object) -> tuple[str, bool]:
+        del args
+        nonlocal called
+        called = True
+        return "manyforge-only", False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "manyforge_core_py",
+        SimpleNamespace(verify_scenario_artifact_closure=verify),
+    )
+    closure = ScenarioArtifactClosure(
+        scenario_id="ur5_pick_and_place",
+        scenario_catalog_revision="sha256:" + "1" * 64,
+        repository_root=program_path.parent,
+        scenario_catalog_path=program_path,
+        deployment_path=program_path,
+        retained_bundle_path=program_path,
+        program_binding_path=program_path,
+        program_path=program_path,
+        deployment_artifact_id="ur5_roboplan_local_pick_place",
+        deployment_revision="sha256:" + "2" * 64,
+        retained_bundle_id="sha256:" + "3" * 64,
+        program_binding_id="sha256:" + "4" * 64,
+        graph_revision="sha256:" + "5" * 64,
+        program_id="pick_and_place_demo",
+        program_revision="sha256:" + "6" * 64,
+        node_environment_digest=environment.environment_digest,
+        assistant_mode="forbidden",
+        typed_parameter_overrides_json=overrides_json,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        NativeScenarioArtifactClosureVerifier(environment).verify(closure)
+    assert not called
+
+
 def test_scenarios_are_globally_deterministic_across_root_order(
     tmp_path: Path,
 ) -> None:
@@ -267,7 +380,7 @@ def test_missing_scenario_root_is_a_structured_discovery_error(
         )
 
 
-def test_repository_artifacts_must_be_canonical_and_root_local(
+def test_repository_canonicality_is_delegated_to_qualified_closure_verifier(
     tmp_path: Path,
 ) -> None:
     environment = build_node_environment()
@@ -276,12 +389,16 @@ def test_repository_artifacts_must_be_canonical_and_root_local(
     value = json.loads(binding_path.read_text(encoding="utf-8"))
     binding_path.write_text(json.dumps(value, indent=2), encoding="utf-8")
 
+    verifier = _RecordingQualifiedVerifier(
+        "Program Binding repository bytes are not canonical JSON"
+    )
     with pytest.raises(ScenarioDiscoveryError, match="not canonical JSON"):
         discover_scenarios(
             [tmp_path],
             node_environment=environment,
-            closure_verifier=_RecordingQualifiedVerifier(),
+            closure_verifier=verifier,
         )
+    assert len(verifier.closures) == 1
 
 
 def test_qualified_closure_rejection_is_a_structured_discovery_error(

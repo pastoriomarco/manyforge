@@ -19,6 +19,8 @@ inline constexpr std::string_view kStatusEndpointRoleId =
     "native_execution_status";
 inline constexpr std::string_view kProjectionEndpointRoleId =
     "planner_scene_projection";
+inline constexpr std::string_view kLogicalSceneEndpointRoleId =
+    "logical_scene_services";
 inline constexpr std::string_view kImplementationId =
     "manyforge.native_execution_host";
 inline constexpr std::string_view kProcessAdapterContractId =
@@ -29,6 +31,8 @@ inline constexpr std::string_view kStatusEndpointContractId =
     "manyforge.native_execution.status_direct";
 inline constexpr std::string_view kProjectionEndpointContractId =
     "manyforge.planner_scene_projection.rpc";
+inline constexpr std::string_view kLogicalSceneEndpointContractId =
+    "manyforge.logical_scene.services";
 inline constexpr std::string_view kOperatingSystem = "linux";
 inline constexpr std::string_view kLaunchEnvironmentContract =
     "manyforge.native_execution_host.abi.v1";

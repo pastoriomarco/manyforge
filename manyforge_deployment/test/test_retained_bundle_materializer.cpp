@@ -991,11 +991,24 @@ TEST(RetainedBundleMaterializer,
       raw_store);
   EXPECT_EQ(launch_descriptor,
             detail::native_execution_runtime_launch_descriptor());
-  EXPECT_NO_THROW(static_cast<void>(
-      detail::parse_and_verify_native_execution_runtime_manifest(manifest)));
+  const auto parsed_manifest =
+      detail::parse_and_verify_native_execution_runtime_manifest(manifest);
+  EXPECT_EQ(
+      canonical_json(member(parsed_manifest, "configuration")),
+      R"({"collision_monitor_period_ms":50,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"mode":"simulated","planner_rng_seed":12345})");
   EXPECT_NO_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
           manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
+  const std::string changed_configuration = replace_once(
+      manifest, "\"execution_tick_hz\":100", "\"execution_tick_hz\":99");
+  EXPECT_NO_THROW(static_cast<void>(
+      detail::parse_and_verify_native_execution_runtime_manifest(
+          changed_configuration)));
+  EXPECT_THROW(
+      detail::require_native_execution_runtime_product_matches_retained_bundle(
+          changed_configuration, launch_descriptor, bundle->value(),
+          group.runtime_unit_id),
+      RetainedBundleError);
 
   test::InMemoryCatalogArtifactStoreFixture second_catalog_store;
   test::InMemoryRawArtifactStoreFixture second_raw_store;
@@ -1095,7 +1108,7 @@ TEST(RetainedBundleMaterializer,
     std::string from;
     std::string to;
   };
-  const std::array<Mutation, 8U> mutations{{
+  const std::array<Mutation, 9U> mutations{{
       {"API version", "manyforge.native_execution_runtime_manifest.v1",
        "manyforge.native_execution_runtime_manifest.v2"},
       {"lifecycle", "manager_managed", "externally_managed"},
@@ -1107,6 +1120,8 @@ TEST(RetainedBundleMaterializer,
        "manyforge.native_execution.status_discovered"},
       {"projection endpoint", "manyforge.planner_scene_projection.rpc",
        "manyforge.planner_scene_projection.ros_topic"},
+      {"logical scene endpoint", "manyforge.logical_scene.services",
+       "manyforge.logical_scene.discovered"},
       {"operating system", "\"operating_system\":\"linux\"",
        "\"operating_system\":\"other\""},
       {"launch environment", "manyforge.native_execution_host.abi.v1",

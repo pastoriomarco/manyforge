@@ -14,7 +14,7 @@ CAPABILITY_SCHEMA_REVISION = (
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0"
 )
 COMPONENT_TYPE_SCHEMA_REVISION = (
-    "sha256:fdd03c397fb792d387002df453055d9ccd7d1826ae41d3b0706e5f7c27480d87"
+    "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
 )
 
 
@@ -151,8 +151,10 @@ def test_component_type_dto_surface_is_typed_read_only_and_uses_closed_union():
         asset_resource_role_id=core.ResourceRoleId("joints"),
     )
     local_resource = core.ComponentTypeLocalResourceRoleDTO(
-        resource_role_id=core.ResourceRoleId("vacuum")
+        resource_role_id=core.ResourceRoleId("vacuum"),
+        coordinate_kind=core.CoordinateKind.kLinear,
     )
+    assert local_resource.coordinate_kind == core.CoordinateKind.kLinear
 
     assert set(typing.get_args(core.ComponentTypeResourceRoleDTO)) == {
         core.ComponentTypeModelResourceRoleDTO,

@@ -72,14 +72,16 @@ void require_exact_closure(const Map& supplied, const Set& required,
   for (const auto& key : required) {
     if (!supplied.contains(key)) {
       fail(std::string(family) +
-           " is missing a selected exact qualified referent");
+           " is missing selected exact qualified referent '" + key.first +
+           "' at revision '" + key.second + "'");
     }
   }
   for (const auto& [key, unused] : supplied) {
     (void)unused;
     if (!required.contains(key)) {
       fail(std::string(family) +
-           " contains an unused exact qualified referent");
+           " contains unused exact qualified referent '" + key.first +
+           "' at revision '" + key.second + "'");
     }
   }
 }
@@ -1880,39 +1882,40 @@ void qualify_complete_capability_coverage(
           continue;
         }
 
-        for (const auto* anchor : target_bindings) {
-          const auto count = std::count_if(
-              inputs.capability_provider_bindings.begin(),
-              inputs.capability_provider_bindings.end(),
-              [&](const auto& candidate) {
-                if (candidate.capability_id !=
-                        declared.capability_id ||
-                    candidate.capability_definition_revision !=
-                        declared.capability_definition_revision ||
-                    candidate.scope !=
-                        core::CapabilityScope::kTargetBinding) {
-                  return false;
-                }
-                const auto* target_binding =
-                    std::get_if<
-                        core::TargetBindingCapabilityProviderTargetDTO>(
-                        &candidate.target);
-                return target_binding != nullptr &&
-                       target_binding->controllable_component_id ==
-                           component.controllable_component_id &&
-                       target_binding->component_type_revision ==
-                           component.component_type_revision &&
-                       target_binding->command_target_id ==
-                           target.command_target_id &&
-                       target_binding->control_binding_id ==
-                           anchor->control_binding_id &&
-                       target_binding->control_binding_revision ==
-                           anchor->control_binding_revision;
-              });
-          if (count != 1) {
-            fail("a capability-provider target capability does not have "
-                 "exactly one row for its target/control-binding anchor");
-          }
+        const auto count = std::count_if(
+            inputs.capability_provider_bindings.begin(),
+            inputs.capability_provider_bindings.end(),
+            [&](const auto& candidate) {
+              if (candidate.capability_id != declared.capability_id ||
+                  candidate.capability_definition_revision !=
+                      declared.capability_definition_revision ||
+                  candidate.scope != core::CapabilityScope::kTargetBinding) {
+                return false;
+              }
+              const auto* target_binding =
+                  std::get_if<core::TargetBindingCapabilityProviderTargetDTO>(
+                      &candidate.target);
+              if (target_binding == nullptr ||
+                  target_binding->controllable_component_id !=
+                      component.controllable_component_id ||
+                  target_binding->component_type_revision !=
+                      component.component_type_revision ||
+                  target_binding->command_target_id !=
+                      target.command_target_id) {
+                return false;
+              }
+              return std::any_of(
+                  target_bindings.begin(), target_bindings.end(),
+                  [&](const auto* anchor) {
+                    return target_binding->control_binding_id ==
+                               anchor->control_binding_id &&
+                           target_binding->control_binding_revision ==
+                               anchor->control_binding_revision;
+                  });
+            });
+        if (count != 1) {
+          fail("a capability-provider target capability does not select "
+               "exactly one applicable target/control-binding anchor");
         }
       }
     }

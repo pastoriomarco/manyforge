@@ -7,6 +7,7 @@ select runtime truth, compile a Program Binding, or dispatch robot work.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -27,9 +28,7 @@ SCENARIO_CATALOG_IDENTITY_DOMAIN: Final = "scenario-catalog-revision"
 PROGRAM_API: Final = "manyforge.program.v1"
 DEPLOYMENT_API: Final = "manyforge.deployment.v1"
 PROGRAM_BINDING_API: Final = "manyforge.program_binding.v1"
-PROGRAM_BINDING_IDENTITY_DOMAIN: Final = "program-binding-id"
 RETAINED_BUNDLE_API: Final = "manyforge.retained_bundle.v1"
-RETAINED_BUNDLE_IDENTITY_DOMAIN: Final = "retained-bundle-id"
 
 _MAX_ROOTS: Final = 128
 _MAX_SOURCE_ARTIFACTS: Final = 4096
@@ -114,6 +113,106 @@ class ScenarioArtifactClosureVerifier(Protocol):
 
     def verify(self, closure: ScenarioArtifactClosure, /) -> VerifiedScenarioMetadata:
         """Reject or return facts from the complete verified closure."""
+
+
+class NativeScenarioArtifactClosureVerifier:
+    """Production adapter over the qualified C++ cross-artifact verifier.
+
+    The existing Program owner first validates catalog parameter/dataflow
+    meaning and typed scenario overrides. C++ then independently joins the
+    exact deployment, retained bundle, symbol map, Program Binding, Program,
+    node environment, lane, and assistant closure. Neither side activates or
+    dispatches anything.
+    """
+
+    def __init__(self, node_environment: NodeEnvironment) -> None:
+        if not isinstance(node_environment, NodeEnvironment):
+            raise TypeError("native scenario verifier requires one NodeEnvironment")
+        self._node_environment = node_environment
+
+    def verify(self, closure: ScenarioArtifactClosure, /) -> VerifiedScenarioMetadata:
+        if not isinstance(closure, ScenarioArtifactClosure):
+            raise TypeError("native scenario verifier requires one artifact closure")
+        if closure.node_environment_digest != self._node_environment.environment_digest:
+            raise ValueError("scenario closure selects another node environment")
+
+        try:
+            overrides = json.loads(closure.typed_parameter_overrides_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("scenario parameter overrides are not JSON") from exc
+        if type(overrides) is not dict:
+            raise ValueError("scenario parameter overrides must be a mapping")
+
+        # Reuse the qualified Program/catalog value owner instead of creating a
+        # second Python schema implementation for scenario discovery.
+        from manyforge_behavior.orchestration_values import (
+            NodeAttemptInputResolver,
+            ProgramValueStore,
+        )
+        from manyforge_behavior.program import Program
+
+        program = Program(
+            closure.program_path,
+            catalog=self._node_environment.catalog,
+        )
+        for parameter_id in overrides:
+            declaration = program.parameters.get(parameter_id)
+            if declaration is None:
+                raise ValueError(
+                    f"scenario override selects undeclared parameter {parameter_id!r}"
+                )
+            if declaration.runtime_mutability == "immutable":
+                raise ValueError(
+                    f"scenario override selects immutable parameter {parameter_id!r}"
+                )
+        NodeAttemptInputResolver(
+            program=program,
+            catalog=self._node_environment.catalog,
+            value_store=ProgramValueStore.from_program(program),
+            program_parameter_values=overrides,
+        )
+
+        try:
+            from manyforge_core_py import verify_scenario_artifact_closure
+        except (ImportError, AttributeError) as exc:
+            raise ValueError(
+                "native scenario artifact verifier is unavailable in this build"
+            ) from exc
+
+        lane, assistant_enabled = verify_scenario_artifact_closure(
+            closure.scenario_id,
+            closure.scenario_catalog_revision,
+            str(closure.repository_root),
+            str(closure.scenario_catalog_path),
+            str(closure.deployment_path),
+            str(closure.retained_bundle_path),
+            str(closure.program_binding_path),
+            str(closure.program_path),
+            closure.deployment_artifact_id,
+            closure.deployment_revision,
+            closure.retained_bundle_id,
+            closure.program_binding_id,
+            closure.graph_revision,
+            closure.program_id,
+            closure.program_revision,
+            closure.node_environment_digest,
+            closure.assistant_mode,
+            closure.typed_parameter_overrides_json,
+        )
+        if type(lane) is not str or lane not in {
+            "manyforge-only",
+            "isaac-sim",
+            "real-robot",
+        }:
+            raise ValueError("native scenario verifier returned an invalid lane")
+        if type(assistant_enabled) is not bool:
+            raise ValueError(
+                "native scenario verifier returned invalid assistant state"
+            )
+        return VerifiedScenarioMetadata(
+            lane=lane,
+            assistant_enabled=assistant_enabled,
+        )
 
 
 class ScenarioCatalog:
@@ -297,7 +396,6 @@ def _load_repository_artifact(
     digest: str,
     api_version: str,
     own_field: str,
-    identity_domain: str,
     cache: dict[tuple[str, str], _SourceArtifact],
 ) -> _SourceArtifact:
     key = (collection, digest)
@@ -315,25 +413,17 @@ def _load_repository_artifact(
             f"{collection} artifact is unavailable for {digest} below {root}"
         )
     value = _load(path, label=f"{collection} artifact {digest}")
-    verified = _verify_identity(
-        value,
-        own_field=own_field,
-        identity_domain=identity_domain,
-        api_version=api_version,
-        label=str(path),
+    if value.get("api_version") != api_version:
+        raise ScenarioDiscoveryError(f"{path}.api_version must be {api_version}")
+    selected_digest = _require_digest(
+        value.get(own_field), path=f"{path}.{own_field}"
     )
-    if verified != digest:
+    if selected_digest != digest:
         raise ScenarioDiscoveryError(f"{path}: repository key and {own_field} differ")
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise ScenarioDiscoveryError(
-            f"cannot reread repository artifact: {path}"
-        ) from exc
-    if raw != canonical_json_bytes(value):
-        raise ScenarioDiscoveryError(
-            f"{path}: durable repository artifact is not canonical JSON"
-        )
+    # The qualified native closure verifier below independently validates the
+    # complete content identity and canonical repository bytes. Repeating that
+    # cryptographic serialization here made discovery slower without adding a
+    # distinct acceptance boundary.
     artifact = _SourceArtifact(path=path.resolve(), value=value)
     cache[key] = artifact
     return artifact
@@ -387,7 +477,6 @@ def _scenario_from_row(
         digest=retained_bundle_id,
         api_version=RETAINED_BUNDLE_API,
         own_field="retained_bundle_id",
-        identity_domain=RETAINED_BUNDLE_IDENTITY_DOMAIN,
         cache=repository_cache,
     )
     binding = _load_repository_artifact(
@@ -396,7 +485,6 @@ def _scenario_from_row(
         digest=program_binding_id,
         api_version=PROGRAM_BINDING_API,
         own_field="program_binding_id",
-        identity_domain=PROGRAM_BINDING_IDENTITY_DOMAIN,
         cache=repository_cache,
     )
     if (
@@ -612,6 +700,7 @@ __all__ = [
     "Scenario",
     "ScenarioArtifactClosure",
     "ScenarioArtifactClosureVerifier",
+    "NativeScenarioArtifactClosureVerifier",
     "ScenarioCatalog",
     "ScenarioDiscoveryError",
     "VerifiedScenarioMetadata",

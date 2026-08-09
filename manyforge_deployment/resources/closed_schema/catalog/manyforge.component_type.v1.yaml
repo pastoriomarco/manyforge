@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.component_type.v1
-schema_revision: sha256:fdd03c397fb792d387002df453055d9ccd7d1826ae41d3b0706e5f7c27480d87
+schema_revision: sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009
 schema_purpose: artifact_document
 root_definition_id: component_type
 definitions:
@@ -465,6 +465,18 @@ definitions:
                   - component_local
               - kind: string_format
                 value: portable_id
+        - field_id: coordinate_kind
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - angular
+                  - linear
   - definition_id: command_target_frame_role
     value_schema:
       kind: object

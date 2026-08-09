@@ -15,7 +15,7 @@ namespace manyforge::core {
 inline constexpr std::string_view kCapabilityDefinitionApiVersion =
     "manyforge.capability_definition.v1";
 inline constexpr std::string_view kBuiltinCapabilityDefinitionRegistryDigest =
-    "sha256:ef97d52fedb97c62a226ce4cd77e2febcbf4cf9d643374b9a5d23ad0db9f77b4";
+    "sha256:f194fca190d7de357d984fc6845e5557a75285697e65ed81dbbf5eba88e8a276";
 
 enum class CapabilityScope : std::uint8_t {
   kCellGlobal = 0,
@@ -193,14 +193,6 @@ inline constexpr std::array<CapabilityDefinitionDescriptor, 69>
          "sha256:59cfd352c4a08e315f95c2cb93ada8d2a16a6d2155f83b1c7603e9643088f73b",
          CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
-        {"assistant.model.invoke",
-         "sha256:f900f43ad7bbc61f49c09295a2a63e5fabe93eb57bc9c5f44c26e3c4eeeac158",
-         CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
-         std::nullopt},
-        {"assistant.bridge.request",
-         "sha256:221f74e397dcae43f8122e30f78cd1e11923b755abf51e70085bc30257f3def9",
-         CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
-         std::nullopt},
         {"execution.trajectory.execute",
          "sha256:7e5958db0906b84cb4e5c68ab0ef896f74dc0ba49a9ceb4d918b386abaf9f28c",
          CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kControlBinding,
@@ -355,6 +347,14 @@ inline constexpr std::array<CapabilityDefinitionDescriptor, 69>
          std::nullopt},
         {"observability.logging.operational",
          "sha256:c7060b1666aad447ee2c64e8cf1d3cfc4f4ca95c7be1214069a12e573ac41879",
+         CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
+         std::nullopt},
+        {"assistant.model.invoke",
+         "sha256:f900f43ad7bbc61f49c09295a2a63e5fabe93eb57bc9c5f44c26e3c4eeeac158",
+         CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
+         std::nullopt},
+        {"assistant.bridge.request",
+         "sha256:221f74e397dcae43f8122e30f78cd1e11923b755abf51e70085bc30257f3def9",
          CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
     }};

@@ -599,6 +599,11 @@ using SymbolIndex = std::map<SymbolKey, std::string>;
           {"resource_role_id",
            CanonicalValue(resource.resource_role_id.value())},
           {"resource_id", CanonicalValue(resource.resource_id.value())},
+          {"component_local_coordinate_kind",
+           resource.component_local_coordinate_kind.has_value()
+               ? CanonicalValue(std::string(core::to_string(
+                     *resource.component_local_coordinate_kind)))
+               : CanonicalValue(nullptr)},
           {"coordinates", CanonicalValue(std::move(coordinates))},
       });
     }

@@ -203,6 +203,22 @@ decode_group_roles(const CanonicalValue& value) {
   fail("component-type resource role has unknown source_kind");
 }
 
+[[nodiscard]] std::optional<core::CoordinateKind>
+decode_optional_coordinate_kind(const CanonicalValue& value) {
+  const auto* member = value.find_object_member("coordinate_kind");
+  if (member == nullptr) {
+    return std::nullopt;
+  }
+  const auto& kind = require_string(*member, "coordinate_kind");
+  if (kind == "angular") {
+    return core::CoordinateKind::kAngular;
+  }
+  if (kind == "linear") {
+    return core::CoordinateKind::kLinear;
+  }
+  fail("component-type local resource has unknown coordinate_kind");
+}
+
 [[nodiscard]] std::vector<core::ComponentTypeResourceRoleDTO>
 decode_resource_roles(const CanonicalValue& value) {
   const auto& source = require_array(value, "resource_roles");
@@ -227,6 +243,7 @@ decode_resource_roles(const CanonicalValue& value) {
           core::ResourceRoleId(require_string(
               require_member(item, "resource_role_id"),
               "resource_role_id")),
+          decode_optional_coordinate_kind(item),
       });
     }
   }

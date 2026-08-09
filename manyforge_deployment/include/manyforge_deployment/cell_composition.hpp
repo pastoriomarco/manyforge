@@ -239,6 +239,7 @@ struct CompositionResourceCoordinateRow final {
   core::ResourceRoleId resource_role_id;
   core::ResourceId resource_id;
   std::vector<CompositionCoordinateProjection> coordinates;
+  std::optional<core::CoordinateKind> component_local_coordinate_kind;
 
   friend bool operator==(const CompositionResourceCoordinateRow&,
                          const CompositionResourceCoordinateRow&) = default;

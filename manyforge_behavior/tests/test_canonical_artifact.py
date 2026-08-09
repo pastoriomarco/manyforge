@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import manyforge_behavior.canonical_artifact as canonical_artifact
 from manyforge_behavior.canonical_artifact import (
     MAX_SAFE_INTEGER,
     MAX_SCALAR_BYTES,
@@ -19,6 +20,25 @@ def _load(tmp_path: Path, text: str):
     path = tmp_path / "artifact.yaml"
     path.write_text(text, encoding="utf-8")
     return load_strict_json_yaml(path)
+
+
+def test_exact_json_mapping_uses_the_bounded_fast_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "artifact.json"
+    path.write_text('{"nested":{"enabled":true},"value":1.25}', encoding="utf-8")
+
+    def unexpected_yaml_scan(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("exact JSON must not enter the YAML scanner")
+
+    monkeypatch.setattr(canonical_artifact.yaml, "scan", unexpected_yaml_scan)
+
+    assert load_strict_json_yaml(path) == {
+        "nested": {"enabled": True},
+        "value": 1.25,
+    }
 
 
 def test_unambiguous_plain_scalars_remain_strings(tmp_path: Path) -> None:

@@ -1184,12 +1184,36 @@ def _validate_role_assignment(
     root: Path,
     component_occurrence_id: str,
     path: str,
-) -> set[str]:
+) -> tuple[set[str], str, tuple[str, ...]]:
     row = _exact(
         value,
-        required=frozenset({"program_source", "component_roles", "target_roles"}),
+        required=frozenset(
+            {
+                "scenario_id",
+                "scenario_aliases",
+                "program_source",
+                "component_roles",
+                "target_roles",
+            }
+        ),
         path=path,
     )
+    scenario_id = _identifier(row["scenario_id"], path=f"{path}.scenario_id")
+    aliases = tuple(
+        _identifier(alias, path=f"{path}.scenario_aliases[{index}]")
+        for index, alias in enumerate(
+            _array(row["scenario_aliases"], path=f"{path}.scenario_aliases")
+        )
+    )
+    if (
+        len(aliases) > 64
+        or aliases != tuple(sorted(set(aliases)))
+        or scenario_id in aliases
+    ):
+        raise SourceDescriptionError(
+            f"{path}.scenario_aliases must be bounded, unique, "
+            "canonical-sorted, and distinct from scenario_id"
+        )
     program_source = _source_path(
         row["program_source"], root=root, path=f"{path}.program_source"
     )
@@ -1228,7 +1252,7 @@ def _validate_role_assignment(
             raise SourceDescriptionError(
                 f"{path}.target_roles.{role} changes the Program component role"
             )
-    return set(targets)
+    return set(targets), scenario_id, aliases
 
 
 def _validate_policy(value: object, *, target_roles: set[str], path: str) -> str:
@@ -1595,6 +1619,7 @@ def validate(source: Path, root: Path) -> None:
         )
 
     deployment_sources: list[str] = []
+    scenario_identifiers: set[str] = set()
     open_loop_sources: set[str] = set()
     speed_sources: set[str] = set()
     for index, raw_deployment in enumerate(
@@ -1703,14 +1728,20 @@ def validate(source: Path, root: Path) -> None:
             )
         all_target_roles: set[str] = set()
         for assignment_index, assignment in enumerate(assignment_rows):
-            all_target_roles.update(
-                _validate_role_assignment(
-                    assignment,
-                    root=root,
-                    component_occurrence_id=occurrence,
-                    path=f"{path}.program_role_assignments[{assignment_index}]",
-                )
+            target_roles, scenario_id, scenario_aliases = _validate_role_assignment(
+                assignment,
+                root=root,
+                component_occurrence_id=occurrence,
+                path=f"{path}.program_role_assignments[{assignment_index}]",
             )
+            for identifier in (scenario_id, *scenario_aliases):
+                if identifier in scenario_identifiers:
+                    raise SourceDescriptionError(
+                        f"{path}.program_role_assignments[{assignment_index}] "
+                        f"duplicates scenario identifier {identifier!r}"
+                    )
+                scenario_identifiers.add(identifier)
+            all_target_roles.update(target_roles)
         policy_rows = _array(
             row["policy_restoration_inputs"], path=f"{path}.policy_restoration_inputs"
         )

@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:4f66fab4656567598a11844b3b2572112b5239d9eaca4a538f90e082db7154d9",
+  "capability_id": "scene.reference.resolve",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

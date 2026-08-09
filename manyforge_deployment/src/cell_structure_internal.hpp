@@ -99,6 +99,7 @@ struct StructuralModelResourceResolution final {
 
 struct StructuralComponentLocalResourceResolution final {
   core::ResourceRoleId resource_role_id;
+  std::optional<core::CoordinateKind> coordinate_kind;
 
   friend bool operator==(
       const StructuralComponentLocalResourceResolution&,

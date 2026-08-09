@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 namespace manyforge::deployment {
@@ -296,22 +297,8 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
             return candidate.resource_id == resource_binding.resource_id;
           },
           "resource coordinate");
-      if (coordinate.resource_role_id != resource_binding.resource_role_id ||
-          coordinate.coordinates.empty() ||
-          coordinate.coordinates.front().derived_mimic ||
-          coordinate.coordinates.front().compiled_joint_name.empty()) {
+      if (coordinate.resource_role_id != resource_binding.resource_role_id) {
         fail("runtime resource is not one exact direct coordinate binding");
-      }
-      const auto &projection = coordinate.coordinates.front();
-      core::CoordinateKind kind{};
-      if (projection.coordinate_kind == UrdfCoordinateKind::kAngular &&
-          projection.unit == CompositionCoordinateUnit::kRadians) {
-        kind = core::CoordinateKind::kAngular;
-      } else if (projection.coordinate_kind == UrdfCoordinateKind::kLinear &&
-                 projection.unit == CompositionCoordinateUnit::kMeters) {
-        kind = core::CoordinateKind::kLinear;
-      } else {
-        fail("runtime resource has an unsupported coordinate kind or unit");
       }
       const auto &program_resource = require_one(
           target.target_role().resource_role_bindings,
@@ -325,6 +312,42 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
                     resource_binding.resource_id) ==
           program_resource.resource_ids.end()) {
         fail("runtime control resource is absent from the Program Binding");
+      }
+      if (coordinate.coordinates.empty()) {
+        if (!target.capability().command_schema.has_value() ||
+            target.capability().command_schema->command_schema_id.value() !=
+                core::kGripperPositionCommandSchemaId) {
+          fail("component-local runtime resource has no exact scalar command "
+               "schema");
+        }
+        if (!coordinate.component_local_coordinate_kind.has_value()) {
+          fail("component-local runtime resource has no exact coordinate "
+               "kind");
+        }
+        resources.push_back(core::RuntimeResourceBindingDTO{
+            resource_binding.resource_role_id, resource_binding.resource_id,
+            std::nullopt, resource_binding.resource_id.value(),
+            *coordinate.component_local_coordinate_kind});
+        continue;
+      }
+      if (coordinate.component_local_coordinate_kind.has_value()) {
+        fail("model-backed runtime resource carries component-local "
+             "coordinate semantics");
+      }
+      if (coordinate.coordinates.front().derived_mimic ||
+          coordinate.coordinates.front().compiled_joint_name.empty()) {
+        fail("runtime resource is not one exact direct coordinate binding");
+      }
+      const auto &projection = coordinate.coordinates.front();
+      core::CoordinateKind kind{};
+      if (projection.coordinate_kind == UrdfCoordinateKind::kAngular &&
+          projection.unit == CompositionCoordinateUnit::kRadians) {
+        kind = core::CoordinateKind::kAngular;
+      } else if (projection.coordinate_kind == UrdfCoordinateKind::kLinear &&
+                 projection.unit == CompositionCoordinateUnit::kMeters) {
+        kind = core::CoordinateKind::kLinear;
+      } else {
+        fail("runtime resource has an unsupported coordinate kind or unit");
       }
       resources.push_back(core::RuntimeResourceBindingDTO{
           resource_binding.resource_role_id, resource_binding.resource_id,
@@ -404,6 +427,34 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
     }
     const auto &capability = supporting.capability();
     const auto &provider = *supporting.capability_provider_binding();
+    const bool exact_support_scope = std::visit(
+        [&](const auto &provider_target) {
+          using Target = std::remove_cvref_t<decltype(provider_target)>;
+          if constexpr (std::is_same_v<
+                            Target,
+                            core::TargetBindingCapabilityProviderTargetDTO>) {
+            return target.control_binding().has_value() &&
+                   provider_target.control_binding_id ==
+                       target.control_binding()->control_binding_id &&
+                   provider_target.control_binding_revision ==
+                       target.control_binding()->control_binding_revision;
+          } else if constexpr (
+              std::is_same_v<
+                  Target, core::ControlDomainCapabilityProviderTargetDTO>) {
+            return target.control_domain().has_value() &&
+                   provider_target.control_domain_id ==
+                       target.control_domain()->control_domain_id &&
+                   provider_target.control_domain_revision ==
+                       target.control_domain()->control_domain_revision;
+          } else {
+            return true;
+          }
+        },
+        provider.target);
+    if (!exact_support_scope) {
+      fail("supporting runtime capability is not anchored to the selected "
+           "control path");
+    }
     supporting_paths.push_back(core::RuntimeCapabilityProviderPathDTO{
         capability.capability_id, capability.capability_definition_revision,
         provider.capability_provider_binding_id,

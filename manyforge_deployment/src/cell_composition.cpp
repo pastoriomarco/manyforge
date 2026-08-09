@@ -32,6 +32,7 @@ using SymbolTuple =
     std::tuple<std::string, std::uint8_t, std::string, std::string>;
 using detail::StructuralAttachmentResolution;
 using detail::StructuralCommandTargetResolution;
+using detail::StructuralComponentLocalResourceResolution;
 using detail::StructuralComponentResolution;
 using detail::StructuralFrameResolution;
 using detail::StructuralModelInstanceResolution;
@@ -1231,7 +1232,7 @@ build_control_binding_maps(
           const auto& graph_resource =
               binding->resource_bindings[group_begin + coordinate_slot];
           map.resources.push_back(
-              {expected_role, graph_resource.resource_id, {}});
+              {expected_role, graph_resource.resource_id, {}, std::nullopt});
           require_room(projection_count, 1U,
                        kMaxCompositionCoordinateProjections,
                        "coordinate projection");
@@ -1280,12 +1281,16 @@ build_control_binding_maps(
                projection->second.derived});
         }
       } else {
+        const auto& local_resource =
+            std::get<StructuralComponentLocalResourceResolution>(
+                target.resources[resource_index]);
         for (std::size_t index = group_begin; index < binding_cursor;
              ++index) {
           map.resources.push_back(
               {expected_role,
                binding->resource_bindings[index].resource_id,
-               {}});
+               {},
+               local_resource.coordinate_kind});
         }
       }
     }

@@ -527,6 +527,11 @@ manyforge_embed_closed_schema(
   resources/closed_schema/value/manyforge.value_schema.runtime.empty.v1.yaml
   mf_empty_cfg)
 manyforge_embed_closed_schema(
+  kEmbeddedNativeExecutionRuntimeConfigurationSchema
+  native_execution_runtime_configuration
+  resources/closed_schema/value/manyforge.value_schema.runtime.native_execution.v1.yaml
+  mf_native_cfg)
+manyforge_embed_closed_schema(
   kEmbeddedEmptyProviderContractSchema
   empty_provider_contract
   resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml
@@ -619,6 +624,7 @@ add_library(manyforge_deployment
   src/retained_bundle_materializer.cpp
   src/retained_bundle_store.cpp
   src/retention_qualified_deployment.cpp
+  src/scenario_catalog.cpp
   src/site_overlay_resolution.cpp
   src/stop_evidence_policy_codec.cpp
   src/structural_model_preparation.cpp
@@ -678,6 +684,9 @@ target_link_libraries(
 add_executable(
   manyforge_maintained_deployment_occurrences
   tools/maintained_deployment_occurrences.cpp)
+target_include_directories(
+  manyforge_maintained_deployment_occurrences PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(
   manyforge_maintained_deployment_occurrences PRIVATE
   manyforge::deployment)
@@ -826,13 +835,6 @@ if(BUILD_TESTING)
       --revision-tool "$<TARGET_FILE:manyforge_deployment_revision>")
   set_tests_properties(
     MaintainedDeploymentOccurrenceSources PROPERTIES TIMEOUT 60)
-
-  add_test(
-    NAME MaintainedDeploymentOccurrenceQualification
-    COMMAND
-      "$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
-      --check
-      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}")
 
   function(manyforge_try_public_header result_variable source_file)
     unset(${result_variable} CACHE)
@@ -995,6 +997,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_program_binding PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_program_binding
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_scenario_catalog
+    test/test_scenario_catalog.cpp)
+  target_include_directories(test_scenario_catalog PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_scenario_catalog PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_scenario_catalog
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_program_contract
@@ -1304,6 +1315,19 @@ if(BUILD_TESTING)
       "$<TARGET_FILE:manyforge_maintained_model_catalog>"
       --check
       --description "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
+      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
+      --prepared
+      "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "ur10e_robotiq_2f_140=${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}")
+
+  add_test(
+    NAME MaintainedDeploymentOccurrenceQualification
+    COMMAND
+      "$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
+      --check
       --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
       --prepared
       "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"

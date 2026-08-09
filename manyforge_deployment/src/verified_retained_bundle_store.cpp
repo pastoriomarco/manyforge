@@ -262,6 +262,24 @@ read_verified_bundle_entry(
   return *text;
 }
 
+[[nodiscard]] std::optional<core::CoordinateKind>
+require_map_optional_coordinate_kind(const CanonicalValue& value,
+                                     std::string_view name) {
+  const auto kind = require_map_optional_text(value, name);
+  if (!kind.has_value()) {
+    return std::nullopt;
+  }
+  if (*kind == "angular") {
+    return core::CoordinateKind::kAngular;
+  }
+  if (*kind == "linear") {
+    return core::CoordinateKind::kLinear;
+  }
+  detail::fail_retained_bundle(
+      "verified symbol/role map has an unknown component-local coordinate "
+      "kind");
+}
+
 [[nodiscard]] double require_map_number(
     const CanonicalValue& value, std::string_view name) {
   const auto* number = std::get_if<double>(
@@ -743,7 +761,9 @@ struct DecodedRetainedModelMap final {
           core::ResourceRoleId(
               require_map_text(resource, "resource_role_id")),
           core::ResourceId(require_map_text(resource, "resource_id")),
-          std::move(projections)});
+          std::move(projections),
+          require_map_optional_coordinate_kind(
+              resource, "component_local_coordinate_kind")});
     }
     result.control_bindings.push_back(
         CompositionControlBindingCoordinateMap{
