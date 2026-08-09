@@ -200,6 +200,72 @@ def _preview_response(operation: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _direct_command_request() -> OperationIntentRequest:
+    value = _direct_motion_request().model_dump(mode="json")
+    value["request_context"]["request_id"] = "preview-gripper-1"
+    value["program_id"] = "manyforge.direct_control.gripper"
+    value["program_revision"] = "sha256:gripper-program"
+    value["program_binding_id"] = "sha256:gripper-binding"
+    value["program_run_id"] = "direct-control-gripper-owner-1"
+    participant = value["participants"][0]
+    participant["required_capability_id"] = "tool.gripper.command"
+    participant["payload"] = {
+        "kind": "capability_command",
+        "command_schema_id": "gripper.command_position",
+        "command_schema_revision": "sha256:gripper-schema",
+        "command_value": {
+            "kind": "gripper_position",
+            "position": {"kind": "linear_m", "value_m": 0.03},
+            "max_effort": None,
+        },
+        "completion_timeout_s": 2.0,
+        "caller_options": [
+            {"option_id": "command_duration_s", "value_s": 0.5}
+        ],
+    }
+    return OperationIntentRequest.model_validate(value)
+
+
+def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
+    receipt = {
+        "command_schema_id": "gripper.command_position",
+        "command_schema_revision": "sha256:gripper-schema",
+        "commit_eligible": True,
+        "component_role_id": "controlled_component",
+        "coordinate_kind": "linear_m",
+        "graph_revision": "sha256:graph",
+        "intent_digest": (
+            "sha256:" + hashlib.sha256(rfc8785.dumps(operation)).hexdigest()
+        ),
+        "max_position": 0.04,
+        "min_position": 0.0,
+        "program_binding_id": "sha256:gripper-binding",
+        "program_id": "manyforge.direct_control.gripper",
+        "program_revision": "sha256:gripper-program",
+        "program_run_id": "direct-control-gripper-owner-1",
+        "request_id": "preview-gripper-1",
+        "request_owner_epoch": "owner-1",
+        "required_capability_id": "tool.gripper.command",
+        "retained_bundle_id": "sha256:bundle",
+        "scene_revision": operation["expected_scene_revision"],
+        "schema_version": (
+            "manyforge.direct_control_capability_command_preview.v1"
+        ),
+        "source_coordinate_name": "finger_joint",
+        "target_position": 0.03,
+        "target_role_id": "command_target",
+    }
+    receipt["receipt_digest"] = (
+        "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+    )
+    return {
+        "api_version": "manyforge.execution_command_response.v1",
+        "command": "preview_capability_command",
+        "ok": True,
+        "preview_receipt": receipt,
+    }
+
+
 def test_execution_client_verifies_complete_motion_preview_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -277,6 +343,38 @@ def test_execution_client_verifies_complete_motion_preview_receipt(
     with pytest.raises(HeadlessApiError) as unsafe_revision:
         client.preview_motion(request, trusted_principal_id=None)
     assert unsafe_revision.value.code == "execution_command_response_invalid"
+
+
+def test_execution_client_verifies_capability_command_preview_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_command_request()
+    captured: dict[str, Any] = {}
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        captured.update(command)
+        return _command_preview_response(command["operation"])
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    response = client.preview_capability_command(
+        request, trusted_principal_id=None
+    )
+
+    assert captured["command"] == "preview_capability_command"
+    assert response["preview_receipt"]["target_position"] == 0.03
+
+    def stale_schema(command: dict[str, Any]) -> dict[str, Any]:
+        response = _command_preview_response(command["operation"])
+        response["preview_receipt"]["command_schema_revision"] = (
+            "sha256:stale"
+        )
+        return response
+
+    monkeypatch.setattr(client, "_exchange", stale_schema)
+    with pytest.raises(HeadlessApiError) as mismatch:
+        client.preview_capability_command(request, trusted_principal_id=None)
+    assert mismatch.value.code == "execution_command_response_identity_mismatch"
 
 
 class _RecordingCore:

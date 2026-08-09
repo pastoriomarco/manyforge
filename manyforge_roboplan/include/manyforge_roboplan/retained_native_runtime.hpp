@@ -54,6 +54,8 @@ struct RetainedNativeRuntimeInput final {
   /// This is used by build-owned direct-control Programs; aliases may differ
   /// only in Program/role identity and cannot widen the physical runtime.
   std::vector<core::RuntimeParticipantBinding> motion_binding_aliases;
+  /// Additional Program contexts for the same exact physical gripper target.
+  std::vector<core::RuntimeParticipantBinding> gripper_binding_aliases;
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<std::mutex> scene_mutex;
   std::shared_ptr<RetainedKinematicStateProjector> state_projector;
@@ -96,6 +98,7 @@ struct RetainedNativeRuntime final {
       collision_trajectory_projector;
   std::unique_ptr<RoboPlanExecutionBackend> execution;
   std::unique_ptr<RetainedGripperCommandBackend> gripper;
+  std::optional<RetainedGripperPositionLimits> gripper_position_limits;
 
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
   std::shared_ptr<core::ICollisionQueryEngine> runtime_collision_engine;

@@ -1429,6 +1429,7 @@ enum class CommandKind {
   kStatus,
   kEvents,
   kPreviewMotion,
+  kPreviewCapabilityCommand,
   kSubmit,
   kRead,
   kPause,
@@ -1517,6 +1518,18 @@ struct Command final {
         DecodeRequestAttribution(Member(root, "attribution"));
     const auto& operation = Member(root, "operation");
     Command decoded{CommandKind::kPreviewMotion};
+    decoded.operation = DecodeOperation(operation, attribution);
+    decoded.operation_digest = core::ContentDigest(
+        content_identity::sha256_digest(
+            content_identity::canonical_json(operation)));
+    return decoded;
+  }
+  if (command == "preview_capability_command") {
+    RequireExactObjectSize(root, 4U, "capability-command preview command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    const auto& operation = Member(root, "operation");
+    Command decoded{CommandKind::kPreviewCapabilityCommand};
     decoded.operation = DecodeOperation(operation, attribution);
     decoded.operation_digest = core::ContentDigest(
         content_identity::sha256_digest(
@@ -1732,6 +1745,78 @@ class CollisionLeaseRelease final {
       {"source_joint_names",
        CanonicalValue(std::move(source_joint_names))},
       {"start_positions_rad", CanonicalValue(std::move(start_positions))},
+      {"target_role_id", CanonicalValue(binding.target_role_id.value())},
+  };
+  const core::ContentDigest receipt_digest(
+      content_identity::sha256_digest(content_identity::canonical_json(
+          CanonicalValue(receipt))));
+  receipt.emplace_back("receipt_digest",
+                       CanonicalValue(receipt_digest.value()));
+  return CanonicalValue(std::move(receipt));
+}
+
+[[nodiscard]] CanonicalValue CapabilityCommandPreviewReceiptValue(
+    const core::CapabilityCommandPreviewResultDTO& preview,
+    const core::OperationIntentDTO& intent,
+    const core::ContentDigest& intent_digest,
+    const RetainedGripperPositionLimits& limits,
+    const core::RequestOwnerEpoch& owner_epoch) {
+  const auto& binding = preview.binding;
+  Require(intent.expected_scene_revision.has_value() &&
+              binding.resources.size() == 1U &&
+              binding.resources.front().source_joint_name.has_value() &&
+              binding.command_schema.has_value() &&
+              preview.command_request.gripper_id ==
+                  binding.command_target_id.value() &&
+              preview.command_request.joint_name ==
+                  binding.resources.front().compiled_resource_name &&
+              limits.coordinate_kind ==
+                  binding.resources.front().coordinate_kind &&
+              std::isfinite(limits.lower_position) &&
+              std::isfinite(limits.upper_position) &&
+              limits.lower_position <= limits.upper_position &&
+              std::isfinite(preview.command_request.target_position),
+          "capability-command preview crosses its direct-control binding");
+  const auto coordinate_kind =
+      limits.coordinate_kind == core::CoordinateKind::kAngular
+          ? "angular_rad"
+          : "linear_m";
+  CanonicalValue::Object receipt{
+      {"command_schema_id",
+       CanonicalValue(binding.command_schema->command_schema_id.value())},
+      {"command_schema_revision",
+       CanonicalValue(
+           binding.command_schema->command_schema_revision.value())},
+      {"commit_eligible", CanonicalValue(true)},
+      {"component_role_id",
+       CanonicalValue(binding.component_role_id.value())},
+      {"coordinate_kind", CanonicalValue(coordinate_kind)},
+      {"graph_revision", CanonicalValue(binding.graph_revision.value())},
+      {"intent_digest", CanonicalValue(intent_digest.value())},
+      {"max_position", CanonicalValue(limits.upper_position)},
+      {"min_position", CanonicalValue(limits.lower_position)},
+      {"program_binding_id",
+       CanonicalValue(binding.program_binding_id.value())},
+      {"program_id", CanonicalValue(binding.program_id.value())},
+      {"program_revision",
+       CanonicalValue(binding.program_revision.value())},
+      {"program_run_id", CanonicalValue(intent.program_run_id.value())},
+      {"request_id",
+       CanonicalValue(intent.request_context.request_id.value())},
+      {"request_owner_epoch", CanonicalValue(owner_epoch.value())},
+      {"required_capability_id",
+       CanonicalValue(intent.participants.front()
+                          .required_capability_id.value())},
+      {"retained_bundle_id",
+       CanonicalValue(binding.retained_bundle_id.value())},
+      {"scene_revision", SceneRevisionValue(*intent.expected_scene_revision)},
+      {"schema_version",
+       CanonicalValue(
+           "manyforge.direct_control_capability_command_preview.v1")},
+      {"source_coordinate_name",
+       CanonicalValue(*binding.resources.front().source_joint_name)},
+      {"target_position",
+       CanonicalValue(preview.command_request.target_position)},
       {"target_role_id", CanonicalValue(binding.target_role_id.value())},
   };
   const core::ContentDigest receipt_digest(
@@ -2374,7 +2459,10 @@ struct Composition final {
   std::shared_ptr<const deployment::ProgramBindingContract> program;
   std::shared_ptr<const deployment::ProgramBinding> program_binding;
   std::shared_ptr<const deployment::ProgramBinding> direct_control_binding;
+  std::shared_ptr<const deployment::ProgramBinding>
+      direct_control_gripper_program_binding;
   core::RuntimeParticipantBinding direct_control_motion_binding;
+  core::RuntimeParticipantBinding direct_control_gripper_binding;
   core::JointLimitsDTO direct_control_joint_limits;
   RetainedPlanningModelStage stage;
   std::shared_ptr<RetainedNativeRuntime> runtime;
@@ -2391,7 +2479,10 @@ struct Composition final {
               std::shared_ptr<const deployment::ProgramBindingContract> selected_program,
               std::shared_ptr<const deployment::ProgramBinding> selected_binding,
               std::shared_ptr<const deployment::ProgramBinding> selected_direct_control_binding,
+              std::shared_ptr<const deployment::ProgramBinding>
+                  selected_direct_control_gripper_program_binding,
               core::RuntimeParticipantBinding selected_direct_control_motion_binding,
+              core::RuntimeParticipantBinding selected_direct_control_gripper_binding,
               core::JointLimitsDTO selected_direct_control_joint_limits,
               RetainedPlanningModelStage selected_stage,
               std::shared_ptr<RetainedNativeRuntime> selected_runtime,
@@ -2401,8 +2492,12 @@ struct Composition final {
         program(std::move(selected_program)),
         program_binding(std::move(selected_binding)),
         direct_control_binding(std::move(selected_direct_control_binding)),
+        direct_control_gripper_program_binding(
+            std::move(selected_direct_control_gripper_program_binding)),
         direct_control_motion_binding(
             std::move(selected_direct_control_motion_binding)),
+        direct_control_gripper_binding(
+            std::move(selected_direct_control_gripper_binding)),
         direct_control_joint_limits(
             std::move(selected_direct_control_joint_limits)),
         stage(std::move(selected_stage)),
@@ -2477,16 +2572,20 @@ struct Composition final {
               std::string(deployment::kDirectControlTargetRoleId)),
           core::CapabilityId("execution.trajectory.execute"), *bundle,
           *model_map);
-  const auto direct_control_planner_target =
-      deployment::resolve_runtime_program_target(
-          *direct_control_binding,
-          core::TargetRoleId(
-              std::string(deployment::kDirectControlTargetRoleId)),
-          core::CapabilityId("planning.motion.joint_goal"), *bundle,
-          *model_map);
   const auto gripper_target = deployment::resolve_runtime_program_target(
       *program_binding, gripper_target_role, core::CapabilityId("tool.gripper.command"), *bundle,
       *model_map);
+  auto direct_control_gripper_program_binding =
+      deployment::compile_direct_control_gripper_program_binding(
+          gripper_target.component().controllable_component_id,
+          gripper_target.target_role().command_target_id, *bundle, *model_map,
+          catalog_store);
+  const auto direct_control_gripper_target =
+      deployment::resolve_runtime_program_target(
+          *direct_control_gripper_program_binding,
+          core::TargetRoleId(
+              std::string(deployment::kDirectControlTargetRoleId)),
+          core::CapabilityId("tool.gripper.command"), *bundle, *model_map);
   const std::array<deployment::RuntimeProgramTargetBinding, 1U> support{planner_target};
   auto motion_binding_dto = deployment::build_runtime_participant_binding_dto(
       motion_target,
@@ -2498,16 +2597,46 @@ struct Composition final {
     Fail("active motion participant binding failed verification: " +
          motion_binding.error().message);
   }
-  const std::array<deployment::RuntimeProgramTargetBinding, 1U>
-      direct_control_support{direct_control_planner_target};
+  std::vector<deployment::RuntimeProgramTargetBinding>
+      direct_control_support;
+  const auto& direct_control_target_role =
+      direct_control_binding->value().target_role_bindings.front();
+  for (const std::string_view capability_id : {
+           std::string_view("planning.motion.cartesian_path"),
+           std::string_view("planning.motion.joint_goal"),
+           std::string_view("planning.motion.pose_goal")}) {
+    if (std::any_of(
+            direct_control_target_role.capability_bindings.begin(),
+            direct_control_target_role.capability_bindings.end(),
+            [&](const auto& capability) {
+              return capability.capability_id.value() == capability_id;
+            })) {
+      direct_control_support.push_back(
+          deployment::resolve_runtime_program_target(
+              *direct_control_binding,
+              core::TargetRoleId(
+                  std::string(deployment::kDirectControlTargetRoleId)),
+              core::CapabilityId(std::string(capability_id)), *bundle,
+              *model_map));
+    }
+  }
+  Require(std::any_of(direct_control_support.begin(),
+                      direct_control_support.end(), [](const auto& support) {
+                        return support.capability().capability_id.value() ==
+                               "planning.motion.joint_goal";
+                      }),
+          "direct-control motion binding has no joint planner");
   auto direct_control_motion_binding_dto =
       deployment::build_runtime_participant_binding_dto(
           direct_control_motion_target,
-          ActiveFacts(direct_control_motion_target, direct_control_support,
+          ActiveFacts(direct_control_motion_target,
+                      std::span<const deployment::RuntimeProgramTargetBinding>(
+                          direct_control_support),
                       runtime_epoch,
                       core::ActiveControlConfigurationId(
                           "active.i6.native.arm")),
-          direct_control_support);
+          std::span<const deployment::RuntimeProgramTargetBinding>(
+              direct_control_support));
   auto direct_control_motion_binding =
       core::verify_runtime_participant_binding(
           std::move(direct_control_motion_binding_dto));
@@ -2523,6 +2652,22 @@ struct Composition final {
   if (!gripper_binding.ok()) {
     Fail("active gripper participant binding failed verification: " +
          gripper_binding.error().message);
+  }
+  auto direct_control_gripper_binding_dto =
+      deployment::build_runtime_participant_binding_dto(
+          direct_control_gripper_target,
+          ActiveFacts(
+              direct_control_gripper_target,
+              std::span<const deployment::RuntimeProgramTargetBinding>{},
+              runtime_epoch,
+              core::ActiveControlConfigurationId(
+                  "active.i6.native.gripper")));
+  auto direct_control_gripper_binding =
+      core::verify_runtime_participant_binding(
+          std::move(direct_control_gripper_binding_dto));
+  if (!direct_control_gripper_binding.ok()) {
+    Fail("direct-control gripper participant binding failed verification: " +
+         direct_control_gripper_binding.error().message);
   }
 
   const deployment::FilesystemVerifiedRetainedPlanningModelSource planning_source(
@@ -2582,7 +2727,8 @@ struct Composition final {
   auto runtime = create_retained_native_runtime(
       RetainedNativeRuntimeInput{
           motion_binding.value(), gripper_binding.value(),
-          {direct_control_motion_binding.value()}, scene, scene_mutex,
+          {direct_control_motion_binding.value()},
+          {direct_control_gripper_binding.value()}, scene, scene_mutex,
           state_projector, publisher, collision_model, std::move(planner),
           [](const auto&) { return std::make_shared<AbsoluteOnlyReferenceResolver>(); }},
       RetainedNativeRuntimeConfig{
@@ -2602,7 +2748,9 @@ struct Composition final {
   auto composition = std::make_unique<Composition>(
       std::move(bundle), std::move(program), std::move(program_binding),
       std::move(direct_control_binding),
+      std::move(direct_control_gripper_program_binding),
       std::move(direct_control_motion_binding.value()),
+      std::move(direct_control_gripper_binding.value()),
       std::move(direct_control_joint_limits.value()), std::move(stage),
       std::move(runtime), receipt.request.candidate_projection_revision,
       receipt.publication_generation);
@@ -2624,6 +2772,8 @@ class NativeExecutionHost final {
         runtime_epoch_(RandomToken("native-runtime-")),
         direct_control_program_run_id_("direct-control-" +
                                        owner_epoch_.value()),
+        direct_control_gripper_program_run_id_(
+            "direct-control-gripper-" + owner_epoch_.value()),
         host_lock_(config_.execution_state_root),
         composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_)),
         command_socket_(config_.execution_state_root, kSocketFileName),
@@ -2696,9 +2846,11 @@ class NativeExecutionHost final {
     CanonicalValue::Array joints;
     CanonicalValue::Array source_joint_names;
     CanonicalValue::Array observed_positions;
+    std::vector<double> observed_positions_rad;
     joints.reserve(binding.resources.size());
     source_joint_names.reserve(binding.resources.size());
     observed_positions.reserve(binding.resources.size());
+    observed_positions_rad.reserve(binding.resources.size());
     for (std::size_t index = 0U; index < binding.resources.size(); ++index) {
       const auto& resource = binding.resources[index];
       Require(resource.source_joint_name.has_value() &&
@@ -2716,6 +2868,7 @@ class NativeExecutionHost final {
               "direct-control observed state is not all-angular");
       source_joint_names.emplace_back(*resource.source_joint_name);
       observed_positions.emplace_back(position->value_rad);
+      observed_positions_rad.push_back(position->value_rad);
       joints.emplace_back(CanonicalValue::Object{
           {"max_acceleration_rad_s2",
            limits.acceleration_max_rad_s2.empty()
@@ -2742,6 +2895,31 @@ class NativeExecutionHost final {
          binding.supporting_capability_provider_paths) {
       planning_capabilities.emplace_back(path.capability_id.value());
     }
+    const auto base_frame = std::find_if(
+        binding.frame_bindings.begin(), binding.frame_bindings.end(),
+        [](const auto& frame) {
+          return frame.frame_role_id.value() ==
+                 deployment::kDirectControlBaseFrameRoleId;
+        });
+    const auto tcp_frame = std::find_if(
+        binding.frame_bindings.begin(), binding.frame_bindings.end(),
+        [](const auto& frame) {
+          return frame.frame_role_id.value() ==
+                 deployment::kDirectControlTcpFrameRoleId;
+        });
+    Require(base_frame != binding.frame_bindings.end() &&
+                tcp_frame != binding.frame_bindings.end(),
+            "direct-control status has no exact base/TCP frame binding");
+    const auto current_tcp = composition_->runtime->kinematics->forward_kinematics(
+        core::FkRequestDTO{
+            core::RobotStateDTO{observed_state.joint_names,
+                                std::move(observed_positions_rad), {}},
+            tcp_frame->compiled_frame_name,
+            base_frame->compiled_frame_name});
+    if (!current_tcp.ok()) {
+      Fail("direct-control current TCP pose is unavailable: " +
+           current_tcp.error().message);
+    }
     return CanonicalValue(CanonicalValue::Object{
         {"command_target_id",
          CanonicalValue(binding.command_target_id.value())},
@@ -2759,6 +2937,7 @@ class NativeExecutionHost final {
         {"observed_state",
          CanonicalValue(CanonicalValue::Object{
              {"complete", CanonicalValue(observed_state.complete)},
+             {"current_tcp_pose", PoseValue(current_tcp.value())},
              {"positions_rad",
               CanonicalValue(std::move(observed_positions))},
              {"sequence",
@@ -2781,6 +2960,83 @@ class NativeExecutionHost final {
         {"tcp_frame_role_id",
          CanonicalValue(
              std::string(deployment::kDirectControlTcpFrameRoleId))},
+    });
+  }
+
+  [[nodiscard]] CanonicalValue DirectControlGripperStatusValue(
+      const core::ObservedStateSnapshotDTO& observed_state) const {
+    const auto& binding =
+        composition_->direct_control_gripper_binding.value();
+    Require(binding.resources.size() == 1U &&
+                binding.resources.front().source_joint_name.has_value() &&
+                binding.command_schema.has_value() &&
+                composition_->runtime->gripper_position_limits.has_value() &&
+                observed_state.resources.size() == 1U &&
+                observed_state.joint_names.size() == 1U &&
+                observed_state.positions.size() == 1U &&
+                observed_state.resources.front() ==
+                    binding.resources.front().resource_id &&
+                observed_state.joint_names.front() ==
+                    binding.resources.front().compiled_resource_name,
+            "direct-control gripper status crosses its retained binding");
+    const auto& limits =
+        *composition_->runtime->gripper_position_limits;
+    Require(limits.coordinate_kind ==
+                binding.resources.front().coordinate_kind &&
+                std::isfinite(limits.lower_position) &&
+                std::isfinite(limits.upper_position) &&
+                limits.lower_position <= limits.upper_position &&
+                core::coordinate_kind(observed_state.positions.front()) ==
+                    limits.coordinate_kind,
+            "direct-control gripper status has inconsistent units or limits");
+    const auto coordinate_kind =
+        limits.coordinate_kind == core::CoordinateKind::kAngular
+            ? "angular_rad"
+            : "linear_m";
+    return CanonicalValue(CanonicalValue::Object{
+        {"command_schema_id",
+         CanonicalValue(binding.command_schema->command_schema_id.value())},
+        {"command_schema_revision",
+         CanonicalValue(
+             binding.command_schema->command_schema_revision.value())},
+        {"command_target_id",
+         CanonicalValue(binding.command_target_id.value())},
+        {"component_role_id",
+         CanonicalValue(binding.component_role_id.value())},
+        {"controllable_component_id",
+         CanonicalValue(binding.controllable_component_id.value())},
+        {"observed_state",
+         CanonicalValue(CanonicalValue::Object{
+             {"complete", CanonicalValue(observed_state.complete)},
+             {"position",
+              CoordinatePositionValue(observed_state.positions.front())},
+             {"sequence",
+              CanonicalValue(static_cast<double>(observed_state.sequence))},
+             {"source_coordinate_name",
+              CanonicalValue(
+                  *binding.resources.front().source_joint_name)},
+             {"source_epoch",
+              CanonicalValue(observed_state.source_epoch.value())},
+         })},
+        {"operation_capability_id",
+         CanonicalValue(binding.capability_id.value())},
+        {"program_binding_id",
+         CanonicalValue(binding.program_binding_id.value())},
+        {"program_id", CanonicalValue(binding.program_id.value())},
+        {"program_revision",
+         CanonicalValue(binding.program_revision.value())},
+        {"program_run_id",
+         CanonicalValue(direct_control_gripper_program_run_id_.value())},
+        {"resource",
+         CanonicalValue(CanonicalValue::Object{
+             {"coordinate_kind", CanonicalValue(coordinate_kind)},
+             {"max_position", CanonicalValue(limits.upper_position)},
+             {"min_position", CanonicalValue(limits.lower_position)},
+             {"source_coordinate_name",
+              CanonicalValue(
+                  *binding.resources.front().source_joint_name)},
+         })},
+        {"target_role_id", CanonicalValue(binding.target_role_id.value())},
     });
   }
 
@@ -2819,6 +3075,8 @@ class NativeExecutionHost final {
               CanonicalValue(static_cast<double>(composition_->publication_generation.value()))},
              {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
              {"direct_control", DirectControlStatusValue(motion_state.value())},
+             {"direct_control_gripper",
+              DirectControlGripperStatusValue(gripper_state.value())},
              {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
              {"gripper_command_schema_id",
               CanonicalValue(gripper_schema.command_schema_id.value())},
@@ -2889,6 +3147,32 @@ class NativeExecutionHost final {
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"error", ErrorValue(*last_reconcile_error_)},
           {"ok", CanonicalValue(false)},
+      });
+    }
+    if (command.kind == CommandKind::kPreviewCapabilityCommand) {
+      auto preview =
+          composition_->runtime->addressed_kernel
+              ->preview_capability_command(*command.operation);
+      if (!preview.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version",
+             CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(preview.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      Require(composition_->runtime->gripper_position_limits.has_value(),
+              "direct-control gripper limits are unavailable");
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("preview_capability_command")},
+          {"ok", CanonicalValue(true)},
+          {"preview_receipt",
+           CapabilityCommandPreviewReceiptValue(
+               preview.value(), *command.operation,
+               *command.operation_digest,
+               *composition_->runtime->gripper_position_limits,
+               owner_epoch_)},
       });
     }
     if (command.kind == CommandKind::kPreviewMotion) {
@@ -3121,6 +3405,7 @@ class NativeExecutionHost final {
         case CommandKind::kStatus:
         case CommandKind::kEvents:
         case CommandKind::kPreviewMotion:
+        case CommandKind::kPreviewCapabilityCommand:
         case CommandKind::kSubmit:
         case CommandKind::kRead:
         case CommandKind::kStop:
@@ -3246,6 +3531,7 @@ class NativeExecutionHost final {
   // Manager-launched mode receives its epoch from the direct-child adapter.
   core::RuntimeEpoch runtime_epoch_;
   core::ProgramRunId direct_control_program_run_id_;
+  core::ProgramRunId direct_control_gripper_program_run_id_;
   HostLock host_lock_;
   std::unique_ptr<Composition> composition_;
   CommandSocket command_socket_;

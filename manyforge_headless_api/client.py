@@ -192,6 +192,13 @@ class HeadlessHttpClient:
             "POST", "/api/execution/motion-previews", body=body
         )
 
+    def preview_capability_command(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/execution/capability-command-previews", body=body
+        )
+
     def plan_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request(
             "POST", "/api/execution/pick-place/plans/pick", body=body

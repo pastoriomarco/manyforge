@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { api } from '../api/client';
 import {
-  buildJointMotionIntent,
+  buildPreviewIntent,
   initialRobotControlState,
   operationStateIsTerminal,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
@@ -10,7 +10,13 @@ import {
   robotControlReducer,
 } from '../state/robotControl';
 import type { RobotControlState } from '../state/robotControl';
-import type { JointMotionOperationIntent } from '../types/robotControl';
+import type {
+  RobotControlMode,
+} from '../state/robotControl';
+import type {
+  DirectControlOperationIntent,
+  Pose3Value,
+} from '../types/robotControl';
 
 function requestId(): string {
   return globalThis.crypto?.randomUUID?.()
@@ -25,7 +31,10 @@ function errorMessage(error: unknown, fallback: string): string {
 
 export interface RobotControlController {
   state: RobotControlState;
+  selectMode: (mode: RobotControlMode) => void;
   editJoint: (jointIndex: number, positionRad: number) => void;
+  editPose: (pose: Pose3Value) => void;
+  editGripper: (position: number) => void;
   approve: () => Promise<void>;
   revert: () => void;
   stop: () => Promise<void>;
@@ -74,14 +83,19 @@ export function useRobotControl(enabled: boolean): RobotControlController {
       || state.status === null
     ) return undefined;
     const generation = state.generation;
-    const status = state.status;
-    const positions = [...state.draftPositionsRad];
+    const previewDraft = {
+      status: state.status,
+      mode: state.mode,
+      draftPositionsRad: state.draftPositionsRad,
+      draftPose: state.draftPose,
+      draftGripperPosition: state.draftGripperPosition,
+    };
     const controller = new AbortController();
     let current = true;
     const timer = window.setTimeout(() => {
-      let intent: JointMotionOperationIntent;
+      let intent: DirectControlOperationIntent;
       try {
-        intent = buildJointMotionIntent(status, positions, requestId());
+        intent = buildPreviewIntent(previewDraft, requestId());
       } catch (error: unknown) {
         if (current) {
           dispatch({
@@ -93,7 +107,10 @@ export function useRobotControl(enabled: boolean): RobotControlController {
         return;
       }
       dispatch({ type: 'preview_started', generation, intent });
-      void api.execution.previewMotion(intent, controller.signal)
+      const preview = intent.participants[0].payload.kind === 'motion'
+        ? api.execution.previewMotion(intent, controller.signal)
+        : api.execution.previewCapabilityCommand(intent, controller.signal);
+      void preview
         .then((receipt) => {
           if (current) {
             dispatch({ type: 'preview_resolved', generation, receipt });
@@ -117,10 +134,17 @@ export function useRobotControl(enabled: boolean): RobotControlController {
   }, [
     enabled,
     state.draftPositionsRad,
+    state.draftPose,
+    state.draftGripperPosition,
     state.generation,
+    state.mode,
     state.phase,
     state.status,
   ]);
+
+  const selectMode = useCallback((mode: RobotControlMode) => {
+    dispatch({ type: 'select_mode', mode });
+  }, []);
 
   const operationId = state.operation?.operationId ?? null;
   const operationActive = state.operation !== null
@@ -190,8 +214,16 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     ) return;
     const positionsRad = [...state.draftPositionsRad];
     positionsRad[jointIndex] = positionRad;
-    dispatch({ type: 'edit', positionsRad });
+    dispatch({ type: 'edit_joint', positionsRad });
   }, [state]);
+
+  const editPose = useCallback((pose: Pose3Value) => {
+    dispatch({ type: 'edit_pose', pose });
+  }, []);
+
+  const editGripper = useCallback((position: number) => {
+    dispatch({ type: 'edit_gripper', position });
+  }, []);
 
   const approve = useCallback(async () => {
     if (
@@ -248,5 +280,15 @@ export function useRobotControl(enabled: boolean): RobotControlController {
     setReloadToken((current) => current + 1);
   }, []);
 
-  return { state, editJoint, approve, revert, stop, retry };
+  return {
+    state,
+    selectMode,
+    editJoint,
+    editPose,
+    editGripper,
+    approve,
+    revert,
+    stop,
+    retry,
+  };
 }

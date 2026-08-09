@@ -818,6 +818,73 @@ ResourceAddressedExecutionKernel::begin_motion_preview_session(
       std::move(session));
 }
 
+Result<CapabilityCommandPreviewResultDTO>
+ResourceAddressedExecutionKernel::preview_capability_command(
+    const OperationIntentDTO& intent) {
+  std::lock_guard submit_lock(submission_mutex_);
+  auto validation = validate_operation_intent(intent);
+  if (!validation.ok()) {
+    return Result<CapabilityCommandPreviewResultDTO>::Err(
+        validation.error());
+  }
+  if (intent.request_context.request_owner_epoch !=
+      config_.request_owner_epoch) {
+    return Result<CapabilityCommandPreviewResultDTO>::Err(error(
+        "stale_request_owner_epoch",
+        "capability-command preview names a stale Kernel owner epoch",
+        "stale_request_owner_epoch"));
+  }
+  if (intent.participants.size() != 1U ||
+      intent.coordination_policy !=
+          OperationCoordinationPolicy::kIndependent ||
+      !std::holds_alternative<CapabilityCommandIntentDTO>(
+          intent.participants.front().payload)) {
+    return reject<CapabilityCommandPreviewResultDTO>(
+        "I6 command preview requires one independent capability command",
+        "i6_preview_capability_command_invalid", ErrorCode::kInvalidRequest);
+  }
+  {
+    std::lock_guard state_lock(state_mutex_);
+    if (active_operation_ != nullptr) {
+      return reject<CapabilityCommandPreviewResultDTO>(
+          "capability-command preview cannot begin while an operation is "
+          "unsettled",
+          "capability_command_preview_operation_busy");
+    }
+  }
+  auto resolved = registry_.resolve(intent, 0U);
+  if (!resolved.ok()) {
+    return Result<CapabilityCommandPreviewResultDTO>::Err(resolved.error());
+  }
+  auto* engine = engine_for(resolved.value());
+  if (engine == nullptr) {
+    return reject<CapabilityCommandPreviewResultDTO>(
+        "resolved command participant has no registered subordinate engine",
+        "runtime_participant_engine_missing",
+        ErrorCode::kInvariantViolation);
+  }
+  const auto& command = std::get<CapabilityCommandIntentDTO>(
+      intent.participants.front().payload);
+  auto request = build_command_request(command, resolved.value().value());
+  if (!request.ok()) {
+    return Result<CapabilityCommandPreviewResultDTO>::Err(request.error());
+  }
+  auto preflight = engine->validate_gripper_command(request.value());
+  if (!preflight.ok()) {
+    return Result<CapabilityCommandPreviewResultDTO>::Err(preflight.error());
+  }
+  const auto status = engine->get_gripper_status(
+      request.value().gripper_id);
+  if (status.state == GripperCommandState::kExecuting) {
+    return reject<CapabilityCommandPreviewResultDTO>(
+        "gripper command preview cannot validate a busy target",
+        "gripper_busy");
+  }
+  return Result<CapabilityCommandPreviewResultDTO>::Ok(
+      CapabilityCommandPreviewResultDTO{resolved.value().value(),
+                                        std::move(request.value())});
+}
+
 IResolvedParticipantExecutionEngine* ResourceAddressedExecutionKernel::engine_for(
     const RuntimeParticipantBinding& binding) const noexcept {
   const auto found = std::find_if(registrations_.begin(), registrations_.end(),

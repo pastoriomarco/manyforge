@@ -1,5 +1,6 @@
 import {
   parseCatalogResponse,
+  parseCapabilityCommandPreviewResponse,
   parseFileBrowserResponse,
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
@@ -27,8 +28,9 @@ import type {
   OperatorAlarmSnapshot,
 } from '../types/headless';
 import type {
+  CapabilityCommandPreviewReceipt,
+  DirectControlOperationIntent,
   ExecutionOwnerStatus,
-  JointMotionOperationIntent,
   MotionPreviewReceipt,
   OperationAcceptance,
   OperationObservation,
@@ -177,13 +179,19 @@ export const api = {
         signal,
       ),
     previewMotion: (
-      intent: JointMotionOperationIntent,
+      intent: DirectControlOperationIntent,
       signal?: AbortSignal,
     ): Promise<MotionPreviewReceipt> => requestJson(
       '/api/execution/motion-previews',
       (value) => {
         const receipt = parseMotionPreviewResponse(value);
         const participant = intent.participants[0];
+        if (participant.payload.kind !== 'motion') {
+          throw new Error('motion preview requires a motion intent');
+        }
+        const authoredJointNames = participant.payload.motion.kind === 'joint_goal'
+          ? participant.payload.motion.joint_names
+          : null;
         if (
           receipt.requestId !== intent.request_context.request_id
           || receipt.requestOwnerEpoch
@@ -204,12 +212,12 @@ export const api = {
           || receipt.targetRoleId !== participant.target_role_id
           || receipt.requiredCapabilityId
             !== participant.required_capability_id
-          || receipt.sourceJointNames.length
-            !== participant.payload.motion.joint_names.length
-          || receipt.sourceJointNames.some(
-            (name, index) => name
-              !== participant.payload.motion.joint_names[index],
-          )
+          || (authoredJointNames !== null && (
+            receipt.sourceJointNames.length !== authoredJointNames.length
+            || receipt.sourceJointNames.some(
+              (name, index) => name !== authoredJointNames[index],
+            )
+          ))
         ) {
           throw new Error('preview receipt does not match the authored intent');
         }
@@ -218,8 +226,62 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(intent) },
     ),
+    previewCapabilityCommand: (
+      intent: DirectControlOperationIntent,
+      signal?: AbortSignal,
+    ): Promise<CapabilityCommandPreviewReceipt> => requestJson(
+      '/api/execution/capability-command-previews',
+      (value) => {
+        const receipt = parseCapabilityCommandPreviewResponse(value);
+        const participant = intent.participants[0];
+        if (participant.payload.kind !== 'capability_command') {
+          throw new Error(
+            'capability-command preview requires a command intent',
+          );
+        }
+        if (
+          receipt.requestId !== intent.request_context.request_id
+          || receipt.requestOwnerEpoch
+            !== intent.request_context.request_owner_epoch
+          || receipt.programId !== intent.program_id
+          || receipt.programRevision !== intent.program_revision
+          || receipt.programBindingId !== intent.program_binding_id
+          || receipt.programRunId !== intent.program_run_id
+          || receipt.graphRevision !== intent.expected_graph_revision
+          || receipt.retainedBundleId !== intent.expected_retained_bundle_id
+          || receipt.sceneRevision.scene_id
+            !== intent.expected_scene_revision.scene_id
+          || receipt.sceneRevision.revision_id
+            !== intent.expected_scene_revision.revision_id
+          || receipt.sceneRevision.content_hash
+            !== intent.expected_scene_revision.content_hash
+          || receipt.componentRoleId !== participant.component_role_id
+          || receipt.targetRoleId !== participant.target_role_id
+          || receipt.requiredCapabilityId
+            !== participant.required_capability_id
+          || receipt.commandSchemaId
+            !== participant.payload.command_schema_id
+          || receipt.commandSchemaRevision
+            !== participant.payload.command_schema_revision
+          || receipt.coordinateKind
+            !== participant.payload.command_value.position.kind
+          || receipt.targetPosition !== (
+            participant.payload.command_value.position.kind === 'angular_rad'
+              ? participant.payload.command_value.position.value_rad
+              : participant.payload.command_value.position.value_m
+          )
+        ) {
+          throw new Error(
+            'command preview receipt does not match the authored intent',
+          );
+        }
+        return receipt;
+      },
+      signal,
+      { method: 'POST', body: JSON.stringify(intent) },
+    ),
     submit: (
-      intent: JointMotionOperationIntent,
+      intent: DirectControlOperationIntent,
       signal?: AbortSignal,
     ): Promise<OperationAcceptance> => requestJson(
       '/api/execution/operations',

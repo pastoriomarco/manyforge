@@ -19,8 +19,9 @@ not currently available on `dev`.
 > clients without restoring a product lane. I6/N3 now proves one bounded native
 > absolute joint-goal path through an independently restartable C++ owner,
 > headless API, Behavior caller, and Composer proxy. It is development evidence,
-> not the complete native lane. N6-c1 now adds one bounded addressed joint
-> Robot Control workflow: source-local no-motion preview, explicit approval,
+> not the complete native lane. N6-c1 and N6-c2 now add a bounded addressed
+> four-mode Robot Control workflow: joint goals, pose goals, Cartesian paths,
+> and gripper commands with source-local no-motion preview, explicit approval,
 > owner-issued progress, and operation Stop. It is not the complete manual-
 > control or product workflow. Composer Program-tree
 > execution and all three product lanes remain intentionally unavailable; the

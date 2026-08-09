@@ -582,6 +582,11 @@ TEST(RetainedGripperCommandBackendTest,
   EXPECT_EQ(reset.state, GripperCommandState::kIdle);
   EXPECT_NE(reset.generation, first.generation);
   EXPECT_EQ(channel->publish_calls(), 0);
+  const auto fenced_preflight =
+      backend.validate_gripper_command(gripper_request(binding, 0.01, 0.0));
+  ASSERT_FALSE(fenced_preflight.ok());
+  EXPECT_EQ(fenced_preflight.error().code,
+            "gripper_command_not_authorized");
   EXPECT_FALSE(
       backend.command_gripper(gripper_request(binding, 0.01, 0.0)).accepted);
 
@@ -589,6 +594,10 @@ TEST(RetainedGripperCommandBackendTest,
   const auto replacement =
       backend.command_gripper(gripper_request(binding, 0.01, 0.0));
   ASSERT_TRUE(replacement.accepted);
+  const auto busy_preflight =
+      backend.validate_gripper_command(gripper_request(binding, 0.015, 0.0));
+  ASSERT_FALSE(busy_preflight.ok());
+  EXPECT_EQ(busy_preflight.error().code, "gripper_busy");
   scheduler.advance_to(clock.now());
   EXPECT_NE(replacement.generation, first.generation);
 }
@@ -617,6 +626,10 @@ TEST(RetainedGripperCommandBackendTest,
   ASSERT_TRUE(failed.error.has_value());
   EXPECT_EQ(failed.error->code, "gripper_projection_failed");
   EXPECT_EQ(channel->project_calls(), 10);
+  const auto failed_preflight =
+      backend.validate_gripper_command(gripper_request(binding, 0.01, 0.0));
+  ASSERT_FALSE(failed_preflight.ok());
+  EXPECT_EQ(failed_preflight.error().code, "gripper_projection_failed");
 }
 
 TEST(RetainedGripperCommandBackendTest,

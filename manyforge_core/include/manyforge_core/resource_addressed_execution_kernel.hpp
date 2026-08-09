@@ -31,6 +31,14 @@ struct ResourceAddressedExecutionKernelConfig final {
   std::size_t request_replay_capacity{1024U};
 };
 
+/// Private no-effect result used to project a capability-command preview at a
+/// trusted transport boundary. The public receipt is minted by that boundary;
+/// this value carries no reusable admission or reservation.
+struct CapabilityCommandPreviewResultDTO final {
+  RuntimeParticipantBindingDTO binding;
+  GripperCommandRequestDTO command_request;
+};
+
 /// I6 resource-addressed Kernel owner.
 ///
 /// The current restoration gate deliberately admits one operation with one
@@ -58,6 +66,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<std::unique_ptr<IAddressedMotionPreviewSession>>
   begin_motion_preview_session(
       const OperationIntentDTO& primary_motion) override;
+
+  /// Resolve and validate one capability command without reserving,
+  /// journaling, changing observed state, or dispatching a command.
+  [[nodiscard]] Result<CapabilityCommandPreviewResultDTO>
+  preview_capability_command(const OperationIntentDTO& intent);
 
   [[nodiscard]] Result<OperationControlAcceptedDTO> pause(
       const OperationControlRequestDTO& request);

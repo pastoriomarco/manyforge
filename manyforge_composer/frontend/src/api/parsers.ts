@@ -33,9 +33,12 @@ import type {
   SourceFreshness,
 } from '../types/headless';
 import type {
+  CapabilityCommandPreviewReceipt,
+  CoordinateKind,
   DirectControlJoint,
   ExecutionOwnerStatus,
   MotionPreviewReceipt,
+  ObservedGripperTarget,
   ObservedMotionTarget,
   OperationAcceptance,
   OperationObservation,
@@ -1033,6 +1036,7 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
   );
   exactKeysAt(observed, [
     'complete',
+    'current_tcp_pose',
     'positions_rad',
     'sequence',
     'source_epoch',
@@ -1079,6 +1083,128 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
     complete: booleanAt(
       observed.complete,
       'executionStatus.observedMotion.complete',
+    ),
+    currentTcpPose: poseAt(
+      observed.current_tcp_pose,
+      'executionStatus.observedMotion.current_tcp_pose',
+    ),
+  };
+  const directGripper = objectAt(
+    status.direct_control_gripper,
+    'executionStatus.status.direct_control_gripper',
+  );
+  exactKeysAt(directGripper, [
+    'command_schema_id',
+    'command_schema_revision',
+    'command_target_id',
+    'component_role_id',
+    'controllable_component_id',
+    'observed_state',
+    'operation_capability_id',
+    'program_binding_id',
+    'program_id',
+    'program_revision',
+    'program_run_id',
+    'resource',
+    'target_role_id',
+  ], 'executionStatus.status.direct_control_gripper');
+  const gripperResource = objectAt(
+    directGripper.resource,
+    'executionStatus.status.direct_control_gripper.resource',
+  );
+  exactKeysAt(gripperResource, [
+    'coordinate_kind',
+    'max_position',
+    'min_position',
+    'source_coordinate_name',
+  ], 'executionStatus.status.direct_control_gripper.resource');
+  const coordinateKind = stringAt(
+    gripperResource.coordinate_kind,
+    'executionStatus.status.direct_control_gripper.resource.coordinate_kind',
+  );
+  if (coordinateKind !== 'angular_rad' && coordinateKind !== 'linear_m') {
+    return fail(
+      'executionStatus.status.direct_control_gripper.resource.coordinate_kind',
+      'angular_rad or linear_m',
+    );
+  }
+  const gripperMin = numberAt(
+    gripperResource.min_position,
+    'executionStatus.status.direct_control_gripper.resource.min_position',
+  );
+  const gripperMax = numberAt(
+    gripperResource.max_position,
+    'executionStatus.status.direct_control_gripper.resource.max_position',
+  );
+  if (gripperMin > gripperMax) {
+    return fail(
+      'executionStatus.status.direct_control_gripper.resource',
+      'ordered finite position limits',
+    );
+  }
+  const gripperObserved = objectAt(
+    directGripper.observed_state,
+    'executionStatus.status.direct_control_gripper.observed_state',
+  );
+  exactKeysAt(gripperObserved, [
+    'complete',
+    'position',
+    'sequence',
+    'source_coordinate_name',
+    'source_epoch',
+  ], 'executionStatus.status.direct_control_gripper.observed_state');
+  const observedPosition = objectAt(
+    gripperObserved.position,
+    'executionStatus.status.direct_control_gripper.observed_state.position',
+  );
+  const expectedPositionKey = coordinateKind === 'angular_rad'
+    ? 'value_rad'
+    : 'value_m';
+  exactKeysAt(
+    observedPosition,
+    ['kind', expectedPositionKey],
+    'executionStatus.status.direct_control_gripper.observed_state.position',
+  );
+  if (stringAt(
+    observedPosition.kind,
+    'executionStatus.status.direct_control_gripper.observed_state.position.kind',
+  ) !== coordinateKind) {
+    return fail(
+      'executionStatus.status.direct_control_gripper.observed_state.position.kind',
+      coordinateKind,
+    );
+  }
+  const gripperSourceName = stringAt(
+    gripperResource.source_coordinate_name,
+    'executionStatus.status.direct_control_gripper.resource.source_coordinate_name',
+  );
+  if (stringAt(
+    gripperObserved.source_coordinate_name,
+    'executionStatus.status.direct_control_gripper.observed_state.source_coordinate_name',
+  ) !== gripperSourceName) {
+    return fail(
+      'executionStatus.status.direct_control_gripper.observed_state.source_coordinate_name',
+      'the exact retained source coordinate',
+    );
+  }
+  const observedGripper: ObservedGripperTarget = {
+    sequence: integerAt(
+      gripperObserved.sequence,
+      'executionStatus.status.direct_control_gripper.observed_state.sequence',
+    ),
+    sourceEpoch: stringAt(
+      gripperObserved.source_epoch,
+      'executionStatus.status.direct_control_gripper.observed_state.source_epoch',
+    ),
+    sourceCoordinateName: gripperSourceName,
+    position: numberAt(
+      observedPosition[expectedPositionKey],
+      `executionStatus.status.direct_control_gripper.observed_state.position.${expectedPositionKey}`,
+    ),
+    coordinateKind: coordinateKind as CoordinateKind,
+    complete: booleanAt(
+      gripperObserved.complete,
+      'executionStatus.status.direct_control_gripper.observed_state.complete',
     ),
   };
   return {
@@ -1144,7 +1270,58 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
       ),
       joints,
     },
+    directControlGripper: {
+      controllableComponentId: stringAt(
+        directGripper.controllable_component_id,
+        'executionStatus.status.direct_control_gripper.controllable_component_id',
+      ),
+      commandTargetId: stringAt(
+        directGripper.command_target_id,
+        'executionStatus.status.direct_control_gripper.command_target_id',
+      ),
+      componentRoleId: stringAt(
+        directGripper.component_role_id,
+        'executionStatus.status.direct_control_gripper.component_role_id',
+      ),
+      targetRoleId: stringAt(
+        directGripper.target_role_id,
+        'executionStatus.status.direct_control_gripper.target_role_id',
+      ),
+      operationCapabilityId: stringAt(
+        directGripper.operation_capability_id,
+        'executionStatus.status.direct_control_gripper.operation_capability_id',
+      ),
+      programId: stringAt(
+        directGripper.program_id,
+        'executionStatus.status.direct_control_gripper.program_id',
+      ),
+      programRevision: stringAt(
+        directGripper.program_revision,
+        'executionStatus.status.direct_control_gripper.program_revision',
+      ),
+      programBindingId: stringAt(
+        directGripper.program_binding_id,
+        'executionStatus.status.direct_control_gripper.program_binding_id',
+      ),
+      programRunId: stringAt(
+        directGripper.program_run_id,
+        'executionStatus.status.direct_control_gripper.program_run_id',
+      ),
+      commandSchemaId: stringAt(
+        directGripper.command_schema_id,
+        'executionStatus.status.direct_control_gripper.command_schema_id',
+      ),
+      commandSchemaRevision: stringAt(
+        directGripper.command_schema_revision,
+        'executionStatus.status.direct_control_gripper.command_schema_revision',
+      ),
+      sourceCoordinateName: gripperSourceName,
+      coordinateKind: coordinateKind as CoordinateKind,
+      minPosition: gripperMin,
+      maxPosition: gripperMax,
+    },
     observedMotion,
+    observedGripper,
   };
 }
 
@@ -1349,6 +1526,185 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
         'motionPreview.preview_receipt.collision_world_revision.content_hash',
       ),
     },
+    commitEligible: true,
+  };
+}
+
+export function parseCapabilityCommandPreviewResponse(
+  value: unknown,
+): CapabilityCommandPreviewReceipt {
+  const envelope = objectAt(value, 'capabilityCommandPreview');
+  if (
+    booleanAt(envelope.ok, 'capabilityCommandPreview.ok') !== true
+    || stringAt(
+      envelope.command,
+      'capabilityCommandPreview.command',
+    ) !== 'preview_capability_command'
+  ) {
+    return fail(
+      'capabilityCommandPreview',
+      'a successful capability-command preview response',
+    );
+  }
+  const receipt = objectAt(
+    envelope.preview_receipt,
+    'capabilityCommandPreview.preview_receipt',
+  );
+  exactKeysAt(receipt, [
+    'command_schema_id',
+    'command_schema_revision',
+    'commit_eligible',
+    'component_role_id',
+    'coordinate_kind',
+    'graph_revision',
+    'intent_digest',
+    'max_position',
+    'min_position',
+    'program_binding_id',
+    'program_id',
+    'program_revision',
+    'program_run_id',
+    'receipt_digest',
+    'request_id',
+    'request_owner_epoch',
+    'required_capability_id',
+    'retained_bundle_id',
+    'scene_revision',
+    'schema_version',
+    'source_coordinate_name',
+    'target_position',
+    'target_role_id',
+  ], 'capabilityCommandPreview.preview_receipt');
+  const schemaVersion = stringAt(
+    receipt.schema_version,
+    'capabilityCommandPreview.preview_receipt.schema_version',
+  );
+  if (
+    schemaVersion
+    !== 'manyforge.direct_control_capability_command_preview.v1'
+  ) {
+    return fail(
+      'capabilityCommandPreview.preview_receipt.schema_version',
+      'manyforge.direct_control_capability_command_preview.v1',
+    );
+  }
+  const coordinateKind = stringAt(
+    receipt.coordinate_kind,
+    'capabilityCommandPreview.preview_receipt.coordinate_kind',
+  );
+  if (coordinateKind !== 'angular_rad' && coordinateKind !== 'linear_m') {
+    return fail(
+      'capabilityCommandPreview.preview_receipt.coordinate_kind',
+      'angular_rad or linear_m',
+    );
+  }
+  const minPosition = numberAt(
+    receipt.min_position,
+    'capabilityCommandPreview.preview_receipt.min_position',
+  );
+  const maxPosition = numberAt(
+    receipt.max_position,
+    'capabilityCommandPreview.preview_receipt.max_position',
+  );
+  const targetPosition = numberAt(
+    receipt.target_position,
+    'capabilityCommandPreview.preview_receipt.target_position',
+  );
+  if (
+    minPosition > targetPosition
+    || targetPosition > maxPosition
+    || booleanAt(
+      receipt.commit_eligible,
+      'capabilityCommandPreview.preview_receipt.commit_eligible',
+    ) !== true
+  ) {
+    return fail(
+      'capabilityCommandPreview.preview_receipt',
+      'an in-limit commit-eligible command',
+    );
+  }
+  exactKeysAt(
+    objectAt(
+      receipt.scene_revision,
+      'capabilityCommandPreview.preview_receipt.scene_revision',
+    ),
+    ['content_hash', 'revision_id', 'scene_id'],
+    'capabilityCommandPreview.preview_receipt.scene_revision',
+  );
+  return {
+    schemaVersion,
+    receiptDigest: stringAt(
+      receipt.receipt_digest,
+      'capabilityCommandPreview.preview_receipt.receipt_digest',
+    ),
+    intentDigest: stringAt(
+      receipt.intent_digest,
+      'capabilityCommandPreview.preview_receipt.intent_digest',
+    ),
+    requestId: stringAt(
+      receipt.request_id,
+      'capabilityCommandPreview.preview_receipt.request_id',
+    ),
+    requestOwnerEpoch: stringAt(
+      receipt.request_owner_epoch,
+      'capabilityCommandPreview.preview_receipt.request_owner_epoch',
+    ),
+    programId: stringAt(
+      receipt.program_id,
+      'capabilityCommandPreview.preview_receipt.program_id',
+    ),
+    programRevision: stringAt(
+      receipt.program_revision,
+      'capabilityCommandPreview.preview_receipt.program_revision',
+    ),
+    programBindingId: stringAt(
+      receipt.program_binding_id,
+      'capabilityCommandPreview.preview_receipt.program_binding_id',
+    ),
+    programRunId: stringAt(
+      receipt.program_run_id,
+      'capabilityCommandPreview.preview_receipt.program_run_id',
+    ),
+    graphRevision: stringAt(
+      receipt.graph_revision,
+      'capabilityCommandPreview.preview_receipt.graph_revision',
+    ),
+    retainedBundleId: stringAt(
+      receipt.retained_bundle_id,
+      'capabilityCommandPreview.preview_receipt.retained_bundle_id',
+    ),
+    sceneRevision: sceneRevisionAt(
+      receipt.scene_revision,
+      'capabilityCommandPreview.preview_receipt.scene_revision',
+    ),
+    componentRoleId: stringAt(
+      receipt.component_role_id,
+      'capabilityCommandPreview.preview_receipt.component_role_id',
+    ),
+    targetRoleId: stringAt(
+      receipt.target_role_id,
+      'capabilityCommandPreview.preview_receipt.target_role_id',
+    ),
+    requiredCapabilityId: stringAt(
+      receipt.required_capability_id,
+      'capabilityCommandPreview.preview_receipt.required_capability_id',
+    ),
+    commandSchemaId: stringAt(
+      receipt.command_schema_id,
+      'capabilityCommandPreview.preview_receipt.command_schema_id',
+    ),
+    commandSchemaRevision: stringAt(
+      receipt.command_schema_revision,
+      'capabilityCommandPreview.preview_receipt.command_schema_revision',
+    ),
+    sourceCoordinateName: stringAt(
+      receipt.source_coordinate_name,
+      'capabilityCommandPreview.preview_receipt.source_coordinate_name',
+    ),
+    coordinateKind: coordinateKind as CoordinateKind,
+    targetPosition,
+    minPosition,
+    maxPosition,
     commitEligible: true,
   };
 }

@@ -74,6 +74,36 @@ MOTION_PREVIEW_RECEIPT_KEYS = frozenset(
 MOTION_PREVIEW_COLLISION_REVISION_KEYS = frozenset(
     {"content_hash", "revision_id"}
 )
+CAPABILITY_COMMAND_PREVIEW_RESPONSE_KEYS = frozenset(
+    {"api_version", "command", "ok", "preview_receipt"}
+)
+CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS = frozenset(
+    {
+        "command_schema_id",
+        "command_schema_revision",
+        "commit_eligible",
+        "component_role_id",
+        "coordinate_kind",
+        "graph_revision",
+        "intent_digest",
+        "max_position",
+        "min_position",
+        "program_binding_id",
+        "program_id",
+        "program_revision",
+        "program_run_id",
+        "receipt_digest",
+        "request_id",
+        "request_owner_epoch",
+        "required_capability_id",
+        "retained_bundle_id",
+        "scene_revision",
+        "schema_version",
+        "source_coordinate_name",
+        "target_position",
+        "target_role_id",
+    }
+)
 
 
 class ExecutionPort(Protocol):
@@ -87,6 +117,13 @@ class ExecutionPort(Protocol):
     ) -> dict[str, Any]: ...
 
     def preview_motion(
+        self,
+        request: OperationIntentRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
+    def preview_capability_command(
         self,
         request: OperationIntentRequest,
         *,
@@ -587,6 +624,123 @@ class ExecutionCommandClient:
                 "execution_command_response_invalid",
                 "native motion preview pose is malformed",
             ) from exc
+        return response
+
+    def preview_capability_command(
+        self,
+        request: OperationIntentRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        operation = request.model_dump(mode="json")
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._http_attribution(trusted_principal_id),
+                "command": "preview_capability_command",
+                "operation": operation,
+            }
+        )
+        if response.get("ok") is not True:
+            return response
+        receipt = response.get("preview_receipt")
+        participant = operation["participants"][0]
+        payload = participant["payload"]
+        command_value = payload.get("command_value")
+        position = (
+            command_value.get("position")
+            if isinstance(command_value, dict)
+            else None
+        )
+        expected_intent_digest = (
+            "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
+        )
+        if (
+            set(response) != CAPABILITY_COMMAND_PREVIEW_RESPONSE_KEYS
+            or not isinstance(receipt, dict)
+            or set(receipt) != CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native capability-command preview has an undeclared shape",
+            )
+        if (
+            response.get("command") != "preview_capability_command"
+            or receipt.get("schema_version")
+            != "manyforge.direct_control_capability_command_preview.v1"
+            or receipt.get("commit_eligible") is not True
+            or receipt.get("intent_digest") != expected_intent_digest
+            or receipt.get("request_id")
+            != operation["request_context"]["request_id"]
+            or receipt.get("request_owner_epoch")
+            != operation["request_context"]["request_owner_epoch"]
+            or receipt.get("program_id") != operation["program_id"]
+            or receipt.get("program_revision")
+            != operation["program_revision"]
+            or receipt.get("program_binding_id")
+            != operation["program_binding_id"]
+            or receipt.get("program_run_id") != operation["program_run_id"]
+            or receipt.get("graph_revision")
+            != operation["expected_graph_revision"]
+            or receipt.get("retained_bundle_id")
+            != operation["expected_retained_bundle_id"]
+            or receipt.get("scene_revision")
+            != operation["expected_scene_revision"]
+            or receipt.get("component_role_id")
+            != participant["component_role_id"]
+            or receipt.get("target_role_id") != participant["target_role_id"]
+            or receipt.get("required_capability_id")
+            != participant["required_capability_id"]
+            or receipt.get("command_schema_id")
+            != payload.get("command_schema_id")
+            or receipt.get("command_schema_revision")
+            != payload.get("command_schema_revision")
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "capability-command preview does not match its submitted intent",
+            )
+        coordinate_kind = receipt.get("coordinate_kind")
+        expected_target: object = None
+        if isinstance(position, dict):
+            if position.get("kind") == "angular_rad":
+                expected_target = position.get("value_rad")
+            elif position.get("kind") == "linear_m":
+                expected_target = position.get("value_m")
+        numeric_values = [
+            receipt.get("min_position"),
+            receipt.get("max_position"),
+            receipt.get("target_position"),
+        ]
+        if (
+            not isinstance(position, dict)
+            or coordinate_kind != position.get("kind")
+            or receipt.get("target_position") != expected_target
+            or not isinstance(receipt.get("source_coordinate_name"), str)
+            or not receipt["source_coordinate_name"]
+            or not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                for value in numeric_values
+            )
+            or receipt["min_position"] > receipt["target_position"]
+            or receipt["target_position"] > receipt["max_position"]
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native capability-command preview is malformed",
+            )
+        digest_input = dict(receipt)
+        receipt_digest = digest_input.pop("receipt_digest", None)
+        expected_receipt_digest = (
+            "sha256:" + hashlib.sha256(_canonical_json(digest_input)).hexdigest()
+        )
+        if receipt_digest != expected_receipt_digest:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native capability-command preview digest is invalid",
+            )
         return response
 
     def read(self, operation_id: str) -> dict[str, Any]:

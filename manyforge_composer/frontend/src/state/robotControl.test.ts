@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildCartesianMotionIntent,
+  buildGripperCommandIntent,
   buildJointMotionIntent,
+  buildPoseMotionIntent,
   initialRobotControlState,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
   ROBOT_CONTROL_OPERATION_POLL_MS,
   robotControlReducer,
 } from './robotControl';
 import type {
+  CapabilityCommandPreviewReceipt,
   ExecutionOwnerStatus,
   MotionPreviewReceipt,
 } from '../types/robotControl';
@@ -29,7 +33,11 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
       baseFrameRoleId: 'base',
       tcpFrameRoleId: 'tcp',
       operationCapabilityId: 'execution.trajectory.execute',
-      planningCapabilityIds: ['planning.motion.joint_goal'],
+      planningCapabilityIds: [
+        'planning.motion.cartesian_path',
+        'planning.motion.joint_goal',
+        'planning.motion.pose_goal',
+      ],
       frameRoleIds: ['base', 'tcp'],
       programId: 'manyforge.direct_control.motion',
       programRevision: 'sha256:direct-program',
@@ -52,6 +60,23 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
         },
       ],
     },
+    directControlGripper: {
+      controllableComponentId: 'robot-a',
+      commandTargetId: 'gripper',
+      componentRoleId: 'controlled_component',
+      targetRoleId: 'command_target',
+      operationCapabilityId: 'tool.gripper.command',
+      programId: 'manyforge.direct_control.gripper',
+      programRevision: 'sha256:direct-gripper-program',
+      programBindingId: 'sha256:direct-gripper-binding',
+      programRunId: 'direct-control-gripper-owner-1',
+      commandSchemaId: 'gripper.command_position',
+      commandSchemaRevision: 'sha256:gripper-schema',
+      sourceCoordinateName: 'finger_joint',
+      coordinateKind: 'linear_m',
+      minPosition: 0,
+      maxPosition: 0.04,
+    },
     observedMotion: {
       targetRoleId: 'scenario-arm',
       controllableComponentId: 'robot-a',
@@ -60,6 +85,18 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
       sourceEpoch: 'joint-source-1',
       sourceJointNames: ['joint1', 'joint2'],
       positionsRad: [0, 0.1],
+      complete: true,
+      currentTcpPose: {
+        position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
+        orientation: { x: 0, y: 0, z: 0, w: 1 },
+      },
+    },
+    observedGripper: {
+      sequence: 4,
+      sourceEpoch: 'gripper-source-1',
+      sourceCoordinateName: 'finger_joint',
+      position: 0.02,
+      coordinateKind: 'linear_m',
       complete: true,
     },
   };
@@ -125,6 +162,38 @@ function readyState() {
   return state;
 }
 
+function gripperReceiptFixture(
+  status: ExecutionOwnerStatus,
+  requestId: string,
+  position: number,
+): CapabilityCommandPreviewReceipt {
+  return {
+    schemaVersion: 'manyforge.direct_control_capability_command_preview.v1',
+    receiptDigest: 'sha256:gripper-receipt',
+    intentDigest: 'sha256:gripper-intent',
+    requestId,
+    requestOwnerEpoch: status.ownerEpoch,
+    programId: status.directControlGripper.programId,
+    programRevision: status.directControlGripper.programRevision,
+    programBindingId: status.directControlGripper.programBindingId,
+    programRunId: status.directControlGripper.programRunId,
+    graphRevision: status.graphRevision,
+    retainedBundleId: status.retainedBundleId,
+    sceneRevision: { ...status.sceneRevision },
+    componentRoleId: status.directControlGripper.componentRoleId,
+    targetRoleId: status.directControlGripper.targetRoleId,
+    requiredCapabilityId: status.directControlGripper.operationCapabilityId,
+    commandSchemaId: status.directControlGripper.commandSchemaId,
+    commandSchemaRevision: status.directControlGripper.commandSchemaRevision,
+    sourceCoordinateName: status.directControlGripper.sourceCoordinateName,
+    coordinateKind: status.directControlGripper.coordinateKind,
+    targetPosition: position,
+    minPosition: status.directControlGripper.minPosition,
+    maxPosition: status.directControlGripper.maxPosition,
+    commitEligible: true,
+  };
+}
+
 describe('addressed Robot Control state', () => {
   it('preserves the historical bounded authoring cadence', () => {
     expect(ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS).toBe(150);
@@ -135,6 +204,9 @@ describe('addressed Robot Control state', () => {
     const status = statusFixture();
     const intent = buildJointMotionIntent(status, [0.2, -0.4], 'request-9');
     const participant = intent.participants[0];
+    if (participant.payload.kind !== 'motion') {
+      throw new Error('expected motion payload');
+    }
 
     expect(intent.program_id).toBe('manyforge.direct_control.motion');
     expect(intent.program_binding_id).toBe('sha256:direct-binding');
@@ -326,5 +398,166 @@ describe('addressed Robot Control state', () => {
     expect(restarted.preview).toBeNull();
     expect(restarted.ghost).toBeNull();
     expect(restarted.error).toContain('restarted');
+  });
+
+  it('preserves absolute pose and explicit current-to-target Cartesian meaning', () => {
+    const status = statusFixture();
+    const target = {
+      position_m: { x_m: 0.4, y_m: -0.1, z_m: 0.2 },
+      orientation: { x: 0, y: 0, z: 0, w: 1 },
+    };
+    const pose = buildPoseMotionIntent(status, target, 'pose-request');
+    const cartesian = buildCartesianMotionIntent(
+      status,
+      target,
+      'cartesian-request',
+    );
+    const posePayload = pose.participants[0].payload;
+    const cartesianPayload = cartesian.participants[0].payload;
+    if (
+      posePayload.kind !== 'motion'
+      || cartesianPayload.kind !== 'motion'
+    ) throw new Error('expected motion payloads');
+
+    expect(posePayload.motion).toEqual({ kind: 'pose_goal', goal: target });
+    expect(cartesianPayload.motion).toMatchObject({
+      kind: 'cartesian_path',
+      waypoints: [status.observedMotion.currentTcpPose, target],
+      fallback_policy: 'fail_closed',
+    });
+  });
+
+  it('authors gripper commands with the exact schema and source-local unit', () => {
+    const status = statusFixture();
+    const intent = buildGripperCommandIntent(status, 0.03, 'gripper-request');
+    const payload = intent.participants[0].payload;
+    if (payload.kind !== 'capability_command') {
+      throw new Error('expected capability command');
+    }
+
+    expect(intent.program_id).toBe('manyforge.direct_control.gripper');
+    expect(payload.command_schema_id).toBe('gripper.command_position');
+    expect(payload.command_value.position).toEqual({
+      kind: 'linear_m',
+      value_m: 0.03,
+    });
+  });
+
+  it('makes a prior preview non-approvable immediately on a mode change', () => {
+    const ready = readyState();
+    const changed = robotControlReducer(ready, {
+      type: 'select_mode',
+      mode: 'pose_goal',
+    });
+
+    expect(changed.phase).toBe('planning');
+    expect(changed.intent).toBeNull();
+    expect(changed.preview).toBeNull();
+    expect(changed.ghost).toBe(ready.ghost);
+    expect(changed.ghostStale).toBe(true);
+  });
+
+  it('accepts only the latest exact gripper preview and fabricates no ghost', () => {
+    const status = statusFixture();
+    let state = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status,
+    });
+    state = robotControlReducer(state, {
+      type: 'edit_gripper',
+      position: 0.03,
+    });
+    const intent = buildGripperCommandIntent(status, 0.03, 'gripper-new');
+    state = robotControlReducer(state, {
+      type: 'preview_started',
+      generation: state.generation,
+      intent,
+    });
+    const staleSceneReceipt = gripperReceiptFixture(
+      status,
+      'gripper-new',
+      0.03,
+    );
+    staleSceneReceipt.sceneRevision.revision_id += 1;
+    const rejected = robotControlReducer(state, {
+      type: 'preview_resolved',
+      generation: state.generation,
+      receipt: staleSceneReceipt,
+    });
+    expect(rejected.phase).toBe('blocked');
+    expect(rejected.preview).toBeNull();
+    state = robotControlReducer(state, {
+      type: 'preview_resolved',
+      generation: state.generation,
+      receipt: gripperReceiptFixture(status, 'gripper-new', 0.03),
+    });
+
+    expect(state.phase).toBe('ready');
+    expect(state.preview?.requestId).toBe('gripper-new');
+    expect(state.ghost).toBeNull();
+  });
+
+  it('keeps approval fail-closed after the current preview is rejected', () => {
+    const ready = readyState();
+    const planning = robotControlReducer(ready, {
+      type: 'edit',
+      positionsRad: [0.6, 0.5],
+    });
+    const blocked = robotControlReducer(planning, {
+      type: 'preview_rejected',
+      generation: planning.generation,
+      error: 'state changed before validation',
+    });
+
+    expect(blocked.phase).toBe('blocked');
+    expect(blocked.intent).toBeNull();
+    expect(blocked.preview).toBeNull();
+    expect(robotControlReducer(blocked, { type: 'approve_started' }))
+      .toBe(blocked);
+  });
+
+  it('rejects a late receipt that targets an older request identity', () => {
+    const status = statusFixture();
+    let state = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status,
+    });
+    state = robotControlReducer(state, {
+      type: 'edit',
+      positionsRad: [0.3, 0.1],
+    });
+    state = robotControlReducer(state, {
+      type: 'preview_started',
+      generation: state.generation,
+      intent: buildJointMotionIntent(status, [0.3, 0.1], 'new-request'),
+    });
+    const blocked = robotControlReducer(state, {
+      type: 'preview_resolved',
+      generation: state.generation,
+      receipt: receiptFixture(status, 'old-request', [0.3, 0.1]),
+    });
+
+    expect(blocked.phase).toBe('blocked');
+    expect(blocked.preview).toBeNull();
+  });
+
+  it('Revert clears a settled local command without issuing cancellation state', () => {
+    const status = statusFixture();
+    let state = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status,
+    });
+    state = robotControlReducer(state, {
+      type: 'edit_gripper',
+      position: 0.03,
+    });
+    const reverted = robotControlReducer(state, { type: 'revert' });
+
+    expect(reverted.phase).toBe('idle');
+    expect(reverted.operation).toBeNull();
+    expect(reverted.preview).toBeNull();
+    expect(reverted.draftGripperPosition).toBe(
+      status.observedGripper.position,
+    );
   });
 });

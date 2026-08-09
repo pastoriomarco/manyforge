@@ -29,8 +29,11 @@
 > valid subsets without restoring a singleton robot/group lookup. N6-c1
 > additionally reconnects bounded addressed joint Robot Control: no-motion
 > preview, explicit approval through the ordinary operation path, owner-issued
-> progress, and operation Stop. These are bounded vertical slices, not the
-> restored native lane or an operator recipe.
+> progress, and operation Stop. N6-c2 extends that same thin client to the
+> historically required four manual-control forms: joint goals, pose goals,
+> Cartesian paths, and gripper commands. Preview remains effect-free; approval
+> submits through the ordinary Kernel operation path. These are bounded
+> vertical slices, not the restored native lane or an operator recipe.
 > Full Program-tree execution, lifecycle and execution controls, live scene
 > editing, broader motion/manipulation, provider-backed assistant/public-MCP
 > operation, Isaac/ROS product launch, and real-robot operation remain
@@ -127,9 +130,10 @@ Stop port. I5/H0 now exposes the bounded public Manager/headless read and
 attributed-intent surfaces while keeping robot readiness and operational Apply
 explicitly unavailable. I6/N3 adds one selected native absolute joint-goal
 development/qualification path through an independently restartable C++ host
-and thin public clients. N6-c1 adds the narrow addressed joint Robot Control
-preview/approval/progress/Stop client over that owner. Neither is a restored
-runtime product lane.
+and thin public clients. N6-c1 and N6-c2 add the addressed four-mode Robot
+Control preview/approval/progress/Stop client over that owner: joint goals,
+pose goals, Cartesian paths, and gripper commands. It remains a thin client of
+the ordinary operation path, not a restored runtime product lane.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).

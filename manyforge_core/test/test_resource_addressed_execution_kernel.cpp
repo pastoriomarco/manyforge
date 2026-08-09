@@ -1005,6 +1005,61 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     CapabilityCommandPreviewValidatesWithoutReservationJournalOrDispatch) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  engine.gripper_status.state = GripperCommandState::kIdle;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding("gripper", "gripper.target", "tool.gripper.command",
+                     CoordinateKind::kLinear, schema),
+        &engine}},
+      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+
+  const auto preview = kernel.preview_capability_command(command_operation());
+  ASSERT_TRUE(preview.ok()) << preview.error().message;
+  EXPECT_EQ(preview.value().binding.program_id.value(), "program.pick");
+  EXPECT_EQ(preview.value().binding.command_target_id.value(),
+            "gripper.target");
+  EXPECT_EQ(preview.value().command_request.joint_name,
+            "mf2_finger_joint");
+  EXPECT_DOUBLE_EQ(preview.value().command_request.target_position, 0.02);
+  EXPECT_EQ(engine.validate_command_calls, 1);
+  EXPECT_EQ(engine.command_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(journal.calls, (std::vector<std::string>{"begin"}));
+  EXPECT_EQ(kernel.resource_snapshot().front().state,
+            ResourceSlotState::kFree);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CapabilityCommandPreviewRejectsBusyTargetWithoutEffect) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernel kernel(
+      {{make_binding("gripper", "gripper.target", "tool.gripper.command",
+                     CoordinateKind::kLinear, schema),
+        &engine}},
+      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+
+  const auto preview = kernel.preview_capability_command(command_operation());
+  ASSERT_FALSE(preview.ok());
+  EXPECT_EQ(preview.error().details.at("reason"), "gripper_busy");
+  EXPECT_EQ(engine.command_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(journal.calls, (std::vector<std::string>{"begin"}));
+  EXPECT_EQ(kernel.resource_snapshot().front().state,
+            ResourceSlotState::kFree);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      GripperValidationPrecedesAcceptanceAndScopedStopResetUseCommandLifecycle) {
   FakeClock clock;
   const ProgramCommandSchemaRefDTO schema{

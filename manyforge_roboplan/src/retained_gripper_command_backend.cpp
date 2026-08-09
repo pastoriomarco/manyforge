@@ -436,14 +436,35 @@ RetainedGripperCommandBackend::~RetainedGripperCommandBackend() {
 core::Result<void> RetainedGripperCommandBackend::validate_gripper_command(
     const core::GripperCommandRequestDTO& request) const {
   const auto invalid = validate_request(request, *state_);
-  if (!invalid.has_value()) {
-    return core::Result<void>::Ok();
+  if (invalid.has_value()) {
+    auto public_error = *invalid;
+    public_error.details["reason"] = public_error.code;
+    public_error.code =
+        std::string(core::to_string(core::ErrorCode::kInvalidRequest));
+    return core::Result<void>::Err(std::move(public_error));
   }
-  auto public_error = *invalid;
-  public_error.details["reason"] = public_error.code;
-  public_error.code =
-      std::string(core::to_string(core::ErrorCode::kInvalidRequest));
-  return core::Result<void>::Err(std::move(public_error));
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  if (state_->closing || state_->admission_blocked) {
+    return core::Result<void>::Err(gripper_error(
+        "gripper_command_not_authorized",
+        "Gripper command admission is closed by the execution lifecycle"));
+  }
+  const auto current = state_->runtimes.find(request.gripper_id);
+  if (current != state_->runtimes.end() &&
+      current->second.status.state ==
+          core::GripperCommandState::kExecuting) {
+    return core::Result<void>::Err(gripper_error(
+        "gripper_busy", "Gripper is already executing a command"));
+  }
+  if (current != state_->runtimes.end() &&
+      current->second.status.state == core::GripperCommandState::kFailed &&
+      !supersedable_grasp_loss(current->second.status.error)) {
+    return core::Result<void>::Err(
+        current->second.status.error.value_or(gripper_error(
+            "gripper_command_failed",
+            "Gripper requires recovery before another command")));
+  }
+  return core::Result<void>::Ok();
 }
 
 core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(

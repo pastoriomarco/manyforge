@@ -2048,7 +2048,7 @@ TEST(RetainedProductCrossConsumer,
       10'000'000};
   auto runtime = create_retained_native_runtime(
       RetainedNativeRuntimeInput{
-          arm_binding, gripper_binding, {}, scene, scene_mutex,
+          arm_binding, gripper_binding, {}, {}, scene, scene_mutex,
           state_projector, projection, shared_collision_model,
           std::move(planner),
           [&](const auto &channels) {

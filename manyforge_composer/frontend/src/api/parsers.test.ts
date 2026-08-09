@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   StructuralContractError,
+  parseCapabilityCommandPreviewResponse,
   parseCatalogResponse,
   parseExecutionOwnerStatus,
   parseHealthResponse,
@@ -321,6 +322,10 @@ describe('addressed Robot Control parsers', () => {
           program_run_id: 'direct-control-owner-1',
           observed_state: {
             complete: true,
+            current_tcp_pose: {
+              position_m: { x_m: 0, y_m: 0, z_m: 0.4 },
+              orientation: { x: 0, y: 0, z: 0, w: 1 },
+            },
             positions_rad: [0.2],
             sequence: 7,
             source_epoch: 'source-1',
@@ -334,6 +339,32 @@ describe('addressed Robot Control parsers', () => {
             max_acceleration_rad_s2: null,
           }],
         },
+        direct_control_gripper: {
+          command_schema_id: 'gripper.command_position',
+          command_schema_revision: 'sha256:gripper-schema',
+          command_target_id: 'gripper',
+          component_role_id: 'controlled_component',
+          controllable_component_id: 'robot-a',
+          observed_state: {
+            complete: true,
+            position: { kind: 'linear_m', value_m: 0.02 },
+            sequence: 8,
+            source_coordinate_name: 'finger_joint',
+            source_epoch: 'gripper-source-1',
+          },
+          operation_capability_id: 'tool.gripper.command',
+          program_binding_id: 'sha256:gripper-binding',
+          program_id: 'manyforge.direct_control.gripper',
+          program_revision: 'sha256:gripper-program',
+          program_run_id: 'direct-control-gripper-owner-1',
+          resource: {
+            coordinate_kind: 'linear_m',
+            max_position: 0.04,
+            min_position: 0,
+            source_coordinate_name: 'finger_joint',
+          },
+          target_role_id: 'command_target',
+        },
         observed_targets: [],
       },
     };
@@ -342,6 +373,8 @@ describe('addressed Robot Control parsers', () => {
     expect(status.directControl.baseFrameRoleId).toBe('base');
     expect(status.observedMotion.sourceJointNames).toEqual(['joint1']);
     expect(status.observedMotion.positionsRad).toEqual([0.2]);
+    expect(status.observedMotion.currentTcpPose.position_m.z_m).toBe(0.4);
+    expect(status.observedGripper.position).toBe(0.02);
 
     const leaked = structuredClone(response);
     Object.assign(leaked.status.direct_control, {
@@ -394,5 +427,49 @@ describe('addressed Robot Control parsers', () => {
     expect(() => parseMotionPreviewResponse(undeclared)).toThrow(
       /exactly/,
     );
+  });
+
+  it('accepts an exact unit-tagged capability-command preview', () => {
+    const response = {
+      ok: true,
+      command: 'preview_capability_command',
+      preview_receipt: {
+        schema_version:
+          'manyforge.direct_control_capability_command_preview.v1',
+        receipt_digest: 'sha256:receipt',
+        intent_digest: 'sha256:intent',
+        request_id: 'request-gripper-1',
+        request_owner_epoch: 'owner-1',
+        program_id: 'manyforge.direct_control.gripper',
+        program_revision: 'sha256:gripper-program',
+        program_binding_id: 'sha256:gripper-binding',
+        program_run_id: 'direct-control-gripper-owner-1',
+        graph_revision: 'sha256:graph',
+        retained_bundle_id: 'sha256:bundle',
+        scene_revision: sceneRevision,
+        component_role_id: 'controlled_component',
+        target_role_id: 'command_target',
+        required_capability_id: 'tool.gripper.command',
+        command_schema_id: 'gripper.command_position',
+        command_schema_revision: 'sha256:gripper-schema',
+        source_coordinate_name: 'finger_joint',
+        coordinate_kind: 'linear_m',
+        target_position: 0.03,
+        min_position: 0,
+        max_position: 0.04,
+        commit_eligible: true,
+      },
+    };
+    const receipt = parseCapabilityCommandPreviewResponse(response);
+
+    expect(receipt.targetPosition).toBe(0.03);
+    expect(receipt.coordinateKind).toBe('linear_m');
+
+    const undeclaredNested = structuredClone(response);
+    Object.assign(undeclaredNested.preview_receipt.scene_revision, {
+      private_generation: 7,
+    });
+    expect(() => parseCapabilityCommandPreviewResponse(undeclaredNested))
+      .toThrow(/exactly/);
   });
 });

@@ -123,9 +123,39 @@ retained_gripper_limits(const roboplan::Scene &scene,
   return std::make_shared<collision::ManyForgeCollisionEngine>(model, cache);
 }
 
-[[nodiscard]] bool same_physical_motion_binding(
+[[nodiscard]] bool same_provider_runtime(
+    const core::RuntimeCapabilityProviderPathDTO& left,
+    const core::RuntimeCapabilityProviderPathDTO& right) noexcept {
+  return left.provider_instance_id == right.provider_instance_id &&
+         left.provider_manifest_id == right.provider_manifest_id &&
+         left.provider_manifest_revision == right.provider_manifest_revision &&
+         left.provider_runtime_epoch == right.provider_runtime_epoch;
+}
+
+[[nodiscard]] bool same_supporting_provider_runtime(
+    const std::vector<core::RuntimeCapabilityProviderPathDTO>& primary,
+    const std::vector<core::RuntimeCapabilityProviderPathDTO>& alias) noexcept {
+  return !primary.empty() &&
+         std::all_of(alias.begin(), alias.end(), [&](const auto& candidate) {
+           return std::any_of(primary.begin(), primary.end(),
+                              [&](const auto& selected) {
+                                return same_provider_runtime(selected,
+                                                             candidate);
+                              });
+         }) &&
+         std::all_of(primary.begin(), primary.end(), [&](const auto& selected) {
+           return std::any_of(alias.begin(), alias.end(),
+                              [&](const auto& candidate) {
+                                return same_provider_runtime(selected,
+                                                             candidate);
+                              });
+         });
+}
+
+[[nodiscard]] bool same_physical_binding(
     const core::RuntimeParticipantBinding& primary,
-    const core::RuntimeParticipantBinding& alias) noexcept {
+    const core::RuntimeParticipantBinding& alias,
+    const bool permit_supporting_capability_expansion) noexcept {
   const auto& left = primary.value();
   const auto& right = alias.value();
   return right.contact_grasp_bindings.empty() &&
@@ -146,8 +176,12 @@ retained_gripper_limits(const roboplan::Scene &scene,
          left.collision_body_bindings == right.collision_body_bindings &&
          left.control_path == right.control_path &&
          left.capability_provider_path == right.capability_provider_path &&
-         left.supporting_capability_provider_paths ==
-             right.supporting_capability_provider_paths &&
+         (left.supporting_capability_provider_paths ==
+              right.supporting_capability_provider_paths ||
+          (permit_supporting_capability_expansion &&
+           same_supporting_provider_runtime(
+               left.supporting_capability_provider_paths,
+               right.supporting_capability_provider_paths))) &&
          left.runtime_unit_epochs == right.runtime_unit_epochs;
 }
 
@@ -183,17 +217,30 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
   const auto &projection_revision =
       current_inventory->projection_binding.projection_revision;
   const auto &motion_value = input.motion_binding.value();
-  const std::size_t reserved_registrations =
-      1U + (input.gripper_binding.has_value() ? 1U : 0U);
-  if (input.motion_binding_aliases.size() >
-          core::kMaxOperationParticipants - reserved_registrations ||
+  const std::size_t registration_count =
+      1U + input.motion_binding_aliases.size() +
+      (input.gripper_binding.has_value() ? 1U : 0U) +
+      input.gripper_binding_aliases.size();
+  if (registration_count > core::kMaxOperationParticipants ||
       std::any_of(input.motion_binding_aliases.begin(),
                   input.motion_binding_aliases.end(), [&](const auto& alias) {
-                    return !same_physical_motion_binding(input.motion_binding,
-                                                         alias);
+                    return !same_physical_binding(input.motion_binding, alias,
+                                                  true);
                   })) {
     throw std::invalid_argument(
         "native motion alias crosses or widens its physical runtime binding");
+  }
+  if ((!input.gripper_binding.has_value() &&
+       !input.gripper_binding_aliases.empty()) ||
+      (input.gripper_binding.has_value() &&
+       std::any_of(input.gripper_binding_aliases.begin(),
+                   input.gripper_binding_aliases.end(),
+                   [&](const auto& alias) {
+                     return !same_physical_binding(*input.gripper_binding,
+                                                   alias, false);
+                   }))) {
+    throw std::invalid_argument(
+        "native gripper alias crosses or widens its physical runtime binding");
   }
   if (motion_value.control_path.has_value() &&
       motion_value.control_path->runtime_scale_qualification.has_value()) {
@@ -276,9 +323,11 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
       throw std::invalid_argument(
           "native gripper state could not be seeded from the retained model");
     }
+    runtime->gripper_position_limits =
+        retained_gripper_limits(*runtime->scene, *runtime->gripper_binding);
     runtime->gripper = std::make_unique<RetainedGripperCommandBackend>(
         *runtime->gripper_binding, runtime->gripper_state_channel,
-        retained_gripper_limits(*runtime->scene, *runtime->gripper_binding),
+        *runtime->gripper_position_limits,
         *runtime->clock, *runtime->scheduler, config.gripper_update_period_ns);
   }
 
@@ -354,6 +403,9 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
   if (runtime->gripper_binding.has_value()) {
     registrations.push_back(
         {*runtime->gripper_binding, runtime->participant_engine.get()});
+  }
+  for (const auto& alias : input.gripper_binding_aliases) {
+    registrations.push_back({alias, runtime->participant_engine.get()});
   }
   runtime->operation_journal = std::make_unique<core::SqliteOperationJournal>(
       std::move(config.operation_journal_path), std::move(config.cell_id));

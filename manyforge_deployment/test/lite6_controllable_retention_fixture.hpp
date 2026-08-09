@@ -57,7 +57,7 @@ struct Lite6ControllableRetentionFixture final {
   std::optional<QualifiedControlInterfaceContract> gripper_control_contract;
   std::optional<QualifiedControllerTopology> gripper_topology;
   std::optional<QualifiedProviderManifest> gripper_provider_manifest;
-  std::optional<QualifiedCapabilityDefinition> planner_capability;
+  std::vector<QualifiedCapabilityDefinition> planner_capabilities;
   std::optional<QualifiedProviderManifest> planner_provider_manifest;
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
 
@@ -191,7 +191,7 @@ struct QualifiedControlCatalog final {
   std::optional<QualifiedControlInterfaceContract> gripper_contract;
   std::optional<QualifiedControllerTopology> gripper_topology;
   std::optional<QualifiedProviderManifest> gripper_provider;
-  std::optional<QualifiedCapabilityDefinition> planner_capability;
+  std::vector<QualifiedCapabilityDefinition> planner_capabilities;
   std::optional<QualifiedProviderManifest> planner_provider;
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
 };
@@ -376,44 +376,54 @@ struct AssistantOverlayFixture final {
   auto capability = resolve_and_qualify_capability_definition(
       capability_ref, capability_key, capability_bytes);
 
-  std::optional<QualifiedCapabilityDefinition> planner_capability;
-  std::optional<std::string> planner_capability_bytes;
+  std::vector<QualifiedCapabilityDefinition> planner_capabilities;
+  std::vector<std::string> planner_capability_bytes;
   if (native_motion) {
-    const auto* planner_descriptor =
-        core::find_builtin_capability_definition("planning.motion.joint_goal");
-    if (planner_descriptor == nullptr) {
-      throw std::logic_error(
-          "Lite6 native-motion fixture requires joint planning");
-    }
-    planner_capability_bytes =
-        canonical_json(CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(
-                                core::kCapabilityDefinitionApiVersion))},
-            {"capability_id", CanonicalValue("planning.motion.joint_goal")},
-            {"scope", CanonicalValue(std::string(
-                          core::to_string(planner_descriptor->scope)))},
-            {"provider_binding_kind",
-             CanonicalValue(std::string(
-                 core::to_string(planner_descriptor->provider_binding_kind)))},
-            {"capability_definition_revision",
-             CanonicalValue(std::string(
-                 planner_descriptor->capability_definition_revision))},
-        }));
-    const core::ContentDigest planner_digest(
-        sha256_digest(*planner_capability_bytes));
-    const core::ContentAddressedStoreKey planner_key(
-        catalog_key("capability", planner_digest.value()));
-    const core::CapabilityDefinitionCatalogRecordRefDTO planner_ref{
-        core::CapabilityId("planning.motion.joint_goal"),
-        core::CapabilityDefinitionRevision(
-            std::string(planner_descriptor->capability_definition_revision)),
-        core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
-        schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
-        planner_digest,
-        planner_key,
+    constexpr std::array<std::string_view, 3U> kPlannerCapabilities{
+        "planning.motion.cartesian_path",
+        "planning.motion.joint_goal",
+        "planning.motion.pose_goal",
     };
-    planner_capability = resolve_and_qualify_capability_definition(
-        planner_ref, planner_key, *planner_capability_bytes);
+    planner_capabilities.reserve(kPlannerCapabilities.size());
+    planner_capability_bytes.reserve(kPlannerCapabilities.size());
+    for (const auto capability_id : kPlannerCapabilities) {
+      const auto* planner_descriptor =
+          core::find_builtin_capability_definition(capability_id);
+      if (planner_descriptor == nullptr) {
+        throw std::logic_error(
+            "Lite6 native-motion fixture requires its maintained planning "
+            "capabilities");
+      }
+      std::string bytes = canonical_json(CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(
+                              core::kCapabilityDefinitionApiVersion))},
+          {"capability_id", CanonicalValue(std::string(capability_id))},
+          {"scope", CanonicalValue(std::string(
+                        core::to_string(planner_descriptor->scope)))},
+          {"provider_binding_kind",
+           CanonicalValue(std::string(
+               core::to_string(planner_descriptor->provider_binding_kind)))},
+          {"capability_definition_revision",
+           CanonicalValue(std::string(
+               planner_descriptor->capability_definition_revision))},
+      }));
+      const core::ContentDigest planner_digest(sha256_digest(bytes));
+      const core::ContentAddressedStoreKey planner_key(
+          catalog_key("capability", planner_digest.value()));
+      const core::CapabilityDefinitionCatalogRecordRefDTO planner_ref{
+          core::CapabilityId(std::string(capability_id)),
+          core::CapabilityDefinitionRevision(
+              std::string(planner_descriptor->capability_definition_revision)),
+          core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+          schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
+          planner_digest,
+          planner_key,
+      };
+      planner_capabilities.push_back(
+          resolve_and_qualify_capability_definition(planner_ref, planner_key,
+                                                    bytes));
+      planner_capability_bytes.push_back(std::move(bytes));
+    }
   }
 
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
@@ -447,12 +457,12 @@ struct AssistantOverlayFixture final {
            CanonicalValue(
                capability.value().capability_definition_revision.value())},
       })};
-  if (planner_capability.has_value()) {
+  for (const auto& planner_capability : planner_capabilities) {
     target_capabilities.emplace_back(CanonicalValue::Object{
         {"capability_id",
-         CanonicalValue(planner_capability->value().capability_id.value())},
+         CanonicalValue(planner_capability.value().capability_id.value())},
         {"capability_definition_revision",
-         CanonicalValue(planner_capability->value()
+         CanonicalValue(planner_capability.value()
                             .capability_definition_revision.value())},
     });
   }
@@ -538,9 +548,9 @@ struct AssistantOverlayFixture final {
       component_key,
   };
   std::vector<QualifiedCapabilityDefinition> component_capabilities{capability};
-  if (planner_capability.has_value()) {
-    component_capabilities.push_back(*planner_capability);
-  }
+  component_capabilities.insert(component_capabilities.end(),
+                                planner_capabilities.begin(),
+                                planner_capabilities.end());
   auto component_type = resolve_and_qualify_component_type(
       component_ref, component_key, component_bytes, component_capabilities);
 
@@ -743,7 +753,22 @@ struct AssistantOverlayFixture final {
 
   std::optional<QualifiedProviderManifest> planner_provider;
   std::optional<std::string> planner_provider_bytes;
-  if (planner_capability.has_value()) {
+  if (!planner_capabilities.empty()) {
+    CanonicalValue::Array offered_capabilities;
+    offered_capabilities.reserve(planner_capabilities.size());
+    for (const auto& planner_capability : planner_capabilities) {
+      offered_capabilities.emplace_back(CanonicalValue::Object{
+          {"capability_id",
+           CanonicalValue(
+               planner_capability.value().capability_id.value())},
+          {"capability_definition_revision",
+           CanonicalValue(planner_capability.value()
+                              .capability_definition_revision.value())},
+          {"required_endpoint_role_ids",
+           text_array(
+               {detail::kNativeExecutionRuntimeProjectionEndpointRoleId})},
+      });
+    }
     planner_provider_bytes = revisioned_document(
         CanonicalValue(CanonicalValue::Object{
             {"api_version",
@@ -751,20 +776,7 @@ struct AssistantOverlayFixture final {
             {"provider_manifest_id",
              CanonicalValue("lite6_native_joint_planner")},
             {"offered_capabilities",
-             CanonicalValue(
-                 CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-                     {"capability_id",
-                      CanonicalValue(
-                          planner_capability->value().capability_id.value())},
-                     {"capability_definition_revision",
-                      CanonicalValue(
-                          planner_capability->value()
-                              .capability_definition_revision.value())},
-                     {"required_endpoint_role_ids",
-                      text_array(
-                          {detail::
-                               kNativeExecutionRuntimeProjectionEndpointRoleId})},
-                 })})},
+             CanonicalValue(std::move(offered_capabilities))},
             {"provider_contracts", CanonicalValue(CanonicalValue::Array{})},
         }),
         "catalog-record-revision/provider_manifest",
@@ -812,7 +824,7 @@ struct AssistantOverlayFixture final {
       resolve_and_qualify_stop_evidence_policy(stop_ref, stop_key, stop_bytes);
 
   std::vector<Lite6InputArtifact> artifacts;
-  artifacts.reserve(native_motion ? 9U : 6U);
+  artifacts.reserve(native_motion ? 11U : 6U);
   artifacts.push_back(catalog_artifact("catalog://capability/" +
                                            std::string(primary_capability_id),
                                        capability_bytes, capability));
@@ -828,11 +840,15 @@ struct AssistantOverlayFixture final {
   artifacts.push_back(
       catalog_artifact("catalog://provider_manifest/lite6_arm_provider",
                        provider_bytes, provider));
-  if (planner_capability.has_value() && planner_capability_bytes.has_value() &&
+  if (!planner_capabilities.empty() &&
+      planner_capabilities.size() == planner_capability_bytes.size() &&
       planner_provider.has_value() && planner_provider_bytes.has_value()) {
-    artifacts.push_back(
-        catalog_artifact("catalog://capability/planning.motion.joint_goal",
-                         *planner_capability_bytes, *planner_capability));
+    for (std::size_t index = 0U; index < planner_capabilities.size(); ++index) {
+      artifacts.push_back(catalog_artifact(
+          "catalog://capability/" +
+              planner_capabilities[index].value().capability_id.value(),
+          planner_capability_bytes[index], planner_capabilities[index]));
+    }
     artifacts.push_back(catalog_artifact(
         "catalog://provider_manifest/lite6_native_joint_planner",
         *planner_provider_bytes, *planner_provider));
@@ -860,7 +876,7 @@ struct AssistantOverlayFixture final {
       std::nullopt,
       std::nullopt,
       std::nullopt,
-      std::move(planner_capability),
+      std::move(planner_capabilities),
       std::move(planner_provider),
       std::move(native_execution_runtime_profile),
   };
@@ -970,16 +986,15 @@ struct AssistantOverlayFixture final {
   })};
   std::vector<QualifiedCapabilityDefinition> capabilities{catalog.capability,
                                                           gripper_capability};
-  if (catalog.planner_capability.has_value()) {
+  for (const auto& planner_capability : catalog.planner_capabilities) {
     arm_capabilities.emplace_back(CanonicalValue::Object{
         {"capability_id",
-         CanonicalValue(
-             catalog.planner_capability->value().capability_id.value())},
+         CanonicalValue(planner_capability.value().capability_id.value())},
         {"capability_definition_revision",
-         CanonicalValue(catalog.planner_capability->value()
+         CanonicalValue(planner_capability.value()
                             .capability_definition_revision.value())},
     });
-    capabilities.push_back(*catalog.planner_capability);
+    capabilities.push_back(planner_capability);
   }
   const std::string component_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
@@ -1299,7 +1314,7 @@ struct AssistantOverlayFixture final {
     const QualifiedControlCatalog& catalog, std::size_t instance_count = 1U,
     std::string_view cell_id = {}) {
   const bool aggregate = catalog.gripper_capability.has_value();
-  const bool native_motion = catalog.planner_capability.has_value();
+  const bool native_motion = !catalog.planner_capabilities.empty();
   if (instance_count == 0U || instance_count > 32U) {
     throw std::logic_error(
         "Lite6 control fixture instance count is outside its test bound");
@@ -1584,7 +1599,7 @@ struct AssistantOverlayFixture final {
 make_applicability_inputs(
     const GraphRevisionVerifiedCellGraph& graph,
     const QualifiedProviderManifest& provider,
-    const QualifiedCapabilityDefinition* planner_capability,
+    std::span<const QualifiedCapabilityDefinition> planner_capabilities,
     const QualifiedProviderManifest* planner_provider,
     const AssistantOverlayFixture* assistant_overlay, const bool composer_draft_enabled = false) {
   CanonicalValue::Array desired_configurations;
@@ -1630,11 +1645,23 @@ make_applicability_inputs(
     });
   }
   CanonicalValue::Array capability_provider_bindings;
-  if ((planner_capability == nullptr) != (planner_provider == nullptr)) {
+  if (planner_capabilities.empty() != (planner_provider == nullptr)) {
     throw std::logic_error(
         "Lite6 native-motion provider fixture is incomplete");
   }
-  if (planner_capability != nullptr) {
+  for (const auto& planner_capability : planner_capabilities) {
+    const std::string_view capability_id =
+        planner_capability.value().capability_id.value();
+    const std::string_view binding_id =
+        capability_id == "planning.motion.cartesian_path"
+            ? "lite6_cartesian_planner_binding"
+        : capability_id == "planning.motion.joint_goal"
+            ? "lite6_joint_planner_binding"
+        : capability_id == "planning.motion.pose_goal"
+            ? "lite6_pose_planner_binding"
+            : throw std::logic_error(
+                  "Lite6 native-motion fixture selected an unknown planner "
+                  "capability");
     for (std::size_t index = 0U; index < graph.graph().control_bindings.size();
          ++index) {
       const auto& binding = graph.graph().control_bindings[index];
@@ -1658,13 +1685,13 @@ make_applicability_inputs(
       }
       capability_provider_bindings.emplace_back(CanonicalValue::Object{
           {"capability_provider_binding_id",
-           CanonicalValue(indexed_id("lite6_joint_planner_binding", index))},
+           CanonicalValue(indexed_id(binding_id, index))},
           {"capability_provider_binding_revision",
            CanonicalValue(std::string(kZeroDigest))},
           {"capability_id",
-           CanonicalValue(planner_capability->value().capability_id.value())},
+           CanonicalValue(planner_capability.value().capability_id.value())},
           {"capability_definition_revision",
-           CanonicalValue(planner_capability->value()
+           CanonicalValue(planner_capability.value()
                               .capability_definition_revision.value())},
           {"scope", CanonicalValue("target_binding")},
           {"target",
@@ -1782,8 +1809,7 @@ make_lite6_controllable_retention_fixture(bool chained = false,
               : std::nullopt;
   const auto inputs = fixture_detail::make_applicability_inputs(
       graph, catalog.provider,
-      catalog.planner_capability.has_value() ? &*catalog.planner_capability
-                                             : nullptr,
+      catalog.planner_capabilities,
       catalog.planner_provider.has_value() ? &*catalog.planner_provider
                                            : nullptr,
       assistant_overlay.has_value() ? &*assistant_overlay : nullptr,
@@ -1802,8 +1828,10 @@ make_lite6_controllable_retention_fixture(bool chained = false,
     catalog_records.push_back(catalog.gripper_topology->reference());
     catalog_records.push_back(catalog.gripper_provider->reference());
   }
-  if (catalog.planner_capability.has_value()) {
-    catalog_records.push_back(catalog.planner_capability->reference());
+  for (const auto& planner_capability : catalog.planner_capabilities) {
+    catalog_records.push_back(planner_capability.reference());
+  }
+  if (!catalog.planner_capabilities.empty()) {
     catalog_records.push_back(catalog.planner_provider->reference());
   }
   if (catalog.native_execution_runtime_profile.has_value()) {
@@ -1894,8 +1922,9 @@ make_lite6_controllable_retention_fixture(bool chained = false,
     topologies.push_back(*catalog.gripper_topology);
     providers.push_back(*catalog.gripper_provider);
   }
-  if (catalog.planner_capability.has_value()) {
-    capabilities.push_back(*catalog.planner_capability);
+  capabilities.insert(capabilities.end(), catalog.planner_capabilities.begin(),
+                      catalog.planner_capabilities.end());
+  if (!catalog.planner_capabilities.empty()) {
     providers.push_back(*catalog.planner_provider);
   }
   const std::array<QualifiedStopEvidencePolicy, 1U> stop_policies{catalog.stop};
@@ -1921,7 +1950,7 @@ make_lite6_controllable_retention_fixture(bool chained = false,
       std::move(catalog.gripper_contract),
       std::move(catalog.gripper_topology),
       std::move(catalog.gripper_provider),
-      std::move(catalog.planner_capability),
+      std::move(catalog.planner_capabilities),
       std::move(catalog.planner_provider),
       std::move(catalog.native_execution_runtime_profile),
   };

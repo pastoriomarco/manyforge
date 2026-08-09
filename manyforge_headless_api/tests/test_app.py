@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any, Sequence
 
 import pytest
@@ -261,6 +262,22 @@ class FakeExecution:
         return {
             "ok": True,
             "command": "preview_motion",
+            "preview_receipt": {},
+        }
+
+    def preview_capability_command(
+        self,
+        request: object,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.requests.append(("preview_capability_command", request))
+        self.principals.append(
+            ("preview_capability_command", trusted_principal_id)
+        )
+        return {
+            "ok": True,
+            "command": "preview_capability_command",
             "preview_receipt": {},
         }
 
@@ -724,6 +741,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/operations/{operation_id}/acknowledge-completed",
         "/api/execution/operations/{operation_id}/runtime-scale",
         "/api/execution/motion-previews",
+        "/api/execution/capability-command-previews",
         "/api/execution/stops",
         "/api/execution/pick-place/plans/pick",
         "/api/execution/pick-place/plans/place",
@@ -813,6 +831,72 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route() -> None:
         "preview_motion"
     ]
     assert execution.principals == [("preview_motion", None)]
+
+
+def test_capability_command_preview_is_a_thin_non_effectful_execution_route() -> None:
+    execution = FakeExecution()
+    app = create_app(
+        service=HeadlessService(FakeCore(), FakeManager(), execution)
+    )
+    body = {
+        "request_context": {
+            "request_id": "request.gripper-preview.1",
+            "request_owner_epoch": "execution.epoch.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+        },
+        "program_id": "manyforge.direct_control.gripper",
+        "program_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "b" * 64,
+        "program_run_id": "direct-control-gripper-run.1",
+        "expected_graph_revision": "sha256:" + "c" * 64,
+        "expected_retained_bundle_id": "sha256:" + "d" * 64,
+        "expected_scene_revision": {
+            "scene_id": "sha256:" + "e" * 64,
+            "revision_id": 1,
+            "content_hash": "sha256:" + "f" * 64,
+        },
+        "participants": [
+            {
+                "component_role_id": "controlled_component",
+                "target_role_id": "command_target",
+                "required_capability_id": "tool.gripper.command",
+                "action_span": None,
+                "payload": {
+                    "kind": "capability_command",
+                    "command_schema_id": "gripper.command_position",
+                    "command_schema_revision": "sha256:" + "1" * 64,
+                    "command_value": {
+                        "kind": "gripper_position",
+                        "position": {"kind": "linear_m", "value_m": 0.02},
+                        "max_effort": None,
+                    },
+                    "completion_timeout_s": 2.0,
+                    "caller_options": [
+                        {"option_id": "command_duration_s", "value_s": 0.5}
+                    ],
+                },
+            }
+        ],
+        "coordination_policy": "independent",
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/execution/capability-command-previews", json=body
+        )
+        forged = client.post(
+            "/api/execution/capability-command-previews",
+            json={**copy.deepcopy(body), "attribution": {"transport": "http"}},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["command"] == "preview_capability_command"
+    assert forged.status_code == 422
+    assert [kind for kind, _request in execution.requests] == [
+        "preview_capability_command"
+    ]
+    assert execution.principals == [("preview_capability_command", None)]
 
 
 def test_execution_missing_reference_is_a_public_not_found() -> None:

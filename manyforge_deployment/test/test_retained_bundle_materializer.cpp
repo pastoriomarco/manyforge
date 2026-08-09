@@ -943,11 +943,33 @@ TEST(RetainedBundleMaterializer,
 
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-  EXPECT_EQ(bundle->value().catalogs.records.size(), 10U);
-  EXPECT_EQ(catalog_store.size(), 10U);
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 12U);
+  EXPECT_EQ(catalog_store.size(), 12U);
   ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
-  ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 1U);
-  const auto& provider = bundle->value().capability_provider_bindings.front();
+  ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 3U);
+  const std::vector<std::string> capability_ids = [&] {
+    std::vector<std::string> result;
+    for (const auto& binding :
+         bundle->value().capability_provider_bindings) {
+      result.push_back(binding.capability_id.value());
+    }
+    return result;
+  }();
+  EXPECT_EQ(capability_ids,
+            (std::vector<std::string>{
+                "planning.motion.cartesian_path",
+                "planning.motion.joint_goal",
+                "planning.motion.pose_goal"}));
+  const auto provider_it = std::find_if(
+      bundle->value().capability_provider_bindings.begin(),
+      bundle->value().capability_provider_bindings.end(),
+      [](const auto& binding) {
+        return binding.capability_id.value() ==
+               "planning.motion.joint_goal";
+      });
+  ASSERT_NE(provider_it,
+            bundle->value().capability_provider_bindings.end());
+  const auto& provider = *provider_it;
   EXPECT_EQ(provider.capability_provider_binding_id.value(), "lite6_joint_planner_binding");
   EXPECT_EQ(provider.capability_id.value(), "planning.motion.joint_goal");
   EXPECT_EQ(provider.provider_manifest_id.value(),
@@ -963,10 +985,18 @@ TEST(RetainedBundleMaterializer,
             test::kLite6NativeExecutionRuntimeId);
   EXPECT_EQ(endpoint.source_endpoint_role_id.value(),
             detail::kNativeExecutionRuntimeProjectionEndpointRoleId);
-  EXPECT_EQ(provider, fixture.qualified.deployment()
-                          .applicability_inputs()
-                          .value()
-                          .capability_provider_bindings.front());
+  const auto& deployment_providers = fixture.qualified.deployment()
+                                         .applicability_inputs()
+                                         .value()
+                                         .capability_provider_bindings;
+  const auto deployment_provider_it = std::find_if(
+      deployment_providers.begin(), deployment_providers.end(),
+      [](const auto& binding) {
+        return binding.capability_id.value() ==
+               "planning.motion.joint_goal";
+      });
+  ASSERT_NE(deployment_provider_it, deployment_providers.end());
+  EXPECT_EQ(provider, *deployment_provider_it);
 
   ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(), 1U);
   const auto &group =

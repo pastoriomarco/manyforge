@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -313,6 +314,29 @@ def _pose(x_m: float = 0.0, y_m: float = 0.0, z_m: float = 0.0) -> dict[str, Any
     }
 
 
+def _translation_error_m(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> float:
+    return math.sqrt(
+        sum(
+            (float(left[axis]) - float(right[axis])) ** 2
+            for axis in ("x_m", "y_m", "z_m")
+        )
+    )
+
+
+def _rotation_error_rad(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> float:
+    dot = abs(
+        sum(
+            float(left[axis]) * float(right[axis])
+            for axis in ("x", "y", "z", "w")
+        )
+    )
+    return 2.0 * math.acos(max(-1.0, min(1.0, dot)))
+
+
 def _planning_motion(
     move_id: str,
     motion: dict[str, Any],
@@ -453,6 +477,81 @@ def _direct_control_joint_operation(
         ],
         "coordination_policy": "independent",
     }
+
+
+def _direct_control_gripper_operation(
+    status: dict[str, Any], *, request_id: str, position: float
+) -> dict[str, Any]:
+    direct = status["direct_control_gripper"]
+    position_value = (
+        {"kind": "angular_rad", "value_rad": position}
+        if direct["resource"]["coordinate_kind"] == "angular_rad"
+        else {"kind": "linear_m", "value_m": position}
+    )
+    return {
+        "request_context": {
+            "request_id": request_id,
+            "request_owner_epoch": status["owner_epoch"],
+            "source_label": "composer_ui",
+            "correlation_id": None,
+        },
+        "program_id": direct["program_id"],
+        "program_revision": direct["program_revision"],
+        "program_binding_id": direct["program_binding_id"],
+        "program_run_id": direct["program_run_id"],
+        "expected_graph_revision": status["graph_revision"],
+        "expected_retained_bundle_id": status["retained_bundle_id"],
+        "expected_scene_revision": status["scene_revision"],
+        "participants": [
+            {
+                "component_role_id": direct["component_role_id"],
+                "target_role_id": direct["target_role_id"],
+                "required_capability_id": direct[
+                    "operation_capability_id"
+                ],
+                "action_span": None,
+                "payload": {
+                    "kind": "capability_command",
+                    "command_schema_id": direct["command_schema_id"],
+                    "command_schema_revision": direct[
+                        "command_schema_revision"
+                    ],
+                    "command_value": {
+                        "kind": "gripper_position",
+                        "position": position_value,
+                        "max_effort": None,
+                    },
+                    "completion_timeout_s": 2.0,
+                    "caller_options": [
+                        {
+                            "option_id": "command_duration_s",
+                            "value_s": 0.5,
+                        }
+                    ],
+                },
+            }
+        ],
+        "coordination_policy": "independent",
+    }
+
+
+def _direct_control_motion_operation(
+    status: dict[str, Any], *, request_id: str, motion: dict[str, Any]
+) -> dict[str, Any]:
+    operation = _direct_control_joint_operation(
+        status,
+        request_id=request_id,
+        positions_rad=[
+            float(value)
+            for value in status["direct_control"]["observed_state"][
+                "positions_rad"
+            ]
+        ],
+    )
+    payload = operation["participants"][0]["payload"]
+    payload["motion"] = motion
+    payload["speed_profile"]["max_tcp_linear_speed_mps"] = 0.1
+    return operation
 
 
 def _tool_payload(position_m: float) -> dict[str, Any]:
@@ -783,7 +882,9 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert direct["base_frame_role_id"] == "base"
         assert direct["tcp_frame_role_id"] == "tcp"
         assert direct["planning_capability_ids"] == [
-            "planning.motion.joint_goal"
+            "planning.motion.cartesian_path",
+            "planning.motion.joint_goal",
+            "planning.motion.pose_goal",
         ]
         assert [joint["source_joint_name"] for joint in direct["joints"]] == (
             manifest["source_joint_names"]
@@ -791,10 +892,32 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert direct["observed_state"]["source_joint_names"] == manifest[
             "source_joint_names"
         ]
+        current_orientation = direct["observed_state"]["current_tcp_pose"][
+            "orientation"
+        ]
+        assert sum(value * value for value in current_orientation.values()) == (
+            pytest.approx(1.0)
+        )
         assert all(
             joint["min_position_rad"] <= joint["max_position_rad"]
             and joint["max_velocity_rad_s"] > 0.0
             for joint in direct["joints"]
+        )
+
+        direct_gripper = first_status["direct_control_gripper"]
+        assert direct_gripper["program_id"] == (
+            "manyforge.direct_control.gripper"
+        )
+        assert direct_gripper["program_binding_id"] != manifest[
+            "program_binding_id"
+        ]
+        assert direct_gripper["command_schema_id"] == manifest[
+            "gripper_command_schema_id"
+        ]
+        assert direct_gripper["resource"]["coordinate_kind"] == "linear_m"
+        assert direct_gripper["resource"]["source_coordinate_name"]
+        assert direct_gripper["resource"]["min_position"] <= (
+            direct_gripper["resource"]["max_position"]
         )
 
         native = ExecutionCommandClient(execution_root, timeout_seconds=2.0)
@@ -802,6 +925,40 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "events"
         ]
         before_preview_state = copy.deepcopy(observed["arm"]["positions"])
+        before_gripper_preview_state = copy.deepcopy(
+            observed["gripper"]["positions"]
+        )
+        gripper_preview_target = (
+            direct_gripper["resource"]["min_position"]
+            + direct_gripper["resource"]["max_position"]
+        ) / 2.0
+        gripper_intent = _direct_control_gripper_operation(
+            first_status,
+            request_id="composer-direct-gripper-preview",
+            position=gripper_preview_target,
+        )
+        gripper_preview = composer.preview_capability_command(gripper_intent)
+        gripper_receipt = gripper_preview["preview_receipt"]
+        assert gripper_receipt["commit_eligible"] is True
+        assert gripper_receipt["target_position"] == pytest.approx(
+            gripper_preview_target
+        )
+        assert gripper_receipt["coordinate_kind"] == "linear_m"
+        assert gripper_receipt["program_binding_id"] == direct_gripper[
+            "program_binding_id"
+        ]
+        assert native.events(first_status["owner_epoch"], 0)["events"] == (
+            before_preview_events
+        )
+        after_gripper_preview = headless.execution_status()["status"]
+        after_gripper_observed = next(
+            target
+            for target in after_gripper_preview["observed_targets"]
+            if target["target_role_id"] == "gripper"
+        )
+        assert after_gripper_observed["positions"] == (
+            before_gripper_preview_state
+        )
         direct_positions = [
             float(position)
             for position in direct["observed_state"]["positions_rad"]
@@ -821,6 +978,49 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert "trajectory" not in receipt
         assert "compiled" not in receipt
         assert "providers" not in receipt
+        pose_intent = _direct_control_motion_operation(
+            first_status,
+            request_id="composer-direct-pose-preview",
+            motion={
+                "kind": "pose_goal",
+                "goal": receipt["final_tcp_pose"],
+            },
+        )
+        pose_preview = composer.preview_motion(pose_intent)["preview_receipt"]
+        pose_tolerances = pose_intent["participants"][0]["payload"][
+            "tolerances"
+        ]
+        assert _translation_error_m(
+            pose_preview["final_tcp_pose"]["position_m"],
+            receipt["final_tcp_pose"]["position_m"],
+        ) <= pose_tolerances["translation_tol_m"]
+        assert _rotation_error_rad(
+            pose_preview["final_tcp_pose"]["orientation"],
+            receipt["final_tcp_pose"]["orientation"],
+        ) <= pose_tolerances["rotation_tol_rad"]
+        cartesian_intent = _direct_control_motion_operation(
+            first_status,
+            request_id="composer-direct-cartesian-preview",
+            motion={
+                "kind": "cartesian_path",
+                "waypoints": [
+                    direct["observed_state"]["current_tcp_pose"],
+                    receipt["final_tcp_pose"],
+                ],
+                "max_translation_step_m": 0.005,
+                "max_rotation_step_rad": 0.05,
+                "speed_mode": "bounded",
+                "max_linear_speed_mps": 0.1,
+                "max_angular_speed_rad_s": 0.5,
+                "max_linear_acceleration_mps2": 0.5,
+                "max_angular_acceleration_rad_s2": 2.5,
+                "fallback_policy": "fail_closed",
+            },
+        )
+        cartesian_preview = composer.preview_motion(cartesian_intent)[
+            "preview_receipt"
+        ]
+        assert cartesian_preview["commit_eligible"] is True
         assert native.events(first_status["owner_epoch"], 0)["events"] == (
             before_preview_events
         )
@@ -864,6 +1064,34 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
                     "operation_revision"
                 ],
                 "reason": "release completed direct-control operation",
+            },
+        )
+
+        direct_gripper_accepted = composer.execute(gripper_intent)
+        direct_gripper_operation_id = direct_gripper_accepted["accepted"][
+            "operation_id"
+        ]
+        direct_gripper_terminal = _wait_terminal(
+            runner, direct_gripper_operation_id
+        )["operation"]
+        assert direct_gripper_terminal["state"] == "completed"
+        assert direct_gripper_terminal["program_binding_id"] == (
+            direct_gripper["program_binding_id"]
+        )
+        composer.acknowledge_completed_operation(
+            direct_gripper_operation_id,
+            {
+                "request_context": {
+                    "request_id": "ack-composer-direct-gripper-operation",
+                    "request_owner_epoch": first_status["owner_epoch"],
+                    "source_label": "composer_ui",
+                    "correlation_id": None,
+                },
+                "operation_id": direct_gripper_operation_id,
+                "expected_operation_revision": direct_gripper_terminal[
+                    "operation_revision"
+                ],
+                "reason": "release completed direct-control gripper operation",
             },
         )
 

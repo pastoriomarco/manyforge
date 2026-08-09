@@ -366,6 +366,17 @@ def create_app(
             )
         )
 
+    @app.post("/api/execution/capability-command-previews")
+    def execution_preview_capability_command(
+        body: OperationIntentRequest,
+        request: Request,
+    ) -> JSONResponse:
+        return execution_response(
+            service.execution_preview_capability_command(
+                body, _trusted_attribution(request, trusted_principal_adapter)
+            )
+        )
+
     @app.get("/api/execution/operations/{operation_id}")
     def execution_read(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],

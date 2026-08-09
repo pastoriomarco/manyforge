@@ -227,6 +227,20 @@ def headless_client() -> (
                 "ok": True,
                 "operation": {"operation_id": "operation-1"},
             }
+        elif path in {
+            "/api/execution/motion-previews",
+            "/api/execution/capability-command-previews",
+        }:
+            payload = {
+                "api_version": "manyforge.execution_command_response.v1",
+                "command": (
+                    "preview_motion"
+                    if path.endswith("motion-previews")
+                    else "preview_capability_command"
+                ),
+                "ok": True,
+                "preview_receipt": {},
+            }
         elif path == "/api/scene/transactions":
             if body["operation"]["scene_resource_id"] == "missing-part":
                 return httpx.Response(
@@ -470,6 +484,80 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
     assert forwarded[4]["body"] == stop
     assert forwarded[5]["body"] == scale
     assert forwarded[6]["method"] == "GET"
+
+
+def test_composer_preview_routes_are_strict_stateless_forwarders(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    body = {
+        "request_context": {
+            "request_id": "request.preview.1",
+            "request_owner_epoch": "execution.epoch.1",
+            "source_label": "composer_ui",
+            "correlation_id": None,
+        },
+        "program_id": "manyforge.direct_control.gripper",
+        "program_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "b" * 64,
+        "program_run_id": "direct-control-gripper-run.1",
+        "expected_graph_revision": "sha256:" + "c" * 64,
+        "expected_retained_bundle_id": "sha256:" + "d" * 64,
+        "expected_scene_revision": {
+            "scene_id": "sha256:" + "e" * 64,
+            "revision_id": 1,
+            "content_hash": "sha256:" + "f" * 64,
+        },
+        "participants": [
+            {
+                "component_role_id": "controlled_component",
+                "target_role_id": "command_target",
+                "required_capability_id": "tool.gripper.command",
+                "action_span": None,
+                "payload": {
+                    "kind": "capability_command",
+                    "command_schema_id": "gripper.command_position",
+                    "command_schema_revision": "sha256:" + "1" * 64,
+                    "command_value": {
+                        "kind": "gripper_position",
+                        "position": {"kind": "linear_m", "value_m": 0.02},
+                        "max_effort": None,
+                    },
+                    "completion_timeout_s": 2.0,
+                    "caller_options": [
+                        {"option_id": "command_duration_s", "value_s": 0.5}
+                    ],
+                },
+            }
+        ],
+        "coordination_policy": "independent",
+    }
+
+    with _composer(client) as composer:
+        response = composer.post(
+            "/api/execution/capability-command-previews", json=body
+        )
+        forged = composer.post(
+            "/api/execution/capability-command-previews",
+            json={**body, "trusted_principal_id": "forged"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["command"] == "preview_capability_command"
+    assert forged.status_code == 422
+    forwarded = [
+        item
+        for item in requests
+        if item["path"] == "/api/execution/capability-command-previews"
+    ]
+    assert forwarded == [
+        {
+            "method": "POST",
+            "path": "/api/execution/capability-command-previews",
+            "query": "",
+            "body": body,
+        }
+    ]
 
 
 def test_composer_scene_transaction_is_a_strict_stateless_forwarder(

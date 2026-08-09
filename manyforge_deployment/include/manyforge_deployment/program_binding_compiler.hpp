@@ -19,6 +19,8 @@ class ProgramBindingCompilerError final : public std::invalid_argument {
 
 inline constexpr std::string_view kDirectControlMotionProgramId =
     "manyforge.direct_control.motion";
+inline constexpr std::string_view kDirectControlGripperProgramId =
+    "manyforge.direct_control.gripper";
 inline constexpr std::string_view kDirectControlComponentRoleId =
     "controlled_component";
 inline constexpr std::string_view kDirectControlTargetRoleId =
@@ -52,6 +54,21 @@ inline constexpr std::string_view kDirectControlTcpFrameRoleId = "tcp";
 /// runtime or borrowing a scenario Program Binding.
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 compile_direct_control_motion_program_binding(
+    const core::ControllableComponentId& controllable_component_id,
+    const core::CommandTargetId& command_target_id,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactStore& catalog_artifact_store);
+
+/// Compile the build-owned direct Robot Control gripper contract for one exact
+/// retained command target.
+///
+/// The binding uses the target's qualified command schema and complete
+/// model/resource/control closure. It is an ordinary Program Binding that may
+/// alias an existing physical gripper engine only after exact physical
+/// equality is verified.
+[[nodiscard]] std::shared_ptr<const ProgramBinding>
+compile_direct_control_gripper_program_binding(
     const core::ControllableComponentId& controllable_component_id,
     const core::CommandTargetId& command_target_id,
     const RetainedBundle& retained_bundle,

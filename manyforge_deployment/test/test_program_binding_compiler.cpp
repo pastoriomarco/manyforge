@@ -37,6 +37,7 @@ using manyforge::deployment::ActiveRuntimeParticipantFactsDTO;
 using manyforge::deployment::build_runtime_participant_binding_dto;
 using manyforge::deployment::canonical_json;
 using manyforge::deployment::CanonicalValue;
+using manyforge::deployment::compile_direct_control_gripper_program_binding;
 using manyforge::deployment::compile_direct_control_motion_program_binding;
 using manyforge::deployment::compile_program_binding;
 using manyforge::deployment::FilesystemCatalogArtifactStore;
@@ -486,7 +487,9 @@ TEST(ProgramBindingCompilerTest,
   }
   EXPECT_EQ(capabilities,
             (std::vector<std::string>{"execution.trajectory.execute",
-                                      "planning.motion.joint_goal"}));
+                                      "planning.motion.cartesian_path",
+                                      "planning.motion.joint_goal",
+                                      "planning.motion.pose_goal"}));
 }
 
 TEST(ProgramBindingCompilerTest,
@@ -507,6 +510,64 @@ TEST(ProgramBindingCompilerTest,
               std::string(kLite6ControllableComponentId)),
           manyforge::core::CommandTargetId("missing_target"), *context.bundle,
           context.model_map, catalog_store)),
+      ProgramBindingCompilerError);
+}
+
+TEST(ProgramBindingCompilerTest,
+     DerivesDeterministicDirectControlGripperBindingWithExactSchema) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path(), true);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+
+  const auto first = compile_direct_control_gripper_program_binding(
+      manyforge::core::ControllableComponentId(
+          std::string(kLite6ControllableComponentId)),
+      manyforge::core::CommandTargetId(std::string(kLite6GripperTargetId)),
+      *context.bundle, context.model_map, catalog_store);
+  const auto second = compile_direct_control_gripper_program_binding(
+      manyforge::core::ControllableComponentId(
+          std::string(kLite6ControllableComponentId)),
+      manyforge::core::CommandTargetId(std::string(kLite6GripperTargetId)),
+      *context.bundle, context.model_map, catalog_store);
+
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(first->program_binding_id(), second->program_binding_id());
+  EXPECT_EQ(first->canonical_bytes(), second->canonical_bytes());
+  EXPECT_EQ(first->value().program_id.value(),
+            manyforge::deployment::kDirectControlGripperProgramId);
+  EXPECT_TRUE(manyforge::deployment::is_sha256_digest(
+      first->value().program_revision.value()));
+  ASSERT_EQ(first->value().target_role_bindings.size(), 1U);
+  const auto& target = first->value().target_role_bindings.front();
+  EXPECT_EQ(target.target_role_id.value(),
+            manyforge::deployment::kDirectControlTargetRoleId);
+  EXPECT_EQ(target.command_target_id.value(), kLite6GripperTargetId);
+  ASSERT_EQ(target.capability_bindings.size(), 1U);
+  const auto& capability = target.capability_bindings.front();
+  EXPECT_EQ(capability.capability_id.value(), "tool.gripper.command");
+  ASSERT_TRUE(capability.command_schema.has_value());
+  EXPECT_EQ(capability.command_schema->command_schema_id.value(),
+            manyforge::core::kGripperPositionCommandSchemaId);
+  EXPECT_EQ(capability.command_schema->command_schema_revision.value(),
+            manyforge::core::kGripperPositionCommandSchemaRevision);
+  ASSERT_EQ(target.resource_role_bindings.size(), 1U);
+  ASSERT_EQ(target.resource_role_bindings.front().resource_ids.size(), 1U);
+  EXPECT_TRUE(first->value().contact_grasp_bindings.empty());
+}
+
+TEST(ProgramBindingCompilerTest,
+     DirectControlGripperBindingRejectsANonGripperTarget) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path(), true);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+
+  EXPECT_THROW(
+      static_cast<void>(compile_direct_control_gripper_program_binding(
+          manyforge::core::ControllableComponentId(
+              std::string(kLite6ControllableComponentId)),
+          manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)),
+          *context.bundle, context.model_map, catalog_store)),
       ProgramBindingCompilerError);
 }
 

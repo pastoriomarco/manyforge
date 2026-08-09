@@ -1404,6 +1404,119 @@ make_direct_control_motion_contract(
       {}};
 }
 
+[[nodiscard]] core::ProgramBindingContractDTO
+make_direct_control_gripper_contract(
+    const core::RetainedNodeEnvironmentDTO& node_environment,
+    const core::ComponentTypeCommandTargetDTO& target) {
+  const auto* capability =
+      find_target_capability(target, "tool.gripper.command");
+  if (capability == nullptr) {
+    fail("direct-control gripper target omits tool.gripper.command");
+  }
+
+  std::set<std::string> model_role_names;
+  for (const auto& group : target.model_group_roles) {
+    model_role_names.insert(group.model_role_id.value());
+  }
+  for (const auto& resource : target.resource_roles) {
+    if (const auto* model =
+            std::get_if<core::ComponentTypeModelResourceRoleDTO>(&resource)) {
+      model_role_names.insert(model->model_role_id.value());
+    }
+  }
+  for (const auto& frame : target.frame_roles) {
+    model_role_names.insert(frame.model_role_id.value());
+  }
+  for (const auto& body : target.collision_body_roles) {
+    model_role_names.insert(body.model_role_id.value());
+  }
+  if (model_role_names.empty() || target.model_group_roles.size() != 1U ||
+      target.resource_roles.size() != 1U) {
+    fail("direct-control gripper target has no exact model/group/resource "
+         "contract");
+  }
+
+  const auto model_roles = sorted_ids<core::ModelRoleId>(model_role_names);
+  std::set<std::string> frame_role_names;
+  for (const auto& frame : target.frame_roles) {
+    frame_role_names.insert(frame.frame_role_id.value());
+  }
+  std::set<std::string> resource_role_names;
+  for (const auto& resource : target.resource_roles) {
+    resource_role_names.insert(core::resource_role_id(resource).value());
+  }
+  std::set<std::string> collision_role_names;
+  for (const auto& body : target.collision_body_roles) {
+    collision_role_names.insert(body.collision_body_role_id.value());
+  }
+  const auto frame_roles = sorted_ids<core::FrameRoleId>(frame_role_names);
+  const auto resource_roles =
+      sorted_ids<core::ResourceRoleId>(resource_role_names);
+  const auto collision_roles =
+      sorted_ids<core::CollisionBodyRoleId>(collision_role_names);
+  std::vector<core::ProgramCapabilityRequirementDTO> capabilities{
+      core::ProgramCapabilityRequirementDTO{
+          capability->capability_id,
+          capability->capability_definition_revision,
+          core::ProgramCapabilityDisposition::kRequired}};
+
+  const CanonicalValue projection(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue("manyforge.direct_control_gripper_program.v1")},
+      {"component_role_id",
+       CanonicalValue(std::string(kDirectControlComponentRoleId))},
+      {"model_roles", strong_id_array(model_roles)},
+      {"node_environment",
+       CanonicalValue(CanonicalValue::Object{
+           {"catalog_digest",
+            CanonicalValue(node_environment.catalog_digest.value())},
+           {"catalog_id", CanonicalValue(node_environment.catalog_id)},
+           {"content_version",
+            CanonicalValue(node_environment.content_version)},
+           {"environment_digest",
+            CanonicalValue(node_environment.environment_digest.value())},
+       })},
+      {"program_id",
+       CanonicalValue(std::string(kDirectControlGripperProgramId))},
+      {"target_role",
+       CanonicalValue(CanonicalValue::Object{
+           {"capabilities",
+            CanonicalValue(CanonicalValue::Array{CanonicalValue(
+                CanonicalValue::Object{
+                    {"capability_definition_revision",
+                     CanonicalValue(
+                         capability->capability_definition_revision.value())},
+                    {"capability_id",
+                     CanonicalValue(capability->capability_id.value())},
+                    {"disposition", CanonicalValue("required")},
+                })})},
+           {"collision_body_roles", strong_id_array(collision_roles)},
+           {"frame_roles", strong_id_array(frame_roles)},
+           {"resource_roles", strong_id_array(resource_roles)},
+           {"target_role_id",
+            CanonicalValue(std::string(kDirectControlTargetRoleId))},
+       })},
+  });
+  std::string revision_preimage{
+      "manyforge.direct-control-gripper-program-revision.v1"};
+  revision_preimage.push_back('\0');
+  revision_preimage.append(canonical_json(projection));
+
+  return core::ProgramBindingContractDTO{
+      core::ProgramId(std::string(kDirectControlGripperProgramId)),
+      core::ProgramRevision(sha256_digest(revision_preimage)),
+      node_environment,
+      {core::ProgramComponentRoleRequirementDTO{
+          core::ComponentRoleId(std::string(kDirectControlComponentRoleId)),
+          {}, model_roles, {}}},
+      {core::ProgramTargetRoleRequirementDTO{
+          core::TargetRoleId(std::string(kDirectControlTargetRoleId)),
+          core::ComponentRoleId(std::string(kDirectControlComponentRoleId)),
+          std::move(capabilities), frame_roles, resource_roles,
+          collision_roles, model_roles}},
+      {}};
+}
+
 }  // namespace
 
 std::shared_ptr<const ProgramBinding> compile_program_binding(
@@ -1452,6 +1565,58 @@ compile_direct_control_motion_program_binding(
     return compile_program_binding_contract(
         contract, std::move(assignment), retained_bundle,
         retained_model_map, catalog_artifact_store);
+  } catch (const ProgramBindingCompilerError&) {
+    throw;
+  } catch (const std::exception& error) {
+    fail(std::string("Direct-control Program Binding compilation failed: ") +
+         error.what());
+  }
+}
+
+std::shared_ptr<const ProgramBinding>
+compile_direct_control_gripper_program_binding(
+    const core::ControllableComponentId& controllable_component_id,
+    const core::CommandTargetId& command_target_id,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactStore& catalog_artifact_store) {
+  try {
+    if (!verify_retained_bundle_identity(retained_bundle) ||
+        retained_model_map.query().retained_bundle_id !=
+            retained_bundle.retained_bundle_id()) {
+      fail("direct-control compiler inputs do not share one verified retained "
+           "bundle");
+    }
+    const auto& bundle = retained_bundle.value();
+    const auto& component =
+        require_component(bundle.cell_graph, controllable_component_id);
+    const auto catalog = load_qualified_catalog_closure(
+        bundle, catalog_artifact_store);
+    const auto component_type = load_component_type(
+        bundle, component, catalog.capabilities, catalog_artifact_store);
+    const auto& target = require_target_type(component_type, command_target_id);
+    auto contract = make_direct_control_gripper_contract(
+        bundle.catalogs.node_environment, target);
+    core::ProgramRoleAssignmentDTO assignment{
+        {core::ProgramComponentRoleAssignmentDTO{
+            core::ComponentRoleId(
+                std::string(kDirectControlComponentRoleId)),
+            controllable_component_id}},
+        {core::ProgramTargetRoleAssignmentDTO{
+            core::TargetRoleId(std::string(kDirectControlTargetRoleId)),
+            command_target_id}}};
+    auto binding = compile_program_binding_contract(
+        contract, std::move(assignment), retained_bundle,
+        retained_model_map, catalog_artifact_store);
+    const auto& targets = binding->value().target_role_bindings;
+    if (targets.size() != 1U ||
+        targets.front().resource_role_bindings.size() != 1U ||
+        targets.front().resource_role_bindings.front().resource_ids.size() !=
+            1U) {
+      fail("direct-control gripper target does not resolve to one exact "
+           "command coordinate");
+    }
+    return binding;
   } catch (const ProgramBindingCompilerError&) {
     throw;
   } catch (const std::exception& error) {

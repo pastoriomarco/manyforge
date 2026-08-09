@@ -991,9 +991,34 @@ code {
   grid-template-columns: minmax(24rem, 1.25fr) minmax(20rem, 0.75fr);
 }
 
-.robot-control-joints {
+.robot-control-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  padding: 0.65rem 1rem;
+  border-bottom: 1px solid #203542;
+  background: #0d1c25;
+}
+
+.robot-control-modes button {
+  padding: 0.42rem 0.72rem;
+}
+
+.robot-control-modes button[aria-pressed="true"] {
+  border-color: #3a8498;
+  color: #d9f4fa;
+  background: #17404c;
+}
+
+.robot-control-editor {
+  max-height: 34rem;
+  overflow: auto;
   padding: 0.9rem 1rem 1rem;
   border-right: 1px solid #203542;
+}
+
+.robot-control-joints {
+  padding: 0;
 }
 
 .robot-control-joint {
@@ -1049,8 +1074,35 @@ code {
 
 .robot-control-preview {
   min-width: 0;
+  max-height: 34rem;
+  overflow: auto;
   padding: 1rem;
   background: #091720;
+}
+
+.robot-control-pose-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(12rem, 1fr));
+  gap: 0.8rem;
+  margin-top: 0.85rem;
+}
+
+.robot-control-pose-grid label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+  color: #a8bbc5;
+  font-size: 0.76rem;
+}
+
+.robot-control-pose-note {
+  grid-column: 1 / -1;
+  line-height: 1.45;
+}
+
+.robot-control-gripper {
+  margin-top: 0.75rem;
 }
 
 .robot-control-preview h3 {
@@ -1112,7 +1164,7 @@ code {
   display: flex;
   flex-wrap: wrap;
   gap: 0.55rem;
-  margin-top: 1rem;
+  margin-top: 0;
 }
 
 .robot-control-actions button {
@@ -1134,6 +1186,12 @@ code {
 .robot-control-boundary {
   margin-bottom: 0;
   line-height: 1.45;
+}
+
+.robot-control-footer {
+  padding: 0.8rem 1rem;
+  border-top: 1px solid #29414f;
+  background: #0b1a23;
 }
 
 .phase-ready {
@@ -1601,7 +1659,7 @@ code {
     grid-template-columns: 1fr;
   }
 
-  .robot-control-joints {
+  .robot-control-editor {
     border-right: 0;
     border-bottom: 1px solid #203542;
   }

@@ -257,7 +257,12 @@ int main(int argc, char** argv) {
         {"target_role_id", CanonicalValue("arm")},
         {"gripper_target_role_id", CanonicalValue("gripper")},
         {"execution_capability_id", CanonicalValue("execution.trajectory.execute")},
-        {"planning_capability_id", CanonicalValue("planning.motion.joint_goal")},
+        {"planning_capability_ids",
+         CanonicalValue(CanonicalValue::Array{
+             CanonicalValue("planning.motion.cartesian_path"),
+             CanonicalValue("planning.motion.joint_goal"),
+             CanonicalValue("planning.motion.pose_goal"),
+         })},
         {"gripper_capability_id", CanonicalValue("tool.gripper.command")},
         {"gripper_command_schema_id",
          CanonicalValue(std::string(core::kGripperPositionCommandSchemaId))},
