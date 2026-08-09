@@ -306,6 +306,21 @@ class HeadlessService:
             )
         return projection
 
+    def scenarios(self) -> dict[str, Any]:
+        projection = self.core.scenario_catalog_projection()
+        if (
+            set(projection)
+            != {"api_version", "scenario_catalog_revision", "scenarios"}
+            or projection.get("api_version") != "manyforge.scenario_catalog.v1"
+            or not isinstance(projection.get("scenario_catalog_revision"), str)
+            or not isinstance(projection.get("scenarios"), list)
+        ):
+            raise HeadlessApiError(
+                "scenario_catalog_projection_invalid",
+                "native core returned an unsupported scenario catalog",
+            )
+        return projection
+
     @staticmethod
     def _verified_viewer_asset(
         asset: ViewerModelAsset,

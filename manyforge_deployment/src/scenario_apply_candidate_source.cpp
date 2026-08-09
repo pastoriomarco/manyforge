@@ -4,7 +4,10 @@
 
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/program_binding.hpp>
+#include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/scenario_catalog.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -145,17 +148,18 @@ private:
          left.st_ctim.tv_nsec == right.st_ctim.tv_nsec;
 }
 
-[[nodiscard]] std::string ReadExactCatalog(const std::filesystem::path &path) {
+[[nodiscard]] std::string ReadExactArtifact(
+    const std::filesystem::path &path, const std::string_view label) {
   const FileDescriptor descriptor(
       ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-  Require(descriptor.get() >= 0, "scenario Apply catalog cannot be opened: " +
+  Require(descriptor.get() >= 0, std::string(label) + " cannot be opened: " +
                                      std::string(std::strerror(errno)));
   struct stat before {};
   Require(::fstat(descriptor.get(), &before) == 0 && S_ISREG(before.st_mode) &&
               before.st_size >= 0 &&
               static_cast<std::uint64_t>(before.st_size) <=
                   kMaxArtifactEncodedBytes,
-          "scenario Apply catalog is not one bounded regular file");
+          std::string(label) + " is not one bounded regular file");
   std::string bytes(static_cast<std::size_t>(before.st_size), '\0');
   std::size_t offset = 0U;
   while (offset < bytes.size()) {
@@ -164,7 +168,7 @@ private:
     if (count < 0 && errno == EINTR) {
       continue;
     }
-    Require(count > 0, "scenario Apply catalog changed during its read");
+    Require(count > 0, std::string(label) + " changed during its read");
     offset += static_cast<std::size_t>(count);
   }
   char extra{};
@@ -172,20 +176,61 @@ private:
   do {
     extra_count = ::read(descriptor.get(), &extra, 1U);
   } while (extra_count < 0 && errno == EINTR);
-  Require(extra_count == 0,
-          "scenario Apply catalog grew during its read");
+  Require(extra_count == 0, std::string(label) + " grew during its read");
   struct stat after {};
   Require(::fstat(descriptor.get(), &after) == 0 && SameSnapshot(before, after),
-          "scenario Apply catalog changed during its read");
+          std::string(label) + " changed during its read");
   return bytes;
 }
 
-[[nodiscard]] ScenarioApplyCandidateSelection
-ResolveCatalog(const std::string_view bytes,
-               const ScenarioApplyCandidateQuery &query) {
+[[nodiscard]] std::filesystem::path DigestPath(
+    const std::filesystem::path &root, const std::string_view collection,
+    const std::string_view digest) {
+  Require(is_sha256_digest(digest),
+          "scenario Program selection contains an invalid digest");
+  return root / collection / "sha256" /
+         (std::string(digest.substr(7U)) + ".json");
+}
+
+struct VerifiedScenarioCatalog final {
+  CanonicalValue root;
+  core::ScenarioCatalogRevision revision;
+};
+
+[[nodiscard]] const CanonicalValue &ExactScenario(
+    const CanonicalValue &catalog, const std::string_view scenario_id) {
+  Require(IsIdentifier(scenario_id), "scenario ID is invalid");
+  const auto &rows = Array(Member(catalog, "scenarios", "$"), "$.scenarios");
+  const auto found = std::lower_bound(
+      rows.begin(), rows.end(), scenario_id,
+      [](const CanonicalValue &row, const std::string_view selected) {
+        return Text(Member(row, "scenario_id", "$.scenarios[]"),
+                    "$.scenarios[].scenario_id") < selected;
+      });
+  Require(found != rows.end() &&
+              Text(Member(*found, "scenario_id", "$.scenarios[]"),
+                   "$.scenarios[].scenario_id") == scenario_id,
+          "scenario catalog has no exact canonical scenario ID");
+  return *found;
+}
+
+[[nodiscard]] ScenarioAssistantMode
+AssistantMode(const std::string_view value) {
+  if (value == "required") {
+    return ScenarioAssistantMode::kRequired;
+  }
+  if (value == "optional") {
+    return ScenarioAssistantMode::kOptional;
+  }
+  Require(value == "forbidden", "scenario assistant mode is invalid");
+  return ScenarioAssistantMode::kForbidden;
+}
+
+[[nodiscard]] VerifiedScenarioCatalog
+VerifyCatalog(const std::string_view bytes) {
   Require(!bytes.empty() && bytes.size() <= kMaxArtifactEncodedBytes,
           "scenario Apply catalog is empty or oversized");
-  const auto root = parse_strict_json_model_yaml(bytes).root();
+  auto root = parse_strict_json_model_yaml(bytes).root();
   Require(canonical_json(root) == bytes,
           "scenario Apply catalog is not canonical JSON");
   ExactMembers(root, {"api_version", "scenario_catalog_revision", "scenarios"},
@@ -204,7 +249,6 @@ ResolveCatalog(const std::string_view bytes,
           "scenario Apply catalog exceeds its row bound");
   std::set<std::string, std::less<>> global_identifiers;
   std::string previous_scenario;
-  std::optional<core::RetainedBundleId> selected_bundle;
   for (std::size_t index = 0U; index < rows.size(); ++index) {
     const auto path = "$.scenarios[" + std::to_string(index) + "]";
     const auto &row = rows[index];
@@ -266,9 +310,30 @@ ResolveCatalog(const std::string_view bytes,
         previous_alias = alias;
       }
     }
+  }
+  core::ScenarioCatalogRevision verified_revision(revision);
+  return {std::move(root), std::move(verified_revision)};
+}
+
+[[nodiscard]] ScenarioApplyCandidateSelection
+ResolveCatalog(const std::string_view bytes,
+               const ScenarioApplyCandidateQuery &query) {
+  auto catalog = VerifyCatalog(bytes);
+  std::optional<core::RetainedBundleId> selected_bundle;
+  const auto &rows =
+      Array(Member(catalog.root, "scenarios", "$"), "$.scenarios");
+  for (const auto &row : rows) {
+    const auto &artifact_id =
+        Text(Member(row, "deployment_artifact_id", "$.scenarios[]"),
+             "$.scenarios[].deployment_artifact_id");
+    const auto &deployment_revision =
+        Text(Member(row, "deployment_revision", "$.scenarios[]"),
+             "$.scenarios[].deployment_revision");
     if (artifact_id == query.deployment_artifact_id.value() &&
         deployment_revision == query.deployment_revision.value()) {
-      const core::RetainedBundleId candidate(retained_bundle);
+      const core::RetainedBundleId candidate(
+          Text(Member(row, "retained_bundle_id", "$.scenarios[]"),
+               "$.scenarios[].retained_bundle_id"));
       Require(!selected_bundle.has_value() || *selected_bundle == candidate,
               "scenario Apply catalog maps one deployment revision to "
               "multiple retained bundles");
@@ -280,7 +345,7 @@ ResolveCatalog(const std::string_view bytes,
           "revision");
   return {
       query,
-      core::ScenarioCatalogRevision(revision),
+      std::move(catalog.revision),
       std::move(*selected_bundle),
   };
 }
@@ -297,6 +362,22 @@ bool ScenarioApplyCandidateSelection::valid() const noexcept {
          !retained_bundle_id.empty();
 }
 
+bool ScenarioProgramSelection::valid() const noexcept {
+  return IsIdentifier(scenario_id) &&
+         is_sha256_digest(scenario_catalog_revision.value()) &&
+         IsIdentifier(deployment_artifact_id.value()) &&
+         is_sha256_digest(deployment_revision.value()) &&
+         is_sha256_digest(retained_bundle_id.value()) &&
+         is_sha256_digest(graph_revision.value()) &&
+         is_sha256_digest(program_binding_id.value()) &&
+         IsIdentifier(program_id.value()) &&
+         is_sha256_digest(program_revision.value()) &&
+         is_sha256_digest(node_environment_digest.value()) &&
+         typed_parameter_overrides.is_object() &&
+         normalized_program_root.is_object() &&
+         normalized_program_binding_root.is_object();
+}
+
 FilesystemScenarioApplyCandidateSource::FilesystemScenarioApplyCandidateSource(
     std::filesystem::path package_root, std::string catalog_name)
     : package_root_(ExistingRoot(std::move(package_root))) {
@@ -309,8 +390,116 @@ ScenarioApplyCandidateSelection
 FilesystemScenarioApplyCandidateSource::ResolveExact(
     const ScenarioApplyCandidateQuery &query) const {
   Require(query.valid(), "scenario Apply candidate query is invalid");
-  auto result = ResolveCatalog(ReadExactCatalog(catalog_path_), query);
+  auto result = ResolveCatalog(
+      ReadExactArtifact(catalog_path_, "scenario Apply catalog"), query);
   Require(result.valid(), "scenario Apply candidate selection is invalid");
+  return result;
+}
+
+CanonicalValue
+FilesystemScenarioApplyCandidateSource::LoadVerifiedCatalog() const {
+  return VerifyCatalog(ReadExactArtifact(catalog_path_, "scenario catalog"))
+      .root;
+}
+
+ScenarioProgramSelection
+FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
+    const std::string_view scenario_id) const {
+  const auto catalog = VerifyCatalog(
+      ReadExactArtifact(catalog_path_, "scenario catalog"));
+  const auto &row = ExactScenario(catalog.root, scenario_id);
+  const auto &row_scenario_id =
+      Text(Member(row, "scenario_id", "$.scenarios[]"),
+           "$.scenarios[].scenario_id");
+  const core::DeploymentArtifactId deployment_artifact_id(
+      Text(Member(row, "deployment_artifact_id", "$.scenarios[]"),
+           "$.scenarios[].deployment_artifact_id"));
+  const core::DeploymentRevision deployment_revision(
+      Text(Member(row, "deployment_revision", "$.scenarios[]"),
+           "$.scenarios[].deployment_revision"));
+  const core::RetainedBundleId retained_bundle_id(
+      Text(Member(row, "retained_bundle_id", "$.scenarios[]"),
+           "$.scenarios[].retained_bundle_id"));
+  const core::ProgramBindingId program_binding_id(
+      Text(Member(row, "program_binding_id", "$.scenarios[]"),
+           "$.scenarios[].program_binding_id"));
+  const auto assistant_mode = AssistantMode(
+      Text(Member(row, "assistant_mode", "$.scenarios[]"),
+           "$.scenarios[].assistant_mode"));
+  const auto &typed_parameter_overrides =
+      Member(row, "typed_parameter_overrides", "$.scenarios[]");
+
+  const FilesystemVerifiedRetainedBundleSource bundle_source(package_root_);
+  const auto bundle = bundle_source.get_verified(retained_bundle_id);
+  Require(bundle != nullptr,
+          "scenario retained bundle is absent or unverifiable");
+  Require(bundle->value().deployment_artifact_id ==
+                  deployment_artifact_id &&
+              bundle->value().deployment_revision == deployment_revision &&
+              bundle->value().compiled_products.symbol_role_maps.size() == 1U,
+          "scenario retained bundle differs from its canonical row");
+
+  const auto graph_revision = bundle->value().cell_graph.graph_revision;
+  const auto node_environment_digest =
+      bundle->value().catalogs.node_environment.environment_digest;
+  const FilesystemVerifiedRetainedModelMapSource model_map_source(package_root_);
+  const auto model_map = model_map_source.get_verified(RetainedModelMapQuery{
+      retained_bundle_id,
+      bundle->value().compiled_products.symbol_role_maps.front().product_id,
+  });
+  Require(model_map.has_value(),
+          "scenario retained model map is absent or unverifiable");
+
+  const auto binding_bytes = ReadExactArtifact(
+      DigestPath(package_root_, "program-bindings",
+                 program_binding_id.value()),
+      "scenario Program Binding");
+  const auto binding =
+      reload_verified_program_binding(binding_bytes, *bundle, *model_map);
+  Require(binding->program_binding_id() == program_binding_id &&
+              binding->value().retained_bundle_id == retained_bundle_id &&
+              binding->value().graph_revision == graph_revision &&
+              binding->value().node_environment.environment_digest ==
+                  node_environment_digest,
+          "scenario Program Binding differs from its retained closure");
+
+  const auto program_bytes = ReadExactArtifact(
+      DigestPath(package_root_, "programs",
+                 binding->value().program_revision.value()),
+      "scenario Program");
+  const auto program = verify_program_binding_contract(program_bytes, *bundle);
+  Require(program->value().program_id == binding->value().program_id &&
+              program->value().program_revision ==
+                  binding->value().program_revision &&
+              program->value().node_environment ==
+                  binding->value().node_environment,
+          "scenario Program differs from its exact Program Binding");
+
+  const bool assistant_available = bundle->value().assistant.has_value();
+  Require(assistant_mode != ScenarioAssistantMode::kRequired ||
+              assistant_available,
+          "scenario requires an unavailable assistant product");
+  Require(assistant_mode != ScenarioAssistantMode::kForbidden ||
+              !assistant_available,
+          "scenario forbids the retained assistant product");
+
+  ScenarioProgramSelection result{
+      .scenario_id = row_scenario_id,
+      .scenario_catalog_revision = catalog.revision,
+      .deployment_artifact_id = deployment_artifact_id,
+      .deployment_revision = deployment_revision,
+      .retained_bundle_id = retained_bundle_id,
+      .graph_revision = graph_revision,
+      .program_binding_id = program_binding_id,
+      .program_id = binding->value().program_id,
+      .program_revision = binding->value().program_revision,
+      .node_environment_digest = node_environment_digest,
+      .assistant_mode = assistant_mode,
+      .typed_parameter_overrides = typed_parameter_overrides,
+      .normalized_program_root = program->normalized_program_root(),
+      .normalized_program_binding_root = binding->normalized_root(),
+  };
+  Require(result.valid(), "scenario Program selection is invalid");
   return result;
 }
 

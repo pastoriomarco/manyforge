@@ -17,6 +17,12 @@ class OwnerTaskState(Enum):
     INTERRUPTED = "interrupted"
 
 
+class ProgramRunScopeState(Enum):
+    ACTIVE = "active"
+    SETTLED = "settled"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class NodeAttemptIdentity:
     program_run_id: str
@@ -189,6 +195,55 @@ class OwnerInvocationPort(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class ProgramRunScopeSnapshot:
+    """Kernel-operation quiescence for one exact Program run."""
+
+    program_run_id: str
+    state: ProgramRunScopeState
+    active_operation_count: int | None
+    reason_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.program_run_id, str) or not self.program_run_id:
+            raise ValueError("program_run_id must be non-empty text")
+        if not isinstance(self.state, ProgramRunScopeState):
+            raise TypeError("Program-run scope state is invalid")
+        if self.active_operation_count is not None and (
+            type(self.active_operation_count) is not int
+            or not 0 <= self.active_operation_count <= 4_096
+        ):
+            raise ValueError("active_operation_count is outside its bound")
+        if self.state is ProgramRunScopeState.SETTLED and (
+            self.active_operation_count != 0 or self.reason_code is not None
+        ):
+            raise ValueError("a settled Program-run scope must be empty")
+        if self.state is ProgramRunScopeState.ACTIVE and (
+            self.active_operation_count is None
+            or self.active_operation_count < 1
+            or self.reason_code is not None
+        ):
+            raise ValueError("an active Program-run scope must name active work")
+        if self.state is ProgramRunScopeState.UNKNOWN and (
+            self.active_operation_count is not None
+            or not isinstance(self.reason_code, str)
+            or not self.reason_code
+        ):
+            raise ValueError("an unknown Program-run scope requires one reason")
+
+
+class ProgramRunScopePort(Protocol):
+    """Stop and observe all Kernel operations attributed to one Program run."""
+
+    def request_stop(
+        self,
+        program_run_id: str,
+        reason: str | None,
+    ) -> ProgramRunScopeSnapshot: ...
+
+    def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
+
+
+@dataclass(frozen=True, slots=True)
 class NodeAdapterPorts:
     """Explicit focused ports; co-location never merges semantic ownership."""
 
@@ -199,6 +254,7 @@ class NodeAdapterPorts:
     assistant_requests: OwnerTaskPort | None = None
     pick_place: OwnerTaskPort | None = None
     kernel_controls: OwnerInvocationPort | None = None
+    program_run_scope: ProgramRunScopePort | None = None
 
 
 __all__ = [
@@ -211,4 +267,7 @@ __all__ = [
     "OwnerTaskPort",
     "OwnerTaskSnapshot",
     "OwnerTaskState",
+    "ProgramRunScopePort",
+    "ProgramRunScopeSnapshot",
+    "ProgramRunScopeState",
 ]

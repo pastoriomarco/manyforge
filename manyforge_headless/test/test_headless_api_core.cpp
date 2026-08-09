@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <manyforge_deployment/scenario_catalog.hpp>
 #include <memory>
 #include <optional>
 #include <set>
@@ -61,6 +62,10 @@ public:
   [[nodiscard]] std::filesystem::path history() const {
     return path_ / "history.sqlite3";
   }
+  void CreateRetentionSkeleton() const {
+    std::filesystem::create_directories(path_ / "retained-bundles/sha256");
+    std::filesystem::create_directories(path_ / "raw-artifacts/sha256");
+  }
 
 private:
   std::vector<char> buffer_;
@@ -104,10 +109,12 @@ AlarmCallerAttribution Caller(std::string request_id = "request.1",
 }
 
 HeadlessApiCoreConfig Config(const TemporaryDirectory &directory,
-                             std::string owner_epoch) {
+                             std::string owner_epoch,
+                             std::filesystem::path package_root =
+                                 MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT) {
   return {
       directory.publications(),
-      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
+      std::move(package_root),
       MANYFORGE_HEADLESS_TEST_NODE_CATALOG,
       MANYFORGE_HEADLESS_TEST_ALARM_CATALOG,
       directory.history(),
@@ -121,6 +128,10 @@ HeadlessApiCoreConfig Config(const TemporaryDirectory &directory,
       1000U,
       32U,
   };
+}
+
+std::string Digest(const char digit) {
+  return "sha256:" + std::string(64U, digit);
 }
 
 HeadlessApiCoreClocks Clocks() {
@@ -443,6 +454,54 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Unsigned(Member(second, "source"), "projection_generation"), 1U);
   EXPECT_EQ(Text(Member(second, "source"), "source_content_digest"),
             Text(source, "source_content_digest"));
+}
+
+TEST(HeadlessApiCore,
+     ServesTheExactVerifiedScenarioCatalogWithoutRuntimeSelection) {
+  TemporaryDirectory directory;
+  directory.CreateRetentionSkeleton();
+  const auto catalog = deployment::build_scenario_catalog({
+      deployment::ScenarioCatalogRowDTO{
+          .scenario_id = "cell-pick",
+          .description = "Exact maintained scenario",
+          .aliases = {"pick"},
+          .deployment_artifact_id = core::DeploymentArtifactId("cell_a"),
+          .deployment_revision = core::DeploymentRevision(Digest('1')),
+          .retained_bundle_id = core::RetainedBundleId(Digest('2')),
+          .program_binding_id = core::ProgramBindingId(Digest('3')),
+          .assistant_mode = deployment::ScenarioAssistantMode::kForbidden,
+          .typed_parameter_overrides =
+              CanonicalValue(CanonicalValue::Object{}),
+      },
+  });
+  {
+    deployment::FilesystemScenarioCatalogRepository repository(
+        directory.path(), "maintained");
+    ASSERT_EQ(repository.compare_and_set(std::nullopt, catalog),
+              deployment::ScenarioCatalogPublishResult::kPublished);
+  }
+  PublishHealthySources(directory, "open");
+  HeadlessApiCore core(Config(directory, "api.epoch.1", directory.path()),
+                       Clocks());
+
+  const auto projection = core.ScenarioCatalogProjection();
+  EXPECT_EQ(Text(projection, "api_version"),
+            deployment::kScenarioCatalogApiVersion);
+  EXPECT_EQ(Text(projection, "scenario_catalog_revision"),
+            catalog->revision().value());
+  const auto &scenarios = Array(projection, "scenarios");
+  ASSERT_EQ(scenarios.size(), 1U);
+  EXPECT_EQ(Text(scenarios.front(), "scenario_id"), "cell-pick");
+  EXPECT_EQ(Text(scenarios.front(), "program_binding_id"), Digest('3'));
+
+  try {
+    static_cast<void>(core.ScenarioProgramSelection("pick"));
+    FAIL() << "presentation alias selected a Program closure";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "scenario_program_selection_unavailable");
+    EXPECT_NE(std::string(error.what()).find("exact canonical"),
+              std::string::npos);
+  }
 }
 
 TEST(HeadlessApiCore, ServesOnlyTheExactVerifiedActiveRetainedViewerProduct) {

@@ -70,6 +70,33 @@ def test_client_uses_the_dedicated_source_model_route() -> None:
     assert [request.url.path for request in requests] == ["/api/source-model"]
 
 
+def test_client_uses_the_verified_scenario_catalog_route() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "api_version": "manyforge.scenario_catalog.v1",
+                "scenario_catalog_revision": "sha256:" + "1" * 64,
+                "scenarios": [],
+            },
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        assert client.scenarios()["api_version"] == "manyforge.scenario_catalog.v1"
+    finally:
+        raw.close()
+    assert [request.url.path for request in requests] == ["/api/scenarios"]
+
+
 def _viewer_headers(
     *,
     kind: str,

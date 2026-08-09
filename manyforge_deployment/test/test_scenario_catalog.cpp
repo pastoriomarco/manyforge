@@ -143,6 +143,8 @@ TEST(ScenarioApplyCandidateSourceTest,
   }
 
   FilesystemScenarioApplyCandidateSource source(root.path(), "maintained");
+  const auto verified = source.LoadVerifiedCatalog();
+  EXPECT_EQ(verified, catalog->normalized_root());
   const auto selected = source.ResolveExact({
       first.deployment_artifact_id,
       first.deployment_revision,

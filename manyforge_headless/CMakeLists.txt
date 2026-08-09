@@ -472,6 +472,7 @@ if(BUILD_TESTING)
     MANYFORGE_HEADLESS_TEST_NODE_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_catalog.yaml")
   target_link_libraries(test_headless_api_core PRIVATE
     manyforge_event_historian
+    manyforge::deployment
     manyforge::deployment_admission
     GTest::gtest_main)
   gtest_discover_tests(test_headless_api_core

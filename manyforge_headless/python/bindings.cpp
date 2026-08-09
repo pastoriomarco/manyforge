@@ -205,6 +205,18 @@ public:
     return Invoke([this]() { return core_->SourceModelProjection(); });
   }
 
+  std::string ScenarioCatalogProjection() {
+    py::gil_scoped_release release;
+    return Invoke([this]() { return core_->ScenarioCatalogProjection(); });
+  }
+
+  std::string ScenarioProgramSelection(std::string scenario_id) {
+    py::gil_scoped_release release;
+    return Invoke([this, scenario_id = std::move(scenario_id)]() {
+      return core_->ScenarioProgramSelection(scenario_id);
+    });
+  }
+
   py::dict ViewerModelUrdf() {
     return InvokeAsset([this]() { return core_->ViewerModelUrdf(); });
   }
@@ -449,6 +461,11 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("node_environment_projection",
            &HeadlessApiBridge::NodeEnvironmentProjection)
       .def("source_model_projection", &HeadlessApiBridge::SourceModelProjection)
+      .def("scenario_catalog_projection",
+           &HeadlessApiBridge::ScenarioCatalogProjection)
+      .def("scenario_program_selection",
+           &HeadlessApiBridge::ScenarioProgramSelection,
+           py::arg("scenario_id"))
       .def("viewer_model_urdf", &HeadlessApiBridge::ViewerModelUrdf)
       .def("viewer_model_resource", &HeadlessApiBridge::ViewerModelResource,
            py::arg("expected_retained_bundle_id"), py::arg("logical_uri"))

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_deployment/scenario_apply_candidate_source.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_headless/assistant_mode_projection.hpp>
 #include <manyforge_headless/event_historian.hpp>
@@ -27,6 +28,8 @@ inline constexpr std::string_view kHeadlessApiMutationResponseSchemaVersion =
     "manyforge.headless_api_mutation_response.v1";
 inline constexpr std::string_view kViewerModelAssetSchemaVersion =
     "manyforge.viewer_model_asset.v1";
+inline constexpr std::string_view kScenarioProgramSelectionSchemaVersion =
+    "manyforge.scenario_program_selection.v1";
 inline constexpr std::size_t kMaximumViewerModelResourceUriBytes = 4096U;
 
 class HeadlessApiOwnerLock;
@@ -165,6 +168,10 @@ public:
   NodeEnvironmentProjection();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   SourceModelProjection();
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ScenarioCatalogProjection();
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ScenarioProgramSelection(std::string_view scenario_id);
   [[nodiscard]] ViewerModelAsset ViewerModelUrdf();
   [[nodiscard]] ViewerModelAsset
   ViewerModelResource(std::string_view expected_retained_bundle_id,
@@ -280,6 +287,8 @@ private:
   std::unique_ptr<HeadlessApiOwnerLock> owner_lock_;
   manyforge::deployment::FilesystemVerifiedRetainedBundleSource
       retained_bundle_source_;
+  manyforge::deployment::FilesystemScenarioApplyCandidateSource
+      scenario_catalog_source_;
   ActiveNodeEnvironmentProjection node_environment_projection_;
   ActiveSourceModelProjection source_model_projection_;
   manyforge::deployment::FilesystemVerifiedRetainedViewerModelSource

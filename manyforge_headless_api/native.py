@@ -116,6 +116,10 @@ class HeadlessCorePort(Protocol):
 
     def source_model_projection(self) -> dict[str, Any]: ...
 
+    def scenario_catalog_projection(self) -> dict[str, Any]: ...
+
+    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]: ...
+
     def viewer_model_urdf(self) -> ViewerModelAsset: ...
 
     def viewer_model_resource(
@@ -433,6 +437,18 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("source_model_projection"),
             method="source_model_projection",
+        )
+
+    def scenario_catalog_projection(self) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("scenario_catalog_projection"),
+            method="scenario_catalog_projection",
+        )
+
+    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("scenario_program_selection", scenario_id),
+            method="scenario_program_selection",
         )
 
     def viewer_model_urdf(self) -> ViewerModelAsset:

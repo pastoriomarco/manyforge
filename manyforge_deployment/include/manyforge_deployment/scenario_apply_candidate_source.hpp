@@ -3,9 +3,11 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <manyforge_deployment/scenario_catalog.hpp>
 
 namespace manyforge::deployment {
 
@@ -35,6 +37,25 @@ struct ScenarioApplyCandidateSelection final {
                          const ScenarioApplyCandidateSelection &) = default;
 };
 
+struct ScenarioProgramSelection final {
+  std::string scenario_id;
+  core::ScenarioCatalogRevision scenario_catalog_revision;
+  core::DeploymentArtifactId deployment_artifact_id;
+  core::DeploymentRevision deployment_revision;
+  core::RetainedBundleId retained_bundle_id;
+  core::GraphRevision graph_revision;
+  core::ProgramBindingId program_binding_id;
+  core::ProgramId program_id;
+  core::ProgramRevision program_revision;
+  core::ContentDigest node_environment_digest;
+  ScenarioAssistantMode assistant_mode;
+  CanonicalValue typed_parameter_overrides;
+  CanonicalValue normalized_program_root;
+  CanonicalValue normalized_program_binding_root;
+
+  [[nodiscard]] bool valid() const noexcept;
+};
+
 /// Read-only runtime selector for one fixed, sealed scenario catalog.
 ///
 /// The source opens exactly `<catalog_name>.scenario-catalog.yaml` beneath an
@@ -51,6 +72,15 @@ public:
 
   [[nodiscard]] ScenarioApplyCandidateSelection
   ResolveExact(const ScenarioApplyCandidateQuery &query) const;
+
+  /// Load and independently verify the complete immutable catalog without
+  /// selecting an active/current scenario or acquiring publication authority.
+  [[nodiscard]] CanonicalValue LoadVerifiedCatalog() const;
+
+  /// Resolve one canonical scenario ID to its independently verified retained
+  /// Program closure. Aliases and source paths are deliberately not accepted.
+  [[nodiscard]] ScenarioProgramSelection
+  LoadExactProgramSelection(std::string_view scenario_id) const;
 
   [[nodiscard]] const std::filesystem::path &catalog_path() const noexcept;
 

@@ -415,6 +415,7 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
       owner_lock_(std::make_unique<HeadlessApiOwnerLock>(
           config_.historian_database_path)),
       retained_bundle_source_(config_.package_root),
+      scenario_catalog_source_(config_.package_root, "maintained"),
       node_environment_projection_(config_.package_root,
                                    config_.node_catalog_path),
       source_model_projection_(config_.package_root),
@@ -487,6 +488,121 @@ CanonicalValue HeadlessApiCore::SourceModelProjection() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   return SourceModelProjectionLocked(RefreshLocked());
+}
+
+CanonicalValue HeadlessApiCore::ScenarioCatalogProjection() {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  try {
+    return scenario_catalog_source_.LoadVerifiedCatalog();
+  } catch (const deployment::ScenarioApplyCandidateError &error) {
+    CoreFail("scenario_catalog_unavailable", error.what());
+  } catch (const deployment::ScenarioCatalogError &error) {
+    CoreFail("scenario_catalog_unavailable", error.what());
+  }
+}
+
+CanonicalValue
+HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto runtime = RefreshLocked();
+  Require(RequiredBool(runtime.root, "complete"),
+          "scenario_program_selection_unavailable",
+          "scenario Program selection requires fresh Manager and scene owners");
+  const auto &manager_section = RequiredSection(runtime.root, "manager");
+  const auto &logical_scene_section =
+      RequiredSection(runtime.root, "logical_scene");
+  const auto &scene_runtime_section =
+      RequiredSection(runtime.root, "scene_runtime");
+  const auto &manager_payload = RequiredMember(manager_section, "payload");
+  Require(manager_payload.is_object(), "scenario_program_selection_invalid",
+          "Manager has no active selection");
+  const auto &active = RequiredMember(manager_payload, "active");
+  const auto active_bundle_id = RequiredString(active, "retained_bundle_id");
+  const auto active_graph_revision = RequiredString(active, "graph_revision");
+  Require(RequiredBool(manager_payload, "manager_ready") &&
+              RequiredBool(RequiredMember(manager_payload, "runtime"),
+                           "converged"),
+          "scenario_program_selection_unavailable",
+          "Manager has not converged the active retained bundle");
+
+  const auto selection = [&]() -> deployment::ScenarioProgramSelection {
+    try {
+      return scenario_catalog_source_.LoadExactProgramSelection(scenario_id);
+    } catch (const deployment::ScenarioApplyCandidateError &error) {
+      CoreFail("scenario_program_selection_unavailable", error.what());
+    } catch (const deployment::ScenarioCatalogError &error) {
+      CoreFail("scenario_program_selection_unavailable", error.what());
+    } catch (const std::exception &error) {
+      CoreFail("scenario_program_selection_invalid", error.what());
+    }
+  }();
+  Require(selection.retained_bundle_id.value() == active_bundle_id &&
+              selection.graph_revision.value() == active_graph_revision,
+          "scenario_program_selection_not_applied",
+          "scenario Program selection names another active deployment");
+
+  const auto environment = NodeEnvironmentProjectionLocked(runtime);
+  Require(RequiredString(environment, "environment_digest") ==
+              selection.node_environment_digest.value() &&
+              RequiredString(environment, "retained_bundle_id") ==
+                  selection.retained_bundle_id.value() &&
+              RequiredString(environment, "graph_revision") ==
+                  selection.graph_revision.value(),
+          "scenario_program_selection_invalid",
+          "scenario Program selection and retained node environment disagree");
+
+  const auto owner_identity = [](const std::string_view role,
+                                 const CanonicalValue &section) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"owner_epoch", RequiredMember(section, "source_owner_epoch")},
+        {"owner_id", RequiredMember(section, "source_owner_id")},
+        {"owner_role", CanonicalValue(std::string(role))},
+    });
+  };
+  return CanonicalValue(CanonicalValue::Object{
+      {"assistant_mode",
+       CanonicalValue(selection.assistant_mode ==
+                              deployment::ScenarioAssistantMode::kRequired
+                          ? "required"
+                          : selection.assistant_mode ==
+                                    deployment::ScenarioAssistantMode::kOptional
+                                ? "optional"
+                                : "forbidden")},
+      {"deployment_artifact_id",
+       CanonicalValue(selection.deployment_artifact_id.value())},
+      {"deployment_revision",
+       CanonicalValue(selection.deployment_revision.value())},
+      {"graph_revision", CanonicalValue(selection.graph_revision.value())},
+      {"node_environment_digest",
+       CanonicalValue(selection.node_environment_digest.value())},
+      {"owner_identities",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"owner_epoch", CanonicalValue(config_.owner_epoch)},
+               {"owner_id", CanonicalValue(config_.owner_id)},
+               {"owner_role", CanonicalValue("headless_projection")},
+           }),
+           owner_identity("manager", manager_section),
+           owner_identity("scene_runtime", scene_runtime_section),
+           owner_identity("scene_transactions", logical_scene_section),
+       })},
+      {"program", selection.normalized_program_root},
+      {"program_binding", selection.normalized_program_binding_root},
+      {"program_binding_id",
+       CanonicalValue(selection.program_binding_id.value())},
+      {"program_id", CanonicalValue(selection.program_id.value())},
+      {"program_revision", CanonicalValue(selection.program_revision.value())},
+      {"retained_bundle_id",
+       CanonicalValue(selection.retained_bundle_id.value())},
+      {"scenario_catalog_revision",
+       CanonicalValue(selection.scenario_catalog_revision.value())},
+      {"scenario_id", CanonicalValue(selection.scenario_id)},
+      {"schema_version",
+       CanonicalValue(std::string(kScenarioProgramSelectionSchemaVersion))},
+      {"typed_parameter_overrides", selection.typed_parameter_overrides},
+  });
 }
 
 ViewerModelAsset HeadlessApiCore::ViewerModelUrdf() {

@@ -134,6 +134,7 @@ def _error_status(code: str) -> int:
         "execution_command_response_identity_mismatch",
         "node_environment_projection_invalid",
         "source_model_projection_invalid",
+        "scenario_catalog_projection_invalid",
         "viewer_model_asset_invalid",
         "assistant_mode_projection_invalid",
     }:
@@ -310,6 +311,10 @@ def create_app(
     @app.get("/api/source-model")
     def source_model() -> dict[str, Any]:
         return service.source_model()
+
+    @app.get("/api/scenarios")
+    def scenarios() -> dict[str, Any]:
+        return service.scenarios()
 
     def viewer_asset_response(asset: ViewerModelAsset) -> Response:
         cache_control = (

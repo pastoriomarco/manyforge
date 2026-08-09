@@ -116,6 +116,23 @@ class FakeCore:
             },
         }
 
+    def scenario_catalog_projection(self) -> dict[str, Any]:
+        return {
+            "api_version": "manyforge.scenario_catalog.v1",
+            "scenario_catalog_revision": "sha256:" + "6" * 64,
+            "scenarios": [
+                {
+                    "scenario_id": "cell-pick",
+                    "deployment_artifact_id": "cell_a",
+                    "deployment_revision": "sha256:" + "1" * 64,
+                    "retained_bundle_id": "sha256:" + "2" * 64,
+                    "program_binding_id": "sha256:" + "3" * 64,
+                    "assistant_mode": "forbidden",
+                    "typed_parameter_overrides": {},
+                }
+            ],
+        }
+
     def viewer_model_urdf(self) -> ViewerModelAsset:
         return ViewerModelAsset(
             asset_kind="urdf",
@@ -500,6 +517,11 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert source_model["source"]["source_owner_id"] == (
             "headless-api.source-model"
         )
+        scenarios = client.get("/api/scenarios").json()
+        assert scenarios["api_version"] == "manyforge.scenario_catalog.v1"
+        assert [row["scenario_id"] for row in scenarios["scenarios"]] == [
+            "cell-pick"
+        ]
 
         urdf = client.get("/api/viewer-model/urdf")
         assert urdf.status_code == 200
@@ -819,6 +841,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/execution/alarms/{condition_id}/acknowledge" in paths
     assert "/api/node-environment" in paths
     assert "/api/source-model" in paths
+    assert "/api/scenarios" in paths
     assert "/api/viewer-model/urdf" in paths
     assert "/api/viewer-model/resource" in paths
     assert "/api/assistant/modes" in paths

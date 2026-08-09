@@ -55,21 +55,47 @@ def _require_digest(value: object, *, field: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class ProgramRunOwnerIdentity:
+    """One exact downstream or orchestration owner captured for a run."""
+
+    owner_role: str
+    owner_id: str
+    owner_epoch: str
+
+    def __post_init__(self) -> None:
+        _require_text(self.owner_role, field="owner_role", maximum_bytes=128)
+        _require_text(self.owner_id, field="owner_id")
+        _require_text(self.owner_epoch, field="owner_epoch")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "owner_role": self.owner_role,
+            "owner_id": self.owner_id,
+            "owner_epoch": self.owner_epoch,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ProgramRunCapture:
     """Verified identities captured before one Program run is constructed."""
 
     program_run_id: str
+    scenario_id: str
+    scenario_catalog_revision: str
     program_id: str
     program_revision: str
     program_binding_id: str
     retained_bundle_id: str
     graph_revision: str
     node_environment_digest: str
+    owner_identities: tuple[ProgramRunOwnerIdentity, ...]
 
     def __post_init__(self) -> None:
         _require_text(self.program_run_id, field="program_run_id")
+        _require_text(self.scenario_id, field="scenario_id", maximum_bytes=128)
         _require_text(self.program_id, field="program_id")
         for field_name in (
+            "scenario_catalog_revision",
             "program_revision",
             "program_binding_id",
             "retained_bundle_id",
@@ -77,17 +103,45 @@ class ProgramRunCapture:
             "node_environment_digest",
         ):
             _require_digest(getattr(self, field_name), field=field_name)
+        if (
+            not isinstance(self.owner_identities, tuple)
+            or not self.owner_identities
+            or any(
+                not isinstance(identity, ProgramRunOwnerIdentity)
+                for identity in self.owner_identities
+            )
+            or tuple(
+                sorted(
+                    self.owner_identities,
+                    key=lambda identity: identity.owner_role,
+                )
+            )
+            != self.owner_identities
+            or len({identity.owner_role for identity in self.owner_identities})
+            != len(self.owner_identities)
+            or "program_runner"
+            not in {identity.owner_role for identity in self.owner_identities}
+        ):
+            raise ValueError(
+                "owner_identities must be unique, role-sorted, and include "
+                "program_runner"
+            )
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": PROGRAM_RUN_CAPTURE_API,
             "program_run_id": self.program_run_id,
+            "scenario_id": self.scenario_id,
+            "scenario_catalog_revision": self.scenario_catalog_revision,
             "program_id": self.program_id,
             "program_revision": self.program_revision,
             "program_binding_id": self.program_binding_id,
             "retained_bundle_id": self.retained_bundle_id,
             "graph_revision": self.graph_revision,
             "node_environment_digest": self.node_environment_digest,
+            "owner_identities": [
+                identity.to_dict() for identity in self.owner_identities
+            ],
         }
 
 
@@ -268,5 +322,6 @@ __all__ = [
     "PROGRAM_RUN_CAPTURE_API",
     "ProgramRunAttemptSource",
     "ProgramRunCapture",
+    "ProgramRunOwnerIdentity",
     "ProgramRuntimeError",
 ]

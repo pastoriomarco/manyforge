@@ -1,0 +1,468 @@
+"""Exact Program-run admission, lifecycle, and Stop-priority contracts."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+from threading import Event, Thread
+from typing import Any
+
+from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.executable_node_resolver import (
+    build_executable_node_resolver,
+)
+from manyforge_behavior.node_availability import (
+    AvailabilityFact,
+    NodeExecutionReadiness,
+)
+from manyforge_behavior.node_environment import build_node_environment
+from manyforge_behavior.orchestration_ports import (
+    NodeAdapterPorts,
+    NodeAttemptIdentity,
+    OwnerInvocationResult,
+    OwnerNodeInputs,
+    OwnerTaskSnapshot,
+    OwnerTaskState,
+    ProgramRunScopeSnapshot,
+    ProgramRunScopeState,
+)
+from manyforge_behavior.program import Program
+from manyforge_behavior.program_run_owner import (
+    ProgramRunAdmission,
+    ProgramRunOwner,
+    ProgramRunOwnerError,
+    ProgramRunState,
+    build_program_run_admission,
+)
+from manyforge_behavior.program_runtime import ProgramRunOwnerIdentity
+
+
+_ROOT = Path(__file__).resolve().parents[2]
+_DIGEST_A = "sha256:" + "a" * 64
+_DIGEST_B = "sha256:" + "b" * 64
+_DIGEST_C = "sha256:" + "c" * 64
+
+
+class _TaskPort:
+    def __init__(
+        self,
+        events: list[str],
+        initial_state: OwnerTaskState,
+    ) -> None:
+        self._events = events
+        self._initial_state = initial_state
+        self.starts = 0
+        self.cancels = 0
+
+    def start(
+        self,
+        _node_id: str,
+        _identity: NodeAttemptIdentity,
+        _inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        self.starts += 1
+        self._events.append("leaf_start")
+        return OwnerTaskSnapshot(
+            task_id=f"task-{self.starts}",
+            state=self._initial_state,
+            reason_code=(
+                "owner_failed"
+                if self._initial_state is OwnerTaskState.FAILED
+                else None
+            ),
+        )
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.ACTIVE)
+
+    def cancel(
+        self,
+        _task_id: str,
+        _identity: NodeAttemptIdentity,
+    ) -> None:
+        self.cancels += 1
+        self._events.append("leaf_cancel")
+
+    def acknowledge(
+        self,
+        _task_id: str,
+        _identity: NodeAttemptIdentity,
+    ) -> None:
+        self._events.append("leaf_acknowledge")
+
+
+class _BlockingTaskPort(_TaskPort):
+    def __init__(
+        self,
+        events: list[str],
+        entered: Event,
+        release: Event,
+    ) -> None:
+        super().__init__(events, OwnerTaskState.ACTIVE)
+        self._entered = entered
+        self._release = release
+
+    def start(
+        self,
+        _node_id: str,
+        _identity: NodeAttemptIdentity,
+        _inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        self.starts += 1
+        self._events.append("leaf_start_enter")
+        self._entered.set()
+        if not self._release.wait(timeout=2.0):
+            raise RuntimeError("test did not release the blocked dispatch")
+        self._events.append("leaf_start")
+        return OwnerTaskSnapshot(
+            task_id=f"task-{self.starts}",
+            state=OwnerTaskState.ACTIVE,
+        )
+
+
+class _InvocationPort:
+    def invoke(
+        self,
+        _node_id: str,
+        _identity: NodeAttemptIdentity,
+        _inputs: OwnerNodeInputs,
+    ) -> OwnerInvocationResult:
+        return OwnerInvocationResult(True)
+
+
+class _ScopePort:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.state = ProgramRunScopeState.SETTLED
+        self.stop_requests = 0
+
+    def _snapshot(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        if self.state is ProgramRunScopeState.SETTLED:
+            return ProgramRunScopeSnapshot(
+                program_run_id,
+                self.state,
+                0,
+            )
+        if self.state is ProgramRunScopeState.UNKNOWN:
+            return ProgramRunScopeSnapshot(
+                program_run_id,
+                self.state,
+                None,
+                "kernel_scope_unknown",
+            )
+        return ProgramRunScopeSnapshot(program_run_id, self.state, 1)
+
+    def request_stop(
+        self,
+        program_run_id: str,
+        _reason: str | None,
+    ) -> ProgramRunScopeSnapshot:
+        self.stop_requests += 1
+        self._events.append("scope_stop")
+        return self._snapshot(program_run_id)
+
+    def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+        return self._snapshot(program_run_id)
+
+
+def _readiness(binding_id: str) -> NodeExecutionReadiness:
+    resolver = build_executable_node_resolver(build_node_environment())
+    return NodeExecutionReadiness(
+        program_binding_id=binding_id,
+        binding_by_node={
+            disposition.row.node_id: AvailabilityFact(True)
+            for disposition in resolver.dispositions
+        },
+        owner_by_port={
+            owner_port: AvailabilityFact(True)
+            for owner_port in {
+                disposition.owner_port_name
+                for disposition in resolver.dispositions
+                if disposition.owner_port_name is not None
+            }
+        },
+    )
+
+
+def _fixture(
+    *,
+    initial_task_state: OwnerTaskState,
+    task_factory: Callable[[list[str]], _TaskPort] | None = None,
+) -> tuple[ProgramRunOwner, ProgramRunAdmission, _TaskPort, _ScopePort, list[str]]:
+    events: list[str] = []
+    task = (
+        _TaskPort(events, initial_task_state)
+        if task_factory is None
+        else task_factory(events)
+    )
+    invocation = _InvocationPort()
+    scope = _ScopePort(events)
+    ports = NodeAdapterPorts(
+        kernel_operations=task,
+        scene_transactions=invocation,
+        gripper_status=invocation,
+        model_queries=invocation,
+        assistant_requests=task,
+        pick_place=task,
+        kernel_controls=invocation,
+        program_run_scope=scope,
+    )
+    environment = build_node_environment()
+    program = Program(
+        _ROOT / "examples/pick_and_place_minimal.program.yaml",
+        NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml"),
+    )
+    admission = ProgramRunAdmission(
+        scenario_id="ur5-pick-place",
+        scenario_catalog_revision=_DIGEST_A,
+        program=program,
+        environment=environment,
+        program_binding_id=_DIGEST_A,
+        retained_bundle_id=_DIGEST_B,
+        graph_revision=_DIGEST_C,
+        readiness=_readiness(_DIGEST_A),
+        owner_identities=(
+            ProgramRunOwnerIdentity(
+                owner_role="kernel_operations",
+                owner_id="kernel.cell-a",
+                owner_epoch="kernel.epoch.1",
+            ),
+        ),
+        program_parameter_values={},
+    )
+    owner = ProgramRunOwner(
+        owner_id="program-runner.cell-a",
+        owner_epoch="program-runner.epoch.1",
+        ports=ports,
+        run_id_factory=lambda: "program-run-1",
+        maximum_retained_runs=8,
+    )
+    return owner, admission, task, scope, events
+
+
+def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> None:
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+
+    started = owner.start(admission)
+    assert started.state is ProgramRunState.RUNNING
+    assert started.tree_status == "invalid"
+    assert task.starts == 0
+    assert started.capture.scenario_id == "ur5-pick-place"
+    assert started.capture.scenario_catalog_revision == _DIGEST_A
+    assert started.capture.program_id == admission.program.program_id
+    assert started.capture.program_revision == admission.program.program_revision
+    assert started.capture.program_binding_id == _DIGEST_A
+    assert started.capture.retained_bundle_id == _DIGEST_B
+    assert started.capture.graph_revision == _DIGEST_C
+    assert started.capture.node_environment_digest == (
+        admission.environment.environment_digest
+    )
+    assert [identity.owner_role for identity in started.capture.owner_identities] == [
+        "kernel_operations",
+        "program_runner",
+    ]
+
+    completed = owner.advance_once(started.capture.program_run_id)
+    assert completed.state is ProgramRunState.SUCCEEDED
+    assert completed.active_operation_count == 0
+
+
+def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof() -> (
+    None
+):
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    started = owner.start(admission)
+    running = owner.advance_once(started.capture.program_run_id)
+    assert running.state is ProgramRunState.RUNNING
+    assert events == ["leaf_start"]
+
+    scope.state = ProgramRunScopeState.ACTIVE
+    stopping = owner.stop(started.capture.program_run_id, reason="operator stop")
+    assert stopping.state is ProgramRunState.STOPPING
+    assert stopping.active_operation_count == 1
+    assert events == ["leaf_start", "scope_stop", "leaf_cancel"]
+    assert scope.stop_requests == 1
+    assert task.cancels == 1
+
+    still_stopping = owner.read(started.capture.program_run_id)
+    assert still_stopping.state is ProgramRunState.STOPPING
+    scope.state = ProgramRunScopeState.SETTLED
+    stopped = owner.read(started.capture.program_run_id)
+    assert stopped.state is ProgramRunState.STOPPED
+    assert stopped.active_operation_count == 0
+
+    repeated = owner.stop(started.capture.program_run_id)
+    assert repeated.state is ProgramRunState.STOPPED
+    assert scope.stop_requests == 1
+    assert task.cancels == 1
+
+
+def test_stop_cannot_race_a_tick_and_dispatch_after_the_kernel_stop_request() -> None:
+    tick_entered = Event()
+    release_tick = Event()
+    owner, admission, task, _scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda target: _BlockingTaskPort(
+            target,
+            tick_entered,
+            release_tick,
+        ),
+    )
+    started = owner.start(admission)
+    program_run_id = started.capture.program_run_id
+    tick_results: list[object] = []
+    stop_results: list[object] = []
+    tick_thread = Thread(
+        target=lambda: tick_results.append(owner.advance_once(program_run_id)),
+    )
+    stop_thread = Thread(
+        target=lambda: stop_results.append(owner.stop(program_run_id)),
+    )
+
+    tick_thread.start()
+    assert tick_entered.wait(timeout=1.0)
+    stop_thread.start()
+    stop_thread.join(timeout=0.05)
+    assert stop_thread.is_alive()
+    assert events == ["leaf_start_enter"]
+
+    release_tick.set()
+    tick_thread.join(timeout=1.0)
+    stop_thread.join(timeout=1.0)
+    assert not tick_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert len(tick_results) == 1
+    assert len(stop_results) == 1
+    assert events == ["leaf_start_enter", "leaf_start", "scope_stop", "leaf_cancel"]
+    assert task.starts == 1
+
+
+def test_failure_is_not_relabelled_as_stopped_while_kernel_work_settles() -> None:
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED
+    )
+    started = owner.start(admission)
+    scope.state = ProgramRunScopeState.ACTIVE
+
+    stopping = owner.advance_once(started.capture.program_run_id)
+    assert stopping.state is ProgramRunState.STOPPING
+    assert stopping.reason_code == "program_terminal_scope_not_settled"
+    repeated = owner.stop(started.capture.program_run_id)
+    assert repeated.state is ProgramRunState.STOPPING
+
+    scope.state = ProgramRunScopeState.SETTLED
+    failed = owner.read(started.capture.program_run_id)
+    assert failed.state is ProgramRunState.FAILED
+    assert failed.reason_code == "program_terminal_scope_not_settled"
+
+
+def test_unknown_kernel_scope_never_reports_stopped_and_recovers_cleanly() -> None:
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    started = owner.start(admission)
+    scope.state = ProgramRunScopeState.UNKNOWN
+
+    unknown = owner.stop(started.capture.program_run_id)
+    assert unknown.state is ProgramRunState.STOPPING
+    assert unknown.active_operation_count is None
+    assert unknown.reason_code == "kernel_scope_unknown"
+
+    scope.state = ProgramRunScopeState.SETTLED
+    stopped = owner.read(started.capture.program_run_id)
+    assert stopped.state is ProgramRunState.STOPPED
+    assert stopped.active_operation_count == 0
+    assert stopped.reason_code is None
+    assert stopped.message == ""
+
+
+def test_program_run_snapshot_is_a_closed_serializable_owner_projection() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    value: dict[str, Any] = owner.start(admission).to_dict()
+
+    assert set(value) == {
+        "schema_version",
+        "owner_id",
+        "owner_epoch",
+        "run_revision",
+        "state",
+        "capture",
+        "tree_status",
+        "active_operation_count",
+        "reason_code",
+        "message",
+    }
+    assert value["schema_version"] == "manyforge.program_run_status.v1"
+    assert value["capture"]["schema_version"] == ("manyforge.program_run_capture.v1")
+
+
+def test_native_selection_join_rejects_a_catalog_change_before_construction() -> None:
+    _owner, fixture_admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    program = fixture_admission.program
+    environment = fixture_admission.environment
+    selection = {
+        "schema_version": "manyforge.scenario_program_selection.v1",
+        "scenario_id": fixture_admission.scenario_id,
+        "scenario_catalog_revision": fixture_admission.scenario_catalog_revision,
+        "deployment_artifact_id": "cell_a",
+        "deployment_revision": "sha256:" + "d" * 64,
+        "retained_bundle_id": fixture_admission.retained_bundle_id,
+        "graph_revision": fixture_admission.graph_revision,
+        "program_binding_id": fixture_admission.program_binding_id,
+        "program_id": program.program_id,
+        "program_revision": program.program_revision,
+        "node_environment_digest": environment.environment_digest,
+        "assistant_mode": "forbidden",
+        "typed_parameter_overrides": {},
+        "owner_identities": [
+            {
+                "owner_role": "headless_projection",
+                "owner_id": "headless-api.cell-a",
+                "owner_epoch": "headless.epoch.1",
+            }
+        ],
+        "program": program.to_dict(),
+        "program_binding": {
+            "program_binding_id": fixture_admission.program_binding_id,
+            "program_id": program.program_id,
+            "program_revision": program.program_revision,
+            "retained_bundle_id": fixture_admission.retained_bundle_id,
+            "graph_revision": fixture_admission.graph_revision,
+            "node_environment": {
+                "environment_digest": environment.environment_digest,
+            },
+        },
+    }
+
+    admitted = build_program_run_admission(
+        selection,
+        expected_scenario_id=fixture_admission.scenario_id,
+        expected_scenario_catalog_revision=(
+            fixture_admission.scenario_catalog_revision
+        ),
+        environment=environment,
+        owner_availability=fixture_admission.readiness.owner_by_port,
+    )
+    assert admitted.program.program_revision == program.program_revision
+    assert admitted.program_binding_id == fixture_admission.program_binding_id
+
+    try:
+        build_program_run_admission(
+            selection,
+            expected_scenario_id=fixture_admission.scenario_id,
+            expected_scenario_catalog_revision="sha256:" + "e" * 64,
+            environment=environment,
+            owner_availability=fixture_admission.readiness.owner_by_port,
+        )
+    except ProgramRunOwnerError as error:
+        assert "catalog changed" in str(error)
+    else:
+        raise AssertionError("stale scenario-catalog revision was admitted")

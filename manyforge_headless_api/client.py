@@ -330,6 +330,9 @@ class HeadlessHttpClient:
     def source_model(self) -> dict[str, Any]:
         return self.request("GET", "/api/source-model")
 
+    def scenarios(self) -> dict[str, Any]:
+        return self.request("GET", "/api/scenarios")
+
     def viewer_model_urdf(self) -> ViewerModelAsset:
         asset = self._request_viewer_asset(
             "/api/viewer-model/urdf",

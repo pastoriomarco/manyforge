@@ -31,6 +31,7 @@
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
+#include <manyforge_deployment/scenario_apply_candidate_source.hpp>
 #include <manyforge_deployment/scenario_catalog.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
@@ -1120,6 +1121,9 @@ void publish_and_verify_scenario_catalog(
         "maintained scenario catalog did not independently reload exactly");
   }
 
+  const deployment::FilesystemScenarioApplyCandidateSource scenario_source(
+      package_root, "maintained");
+
   std::vector<deployment::ScenarioArtifactClosureQuery> verified_queries;
   verified_queries.reserve(bindings.size());
   for (const auto &record : bindings) {
@@ -1129,6 +1133,30 @@ void publish_and_verify_scenario_catalog(
         [&](const auto &row) { return row.scenario_id == record.scenario_id; });
     if (product == products.end() || binding_row == reloaded->rows().end()) {
       throw std::logic_error("maintained scenario catalog lost one closure");
+    }
+    const auto selected =
+        scenario_source.LoadExactProgramSelection(record.scenario_id);
+    if (!selected.valid() || selected.scenario_id != record.scenario_id ||
+        selected.scenario_catalog_revision != reloaded->revision() ||
+        selected.deployment_artifact_id !=
+            product->second.deployment_artifact_id ||
+        selected.deployment_revision != product->second.deployment_revision ||
+        selected.retained_bundle_id !=
+            product->second.bundle->retained_bundle_id() ||
+        selected.graph_revision !=
+            product->second.bundle->value().cell_graph.graph_revision ||
+        selected.program_binding_id != record.program_binding_id ||
+        selected.program_id != record.program_id ||
+        selected.program_revision != record.program_revision ||
+        selected.node_environment_digest !=
+            product->second.bundle->value()
+                .catalogs.node_environment.environment_digest ||
+        selected.assistant_mode != binding_row->assistant_mode ||
+        selected.typed_parameter_overrides !=
+            deployment::CanonicalValue(
+                deployment::CanonicalValue::Object{})) {
+      throw std::logic_error(
+          "maintained scenario selector did not preserve its exact closure");
     }
     const auto binding_path =
         package_root / "program-bindings" / "sha256" /

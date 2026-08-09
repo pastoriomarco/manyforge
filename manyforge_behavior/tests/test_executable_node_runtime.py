@@ -44,6 +44,7 @@ from manyforge_behavior.program_runtime import (
     ExecutableProgramRun,
     ProgramRunAttemptSource,
     ProgramRunCapture,
+    ProgramRunOwnerIdentity,
     ProgramRuntimeError,
 )
 
@@ -182,12 +183,21 @@ def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapt
     environment = build_node_environment()
     return ProgramRunCapture(
         program_run_id="run.test",
+        scenario_id="scenario.test",
+        scenario_catalog_revision=_DIGEST_A,
         program_id=program.program_id,
         program_revision=program.program_revision,
         program_binding_id=binding_id,
         retained_bundle_id=_DIGEST_B,
         graph_revision=_DIGEST_C,
         node_environment_digest=environment.environment_digest,
+        owner_identities=(
+            ProgramRunOwnerIdentity(
+                owner_role="program_runner",
+                owner_id="program-runner.cell-a",
+                owner_epoch="program-runner.epoch.1",
+            ),
+        ),
     )
 
 
