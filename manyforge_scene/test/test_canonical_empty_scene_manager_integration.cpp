@@ -71,6 +71,12 @@ class ExactReleaseFencePort final : public core::IManagerKernelApplyFencePort {
   explicit ExactReleaseFencePort(component_manager::SqliteManagerApplyJournal& journal)
       : journal_(journal) {}
 
+  [[nodiscard]] core::ConfigurationFenceAdmissionSnapshotDTO ObserveAdmission(
+      const core::ConfigurationFenceAdmissionQueryDTO&) const override {
+    throw std::runtime_error(
+        "admission observation is outside the completion fixture");
+  }
+
   [[nodiscard]] core::ConfigurationFenceAcceptedDTO Acquire(
       const core::ApplyConfigurationFenceIntentDTO&) override {
     throw std::runtime_error("Acquire is outside the completion fixture");

@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <manyforge_component_manager/active_bundle_publication_store.hpp>
+#include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
 #include <manyforge_component_manager/native_execution_runtime_unit_admission.hpp>
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
@@ -250,9 +252,36 @@ MakeActivePlan(const component_manager::RuntimeUnitConvergenceQueryDTO &query) {
 MakeAdapter(NativeFixture &fixture, const std::filesystem::path &target_root) {
   return component_manager::RetainedNativeRuntimeUnitAdapter(
       target_root, fixture.root / "retained-package",
-      fixture.staging_root.path(), fixture.bundle_source,
-      fixture.artifact_source, std::string(contract::kOperatingSystem),
+      fixture.staging_root.path(), fixture.staging_root.path(),
+      fixture.bundle_source, fixture.artifact_source,
+      std::string(contract::kOperatingSystem),
       std::string(contract::kLaunchEnvironmentContract));
+}
+
+[[nodiscard]] core::ActiveBundlePublicationReceiptDTO
+PublishActiveFixture(NativeFixture &fixture) {
+  component_manager::SqliteActiveBundlePublicationStore store(
+      fixture.staging_root.path() /
+          std::string(component_manager::kActiveBundlePublicationStoreFilename),
+      fixture.bundle->value().cell_graph.cell_id);
+  const core::ContentDigest digest{std::string(kIntentDigest)};
+  auto receipt = store.PublishActiveBundle({
+      core::BootstrapPublicationTransactionDTO{
+          core::BootstrapId("native-adapter-bootstrap"),
+          core::BootstrapGeneration(1U)},
+      core::ProjectionRevisionDTO{
+          fixture.bundle->retained_bundle_id(),
+          fixture.bundle->value().cell_graph.graph_revision,
+          core::SceneRevision{core::SceneId(std::string(kIntentDigest)), 1U,
+                              digest}},
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      std::nullopt,
+      digest,
+      digest,
+  });
+  store.Close();
+  return receipt;
 }
 
 [[nodiscard]] core::ProjectionNativeRuntimeBindingDTO
@@ -378,6 +407,140 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_NE(restarted.process_incarnation(), first_epoch.value());
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     PrivateManagedChildOwnsDurableExactApplyFenceLifecycle) {
+  NativeFixture fixture;
+  const auto publication = PublishActiveFixture(fixture);
+  auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
+  const auto first = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(first.state(), component_manager::ProcessPresenceState::kPresent);
+
+  const core::RuntimeEpoch manager_epoch("manager-runtime-fence-test");
+  const core::ConfigurationFenceAdmissionQueryDTO observation_query{
+      {}, manager_epoch};
+  const auto observation = adapter.ObserveAdmission(observation_query);
+  ASSERT_TRUE(observation.matches(observation_query));
+  EXPECT_EQ(observation.active_projection_revision,
+            publication.request.candidate_projection_revision);
+  EXPECT_EQ(observation.active_public_pointer_digest,
+            publication.durable_public_pointer_content_digest);
+  EXPECT_EQ(observation.configuration_fence_generation.value(), 0U);
+  EXPECT_TRUE(observation.active_control_configurations.empty());
+
+  const core::ApplyConfigurationFenceIntentDTO intent{
+      core::PublicRequestContextDTO{
+          core::RequestId("native-fence-request-1"),
+          core::RequestOwnerEpoch("manager-owner-fence-test"),
+          "retained-native-adapter-test", std::nullopt},
+      core::ApplyFenceOwnerDTO{core::ApplyId("native-fence-apply-1"),
+                               core::ApplyGeneration(1U)},
+      {},
+      core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      observation.operation_resource_generation,
+      observation.configuration_fence_generation,
+      {},
+      "verify the direct-child durable fence lifecycle"};
+  ASSERT_TRUE(intent.valid());
+  const auto accepted = adapter.Acquire(intent);
+  ASSERT_TRUE(accepted.matches(intent));
+  EXPECT_EQ(accepted.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
+  const auto replayed = adapter.Acquire(intent);
+  EXPECT_EQ(replayed.configuration_fence_id, accepted.configuration_fence_id);
+  EXPECT_EQ(replayed.configuration_fence_generation,
+            accepted.configuration_fence_generation);
+  EXPECT_EQ(replayed.replay_status,
+            core::RequestReplayStatusDTO::kReplayedExact);
+
+  auto competing_intent = intent;
+  competing_intent.owner_request_context.request_id =
+      core::RequestId("native-fence-request-2");
+  competing_intent.owner_transaction.apply_id =
+      core::ApplyId("native-fence-apply-2");
+  competing_intent.expected_fence_generation =
+      accepted.configuration_fence_generation;
+  ASSERT_TRUE(competing_intent.valid());
+  EXPECT_THROW(adapter.Acquire(competing_intent),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_EQ(adapter.ObserveAdmission(observation_query)
+                .configuration_fence_generation,
+            accepted.configuration_fence_generation);
+
+  const core::ApplyFenceAcquireAttemptQueryDTO attempt_query{
+      intent, core::ContentDigest(std::string(kIntentDigest)), manager_epoch};
+  const auto attempt = adapter.ReconcileAcquireAttempt(attempt_query);
+  ASSERT_TRUE(attempt.matches(attempt_query));
+  EXPECT_EQ(attempt.state,
+            core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact);
+  ASSERT_TRUE(attempt.accepted_fence.has_value());
+  EXPECT_EQ(attempt.accepted_fence->configuration_fence_id,
+            accepted.configuration_fence_id);
+
+  const core::ApplyFenceRehydrateDTO rehydrate{
+      intent.owner_transaction.apply_id,
+      intent.owner_transaction.apply_generation,
+      intent.owner_request_context.request_id,
+      intent.owner_request_context.request_owner_epoch,
+      core::ContentDigest(std::string(kIntentDigest)),
+      intent.expected_retained_bundle_id,
+      intent.expected_graph_revision,
+      intent.expected_retained_bundle_id,
+      intent.expected_graph_revision,
+      accepted.configuration_fence_id,
+      accepted.configuration_fence_generation,
+      accepted.captured_scope,
+      "fence_accepted",
+      manager_epoch};
+  const auto rehydrated = adapter.Rehydrate(rehydrate);
+  ASSERT_TRUE(rehydrated.matches(rehydrate));
+  EXPECT_FALSE(rehydrated.admission_fenced);
+  EXPECT_EQ(rehydrated.fence_results.front().state,
+            core::ApplyFenceReconcileState::kMatched);
+
+  const core::ConfigurationFenceStatusQueryDTO status_query{
+      intent.owner_transaction, accepted.configuration_fence_id,
+      accepted.configuration_fence_generation, accepted.captured_scope,
+      manager_epoch};
+  const auto held = adapter.QueryStatus(status_query);
+  ASSERT_TRUE(held.matches(status_query));
+  EXPECT_EQ(held.state, core::ConfigurationFenceState::kHeld);
+  EXPECT_TRUE(held.admission_fenced);
+  EXPECT_EQ(held.reconciliation_evidence.active_projection_revision,
+            publication.request.candidate_projection_revision);
+
+  static_cast<void>(adapter.EnsureStopped(*fixture.query));
+  const auto second = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(second.state(), component_manager::ProcessPresenceState::kPresent);
+  EXPECT_NE(second.process_incarnation(), first.process_incarnation());
+  const auto restored_held = adapter.QueryStatus(status_query);
+  ASSERT_TRUE(restored_held.matches(status_query));
+  EXPECT_EQ(restored_held.state, core::ConfigurationFenceState::kHeld);
+  EXPECT_TRUE(restored_held.admission_fenced);
+
+  const core::ConfigurationFenceReleaseDTO release_request{
+      restored_held.reconciliation_evidence, manager_epoch};
+  const auto released = adapter.Release(release_request);
+  ASSERT_TRUE(released.valid());
+  EXPECT_EQ(released.request, release_request);
+  const auto released_status = adapter.QueryStatus(status_query);
+  ASSERT_TRUE(released_status.matches(status_query));
+  EXPECT_EQ(released_status.state, core::ConfigurationFenceState::kReleased);
+  ASSERT_TRUE(released_status.release_receipt.has_value());
+  EXPECT_EQ(*released_status.release_receipt, released);
+
+  static_cast<void>(adapter.EnsureStopped(*fixture.query));
+  const auto third = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(third.state(), component_manager::ProcessPresenceState::kPresent);
+  EXPECT_NE(third.process_incarnation(), second.process_incarnation());
+  const auto restored_status = adapter.QueryStatus(status_query);
+  ASSERT_TRUE(restored_status.matches(status_query));
+  EXPECT_EQ(restored_status.state, core::ConfigurationFenceState::kReleased);
+  EXPECT_EQ(adapter.Release(release_request), released);
+  const auto next_observation = adapter.ObserveAdmission(observation_query);
+  EXPECT_EQ(next_observation.configuration_fence_generation.value(), 1U);
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,

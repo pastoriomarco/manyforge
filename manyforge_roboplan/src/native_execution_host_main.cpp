@@ -62,6 +62,8 @@
 #include <variant>
 #include <vector>
 
+#include "kernel_apply_fence_rpc_internal.hpp"
+#include "managed_kernel_apply_fence_owner.hpp"
 #include "native_projection_rpc_internal.hpp"
 
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
@@ -341,7 +343,9 @@ struct HostConfig final {
 struct ManagedRuntimeChildConfig final {
   int manager_channel_fd{-1};
   std::filesystem::path package_root;
+  std::filesystem::path manager_state_root;
   std::filesystem::path staging_root;
+  std::string cell_id;
   std::string runtime_unit_id;
   std::string runtime_epoch;
   std::string product_identity;
@@ -388,8 +392,12 @@ struct ManagedRuntimeChildConfig final {
       config.manager_channel_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-package-root") {
       config.package_root = value;
+    } else if (option == "--manyforge-managed-manager-state-root") {
+      config.manager_state_root = value;
     } else if (option == "--manyforge-managed-staging-root") {
       config.staging_root = value;
+    } else if (option == "--manyforge-managed-cell-id") {
+      config.cell_id = value;
     } else if (option == "--runtime-unit-id") {
       config.runtime_unit_id = value;
     } else if (option == "--runtime-epoch") {
@@ -402,9 +410,10 @@ struct ManagedRuntimeChildConfig final {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() == 7U && config.manager_channel_fd >= 0,
+  Require(seen.size() == 9U && config.manager_channel_fd >= 0,
           "managed runtime invocation is incomplete");
-  Require(IsPortableRuntimeIdentity(config.runtime_unit_id) &&
+  Require(IsPortableRuntimeIdentity(config.cell_id) &&
+              IsPortableRuntimeIdentity(config.runtime_unit_id) &&
               IsPortableRuntimeIdentity(config.runtime_epoch),
           "managed runtime identity is invalid");
   Require(core::IsExactLowercaseSha256Digest(config.product_identity) &&
@@ -412,6 +421,8 @@ struct ManagedRuntimeChildConfig final {
           "managed runtime retained identity is invalid");
   config.package_root =
       ExistingDirectory(std::move(config.package_root), "managed retained-package root");
+  config.manager_state_root =
+      ExistingDirectory(std::move(config.manager_state_root), "managed Manager state root");
   config.staging_root =
       ExistingDirectory(std::move(config.staging_root), "managed native staging root");
 
@@ -758,6 +769,23 @@ class ManagedProjectionRegistry final {
                                    " " + config.product_identity + " " +
                                    config.configuration_identity;
   std::uint64_t source_report_sequence = 0U;
+  ManagedKernelAdmissionGate admission_gate;
+  ManagedKernelApplyFenceOwner fence_owner(
+      ManagedKernelApplyFenceOwnerConfig{
+          config.staging_root / "kernel-apply-fence.sqlite3",
+          config.manager_state_root,
+          config.package_root,
+          core::CellId(config.cell_id),
+          core::RuntimeUnitId(config.runtime_unit_id),
+          core::RuntimeEpoch(config.runtime_epoch),
+          core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+          [] {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+          },
+      },
+      admission_gate);
   ManagedProjectionRegistry projections(config);
 
   while (g_stop_requested == 0) {
@@ -804,6 +832,51 @@ class ManagedProjectionRegistry final {
     if (request == "shutdown") {
       SendManagedRuntimePacket(config.manager_channel_fd, "shutdown-accepted");
       return 0;
+    }
+    if (component_manager::detail::IsKernelApplyFenceRpcPacket(request)) {
+      component_manager::detail::KernelApplyFenceRpcResponse response =
+          component_manager::detail::KernelApplyFenceRpcFailure{
+              core::ErrorDTO{"kernel_apply_fence_request_failed",
+                             "Kernel Apply-fence request was not dispatched", {}}};
+      try {
+        const auto decoded =
+            component_manager::detail::DecodeKernelApplyFenceRpcRequest(request);
+        response = std::visit(
+            [&](const auto& value)
+                -> component_manager::detail::KernelApplyFenceRpcResponse {
+              using T = std::decay_t<decltype(value)>;
+              if constexpr (std::is_same_v<
+                                T, core::ConfigurationFenceAdmissionQueryDTO>) {
+                return fence_owner.ObserveAdmission(value);
+              } else if constexpr (
+                  std::is_same_v<T, core::ApplyConfigurationFenceIntentDTO>) {
+                return fence_owner.Acquire(value);
+              } else if constexpr (
+                  std::is_same_v<T, core::ApplyFenceAcquireAttemptQueryDTO>) {
+                return fence_owner.ReconcileAcquireAttempt(value);
+              } else if constexpr (
+                  std::is_same_v<T, core::ApplyFenceRehydrateDTO>) {
+                return fence_owner.Rehydrate(value);
+              } else if constexpr (
+                  std::is_same_v<T, core::ConfigurationFenceStatusQueryDTO>) {
+                return fence_owner.QueryStatus(value);
+              } else {
+                return fence_owner.Release(value);
+              }
+            },
+            decoded);
+      } catch (const std::exception& error) {
+        response = component_manager::detail::KernelApplyFenceRpcFailure{
+            core::ErrorDTO{"kernel_apply_fence_request_failed", error.what(), {}}};
+      } catch (...) {
+        response = component_manager::detail::KernelApplyFenceRpcFailure{
+            core::ErrorDTO{"kernel_apply_fence_request_failed",
+                           "Kernel Apply-fence request failed", {}}};
+      }
+      SendManagedRuntimePacket(
+          config.manager_channel_fd,
+          component_manager::detail::EncodeKernelApplyFenceRpcResponse(response));
+      continue;
     }
     component_manager::detail::NativeProjectionRpcResponse response;
     try {

@@ -9,9 +9,12 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -25,6 +28,7 @@ namespace {
 namespace component_manager = manyforge::component_manager;
 namespace content_identity = manyforge::content_identity;
 namespace core = manyforge::core;
+namespace deployment = manyforge::deployment;
 
 constexpr std::string_view kDeploymentRevision =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
@@ -39,6 +43,53 @@ RequiredMember(const content_identity::CanonicalValue &value,
   }
   return *member;
 }
+
+#if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
+const std::string &RequiredText(const content_identity::CanonicalValue &value,
+                                const std::string_view name) {
+  const auto *text =
+      std::get_if<std::string>(&RequiredMember(value, name).storage());
+  if (text == nullptr || text->empty()) {
+    throw std::runtime_error("Manager Apply metadata has invalid " +
+                             std::string(name));
+  }
+  return *text;
+}
+
+struct ManagerApplyFixtureMetadata final {
+  std::string admission_filename;
+  std::string candidate_retained_bundle_id;
+  std::string cell_id;
+  std::string deployment_artifact_id;
+  std::string deployment_revision;
+  std::string predecessor_graph_revision;
+  std::string predecessor_retained_bundle_id;
+};
+
+ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata() {
+  std::ifstream stream(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA,
+                       std::ios::binary);
+  if (!stream) {
+    throw std::runtime_error("Manager Apply fixture metadata is absent");
+  }
+  const std::string bytes{std::istreambuf_iterator<char>(stream),
+                          std::istreambuf_iterator<char>()};
+  const auto root = deployment::parse_strict_json_model_yaml(bytes).root();
+  if (!root.is_object() || root.as_object().size() != 7U ||
+      content_identity::canonical_json(root) != bytes) {
+    throw std::runtime_error("Manager Apply fixture metadata is invalid");
+  }
+  return {
+      RequiredText(root, "admission_filename"),
+      RequiredText(root, "candidate_retained_bundle_id"),
+      RequiredText(root, "cell_id"),
+      RequiredText(root, "deployment_artifact_id"),
+      RequiredText(root, "deployment_revision"),
+      RequiredText(root, "predecessor_graph_revision"),
+      RequiredText(root, "predecessor_retained_bundle_id"),
+  };
+}
+#endif
 
 class DaemonDirectory final {
 public:
@@ -78,6 +129,12 @@ public:
   [[nodiscard]] std::filesystem::path socket_path() const {
     return manager_root() / "manager-command.sock";
   }
+  [[nodiscard]] std::filesystem::path installed_root() const {
+    return root_ / "installed";
+  }
+  [[nodiscard]] std::filesystem::path apply_package_root() const {
+    return root_ / "apply-package";
+  }
 
 private:
   std::vector<char> buffer_;
@@ -91,10 +148,12 @@ void SendCommandAndDisconnect(const std::filesystem::path &path,
 
 class ManagerProcess final {
 public:
-  explicit ManagerProcess(const DaemonDirectory &directory) {
-    const std::string executable = MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON;
-    const std::string package_root =
-        MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT;
+  explicit ManagerProcess(
+      const DaemonDirectory &directory,
+      std::string package_root =
+          MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
+      std::string admission_filename = "canonical-empty-admission.json",
+      std::string executable = MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON) {
     const auto manager_root = directory.manager_root().string();
     const auto runtime_root = directory.runtime_root().string();
     const auto scene_database = directory.scene_database().string();
@@ -105,7 +164,8 @@ public:
     }
     if (pid_ == 0) {
       ::execl(executable.c_str(), executable.c_str(), "--package-root",
-              package_root.c_str(), "--manager-state-root",
+              package_root.c_str(), "--canonical-empty-admission-filename",
+              admission_filename.c_str(), "--manager-state-root",
               manager_root.c_str(), "--runtime-state-root",
               runtime_root.c_str(), "--logical-scene-database",
               scene_database.c_str(), "--publication-root",
@@ -192,6 +252,31 @@ private:
   pid_t pid_{-1};
 };
 
+#if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
+std::filesystem::path
+PrepareManagerApplyInstalledTargets(const DaemonDirectory &directory) {
+  std::filesystem::create_directory(directory.installed_root());
+  const auto manager = directory.installed_root() / "manyforge_manager_daemon";
+  const auto native_host =
+      directory.installed_root() / "manyforge_native_execution_host";
+  std::filesystem::copy_file(MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON, manager,
+                             std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::copy_file(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST,
+                             native_host,
+                             std::filesystem::copy_options::overwrite_existing);
+  constexpr auto protected_executable_permissions =
+      std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+      std::filesystem::perms::owner_exec | std::filesystem::perms::group_read |
+      std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
+      std::filesystem::perms::others_exec;
+  std::filesystem::permissions(manager, protected_executable_permissions,
+                               std::filesystem::perm_options::replace);
+  std::filesystem::permissions(native_host, protected_executable_permissions,
+                               std::filesystem::perm_options::replace);
+  return manager;
+}
+#endif
+
 std::string SendCommand(const std::filesystem::path &path,
                         const std::string &request) {
   const int client = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
@@ -259,15 +344,25 @@ void SendCommandAndDisconnect(const std::filesystem::path &path,
   static_cast<void>(::close(client));
 }
 
-std::string ApplyRequest(const std::string_view manager_owner_epoch) {
+std::string ApplyRequest(
+    const std::string_view manager_owner_epoch,
+    const std::string_view deployment_artifact_id = "candidate",
+    const std::string_view deployment_revision = kDeploymentRevision,
+    const std::string_view expected_graph_revision = "current-graph",
+    const std::string_view expected_retained_bundle_id = "current-bundle",
+    const std::string_view request_id = "request-1") {
   return std::string("{\"api_version\":\"manyforge.manager_command.v1\","
                      "\"command\":\"apply\",\"correlation_id\":"
                      "\"correlation-1\",\"deployment_artifact_id\":"
-                     "\"candidate\",\"deployment_revision\":\"") +
-         std::string(kDeploymentRevision) +
-         "\",\"expected_current\":{\"graph_revision\":\"current-graph\","
-         "\"retained_bundle_id\":\"current-bundle\"},"
-         "\"reject_if_affected_busy\":true,\"request_id\":\"request-1\","
+                     "\"") +
+         std::string(deployment_artifact_id) + "\",\"deployment_revision\":\"" +
+         std::string(deployment_revision) +
+         "\",\"expected_current\":{\"graph_revision\":\"" +
+         std::string(expected_graph_revision) + "\",\"retained_bundle_id\":\"" +
+         std::string(expected_retained_bundle_id) +
+         "\"},\"reject_if_affected_busy\":true,\"request_id\":\"" +
+         std::string(request_id) +
+         "\","
          "\"request_owner_epoch\":\"" +
          std::string(manager_owner_epoch) +
          "\",\"source_label\":\"manager-process-test\"}";
@@ -567,6 +662,95 @@ TEST(ManagerDaemonProcess,
   const auto stopped = replacement.Stop(SIGTERM);
   EXPECT_TRUE(WIFEXITED(stopped));
 }
+
+#if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
+TEST(ManagerDaemonProcess,
+     RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement) {
+  const auto fixture = ReadManagerApplyFixtureMetadata();
+  DaemonDirectory directory;
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
+                        directory.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
+  const auto package_root = directory.apply_package_root().string();
+  const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
+  std::string first_manager_epoch;
+  std::string request;
+  {
+    ManagerProcess manager(directory, package_root, fixture.admission_filename,
+                           installed_manager.string());
+    manager.WaitReady(directory);
+    AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                               "manager-source.json");
+    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
+                                             "logical-scene-source.json");
+    const auto before = manager_source.Read();
+    ASSERT_TRUE(before.has_value());
+    first_manager_epoch = before->source_owner_epoch;
+    EXPECT_NE(content_identity::canonical_json(before->payload)
+                  .find("\"apply\":{\"mutation_available\":true"),
+              std::string::npos);
+    request = ApplyRequest(
+        first_manager_epoch, fixture.deployment_artifact_id,
+        fixture.deployment_revision, fixture.predecessor_graph_revision,
+        fixture.predecessor_retained_bundle_id, "manager-runtime-only-apply.1");
+
+    const auto applied = SendCommand(directory.socket_path(), request);
+    EXPECT_NE(applied.find("\"ok\":true"), std::string::npos);
+    EXPECT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos);
+    EXPECT_NE(applied.find("\"replay_status\":\"accepted_new\""),
+              std::string::npos);
+    EXPECT_NE(applied.find(fixture.candidate_retained_bundle_id),
+              std::string::npos);
+    ASSERT_TRUE(std::filesystem::remove(directory.apply_package_root() /
+                                        "maintained.scenario-catalog.yaml"));
+    const auto replayed = SendCommand(directory.socket_path(), request);
+    EXPECT_NE(replayed.find("\"replay_status\":\"replayed_exact\""),
+              std::string::npos);
+
+    component_manager::SqliteManagerApplyJournal journal(
+        directory.manager_root() /
+            std::string(component_manager::kManagerApplyJournalFilename),
+        core::CellId(fixture.cell_id));
+    const auto inventory = journal.ReadStatusInventory();
+    ASSERT_EQ(inventory.size(), 1U);
+    ASSERT_TRUE(inventory.front().terminal_outcome.has_value());
+    EXPECT_EQ(inventory.front()
+                  .terminal_outcome->terminal_outcome
+                  .candidate_projection_revision.retained_bundle_id.value(),
+              fixture.candidate_retained_bundle_id);
+
+    const auto manager_after = manager_source.Read();
+    const auto scene_after = scene_source.Read();
+    ASSERT_TRUE(manager_after.has_value());
+    ASSERT_TRUE(scene_after.has_value());
+    EXPECT_NE(content_identity::canonical_json(manager_after->payload)
+                  .find(fixture.candidate_retained_bundle_id),
+              std::string::npos);
+    EXPECT_NE(content_identity::canonical_json(scene_after->payload)
+                  .find(fixture.candidate_retained_bundle_id),
+              std::string::npos);
+    const auto status = manager.Stop(SIGKILL);
+    EXPECT_TRUE(WIFSIGNALED(status));
+  }
+
+  ManagerProcess replacement(directory, package_root,
+                             fixture.admission_filename,
+                             installed_manager.string());
+  replacement.WaitReady(directory);
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                             "manager-source.json");
+  const auto recovered = manager_source.Read();
+  ASSERT_TRUE(recovered.has_value());
+  EXPECT_NE(recovered->source_owner_epoch, first_manager_epoch);
+  EXPECT_NE(content_identity::canonical_json(recovered->payload)
+                .find(fixture.candidate_retained_bundle_id),
+            std::string::npos);
+  const auto stale = SendCommand(directory.socket_path(), request);
+  EXPECT_NE(stale.find("\"stale_request_owner_epoch\""), std::string::npos);
+  const auto stopped = replacement.Stop(SIGTERM);
+  EXPECT_TRUE(WIFEXITED(stopped));
+}
+#endif
 
 } // namespace
 } // namespace manyforge::headless

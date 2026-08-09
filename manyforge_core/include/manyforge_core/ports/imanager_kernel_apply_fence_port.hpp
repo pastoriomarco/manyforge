@@ -17,6 +17,9 @@ class IManagerKernelApplyFencePort {
  public:
   virtual ~IManagerKernelApplyFencePort() = default;
 
+  [[nodiscard]] virtual ConfigurationFenceAdmissionSnapshotDTO ObserveAdmission(
+      const ConfigurationFenceAdmissionQueryDTO& query) const = 0;
+
   [[nodiscard]] virtual ConfigurationFenceAcceptedDTO Acquire(
       const ApplyConfigurationFenceIntentDTO& intent) = 0;
 

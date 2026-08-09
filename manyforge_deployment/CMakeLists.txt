@@ -579,6 +579,7 @@ add_library(manyforge_deployment_verification_core
   src/reference_runtime_unit_verifier.cpp
   src/verified_retained_projection.cpp
   src/runtime_profile_codec.cpp
+  src/scenario_apply_candidate_source.cpp
   src/verified_retained_bundle.cpp
   src/verified_retained_bundle_store.cpp
 )

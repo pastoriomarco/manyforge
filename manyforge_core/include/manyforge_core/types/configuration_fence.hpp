@@ -417,6 +417,71 @@ struct ExecutionHostEpochDTO final {
   friend bool operator==(const ExecutionHostEpochDTO&, const ExecutionHostEpochDTO&) = default;
 };
 
+/// Read-only Kernel admission observation used to construct one exact
+/// compare-and-swap Apply-fence request.
+///
+/// This is sampled once on the Manager command strand before Acquire. It is
+/// not caller authorization and it is not consulted on motion hot paths.
+/// Acquire rechecks every returned generation and active-configuration row
+/// atomically with reject-if-busy admission, so a concurrent operation or
+/// configuration change cannot be accepted from a stale observation.
+struct ConfigurationFenceAdmissionQueryDTO final {
+  ConfigurationFenceScopeDTO affected_scope;
+  RuntimeEpoch manager_runtime_epoch;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return affected_scope.valid() && !manager_runtime_epoch.empty();
+  }
+
+  friend bool operator==(const ConfigurationFenceAdmissionQueryDTO&,
+                         const ConfigurationFenceAdmissionQueryDTO&) = default;
+};
+
+struct ConfigurationFenceAdmissionSnapshotDTO final {
+  ConfigurationFenceAdmissionQueryDTO echoed_query;
+  ExecutionHostEpochDTO execution_host_epoch;
+  ProjectionRevisionDTO active_projection_revision;
+  ContentDigest active_public_pointer_digest;
+  std::uint64_t operation_resource_generation;
+  ConfigurationFenceGeneration configuration_fence_generation;
+  std::vector<DomainActiveControlConfigurationDTO> active_control_configurations;
+  std::uint64_t affected_queued_operation_count;
+  std::uint64_t affected_active_operation_count;
+  ContentDigest result_digest;
+
+  [[nodiscard]] bool presence_valid() const noexcept {
+    if (!echoed_query.valid() || !execution_host_epoch.valid() ||
+        !active_projection_revision.valid() ||
+        active_projection_revision.retained_bundle_id.empty() ||
+        active_projection_revision.graph_revision.empty() || active_public_pointer_digest.empty() ||
+        result_digest.empty()) {
+      return false;
+    }
+
+    std::size_t configuration_index = 0U;
+    for (const auto& domain : echoed_query.affected_scope.domains) {
+      if (!domain.predecessor_control_domain_revision.has_value()) {
+        continue;
+      }
+      if (configuration_index >= active_control_configurations.size()) {
+        return false;
+      }
+      const auto& configuration = active_control_configurations[configuration_index++];
+      if (!configuration.valid() || configuration.control_domain_id != domain.control_domain_id) {
+        return false;
+      }
+    }
+    return configuration_index == active_control_configurations.size();
+  }
+
+  [[nodiscard]] bool matches(const ConfigurationFenceAdmissionQueryDTO& query) const noexcept {
+    return presence_valid() && query.valid() && echoed_query == query;
+  }
+
+  friend bool operator==(const ConfigurationFenceAdmissionSnapshotDTO&,
+                         const ConfigurationFenceAdmissionSnapshotDTO&) = default;
+};
+
 /// Kernel-owned observation used to compare-and-swap an exact fence release.
 ///
 /// It binds the fence identity and whole-Apply scope to the current Kernel

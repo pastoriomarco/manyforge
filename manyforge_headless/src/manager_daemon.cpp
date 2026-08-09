@@ -6,6 +6,7 @@
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
+#include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
@@ -13,6 +14,7 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/scenario_apply_candidate_source.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_scene/canonical_empty_scene_owner.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
@@ -291,6 +293,10 @@ struct ManagerCommand final {
   std::optional<std::string> source_label;
   std::optional<std::string> correlation_id;
   std::optional<core::SceneTransactionRequestDTO> scene_transaction;
+  std::optional<core::DeploymentArtifactId> deployment_artifact_id;
+  std::optional<core::DeploymentRevision> deployment_revision;
+  std::optional<core::RetainedBundleId> expected_current_retained_bundle_id;
+  std::optional<core::GraphRevision> expected_current_graph_revision;
 };
 
 const CanonicalValue &RequiredMember(const CanonicalValue &root,
@@ -361,11 +367,19 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
             std::nullopt,
             std::nullopt,
             std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
             std::nullopt};
   }
   if (command == "shutdown_runtime") {
     RequireExactObjectSize(root, 2U, "shutdown command");
     return {CommandKind::kShutdownRuntime,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
             std::nullopt,
             std::nullopt,
             std::nullopt,
@@ -383,6 +397,10 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
         transaction.request_context.source_label,
         transaction.request_context.correlation_id,
         std::move(transaction),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
     };
   }
   Require(command == "apply", "command kind is unsupported");
@@ -393,18 +411,29 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   const auto correlation_id = OptionalString(root, "correlation_id");
   const auto deployment_artifact_id =
       RequiredString(root, "deployment_artifact_id");
-  static_cast<void>(deployment_artifact_id);
   const auto deployment_revision = RequiredString(root, "deployment_revision");
   Require(core::IsExactLowercaseSha256Digest(deployment_revision),
           "Apply deployment_revision must be canonical SHA-256");
   const auto &expected = RequiredMember(root, "expected_current");
   RequireExactObjectSize(expected, 2U, "Apply expected_current");
-  static_cast<void>(RequiredString(expected, "graph_revision"));
-  static_cast<void>(RequiredString(expected, "retained_bundle_id"));
+  const auto expected_graph_revision =
+      RequiredString(expected, "graph_revision");
+  const auto expected_retained_bundle_id =
+      RequiredString(expected, "retained_bundle_id");
   Require(RequiredBool(root, "reject_if_affected_busy"),
           "Apply busy disposition must be reject_if_affected_busy");
-  return {CommandKind::kApply, request_id,     request_owner_epoch,
-          source_label,        correlation_id, std::nullopt};
+  ManagerCommand result{
+      CommandKind::kApply, request_id,   request_owner_epoch, source_label,
+      correlation_id,      std::nullopt, std::nullopt,        std::nullopt,
+      std::nullopt,        std::nullopt};
+  result.deployment_artifact_id =
+      core::DeploymentArtifactId(deployment_artifact_id);
+  result.deployment_revision = core::DeploymentRevision(deployment_revision);
+  result.expected_current_retained_bundle_id =
+      core::RetainedBundleId(expected_retained_bundle_id);
+  result.expected_current_graph_revision =
+      core::GraphRevision(expected_graph_revision);
+  return result;
 }
 
 CanonicalValue Unsigned(const std::uint64_t value,
@@ -517,8 +546,40 @@ CanonicalValue ApplyErrorResponse(const ManagerCommand &command,
 CanonicalValue ApplyUnavailableResponse(const ManagerCommand &command) {
   return ApplyErrorResponse(
       command, kKernelOwnerUnavailableReasonCode,
-      "operational Apply requires the real Kernel execution-host owner "
-      "supplied by I6/N");
+      "operational Apply requires one converged managed Kernel execution "
+      "host");
+}
+
+CanonicalValue
+ApplyResponse(const ManagerCommand &command,
+              const component_manager::ManagerNamedApplyResult &result) {
+  Require(command.request_id.has_value() &&
+              command.request_owner_epoch.has_value(),
+          "decoded Apply command lacks request identity");
+  const auto succeeded =
+      result.state ==
+      component_manager::ManagerNamedApplyResultState::kSucceeded;
+  Require(succeeded == result.terminal_outcome.has_value(),
+          "Manager Apply result has inconsistent terminal evidence");
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"apply_generation",
+       Unsigned(result.apply_generation.value(), "Apply generation")},
+      {"apply_id", CanonicalValue(result.apply_id.value())},
+      {"candidate_projection_revision",
+       succeeded ? ProjectionRevision(
+                       result.terminal_outcome->candidate_projection_revision)
+                 : CanonicalValue(nullptr)},
+      {"error", CanonicalValue(nullptr)},
+      {"ok", CanonicalValue(true)},
+      {"replay_status",
+       CanonicalValue(result.request_replayed ? "replayed_exact"
+                                              : "accepted_new")},
+      {"request_id", CanonicalValue(*command.request_id)},
+      {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
+      {"state", CanonicalValue(succeeded ? "succeeded" : "pending")},
+  });
 }
 
 CanonicalValue
@@ -601,6 +662,23 @@ BuildBootstrapRuntimePlan(
       admission.admission_digest(), std::move(rows)};
 }
 
+[[nodiscard]] bool HasConvergedKernelApplyOwner(
+    const component_manager::ManagerActiveRuntimeConvergenceResult &runtime) {
+  if (runtime.state !=
+      component_manager::ManagerActiveRuntimeConvergenceState::kConverged) {
+    return false;
+  }
+  std::size_t native_execution_hosts = 0U;
+  for (const auto &row : runtime.plan.runtime_units) {
+    if (row.process_adapter_contract_id ==
+        deployment::native_execution_runtime_contract::
+            kProcessAdapterContractId) {
+      ++native_execution_hosts;
+    }
+  }
+  return native_execution_hosts == 1U;
+}
+
 class ManagerDaemon final {
 public:
   explicit ManagerDaemon(DaemonConfig config)
@@ -613,10 +691,11 @@ public:
                        .load_verified()),
         bundle_source_(config_.package_root),
         artifact_source_(config_.package_root),
+        candidate_source_(config_.package_root, "maintained"),
         native_runtime_adapter_(
             InstalledTargetRoot(), config_.package_root,
-            config_.runtime_state_root, bundle_source_, artifact_source_,
-            "linux",
+            config_.manager_state_root, config_.runtime_state_root,
+            bundle_source_, artifact_source_, "linux",
             std::string(deployment::native_execution_runtime_contract::
                             kLaunchEnvironmentContract)),
         stores_(config_.manager_state_root, admission_),
@@ -638,6 +717,17 @@ public:
         active_runtime_(plan_source_, runtime_adapter_router_,
                         runtime_adapter_router_,
                         [this] { return ElapsedNs(); }),
+        manager_runtime_epoch_(RandomToken("manager-runtime-")),
+        named_apply_(
+            stores_.apply_journal(), plan_source_, bundle_source_,
+            artifact_source_, stores_.active_bundle_publication_store(),
+            scene_owner_, &scene_owner_, native_runtime_adapter_,
+            runtime_adapter_router_, runtime_adapter_router_,
+            manager_runtime_epoch_, "linux",
+            {std::string(deployment::native_execution_runtime_contract::
+                             kLaunchEnvironmentContract)},
+            [this] { return ElapsedNs(); },
+            [] { return core::ApplyId(RandomToken("apply-")); }),
         scene_runtime_owner_(
             [this] { return static_cast<std::int64_t>(ElapsedNs()); },
             [] { return RandomToken("scene-init-"); }),
@@ -655,6 +745,9 @@ public:
                                 admission_.cell_id().value()) {
     EnsureBootstrap();
     static_cast<void>(ReconcileAndPublish());
+    if (TryRecoverIncompleteApply()) {
+      static_cast<void>(ReconcileAndPublish());
+    }
   }
 
   int Run() {
@@ -742,6 +835,7 @@ private:
 
   PublicationGenerations ReconcileAndPublish() {
     const auto runtime = active_runtime_.Reconcile();
+    kernel_apply_available_ = HasConvergedKernelApplyOwner(runtime);
     const auto bundle_id =
         runtime.plan.active_publication.request.candidate_retained_bundle_id;
     const auto active_bundle = bundle_source_.get_verified(bundle_id);
@@ -794,7 +888,9 @@ private:
         observed_at,
         BuildManagerSourcePayload(
             *active_bundle, runtime, stores_.apply_journal(),
-            ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
+            kernel_apply_available_
+                ? ManagerApplyMutationAvailability::kAvailable
+                : ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
 
     const auto scene_generation = PublishLogicalScene(observed_at);
     const auto scene_runtime_publication = scene_runtime_channel_.Publish(
@@ -835,6 +931,9 @@ private:
   void TryPeriodicReconcile() noexcept {
     try {
       static_cast<void>(ReconcileAndPublish());
+      if (TryRecoverIncompleteApply()) {
+        static_cast<void>(ReconcileAndPublish());
+      }
     } catch (const std::exception &error) {
       std::cerr << "Manager daemon periodic reconciliation failed: "
                 << error.what() << '\n';
@@ -842,6 +941,20 @@ private:
       std::cerr << "Manager daemon periodic reconciliation failed with an "
                    "unknown error\n";
     }
+  }
+
+  bool TryRecoverIncompleteApply() noexcept {
+    try {
+      return named_apply_.RecoverIncompleteApply().has_value();
+    } catch (const std::exception &error) {
+      std::cerr << "Manager daemon incomplete Apply recovery remains "
+                   "fail-closed: "
+                << error.what() << '\n';
+    } catch (...) {
+      std::cerr << "Manager daemon incomplete Apply recovery remains "
+                   "fail-closed after an unknown failure\n";
+    }
+    return false;
   }
 
   bool HandleOneClient(const CommandSocket &socket) {
@@ -873,7 +986,7 @@ private:
     try {
       const auto command = DecodeCommand(*packet);
       switch (command.kind) {
-      case CommandKind::kApply:
+      case CommandKind::kApply: {
         if (*command.request_owner_epoch != manager_owner_epoch_) {
           TrySendResponse(
               client.get(),
@@ -882,8 +995,64 @@ private:
                   "Apply request targets a stale Manager owner epoch"));
           return false;
         }
-        TrySendResponse(client.get(), ApplyUnavailableResponse(command));
+        Require(command.deployment_artifact_id.has_value() &&
+                    command.deployment_revision.has_value() &&
+                    command.expected_current_retained_bundle_id.has_value() &&
+                    command.expected_current_graph_revision.has_value() &&
+                    command.request_id.has_value() &&
+                    command.request_owner_epoch.has_value() &&
+                    command.source_label.has_value(),
+                "decoded Apply command lacks its exact selection");
+        try {
+          const auto existing = stores_.apply_journal().ReadRequest(
+              core::RequestOwnerEpoch(*command.request_owner_epoch),
+              core::RequestId(*command.request_id));
+          if (!existing.has_value() && !kernel_apply_available_) {
+            TrySendResponse(client.get(), ApplyUnavailableResponse(command));
+            return false;
+          }
+          const auto candidate_retained_bundle_id =
+              existing.has_value()
+                  ? existing->intent.candidate_retained_bundle_id
+                  : candidate_source_
+                        .ResolveExact({*command.deployment_artifact_id,
+                                       *command.deployment_revision})
+                        .retained_bundle_id;
+          const auto result = named_apply_.ApplyOrRecover({
+              core::PublicRequestContextDTO{
+                  core::RequestId(*command.request_id),
+                  core::RequestOwnerEpoch(*command.request_owner_epoch),
+                  *command.source_label,
+                  command.correlation_id,
+              },
+              *command.deployment_artifact_id,
+              *command.deployment_revision,
+              *command.expected_current_retained_bundle_id,
+              *command.expected_current_graph_revision,
+              candidate_retained_bundle_id,
+          });
+          // Apply durability is authoritative. A source-publication failure is
+          // logged and retried by the periodic strand; it cannot turn a
+          // successful Apply into a second mutation on client retry.
+          try {
+            static_cast<void>(ReconcileAndPublish());
+          } catch (const std::exception &error) {
+            std::cerr << "Manager daemon publication failed after durable "
+                         "Apply: "
+                      << error.what() << '\n';
+          }
+          TrySendResponse(client.get(), ApplyResponse(command, result));
+        } catch (const component_manager::ManagerNamedApplyBusyError &error) {
+          TrySendResponse(
+              client.get(),
+              ApplyErrorResponse(command, "apply_busy", error.what()));
+        } catch (const std::exception &error) {
+          TrySendResponse(
+              client.get(),
+              ApplyErrorResponse(command, "apply_rejected", error.what()));
+        }
         return false;
+      }
       case CommandKind::kSceneCommit: {
         Require(command.scene_transaction.has_value(),
                 "decoded scene command lacks its transaction");
@@ -930,6 +1099,7 @@ private:
   deployment::CanonicalEmptyRetainedBundleAdmission admission_;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
   deployment::FilesystemVerifiedRetainedProductArtifactSource artifact_source_;
+  deployment::FilesystemScenarioApplyCandidateSource candidate_source_;
   component_manager::RetainedNativeRuntimeUnitAdapter native_runtime_adapter_;
   component_manager::ExternallyProvisionedManagerStores stores_;
   manyforge::scene::CanonicalEmptySceneOwner scene_owner_;
@@ -937,6 +1107,9 @@ private:
   component_manager::RetainedPosixRuntimeUnitAdapter reference_runtime_adapter_;
   component_manager::RuntimeUnitAdapterRouter runtime_adapter_router_;
   component_manager::ManagerActiveRuntimeCoordinator active_runtime_;
+  bool kernel_apply_available_{};
+  core::RuntimeEpoch manager_runtime_epoch_;
+  component_manager::ManagerNamedApplyCoordinator named_apply_;
   SceneRuntimeStateOwner scene_runtime_owner_;
   AtomicSourceSnapshotChannel manager_channel_;
   AtomicSourceSnapshotChannel scene_channel_;

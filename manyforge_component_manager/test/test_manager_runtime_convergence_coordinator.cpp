@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "manyforge_component_manager/manager_apply_fence_release_coordinator.hpp"
+#include "manyforge_component_manager/manager_named_apply_coordinator.hpp"
 #include "manyforge_component_manager/manager_runtime_convergence_coordinator.hpp"
 #include "manyforge_component_manager/manager_scene_activation_coordinator.hpp"
 #include "manyforge_component_manager/manager_scene_stage_coordinator.hpp"
@@ -254,8 +255,37 @@ private:
   SqliteManagerApplyJournal *independent_reader_;
 };
 
+class FixedActiveRuntimePlanSource final
+    : public IManagerActiveRuntimePlanSource {
+public:
+  FixedActiveRuntimePlanSource(
+      ActiveBundlePublicationReceiptDTO publication,
+      std::vector<RuntimeUnitConvergencePlanRowDTO> runtime_units)
+      : plan_{std::move(publication), ContentDigest(std::string(kDigestOne)),
+              std::move(runtime_units)} {
+    if (!plan_.valid()) {
+      throw std::runtime_error("fixed active runtime plan is invalid");
+    }
+  }
+
+  [[nodiscard]] ManagerActiveRuntimePlanDTO ReadCurrentPlan() const override {
+    ++read_calls;
+    return plan_;
+  }
+
+  mutable int read_calls{0};
+
+private:
+  ManagerActiveRuntimePlanDTO plan_;
+};
+
 class ExactFencePort final : public IManagerKernelApplyFencePort {
 public:
+  [[nodiscard]] ConfigurationFenceAdmissionSnapshotDTO
+  ObserveAdmission(const ConfigurationFenceAdmissionQueryDTO &) const override {
+    throw std::runtime_error("admission observation is outside this fixture");
+  }
+
   [[nodiscard]] ConfigurationFenceAcceptedDTO
   Acquire(const ApplyConfigurationFenceIntentDTO &intent) override {
     ++acquire_calls;
@@ -324,6 +354,11 @@ public:
   explicit ScriptedFenceReleasePort(
       SqliteManagerApplyJournal &independent_reader)
       : independent_reader_(independent_reader) {}
+
+  [[nodiscard]] ConfigurationFenceAdmissionSnapshotDTO
+  ObserveAdmission(const ConfigurationFenceAdmissionQueryDTO &) const override {
+    throw std::runtime_error("admission observation is outside this fixture");
+  }
 
   [[nodiscard]] ConfigurationFenceAcceptedDTO
   Acquire(const ApplyConfigurationFenceIntentDTO &) override {
@@ -435,6 +470,169 @@ public:
 
 private:
   SqliteManagerApplyJournal &independent_reader_;
+  std::optional<ConfigurationFenceReleasedDTO> released_;
+};
+
+class AggregateFencePort final : public IManagerKernelApplyFencePort {
+public:
+  AggregateFencePort(SqliteManagerApplyJournal &independent_reader,
+                     ActiveBundlePublicationReceiptDTO predecessor)
+      : independent_reader_(independent_reader),
+        predecessor_(std::move(predecessor)) {}
+
+  [[nodiscard]] ConfigurationFenceAdmissionSnapshotDTO ObserveAdmission(
+      const ConfigurationFenceAdmissionQueryDTO &query) const override {
+    ++observe_admission_calls;
+    return {
+        query,
+        ExecutionHostEpochDTO{
+            RuntimeUnitId("runtime.kernel"),
+            RuntimeEpoch("kernel-runtime-aggregate-1"),
+            RequestOwnerEpoch("kernel-owner-aggregate-1"),
+            ContentDigest(std::string(kDigestOne)),
+            predecessor_.publication_generation,
+        },
+        predecessor_.request.candidate_projection_revision,
+        predecessor_.durable_public_pointer_content_digest,
+        0U,
+        ConfigurationFenceGeneration(0U),
+        {},
+        0U,
+        0U,
+        ContentDigest(std::string(kDigestTwo)),
+    };
+  }
+
+  [[nodiscard]] ConfigurationFenceAcceptedDTO
+  Acquire(const ApplyConfigurationFenceIntentDTO &intent) override {
+    ++acquire_calls;
+    accepted_ = ConfigurationFenceAcceptedDTO{
+        ConfigurationFenceId("fence.aggregate.1"),
+        ConfigurationFenceGeneration(intent.expected_fence_generation.value() +
+                                     1U),
+        intent.scope,
+        100U,
+        RequestReplayStatusDTO::kAcceptedNew,
+    };
+    return *accepted_;
+  }
+
+  [[nodiscard]] ApplyFenceAcquireAttemptReconcileResultDTO
+  ReconcileAcquireAttempt(
+      const ApplyFenceAcquireAttemptQueryDTO &query) const override {
+    ++reconcile_calls;
+    return {
+        HostEpoch(),
+        query,
+        accepted_.has_value()
+            ? ApplyFenceAcquireAttemptReconcileState::kAcceptedExact
+            : ApplyFenceAcquireAttemptReconcileState::kNotSeen,
+        accepted_,
+        false,
+        "",
+        ContentDigest(std::string(kDigestOne)),
+        std::nullopt,
+    };
+  }
+
+  [[nodiscard]] ApplyFenceReconcileResultDTO
+  Rehydrate(const ApplyFenceRehydrateDTO &request) override {
+    ++rehydrate_calls;
+    if (!accepted_.has_value()) {
+      throw std::runtime_error(
+          "aggregate fence cannot rehydrate before Acquire");
+    }
+    return {
+        HostEpoch(),
+        {ApplyFenceReconcileEntryDTO{
+            request.persisted_configuration_fence_id,
+            request.persisted_configuration_fence_generation,
+            ApplyFenceReconcileState::kMatched,
+            std::nullopt,
+            std::nullopt,
+        }},
+        false,
+        "",
+        ContentDigest(std::string(kDigestOne)),
+        std::nullopt,
+    };
+  }
+
+  [[nodiscard]] ConfigurationFenceStatusDTO
+  QueryStatus(const ConfigurationFenceStatusQueryDTO &query) const override {
+    ++status_calls;
+    const auto finalized = independent_reader_.ReadSceneFinalized(
+        query.owner_transaction.apply_id,
+        query.owner_transaction.apply_generation);
+    const auto publication = independent_reader_.ReadPublicationReceipt(
+        query.owner_transaction.apply_id,
+        query.owner_transaction.apply_generation);
+    if (!finalized.has_value() || !publication.has_value()) {
+      throw std::runtime_error(
+          "aggregate fence status lacks finalized publication");
+    }
+    const auto &candidate = finalized->scene_finalized.finalized_result
+                                .candidate_projection_revision;
+    const auto &receipt = publication->publication.publication_receipt;
+    ConfigurationFenceReconciliationEvidenceDTO evidence{
+        ExecutionHostEpochDTO{
+            RuntimeUnitId("runtime.kernel"),
+            RuntimeEpoch("kernel-runtime-aggregate-1"),
+            RequestOwnerEpoch("kernel-owner-aggregate-1"),
+            ContentDigest(std::string(kDigestOne)),
+            receipt.publication_generation,
+        },
+        query.owner_transaction,
+        query.configuration_fence_id,
+        query.configuration_fence_generation,
+        query.expected_scope,
+        1U,
+        candidate.graph_revision,
+        candidate,
+        receipt.publication_generation,
+        receipt.durable_public_pointer_content_digest,
+        {},
+        0U,
+        0U,
+        ContentDigest(std::string(kDigestTwo)),
+    };
+    return {
+        query,
+        std::move(evidence),
+        released_.has_value() ? ConfigurationFenceState::kReleased
+                              : ConfigurationFenceState::kHeld,
+        !released_.has_value(),
+        released_,
+        "",
+        ContentDigest(std::string(kDigestOne)),
+        std::nullopt,
+    };
+  }
+
+  [[nodiscard]] ConfigurationFenceReleasedDTO
+  Release(const ConfigurationFenceReleaseDTO &request) override {
+    ++release_calls;
+    released_ = ConfigurationFenceReleasedDTO{
+        request,
+        request.reconciliation_evidence.execution_host_epoch,
+        1'234'567LL,
+        RequestReplayStatusDTO::kAcceptedNew,
+        ContentDigest(std::string(kDigestTwo)),
+    };
+    return *released_;
+  }
+
+  mutable int observe_admission_calls{0};
+  int acquire_calls{0};
+  mutable int reconcile_calls{0};
+  int rehydrate_calls{0};
+  mutable int status_calls{0};
+  int release_calls{0};
+
+private:
+  SqliteManagerApplyJournal &independent_reader_;
+  ActiveBundlePublicationReceiptDTO predecessor_;
+  std::optional<ConfigurationFenceAcceptedDTO> accepted_;
   std::optional<ConfigurationFenceReleasedDTO> released_;
 };
 
@@ -1543,7 +1741,81 @@ TEST(ManagerApplyFenceReleaseCoordinator,
       fixture.journal
           .ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U))
           .has_value());
+}
 
-} // namespace
+TEST(ManagerNamedApplyCoordinator,
+     ComposesTheDurableI4PhasesAndReplaysWithoutDuplicateEffects) {
+  ScopedPackageRoot root;
+  auto package = MaterializeRuntimePackage(root.path());
+  const auto intent_template = ApplyIntent(*package.bundle);
+  const auto predecessor = PredecessorPublication(intent_template);
+  SqliteManagerApplyJournal journal(root.path() / "aggregate-apply.sqlite3",
+                                    package.bundle->value().cell_graph.cell_id);
+  SqliteManagerApplyJournal independent_reader(
+      root.path() / "aggregate-apply.sqlite3",
+      package.bundle->value().cell_graph.cell_id);
+  ScriptedPublicationStore publication_store(predecessor, &independent_reader);
+  FixedActiveRuntimePlanSource active_plan_source(
+      predecessor, BuildVerifiedRuntimeConvergencePlan(
+                       *package.bundle, *package.artifact_source, "linux",
+                       {"posix.1-2017"}));
+  ScriptedRuntimePorts runtime_ports(independent_reader);
+  ScriptedSceneOwner scene_owner(independent_reader);
+  AggregateFencePort kernel_fence(independent_reader, predecessor);
+  ManagerNamedApplyCoordinator coordinator(
+      journal, active_plan_source, *package.bundle_source,
+      *package.artifact_source, publication_store, scene_owner, nullptr,
+      kernel_fence, runtime_ports, runtime_ports,
+      RuntimeEpoch("manager-runtime.aggregate.1"), "linux", {"posix.1-2017"},
+      [] { return 1'000U; }, [] { return ApplyId("apply.aggregate.1"); });
+  const ManagerNamedApplyRequestDTO request{
+      intent_template.request_context,
+      package.bundle->value().deployment_artifact_id,
+      package.bundle->value().deployment_revision,
+      predecessor.request.candidate_retained_bundle_id,
+      predecessor.request.candidate_graph_revision,
+      package.bundle->retained_bundle_id(),
+  };
+
+  const auto applied = coordinator.ApplyOrRecover(request);
+  EXPECT_EQ(applied.state, ManagerNamedApplyResultState::kSucceeded);
+  EXPECT_FALSE(applied.request_replayed);
+  ASSERT_TRUE(applied.terminal_outcome.has_value());
+  EXPECT_EQ(applied.apply_id, ApplyId("apply.aggregate.1"));
+  EXPECT_EQ(kernel_fence.observe_admission_calls, 1);
+  EXPECT_EQ(kernel_fence.acquire_calls, 1);
+  EXPECT_EQ(kernel_fence.release_calls, 1);
+  EXPECT_EQ(runtime_ports.ensure_calls, 1);
+  EXPECT_EQ(scene_owner.stage_calls, 1);
+  EXPECT_EQ(scene_owner.activation_calls, 1);
+  EXPECT_EQ(publication_store.publish_calls, 1);
+  EXPECT_EQ(scene_owner.finalize_calls, 1);
+
+  const auto replayed = coordinator.ApplyOrRecover(request);
+  EXPECT_EQ(replayed.state, ManagerNamedApplyResultState::kSucceeded);
+  EXPECT_TRUE(replayed.request_replayed);
+  EXPECT_EQ(replayed.terminal_outcome, applied.terminal_outcome);
+  EXPECT_EQ(kernel_fence.observe_admission_calls, 1);
+  EXPECT_EQ(kernel_fence.acquire_calls, 1);
+  EXPECT_EQ(kernel_fence.release_calls, 1);
+  EXPECT_EQ(runtime_ports.ensure_calls, 1);
+  EXPECT_EQ(scene_owner.stage_calls, 1);
+  EXPECT_EQ(scene_owner.activation_calls, 1);
+  EXPECT_EQ(publication_store.publish_calls, 1);
+  EXPECT_EQ(scene_owner.finalize_calls, 1);
+  EXPECT_FALSE(coordinator.RecoverIncompleteApply().has_value());
+
+  const auto report = journal.VerifyIntegrity();
+  EXPECT_EQ(report.apply_intent_count, 1);
+  EXPECT_EQ(report.fence_acceptance_count, 1);
+  EXPECT_EQ(report.runtime_staged_ready_count, 1);
+  EXPECT_EQ(report.scene_staged_count, 1);
+  EXPECT_EQ(report.scene_activated_count, 1);
+  EXPECT_EQ(report.publication_receipt_count, 1);
+  EXPECT_EQ(report.scene_finalized_count, 1);
+  EXPECT_EQ(report.fence_released_count, 1);
+  EXPECT_EQ(report.terminal_outcome_count, 1);
+}
+
 } // namespace
 } // namespace manyforge::component_manager

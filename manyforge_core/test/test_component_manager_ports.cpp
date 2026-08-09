@@ -126,6 +126,8 @@ static_assert(
     std::is_same_v<decltype(&IManagerSceneProjectionBootstrapPort::FinalizeProjectionBootstrap),
                    FinalizeBootstrapSignature>);
 
+using ObserveFenceAdmissionSignature = ConfigurationFenceAdmissionSnapshotDTO (
+    IManagerKernelApplyFencePort::*)(const ConfigurationFenceAdmissionQueryDTO&) const;
 using AcquireFenceSignature = ConfigurationFenceAcceptedDTO (IManagerKernelApplyFencePort::*)(const ApplyConfigurationFenceIntentDTO&);
 using ReconcileFenceAttemptSignature = ApplyFenceAcquireAttemptReconcileResultDTO (
     IManagerKernelApplyFencePort::*)(const ApplyFenceAcquireAttemptQueryDTO&) const;
@@ -134,6 +136,8 @@ using QueryFenceStatusSignature = ConfigurationFenceStatusDTO (IManagerKernelApp
     const ConfigurationFenceStatusQueryDTO&) const;
 using ReleaseFenceSignature = ConfigurationFenceReleasedDTO (IManagerKernelApplyFencePort::*)(
     const ConfigurationFenceReleaseDTO&);
+static_assert(std::is_same_v<decltype(&IManagerKernelApplyFencePort::ObserveAdmission),
+                             ObserveFenceAdmissionSignature>);
 static_assert(std::is_same_v<decltype(&IManagerKernelApplyFencePort::Acquire),
                              AcquireFenceSignature>);
 static_assert(
@@ -499,6 +503,25 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
       RuntimeUnitId{"runtime.kernel"},       RuntimeEpoch{"kernel-runtime-2"},
       RequestOwnerEpoch{"kernel-epoch-1"},   ContentDigest{kDigest},
       ActiveBundlePublicationGeneration{4U},
+  };
+}
+
+[[nodiscard]] ConfigurationFenceAdmissionSnapshotDTO FenceAdmissionSnapshot() {
+  const ConfigurationFenceAdmissionQueryDTO query{
+      FenceScope(), RuntimeEpoch{"manager-epoch-2"}};
+  return {
+      query,
+      ExecutionHostEpoch(),
+      Projection(),
+      ContentDigest{kOtherDigest},
+      7U,
+      ConfigurationFenceGeneration{0U},
+      {{ControlDomainId{"domain.arm-a"},
+        ActiveControlConfigurationId{"active.arm-a"},
+        ActiveControlConfigurationGeneration{9U}}},
+      0U,
+      0U,
+      ContentDigest{kDigest},
   };
 }
 
@@ -1545,6 +1568,28 @@ TEST(ComponentManagerPortContracts, FenceAcceptedAllowsOnlyAcceptedOrExactReplay
   EXPECT_FALSE(accepted.valid());
   accepted.replay_status = static_cast<RequestReplayStatusDTO>(999);
   EXPECT_FALSE(accepted.valid());
+}
+
+TEST(ComponentManagerPortContracts,
+     FenceAdmissionSnapshotIsReadOnlyCanonicalPredecessorEvidence) {
+  const auto query = ConfigurationFenceAdmissionQueryDTO{
+      FenceScope(), RuntimeEpoch{"manager-epoch-2"}};
+  auto snapshot = FenceAdmissionSnapshot();
+  EXPECT_TRUE(snapshot.presence_valid());
+  EXPECT_TRUE(snapshot.matches(query));
+
+  snapshot.active_control_configurations.clear();
+  EXPECT_FALSE(snapshot.presence_valid());
+
+  snapshot = FenceAdmissionSnapshot();
+  snapshot.active_control_configurations.front().control_domain_id =
+      ControlDomainId{"domain.other"};
+  EXPECT_FALSE(snapshot.presence_valid());
+
+  snapshot = FenceAdmissionSnapshot();
+  snapshot.echoed_query.manager_runtime_epoch = RuntimeEpoch{"manager-epoch-3"};
+  EXPECT_TRUE(snapshot.presence_valid());
+  EXPECT_FALSE(snapshot.matches(query));
 }
 
 TEST(ComponentManagerPortContracts, FenceAcceptanceMatchesExactScopeAndSuccessorGeneration) {

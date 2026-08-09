@@ -9,6 +9,7 @@ add_compile_options(-Wall -Wextra -Werror -Wno-deprecated-copy)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(OpenSSL REQUIRED)
+find_package(SQLite3 3.37 REQUIRED)
 find_package(Threads REQUIRED)
 option(BUILD_TESTING "Build unit tests" ON)
 
@@ -288,6 +289,7 @@ target_link_libraries(manyforge_roboplan_candidate_worker PRIVATE
 # Its same-user Unix socket is a bounded private transport consumed by the
 # headless API; it is not a second public execution contract.
 add_executable(manyforge_native_execution_host
+  src/managed_kernel_apply_fence_owner.cpp
   src/native_execution_host_main.cpp)
 target_include_directories(manyforge_native_execution_host PRIVATE
   "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
@@ -298,7 +300,10 @@ target_link_libraries(manyforge_native_execution_host PRIVATE
   manyforge_roboplan_process_candidate_client
   manyforge_roboplan_retained_consumer
   manyforge_component_manager
+  manyforge::content_identity
   manyforge_deployment
+  manyforge::persistence
+  SQLite::SQLite3
   Threads::Threads)
 install(TARGETS manyforge_native_execution_host
   RUNTIME DESTINATION bin)

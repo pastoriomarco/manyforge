@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <manyforge_deployment/scenario_apply_candidate_source.hpp>
 #include <manyforge_deployment/scenario_catalog.hpp>
 
 #include <filesystem>
@@ -126,6 +127,34 @@ TEST(ScenarioCatalogRepositoryTest,
   ASSERT_NE(current, nullptr);
   EXPECT_EQ(current->revision(), second->revision());
   EXPECT_EQ(current->rows(), second->rows());
+}
+
+TEST(ScenarioApplyCandidateSourceTest,
+     ResolvesOneExactBundleAcrossMultipleProgramRows) {
+  TemporaryDirectory root;
+  auto first = row("alpha", '1');
+  auto second = row("beta", '1');
+  second.program_binding_id = core::ProgramBindingId(digest('4'));
+  const auto catalog = build_scenario_catalog({first, second});
+  {
+    FilesystemScenarioCatalogRepository repository(root.path(), "maintained");
+    ASSERT_EQ(repository.compare_and_set(std::nullopt, catalog),
+              ScenarioCatalogPublishResult::kPublished);
+  }
+
+  FilesystemScenarioApplyCandidateSource source(root.path(), "maintained");
+  const auto selected = source.ResolveExact({
+      first.deployment_artifact_id,
+      first.deployment_revision,
+  });
+  EXPECT_TRUE(selected.valid());
+  EXPECT_EQ(selected.query.deployment_artifact_id,
+            first.deployment_artifact_id);
+  EXPECT_EQ(selected.scenario_catalog_revision, catalog->revision());
+  EXPECT_EQ(selected.retained_bundle_id, first.retained_bundle_id);
+  EXPECT_THROW(source.ResolveExact({core::DeploymentArtifactId("missing"),
+                                    first.deployment_revision}),
+               ScenarioApplyCandidateError);
 }
 
 }  // namespace

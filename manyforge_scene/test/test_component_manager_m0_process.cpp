@@ -175,6 +175,11 @@ public:
           &publication_store)
       : journal_(journal), publication_store_(publication_store) {}
 
+  [[nodiscard]] core::ConfigurationFenceAdmissionSnapshotDTO ObserveAdmission(
+      const core::ConfigurationFenceAdmissionQueryDTO &) const override {
+    throw std::runtime_error("admission observation is outside the M0 fixture");
+  }
+
   [[nodiscard]] core::ConfigurationFenceAcceptedDTO
   Acquire(const core::ApplyConfigurationFenceIntentDTO &intent) override {
     if (!intent.valid() || !EmptyScope(intent.scope)) {

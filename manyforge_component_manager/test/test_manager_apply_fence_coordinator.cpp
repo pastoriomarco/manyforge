@@ -230,6 +230,11 @@ public:
         independent_reader_(independent_reader),
         expected_intent_(std::move(expected_intent)) {}
 
+  [[nodiscard]] ConfigurationFenceAdmissionSnapshotDTO
+  ObserveAdmission(const ConfigurationFenceAdmissionQueryDTO &) const override {
+    throw std::runtime_error("admission observation is outside this fixture");
+  }
+
   [[nodiscard]] ConfigurationFenceAcceptedDTO
   Acquire(const ApplyConfigurationFenceIntentDTO &intent) override {
     acquire_calls.fetch_add(1, std::memory_order_relaxed);

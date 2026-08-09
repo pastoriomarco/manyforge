@@ -189,6 +189,11 @@ target_link_libraries(manyforge_manager_daemon PRIVATE
   manyforge::deployment_admission)
 
 option(BUILD_TESTING "Build unit tests" ON)
+set(
+  MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST
+  ""
+  CACHE FILEPATH
+  "Optional selected native execution host for the real Manager Apply process test")
 if(BUILD_TESTING)
   enable_testing()
   find_package(GTest REQUIRED)
@@ -370,6 +375,65 @@ if(BUILD_TESTING)
   add_custom_target(manyforge_headless_test_assistant_package
     DEPENDS "${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}")
 
+  if(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
+    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}")
+      message(FATAL_ERROR
+        "the selected native execution host for the Manager Apply process "
+        "test does not exist: ${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}")
+    endif()
+    get_filename_component(
+      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST
+      "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+      REALPATH)
+    add_executable(manyforge_generate_headless_manager_apply_test_package
+      test/generate_manager_apply_package.cpp)
+    target_compile_definitions(
+      manyforge_generate_headless_manager_apply_test_package PRIVATE
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}"
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}")
+    target_include_directories(
+      manyforge_generate_headless_manager_apply_test_package PRIVATE
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
+    target_link_libraries(
+      manyforge_generate_headless_manager_apply_test_package PRIVATE
+      manyforge::deployment
+      manyforge::deployment_admission
+      manyforge_deployment_canonical_package_generator)
+
+    set(
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/manager-apply-test-fixture")
+    set(
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT
+      "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_FIXTURE_ROOT}/retained-package")
+    set(
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA
+      "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_FIXTURE_ROOT}/metadata.json")
+    add_custom_command(
+      OUTPUT "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E remove_directory
+        "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_FIXTURE_ROOT}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_FIXTURE_ROOT}"
+      COMMAND
+        "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
+        --package-root
+        "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
+        --metadata
+        "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
+      DEPENDS
+        manyforge_generate_headless_manager_apply_test_package
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(manyforge_headless_test_manager_apply_package
+      DEPENDS "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}")
+  endif()
+
   add_executable(manyforge_publish_headless_assistant_test_source
     test/publish_assistant_authoring_source.cpp)
   add_dependencies(manyforge_publish_headless_assistant_test_source
@@ -462,6 +526,14 @@ if(BUILD_TESTING)
   target_compile_definitions(test_manager_daemon_process PRIVATE
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
     MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON="$<TARGET_FILE:manyforge_manager_daemon>")
+  if(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
+    add_dependencies(test_manager_daemon_process
+      manyforge_headless_test_manager_apply_package)
+    target_compile_definitions(test_manager_daemon_process PRIVATE
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
+      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
+      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}")
+  endif()
   target_link_libraries(test_manager_daemon_process PRIVATE
     manyforge_headless_owner_publication
     GTest::gtest_main)

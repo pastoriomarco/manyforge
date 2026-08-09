@@ -1,5 +1,6 @@
 #include "manyforge_component_manager/retained_native_runtime_unit_adapter.hpp"
 
+#include "kernel_apply_fence_rpc_internal.hpp"
 #include "native_projection_rpc_internal.hpp"
 
 #include <fcntl.h>
@@ -541,6 +542,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 
   Impl(std::filesystem::path trusted_installed_target_root,
        std::filesystem::path trusted_package_root,
+       std::filesystem::path manager_state_root,
        std::filesystem::path private_staging_root,
        const manyforge::deployment::IVerifiedRetainedBundleSource
            &selected_bundle_source,
@@ -553,6 +555,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
             "trusted installed-target root")),
         package_root_path(NormalizedPlainDirectory(
             std::move(trusted_package_root), "trusted retained-package root")),
+        manager_state_root_path(NormalizedPlainDirectory(
+            std::move(manager_state_root), "Manager state root")),
         staging_root_path(NormalizedPlainDirectory(
             std::move(private_staging_root), "private native staging root")),
         bundle_source(selected_bundle_source),
@@ -748,6 +752,39 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     return manyforge::core::Result<Response>::Ok(*typed);
   }
 
+  template <typename Response, typename Request>
+  [[nodiscard]] Response KernelFenceCall(const Request &request) {
+    std::lock_guard lock(mutex);
+    if (children.size() != 1U) {
+      Fail("Kernel Apply-fence request requires the sole managed native "
+           "execution child");
+    }
+    auto found = children.begin();
+    if (!ChildIsLive(found->second)) {
+      children.erase(found);
+      Fail("managed Kernel child exited before its fence response");
+    }
+    const auto encoded = detail::EncodeKernelApplyFenceRpcRequest(
+        detail::KernelApplyFenceRpcRequest(request));
+    SendPacket(found->second.channel.get(), encoded, kStatusTimeout);
+    const auto packet =
+        ReceivePacket(found->second.channel.get(), kStatusTimeout);
+    if (!packet.has_value()) {
+      Fail("managed Kernel Apply-fence response timed out");
+    }
+    auto response = detail::DecodeKernelApplyFenceRpcResponse(*packet);
+    if (const auto *failure =
+            std::get_if<detail::KernelApplyFenceRpcFailure>(&response)) {
+      Fail("managed Kernel Apply-fence request failed [" + failure->error.code +
+           "]: " + failure->error.message);
+    }
+    const auto *typed = std::get_if<Response>(&response);
+    if (typed == nullptr) {
+      Fail("managed Kernel child returned the wrong fence response kind");
+    }
+    return *typed;
+  }
+
   void PrepareChildProjectionBindings(
       Child &child, const RetainedBundle &bundle,
       const manyforge::core::RuntimeUnitId &runtime_unit_id) {
@@ -879,14 +916,18 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     const auto launch_arguments =
         admission.launch_arguments(kChildChannelFd, runtime_epoch);
     std::vector<std::string> arguments;
-    arguments.reserve(launch_arguments.size() + 5U);
+    arguments.reserve(launch_arguments.size() + 9U);
     arguments.emplace_back(contract::kInstalledTargetId);
     arguments.insert(arguments.end(), launch_arguments.begin(),
                      launch_arguments.end());
     arguments.emplace_back("--manyforge-managed-package-root");
     arguments.push_back(package_root_path.string());
+    arguments.emplace_back("--manyforge-managed-manager-state-root");
+    arguments.push_back(manager_state_root_path.string());
     arguments.emplace_back("--manyforge-managed-staging-root");
     arguments.push_back(staging_root_path.string());
+    arguments.emplace_back("--manyforge-managed-cell-id");
+    arguments.push_back(bundle.value().cell_graph.cell_id.value());
     std::vector<char *> argv;
     argv.reserve(arguments.size() + 1U);
     for (auto &argument : arguments) {
@@ -1076,6 +1117,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 
   std::filesystem::path target_root_path;
   std::filesystem::path package_root_path;
+  std::filesystem::path manager_state_root_path;
   std::filesystem::path staging_root_path;
   const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source;
   const manyforge::deployment::IVerifiedRetainedProductArtifactSource
@@ -1271,6 +1313,7 @@ RetainedNativeRuntimeUnitAdapter::Impl::ResolveProjection(
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
     std::filesystem::path trusted_package_root,
+    std::filesystem::path manager_state_root,
     std::filesystem::path private_staging_root,
     const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
@@ -1278,6 +1321,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::string operating_system, std::string launch_environment_contract)
     : impl_(std::make_shared<Impl>(std::move(trusted_installed_target_root),
                                    std::move(trusted_package_root),
+                                   std::move(manager_state_root),
                                    std::move(private_staging_root),
                                    bundle_source, artifact_source,
                                    std::move(operating_system),
@@ -1305,6 +1349,48 @@ RetainedNativeRuntimeUnitAdapter::ObserveProgress(
     const RuntimeUnitConvergenceQueryDTO &query,
     const RuntimeEpoch &runtime_epoch) {
   return impl_->ObserveProgress(query, runtime_epoch);
+}
+
+manyforge::core::ConfigurationFenceAdmissionSnapshotDTO
+RetainedNativeRuntimeUnitAdapter::ObserveAdmission(
+    const manyforge::core::ConfigurationFenceAdmissionQueryDTO &query) const {
+  return impl_->KernelFenceCall<
+      manyforge::core::ConfigurationFenceAdmissionSnapshotDTO>(query);
+}
+
+manyforge::core::ConfigurationFenceAcceptedDTO
+RetainedNativeRuntimeUnitAdapter::Acquire(
+    const manyforge::core::ApplyConfigurationFenceIntentDTO &intent) {
+  return impl_->KernelFenceCall<manyforge::core::ConfigurationFenceAcceptedDTO>(
+      intent);
+}
+
+manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO
+RetainedNativeRuntimeUnitAdapter::ReconcileAcquireAttempt(
+    const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &query) const {
+  return impl_->KernelFenceCall<
+      manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO>(query);
+}
+
+manyforge::core::ApplyFenceReconcileResultDTO
+RetainedNativeRuntimeUnitAdapter::Rehydrate(
+    const manyforge::core::ApplyFenceRehydrateDTO &request) {
+  return impl_->KernelFenceCall<manyforge::core::ApplyFenceReconcileResultDTO>(
+      request);
+}
+
+manyforge::core::ConfigurationFenceStatusDTO
+RetainedNativeRuntimeUnitAdapter::QueryStatus(
+    const manyforge::core::ConfigurationFenceStatusQueryDTO &query) const {
+  return impl_->KernelFenceCall<manyforge::core::ConfigurationFenceStatusDTO>(
+      query);
+}
+
+manyforge::core::ConfigurationFenceReleasedDTO
+RetainedNativeRuntimeUnitAdapter::Release(
+    const manyforge::core::ConfigurationFenceReleaseDTO &request) {
+  return impl_->KernelFenceCall<manyforge::core::ConfigurationFenceReleasedDTO>(
+      request);
 }
 
 manyforge::core::Result<
