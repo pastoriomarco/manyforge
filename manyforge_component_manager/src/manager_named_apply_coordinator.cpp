@@ -128,6 +128,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     core::IManagerSceneProjectionHandoffPort &scene_owner,
     core::IManagerSceneProjectionBootstrapPort *bootstrap_scene_owner,
     core::IManagerKernelApplyFencePort &kernel_fence,
+    IManagerSelectedRuntimeCompositionPort &runtime_composition,
     IRuntimeUnitProcessPort &process_port,
     IRuntimeUnitProgressPort &progress_port,
     core::RuntimeEpoch manager_runtime_epoch, std::string operating_system,
@@ -148,6 +149,9 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
                                publication_store, scene_owner,
                                bootstrap_scene_owner),
       scene_activation_coordinator_(apply_journal_, scene_owner),
+      runtime_composition_coordinator_(apply_journal_, retained_bundle_source_,
+                                       runtime_composition,
+                                       manager_runtime_epoch_),
       selected_bundle_coordinator_(apply_journal_, retained_bundle_source_,
                                    publication_store, scene_owner),
       fence_release_coordinator_(apply_journal_, kernel_fence_,
@@ -293,6 +297,15 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
     }
     static_cast<void>(scene_activation_coordinator_.ActivateOrRecover(
         intent.apply_id, intent.apply_generation));
+  }
+
+  const auto composition = runtime_composition_coordinator_.InstallOrRecover(
+      intent.apply_id, intent.apply_generation);
+  if (composition.state ==
+      ManagerSelectedRuntimeCompositionResultState::kPending) {
+    return {intent.apply_id, intent.apply_generation,
+            ManagerNamedApplyResultState::kPending, request_replayed,
+            std::nullopt};
   }
 
   bool finalized_now = false;

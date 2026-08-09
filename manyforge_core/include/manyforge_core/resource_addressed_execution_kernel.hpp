@@ -3,9 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <manyforge_core/ports/ioperation_journal.hpp>
-#include <manyforge_core/ports/iaddressed_operation_owner.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
+#include <manyforge_core/ports/iaddressed_operation_owner.hpp>
+#include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
@@ -28,16 +28,15 @@ struct RuntimeParticipantExecutionRegistration final {
   IResolvedParticipantExecutionEngine* engine{};
 };
 
-using RuntimeParticipantAdmissionResolver = std::function<
-    Result<RuntimeParticipantExecutionRegistration>(
-        const OperationIntentDTO&, std::size_t)>;
+using RuntimeParticipantAdmissionResolver =
+    std::function<Result<RuntimeParticipantExecutionRegistration>(const OperationIntentDTO&,
+                                                                  std::size_t)>;
 
 struct ResourceAddressedExecutionKernelConfig final {
   ResourceAddressedExecutionKernelConfig() = default;
-  ResourceAddressedExecutionKernelConfig(
-      RequestOwnerEpoch owner_epoch, std::size_t replay_capacity,
-      RuntimeParticipantAdmissionResolver resolver = {},
-      IResourceOperationAdmissionGate* admission_gate = nullptr)
+  ResourceAddressedExecutionKernelConfig(RequestOwnerEpoch owner_epoch, std::size_t replay_capacity,
+                                         RuntimeParticipantAdmissionResolver resolver = {},
+                                         IResourceOperationAdmissionGate* admission_gate = nullptr)
       : request_owner_epoch(std::move(owner_epoch)),
         request_replay_capacity(replay_capacity),
         participant_resolver(std::move(resolver)),
@@ -77,24 +76,20 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       IOperationJournal& journal, ResourceAddressedExecutionKernelConfig config);
   ~ResourceAddressedExecutionKernel();
 
-  ResourceAddressedExecutionKernel(const ResourceAddressedExecutionKernel&) =
-      delete;
-  ResourceAddressedExecutionKernel& operator=(
-      const ResourceAddressedExecutionKernel&) = delete;
+  ResourceAddressedExecutionKernel(const ResourceAddressedExecutionKernel&) = delete;
+  ResourceAddressedExecutionKernel& operator=(const ResourceAddressedExecutionKernel&) = delete;
 
   /// Resolve, reserve, and submit one portable operation. Exact replay returns
   /// the original owner-minted identities and performs no subordinate call.
-  [[nodiscard]] Result<OperationAcceptedDTO> execute(
-      const OperationIntentDTO& intent) override;
+  [[nodiscard]] Result<OperationAcceptedDTO> execute(const OperationIntentDTO& intent) override;
 
   [[nodiscard]] Result<std::unique_ptr<IAddressedMotionPreviewSession>>
-  begin_motion_preview_session(
-      const OperationIntentDTO& primary_motion) override;
+  begin_motion_preview_session(const OperationIntentDTO& primary_motion) override;
 
   /// Resolve and validate one capability command without reserving,
   /// journaling, changing observed state, or dispatching a command.
-  [[nodiscard]] Result<CapabilityCommandPreviewResultDTO>
-  preview_capability_command(const OperationIntentDTO& intent);
+  [[nodiscard]] Result<CapabilityCommandPreviewResultDTO> preview_capability_command(
+      const OperationIntentDTO& intent);
 
   [[nodiscard]] Result<OperationControlAcceptedDTO> pause(
       const OperationControlRequestDTO& request);
@@ -121,14 +116,28 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// effectful.
   [[nodiscard]] Result<void> reconcile_subordinate_state() override;
 
-  [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> resource_snapshot()
-      const;
-  [[nodiscard]] std::shared_ptr<const ResourceSlotTable>
-  resource_admission_table() const noexcept {
+  [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> resource_snapshot() const;
+
+  /// Atomically select a verified candidate participant set while preserving
+  /// the stable addressed owner, operation journal, replay ledgers, and any
+  /// unaffected in-flight operation. The caller must hold the exact durable
+  /// configuration fence for every changed resource.
+  [[nodiscard]] Result<void> reconfigure_runtime_participants(
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver = {});
+
+  /// A removed subordinate engine stays lifetime-pinned while an operation
+  /// still references it. Once this returns false, release_retired_engine()
+  /// removes the remaining event subscription before the caller destroys the
+  /// engine.
+  [[nodiscard]] bool participant_engine_in_use(
+      const IResolvedParticipantExecutionEngine* engine) const;
+  [[nodiscard]] Result<void> release_retired_engine(IResolvedParticipantExecutionEngine* engine);
+
+  [[nodiscard]] std::shared_ptr<const ResourceSlotTable> resource_admission_table() const noexcept {
     return resource_slots_;
   }
-  [[nodiscard]] const RequestOwnerEpoch& request_owner_epoch()
-      const noexcept override {
+  [[nodiscard]] const RequestOwnerEpoch& request_owner_epoch() const noexcept override {
     return config_.request_owner_epoch;
   }
 
@@ -143,18 +152,15 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   [[nodiscard]] IResolvedParticipantExecutionEngine* engine_for(
       const RuntimeParticipantBinding& binding) const noexcept;
-  [[nodiscard]] Result<RuntimeParticipantExecutionRegistration>
-  resolve_registration(const OperationIntentDTO& operation,
-                       std::size_t participant_index) const;
-  void on_engine_event(IResolvedParticipantExecutionEngine* engine,
-                       const KernelEvent& event);
-  [[nodiscard]] Result<void> apply_subordinate_state(
-      IResolvedParticipantExecutionEngine* engine,
-      std::uint64_t subordinate_id, OperationStateKind state, double progress,
-      std::optional<ErrorDTO> terminal_error);
+  [[nodiscard]] Result<RuntimeParticipantExecutionRegistration> resolve_registration(
+      const OperationIntentDTO& operation, std::size_t participant_index) const;
+  void on_engine_event(IResolvedParticipantExecutionEngine* engine, const KernelEvent& event);
+  [[nodiscard]] Result<void> apply_subordinate_state(IResolvedParticipantExecutionEngine* engine,
+                                                     std::uint64_t subordinate_id,
+                                                     OperationStateKind state, double progress,
+                                                     std::optional<ErrorDTO> terminal_error);
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
-      const OperationControlRequestDTO& request,
-      OperationControlKind control);
+      const OperationControlRequestDTO& request, OperationControlKind control);
   [[nodiscard]] Result<void> apply_runtime_scale_status(
       IResolvedParticipantExecutionEngine* engine,
       const ResolvedRuntimeScaleStatusDTO& resolved_status);

@@ -245,8 +245,7 @@ void Exec(sqlite3 *database, const std::string_view sql) {
                                               const std::string_view sql,
                                               const std::string_view label) {
   Statement statement(database, sql);
-  Require(statement.Step() == SQLITE_ROW,
-          std::string(label) + " is absent");
+  Require(statement.Step() == SQLITE_ROW, std::string(label) + " is absent");
   const auto value = statement.ColumnInteger(0);
   Require(statement.Step() == SQLITE_DONE,
           std::string(label) + " has extra rows");
@@ -254,18 +253,16 @@ void Exec(sqlite3 *database, const std::string_view sql) {
 }
 
 [[nodiscard]] bool ValidateLedgerEnvelope(sqlite3 *database) {
-  const auto application_id =
-      ReadSingleInteger(database, "PRAGMA application_id",
-                        "durable ledger application ID");
-  const auto user_version =
-      ReadSingleInteger(database, "PRAGMA user_version",
-                        "durable ledger schema version");
+  const auto application_id = ReadSingleInteger(
+      database, "PRAGMA application_id", "durable ledger application ID");
+  const auto user_version = ReadSingleInteger(database, "PRAGMA user_version",
+                                              "durable ledger schema version");
   const auto schema_object_count = ReadSingleInteger(
       database,
       "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
       "durable ledger schema-object count");
-  const bool fresh = application_id == 0U && user_version == 0U &&
-                     schema_object_count == 0U;
+  const bool fresh =
+      application_id == 0U && user_version == 0U && schema_object_count == 0U;
   if (fresh) {
     return true;
   }
@@ -273,17 +270,15 @@ void Exec(sqlite3 *database, const std::string_view sql) {
               user_version == static_cast<std::uint64_t>(kSchemaVersion) &&
               schema_object_count == 2U,
           "existing durable ledger has an unknown schema envelope");
-  Statement objects(
-      database,
-      "SELECT name,type FROM sqlite_schema WHERE name NOT LIKE "
-      "'sqlite_%' ORDER BY name");
+  Statement objects(database,
+                    "SELECT name,type FROM sqlite_schema WHERE name NOT LIKE "
+                    "'sqlite_%' ORDER BY name");
   Require(objects.Step() == SQLITE_ROW &&
               objects.ColumnText(0) == "kernel_apply_fence_meta" &&
               objects.ColumnText(1) == "table" &&
               objects.Step() == SQLITE_ROW &&
               objects.ColumnText(0) == "kernel_apply_fences" &&
-              objects.ColumnText(1) == "table" &&
-              objects.Step() == SQLITE_DONE,
+              objects.ColumnText(1) == "table" && objects.Step() == SQLITE_DONE,
           "existing durable ledger has foreign schema objects");
   return false;
 }
@@ -292,32 +287,28 @@ void ValidateExistingLedgerForPreflight(sqlite3 *database,
                                         const core::CellId &cell_id) {
   const bool fresh = ValidateLedgerEnvelope(database);
   Statement integrity(database, "PRAGMA quick_check");
-  Require(integrity.Step() == SQLITE_ROW &&
-              integrity.ColumnText(0) == "ok" &&
+  Require(integrity.Step() == SQLITE_ROW && integrity.ColumnText(0) == "ok" &&
               integrity.Step() == SQLITE_DONE,
           "durable ledger failed its SQLite integrity check");
   if (fresh) {
     return;
   }
-  Statement metadata(database,
-                     "SELECT schema_id,schema_version,cell_id,"
-                     "maximum_fence_records,"
-                     "maximum_database_page_image_bytes FROM "
-                     "kernel_apply_fence_meta WHERE id=1");
+  Statement metadata(database, "SELECT schema_id,schema_version,cell_id,"
+                               "maximum_fence_records,"
+                               "maximum_database_page_image_bytes FROM "
+                               "kernel_apply_fence_meta WHERE id=1");
   Require(metadata.Step() == SQLITE_ROW &&
               metadata.ColumnText(0) == kSchemaId &&
               metadata.ColumnInteger(1) == kSchemaVersion &&
               metadata.ColumnText(2) == cell_id.value() &&
               metadata.ColumnInteger(3) == kMaximumFenceRecords &&
-              metadata.ColumnInteger(4) ==
-                  kMaximumDatabasePageImageBytes &&
+              metadata.ColumnInteger(4) == kMaximumDatabasePageImageBytes &&
               metadata.Step() == SQLITE_DONE,
           "durable ledger metadata differs from this owner");
-  Require(ReadSingleInteger(database,
-                            "SELECT COUNT(*) FROM kernel_apply_fences",
-                            "durable fence record count") <=
-              kMaximumFenceRecords,
-          "durable ledger exceeds its fixed record bound");
+  Require(
+      ReadSingleInteger(database, "SELECT COUNT(*) FROM kernel_apply_fences",
+                        "durable fence record count") <= kMaximumFenceRecords,
+      "durable ledger exceeds its fixed record bound");
 }
 
 class Transaction final {
@@ -504,12 +495,11 @@ core::Result<void> ManagedKernelAdmissionGate::reserve(
   }
   const auto blocked = std::any_of(
       held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
-        return std::any_of(resources.begin(), resources.end(),
-                           [&](const auto &resource) {
-                             return std::binary_search(
-                                 held.scope.resources.begin(),
-                                 held.scope.resources.end(), resource);
-                           });
+        return std::any_of(
+            resources.begin(), resources.end(), [&](const auto &resource) {
+              return std::binary_search(held.scope.resources.begin(),
+                                        held.scope.resources.end(), resource);
+            });
       });
   if (blocked) {
     return core::Result<void>::Err(core::ErrorDTO{
@@ -553,19 +543,17 @@ void ManagedKernelAdmissionGate::AcquireFenceDurably(
   const auto table = resource_table_.lock();
   Require(table != nullptr || !resource_table_was_bound_,
           "the bound Kernel resource table is no longer available");
-  const auto observation =
-      table != nullptr
-          ? table->admission_snapshot(scope.resources)
-          : core::ResourceSlotAdmissionSnapshotDTO{};
+  const auto observation = table != nullptr
+                               ? table->admission_snapshot(scope.resources)
+                               : core::ResourceSlotAdmissionSnapshotDTO{};
   Require(observation.operation_resource_generation ==
                   expected_operation_resource_generation &&
               observation.affected_queued_operation_count == 0U &&
               observation.affected_active_operation_count == 0U,
           "affected operation admission is busy or changed before fence "
           "acquisition");
-  Require(SelectConfigurations(observation.active_control_configurations,
-                               scope, false) ==
-              expected_active_control_configurations,
+  Require(SelectConfigurations(observation.active_control_configurations, scope,
+                               false) == expected_active_control_configurations,
           "active control configuration changed before fence acquisition");
   Require(held_fences_.empty(),
           "another configuration fence already closes operation admission");
@@ -609,6 +597,22 @@ void ManagedKernelAdmissionGate::ReleaseFence(
   Require(found != held_fences_.end(),
           "released fence is not held by the admission gate");
   held_fences_.erase(found);
+}
+
+void ManagedKernelAdmissionGate::RunWithExactHeldFence(
+    const core::ConfigurationFenceId &fence_id,
+    const core::ConfigurationFenceScopeDTO &scope,
+    const std::function<void()> &effect) {
+  Require(!fence_id.empty() && scope.valid() && static_cast<bool>(effect),
+          "fenced runtime-composition effect is invalid");
+  std::lock_guard lock(*admission_mutex_);
+  const auto found = std::find_if(
+      held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
+        return held.fence_id == fence_id && held.scope == scope;
+      });
+  Require(found != held_fences_.end(),
+          "runtime composition does not name the exact held fence");
+  effect();
 }
 
 class ManagedKernelApplyFenceOwner::Impl final {
@@ -687,11 +691,10 @@ public:
               "durable exact-replay acceptance contradicts its intent");
       return accepted;
     }
-    Require(ReadSingleInteger(database_,
-                              "SELECT COUNT(*) FROM kernel_apply_fences",
-                              "durable fence record count") <
-                kMaximumFenceRecords,
-            "durable fence ledger has reached its fixed record bound");
+    Require(
+        ReadSingleInteger(database_, "SELECT COUNT(*) FROM kernel_apply_fences",
+                          "durable fence record count") < kMaximumFenceRecords,
+        "durable fence ledger has reached its fixed record bound");
 
     const auto active = ReadActivePublication();
     Require(active.receipt.request.candidate_retained_bundle_id ==
@@ -960,8 +963,7 @@ private:
     try {
       static_cast<void>(persistence::PreflightExistingSqliteReadOnly(
           config_.ledger_path,
-          {kMaximumDatabasePageImageBytes,
-           kMaximumDatabasePageImageBytes},
+          {kMaximumDatabasePageImageBytes, kMaximumDatabasePageImageBytes},
           [&](sqlite3 *preflight) {
             ValidateExistingLedgerForPreflight(preflight, config_.cell_id);
           }));
@@ -993,13 +995,11 @@ private:
     Exec(database_, "PRAGMA secure_delete=ON");
     const auto page_size =
         ReadSingleInteger(database_, "PRAGMA page_size", "SQLite page size");
-    Require(page_size != 0U &&
-                kMaximumDatabasePageImageBytes % page_size == 0U,
+    Require(page_size != 0U && kMaximumDatabasePageImageBytes % page_size == 0U,
             "SQLite page size cannot represent the fixed database bound");
-    const auto maximum_page_count =
-        kMaximumDatabasePageImageBytes / page_size;
-    Exec(database_, "PRAGMA max_page_count=" +
-                        std::to_string(maximum_page_count));
+    const auto maximum_page_count = kMaximumDatabasePageImageBytes / page_size;
+    Exec(database_,
+         "PRAGMA max_page_count=" + std::to_string(maximum_page_count));
     Require(ReadSingleInteger(database_, "PRAGMA max_page_count",
                               "SQLite maximum page count") ==
                 maximum_page_count,
@@ -1020,20 +1020,21 @@ private:
            "maximum_fence_records INTEGER NOT NULL CHECK("
            "maximum_fence_records>0),maximum_database_page_image_bytes "
            "INTEGER NOT NULL CHECK(maximum_database_page_image_bytes>0))");
-      Exec(database_,
-           "CREATE TABLE kernel_apply_fences ("
-           "apply_id TEXT NOT NULL,apply_generation INTEGER NOT NULL CHECK("
-           "apply_generation>0),request_id TEXT NOT NULL,request_owner_epoch "
-           "TEXT NOT NULL,intent_blob BLOB NOT NULL,accepted_blob BLOB NOT NULL,"
-           "fence_id TEXT NOT NULL,fence_generation INTEGER NOT NULL CHECK("
-           "fence_generation>0),state INTEGER NOT NULL CHECK(state IN (0,1)),"
-           "release_request_blob BLOB,release_receipt_blob BLOB,"
-           "PRIMARY KEY(request_owner_epoch,request_id),"
-           "UNIQUE(apply_id,apply_generation),UNIQUE(fence_id),"
-           "UNIQUE(fence_generation),CHECK((state=0 AND release_request_blob IS "
-           "NULL AND release_receipt_blob IS NULL) OR (state=1 AND "
-           "release_request_blob IS NOT NULL AND release_receipt_blob IS NOT "
-           "NULL)))");
+      Exec(
+          database_,
+          "CREATE TABLE kernel_apply_fences ("
+          "apply_id TEXT NOT NULL,apply_generation INTEGER NOT NULL CHECK("
+          "apply_generation>0),request_id TEXT NOT NULL,request_owner_epoch "
+          "TEXT NOT NULL,intent_blob BLOB NOT NULL,accepted_blob BLOB NOT NULL,"
+          "fence_id TEXT NOT NULL,fence_generation INTEGER NOT NULL CHECK("
+          "fence_generation>0),state INTEGER NOT NULL CHECK(state IN (0,1)),"
+          "release_request_blob BLOB,release_receipt_blob BLOB,"
+          "PRIMARY KEY(request_owner_epoch,request_id),"
+          "UNIQUE(apply_id,apply_generation),UNIQUE(fence_id),"
+          "UNIQUE(fence_generation),CHECK((state=0 AND release_request_blob IS "
+          "NULL AND release_receipt_blob IS NULL) OR (state=1 AND "
+          "release_request_blob IS NOT NULL AND release_receipt_blob IS NOT "
+          "NULL)))");
     }
     Statement count(database_, "SELECT COUNT(*) FROM kernel_apply_fence_meta");
     Require(count.Step() == SQLITE_ROW, "metadata count is absent");
@@ -1054,18 +1055,16 @@ private:
               "metadata insertion returned a row");
     } else {
       Require(rows == 1U, "metadata singleton contains extra rows");
-      Statement metadata(database_,
-                         "SELECT schema_id,schema_version,cell_id,"
-                         "maximum_fence_records,"
-                         "maximum_database_page_image_bytes FROM "
-                         "kernel_apply_fence_meta WHERE id=1");
+      Statement metadata(database_, "SELECT schema_id,schema_version,cell_id,"
+                                    "maximum_fence_records,"
+                                    "maximum_database_page_image_bytes FROM "
+                                    "kernel_apply_fence_meta WHERE id=1");
       Require(metadata.Step() == SQLITE_ROW &&
                   metadata.ColumnText(0) == kSchemaId &&
                   metadata.ColumnInteger(1) == kSchemaVersion &&
                   metadata.ColumnText(2) == config_.cell_id.value() &&
                   metadata.ColumnInteger(3) == kMaximumFenceRecords &&
-                  metadata.ColumnInteger(4) ==
-                      kMaximumDatabasePageImageBytes &&
+                  metadata.ColumnInteger(4) == kMaximumDatabasePageImageBytes &&
                   metadata.Step() == SQLITE_DONE,
               "durable ledger metadata differs from this owner");
     }
@@ -1076,15 +1075,13 @@ private:
     }
     transaction.Commit();
     Statement integrity(database_, "PRAGMA quick_check");
-    Require(integrity.Step() == SQLITE_ROW &&
-                integrity.ColumnText(0) == "ok" &&
+    Require(integrity.Step() == SQLITE_ROW && integrity.ColumnText(0) == "ok" &&
                 integrity.Step() == SQLITE_DONE,
             "durable ledger failed its SQLite integrity check");
-    Require(ReadSingleInteger(database_,
-                              "SELECT COUNT(*) FROM kernel_apply_fences",
-                              "durable fence record count") <=
-                kMaximumFenceRecords,
-            "durable ledger exceeds its fixed record bound");
+    Require(
+        ReadSingleInteger(database_, "SELECT COUNT(*) FROM kernel_apply_fences",
+                          "durable fence record count") <= kMaximumFenceRecords,
+        "durable ledger exceeds its fixed record bound");
   }
 
   void RestoreHeldFence() {

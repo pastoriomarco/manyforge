@@ -19,6 +19,7 @@
 #include "manyforge_component_manager/manager_scene_activation_coordinator.hpp"
 #include "manyforge_component_manager/manager_scene_stage_coordinator.hpp"
 #include "manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp"
+#include "manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp"
 #include "manyforge_component_manager/reference_runtime_unit_admission.hpp"
 #include "manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp"
 #include "runtime_only_retention_fixture.hpp"
@@ -730,6 +731,29 @@ private:
   std::string process_incarnation_{"process-epoch-1"};
 };
 
+class ScriptedRuntimeCompositionPort final
+    : public IManagerSelectedRuntimeCompositionPort {
+public:
+  [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO InstallOrObserve(
+      const ManagerSelectedRuntimeCompositionRequestDTO &request) override {
+    ++calls;
+    last_request = request;
+    auto response_request = request;
+    if (foreign_response) {
+      response_request.manager_runtime_epoch = RuntimeEpoch("foreign-manager");
+    }
+    const auto preparing = prepare_once && calls == 1;
+    return {std::move(response_request),
+            preparing ? ManagerSelectedRuntimeCompositionState::kPreparing
+                      : ManagerSelectedRuntimeCompositionState::kInstalled};
+  }
+
+  bool prepare_once{false};
+  bool foreign_response{false};
+  int calls{0};
+  std::optional<ManagerSelectedRuntimeCompositionRequestDTO> last_request;
+};
+
 class ScriptedSceneOwner final : public IManagerSceneProjectionHandoffPort {
 public:
   explicit ScriptedSceneOwner(SqliteManagerApplyJournal &independent_reader)
@@ -1081,10 +1105,24 @@ void ReachDurableSceneActivation(CoordinatorFixture &fixture,
             ManagerSceneActivationPath::kActivatedFromNewCall);
 }
 
+void ReachDurableRuntimeComposition(CoordinatorFixture &fixture,
+                                    ScriptedRuntimeCompositionPort &port) {
+  ManagerSelectedRuntimeCompositionCoordinator coordinator(
+      fixture.journal, *fixture.package.bundle_source, port,
+      RuntimeEpoch("manager-runtime-1"));
+  const auto installed =
+      coordinator.InstallOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_EQ(installed.state,
+            ManagerSelectedRuntimeCompositionResultState::kInstalled);
+  ASSERT_TRUE(installed.durable_materialization.has_value());
+}
+
 void ReachDurableSceneFinalize(CoordinatorFixture &fixture,
                                ScriptedSceneOwner &scene_owner,
                                ScriptedPublicationStore &publication_store) {
   ReachDurableSceneActivation(fixture, scene_owner);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  ReachDurableRuntimeComposition(fixture, runtime_composition);
   ManagerSelectedBundleTransitionCoordinator coordinator(
       fixture.journal, *fixture.package.bundle_source, publication_store,
       scene_owner);
@@ -1509,12 +1547,79 @@ TEST(ManagerSceneActivationCoordinator,
   EXPECT_EQ(scene_owner.activation_calls, 1);
 }
 
+TEST(ManagerSelectedRuntimeCompositionCoordinator,
+     PersistsOnlyAfterInstallAndReobservesTheCurrentChildOnReplay) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  ScriptedSceneOwner scene_owner(fixture.independent_reader);
+  ReachDurableSceneActivation(fixture, scene_owner);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  runtime_composition.prepare_once = true;
+  ManagerSelectedRuntimeCompositionCoordinator coordinator(
+      fixture.journal, *fixture.package.bundle_source, runtime_composition,
+      RuntimeEpoch("manager-runtime-1"));
+
+  const auto preparing =
+      coordinator.InstallOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(preparing.state,
+            ManagerSelectedRuntimeCompositionResultState::kPending);
+  EXPECT_FALSE(preparing.durable_materialization.has_value());
+  EXPECT_FALSE(
+      fixture.journal
+          .ReadPrivateMaterialization(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
+
+  const auto installed =
+      coordinator.InstallOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(installed.state,
+            ManagerSelectedRuntimeCompositionResultState::kInstalled);
+  ASSERT_TRUE(installed.durable_materialization.has_value());
+  EXPECT_TRUE(installed.durable_materialization->inserted);
+  ASSERT_TRUE(runtime_composition.last_request.has_value());
+  EXPECT_EQ(runtime_composition.last_request->manager_runtime_epoch,
+            RuntimeEpoch("manager-runtime-1"));
+  EXPECT_EQ(runtime_composition.calls, 2);
+
+  const auto replay =
+      coordinator.InstallOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
+  EXPECT_EQ(replay.state,
+            ManagerSelectedRuntimeCompositionResultState::kInstalled);
+  ASSERT_TRUE(replay.durable_materialization.has_value());
+  EXPECT_FALSE(replay.durable_materialization->inserted);
+  EXPECT_EQ(replay.durable_materialization->record,
+            installed.durable_materialization->record);
+  EXPECT_EQ(runtime_composition.calls, 3);
+}
+
+TEST(ManagerSelectedRuntimeCompositionCoordinator,
+     RejectsForeignOwnerEvidenceBeforeDurableMaterialization) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  ScriptedSceneOwner scene_owner(fixture.independent_reader);
+  ReachDurableSceneActivation(fixture, scene_owner);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  runtime_composition.foreign_response = true;
+  ManagerSelectedRuntimeCompositionCoordinator coordinator(
+      fixture.journal, *fixture.package.bundle_source, runtime_composition,
+      RuntimeEpoch("manager-runtime-1"));
+
+  EXPECT_THROW(static_cast<void>(coordinator.InstallOrRecover(
+                   ApplyId("apply-1"), ApplyGeneration(1U))),
+               ManagerSelectedRuntimeCompositionCoordinatorError);
+  EXPECT_FALSE(
+      fixture.journal
+          .ReadPrivateMaterialization(ApplyId("apply-1"), ApplyGeneration(1U))
+          .has_value());
+}
+
 TEST(ManagerSelectedBundleTransitionCoordinator,
      PublishesThenFinalizesWithOneExternalEffectPerAdvance) {
   ScopedPackageRoot root;
   CoordinatorFixture fixture(root.path());
   ScriptedSceneOwner scene_owner(fixture.independent_reader);
   ReachDurableSceneActivation(fixture, scene_owner);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  ReachDurableRuntimeComposition(fixture, runtime_composition);
   ScriptedPublicationStore publication_store(
       PredecessorPublication(fixture.apply_intent),
       &fixture.independent_reader);
@@ -1526,7 +1631,7 @@ TEST(ManagerSelectedBundleTransitionCoordinator,
       coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
   EXPECT_EQ(published.path,
             ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
-  EXPECT_TRUE(published.durable_materialization.inserted);
+  EXPECT_FALSE(published.durable_materialization.inserted);
   EXPECT_TRUE(published.durable_retired_command_surfaces.inserted);
   EXPECT_TRUE(published.durable_publication.inserted);
   EXPECT_FALSE(published.durable_finalized.has_value());
@@ -1565,6 +1670,8 @@ TEST(ManagerSelectedBundleTransitionCoordinator,
   CoordinatorFixture fixture(root.path());
   ScriptedSceneOwner scene_owner(fixture.independent_reader);
   ReachDurableSceneActivation(fixture, scene_owner);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  ReachDurableRuntimeComposition(fixture, runtime_composition);
   ScriptedPublicationStore publication_store(
       PredecessorPublication(fixture.apply_intent),
       &fixture.independent_reader);
@@ -1602,6 +1709,8 @@ TEST(ManagerSelectedBundleTransitionCoordinator,
   CoordinatorFixture fixture(root.path());
   ScriptedSceneOwner scene_owner(fixture.independent_reader);
   ReachDurableSceneActivation(fixture, scene_owner);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  ReachDurableRuntimeComposition(fixture, runtime_composition);
   ScriptedPublicationStore publication_store(
       PredecessorPublication(fixture.apply_intent),
       &fixture.independent_reader);
@@ -1770,10 +1879,11 @@ TEST(ManagerNamedApplyCoordinator,
   ScriptedRuntimePorts runtime_ports(independent_reader);
   ScriptedSceneOwner scene_owner(independent_reader);
   AggregateFencePort kernel_fence(independent_reader, predecessor);
+  ScriptedRuntimeCompositionPort runtime_composition;
   ManagerNamedApplyCoordinator coordinator(
       journal, active_plan_source, *package.bundle_source,
       *package.artifact_source, publication_store, scene_owner, nullptr,
-      kernel_fence, runtime_ports, runtime_ports,
+      kernel_fence, runtime_composition, runtime_ports, runtime_ports,
       RuntimeEpoch("manager-runtime.aggregate.1"), "linux", {"posix.1-2017"},
       [] { return 1'000U; }, [] { return ApplyId("apply.aggregate.1"); });
   const ManagerNamedApplyRequestDTO request{
@@ -1796,6 +1906,7 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(runtime_ports.ensure_calls, 1);
   EXPECT_EQ(scene_owner.stage_calls, 1);
   EXPECT_EQ(scene_owner.activation_calls, 1);
+  EXPECT_EQ(runtime_composition.calls, 1);
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(scene_owner.finalize_calls, 1);
 
@@ -1809,6 +1920,7 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(runtime_ports.ensure_calls, 1);
   EXPECT_EQ(scene_owner.stage_calls, 1);
   EXPECT_EQ(scene_owner.activation_calls, 1);
+  EXPECT_EQ(runtime_composition.calls, 1);
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(scene_owner.finalize_calls, 1);
   EXPECT_FALSE(coordinator.RecoverIncompleteApply().has_value());

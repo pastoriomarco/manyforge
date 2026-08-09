@@ -692,23 +692,37 @@ TEST(ManagerDaemonProcess,
                                                "manager-source.json");
     AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
                                              "logical-scene-source.json");
+    AtomicSourceSnapshotChannel scene_runtime_source(
+        directory.publication_root(), "scene-runtime-source.json");
     const auto before = manager_source.Read();
+    const auto scene_runtime_before = scene_runtime_source.Read();
     ASSERT_TRUE(before.has_value());
+    ASSERT_TRUE(scene_runtime_before.has_value());
     first_manager_epoch = before->source_owner_epoch;
     EXPECT_NE(content_identity::canonical_json(before->payload)
                   .find("\"apply\":{\"mutation_available\":true"),
+              std::string::npos);
+    EXPECT_NE(content_identity::canonical_json(scene_runtime_before->payload)
+                  .find(fixture.predecessor_retained_bundle_id),
               std::string::npos);
     request = ApplyRequest(
         first_manager_epoch, fixture.deployment_artifact_id,
         fixture.deployment_revision, fixture.predecessor_graph_revision,
         fixture.predecessor_retained_bundle_id, "manager-runtime-only-apply.1");
 
-    const auto applied = SendCommand(directory.socket_path(), request);
-    SCOPED_TRACE(applied);
+    auto applied = SendCommand(directory.socket_path(), request);
     EXPECT_NE(applied.find("\"ok\":true"), std::string::npos);
-    EXPECT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos);
     EXPECT_NE(applied.find("\"replay_status\":\"accepted_new\""),
               std::string::npos);
+    const auto apply_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
+           std::chrono::steady_clock::now() < apply_deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      applied = SendCommand(directory.socket_path(), request);
+    }
+    SCOPED_TRACE(applied);
+    EXPECT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos);
     EXPECT_NE(applied.find(fixture.candidate_retained_bundle_id),
               std::string::npos);
     ASSERT_TRUE(std::filesystem::remove(directory.apply_package_root() /
@@ -731,12 +745,17 @@ TEST(ManagerDaemonProcess,
 
     const auto manager_after = manager_source.Read();
     const auto scene_after = scene_source.Read();
+    const auto scene_runtime_after = scene_runtime_source.Read();
     ASSERT_TRUE(manager_after.has_value());
     ASSERT_TRUE(scene_after.has_value());
+    ASSERT_TRUE(scene_runtime_after.has_value());
     EXPECT_NE(content_identity::canonical_json(manager_after->payload)
                   .find(fixture.candidate_retained_bundle_id),
               std::string::npos);
     EXPECT_NE(content_identity::canonical_json(scene_after->payload)
+                  .find(fixture.candidate_retained_bundle_id),
+              std::string::npos);
+    EXPECT_NE(content_identity::canonical_json(scene_runtime_after->payload)
                   .find(fixture.candidate_retained_bundle_id),
               std::string::npos);
     const auto status = manager.Stop(SIGKILL);
@@ -749,10 +768,17 @@ TEST(ManagerDaemonProcess,
   replacement.WaitReady(directory);
   AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
                                              "manager-source.json");
+  AtomicSourceSnapshotChannel scene_runtime_source(directory.publication_root(),
+                                                   "scene-runtime-source.json");
   const auto recovered = manager_source.Read();
+  const auto scene_runtime_recovered = scene_runtime_source.Read();
   ASSERT_TRUE(recovered.has_value());
+  ASSERT_TRUE(scene_runtime_recovered.has_value());
   EXPECT_NE(recovered->source_owner_epoch, first_manager_epoch);
   EXPECT_NE(content_identity::canonical_json(recovered->payload)
+                .find(fixture.candidate_retained_bundle_id),
+            std::string::npos);
+  EXPECT_NE(content_identity::canonical_json(scene_runtime_recovered->payload)
                 .find(fixture.candidate_retained_bundle_id),
             std::string::npos);
   const auto stale = SendCommand(directory.socket_path(), request);

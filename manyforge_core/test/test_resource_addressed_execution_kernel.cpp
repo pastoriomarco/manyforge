@@ -42,39 +42,37 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return next_execute_result;
   }
 
-  Result<RobotStateDTO> current_preview_state(
-      std::int64_t) const override {
-    return Result<RobotStateDTO>::Ok(
-        RobotStateDTO{{"mf2_joint_1"}, {0.0}, {}});
+  Result<RobotStateDTO> current_preview_state(std::int64_t) const override {
+    return Result<RobotStateDTO>::Ok(RobotStateDTO{{"mf2_joint_1"}, {0.0}, {}});
   }
 
-  Result<MotionPreviewResultDTO> preview_motion(
-      ExecuteRequestDTO request,
-      CollisionWorldLeaseInventory projection_inventory,
-      RobotStateDTO start_state, std::uint32_t,
-      std::stop_token) override {
+  Result<MotionPreviewResultDTO> preview_motion(ExecuteRequestDTO request,
+                                                CollisionWorldLeaseInventory projection_inventory,
+                                                RobotStateDTO start_state, std::uint32_t,
+                                                std::stop_token) override {
     ++preview_calls;
     last_preview = request;
-    const RobotStateDTO final_state{start_state.joint_names,
-                                    start_state.positions_rad, {}};
+    const RobotStateDTO final_state{start_state.joint_names, start_state.positions_rad, {}};
     return Result<MotionPreviewResultDTO>::Ok(MotionPreviewResultDTO{
-        TrajectoryDTO{request.binding.resources, start_state.joint_names,
+        TrajectoryDTO{request.binding.resources,
+                      start_state.joint_names,
                       {{0.0, start_state.positions_rad, {}, {}}}},
         start_state, final_state,
-        ControlledStateDTO{
-            request.binding.controllable_component_id,
-            request.binding.command_target_id,
-            request.binding.control_domain_id,
-            request.binding.control_domain_revision,
-            request.binding.control_binding_id,
-            request.binding.control_binding_revision,
-            request.binding.controller_topology_id,
-            request.binding.topology_revision,
-            request.binding.control_route_id,
-            request.binding.active_control_configuration_id,
-            request.binding.active_control_configuration_generation,
-            request.binding.resources, start_state.joint_names,
-            {AngularPositionDTO{0.0}}, std::nullopt},
+        ControlledStateDTO{request.binding.controllable_component_id,
+                           request.binding.command_target_id,
+                           request.binding.control_domain_id,
+                           request.binding.control_domain_revision,
+                           request.binding.control_binding_id,
+                           request.binding.control_binding_revision,
+                           request.binding.controller_topology_id,
+                           request.binding.topology_revision,
+                           request.binding.control_route_id,
+                           request.binding.active_control_configuration_id,
+                           request.binding.active_control_configuration_generation,
+                           request.binding.resources,
+                           start_state.joint_names,
+                           {AngularPositionDTO{0.0}},
+                           std::nullopt},
         Pose3DTO{}, projection_inventory.projection_binding,
         projection_inventory.bundle.world->revision, 0U});
   }
@@ -266,6 +264,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   void unsubscribe_events(SubscriptionHandle handle) override { callbacks.erase(handle.id); }
 
+  [[nodiscard]] std::size_t subscription_count() const noexcept { return callbacks.size(); }
+
   void emit_transition(ExecutionState from, ExecutionState to,
                        std::optional<ErrorDTO> error = std::nullopt) {
     status.state = to;
@@ -408,27 +408,22 @@ class FakeOperationJournal final : public IOperationJournal {
   std::vector<std::string>* timeline{};
 };
 
-class FakeResourceAdmissionGate final
-    : public IResourceOperationAdmissionGate {
+class FakeResourceAdmissionGate final : public IResourceOperationAdmissionGate {
  public:
-  FakeResourceAdmissionGate()
-      : admission_mutex_(std::make_shared<std::recursive_mutex>()) {}
+  FakeResourceAdmissionGate() : admission_mutex_(std::make_shared<std::recursive_mutex>()) {}
 
-  [[nodiscard]] std::shared_ptr<std::recursive_mutex>
-  shared_admission_mutex() const override {
+  [[nodiscard]] std::shared_ptr<std::recursive_mutex> shared_admission_mutex() const override {
     return admission_mutex_;
   }
 
-  [[nodiscard]] Result<void> reserve(
-      ResourceSlotTable& table, const ResourceSlotOwnerDTO& owner,
-      const std::vector<ResourceId>& resources) override {
+  [[nodiscard]] Result<void> reserve(ResourceSlotTable& table, const ResourceSlotOwnerDTO& owner,
+                                     const std::vector<ResourceId>& resources) override {
     std::lock_guard lock(*admission_mutex_);
     ++reserve_calls;
     if (reject_reservation) {
-      return Result<void>::Err(ErrorDTO{
-          std::string(to_string(ErrorCode::kExecutionRejected)),
-          "test configuration fence is held",
-          {{"reason", "configuration_fence_held"}}});
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                        "test configuration fence is held",
+                                        {{"reason", "configuration_fence_held"}}});
     }
     return table.reserve(owner, resources);
   }
@@ -481,14 +476,18 @@ FakeOperationJournal default_journal;
         ContactPolicyRevision("contact-policy-revision"),
         RuntimeObjectId("selected_object"),
         {ProgramContactGraspBodyBindingDTO{
-            ComponentRoleId("robot"), TargetRoleId("gripper"),
+            ComponentRoleId("robot"),
+            TargetRoleId("gripper"),
             ControllableComponentId("robot.1"),
-            CommandTargetId("gripper"), ModelRoleId("body"), body_role,
-            ModelInstanceId("robot.model"), ModelRevision("model-revision"),
-            {make_component_collision_body_id(
-                ControllableComponentId("robot.1"),
-                ModelInstanceId("robot.model"), body_role, 0U)}}},
-        0.002, 0.8});
+            CommandTargetId("gripper"),
+            ModelRoleId("body"),
+            body_role,
+            ModelInstanceId("robot.model"),
+            ModelRevision("model-revision"),
+            {make_component_collision_body_id(ControllableComponentId("robot.1"),
+                                              ModelInstanceId("robot.model"), body_role, 0U)}}},
+        0.002,
+        0.8});
   }
   RuntimeParticipantBindingDTO value{
       ProgramId("program.pick"),
@@ -556,6 +555,20 @@ FakeOperationJournal default_journal;
   return std::move(sealed.value());
 }
 
+[[nodiscard]] RuntimeParticipantBinding select_candidate_product(
+    const RuntimeParticipantBinding& source) {
+  auto value = source.value();
+  value.program_revision = ProgramRevision("program-revision.candidate");
+  value.program_binding_id = ProgramBindingId("program-binding.candidate");
+  value.retained_bundle_id = RetainedBundleId("bundle.candidate");
+  value.graph_revision = GraphRevision("graph.candidate");
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
 [[nodiscard]] OperationIntentDTO motion_operation(std::string request_id = "request.motion.1") {
   return OperationIntentDTO{
       PublicRequestContextDTO{RequestId(std::move(request_id)), RequestOwnerEpoch("kernel.epoch.1"),
@@ -586,6 +599,16 @@ FakeOperationJournal default_journal;
                                      {{"joint_1", JointDynamicsLimitDTO{1.0, 2.0, std::nullopt}}},
                                      {}}}},
       OperationCoordinationPolicy::kIndependent};
+}
+
+[[nodiscard]] OperationIntentDTO candidate_motion_operation(
+    std::string request_id = "request.motion.candidate") {
+  auto operation = motion_operation(std::move(request_id));
+  operation.program_revision = ProgramRevision("program-revision.candidate");
+  operation.program_binding_id = ProgramBindingId("program-binding.candidate");
+  operation.expected_retained_bundle_id = RetainedBundleId("bundle.candidate");
+  operation.expected_graph_revision = GraphRevision("graph.candidate");
+  return operation;
 }
 
 [[nodiscard]] OperationIntentDTO command_operation() {
@@ -676,31 +699,27 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
   EXPECT_EQ(state.value().participants.front().command_target_id.value(), "arm");
 }
 
-TEST(ResourceAddressedExecutionKernelTest,
-     UsesOneInjectedGateForTheActualSlotTableReservation) {
+TEST(ResourceAddressedExecutionKernelTest, UsesOneInjectedGateForTheActualSlotTableReservation) {
   FakeClock clock;
   FakeParticipantEngine engine;
   FakeResourceAdmissionGate gate;
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("arm", "arm", "execution.trajectory.execute",
-                     CoordinateKind::kAngular),
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
       clock, default_journal,
-      ResourceAddressedExecutionKernelConfig{
-          RequestOwnerEpoch("kernel.epoch.1"), 8U, {}, &gate});
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), 8U, {}, &gate});
 
   const auto blocked = kernel.execute(motion_operation());
   ASSERT_FALSE(blocked.ok());
-  EXPECT_EQ(blocked.error().details.at("reason"),
-            "configuration_fence_held");
+  EXPECT_EQ(blocked.error().details.at("reason"), "configuration_fence_held");
   EXPECT_EQ(gate.reserve_calls, 1);
   EXPECT_EQ(engine.execute_calls, 0);
   const auto blocked_slots = kernel.resource_snapshot();
   ASSERT_EQ(blocked_slots.size(), 1U);
   EXPECT_EQ(blocked_slots.front().state, ResourceSlotState::kFree);
 
-  const auto admission = kernel.resource_admission_table()->admission_snapshot(
-      {ResourceId("robot.joint_1")});
+  const auto admission =
+      kernel.resource_admission_table()->admission_snapshot({ResourceId("robot.joint_1")});
   EXPECT_EQ(admission.operation_resource_generation, 0U);
   ASSERT_EQ(admission.active_control_configurations.size(), 1U);
   EXPECT_EQ(admission.affected_queued_operation_count, 0U);
@@ -711,8 +730,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   EXPECT_EQ(gate.reserve_calls, 2);
   EXPECT_EQ(engine.execute_calls, 1);
-  const auto admitted = kernel.resource_admission_table()->admission_snapshot(
-      {ResourceId("robot.joint_1")});
+  const auto admitted =
+      kernel.resource_admission_table()->admission_snapshot({ResourceId("robot.joint_1")});
   EXPECT_EQ(admitted.operation_resource_generation, 1U);
   EXPECT_EQ(admitted.affected_queued_operation_count, 1U);
   EXPECT_EQ(admitted.affected_active_operation_count, 0U);
@@ -723,9 +742,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   clock.set(1234);
   FakeParticipantEngine engine;
-  const auto physical = make_binding(
-      "arm", "arm", "execution.trajectory.execute",
-      CoordinateKind::kAngular);
+  const auto physical =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto dynamic_value = physical.value();
   dynamic_value.program_id = ProgramId("program.dynamic");
   dynamic_value.program_revision = ProgramRevision("program-dynamic-revision");
@@ -742,12 +760,11 @@ TEST(ResourceAddressedExecutionKernelTest,
       {{physical, &engine}}, clock, default_journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), 8U,
-          [&](const OperationIntentDTO&, const std::size_t)
-              -> Result<RuntimeParticipantExecutionRegistration> {
+          [&](const OperationIntentDTO&,
+              const std::size_t) -> Result<RuntimeParticipantExecutionRegistration> {
             ++resolver_calls;
             return Result<RuntimeParticipantExecutionRegistration>::Ok(
-                RuntimeParticipantExecutionRegistration{dynamic.value(),
-                                                        &engine});
+                RuntimeParticipantExecutionRegistration{dynamic.value(), &engine});
           }});
 
   const auto result = kernel.execute(intent);
@@ -756,8 +773,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.execute_calls, 1);
   ASSERT_TRUE(engine.last_execute.has_value());
   EXPECT_EQ(engine.last_execute->binding.program_id, intent.program_id);
-  EXPECT_EQ(engine.last_execute->binding.program_binding_id,
-            intent.program_binding_id);
+  EXPECT_EQ(engine.last_execute->binding.program_binding_id, intent.program_binding_id);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -766,16 +782,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {{make_binding(
-            "arm", "arm", "execution.trajectory.execute",
-            CoordinateKind::kAngular, std::nullopt, false,
-            "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
-            true),
+            "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular, std::nullopt,
+            false, "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce", true),
         &engine}},
-      clock, default_journal,
-      {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   auto intent = motion_operation();
-  auto& motion =
-      std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+  auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
   motion.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
       RuntimeObjectId("selected_object"), SceneResourceId("part.7")}};
@@ -789,8 +801,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(resolved.runtime_object_id.value(), "selected_object");
   EXPECT_EQ(resolved.selected_object_id.value(), "part.7");
   EXPECT_EQ(resolved.allowed_robot_body_ids.size(), 1U);
-  EXPECT_EQ(engine.last_execute->runtime_object_bindings,
-            motion.runtime_object_bindings);
+  EXPECT_EQ(engine.last_execute->runtime_object_bindings, motion.runtime_object_bindings);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -801,16 +812,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   ResourceAddressedExecutionKernel kernel(
       {{make_binding(
-            "arm", "arm", "execution.trajectory.execute",
-            CoordinateKind::kAngular, std::nullopt, false,
-            "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
-            true),
+            "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular, std::nullopt,
+            false, "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce", true),
         &engine}},
-      clock, journal,
-      {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   auto intent = motion_operation("request.preview.1");
-  auto& motion =
-      std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+  auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
   motion.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
       RuntimeObjectId("selected_object"), SceneResourceId("part.7")}};
@@ -820,14 +827,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto prepared = session.value()->prepare_motion(intent);
   ASSERT_TRUE(prepared.ok()) << prepared.error().message;
   ASSERT_TRUE(prepared.value().resolved_contact_grasp.has_value());
-  EXPECT_EQ(prepared.value().resolved_contact_grasp->selected_object_id.value(),
-            "part.7");
-  EXPECT_EQ(prepared.value().binding.controllable_component_id.value(),
-            "robot.1");
+  EXPECT_EQ(prepared.value().resolved_contact_grasp->selected_object_id.value(), "part.7");
+  EXPECT_EQ(prepared.value().binding.controllable_component_id.value(), "robot.1");
   auto state = session.value()->current_state();
   ASSERT_TRUE(state.ok()) << state.error().message;
-  EXPECT_EQ(state.value().joint_names,
-            std::vector<std::string>{"mf2_joint_1"});
+  EXPECT_EQ(state.value().joint_names, std::vector<std::string>{"mf2_joint_1"});
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(engine.preview_calls, 0);
   EXPECT_EQ(journal.calls, std::vector<std::string>{"begin"});
@@ -839,19 +843,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("arm", "arm", "execution.trajectory.execute",
-                     CoordinateKind::kAngular),
+      {{make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         &engine}},
-      clock, journal,
-      {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   auto intent = motion_operation("request.preview.stale");
-  intent.request_context.request_owner_epoch =
-      RequestOwnerEpoch("kernel.epoch.old");
+  intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.old");
 
   auto session = kernel.begin_motion_preview_session(intent);
   ASSERT_FALSE(session.ok());
-  EXPECT_EQ(session.error().details.at("reason"),
-            "stale_request_owner_epoch");
+  EXPECT_EQ(session.error().details.at("reason"), "stale_request_owner_epoch");
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(engine.preview_calls, 0);
   EXPECT_EQ(journal.calls, std::vector<std::string>{"begin"});
@@ -863,21 +863,17 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   ResourceAddressedExecutionKernel kernel(
       {{make_binding(
-            "arm", "arm", "execution.trajectory.execute",
-            CoordinateKind::kAngular, std::nullopt, false,
-            "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
-            true),
+            "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular, std::nullopt,
+            false, "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce", true),
         &engine}},
-      clock, default_journal,
-      {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
   auto intent = motion_operation();
-  std::get<MotionParticipantIntentDTO>(intent.participants.front().payload)
-      .contact_policy_id = ContactPolicyId("selected_object_grasp");
+  std::get<MotionParticipantIntentDTO>(intent.participants.front().payload).contact_policy_id =
+      ContactPolicyId("selected_object_grasp");
 
   const auto result = kernel.execute(intent);
   ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"),
-            "contact_grasp_runtime_object_unresolved");
+  EXPECT_EQ(result.error().details.at("reason"), "contact_grasp_runtime_object_unresolved");
   EXPECT_EQ(engine.execute_calls, 0);
 }
 
@@ -1130,29 +1126,25 @@ TEST(ResourceAddressedExecutionKernelTest,
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   FakeOperationJournal journal;
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("gripper", "gripper.target", "tool.gripper.command",
-                     CoordinateKind::kLinear, schema),
+      {{make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear,
+                     schema),
         &engine}},
       clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
 
   const auto preview = kernel.preview_capability_command(command_operation());
   ASSERT_TRUE(preview.ok()) << preview.error().message;
   EXPECT_EQ(preview.value().binding.program_id.value(), "program.pick");
-  EXPECT_EQ(preview.value().binding.command_target_id.value(),
-            "gripper.target");
-  EXPECT_EQ(preview.value().command_request.joint_name,
-            "mf2_finger_joint");
+  EXPECT_EQ(preview.value().binding.command_target_id.value(), "gripper.target");
+  EXPECT_EQ(preview.value().command_request.joint_name, "mf2_finger_joint");
   EXPECT_DOUBLE_EQ(preview.value().command_request.target_position, 0.02);
   EXPECT_EQ(engine.validate_command_calls, 1);
   EXPECT_EQ(engine.command_calls, 0);
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(journal.calls, (std::vector<std::string>{"begin"}));
-  EXPECT_EQ(kernel.resource_snapshot().front().state,
-            ResourceSlotState::kFree);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
 }
 
-TEST(ResourceAddressedExecutionKernelTest,
-     CapabilityCommandPreviewRejectsBusyTargetWithoutEffect) {
+TEST(ResourceAddressedExecutionKernelTest, CapabilityCommandPreviewRejectsBusyTargetWithoutEffect) {
   FakeClock clock;
   FakeParticipantEngine engine;
   const ProgramCommandSchemaRefDTO schema{
@@ -1160,8 +1152,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   FakeOperationJournal journal;
   ResourceAddressedExecutionKernel kernel(
-      {{make_binding("gripper", "gripper.target", "tool.gripper.command",
-                     CoordinateKind::kLinear, schema),
+      {{make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear,
+                     schema),
         &engine}},
       clock, journal, {RequestOwnerEpoch("kernel.epoch.1"), 8U});
 
@@ -1171,8 +1163,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.command_calls, 0);
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(journal.calls, (std::vector<std::string>{"begin"}));
-  EXPECT_EQ(kernel.resource_snapshot().front().state,
-            ResourceSlotState::kFree);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -1737,6 +1728,106 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(blocked.error().details.at("reason"), "resource_scope_busy");
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(engine.stop_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ReconfigurationPreservesActiveEngineThenSelectsCandidateProduct) {
+  FakeClock clock;
+  FakeParticipantEngine predecessor_engine;
+  FakeParticipantEngine candidate_engine;
+  FakeOperationJournal journal;
+  const auto predecessor_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto candidate_binding = select_candidate_product(predecessor_binding);
+  ResourceAddressedExecutionKernel kernel({{predecessor_binding, &predecessor_engine}}, clock,
+                                          journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+
+  const auto predecessor = kernel.execute(motion_operation("request.motion.predecessor"));
+  ASSERT_TRUE(predecessor.ok()) << predecessor.error().message;
+  ASSERT_TRUE(kernel.participant_engine_in_use(&predecessor_engine));
+
+  const auto reconfigured =
+      kernel.reconfigure_runtime_participants({{candidate_binding, &candidate_engine}});
+  ASSERT_TRUE(reconfigured.ok()) << reconfigured.error().message;
+  EXPECT_TRUE(kernel.participant_engine_in_use(&predecessor_engine));
+  EXPECT_TRUE(kernel.participant_engine_in_use(&candidate_engine));
+  EXPECT_EQ(predecessor_engine.subscription_count(), 1U);
+  EXPECT_EQ(candidate_engine.subscription_count(), 1U);
+  const auto occupied = kernel.resource_snapshot();
+  ASSERT_EQ(occupied.size(), 1U);
+  EXPECT_EQ(occupied.front().state, ResourceSlotState::kReserved);
+  ASSERT_TRUE(occupied.front().owner.has_value());
+  EXPECT_EQ(occupied.front().owner->operation_id, predecessor.value().operation_id);
+
+  predecessor_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+  const auto acknowledged = kernel.acknowledge_completed(
+      control_request("request.ack.predecessor", predecessor.value(), 1U));
+  ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
+  EXPECT_FALSE(kernel.participant_engine_in_use(&predecessor_engine));
+  const auto released = kernel.release_retired_engine(&predecessor_engine);
+  ASSERT_TRUE(released.ok()) << released.error().message;
+  EXPECT_EQ(predecessor_engine.subscription_count(), 0U);
+  EXPECT_EQ(candidate_engine.subscription_count(), 1U);
+
+  const auto candidate = kernel.execute(candidate_motion_operation());
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  EXPECT_EQ(predecessor_engine.execute_calls, 1);
+  EXPECT_EQ(candidate_engine.execute_calls, 1);
+  ASSERT_TRUE(candidate_engine.last_execute.has_value());
+  EXPECT_EQ(candidate_engine.last_execute->binding.retained_bundle_id,
+            RetainedBundleId("bundle.candidate"));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     FailedReconfigurationRollsBackCandidateSubscriptionAndSelection) {
+  FakeClock clock;
+  FakeParticipantEngine predecessor_engine;
+  FakeParticipantEngine candidate_engine;
+  FakeOperationJournal journal;
+  const auto predecessor_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto candidate_value = select_candidate_product(predecessor_binding).value();
+  candidate_value.control_path->active_control_configuration_id =
+      ActiveControlConfigurationId("active.replaced");
+  auto sealed_candidate = verify_runtime_participant_binding(std::move(candidate_value));
+  ASSERT_TRUE(sealed_candidate.ok()) << sealed_candidate.error().message;
+  ResourceAddressedExecutionKernel kernel({{predecessor_binding, &predecessor_engine}}, clock,
+                                          journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+  const auto predecessor = kernel.execute(motion_operation("request.motion.predecessor"));
+  ASSERT_TRUE(predecessor.ok()) << predecessor.error().message;
+
+  const auto rejected = kernel.reconfigure_runtime_participants(
+      {{std::move(sealed_candidate.value()), &candidate_engine}});
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "runtime_active_control_configuration_changed");
+  EXPECT_EQ(predecessor_engine.subscription_count(), 1U);
+  EXPECT_EQ(candidate_engine.subscription_count(), 0U);
+  EXPECT_TRUE(kernel.participant_engine_in_use(&predecessor_engine));
+  EXPECT_FALSE(kernel.participant_engine_in_use(&candidate_engine));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     QuiescentReconfigurationToEmptyRetiresCommandsAndTheOldEngine) {
+  FakeClock clock;
+  FakeParticipantEngine predecessor_engine;
+  FakeOperationJournal journal;
+  const auto predecessor_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel({{predecessor_binding, &predecessor_engine}}, clock,
+                                          journal, {RequestOwnerEpoch("kernel.epoch.1"), 16U});
+
+  const auto reconfigured = kernel.reconfigure_runtime_participants({});
+  ASSERT_TRUE(reconfigured.ok()) << reconfigured.error().message;
+  EXPECT_FALSE(kernel.participant_engine_in_use(&predecessor_engine));
+  const auto released = kernel.release_retired_engine(&predecessor_engine);
+  ASSERT_TRUE(released.ok()) << released.error().message;
+  EXPECT_EQ(predecessor_engine.subscription_count(), 0U);
+  EXPECT_TRUE(kernel.resource_snapshot().empty());
+
+  const auto unavailable = kernel.execute(motion_operation("request.motion.empty-runtime"));
+  ASSERT_FALSE(unavailable.ok());
+  EXPECT_EQ(unavailable.error().details.at("reason"), "runtime_participant_unavailable");
+  EXPECT_EQ(predecessor_engine.execute_calls, 0);
 }
 
 }  // namespace

@@ -204,6 +204,7 @@ add_library(manyforge_component_manager
   src/manager_scene_activation_coordinator.cpp
   src/manager_scene_stage_coordinator.cpp
   src/manager_selected_bundle_transition_coordinator.cpp
+  src/manager_selected_runtime_composition_coordinator.cpp
   src/native_projection_rpc_internal.cpp
   src/native_projection_transition_internal.cpp
   src/manager_bootstrap_journal.cpp
@@ -216,6 +217,7 @@ add_library(manyforge_component_manager
   src/runtime_unit_adapter_router.cpp
   src/scene_staging.cpp
   src/selected_bundle_transition.cpp
+  src/selected_runtime_composition_rpc_internal.cpp
   src/sqlite_store_startup_internal.cpp
 )
 add_library(
@@ -397,6 +399,17 @@ if(BUILD_TESTING)
     manyforge::deployment
     GTest::gtest_main)
   gtest_discover_tests(test_manager_runtime_convergence_coordinator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_selected_runtime_composition_rpc_internal
+    test/test_selected_runtime_composition_rpc_internal.cpp)
+  target_include_directories(
+    test_selected_runtime_composition_rpc_internal PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_selected_runtime_composition_rpc_internal PRIVATE
+    manyforge_component_manager
+    GTest::gtest_main)
+  gtest_discover_tests(test_selected_runtime_composition_rpc_internal
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_native_projection_transition_internal

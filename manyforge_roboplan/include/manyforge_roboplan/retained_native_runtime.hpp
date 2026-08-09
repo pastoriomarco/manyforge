@@ -36,12 +36,20 @@ struct RetainedNativeRuntimeConfig final {
   core::Duration gripper_update_period_ns{10'000'000};
 };
 
+struct RetainedNativeAddressedOwnerConfig final {
+  core::RequestOwnerEpoch request_owner_epoch;
+  core::CellId cell_id;
+  std::filesystem::path operation_journal_path;
+  std::size_t request_replay_capacity{1024U};
+  core::IResourceOperationAdmissionGate *operation_admission_gate{};
+};
+
 using RetainedReferenceResolverFactory =
     std::function<std::shared_ptr<core::IReferencePoseResolver>(
         const std::vector<std::shared_ptr<RetainedObservedStateChannel>> &)>;
 
-using RetainedRuntimeParticipantResolver = std::function<
-    core::Result<core::RuntimeParticipantBinding>(
+using RetainedRuntimeParticipantResolver =
+    std::function<core::Result<core::RuntimeParticipantBinding>(
         const core::OperationIntentDTO &, std::size_t)>;
 
 /// Already-verified inputs to one native runtime composition.
@@ -73,7 +81,7 @@ struct RetainedNativeRuntimeInput final {
   RetainedRuntimeParticipantResolver participant_resolver;
   /// Optional configuration-fence interlock owned by the surrounding managed
   /// execution process. It must outlive this runtime composition.
-  core::IResourceOperationAdmissionGate* operation_admission_gate{};
+  core::IResourceOperationAdmissionGate *operation_admission_gate{};
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public
@@ -96,7 +104,7 @@ struct RetainedNativeRuntime final {
   std::shared_ptr<RetainedObservedStateChannel> motion_state_channel;
   std::shared_ptr<RetainedObservedStateChannel> gripper_state_channel;
 
-  std::unique_ptr<WallClock> clock;
+  std::shared_ptr<WallClock> clock;
   std::unique_ptr<SimpleScheduler> scheduler;
   std::unique_ptr<core::TrajectoryCache> cache;
   std::unique_ptr<RoboPlanPlannerBackend> planner;
@@ -119,9 +127,27 @@ struct RetainedNativeRuntime final {
       lookahead_collision_engines;
 
   std::shared_ptr<core::ExecutionKernel> participant_engine;
+  std::vector<core::RuntimeParticipantExecutionRegistration>
+      participant_registrations;
+  core::RuntimeParticipantAdmissionResolver participant_resolver;
   std::unique_ptr<core::SqliteOperationJournal> operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel> addressed_kernel;
 };
+
+/// Assemble only the product-specific subordinate participant runtime. This
+/// is the preparation boundary for a fenced Apply: it opens no operation
+/// journal and creates no addressed Kernel owner. A supplied clock keeps a
+/// later candidate attached to the same stable owner lifetime.
+[[nodiscard]] std::shared_ptr<RetainedNativeRuntime>
+create_retained_native_runtime_participants(
+    RetainedNativeRuntimeInput input, RetainedNativeRuntimeConfig config,
+    std::shared_ptr<WallClock> shared_clock = {});
+
+/// Attach the sole stable addressed owner to one prepared participant set.
+/// The owner config is process-selected, not supplied by a Program or caller.
+void attach_retained_native_addressed_owner(
+    const std::shared_ptr<RetainedNativeRuntime> &runtime,
+    RetainedNativeAddressedOwnerConfig config);
 
 /// Assemble and seed one production native participant runtime from exact
 /// retained values. Inconsistent projection, planner, state, component, target,

@@ -100,6 +100,40 @@ TEST(SceneRuntimeStateOwner,
 }
 
 TEST(SceneRuntimeStateOwner,
+     AdoptsOnlyMonotonicFinalizedOpenRuntimeWithoutInitializationEffects) {
+  std::int64_t now = 10;
+  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token-1"; });
+  owner.EstablishOpenRuntime(RuntimeIdentity(4U), 4U, "durable_bootstrap");
+
+  EXPECT_FALSE(owner.AdoptFinalizedOpenRuntime(RuntimeIdentity(4U), 4U,
+                                               "durable_apply_finalized"));
+  now = 20;
+  EXPECT_TRUE(owner.AdoptFinalizedOpenRuntime(RuntimeIdentity(6U), 6U,
+                                              "durable_apply_finalized"));
+  const auto adopted = owner.Snapshot();
+  ASSERT_TRUE(adopted.runtime_identity.has_value());
+  EXPECT_EQ(*adopted.runtime_identity, RuntimeIdentity(6U));
+  EXPECT_EQ(adopted.initialization_generation, 6U);
+  EXPECT_EQ(adopted.state, SceneInitializationState::kOpen);
+  EXPECT_FALSE(adopted.initialization_token.has_value());
+  EXPECT_EQ(adopted.counters.closed, 0U);
+  EXPECT_EQ(adopted.counters.opened, 0U);
+
+  EXPECT_THROW(static_cast<void>(owner.AdoptFinalizedOpenRuntime(
+                   RuntimeIdentity(5U), 5U, "stale_apply")),
+               SceneRuntimeStateConflictError);
+  EXPECT_THROW(static_cast<void>(owner.AdoptFinalizedOpenRuntime(
+                   RuntimeIdentity(7U), 6U, "conflicting_apply")),
+               SceneRuntimeStateConflictError);
+
+  static_cast<void>(
+      owner.BeginInitialization(RuntimeIdentity(7U), false, "program_load"));
+  EXPECT_THROW(static_cast<void>(owner.AdoptFinalizedOpenRuntime(
+                   RuntimeIdentity(8U), 8U, "concurrent_apply")),
+               SceneRuntimeStateConflictError);
+}
+
+TEST(SceneRuntimeStateOwner,
      SupersessionAndFailedReplayCannotOpenWithStaleCompletion) {
   std::int64_t now = 10;
   std::uint64_t token_serial = 0U;

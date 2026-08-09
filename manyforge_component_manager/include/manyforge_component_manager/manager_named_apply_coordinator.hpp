@@ -7,6 +7,7 @@
 #include <manyforge_component_manager/manager_scene_activation_coordinator.hpp>
 #include <manyforge_component_manager/manager_scene_stage_coordinator.hpp>
 #include <manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp>
+#include <manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp>
 
 #include <functional>
 #include <mutex>
@@ -85,6 +86,7 @@ public:
       manyforge::core::IManagerSceneProjectionBootstrapPort
           *bootstrap_scene_owner,
       manyforge::core::IManagerKernelApplyFencePort &kernel_fence,
+      IManagerSelectedRuntimeCompositionPort &runtime_composition,
       IRuntimeUnitProcessPort &process_port,
       IRuntimeUnitProgressPort &progress_port,
       manyforge::core::RuntimeEpoch manager_runtime_epoch,
@@ -121,6 +123,7 @@ private:
   ManagerApplyRuntimeConvergenceCoordinator runtime_coordinator_;
   ManagerSceneStageCoordinator scene_stage_coordinator_;
   ManagerSceneActivationCoordinator scene_activation_coordinator_;
+  ManagerSelectedRuntimeCompositionCoordinator runtime_composition_coordinator_;
   ManagerSelectedBundleTransitionCoordinator selected_bundle_coordinator_;
   ManagerApplyFenceReleaseCoordinator fence_release_coordinator_;
   std::mutex operation_mutex_;

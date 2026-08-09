@@ -124,8 +124,8 @@ retained_gripper_limits(const roboplan::Scene &scene,
 }
 
 [[nodiscard]] bool same_provider_runtime(
-    const core::RuntimeCapabilityProviderPathDTO& left,
-    const core::RuntimeCapabilityProviderPathDTO& right) noexcept {
+    const core::RuntimeCapabilityProviderPathDTO &left,
+    const core::RuntimeCapabilityProviderPathDTO &right) noexcept {
   return left.provider_instance_id == right.provider_instance_id &&
          left.provider_manifest_id == right.provider_manifest_id &&
          left.provider_manifest_revision == right.provider_manifest_revision &&
@@ -133,31 +133,31 @@ retained_gripper_limits(const roboplan::Scene &scene,
 }
 
 [[nodiscard]] bool same_supporting_provider_runtime(
-    const std::vector<core::RuntimeCapabilityProviderPathDTO>& primary,
-    const std::vector<core::RuntimeCapabilityProviderPathDTO>& alias) noexcept {
+    const std::vector<core::RuntimeCapabilityProviderPathDTO> &primary,
+    const std::vector<core::RuntimeCapabilityProviderPathDTO> &alias) noexcept {
   return !primary.empty() &&
-         std::all_of(alias.begin(), alias.end(), [&](const auto& candidate) {
-           return std::any_of(primary.begin(), primary.end(),
-                              [&](const auto& selected) {
-                                return same_provider_runtime(selected,
-                                                             candidate);
-                              });
-         }) &&
-         std::all_of(primary.begin(), primary.end(), [&](const auto& selected) {
-           return std::any_of(alias.begin(), alias.end(),
-                              [&](const auto& candidate) {
-                                return same_provider_runtime(selected,
-                                                             candidate);
-                              });
+         std::all_of(alias.begin(), alias.end(),
+                     [&](const auto &candidate) {
+                       return std::any_of(primary.begin(), primary.end(),
+                                          [&](const auto &selected) {
+                                            return same_provider_runtime(
+                                                selected, candidate);
+                                          });
+                     }) &&
+         std::all_of(primary.begin(), primary.end(), [&](const auto &selected) {
+           return std::any_of(
+               alias.begin(), alias.end(), [&](const auto &candidate) {
+                 return same_provider_runtime(selected, candidate);
+               });
          });
 }
 
 [[nodiscard]] bool same_physical_binding(
-    const core::RuntimeParticipantBinding& primary,
-    const core::RuntimeParticipantBinding& alias,
+    const core::RuntimeParticipantBinding &primary,
+    const core::RuntimeParticipantBinding &alias,
     const bool permit_supporting_capability_expansion) noexcept {
-  const auto& left = primary.value();
-  const auto& right = alias.value();
+  const auto &left = primary.value();
+  const auto &right = alias.value();
   return right.contact_grasp_bindings.empty() &&
          left.retained_bundle_id == right.retained_bundle_id &&
          left.graph_revision == right.graph_revision &&
@@ -188,15 +188,12 @@ retained_gripper_limits(const roboplan::Scene &scene,
 } // namespace
 
 std::shared_ptr<RetainedNativeRuntime>
-create_retained_native_runtime(RetainedNativeRuntimeInput input,
-                               RetainedNativeRuntimeConfig config) {
+create_retained_native_runtime_participants(
+    RetainedNativeRuntimeInput input, RetainedNativeRuntimeConfig config,
+    std::shared_ptr<WallClock> shared_clock) {
   if (!input.scene || !input.scene_mutex || !input.state_projector ||
       !input.collision_publisher || !input.planner ||
       !input.collision_shared_model || !input.reference_resolver_factory ||
-      config.request_owner_epoch.empty() || config.cell_id.empty() ||
-      config.operation_journal_path.empty() ||
-      config.request_replay_capacity == 0U ||
-      config.request_replay_capacity > core::kMaxI6OperationReplayEntries ||
       config.kernel.validation_collision_workers < 1 ||
       config.kernel.validation_collision_workers > 64 ||
       config.kernel.runtime_collision_lookahead_workers < 1 ||
@@ -223,7 +220,7 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
       input.gripper_binding_aliases.size();
   if (registration_count > core::kMaxOperationParticipants ||
       std::any_of(input.motion_binding_aliases.begin(),
-                  input.motion_binding_aliases.end(), [&](const auto& alias) {
+                  input.motion_binding_aliases.end(), [&](const auto &alias) {
                     return !same_physical_binding(input.motion_binding, alias,
                                                   true);
                   })) {
@@ -234,8 +231,7 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
        !input.gripper_binding_aliases.empty()) ||
       (input.gripper_binding.has_value() &&
        std::any_of(input.gripper_binding_aliases.begin(),
-                   input.gripper_binding_aliases.end(),
-                   [&](const auto& alias) {
+                   input.gripper_binding_aliases.end(), [&](const auto &alias) {
                      return !same_physical_binding(*input.gripper_binding,
                                                    alias, false);
                    }))) {
@@ -272,7 +268,8 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
   runtime->state_projector = std::move(input.state_projector);
   runtime->collision_publisher = std::move(input.collision_publisher);
 
-  runtime->clock = std::make_unique<WallClock>();
+  runtime->clock = shared_clock != nullptr ? std::move(shared_clock)
+                                           : std::make_shared<WallClock>();
   runtime->scheduler =
       std::make_unique<SimpleScheduler>(std::move(config.scheduler));
   runtime->cache = std::make_unique<core::TrajectoryCache>(config.cache);
@@ -327,8 +324,8 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
         retained_gripper_limits(*runtime->scene, *runtime->gripper_binding);
     runtime->gripper = std::make_unique<RetainedGripperCommandBackend>(
         *runtime->gripper_binding, runtime->gripper_state_channel,
-        *runtime->gripper_position_limits,
-        *runtime->clock, *runtime->scheduler, config.gripper_update_period_ns);
+        *runtime->gripper_position_limits, *runtime->clock, *runtime->scheduler,
+        config.gripper_update_period_ns);
   }
 
   std::vector<std::shared_ptr<RetainedObservedStateChannel>> state_channels{
@@ -397,48 +394,83 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
   std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
   registrations.push_back(
       {runtime->motion_binding, runtime->participant_engine.get()});
-  for (const auto& alias : input.motion_binding_aliases) {
+  for (const auto &alias : input.motion_binding_aliases) {
     registrations.push_back({alias, runtime->participant_engine.get()});
   }
   if (runtime->gripper_binding.has_value()) {
     registrations.push_back(
         {*runtime->gripper_binding, runtime->participant_engine.get()});
   }
-  for (const auto& alias : input.gripper_binding_aliases) {
+  for (const auto &alias : input.gripper_binding_aliases) {
     registrations.push_back({alias, runtime->participant_engine.get()});
   }
   core::RuntimeParticipantAdmissionResolver participant_resolver;
   if (input.participant_resolver) {
     auto binding_resolver = std::move(input.participant_resolver);
-    auto* const participant_engine = runtime->participant_engine.get();
+    auto *const participant_engine = runtime->participant_engine.get();
     participant_resolver =
-        [binding_resolver = std::move(binding_resolver), participant_engine](
-            const core::OperationIntentDTO& operation,
-            const std::size_t participant_index)
-            -> core::Result<core::RuntimeParticipantExecutionRegistration> {
+        [binding_resolver = std::move(binding_resolver),
+         participant_engine](const core::OperationIntentDTO &operation,
+                             const std::size_t participant_index)
+        -> core::Result<core::RuntimeParticipantExecutionRegistration> {
       auto binding = binding_resolver(operation, participant_index);
       if (!binding.ok()) {
-        return core::Result<
-            core::RuntimeParticipantExecutionRegistration>::Err(
+        return core::Result<core::RuntimeParticipantExecutionRegistration>::Err(
             binding.error());
       }
-      return core::Result<
-          core::RuntimeParticipantExecutionRegistration>::Ok(
+      return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
           core::RuntimeParticipantExecutionRegistration{
               std::move(binding.value()), participant_engine});
     };
   }
+  runtime->participant_registrations = std::move(registrations);
+  runtime->participant_resolver = std::move(participant_resolver);
+  return runtime;
+}
+
+void attach_retained_native_addressed_owner(
+    const std::shared_ptr<RetainedNativeRuntime> &runtime,
+    RetainedNativeAddressedOwnerConfig config) {
+  if (runtime == nullptr || runtime->clock == nullptr ||
+      runtime->participant_registrations.empty() ||
+      runtime->participant_engine == nullptr ||
+      runtime->operation_journal != nullptr ||
+      runtime->addressed_kernel != nullptr ||
+      config.request_owner_epoch.empty() || config.cell_id.empty() ||
+      config.operation_journal_path.empty() ||
+      config.request_replay_capacity == 0U ||
+      config.request_replay_capacity > core::kMaxI6OperationReplayEntries) {
+    throw std::invalid_argument(
+        "native addressed-owner attachment is incomplete or duplicated");
+  }
   runtime->operation_journal = std::make_unique<core::SqliteOperationJournal>(
       std::move(config.operation_journal_path), std::move(config.cell_id));
-  runtime->addressed_kernel =
-      std::make_unique<core::ResourceAddressedExecutionKernel>(
-          std::move(registrations), *runtime->clock,
-          *runtime->operation_journal,
-          core::ResourceAddressedExecutionKernelConfig{
-              std::move(config.request_owner_epoch),
-              config.request_replay_capacity,
-              std::move(participant_resolver),
-              input.operation_admission_gate});
+  try {
+    runtime->addressed_kernel =
+        std::make_unique<core::ResourceAddressedExecutionKernel>(
+            runtime->participant_registrations, *runtime->clock,
+            *runtime->operation_journal,
+            core::ResourceAddressedExecutionKernelConfig{
+                std::move(config.request_owner_epoch),
+                config.request_replay_capacity,
+                std::move(runtime->participant_resolver),
+                config.operation_admission_gate});
+  } catch (...) {
+    runtime->operation_journal.reset();
+    throw;
+  }
+}
+
+std::shared_ptr<RetainedNativeRuntime>
+create_retained_native_runtime(RetainedNativeRuntimeInput input,
+                               RetainedNativeRuntimeConfig config) {
+  RetainedNativeAddressedOwnerConfig owner_config{
+      std::move(config.request_owner_epoch), std::move(config.cell_id),
+      std::move(config.operation_journal_path), config.request_replay_capacity,
+      input.operation_admission_gate};
+  auto runtime = create_retained_native_runtime_participants(std::move(input),
+                                                             std::move(config));
+  attach_retained_native_addressed_owner(runtime, std::move(owner_config));
   return runtime;
 }
 

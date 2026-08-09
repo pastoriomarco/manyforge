@@ -328,6 +328,42 @@ void SceneRuntimeStateOwner::EstablishOpenRuntime(
   updated_at_ns_ = now;
 }
 
+bool SceneRuntimeStateOwner::AdoptFinalizedOpenRuntime(
+    SceneRuntimeIdentity identity,
+    const std::uint64_t initialization_generation, std::string reason) {
+  ValidateIdentity(identity);
+  ValidateSafeInteger(initialization_generation, "initialization_generation",
+                      true);
+  ValidateText(reason, "reason", kMaximumReasonBytes);
+  const auto now = Now();
+  std::lock_guard lock(mutex_);
+  if (state_ != SceneInitializationState::kOpen ||
+      initialization_token_.has_value() || !runtime_identity_.has_value()) {
+    throw SceneRuntimeStateConflictError(
+        "scene runtime state owner: finalized runtime adoption requires one "
+        "already-open runtime");
+  }
+  if (initialization_generation == initialization_generation_) {
+    if (identity != *runtime_identity_) {
+      throw SceneRuntimeStateConflictError(
+          "scene runtime state owner: finalized runtime generation "
+          "conflicts");
+    }
+    return false;
+  }
+  if (initialization_generation < initialization_generation_) {
+    throw SceneRuntimeStateConflictError(
+        "scene runtime state owner: finalized runtime generation is stale");
+  }
+  initialization_generation_ = initialization_generation;
+  runtime_identity_ = std::move(identity);
+  reason_ = std::move(reason);
+  error_.reset();
+  started_at_ns_ = now;
+  updated_at_ns_ = now;
+  return true;
+}
+
 std::string SceneRuntimeStateOwner::BeginInitialization(
     SceneRuntimeIdentity candidate, const bool deferred, std::string reason) {
   ValidateIdentity(candidate);

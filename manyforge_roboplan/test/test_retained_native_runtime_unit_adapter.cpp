@@ -14,6 +14,7 @@
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
@@ -33,6 +34,7 @@ namespace manyforge::roboplan_backend {
 namespace {
 
 namespace component_manager = manyforge::component_manager;
+namespace content_identity = manyforge::content_identity;
 namespace contract = manyforge::deployment::native_execution_runtime_contract;
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
@@ -296,8 +298,7 @@ NativeProjectionBinding(const NativeFixture &fixture,
       fixture.bundle->value().capability_provider_bindings.begin(),
       fixture.bundle->value().capability_provider_bindings.end(),
       [&](const auto &binding) {
-        if (binding.capability_id.value() !=
-                "planning.motion.joint_goal" ||
+        if (binding.capability_id.value() != "planning.motion.joint_goal" ||
             !core::RequiresNativeSceneProjection(
                 binding.capability_id,
                 binding.capability_definition_revision)) {
@@ -345,11 +346,11 @@ PhysicalConfigurationScope(const NativeFixture &fixture) {
   }
   std::vector<core::ConfigurationFenceDomainScopeDTO> domains;
   for (const auto &domain_id : domain_ids) {
-    const auto found = std::find_if(
-        graph.control_domains.begin(), graph.control_domains.end(),
-        [&](const auto &domain) {
-          return domain.control_domain_id == domain_id;
-        });
+    const auto found =
+        std::find_if(graph.control_domains.begin(), graph.control_domains.end(),
+                     [&](const auto &domain) {
+                       return domain.control_domain_id == domain_id;
+                     });
     if (found == graph.control_domains.end()) {
       throw std::logic_error(
           "native adapter fixture control domain is unresolved");
@@ -358,13 +359,14 @@ PhysicalConfigurationScope(const NativeFixture &fixture) {
         domain_id, found->control_domain_revision,
         found->control_domain_revision});
   }
-  std::sort(bindings.begin(), bindings.end(), [](const auto &left,
-                                                 const auto &right) {
-    return left.control_binding_id < right.control_binding_id;
-  });
-  core::ConfigurationFenceScopeDTO scope{
-      {components.begin(), components.end()}, std::move(domains),
-      std::move(bindings), {resources.begin(), resources.end()}};
+  std::sort(bindings.begin(), bindings.end(),
+            [](const auto &left, const auto &right) {
+              return left.control_binding_id < right.control_binding_id;
+            });
+  core::ConfigurationFenceScopeDTO scope{{components.begin(), components.end()},
+                                         std::move(domains),
+                                         std::move(bindings),
+                                         {resources.begin(), resources.end()}};
   if (!scope.valid()) {
     throw std::logic_error(
         "native adapter physical configuration scope is invalid");
@@ -372,9 +374,9 @@ PhysicalConfigurationScope(const NativeFixture &fixture) {
   return scope;
 }
 
-[[nodiscard]] bool WaitForRegularFile(
-    const std::filesystem::path &path,
-    const std::chrono::steady_clock::duration timeout) {
+[[nodiscard]] bool
+WaitForRegularFile(const std::filesystem::path &path,
+                   const std::chrono::steady_clock::duration timeout) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     std::error_code error;
@@ -657,10 +659,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
             core::NativeProjectionBootstrapRebuildState::kRebuilt);
   EXPECT_TRUE(
       bootstrapped.resulting_health.healthy_for_target(initial_revision));
-  EXPECT_TRUE(WaitForRegularFile(
-      fixture.staging_root.path() /
-          std::string(core::kOperationJournalFilename),
-      std::chrono::seconds(10)))
+  EXPECT_TRUE(
+      WaitForRegularFile(fixture.staging_root.path() /
+                             std::string(core::kOperationJournalFilename),
+                         std::chrono::seconds(10)))
       << "the managed child did not compose the active physical product";
 
   const auto physical_scope = PhysicalConfigurationScope(fixture);
@@ -681,9 +683,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
           core::RequestId("native-physical-fence-request-1"),
           core::RequestOwnerEpoch("manager-owner-physical-fence-test"),
           "retained-native-adapter-test", std::nullopt},
-      core::ApplyFenceOwnerDTO{
-          core::ApplyId("native-physical-fence-apply-1"),
-          core::ApplyGeneration(1U)},
+      core::ApplyFenceOwnerDTO{core::ApplyId("native-physical-fence-apply-1"),
+                               core::ApplyGeneration(1U)},
       physical_scope,
       core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       fixture.bundle->retained_bundle_id(),
@@ -703,11 +704,51 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       physical_fence.captured_scope, manager_epoch};
   const auto physical_held = adapter.QueryStatus(physical_status_query);
   ASSERT_TRUE(physical_held.matches(physical_status_query));
-  EXPECT_EQ(physical_held.reconciliation_evidence
-                .active_control_configurations,
+  EXPECT_EQ(physical_held.reconciliation_evidence.active_control_configurations,
             admission.active_control_configurations);
+  const auto canonical_bundle = fixture.bundle->canonical_bytes();
+  ASSERT_FALSE(canonical_bundle.empty());
+  const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
+      composition_request{
+          initial_scene.shared()->revision.content_hash,
+          physical_fence_intent.owner_transaction.apply_id,
+          physical_fence_intent.owner_transaction.apply_generation,
+          core::ProjectionStageGeneration(1U),
+          initial_revision,
+          publication.publication_generation,
+          publication.durable_public_pointer_content_digest,
+          core::ContentDigest(
+              content_identity::sha256_digest(canonical_bundle)),
+          static_cast<std::uint64_t>(canonical_bundle.size()),
+          fixture.query->plan.runtime_unit_id,
+          first_epoch,
+          manager_epoch,
+          physical_fence.configuration_fence_id,
+          physical_fence.configuration_fence_generation,
+          physical_fence.captured_scope,
+      };
+  ASSERT_TRUE(composition_request.valid());
+  auto composition = adapter.InstallOrObserve(composition_request);
+  const auto composition_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (composition.state ==
+             component_manager::ManagerSelectedRuntimeCompositionState::
+                 kPreparing &&
+         std::chrono::steady_clock::now() < composition_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    composition = adapter.InstallOrObserve(composition_request);
+  }
+  ASSERT_EQ(
+      composition.state,
+      component_manager::ManagerSelectedRuntimeCompositionState::kInstalled);
+  const auto physical_reconfigured = adapter.QueryStatus(physical_status_query);
+  ASSERT_TRUE(physical_reconfigured.matches(physical_status_query));
+  EXPECT_GT(
+      physical_reconfigured.reconciliation_evidence
+          .operation_resource_generation,
+      physical_held.reconciliation_evidence.operation_resource_generation);
   const core::ConfigurationFenceReleaseDTO physical_release{
-      physical_held.reconciliation_evidence, manager_epoch};
+      physical_reconfigured.reconciliation_evidence, manager_epoch};
   EXPECT_TRUE(adapter.Release(physical_release).valid());
 
   ASSERT_FALSE(fixture.bundle->value().cell_graph.control_bindings.empty());

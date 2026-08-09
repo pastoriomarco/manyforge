@@ -2,6 +2,7 @@
 
 #include "kernel_apply_fence_rpc_internal.hpp"
 #include "native_projection_rpc_internal.hpp"
+#include "selected_runtime_composition_rpc_internal.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -276,16 +277,13 @@ FindRuntimeUnit(const RetainedBundle &bundle,
   return *found;
 }
 
-[[nodiscard]] std::set<ProjectionBindingKey>
-NativeProjectionBindingsForRuntime(
+[[nodiscard]] std::set<ProjectionBindingKey> NativeProjectionBindingsForRuntime(
     const RetainedBundle &bundle,
     const manyforge::core::RuntimeUnitId &runtime_unit_id) {
   std::set<ProjectionBindingKey> result;
-  for (const auto &binding :
-       bundle.value().capability_provider_bindings) {
+  for (const auto &binding : bundle.value().capability_provider_bindings) {
     if (!manyforge::core::RequiresNativeSceneProjection(
-            binding.capability_id,
-            binding.capability_definition_revision)) {
+            binding.capability_id, binding.capability_definition_revision)) {
       continue;
     }
     std::set<manyforge::core::RuntimeUnitId> runtime_sources;
@@ -531,8 +529,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
           configuration_identity(std::move(selected_configuration_identity)),
           implementation_revision(std::move(selected_implementation_revision)),
           admitted_projection_bindings(
-              std::move(selected_projection_bindings)) {
-    }
+              std::move(selected_projection_bindings)) {}
 
     Child(const Child &) = delete;
     Child &operator=(const Child &) = delete;
@@ -550,9 +547,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
            &selected_artifact_source,
        std::string selected_operating_system,
        std::string selected_launch_environment_contract)
-      : target_root_path(NormalizedPlainDirectory(
-            std::move(trusted_installed_target_root),
-            "trusted installed-target root")),
+      : target_root_path(
+            NormalizedPlainDirectory(std::move(trusted_installed_target_root),
+                                     "trusted installed-target root")),
         package_root_path(NormalizedPlainDirectory(
             std::move(trusted_package_root), "trusted retained-package root")),
         manager_state_root_path(NormalizedPlainDirectory(
@@ -665,8 +662,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     Fail("native runtime child observation returned a foreign PID");
   }
 
-  [[nodiscard]] detail::NativeProjectionRpcResponse ExchangeProjectionRaw(
-      Child &child, const detail::NativeProjectionRpcRequest &request) {
+  [[nodiscard]] detail::NativeProjectionRpcResponse
+  ExchangeProjectionRaw(Child &child,
+                        const detail::NativeProjectionRpcRequest &request) {
     const auto encoded = detail::EncodeNativeProjectionRpcRequest(request);
     SendPacket(child.channel.get(), encoded, kStatusTimeout);
     const auto packet = ReceivePacket(child.channel.get(), kStatusTimeout);
@@ -677,8 +675,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     return response;
   }
 
-  [[nodiscard]] detail::NativeProjectionRpcResponse ExchangeProjection(
-      Child &child, const detail::NativeProjectionRpcRequest &request) {
+  [[nodiscard]] detail::NativeProjectionRpcResponse
+  ExchangeProjection(Child &child,
+                     const detail::NativeProjectionRpcRequest &request) {
     auto response = ExchangeProjectionRaw(child, request);
     if (const auto *failure =
             std::get_if<detail::NativeProjectionRpcFailure>(&response)) {
@@ -785,6 +784,47 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     return *typed;
   }
 
+  [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO
+  InstallOrObserveRuntimeComposition(
+      const ManagerSelectedRuntimeCompositionRequestDTO &request) {
+    if (!request.valid()) {
+      Fail("selected runtime-composition request is invalid");
+    }
+    std::lock_guard lock(mutex);
+    const auto found = children.find(request.runtime_unit_id.value());
+    if (found == children.end() ||
+        found->second.runtime_epoch != request.runtime_epoch) {
+      Fail("selected runtime composition no longer names the current child "
+           "epoch");
+    }
+    if (!ChildIsLive(found->second)) {
+      children.erase(found);
+      Fail("managed runtime child exited before its composition response");
+    }
+    const auto encoded =
+        detail::EncodeSelectedRuntimeCompositionRpcRequest(request);
+    SendPacket(found->second.channel.get(), encoded, kStatusTimeout);
+    const auto packet =
+        ReceivePacket(found->second.channel.get(), kStatusTimeout);
+    if (!packet.has_value()) {
+      Fail("managed runtime-composition response timed out");
+    }
+    auto response =
+        detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
+    if (const auto *failure =
+            std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(
+                &response)) {
+      Fail("managed runtime-composition request failed [" +
+           failure->error.code + "]: " + failure->error.message);
+    }
+    const auto *result =
+        std::get_if<ManagerSelectedRuntimeCompositionResultDTO>(&response);
+    if (result == nullptr || !result->valid() || result->request != request) {
+      Fail("managed runtime child returned foreign composition evidence");
+    }
+    return *result;
+  }
+
   void PrepareChildProjectionBindings(
       Child &child, const RetainedBundle &bundle,
       const manyforge::core::RuntimeUnitId &runtime_unit_id) {
@@ -808,8 +848,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       if (previous != child.prepared_projection_products.end() &&
           previous->second.retained_bundle_id ==
               request.candidate_retained_bundle_id &&
-          previous->second.graph_revision ==
-              request.candidate_graph_revision &&
+          previous->second.graph_revision == request.candidate_graph_revision &&
           previous->second.planning_collision_model ==
               request.planning_collision_model) {
         continue;
@@ -830,12 +869,12 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
              "binding and product");
       }
       child.admitted_projection_bindings.emplace(provider_binding_id,
-                                                  provider_binding_revision);
+                                                 provider_binding_revision);
       child.prepared_projection_products.insert_or_assign(
-          key, Child::ProjectionPreparation{
-                   request.candidate_retained_bundle_id,
-                   request.candidate_graph_revision,
-                   request.planning_collision_model});
+          key,
+          Child::ProjectionPreparation{request.candidate_retained_bundle_id,
+                                       request.candidate_graph_revision,
+                                       request.planning_collision_model});
     }
   }
 
@@ -1139,9 +1178,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 class RetainedNativeRuntimeUnitAdapter::Impl::ProjectionClient final
     : public manyforge::core::IPlannerSceneProjection {
 public:
-  ProjectionClient(
-      std::shared_ptr<Impl> adapter,
-      manyforge::core::ProjectionNativeRuntimeBindingDTO binding)
+  ProjectionClient(std::shared_ptr<Impl> adapter,
+                   manyforge::core::ProjectionNativeRuntimeBindingDTO binding)
       : adapter_(std::move(adapter)), binding_(std::move(binding)) {}
 
   [[noreturn]] static void Unavailable(const std::string_view operation) {
@@ -1152,8 +1190,8 @@ public:
   manyforge::core::ProjectionCommitResultDTO ApplyTransaction(
       const manyforge::core::SceneTransactionDTO &transaction) override {
     return adapter_->ProjectionCall<manyforge::core::ProjectionCommitResultDTO>(
-        binding_, detail::NativeProjectionTransactionRequest{binding_,
-                                                              transaction});
+        binding_,
+        detail::NativeProjectionTransactionRequest{binding_, transaction});
   }
 
   manyforge::core::Result<manyforge::core::CollisionWorldLeaseInventory>
@@ -1166,24 +1204,24 @@ public:
   RetainProjectionBinding(
       const manyforge::core::ProjectionRevisionDTO &revision,
       manyforge::core::ProjectionLeaseId lease_id) override {
-    auto result = adapter_->ProjectionResultCall<
-        detail::NativeProjectionRetainResult>(
-        binding_, detail::NativeProjectionRetainRequest{
-                      binding_, revision, std::move(lease_id)});
+    auto result =
+        adapter_->ProjectionResultCall<detail::NativeProjectionRetainResult>(
+            binding_, detail::NativeProjectionRetainRequest{
+                          binding_, revision, std::move(lease_id)});
     if (!result.ok()) {
       return manyforge::core::Result<
           manyforge::core::ProjectionLeaseBindingDTO>::Err(result.error());
     }
-    return manyforge::core::Result<
-        manyforge::core::ProjectionLeaseBindingDTO>::Ok(
-        std::move(result.value().projection_binding));
+    return manyforge::core::Result<manyforge::core::ProjectionLeaseBindingDTO>::
+        Ok(std::move(result.value().projection_binding));
   }
 
   void ReleaseProjection(
       const manyforge::core::ProjectionLeaseId &lease_id) override {
-    const auto released = adapter_->ProjectionCall<
-        detail::NativeProjectionReleaseResult>(
-        binding_, detail::NativeProjectionReleaseRequest{binding_, lease_id});
+    const auto released =
+        adapter_->ProjectionCall<detail::NativeProjectionReleaseResult>(
+            binding_,
+            detail::NativeProjectionReleaseRequest{binding_, lease_id});
     if (released.projection_lease_id != lease_id) {
       Fail("native projection released a different lease");
     }
@@ -1210,69 +1248,74 @@ public:
   }
 
   manyforge::core::NativeProjectionBootstrapStatusDTO BootstrapProjectionStatus(
-      const manyforge::core::NativeProjectionBootstrapStatusQueryDTO &request) const
-      override {
-    return adapter_->ProjectionCall<
-        manyforge::core::NativeProjectionBootstrapStatusDTO>(binding_,
-                                                              request);
+      const manyforge::core::NativeProjectionBootstrapStatusQueryDTO &request)
+      const override {
+    return adapter_
+        ->ProjectionCall<manyforge::core::NativeProjectionBootstrapStatusDTO>(
+            binding_, request);
   }
 
   manyforge::core::NativeProjectionStageResultDTO StageProjection(
       const manyforge::core::NativeProjectionStageDTO &request) override {
-    return adapter_->ProjectionCall<
-        manyforge::core::NativeProjectionStageResultDTO>(binding_, request);
+    return adapter_
+        ->ProjectionCall<manyforge::core::NativeProjectionStageResultDTO>(
+            binding_, request);
   }
 
-  manyforge::core::NativeProjectionActivationResultDTO
-  ActivateStagedProjection(
+  manyforge::core::NativeProjectionActivationResultDTO ActivateStagedProjection(
       const manyforge::core::NativeProjectionActivationDTO &request) override {
-    return adapter_->ProjectionCall<
-        manyforge::core::NativeProjectionActivationResultDTO>(binding_,
-                                                               request);
+    return adapter_
+        ->ProjectionCall<manyforge::core::NativeProjectionActivationResultDTO>(
+            binding_, request);
   }
 
   manyforge::core::NativeProjectionRetireResultDTO RetireProjection(
       const manyforge::core::NativeProjectionRetireDTO &request) override {
-    return adapter_->ProjectionCall<
-        manyforge::core::NativeProjectionRetireResultDTO>(binding_, request);
+    return adapter_
+        ->ProjectionCall<manyforge::core::NativeProjectionRetireResultDTO>(
+            binding_, request);
   }
 
   manyforge::core::NativeProjectionRetireStatusDTO ProjectionRetireStatus(
-      const manyforge::core::NativeProjectionRetireStatusQueryDTO &request) const
-      override {
-    return adapter_->ProjectionCall<
-        manyforge::core::NativeProjectionRetireStatusDTO>(binding_, request);
+      const manyforge::core::NativeProjectionRetireStatusQueryDTO &request)
+      const override {
+    return adapter_
+        ->ProjectionCall<manyforge::core::NativeProjectionRetireStatusDTO>(
+            binding_, request);
   }
 
   manyforge::core::NativeProjectionDiscardResultDTO DiscardStagedProjection(
       const manyforge::core::NativeProjectionDiscardDTO &request) override {
-    return adapter_->ProjectionCall<
-        manyforge::core::NativeProjectionDiscardResultDTO>(binding_, request);
+    return adapter_
+        ->ProjectionCall<manyforge::core::NativeProjectionDiscardResultDTO>(
+            binding_, request);
   }
 
   manyforge::core::NativeProjectionStatusDTO ProjectionStageStatus(
-      const manyforge::core::NativeProjectionStatusQueryDTO &request) const override {
+      const manyforge::core::NativeProjectionStatusQueryDTO &request)
+      const override {
     return adapter_->ProjectionCall<manyforge::core::NativeProjectionStatusDTO>(
         binding_, request);
   }
 
   manyforge::core::Result<manyforge::core::SceneFrameResolutionReceiptDTO>
-  ResolveSceneFrame(
-      const manyforge::core::SceneFrameResolutionQueryDTO &query) const override {
-    return adapter_->ProjectionResultCall<
-        manyforge::core::SceneFrameResolutionReceiptDTO>(
-        binding_, detail::NativeProjectionSceneFrameRequest{binding_, query});
+  ResolveSceneFrame(const manyforge::core::SceneFrameResolutionQueryDTO &query)
+      const override {
+    return adapter_
+        ->ProjectionResultCall<manyforge::core::SceneFrameResolutionReceiptDTO>(
+            binding_,
+            detail::NativeProjectionSceneFrameRequest{binding_, query});
   }
 
   manyforge::core::Result<manyforge::core::CollisionPolicySnapshot>
   ProjectEffectiveCollisionPolicy(
       const manyforge::core::LogicalSceneSnapshotDTO &logical_scene,
       const std::uint64_t effective_policy_revision_id) const override {
-    return adapter_->ProjectionResultCall<
-        manyforge::core::CollisionPolicySnapshot>(
-        binding_, detail::NativeProjectionEffectivePolicyRequest{
-                      binding_, logical_scene,
-                      effective_policy_revision_id});
+    return adapter_
+        ->ProjectionResultCall<manyforge::core::CollisionPolicySnapshot>(
+            binding_,
+            detail::NativeProjectionEffectivePolicyRequest{
+                binding_, logical_scene, effective_policy_revision_id});
   }
 
 private:
@@ -1285,9 +1328,10 @@ manyforge::core::Result<
 RetainedNativeRuntimeUnitAdapter::Impl::ResolveProjection(
     const manyforge::core::ProjectionNativeRuntimeBindingDTO &binding) {
   const auto missing = [](std::string message) {
-    return manyforge::core::Result<
-        std::shared_ptr<manyforge::core::IPlannerSceneProjection>>::Err(
-        manyforge::core::ErrorDTO{"missing_reference", std::move(message), {}});
+    return manyforge::core::
+        Result<std::shared_ptr<manyforge::core::IPlannerSceneProjection>>::Err(
+            manyforge::core::ErrorDTO{
+                "missing_reference", std::move(message), {}});
   };
   if (!binding.valid()) {
     return missing("native projection binding is invalid");
@@ -1310,9 +1354,9 @@ RetainedNativeRuntimeUnitAdapter::Impl::ResolveProjection(
           "the verified child product does not own the projection binding");
     }
   }
-  return manyforge::core::Result<
-      std::shared_ptr<manyforge::core::IPlannerSceneProjection>>::Ok(
-      std::make_shared<ProjectionClient>(shared_from_this(), binding));
+  return manyforge::core::
+      Result<std::shared_ptr<manyforge::core::IPlannerSceneProjection>>::Ok(
+          std::make_shared<ProjectionClient>(shared_from_this(), binding));
 }
 
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
@@ -1324,13 +1368,12 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
     std::string operating_system, std::string launch_environment_contract)
-    : impl_(std::make_shared<Impl>(std::move(trusted_installed_target_root),
-                                   std::move(trusted_package_root),
-                                   std::move(manager_state_root),
-                                   std::move(private_staging_root),
-                                   bundle_source, artifact_source,
-                                   std::move(operating_system),
-                                   std::move(launch_environment_contract))) {}
+    : impl_(std::make_shared<Impl>(
+          std::move(trusted_installed_target_root),
+          std::move(trusted_package_root), std::move(manager_state_root),
+          std::move(private_staging_root), bundle_source, artifact_source,
+          std::move(operating_system),
+          std::move(launch_environment_contract))) {}
 
 RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;
 
@@ -1404,6 +1447,12 @@ RetainedNativeRuntimeUnitAdapter::ResolveProjection(
     const manyforge::core::ProjectionNativeRuntimeBindingDTO
         &native_runtime_binding) const {
   return impl_->ResolveProjection(native_runtime_binding);
+}
+
+ManagerSelectedRuntimeCompositionResultDTO
+RetainedNativeRuntimeUnitAdapter::InstallOrObserve(
+    const ManagerSelectedRuntimeCompositionRequestDTO &request) {
+  return impl_->InstallOrObserveRuntimeComposition(request);
 }
 
 } // namespace manyforge::component_manager

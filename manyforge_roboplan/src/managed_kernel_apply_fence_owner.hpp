@@ -33,10 +33,10 @@ public:
 
   [[nodiscard]] std::shared_ptr<std::recursive_mutex>
   shared_admission_mutex() const override;
-  [[nodiscard]] manyforge::core::Result<void> reserve(
-      manyforge::core::ResourceSlotTable &table,
-      const manyforge::core::ResourceSlotOwnerDTO &owner,
-      const std::vector<manyforge::core::ResourceId> &resources) override;
+  [[nodiscard]] manyforge::core::Result<void>
+  reserve(manyforge::core::ResourceSlotTable &table,
+          const manyforge::core::ResourceSlotOwnerDTO &owner,
+          const std::vector<manyforge::core::ResourceId> &resources) override;
 
   /// Attach the exact table owned by the currently composed addressed Kernel.
   /// The gate keeps only a weak reference and owns no duplicate operation or
@@ -50,14 +50,21 @@ public:
       const manyforge::core::ConfigurationFenceId &fence_id,
       const manyforge::core::ConfigurationFenceScopeDTO &scope,
       std::uint64_t expected_operation_resource_generation,
-      const std::vector<
-          manyforge::core::DomainActiveControlConfigurationDTO>
+      const std::vector<manyforge::core::DomainActiveControlConfigurationDTO>
           &expected_active_control_configurations,
       const std::function<void()> &commit_durable_fence);
   void RestoreFence(const manyforge::core::ConfigurationFenceId &fence_id,
                     const manyforge::core::ConfigurationFenceScopeDTO &scope);
   void ReleaseFence(const manyforge::core::ConfigurationFenceId &fence_id,
                     const manyforge::core::ConfigurationFenceScopeDTO &scope);
+
+  /// Execute one bounded in-process installation step only while the exact
+  /// durable fence remains held. This is an Apply interlock, not caller
+  /// authorization; the fence owner separately validates its generation.
+  void RunWithExactHeldFence(
+      const manyforge::core::ConfigurationFenceId &fence_id,
+      const manyforge::core::ConfigurationFenceScopeDTO &scope,
+      const std::function<void()> &effect);
 
   ManagedKernelAdmissionGate(const ManagedKernelAdmissionGate &) = delete;
   ManagedKernelAdmissionGate &

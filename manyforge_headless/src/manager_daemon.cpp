@@ -722,8 +722,8 @@ public:
             stores_.apply_journal(), plan_source_, bundle_source_,
             artifact_source_, stores_.active_bundle_publication_store(),
             scene_owner_, &scene_owner_, native_runtime_adapter_,
-            runtime_adapter_router_, runtime_adapter_router_,
-            manager_runtime_epoch_, "linux",
+            native_runtime_adapter_, runtime_adapter_router_,
+            runtime_adapter_router_, manager_runtime_epoch_, "linux",
             {std::string(deployment::native_execution_runtime_contract::
                              kLaunchEnvironmentContract)},
             [this] { return ElapsedNs(); },
@@ -833,6 +833,78 @@ private:
     Fail("canonical-empty bootstrap did not finalize within its bounded steps");
   }
 
+  struct FinalizedSceneRuntimeSelection final {
+    core::ProjectionRevisionDTO projection_revision;
+    core::ActiveBundlePublicationGeneration publication_generation;
+  };
+
+  [[nodiscard]] FinalizedSceneRuntimeSelection SelectFinalizedSceneRuntime(
+      const core::ActiveBundlePublicationReceiptDTO &active_publication) {
+    Require(active_publication.valid(),
+            "scene-runtime selection received an invalid active pointer");
+    const auto *named = std::get_if<core::NamedApplyPublicationTransactionDTO>(
+        &active_publication.request.transaction_ref);
+    if (named == nullptr) {
+      Require(std::holds_alternative<core::BootstrapPublicationTransactionDTO>(
+                  active_publication.request.transaction_ref),
+              "scene-runtime active pointer has an unknown transaction");
+      return {active_publication.request.candidate_projection_revision,
+              active_publication.publication_generation};
+    }
+
+    const auto finalized = stores_.apply_journal().ReadSceneFinalized(
+        named->apply_id, named->apply_generation);
+    if (finalized.has_value()) {
+      const auto &result = finalized->scene_finalized.finalized_result;
+      Require(
+          result.state ==
+                  core::ProjectionApplyFinalizeResultState::kFinalized &&
+              result.apply_id == named->apply_id &&
+              result.apply_generation == named->apply_generation &&
+              result.projection_stage_generation ==
+                  named->projection_stage_generation &&
+              result.candidate_projection_revision ==
+                  active_publication.request.candidate_projection_revision &&
+              result.publication_receipt == active_publication,
+          "scene-runtime finalized evidence differs from the active "
+          "publication");
+      return {active_publication.request.candidate_projection_revision,
+              active_publication.publication_generation};
+    }
+
+    const auto intent = stores_.apply_journal().ReadIntent(
+        named->apply_id, named->apply_generation);
+    const auto stage = stores_.apply_journal().ReadSceneStageIntent(
+        named->apply_id, named->apply_generation);
+    const auto activation = stores_.apply_journal().ReadActivationSelection(
+        named->apply_id, named->apply_generation);
+    Require(intent.has_value() && stage.has_value() && activation.has_value() &&
+                intent->intent.candidate_retained_bundle_id ==
+                    active_publication.request.candidate_retained_bundle_id &&
+                intent->intent.candidate_graph_revision ==
+                    active_publication.request.candidate_graph_revision &&
+                activation->activation_selection
+                        .projection_stage_generation ==
+                    named->projection_stage_generation &&
+                activation->activation_selection
+                        .candidate_projection_revision ==
+                    active_publication.request
+                        .candidate_projection_revision &&
+                stage->scene_stage_intent.candidate_retained_bundle_id ==
+                    active_publication.request.candidate_retained_bundle_id &&
+                stage->scene_stage_intent.candidate_graph_revision ==
+                    active_publication.request.candidate_graph_revision &&
+                active_publication.request
+                        .expected_previous_publication_generation ==
+                    std::optional<core::ActiveBundlePublicationGeneration>{
+                        stage->scene_stage_intent
+                            .predecessor_publication_generation},
+            "unfinalized scene-runtime publication lacks its exact durable "
+            "predecessor evidence");
+    return {intent->intent.expected_active_projection_revision,
+            stage->scene_stage_intent.predecessor_publication_generation};
+  }
+
   PublicationGenerations ReconcileAndPublish() {
     const auto runtime = active_runtime_.Reconcile();
     kernel_apply_available_ = HasConvergedKernelApplyOwner(runtime);
@@ -870,18 +942,36 @@ private:
       }
     }
     const auto observed_at = static_cast<std::int64_t>(ElapsedNs());
+    const auto finalized_scene_runtime =
+        SelectFinalizedSceneRuntime(runtime.plan.active_publication);
+    const auto finalized_bundle =
+        finalized_scene_runtime.projection_revision.retained_bundle_id ==
+                bundle_id
+            ? active_bundle
+            : bundle_source_.get_verified(
+                  finalized_scene_runtime.projection_revision
+                      .retained_bundle_id);
+    Require(finalized_bundle != nullptr &&
+                finalized_bundle->value().cell_graph.graph_revision ==
+                    finalized_scene_runtime.projection_revision.graph_revision,
+            "finalized scene-runtime identity has no exact verified bundle");
+    const auto publication_generation =
+        finalized_scene_runtime.publication_generation.value();
+    const SceneRuntimeIdentity desired_scene_runtime{
+        finalized_bundle->retained_bundle_id().value(),
+        finalized_bundle->value().cell_graph.graph_revision.value(),
+        publication_generation,
+        0U,
+        publication_generation,
+    };
     if (scene_runtime_owner_.Snapshot().initialization_generation == 0U) {
-      const auto publication_generation =
-          runtime.plan.active_publication.publication_generation.value();
       scene_runtime_owner_.EstablishOpenRuntime(
-          SceneRuntimeIdentity{
-              active_bundle->retained_bundle_id().value(),
-              active_bundle->value().cell_graph.graph_revision.value(),
-              publication_generation,
-              0U,
-              publication_generation,
-          },
-          publication_generation, "durable_bootstrap");
+          desired_scene_runtime, publication_generation,
+          "durable_finalized_active_projection");
+    } else {
+      static_cast<void>(scene_runtime_owner_.AdoptFinalizedOpenRuntime(
+          desired_scene_runtime, publication_generation,
+          "durable_finalized_active_projection"));
     }
     const auto manager = manager_channel_.Publish(
         "component_manager", manager_owner_id_, manager_owner_epoch_,

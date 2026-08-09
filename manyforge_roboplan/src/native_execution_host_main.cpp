@@ -66,6 +66,7 @@
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "native_projection_rpc_internal.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
+#include "selected_runtime_composition_rpc_internal.hpp"
 
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
 #include "focused_pick_place_planning_fixture.hpp"
@@ -81,8 +82,10 @@ namespace deployment = manyforge::deployment;
 
 using content_identity::CanonicalValue;
 
-constexpr std::string_view kCommandApiVersion = "manyforge.execution_command.v1";
-constexpr std::string_view kResponseApiVersion = "manyforge.execution_command_response.v1";
+constexpr std::string_view kCommandApiVersion =
+    "manyforge.execution_command.v1";
+constexpr std::string_view kResponseApiVersion =
+    "manyforge.execution_command_response.v1";
 constexpr std::string_view kSocketFileName = "execution-command.sock";
 constexpr std::string_view kControlSocketFileName = "execution-control.sock";
 constexpr std::string_view kLockFileName = ".execution-host.lock";
@@ -99,22 +102,21 @@ constexpr int kClientPacketDeadlineMilliseconds = 100;
 
 volatile sig_atomic_t g_stop_requested = 0;
 
-void HandleStopSignal(int) {
-  g_stop_requested = 1;
-}
+void HandleStopSignal(int) { g_stop_requested = 1; }
 
 class FileDescriptor final {
- public:
+public:
   explicit FileDescriptor(int value = -1) noexcept : value_(value) {}
   ~FileDescriptor() {
     if (value_ >= 0) {
       static_cast<void>(::close(value_));
     }
   }
-  FileDescriptor(const FileDescriptor&) = delete;
-  FileDescriptor& operator=(const FileDescriptor&) = delete;
-  FileDescriptor(FileDescriptor&& other) noexcept : value_(std::exchange(other.value_, -1)) {}
-  FileDescriptor& operator=(FileDescriptor&& other) noexcept {
+  FileDescriptor(const FileDescriptor &) = delete;
+  FileDescriptor &operator=(const FileDescriptor &) = delete;
+  FileDescriptor(FileDescriptor &&other) noexcept
+      : value_(std::exchange(other.value_, -1)) {}
+  FileDescriptor &operator=(FileDescriptor &&other) noexcept {
     if (this != &other) {
       if (value_ >= 0) {
         static_cast<void>(::close(value_));
@@ -126,7 +128,7 @@ class FileDescriptor final {
   [[nodiscard]] int get() const noexcept { return value_; }
   [[nodiscard]] explicit operator bool() const noexcept { return value_ >= 0; }
 
- private:
+private:
   int value_;
 };
 
@@ -135,7 +137,8 @@ class FileDescriptor final {
 }
 
 [[noreturn]] void FailErrno(std::string_view context) {
-  Fail(std::string(context) + ": " + std::system_error(errno, std::generic_category()).what());
+  Fail(std::string(context) + ": " +
+       std::system_error(errno, std::generic_category()).what());
 }
 
 void Require(bool condition, std::string detail) {
@@ -144,25 +147,27 @@ void Require(bool condition, std::string detail) {
   }
 }
 
-[[nodiscard]] std::filesystem::path ExistingDirectory(std::filesystem::path path,
-                                                      std::string_view label) {
+[[nodiscard]] std::filesystem::path
+ExistingDirectory(std::filesystem::path path, std::string_view label) {
   Require(!path.empty(), std::string(label) + " cannot be empty");
   std::error_code error;
   const auto status = std::filesystem::symlink_status(path, error);
-  Require(!error && !std::filesystem::is_symlink(status) && std::filesystem::is_directory(status),
+  Require(!error && !std::filesystem::is_symlink(status) &&
+              std::filesystem::is_directory(status),
           std::string(label) + " must be an existing non-symlink directory");
   auto absolute = std::filesystem::absolute(path, error);
   Require(!error, std::string(label) + " cannot be resolved");
   return absolute.lexically_normal();
 }
 
-[[nodiscard]] std::filesystem::path ExistingRegularFile(std::filesystem::path path,
-                                                        std::string_view label, bool executable) {
+[[nodiscard]] std::filesystem::path
+ExistingRegularFile(std::filesystem::path path, std::string_view label,
+                    bool executable) {
   Require(!path.empty(), std::string(label) + " cannot be empty");
   struct stat status {};
-  Require(
-      ::lstat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode) && !S_ISLNK(status.st_mode),
-      std::string(label) + " must be an existing non-symlink file");
+  Require(::lstat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode) &&
+              !S_ISLNK(status.st_mode),
+          std::string(label) + " must be an existing non-symlink file");
   Require(!executable || ::access(path.c_str(), X_OK) == 0,
           std::string(label) + " must be executable");
   std::error_code error;
@@ -175,7 +180,8 @@ void Require(bool condition, std::string detail) {
   std::array<unsigned char, kOwnerEpochRandomBytes> bytes{};
   std::size_t offset = 0U;
   while (offset < bytes.size()) {
-    const auto count = ::getrandom(bytes.data() + offset, bytes.size() - offset, 0);
+    const auto count =
+        ::getrandom(bytes.data() + offset, bytes.size() - offset, 0);
     if (count < 0 && errno == EINTR) {
       continue;
     }
@@ -195,11 +201,12 @@ void Require(bool condition, std::string detail) {
 }
 
 class HostLock final {
- public:
-  explicit HostLock(const std::filesystem::path& state_root) {
+public:
+  explicit HostLock(const std::filesystem::path &state_root) {
     const auto path = state_root / std::string(kLockFileName);
     descriptor_ = FileDescriptor(
-        ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR));
+        ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+               S_IRUSR | S_IWUSR));
     if (!descriptor_) {
       FailErrno("open execution-host lock");
     }
@@ -207,7 +214,8 @@ class HostLock final {
     if (::fstat(descriptor_.get(), &status) != 0) {
       FailErrno("inspect execution-host lock");
     }
-    Require(S_ISREG(status.st_mode), "execution-host lock is not a regular file");
+    Require(S_ISREG(status.st_mode),
+            "execution-host lock is not a regular file");
     if (::flock(descriptor_.get(), LOCK_EX | LOCK_NB) != 0) {
       if (errno == EWOULDBLOCK || errno == EAGAIN) {
         Fail("another execution host already owns this state root");
@@ -216,13 +224,13 @@ class HostLock final {
     }
   }
 
- private:
+private:
   FileDescriptor descriptor_;
 };
 
 class CommandSocket final {
- public:
-  CommandSocket(const std::filesystem::path& state_root,
+public:
+  CommandSocket(const std::filesystem::path &state_root,
                 std::string_view socket_file_name)
       : path_(state_root / std::string(socket_file_name)) {
     const auto spelling = path_.string();
@@ -230,33 +238,36 @@ class CommandSocket final {
             "execution command socket path is too long");
     struct stat existing {};
     if (::lstat(path_.c_str(), &existing) == 0) {
-      Require(S_ISSOCK(existing.st_mode), "execution command path exists and is not a socket");
+      Require(S_ISSOCK(existing.st_mode),
+              "execution command path exists and is not a socket");
       if (::unlink(path_.c_str()) != 0) {
         FailErrno("remove stale execution command socket");
       }
     } else if (errno != ENOENT) {
       FailErrno("inspect execution command socket path");
     }
-    descriptor_ =
-        FileDescriptor(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+    descriptor_ = FileDescriptor(
+        ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
     if (!descriptor_) {
       FailErrno("create execution command socket");
     }
     const int send_buffer_bytes = static_cast<int>(kMaximumResponseBytes);
-    if (::setsockopt(descriptor_.get(), SOL_SOCKET, SO_SNDBUF, &send_buffer_bytes,
-                     sizeof(send_buffer_bytes)) != 0) {
+    if (::setsockopt(descriptor_.get(), SOL_SOCKET, SO_SNDBUF,
+                     &send_buffer_bytes, sizeof(send_buffer_bytes)) != 0) {
       FailErrno("set execution command response buffer");
     }
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, spelling.c_str(), spelling.size() + 1U);
-    if (::bind(descriptor_.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+    if (::bind(descriptor_.get(), reinterpret_cast<sockaddr *>(&address),
+               sizeof(address)) != 0) {
       FailErrno("bind execution command socket");
     }
     if (::chmod(path_.c_str(), S_IRUSR | S_IWUSR) != 0) {
       FailErrno("restrict execution command socket permissions");
     }
-    if (::lstat(path_.c_str(), &bound_status_) != 0 || !S_ISSOCK(bound_status_.st_mode)) {
+    if (::lstat(path_.c_str(), &bound_status_) != 0 ||
+        !S_ISSOCK(bound_status_.st_mode)) {
       Fail("bound execution command path is not a socket");
     }
     if (::listen(descriptor_.get(), kSocketBacklog) != 0) {
@@ -266,7 +277,8 @@ class CommandSocket final {
 
   ~CommandSocket() {
     struct stat current {};
-    if (::lstat(path_.c_str(), &current) == 0 && current.st_dev == bound_status_.st_dev &&
+    if (::lstat(path_.c_str(), &current) == 0 &&
+        current.st_dev == bound_status_.st_dev &&
         current.st_ino == bound_status_.st_ino) {
       static_cast<void>(::unlink(path_.c_str()));
     }
@@ -274,7 +286,7 @@ class CommandSocket final {
 
   [[nodiscard]] int get() const noexcept { return descriptor_.get(); }
 
- private:
+private:
   std::filesystem::path path_;
   FileDescriptor descriptor_;
   struct stat bound_status_ {};
@@ -305,7 +317,8 @@ struct ManagedRuntimeChildConfig final {
   std::string configuration_identity;
 };
 
-[[nodiscard]] bool IsPortableRuntimeIdentity(const std::string_view value) noexcept {
+[[nodiscard]] bool
+IsPortableRuntimeIdentity(const std::string_view value) noexcept {
   if (value.empty() || value.size() > 128U ||
       !((value.front() >= 'a' && value.front() <= 'z') ||
         (value.front() >= 'A' && value.front() <= 'Z') ||
@@ -313,9 +326,10 @@ struct ManagedRuntimeChildConfig final {
     return false;
   }
   return std::all_of(value.begin() + 1, value.end(), [](const char character) {
-    return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
-           (character >= '0' && character <= '9') || character == '.' || character == '_' ||
-           character == '-';
+    return (character >= 'a' && character <= 'z') ||
+           (character >= 'A' && character <= 'Z') ||
+           (character >= '0' && character <= '9') || character == '.' ||
+           character == '_' || character == '-';
   });
 }
 
@@ -324,7 +338,8 @@ struct ManagedRuntimeChildConfig final {
           "managed runtime channel FD is not canonical");
   unsigned int result = 0U;
   for (const char digit : value) {
-    Require(digit >= '0' && digit <= '9', "managed runtime channel FD is not decimal");
+    Require(digit >= '0' && digit <= '9',
+            "managed runtime channel FD is not decimal");
     const auto next = static_cast<unsigned int>(digit - '0');
     Require(result <= (static_cast<unsigned int>(INT_MAX) - next) / 10U,
             "managed runtime channel FD overflows");
@@ -333,14 +348,17 @@ struct ManagedRuntimeChildConfig final {
   return static_cast<int>(result);
 }
 
-[[nodiscard]] ManagedRuntimeChildConfig ParseManagedRuntimeArguments(const int argc, char** argv) {
+[[nodiscard]] ManagedRuntimeChildConfig
+ParseManagedRuntimeArguments(const int argc, char **argv) {
   ManagedRuntimeChildConfig config;
   std::set<std::string> seen;
   for (int index = 1; index < argc; index += 2) {
-    Require(index + 1 < argc, "every managed runtime option requires one value");
+    Require(index + 1 < argc,
+            "every managed runtime option requires one value");
     const std::string option(argv[index]);
     const std::string value(argv[index + 1]);
-    Require(seen.insert(option).second, "duplicate managed runtime option " + option);
+    Require(seen.insert(option).second,
+            "duplicate managed runtime option " + option);
     if (option == "--manyforge-managed-runtime-channel-fd") {
       config.manager_channel_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-package-root") {
@@ -374,12 +392,12 @@ struct ManagedRuntimeChildConfig final {
   Require(core::IsExactLowercaseSha256Digest(config.product_identity) &&
               core::IsExactLowercaseSha256Digest(config.configuration_identity),
           "managed runtime retained identity is invalid");
-  config.package_root =
-      ExistingDirectory(std::move(config.package_root), "managed retained-package root");
-  config.manager_state_root =
-      ExistingDirectory(std::move(config.manager_state_root), "managed Manager state root");
-  config.staging_root =
-      ExistingDirectory(std::move(config.staging_root), "managed native staging root");
+  config.package_root = ExistingDirectory(std::move(config.package_root),
+                                          "managed retained-package root");
+  config.manager_state_root = ExistingDirectory(
+      std::move(config.manager_state_root), "managed Manager state root");
+  config.staging_root = ExistingDirectory(std::move(config.staging_root),
+                                          "managed native staging root");
   config.candidate_worker = ExistingRegularFile(
       std::move(config.candidate_worker), "managed candidate worker", true);
 
@@ -388,23 +406,27 @@ struct ManagedRuntimeChildConfig final {
   socklen_t socket_type_size = sizeof(socket_type);
   ucred credentials{};
   socklen_t credentials_size = sizeof(credentials);
-  Require(::fstat(config.manager_channel_fd, &status) == 0 && S_ISSOCK(status.st_mode) &&
-              ::getsockopt(config.manager_channel_fd, SOL_SOCKET, SO_TYPE, &socket_type,
-                           &socket_type_size) == 0 &&
-              socket_type_size == sizeof(socket_type) && socket_type == SOCK_SEQPACKET &&
-              ::getsockopt(config.manager_channel_fd, SOL_SOCKET, SO_PEERCRED, &credentials,
-                           &credentials_size) == 0 &&
-              credentials_size == sizeof(credentials) && credentials.uid == ::geteuid() &&
-              credentials.pid == ::getppid(),
+  Require(::fstat(config.manager_channel_fd, &status) == 0 &&
+              S_ISSOCK(status.st_mode) &&
+              ::getsockopt(config.manager_channel_fd, SOL_SOCKET, SO_TYPE,
+                           &socket_type, &socket_type_size) == 0 &&
+              socket_type_size == sizeof(socket_type) &&
+              socket_type == SOCK_SEQPACKET &&
+              ::getsockopt(config.manager_channel_fd, SOL_SOCKET, SO_PEERCRED,
+                           &credentials, &credentials_size) == 0 &&
+              credentials_size == sizeof(credentials) &&
+              credentials.uid == ::geteuid() && credentials.pid == ::getppid(),
           "managed runtime channel is not the direct same-user parent "
           "channel");
   return config;
 }
 
 void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
-  Require(!bytes.empty() &&
-              bytes.size() <= component_manager::detail::kMaximumNativeProjectionRpcPacketBytes,
-          "managed runtime response is empty or oversized");
+  Require(
+      !bytes.empty() &&
+          bytes.size() <=
+              component_manager::detail::kMaximumNativeProjectionRpcPacketBytes,
+      "managed runtime response is empty or oversized");
   pollfd descriptor{fd, POLLOUT | POLLHUP, 0};
   int ready = -1;
   do {
@@ -420,7 +442,8 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
           "managed runtime response was not sent atomically");
 }
 
-[[nodiscard]] std::optional<std::string> ReceiveManagedRuntimePacket(const int fd) {
+[[nodiscard]] std::optional<std::string>
+ReceiveManagedRuntimePacket(const int fd) {
   char probe = '\0';
   ssize_t size = -1;
   do {
@@ -429,96 +452,129 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
   if (size == 0) {
     return std::nullopt;
   }
-  Require(size > 0 && static_cast<std::size_t>(size) <=
-                          component_manager::detail::kMaximumNativeProjectionRpcPacketBytes,
-          "managed runtime request is absent or oversized");
+  Require(
+      size > 0 &&
+          static_cast<std::size_t>(size) <=
+              component_manager::detail::kMaximumNativeProjectionRpcPacketBytes,
+      "managed runtime request is absent or oversized");
   std::string bytes(static_cast<std::size_t>(size), '\0');
   ssize_t received = -1;
   do {
     received = ::recv(fd, bytes.data(), bytes.size(), 0);
   } while (received < 0 && errno == EINTR);
-  Require(received == size, "managed runtime request changed while being received");
+  Require(received == size,
+          "managed runtime request changed while being received");
   return bytes;
 }
 
-using ManagedProjectionKey =
-    std::pair<core::CapabilityProviderBindingId, core::CapabilityProviderBindingRevision>;
+using ManagedProjectionKey = std::pair<core::CapabilityProviderBindingId,
+                                       core::CapabilityProviderBindingRevision>;
 
 class ManagedProjectionRegistry final {
- public:
-  explicit ManagedProjectionRegistry(const ManagedRuntimeChildConfig& config)
-      : config_(config),
-        bundle_source_(config.package_root),
+public:
+  explicit ManagedProjectionRegistry(const ManagedRuntimeChildConfig &config)
+      : config_(config), bundle_source_(config.package_root),
         map_source_(config.package_root),
         planning_source_(config.package_root) {}
 
   [[nodiscard]] component_manager::detail::NativeProjectionRpcResponse Dispatch(
-      const component_manager::detail::NativeProjectionRpcRequest& request) {
+      const component_manager::detail::NativeProjectionRpcRequest &request) {
+    std::lock_guard lock(mutex_);
     return std::visit(
-        [&](const auto& value) -> component_manager::detail::NativeProjectionRpcResponse {
+        [&](const auto &value)
+            -> component_manager::detail::NativeProjectionRpcResponse {
           using T = std::decay_t<decltype(value)>;
-          if constexpr (std::is_same_v<T,
-                                       component_manager::detail::NativeProjectionPrepareRequest>) {
+          if constexpr (std::is_same_v<T, component_manager::detail::
+                                              NativeProjectionPrepareRequest>) {
             Prepare(value);
-            return component_manager::detail::NativeProjectionPrepareResult{value};
+            return component_manager::detail::NativeProjectionPrepareResult{
+                value};
           } else if constexpr (std::is_same_v<
-                                   T, component_manager::detail::NativeProjectionHealthQuery>) {
+                                   T, component_manager::detail::
+                                          NativeProjectionHealthQuery>) {
             return Projection(value.native_runtime_binding).ProjectionHealth();
           } else if constexpr (std::is_same_v<
+                                   T, component_manager::detail::
+                                          NativeProjectionTransactionRequest>) {
+            return Projection(value.native_runtime_binding)
+                .ApplyTransaction(value.transaction);
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionRebuildDTO>) {
+            return Projection(value.expected_native_runtime_binding)
+                .RebuildProjection(value);
+          } else if constexpr (std::is_same_v<
                                    T,
-                                   component_manager::detail::NativeProjectionTransactionRequest>) {
-            return Projection(value.native_runtime_binding).ApplyTransaction(value.transaction);
-          } else if constexpr (std::is_same_v<T, core::NativeProjectionRebuildDTO>) {
-            return Projection(value.expected_native_runtime_binding).RebuildProjection(value);
-          } else if constexpr (std::is_same_v<T, core::NativeProjectionBootstrapRebuildDTO>) {
-            return Projection(value.native_runtime_binding).RebuildBootstrapProjection(value);
-          } else if constexpr (std::is_same_v<T, core::NativeProjectionBootstrapStatusQueryDTO>) {
-            return Projection(value.native_runtime_binding).BootstrapProjectionStatus(value);
-          } else if constexpr (std::is_same_v<T, core::NativeProjectionStageDTO>) {
-            return Projection(value.transition_row.native_runtime_binding).StageProjection(value);
-          } else if constexpr (std::is_same_v<T, core::NativeProjectionActivationDTO>) {
+                                   core::NativeProjectionBootstrapRebuildDTO>) {
+            return Projection(value.native_runtime_binding)
+                .RebuildBootstrapProjection(value);
+          } else if constexpr (
+              std::is_same_v<T,
+                             core::NativeProjectionBootstrapStatusQueryDTO>) {
+            return Projection(value.native_runtime_binding)
+                .BootstrapProjectionStatus(value);
+          } else if constexpr (std::is_same_v<T,
+                                              core::NativeProjectionStageDTO>) {
+            return Projection(value.transition_row.native_runtime_binding)
+                .StageProjection(value);
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionActivationDTO>) {
             return Projection(value.transition_row.native_runtime_binding)
                 .ActivateStagedProjection(value);
-          } else if constexpr (std::is_same_v<T, core::NativeProjectionRetireDTO>) {
-            return Projection(value.transition_row.native_runtime_binding).RetireProjection(value);
-          } else if constexpr (std::is_same_v<T, core::NativeProjectionRetireStatusQueryDTO>) {
-            return Projection(value.request.transition_row.native_runtime_binding)
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionRetireDTO>) {
+            return Projection(value.transition_row.native_runtime_binding)
+                .RetireProjection(value);
+          } else if constexpr (
+              std::is_same_v<T, core::NativeProjectionRetireStatusQueryDTO>) {
+            return Projection(
+                       value.request.transition_row.native_runtime_binding)
                 .ProjectionRetireStatus(value);
-          } else if constexpr (std::is_same_v<T, core::NativeProjectionDiscardDTO>) {
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionDiscardDTO>) {
             return Projection(value.transition_row.native_runtime_binding)
                 .DiscardStagedProjection(value);
-          } else if constexpr (std::is_same_v<T, core::NativeProjectionStatusQueryDTO>) {
+          } else if constexpr (std::is_same_v<
+                                   T, core::NativeProjectionStatusQueryDTO>) {
             return Projection(value.transition_row.native_runtime_binding)
                 .ProjectionStageStatus(value);
           } else if constexpr (std::is_same_v<
-                                   T, component_manager::detail::NativeProjectionRetainRequest>) {
+                                   T, component_manager::detail::
+                                          NativeProjectionRetainRequest>) {
             auto retained =
                 Projection(value.native_runtime_binding)
-                    .RetainProjectionBinding(value.projection_revision, value.projection_lease_id);
+                    .RetainProjectionBinding(value.projection_revision,
+                                             value.projection_lease_id);
             if (!retained.ok()) {
-              return component_manager::detail::NativeProjectionRpcFailure{retained.error()};
+              return component_manager::detail::NativeProjectionRpcFailure{
+                  retained.error()};
             }
             return component_manager::detail::NativeProjectionRetainResult{
                 std::move(retained.value())};
           } else if constexpr (std::is_same_v<
-                                   T, component_manager::detail::NativeProjectionReleaseRequest>) {
-            Projection(value.native_runtime_binding).ReleaseProjection(value.projection_lease_id);
+                                   T, component_manager::detail::
+                                          NativeProjectionReleaseRequest>) {
+            Projection(value.native_runtime_binding)
+                .ReleaseProjection(value.projection_lease_id);
             return component_manager::detail::NativeProjectionReleaseResult{
                 value.projection_lease_id};
           } else if constexpr (std::is_same_v<
-                                   T,
-                                   component_manager::detail::NativeProjectionSceneFrameRequest>) {
-            auto resolved = Projection(value.native_runtime_binding).ResolveSceneFrame(value.query);
+                                   T, component_manager::detail::
+                                          NativeProjectionSceneFrameRequest>) {
+            auto resolved = Projection(value.native_runtime_binding)
+                                .ResolveSceneFrame(value.query);
             if (!resolved.ok()) {
-              return component_manager::detail::NativeProjectionRpcFailure{resolved.error()};
+              return component_manager::detail::NativeProjectionRpcFailure{
+                  resolved.error()};
             }
             return std::move(resolved.value());
           } else {
             auto projected = Projection(value.native_runtime_binding)
                                  .ProjectEffectiveCollisionPolicy(
-                                     value.logical_scene, value.effective_policy_revision_id);
+                                     value.logical_scene,
+                                     value.effective_policy_revision_id);
             if (!projected.ok()) {
-              return component_manager::detail::NativeProjectionRpcFailure{projected.error()};
+              return component_manager::detail::NativeProjectionRpcFailure{
+                  projected.error()};
             }
             return std::move(projected.value());
           }
@@ -528,8 +584,9 @@ class ManagedProjectionRegistry final {
 
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
   FindActiveProjection(
-      const core::ProjectionRevisionDTO& expected,
-      const core::ProjectionNativeRuntimeBindingDTO& binding) const {
+      const core::ProjectionRevisionDTO &expected,
+      const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+    std::lock_guard lock(mutex_);
     RequireLocalBinding(binding);
     const auto found = projections_.find(Key(binding));
     if (found == projections_.end() || found->second == nullptr ||
@@ -544,87 +601,100 @@ class ManagedProjectionRegistry final {
                : nullptr;
   }
 
- private:
+private:
   struct PreparedIdentity final {
     core::RetainedBundleId retained_bundle_id;
     core::GraphRevision graph_revision;
     core::RetainedProductDTO planning_collision_model;
   };
 
-  [[nodiscard]] static ManagedProjectionKey Key(
-      const core::ProjectionNativeRuntimeBindingDTO& binding) {
+  [[nodiscard]] static ManagedProjectionKey
+  Key(const core::ProjectionNativeRuntimeBindingDTO &binding) {
     return {binding.provider_binding_id, binding.provider_binding_revision};
   }
 
-  void RequireLocalBinding(const core::ProjectionNativeRuntimeBindingDTO& binding) const {
-    Require(binding.valid() && binding.runtime_unit_id.value() == config_.runtime_unit_id &&
+  void RequireLocalBinding(
+      const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+    Require(binding.valid() &&
+                binding.runtime_unit_id.value() == config_.runtime_unit_id &&
                 binding.runtime_epoch.value() == config_.runtime_epoch,
             "native projection request names another runtime child");
   }
 
-  [[nodiscard]] RetainedPlannerSceneProjection& Projection(
-      const core::ProjectionNativeRuntimeBindingDTO& binding) {
+  [[nodiscard]] RetainedPlannerSceneProjection &
+  Projection(const core::ProjectionNativeRuntimeBindingDTO &binding) {
     RequireLocalBinding(binding);
     const auto found = projections_.find(Key(binding));
     Require(found != projections_.end() && found->second != nullptr &&
-                found->second->ProjectionHealth().native_runtime_binding == binding,
+                found->second->ProjectionHealth().native_runtime_binding ==
+                    binding,
             "native projection request names an unprepared binding");
     return *found->second;
   }
 
-  [[nodiscard]] const core::CapabilityProviderBindingDTO& RequireProviderBinding(
-      const deployment::RetainedBundle& bundle,
-      const core::ProjectionNativeRuntimeBindingDTO& runtime_binding) const {
-    const auto& bindings = bundle.value().capability_provider_bindings;
-    const auto found = std::find_if(bindings.begin(), bindings.end(), [&](const auto& candidate) {
-      return candidate.capability_provider_binding_id == runtime_binding.provider_binding_id &&
-             candidate.capability_provider_binding_revision ==
-                 runtime_binding.provider_binding_revision;
-    });
+  [[nodiscard]] const core::CapabilityProviderBindingDTO &
+  RequireProviderBinding(
+      const deployment::RetainedBundle &bundle,
+      const core::ProjectionNativeRuntimeBindingDTO &runtime_binding) const {
+    const auto &bindings = bundle.value().capability_provider_bindings;
+    const auto found = std::find_if(
+        bindings.begin(), bindings.end(), [&](const auto &candidate) {
+          return candidate.capability_provider_binding_id ==
+                     runtime_binding.provider_binding_id &&
+                 candidate.capability_provider_binding_revision ==
+                     runtime_binding.provider_binding_revision;
+        });
     Require(
-        found != bindings.end() && core::RequiresNativeSceneProjection(
-                                       found->capability_id, found->capability_definition_revision),
+        found != bindings.end() &&
+            core::RequiresNativeSceneProjection(
+                found->capability_id, found->capability_definition_revision),
         "prepared provider is absent or not a native projection "
         "participant");
     std::set<core::RuntimeUnitId> runtime_sources;
-    for (const auto& endpoint : found->endpoint_bindings) {
-      if (endpoint.source_kind != core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+    for (const auto &endpoint : found->endpoint_bindings) {
+      if (endpoint.source_kind !=
+          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
         continue;
       }
-      const auto* runtime_unit = std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+      const auto *runtime_unit =
+          std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
       Require(runtime_unit != nullptr && !runtime_unit->empty(),
               "prepared provider has a mismatched runtime endpoint");
       runtime_sources.insert(*runtime_unit);
     }
-    Require(
-        runtime_sources.size() == 1U && runtime_sources.begin()->value() == config_.runtime_unit_id,
-        "prepared provider is assigned to another runtime unit");
+    Require(runtime_sources.size() == 1U &&
+                runtime_sources.begin()->value() == config_.runtime_unit_id,
+            "prepared provider is assigned to another runtime unit");
     return *found;
   }
 
-  [[nodiscard]] static std::string SelectProjectionGroup(
-      const core::CapabilityProviderBindingDTO& provider,
-      const deployment::VerifiedRetainedModelMap& model_map) {
+  [[nodiscard]] static std::string
+  SelectProjectionGroup(const core::CapabilityProviderBindingDTO &provider,
+                        const deployment::VerifiedRetainedModelMap &model_map) {
     std::vector<std::string> groups;
-    if (const auto* target =
-            std::get_if<core::TargetBindingCapabilityProviderTargetDTO>(&provider.target)) {
-      const auto* resolved =
-          model_map.find_target(target->controllable_component_id, target->command_target_id);
-      Require(resolved != nullptr, "native provider target is absent from its retained model map");
-      for (const auto& group : resolved->model_groups) {
+    if (const auto *target =
+            std::get_if<core::TargetBindingCapabilityProviderTargetDTO>(
+                &provider.target)) {
+      const auto *resolved = model_map.find_target(
+          target->controllable_component_id, target->command_target_id);
+      Require(resolved != nullptr,
+              "native provider target is absent from its retained model map");
+      for (const auto &group : resolved->model_groups) {
         groups.push_back(group.compiled_group_name);
       }
     } else {
-      for (const auto& target : model_map.targets()) {
-        for (const auto& group : target.model_groups) {
+      for (const auto &target : model_map.targets()) {
+        for (const auto &group : target.model_groups) {
           groups.push_back(group.compiled_group_name);
         }
       }
     }
-    groups.erase(std::remove(groups.begin(), groups.end(), std::string{}), groups.end());
+    groups.erase(std::remove(groups.begin(), groups.end(), std::string{}),
+                 groups.end());
     std::sort(groups.begin(), groups.end());
     groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
-    Require(!groups.empty(), "retained native projection has no compiled planning group");
+    Require(!groups.empty(),
+            "retained native projection has no compiled planning group");
     return groups.front();
   }
 
@@ -640,58 +710,74 @@ class ManagedProjectionRegistry final {
   }
 
   [[nodiscard]] ProjectionAssets BuildProjectionAssets(
-      const component_manager::detail::NativeProjectionPrepareRequest& request) {
-    auto bundle = bundle_source_.get_verified(request.candidate_retained_bundle_id);
+      const component_manager::detail::NativeProjectionPrepareRequest
+          &request) {
+    auto bundle =
+        bundle_source_.get_verified(request.candidate_retained_bundle_id);
     Require(bundle != nullptr &&
-                bundle->value().cell_graph.graph_revision == request.candidate_graph_revision &&
+                bundle->value().cell_graph.graph_revision ==
+                    request.candidate_graph_revision &&
                 bundle->value().compiled_products.planning_collision_model ==
                     request.planning_collision_model,
             "prepared native projection differs from its verified retained "
             "bundle");
-    const auto& provider = RequireProviderBinding(*bundle, request.native_runtime_binding);
-    const auto& products = bundle->value().compiled_products;
+    const auto &provider =
+        RequireProviderBinding(*bundle, request.native_runtime_binding);
+    const auto &products = bundle->value().compiled_products;
     Require(products.symbol_role_maps.size() == 1U,
             "native projection requires one exact retained model map");
     auto model_map = map_source_.get_verified(deployment::RetainedModelMapQuery{
-        bundle->retained_bundle_id(), products.symbol_role_maps.front().product_id});
-    Require(model_map.has_value(), "native projection retained model map is absent or invalid");
+        bundle->retained_bundle_id(),
+        products.symbol_role_maps.front().product_id});
+    Require(model_map.has_value(),
+            "native projection retained model map is absent or invalid");
     const auto group = SelectProjectionGroup(provider, *model_map);
-    const auto cache_key = std::make_tuple(request.candidate_retained_bundle_id.value(),
-                                           request.candidate_graph_revision.value(), group);
+    const auto cache_key =
+        std::make_tuple(request.candidate_retained_bundle_id.value(),
+                        request.candidate_graph_revision.value(), group);
     if (const auto cached = projection_asset_cache_.find(cache_key);
         cached != projection_asset_cache_.end()) {
       return cached->second;
     }
 
-    auto planning_model = planning_source_.get_verified(deployment::RetainedPlanningModelQuery{
-        bundle->retained_bundle_id(), request.planning_collision_model.product_id});
+    auto planning_model =
+        planning_source_.get_verified(deployment::RetainedPlanningModelQuery{
+            bundle->retained_bundle_id(),
+            request.planning_collision_model.product_id});
     Require(planning_model.has_value(),
             "native projection retained planning model is absent or invalid");
-    auto stage = RetainedPlanningModelStage::create_verified(*planning_model, config_.staging_root);
+    auto stage = RetainedPlanningModelStage::create_verified(
+        *planning_model, config_.staging_root);
     auto shared_model = collision::ManyForgeCollisionEngine::load_shared_model(
-        "manyforge_managed_native_projection", stage.loader_urdf_path(), stage.srdf_path(),
-        stage.package_paths(), group);
-    auto projector = RetainedCollisionWorldProjector::create_verified(shared_model, *bundle,
-                                                                      *model_map, *planning_model);
+        "manyforge_managed_native_projection", stage.loader_urdf_path(),
+        stage.srdf_path(), stage.package_paths(), group);
+    auto projector = RetainedCollisionWorldProjector::create_verified(
+        shared_model, *bundle, *model_map, *planning_model);
     auto frame_resolver = RetainedSceneFrameResolver::create_verified(
         std::move(shared_model), *bundle, *model_map, *planning_model,
-        core::RuntimeUnitId(config_.runtime_unit_id), core::RuntimeEpoch(config_.runtime_epoch),
-        RetainedSceneFrameLocalStateMode::kCommandFencedNeutralBootstrap, {}, MonotonicNowNs());
+        core::RuntimeUnitId(config_.runtime_unit_id),
+        core::RuntimeEpoch(config_.runtime_epoch),
+        RetainedSceneFrameLocalStateMode::kCommandFencedNeutralBootstrap, {},
+        MonotonicNowNs());
     ProjectionAssets assets{std::move(projector), std::move(frame_resolver)};
-    const auto [inserted, unique] = projection_asset_cache_.emplace(cache_key, std::move(assets));
+    const auto [inserted, unique] =
+        projection_asset_cache_.emplace(cache_key, std::move(assets));
     Require(unique, "native projection model cache insertion conflicted");
     return inserted->second;
   }
 
-  void Prepare(const component_manager::detail::NativeProjectionPrepareRequest& request) {
+  void Prepare(const component_manager::detail::NativeProjectionPrepareRequest
+                   &request) {
     Require(request.valid(), "native projection preparation is invalid");
     RequireLocalBinding(request.native_runtime_binding);
     const auto key = Key(request.native_runtime_binding);
     if (const auto prior = prepared_.find(key);
         prior != prepared_.end() &&
-        prior->second.retained_bundle_id == request.candidate_retained_bundle_id &&
+        prior->second.retained_bundle_id ==
+            request.candidate_retained_bundle_id &&
         prior->second.graph_revision == request.candidate_graph_revision &&
-        prior->second.planning_collision_model == request.planning_collision_model) {
+        prior->second.planning_collision_model ==
+            request.planning_collision_model) {
       return;
     }
 
@@ -707,140 +793,166 @@ class ManagedProjectionRegistry final {
               256U, RetainedCollisionWorldPublisher::kDefaultLedgerCapacity},
           MonotonicNowNs, std::move(assets.frame_resolver));
       if (!created.ok()) {
-        Fail("native projection construction failed: " + created.error().message);
+        Fail("native projection construction failed: " +
+             created.error().message);
       }
-      const auto [inserted, unique] = projections_.emplace(key, std::move(created.value()));
+      const auto [inserted, unique] =
+          projections_.emplace(key, std::move(created.value()));
       Require(unique && inserted->second != nullptr,
               "native projection registry insertion conflicted");
     } else {
-      Require(found->second != nullptr, "native projection registry contains an empty participant");
-      auto prepared = found->second->PrepareCandidateProjection(std::move(assets.projector),
-                                                                request.planning_collision_model,
-                                                                std::move(assets.frame_resolver));
+      Require(found->second != nullptr,
+              "native projection registry contains an empty participant");
+      auto prepared = found->second->PrepareCandidateProjection(
+          std::move(assets.projector), request.planning_collision_model,
+          std::move(assets.frame_resolver));
       if (!prepared.ok()) {
-        Fail("native projection candidate preparation failed: " + prepared.error().message);
+        Fail("native projection candidate preparation failed: " +
+             prepared.error().message);
       }
     }
     prepared_.insert_or_assign(
         key, PreparedIdentity{request.candidate_retained_bundle_id,
-                              request.candidate_graph_revision, request.planning_collision_model});
+                              request.candidate_graph_revision,
+                              request.planning_collision_model});
   }
 
-  const ManagedRuntimeChildConfig& config_;
+  const ManagedRuntimeChildConfig &config_;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
   deployment::FilesystemVerifiedRetainedModelMapSource map_source_;
   deployment::FilesystemVerifiedRetainedPlanningModelSource planning_source_;
   std::map<std::tuple<std::string, std::string, std::string>, ProjectionAssets>
       projection_asset_cache_;
-  std::map<ManagedProjectionKey, std::shared_ptr<RetainedPlannerSceneProjection>> projections_;
+  std::map<ManagedProjectionKey,
+           std::shared_ptr<RetainedPlannerSceneProjection>>
+      projections_;
   std::map<ManagedProjectionKey, PreparedIdentity> prepared_;
+  mutable std::mutex mutex_;
 };
 
-[[nodiscard]] int RunManagedRuntimeChild(const ManagedRuntimeChildConfig& config);
-void RequireExactObjectSize(const CanonicalValue& value, std::size_t size, std::string_view label) {
+[[nodiscard]] int
+RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config);
+void RequireExactObjectSize(const CanonicalValue &value, std::size_t size,
+                            std::string_view label) {
   Require(value.is_object() && value.as_object().size() == size,
           std::string(label) + " has an unknown or missing field");
 }
 
-const CanonicalValue& Member(const CanonicalValue& root, std::string_view name) {
-  const auto* value = root.find_object_member(name);
+const CanonicalValue &Member(const CanonicalValue &root,
+                             std::string_view name) {
+  const auto *value = root.find_object_member(name);
   Require(value != nullptr, "command is missing field " + std::string(name));
   return *value;
 }
 
-std::string Text(const CanonicalValue& root, std::string_view name, bool allow_empty = false) {
-  const auto* value = std::get_if<std::string>(&Member(root, name).storage());
+std::string Text(const CanonicalValue &root, std::string_view name,
+                 bool allow_empty = false) {
+  const auto *value = std::get_if<std::string>(&Member(root, name).storage());
   Require(value != nullptr && (allow_empty || !value->empty()) &&
               value->size() <= kMaximumIdentityBytes,
           "command field " + std::string(name) + " must be one bounded string");
   return *value;
 }
 
-double Number(const CanonicalValue& root, std::string_view name) {
-  const auto* value = std::get_if<double>(&Member(root, name).storage());
+double Number(const CanonicalValue &root, std::string_view name) {
+  const auto *value = std::get_if<double>(&Member(root, name).storage());
   Require(value != nullptr && std::isfinite(*value),
           "command field " + std::string(name) + " must be one finite number");
   return *value;
 }
 
-bool Boolean(const CanonicalValue& root, std::string_view name) {
-  const auto* value = std::get_if<bool>(&Member(root, name).storage());
-  Require(value != nullptr, "command field " + std::string(name) + " must be boolean");
+bool Boolean(const CanonicalValue &root, std::string_view name) {
+  const auto *value = std::get_if<bool>(&Member(root, name).storage());
+  Require(value != nullptr,
+          "command field " + std::string(name) + " must be boolean");
   return *value;
 }
 
-std::uint64_t Counter(const CanonicalValue& root, std::string_view name, std::uint64_t minimum) {
+std::uint64_t Counter(const CanonicalValue &root, std::string_view name,
+                      std::uint64_t minimum) {
   const double value = Number(root, name);
   Require(value >= static_cast<double>(minimum) && std::floor(value) == value &&
               value <= kMaximumSafeInteger,
-          "command field " + std::string(name) + " must be one safe unsigned integer");
+          "command field " + std::string(name) +
+              " must be one safe unsigned integer");
   return static_cast<std::uint64_t>(value);
 }
 
-std::optional<double> OptionalNumber(const CanonicalValue& root, std::string_view name) {
-  const auto& member = Member(root, name);
+std::optional<double> OptionalNumber(const CanonicalValue &root,
+                                     std::string_view name) {
+  const auto &member = Member(root, name);
   if (std::holds_alternative<std::nullptr_t>(member.storage())) {
     return std::nullopt;
   }
-  const auto* value = std::get_if<double>(&member.storage());
+  const auto *value = std::get_if<double>(&member.storage());
   Require(value != nullptr && std::isfinite(*value),
           "command field " + std::string(name) + " must be null or finite");
   return *value;
 }
 
-std::optional<std::string> OptionalText(const CanonicalValue& root, std::string_view name) {
-  const auto& member = Member(root, name);
+std::optional<std::string> OptionalText(const CanonicalValue &root,
+                                        std::string_view name) {
+  const auto &member = Member(root, name);
   if (std::holds_alternative<std::nullptr_t>(member.storage())) {
     return std::nullopt;
   }
-  const auto* value = std::get_if<std::string>(&member.storage());
-  Require(value != nullptr && !value->empty() && value->size() <= kMaximumIdentityBytes,
-          "command field " + std::string(name) + " must be null or one bounded string");
+  const auto *value = std::get_if<std::string>(&member.storage());
+  Require(value != nullptr && !value->empty() &&
+              value->size() <= kMaximumIdentityBytes,
+          "command field " + std::string(name) +
+              " must be null or one bounded string");
   return *value;
 }
 
-std::optional<std::string> OptionalBoundedText(const CanonicalValue& root, std::string_view name,
+std::optional<std::string> OptionalBoundedText(const CanonicalValue &root,
+                                               std::string_view name,
                                                std::size_t maximum_bytes) {
-  const auto& member = Member(root, name);
+  const auto &member = Member(root, name);
   if (std::holds_alternative<std::nullptr_t>(member.storage())) {
     return std::nullopt;
   }
-  const auto* value = std::get_if<std::string>(&member.storage());
+  const auto *value = std::get_if<std::string>(&member.storage());
   Require(value != nullptr && !value->empty() && value->size() <= maximum_bytes,
-          "command field " + std::string(name) + " must be null or one bounded string");
+          "command field " + std::string(name) +
+              " must be null or one bounded string");
   return *value;
 }
 
-const CanonicalValue::Array& Array(const CanonicalValue& root, std::string_view name) {
-  const auto& member = Member(root, name);
-  const auto* values = std::get_if<CanonicalValue::Array>(&member.storage());
-  Require(values != nullptr, "command field " + std::string(name) + " must be an array");
+const CanonicalValue::Array &Array(const CanonicalValue &root,
+                                   std::string_view name) {
+  const auto &member = Member(root, name);
+  const auto *values = std::get_if<CanonicalValue::Array>(&member.storage());
+  Require(values != nullptr,
+          "command field " + std::string(name) + " must be an array");
   return *values;
 }
 
-std::vector<std::string> TextArray(const CanonicalValue& root, std::string_view name,
-                                   std::size_t maximum) {
-  const auto& values = Array(root, name);
-  Require(values.size() <= maximum, "command text array exceeds its fixed bound");
+std::vector<std::string> TextArray(const CanonicalValue &root,
+                                   std::string_view name, std::size_t maximum) {
+  const auto &values = Array(root, name);
+  Require(values.size() <= maximum,
+          "command text array exceeds its fixed bound");
   std::vector<std::string> result;
   result.reserve(values.size());
-  for (const auto& value : values) {
-    const auto* text = std::get_if<std::string>(&value.storage());
-    Require(text != nullptr && !text->empty() && text->size() <= kMaximumIdentityBytes,
+  for (const auto &value : values) {
+    const auto *text = std::get_if<std::string>(&value.storage());
+    Require(text != nullptr && !text->empty() &&
+                text->size() <= kMaximumIdentityBytes,
             "command text array contains an invalid value");
     result.push_back(*text);
   }
   return result;
 }
 
-std::vector<double> NumberArray(const CanonicalValue& root, std::string_view name,
-                                std::size_t maximum) {
-  const auto& values = Array(root, name);
-  Require(values.size() <= maximum, "command number array exceeds its fixed bound");
+std::vector<double> NumberArray(const CanonicalValue &root,
+                                std::string_view name, std::size_t maximum) {
+  const auto &values = Array(root, name);
+  Require(values.size() <= maximum,
+          "command number array exceeds its fixed bound");
   std::vector<double> result;
   result.reserve(values.size());
-  for (const auto& value : values) {
-    const auto* number = std::get_if<double>(&value.storage());
+  for (const auto &value : values) {
+    const auto *number = std::get_if<double>(&value.storage());
     Require(number != nullptr && std::isfinite(*number),
             "command number array contains a non-finite value");
     result.push_back(*number);
@@ -848,24 +960,27 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   return result;
 }
 
-[[nodiscard]] core::Pose3DTO DecodePose(const CanonicalValue& value) {
+[[nodiscard]] core::Pose3DTO DecodePose(const CanonicalValue &value) {
   RequireExactObjectSize(value, 2U, "pose");
-  const auto& position = Member(value, "position_m");
-  const auto& orientation = Member(value, "orientation");
+  const auto &position = Member(value, "position_m");
+  const auto &orientation = Member(value, "orientation");
   RequireExactObjectSize(position, 3U, "pose position");
   RequireExactObjectSize(orientation, 4U, "pose orientation");
   return core::Pose3DTO{
-      core::Vector3DTO{Number(position, "x_m"), Number(position, "y_m"), Number(position, "z_m")},
+      core::Vector3DTO{Number(position, "x_m"), Number(position, "y_m"),
+                       Number(position, "z_m")},
       core::QuaternionDTO{Number(orientation, "x"), Number(orientation, "y"),
                           Number(orientation, "z"), Number(orientation, "w")}};
 }
 
-[[nodiscard]] core::MotionSpecDTO DecodeMotionSpec(const CanonicalValue& value) {
+[[nodiscard]] core::MotionSpecDTO
+DecodeMotionSpec(const CanonicalValue &value) {
   const auto kind = Text(value, "kind");
   if (kind == "joint_goal") {
     RequireExactObjectSize(value, 3U, "joint goal");
-    return core::JointGoalDTO{TextArray(value, "joint_names", core::kMaxOperationParticipants),
-                              NumberArray(value, "positions_rad", core::kMaxOperationParticipants)};
+    return core::JointGoalDTO{
+        TextArray(value, "joint_names", core::kMaxOperationParticipants),
+        NumberArray(value, "positions_rad", core::kMaxOperationParticipants)};
   }
   if (kind == "pose_goal") {
     RequireExactObjectSize(value, 2U, "pose goal");
@@ -873,16 +988,17 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   }
   if (kind == "cartesian_path") {
     RequireExactObjectSize(value, 10U, "Cartesian path");
-    const auto& encoded_waypoints = Array(value, "waypoints");
-    Require(
-        !encoded_waypoints.empty() && encoded_waypoints.size() <= core::kMaxOperationParticipants,
-        "Cartesian path waypoint count is outside its fixed bound");
+    const auto &encoded_waypoints = Array(value, "waypoints");
+    Require(!encoded_waypoints.empty() &&
+                encoded_waypoints.size() <= core::kMaxOperationParticipants,
+            "Cartesian path waypoint count is outside its fixed bound");
     std::vector<core::Pose3DTO> waypoints;
     waypoints.reserve(encoded_waypoints.size());
-    for (const auto& waypoint : encoded_waypoints) {
+    for (const auto &waypoint : encoded_waypoints) {
       waypoints.push_back(DecodePose(waypoint));
     }
-    Require(Text(value, "speed_mode") == "bounded", "Cartesian speed mode is unsupported");
+    Require(Text(value, "speed_mode") == "bounded",
+            "Cartesian speed mode is unsupported");
     core::CartesianFallbackPolicyDTO fallback;
     const auto fallback_name = Text(value, "fallback_policy");
     if (fallback_name == "fail_closed") {
@@ -892,33 +1008,37 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
     } else {
       Fail("Cartesian fallback policy is unsupported");
     }
-    return core::CartesianPathDTO{std::move(waypoints),
-                                  Number(value, "max_translation_step_m"),
-                                  Number(value, "max_rotation_step_rad"),
-                                  core::CartesianSpeedModeDTO::kBounded,
-                                  Number(value, "max_linear_speed_mps"),
-                                  Number(value, "max_angular_speed_rad_s"),
-                                  Number(value, "max_linear_acceleration_mps2"),
-                                  Number(value, "max_angular_acceleration_rad_s2"),
-                                  fallback};
+    return core::CartesianPathDTO{
+        std::move(waypoints),
+        Number(value, "max_translation_step_m"),
+        Number(value, "max_rotation_step_rad"),
+        core::CartesianSpeedModeDTO::kBounded,
+        Number(value, "max_linear_speed_mps"),
+        Number(value, "max_angular_speed_rad_s"),
+        Number(value, "max_linear_acceleration_mps2"),
+        Number(value, "max_angular_acceleration_rad_s2"),
+        fallback};
   }
   Fail("motion specification kind is unsupported");
 }
 
-[[nodiscard]] core::SceneRevision DecodeSceneRevision(const CanonicalValue& value) {
+[[nodiscard]] core::SceneRevision
+DecodeSceneRevision(const CanonicalValue &value) {
   RequireExactObjectSize(value, 3U, "scene revision");
   const double revision = Number(value, "revision_id");
-  Require(
-      revision >= 1.0 && std::floor(revision) == revision && revision <= 9'007'199'254'740'991.0,
-      "scene revision id is invalid");
+  Require(revision >= 1.0 && std::floor(revision) == revision &&
+              revision <= 9'007'199'254'740'991.0,
+          "scene revision id is invalid");
   return core::SceneRevision{core::SceneId(Text(value, "scene_id")),
                              static_cast<std::uint64_t>(revision),
                              core::ContentDigest(Text(value, "content_hash"))};
 }
 
-[[nodiscard]] core::ActionSpanDTO DecodeActionSpan(const CanonicalValue& value) {
+[[nodiscard]] core::ActionSpanDTO
+DecodeActionSpan(const CanonicalValue &value) {
   RequireExactObjectSize(value, 6U, "action span");
-  const auto source = core::action_source_from_string(Text(value, "action_source"));
+  const auto source =
+      core::action_source_from_string(Text(value, "action_source"));
   Require(source.has_value(), "action span source is unsupported");
   const auto optional_or_empty = [&](std::string_view name) {
     return OptionalText(value, name).value_or(std::string{});
@@ -931,15 +1051,17 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
                              optional_or_empty("parent_node_attempt_id")};
 }
 
-[[nodiscard]] core::PublicRequestContextDTO DecodeRequestContext(const CanonicalValue& value) {
+[[nodiscard]] core::PublicRequestContextDTO
+DecodeRequestContext(const CanonicalValue &value) {
   RequireExactObjectSize(value, 4U, "public request context");
-  return core::PublicRequestContextDTO{core::RequestId(Text(value, "request_id")),
-                                       core::RequestOwnerEpoch(Text(value, "request_owner_epoch")),
-                                       Text(value, "source_label"),
-                                       OptionalText(value, "correlation_id")};
+  return core::PublicRequestContextDTO{
+      core::RequestId(Text(value, "request_id")),
+      core::RequestOwnerEpoch(Text(value, "request_owner_epoch")),
+      Text(value, "source_label"), OptionalText(value, "correlation_id")};
 }
 
-[[nodiscard]] core::RequestAttributionDTO DecodeRequestAttribution(const CanonicalValue& value) {
+[[nodiscard]] core::RequestAttributionDTO
+DecodeRequestAttribution(const CanonicalValue &value) {
   RequireExactObjectSize(value, 3U, "request attribution");
   core::RequestTransportDTO transport;
   const auto transport_name = Text(value, "transport");
@@ -963,30 +1085,37 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   }
   core::RequestAttributionDTO attribution{transport, assurance,
                                           OptionalText(value, "principal_id")};
-  Require(attribution.locally_valid(), "request attribution is internally inconsistent");
+  Require(attribution.locally_valid(),
+          "request attribution is internally inconsistent");
   return attribution;
 }
 
-[[nodiscard]] core::JointDynamicsLimitDTO DecodeDynamicsLimit(const CanonicalValue& value) {
+[[nodiscard]] core::JointDynamicsLimitDTO
+DecodeDynamicsLimit(const CanonicalValue &value) {
   RequireExactObjectSize(value, 3U, "joint dynamics limit");
   return {OptionalNumber(value, "max_velocity_rad_s"),
           OptionalNumber(value, "max_acceleration_rad_s2"),
           OptionalNumber(value, "max_jerk_rad_s3")};
 }
 
-[[nodiscard]] core::MotionParticipantIntentDTO DecodeMotionPayload(const CanonicalValue& value) {
+[[nodiscard]] core::MotionParticipantIntentDTO
+DecodeMotionPayload(const CanonicalValue &value) {
   const bool has_runtime_object_bindings =
-      value.is_object() && value.find_object_member("runtime_object_bindings") != nullptr;
-  Require(value.is_object() && ((value.as_object().size() == 16U && !has_runtime_object_bindings) ||
-                                (value.as_object().size() == 17U && has_runtime_object_bindings)),
-          "motion payload has an unknown or missing field");
-  Require(Text(value, "kind") == "motion", "operation payload kind is unsupported");
+      value.is_object() &&
+      value.find_object_member("runtime_object_bindings") != nullptr;
+  Require(
+      value.is_object() &&
+          ((value.as_object().size() == 16U && !has_runtime_object_bindings) ||
+           (value.as_object().size() == 17U && has_runtime_object_bindings)),
+      "motion payload has an unknown or missing field");
+  Require(Text(value, "kind") == "motion",
+          "operation payload kind is unsupported");
 
-  const auto& tolerances = Member(value, "tolerances");
+  const auto &tolerances = Member(value, "tolerances");
   RequireExactObjectSize(tolerances, 3U, "motion tolerances");
-  const auto& speed = Member(value, "speed_profile");
+  const auto &speed = Member(value, "speed_profile");
   RequireExactObjectSize(speed, 3U, "motion speed profile");
-  const auto& timeouts = Member(value, "timeouts");
+  const auto &timeouts = Member(value, "timeouts");
   RequireExactObjectSize(timeouts, 2U, "motion timeouts");
 
   core::CacheMode cache_mode;
@@ -1009,14 +1138,17 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   } else {
     Fail("motion planning profile is unsupported");
   }
-  Require(Text(value, "target_mode") == "absolute", "native execution admits only absolute motion");
-  Require(std::holds_alternative<std::nullptr_t>(Member(value, "target_reference").storage()) &&
-              std::holds_alternative<std::nullptr_t>(Member(value, "offset_reference").storage()),
+  Require(Text(value, "target_mode") == "absolute",
+          "native execution admits only absolute motion");
+  Require(std::holds_alternative<std::nullptr_t>(
+              Member(value, "target_reference").storage()) &&
+              std::holds_alternative<std::nullptr_t>(
+                  Member(value, "offset_reference").storage()),
           "native absolute motion cannot carry references");
   Require(Array(value, "motion_interrupt_scopes").empty(),
           "native absolute motion cannot carry interrupt scopes");
 
-  const auto& motion = Member(value, "motion");
+  const auto &motion = Member(value, "motion");
   auto decoded_motion = DecodeMotionSpec(motion);
 
   std::optional<core::ContactPolicyId> contact_policy;
@@ -1026,11 +1158,13 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   }
   std::vector<core::RuntimeObjectReferenceBindingDTO> runtime_objects;
   if (has_runtime_object_bindings) {
-    const auto& encoded_runtime_objects = Array(value, "runtime_object_bindings");
-    Require(encoded_runtime_objects.size() <= core::kMaxOperationRuntimeObjectBindings,
+    const auto &encoded_runtime_objects =
+        Array(value, "runtime_object_bindings");
+    Require(encoded_runtime_objects.size() <=
+                core::kMaxOperationRuntimeObjectBindings,
             "runtime-object binding count exceeds its fixed bound");
     runtime_objects.reserve(encoded_runtime_objects.size());
-    for (const auto& encoded : encoded_runtime_objects) {
+    for (const auto &encoded : encoded_runtime_objects) {
       RequireExactObjectSize(encoded, 2U, "runtime-object binding");
       runtime_objects.push_back(core::RuntimeObjectReferenceBindingDTO{
           core::RuntimeObjectId(Text(encoded, "runtime_object_id")),
@@ -1038,18 +1172,21 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
     }
   }
   if (std::holds_alternative<core::JointGoalDTO>(decoded_motion)) {
-    Require(!contact_policy.has_value() && runtime_objects.empty(),
-            "joint motion cannot carry contact-policy or runtime-object bindings");
+    Require(
+        !contact_policy.has_value() && runtime_objects.empty(),
+        "joint motion cannot carry contact-policy or runtime-object bindings");
   }
 
-  const auto& dynamics = Member(value, "per_joint_dynamics_limits");
-  Require(dynamics.is_object() && dynamics.as_object().size() <= core::kMaxOperationParticipants,
+  const auto &dynamics = Member(value, "per_joint_dynamics_limits");
+  Require(dynamics.is_object() &&
+              dynamics.as_object().size() <= core::kMaxOperationParticipants,
           "joint dynamics map exceeds its fixed bound");
   std::map<std::string, core::JointDynamicsLimitDTO> limits;
-  for (const auto& [joint_name, limit] : dynamics.as_object()) {
+  for (const auto &[joint_name, limit] : dynamics.as_object()) {
     Require(!joint_name.empty() && joint_name.size() <= kMaximumIdentityBytes,
             "joint dynamics map contains an invalid name");
-    const auto [position, inserted] = limits.emplace(joint_name, DecodeDynamicsLimit(limit));
+    const auto [position, inserted] =
+        limits.emplace(joint_name, DecodeDynamicsLimit(limit));
     static_cast<void>(position);
     Require(inserted, "joint dynamics map repeats one name");
   }
@@ -1061,7 +1198,8 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       core::TolerancesDTO{Number(tolerances, "joint_position_tol_rad"),
                           Number(tolerances, "translation_tol_m"),
                           Number(tolerances, "rotation_tol_rad")},
-      core::SpeedProfileDTO{Number(speed, "velocity_scale"), Number(speed, "acceleration_scale"),
+      core::SpeedProfileDTO{Number(speed, "velocity_scale"),
+                            Number(speed, "acceleration_scale"),
                             OptionalNumber(speed, "max_tcp_linear_speed_mps")},
       core::TimeoutsDTO{Number(timeouts, "planning_timeout_s"),
                         Number(timeouts, "execution_timeout_s")},
@@ -1077,7 +1215,8 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       std::move(runtime_objects)};
 }
 
-[[nodiscard]] core::CoordinatePositionDTO DecodeCoordinatePosition(const CanonicalValue& value) {
+[[nodiscard]] core::CoordinatePositionDTO
+DecodeCoordinatePosition(const CanonicalValue &value) {
   RequireExactObjectSize(value, 2U, "coordinate position");
   const auto kind = Text(value, "kind");
   if (kind == "angular_rad") {
@@ -1089,7 +1228,8 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   Fail("coordinate position kind is unsupported");
 }
 
-[[nodiscard]] core::CoordinateEffortDTO DecodeCoordinateEffort(const CanonicalValue& value) {
+[[nodiscard]] core::CoordinateEffortDTO
+DecodeCoordinateEffort(const CanonicalValue &value) {
   RequireExactObjectSize(value, 2U, "coordinate effort");
   const auto kind = Text(value, "kind");
   if (kind == "angular_newton_meter") {
@@ -1101,42 +1241,45 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   Fail("coordinate effort kind is unsupported");
 }
 
-[[nodiscard]] core::CapabilityCommandIntentDTO DecodeCapabilityCommandPayload(
-    const CanonicalValue& value) {
+[[nodiscard]] core::CapabilityCommandIntentDTO
+DecodeCapabilityCommandPayload(const CanonicalValue &value) {
   RequireExactObjectSize(value, 6U, "capability-command payload");
-  Require(Text(value, "kind") == "capability_command", "operation payload kind is unsupported");
-  const auto& command_value = Member(value, "command_value");
+  Require(Text(value, "kind") == "capability_command",
+          "operation payload kind is unsupported");
+  const auto &command_value = Member(value, "command_value");
   RequireExactObjectSize(command_value, 3U, "gripper-position command value");
   Require(Text(command_value, "kind") == "gripper_position",
           "capability-command value kind is unsupported");
 
   std::optional<core::CoordinateEffortDTO> max_effort;
-  const auto& effort = Member(command_value, "max_effort");
+  const auto &effort = Member(command_value, "max_effort");
   if (!std::holds_alternative<std::nullptr_t>(effort.storage())) {
     max_effort = DecodeCoordinateEffort(effort);
   }
 
-  const auto& option_values = Array(value, "caller_options");
+  const auto &option_values = Array(value, "caller_options");
   Require(option_values.size() <= core::kMaxOperationCommandOptions,
           "capability-command options exceed their fixed bound");
   std::vector<core::CommandDurationOptionDTO> caller_options;
   caller_options.reserve(option_values.size());
-  for (const auto& option : option_values) {
+  for (const auto &option : option_values) {
     RequireExactObjectSize(option, 2U, "capability-command option");
     caller_options.push_back(core::CommandDurationOptionDTO{
-        core::CommandOptionId(Text(option, "option_id")), Number(option, "value_s")});
+        core::CommandOptionId(Text(option, "option_id")),
+        Number(option, "value_s")});
   }
 
   return core::CapabilityCommandIntentDTO{
       core::CommandSchemaId(Text(value, "command_schema_id")),
       core::CommandSchemaRevision(Text(value, "command_schema_revision")),
       core::GripperPositionCommandValueDTO{
-          DecodeCoordinatePosition(Member(command_value, "position")), std::move(max_effort)},
+          DecodeCoordinatePosition(Member(command_value, "position")),
+          std::move(max_effort)},
       Number(value, "completion_timeout_s"), std::move(caller_options)};
 }
 
-[[nodiscard]] core::OperationParticipantPayloadDTO DecodeParticipantPayload(
-    const CanonicalValue& value) {
+[[nodiscard]] core::OperationParticipantPayloadDTO
+DecodeParticipantPayload(const CanonicalValue &value) {
   const auto kind = Text(value, "kind");
   if (kind == "motion") {
     return DecodeMotionPayload(value);
@@ -1147,21 +1290,23 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   Fail("operation payload kind is unsupported");
 }
 
-[[nodiscard]] core::OperationIntentDTO DecodeOperation(
-    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
+[[nodiscard]] core::OperationIntentDTO
+DecodeOperation(const CanonicalValue &value,
+                const core::RequestAttributionDTO &attribution) {
   RequireExactObjectSize(value, 10U, "operation intent");
-  const auto& request = Member(value, "request_context");
-  const auto& participants = Array(value, "participants");
-  Require(participants.size() == 1U, "N3 admits exactly one operation participant");
-  const auto& participant = participants.front();
+  const auto &request = Member(value, "request_context");
+  const auto &participants = Array(value, "participants");
+  Require(participants.size() == 1U,
+          "N3 admits exactly one operation participant");
+  const auto &participant = participants.front();
   RequireExactObjectSize(participant, 5U, "operation participant");
   std::optional<core::ActionSpanDTO> action_span;
-  const auto& span = Member(participant, "action_span");
+  const auto &span = Member(participant, "action_span");
   if (!std::holds_alternative<std::nullptr_t>(span.storage())) {
     action_span = DecodeActionSpan(span);
   }
   std::optional<core::SceneRevision> expected_scene;
-  const auto& scene = Member(value, "expected_scene_revision");
+  const auto &scene = Member(value, "expected_scene_revision");
   if (!std::holds_alternative<std::nullptr_t>(scene.storage())) {
     expected_scene = DecodeSceneRevision(scene);
   }
@@ -1179,21 +1324,23 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       {core::OperationParticipantIntentDTO{
           core::ComponentRoleId(Text(participant, "component_role_id")),
           core::TargetRoleId(Text(participant, "target_role_id")),
-          core::CapabilityId(Text(participant, "required_capability_id")), std::move(action_span),
+          core::CapabilityId(Text(participant, "required_capability_id")),
+          std::move(action_span),
           DecodeParticipantPayload(Member(participant, "payload"))}},
       core::OperationCoordinationPolicy::kIndependent,
       attribution};
 }
 
-[[nodiscard]] std::array<double, 3U> DecodeTriple(const CanonicalValue& root,
+[[nodiscard]] std::array<double, 3U> DecodeTriple(const CanonicalValue &root,
                                                   const std::string_view name) {
   const auto values = NumberArray(root, name, 3U);
-  Require(values.size() == 3U,
-          "command field " + std::string(name) + " must contain exactly three numbers");
+  Require(values.size() == 3U, "command field " + std::string(name) +
+                                   " must contain exactly three numbers");
   return {values[0], values[1], values[2]};
 }
 
-[[nodiscard]] core::PickOffsetEnvelopeDTO DecodePickEnvelope(const CanonicalValue& value) {
+[[nodiscard]] core::PickOffsetEnvelopeDTO
+DecodePickEnvelope(const CanonicalValue &value) {
   RequireExactObjectSize(value, 4U, "pick offset envelope");
   const auto position_min = DecodeTriple(value, "position_min_m");
   const auto position_max = DecodeTriple(value, "position_max_m");
@@ -1207,16 +1354,18 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   return {position_min, position_max, orientation_min, orientation_max};
 }
 
-[[nodiscard]] std::optional<core::ReferenceDTO> DecodePickOffsetReference(
-    const CanonicalValue& root, const std::string_view name) {
-  const auto& value = Member(root, name);
+[[nodiscard]] std::optional<core::ReferenceDTO>
+DecodePickOffsetReference(const CanonicalValue &root,
+                          const std::string_view name) {
+  const auto &value = Member(root, name);
   if (std::holds_alternative<std::nullptr_t>(value.storage())) {
     return std::nullopt;
   }
   RequireExactObjectSize(value, 2U, "pick offset reference");
   const auto type = Text(value, "type");
   if (type == "frame_role") {
-    return core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole, Text(value, "frame_role_id"));
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole,
+                              Text(value, "frame_role_id"));
   }
   if (type == "component_body_role") {
     return core::ReferenceDTO(core::ReferenceDTO::Type::kComponentBodyRole,
@@ -1236,8 +1385,8 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
   Fail("pick offset reference type is unsupported");
 }
 
-[[nodiscard]] core::PickCandidateSynthesisIntentDTO DecodePickSynthesis(
-    const CanonicalValue& value) {
+[[nodiscard]] core::PickCandidateSynthesisIntentDTO
+DecodePickSynthesis(const CanonicalValue &value) {
   RequireExactObjectSize(value, 11U, "pick synthesis intent");
   core::PickCandidateSearchStrategyDTO strategy;
   const auto strategy_name = Text(value, "search_strategy");
@@ -1249,7 +1398,8 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
     Fail("pick search strategy is unsupported");
   }
   const auto maximum = Counter(value, "maximum_candidate_count", 1U);
-  Require(maximum <= 4096U, "pick maximum candidate count exceeds its fixed bound");
+  Require(maximum <= 4096U,
+          "pick maximum candidate count exceeds its fixed bound");
   const auto translation_step = Number(value, "translation_step_m");
   const auto rotation_step = Number(value, "rotation_step_deg");
   const auto min_tcp_z = OptionalNumber(value, "min_tcp_z_m");
@@ -1270,8 +1420,9 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       strategy};
 }
 
-[[nodiscard]] core::PickSequencePlanningIntentDTO DecodePickPlanningIntent(
-    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
+[[nodiscard]] core::PickSequencePlanningIntentDTO
+DecodePickPlanningIntent(const CanonicalValue &value,
+                         const core::RequestAttributionDTO &attribution) {
   RequireExactObjectSize(value, 9U, "pick planning intent");
   return core::PickSequencePlanningIntentDTO{
       Text(value, "sequence_id"),
@@ -1285,8 +1436,9 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       DecodeOperation(Member(value, "retreat_operation"), attribution)};
 }
 
-[[nodiscard]] core::PlaceSequencePlanningIntentDTO DecodePlacePlanningIntent(
-    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
+[[nodiscard]] core::PlaceSequencePlanningIntentDTO
+DecodePlacePlanningIntent(const CanonicalValue &value,
+                          const core::RequestAttributionDTO &attribution) {
   RequireExactObjectSize(value, 7U, "place planning intent");
   return core::PlaceSequencePlanningIntentDTO{
       Text(value, "sequence_id"),
@@ -1298,43 +1450,53 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
       DecodeOperation(Member(value, "retreat_operation"), attribution)};
 }
 
-[[nodiscard]] core::OperationControlRequestDTO DecodeOperationControlRequest(
-    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
+[[nodiscard]] core::OperationControlRequestDTO
+DecodeOperationControlRequest(const CanonicalValue &value,
+                              const core::RequestAttributionDTO &attribution) {
   RequireExactObjectSize(value, 4U, "operation control request");
   return core::OperationControlRequestDTO{
       DecodeRequestContext(Member(value, "request_context")),
       core::OperationId(Text(value, "operation_id")),
-      core::OperationRevision(Counter(value, "expected_operation_revision", 1U)),
+      core::OperationRevision(
+          Counter(value, "expected_operation_revision", 1U)),
       OptionalBoundedText(value, "reason", kMaximumReasonBytes), attribution};
 }
 
-[[nodiscard]] core::StopIntentDTO DecodeStopIntent(const CanonicalValue& value,
-                                                   const core::RequestAttributionDTO& attribution) {
+[[nodiscard]] core::StopIntentDTO
+DecodeStopIntent(const CanonicalValue &value,
+                 const core::RequestAttributionDTO &attribution) {
   RequireExactObjectSize(value, 3U, "Stop intent");
-  const auto& operations = Array(value, "operations");
-  Require(operations.size() == 1U, "N4 admits exactly one operation in ordinary Stop intent");
-  const auto& target = operations.front();
+  const auto &operations = Array(value, "operations");
+  Require(operations.size() == 1U,
+          "N4 admits exactly one operation in ordinary Stop intent");
+  const auto &target = operations.front();
   RequireExactObjectSize(target, 3U, "Stop operation target");
   return core::StopIntentDTO{
       DecodeRequestContext(Member(value, "request_context")),
       {core::StopOperationTargetDTO{
           core::OperationId(Text(target, "operation_id")),
-          core::OperationRevision(Counter(target, "expected_operation_revision", 1U)),
-          core::StopGeneration(Counter(target, "expected_stop_generation", 0U))}},
+          core::OperationRevision(
+              Counter(target, "expected_operation_revision", 1U)),
+          core::StopGeneration(
+              Counter(target, "expected_stop_generation", 0U))}},
       OptionalBoundedText(value, "reason", kMaximumReasonBytes),
       attribution};
 }
 
-[[nodiscard]] core::RuntimeScaleRequestDTO DecodeRuntimeScaleRequest(
-    const CanonicalValue& value, const core::RequestAttributionDTO& attribution) {
+[[nodiscard]] core::RuntimeScaleRequestDTO
+DecodeRuntimeScaleRequest(const CanonicalValue &value,
+                          const core::RequestAttributionDTO &attribution) {
   RequireExactObjectSize(value, 5U, "runtime-scale request");
   const double scale = Number(value, "scale");
-  Require(scale >= 0.0 && scale <= 1.0, "runtime scale must be in the closed interval [0, 1]");
+  Require(scale >= 0.0 && scale <= 1.0,
+          "runtime scale must be in the closed interval [0, 1]");
   return core::RuntimeScaleRequestDTO{
       DecodeRequestContext(Member(value, "request_context")),
       core::OperationId(Text(value, "operation_id")),
-      core::OperationRevision(Counter(value, "expected_operation_revision", 1U)),
-      core::RuntimeScaleGeneration(Counter(value, "expected_runtime_scale_generation", 0U)),
+      core::OperationRevision(
+          Counter(value, "expected_operation_revision", 1U)),
+      core::RuntimeScaleGeneration(
+          Counter(value, "expected_runtime_scale_generation", 0U)),
       scale,
       attribution};
 }
@@ -1384,7 +1546,7 @@ struct Command final {
   CanonicalValue root;
   try {
     root = deployment::parse_strict_json_model_yaml(bytes).root();
-  } catch (const std::exception& error) {
+  } catch (const std::exception &error) {
     Fail("execution command is not strict JSON: " + std::string(error.what()));
   }
   Require(content_identity::canonical_json(root) == bytes,
@@ -1400,9 +1562,11 @@ struct Command final {
   if (command == "events") {
     RequireExactObjectSize(root, 5U, "events command");
     const auto limit = Counter(root, "limit", 1U);
-    Require(limit <= kMaximumEventPage, "events command exceeds its page bound");
+    Require(limit <= kMaximumEventPage,
+            "events command exceeds its page bound");
     Command decoded{CommandKind::kEvents};
-    decoded.event_owner_epoch = core::RequestOwnerEpoch(Text(root, "owner_epoch"));
+    decoded.event_owner_epoch =
+        core::RequestOwnerEpoch(Text(root, "owner_epoch"));
     decoded.after_sequence = Counter(root, "after_sequence", 0U);
     decoded.event_limit = static_cast<std::size_t>(limit);
     return decoded;
@@ -1421,7 +1585,8 @@ struct Command final {
   }
   if (command == "submit") {
     RequireExactObjectSize(root, 4U, "submit command");
-    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kSubmit};
     decoded.operation = DecodeOperation(Member(root, "operation"), attribution);
     return decoded;
@@ -1430,11 +1595,11 @@ struct Command final {
     RequireExactObjectSize(root, 4U, "motion preview command");
     const auto attribution =
         DecodeRequestAttribution(Member(root, "attribution"));
-    const auto& operation = Member(root, "operation");
+    const auto &operation = Member(root, "operation");
     Command decoded{CommandKind::kPreviewMotion};
     decoded.operation = DecodeOperation(operation, attribution);
-    decoded.operation_digest = core::ContentDigest(
-        content_identity::sha256_digest(
+    decoded.operation_digest =
+        core::ContentDigest(content_identity::sha256_digest(
             content_identity::canonical_json(operation)));
     return decoded;
   }
@@ -1442,40 +1607,48 @@ struct Command final {
     RequireExactObjectSize(root, 4U, "capability-command preview command");
     const auto attribution =
         DecodeRequestAttribution(Member(root, "attribution"));
-    const auto& operation = Member(root, "operation");
+    const auto &operation = Member(root, "operation");
     Command decoded{CommandKind::kPreviewCapabilityCommand};
     decoded.operation = DecodeOperation(operation, attribution);
-    decoded.operation_digest = core::ContentDigest(
-        content_identity::sha256_digest(
+    decoded.operation_digest =
+        core::ContentDigest(content_identity::sha256_digest(
             content_identity::canonical_json(operation)));
     return decoded;
   }
   if (command == "plan_pick") {
     RequireExactObjectSize(root, 4U, "pick planning command");
-    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kPlanPick};
-    decoded.pick_planning = DecodePickPlanningIntent(Member(root, "intent"), attribution);
+    decoded.pick_planning =
+        DecodePickPlanningIntent(Member(root, "intent"), attribution);
     return decoded;
   }
   if (command == "plan_place") {
     RequireExactObjectSize(root, 4U, "place planning command");
-    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kPlanPlace};
-    decoded.place_planning = DecodePlacePlanningIntent(Member(root, "intent"), attribution);
+    decoded.place_planning =
+        DecodePlacePlanningIntent(Member(root, "intent"), attribution);
     return decoded;
   }
   if (command == "start_pick") {
     RequireExactObjectSize(root, 4U, "pick sequence start command");
-    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kStartPick};
-    decoded.pick_planning = DecodePickPlanningIntent(Member(root, "intent"), attribution);
+    decoded.pick_planning =
+        DecodePickPlanningIntent(Member(root, "intent"), attribution);
     return decoded;
   }
   if (command == "start_place") {
     RequireExactObjectSize(root, 4U, "place sequence start command");
-    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kStartPlace};
-    decoded.place_planning = DecodePlacePlanningIntent(Member(root, "intent"), attribution);
+    decoded.place_planning =
+        DecodePlacePlanningIntent(Member(root, "intent"), attribution);
     return decoded;
   }
   if (command == "read_pick_place_sequence") {
@@ -1486,16 +1659,19 @@ struct Command final {
   }
   if (command == "stop") {
     RequireExactObjectSize(root, 4U, "Stop command");
-    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kStop};
     decoded.stop = DecodeStopIntent(Member(root, "request"), attribution);
     return decoded;
   }
   if (command == "set_runtime_scale") {
     RequireExactObjectSize(root, 4U, "runtime-scale command");
-    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kSetRuntimeScale};
-    decoded.runtime_scale = DecodeRuntimeScaleRequest(Member(root, "request"), attribution);
+    decoded.runtime_scale =
+        DecodeRuntimeScaleRequest(Member(root, "request"), attribution);
     return decoded;
   }
   CommandKind kind;
@@ -1511,16 +1687,18 @@ struct Command final {
     Fail("execution command kind is unsupported");
   }
   RequireExactObjectSize(root, 4U, "operation control command");
-  const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+  const auto attribution =
+      DecodeRequestAttribution(Member(root, "attribution"));
   Command decoded{kind};
-  decoded.control = DecodeOperationControlRequest(Member(root, "request"), attribution);
+  decoded.control =
+      DecodeOperationControlRequest(Member(root, "request"), attribution);
   return decoded;
 }
 
-[[nodiscard]] CanonicalValue ErrorValue(const core::ErrorDTO& error) {
+[[nodiscard]] CanonicalValue ErrorValue(const core::ErrorDTO &error) {
   CanonicalValue::Object details;
   details.reserve(error.details.size());
-  for (const auto& [key, value] : error.details) {
+  for (const auto &[key, value] : error.details) {
     details.emplace_back(key, CanonicalValue(value));
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -1530,15 +1708,17 @@ struct Command final {
   });
 }
 
-[[nodiscard]] CanonicalValue ErrorResponse(std::string code, std::string message) {
+[[nodiscard]] CanonicalValue ErrorResponse(std::string code,
+                                           std::string message) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-      {"error", ErrorValue(core::ErrorDTO{std::move(code), std::move(message), {}})},
+      {"error",
+       ErrorValue(core::ErrorDTO{std::move(code), std::move(message), {}})},
       {"ok", CanonicalValue(false)},
   });
 }
 
-[[nodiscard]] CanonicalValue PoseValue(const core::Pose3DTO& value) {
+[[nodiscard]] CanonicalValue PoseValue(const core::Pose3DTO &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"orientation", CanonicalValue(CanonicalValue::Object{
                           {"w", CanonicalValue(value.orientation.w)},
@@ -1554,8 +1734,8 @@ struct Command final {
   });
 }
 
-[[nodiscard]] CanonicalValue SceneRevisionValue(
-    const core::SceneRevision& value) {
+[[nodiscard]] CanonicalValue
+SceneRevisionValue(const core::SceneRevision &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"content_hash", CanonicalValue(value.content_hash.value())},
       {"revision_id", CanonicalValue(static_cast<double>(value.revision_id))},
@@ -1564,38 +1744,36 @@ struct Command final {
 }
 
 class CollisionLeaseRelease final {
- public:
-  CollisionLeaseRelease(
-      core::ICollisionWorldSnapshotPublisher& publisher,
-      core::ProjectionLeaseId lease_id)
+public:
+  CollisionLeaseRelease(core::ICollisionWorldSnapshotPublisher &publisher,
+                        core::ProjectionLeaseId lease_id)
       : publisher_(publisher), lease_id_(std::move(lease_id)) {}
   ~CollisionLeaseRelease() {
     publisher_.release_scene_snapshot_lease_inventory(lease_id_);
   }
-  CollisionLeaseRelease(const CollisionLeaseRelease&) = delete;
-  CollisionLeaseRelease& operator=(const CollisionLeaseRelease&) = delete;
+  CollisionLeaseRelease(const CollisionLeaseRelease &) = delete;
+  CollisionLeaseRelease &operator=(const CollisionLeaseRelease &) = delete;
 
- private:
-  core::ICollisionWorldSnapshotPublisher& publisher_;
+private:
+  core::ICollisionWorldSnapshotPublisher &publisher_;
   core::ProjectionLeaseId lease_id_;
 };
 
 [[nodiscard]] CanonicalValue MotionPreviewReceiptValue(
-    const core::MotionPreviewResultDTO& preview,
-    const core::OperationIntentDTO& intent,
-    const core::ContentDigest& intent_digest,
-    const core::RuntimeParticipantBinding& direct_control_binding,
-    const core::RequestOwnerEpoch& owner_epoch) {
-  const auto& binding = direct_control_binding.value();
-  const auto& final_state = preview.final_controlled_state;
-  Require(final_state.resources.size() == binding.resources.size() &&
-              final_state.joint_names.size() == binding.resources.size() &&
-              final_state.positions.size() == binding.resources.size() &&
-              preview.start_state.joint_names.size() ==
-                  binding.resources.size() &&
-              preview.start_state.positions_rad.size() ==
-                  binding.resources.size(),
-          "motion preview result crosses its direct-control resource shape");
+    const core::MotionPreviewResultDTO &preview,
+    const core::OperationIntentDTO &intent,
+    const core::ContentDigest &intent_digest,
+    const core::RuntimeParticipantBinding &direct_control_binding,
+    const core::RequestOwnerEpoch &owner_epoch) {
+  const auto &binding = direct_control_binding.value();
+  const auto &final_state = preview.final_controlled_state;
+  Require(
+      final_state.resources.size() == binding.resources.size() &&
+          final_state.joint_names.size() == binding.resources.size() &&
+          final_state.positions.size() == binding.resources.size() &&
+          preview.start_state.joint_names.size() == binding.resources.size() &&
+          preview.start_state.positions_rad.size() == binding.resources.size(),
+      "motion preview result crosses its direct-control resource shape");
 
   CanonicalValue::Array source_joint_names;
   CanonicalValue::Array start_positions;
@@ -1604,7 +1782,7 @@ class CollisionLeaseRelease final {
   start_positions.reserve(binding.resources.size());
   final_positions.reserve(binding.resources.size());
   for (std::size_t index = 0U; index < binding.resources.size(); ++index) {
-    const auto& resource = binding.resources[index];
+    const auto &resource = binding.resources[index];
     Require(resource.source_joint_name.has_value() &&
                 final_state.resources[index] == resource.resource_id &&
                 final_state.joint_names[index] ==
@@ -1612,7 +1790,7 @@ class CollisionLeaseRelease final {
                 preview.start_state.joint_names[index] ==
                     resource.compiled_resource_name,
             "motion preview result crosses its source-local binding");
-    const auto* angular =
+    const auto *angular =
         std::get_if<core::AngularPositionDTO>(&final_state.positions[index]);
     Require(angular != nullptr,
             "joint motion preview returned a non-angular terminal state");
@@ -1626,13 +1804,11 @@ class CollisionLeaseRelease final {
        CanonicalValue(CanonicalValue::Object{
            {"content_hash",
             CanonicalValue(preview.collision_world_revision.content_hash)},
-           {"revision_id",
-            CanonicalValue(static_cast<double>(
-                preview.collision_world_revision.revision_id))},
+           {"revision_id", CanonicalValue(static_cast<double>(
+                               preview.collision_world_revision.revision_id))},
        })},
       {"commit_eligible", CanonicalValue(true)},
-      {"component_role_id",
-       CanonicalValue(binding.component_role_id.value())},
+      {"component_role_id", CanonicalValue(binding.component_role_id.value())},
       {"final_positions_rad", CanonicalValue(std::move(final_positions))},
       {"final_tcp_pose", PoseValue(preview.final_tcp_pose)},
       {"graph_revision", CanonicalValue(binding.graph_revision.value())},
@@ -1640,15 +1816,13 @@ class CollisionLeaseRelease final {
       {"program_binding_id",
        CanonicalValue(binding.program_binding_id.value())},
       {"program_id", CanonicalValue(binding.program_id.value())},
-      {"program_revision",
-       CanonicalValue(binding.program_revision.value())},
+      {"program_revision", CanonicalValue(binding.program_revision.value())},
       {"program_run_id", CanonicalValue(intent.program_run_id.value())},
-      {"request_id",
-       CanonicalValue(intent.request_context.request_id.value())},
+      {"request_id", CanonicalValue(intent.request_context.request_id.value())},
       {"request_owner_epoch", CanonicalValue(owner_epoch.value())},
       {"required_capability_id",
-       CanonicalValue(intent.participants.front()
-                          .required_capability_id.value())},
+       CanonicalValue(
+           intent.participants.front().required_capability_id.value())},
       {"retained_bundle_id",
        CanonicalValue(binding.retained_bundle_id.value())},
       {"scene_revision",
@@ -1656,26 +1830,24 @@ class CollisionLeaseRelease final {
            preview.projection_binding.projection_revision.scene_revision)},
       {"schema_version",
        CanonicalValue("manyforge.direct_control_motion_preview.v1")},
-      {"source_joint_names",
-       CanonicalValue(std::move(source_joint_names))},
+      {"source_joint_names", CanonicalValue(std::move(source_joint_names))},
       {"start_positions_rad", CanonicalValue(std::move(start_positions))},
       {"target_role_id", CanonicalValue(binding.target_role_id.value())},
   };
-  const core::ContentDigest receipt_digest(
-      content_identity::sha256_digest(content_identity::canonical_json(
-          CanonicalValue(receipt))));
+  const core::ContentDigest receipt_digest(content_identity::sha256_digest(
+      content_identity::canonical_json(CanonicalValue(receipt))));
   receipt.emplace_back("receipt_digest",
                        CanonicalValue(receipt_digest.value()));
   return CanonicalValue(std::move(receipt));
 }
 
 [[nodiscard]] CanonicalValue CapabilityCommandPreviewReceiptValue(
-    const core::CapabilityCommandPreviewResultDTO& preview,
-    const core::OperationIntentDTO& intent,
-    const core::ContentDigest& intent_digest,
-    const RetainedGripperPositionLimits& limits,
-    const core::RequestOwnerEpoch& owner_epoch) {
-  const auto& binding = preview.binding;
+    const core::CapabilityCommandPreviewResultDTO &preview,
+    const core::OperationIntentDTO &intent,
+    const core::ContentDigest &intent_digest,
+    const RetainedGripperPositionLimits &limits,
+    const core::RequestOwnerEpoch &owner_epoch) {
+  const auto &binding = preview.binding;
   Require(intent.expected_scene_revision.has_value() &&
               binding.resources.size() == 1U &&
               binding.resources.front().source_joint_name.has_value() &&
@@ -1692,18 +1864,15 @@ class CollisionLeaseRelease final {
               std::isfinite(preview.command_request.target_position),
           "capability-command preview crosses its direct-control binding");
   const auto coordinate_kind =
-      limits.coordinate_kind == core::CoordinateKind::kAngular
-          ? "angular_rad"
-          : "linear_m";
+      limits.coordinate_kind == core::CoordinateKind::kAngular ? "angular_rad"
+                                                               : "linear_m";
   CanonicalValue::Object receipt{
       {"command_schema_id",
        CanonicalValue(binding.command_schema->command_schema_id.value())},
       {"command_schema_revision",
-       CanonicalValue(
-           binding.command_schema->command_schema_revision.value())},
+       CanonicalValue(binding.command_schema->command_schema_revision.value())},
       {"commit_eligible", CanonicalValue(true)},
-      {"component_role_id",
-       CanonicalValue(binding.component_role_id.value())},
+      {"component_role_id", CanonicalValue(binding.component_role_id.value())},
       {"coordinate_kind", CanonicalValue(coordinate_kind)},
       {"graph_revision", CanonicalValue(binding.graph_revision.value())},
       {"intent_digest", CanonicalValue(intent_digest.value())},
@@ -1712,15 +1881,13 @@ class CollisionLeaseRelease final {
       {"program_binding_id",
        CanonicalValue(binding.program_binding_id.value())},
       {"program_id", CanonicalValue(binding.program_id.value())},
-      {"program_revision",
-       CanonicalValue(binding.program_revision.value())},
+      {"program_revision", CanonicalValue(binding.program_revision.value())},
       {"program_run_id", CanonicalValue(intent.program_run_id.value())},
-      {"request_id",
-       CanonicalValue(intent.request_context.request_id.value())},
+      {"request_id", CanonicalValue(intent.request_context.request_id.value())},
       {"request_owner_epoch", CanonicalValue(owner_epoch.value())},
       {"required_capability_id",
-       CanonicalValue(intent.participants.front()
-                          .required_capability_id.value())},
+       CanonicalValue(
+           intent.participants.front().required_capability_id.value())},
       {"retained_bundle_id",
        CanonicalValue(binding.retained_bundle_id.value())},
       {"scene_revision", SceneRevisionValue(*intent.expected_scene_revision)},
@@ -1733,24 +1900,24 @@ class CollisionLeaseRelease final {
        CanonicalValue(preview.command_request.target_position)},
       {"target_role_id", CanonicalValue(binding.target_role_id.value())},
   };
-  const core::ContentDigest receipt_digest(
-      content_identity::sha256_digest(content_identity::canonical_json(
-          CanonicalValue(receipt))));
+  const core::ContentDigest receipt_digest(content_identity::sha256_digest(
+      content_identity::canonical_json(CanonicalValue(receipt))));
   receipt.emplace_back("receipt_digest",
                        CanonicalValue(receipt_digest.value()));
   return CanonicalValue(std::move(receipt));
 }
 
-[[nodiscard]] CanonicalValue MotionSpecValue(const core::MotionSpecDTO& motion) {
+[[nodiscard]] CanonicalValue
+MotionSpecValue(const core::MotionSpecDTO &motion) {
   return std::visit(
-      [](const auto& value) -> CanonicalValue {
+      [](const auto &value) -> CanonicalValue {
         using Motion = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<Motion, core::JointGoalDTO>) {
           CanonicalValue::Array joint_names;
           CanonicalValue::Array positions;
           joint_names.reserve(value.joint_names.size());
           positions.reserve(value.positions_rad.size());
-          for (const auto& name : value.joint_names) {
+          for (const auto &name : value.joint_names) {
             joint_names.emplace_back(name);
           }
           for (const auto position : value.positions_rad) {
@@ -1774,22 +1941,29 @@ class CollisionLeaseRelease final {
         } else {
           CanonicalValue::Array waypoints;
           waypoints.reserve(value.waypoints.size());
-          for (const auto& waypoint : value.waypoints) {
+          for (const auto &waypoint : value.waypoints) {
             waypoints.push_back(PoseValue(waypoint));
           }
           return CanonicalValue(CanonicalValue::Object{
               {"fallback_policy",
-               CanonicalValue(value.fallback_policy == core::CartesianFallbackPolicyDTO::kFailClosed
-                                  ? "fail_closed"
-                                  : "allow_joint_space_fallback")},
+               CanonicalValue(
+                   value.fallback_policy ==
+                           core::CartesianFallbackPolicyDTO::kFailClosed
+                       ? "fail_closed"
+                       : "allow_joint_space_fallback")},
               {"kind", CanonicalValue("cartesian_path")},
               {"max_angular_acceleration_rad_s2",
                CanonicalValue(value.max_angular_acceleration_rad_s2)},
-              {"max_angular_speed_rad_s", CanonicalValue(value.max_angular_speed_rad_s)},
-              {"max_linear_acceleration_mps2", CanonicalValue(value.max_linear_acceleration_mps2)},
-              {"max_linear_speed_mps", CanonicalValue(value.max_linear_speed_mps)},
-              {"max_rotation_step_rad", CanonicalValue(value.max_rotation_step_rad)},
-              {"max_translation_step_m", CanonicalValue(value.max_translation_step_m)},
+              {"max_angular_speed_rad_s",
+               CanonicalValue(value.max_angular_speed_rad_s)},
+              {"max_linear_acceleration_mps2",
+               CanonicalValue(value.max_linear_acceleration_mps2)},
+              {"max_linear_speed_mps",
+               CanonicalValue(value.max_linear_speed_mps)},
+              {"max_rotation_step_rad",
+               CanonicalValue(value.max_rotation_step_rad)},
+              {"max_translation_step_m",
+               CanonicalValue(value.max_translation_step_m)},
               {"speed_mode", CanonicalValue("bounded")},
               {"waypoints", CanonicalValue(std::move(waypoints))},
           });
@@ -1798,90 +1972,106 @@ class CollisionLeaseRelease final {
       motion);
 }
 
-[[nodiscard]] CanonicalValue ProjectionRevisionValue(const core::ProjectionRevisionDTO& value) {
+[[nodiscard]] CanonicalValue
+ProjectionRevisionValue(const core::ProjectionRevisionDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"graph_revision", CanonicalValue(value.graph_revision.value())},
       {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
       {"scene_revision",
        CanonicalValue(CanonicalValue::Object{
-           {"content_hash", CanonicalValue(value.scene_revision.content_hash.value())},
-           {"revision_id", CanonicalValue(static_cast<double>(value.scene_revision.revision_id))},
+           {"content_hash",
+            CanonicalValue(value.scene_revision.content_hash.value())},
+           {"revision_id", CanonicalValue(static_cast<double>(
+                               value.scene_revision.revision_id))},
            {"scene_id", CanonicalValue(value.scene_revision.scene_id.value())},
        })},
   });
 }
 
-[[nodiscard]] CanonicalValue PickCandidateValue(const core::PickPoseCandidateDTO& value) {
+[[nodiscard]] CanonicalValue
+PickCandidateValue(const core::PickPoseCandidateDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"approach_pose", PoseValue(value.approach_pose)},
-      {"candidate_index", CanonicalValue(static_cast<double>(value.candidate_index))},
+      {"candidate_index",
+       CanonicalValue(static_cast<double>(value.candidate_index))},
       {"min_tcp_z_applied", CanonicalValue(value.min_tcp_z_applied)},
-      {"pick_cartesian_path", MotionSpecValue(core::MotionSpecDTO{value.descend_path})},
+      {"pick_cartesian_path",
+       MotionSpecValue(core::MotionSpecDTO{value.descend_path})},
       {"pick_pose", PoseValue(value.pick_pose)},
-      {"retreat_cartesian_path", MotionSpecValue(core::MotionSpecDTO{value.retreat_path})},
+      {"retreat_cartesian_path",
+       MotionSpecValue(core::MotionSpecDTO{value.retreat_path})},
       {"retreat_pose", PoseValue(value.retreat_pose)},
   });
 }
 
-[[nodiscard]] CanonicalValue PickPlacePlanningResultValue(
-    const std::string_view sequence_id, const core::PickPlaceExecutionKindDTO kind,
-    const core::PickPlacePlanningResultDTO& value) {
+[[nodiscard]] CanonicalValue
+PickPlacePlanningResultValue(const std::string_view sequence_id,
+                             const core::PickPlaceExecutionKindDTO kind,
+                             const core::PickPlacePlanningResultDTO &value) {
   CanonicalValue::Array reports;
   reports.reserve(value.reports.size());
-  for (const auto& report : value.reports) {
+  for (const auto &report : value.reports) {
     CanonicalValue::Array stages;
     stages.reserve(report.stages.size());
-    for (const auto& stage : report.stages) {
+    for (const auto &stage : report.stages) {
       stages.emplace_back(CanonicalValue::Object{
-          {"error", stage.error.has_value() ? ErrorValue(*stage.error) : CanonicalValue(nullptr)},
+          {"error", stage.error.has_value() ? ErrorValue(*stage.error)
+                                            : CanonicalValue(nullptr)},
           {"stage", CanonicalValue(std::string(core::to_string(stage.stage)))},
           {"succeeded", CanonicalValue(stage.succeeded)},
-          {"trajectory_duration_s", CanonicalValue(stage.trajectory_duration_s)},
-          {"trajectory_waypoint_count",
-           CanonicalValue(static_cast<double>(stage.trajectory_waypoint_count))},
+          {"trajectory_duration_s",
+           CanonicalValue(stage.trajectory_duration_s)},
+          {"trajectory_waypoint_count", CanonicalValue(static_cast<double>(
+                                            stage.trajectory_waypoint_count))},
       });
     }
     reports.emplace_back(CanonicalValue::Object{
-        {"candidate_index", CanonicalValue(static_cast<double>(report.candidate_index))},
+        {"candidate_index",
+         CanonicalValue(static_cast<double>(report.candidate_index))},
         {"stages", CanonicalValue(std::move(stages))},
     });
   }
   CanonicalValue plan(nullptr);
   if (value.sequence_request.has_value()) {
-    const auto& request = *value.sequence_request;
+    const auto &request = *value.sequence_request;
     plan = CanonicalValue(CanonicalValue::Object{
         {"approach_motion", MotionSpecValue(request.plan.approach_motion)},
         {"descend_motion", MotionSpecValue(request.plan.descend_motion)},
         {"predecessor_projection_revision",
          ProjectionRevisionValue(request.plan.predecessor_projection_revision)},
         {"preview_successor_projection_revision",
-         ProjectionRevisionValue(request.plan.preview_successor_projection_revision)},
+         ProjectionRevisionValue(
+             request.plan.preview_successor_projection_revision)},
         {"retreat_motion", MotionSpecValue(request.plan.retreat_motion)},
     });
   }
   CanonicalValue last_attempted_candidate(nullptr);
   if (value.last_attempted_pick_candidate.has_value()) {
-    last_attempted_candidate = PickCandidateValue(*value.last_attempted_pick_candidate);
+    last_attempted_candidate =
+        PickCandidateValue(*value.last_attempted_pick_candidate);
   }
   return CanonicalValue(CanonicalValue::Object{
       {"attempted_candidate_count",
        CanonicalValue(static_cast<double>(value.attempted_candidate_count))},
-      {"kind", CanonicalValue(kind == core::PickPlaceExecutionKindDTO::kPick ? "pick" : "place")},
+      {"kind", CanonicalValue(kind == core::PickPlaceExecutionKindDTO::kPick
+                                  ? "pick"
+                                  : "place")},
       {"last_attempted_candidate", std::move(last_attempted_candidate)},
       {"plan", std::move(plan)},
       {"reports", CanonicalValue(std::move(reports))},
-      {"schema_version", CanonicalValue("manyforge.pick_place_planning_result.v1")},
+      {"schema_version",
+       CanonicalValue("manyforge.pick_place_planning_result.v1")},
       {"selected_object_id", CanonicalValue(value.selected_object_id.value())},
       {"sequence_id", CanonicalValue(std::string(sequence_id))},
       {"status", CanonicalValue(std::string(core::to_string(value.status)))},
   });
 }
 
-[[nodiscard]] CanonicalValue PickPlaceSequenceStatusValue(
-    const core::PickPlaceSequenceStatusDTO& value) {
+[[nodiscard]] CanonicalValue
+PickPlaceSequenceStatusValue(const core::PickPlaceSequenceStatusDTO &value) {
   CanonicalValue::Array completed_operations;
   completed_operations.reserve(value.completed_operations.size());
-  for (const auto& operation_id : value.completed_operations) {
+  for (const auto &operation_id : value.completed_operations) {
     completed_operations.emplace_back(operation_id.value());
   }
   CanonicalValue active_operation_id(nullptr);
@@ -1890,7 +2080,8 @@ class CollisionLeaseRelease final {
   }
   CanonicalValue committed_projection_revision(nullptr);
   if (value.committed_projection_revision.has_value()) {
-    committed_projection_revision = ProjectionRevisionValue(*value.committed_projection_revision);
+    committed_projection_revision =
+        ProjectionRevisionValue(*value.committed_projection_revision);
   }
   CanonicalValue terminal_error(nullptr);
   if (value.terminal_error.has_value()) {
@@ -1898,11 +2089,14 @@ class CollisionLeaseRelease final {
   }
   return CanonicalValue(CanonicalValue::Object{
       {"active_operation_id", std::move(active_operation_id)},
-      {"committed_projection_revision", std::move(committed_projection_revision)},
-      {"completed_operation_ids", CanonicalValue(std::move(completed_operations))},
+      {"committed_projection_revision",
+       std::move(committed_projection_revision)},
+      {"completed_operation_ids",
+       CanonicalValue(std::move(completed_operations))},
       {"kind", CanonicalValue(std::string(core::to_string(value.kind)))},
       {"phase", CanonicalValue(std::string(core::to_string(value.phase)))},
-      {"schema_version", CanonicalValue("manyforge.pick_place_sequence_status.v1")},
+      {"schema_version",
+       CanonicalValue("manyforge.pick_place_sequence_status.v1")},
       {"selected_object_id", CanonicalValue(value.selected_object_id.value())},
       {"sequence_id", CanonicalValue(value.sequence_id)},
       {"terminal_error", std::move(terminal_error)},
@@ -1911,215 +2105,266 @@ class CollisionLeaseRelease final {
 
 [[nodiscard]] std::string_view StateName(core::OperationStateKind state) {
   switch (state) {
-    case core::OperationStateKind::kQueued:
-      return "queued";
-    case core::OperationStateKind::kResolving:
-      return "resolving";
-    case core::OperationStateKind::kPlanning:
-      return "planning";
-    case core::OperationStateKind::kValidating:
-      return "validating";
-    case core::OperationStateKind::kPrepared:
-      return "prepared";
-    case core::OperationStateKind::kDispatching:
-      return "dispatching";
-    case core::OperationStateKind::kExecuting:
-      return "executing";
-    case core::OperationStateKind::kPaused:
-      return "paused";
-    case core::OperationStateKind::kStopping:
-      return "stopping";
-    case core::OperationStateKind::kCompleted:
-      return "completed";
-    case core::OperationStateKind::kStopped:
-      return "stopped";
-    case core::OperationStateKind::kFailed:
-      return "failed";
-    case core::OperationStateKind::kInterrupted:
-      return "interrupted";
-    case core::OperationStateKind::kInterventionRequired:
-      return "intervention_required";
-    case core::OperationStateKind::kCancelledPreDispatch:
-      return "cancelled_pre_dispatch";
+  case core::OperationStateKind::kQueued:
+    return "queued";
+  case core::OperationStateKind::kResolving:
+    return "resolving";
+  case core::OperationStateKind::kPlanning:
+    return "planning";
+  case core::OperationStateKind::kValidating:
+    return "validating";
+  case core::OperationStateKind::kPrepared:
+    return "prepared";
+  case core::OperationStateKind::kDispatching:
+    return "dispatching";
+  case core::OperationStateKind::kExecuting:
+    return "executing";
+  case core::OperationStateKind::kPaused:
+    return "paused";
+  case core::OperationStateKind::kStopping:
+    return "stopping";
+  case core::OperationStateKind::kCompleted:
+    return "completed";
+  case core::OperationStateKind::kStopped:
+    return "stopped";
+  case core::OperationStateKind::kFailed:
+    return "failed";
+  case core::OperationStateKind::kInterrupted:
+    return "interrupted";
+  case core::OperationStateKind::kInterventionRequired:
+    return "intervention_required";
+  case core::OperationStateKind::kCancelledPreDispatch:
+    return "cancelled_pre_dispatch";
   }
   return "unknown";
 }
 
-[[nodiscard]] CanonicalValue AcceptedValue(const core::OperationAcceptedDTO& value) {
+[[nodiscard]] CanonicalValue
+AcceptedValue(const core::OperationAcceptedDTO &value) {
   CanonicalValue::Array assignments;
   assignments.reserve(value.participant_assignments.size());
-  for (const auto& assignment : value.participant_assignments) {
+  for (const auto &assignment : value.participant_assignments) {
     assignments.emplace_back(CanonicalValue::Object{
-        {"input_index", CanonicalValue(static_cast<double>(assignment.input_index))},
+        {"input_index",
+         CanonicalValue(static_cast<double>(assignment.input_index))},
         {"participant_id", CanonicalValue(assignment.participant_id.value())},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns", CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"accepted_at_ns",
+       CanonicalValue(static_cast<double>(value.accepted_at_ns))},
       {"operation_id", CanonicalValue(value.operation_id.value())},
-      {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
+      {"operation_revision",
+       CanonicalValue(static_cast<double>(value.operation_revision.value()))},
       {"participant_assignments", CanonicalValue(std::move(assignments))},
-      {"replay_status", CanonicalValue(std::string(core::to_string(value.replay_status)))},
+      {"replay_status",
+       CanonicalValue(std::string(core::to_string(value.replay_status)))},
       {"request_id", CanonicalValue(value.request_id.value())},
   });
 }
 
 [[nodiscard]] std::string_view ControlName(core::OperationControlKind control) {
   switch (control) {
-    case core::OperationControlKind::kPause:
-      return "pause";
-    case core::OperationControlKind::kResume:
-      return "resume";
-    case core::OperationControlKind::kReset:
-      return "reset";
-    case core::OperationControlKind::kAcknowledgeCompleted:
-      return "acknowledge_completed";
+  case core::OperationControlKind::kPause:
+    return "pause";
+  case core::OperationControlKind::kResume:
+    return "resume";
+  case core::OperationControlKind::kReset:
+    return "reset";
+  case core::OperationControlKind::kAcknowledgeCompleted:
+    return "acknowledge_completed";
   }
   return "unknown";
 }
 
-[[nodiscard]] CanonicalValue ControlAcceptedValue(const core::OperationControlAcceptedDTO& value) {
+[[nodiscard]] CanonicalValue
+ControlAcceptedValue(const core::OperationControlAcceptedDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"accepted_against_revision",
-       CanonicalValue(static_cast<double>(value.accepted_against_revision.value()))},
-      {"accepted_at_ns", CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+       CanonicalValue(
+           static_cast<double>(value.accepted_against_revision.value()))},
+      {"accepted_at_ns",
+       CanonicalValue(static_cast<double>(value.accepted_at_ns))},
       {"control", CanonicalValue(std::string(ControlName(value.control)))},
       {"operation_id", CanonicalValue(value.operation_id.value())},
       {"operation_revision_after_acceptance",
-       CanonicalValue(static_cast<double>(value.operation_revision_after_acceptance.value()))},
-      {"replay_status", CanonicalValue(std::string(core::to_string(value.replay_status)))},
+       CanonicalValue(static_cast<double>(
+           value.operation_revision_after_acceptance.value()))},
+      {"replay_status",
+       CanonicalValue(std::string(core::to_string(value.replay_status)))},
       {"request_id", CanonicalValue(value.request_id.value())},
   });
 }
 
-[[nodiscard]] CanonicalValue StopAcceptedValue(const core::StopAcceptedDTO& value) {
+[[nodiscard]] CanonicalValue
+StopAcceptedValue(const core::StopAcceptedDTO &value) {
   CanonicalValue::Array operations;
   operations.reserve(value.operations.size());
-  for (const auto& operation : value.operations) {
+  for (const auto &operation : value.operations) {
     operations.emplace_back(operation.value());
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns", CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"accepted_at_ns",
+       CanonicalValue(static_cast<double>(value.accepted_at_ns))},
       {"operation_revision_after_acceptance",
-       CanonicalValue(static_cast<double>(value.operation_revision_after_acceptance.value()))},
+       CanonicalValue(static_cast<double>(
+           value.operation_revision_after_acceptance.value()))},
       {"operations", CanonicalValue(std::move(operations))},
-      {"replay_status", CanonicalValue(std::string(core::to_string(value.replay_status)))},
+      {"replay_status",
+       CanonicalValue(std::string(core::to_string(value.replay_status)))},
       {"request_id", CanonicalValue(value.request_id.value())},
-      {"stop_generation", CanonicalValue(static_cast<double>(value.stop_generation.value()))},
+      {"stop_generation",
+       CanonicalValue(static_cast<double>(value.stop_generation.value()))},
       {"stop_id", CanonicalValue(value.stop_id.value())},
   });
 }
 
-[[nodiscard]] CanonicalValue RuntimeScaleAcceptedValue(const core::RuntimeScaleAcceptedDTO& value) {
+[[nodiscard]] CanonicalValue
+RuntimeScaleAcceptedValue(const core::RuntimeScaleAcceptedDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_at_ns", CanonicalValue(static_cast<double>(value.accepted_at_ns))},
+      {"accepted_at_ns",
+       CanonicalValue(static_cast<double>(value.accepted_at_ns))},
       {"operation_id", CanonicalValue(value.operation_id.value())},
-      {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
-      {"replay_status", CanonicalValue(std::string(core::to_string(value.replay_status)))},
+      {"operation_revision",
+       CanonicalValue(static_cast<double>(value.operation_revision.value()))},
+      {"replay_status",
+       CanonicalValue(std::string(core::to_string(value.replay_status)))},
       {"request_id", CanonicalValue(value.request_id.value())},
       {"requested_scale", CanonicalValue(value.requested_scale)},
       {"runtime_scale_generation",
-       CanonicalValue(static_cast<double>(value.runtime_scale_generation.value()))},
+       CanonicalValue(
+           static_cast<double>(value.runtime_scale_generation.value()))},
   });
 }
 
-[[nodiscard]] CanonicalValue RuntimeScaleStatusValue(const core::RuntimeScaleStatusDTO& value) {
+[[nodiscard]] CanonicalValue
+RuntimeScaleStatusValue(const core::RuntimeScaleStatusDTO &value) {
   CanonicalValue::Array participants;
   participants.reserve(value.participants.size());
-  for (const auto& participant : value.participants) {
+  for (const auto &participant : value.participants) {
     CanonicalValue::Array resources;
     resources.reserve(participant.resources.size());
-    for (const auto& resource : participant.resources) {
+    for (const auto &resource : participant.resources) {
       resources.emplace_back(resource.value());
     }
     participants.emplace_back(CanonicalValue::Object{
-        {"accepted_generation",
-         CanonicalValue(static_cast<double>(participant.accepted_generation.value()))},
+        {"accepted_generation", CanonicalValue(static_cast<double>(
+                                    participant.accepted_generation.value()))},
         {"acknowledgement_sequence",
-         CanonicalValue(static_cast<double>(participant.acknowledgement_sequence))},
+         CanonicalValue(
+             static_cast<double>(participant.acknowledgement_sequence))},
         {"acknowledgement_source_epoch",
          CanonicalValue(participant.acknowledgement_source_epoch.value())},
         {"acknowledgement_timestamp_ns",
-         CanonicalValue(static_cast<double>(participant.acknowledgement_timestamp_ns))},
-        {"active_control_configuration_generation",
          CanonicalValue(
-             static_cast<double>(participant.active_control_configuration_generation.value()))},
+             static_cast<double>(participant.acknowledgement_timestamp_ns))},
+        {"active_control_configuration_generation",
+         CanonicalValue(static_cast<double>(
+             participant.active_control_configuration_generation.value()))},
         {"active_control_configuration_id",
          CanonicalValue(participant.active_control_configuration_id.value())},
         {"applied_scale", CanonicalValue(participant.applied_scale)},
         {"capability_id", CanonicalValue(participant.capability_id.value())},
         {"commanded_scale", CanonicalValue(participant.commanded_scale)},
-        {"command_target_id", CanonicalValue(participant.command_target_id.value())},
+        {"command_target_id",
+         CanonicalValue(participant.command_target_id.value())},
         {"controllable_component_id",
          CanonicalValue(participant.controllable_component_id.value())},
-        {"control_binding_id", CanonicalValue(participant.control_binding_id.value())},
-        {"control_binding_revision", CanonicalValue(participant.control_binding_revision.value())},
-        {"control_domain_id", CanonicalValue(participant.control_domain_id.value())},
-        {"control_domain_revision", CanonicalValue(participant.control_domain_revision.value())},
-        {"control_route_id", CanonicalValue(participant.control_route_id.value())},
+        {"control_binding_id",
+         CanonicalValue(participant.control_binding_id.value())},
+        {"control_binding_revision",
+         CanonicalValue(participant.control_binding_revision.value())},
+        {"control_domain_id",
+         CanonicalValue(participant.control_domain_id.value())},
+        {"control_domain_revision",
+         CanonicalValue(participant.control_domain_revision.value())},
+        {"control_route_id",
+         CanonicalValue(participant.control_route_id.value())},
         {"controller_goal_generation",
-         CanonicalValue(static_cast<double>(participant.controller_goal_generation.value()))},
-        {"controller_goal_id", CanonicalValue(participant.controller_goal_id.value())},
-        {"controller_topology_id", CanonicalValue(participant.controller_topology_id.value())},
-        {"coordinated_barrier_id", participant.coordinated_barrier_id.has_value()
-                                       ? CanonicalValue(participant.coordinated_barrier_id->value())
-                                       : CanonicalValue(nullptr)},
-        {"error",
-         participant.error.has_value() ? ErrorValue(*participant.error) : CanonicalValue(nullptr)},
+         CanonicalValue(static_cast<double>(
+             participant.controller_goal_generation.value()))},
+        {"controller_goal_id",
+         CanonicalValue(participant.controller_goal_id.value())},
+        {"controller_topology_id",
+         CanonicalValue(participant.controller_topology_id.value())},
+        {"coordinated_barrier_id",
+         participant.coordinated_barrier_id.has_value()
+             ? CanonicalValue(participant.coordinated_barrier_id->value())
+             : CanonicalValue(nullptr)},
+        {"error", participant.error.has_value() ? ErrorValue(*participant.error)
+                                                : CanonicalValue(nullptr)},
         {"participant_id", CanonicalValue(participant.participant_id.value())},
         {"resources", CanonicalValue(std::move(resources))},
-        {"scaling_domain_id", CanonicalValue(participant.scaling_domain_id.value())},
-        {"state", CanonicalValue(std::string(core::to_string(participant.state)))},
+        {"scaling_domain_id",
+         CanonicalValue(participant.scaling_domain_id.value())},
+        {"state",
+         CanonicalValue(std::string(core::to_string(participant.state)))},
         {"supported", CanonicalValue(participant.supported)},
-        {"topology_revision", CanonicalValue(participant.topology_revision.value())},
-        {"virtual_trajectory_time_s", CanonicalValue(participant.virtual_trajectory_time_s)},
+        {"topology_revision",
+         CanonicalValue(participant.topology_revision.value())},
+        {"virtual_trajectory_time_s",
+         CanonicalValue(participant.virtual_trajectory_time_s)},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
       {"effective_scale", CanonicalValue(value.effective_scale)},
       {"operation_id", CanonicalValue(value.operation_id.value())},
-      {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
+      {"operation_revision",
+       CanonicalValue(static_cast<double>(value.operation_revision.value()))},
       {"participants", CanonicalValue(std::move(participants))},
       {"requested_scale", CanonicalValue(value.requested_scale)},
       {"runtime_scale_generation",
-       CanonicalValue(static_cast<double>(value.runtime_scale_generation.value()))},
+       CanonicalValue(
+           static_cast<double>(value.runtime_scale_generation.value()))},
       {"state", CanonicalValue(std::string(core::to_string(value.state)))},
-      {"updated_at_ns", CanonicalValue(static_cast<double>(value.updated_at_ns))},
+      {"updated_at_ns",
+       CanonicalValue(static_cast<double>(value.updated_at_ns))},
   });
 }
 
-[[nodiscard]] CanonicalValue OperationStateValue(const core::OperationStateDTO& value) {
+[[nodiscard]] CanonicalValue
+OperationStateValue(const core::OperationStateDTO &value) {
   CanonicalValue::Array participants;
   participants.reserve(value.participants.size());
-  for (const auto& participant : value.participants) {
+  for (const auto &participant : value.participants) {
     CanonicalValue::Array resources;
     resources.reserve(participant.resources.size());
-    for (const auto& resource : participant.resources) {
+    for (const auto &resource : participant.resources) {
       resources.emplace_back(resource.value());
     }
     participants.emplace_back(CanonicalValue::Object{
         {"capability_id", CanonicalValue(participant.capability_id.value())},
         {"capability_provider_binding_id",
          participant.capability_provider_binding_id.has_value()
-             ? CanonicalValue(participant.capability_provider_binding_id->value())
+             ? CanonicalValue(
+                   participant.capability_provider_binding_id->value())
              : CanonicalValue(nullptr)},
         {"capability_provider_binding_revision",
          participant.capability_provider_binding_revision.has_value()
-             ? CanonicalValue(participant.capability_provider_binding_revision->value())
+             ? CanonicalValue(
+                   participant.capability_provider_binding_revision->value())
              : CanonicalValue(nullptr)},
-        {"command_target_id", CanonicalValue(participant.command_target_id.value())},
+        {"command_target_id",
+         CanonicalValue(participant.command_target_id.value())},
         {"controllable_component_id",
          CanonicalValue(participant.controllable_component_id.value())},
-        {"control_binding_id", CanonicalValue(participant.control_binding_id.value())},
-        {"control_binding_revision", CanonicalValue(participant.control_binding_revision.value())},
-        {"control_domain_id", CanonicalValue(participant.control_domain_id.value())},
-        {"control_domain_revision", CanonicalValue(participant.control_domain_revision.value())},
+        {"control_binding_id",
+         CanonicalValue(participant.control_binding_id.value())},
+        {"control_binding_revision",
+         CanonicalValue(participant.control_binding_revision.value())},
+        {"control_domain_id",
+         CanonicalValue(participant.control_domain_id.value())},
+        {"control_domain_revision",
+         CanonicalValue(participant.control_domain_revision.value())},
         {"controller_goal_generation",
-         CanonicalValue(static_cast<double>(participant.controller_goal_generation.value()))},
-        {"controller_goal_id", CanonicalValue(participant.controller_goal_id.value())},
+         CanonicalValue(static_cast<double>(
+             participant.controller_goal_generation.value()))},
+        {"controller_goal_id",
+         CanonicalValue(participant.controller_goal_id.value())},
         {"participant_id", CanonicalValue(participant.participant_id.value())},
         {"payload_kind",
-         CanonicalValue(participant.payload_kind == core::OperationParticipantPayloadKind::kMotion
+         CanonicalValue(participant.payload_kind ==
+                                core::OperationParticipantPayloadKind::kMotion
                             ? "motion"
                             : "capability_command")},
         {"progress", CanonicalValue(participant.progress)},
@@ -2133,42 +2378,49 @@ class CollisionLeaseRelease final {
   return CanonicalValue(CanonicalValue::Object{
       {"active_stop_generation",
        value.active_stop_generation.has_value()
-           ? CanonicalValue(static_cast<double>(value.active_stop_generation->value()))
+           ? CanonicalValue(
+                 static_cast<double>(value.active_stop_generation->value()))
            : CanonicalValue(nullptr)},
       {"active_stop_id", value.active_stop_id.has_value()
                              ? CanonicalValue(value.active_stop_id->value())
                              : CanonicalValue(nullptr)},
       {"coordination_policy", CanonicalValue("independent")},
       {"operation_id", CanonicalValue(value.operation_id.value())},
-      {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
+      {"operation_revision",
+       CanonicalValue(static_cast<double>(value.operation_revision.value()))},
       {"participants", CanonicalValue(std::move(participants))},
       {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
       {"program_run_id", CanonicalValue(value.program_run_id.value())},
       {"runtime_scale_generation",
        value.runtime_scale_generation.has_value()
-           ? CanonicalValue(static_cast<double>(value.runtime_scale_generation->value()))
+           ? CanonicalValue(
+                 static_cast<double>(value.runtime_scale_generation->value()))
            : CanonicalValue(nullptr)},
       {"state", CanonicalValue(std::string(StateName(value.state)))},
-      {"updated_at_ns", CanonicalValue(static_cast<double>(value.updated_at_ns))},
+      {"updated_at_ns",
+       CanonicalValue(static_cast<double>(value.updated_at_ns))},
   });
 }
 
-[[nodiscard]] CanonicalValue OperationEventPageValue(
-    const core::OperationJournalEventPageDTO& page) {
+[[nodiscard]] CanonicalValue
+OperationEventPageValue(const core::OperationJournalEventPageDTO &page) {
   CanonicalValue::Array events;
   events.reserve(page.events.size());
-  for (const auto& event : page.events) {
+  for (const auto &event : page.events) {
     CanonicalValue payload;
     try {
-      payload = deployment::parse_strict_json_model_yaml(event.payload_json).root();
-    } catch (const std::exception& error) {
-      Fail("durable operation event payload is not strict JSON: " + std::string(error.what()));
+      payload =
+          deployment::parse_strict_json_model_yaml(event.payload_json).root();
+    } catch (const std::exception &error) {
+      Fail("durable operation event payload is not strict JSON: " +
+           std::string(error.what()));
     }
     Require(content_identity::canonical_json(payload) == event.payload_json,
             "durable operation event payload is not canonical JSON");
     events.emplace_back(CanonicalValue::Object{
         {"effect_pending", CanonicalValue(event.effect_pending)},
-        {"occurred_at_ns", CanonicalValue(static_cast<double>(event.occurred_at_ns))},
+        {"occurred_at_ns",
+         CanonicalValue(static_cast<double>(event.occurred_at_ns))},
         {"occurred_at_wall", CanonicalValue(event.occurred_at_wall)},
         {"operation_id", CanonicalValue(event.operation_id.value())},
         {"operation_revision",
@@ -2177,22 +2429,25 @@ class CollisionLeaseRelease final {
         {"payload", std::move(payload)},
         {"payload_digest", CanonicalValue(event.payload_digest)},
         {"record_kind", CanonicalValue(event.record_kind)},
-        {"request_id", event.request_id.has_value() ? CanonicalValue(event.request_id->value())
-                                                    : CanonicalValue(nullptr)},
+        {"request_id", event.request_id.has_value()
+                           ? CanonicalValue(event.request_id->value())
+                           : CanonicalValue(nullptr)},
         {"sequence", CanonicalValue(static_cast<double>(event.sequence))},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
       {"events", CanonicalValue(std::move(events))},
       {"has_more", CanonicalValue(page.has_more)},
-      {"next_after_sequence", CanonicalValue(static_cast<double>(page.next_after_sequence))},
+      {"next_after_sequence",
+       CanonicalValue(static_cast<double>(page.next_after_sequence))},
       {"owner_epoch", CanonicalValue(page.owner_epoch.value())},
       {"schema_version", CanonicalValue("manyforge.execution_event_page.v1")},
   });
 }
 
-[[nodiscard]] CanonicalValue CoordinatePositionValue(const core::CoordinatePositionDTO& position) {
-  if (const auto* angular = std::get_if<core::AngularPositionDTO>(&position)) {
+[[nodiscard]] CanonicalValue
+CoordinatePositionValue(const core::CoordinatePositionDTO &position) {
+  if (const auto *angular = std::get_if<core::AngularPositionDTO>(&position)) {
     return CanonicalValue(CanonicalValue::Object{
         {"kind", CanonicalValue("angular_rad")},
         {"value_rad", CanonicalValue(angular->value_rad)},
@@ -2200,12 +2455,14 @@ class CollisionLeaseRelease final {
   }
   return CanonicalValue(CanonicalValue::Object{
       {"kind", CanonicalValue("linear_m")},
-      {"value_m", CanonicalValue(std::get<core::LinearPositionDTO>(position).value_m)},
+      {"value_m",
+       CanonicalValue(std::get<core::LinearPositionDTO>(position).value_m)},
   });
 }
 
-[[nodiscard]] CanonicalValue CoordinateVelocityValue(const core::CoordinateVelocityDTO& velocity) {
-  if (const auto* angular = std::get_if<core::AngularVelocityDTO>(&velocity)) {
+[[nodiscard]] CanonicalValue
+CoordinateVelocityValue(const core::CoordinateVelocityDTO &velocity) {
+  if (const auto *angular = std::get_if<core::AngularVelocityDTO>(&velocity)) {
     return CanonicalValue(CanonicalValue::Object{
         {"kind", CanonicalValue("angular_rad_s")},
         {"value_rad_s", CanonicalValue(angular->value_rad_s)},
@@ -2213,136 +2470,155 @@ class CollisionLeaseRelease final {
   }
   return CanonicalValue(CanonicalValue::Object{
       {"kind", CanonicalValue("linear_m_s")},
-      {"value_m_s", CanonicalValue(std::get<core::LinearVelocityDTO>(velocity).value_m_s)},
+      {"value_m_s",
+       CanonicalValue(std::get<core::LinearVelocityDTO>(velocity).value_m_s)},
   });
 }
 
-[[nodiscard]] CanonicalValue ObservedTargetValue(const core::TargetRoleId& target_role_id,
-                                                 const core::ObservedStateSnapshotDTO& state) {
+[[nodiscard]] CanonicalValue
+ObservedTargetValue(const core::TargetRoleId &target_role_id,
+                    const core::ObservedStateSnapshotDTO &state) {
   CanonicalValue::Array resources;
   resources.reserve(state.resources.size());
-  for (const auto& resource : state.resources) {
+  for (const auto &resource : state.resources) {
     resources.emplace_back(resource.value());
   }
   CanonicalValue::Array joint_names;
   joint_names.reserve(state.joint_names.size());
-  for (const auto& joint_name : state.joint_names) {
+  for (const auto &joint_name : state.joint_names) {
     joint_names.emplace_back(joint_name);
   }
   CanonicalValue::Array positions;
   positions.reserve(state.positions.size());
-  for (const auto& position : state.positions) {
+  for (const auto &position : state.positions) {
     positions.push_back(CoordinatePositionValue(position));
   }
   CanonicalValue velocities(nullptr);
   if (state.velocities.has_value()) {
     CanonicalValue::Array values;
     values.reserve(state.velocities->size());
-    for (const auto& velocity : *state.velocities) {
+    for (const auto &velocity : *state.velocities) {
       values.push_back(CoordinateVelocityValue(velocity));
     }
     velocities = CanonicalValue(std::move(values));
   }
   return CanonicalValue(CanonicalValue::Object{
       {"active_control_configuration_generation",
-       CanonicalValue(static_cast<double>(state.active_control_configuration_generation.value()))},
+       CanonicalValue(static_cast<double>(
+           state.active_control_configuration_generation.value()))},
       {"active_control_configuration_id",
        CanonicalValue(state.active_control_configuration_id.value())},
       {"command_target_id", CanonicalValue(state.command_target_id.value())},
       {"complete", CanonicalValue(state.complete)},
-      {"controllable_component_id", CanonicalValue(state.controllable_component_id.value())},
+      {"controllable_component_id",
+       CanonicalValue(state.controllable_component_id.value())},
       {"control_binding_id", CanonicalValue(state.control_binding_id.value())},
-      {"control_binding_revision", CanonicalValue(state.control_binding_revision.value())},
+      {"control_binding_revision",
+       CanonicalValue(state.control_binding_revision.value())},
       {"control_domain_id", CanonicalValue(state.control_domain_id.value())},
-      {"control_domain_revision", CanonicalValue(state.control_domain_revision.value())},
+      {"control_domain_revision",
+       CanonicalValue(state.control_domain_revision.value())},
       {"control_route_id", CanonicalValue(state.control_route_id.value())},
       {"joint_names", CanonicalValue(std::move(joint_names))},
       {"positions", CanonicalValue(std::move(positions))},
-      {"received_timestamp_ns", CanonicalValue(static_cast<double>(state.received_timestamp_ns))},
+      {"received_timestamp_ns",
+       CanonicalValue(static_cast<double>(state.received_timestamp_ns))},
       {"resources", CanonicalValue(std::move(resources))},
       {"sequence", CanonicalValue(static_cast<double>(state.sequence))},
       {"source_epoch", CanonicalValue(state.source_epoch.value())},
       {"source_id", CanonicalValue(state.source_id)},
-      {"source_kind", CanonicalValue(std::string(core::to_string(state.source_kind)))},
-      {"source_timestamp_ns", CanonicalValue(static_cast<double>(state.source_timestamp_ns))},
-      {"state_authority_class",
-       CanonicalValue(std::string(core::to_string(state.state_authority_class)))},
+      {"source_kind",
+       CanonicalValue(std::string(core::to_string(state.source_kind)))},
+      {"source_timestamp_ns",
+       CanonicalValue(static_cast<double>(state.source_timestamp_ns))},
+      {"state_authority_class", CanonicalValue(std::string(core::to_string(
+                                    state.state_authority_class)))},
       {"state_authority_id", CanonicalValue(state.state_authority_id.value())},
       {"target_role_id", CanonicalValue(target_role_id.value())},
       {"velocities", std::move(velocities)},
   });
 }
 
-class AbsoluteOnlyReferenceResolver final : public core::IReferencePoseResolver {
- public:
+class AbsoluteOnlyReferenceResolver final
+    : public core::IReferencePoseResolver {
+public:
   [[nodiscard]] core::Result<core::Pose3DTO> resolve_reference_pose(
-      const core::ReferenceDTO&, const core::ProgramFrameResolutionContextDTO&) const override {
-    return core::Result<core::Pose3DTO>::Err(
-        core::ErrorDTO{std::string(core::to_string(core::ErrorCode::kMissingReference)),
-                       "N3 native execution host has no logical-scene reference resolver",
-                       {{"reason", "n3_reference_resolution_unavailable"}}});
+      const core::ReferenceDTO &,
+      const core::ProgramFrameResolutionContextDTO &) const override {
+    return core::Result<core::Pose3DTO>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kMissingReference)),
+        "N3 native execution host has no logical-scene reference resolver",
+        {{"reason", "n3_reference_resolution_unavailable"}}});
   }
 };
 
-[[nodiscard]] RoboPlanCandidateBindingDTO CandidateBinding(
-    const core::RuntimeParticipantBinding& runtime) {
-  const auto& value = runtime.value();
-  Require(value.model_groups.size() == 1U, "motion binding has no sole retained model group");
-  const auto& group = value.model_groups.front();
-  const auto model = std::find_if(value.model_bindings.begin(), value.model_bindings.end(),
-                                  [&](const auto& candidate) {
-                                    return candidate.model_instance_id == group.model_instance_id;
-                                  });
-  Require(model != value.model_bindings.end(), "motion model group has no retained model revision");
+[[nodiscard]] RoboPlanCandidateBindingDTO
+CandidateBinding(const core::RuntimeParticipantBinding &runtime) {
+  const auto &value = runtime.value();
+  Require(value.model_groups.size() == 1U,
+          "motion binding has no sole retained model group");
+  const auto &group = value.model_groups.front();
+  const auto model = std::find_if(
+      value.model_bindings.begin(), value.model_bindings.end(),
+      [&](const auto &candidate) {
+        return candidate.model_instance_id == group.model_instance_id;
+      });
+  Require(model != value.model_bindings.end(),
+          "motion model group has no retained model revision");
   std::vector<core::ResourceId> resources;
   std::vector<std::string> compiled_joint_names;
   resources.reserve(value.resources.size());
   compiled_joint_names.reserve(value.resources.size());
-  for (const auto& resource : value.resources) {
+  for (const auto &resource : value.resources) {
     resources.push_back(resource.resource_id);
     compiled_joint_names.push_back(resource.compiled_resource_name);
   }
   std::vector<core::ResolvedFrameDTO> frames;
   frames.reserve(value.frame_bindings.size());
-  for (const auto& frame : value.frame_bindings) {
+  for (const auto &frame : value.frame_bindings) {
     frames.emplace_back(core::ResolvedComponentModelFrameDTO{
-        value.controllable_component_id, frame.model_instance_id, frame.frame_role_id,
-        frame.compiled_frame_name, frame.model_revision});
+        value.controllable_component_id, frame.model_instance_id,
+        frame.frame_role_id, frame.compiled_frame_name, frame.model_revision});
   }
-  return RoboPlanCandidateBindingDTO{value.controllable_component_id, value.command_target_id,
-                                     group.model_instance_id,         model->model_revision,
-                                     group.compiled_group_name,       std::move(resources),
-                                     std::move(compiled_joint_names), std::move(frames)};
+  return RoboPlanCandidateBindingDTO{
+      value.controllable_component_id, value.command_target_id,
+      group.model_instance_id,         model->model_revision,
+      group.compiled_group_name,       std::move(resources),
+      std::move(compiled_joint_names), std::move(frames)};
 }
 
-[[nodiscard]] core::LogicalSceneSnapshotDTO EmptyScene(const core::CellId& cell_id,
-                                                       const core::SceneRevision& revision) {
+[[nodiscard]] core::LogicalSceneSnapshotDTO
+EmptyScene(const core::CellId &cell_id, const core::SceneRevision &revision) {
   core::CollisionPolicySnapshot policy;
-  policy.revision = {1U, std::string(core::kCanonicalEmptyCollisionPolicyDigest)};
-  core::LogicalSceneSnapshotDTO snapshot{revision, cell_id, 0U, 0U, 0U, std::move(policy), {}, {}};
-  Require(core::logical_scene_identity::ComputeLogicalSceneContentHash(snapshot) ==
-                  revision.content_hash &&
+  policy.revision = {1U,
+                     std::string(core::kCanonicalEmptyCollisionPolicyDigest)};
+  core::LogicalSceneSnapshotDTO snapshot{revision, cell_id,           0U, 0U,
+                                         0U,       std::move(policy), {}, {}};
+  Require(core::logical_scene_identity::ComputeLogicalSceneContentHash(
+              snapshot) == revision.content_hash &&
               snapshot.locally_valid(),
           "active scene revision is not the exact canonical empty scene; "
           "live scene consumption starts at N5");
   return snapshot;
 }
 
-[[nodiscard]] deployment::ActiveRuntimeParticipantFactsDTO ActiveFacts(
-    const deployment::RuntimeProgramTargetBinding& primary,
-    std::span<const deployment::RuntimeProgramTargetBinding> supporting,
-    const core::RuntimeEpoch& runtime_epoch,
-    core::ActiveControlConfigurationId active_configuration_id) {
-  Require(primary.desired_route().has_value(), "runtime binding has no desired I6 route");
-  std::set<core::RuntimeUnitId> runtime_units(primary.component().runtime_unit_ids.begin(),
-                                              primary.component().runtime_unit_ids.end());
+[[nodiscard]] deployment::ActiveRuntimeParticipantFactsDTO
+ActiveFacts(const deployment::RuntimeProgramTargetBinding &primary,
+            std::span<const deployment::RuntimeProgramTargetBinding> supporting,
+            const core::RuntimeEpoch &runtime_epoch,
+            core::ActiveControlConfigurationId active_configuration_id) {
+  Require(primary.desired_route().has_value(),
+          "runtime binding has no desired I6 route");
+  std::set<core::RuntimeUnitId> runtime_units(
+      primary.component().runtime_unit_ids.begin(),
+      primary.component().runtime_unit_ids.end());
   if (primary.control_domain().has_value()) {
     runtime_units.insert(primary.control_domain()->runtime_unit_ids.begin(),
                          primary.control_domain()->runtime_unit_ids.end());
   }
   std::vector<core::RuntimeUnitEpochBindingDTO> runtime_epochs;
   runtime_epochs.reserve(runtime_units.size());
-  for (const auto& runtime_unit : runtime_units) {
+  for (const auto &runtime_unit : runtime_units) {
     runtime_epochs.push_back({runtime_unit, runtime_epoch});
   }
   std::set<core::ProviderInstanceId> providers;
@@ -2350,16 +2626,18 @@ class AbsoluteOnlyReferenceResolver final : public core::IReferencePoseResolver 
     providers.insert(primary.control_binding()->provider_instance_id);
   }
   if (primary.capability_provider_binding().has_value()) {
-    providers.insert(primary.capability_provider_binding()->provider_instance_id);
+    providers.insert(
+        primary.capability_provider_binding()->provider_instance_id);
   }
-  for (const auto& support : supporting) {
+  for (const auto &support : supporting) {
     if (support.capability_provider_binding().has_value()) {
-      providers.insert(support.capability_provider_binding()->provider_instance_id);
+      providers.insert(
+          support.capability_provider_binding()->provider_instance_id);
     }
   }
   std::vector<deployment::RuntimeProviderEpochFactDTO> provider_epochs;
   provider_epochs.reserve(providers.size());
-  for (const auto& provider : providers) {
+  for (const auto &provider : providers) {
     provider_epochs.push_back({provider, runtime_epoch});
   }
   return deployment::ActiveRuntimeParticipantFactsDTO{
@@ -2387,25 +2665,31 @@ struct Composition final {
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
   std::shared_ptr<void> pick_place_planning_fixture_lifetime;
 #endif
-  std::unique_ptr<core::AddressedPickPlacePlanningOwner> pick_place_planning_owner;
-  std::unique_ptr<core::PickPlaceSequenceCoordinator> pick_place_sequence_coordinator;
-  std::unique_ptr<core::AddressedPickPlaceExecutionOwner> pick_place_execution_owner;
+  std::unique_ptr<core::AddressedPickPlacePlanningOwner>
+      pick_place_planning_owner;
+  std::unique_ptr<core::PickPlaceSequenceCoordinator>
+      pick_place_sequence_coordinator;
+  std::unique_ptr<core::AddressedPickPlaceExecutionOwner>
+      pick_place_execution_owner;
 
-  Composition(std::shared_ptr<const deployment::RetainedBundle> selected_bundle,
-              std::shared_ptr<const deployment::ProgramBindingContract> selected_program,
-              std::shared_ptr<const deployment::ProgramBinding> selected_binding,
-              std::shared_ptr<const deployment::ProgramBinding> selected_direct_control_binding,
-              std::shared_ptr<const deployment::ProgramBinding>
-                  selected_direct_control_gripper_program_binding,
-              core::RuntimeParticipantBinding selected_direct_control_motion_binding,
-              core::RuntimeParticipantBinding selected_direct_control_gripper_binding,
-              core::JointLimitsDTO selected_direct_control_joint_limits,
-              RetainedPlanningModelStage selected_stage,
-              std::shared_ptr<RetainedNativeRuntime> selected_runtime,
-              core::ProjectionRevisionDTO selected_projection,
-              core::ActiveBundlePublicationGeneration selected_generation,
-              core::TargetRoleId selected_status_motion_target_role_id,
-              core::TargetRoleId selected_status_gripper_target_role_id)
+  Composition(
+      std::shared_ptr<const deployment::RetainedBundle> selected_bundle,
+      std::shared_ptr<const deployment::ProgramBindingContract>
+          selected_program,
+      std::shared_ptr<const deployment::ProgramBinding> selected_binding,
+      std::shared_ptr<const deployment::ProgramBinding>
+          selected_direct_control_binding,
+      std::shared_ptr<const deployment::ProgramBinding>
+          selected_direct_control_gripper_program_binding,
+      core::RuntimeParticipantBinding selected_direct_control_motion_binding,
+      core::RuntimeParticipantBinding selected_direct_control_gripper_binding,
+      core::JointLimitsDTO selected_direct_control_joint_limits,
+      RetainedPlanningModelStage selected_stage,
+      std::shared_ptr<RetainedNativeRuntime> selected_runtime,
+      core::ProjectionRevisionDTO selected_projection,
+      core::ActiveBundlePublicationGeneration selected_generation,
+      core::TargetRoleId selected_status_motion_target_role_id,
+      core::TargetRoleId selected_status_gripper_target_role_id)
       : bundle(std::move(selected_bundle)),
         program(std::move(selected_program)),
         program_binding(std::move(selected_binding)),
@@ -2418,8 +2702,7 @@ struct Composition final {
             std::move(selected_direct_control_gripper_binding)),
         direct_control_joint_limits(
             std::move(selected_direct_control_joint_limits)),
-        stage(std::move(selected_stage)),
-        runtime(std::move(selected_runtime)),
+        stage(std::move(selected_stage)), runtime(std::move(selected_runtime)),
         projection_revision(std::move(selected_projection)),
         publication_generation(selected_generation),
         status_motion_target_role_id(
@@ -2442,15 +2725,17 @@ struct CompositionBuildInput final {
   core::ActiveBundlePublicationGeneration publication_generation;
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
   collision::ManyForgeCollisionEngine::SharedModelPtr collision_shared_model;
-  ManagedKernelAdmissionGate* operation_admission_gate{};
+  ManagedKernelAdmissionGate *operation_admission_gate{};
   std::shared_ptr<const deployment::ProgramBindingContract> status_program;
   std::shared_ptr<const deployment::ProgramBinding> status_program_binding;
   core::TargetRoleId status_motion_target_role_id;
   core::TargetRoleId status_gripper_target_role_id;
+  bool attach_addressed_owner{true};
+  std::shared_ptr<WallClock> shared_clock;
 };
 
-[[nodiscard]] std::unique_ptr<Composition> BuildProductComposition(
-    CompositionBuildInput input) {
+[[nodiscard]] std::unique_ptr<Composition>
+BuildProductComposition(CompositionBuildInput input) {
   Require(input.bundle != nullptr &&
               input.bundle->value().cell_graph.cell_id == input.cell_id &&
               input.model_map.query().retained_bundle_id ==
@@ -2464,7 +2749,7 @@ struct CompositionBuildInput final {
                   (input.status_program_binding == nullptr),
           "native physical composition inputs do not share one active "
           "product");
-  const auto& products = input.bundle->value().compiled_products;
+  const auto &products = input.bundle->value().compiled_products;
   const deployment::FilesystemCatalogArtifactStore catalog_store(
       input.package_root);
   auto direct_control_inventory =
@@ -2491,11 +2776,11 @@ struct CompositionBuildInput final {
               std::string(deployment::kDirectControlTargetRoleId)),
           core::CapabilityId("tool.gripper.command"), *input.bundle,
           input.model_map);
-  Require(direct_control_motion_target.component().controllable_component_id ==
-              direct_control_gripper_target.component()
-                  .controllable_component_id,
-          "N7-a4 motion and gripper targets do not form one physical "
-          "component");
+  Require(
+      direct_control_motion_target.component().controllable_component_id ==
+          direct_control_gripper_target.component().controllable_component_id,
+      "N7-a4 motion and gripper targets do not form one physical "
+      "component");
 
   if (input.status_program_binding != nullptr) {
     const auto selected_motion_target =
@@ -2508,21 +2793,19 @@ struct CompositionBuildInput final {
             *input.status_program_binding, input.status_gripper_target_role_id,
             core::CapabilityId("tool.gripper.command"), *input.bundle,
             input.model_map);
-    Require(selected_motion_target.component().controllable_component_id ==
-                    direct_control_motion_target.component()
-                        .controllable_component_id &&
-                selected_motion_target.target_role().command_target_id ==
-                    direct_control_motion_target.target_role()
-                        .command_target_id &&
-                selected_gripper_target.component()
-                        .controllable_component_id ==
-                    direct_control_gripper_target.component()
-                        .controllable_component_id &&
-                selected_gripper_target.target_role().command_target_id ==
-                    direct_control_gripper_target.target_role()
-                        .command_target_id,
-            "development Program selection crosses the product-derived "
-            "physical runtime");
+    Require(
+        selected_motion_target.component().controllable_component_id ==
+                direct_control_motion_target.component()
+                    .controllable_component_id &&
+            selected_motion_target.target_role().command_target_id ==
+                direct_control_motion_target.target_role().command_target_id &&
+            selected_gripper_target.component().controllable_component_id ==
+                direct_control_gripper_target.component()
+                    .controllable_component_id &&
+            selected_gripper_target.target_role().command_target_id ==
+                direct_control_gripper_target.target_role().command_target_id,
+        "development Program selection crosses the product-derived "
+        "physical runtime");
   } else {
     input.status_motion_target_role_id = core::TargetRoleId(
         direct_control_motion_target.target_role().command_target_id.value());
@@ -2530,20 +2813,18 @@ struct CompositionBuildInput final {
         direct_control_gripper_target.target_role().command_target_id.value());
   }
 
-  std::vector<deployment::RuntimeProgramTargetBinding>
-      direct_control_support;
-  const auto& direct_control_target_role =
+  std::vector<deployment::RuntimeProgramTargetBinding> direct_control_support;
+  const auto &direct_control_target_role =
       direct_control_binding->value().target_role_bindings.front();
-  for (const std::string_view capability_id : {
-           std::string_view("planning.motion.cartesian_path"),
-           std::string_view("planning.motion.joint_goal"),
-           std::string_view("planning.motion.pose_goal")}) {
-    if (std::any_of(
-            direct_control_target_role.capability_bindings.begin(),
-            direct_control_target_role.capability_bindings.end(),
-            [&](const auto& capability) {
-              return capability.capability_id.value() == capability_id;
-            })) {
+  for (const std::string_view capability_id :
+       {std::string_view("planning.motion.cartesian_path"),
+        std::string_view("planning.motion.joint_goal"),
+        std::string_view("planning.motion.pose_goal")}) {
+    if (std::any_of(direct_control_target_role.capability_bindings.begin(),
+                    direct_control_target_role.capability_bindings.end(),
+                    [&](const auto &capability) {
+                      return capability.capability_id.value() == capability_id;
+                    })) {
       direct_control_support.push_back(
           deployment::resolve_runtime_program_target(
               *direct_control_binding,
@@ -2554,24 +2835,23 @@ struct CompositionBuildInput final {
     }
   }
   Require(std::any_of(direct_control_support.begin(),
-                      direct_control_support.end(), [](const auto& support) {
+                      direct_control_support.end(),
+                      [](const auto &support) {
                         return support.capability().capability_id.value() ==
                                "planning.motion.joint_goal";
                       }),
           "direct-control motion binding has no joint planner");
-  auto direct_control_motion_binding =
-      core::verify_runtime_participant_binding(
-          deployment::build_runtime_participant_binding_dto(
+  auto direct_control_motion_binding = core::verify_runtime_participant_binding(
+      deployment::build_runtime_participant_binding_dto(
+          direct_control_motion_target,
+          ActiveFacts(
               direct_control_motion_target,
-              ActiveFacts(
-                  direct_control_motion_target,
-                  std::span<const deployment::RuntimeProgramTargetBinding>(
-                      direct_control_support),
-                  input.runtime_epoch,
-                  core::ActiveControlConfigurationId(
-                      "active.i6.native.arm")),
               std::span<const deployment::RuntimeProgramTargetBinding>(
-                  direct_control_support)));
+                  direct_control_support),
+              input.runtime_epoch,
+              core::ActiveControlConfigurationId("active.i6.native.arm")),
+          std::span<const deployment::RuntimeProgramTargetBinding>(
+              direct_control_support)));
   if (!direct_control_motion_binding.ok()) {
     Fail("direct-control motion participant binding failed verification: " +
          direct_control_motion_binding.error().message);
@@ -2593,18 +2873,18 @@ struct CompositionBuildInput final {
 
   const deployment::FilesystemVerifiedRetainedPlanningModelSource
       planning_source(input.package_root);
-  auto retained_model = planning_source.get_verified(
-      deployment::RetainedPlanningModelQuery{
+  auto retained_model =
+      planning_source.get_verified(deployment::RetainedPlanningModelQuery{
           input.bundle->retained_bundle_id(),
           products.planning_collision_model.product_id});
   Require(retained_model.has_value(),
           "active retained planning model is absent or invalid");
-  auto stage = RetainedPlanningModelStage::create_verified(
-      *retained_model, input.staging_root);
+  auto stage = RetainedPlanningModelStage::create_verified(*retained_model,
+                                                           input.staging_root);
   auto scene = std::make_shared<roboplan::Scene>(
       "manyforge_i6_native_execution_host",
-      std::string(stage.loader_urdf_bytes()),
-      std::string(stage.srdf_bytes()), stage.package_paths());
+      std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
+      stage.package_paths());
   auto scene_mutex = std::make_shared<std::mutex>();
   auto state_projector = std::make_shared<RetainedKinematicStateProjector>(
       RetainedKinematicStateProjector::create_verified(
@@ -2617,23 +2897,25 @@ struct CompositionBuildInput final {
   auto publisher = std::move(input.collision_publisher);
   auto collision_model = std::move(input.collision_shared_model);
   if (publisher == nullptr) {
-    const auto& group =
+    const auto &group =
         direct_control_motion_binding.value().value().model_groups.front();
     collision_model = collision::ManyForgeCollisionEngine::load_shared_model(
         "manyforge_i6_native_execution_host", stage.loader_urdf_path(),
         stage.srdf_path(), stage.package_paths(), group.compiled_group_name);
-    auto collision_projector =
-        RetainedCollisionWorldProjector::create_verified(
-            collision_model, *input.bundle, input.model_map, *retained_model);
-    const auto logical_scene = EmptyScene(
-        input.bundle->value().cell_graph.cell_id,
-        input.projection_revision.scene_revision);
+    auto collision_projector = RetainedCollisionWorldProjector::create_verified(
+        collision_model, *input.bundle, input.model_map, *retained_model);
+    const auto logical_scene =
+        EmptyScene(input.bundle->value().cell_graph.cell_id,
+                   input.projection_revision.scene_revision);
     auto publisher_result = RetainedCollisionWorldPublisher::create(
         std::move(collision_projector), "i6-native-execution-host",
         logical_scene,
         RetainedCollisionWorldPublicationContext{
-            core::CollisionWorldMutationSource::kDeploymentApply, {},
-            WallClock{}.now(), {}, "i6_native_execution_host_startup",
+            core::CollisionWorldMutationSource::kDeploymentApply,
+            {},
+            WallClock{}.now(),
+            {},
+            "i6_native_execution_host_startup",
             std::nullopt});
     if (!publisher_result.ok()) {
       Fail("retained collision publication failed: " +
@@ -2643,8 +2925,7 @@ struct CompositionBuildInput final {
   }
   Require(publisher != nullptr && collision_model != nullptr,
           "native composition has no authoritative collision projection");
-  const auto inventory =
-      publisher->current_scene_snapshot_lease_inventory();
+  const auto inventory = publisher->current_scene_snapshot_lease_inventory();
   Require(inventory.has_value() &&
               inventory->projection_binding.projection_revision ==
                   input.projection_revision,
@@ -2655,13 +2936,16 @@ struct CompositionBuildInput final {
       CandidateBinding(direct_control_motion_binding.value());
   auto candidate_client =
       std::make_unique<ProcessContainedRoboPlanCandidateClient>(
-          RoboPlanWorkerModelDTO{
-              "manyforge_i6_native_execution_worker",
-              stage.loader_urdf_path(), stage.srdf_path(),
-              stage.package_paths(), std::nullopt, {}, {}},
+          RoboPlanWorkerModelDTO{"manyforge_i6_native_execution_worker",
+                                 stage.loader_urdf_path(),
+                                 stage.srdf_path(),
+                                 stage.package_paths(),
+                                 std::nullopt,
+                                 {},
+                                 {}},
           candidate_binding, RoboPlanCandidateComputerConfig{.rng_seed = 7U},
-          ProcessContainedCandidateClientConfig{
-              .worker_executable = input.candidate_worker});
+          ProcessContainedCandidateClientConfig{.worker_executable =
+                                                    input.candidate_worker});
   auto planner = std::make_unique<RoboPlanPlannerBackend>(
       inventory->projection_binding, candidate_binding,
       std::move(candidate_client));
@@ -2671,27 +2955,43 @@ struct CompositionBuildInput final {
           std::vector<core::RuntimeParticipantBinding>{
               direct_control_motion_binding.value(),
               direct_control_gripper_binding.value()});
-  auto runtime = create_retained_native_runtime(
-      RetainedNativeRuntimeInput{
-          direct_control_motion_binding.value(),
-          direct_control_gripper_binding.value(), {}, {}, scene, scene_mutex,
-          state_projector, publisher, collision_model, std::move(planner),
-          [](const auto&) {
-            return std::make_shared<AbsoluteOnlyReferenceResolver>();
-          },
-          [product_resolver](const core::OperationIntentDTO& operation,
-                             const std::size_t participant_index) {
-            return product_resolver->Resolve(operation, participant_index);
-          },
-          input.operation_admission_gate},
-      RetainedNativeRuntimeConfig{
-          input.owner_epoch, input.cell_id,
-          input.execution_state_root /
-              std::string(core::kOperationJournalFilename),
-          1024U, core::CacheConfig{}, core::ExecutionKernelConfig{},
-          RoboPlanExecutionBackendConfig{},
-          SimpleSchedulerConfig::from_environment(), 10'000'000});
-  if (input.operation_admission_gate != nullptr) {
+  RetainedNativeRuntimeInput runtime_input{
+      direct_control_motion_binding.value(),
+      direct_control_gripper_binding.value(),
+      {},
+      {},
+      scene,
+      scene_mutex,
+      state_projector,
+      publisher,
+      collision_model,
+      std::move(planner),
+      [](const auto &) {
+        return std::make_shared<AbsoluteOnlyReferenceResolver>();
+      },
+      [product_resolver](const core::OperationIntentDTO &operation,
+                         const std::size_t participant_index) {
+        return product_resolver->Resolve(operation, participant_index);
+      },
+      input.operation_admission_gate};
+  RetainedNativeRuntimeConfig runtime_config{
+      input.owner_epoch,
+      input.cell_id,
+      input.execution_state_root / std::string(core::kOperationJournalFilename),
+      1024U,
+      core::CacheConfig{},
+      core::ExecutionKernelConfig{},
+      RoboPlanExecutionBackendConfig{},
+      SimpleSchedulerConfig::from_environment(),
+      10'000'000};
+  auto runtime = input.attach_addressed_owner
+                     ? create_retained_native_runtime(std::move(runtime_input),
+                                                      std::move(runtime_config))
+                     : create_retained_native_runtime_participants(
+                           std::move(runtime_input), std::move(runtime_config),
+                           std::move(input.shared_clock));
+  if (input.attach_addressed_owner &&
+      input.operation_admission_gate != nullptr) {
     input.operation_admission_gate->BindResourceTable(
         runtime->addressed_kernel->resource_admission_table());
   }
@@ -2699,9 +2999,7 @@ struct CompositionBuildInput final {
       direct_control_motion_binding.value()
           .value()
           .controllable_component_id.value(),
-      direct_control_motion_binding.value()
-          .value()
-          .command_target_id.value());
+      direct_control_motion_binding.value().value().command_target_id.value());
   if (!direct_control_joint_limits.ok()) {
     Fail("direct-control joint limits are unavailable: " +
          direct_control_joint_limits.error().message);
@@ -2725,47 +3023,57 @@ struct CompositionBuildInput final {
   composition->pick_place_planning_owner = std::move(fixture.owner);
   composition->pick_place_sequence_coordinator =
       std::move(fixture.sequence_coordinator);
-  composition->pick_place_execution_owner =
-      std::move(fixture.execution_owner);
+  composition->pick_place_execution_owner = std::move(fixture.execution_owner);
 #endif
   return composition;
 }
 
-[[nodiscard]] std::unique_ptr<Composition> BuildComposition(
-    const HostConfig& config, const core::RequestOwnerEpoch& owner_epoch,
-    const core::RuntimeEpoch& runtime_epoch) {
+[[nodiscard]] std::unique_ptr<Composition>
+BuildComposition(const HostConfig &config,
+                 const core::RequestOwnerEpoch &owner_epoch,
+                 const core::RuntimeEpoch &runtime_epoch) {
   component_manager::SqliteActiveBundlePublicationStore publication_store(
       config.manager_state_root /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
       core::CellId(config.cell_id));
   const auto integrity = publication_store.VerifyIntegrity();
-  Require(integrity.current_generation.nonzero(), "active retained-bundle publication is absent");
-  const auto publication =
-      publication_store.ReadActiveBundlePublication(integrity.current_generation);
+  Require(integrity.current_generation.nonzero(),
+          "active retained-bundle publication is absent");
+  const auto publication = publication_store.ReadActiveBundlePublication(
+      integrity.current_generation);
   Require(publication.ok() && publication.value().valid(),
           "active retained-bundle publication cannot be verified");
   const auto receipt = publication.value();
   publication_store.Close();
 
-  const deployment::FilesystemVerifiedRetainedBundleSource bundle_source(config.package_root);
-  auto bundle = bundle_source.get_verified(receipt.request.candidate_retained_bundle_id);
-  Require(
-      bundle != nullptr && bundle->value().cell_graph.cell_id == core::CellId(config.cell_id) &&
-          bundle->value().cell_graph.graph_revision == receipt.request.candidate_graph_revision &&
-          bundle->retained_bundle_id() ==
-              receipt.request.candidate_projection_revision.retained_bundle_id &&
-          bundle->value().cell_graph.graph_revision ==
-              receipt.request.candidate_projection_revision.graph_revision,
-      "active publication and retained bundle disagree");
-  const auto& products = bundle->value().compiled_products;
+  const deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      config.package_root);
+  auto bundle =
+      bundle_source.get_verified(receipt.request.candidate_retained_bundle_id);
+  Require(bundle != nullptr &&
+              bundle->value().cell_graph.cell_id ==
+                  core::CellId(config.cell_id) &&
+              bundle->value().cell_graph.graph_revision ==
+                  receipt.request.candidate_graph_revision &&
+              bundle->retained_bundle_id() ==
+                  receipt.request.candidate_projection_revision
+                      .retained_bundle_id &&
+              bundle->value().cell_graph.graph_revision ==
+                  receipt.request.candidate_projection_revision.graph_revision,
+          "active publication and retained bundle disagree");
+  const auto &products = bundle->value().compiled_products;
   Require(products.symbol_role_maps.size() == 1U,
           "N3 native host requires one exact retained model map");
-  const deployment::FilesystemVerifiedRetainedModelMapSource map_source(config.package_root);
+  const deployment::FilesystemVerifiedRetainedModelMapSource map_source(
+      config.package_root);
   auto model_map = map_source.get_verified(deployment::RetainedModelMapQuery{
-      bundle->retained_bundle_id(), products.symbol_role_maps.front().product_id});
-  Require(model_map.has_value(), "active retained model map is absent or invalid");
+      bundle->retained_bundle_id(),
+      products.symbol_role_maps.front().product_id});
+  Require(model_map.has_value(),
+          "active retained model map is absent or invalid");
 
-  const deployment::FilesystemProgramBindingRepository binding_repository(config.package_root);
+  const deployment::FilesystemProgramBindingRepository binding_repository(
+      config.package_root);
   auto program_binding = binding_repository.get_verified(
       core::ProgramBindingId(config.program_binding_id), *bundle, *model_map);
   Require(program_binding != nullptr,
@@ -2797,13 +3105,16 @@ struct CompositionBuildInput final {
       std::move(program_binding),
       core::TargetRoleId(config.motion_target_role_id),
       core::TargetRoleId(config.gripper_target_role_id),
+      true,
+      {},
   });
 }
 
 [[nodiscard]] std::optional<CompositionBuildInput>
-TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
-                                const ManagedProjectionRegistry& projections,
-                                ManagedKernelAdmissionGate& admission_gate) {
+TryBuildCurrentManagedCompositionInput(
+    const ManagedRuntimeChildConfig &config,
+    const ManagedProjectionRegistry &projections,
+    ManagedKernelAdmissionGate &admission_gate) {
   component_manager::SqliteActiveBundlePublicationStore publication_store(
       config.manager_state_root /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
@@ -2822,14 +3133,16 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
 
   const deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       config.package_root);
-  auto bundle = bundle_source.get_verified(
-      receipt.request.candidate_retained_bundle_id);
+  auto bundle =
+      bundle_source.get_verified(receipt.request.candidate_retained_bundle_id);
   Require(bundle != nullptr &&
-              bundle->value().cell_graph.cell_id == core::CellId(config.cell_id) &&
+              bundle->value().cell_graph.cell_id ==
+                  core::CellId(config.cell_id) &&
               bundle->value().cell_graph.graph_revision ==
                   receipt.request.candidate_graph_revision &&
               bundle->retained_bundle_id() ==
-                  receipt.request.candidate_projection_revision.retained_bundle_id &&
+                  receipt.request.candidate_projection_revision
+                      .retained_bundle_id &&
               bundle->value().cell_graph.graph_revision ==
                   receipt.request.candidate_projection_revision.graph_revision,
           "managed active publication and retained bundle disagree");
@@ -2837,7 +3150,7 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
     return std::nullopt;
   }
 
-  const auto& products = bundle->value().compiled_products;
+  const auto &products = bundle->value().compiled_products;
   Require(products.symbol_role_maps.size() == 1U,
           "managed native composition requires one exact retained model map");
   const deployment::FilesystemVerifiedRetainedModelMapSource map_source(
@@ -2848,21 +3161,20 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
   Require(model_map.has_value(),
           "managed active retained model map is absent or invalid");
 
-  const core::CapabilityProviderBindingDTO* joint_planner = nullptr;
-  for (const auto& provider : bundle->value().capability_provider_bindings) {
+  const core::CapabilityProviderBindingDTO *joint_planner = nullptr;
+  for (const auto &provider : bundle->value().capability_provider_bindings) {
     if (provider.capability_id.value() != "planning.motion.joint_goal" ||
         !core::RequiresNativeSceneProjection(
-            provider.capability_id,
-            provider.capability_definition_revision)) {
+            provider.capability_id, provider.capability_definition_revision)) {
       continue;
     }
     std::set<core::RuntimeUnitId> runtime_sources;
-    for (const auto& endpoint : provider.endpoint_bindings) {
+    for (const auto &endpoint : provider.endpoint_bindings) {
       if (endpoint.source_kind !=
           core::CapabilityEndpointSourceKind::kRuntimeUnit) {
         continue;
       }
-      const auto* runtime =
+      const auto *runtime =
           std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
       Require(runtime != nullptr && !runtime->empty(),
               "managed joint planner has a malformed runtime endpoint");
@@ -2884,8 +3196,7 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
       core::RuntimeEpoch(config.runtime_epoch),
   };
   auto projection = projections.FindActiveProjection(
-      receipt.request.candidate_projection_revision,
-      joint_projection_binding);
+      receipt.request.candidate_projection_revision, joint_projection_binding);
   if (projection == nullptr) {
     return std::nullopt;
   }
@@ -2910,20 +3221,214 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
       &admission_gate,
       {},
       {},
-      core::TargetRoleId(
-          std::string(deployment::kDirectControlTargetRoleId)),
-      core::TargetRoleId(
-          std::string(deployment::kDirectControlTargetRoleId)),
+      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+      true,
+      {},
   };
 }
 
-[[nodiscard]] int RunManagedRuntimeChild(const ManagedRuntimeChildConfig& config) {
+[[nodiscard]] bool CurrentPublicationIsInstalledSuccessor(
+    const ManagedRuntimeChildConfig &config,
+    const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
+        &request) {
+  const auto predecessor_generation =
+      request.expected_predecessor_publication_generation.value();
+  Require(predecessor_generation != std::numeric_limits<std::uint64_t>::max(),
+          "managed composition publication generation is exhausted");
+  const core::ActiveBundlePublicationGeneration successor_generation(
+      predecessor_generation + 1U);
+  component_manager::SqliteActiveBundlePublicationStore publication_store(
+      config.manager_state_root /
+          std::string(component_manager::kActiveBundlePublicationStoreFilename),
+      core::CellId(config.cell_id));
+  const auto integrity = publication_store.VerifyIntegrity();
+  if (integrity.current_generation ==
+      request.expected_predecessor_publication_generation) {
+    publication_store.Close();
+    return false;
+  }
+  Require(integrity.current_generation == successor_generation,
+          "managed composition public pointer is neither predecessor nor "
+          "exact successor");
+  const auto publication =
+      publication_store.ReadActiveBundlePublication(successor_generation);
+  publication_store.Close();
+  Require(publication.ok() && publication.value().valid(),
+          "managed composition successor publication cannot be verified");
+  const auto *transaction =
+      std::get_if<core::NamedApplyPublicationTransactionDTO>(
+          &publication.value().request.transaction_ref);
+  Require(transaction != nullptr && transaction->apply_id == request.apply_id &&
+              transaction->apply_generation == request.apply_generation &&
+              transaction->projection_stage_generation ==
+                  request.projection_stage_generation &&
+              publication.value().request.candidate_projection_revision ==
+                  request.candidate_projection_revision &&
+              publication.value()
+                      .request.expected_previous_publication_generation ==
+                  std::optional<core::ActiveBundlePublicationGeneration>{
+                      request.expected_predecessor_publication_generation},
+          "managed composition successor belongs to another Apply");
+  return true;
+}
+
+[[nodiscard]] std::shared_ptr<const deployment::RetainedBundle>
+LoadExactManagedCandidateBundle(
+    const ManagedRuntimeChildConfig &config,
+    const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
+        &request) {
+  Require(request.valid() &&
+              request.runtime_unit_id.value() == config.runtime_unit_id &&
+              request.runtime_epoch.value() == config.runtime_epoch,
+          "managed composition request names another runtime child");
+  const deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      config.package_root);
+  auto bundle = bundle_source.get_verified(
+      request.candidate_projection_revision.retained_bundle_id);
+  const auto canonical_bytes =
+      bundle != nullptr ? bundle->canonical_bytes() : std::string_view{};
+  Require(bundle != nullptr &&
+              bundle->value().cell_graph.cell_id ==
+                  core::CellId(config.cell_id) &&
+              bundle->value().cell_graph.graph_revision ==
+                  request.candidate_projection_revision.graph_revision &&
+              bundle->retained_bundle_id() ==
+                  request.candidate_projection_revision.retained_bundle_id &&
+              !canonical_bytes.empty() &&
+              canonical_bytes.size() ==
+                  request.retained_bundle_canonical_byte_size &&
+              core::ContentDigest(
+                  content_identity::sha256_digest(canonical_bytes)) ==
+                  request.retained_bundle_canonical_content_digest,
+          "managed selected retained bundle identity or materialization "
+          "differs");
+  return bundle;
+}
+
+[[nodiscard]] std::optional<CompositionBuildInput> BuildManagedCompositionInput(
+    const ManagedRuntimeChildConfig &config,
+    const ManagedProjectionRegistry &projections,
+    ManagedKernelAdmissionGate &admission_gate,
+    const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
+        &request,
+    std::shared_ptr<WallClock> shared_clock) {
+  auto bundle = LoadExactManagedCandidateBundle(config, request);
+  component_manager::SqliteActiveBundlePublicationStore publication_store(
+      config.manager_state_root /
+          std::string(component_manager::kActiveBundlePublicationStoreFilename),
+      core::CellId(config.cell_id));
+  const auto integrity = publication_store.VerifyIntegrity();
+  Require(integrity.current_generation ==
+                  request.expected_predecessor_publication_generation &&
+              integrity.current_pointer_digest ==
+                  request.expected_predecessor_public_pointer_digest.value(),
+          "managed composition predecessor publication changed before "
+          "installation");
+  const auto publication = publication_store.ReadActiveBundlePublication(
+      request.expected_predecessor_publication_generation);
+  Require(publication.ok() && publication.value().valid() &&
+              publication.value().publication_generation ==
+                  request.expected_predecessor_publication_generation &&
+              publication.value().durable_public_pointer_content_digest ==
+                  request.expected_predecessor_public_pointer_digest,
+          "managed predecessor publication cannot be verified");
+  publication_store.Close();
+
+  if (bundle->value().cell_graph.controllable_components.empty()) {
+    return std::nullopt;
+  }
+
+  const auto &products = bundle->value().compiled_products;
+  Require(products.symbol_role_maps.size() == 1U,
+          "managed native composition requires one exact retained model map");
+  const deployment::FilesystemVerifiedRetainedModelMapSource map_source(
+      config.package_root);
+  auto model_map = map_source.get_verified(deployment::RetainedModelMapQuery{
+      bundle->retained_bundle_id(),
+      products.symbol_role_maps.front().product_id});
+  Require(model_map.has_value(),
+          "managed active retained model map is absent or invalid");
+
+  const core::CapabilityProviderBindingDTO *joint_planner = nullptr;
+  for (const auto &provider : bundle->value().capability_provider_bindings) {
+    if (provider.capability_id.value() != "planning.motion.joint_goal" ||
+        !core::RequiresNativeSceneProjection(
+            provider.capability_id, provider.capability_definition_revision)) {
+      continue;
+    }
+    std::set<core::RuntimeUnitId> runtime_sources;
+    for (const auto &endpoint : provider.endpoint_bindings) {
+      if (endpoint.source_kind !=
+          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+        continue;
+      }
+      const auto *runtime =
+          std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+      Require(runtime != nullptr && !runtime->empty(),
+              "managed joint planner has a malformed runtime endpoint");
+      runtime_sources.insert(*runtime);
+    }
+    if (runtime_sources.size() == 1U &&
+        runtime_sources.begin()->value() == config.runtime_unit_id) {
+      Require(joint_planner == nullptr,
+              "managed product has ambiguous joint-planner projections");
+      joint_planner = &provider;
+    }
+  }
+  Require(joint_planner != nullptr,
+          "managed product has no native joint-planner projection");
+  const core::ProjectionNativeRuntimeBindingDTO joint_projection_binding{
+      joint_planner->capability_provider_binding_id,
+      joint_planner->capability_provider_binding_revision,
+      core::RuntimeUnitId(config.runtime_unit_id),
+      core::RuntimeEpoch(config.runtime_epoch),
+  };
+  auto projection = projections.FindActiveProjection(
+      request.candidate_projection_revision, joint_projection_binding);
+  Require(projection != nullptr,
+          "managed selected projection is not active at the candidate "
+          "revision");
+  auto collision_model = projection->collision_shared_model();
+  Require(collision_model != nullptr,
+          "managed active projection has no collision model");
+
+  const auto predecessor_generation =
+      request.expected_predecessor_publication_generation.value();
+  Require(predecessor_generation != std::numeric_limits<std::uint64_t>::max(),
+          "managed composition publication generation is exhausted");
+  return CompositionBuildInput{
+      config.package_root,
+      config.staging_root,
+      config.staging_root,
+      config.candidate_worker,
+      core::CellId(config.cell_id),
+      core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+      core::RuntimeEpoch(config.runtime_epoch),
+      std::move(bundle),
+      std::move(*model_map),
+      request.candidate_projection_revision,
+      core::ActiveBundlePublicationGeneration(predecessor_generation + 1U),
+      std::move(projection),
+      std::move(collision_model),
+      &admission_gate,
+      {},
+      {},
+      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+      core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+      false,
+      std::move(shared_clock),
+  };
+}
+
+[[nodiscard]] int
+RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   const auto implementation_revision =
       deployment::native_execution_runtime_contract::implementation_revision();
-  const std::string ready_packet = "manyforge.native-execution-ready.v1 " + config.runtime_unit_id +
-                                   " " + config.runtime_epoch + " " + implementation_revision +
-                                   " " + config.product_identity + " " +
-                                   config.configuration_identity;
+  const std::string ready_packet =
+      "manyforge.native-execution-ready.v1 " + config.runtime_unit_id + " " +
+      config.runtime_epoch + " " + implementation_revision + " " +
+      config.product_identity + " " + config.configuration_identity;
   std::uint64_t source_report_sequence = 0U;
   ManagedKernelAdmissionGate admission_gate;
   ManagedKernelApplyFenceOwner fence_owner(
@@ -2944,10 +3449,53 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
       admission_gate);
   ManagedProjectionRegistry projections(config);
   std::mutex managed_composition_mutex;
-  std::unique_ptr<Composition> managed_composition;
+  std::unique_ptr<Composition> active_managed_composition;
+  std::unique_ptr<Composition> retired_managed_composition;
+  std::unique_ptr<Composition> prepared_managed_composition;
+  bool prepared_managed_composition_is_empty = false;
+  std::shared_ptr<WallClock> detached_owner_clock;
+  std::unique_ptr<core::SqliteOperationJournal> detached_operation_journal;
+  std::unique_ptr<core::ResourceAddressedExecutionKernel>
+      detached_addressed_kernel;
+  std::optional<component_manager::ManagerSelectedRuntimeCompositionRequestDTO>
+      preparing_composition_request;
+  std::optional<component_manager::ManagerSelectedRuntimeCompositionRequestDTO>
+      installed_composition_request;
   std::exception_ptr managed_composition_failure;
+  std::jthread current_composition_builder;
+  bool current_composition_builder_started = false;
+  bool current_composition_building = false;
   std::jthread managed_composition_builder;
-  bool managed_composition_started = false;
+  bool managed_composition_building = false;
+
+  const auto stable_addressed_kernel =
+      [&]() -> core::ResourceAddressedExecutionKernel * {
+    if (detached_addressed_kernel != nullptr) {
+      return detached_addressed_kernel.get();
+    }
+    if (active_managed_composition != nullptr &&
+        active_managed_composition->runtime->addressed_kernel != nullptr) {
+      return active_managed_composition->runtime->addressed_kernel.get();
+    }
+    return nullptr;
+  };
+
+  const auto try_release_retired_composition = [&] {
+    std::lock_guard lock(managed_composition_mutex);
+    auto *const owner = stable_addressed_kernel();
+    if (retired_managed_composition == nullptr || owner == nullptr) {
+      return;
+    }
+    auto *const retired_engine =
+        retired_managed_composition->runtime->participant_engine.get();
+    if (owner->participant_engine_in_use(retired_engine)) {
+      return;
+    }
+    const auto released = owner->release_retired_engine(retired_engine);
+    if (released.ok()) {
+      retired_managed_composition.reset();
+    }
+  };
 
   const auto rethrow_composition_failure = [&] {
     std::exception_ptr failure;
@@ -2959,32 +3507,299 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
       std::rethrow_exception(failure);
     }
   };
-  const auto try_start_managed_composition = [&] {
-    if (managed_composition_started) {
-      return;
+
+  const auto try_start_current_composition = [&] {
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      if (active_managed_composition != nullptr ||
+          current_composition_builder_started ||
+          preparing_composition_request.has_value()) {
+        return;
+      }
     }
-    auto input = TryBuildManagedCompositionInput(config, projections,
-                                                 admission_gate);
+    auto input = TryBuildCurrentManagedCompositionInput(config, projections,
+                                                        admission_gate);
     if (!input.has_value()) {
       return;
     }
-    managed_composition_started = true;
-    managed_composition_builder = std::jthread(
-        [&, input = std::move(*input)]() mutable {
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      if (active_managed_composition != nullptr ||
+          current_composition_builder_started ||
+          preparing_composition_request.has_value()) {
+        return;
+      }
+      current_composition_builder_started = true;
+      current_composition_building = true;
+    }
+    current_composition_builder =
+        std::jthread([&, input = std::move(*input)]() mutable {
           try {
             auto built = BuildProductComposition(std::move(input));
             std::lock_guard lock(managed_composition_mutex);
-            managed_composition = std::move(built);
+            active_managed_composition = std::move(built);
+            current_composition_building = false;
           } catch (...) {
             std::lock_guard lock(managed_composition_mutex);
             managed_composition_failure = std::current_exception();
+            current_composition_building = false;
           }
         });
   };
 
+  const auto install_or_observe_composition =
+      [&](const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
+              &request)
+      -> component_manager::ManagerSelectedRuntimeCompositionResultDTO {
+    Require(request.valid() &&
+                request.runtime_unit_id.value() == config.runtime_unit_id &&
+                request.runtime_epoch.value() == config.runtime_epoch,
+            "runtime-composition request names another managed child");
+    try_release_retired_composition();
+    try_start_current_composition();
+    rethrow_composition_failure();
+    const bool publication_is_successor =
+        CurrentPublicationIsInstalledSuccessor(config, request);
+    const auto successor_bundle =
+        publication_is_successor
+            ? LoadExactManagedCandidateBundle(config, request)
+            : std::shared_ptr<const deployment::RetainedBundle>{};
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      if (installed_composition_request.has_value()) {
+        if (*installed_composition_request == request) {
+          return {request,
+                  component_manager::ManagerSelectedRuntimeCompositionState::
+                      kInstalled};
+        }
+      }
+      if (current_composition_building) {
+        return {request,
+                component_manager::ManagerSelectedRuntimeCompositionState::
+                    kPreparing};
+      }
+      if (publication_is_successor) {
+        const auto expected_generation =
+            core::ActiveBundlePublicationGeneration(
+                request.expected_predecessor_publication_generation.value() +
+                1U);
+        if (active_managed_composition == nullptr) {
+          if (successor_bundle->value()
+                  .cell_graph.controllable_components.empty()) {
+            installed_composition_request = request;
+            return {request,
+                    component_manager::ManagerSelectedRuntimeCompositionState::
+                        kInstalled};
+          }
+          return {request,
+                  component_manager::ManagerSelectedRuntimeCompositionState::
+                      kPreparing};
+        }
+        Require(
+            active_managed_composition->bundle->retained_bundle_id() ==
+                    request.candidate_projection_revision.retained_bundle_id &&
+                active_managed_composition->projection_revision ==
+                    request.candidate_projection_revision &&
+                active_managed_composition->publication_generation ==
+                    expected_generation,
+            "recovered active composition differs from the published "
+            "Apply successor");
+        installed_composition_request = request;
+        return {request,
+                component_manager::ManagerSelectedRuntimeCompositionState::
+                    kInstalled};
+      }
+      if (retired_managed_composition != nullptr) {
+        return {request,
+                component_manager::ManagerSelectedRuntimeCompositionState::
+                    kPreparing};
+      }
+    }
+
+    std::unique_ptr<Composition> prepared;
+    bool prepared_is_empty = false;
+    bool start_builder = false;
+    std::shared_ptr<WallClock> shared_clock;
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      if (managed_composition_failure != nullptr) {
+        std::rethrow_exception(managed_composition_failure);
+      }
+      if (preparing_composition_request.has_value() &&
+          *preparing_composition_request != request) {
+        Fail("another selected runtime composition is still preparing");
+      }
+      if (prepared_managed_composition != nullptr) {
+        prepared = std::move(prepared_managed_composition);
+      } else if (prepared_managed_composition_is_empty) {
+        prepared_is_empty = true;
+        prepared_managed_composition_is_empty = false;
+      } else if (!preparing_composition_request.has_value()) {
+        preparing_composition_request = request;
+        managed_composition_building = true;
+        start_builder = true;
+        if (active_managed_composition != nullptr) {
+          shared_clock = active_managed_composition->runtime->clock;
+        } else if (detached_addressed_kernel != nullptr) {
+          shared_clock = detached_owner_clock;
+        }
+      }
+    }
+
+    if (start_builder) {
+      managed_composition_builder = std::jthread(
+          [&, request, shared_clock = std::move(shared_clock)]() mutable {
+            try {
+              auto input = BuildManagedCompositionInput(
+                  config, projections, admission_gate, request,
+                  std::move(shared_clock));
+              auto built = input.has_value()
+                               ? BuildProductComposition(std::move(*input))
+                               : std::unique_ptr<Composition>{};
+              std::lock_guard lock(managed_composition_mutex);
+              prepared_managed_composition = std::move(built);
+              prepared_managed_composition_is_empty = !input.has_value();
+              managed_composition_building = false;
+            } catch (...) {
+              std::lock_guard lock(managed_composition_mutex);
+              managed_composition_failure = std::current_exception();
+              managed_composition_building = false;
+            }
+          });
+      return {request, component_manager::
+                           ManagerSelectedRuntimeCompositionState::kPreparing};
+    }
+    if (prepared == nullptr && !prepared_is_empty) {
+      std::lock_guard lock(managed_composition_mutex);
+      Require(managed_composition_building,
+              "managed composition has no preparation outcome");
+      return {request, component_manager::
+                           ManagerSelectedRuntimeCompositionState::kPreparing};
+    }
+    if (managed_composition_builder.joinable()) {
+      managed_composition_builder.join();
+    }
+
+    const core::ConfigurationFenceStatusQueryDTO fence_query{
+        {request.apply_id, request.apply_generation},
+        request.configuration_fence_id,
+        request.configuration_fence_generation,
+        request.configuration_fence_scope,
+        request.manager_runtime_epoch};
+    const auto fence_status = fence_owner.QueryStatus(fence_query);
+    Require(
+        fence_status.matches(fence_query) &&
+            fence_status.state == core::ConfigurationFenceState::kHeld &&
+            fence_status.admission_fenced &&
+            fence_status.reconciliation_evidence.execution_host_epoch
+                    .runtime_unit_id == request.runtime_unit_id &&
+            fence_status.reconciliation_evidence.execution_host_epoch
+                    .runtime_epoch == request.runtime_epoch &&
+            fence_status.reconciliation_evidence
+                    .active_publication_generation ==
+                request.expected_predecessor_publication_generation &&
+            fence_status.reconciliation_evidence.active_public_pointer_digest ==
+                request.expected_predecessor_public_pointer_digest,
+        "runtime composition does not have its exact durable held fence "
+        "and predecessor publication");
+
+    admission_gate.RunWithExactHeldFence(
+        request.configuration_fence_id, request.configuration_fence_scope, [&] {
+          Require(retired_managed_composition == nullptr,
+                  "a predecessor runtime engine remains lifetime-pinned");
+          if (prepared_is_empty) {
+            Require(prepared == nullptr,
+                    "empty selected product has a physical composition");
+            if (active_managed_composition != nullptr) {
+              Require(detached_addressed_kernel == nullptr &&
+                          detached_operation_journal == nullptr &&
+                          detached_owner_clock == nullptr,
+                      "stable addressed owner is duplicated");
+              auto &stable_runtime = *active_managed_composition->runtime;
+              auto reconfigured = stable_runtime.addressed_kernel
+                                      ->reconfigure_runtime_participants({});
+              if (!reconfigured.ok()) {
+                Fail("stable Kernel rejected the empty selected runtime: " +
+                     reconfigured.error().message);
+              }
+              detached_owner_clock = stable_runtime.clock;
+              detached_operation_journal =
+                  std::move(stable_runtime.operation_journal);
+              detached_addressed_kernel =
+                  std::move(stable_runtime.addressed_kernel);
+              retired_managed_composition =
+                  std::move(active_managed_composition);
+            } else if (detached_addressed_kernel != nullptr) {
+              auto reconfigured =
+                  detached_addressed_kernel->reconfigure_runtime_participants(
+                      {});
+              if (!reconfigured.ok()) {
+                Fail("stable Kernel rejected the empty selected runtime: " +
+                     reconfigured.error().message);
+              }
+            }
+          } else {
+            Require(prepared != nullptr,
+                    "physical selected product has no prepared composition");
+            auto *const stable_owner = stable_addressed_kernel();
+            if (stable_owner == nullptr) {
+              attach_retained_native_addressed_owner(
+                  prepared->runtime,
+                  RetainedNativeAddressedOwnerConfig{
+                      core::RequestOwnerEpoch("kernel-owner-" +
+                                              config.runtime_epoch),
+                      core::CellId(config.cell_id),
+                      config.staging_root /
+                          std::string(core::kOperationJournalFilename),
+                      1024U, &admission_gate});
+              admission_gate.BindResourceTable(
+                  prepared->runtime->addressed_kernel
+                      ->resource_admission_table());
+            } else {
+              auto reconfigured =
+                  stable_owner->reconfigure_runtime_participants(
+                      prepared->runtime->participant_registrations,
+                      std::move(prepared->runtime->participant_resolver));
+              if (!reconfigured.ok()) {
+                Fail("stable Kernel rejected the selected runtime "
+                     "participants: " +
+                     reconfigured.error().message);
+              }
+              if (active_managed_composition != nullptr) {
+                auto &stable_runtime = *active_managed_composition->runtime;
+                prepared->runtime->operation_journal =
+                    std::move(stable_runtime.operation_journal);
+                prepared->runtime->addressed_kernel =
+                    std::move(stable_runtime.addressed_kernel);
+                retired_managed_composition =
+                    std::move(active_managed_composition);
+              } else {
+                Require(detached_operation_journal != nullptr &&
+                            detached_owner_clock != nullptr &&
+                            prepared->runtime->clock == detached_owner_clock,
+                        "detached addressed owner is incomplete");
+                prepared->runtime->operation_journal =
+                    std::move(detached_operation_journal);
+                prepared->runtime->addressed_kernel =
+                    std::move(detached_addressed_kernel);
+                detached_owner_clock.reset();
+              }
+            }
+            active_managed_composition = std::move(prepared);
+          }
+          installed_composition_request = request;
+          preparing_composition_request.reset();
+        });
+    try_release_retired_composition();
+    return {
+        request,
+        component_manager::ManagerSelectedRuntimeCompositionState::kInstalled};
+  };
+
   while (g_stop_requested == 0) {
     rethrow_composition_failure();
-    try_start_managed_composition();
+    try_start_current_composition();
+    try_release_retired_composition();
     pollfd descriptor{config.manager_channel_fd, POLLIN | POLLHUP, 0};
     int ready = -1;
     do {
@@ -2996,7 +3811,8 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
     if (ready < 0) {
       FailErrno("poll managed runtime parent channel");
     }
-    if ((descriptor.revents & POLLHUP) != 0 && (descriptor.revents & POLLIN) == 0) {
+    if ((descriptor.revents & POLLHUP) != 0 &&
+        (descriptor.revents & POLLIN) == 0) {
       return 0;
     }
     Require((descriptor.revents & (POLLERR | POLLNVAL)) == 0,
@@ -3014,31 +3830,68 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
       continue;
     }
     if (request == "status") {
-      Require(source_report_sequence != std::numeric_limits<std::uint64_t>::max(),
+      Require(source_report_sequence !=
+                  std::numeric_limits<std::uint64_t>::max(),
               "managed runtime source sequence is exhausted");
       ++source_report_sequence;
       SendManagedRuntimePacket(
           config.manager_channel_fd,
-          "manyforge.native-execution-status.v1 " + config.runtime_unit_id + " " +
-              config.runtime_epoch + " " + std::to_string(source_report_sequence) +
-              " 1 serving healthy " + implementation_revision + " " + config.product_identity +
-              " " + config.configuration_identity + " native_execution closed_no_active_effect");
+          "manyforge.native-execution-status.v1 " + config.runtime_unit_id +
+              " " + config.runtime_epoch + " " +
+              std::to_string(source_report_sequence) + " 1 serving healthy " +
+              implementation_revision + " " + config.product_identity + " " +
+              config.configuration_identity +
+              " native_execution closed_no_active_effect");
       continue;
     }
     if (request == "shutdown") {
       SendManagedRuntimePacket(config.manager_channel_fd, "shutdown-accepted");
       return 0;
     }
+    if (component_manager::detail::IsSelectedRuntimeCompositionRpcPacket(
+            request)) {
+      component_manager::detail::SelectedRuntimeCompositionRpcResponse
+          response =
+              component_manager::detail::SelectedRuntimeCompositionRpcFailure{
+                  core::ErrorDTO{"selected_runtime_composition_request_failed",
+                                 "selected runtime-composition request was not "
+                                 "dispatched",
+                                 {}}};
+      try {
+        response = install_or_observe_composition(
+            component_manager::detail::
+                DecodeSelectedRuntimeCompositionRpcRequest(request));
+      } catch (const std::exception &error) {
+        response =
+            component_manager::detail::SelectedRuntimeCompositionRpcFailure{
+                core::ErrorDTO{"selected_runtime_composition_request_failed",
+                               error.what(),
+                               {}}};
+      } catch (...) {
+        response =
+            component_manager::detail::SelectedRuntimeCompositionRpcFailure{
+                core::ErrorDTO{"selected_runtime_composition_request_failed",
+                               "selected runtime-composition request failed",
+                               {}}};
+      }
+      SendManagedRuntimePacket(
+          config.manager_channel_fd,
+          component_manager::detail::
+              EncodeSelectedRuntimeCompositionRpcResponse(response));
+      continue;
+    }
     if (component_manager::detail::IsKernelApplyFenceRpcPacket(request)) {
       component_manager::detail::KernelApplyFenceRpcResponse response =
           component_manager::detail::KernelApplyFenceRpcFailure{
               core::ErrorDTO{"kernel_apply_fence_request_failed",
-                             "Kernel Apply-fence request was not dispatched", {}}};
+                             "Kernel Apply-fence request was not dispatched",
+                             {}}};
       try {
         const auto decoded =
-            component_manager::detail::DecodeKernelApplyFenceRpcRequest(request);
+            component_manager::detail::DecodeKernelApplyFenceRpcRequest(
+                request);
         response = std::visit(
-            [&](const auto& value)
+            [&](const auto &value)
                 -> component_manager::detail::KernelApplyFenceRpcResponse {
               using T = std::decay_t<decltype(value)>;
               if constexpr (std::is_same_v<
@@ -3050,8 +3903,8 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
               } else if constexpr (
                   std::is_same_v<T, core::ApplyFenceAcquireAttemptQueryDTO>) {
                 return fence_owner.ReconcileAcquireAttempt(value);
-              } else if constexpr (
-                  std::is_same_v<T, core::ApplyFenceRehydrateDTO>) {
+              } else if constexpr (std::is_same_v<
+                                       T, core::ApplyFenceRehydrateDTO>) {
                 return fence_owner.Rehydrate(value);
               } else if constexpr (
                   std::is_same_v<T, core::ConfigurationFenceStatusQueryDTO>) {
@@ -3061,29 +3914,34 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
               }
             },
             decoded);
-      } catch (const std::exception& error) {
+      } catch (const std::exception &error) {
         response = component_manager::detail::KernelApplyFenceRpcFailure{
-            core::ErrorDTO{"kernel_apply_fence_request_failed", error.what(), {}}};
+            core::ErrorDTO{
+                "kernel_apply_fence_request_failed", error.what(), {}}};
       } catch (...) {
         response = component_manager::detail::KernelApplyFenceRpcFailure{
             core::ErrorDTO{"kernel_apply_fence_request_failed",
-                           "Kernel Apply-fence request failed", {}}};
+                           "Kernel Apply-fence request failed",
+                           {}}};
       }
       SendManagedRuntimePacket(
           config.manager_channel_fd,
-          component_manager::detail::EncodeKernelApplyFenceRpcResponse(response));
+          component_manager::detail::EncodeKernelApplyFenceRpcResponse(
+              response));
       continue;
     }
     component_manager::detail::NativeProjectionRpcResponse response;
     try {
       response = projections.Dispatch(
           component_manager::detail::DecodeNativeProjectionRpcRequest(request));
-    } catch (const std::exception& error) {
+    } catch (const std::exception &error) {
       response = component_manager::detail::NativeProjectionRpcFailure{
           core::ErrorDTO{"native_projection_request_failed", error.what(), {}}};
     } catch (...) {
-      response = component_manager::detail::NativeProjectionRpcFailure{core::ErrorDTO{
-          "native_projection_request_failed", "native projection request failed", {}}};
+      response = component_manager::detail::NativeProjectionRpcFailure{
+          core::ErrorDTO{"native_projection_request_failed",
+                         "native projection request failed",
+                         {}}};
     }
     SendManagedRuntimePacket(
         config.manager_channel_fd,
@@ -3093,15 +3951,15 @@ TryBuildManagedCompositionInput(const ManagedRuntimeChildConfig& config,
 }
 
 class NativeExecutionHost final {
- public:
+public:
   explicit NativeExecutionHost(HostConfig config)
       : config_(std::move(config)),
         owner_epoch_(RandomToken("execution-host-")),
         runtime_epoch_(RandomToken("native-runtime-")),
         direct_control_program_run_id_("direct-control-" +
                                        owner_epoch_.value()),
-        direct_control_gripper_program_run_id_(
-            "direct-control-gripper-" + owner_epoch_.value()),
+        direct_control_gripper_program_run_id_("direct-control-gripper-" +
+                                               owner_epoch_.value()),
         host_lock_(config_.execution_state_root),
         composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_)),
         command_socket_(config_.execution_state_root, kSocketFileName),
@@ -3111,13 +3969,14 @@ class NativeExecutionHost final {
     std::jthread control_thread(
         [this](std::stop_token stop_token) { RunControlLane(stop_token); });
     while (g_stop_requested == 0) {
-      const auto reconciled =
-          composition_->runtime->addressed_kernel->reconcile_subordinate_state();
+      const auto reconciled = composition_->runtime->addressed_kernel
+                                  ->reconcile_subordinate_state();
       if (!reconciled.ok()) {
         last_reconcile_error_ = reconciled.error();
       }
       if (composition_->pick_place_execution_owner) {
-        const auto pick_place_reconciled = composition_->pick_place_execution_owner->Reconcile();
+        const auto pick_place_reconciled =
+            composition_->pick_place_execution_owner->Reconcile();
         if (!pick_place_reconciled.ok()) {
           last_reconcile_error_ = pick_place_reconciled.error();
         }
@@ -3150,19 +4009,15 @@ class NativeExecutionHost final {
     return 0;
   }
 
- private:
+private:
   [[nodiscard]] CanonicalValue DirectControlStatusValue(
-      const core::ObservedStateSnapshotDTO& observed_state) const {
-    const auto& binding =
-        composition_->direct_control_motion_binding.value();
-    const auto& limits = composition_->direct_control_joint_limits;
+      const core::ObservedStateSnapshotDTO &observed_state) const {
+    const auto &binding = composition_->direct_control_motion_binding.value();
+    const auto &limits = composition_->direct_control_joint_limits;
     Require(limits.joint_names.size() == binding.resources.size() &&
-                limits.position_lower_rad.size() ==
-                    binding.resources.size() &&
-                limits.position_upper_rad.size() ==
-                    binding.resources.size() &&
-                limits.velocity_max_rad_s.size() ==
-                    binding.resources.size() &&
+                limits.position_lower_rad.size() == binding.resources.size() &&
+                limits.position_upper_rad.size() == binding.resources.size() &&
+                limits.velocity_max_rad_s.size() == binding.resources.size() &&
                 (limits.acceleration_max_rad_s2.empty() ||
                  limits.acceleration_max_rad_s2.size() ==
                      binding.resources.size()) &&
@@ -3180,17 +4035,16 @@ class NativeExecutionHost final {
     observed_positions.reserve(binding.resources.size());
     observed_positions_rad.reserve(binding.resources.size());
     for (std::size_t index = 0U; index < binding.resources.size(); ++index) {
-      const auto& resource = binding.resources[index];
+      const auto &resource = binding.resources[index];
       Require(resource.source_joint_name.has_value() &&
-                  resource.coordinate_kind ==
-                      core::CoordinateKind::kAngular &&
+                  resource.coordinate_kind == core::CoordinateKind::kAngular &&
                   limits.joint_names[index] ==
                       resource.compiled_resource_name &&
                   observed_state.resources[index] == resource.resource_id &&
                   observed_state.joint_names[index] ==
                       resource.compiled_resource_name,
               "direct-control joint limits cross their source-local binding");
-      const auto* position = std::get_if<core::AngularPositionDTO>(
+      const auto *position = std::get_if<core::AngularPositionDTO>(
           &observed_state.positions[index]);
       Require(position != nullptr,
               "direct-control observed state is not all-angular");
@@ -3201,49 +4055,48 @@ class NativeExecutionHost final {
           {"max_acceleration_rad_s2",
            limits.acceleration_max_rad_s2.empty()
                ? CanonicalValue(nullptr)
-               : CanonicalValue(
-                     limits.acceleration_max_rad_s2[index])},
+               : CanonicalValue(limits.acceleration_max_rad_s2[index])},
           {"max_position_rad",
            CanonicalValue(limits.position_upper_rad[index])},
           {"max_velocity_rad_s",
            CanonicalValue(limits.velocity_max_rad_s[index])},
           {"min_position_rad",
            CanonicalValue(limits.position_lower_rad[index])},
-          {"source_joint_name",
-           CanonicalValue(*resource.source_joint_name)},
+          {"source_joint_name", CanonicalValue(*resource.source_joint_name)},
       });
     }
     CanonicalValue::Array frame_roles;
     frame_roles.reserve(binding.frame_bindings.size());
-    for (const auto& frame : binding.frame_bindings) {
+    for (const auto &frame : binding.frame_bindings) {
       frame_roles.emplace_back(frame.frame_role_id.value());
     }
     CanonicalValue::Array planning_capabilities;
-    for (const auto& path :
-         binding.supporting_capability_provider_paths) {
+    for (const auto &path : binding.supporting_capability_provider_paths) {
       planning_capabilities.emplace_back(path.capability_id.value());
     }
-    const auto base_frame = std::find_if(
-        binding.frame_bindings.begin(), binding.frame_bindings.end(),
-        [](const auto& frame) {
-          return frame.frame_role_id.value() ==
-                 deployment::kDirectControlBaseFrameRoleId;
-        });
-    const auto tcp_frame = std::find_if(
-        binding.frame_bindings.begin(), binding.frame_bindings.end(),
-        [](const auto& frame) {
-          return frame.frame_role_id.value() ==
-                 deployment::kDirectControlTcpFrameRoleId;
-        });
+    const auto base_frame =
+        std::find_if(binding.frame_bindings.begin(),
+                     binding.frame_bindings.end(), [](const auto &frame) {
+                       return frame.frame_role_id.value() ==
+                              deployment::kDirectControlBaseFrameRoleId;
+                     });
+    const auto tcp_frame =
+        std::find_if(binding.frame_bindings.begin(),
+                     binding.frame_bindings.end(), [](const auto &frame) {
+                       return frame.frame_role_id.value() ==
+                              deployment::kDirectControlTcpFrameRoleId;
+                     });
     Require(base_frame != binding.frame_bindings.end() &&
                 tcp_frame != binding.frame_bindings.end(),
             "direct-control status has no exact base/TCP frame binding");
-    const auto current_tcp = composition_->runtime->kinematics->forward_kinematics(
-        core::FkRequestDTO{
-            core::RobotStateDTO{observed_state.joint_names,
-                                std::move(observed_positions_rad), {}},
-            tcp_frame->compiled_frame_name,
-            base_frame->compiled_frame_name});
+    const auto current_tcp =
+        composition_->runtime->kinematics->forward_kinematics(
+            core::FkRequestDTO{
+                core::RobotStateDTO{observed_state.joint_names,
+                                    std::move(observed_positions_rad),
+                                    {}},
+                tcp_frame->compiled_frame_name,
+                base_frame->compiled_frame_name});
     if (!current_tcp.ok()) {
       Fail("direct-control current TCP pose is unavailable: " +
            current_tcp.error().message);
@@ -3251,9 +4104,8 @@ class NativeExecutionHost final {
     return CanonicalValue(CanonicalValue::Object{
         {"command_target_id",
          CanonicalValue(binding.command_target_id.value())},
-        {"base_frame_role_id",
-         CanonicalValue(
-             std::string(deployment::kDirectControlBaseFrameRoleId))},
+        {"base_frame_role_id", CanonicalValue(std::string(
+                                   deployment::kDirectControlBaseFrameRoleId))},
         {"component_role_id",
          CanonicalValue(binding.component_role_id.value())},
         {"controllable_component_id",
@@ -3266,8 +4118,7 @@ class NativeExecutionHost final {
          CanonicalValue(CanonicalValue::Object{
              {"complete", CanonicalValue(observed_state.complete)},
              {"current_tcp_pose", PoseValue(current_tcp.value())},
-             {"positions_rad",
-              CanonicalValue(std::move(observed_positions))},
+             {"positions_rad", CanonicalValue(std::move(observed_positions))},
              {"sequence",
               CanonicalValue(static_cast<double>(observed_state.sequence))},
              {"source_epoch",
@@ -3280,21 +4131,18 @@ class NativeExecutionHost final {
         {"program_binding_id",
          CanonicalValue(binding.program_binding_id.value())},
         {"program_id", CanonicalValue(binding.program_id.value())},
-        {"program_revision",
-         CanonicalValue(binding.program_revision.value())},
+        {"program_revision", CanonicalValue(binding.program_revision.value())},
         {"program_run_id",
          CanonicalValue(direct_control_program_run_id_.value())},
         {"target_role_id", CanonicalValue(binding.target_role_id.value())},
         {"tcp_frame_role_id",
-         CanonicalValue(
-             std::string(deployment::kDirectControlTcpFrameRoleId))},
+         CanonicalValue(std::string(deployment::kDirectControlTcpFrameRoleId))},
     });
   }
 
   [[nodiscard]] CanonicalValue DirectControlGripperStatusValue(
-      const core::ObservedStateSnapshotDTO& observed_state) const {
-    const auto& binding =
-        composition_->direct_control_gripper_binding.value();
+      const core::ObservedStateSnapshotDTO &observed_state) const {
+    const auto &binding = composition_->direct_control_gripper_binding.value();
     Require(binding.resources.size() == 1U &&
                 binding.resources.front().source_joint_name.has_value() &&
                 binding.command_schema.has_value() &&
@@ -3307,10 +4155,9 @@ class NativeExecutionHost final {
                 observed_state.joint_names.front() ==
                     binding.resources.front().compiled_resource_name,
             "direct-control gripper status crosses its retained binding");
-    const auto& limits =
-        *composition_->runtime->gripper_position_limits;
+    const auto &limits = *composition_->runtime->gripper_position_limits;
     Require(limits.coordinate_kind ==
-                binding.resources.front().coordinate_kind &&
+                    binding.resources.front().coordinate_kind &&
                 std::isfinite(limits.lower_position) &&
                 std::isfinite(limits.upper_position) &&
                 limits.lower_position <= limits.upper_position &&
@@ -3318,9 +4165,8 @@ class NativeExecutionHost final {
                     limits.coordinate_kind,
             "direct-control gripper status has inconsistent units or limits");
     const auto coordinate_kind =
-        limits.coordinate_kind == core::CoordinateKind::kAngular
-            ? "angular_rad"
-            : "linear_m";
+        limits.coordinate_kind == core::CoordinateKind::kAngular ? "angular_rad"
+                                                                 : "linear_m";
     return CanonicalValue(CanonicalValue::Object{
         {"command_schema_id",
          CanonicalValue(binding.command_schema->command_schema_id.value())},
@@ -3341,8 +4187,7 @@ class NativeExecutionHost final {
              {"sequence",
               CanonicalValue(static_cast<double>(observed_state.sequence))},
              {"source_coordinate_name",
-              CanonicalValue(
-                  *binding.resources.front().source_joint_name)},
+              CanonicalValue(*binding.resources.front().source_joint_name)},
              {"source_epoch",
               CanonicalValue(observed_state.source_epoch.value())},
          })},
@@ -3351,8 +4196,7 @@ class NativeExecutionHost final {
         {"program_binding_id",
          CanonicalValue(binding.program_binding_id.value())},
         {"program_id", CanonicalValue(binding.program_id.value())},
-        {"program_revision",
-         CanonicalValue(binding.program_revision.value())},
+        {"program_revision", CanonicalValue(binding.program_revision.value())},
         {"program_run_id",
          CanonicalValue(direct_control_gripper_program_run_id_.value())},
         {"resource",
@@ -3361,38 +4205,45 @@ class NativeExecutionHost final {
              {"max_position", CanonicalValue(limits.upper_position)},
              {"min_position", CanonicalValue(limits.lower_position)},
              {"source_coordinate_name",
-              CanonicalValue(
-                  *binding.resources.front().source_joint_name)},
+              CanonicalValue(*binding.resources.front().source_joint_name)},
          })},
         {"target_role_id", CanonicalValue(binding.target_role_id.value())},
     });
   }
 
   [[nodiscard]] CanonicalValue StatusResponse() const {
-    const auto& bundle = *composition_->bundle;
-    const auto& program = composition_->program->value();
-    const auto motion_state = composition_->runtime->motion_state_channel->current_state(
-        composition_->runtime->clock->now());
+    const auto &bundle = *composition_->bundle;
+    const auto &program = composition_->program->value();
+    const auto motion_state =
+        composition_->runtime->motion_state_channel->current_state(
+            composition_->runtime->clock->now());
     if (!motion_state.ok()) {
-      Fail("selected motion observed state is unavailable: " + motion_state.error().message);
+      Fail("selected motion observed state is unavailable: " +
+           motion_state.error().message);
     }
     Require(composition_->runtime->gripper_state_channel != nullptr,
             "selected aggregate gripper observed-state channel is absent");
     Require(composition_->runtime->gripper_binding.has_value() &&
-                composition_->runtime->gripper_binding->value().command_schema.has_value(),
+                composition_->runtime->gripper_binding->value()
+                    .command_schema.has_value(),
             "selected aggregate gripper command schema is absent");
-    const auto& gripper_schema = *composition_->runtime->gripper_binding->value().command_schema;
-    const auto gripper_state = composition_->runtime->gripper_state_channel->current_state(
-        composition_->runtime->clock->now());
+    const auto &gripper_schema =
+        *composition_->runtime->gripper_binding->value().command_schema;
+    const auto gripper_state =
+        composition_->runtime->gripper_state_channel->current_state(
+            composition_->runtime->clock->now());
     if (!gripper_state.ok()) {
-      Fail("selected gripper observed state is unavailable: " + gripper_state.error().message);
+      Fail("selected gripper observed state is unavailable: " +
+           gripper_state.error().message);
     }
     CanonicalValue::Array observed_targets;
     observed_targets.reserve(2U);
-    observed_targets.push_back(ObservedTargetValue(
-        core::TargetRoleId(config_.motion_target_role_id), motion_state.value()));
-    observed_targets.push_back(ObservedTargetValue(
-        core::TargetRoleId(config_.gripper_target_role_id), gripper_state.value()));
+    observed_targets.push_back(
+        ObservedTargetValue(core::TargetRoleId(config_.motion_target_role_id),
+                            motion_state.value()));
+    observed_targets.push_back(
+        ObservedTargetValue(core::TargetRoleId(config_.gripper_target_role_id),
+                            gripper_state.value()));
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("status")},
@@ -3400,25 +4251,33 @@ class NativeExecutionHost final {
         {"status",
          CanonicalValue(CanonicalValue::Object{
              {"active_publication_generation",
-              CanonicalValue(static_cast<double>(composition_->publication_generation.value()))},
-             {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
+              CanonicalValue(static_cast<double>(
+                  composition_->publication_generation.value()))},
+             {"cell_id",
+              CanonicalValue(bundle.value().cell_graph.cell_id.value())},
              {"direct_control", DirectControlStatusValue(motion_state.value())},
              {"direct_control_gripper",
               DirectControlGripperStatusValue(gripper_state.value())},
-             {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
+             {"graph_revision",
+              CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
              {"gripper_command_schema_id",
               CanonicalValue(gripper_schema.command_schema_id.value())},
              {"gripper_command_schema_revision",
               CanonicalValue(gripper_schema.command_schema_revision.value())},
-             {"gripper_target_role_id", CanonicalValue(config_.gripper_target_role_id)},
-             {"motion_target_role_id", CanonicalValue(config_.motion_target_role_id)},
+             {"gripper_target_role_id",
+              CanonicalValue(config_.gripper_target_role_id)},
+             {"motion_target_role_id",
+              CanonicalValue(config_.motion_target_role_id)},
              {"observed_targets", CanonicalValue(std::move(observed_targets))},
              {"owner_epoch", CanonicalValue(owner_epoch_.value())},
              {"program_binding_id",
-              CanonicalValue(composition_->program_binding->program_binding_id().value())},
+              CanonicalValue(
+                  composition_->program_binding->program_binding_id().value())},
              {"program_id", CanonicalValue(program.program_id.value())},
-             {"program_revision", CanonicalValue(program.program_revision.value())},
-             {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
+             {"program_revision",
+              CanonicalValue(program.program_revision.value())},
+             {"retained_bundle_id",
+              CanonicalValue(bundle.retained_bundle_id().value())},
              {"scene_revision",
               SceneRevisionValue(
                   composition_->projection_revision.scene_revision)},
@@ -3426,7 +4285,7 @@ class NativeExecutionHost final {
     });
   }
 
-  [[nodiscard]] CanonicalValue ExecuteStop(const Command& command) {
+  [[nodiscard]] CanonicalValue ExecuteStop(const Command &command) {
     Require(command.kind == CommandKind::kStop && command.stop.has_value(),
             "execution Stop control lane accepts only a complete Stop command");
     const auto result =
@@ -3446,13 +4305,14 @@ class NativeExecutionHost final {
     });
   }
 
-  [[nodiscard]] CanonicalValue Execute(const Command& command) {
+  [[nodiscard]] CanonicalValue Execute(const Command &command) {
     if (command.kind == CommandKind::kStatus) {
       return StatusResponse();
     }
     if (command.kind == CommandKind::kEvents) {
       const auto page = composition_->runtime->operation_journal->ReadEvents(
-          *command.event_owner_epoch, command.after_sequence, command.event_limit);
+          *command.event_owner_epoch, command.after_sequence,
+          command.event_limit);
       if (!page.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3479,12 +4339,11 @@ class NativeExecutionHost final {
     }
     if (command.kind == CommandKind::kPreviewCapabilityCommand) {
       auto preview =
-          composition_->runtime->addressed_kernel
-              ->preview_capability_command(*command.operation);
+          composition_->runtime->addressed_kernel->preview_capability_command(
+              *command.operation);
       if (!preview.ok()) {
         return CanonicalValue(CanonicalValue::Object{
-            {"api_version",
-             CanonicalValue(std::string(kResponseApiVersion))},
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
             {"error", ErrorValue(preview.error())},
             {"ok", CanonicalValue(false)},
         });
@@ -3497,10 +4356,8 @@ class NativeExecutionHost final {
           {"ok", CanonicalValue(true)},
           {"preview_receipt",
            CapabilityCommandPreviewReceiptValue(
-               preview.value(), *command.operation,
-               *command.operation_digest,
-               *composition_->runtime->gripper_position_limits,
-               owner_epoch_)},
+               preview.value(), *command.operation, *command.operation_digest,
+               *composition_->runtime->gripper_position_limits, owner_epoch_)},
       });
     }
     if (command.kind == CommandKind::kPreviewMotion) {
@@ -3515,12 +4372,11 @@ class NativeExecutionHost final {
           *composition_->runtime->collision_publisher,
           inventory->projection_binding.projection_lease_id);
       auto session =
-          composition_->runtime->addressed_kernel
-              ->begin_motion_preview_session(*command.operation);
+          composition_->runtime->addressed_kernel->begin_motion_preview_session(
+              *command.operation);
       if (!session.ok()) {
         return CanonicalValue(CanonicalValue::Object{
-            {"api_version",
-             CanonicalValue(std::string(kResponseApiVersion))},
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
             {"error", ErrorValue(session.error())},
             {"ok", CanonicalValue(false)},
         });
@@ -3528,8 +4384,7 @@ class NativeExecutionHost final {
       auto start_state = session.value()->current_state();
       if (!start_state.ok()) {
         return CanonicalValue(CanonicalValue::Object{
-            {"api_version",
-             CanonicalValue(std::string(kResponseApiVersion))},
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
             {"error", ErrorValue(start_state.error())},
             {"ok", CanonicalValue(false)},
         });
@@ -3539,8 +4394,7 @@ class NativeExecutionHost final {
           std::move(start_state.value()));
       if (!preview.ok()) {
         return CanonicalValue(CanonicalValue::Object{
-            {"api_version",
-             CanonicalValue(std::string(kResponseApiVersion))},
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
             {"error", ErrorValue(preview.error())},
             {"ok", CanonicalValue(false)},
         });
@@ -3551,18 +4405,18 @@ class NativeExecutionHost final {
           {"ok", CanonicalValue(true)},
           {"preview_receipt",
            MotionPreviewReceiptValue(
-               preview.value(), *command.operation,
-               *command.operation_digest,
+               preview.value(), *command.operation, *command.operation_digest,
                composition_->direct_control_motion_binding, owner_epoch_)},
       });
     }
     if (command.kind == CommandKind::kReadPickPlaceSequence) {
       if (!composition_->pick_place_execution_owner) {
         return ErrorResponse("pick_place_execution_owner_unavailable",
-                             "the selected native process has no joined pick/place sequence owner");
+                             "the selected native process has no joined "
+                             "pick/place sequence owner");
       }
-      const auto result =
-          composition_->pick_place_execution_owner->GetStatus(*command.pick_place_sequence_id);
+      const auto result = composition_->pick_place_execution_owner->GetStatus(
+          *command.pick_place_sequence_id);
       if (!result.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3577,18 +4431,67 @@ class NativeExecutionHost final {
           {"sequence_status", PickPlaceSequenceStatusValue(result.value())},
       });
     }
-    if (command.kind == CommandKind::kStartPick || command.kind == CommandKind::kStartPlace) {
+    if (command.kind == CommandKind::kStartPick ||
+        command.kind == CommandKind::kStartPlace) {
       if (!composition_->pick_place_execution_owner) {
         return ErrorResponse("pick_place_execution_owner_unavailable",
-                             "the selected native process has no joined pick/place sequence owner");
+                             "the selected native process has no joined "
+                             "pick/place sequence owner");
       }
       const auto sequence_id = command.kind == CommandKind::kStartPick
                                    ? command.pick_planning->sequence_id
                                    : command.place_planning->sequence_id;
       const auto result =
           command.kind == CommandKind::kStartPick
-              ? composition_->pick_place_execution_owner->BeginPick(*command.pick_planning)
-              : composition_->pick_place_execution_owner->BeginPlace(*command.place_planning);
+              ? composition_->pick_place_execution_owner->BeginPick(
+                    *command.pick_planning)
+              : composition_->pick_place_execution_owner->BeginPlace(
+                    *command.place_planning);
+      if (!result.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(result.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      const auto command_name = command.kind == CommandKind::kStartPick
+                                    ? "start_pick"
+                                    : "start_place";
+      const auto kind = command.kind == CommandKind::kStartPick
+                            ? core::PickPlaceExecutionKindDTO::kPick
+                            : core::PickPlaceExecutionKindDTO::kPlace;
+      CanonicalValue sequence_status(nullptr);
+      if (result.value().sequence_status.has_value()) {
+        sequence_status =
+            PickPlaceSequenceStatusValue(*result.value().sequence_status);
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue(command_name)},
+          {"ok", CanonicalValue(true)},
+          {"planning_result",
+           PickPlacePlanningResultValue(sequence_id, kind,
+                                        result.value().planning_result)},
+          {"sequence_status", std::move(sequence_status)},
+      });
+    }
+    if (command.kind == CommandKind::kPlanPick ||
+        command.kind == CommandKind::kPlanPlace) {
+      if (!composition_->pick_place_planning_owner) {
+        return ErrorResponse(
+            "pick_place_planning_owner_unavailable",
+            "the selected native process has no joined logical-scene "
+            "planning owner");
+      }
+      const auto sequence_id = command.kind == CommandKind::kPlanPick
+                                   ? command.pick_planning->sequence_id
+                                   : command.place_planning->sequence_id;
+      const auto result =
+          command.kind == CommandKind::kPlanPick
+              ? composition_->pick_place_planning_owner->PlanPick(
+                    *command.pick_planning)
+              : composition_->pick_place_planning_owner->PlanPlace(
+                    *command.place_planning);
       if (!result.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3597,44 +4500,7 @@ class NativeExecutionHost final {
         });
       }
       const auto command_name =
-          command.kind == CommandKind::kStartPick ? "start_pick" : "start_place";
-      const auto kind = command.kind == CommandKind::kStartPick
-                            ? core::PickPlaceExecutionKindDTO::kPick
-                            : core::PickPlaceExecutionKindDTO::kPlace;
-      CanonicalValue sequence_status(nullptr);
-      if (result.value().sequence_status.has_value()) {
-        sequence_status = PickPlaceSequenceStatusValue(*result.value().sequence_status);
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue(command_name)},
-          {"ok", CanonicalValue(true)},
-          {"planning_result",
-           PickPlacePlanningResultValue(sequence_id, kind, result.value().planning_result)},
-          {"sequence_status", std::move(sequence_status)},
-      });
-    }
-    if (command.kind == CommandKind::kPlanPick || command.kind == CommandKind::kPlanPlace) {
-      if (!composition_->pick_place_planning_owner) {
-        return ErrorResponse("pick_place_planning_owner_unavailable",
-                             "the selected native process has no joined logical-scene "
-                             "planning owner");
-      }
-      const auto sequence_id = command.kind == CommandKind::kPlanPick
-                                   ? command.pick_planning->sequence_id
-                                   : command.place_planning->sequence_id;
-      const auto result =
-          command.kind == CommandKind::kPlanPick
-              ? composition_->pick_place_planning_owner->PlanPick(*command.pick_planning)
-              : composition_->pick_place_planning_owner->PlanPlace(*command.place_planning);
-      if (!result.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(result.error())},
-            {"ok", CanonicalValue(false)},
-        });
-      }
-      const auto command_name = command.kind == CommandKind::kPlanPick ? "plan_pick" : "plan_place";
+          command.kind == CommandKind::kPlanPick ? "plan_pick" : "plan_place";
       const auto kind = command.kind == CommandKind::kPlanPick
                             ? core::PickPlaceExecutionKindDTO::kPick
                             : core::PickPlaceExecutionKindDTO::kPlace;
@@ -3642,11 +4508,13 @@ class NativeExecutionHost final {
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue(command_name)},
           {"ok", CanonicalValue(true)},
-          {"planning_result", PickPlacePlanningResultValue(sequence_id, kind, result.value())},
+          {"planning_result",
+           PickPlacePlanningResultValue(sequence_id, kind, result.value())},
       });
     }
     if (command.kind == CommandKind::kSubmit) {
-      const auto result = composition_->runtime->addressed_kernel->execute(*command.operation);
+      const auto result =
+          composition_->runtime->addressed_kernel->execute(*command.operation);
       if (!result.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3661,7 +4529,8 @@ class NativeExecutionHost final {
           {"ok", CanonicalValue(true)},
       });
     }
-    const auto reconciled = composition_->runtime->addressed_kernel->reconcile_subordinate_state();
+    const auto reconciled =
+        composition_->runtime->addressed_kernel->reconcile_subordinate_state();
     if (!reconciled.ok()) {
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3671,7 +4540,8 @@ class NativeExecutionHost final {
     }
     if (command.kind == CommandKind::kRead) {
       const auto state =
-          composition_->runtime->addressed_kernel->get_operation_state(*command.operation_id);
+          composition_->runtime->addressed_kernel->get_operation_state(
+              *command.operation_id);
       if (!state.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3688,7 +4558,8 @@ class NativeExecutionHost final {
     }
     if (command.kind == CommandKind::kGetRuntimeScale) {
       const auto status =
-          composition_->runtime->addressed_kernel->get_runtime_scale(*command.operation_id);
+          composition_->runtime->addressed_kernel->get_runtime_scale(
+              *command.operation_id);
       if (!status.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3705,7 +4576,8 @@ class NativeExecutionHost final {
     }
     if (command.kind == CommandKind::kSetRuntimeScale) {
       const auto result =
-          composition_->runtime->addressed_kernel->set_runtime_scale(*command.runtime_scale);
+          composition_->runtime->addressed_kernel->set_runtime_scale(
+              *command.runtime_scale);
       if (!result.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3720,31 +4592,34 @@ class NativeExecutionHost final {
           {"ok", CanonicalValue(true)},
       });
     }
-    const auto control_result = [&]() -> core::Result<core::OperationControlAcceptedDTO> {
+    const auto control_result =
+        [&]() -> core::Result<core::OperationControlAcceptedDTO> {
       switch (command.kind) {
-        case CommandKind::kPause:
-          return composition_->runtime->addressed_kernel->pause(*command.control);
-        case CommandKind::kResume:
-          return composition_->runtime->addressed_kernel->resume(*command.control);
-        case CommandKind::kReset:
-          return composition_->runtime->addressed_kernel->reset(*command.control);
-        case CommandKind::kAcknowledgeCompleted:
-          return composition_->runtime->addressed_kernel->acknowledge_completed(*command.control);
-        case CommandKind::kStatus:
-        case CommandKind::kEvents:
-        case CommandKind::kPreviewMotion:
-        case CommandKind::kPreviewCapabilityCommand:
-        case CommandKind::kSubmit:
-        case CommandKind::kRead:
-        case CommandKind::kStop:
-        case CommandKind::kSetRuntimeScale:
-        case CommandKind::kGetRuntimeScale:
-        case CommandKind::kPlanPick:
-        case CommandKind::kPlanPlace:
-        case CommandKind::kStartPick:
-        case CommandKind::kStartPlace:
-        case CommandKind::kReadPickPlaceSequence:
-          Fail("execution command dispatch is inconsistent");
+      case CommandKind::kPause:
+        return composition_->runtime->addressed_kernel->pause(*command.control);
+      case CommandKind::kResume:
+        return composition_->runtime->addressed_kernel->resume(
+            *command.control);
+      case CommandKind::kReset:
+        return composition_->runtime->addressed_kernel->reset(*command.control);
+      case CommandKind::kAcknowledgeCompleted:
+        return composition_->runtime->addressed_kernel->acknowledge_completed(
+            *command.control);
+      case CommandKind::kStatus:
+      case CommandKind::kEvents:
+      case CommandKind::kPreviewMotion:
+      case CommandKind::kPreviewCapabilityCommand:
+      case CommandKind::kSubmit:
+      case CommandKind::kRead:
+      case CommandKind::kStop:
+      case CommandKind::kSetRuntimeScale:
+      case CommandKind::kGetRuntimeScale:
+      case CommandKind::kPlanPick:
+      case CommandKind::kPlanPlace:
+      case CommandKind::kStartPick:
+      case CommandKind::kStartPlace:
+      case CommandKind::kReadPickPlaceSequence:
+        Fail("execution command dispatch is inconsistent");
       }
       Fail("execution command dispatch is unreachable");
     }();
@@ -3758,7 +4633,8 @@ class NativeExecutionHost final {
     return CanonicalValue(CanonicalValue::Object{
         {"accepted", ControlAcceptedValue(control_result.value())},
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-        {"command", CanonicalValue(std::string(ControlName(control_result.value().control)))},
+        {"command", CanonicalValue(std::string(
+                        ControlName(control_result.value().control)))},
         {"ok", CanonicalValue(true)},
     });
   }
@@ -3784,10 +4660,10 @@ class NativeExecutionHost final {
     }
   }
 
-  void HandleOneClient(const CommandSocket& socket, bool stop_only) noexcept {
+  void HandleOneClient(const CommandSocket &socket, bool stop_only) noexcept {
     try {
-      FileDescriptor client(
-          ::accept4(socket.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));
+      FileDescriptor client(::accept4(socket.get(), nullptr, nullptr,
+                                      SOCK_CLOEXEC | SOCK_NONBLOCK));
       if (!client) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
           return;
@@ -3796,7 +4672,8 @@ class NativeExecutionHost final {
       }
       ucred peer{};
       socklen_t peer_size = sizeof(peer);
-      Require(::getsockopt(client.get(), SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) == 0 &&
+      Require(::getsockopt(client.get(), SOL_SOCKET, SO_PEERCRED, &peer,
+                           &peer_size) == 0 &&
                   peer_size == sizeof(peer) && peer.uid == ::geteuid(),
               "execution command client is not the same user");
       pollfd inbound{client.get(), POLLIN, 0};
@@ -3817,27 +4694,29 @@ class NativeExecutionHost final {
       } while (count < 0 && errno == EINTR);
       CanonicalValue response;
       if (count <= 0 || (message.msg_flags & MSG_TRUNC) != 0) {
-        response = ErrorResponse("execution_command_invalid",
-                                 "execution command packet is empty or oversized");
+        response =
+            ErrorResponse("execution_command_invalid",
+                          "execution command packet is empty or oversized");
       } else {
         try {
           const auto command = DecodeCommand(
               std::string_view(buffer.data(), static_cast<std::size_t>(count)));
           response = stop_only ? ExecuteStop(command) : Execute(command);
-        } catch (const std::exception& error) {
+        } catch (const std::exception &error) {
           response = ErrorResponse("execution_command_invalid", error.what());
         }
       }
       auto bytes = content_identity::canonical_json(response);
       if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
-        bytes = content_identity::canonical_json(
-            ErrorResponse("execution_command_response_oversized",
-                          "execution owner result exceeds the bounded private transport"));
+        bytes = content_identity::canonical_json(ErrorResponse(
+            "execution_command_response_oversized",
+            "execution owner result exceeds the bounded private transport"));
       }
       pollfd outbound{client.get(), POLLOUT, 0};
       int response_ready = -1;
       do {
-        response_ready = ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
+        response_ready =
+            ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
       } while (response_ready < 0 && errno == EINTR);
       Require(response_ready > 0 && (outbound.revents & POLLOUT) != 0,
               "execution command client did not accept a response in time");
@@ -3868,7 +4747,7 @@ class NativeExecutionHost final {
   std::optional<core::ErrorDTO> last_reconcile_error_;
 };
 
-[[nodiscard]] HostConfig ParseArguments(int argc, char** argv) {
+[[nodiscard]] HostConfig ParseArguments(int argc, char **argv) {
   HostConfig config;
   std::set<std::string> seen;
   for (int index = 1; index < argc; index += 2) {
@@ -3903,15 +4782,18 @@ class NativeExecutionHost final {
           "motion/gripper target roles, candidate worker, and "
           "cell options "
           "are required");
-  config.package_root = ExistingDirectory(std::move(config.package_root), "package root");
-  config.manager_state_root =
-      ExistingDirectory(std::move(config.manager_state_root), "Manager state root");
-  config.execution_state_root =
-      ExistingDirectory(std::move(config.execution_state_root), "execution state root");
-  config.staging_root = ExistingDirectory(std::move(config.staging_root), "staging root");
-  config.candidate_worker =
-      ExistingRegularFile(std::move(config.candidate_worker), "candidate worker", true);
-  Require(!config.cell_id.empty() && config.cell_id.size() <= kMaximumIdentityBytes &&
+  config.package_root =
+      ExistingDirectory(std::move(config.package_root), "package root");
+  config.manager_state_root = ExistingDirectory(
+      std::move(config.manager_state_root), "Manager state root");
+  config.execution_state_root = ExistingDirectory(
+      std::move(config.execution_state_root), "execution state root");
+  config.staging_root =
+      ExistingDirectory(std::move(config.staging_root), "staging root");
+  config.candidate_worker = ExistingRegularFile(
+      std::move(config.candidate_worker), "candidate worker", true);
+  Require(!config.cell_id.empty() &&
+              config.cell_id.size() <= kMaximumIdentityBytes &&
               !config.program_binding_id.empty() &&
               config.program_binding_id.size() <= kMaximumIdentityBytes &&
               !config.motion_target_role_id.empty() &&
@@ -3927,7 +4809,8 @@ void InstallSignalHandlers() {
   action.sa_handler = HandleStopSignal;
   sigemptyset(&action.sa_mask);
   action.sa_flags = 0;
-  if (::sigaction(SIGINT, &action, nullptr) != 0 || ::sigaction(SIGTERM, &action, nullptr) != 0) {
+  if (::sigaction(SIGINT, &action, nullptr) != 0 ||
+      ::sigaction(SIGTERM, &action, nullptr) != 0) {
     FailErrno("install execution-host signal handlers");
   }
   struct sigaction ignore {};
@@ -3938,20 +4821,22 @@ void InstallSignalHandlers() {
   }
 }
 
-}  // namespace
-}  // namespace manyforge::roboplan_backend
+} // namespace
+} // namespace manyforge::roboplan_backend
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   try {
     manyforge::roboplan_backend::InstallSignalHandlers();
-    if (argc > 1 && std::string_view(argv[1]) == "--manyforge-managed-runtime-channel-fd") {
+    if (argc > 1 &&
+        std::string_view(argv[1]) == "--manyforge-managed-runtime-channel-fd") {
       return manyforge::roboplan_backend::RunManagedRuntimeChild(
-          manyforge::roboplan_backend::ParseManagedRuntimeArguments(argc, argv));
+          manyforge::roboplan_backend::ParseManagedRuntimeArguments(argc,
+                                                                    argv));
     }
     manyforge::roboplan_backend::NativeExecutionHost host(
         manyforge::roboplan_backend::ParseArguments(argc, argv));
     return host.Run();
-  } catch (const std::exception& error) {
+  } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 70;
   } catch (...) {

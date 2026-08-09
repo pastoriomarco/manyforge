@@ -171,6 +171,15 @@ public:
                             std::uint64_t initialization_generation,
                             std::string reason);
 
+  /// Idempotently advances the open projection to an externally finalized
+  /// Apply result. The logical-scene owner has already completed its durable
+  /// transition, so this performs no reset, seed, replay, or robot effect.
+  /// A stale or conflicting generation is rejected.
+  [[nodiscard]] bool
+  AdoptFinalizedOpenRuntime(SceneRuntimeIdentity identity,
+                            std::uint64_t initialization_generation,
+                            std::string reason);
+
   [[nodiscard]] std::string BeginInitialization(SceneRuntimeIdentity candidate,
                                                 bool deferred,
                                                 std::string reason);

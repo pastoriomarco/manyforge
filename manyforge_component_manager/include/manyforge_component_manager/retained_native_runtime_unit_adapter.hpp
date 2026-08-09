@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <manyforge_component_manager/runtime_convergence.hpp>
+#include <manyforge_component_manager/selected_runtime_composition.hpp>
 #include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <memory>
@@ -32,7 +33,8 @@ class RetainedNativeRuntimeUnitAdapter final
     : public IRuntimeUnitProcessPort,
       public IRuntimeUnitProgressPort,
       public manyforge::core::IManagerKernelApplyFencePort,
-      public manyforge::core::IPlannerSceneProjectionResolver {
+      public manyforge::core::IPlannerSceneProjectionResolver,
+      public IManagerSelectedRuntimeCompositionPort {
 public:
   RetainedNativeRuntimeUnitAdapter(
       std::filesystem::path trusted_installed_target_root,
@@ -82,9 +84,10 @@ public:
       const manyforge::core::ConfigurationFenceReleaseDTO &request) override;
   [[nodiscard]] manyforge::core::Result<
       std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
-  ResolveProjection(
-      const manyforge::core::ProjectionNativeRuntimeBindingDTO
-          &native_runtime_binding) const override;
+  ResolveProjection(const manyforge::core::ProjectionNativeRuntimeBindingDTO
+                        &native_runtime_binding) const override;
+  [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO InstallOrObserve(
+      const ManagerSelectedRuntimeCompositionRequestDTO &request) override;
 
 private:
   struct Impl;

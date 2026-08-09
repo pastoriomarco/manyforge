@@ -1,26 +1,25 @@
 #pragma once
 
 #include <cstddef>
-#include <vector>
-
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/operation_intent.hpp>
+#include <vector>
 
 namespace manyforge::core {
 
-/// Fixed active-runtime registry for the selected Program Bindings.
+/// Fixed active-runtime registry for the selected Program Bindings. A
+/// selected product with no commandable participants has an empty registry;
+/// every operation then fails closed as unavailable.
 ///
 /// Component/target/capability resolution is exact and order-independent.
 /// The registry contains no backend discovery, name-prefix fallback, or first
 /// robot/group behavior.
 class RuntimeParticipantRegistry final {
  public:
-  explicit RuntimeParticipantRegistry(
-      std::vector<RuntimeParticipantBinding> bindings);
+  explicit RuntimeParticipantRegistry(std::vector<RuntimeParticipantBinding> bindings);
 
-  [[nodiscard]] Result<RuntimeParticipantBinding> resolve(
-      const OperationIntentDTO& operation,
-      std::size_t participant_index) const;
+  [[nodiscard]] Result<RuntimeParticipantBinding> resolve(const OperationIntentDTO& operation,
+                                                          std::size_t participant_index) const;
 
   /// Validate one externally resolved sealed binding against the exact
   /// operation address and payload. This supports a bounded product-backed
@@ -29,8 +28,7 @@ class RuntimeParticipantRegistry final {
       const OperationIntentDTO& operation, std::size_t participant_index,
       const RuntimeParticipantBinding& binding);
 
-  [[nodiscard]] const std::vector<ResourceId>& resource_inventory()
-      const noexcept {
+  [[nodiscard]] const std::vector<ResourceId>& resource_inventory() const noexcept {
     return resource_inventory_;
   }
 

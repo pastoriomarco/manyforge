@@ -17,6 +17,10 @@ set(
   "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment"
   CACHE PATH
   "Path to the manyforge_deployment source tree")
+get_filename_component(
+  MANYFORGE_DEPLOYMENT_SOURCE_DIR
+  "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}"
+  REALPATH)
 if(NOT TARGET manyforge::deployment_verification_core)
   if(NOT EXISTS
      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/include/manyforge_deployment/artifact_codec.hpp")
