@@ -123,6 +123,34 @@ retained_gripper_limits(const roboplan::Scene &scene,
   return std::make_shared<collision::ManyForgeCollisionEngine>(model, cache);
 }
 
+[[nodiscard]] bool same_physical_motion_binding(
+    const core::RuntimeParticipantBinding& primary,
+    const core::RuntimeParticipantBinding& alias) noexcept {
+  const auto& left = primary.value();
+  const auto& right = alias.value();
+  return right.contact_grasp_bindings.empty() &&
+         left.retained_bundle_id == right.retained_bundle_id &&
+         left.graph_revision == right.graph_revision &&
+         left.controllable_component_id == right.controllable_component_id &&
+         left.component_type_id == right.component_type_id &&
+         left.component_type_revision == right.component_type_revision &&
+         left.command_target_id == right.command_target_id &&
+         left.capability_id == right.capability_id &&
+         left.capability_definition_revision ==
+             right.capability_definition_revision &&
+         left.command_schema == right.command_schema &&
+         left.model_bindings == right.model_bindings &&
+         left.model_groups == right.model_groups &&
+         left.frame_bindings == right.frame_bindings &&
+         left.resources == right.resources &&
+         left.collision_body_bindings == right.collision_body_bindings &&
+         left.control_path == right.control_path &&
+         left.capability_provider_path == right.capability_provider_path &&
+         left.supporting_capability_provider_paths ==
+             right.supporting_capability_provider_paths &&
+         left.runtime_unit_epochs == right.runtime_unit_epochs;
+}
+
 } // namespace
 
 std::shared_ptr<RetainedNativeRuntime>
@@ -155,6 +183,18 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
   const auto &projection_revision =
       current_inventory->projection_binding.projection_revision;
   const auto &motion_value = input.motion_binding.value();
+  const std::size_t reserved_registrations =
+      1U + (input.gripper_binding.has_value() ? 1U : 0U);
+  if (input.motion_binding_aliases.size() >
+          core::kMaxOperationParticipants - reserved_registrations ||
+      std::any_of(input.motion_binding_aliases.begin(),
+                  input.motion_binding_aliases.end(), [&](const auto& alias) {
+                    return !same_physical_motion_binding(input.motion_binding,
+                                                         alias);
+                  })) {
+    throw std::invalid_argument(
+        "native motion alias crosses or widens its physical runtime binding");
+  }
   if (motion_value.control_path.has_value() &&
       motion_value.control_path->runtime_scale_qualification.has_value()) {
     const auto &runtime_scale =
@@ -308,6 +348,9 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
   std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
   registrations.push_back(
       {runtime->motion_binding, runtime->participant_engine.get()});
+  for (const auto& alias : input.motion_binding_aliases) {
+    registrations.push_back({alias, runtime->participant_engine.get()});
+  }
   if (runtime->gripper_binding.has_value()) {
     registrations.push_back(
         {*runtime->gripper_binding, runtime->participant_engine.get()});

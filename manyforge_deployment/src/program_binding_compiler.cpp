@@ -1,6 +1,7 @@
 #include "manyforge_deployment/program_binding_compiler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <optional>
 #include <set>
@@ -1019,8 +1020,11 @@ resolve_contact_grasp_bindings(
 
 }  // namespace
 
-std::shared_ptr<const ProgramBinding> compile_program_binding(
-    const ProgramBindingContract& program_contract,
+namespace {
+
+[[nodiscard]] std::shared_ptr<const ProgramBinding>
+compile_program_binding_contract(
+    const core::ProgramBindingContractDTO& program_contract,
     core::ProgramRoleAssignmentDTO role_assignment,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
@@ -1032,11 +1036,10 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
       fail("binding compiler inputs do not share one verified retained bundle");
     }
     const auto& bundle = retained_bundle.value();
-    if (program_contract.value().node_environment !=
-        bundle.catalogs.node_environment) {
+    if (program_contract.node_environment != bundle.catalogs.node_environment) {
       fail("Program contract selects another retained node environment");
     }
-    normalize_role_assignment(program_contract.value(), role_assignment);
+    normalize_role_assignment(program_contract, role_assignment);
 
     const auto current = detail::BuildQualifiedRetentionAuthority::qualify();
     if (current.node_environment() != bundle.catalogs.node_environment ||
@@ -1052,9 +1055,8 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
     std::map<std::pair<std::string, std::string>, QualifiedComponentType>
         component_types;
     std::vector<core::ProgramComponentRoleBindingDTO> component_bindings;
-    component_bindings.reserve(program_contract.value().component_roles.size());
-    for (const auto& requirement :
-         program_contract.value().component_roles) {
+    component_bindings.reserve(program_contract.component_roles.size());
+    for (const auto& requirement : program_contract.component_roles) {
       const auto& assignment =
           require_component_assignment(role_assignment,
                                        requirement.component_role_id);
@@ -1075,8 +1077,8 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
     }
 
     std::vector<core::ProgramTargetRoleBindingDTO> target_bindings;
-    target_bindings.reserve(program_contract.value().target_roles.size());
-    for (const auto& requirement : program_contract.value().target_roles) {
+    target_bindings.reserve(program_contract.target_roles.size());
+    for (const auto& requirement : program_contract.target_roles) {
       const auto& component_assignment = require_component_assignment(
           role_assignment, requirement.component_role_id);
       const auto& target_assignment =
@@ -1201,8 +1203,8 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
     core::ProgramBindingDTO binding_value{
             std::string(core::kProgramBindingApiVersion),
             core::ProgramBindingId(std::string(kZeroDigest)),
-            program_contract.value().program_id,
-            program_contract.value().program_revision,
+            program_contract.program_id,
+            program_contract.program_revision,
             retained_bundle.retained_bundle_id(),
             bundle.cell_graph.graph_revision,
             bundle.catalogs.node_environment,
@@ -1214,7 +1216,7 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
                 bundle.provenance.source_records,
                 std::move(resolved_records)}};
     binding_value.contact_grasp_bindings = resolve_contact_grasp_bindings(
-        program_contract.value(), binding_value.component_role_bindings,
+        program_contract, binding_value.component_role_bindings,
         binding_value.target_role_bindings);
     auto sealed = detail::ProgramBindingConstructionAuthority::seal(
         std::move(binding_value));
@@ -1225,6 +1227,236 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
     throw;
   } catch (const std::exception& error) {
     fail(std::string("Program Binding compilation failed: ") + error.what());
+  }
+}
+
+template <typename StrongId>
+[[nodiscard]] std::vector<StrongId> sorted_ids(
+    const std::set<std::string>& values) {
+  std::vector<StrongId> result;
+  result.reserve(values.size());
+  for (const auto& value : values) {
+    result.emplace_back(value);
+  }
+  return result;
+}
+
+template <typename StrongId>
+[[nodiscard]] CanonicalValue strong_id_array(
+    const std::vector<StrongId>& values) {
+  CanonicalValue::Array result;
+  result.reserve(values.size());
+  for (const auto& value : values) {
+    result.emplace_back(value.value());
+  }
+  return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] const core::ComponentTypeCapabilityDTO*
+find_target_capability(const core::ComponentTypeCommandTargetDTO& target,
+                       const std::string_view capability_id) {
+  return find_exactly_one<core::ComponentTypeCapabilityDTO>(
+      target.capabilities, [&](const auto& capability) {
+        return capability.capability_id.value() == capability_id;
+      });
+}
+
+[[nodiscard]] core::ProgramBindingContractDTO
+make_direct_control_motion_contract(
+    const core::RetainedNodeEnvironmentDTO& node_environment,
+    const core::ComponentTypeCommandTargetDTO& target) {
+  std::set<std::string> model_role_names;
+  for (const auto& group : target.model_group_roles) {
+    model_role_names.insert(group.model_role_id.value());
+  }
+  for (const auto& resource : target.resource_roles) {
+    if (const auto* model =
+            std::get_if<core::ComponentTypeModelResourceRoleDTO>(&resource)) {
+      model_role_names.insert(model->model_role_id.value());
+    }
+  }
+  for (const auto& frame : target.frame_roles) {
+    model_role_names.insert(frame.model_role_id.value());
+  }
+  for (const auto& body : target.collision_body_roles) {
+    model_role_names.insert(body.model_role_id.value());
+  }
+  if (model_role_names.empty() || target.frame_roles.empty() ||
+      target.resource_roles.empty() || target.collision_body_roles.empty()) {
+    fail("direct-control motion target has no complete model/frame/resource/"
+         "collision contract");
+  }
+  for (const auto required_role : {kDirectControlBaseFrameRoleId,
+                                   kDirectControlTcpFrameRoleId}) {
+    if (std::none_of(target.frame_roles.begin(), target.frame_roles.end(),
+                     [&](const auto& role) {
+                       return role.frame_role_id.value() == required_role;
+                     })) {
+      fail("direct-control motion target omits its logical " +
+           std::string(required_role) + " frame role");
+    }
+  }
+
+  const auto model_roles =
+      sorted_ids<core::ModelRoleId>(model_role_names);
+  std::set<std::string> frame_role_names;
+  for (const auto& frame : target.frame_roles) {
+    frame_role_names.insert(frame.frame_role_id.value());
+  }
+  std::set<std::string> resource_role_names;
+  for (const auto& resource : target.resource_roles) {
+    resource_role_names.insert(core::resource_role_id(resource).value());
+  }
+  std::set<std::string> collision_role_names;
+  for (const auto& body : target.collision_body_roles) {
+    collision_role_names.insert(body.collision_body_role_id.value());
+  }
+  const auto frame_roles =
+      sorted_ids<core::FrameRoleId>(frame_role_names);
+  const auto resource_roles =
+      sorted_ids<core::ResourceRoleId>(resource_role_names);
+  const auto collision_roles =
+      sorted_ids<core::CollisionBodyRoleId>(collision_role_names);
+
+  constexpr std::array<std::pair<std::string_view, bool>, 4U>
+      kMotionCapabilities{{
+          {"execution.trajectory.execute", true},
+          {"planning.motion.cartesian_path", false},
+          {"planning.motion.joint_goal", true},
+          {"planning.motion.pose_goal", false},
+      }};
+  std::vector<core::ProgramCapabilityRequirementDTO> capabilities;
+  for (const auto& [capability_id, required] : kMotionCapabilities) {
+    const auto* capability = find_target_capability(target, capability_id);
+    if (capability == nullptr) {
+      if (required) {
+        fail("direct-control motion target omits a required execution or "
+             "joint-planning capability");
+      }
+      continue;
+    }
+    capabilities.push_back(core::ProgramCapabilityRequirementDTO{
+        capability->capability_id,
+        capability->capability_definition_revision,
+        core::ProgramCapabilityDisposition::kRequired});
+  }
+
+  CanonicalValue::Array capability_projection;
+  capability_projection.reserve(capabilities.size());
+  for (const auto& capability : capabilities) {
+    capability_projection.emplace_back(CanonicalValue::Object{
+        {"capability_definition_revision",
+         CanonicalValue(
+             capability.capability_definition_revision.value())},
+        {"capability_id",
+         CanonicalValue(capability.capability_id.value())},
+        {"disposition", CanonicalValue("required")},
+    });
+  }
+  const CanonicalValue projection(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue("manyforge.direct_control_motion_program.v1")},
+      {"component_role_id",
+       CanonicalValue(std::string(kDirectControlComponentRoleId))},
+      {"model_roles", strong_id_array(model_roles)},
+      {"node_environment",
+       CanonicalValue(CanonicalValue::Object{
+           {"catalog_digest",
+            CanonicalValue(node_environment.catalog_digest.value())},
+           {"catalog_id", CanonicalValue(node_environment.catalog_id)},
+           {"content_version",
+            CanonicalValue(node_environment.content_version)},
+           {"environment_digest",
+            CanonicalValue(node_environment.environment_digest.value())},
+       })},
+      {"program_id",
+       CanonicalValue(std::string(kDirectControlMotionProgramId))},
+      {"target_role",
+       CanonicalValue(CanonicalValue::Object{
+           {"capabilities",
+            CanonicalValue(std::move(capability_projection))},
+           {"collision_body_roles", strong_id_array(collision_roles)},
+           {"frame_roles", strong_id_array(frame_roles)},
+           {"resource_roles", strong_id_array(resource_roles)},
+           {"target_role_id",
+            CanonicalValue(std::string(kDirectControlTargetRoleId))},
+       })},
+  });
+  std::string revision_preimage{
+      "manyforge.direct-control-motion-program-revision.v1"};
+  revision_preimage.push_back('\0');
+  revision_preimage.append(canonical_json(projection));
+
+  return core::ProgramBindingContractDTO{
+      core::ProgramId(std::string(kDirectControlMotionProgramId)),
+      core::ProgramRevision(sha256_digest(revision_preimage)),
+      node_environment,
+      {core::ProgramComponentRoleRequirementDTO{
+          core::ComponentRoleId(
+              std::string(kDirectControlComponentRoleId)),
+          {}, model_roles, {}}},
+      {core::ProgramTargetRoleRequirementDTO{
+          core::TargetRoleId(std::string(kDirectControlTargetRoleId)),
+          core::ComponentRoleId(
+              std::string(kDirectControlComponentRoleId)),
+          std::move(capabilities), frame_roles, resource_roles,
+          collision_roles, model_roles}},
+      {}};
+}
+
+}  // namespace
+
+std::shared_ptr<const ProgramBinding> compile_program_binding(
+    const ProgramBindingContract& program_contract,
+    core::ProgramRoleAssignmentDTO role_assignment,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactStore& catalog_artifact_store) {
+  return compile_program_binding_contract(
+      program_contract.value(), std::move(role_assignment), retained_bundle,
+      retained_model_map, catalog_artifact_store);
+}
+
+std::shared_ptr<const ProgramBinding>
+compile_direct_control_motion_program_binding(
+    const core::ControllableComponentId& controllable_component_id,
+    const core::CommandTargetId& command_target_id,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactStore& catalog_artifact_store) {
+  try {
+    if (!verify_retained_bundle_identity(retained_bundle) ||
+        retained_model_map.query().retained_bundle_id !=
+            retained_bundle.retained_bundle_id()) {
+      fail("direct-control compiler inputs do not share one verified retained "
+           "bundle");
+    }
+    const auto& bundle = retained_bundle.value();
+    const auto& component = require_component(
+        bundle.cell_graph, controllable_component_id);
+    const auto catalog = load_qualified_catalog_closure(
+        bundle, catalog_artifact_store);
+    const auto component_type = load_component_type(
+        bundle, component, catalog.capabilities, catalog_artifact_store);
+    const auto& target = require_target_type(component_type, command_target_id);
+    auto contract = make_direct_control_motion_contract(
+        bundle.catalogs.node_environment, target);
+    core::ProgramRoleAssignmentDTO assignment{
+        {core::ProgramComponentRoleAssignmentDTO{
+            core::ComponentRoleId(
+                std::string(kDirectControlComponentRoleId)),
+            controllable_component_id}},
+        {core::ProgramTargetRoleAssignmentDTO{
+            core::TargetRoleId(std::string(kDirectControlTargetRoleId)),
+            command_target_id}}};
+    return compile_program_binding_contract(
+        contract, std::move(assignment), retained_bundle,
+        retained_model_map, catalog_artifact_store);
+  } catch (const ProgramBindingCompilerError&) {
+    throw;
+  } catch (const std::exception& error) {
+    fail(std::string("Direct-control Program Binding compilation failed: ") +
+         error.what());
   }
 }
 

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -23,6 +24,7 @@
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
@@ -30,6 +32,7 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/program_binding.hpp>
+#include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -52,6 +55,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -77,6 +81,7 @@ using content_identity::CanonicalValue;
 constexpr std::string_view kCommandApiVersion = "manyforge.execution_command.v1";
 constexpr std::string_view kResponseApiVersion = "manyforge.execution_command_response.v1";
 constexpr std::string_view kSocketFileName = "execution-command.sock";
+constexpr std::string_view kControlSocketFileName = "execution-control.sock";
 constexpr std::string_view kLockFileName = ".execution-host.lock";
 constexpr std::size_t kMaximumPacketBytes = 1024U * 1024U;
 constexpr std::size_t kMaximumResponseBytes = 4U * 1024U * 1024U;
@@ -262,8 +267,9 @@ class HostLock final {
 
 class CommandSocket final {
  public:
-  explicit CommandSocket(const std::filesystem::path& state_root)
-      : path_(state_root / std::string(kSocketFileName)) {
+  CommandSocket(const std::filesystem::path& state_root,
+                std::string_view socket_file_name)
+      : path_(state_root / std::string(socket_file_name)) {
     const auto spelling = path_.string();
     Require(spelling.size() < sizeof(sockaddr_un::sun_path),
             "execution command socket path is too long");
@@ -1422,6 +1428,7 @@ std::vector<double> NumberArray(const CanonicalValue& root, std::string_view nam
 enum class CommandKind {
   kStatus,
   kEvents,
+  kPreviewMotion,
   kSubmit,
   kRead,
   kPause,
@@ -1443,6 +1450,7 @@ struct Command final {
 
   CommandKind kind;
   std::optional<core::OperationIntentDTO> operation;
+  std::optional<core::ContentDigest> operation_digest;
   std::optional<core::OperationId> operation_id;
   std::optional<core::OperationControlRequestDTO> control;
   std::optional<core::StopIntentDTO> stop;
@@ -1501,6 +1509,18 @@ struct Command final {
     const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kSubmit};
     decoded.operation = DecodeOperation(Member(root, "operation"), attribution);
+    return decoded;
+  }
+  if (command == "preview_motion") {
+    RequireExactObjectSize(root, 4U, "motion preview command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    const auto& operation = Member(root, "operation");
+    Command decoded{CommandKind::kPreviewMotion};
+    decoded.operation = DecodeOperation(operation, attribution);
+    decoded.operation_digest = core::ContentDigest(
+        content_identity::sha256_digest(
+            content_identity::canonical_json(operation)));
     return decoded;
   }
   if (command == "plan_pick") {
@@ -1605,6 +1625,121 @@ struct Command final {
                          {"z_m", CanonicalValue(value.position_m.z_m)},
                      })},
   });
+}
+
+[[nodiscard]] CanonicalValue SceneRevisionValue(
+    const core::SceneRevision& value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"content_hash", CanonicalValue(value.content_hash.value())},
+      {"revision_id", CanonicalValue(static_cast<double>(value.revision_id))},
+      {"scene_id", CanonicalValue(value.scene_id.value())},
+  });
+}
+
+class CollisionLeaseRelease final {
+ public:
+  CollisionLeaseRelease(
+      core::ICollisionWorldSnapshotPublisher& publisher,
+      core::ProjectionLeaseId lease_id)
+      : publisher_(publisher), lease_id_(std::move(lease_id)) {}
+  ~CollisionLeaseRelease() {
+    publisher_.release_scene_snapshot_lease_inventory(lease_id_);
+  }
+  CollisionLeaseRelease(const CollisionLeaseRelease&) = delete;
+  CollisionLeaseRelease& operator=(const CollisionLeaseRelease&) = delete;
+
+ private:
+  core::ICollisionWorldSnapshotPublisher& publisher_;
+  core::ProjectionLeaseId lease_id_;
+};
+
+[[nodiscard]] CanonicalValue MotionPreviewReceiptValue(
+    const core::MotionPreviewResultDTO& preview,
+    const core::OperationIntentDTO& intent,
+    const core::ContentDigest& intent_digest,
+    const core::RuntimeParticipantBinding& direct_control_binding,
+    const core::RequestOwnerEpoch& owner_epoch) {
+  const auto& binding = direct_control_binding.value();
+  const auto& final_state = preview.final_controlled_state;
+  Require(final_state.resources.size() == binding.resources.size() &&
+              final_state.joint_names.size() == binding.resources.size() &&
+              final_state.positions.size() == binding.resources.size() &&
+              preview.start_state.joint_names.size() ==
+                  binding.resources.size() &&
+              preview.start_state.positions_rad.size() ==
+                  binding.resources.size(),
+          "motion preview result crosses its direct-control resource shape");
+
+  CanonicalValue::Array source_joint_names;
+  CanonicalValue::Array start_positions;
+  CanonicalValue::Array final_positions;
+  source_joint_names.reserve(binding.resources.size());
+  start_positions.reserve(binding.resources.size());
+  final_positions.reserve(binding.resources.size());
+  for (std::size_t index = 0U; index < binding.resources.size(); ++index) {
+    const auto& resource = binding.resources[index];
+    Require(resource.source_joint_name.has_value() &&
+                final_state.resources[index] == resource.resource_id &&
+                final_state.joint_names[index] ==
+                    resource.compiled_resource_name &&
+                preview.start_state.joint_names[index] ==
+                    resource.compiled_resource_name,
+            "motion preview result crosses its source-local binding");
+    const auto* angular =
+        std::get_if<core::AngularPositionDTO>(&final_state.positions[index]);
+    Require(angular != nullptr,
+            "joint motion preview returned a non-angular terminal state");
+    source_joint_names.emplace_back(*resource.source_joint_name);
+    start_positions.emplace_back(preview.start_state.positions_rad[index]);
+    final_positions.emplace_back(angular->value_rad);
+  }
+
+  CanonicalValue::Object receipt{
+      {"collision_world_revision",
+       CanonicalValue(CanonicalValue::Object{
+           {"content_hash",
+            CanonicalValue(preview.collision_world_revision.content_hash)},
+           {"revision_id",
+            CanonicalValue(static_cast<double>(
+                preview.collision_world_revision.revision_id))},
+       })},
+      {"commit_eligible", CanonicalValue(true)},
+      {"component_role_id",
+       CanonicalValue(binding.component_role_id.value())},
+      {"final_positions_rad", CanonicalValue(std::move(final_positions))},
+      {"final_tcp_pose", PoseValue(preview.final_tcp_pose)},
+      {"graph_revision", CanonicalValue(binding.graph_revision.value())},
+      {"intent_digest", CanonicalValue(intent_digest.value())},
+      {"program_binding_id",
+       CanonicalValue(binding.program_binding_id.value())},
+      {"program_id", CanonicalValue(binding.program_id.value())},
+      {"program_revision",
+       CanonicalValue(binding.program_revision.value())},
+      {"program_run_id", CanonicalValue(intent.program_run_id.value())},
+      {"request_id",
+       CanonicalValue(intent.request_context.request_id.value())},
+      {"request_owner_epoch", CanonicalValue(owner_epoch.value())},
+      {"required_capability_id",
+       CanonicalValue(intent.participants.front()
+                          .required_capability_id.value())},
+      {"retained_bundle_id",
+       CanonicalValue(binding.retained_bundle_id.value())},
+      {"scene_revision",
+       SceneRevisionValue(
+           preview.projection_binding.projection_revision.scene_revision)},
+      {"schema_version",
+       CanonicalValue("manyforge.direct_control_motion_preview.v1")},
+      {"source_joint_names",
+       CanonicalValue(std::move(source_joint_names))},
+      {"start_positions_rad", CanonicalValue(std::move(start_positions))},
+      {"target_role_id", CanonicalValue(binding.target_role_id.value())},
+  };
+  const core::ContentDigest receipt_digest(
+      content_identity::sha256_digest(content_identity::canonical_json(
+          CanonicalValue(receipt))));
+  receipt.emplace_back("receipt_digest",
+                       CanonicalValue(receipt_digest.value()));
+  return CanonicalValue(std::move(receipt));
 }
 
 [[nodiscard]] CanonicalValue MotionSpecValue(const core::MotionSpecDTO& motion) {
@@ -2238,6 +2373,9 @@ struct Composition final {
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   std::shared_ptr<const deployment::ProgramBindingContract> program;
   std::shared_ptr<const deployment::ProgramBinding> program_binding;
+  std::shared_ptr<const deployment::ProgramBinding> direct_control_binding;
+  core::RuntimeParticipantBinding direct_control_motion_binding;
+  core::JointLimitsDTO direct_control_joint_limits;
   RetainedPlanningModelStage stage;
   std::shared_ptr<RetainedNativeRuntime> runtime;
   core::ProjectionRevisionDTO projection_revision;
@@ -2252,6 +2390,9 @@ struct Composition final {
   Composition(std::shared_ptr<const deployment::RetainedBundle> selected_bundle,
               std::shared_ptr<const deployment::ProgramBindingContract> selected_program,
               std::shared_ptr<const deployment::ProgramBinding> selected_binding,
+              std::shared_ptr<const deployment::ProgramBinding> selected_direct_control_binding,
+              core::RuntimeParticipantBinding selected_direct_control_motion_binding,
+              core::JointLimitsDTO selected_direct_control_joint_limits,
               RetainedPlanningModelStage selected_stage,
               std::shared_ptr<RetainedNativeRuntime> selected_runtime,
               core::ProjectionRevisionDTO selected_projection,
@@ -2259,6 +2400,11 @@ struct Composition final {
       : bundle(std::move(selected_bundle)),
         program(std::move(selected_program)),
         program_binding(std::move(selected_binding)),
+        direct_control_binding(std::move(selected_direct_control_binding)),
+        direct_control_motion_binding(
+            std::move(selected_direct_control_motion_binding)),
+        direct_control_joint_limits(
+            std::move(selected_direct_control_joint_limits)),
         stage(std::move(selected_stage)),
         runtime(std::move(selected_runtime)),
         projection_revision(std::move(selected_projection)),
@@ -2317,6 +2463,27 @@ struct Composition final {
   const auto planner_target = deployment::resolve_runtime_program_target(
       *program_binding, motion_target_role, core::CapabilityId("planning.motion.joint_goal"),
       *bundle, *model_map);
+  const deployment::FilesystemCatalogArtifactStore catalog_store(
+      config.package_root);
+  auto direct_control_binding =
+      deployment::compile_direct_control_motion_program_binding(
+          motion_target.component().controllable_component_id,
+          motion_target.target_role().command_target_id, *bundle, *model_map,
+          catalog_store);
+  const auto direct_control_motion_target =
+      deployment::resolve_runtime_program_target(
+          *direct_control_binding,
+          core::TargetRoleId(
+              std::string(deployment::kDirectControlTargetRoleId)),
+          core::CapabilityId("execution.trajectory.execute"), *bundle,
+          *model_map);
+  const auto direct_control_planner_target =
+      deployment::resolve_runtime_program_target(
+          *direct_control_binding,
+          core::TargetRoleId(
+              std::string(deployment::kDirectControlTargetRoleId)),
+          core::CapabilityId("planning.motion.joint_goal"), *bundle,
+          *model_map);
   const auto gripper_target = deployment::resolve_runtime_program_target(
       *program_binding, gripper_target_role, core::CapabilityId("tool.gripper.command"), *bundle,
       *model_map);
@@ -2330,6 +2497,23 @@ struct Composition final {
   if (!motion_binding.ok()) {
     Fail("active motion participant binding failed verification: " +
          motion_binding.error().message);
+  }
+  const std::array<deployment::RuntimeProgramTargetBinding, 1U>
+      direct_control_support{direct_control_planner_target};
+  auto direct_control_motion_binding_dto =
+      deployment::build_runtime_participant_binding_dto(
+          direct_control_motion_target,
+          ActiveFacts(direct_control_motion_target, direct_control_support,
+                      runtime_epoch,
+                      core::ActiveControlConfigurationId(
+                          "active.i6.native.arm")),
+          direct_control_support);
+  auto direct_control_motion_binding =
+      core::verify_runtime_participant_binding(
+          std::move(direct_control_motion_binding_dto));
+  if (!direct_control_motion_binding.ok()) {
+    Fail("direct-control motion participant binding failed verification: " +
+         direct_control_motion_binding.error().message);
   }
   auto gripper_binding_dto = deployment::build_runtime_participant_binding_dto(
       gripper_target,
@@ -2397,16 +2581,29 @@ struct Composition final {
       inventory->projection_binding, candidate_binding, std::move(candidate_client));
   auto runtime = create_retained_native_runtime(
       RetainedNativeRuntimeInput{
-          motion_binding.value(), gripper_binding.value(), scene, scene_mutex, state_projector,
-          publisher, collision_model, std::move(planner),
+          motion_binding.value(), gripper_binding.value(),
+          {direct_control_motion_binding.value()}, scene, scene_mutex,
+          state_projector, publisher, collision_model, std::move(planner),
           [](const auto&) { return std::make_shared<AbsoluteOnlyReferenceResolver>(); }},
       RetainedNativeRuntimeConfig{
           owner_epoch, core::CellId(config.cell_id),
           config.execution_state_root / std::string(core::kOperationJournalFilename), 1024U,
           core::CacheConfig{}, core::ExecutionKernelConfig{}, RoboPlanExecutionBackendConfig{},
           SimpleSchedulerConfig::from_environment(), 10'000'000});
+  auto direct_control_joint_limits = runtime->kinematics->joint_limits(
+      direct_control_motion_binding.value()
+          .value()
+          .controllable_component_id.value(),
+      direct_control_motion_binding.value().value().command_target_id.value());
+  if (!direct_control_joint_limits.ok()) {
+    Fail("direct-control joint limits are unavailable: " +
+         direct_control_joint_limits.error().message);
+  }
   auto composition = std::make_unique<Composition>(
-      std::move(bundle), std::move(program), std::move(program_binding), std::move(stage),
+      std::move(bundle), std::move(program), std::move(program_binding),
+      std::move(direct_control_binding),
+      std::move(direct_control_motion_binding.value()),
+      std::move(direct_control_joint_limits.value()), std::move(stage),
       std::move(runtime), receipt.request.candidate_projection_revision,
       receipt.publication_generation);
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
@@ -2425,11 +2622,16 @@ class NativeExecutionHost final {
       : config_(std::move(config)),
         owner_epoch_(RandomToken("execution-host-")),
         runtime_epoch_(RandomToken("native-runtime-")),
+        direct_control_program_run_id_("direct-control-" +
+                                       owner_epoch_.value()),
         host_lock_(config_.execution_state_root),
         composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_)),
-        command_socket_(config_.execution_state_root) {}
+        command_socket_(config_.execution_state_root, kSocketFileName),
+        control_socket_(config_.execution_state_root, kControlSocketFileName) {}
 
   int Run() {
+    std::jthread control_thread(
+        [this](std::stop_token stop_token) { RunControlLane(stop_token); });
     while (g_stop_requested == 0) {
       const auto reconciled =
           composition_->runtime->addressed_kernel->reconcile_subordinate_state();
@@ -2454,16 +2656,134 @@ class NativeExecutionHost final {
         FailErrno("poll execution command socket");
       }
       if ((descriptor.revents & POLLIN) != 0) {
-        HandleOneClient();
+        HandleOneClient(command_socket_, false);
       }
       if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
         Fail("execution command socket became unavailable");
       }
+      if (control_socket_failed_.load(std::memory_order_acquire)) {
+        Fail("execution Stop control socket became unavailable");
+      }
     }
+    control_thread.request_stop();
+    control_thread.join();
+    Require(!control_socket_failed_.load(std::memory_order_acquire),
+            "execution Stop control socket became unavailable");
     return 0;
   }
 
  private:
+  [[nodiscard]] CanonicalValue DirectControlStatusValue(
+      const core::ObservedStateSnapshotDTO& observed_state) const {
+    const auto& binding =
+        composition_->direct_control_motion_binding.value();
+    const auto& limits = composition_->direct_control_joint_limits;
+    Require(limits.joint_names.size() == binding.resources.size() &&
+                limits.position_lower_rad.size() ==
+                    binding.resources.size() &&
+                limits.position_upper_rad.size() ==
+                    binding.resources.size() &&
+                limits.velocity_max_rad_s.size() ==
+                    binding.resources.size() &&
+                (limits.acceleration_max_rad_s2.empty() ||
+                 limits.acceleration_max_rad_s2.size() ==
+                     binding.resources.size()) &&
+                observed_state.resources.size() == binding.resources.size() &&
+                observed_state.joint_names.size() == binding.resources.size() &&
+                observed_state.positions.size() == binding.resources.size(),
+            "direct-control joint limits cross their retained target");
+
+    CanonicalValue::Array joints;
+    CanonicalValue::Array source_joint_names;
+    CanonicalValue::Array observed_positions;
+    joints.reserve(binding.resources.size());
+    source_joint_names.reserve(binding.resources.size());
+    observed_positions.reserve(binding.resources.size());
+    for (std::size_t index = 0U; index < binding.resources.size(); ++index) {
+      const auto& resource = binding.resources[index];
+      Require(resource.source_joint_name.has_value() &&
+                  resource.coordinate_kind ==
+                      core::CoordinateKind::kAngular &&
+                  limits.joint_names[index] ==
+                      resource.compiled_resource_name &&
+                  observed_state.resources[index] == resource.resource_id &&
+                  observed_state.joint_names[index] ==
+                      resource.compiled_resource_name,
+              "direct-control joint limits cross their source-local binding");
+      const auto* position = std::get_if<core::AngularPositionDTO>(
+          &observed_state.positions[index]);
+      Require(position != nullptr,
+              "direct-control observed state is not all-angular");
+      source_joint_names.emplace_back(*resource.source_joint_name);
+      observed_positions.emplace_back(position->value_rad);
+      joints.emplace_back(CanonicalValue::Object{
+          {"max_acceleration_rad_s2",
+           limits.acceleration_max_rad_s2.empty()
+               ? CanonicalValue(nullptr)
+               : CanonicalValue(
+                     limits.acceleration_max_rad_s2[index])},
+          {"max_position_rad",
+           CanonicalValue(limits.position_upper_rad[index])},
+          {"max_velocity_rad_s",
+           CanonicalValue(limits.velocity_max_rad_s[index])},
+          {"min_position_rad",
+           CanonicalValue(limits.position_lower_rad[index])},
+          {"source_joint_name",
+           CanonicalValue(*resource.source_joint_name)},
+      });
+    }
+    CanonicalValue::Array frame_roles;
+    frame_roles.reserve(binding.frame_bindings.size());
+    for (const auto& frame : binding.frame_bindings) {
+      frame_roles.emplace_back(frame.frame_role_id.value());
+    }
+    CanonicalValue::Array planning_capabilities;
+    for (const auto& path :
+         binding.supporting_capability_provider_paths) {
+      planning_capabilities.emplace_back(path.capability_id.value());
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"command_target_id",
+         CanonicalValue(binding.command_target_id.value())},
+        {"base_frame_role_id",
+         CanonicalValue(
+             std::string(deployment::kDirectControlBaseFrameRoleId))},
+        {"component_role_id",
+         CanonicalValue(binding.component_role_id.value())},
+        {"controllable_component_id",
+         CanonicalValue(binding.controllable_component_id.value())},
+        {"frame_role_ids", CanonicalValue(std::move(frame_roles))},
+        {"joints", CanonicalValue(std::move(joints))},
+        {"operation_capability_id",
+         CanonicalValue(binding.capability_id.value())},
+        {"observed_state",
+         CanonicalValue(CanonicalValue::Object{
+             {"complete", CanonicalValue(observed_state.complete)},
+             {"positions_rad",
+              CanonicalValue(std::move(observed_positions))},
+             {"sequence",
+              CanonicalValue(static_cast<double>(observed_state.sequence))},
+             {"source_epoch",
+              CanonicalValue(observed_state.source_epoch.value())},
+             {"source_joint_names",
+              CanonicalValue(std::move(source_joint_names))},
+         })},
+        {"planning_capability_ids",
+         CanonicalValue(std::move(planning_capabilities))},
+        {"program_binding_id",
+         CanonicalValue(binding.program_binding_id.value())},
+        {"program_id", CanonicalValue(binding.program_id.value())},
+        {"program_revision",
+         CanonicalValue(binding.program_revision.value())},
+        {"program_run_id",
+         CanonicalValue(direct_control_program_run_id_.value())},
+        {"target_role_id", CanonicalValue(binding.target_role_id.value())},
+        {"tcp_frame_role_id",
+         CanonicalValue(
+             std::string(deployment::kDirectControlTcpFrameRoleId))},
+    });
+  }
+
   [[nodiscard]] CanonicalValue StatusResponse() const {
     const auto& bundle = *composition_->bundle;
     const auto& program = composition_->program->value();
@@ -2498,6 +2818,7 @@ class NativeExecutionHost final {
              {"active_publication_generation",
               CanonicalValue(static_cast<double>(composition_->publication_generation.value()))},
              {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
+             {"direct_control", DirectControlStatusValue(motion_state.value())},
              {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
              {"gripper_command_schema_id",
               CanonicalValue(gripper_schema.command_schema_id.value())},
@@ -2513,16 +2834,29 @@ class NativeExecutionHost final {
              {"program_revision", CanonicalValue(program.program_revision.value())},
              {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
              {"scene_revision",
-              CanonicalValue(CanonicalValue::Object{
-                  {"content_hash", CanonicalValue(composition_->projection_revision.scene_revision
-                                                      .content_hash.value())},
-                  {"revision_id",
-                   CanonicalValue(static_cast<double>(
-                       composition_->projection_revision.scene_revision.revision_id))},
-                  {"scene_id", CanonicalValue(composition_->projection_revision.scene_revision
-                                                  .scene_id.value())},
-              })},
+              SceneRevisionValue(
+                  composition_->projection_revision.scene_revision)},
          })},
+    });
+  }
+
+  [[nodiscard]] CanonicalValue ExecuteStop(const Command& command) {
+    Require(command.kind == CommandKind::kStop && command.stop.has_value(),
+            "execution Stop control lane accepts only a complete Stop command");
+    const auto result =
+        composition_->runtime->addressed_kernel->stop(*command.stop);
+    if (!result.ok()) {
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"error", ErrorValue(result.error())},
+          {"ok", CanonicalValue(false)},
+      });
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"accepted", StopAcceptedValue(result.value())},
+        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+        {"command", CanonicalValue("stop")},
+        {"ok", CanonicalValue(true)},
     });
   }
 
@@ -2547,11 +2881,67 @@ class NativeExecutionHost final {
           {"ok", CanonicalValue(true)},
       });
     }
+    if (command.kind == CommandKind::kStop) {
+      return ExecuteStop(command);
+    }
     if (last_reconcile_error_.has_value()) {
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"error", ErrorValue(*last_reconcile_error_)},
           {"ok", CanonicalValue(false)},
+      });
+    }
+    if (command.kind == CommandKind::kPreviewMotion) {
+      auto inventory = composition_->runtime->collision_publisher
+                           ->retain_scene_snapshot_lease_inventory();
+      if (!inventory.has_value()) {
+        return ErrorResponse(
+            "motion_preview_projection_unavailable",
+            "the native owner could not retain an exact collision projection");
+      }
+      CollisionLeaseRelease release(
+          *composition_->runtime->collision_publisher,
+          inventory->projection_binding.projection_lease_id);
+      auto session =
+          composition_->runtime->addressed_kernel
+              ->begin_motion_preview_session(*command.operation);
+      if (!session.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version",
+             CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(session.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      auto start_state = session.value()->current_state();
+      if (!start_state.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version",
+             CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(start_state.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      auto preview = session.value()->preview_motion(
+          *command.operation, std::move(*inventory),
+          std::move(start_state.value()));
+      if (!preview.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version",
+             CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(preview.error())},
+            {"ok", CanonicalValue(false)},
+        });
+      }
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("preview_motion")},
+          {"ok", CanonicalValue(true)},
+          {"preview_receipt",
+           MotionPreviewReceiptValue(
+               preview.value(), *command.operation,
+               *command.operation_digest,
+               composition_->direct_control_motion_binding, owner_epoch_)},
       });
     }
     if (command.kind == CommandKind::kReadPickPlaceSequence) {
@@ -2701,22 +3091,6 @@ class NativeExecutionHost final {
           {"runtime_scale", RuntimeScaleStatusValue(status.value())},
       });
     }
-    if (command.kind == CommandKind::kStop) {
-      const auto result = composition_->runtime->addressed_kernel->stop(*command.stop);
-      if (!result.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(result.error())},
-            {"ok", CanonicalValue(false)},
-        });
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"accepted", StopAcceptedValue(result.value())},
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("stop")},
-          {"ok", CanonicalValue(true)},
-      });
-    }
     if (command.kind == CommandKind::kSetRuntimeScale) {
       const auto result =
           composition_->runtime->addressed_kernel->set_runtime_scale(*command.runtime_scale);
@@ -2746,6 +3120,7 @@ class NativeExecutionHost final {
           return composition_->runtime->addressed_kernel->acknowledge_completed(*command.control);
         case CommandKind::kStatus:
         case CommandKind::kEvents:
+        case CommandKind::kPreviewMotion:
         case CommandKind::kSubmit:
         case CommandKind::kRead:
         case CommandKind::kStop:
@@ -2775,10 +3150,31 @@ class NativeExecutionHost final {
     });
   }
 
-  void HandleOneClient() noexcept {
+  void RunControlLane(std::stop_token stop_token) noexcept {
+    while (!stop_token.stop_requested()) {
+      pollfd descriptor{control_socket_.get(), POLLIN, 0};
+      int ready = -1;
+      do {
+        ready = ::poll(&descriptor, 1, kReconcilePeriodMilliseconds);
+      } while (ready < 0 && errno == EINTR && !stop_token.stop_requested());
+      if (stop_token.stop_requested()) {
+        return;
+      }
+      if (ready < 0 ||
+          (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        control_socket_failed_.store(true, std::memory_order_release);
+        return;
+      }
+      if ((descriptor.revents & POLLIN) != 0) {
+        HandleOneClient(control_socket_, true);
+      }
+    }
+  }
+
+  void HandleOneClient(const CommandSocket& socket, bool stop_only) noexcept {
     try {
       FileDescriptor client(
-          ::accept4(command_socket_.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));
+          ::accept4(socket.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));
       if (!client) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
           return;
@@ -2794,7 +3190,7 @@ class NativeExecutionHost final {
       int packet_ready = -1;
       do {
         packet_ready = ::poll(&inbound, 1, kClientPacketDeadlineMilliseconds);
-      } while (packet_ready < 0 && errno == EINTR && g_stop_requested == 0);
+      } while (packet_ready < 0 && errno == EINTR);
       Require(packet_ready > 0 && (inbound.revents & POLLIN) != 0,
               "execution command client did not send a packet in time");
       std::array<char, kMaximumPacketBytes> buffer{};
@@ -2812,8 +3208,9 @@ class NativeExecutionHost final {
                                  "execution command packet is empty or oversized");
       } else {
         try {
-          response = Execute(
-              DecodeCommand(std::string_view(buffer.data(), static_cast<std::size_t>(count))));
+          const auto command = DecodeCommand(
+              std::string_view(buffer.data(), static_cast<std::size_t>(count)));
+          response = stop_only ? ExecuteStop(command) : Execute(command);
         } catch (const std::exception& error) {
           response = ErrorResponse("execution_command_invalid", error.what());
         }
@@ -2828,7 +3225,7 @@ class NativeExecutionHost final {
       int response_ready = -1;
       do {
         response_ready = ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
-      } while (response_ready < 0 && errno == EINTR && g_stop_requested == 0);
+      } while (response_ready < 0 && errno == EINTR);
       Require(response_ready > 0 && (outbound.revents & POLLOUT) != 0,
               "execution command client did not accept a response in time");
       ssize_t sent = -1;
@@ -2848,9 +3245,12 @@ class NativeExecutionHost final {
   // runtime identity independent from the operation-owner epoch. The
   // Manager-launched mode receives its epoch from the direct-child adapter.
   core::RuntimeEpoch runtime_epoch_;
+  core::ProgramRunId direct_control_program_run_id_;
   HostLock host_lock_;
   std::unique_ptr<Composition> composition_;
   CommandSocket command_socket_;
+  CommandSocket control_socket_;
+  std::atomic<bool> control_socket_failed_{false};
   std::optional<core::ErrorDTO> last_reconcile_error_;
 };
 

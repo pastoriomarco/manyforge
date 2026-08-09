@@ -9,8 +9,10 @@
 > historian owners, public API/CLI, and thin Composer/assistant read clients.
 > I6/N3 additionally proves one exact retained Program/Program-Binding absolute
 > joint-goal path through a restartable C++ native owner and thin headless,
-> Behavior, and Composer clients. That bounded slice is not a complete product
-> lane. Robot readiness, lifecycle/controls, live scene/manipulation,
+> Behavior, and Composer clients. N6-c1 reconnects one bounded source-local
+> joint Robot Control preview/approval/progress/operation-Stop workflow over
+> that same owner. These bounded slices are not a complete product lane. Robot
+> readiness, complete lifecycle/controls, live scene/manipulation,
 > provider/authoring effects, and general Program execution remain unavailable
 > until their later gates.
 > Unless a section explicitly identifies a retained foundation or target

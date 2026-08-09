@@ -19,7 +19,10 @@ not currently available on `dev`.
 > clients without restoring a product lane. I6/N3 now proves one bounded native
 > absolute joint-goal path through an independently restartable C++ owner,
 > headless API, Behavior caller, and Composer proxy. It is development evidence,
-> not the complete native lane or an operator workflow. Composer Program-tree
+> not the complete native lane. N6-c1 now adds one bounded addressed joint
+> Robot Control workflow: source-local no-motion preview, explicit approval,
+> owner-issued progress, and operation Stop. It is not the complete manual-
+> control or product workflow. Composer Program-tree
 > execution and all three product lanes remain intentionally unavailable; the
 > full native lane closes at I6/N, and Isaac/real
 > operation at I9/I10. The launch recipes below describe the last qualified
@@ -217,7 +220,8 @@ initialization, recovery, and observability model, see
 
 - **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
 - **manyforge_roboplan** provides retained planning-model staging and the
-  selected N3 native joint-goal host/adapter. Broader motion, controls, scene,
+  selected native joint-goal execution/preview host and adapter. Broader
+  manual control, scene,
   manipulation, and complete product-lane operation remain unavailable.
 - Python code calls C++ through pybind11 bindings -- no duplicate state machines.
 - The Docker container includes all dependencies (Pinocchio, RoboPlan, pybind11).
@@ -245,12 +249,14 @@ historical design inputs:
   The live OpenAPI schema is also available at `http://localhost:9000/docs`
   and `http://localhost:9000/openapi.json` once Composer is running.
 - **Headless REST/CLI** — the independent Manager, runtime, scene, alarm,
-  history, health, and thin N3 execution projection defaults to
+  history, health, and thin addressed execution/preview projection defaults to
   `http://127.0.0.1:9010` when
   started with `python -m manyforge_headless_api serve`. Contract:
   [`docs/reference/HEADLESS_REST_API.md`](docs/reference/HEADLESS_REST_API.md).
   It still reports robot readiness and operational Apply as unavailable; the
-  N3 execution endpoints expose only the selected bounded native slice.
+  execution endpoints expose only the selected bounded native slice. Robot
+  Control preview never moves a resource, and approval uses the ordinary
+  operation endpoint.
 - **MCP Server (historical)** — former Model Context Protocol interface.
   Reference-only tool contract:
   [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md).

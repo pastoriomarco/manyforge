@@ -1,10 +1,13 @@
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -29,6 +32,27 @@ constexpr std::size_t kHeaderBytes = 16U;
 
 [[noreturn]] void fail(std::string message) {
   throw std::runtime_error(std::move(message));
+}
+
+void constrain_to_parent(int argc, char** argv) {
+  if (argc != 3 || std::string_view(argv[1]) != "--parent-pid") {
+    fail("usage: fake_process_candidate_worker --parent-pid PID");
+  }
+  pid_t expected_parent{};
+  const std::string_view encoded(argv[2]);
+  const auto parsed =
+      std::from_chars(encoded.data(), encoded.data() + encoded.size(),
+                      expected_parent);
+  if (encoded.empty() || parsed.ec != std::errc{} ||
+      parsed.ptr != encoded.data() + encoded.size() || expected_parent <= 0) {
+    fail("fake worker parent PID is malformed");
+  }
+  if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+    fail("fake worker could not set its parent-death signal");
+  }
+  if (::getppid() != expected_parent) {
+    fail("parent exited before fake worker containment was established");
+  }
 }
 
 void read_all(int descriptor, void* output, std::size_t size) {
@@ -256,8 +280,9 @@ int run() {
 }  // namespace
 }  // namespace manyforge::roboplan_backend
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    manyforge::roboplan_backend::constrain_to_parent(argc, argv);
     return manyforge::roboplan_backend::run();
   } catch (...) {
     return 2;

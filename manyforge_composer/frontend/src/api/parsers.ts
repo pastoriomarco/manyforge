@@ -32,6 +32,16 @@ import type {
   OperatorAlarmSnapshot,
   SourceFreshness,
 } from '../types/headless';
+import type {
+  DirectControlJoint,
+  ExecutionOwnerStatus,
+  MotionPreviewReceipt,
+  ObservedMotionTarget,
+  OperationAcceptance,
+  OperationObservation,
+  OperationStateName,
+  SceneRevisionValue,
+} from '../types/robotControl';
 
 type JsonObject = Record<string, unknown>;
 
@@ -51,6 +61,21 @@ function objectAt(value: unknown, path: string): JsonObject {
     return fail(path, 'an object');
   }
   return value as JsonObject;
+}
+
+function exactKeysAt(
+  value: JsonObject,
+  expected: readonly string[],
+  path: string,
+): void {
+  const actual = Object.keys(value).sort();
+  const required = [...expected].sort();
+  if (
+    actual.length !== required.length
+    || actual.some((key, index) => key !== required[index])
+  ) {
+    fail(path, `an object with exactly [${required.join(', ')}]`);
+  }
 }
 
 function arrayAt(value: unknown, path: string): unknown[] {
@@ -884,5 +909,576 @@ export function parseHistorianPage(value: unknown): HistorianPage {
       ? null
       : integerAt(record.next_before_sequence, 'history.next_before_sequence'),
     truncated: booleanAt(record.truncated, 'history.truncated'),
+  };
+}
+
+function sceneRevisionAt(value: unknown, path: string): SceneRevisionValue {
+  const record = objectAt(value, path);
+  const revisionId = integerAt(record.revision_id, `${path}.revision_id`);
+  if (revisionId < 1) return fail(`${path}.revision_id`, 'positive');
+  return {
+    scene_id: stringAt(record.scene_id, `${path}.scene_id`),
+    revision_id: revisionId,
+    content_hash: stringAt(record.content_hash, `${path}.content_hash`),
+  };
+}
+
+function directControlJointAt(
+  value: unknown,
+  path: string,
+): DirectControlJoint {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'max_acceleration_rad_s2',
+    'max_position_rad',
+    'max_velocity_rad_s',
+    'min_position_rad',
+    'source_joint_name',
+  ], path);
+  return {
+    sourceJointName: stringAt(
+      record.source_joint_name,
+      `${path}.source_joint_name`,
+    ),
+    minPositionRad: numberAt(
+      record.min_position_rad,
+      `${path}.min_position_rad`,
+    ),
+    maxPositionRad: numberAt(
+      record.max_position_rad,
+      `${path}.max_position_rad`,
+    ),
+    maxVelocityRadS: numberAt(
+      record.max_velocity_rad_s,
+      `${path}.max_velocity_rad_s`,
+    ),
+    maxAccelerationRadS2: nullableNumberAt(
+      record.max_acceleration_rad_s2,
+      `${path}.max_acceleration_rad_s2`,
+    ),
+  };
+}
+
+export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus {
+  const envelope = objectAt(value, 'executionStatus');
+  if (
+    booleanAt(envelope.ok, 'executionStatus.ok') !== true
+    || stringAt(envelope.command, 'executionStatus.command') !== 'status'
+  ) {
+    return fail('executionStatus', 'a successful status response');
+  }
+  const status = objectAt(envelope.status, 'executionStatus.status');
+  const direct = objectAt(
+    status.direct_control,
+    'executionStatus.status.direct_control',
+  );
+  exactKeysAt(direct, [
+    'base_frame_role_id',
+    'command_target_id',
+    'component_role_id',
+    'controllable_component_id',
+    'frame_role_ids',
+    'joints',
+    'observed_state',
+    'operation_capability_id',
+    'planning_capability_ids',
+    'program_binding_id',
+    'program_id',
+    'program_revision',
+    'program_run_id',
+    'target_role_id',
+    'tcp_frame_role_id',
+  ], 'executionStatus.status.direct_control');
+  const joints = arrayAt(
+    direct.joints,
+    'executionStatus.status.direct_control.joints',
+  ).map((item, index) => directControlJointAt(
+    item,
+    `executionStatus.status.direct_control.joints[${index}]`,
+  ));
+  if (joints.length === 0) {
+    return fail('executionStatus.status.direct_control.joints', 'non-empty');
+  }
+  const sourceNames = joints.map((joint) => joint.sourceJointName);
+  if (new Set(sourceNames).size !== sourceNames.length) {
+    return fail(
+      'executionStatus.status.direct_control.joints',
+      'unique source joint names',
+    );
+  }
+  for (const [index, joint] of joints.entries()) {
+    if (
+      joint.minPositionRad > joint.maxPositionRad
+      || joint.maxVelocityRadS <= 0
+      || (joint.maxAccelerationRadS2 !== null
+        && joint.maxAccelerationRadS2 <= 0)
+    ) {
+      return fail(
+        `executionStatus.status.direct_control.joints[${index}]`,
+        'ordered finite limits',
+      );
+    }
+  }
+  const componentId = stringAt(
+    direct.controllable_component_id,
+    'executionStatus.status.direct_control.controllable_component_id',
+  );
+  const targetId = stringAt(
+    direct.command_target_id,
+    'executionStatus.status.direct_control.command_target_id',
+  );
+  const observed = objectAt(
+    direct.observed_state,
+    'executionStatus.status.direct_control.observed_state',
+  );
+  exactKeysAt(observed, [
+    'complete',
+    'positions_rad',
+    'sequence',
+    'source_epoch',
+    'source_joint_names',
+  ], 'executionStatus.status.direct_control.observed_state');
+  const observedNames = stringArrayAt(
+    observed.source_joint_names,
+    'executionStatus.observedMotion.joint_names',
+  );
+  const positions = arrayAt(
+    observed.positions_rad,
+    'executionStatus.observedMotion.positions_rad',
+  ).map((item, index) => numberAt(
+    item,
+    `executionStatus.observedMotion.positions_rad[${index}]`,
+  ));
+  if (
+    observedNames.length !== sourceNames.length
+    || observedNames.some((name, index) => name !== sourceNames[index])
+    || positions.length !== sourceNames.length
+  ) {
+    return fail(
+      'executionStatus.observedMotion',
+      'the exact source-local direct-control joint order',
+    );
+  }
+  const observedMotion: ObservedMotionTarget = {
+    targetRoleId: stringAt(
+      direct.target_role_id,
+      'executionStatus.status.direct_control.target_role_id',
+    ),
+    controllableComponentId: componentId,
+    commandTargetId: targetId,
+    sequence: integerAt(
+      observed.sequence,
+      'executionStatus.observedMotion.sequence',
+    ),
+    sourceEpoch: stringAt(
+      observed.source_epoch,
+      'executionStatus.observedMotion.source_epoch',
+    ),
+    sourceJointNames: observedNames,
+    positionsRad: positions,
+    complete: booleanAt(
+      observed.complete,
+      'executionStatus.observedMotion.complete',
+    ),
+  };
+  return {
+    ownerEpoch: stringAt(status.owner_epoch, 'executionStatus.status.owner_epoch'),
+    graphRevision: stringAt(
+      status.graph_revision,
+      'executionStatus.status.graph_revision',
+    ),
+    retainedBundleId: stringAt(
+      status.retained_bundle_id,
+      'executionStatus.status.retained_bundle_id',
+    ),
+    sceneRevision: sceneRevisionAt(
+      status.scene_revision,
+      'executionStatus.status.scene_revision',
+    ),
+    directControl: {
+      controllableComponentId: componentId,
+      commandTargetId: targetId,
+      componentRoleId: stringAt(
+        direct.component_role_id,
+        'executionStatus.status.direct_control.component_role_id',
+      ),
+      targetRoleId: stringAt(
+        direct.target_role_id,
+        'executionStatus.status.direct_control.target_role_id',
+      ),
+      baseFrameRoleId: stringAt(
+        direct.base_frame_role_id,
+        'executionStatus.status.direct_control.base_frame_role_id',
+      ),
+      tcpFrameRoleId: stringAt(
+        direct.tcp_frame_role_id,
+        'executionStatus.status.direct_control.tcp_frame_role_id',
+      ),
+      operationCapabilityId: stringAt(
+        direct.operation_capability_id,
+        'executionStatus.status.direct_control.operation_capability_id',
+      ),
+      planningCapabilityIds: stringArrayAt(
+        direct.planning_capability_ids,
+        'executionStatus.status.direct_control.planning_capability_ids',
+      ),
+      frameRoleIds: stringArrayAt(
+        direct.frame_role_ids,
+        'executionStatus.status.direct_control.frame_role_ids',
+      ),
+      programId: stringAt(
+        direct.program_id,
+        'executionStatus.status.direct_control.program_id',
+      ),
+      programRevision: stringAt(
+        direct.program_revision,
+        'executionStatus.status.direct_control.program_revision',
+      ),
+      programBindingId: stringAt(
+        direct.program_binding_id,
+        'executionStatus.status.direct_control.program_binding_id',
+      ),
+      programRunId: stringAt(
+        direct.program_run_id,
+        'executionStatus.status.direct_control.program_run_id',
+      ),
+      joints,
+    },
+    observedMotion,
+  };
+}
+
+function poseAt(value: unknown, path: string): MotionPreviewReceipt['finalTcpPose'] {
+  const pose = objectAt(value, path);
+  const position = objectAt(pose.position_m, `${path}.position_m`);
+  const orientation = objectAt(pose.orientation, `${path}.orientation`);
+  exactKeysAt(pose, ['orientation', 'position_m'], path);
+  exactKeysAt(position, ['x_m', 'y_m', 'z_m'], `${path}.position_m`);
+  exactKeysAt(orientation, ['w', 'x', 'y', 'z'], `${path}.orientation`);
+  return {
+    position_m: {
+      x_m: numberAt(position.x_m, `${path}.position_m.x_m`),
+      y_m: numberAt(position.y_m, `${path}.position_m.y_m`),
+      z_m: numberAt(position.z_m, `${path}.position_m.z_m`),
+    },
+    orientation: {
+      x: numberAt(orientation.x, `${path}.orientation.x`),
+      y: numberAt(orientation.y, `${path}.orientation.y`),
+      z: numberAt(orientation.z, `${path}.orientation.z`),
+      w: numberAt(orientation.w, `${path}.orientation.w`),
+    },
+  };
+}
+
+export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt {
+  const envelope = objectAt(value, 'motionPreview');
+  if (
+    booleanAt(envelope.ok, 'motionPreview.ok') !== true
+    || stringAt(envelope.command, 'motionPreview.command') !== 'preview_motion'
+  ) {
+    return fail('motionPreview', 'a successful preview response');
+  }
+  const receipt = objectAt(
+    envelope.preview_receipt,
+    'motionPreview.preview_receipt',
+  );
+  exactKeysAt(receipt, [
+    'collision_world_revision',
+    'commit_eligible',
+    'component_role_id',
+    'final_positions_rad',
+    'final_tcp_pose',
+    'graph_revision',
+    'intent_digest',
+    'program_binding_id',
+    'program_id',
+    'program_revision',
+    'program_run_id',
+    'receipt_digest',
+    'request_id',
+    'request_owner_epoch',
+    'required_capability_id',
+    'retained_bundle_id',
+    'scene_revision',
+    'schema_version',
+    'source_joint_names',
+    'start_positions_rad',
+    'target_role_id',
+  ], 'motionPreview.preview_receipt');
+  const schemaVersion = stringAt(
+    receipt.schema_version,
+    'motionPreview.preview_receipt.schema_version',
+  );
+  if (schemaVersion !== 'manyforge.direct_control_motion_preview.v1') {
+    return fail(
+      'motionPreview.preview_receipt.schema_version',
+      'manyforge.direct_control_motion_preview.v1',
+    );
+  }
+  const sourceJointNames = stringArrayAt(
+    receipt.source_joint_names,
+    'motionPreview.preview_receipt.source_joint_names',
+  );
+  const startPositionsRad = arrayAt(
+    receipt.start_positions_rad,
+    'motionPreview.preview_receipt.start_positions_rad',
+  ).map((item, index) => numberAt(
+    item,
+    `motionPreview.preview_receipt.start_positions_rad[${index}]`,
+  ));
+  const finalPositionsRad = arrayAt(
+    receipt.final_positions_rad,
+    'motionPreview.preview_receipt.final_positions_rad',
+  ).map((item, index) => numberAt(
+    item,
+    `motionPreview.preview_receipt.final_positions_rad[${index}]`,
+  ));
+  if (
+    sourceJointNames.length === 0
+    || new Set(sourceJointNames).size !== sourceJointNames.length
+    || startPositionsRad.length !== sourceJointNames.length
+    || finalPositionsRad.length !== sourceJointNames.length
+  ) {
+    return fail(
+      'motionPreview.preview_receipt',
+      'equal non-empty unique joint arrays',
+    );
+  }
+  const collision = objectAt(
+    receipt.collision_world_revision,
+    'motionPreview.preview_receipt.collision_world_revision',
+  );
+  exactKeysAt(
+    collision,
+    ['content_hash', 'revision_id'],
+    'motionPreview.preview_receipt.collision_world_revision',
+  );
+  exactKeysAt(
+    objectAt(receipt.scene_revision, 'motionPreview.preview_receipt.scene_revision'),
+    ['content_hash', 'revision_id', 'scene_id'],
+    'motionPreview.preview_receipt.scene_revision',
+  );
+  const collisionRevisionId = integerAt(
+    collision.revision_id,
+    'motionPreview.preview_receipt.collision_world_revision.revision_id',
+  );
+  if (collisionRevisionId < 1) {
+    return fail(
+      'motionPreview.preview_receipt.collision_world_revision.revision_id',
+      'positive',
+    );
+  }
+  if (booleanAt(
+    receipt.commit_eligible,
+    'motionPreview.preview_receipt.commit_eligible',
+  ) !== true) {
+    return fail(
+      'motionPreview.preview_receipt.commit_eligible',
+      'true',
+    );
+  }
+  return {
+    schemaVersion,
+    receiptDigest: stringAt(
+      receipt.receipt_digest,
+      'motionPreview.preview_receipt.receipt_digest',
+    ),
+    intentDigest: stringAt(
+      receipt.intent_digest,
+      'motionPreview.preview_receipt.intent_digest',
+    ),
+    requestId: stringAt(
+      receipt.request_id,
+      'motionPreview.preview_receipt.request_id',
+    ),
+    requestOwnerEpoch: stringAt(
+      receipt.request_owner_epoch,
+      'motionPreview.preview_receipt.request_owner_epoch',
+    ),
+    programId: stringAt(
+      receipt.program_id,
+      'motionPreview.preview_receipt.program_id',
+    ),
+    programRevision: stringAt(
+      receipt.program_revision,
+      'motionPreview.preview_receipt.program_revision',
+    ),
+    programBindingId: stringAt(
+      receipt.program_binding_id,
+      'motionPreview.preview_receipt.program_binding_id',
+    ),
+    programRunId: stringAt(
+      receipt.program_run_id,
+      'motionPreview.preview_receipt.program_run_id',
+    ),
+    graphRevision: stringAt(
+      receipt.graph_revision,
+      'motionPreview.preview_receipt.graph_revision',
+    ),
+    retainedBundleId: stringAt(
+      receipt.retained_bundle_id,
+      'motionPreview.preview_receipt.retained_bundle_id',
+    ),
+    sceneRevision: sceneRevisionAt(
+      receipt.scene_revision,
+      'motionPreview.preview_receipt.scene_revision',
+    ),
+    componentRoleId: stringAt(
+      receipt.component_role_id,
+      'motionPreview.preview_receipt.component_role_id',
+    ),
+    targetRoleId: stringAt(
+      receipt.target_role_id,
+      'motionPreview.preview_receipt.target_role_id',
+    ),
+    requiredCapabilityId: stringAt(
+      receipt.required_capability_id,
+      'motionPreview.preview_receipt.required_capability_id',
+    ),
+    sourceJointNames,
+    startPositionsRad,
+    finalPositionsRad,
+    finalTcpPose: poseAt(
+      receipt.final_tcp_pose,
+      'motionPreview.preview_receipt.final_tcp_pose',
+    ),
+    collisionWorldRevision: {
+      revision_id: collisionRevisionId,
+      content_hash: stringAt(
+        collision.content_hash,
+        'motionPreview.preview_receipt.collision_world_revision.content_hash',
+      ),
+    },
+    commitEligible: true,
+  };
+}
+
+export function parseOperationAcceptance(value: unknown): OperationAcceptance {
+  const envelope = objectAt(value, 'operationAcceptance');
+  if (
+    booleanAt(envelope.ok, 'operationAcceptance.ok') !== true
+    || stringAt(envelope.command, 'operationAcceptance.command') !== 'submit'
+  ) {
+    return fail('operationAcceptance', 'a successful submit response');
+  }
+  const accepted = objectAt(envelope.accepted, 'operationAcceptance.accepted');
+  const revision = integerAt(
+    accepted.operation_revision,
+    'operationAcceptance.accepted.operation_revision',
+  );
+  if (revision < 1) {
+    return fail('operationAcceptance.accepted.operation_revision', 'positive');
+  }
+  return {
+    requestId: stringAt(
+      accepted.request_id,
+      'operationAcceptance.accepted.request_id',
+    ),
+    operationId: stringAt(
+      accepted.operation_id,
+      'operationAcceptance.accepted.operation_id',
+    ),
+    operationRevision: revision,
+  };
+}
+
+const OPERATION_STATES = new Set<OperationStateName>([
+  'queued',
+  'resolving',
+  'planning',
+  'validating',
+  'prepared',
+  'dispatching',
+  'executing',
+  'paused',
+  'stopping',
+  'completed',
+  'stopped',
+  'failed',
+  'interrupted',
+  'intervention_required',
+  'cancelled_pre_dispatch',
+]);
+
+export function parseOperationObservation(value: unknown): OperationObservation {
+  const envelope = objectAt(value, 'operationObservation');
+  if (
+    booleanAt(envelope.ok, 'operationObservation.ok') !== true
+    || stringAt(envelope.command, 'operationObservation.command') !== 'read'
+  ) {
+    return fail('operationObservation', 'a successful read response');
+  }
+  const operation = objectAt(
+    envelope.operation,
+    'operationObservation.operation',
+  );
+  const stateValue = stringAt(
+    operation.state,
+    'operationObservation.operation.state',
+  ) as OperationStateName;
+  if (!OPERATION_STATES.has(stateValue)) {
+    return fail('operationObservation.operation.state', 'a known state');
+  }
+  const participants = arrayAt(
+    operation.participants,
+    'operationObservation.operation.participants',
+  );
+  if (participants.length !== 1) {
+    return fail(
+      'operationObservation.operation.participants',
+      'one participant',
+    );
+  }
+  const participant = objectAt(
+    participants[0],
+    'operationObservation.operation.participants[0]',
+  );
+  const progress = numberAt(
+    participant.progress,
+    'operationObservation.operation.participants[0].progress',
+  );
+  if (progress < 0 || progress > 1) {
+    return fail(
+      'operationObservation.operation.participants[0].progress',
+      'within [0, 1]',
+    );
+  }
+  let terminalError: string | null = null;
+  if (participant.terminal_error !== null) {
+    const error = objectAt(
+      participant.terminal_error,
+      'operationObservation.operation.participants[0].terminal_error',
+    );
+    terminalError = stringAt(
+      error.message,
+      'operationObservation.operation.participants[0].terminal_error.message',
+    );
+  }
+  const revision = integerAt(
+    operation.operation_revision,
+    'operationObservation.operation.operation_revision',
+  );
+  if (revision < 1) {
+    return fail('operationObservation.operation.operation_revision', 'positive');
+  }
+  return {
+    operationId: stringAt(
+      operation.operation_id,
+      'operationObservation.operation.operation_id',
+    ),
+    operationRevision: revision,
+    state: stateValue,
+    progress,
+    activeStopId: nullableStringAt(
+      operation.active_stop_id,
+      'operationObservation.operation.active_stop_id',
+    ),
+    activeStopGeneration: operation.active_stop_generation === null
+      ? null
+      : integerAt(
+        operation.active_stop_generation,
+        'operationObservation.operation.active_stop_generation',
+      ),
+    terminalError,
   };
 }

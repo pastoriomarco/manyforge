@@ -50,6 +50,10 @@ using RetainedReferenceResolverFactory =
 struct RetainedNativeRuntimeInput final {
   core::RuntimeParticipantBinding motion_binding;
   std::optional<core::RuntimeParticipantBinding> gripper_binding;
+  /// Additional Program contexts for the same exact physical motion target.
+  /// This is used by build-owned direct-control Programs; aliases may differ
+  /// only in Program/role identity and cannot widen the physical runtime.
+  std::vector<core::RuntimeParticipantBinding> motion_binding_aliases;
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<std::mutex> scene_mutex;
   std::shared_ptr<RetainedKinematicStateProjector> state_projector;

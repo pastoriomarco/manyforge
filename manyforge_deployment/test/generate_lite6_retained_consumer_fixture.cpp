@@ -205,7 +205,7 @@ using manyforge::deployment::CanonicalValue;
         {"resource_id", CanonicalValue(resource.resource_id.value())},
         {"component_local_coordinate_kind",
          resource.component_local_coordinate_kind.has_value()
-             ? CanonicalValue(std::string(core::to_string(
+             ? CanonicalValue(std::string(manyforge::core::to_string(
                    *resource.component_local_coordinate_kind)))
              : CanonicalValue(nullptr)},
         {"coordinates", CanonicalValue(std::move(coordinates))}});

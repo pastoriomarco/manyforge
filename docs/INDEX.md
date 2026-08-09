@@ -37,7 +37,7 @@ branch/commit workflow).
 | Study historical physical-Lite6 qualification | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md); unavailable until R/I10                        |
 | Understand ownership and data flow          | [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)                                                                            |
 | Integrate the current structural API        | Generated [`reference/REST_API.md`](reference/REST_API.md); former clients use the historical interaction index                       |
-| Integrate the current headless API          | Generated [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md); robot readiness/execution remain unavailable             |
+| Integrate the current headless API          | Generated [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md); bounded addressed execution/preview is current, while complete product readiness remains unavailable |
 
 ## Historical operator runbooks (`docs/operations/`)
 

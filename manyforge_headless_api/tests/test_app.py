@@ -250,6 +250,20 @@ class FakeExecution:
         self.principals.append(("submit", trusted_principal_id))
         return {"ok": True, "command": "submit", "accepted": {}}
 
+    def preview_motion(
+        self,
+        request: object,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        self.requests.append(("preview_motion", request))
+        self.principals.append(("preview_motion", trusted_principal_id))
+        return {
+            "ok": True,
+            "command": "preview_motion",
+            "preview_receipt": {},
+        }
+
     def read(self, operation_id: str) -> dict[str, Any]:
         return {
             "ok": True,
@@ -709,6 +723,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/operations/{operation_id}/reset",
         "/api/execution/operations/{operation_id}/acknowledge-completed",
         "/api/execution/operations/{operation_id}/runtime-scale",
+        "/api/execution/motion-previews",
         "/api/execution/stops",
         "/api/execution/pick-place/plans/pick",
         "/api/execution/pick-place/plans/place",
@@ -719,6 +734,85 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/kernel/stop" not in paths
     assert "/api/cycle/stop" not in paths
     assert all("condition" not in path or "acknowledge" in path for path in paths)
+
+
+def test_motion_preview_is_a_thin_non_effectful_execution_route() -> None:
+    execution = FakeExecution()
+    app = create_app(
+        service=HeadlessService(FakeCore(), FakeManager(), execution)
+    )
+    body = {
+        "request_context": {
+            "request_id": "request.preview.1",
+            "request_owner_epoch": "execution.epoch.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+        },
+        "program_id": "manyforge.direct_control.motion",
+        "program_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "b" * 64,
+        "program_run_id": "direct-control-run.1",
+        "expected_graph_revision": "sha256:" + "c" * 64,
+        "expected_retained_bundle_id": "sha256:" + "d" * 64,
+        "expected_scene_revision": {
+            "scene_id": "sha256:" + "e" * 64,
+            "revision_id": 1,
+            "content_hash": "sha256:" + "f" * 64,
+        },
+        "participants": [
+            {
+                "component_role_id": "controlled_component",
+                "target_role_id": "command_target",
+                "required_capability_id": "execution.trajectory.execute",
+                "action_span": None,
+                "payload": {
+                    "kind": "motion",
+                    "move_id": "robot-control-joint-preview",
+                    "base_frame_role_id": "base",
+                    "tcp_frame_role_id": "tcp",
+                    "tolerances": {
+                        "joint_position_tol_rad": 0.001,
+                        "translation_tol_m": 0.001,
+                        "rotation_tol_rad": 0.001,
+                    },
+                    "speed_profile": {
+                        "velocity_scale": 0.5,
+                        "acceleration_scale": 0.5,
+                        "max_tcp_linear_speed_mps": None,
+                    },
+                    "timeouts": {
+                        "planning_timeout_s": 2.0,
+                        "execution_timeout_s": 10.0,
+                    },
+                    "cache_mode": "default",
+                    "planning_profile": "first_feasible",
+                    "target_mode": "absolute",
+                    "target_reference": None,
+                    "offset_reference": None,
+                    "motion": {
+                        "kind": "joint_goal",
+                        "joint_names": ["joint1"],
+                        "positions_rad": [0.1],
+                    },
+                    "contact_policy_id": None,
+                    "per_joint_dynamics_limits": {},
+                    "motion_interrupt_scopes": [],
+                    "runtime_object_bindings": [],
+                },
+            }
+        ],
+        "coordination_policy": "independent",
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/api/execution/motion-previews", json=body)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["command"] == "preview_motion"
+    assert [kind for kind, _request in execution.requests] == [
+        "preview_motion"
+    ]
+    assert execution.principals == [("preview_motion", None)]
 
 
 def test_execution_missing_reference_is_a_public_not_found() -> None:

@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-08-05 15:47:17 UTC
+  Last regenerated: 2026-08-09 06:49:42 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -24,6 +24,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/files/browse` | files | Browse Filesystem |
 | `GET` | `/api/health` |  | Health |
 | `GET` | `/api/nodes/environment` | node-environment | Get Node Environment |
+| `GET` | `/api/program/draft` | composer-draft | Read Draft |
 | `GET` | `/api/scene/urdf/manifest` | structural-urdf | Get Manifest |
 | `GET` | `/api/scene/urdf/models/{model_key}/collision-meshes/{link_name}/{collision_index}` | structural-urdf | Get Model Collision Mesh |
 | `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | structural-urdf | Get Model Mesh |

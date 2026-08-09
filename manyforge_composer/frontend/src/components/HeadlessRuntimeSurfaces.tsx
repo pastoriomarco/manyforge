@@ -99,7 +99,7 @@ export function runtimeStatusView(
     profileLabel: 'H0 projection',
     authorityLabel: 'source-owned facts',
     userMessage: runtime.complete
-      ? 'Manager and scene facts are fresh. Program execution and motion remain gated by later owners.'
+      ? 'Manager and scene facts are fresh. Robot Control verifies execution-owner readiness separately.'
       : `Missing or stale sources: ${runtime.reasons.join(', ') || 'unknown'}.`,
     capabilities: ['runtime observation', 'scene status', 'alarm/history'],
     components,

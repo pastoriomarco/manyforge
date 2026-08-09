@@ -45,7 +45,7 @@ describe('headless Composer presentation adapters', () => {
 
     expect(view.readiness).toBe('degraded');
     expect(view.profileLabel).toBe('H0 projection');
-    expect(view.userMessage).toContain('Program execution and motion remain gated');
+    expect(view.userMessage).toContain('execution-owner readiness separately');
     expect(view.capabilities).not.toContain('robot ready');
   });
 

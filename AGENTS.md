@@ -26,8 +26,11 @@
 > native absolute joint-goal path: an exact retained Program/Program Binding,
 > independently restartable C++ execution host, headless submit/read API, and
 > thin Behavior/Composer callers. It preserves source-local joint names and
-> valid subsets without restoring a singleton robot/group lookup. This is a
-> bounded vertical slice, not the restored native lane or an operator recipe.
+> valid subsets without restoring a singleton robot/group lookup. N6-c1
+> additionally reconnects bounded addressed joint Robot Control: no-motion
+> preview, explicit approval through the ordinary operation path, owner-issued
+> progress, and operation Stop. These are bounded vertical slices, not the
+> restored native lane or an operator recipe.
 > Full Program-tree execution, lifecycle and execution controls, live scene
 > editing, broader motion/manipulation, provider-backed assistant/public-MCP
 > operation, Isaac/ROS product launch, and real-robot operation remain
@@ -124,7 +127,9 @@ Stop port. I5/H0 now exposes the bounded public Manager/headless read and
 attributed-intent surfaces while keeping robot readiness and operational Apply
 explicitly unavailable. I6/N3 adds one selected native absolute joint-goal
 development/qualification path through an independently restartable C++ host
-and thin public clients. It is not a restored runtime product lane.
+and thin public clients. N6-c1 adds the narrow addressed joint Robot Control
+preview/approval/progress/Stop client over that owner. Neither is a restored
+runtime product lane.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
@@ -317,16 +322,16 @@ What lives where in this repo, and what it's for:
 | [`manyforge_deployment/`](manyforge_deployment/)                         | Qualified ROS-free composable-cell compiler and immutable offline retained-product boundary                                 |
 | [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ I4 Apply/runtime-convergence owner hosted by the sole-process I5 Manager daemon; product execution unavailable   |
 | [`manyforge_headless/`](manyforge_headless/)                             | C++ H0 runtime/scene aggregation, scene lifetime, alarm owner, historian, NodeEnvironment projection, and Manager daemon      |
-| [`manyforge_headless_api/`](manyforge_headless_api/)                     | Bounded FastAPI/CLI over H0 owners plus the thin N3 execution transport; no robot-readiness or execution authority             |
+| [`manyforge_headless_api/`](manyforge_headless_api/)                     | Bounded FastAPI/CLI over H0 owners plus thin addressed execution/preview transport; no robot-readiness or execution authority  |
 | [`manyforge_behavior/`](manyforge_behavior/)                             | Build-owned node catalog/environment plus the thin N3 joint-goal caller; no runtime semantic ownership                        |
 | [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
-| [`manyforge_roboplan/`](manyforge_roboplan/)                             | Retained planning-model staging plus the bounded N3 selected native execution host and RoboPlan adapter                       |
+| [`manyforge_roboplan/`](manyforge_roboplan/)                             | Retained planning-model staging plus the bounded selected native execution/preview host and RoboPlan adapter                  |
 | [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | Retained C++ ROS execution/admission library; no current product-lane wiring                                                  |
 | [`manyforge_robot_lifecycle/`](manyforge_robot_lifecycle/)               | Retained ROS-independent lifecycle core; no current physical ingress                                                         |
 | [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                                           |
 | [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model/binding/observation inputs; no current real-robot lane                                               |
 | [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle adapter; provider wiring unavailable until I10/R                                                 |
-| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0 and N3 execution clients; runtime and command ownership unavailable                |
+| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0 and addressed Robot Control clients; runtime and command ownership unavailable     |
 | [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | H0 read client plus retained protocol/supervisor logic; live provider bridge unavailable until I6/N                          |
 | [`manyforge_ros/`](manyforge_ros/)                                       | Retained pure mappings/contracts plus explicit unavailable runtime entry points                                              |
 | [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Non-activatable historical assistant interaction references                                                                 |

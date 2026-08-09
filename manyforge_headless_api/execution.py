@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import socket
 import stat
@@ -15,6 +17,7 @@ import rfc8785
 from .models import (
     OperationControlRequest,
     OperationIntentRequest,
+    Pose3Request,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
@@ -24,6 +27,7 @@ from .native import HeadlessApiError, HeadlessCorePort, strict_json_object
 
 
 EXECUTION_SOCKET_FILE = "execution-command.sock"
+EXECUTION_CONTROL_SOCKET_FILE = "execution-control.sock"
 EXECUTION_COMMAND_VERSION = "manyforge.execution_command.v1"
 EXECUTION_RESPONSE_VERSION = "manyforge.execution_command_response.v1"
 MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
@@ -39,12 +43,50 @@ OPERATION_EVENT_KINDS = frozenset(
 )
 MAX_EXECUTION_PACKET_BYTES = 1024 * 1024
 MAX_EXECUTION_RESPONSE_BYTES = 4 * 1024 * 1024
+MOTION_PREVIEW_RESPONSE_KEYS = frozenset(
+    {"api_version", "command", "ok", "preview_receipt"}
+)
+MOTION_PREVIEW_RECEIPT_KEYS = frozenset(
+    {
+        "collision_world_revision",
+        "commit_eligible",
+        "component_role_id",
+        "final_positions_rad",
+        "final_tcp_pose",
+        "graph_revision",
+        "intent_digest",
+        "program_binding_id",
+        "program_id",
+        "program_revision",
+        "program_run_id",
+        "receipt_digest",
+        "request_id",
+        "request_owner_epoch",
+        "required_capability_id",
+        "retained_bundle_id",
+        "scene_revision",
+        "schema_version",
+        "source_joint_names",
+        "start_positions_rad",
+        "target_role_id",
+    }
+)
+MOTION_PREVIEW_COLLISION_REVISION_KEYS = frozenset(
+    {"content_hash", "revision_id"}
+)
 
 
 class ExecutionPort(Protocol):
     def status(self) -> dict[str, Any]: ...
 
     def submit(
+        self,
+        request: OperationIntentRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
+    def preview_motion(
         self,
         request: OperationIntentRequest,
         *,
@@ -153,11 +195,13 @@ class ExecutionCommandClient:
         if timeout_seconds <= 0 or timeout_seconds > 30:
             raise ValueError("execution timeout must be in (0, 30] seconds")
         self._socket_path = state_root / EXECUTION_SOCKET_FILE
+        self._control_socket_path = state_root / EXECUTION_CONTROL_SOCKET_FILE
         self._timeout_seconds = timeout_seconds
 
-    def _validate_socket(self) -> None:
+    @staticmethod
+    def _validate_socket(socket_path: Path) -> None:
         try:
-            metadata = self._socket_path.lstat()
+            metadata = socket_path.lstat()
         except FileNotFoundError as exc:
             raise HeadlessApiError(
                 "execution_owner_unavailable",
@@ -169,14 +213,16 @@ class ExecutionCommandClient:
                 "native execution path is not the expected same-user socket",
             )
 
-    def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
+    def _exchange_on(
+        self, command: dict[str, Any], socket_path: Path
+    ) -> dict[str, Any]:
         encoded = _canonical_json(command)
         if len(encoded) > MAX_EXECUTION_PACKET_BYTES:
             raise HeadlessApiError(
                 "execution_command_oversized",
                 "execution command exceeds its byte bound",
             )
-        self._validate_socket()
+        self._validate_socket(socket_path)
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
                 client.setsockopt(
@@ -185,7 +231,7 @@ class ExecutionCommandClient:
                     MAX_EXECUTION_RESPONSE_BYTES,
                 )
                 client.settimeout(self._timeout_seconds)
-                client.connect(str(self._socket_path))
+                client.connect(str(socket_path))
                 sent = client.send(encoded)
                 if sent != len(encoded):
                     raise HeadlessApiError(
@@ -215,7 +261,18 @@ class ExecutionCommandClient:
                 "execution response is not UTF-8",
             ) from exc
         response = strict_json_object(text, label="execution command response")
-        if _canonical_json(response) != payload:
+        try:
+            canonical_response = rfc8785.dumps(response)
+        except (
+            rfc8785.CanonicalizationError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "execution response is not canonically encodable",
+            ) from exc
+        if canonical_response != payload:
             raise HeadlessApiError(
                 "execution_command_response_invalid",
                 "execution response is not canonical JSON",
@@ -231,6 +288,12 @@ class ExecutionCommandClient:
                 "execution response has no boolean result",
             )
         return response
+
+    def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
+        return self._exchange_on(command, self._socket_path)
+
+    def _exchange_control(self, command: dict[str, Any]) -> dict[str, Any]:
+        return self._exchange_on(command, self._control_socket_path)
 
     @staticmethod
     def _http_attribution(trusted_principal_id: str | None) -> dict[str, Any]:
@@ -398,6 +461,132 @@ class ExecutionCommandClient:
                 "execution_command_response_identity_mismatch",
                 "execution acceptance does not match the submitted request",
             )
+        return response
+
+    def preview_motion(
+        self,
+        request: OperationIntentRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        operation = request.model_dump(mode="json")
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._http_attribution(trusted_principal_id),
+                "command": "preview_motion",
+                "operation": operation,
+            }
+        )
+        if response.get("ok") is not True:
+            return response
+        receipt = response.get("preview_receipt")
+        participant = operation["participants"][0]
+        expected_intent_digest = (
+            "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
+        )
+        expected_scene = operation["expected_scene_revision"]
+        if (
+            set(response) != MOTION_PREVIEW_RESPONSE_KEYS
+            or not isinstance(receipt, dict)
+            or set(receipt) != MOTION_PREVIEW_RECEIPT_KEYS
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native motion preview response has an undeclared shape",
+            )
+        if (
+            response.get("command") != "preview_motion"
+            or receipt.get("schema_version")
+            != "manyforge.direct_control_motion_preview.v1"
+            or receipt.get("commit_eligible") is not True
+            or receipt.get("intent_digest") != expected_intent_digest
+            or receipt.get("request_id")
+            != operation["request_context"]["request_id"]
+            or receipt.get("request_owner_epoch")
+            != operation["request_context"]["request_owner_epoch"]
+            or receipt.get("program_id") != operation["program_id"]
+            or receipt.get("program_revision")
+            != operation["program_revision"]
+            or receipt.get("program_binding_id")
+            != operation["program_binding_id"]
+            or receipt.get("program_run_id") != operation["program_run_id"]
+            or receipt.get("graph_revision")
+            != operation["expected_graph_revision"]
+            or receipt.get("retained_bundle_id")
+            != operation["expected_retained_bundle_id"]
+            or receipt.get("scene_revision") != expected_scene
+            or receipt.get("component_role_id")
+            != participant["component_role_id"]
+            or receipt.get("target_role_id") != participant["target_role_id"]
+            or receipt.get("required_capability_id")
+            != participant["required_capability_id"]
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "motion preview receipt does not match its submitted intent",
+            )
+        source_names = receipt.get("source_joint_names")
+        submitted_motion = participant["payload"].get("motion")
+        submitted_source_names = (
+            submitted_motion.get("joint_names")
+            if isinstance(submitted_motion, dict)
+            and submitted_motion.get("kind") == "joint_goal"
+            else None
+        )
+        start_positions = receipt.get("start_positions_rad")
+        final_positions = receipt.get("final_positions_rad")
+        collision_revision = receipt.get("collision_world_revision")
+        if (
+            not isinstance(source_names, list)
+            or not source_names
+            or not all(isinstance(name, str) and name for name in source_names)
+            or len(source_names) != len(set(source_names))
+            or (
+                submitted_source_names is not None
+                and source_names != submitted_source_names
+            )
+            or not isinstance(start_positions, list)
+            or not isinstance(final_positions, list)
+            or len(start_positions) != len(source_names)
+            or len(final_positions) != len(source_names)
+            or not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                for value in [*start_positions, *final_positions]
+            )
+            or not isinstance(collision_revision, dict)
+            or set(collision_revision)
+            != MOTION_PREVIEW_COLLISION_REVISION_KEYS
+            or type(collision_revision.get("revision_id")) is not int
+            or collision_revision["revision_id"] < 1
+            or collision_revision["revision_id"] > MAXIMUM_SAFE_INTEGER
+            or not isinstance(collision_revision.get("content_hash"), str)
+            or not collision_revision["content_hash"]
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native motion preview receipt is malformed",
+            )
+        digest_input = dict(receipt)
+        receipt_digest = digest_input.pop("receipt_digest", None)
+        expected_receipt_digest = (
+            "sha256:"
+            + hashlib.sha256(_canonical_json(digest_input)).hexdigest()
+        )
+        if receipt_digest != expected_receipt_digest:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native motion preview receipt digest is invalid",
+            )
+        try:
+            Pose3Request.model_validate(receipt.get("final_tcp_pose"))
+        except ValueError as exc:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native motion preview pose is malformed",
+            ) from exc
         return response
 
     def read(self, operation_id: str) -> dict[str, Any]:
@@ -701,7 +890,7 @@ class ExecutionCommandClient:
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
-        response = self._exchange(
+        response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._http_attribution(trusted_principal_id),

@@ -127,6 +127,14 @@ def create_headless_router(client: HeadlessHttpClient) -> APIRouter:
     def execution_submit(body: OperationIntentRequest) -> dict[str, Any]:
         return _call(lambda: client.execute(body.model_dump(mode="json")))
 
+    @router.post("/api/execution/motion-previews")
+    def execution_preview_motion(
+        body: OperationIntentRequest,
+    ) -> dict[str, Any]:
+        return _call(
+            lambda: client.preview_motion(body.model_dump(mode="json"))
+        )
+
     @router.get("/api/execution/operations/{operation_id}")
     def execution_read(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],

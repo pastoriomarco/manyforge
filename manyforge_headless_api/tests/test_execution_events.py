@@ -12,6 +12,7 @@ from manyforge_headless_api.execution import (
     ExecutionCommandClient,
     ExecutionEventPump,
 )
+from manyforge_headless_api.models import OperationIntentRequest
 from manyforge_headless_api.native import HeadlessApiError
 
 
@@ -84,6 +85,198 @@ def test_execution_client_validates_event_cursor_and_owner(
     with pytest.raises(HeadlessApiError) as stalled:
         client.events(owner_epoch, 0)
     assert stalled.value.code == "execution_command_response_invalid"
+
+
+def _direct_motion_request() -> OperationIntentRequest:
+    return OperationIntentRequest.model_validate(
+        {
+            "request_context": {
+                "request_id": "preview-request-1",
+                "request_owner_epoch": "owner-1",
+                "source_label": "composer_ui",
+                "correlation_id": None,
+            },
+            "program_id": "manyforge.direct_control.motion",
+            "program_revision": "sha256:program",
+            "program_binding_id": "sha256:binding",
+            "program_run_id": "direct-control-owner-1",
+            "expected_graph_revision": "sha256:graph",
+            "expected_retained_bundle_id": "sha256:bundle",
+            "expected_scene_revision": {
+                "scene_id": "sha256:" + "1" * 64,
+                "revision_id": 3,
+                "content_hash": "sha256:" + "2" * 64,
+            },
+            "participants": [
+                {
+                    "component_role_id": "controlled_component",
+                    "target_role_id": "command_target",
+                    "required_capability_id": "execution.trajectory.execute",
+                    "action_span": None,
+                    "payload": {
+                        "kind": "motion",
+                        "move_id": "robot-control-preview-request-1",
+                        "base_frame_role_id": "base",
+                        "tcp_frame_role_id": "tcp",
+                        "tolerances": {
+                            "joint_position_tol_rad": 0.05,
+                            "translation_tol_m": 0.005,
+                            "rotation_tol_rad": 0.05,
+                        },
+                        "speed_profile": {
+                            "velocity_scale": 1.0,
+                            "acceleration_scale": 1.0,
+                            "max_tcp_linear_speed_mps": None,
+                        },
+                        "timeouts": {
+                            "planning_timeout_s": 2.0,
+                            "execution_timeout_s": 10.0,
+                        },
+                        "cache_mode": "default",
+                        "planning_profile": "balanced",
+                        "target_mode": "absolute",
+                        "target_reference": None,
+                        "offset_reference": None,
+                        "motion": {
+                            "kind": "joint_goal",
+                            "joint_names": ["joint1"],
+                            "positions_rad": [0.2],
+                        },
+                        "contact_policy_id": None,
+                        "per_joint_dynamics_limits": {},
+                        "motion_interrupt_scopes": [],
+                        "runtime_object_bindings": [],
+                    },
+                }
+            ],
+            "coordination_policy": "independent",
+        }
+    )
+
+
+def _preview_response(operation: dict[str, Any]) -> dict[str, Any]:
+    receipt = {
+        "collision_world_revision": {
+            "content_hash": "collision-4",
+            "revision_id": 4,
+        },
+        "commit_eligible": True,
+        "component_role_id": "controlled_component",
+        "final_positions_rad": [0.2],
+        "final_tcp_pose": {
+            "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.4},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        },
+        "graph_revision": "sha256:graph",
+        "intent_digest": (
+            "sha256:" + hashlib.sha256(rfc8785.dumps(operation)).hexdigest()
+        ),
+        "program_binding_id": "sha256:binding",
+        "program_id": "manyforge.direct_control.motion",
+        "program_revision": "sha256:program",
+        "program_run_id": "direct-control-owner-1",
+        "request_id": "preview-request-1",
+        "request_owner_epoch": "owner-1",
+        "required_capability_id": "execution.trajectory.execute",
+        "retained_bundle_id": "sha256:bundle",
+        "scene_revision": {
+            "scene_id": "sha256:" + "1" * 64,
+            "revision_id": 3,
+            "content_hash": "sha256:" + "2" * 64,
+        },
+        "schema_version": "manyforge.direct_control_motion_preview.v1",
+        "source_joint_names": ["joint1"],
+        "start_positions_rad": [0.0],
+        "target_role_id": "command_target",
+    }
+    receipt["receipt_digest"] = (
+        "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+    )
+    return {
+        "api_version": "manyforge.execution_command_response.v1",
+        "command": "preview_motion",
+        "ok": True,
+        "preview_receipt": receipt,
+    }
+
+
+def test_execution_client_verifies_complete_motion_preview_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    request = _direct_motion_request()
+    captured: dict[str, Any] = {}
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        captured.update(command)
+        return _preview_response(command["operation"])
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    response = client.preview_motion(request, trusted_principal_id=None)
+
+    assert captured["command"] == "preview_motion"
+    assert captured["attribution"] == {
+        "transport": "http",
+        "assurance": "unverified",
+        "principal_id": None,
+    }
+    assert response["preview_receipt"]["final_positions_rad"] == [0.2]
+
+    def malformed(command: dict[str, Any]) -> dict[str, Any]:
+        response = _preview_response(command["operation"])
+        receipt = response["preview_receipt"]
+        receipt["source_joint_names"] = [["unhashable"]]
+        receipt.pop("receipt_digest")
+        receipt["receipt_digest"] = (
+            "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+        )
+        return response
+
+    monkeypatch.setattr(client, "_exchange", malformed)
+    with pytest.raises(HeadlessApiError) as invalid:
+        client.preview_motion(request, trusted_principal_id=None)
+    assert invalid.value.code == "execution_command_response_invalid"
+
+    def undeclared(command: dict[str, Any]) -> dict[str, Any]:
+        response = _preview_response(command["operation"])
+        receipt = response["preview_receipt"]
+        receipt["trajectory"] = []
+        receipt.pop("receipt_digest")
+        receipt["receipt_digest"] = (
+            "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+        )
+        return response
+
+    monkeypatch.setattr(client, "_exchange", undeclared)
+    with pytest.raises(HeadlessApiError) as invalid_extra:
+        client.preview_motion(request, trusted_principal_id=None)
+    assert invalid_extra.value.code == "execution_command_response_invalid"
+
+    def reordered_source(command: dict[str, Any]) -> dict[str, Any]:
+        response = _preview_response(command["operation"])
+        receipt = response["preview_receipt"]
+        receipt["source_joint_names"] = ["other_joint"]
+        receipt.pop("receipt_digest")
+        receipt["receipt_digest"] = (
+            "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+        )
+        return response
+
+    monkeypatch.setattr(client, "_exchange", reordered_source)
+    with pytest.raises(HeadlessApiError) as mismatched_source:
+        client.preview_motion(request, trusted_principal_id=None)
+    assert mismatched_source.value.code == "execution_command_response_invalid"
+
+    def unsafe_collision_revision(command: dict[str, Any]) -> dict[str, Any]:
+        response = _preview_response(command["operation"])
+        receipt = response["preview_receipt"]
+        receipt["collision_world_revision"]["revision_id"] = 2**53
+        return response
+
+    monkeypatch.setattr(client, "_exchange", unsafe_collision_revision)
+    with pytest.raises(HeadlessApiError) as unsafe_revision:
+        client.preview_motion(request, trusted_principal_id=None)
+    assert unsafe_revision.value.code == "execution_command_response_invalid"
 
 
 class _RecordingCore:

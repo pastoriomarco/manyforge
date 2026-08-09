@@ -4,6 +4,7 @@ import { CatalogPanel } from './components/CatalogPanel';
 import { StructuralViewer } from './components/StructuralViewer';
 import { UnavailableBanner } from './components/UnavailableBanner';
 import { HeadlessRuntimeSurfaces } from './components/HeadlessRuntimeSurfaces';
+import { RobotControlPanel } from './components/RobotControlPanel';
 import { useStructuralResource } from './state/structuralResource';
 
 function isNotFound(error: unknown): boolean {
@@ -31,17 +32,19 @@ export default function App() {
         <div className="brand-mark" aria-hidden="true">MF</div>
         <div>
           <p className="eyebrow">ManyForge Composer</p>
-          <p className="app-title">Structural inspection shell</p>
+          <p className="app-title">Composable cell workspace</p>
         </div>
         <div className="header-boundary">
           <span className="boundary-dot" aria-hidden="true" />
-          Read-only structural mode
+          {headlessEnabled ? 'Headless owner connected' : 'Structural mode'}
         </div>
       </header>
 
       <UnavailableBanner health={health} onRetry={retryHealth} />
 
       <HeadlessRuntimeSurfaces enabled={headlessEnabled} />
+
+      <RobotControlPanel enabled={headlessEnabled} />
 
       <StructuralViewer manifest={manifest} onRetry={retryManifest} />
 
@@ -51,8 +54,9 @@ export default function App() {
       </div>
 
       <footer className="app-footer">
-        This shell is a replaceable client of retained structural APIs. It owns no
-        runtime, scene, lifecycle, alarm, assistant, or command semantics.
+        Composer owns local drafts and presentation only. Runtime state,
+        validation, execution, scene, lifecycle, and Stop remain headless-owner
+        responsibilities.
       </footer>
     </main>
   );

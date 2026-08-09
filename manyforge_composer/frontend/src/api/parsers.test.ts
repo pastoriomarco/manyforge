@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   StructuralContractError,
   parseCatalogResponse,
+  parseExecutionOwnerStatus,
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
   parseHistorianPage,
   parseOperatorAlarmSnapshot,
+  parseMotionPreviewResponse,
   parseSceneUrdfManifest,
 } from './parsers';
 
@@ -284,5 +286,113 @@ describe('headless projection parsers', () => {
 
     expect(page.events[0]?.event.eventType).toBe('operator_alarm_activated');
     expect(page.events[0]?.sequence).toBe(7);
+  });
+});
+
+describe('addressed Robot Control parsers', () => {
+  const sceneRevision = {
+    scene_id: 'scene-1',
+    revision_id: 3,
+    content_hash: 'sha256:scene',
+  };
+
+  it('accepts source-local limits and exactly one matching observation', () => {
+    const response = {
+      ok: true,
+      command: 'status',
+      status: {
+        owner_epoch: 'owner-1',
+        graph_revision: 'sha256:graph',
+        retained_bundle_id: 'sha256:bundle',
+        scene_revision: sceneRevision,
+        direct_control: {
+          controllable_component_id: 'robot-a',
+          command_target_id: 'arm',
+          component_role_id: 'controlled_component',
+          target_role_id: 'command_target',
+          base_frame_role_id: 'base',
+          tcp_frame_role_id: 'tcp',
+          operation_capability_id: 'execution.trajectory.execute',
+          planning_capability_ids: ['planning.motion.joint_goal'],
+          frame_role_ids: ['base', 'tcp'],
+          program_id: 'manyforge.direct_control.motion',
+          program_revision: 'sha256:program',
+          program_binding_id: 'sha256:binding',
+          program_run_id: 'direct-control-owner-1',
+          observed_state: {
+            complete: true,
+            positions_rad: [0.2],
+            sequence: 7,
+            source_epoch: 'source-1',
+            source_joint_names: ['joint1'],
+          },
+          joints: [{
+            source_joint_name: 'joint1',
+            min_position_rad: -1,
+            max_position_rad: 1,
+            max_velocity_rad_s: 2,
+            max_acceleration_rad_s2: null,
+          }],
+        },
+        observed_targets: [],
+      },
+    };
+    const status = parseExecutionOwnerStatus(response);
+
+    expect(status.directControl.baseFrameRoleId).toBe('base');
+    expect(status.observedMotion.sourceJointNames).toEqual(['joint1']);
+    expect(status.observedMotion.positionsRad).toEqual([0.2]);
+
+    const leaked = structuredClone(response);
+    Object.assign(leaked.status.direct_control, {
+      compiled_joint_names: ['robot-a__joint1'],
+    });
+    expect(() => parseExecutionOwnerStatus(leaked)).toThrow(/exactly/);
+  });
+
+  it('accepts only a no-motion receipt with equal source arrays', () => {
+    const response = {
+      ok: true,
+      command: 'preview_motion',
+      preview_receipt: {
+        schema_version: 'manyforge.direct_control_motion_preview.v1',
+        receipt_digest: 'sha256:receipt',
+        intent_digest: 'sha256:intent',
+        request_id: 'request-1',
+        request_owner_epoch: 'owner-1',
+        program_id: 'manyforge.direct_control.motion',
+        program_revision: 'sha256:program',
+        program_binding_id: 'sha256:binding',
+        program_run_id: 'direct-control-owner-1',
+        graph_revision: 'sha256:graph',
+        retained_bundle_id: 'sha256:bundle',
+        scene_revision: sceneRevision,
+        component_role_id: 'controlled_component',
+        target_role_id: 'command_target',
+        required_capability_id: 'execution.trajectory.execute',
+        source_joint_names: ['joint1'],
+        start_positions_rad: [0],
+        final_positions_rad: [0.4],
+        final_tcp_pose: {
+          position_m: { x_m: 0, y_m: 0, z_m: 0.4 },
+          orientation: { x: 0, y: 0, z: 0, w: 1 },
+        },
+        collision_world_revision: {
+          revision_id: 2,
+          content_hash: 'collision-2',
+        },
+        commit_eligible: true,
+      },
+    };
+    const receipt = parseMotionPreviewResponse(response);
+
+    expect(receipt.finalPositionsRad).toEqual([0.4]);
+    expect(receipt.commitEligible).toBe(true);
+
+    const undeclared = structuredClone(response);
+    Object.assign(undeclared.preview_receipt, { trajectory: [] });
+    expect(() => parseMotionPreviewResponse(undeclared)).toThrow(
+      /exactly/,
+    );
   });
 });

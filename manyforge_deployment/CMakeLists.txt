@@ -575,7 +575,6 @@ add_library(manyforge_deployment_verification_core
   src/posix_read_only_internal.cpp
   src/program_contract.cpp
   src/program_binding.cpp
-  src/program_binding_compiler.cpp
   src/runtime_program_binding.cpp
   src/reference_runtime_unit_verifier.cpp
   src/verified_retained_projection.cpp
@@ -618,6 +617,7 @@ add_library(manyforge_deployment
   src/mf2_joint_name_internal.cpp
   src/native_execution_runtime_unit_emitter.cpp
   src/posix_durability_internal.cpp
+  src/program_binding_compiler.cpp
   src/provider_manifest_codec.cpp
   src/reference_runtime_unit_internal.cpp
   src/retained_bundle.cpp

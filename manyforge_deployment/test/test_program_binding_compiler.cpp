@@ -37,6 +37,7 @@ using manyforge::deployment::ActiveRuntimeParticipantFactsDTO;
 using manyforge::deployment::build_runtime_participant_binding_dto;
 using manyforge::deployment::canonical_json;
 using manyforge::deployment::CanonicalValue;
+using manyforge::deployment::compile_direct_control_motion_program_binding;
 using manyforge::deployment::compile_program_binding;
 using manyforge::deployment::FilesystemCatalogArtifactStore;
 using manyforge::deployment::FilesystemVerifiedRetainedBundleSource;
@@ -57,6 +58,7 @@ using manyforge::deployment::test::kLite6GripperTargetId;
 using manyforge::deployment::test::
     materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture;
 using manyforge::deployment::test::materialize_lite6_retained_consumer_fixture;
+using manyforge::deployment::test::materialize_lite6_native_motion_retained_consumer_fixture;
 
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -102,6 +104,28 @@ make_context(const std::filesystem::path &root,
           ? materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
                 root)
           : materialize_lite6_retained_consumer_fixture(root);
+  const FilesystemVerifiedRetainedBundleSource bundle_source(root);
+  auto bundle =
+      bundle_source.get_verified(materialized.bundle->retained_bundle_id());
+  if (bundle == nullptr ||
+      bundle->value().compiled_products.symbol_role_maps.size() != 1U) {
+    throw std::logic_error("test retained bundle has no sole model map");
+  }
+  const auto &product =
+      bundle->value().compiled_products.symbol_role_maps.front();
+  const FilesystemVerifiedRetainedModelMapSource model_map_source(root);
+  auto model_map = model_map_source.get_verified(
+      RetainedModelMapQuery{bundle->retained_bundle_id(), product.product_id});
+  if (!model_map.has_value()) {
+    throw std::logic_error("test could not reload retained model map");
+  }
+  return {std::move(bundle), std::move(*model_map)};
+}
+
+[[nodiscard]] BindingCompilerContext
+make_native_motion_context(const std::filesystem::path &root) {
+  const auto materialized =
+      materialize_lite6_native_motion_retained_consumer_fixture(root);
   const FilesystemVerifiedRetainedBundleSource bundle_source(root);
   auto bundle =
       bundle_source.get_verified(materialized.bundle->retained_bundle_id());
@@ -397,6 +421,93 @@ TEST(ProgramBindingCompilerTest,
   EXPECT_EQ(binding->value().provenance.source_records,
             context.bundle->value().provenance.source_records);
   EXPECT_FALSE(binding->value().provenance.resolved_output_records.empty());
+}
+
+TEST(ProgramBindingCompilerTest,
+     DerivesDeterministicDirectControlMotionBindingWithoutScenarioProgram) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_native_motion_context(root.path());
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+
+  const auto first = compile_direct_control_motion_program_binding(
+      manyforge::core::ControllableComponentId(
+          std::string(kLite6ControllableComponentId)),
+      manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)),
+      *context.bundle, context.model_map, catalog_store);
+  const auto second = compile_direct_control_motion_program_binding(
+      manyforge::core::ControllableComponentId(
+          std::string(kLite6ControllableComponentId)),
+      manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)),
+      *context.bundle, context.model_map, catalog_store);
+
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(first->program_binding_id(), second->program_binding_id());
+  EXPECT_EQ(first->canonical_bytes(), second->canonical_bytes());
+  EXPECT_EQ(first->value().program_id.value(),
+            manyforge::deployment::kDirectControlMotionProgramId);
+  EXPECT_TRUE(manyforge::deployment::is_sha256_digest(
+      first->value().program_revision.value()));
+  EXPECT_EQ(first->value().retained_bundle_id,
+            context.bundle->retained_bundle_id());
+  ASSERT_EQ(first->value().component_role_bindings.size(), 1U);
+  EXPECT_EQ(first->value().component_role_bindings.front()
+                .component_role_id.value(),
+            manyforge::deployment::kDirectControlComponentRoleId);
+  ASSERT_EQ(first->value().target_role_bindings.size(), 1U);
+  const auto &target = first->value().target_role_bindings.front();
+  EXPECT_EQ(target.target_role_id.value(),
+            manyforge::deployment::kDirectControlTargetRoleId);
+  EXPECT_EQ(target.command_target_id.value(), kLite6ArmTargetId);
+  EXPECT_FALSE(target.frame_role_bindings.empty());
+  EXPECT_NE(std::find_if(target.frame_role_bindings.begin(),
+                         target.frame_role_bindings.end(),
+                         [](const auto &frame) {
+                           return frame.frame_role_id.value() ==
+                                  manyforge::deployment::
+                                      kDirectControlBaseFrameRoleId;
+                         }),
+            target.frame_role_bindings.end());
+  EXPECT_NE(std::find_if(target.frame_role_bindings.begin(),
+                         target.frame_role_bindings.end(),
+                         [](const auto &frame) {
+                           return frame.frame_role_id.value() ==
+                                  manyforge::deployment::
+                                      kDirectControlTcpFrameRoleId;
+                         }),
+            target.frame_role_bindings.end());
+  EXPECT_FALSE(target.resource_role_bindings.empty());
+  EXPECT_FALSE(target.collision_body_role_bindings.empty());
+  EXPECT_TRUE(first->value().contact_grasp_bindings.empty());
+
+  std::vector<std::string> capabilities;
+  for (const auto &capability : target.capability_bindings) {
+    capabilities.push_back(capability.capability_id.value());
+  }
+  EXPECT_EQ(capabilities,
+            (std::vector<std::string>{"execution.trajectory.execute",
+                                      "planning.motion.joint_goal"}));
+}
+
+TEST(ProgramBindingCompilerTest,
+     DirectControlMotionBindingRejectsUnknownComponentOrTarget) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_native_motion_context(root.path());
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+
+  EXPECT_THROW(
+      static_cast<void>(compile_direct_control_motion_program_binding(
+          manyforge::core::ControllableComponentId("missing_component"),
+          manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)),
+          *context.bundle, context.model_map, catalog_store)),
+      ProgramBindingCompilerError);
+  EXPECT_THROW(
+      static_cast<void>(compile_direct_control_motion_program_binding(
+          manyforge::core::ControllableComponentId(
+              std::string(kLite6ControllableComponentId)),
+          manyforge::core::CommandTargetId("missing_target"), *context.bundle,
+          context.model_map, catalog_store)),
+      ProgramBindingCompilerError);
 }
 
 TEST(ProgramBindingCompilerTest, RejectsIncompleteAndUnknownRoleAssignments) {

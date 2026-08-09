@@ -66,6 +66,15 @@ class HeadlessService:
             request, trusted_principal_id=attribution.principal_id
         )
 
+    def execution_preview_motion(
+        self,
+        request: OperationIntentRequest,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().preview_motion(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
     def execution_read(self, operation_id: str) -> dict[str, Any]:
         return self._execution().read(operation_id)
 

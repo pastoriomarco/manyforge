@@ -956,6 +956,201 @@ code {
   margin-bottom: 1rem;
 }
 
+.robot-control-panel {
+  margin-bottom: 1rem;
+}
+
+.robot-control-header {
+  min-height: 4.65rem;
+}
+
+.robot-control-header .eyebrow,
+.robot-control-preview-heading .eyebrow {
+  margin-bottom: 0.22rem;
+}
+
+.robot-control-identity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem 1.15rem;
+  padding: 0.65rem 1rem;
+  border-bottom: 1px solid #203542;
+  color: #829aa8;
+  background: #0a1720;
+  font-size: 0.69rem;
+}
+
+.robot-control-identity code,
+.robot-control-operation code,
+.robot-control-tcp code {
+  color: #b6dce5;
+}
+
+.robot-control-body {
+  display: grid;
+  grid-template-columns: minmax(24rem, 1.25fr) minmax(20rem, 0.75fr);
+}
+
+.robot-control-joints {
+  padding: 0.9rem 1rem 1rem;
+  border-right: 1px solid #203542;
+}
+
+.robot-control-joint {
+  display: grid;
+  gap: 0.38rem;
+  padding: 0.72rem 0;
+  border-bottom: 1px solid #1b303d;
+}
+
+.robot-control-joint:last-child {
+  border-bottom: 0;
+}
+
+.robot-control-joint-heading,
+.robot-control-joint-inputs,
+.robot-control-preview-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.robot-control-joint-heading span,
+.robot-control-limits,
+.robot-control-evidence,
+.robot-control-boundary {
+  color: #7f96a4;
+  font-size: 0.68rem;
+}
+
+.robot-control-joint-inputs > input[type="range"] {
+  min-width: 0;
+  flex: 1;
+  accent-color: #5ec2dc;
+}
+
+.robot-control-number {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: #829aa8;
+  font-size: 0.68rem;
+}
+
+.robot-control-number input {
+  width: 6.7rem;
+  padding: 0.38rem 0.45rem;
+  border: 1px solid #314b5b;
+  border-radius: 0.4rem;
+  color: #e6f0f5;
+  background: #091720;
+}
+
+.robot-control-preview {
+  min-width: 0;
+  padding: 1rem;
+  background: #091720;
+}
+
+.robot-control-preview h3 {
+  margin: 0;
+  color: #eef6f9;
+  font-size: 1rem;
+}
+
+.robot-control-ghost-joints {
+  display: grid;
+  gap: 0.28rem;
+  margin: 0.9rem 0;
+}
+
+.robot-control-ghost-joints > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 0.25rem;
+  border-bottom: 1px solid #1a2c38;
+}
+
+.robot-control-ghost-joints dt {
+  color: #9eb2bd;
+}
+
+.robot-control-ghost-joints dd {
+  margin: 0;
+  color: #8ee0d0;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.robot-control-operation {
+  display: grid;
+  gap: 0.4rem;
+  margin-top: 0.85rem;
+  padding: 0.7rem;
+  border: 1px solid #2a4554;
+  border-radius: 0.55rem;
+  color: #9eb4c0;
+  font-size: 0.72rem;
+}
+
+.robot-control-operation progress {
+  width: 100%;
+  accent-color: #66c7dc;
+}
+
+.robot-control-error {
+  padding: 0.65rem;
+  border: 1px solid #824d41;
+  border-radius: 0.5rem;
+  color: #efb7ac;
+  background: #351d1b;
+  font-size: 0.75rem;
+}
+
+.robot-control-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin-top: 1rem;
+}
+
+.robot-control-actions button {
+  padding: 0.55rem 0.8rem;
+}
+
+.robot-control-actions .approve-button:not(:disabled) {
+  border-color: #33806d;
+  color: #c5f5e8;
+  background: #174738;
+}
+
+.robot-control-actions .stop-button:not(:disabled) {
+  border-color: #a74f45;
+  color: #ffe0d9;
+  background: #612920;
+}
+
+.robot-control-boundary {
+  margin-bottom: 0;
+  line-height: 1.45;
+}
+
+.phase-ready {
+  border-color: #327263;
+  color: #a9e6d4;
+  background: #143b34;
+}
+
+.phase-blocked,
+.phase-failed,
+.phase-intervention_required,
+.phase-unavailable {
+  border-color: #844d50;
+  color: #efb8bb;
+  background: #452426;
+}
+
 .viewer-header {
   min-height: 4.65rem;
 }
@@ -1400,6 +1595,15 @@ code {
 @media (max-width: 72rem) {
   .lower-grid {
     grid-template-columns: 1fr;
+  }
+
+  .robot-control-body {
+    grid-template-columns: 1fr;
+  }
+
+  .robot-control-joints {
+    border-right: 0;
+    border-bottom: 1px solid #203542;
   }
 
   .catalog-browser {

@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -22,6 +23,7 @@ from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_headless_api.app import TrustedPrincipal, create_app
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.models import OperationIntentRequest
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
 
@@ -398,6 +400,61 @@ def _planning_operation(
     }
 
 
+def _direct_control_joint_operation(
+    status: dict[str, Any],
+    *,
+    request_id: str,
+    positions_rad: list[float],
+) -> dict[str, Any]:
+    direct = status["direct_control"]
+    joint_names = [joint["source_joint_name"] for joint in direct["joints"]]
+    assert len(joint_names) == len(positions_rad)
+    return {
+        "request_context": {
+            "request_id": request_id,
+            "request_owner_epoch": status["owner_epoch"],
+            "source_label": "composer_ui",
+            "correlation_id": None,
+        },
+        "program_id": direct["program_id"],
+        "program_revision": direct["program_revision"],
+        "program_binding_id": direct["program_binding_id"],
+        "program_run_id": direct["program_run_id"],
+        "expected_graph_revision": status["graph_revision"],
+        "expected_retained_bundle_id": status["retained_bundle_id"],
+        "expected_scene_revision": status["scene_revision"],
+        "participants": [
+            {
+                "component_role_id": direct["component_role_id"],
+                "target_role_id": direct["target_role_id"],
+                "required_capability_id": direct[
+                    "operation_capability_id"
+                ],
+                "action_span": None,
+                "payload": _planning_motion(
+                    f"robot-control-{request_id}",
+                    {
+                        "kind": "joint_goal",
+                        "joint_names": joint_names,
+                        "positions_rad": positions_rad,
+                    },
+                )
+                | {
+                    "base_frame_role_id": direct["base_frame_role_id"],
+                    "tcp_frame_role_id": direct["tcp_frame_role_id"],
+                    "planning_profile": "balanced",
+                    "speed_profile": {
+                        "velocity_scale": 1.0,
+                        "acceleration_scale": 1.0,
+                        "max_tcp_linear_speed_mps": None,
+                    },
+                },
+            }
+        ],
+        "coordination_policy": "independent",
+    }
+
+
 def _tool_payload(position_m: float) -> dict[str, Any]:
     return {
         "kind": "capability_command",
@@ -714,6 +771,102 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         ]
         assert observed["arm"]["resources"] != observed["gripper"]["resources"]
 
+        direct = first_status["direct_control"]
+        assert direct["program_id"] == "manyforge.direct_control.motion"
+        assert direct["program_binding_id"] != manifest["program_binding_id"]
+        assert direct["controllable_component_id"] == observed["arm"][
+            "controllable_component_id"
+        ]
+        assert direct["command_target_id"] == observed["arm"][
+            "command_target_id"
+        ]
+        assert direct["base_frame_role_id"] == "base"
+        assert direct["tcp_frame_role_id"] == "tcp"
+        assert direct["planning_capability_ids"] == [
+            "planning.motion.joint_goal"
+        ]
+        assert [joint["source_joint_name"] for joint in direct["joints"]] == (
+            manifest["source_joint_names"]
+        )
+        assert direct["observed_state"]["source_joint_names"] == manifest[
+            "source_joint_names"
+        ]
+        assert all(
+            joint["min_position_rad"] <= joint["max_position_rad"]
+            and joint["max_velocity_rad_s"] > 0.0
+            for joint in direct["joints"]
+        )
+
+        native = ExecutionCommandClient(execution_root, timeout_seconds=2.0)
+        before_preview_events = native.events(first_status["owner_epoch"], 0)[
+            "events"
+        ]
+        before_preview_state = copy.deepcopy(observed["arm"]["positions"])
+        direct_positions = [
+            float(position)
+            for position in direct["observed_state"]["positions_rad"]
+        ]
+        direct_positions[0] = 0.03
+        direct_intent = _direct_control_joint_operation(
+            first_status,
+            request_id="composer-direct-preview",
+            positions_rad=direct_positions,
+        )
+        preview = composer.preview_motion(direct_intent)
+        receipt = preview["preview_receipt"]
+        assert receipt["commit_eligible"] is True
+        assert receipt["source_joint_names"] == manifest["source_joint_names"]
+        assert receipt["final_positions_rad"] == pytest.approx(direct_positions)
+        assert receipt["program_binding_id"] == direct["program_binding_id"]
+        assert "trajectory" not in receipt
+        assert "compiled" not in receipt
+        assert "providers" not in receipt
+        assert native.events(first_status["owner_epoch"], 0)["events"] == (
+            before_preview_events
+        )
+        after_preview_status = headless.execution_status()["status"]
+        after_preview_arm = next(
+            target
+            for target in after_preview_status["observed_targets"]
+            if target["target_role_id"] == "arm"
+        )
+        assert after_preview_arm["positions"] == before_preview_state
+
+        stale_scene_intent = copy.deepcopy(direct_intent)
+        stale_scene_intent["request_context"]["request_id"] = (
+            "composer-direct-stale-scene"
+        )
+        stale_scene_intent["expected_scene_revision"]["revision_id"] += 1
+        with pytest.raises(HeadlessClientError) as stale_scene:
+            composer.preview_motion(stale_scene_intent)
+        assert stale_scene.value.code == "scene_changed_during_validation"
+
+        direct_accepted = composer.execute(direct_intent)
+        direct_operation_id = direct_accepted["accepted"]["operation_id"]
+        direct_terminal = _wait_terminal(runner, direct_operation_id)[
+            "operation"
+        ]
+        assert direct_terminal["state"] == "completed", direct_terminal
+        assert direct_terminal["program_binding_id"] == direct[
+            "program_binding_id"
+        ]
+        composer.acknowledge_completed_operation(
+            direct_operation_id,
+            {
+                "request_context": {
+                    "request_id": "ack-composer-direct-operation",
+                    "request_owner_epoch": first_status["owner_epoch"],
+                    "source_label": "composer_ui",
+                    "correlation_id": None,
+                },
+                "operation_id": direct_operation_id,
+                "expected_operation_revision": direct_terminal[
+                    "operation_revision"
+                ],
+                "reason": "release completed direct-control operation",
+            },
+        )
+
         with pytest.raises(HeadlessClientError) as rejected:
             _runner_submission(
                 runner,
@@ -1004,6 +1157,109 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
     finally:
         _stop_host(process)
         raw_composer.close()
+        raw_api.close()
+
+
+def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> None:
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_root = tmp_path / "execution"
+    staging_root = tmp_path / "staging"
+    execution_root.mkdir()
+    staging_root.mkdir()
+    marker = tmp_path / "blocked-preview-worker"
+    process = _start_host(
+        fixture_root,
+        execution_root,
+        staging_root,
+        manifest,
+        candidate_worker=_required_path("MANYFORGE_ROBOPLAN_FAKE_WORKER"),
+        fake_worker_marker=marker,
+    )
+    execution = ExecutionCommandClient(execution_root, timeout_seconds=3.0)
+    app = create_app(
+        service=HeadlessService(
+            UnusedCore(),  # type: ignore[arg-type]
+            UnusedManager(),  # type: ignore[arg-type]
+            execution,
+        ),
+        trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
+    )
+    raw_api = TestClient(app)
+    headless = HeadlessHttpClient("http://headless.test", client=raw_api)
+    preview_done = threading.Event()
+    preview_response: list[dict[str, Any]] = []
+    preview_error: list[Exception] = []
+    preview_thread: threading.Thread | None = None
+
+    try:
+        status = headless.execution_status()["status"]
+        positions = [
+            float(position)
+            for position in status["direct_control"]["observed_state"][
+                "positions_rad"
+            ]
+        ]
+        positions[0] = 0.03
+        intent = _direct_control_joint_operation(
+            status,
+            request_id="blocked-direct-preview",
+            positions_rad=positions,
+        )
+
+        def run_preview() -> None:
+            try:
+                preview_response.append(
+                    execution.preview_motion(
+                        OperationIntentRequest.model_validate(intent),
+                        trusted_principal_id=None,
+                    )
+                )
+            except Exception as error:  # surfaced after the causal assertion
+                preview_error.append(error)
+            finally:
+                preview_done.set()
+
+        preview_thread = threading.Thread(target=run_preview, daemon=True)
+        preview_thread.start()
+        deadline = time.monotonic() + 2.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert marker.exists()
+        assert not preview_done.is_set()
+
+        with pytest.raises(HeadlessClientError) as rejected:
+            headless.stop_operations(
+                {
+                    "request_context": {
+                        "request_id": "stop-while-preview-blocked",
+                        "request_owner_epoch": status["owner_epoch"],
+                        "source_label": "headless_process_test",
+                        "correlation_id": "n6-c1-stop-isolation",
+                    },
+                    "operations": [
+                        {
+                            "operation_id": "non-resident-operation",
+                            "expected_operation_revision": 1,
+                            "expected_stop_generation": 0,
+                        }
+                    ],
+                    "reason": "prove Stop transport is independent from preview",
+                }
+            )
+        assert rejected.value.code == "missing_reference"
+        assert not preview_done.is_set()
+
+        preview_thread.join(timeout=3.0)
+        assert preview_done.is_set()
+        assert not preview_error
+        assert preview_response[0]["ok"] is False
+    finally:
+        _stop_host(process)
+        if preview_thread is not None:
+            preview_thread.join(timeout=3.0)
         raw_api.close()
 
 

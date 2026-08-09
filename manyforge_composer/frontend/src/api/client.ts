@@ -4,7 +4,11 @@ import {
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
   parseHistorianPage,
+  parseExecutionOwnerStatus,
+  parseMotionPreviewResponse,
   parseObjectResponse,
+  parseOperationAcceptance,
+  parseOperationObservation,
   parseOperatorAlarmSnapshot,
   parseSceneUrdfManifest,
 } from './parsers';
@@ -22,6 +26,13 @@ import type {
   OperatorAlarmRecord,
   OperatorAlarmSnapshot,
 } from '../types/headless';
+import type {
+  ExecutionOwnerStatus,
+  JointMotionOperationIntent,
+  MotionPreviewReceipt,
+  OperationAcceptance,
+  OperationObservation,
+} from '../types/robotControl';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -157,6 +168,112 @@ export const api = {
   runtime: {
     get: (signal?: AbortSignal): Promise<HeadlessRuntimeSnapshot> =>
       requestJson('/api/runtime', parseHeadlessRuntimeSnapshot, signal),
+  },
+  execution: {
+    status: (signal?: AbortSignal): Promise<ExecutionOwnerStatus> =>
+      requestJson(
+        '/api/execution/status',
+        parseExecutionOwnerStatus,
+        signal,
+      ),
+    previewMotion: (
+      intent: JointMotionOperationIntent,
+      signal?: AbortSignal,
+    ): Promise<MotionPreviewReceipt> => requestJson(
+      '/api/execution/motion-previews',
+      (value) => {
+        const receipt = parseMotionPreviewResponse(value);
+        const participant = intent.participants[0];
+        if (
+          receipt.requestId !== intent.request_context.request_id
+          || receipt.requestOwnerEpoch
+            !== intent.request_context.request_owner_epoch
+          || receipt.programId !== intent.program_id
+          || receipt.programRevision !== intent.program_revision
+          || receipt.programBindingId !== intent.program_binding_id
+          || receipt.programRunId !== intent.program_run_id
+          || receipt.graphRevision !== intent.expected_graph_revision
+          || receipt.retainedBundleId !== intent.expected_retained_bundle_id
+          || receipt.sceneRevision.scene_id
+            !== intent.expected_scene_revision.scene_id
+          || receipt.sceneRevision.revision_id
+            !== intent.expected_scene_revision.revision_id
+          || receipt.sceneRevision.content_hash
+            !== intent.expected_scene_revision.content_hash
+          || receipt.componentRoleId !== participant.component_role_id
+          || receipt.targetRoleId !== participant.target_role_id
+          || receipt.requiredCapabilityId
+            !== participant.required_capability_id
+          || receipt.sourceJointNames.length
+            !== participant.payload.motion.joint_names.length
+          || receipt.sourceJointNames.some(
+            (name, index) => name
+              !== participant.payload.motion.joint_names[index],
+          )
+        ) {
+          throw new Error('preview receipt does not match the authored intent');
+        }
+        return receipt;
+      },
+      signal,
+      { method: 'POST', body: JSON.stringify(intent) },
+    ),
+    submit: (
+      intent: JointMotionOperationIntent,
+      signal?: AbortSignal,
+    ): Promise<OperationAcceptance> => requestJson(
+      '/api/execution/operations',
+      (value) => {
+        const accepted = parseOperationAcceptance(value);
+        if (accepted.requestId !== intent.request_context.request_id) {
+          throw new Error('operation acceptance does not match its request');
+        }
+        return accepted;
+      },
+      signal,
+      { method: 'POST', body: JSON.stringify(intent) },
+    ),
+    read: (
+      operationId: string,
+      signal?: AbortSignal,
+    ): Promise<OperationObservation> => requestJson(
+      `/api/execution/operations/${encodeURIComponent(operationId)}`,
+      (value) => {
+        const observation = parseOperationObservation(value);
+        if (observation.operationId !== operationId) {
+          throw new Error('operation observation does not match its request');
+        }
+        return observation;
+      },
+      signal,
+    ),
+    stop: (
+      ownerEpoch: string,
+      operation: OperationObservation,
+      requestId: string,
+      signal?: AbortSignal,
+    ): Promise<Record<string, unknown>> => requestJson(
+      '/api/execution/stops',
+      parseObjectResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          request_context: {
+            request_id: requestId,
+            request_owner_epoch: ownerEpoch,
+            source_label: 'composer_ui',
+            correlation_id: null,
+          },
+          operations: [{
+            operation_id: operation.operationId,
+            expected_operation_revision: operation.operationRevision,
+            expected_stop_generation: operation.activeStopGeneration ?? 0,
+          }],
+          reason: 'operator Robot Control Stop',
+        }),
+      },
+    ),
   },
   alarms: {
     list: (signal?: AbortSignal): Promise<OperatorAlarmSnapshot> =>
