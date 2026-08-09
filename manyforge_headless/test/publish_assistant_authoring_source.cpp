@@ -1,0 +1,107 @@
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <manyforge_component_manager/manager_apply_journal.hpp>
+#include <manyforge_component_manager/runtime_observation.hpp>
+#include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/types/active_bundle_publication.hpp>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+#include "assistant_authoring_fixture.hpp"
+#include "manyforge_headless/owner_publication.hpp"
+#include "manyforge_headless/source_snapshot.hpp"
+
+namespace {
+
+namespace component_manager = manyforge::component_manager;
+namespace core = manyforge::core;
+namespace headless = manyforge::headless;
+
+constexpr std::string_view kDigestOne =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+constexpr std::string_view kDigestTwo =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+constexpr std::string_view kDigestThree =
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+constexpr std::string_view kSceneId =
+    "sha256:abababababababababababababababababababababababababababababababab";
+
+[[nodiscard]] std::filesystem::path ParsePublicationRoot(const int argc, char** argv) {
+  if (argc != 3 || std::string_view(argv[1]) != "--publication-root" ||
+      std::string_view(argv[2]).empty()) {
+    throw std::invalid_argument(
+        "usage: publish_assistant_authoring_source --publication-root <path>");
+  }
+  return std::filesystem::path(argv[2]);
+}
+
+[[nodiscard]] component_manager::ManagerActiveRuntimeConvergenceResult RuntimeSelection(
+    const manyforge::deployment::RetainedBundle& bundle) {
+  const core::ProjectionRevisionDTO projection{
+      bundle.retained_bundle_id(),
+      bundle.value().cell_graph.graph_revision,
+      core::SceneRevision{
+          core::SceneId(std::string(kSceneId)),
+          1U,
+          core::ContentDigest(std::string(kDigestOne)),
+      },
+  };
+  const core::ActiveBundlePublicationReceiptDTO publication{
+      core::ActiveBundlePublicationRequestDTO{
+          core::NamedApplyPublicationTransactionDTO{
+              core::ApplyId("assistant-authoring-test-apply"),
+              core::ApplyGeneration(1U),
+              core::ProjectionStageGeneration(1U),
+          },
+          projection,
+          projection.retained_bundle_id,
+          projection.graph_revision,
+          core::ActiveBundlePublicationGeneration(1U),
+          core::ContentDigest(std::string(kDigestOne)),
+          core::ContentDigest(std::string(kDigestTwo)),
+      },
+      core::ActiveBundlePublicationGeneration(2U),
+      core::ContentDigest(std::string(kDigestThree)),
+  };
+  component_manager::RuntimeObservationReducer reducer([] { return 1U; }, {});
+  return {
+      component_manager::ManagerActiveRuntimePlanDTO{
+          publication,
+          core::ContentDigest(std::string(kDigestThree)),
+          {},
+      },
+      reducer.Evaluate({}),
+      component_manager::ManagerActiveRuntimeConvergenceState::kConverged,
+  };
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  try {
+    const auto publication_root = ParsePublicationRoot(argc, argv);
+    const auto bundle = manyforge::headless::test::LoadAssistantAuthoringBundle();
+    component_manager::SqliteManagerApplyJournal apply_journal(
+        publication_root / "assistant-authoring-test-apply.sqlite3",
+        bundle->value().cell_graph.cell_id);
+    const auto payload = headless::BuildManagerSourcePayload(
+        *bundle, RuntimeSelection(*bundle), apply_journal,
+        headless::ManagerApplyMutationAvailability::kKernelOwnerUnavailable);
+    const auto observed_at_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+    if (observed_at_ns < 0) {
+      throw std::runtime_error("monotonic clock returned a negative value");
+    }
+    headless::AtomicSourceSnapshotChannel channel(publication_root, "manager-source.json");
+    static_cast<void>(channel.Publish(
+        "component_manager", "component-manager." + bundle->value().cell_graph.cell_id.value(),
+        "component-manager.assistant-authoring-test.epoch.1", observed_at_ns, payload));
+    return 0;
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+  }
+}

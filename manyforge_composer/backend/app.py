@@ -14,10 +14,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .log_throttle import ThrottledLog
 from .models import UnavailableDetail, UnavailableResponse
 from .routes_catalog import create_catalog_router
+from .routes_assistant_draft import create_assistant_draft_router
+from .routes_draft import create_draft_router
 from .routes_filesystem import create_filesystem_router
 from .routes_nodes import create_nodes_router
 from .routes_urdf import create_urdf_router
@@ -31,6 +34,8 @@ from .state import (
 
 logger = logging.getLogger(__name__)
 
+_MAXIMUM_REQUEST_BODY_BYTES = 1024 * 1024
+
 _UNAVAILABLE_PAYLOAD = UnavailableResponse(
     detail=UnavailableDetail(
         code=RUNTIME_UNAVAILABLE_REASON_CODE,
@@ -38,6 +43,85 @@ _UNAVAILABLE_PAYLOAD = UnavailableResponse(
         restoration_gates=["N", "L0", "P5", "I", "R", "T"],
     )
 ).detail.model_dump(by_alias=True)
+
+
+class ComposerRequestBodyLimitMiddleware:
+    """Reject oversized bodies on one bounded callback path family."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        maximum_bytes: int,
+        path_prefix: str,
+    ) -> None:
+        self.app = app
+        self.maximum_bytes = maximum_bytes
+        self.path_prefix = path_prefix
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not scope.get("path", "").startswith(
+            self.path_prefix
+        ):
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers", ()))
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                declared = int(raw_length)
+            except ValueError:
+                await self._reject(scope, receive, send)
+                return
+            if declared < 0 or declared > self.maximum_bytes:
+                await self._reject(scope, receive, send)
+                return
+
+        body = bytearray()
+        disconnected = False
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                disconnected = True
+                break
+            if message["type"] != "http.request":
+                continue
+            body.extend(message.get("body", b""))
+            if len(body) > self.maximum_bytes:
+                await self._reject(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        delivered = False
+
+        async def replay_receive() -> Message:
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                if disconnected:
+                    return {"type": "http.disconnect"}
+                return {
+                    "type": "http.request",
+                    "body": bytes(body),
+                    "more_body": False,
+                }
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={
+                "detail": {
+                    "code": "composer_request_body_oversized",
+                    "message": "request body exceeds the configured byte bound",
+                }
+            },
+        )
+        await response(scope, receive, send)
 
 
 def create_app(
@@ -58,6 +142,11 @@ def create_app(
     state.allowed_fs_roots = list(security.allowed_fs_roots)
 
     app = FastAPI(title="ManyForge Composer (replaceable client)")
+    app.add_middleware(
+        ComposerRequestBodyLimitMiddleware,
+        maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
+        path_prefix="/api/assistant/bridge/tools/",
+    )
     if security.api_token:
         app.add_middleware(BearerAuthMiddleware, token=security.api_token)
     app.add_middleware(
@@ -153,6 +242,11 @@ def create_app(
                         "deployment": (
                             "authored" if state.deployment is not None else "none"
                         ),
+                        "program_draft": (
+                            "loaded"
+                            if state.draft_session.program_loaded
+                            else "none"
+                        ),
                         "headless_projection": (
                             "ready"
                             if headless.get("headless_projection_ready")
@@ -172,6 +266,11 @@ def create_app(
                         "catalog": "available",
                         "deployment": (
                             "authored" if state.deployment is not None else "none"
+                        ),
+                        "program_draft": (
+                            "loaded"
+                            if state.draft_session.program_loaded
+                            else "none"
                         ),
                         "headless_projection": "unavailable",
                     },
@@ -203,6 +302,11 @@ def create_app(
                 "deployment": (
                     "authored" if state.deployment is not None else "none"
                 ),
+                "program_draft": (
+                    "loaded"
+                    if state.draft_session.program_loaded
+                    else "none"
+                ),
                 "runtime": "unavailable",
             },
             "runtimeAvailability": _UNAVAILABLE_PAYLOAD,
@@ -229,6 +333,15 @@ def create_app(
         prefix="/api/scene/urdf",
         tags=["structural-urdf"],
     )
+    app.include_router(
+        create_draft_router(state),
+        tags=["composer-draft"],
+    )
+    if state.headless_client is not None:
+        app.include_router(
+            create_assistant_draft_router(state),
+            tags=["assistant-draft-callback"],
+        )
 
     if state.headless_client is not None:
         from .headless_ws import serve_headless_state

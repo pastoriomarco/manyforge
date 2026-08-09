@@ -64,7 +64,9 @@ target_link_libraries(manyforge_headless PUBLIC
 set_target_properties(manyforge_headless PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(manyforge_node_environment_projection
-  src/node_environment_projection.cpp)
+  src/assistant_mode_projection.cpp
+  src/node_environment_projection.cpp
+  src/source_model_projection.cpp)
 add_library(manyforge::node_environment_projection ALIAS
   manyforge_node_environment_projection)
 target_include_directories(manyforge_node_environment_projection PUBLIC
@@ -272,6 +274,114 @@ if(BUILD_TESTING)
   add_custom_target(manyforge_headless_test_canonical_empty_package
     DEPENDS "${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_MARKER}")
 
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(
+    MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+  set(
+    MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural")
+  file(
+    GLOB_RECURSE
+    MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS
+    CONFIGURE_DEPENDS
+    LIST_DIRECTORIES false
+    "${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}/meshes/*")
+  file(MAKE_DIRECTORY "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}")
+  execute_process(
+    COMMAND
+      "${Python3_EXECUTABLE}"
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/tools/prepare_structural_model.py"
+      --urdf
+      "${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}/lite6_lite_gripper.urdf"
+      --srdf
+      "${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}/lite6_lite_gripper.srdf"
+      --model-asset-id
+      lite6_lite_gripper
+      --accepted-package-uri-prefix
+      "package://manyforge_example_models/models/lite6_lite_gripper/"
+      --resource-root
+      "${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}"
+      --output-directory
+      "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}"
+    RESULT_VARIABLE MANYFORGE_HEADLESS_TEST_LITE6_PREPARATION_RESULT
+    OUTPUT_VARIABLE MANYFORGE_HEADLESS_TEST_LITE6_PREPARATION_OUTPUT
+    ERROR_VARIABLE MANYFORGE_HEADLESS_TEST_LITE6_PREPARATION_ERROR)
+  if(NOT MANYFORGE_HEADLESS_TEST_LITE6_PREPARATION_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "headless assistant fixture preparation failed:\n"
+      "${MANYFORGE_HEADLESS_TEST_LITE6_PREPARATION_OUTPUT}"
+      "${MANYFORGE_HEADLESS_TEST_LITE6_PREPARATION_ERROR}")
+  endif()
+  set_property(
+    DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/tools/prepare_structural_model.py"
+    "${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}/lite6_lite_gripper.urdf"
+    "${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}/lite6_lite_gripper.srdf"
+    ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS})
+
+  add_executable(manyforge_generate_headless_assistant_test_package
+    test/generate_assistant_authoring_package.cpp)
+  target_compile_definitions(
+    manyforge_generate_headless_assistant_test_package PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}")
+  target_include_directories(
+    manyforge_generate_headless_assistant_test_package PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
+  target_link_libraries(
+    manyforge_generate_headless_assistant_test_package PRIVATE
+    manyforge::deployment)
+
+  set(
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_FIXTURE_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/assistant-authoring-test-fixture")
+  set(
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT
+    "${MANYFORGE_HEADLESS_TEST_ASSISTANT_FIXTURE_ROOT}/retained-package")
+  set(
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE
+    "${MANYFORGE_HEADLESS_TEST_ASSISTANT_FIXTURE_ROOT}/retained-bundle-id.txt")
+  set(
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_INSTRUMENT_SOURCE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/resources/assistant/assistant_instrument_registry_source.v1.json")
+  add_custom_command(
+    OUTPUT "${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
+    COMMAND
+      "${CMAKE_COMMAND}" -E remove_directory
+      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_FIXTURE_ROOT}"
+    COMMAND
+      "${CMAKE_COMMAND}" -E make_directory
+      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_FIXTURE_ROOT}"
+    COMMAND
+      "$<TARGET_FILE:manyforge_generate_headless_assistant_test_package>"
+      --package-root
+      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}"
+      --bundle-id-output
+      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
+    DEPENDS
+      manyforge_generate_headless_assistant_test_package
+      "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
+      "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
+      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_INSTRUMENT_SOURCE}"
+      ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
+    VERBATIM)
+  add_custom_target(manyforge_headless_test_assistant_package
+    DEPENDS "${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}")
+
+  add_executable(manyforge_publish_headless_assistant_test_source
+    test/publish_assistant_authoring_source.cpp)
+  add_dependencies(manyforge_publish_headless_assistant_test_source
+    manyforge_headless_test_assistant_package)
+  target_compile_definitions(
+    manyforge_publish_headless_assistant_test_source PRIVATE
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE="${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}")
+  target_link_libraries(
+    manyforge_publish_headless_assistant_test_source PRIVATE
+    manyforge_headless_owner_publication)
+
   add_executable(test_headless_api_core test/test_headless_api_core.cpp)
   add_dependencies(test_headless_api_core
     manyforge_headless_test_canonical_empty_package)
@@ -310,6 +420,38 @@ if(BUILD_TESTING)
     manyforge::deployment_admission
     GTest::gtest_main)
   gtest_discover_tests(test_node_environment_projection
+    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_source_model_projection
+    test/test_source_model_projection.cpp)
+  add_dependencies(test_source_model_projection
+    manyforge_headless_test_canonical_empty_package
+    manyforge_headless_test_assistant_package)
+  target_compile_definitions(test_source_model_projection PRIVATE
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE="${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}"
+    MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
+  target_link_libraries(test_source_model_projection PRIVATE
+    manyforge_node_environment_projection
+    manyforge::deployment_admission
+    GTest::gtest_main)
+  gtest_discover_tests(test_source_model_projection
+    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_assistant_mode_projection
+    test/test_assistant_mode_projection.cpp)
+  add_dependencies(test_assistant_mode_projection
+    manyforge_headless_test_canonical_empty_package
+    manyforge_headless_test_assistant_package)
+  target_compile_definitions(test_assistant_mode_projection PRIVATE
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE="${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}"
+    MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
+  target_link_libraries(test_assistant_mode_projection PRIVATE
+    manyforge_node_environment_projection
+    manyforge::deployment_admission
+    GTest::gtest_main)
+  gtest_discover_tests(test_assistant_mode_projection
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_manager_daemon_process

@@ -6,10 +6,12 @@
 #include <functional>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <manyforge_headless/assistant_mode_projection.hpp>
 #include <manyforge_headless/event_historian.hpp>
 #include <manyforge_headless/node_environment_projection.hpp>
 #include <manyforge_headless/operator_alarm_owner.hpp>
 #include <manyforge_headless/runtime_snapshot.hpp>
+#include <manyforge_headless/source_model_projection.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -64,6 +66,10 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue RuntimeSnapshot();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   NodeEnvironmentProjection();
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  SourceModelProjection();
+  [[nodiscard]] manyforge::content_identity::CanonicalValue AssistantModeProjection(
+      std::string_view mode_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue AlarmSnapshot(
       std::optional<std::size_t> limit = 32U,
       const std::set<AlarmLifecycleState> &states = {},
@@ -119,8 +125,18 @@ private:
   };
 
   [[nodiscard]] HeadlessRuntimeSnapshot RefreshLocked();
+  [[nodiscard]] std::shared_ptr<const manyforge::deployment::RetainedBundle>
+  VerifiedActiveBundleLocked(std::string_view retained_bundle_id,
+                             std::string_view graph_revision,
+                             std::string_view invalid_code,
+                             std::string_view unavailable_code);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   NodeEnvironmentProjectionLocked(const HeadlessRuntimeSnapshot &runtime);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  SourceModelProjectionLocked(const HeadlessRuntimeSnapshot &runtime);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  AssistantModeProjectionLocked(const HeadlessRuntimeSnapshot &runtime,
+                                std::string_view mode_id);
   void
   RefreshRuntimeHealthAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
   void RefreshSceneAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
@@ -156,6 +172,11 @@ private:
   manyforge::deployment::FilesystemVerifiedRetainedBundleSource
       retained_bundle_source_;
   ActiveNodeEnvironmentProjection node_environment_projection_;
+  ActiveSourceModelProjection source_model_projection_;
+  std::shared_ptr<const manyforge::deployment::RetainedBundle> verified_active_bundle_;
+  std::optional<manyforge::content_identity::CanonicalValue> source_model_projection_cache_;
+  std::map<std::string, manyforge::content_identity::CanonicalValue>
+      assistant_mode_projection_cache_;
   std::shared_ptr<SqliteEventHistoryStore> history_store_;
   AsyncEventHistorian historian_;
   RuntimeSnapshotAggregator runtime_aggregator_;
@@ -171,6 +192,8 @@ private:
   std::map<std::string, ReplayEntry> replay_;
   std::uint64_t node_environment_generation_{};
   std::string previous_node_environment_digest_;
+  std::uint64_t source_model_generation_{};
+  std::string previous_source_model_digest_;
   bool shutdown_{};
 };
 

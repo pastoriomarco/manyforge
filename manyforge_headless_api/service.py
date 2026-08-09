@@ -274,6 +274,35 @@ class HeadlessService:
             )
         return projection
 
+    def source_model(self) -> dict[str, Any]:
+        projection = self.core.source_model_projection()
+        source = projection.get("source")
+        if (
+            projection.get("schema_version")
+            != "manyforge.source_model_projection.v1"
+            or not isinstance(source, dict)
+        ):
+            raise HeadlessApiError(
+                "source_model_projection_invalid",
+                "native core returned an unsupported source model projection",
+            )
+        return projection
+
+    def assistant_mode(self, mode_id: str) -> dict[str, Any]:
+        projection = self.core.assistant_mode_projection(mode_id)
+        source = projection.get("source")
+        if (
+            projection.get("schema_version")
+            != "manyforge.assistant_mode_projection.v1"
+            or projection.get("mode") != mode_id
+            or not isinstance(source, dict)
+        ):
+            raise HeadlessApiError(
+                "assistant_mode_projection_invalid",
+                "native core returned an unsupported assistant mode projection",
+            )
+        return projection
+
     def scene(self) -> dict[str, Any]:
         runtime = self.runtime()
         sections = runtime["sections"]

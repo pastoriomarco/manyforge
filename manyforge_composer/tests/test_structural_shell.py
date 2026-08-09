@@ -52,9 +52,9 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     catalog = client.get("/api/catalog")
     assert catalog.status_code == 200
     payload = catalog.json()
-    assert len(payload["entries"]) == 49
+    assert len(payload["entries"]) == 50
     assert payload["apiVersion"] == "manyforge.node_catalog.v2"
-    assert payload["contentVersion"] == "1.0.0"
+    assert payload["contentVersion"] == "1.1.0"
     assert payload["catalogId"] == "manyforge_builtin"
     assert payload["catalogDigest"].startswith("sha256:")
     assert payload["environmentDigest"].startswith("sha256:")
@@ -81,7 +81,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert environment.status_code == 200
     environment_payload = environment.json()
     assert environment_payload["catalog"]["catalogDigest"] == payload["catalogDigest"]
-    assert len(environment_payload["executableRegistry"]) == 49
+    assert len(environment_payload["executableRegistry"]) == 50
 
 
 def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None:
@@ -106,6 +106,54 @@ def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None
         assert response.json()["detail"]["code"] == (
             "composable_cell_runtime_unavailable"
         )
+
+
+def test_program_draft_read_is_available_without_restoring_load_save_or_run() -> None:
+    empty = _client().get("/api/program/draft")
+    assert empty.status_code == 200
+    assert empty.json()["program_loaded"] is False
+    assert empty.json()["saved"] is False
+    assert empty.json()["applied"] is False
+
+    program_path = Path(__file__).resolve().parents[2] / "examples" / (
+        "pick_and_place_minimal.program.yaml"
+    )
+    state = ComposerState.from_paths(
+        deployment_path=None,
+        program_path=str(program_path),
+    )
+    loaded = TestClient(create_app(state)).get("/api/program/draft")
+    assert loaded.status_code == 200
+    assert loaded.json()["program_loaded"] is True
+    assert loaded.json()["program"]["api_version"] == "manyforge.program.v1"
+    assert loaded.json()["draft_revision"] == 1
+    assert loaded.json()["saved"] is False
+    assert loaded.json()["applied"] is False
+
+
+def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> None:
+    state = ComposerState(headless_client=object())  # type: ignore[arg-type]
+    client = TestClient(create_app(state))
+    response = client.post(
+        "/api/assistant/bridge/tools/scene_draft_add_object",
+        content=b"x" * (1024 * 1024 + 1),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == (
+        "composer_request_body_oversized"
+    )
+
+    retained_route = client.post(
+        "/api/program/load",
+        content=b"x" * (1024 * 1024 + 1),
+        headers={"content-type": "application/json"},
+    )
+    assert retained_route.status_code == 503
+    assert retained_route.json()["detail"]["code"] == (
+        "composable_cell_runtime_unavailable"
+    )
 
 
 def test_unavailable_catch_all_has_stable_unique_openapi_operation_ids() -> None:

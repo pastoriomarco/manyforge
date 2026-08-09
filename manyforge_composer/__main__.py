@@ -82,6 +82,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--deployment-path")
+    parser.add_argument("--program-path")
     parser.add_argument("--static-dir")
     parser.add_argument("--headless-api-url")
     parser.add_argument("--headless-api-timeout-s", type=float, default=2.0)
@@ -113,8 +114,9 @@ def main() -> None:
             timeout_seconds=args.headless_api_timeout_s,
         )
     try:
-        state = ComposerState.from_deployment_path(
-            args.deployment_path,
+        state = ComposerState.from_paths(
+            deployment_path=args.deployment_path,
+            program_path=args.program_path,
             allowed_fs_roots=security.allowed_fs_roots,
             headless_client=headless_client,
         )

@@ -55,6 +55,13 @@ materialize_lite6_retained_consumer_fixture(const std::filesystem::path& package
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_composer_assistant_retained_consumer_fixture(
+    const std::filesystem::path& package_root) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_composer_assistant_retention_fixture());
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
     const std::filesystem::path& package_root) {
   return materialize_lite6_retained_consumer_fixture_from(

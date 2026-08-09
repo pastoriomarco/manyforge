@@ -1,0 +1,1000 @@
+"""Bounded in-memory Composer Draft owner with no runtime or file authority."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass
+import threading
+import uuid
+from typing import Any, Callable, NoReturn
+
+from manyforge_behavior.canonical_artifact import compute_content_identity
+from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.geometry import (
+    GeometryError,
+    add_rpy_deg,
+    compose_local,
+    compose_world,
+    normalize_quat,
+    rpy_deg_to_xyzw,
+)
+from manyforge_behavior.program import (
+    Program,
+    ProgramValidationError,
+    merge_param_patch,
+)
+
+
+_DRAFT_API_VERSION = "manyforge.composer_draft.v1"
+_PROGRAM_API_VERSION = "manyforge.program.v1"
+_MAXIMUM_DRAFT_REVISION = 9_007_199_254_740_991
+_ROOT_ALIAS = "@root"
+SUPPORTED_DRAFT_MUTATIONS = (
+    "blackboard_draft_remove_keys",
+    "blackboard_draft_remove_namespaces",
+    "blackboard_draft_upsert_keys",
+    "blackboard_draft_upsert_namespaces",
+    "program_draft_remove_parameters",
+    "program_draft_upsert_parameters",
+    "scene_draft_add_object",
+    "scene_draft_remove_objects",
+    "scene_draft_update_object",
+    "scene_draft_upsert_objects",
+    "tree_draft_change_node_kind",
+    "tree_draft_delete_node",
+    "tree_draft_insert_node",
+    "tree_draft_move_node",
+    "tree_draft_replace_subtree",
+    "tree_draft_update_node_params",
+    "tree_draft_wrap_node",
+)
+
+
+class DraftSessionError(RuntimeError):
+    """One Draft operation failed before an atomic state change."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status_code: int = 400,
+        detail: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+        self.detail = message if detail is None else detail
+
+
+@dataclass(frozen=True, slots=True)
+class DraftMutationResult:
+    mutation: str
+    details: dict[str, Any]
+    snapshot: dict[str, Any]
+
+
+def _error(
+    code: str,
+    message: str,
+    *,
+    status_code: int = 400,
+    detail: Any | None = None,
+) -> NoReturn:
+    raise DraftSessionError(
+        code,
+        message,
+        status_code=status_code,
+        detail=detail,
+    )
+
+
+def _identified(document: dict[str, Any]) -> dict[str, Any]:
+    candidate = deepcopy(document)
+    candidate["program_revision"] = compute_content_identity(
+        candidate,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version=_PROGRAM_API_VERSION,
+    )
+    return candidate
+
+
+def _tree_ref(
+    root: dict[str, Any],
+    instance_id: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None, int | None] | None:
+    target = root.get("instance_id") if instance_id == _ROOT_ALIAS else instance_id
+    pending: list[tuple[dict[str, Any], dict[str, Any] | None, int | None]] = [
+        (root, None, None)
+    ]
+    while pending:
+        node, parent, index = pending.pop()
+        if node.get("instance_id") == target:
+            return node, parent, index
+        children = node.get("children")
+        if type(children) is list:
+            for child_index in range(len(children) - 1, -1, -1):
+                child = children[child_index]
+                if type(child) is dict:
+                    pending.append((child, node, child_index))
+    return None
+
+
+def _tree_ids(root: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        instance_id = node.get("instance_id")
+        if type(instance_id) is str:
+            result.append(instance_id)
+        children = node.get("children")
+        if type(children) is list:
+            pending.extend(
+                child for child in reversed(children) if type(child) is dict
+            )
+    return result
+
+
+def _lookup(
+    tree: dict[str, Any],
+    instance_id: str,
+    *,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
+    found = _tree_ref(tree, instance_id)
+    if found is None:
+        _error(
+            "draft_node_not_found",
+            f"{label} does not name a Draft node: {instance_id}",
+            status_code=404,
+            detail={
+                "message": f"{label} does not name a Draft node: {instance_id}",
+                "validNodeNames": _tree_ids(tree),
+                "rootAlias": _ROOT_ALIAS,
+            },
+        )
+    return found
+
+
+def _insert_index(arguments: dict[str, Any], child_count: int) -> int:
+    index = arguments.get("index", child_count)
+    if type(index) is not int or index < 0 or index > child_count:
+        _error(
+            "draft_insert_index_invalid",
+            f"index must be between 0 and {child_count}",
+        )
+    return index
+
+
+def _contains_instance(root: dict[str, Any], instance_id: str) -> bool:
+    return _tree_ref(root, instance_id) is not None
+
+
+def _absolute_orientation(pose: dict[str, Any]) -> list[float]:
+    orientation = pose.get("orientation")
+    if type(orientation) is not dict:
+        _error("draft_pose_invalid", "Draft pose has no absolute orientation")
+    try:
+        if "xyzw" in orientation:
+            return normalize_quat(orientation["xyzw"])
+        if "rpy_deg" in orientation:
+            return rpy_deg_to_xyzw(orientation["rpy_deg"])
+    except GeometryError as error:
+        _error("draft_pose_invalid", f"Draft pose orientation is invalid: {error}")
+    _error("draft_pose_invalid", "Draft pose has no supported absolute orientation")
+
+
+def _scene_orientation(
+    scene: list[dict[str, Any]],
+    scene_resource_id: str,
+) -> list[float]:
+    for resource in scene:
+        if resource.get("scene_resource_id") == scene_resource_id:
+            return _absolute_orientation(resource.get("pose", {}))
+    _error(
+        "draft_scene_resource_not_found",
+        f"orientation source does not name a Draft scene resource: {scene_resource_id}",
+        status_code=404,
+    )
+
+
+def _resolve_relative_orientation(
+    resource: dict[str, Any],
+    *,
+    scene: list[dict[str, Any]],
+    current: dict[str, Any] | None,
+) -> dict[str, Any]:
+    candidate = deepcopy(resource)
+    pose = candidate.get("pose")
+    if type(pose) is not dict:
+        return candidate
+    intent_fields = (
+        "rotate_local_rpy_deg",
+        "rotate_world_rpy_deg",
+        "rpy_delta_deg",
+        "orientation_from",
+    )
+    present = [field for field in intent_fields if field in pose]
+    if not present:
+        return candidate
+    if len(present) != 1 or "orientation" in pose:
+        _error(
+            "draft_pose_intent_invalid",
+            "pose must contain exactly one absolute or relative orientation form",
+        )
+    current_orientation = (
+        _absolute_orientation(current.get("pose", {}))
+        if current is not None
+        else None
+    )
+    field = present[0]
+    try:
+        if field == "rotate_local_rpy_deg":
+            if current_orientation is None:
+                _error(
+                    "draft_pose_reference_unavailable",
+                    "local rotation requires an existing Draft orientation",
+                )
+            resolved = compose_local(
+                current_orientation,
+                rpy_deg_to_xyzw(pose[field]),
+            )
+        elif field == "rotate_world_rpy_deg":
+            if current_orientation is None:
+                _error(
+                    "draft_pose_reference_unavailable",
+                    "world rotation requires an existing Draft orientation",
+                )
+            resolved = compose_world(
+                current_orientation,
+                rpy_deg_to_xyzw(pose[field]),
+            )
+        elif field == "rpy_delta_deg":
+            if current_orientation is None:
+                _error(
+                    "draft_pose_reference_unavailable",
+                    "RPY delta requires an existing Draft orientation",
+                )
+            resolved = add_rpy_deg(current_orientation, pose[field])
+        else:
+            reference = pose[field]
+            if type(reference) is not dict:
+                _error(
+                    "draft_pose_reference_invalid",
+                    "orientation_from must be an object",
+                )
+            source = reference.get("source")
+            if source == "current_pose":
+                if current_orientation is None:
+                    _error(
+                        "draft_pose_reference_unavailable",
+                        "current-pose orientation requires an existing Draft resource",
+                    )
+                resolved = current_orientation
+            elif source == "scene_resource":
+                resolved = _scene_orientation(
+                    scene,
+                    str(reference.get("scene_resource_id", "")),
+                )
+            elif source == "target_frame":
+                _error(
+                    "draft_pose_reference_unavailable",
+                    "target-frame orientation is not present in the immutable Draft; "
+                    "use an absolute orientation or a scene-resource reference",
+                )
+            else:
+                _error(
+                    "draft_pose_reference_invalid",
+                    "orientation_from source is unsupported",
+                )
+    except GeometryError as error:
+        _error("draft_pose_intent_invalid", f"relative orientation is invalid: {error}")
+    next_pose = deepcopy(pose)
+    for intent in intent_fields:
+        next_pose.pop(intent, None)
+    next_pose["orientation"] = {"xyzw": resolved}
+    candidate["pose"] = next_pose
+    return candidate
+
+
+def _pose_authoring_parameter_ids(
+    catalog: NodeCatalog,
+    node_id: str,
+) -> frozenset[str]:
+    authoring = catalog.schema_registry.types.get("pose_authoring_input")
+    if authoring is None or authoring.resolves_to is None:
+        _error(
+            "composer_draft_catalog_invalid",
+            "active catalog has no pose-authoring resolution contract",
+            status_code=503,
+        )
+    try:
+        entry = catalog.get(node_id)
+    except KeyError:
+        _error(
+            "draft_node_kind_unknown",
+            f"node_id is absent from the active catalog: {node_id}",
+            status_code=404,
+        )
+    return frozenset(
+        parameter.id
+        for parameter in entry.parameters
+        if parameter.schema.ref == authoring.resolves_to
+    )
+
+
+def _merge_pose_authoring_patch(
+    existing: Any,
+    incoming: dict[str, Any],
+    *,
+    merge: bool,
+    scene: list[dict[str, Any]],
+) -> dict[str, Any]:
+    old_pose = deepcopy(existing) if type(existing) is dict else {}
+    candidate = (
+        merge_param_patch(old_pose, incoming)
+        if merge
+        else deepcopy(incoming)
+    )
+    intent_fields = (
+        "rotate_local_rpy_deg",
+        "rotate_world_rpy_deg",
+        "rpy_delta_deg",
+        "orientation_from",
+    )
+    if any(field in incoming for field in intent_fields):
+        # The old absolute orientation is the reference, not a second intent.
+        # Preserve a caller-supplied absolute orientation so the shared
+        # resolver rejects an ambiguous absolute+relative update.
+        if "orientation" not in incoming:
+            candidate.pop("orientation", None)
+        resolved = _resolve_relative_orientation(
+            {"pose": candidate},
+            scene=scene,
+            current={"pose": old_pose} if old_pose else None,
+        )
+        return resolved["pose"]
+    if "orientation" in incoming:
+        # A nested mapping merge would otherwise retain the old `xyzw` beside
+        # a replacement `rpy_deg` (or vice versa), violating the one-form Pose
+        # contract.
+        candidate["orientation"] = deepcopy(incoming["orientation"])
+    return candidate
+
+
+class ComposerDraftSession:
+    """Own exactly one validated in-memory Program Draft."""
+
+    def __init__(self, program: Program | None = None) -> None:
+        self._lock = threading.RLock()
+        self._draft_id = f"draft-{uuid.uuid4().hex}"
+        self._program = program
+        self._revision = 1 if program is not None else 0
+
+    @property
+    def draft_id(self) -> str:
+        return self._draft_id
+
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    @property
+    def program_loaded(self) -> bool:
+        with self._lock:
+            return self._program is not None
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def validate(self, catalog: NodeCatalog) -> dict[str, Any]:
+        """Revalidate the complete Draft against one exact active catalog."""
+
+        with self._lock:
+            if self._program is None:
+                _error(
+                    "composer_draft_unavailable",
+                    "Composer has no loaded Program Draft",
+                    status_code=404,
+                )
+            document = self._program.to_dict()
+            try:
+                Program.from_dict(document, catalog, path="<composer-draft>")
+            except ProgramValidationError as error:
+                _error(
+                    "composer_draft_validation_failed",
+                    str(error),
+                    detail=str(error),
+                )
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict[str, Any]:
+        program = self._program
+        return {
+            "schema_version": _DRAFT_API_VERSION,
+            "draft_id": self._draft_id,
+            "draft_revision": self._revision,
+            "program_loaded": program is not None,
+            "program_revision": (
+                program.program_revision if program is not None else None
+            ),
+            "program": program.to_dict() if program is not None else None,
+            "saved": False,
+            "applied": False,
+        }
+
+    def mutate(
+        self,
+        *,
+        tool_id: str,
+        arguments: dict[str, Any],
+        expected_revision: int,
+        catalog: NodeCatalog,
+    ) -> DraftMutationResult:
+        if type(arguments) is not dict:
+            _error("draft_arguments_invalid", "callback arguments must be an object")
+        if type(expected_revision) is not int or expected_revision < 0:
+            _error(
+                "composer_draft_revision_invalid",
+                "expected Draft revision must be a non-negative integer",
+            )
+        with self._lock:
+            if self._program is None:
+                _error(
+                    "composer_draft_unavailable",
+                    "Composer has no loaded Program Draft",
+                    status_code=404,
+                )
+            if expected_revision != self._revision:
+                _error(
+                    "composer_draft_revision_stale",
+                    "callback Draft revision is stale",
+                    status_code=409,
+                    detail={
+                        "message": "callback Draft revision is stale",
+                        "expectedDraftRevision": self._revision,
+                        "receivedDraftRevision": expected_revision,
+                    },
+                )
+            document = self._program.to_dict()
+            mutation, details = self._edit(
+                document,
+                tool_id=tool_id,
+                arguments=deepcopy(arguments),
+                catalog=catalog,
+            )
+            identified = _identified(document)
+            try:
+                candidate = Program.from_dict(
+                    identified,
+                    catalog,
+                    path="<composer-draft>",
+                )
+            except ProgramValidationError as error:
+                _error(
+                    "composer_draft_validation_failed",
+                    str(error),
+                    detail=str(error),
+                )
+            if self._revision >= _MAXIMUM_DRAFT_REVISION:
+                _error(
+                    "composer_draft_revision_exhausted",
+                    "Composer Draft revision is exhausted",
+                    status_code=503,
+                )
+            self._program = candidate
+            self._revision += 1
+            return DraftMutationResult(
+                mutation=mutation,
+                details=details,
+                snapshot=self._snapshot_locked(),
+            )
+
+    def _edit(
+        self,
+        document: dict[str, Any],
+        *,
+        tool_id: str,
+        arguments: dict[str, Any],
+        catalog: NodeCatalog,
+    ) -> tuple[str, dict[str, Any]]:
+        handlers: dict[
+            str,
+            Callable[[dict[str, Any], dict[str, Any], NodeCatalog], dict[str, Any]],
+        ] = {
+            "scene_draft_add_object": self._scene_add,
+            "scene_draft_update_object": self._scene_update,
+            "scene_draft_upsert_objects": self._scene_upsert,
+            "scene_draft_remove_objects": self._scene_remove,
+            "tree_draft_insert_node": self._tree_insert,
+            "tree_draft_update_node_params": self._tree_update,
+            "tree_draft_delete_node": self._tree_delete,
+            "tree_draft_move_node": self._tree_move,
+            "tree_draft_replace_subtree": self._tree_replace,
+            "tree_draft_change_node_kind": self._tree_change_kind,
+            "tree_draft_wrap_node": self._tree_wrap,
+            "program_draft_upsert_parameters": self._parameters_upsert,
+            "program_draft_remove_parameters": self._parameters_remove,
+            "blackboard_draft_upsert_namespaces": self._namespaces_upsert,
+            "blackboard_draft_remove_namespaces": self._namespaces_remove,
+            "blackboard_draft_upsert_keys": self._keys_upsert,
+            "blackboard_draft_remove_keys": self._keys_remove,
+        }
+        handler = handlers.get(tool_id)
+        if handler is None:
+            _error(
+                "composer_draft_tool_unsupported",
+                f"Composer Draft tool is unsupported: {tool_id}",
+                status_code=404,
+            )
+        details = handler(document, arguments, catalog)
+        return tool_id, details
+
+    @staticmethod
+    def _scene(document: dict[str, Any]) -> list[dict[str, Any]]:
+        scene = document.get("scene")
+        if type(scene) is not list:
+            _error("composer_draft_invalid", "Program Draft scene is not an array")
+        return scene
+
+    def _scene_add(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        scene = self._scene(document)
+        resource = deepcopy(arguments["scene_resource"])
+        identity = resource["scene_resource_id"]
+        if any(item.get("scene_resource_id") == identity for item in scene):
+            _error(
+                "draft_scene_resource_exists",
+                f"Draft scene resource already exists: {identity}",
+                status_code=409,
+            )
+        scene.append(resource)
+        scene.sort(key=lambda item: item["scene_resource_id"])
+        return {"inserted": [identity], "updated": [], "unchanged": []}
+
+    def _scene_update(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        scene = self._scene(document)
+        resource = deepcopy(arguments["scene_resource"])
+        identity = resource["scene_resource_id"]
+        index = next(
+            (
+                position
+                for position, item in enumerate(scene)
+                if item.get("scene_resource_id") == identity
+            ),
+            None,
+        )
+        if index is None:
+            _error(
+                "draft_scene_resource_not_found",
+                f"Draft scene resource does not exist: {identity}",
+                status_code=404,
+            )
+        existing = scene[index]
+        resource = _resolve_relative_orientation(
+            resource,
+            scene=scene,
+            current=existing,
+        )
+        if "metadata" in existing:
+            resource["metadata"] = deepcopy(existing["metadata"])
+        scene[index] = resource
+        return {"inserted": [], "updated": [identity], "unchanged": []}
+
+    def _scene_upsert(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        scene = self._scene(document)
+        by_id = {item["scene_resource_id"]: item for item in scene}
+        inserted: list[str] = []
+        updated: list[str] = []
+        unchanged: list[str] = []
+        seen: set[str] = set()
+        for raw in arguments["scene_resources"]:
+            identity = raw["scene_resource_id"]
+            if identity in seen:
+                _error(
+                    "draft_scene_resource_duplicate",
+                    f"scene_resources contains duplicate identity: {identity}",
+                )
+            seen.add(identity)
+            existing = by_id.get(identity)
+            resource = _resolve_relative_orientation(
+                raw,
+                scene=scene,
+                current=existing,
+            )
+            if existing is not None and "metadata" in existing:
+                resource["metadata"] = deepcopy(existing["metadata"])
+            if existing is None:
+                inserted.append(identity)
+            elif resource == existing:
+                unchanged.append(identity)
+            else:
+                updated.append(identity)
+            by_id[identity] = resource
+        document["scene"] = [by_id[key] for key in sorted(by_id)]
+        return {"inserted": inserted, "updated": updated, "unchanged": unchanged}
+
+    def _scene_remove(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        scene = self._scene(document)
+        identities = arguments["scene_resource_ids"]
+        existing = {item["scene_resource_id"] for item in scene}
+        missing = sorted(set(identities) - existing)
+        if missing:
+            _error(
+                "draft_scene_resource_not_found",
+                f"Draft scene resources do not exist: {missing}",
+                status_code=404,
+            )
+        removed = set(identities)
+        document["scene"] = [
+            item for item in scene if item["scene_resource_id"] not in removed
+        ]
+        return {"removed": list(identities)}
+
+    @staticmethod
+    def _tree(document: dict[str, Any]) -> dict[str, Any]:
+        tree = document.get("tree")
+        if type(tree) is not dict:
+            _error("composer_draft_invalid", "Program Draft tree is not an object")
+        return tree
+
+    def _tree_insert(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        tree = self._tree(document)
+        node = deepcopy(arguments["node"])
+        if _tree_ref(tree, node["instance_id"]) is not None:
+            _error(
+                "draft_node_exists",
+                f"Draft node already exists: {node['instance_id']}",
+                status_code=409,
+            )
+        parent_id = arguments.get("parent_instance_id")
+        index: int
+        if parent_id is not None:
+            parent = _lookup(tree, parent_id, label="parent_instance_id")[0]
+            children = parent["children"]
+            index = _insert_index(arguments, len(children))
+        else:
+            before = arguments.get("before_instance_id")
+            after = arguments.get("after_instance_id")
+            sibling_id = before if before is not None else after
+            _sibling, parent, sibling_index = _lookup(
+                tree, sibling_id, label="sibling instance"
+            )
+            if parent is None or sibling_index is None:
+                _error(
+                    "draft_insert_position_invalid",
+                    "cannot insert before or after the Draft root",
+                )
+            children = parent["children"]
+            index = sibling_index if before is not None else sibling_index + 1
+        children.insert(index, node)
+        return {
+            "inserted_instance_id": node["instance_id"],
+            "index": index,
+            "parent_instance_id": parent["instance_id"],
+        }
+
+    def _tree_update(
+        self, document: dict[str, Any], arguments: dict[str, Any], catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        tree = self._tree(document)
+        node = _lookup(tree, arguments["instance_id"], label="instance_id")[0]
+        if node["node_id"] != arguments["expected_node_id"]:
+            _error(
+                "draft_node_kind_stale",
+                "expected_node_id does not match the current Draft node",
+                status_code=409,
+            )
+        merge = arguments.get("merge", True)
+        incoming_parameters = deepcopy(arguments.get("parameters", {}))
+        incoming_sources = deepcopy(arguments.get("value_sources", {}))
+        if merge:
+            parameters = merge_param_patch(node.get("parameters", {}), incoming_parameters)
+            value_sources = {
+                **deepcopy(node.get("value_sources", {})),
+                **incoming_sources,
+            }
+        else:
+            parameters = incoming_parameters
+            value_sources = incoming_sources
+        pose_parameter_ids = _pose_authoring_parameter_ids(catalog, node["node_id"])
+        for name in pose_parameter_ids & incoming_parameters.keys():
+            incoming_pose = incoming_parameters[name]
+            if type(incoming_pose) is dict:
+                parameters[name] = _merge_pose_authoring_patch(
+                    node.get("parameters", {}).get(name),
+                    incoming_pose,
+                    merge=merge,
+                    scene=self._scene(document),
+                )
+        for name in incoming_parameters:
+            value_sources.pop(name, None)
+        for name in incoming_sources:
+            parameters.pop(name, None)
+        node["parameters"] = parameters
+        if value_sources:
+            node["value_sources"] = value_sources
+        else:
+            node.pop("value_sources", None)
+        return {"updated_instance_id": node["instance_id"]}
+
+    def _tree_delete(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        tree = self._tree(document)
+        node, parent, index = _lookup(
+            tree, arguments["instance_id"], label="instance_id"
+        )
+        if parent is None or index is None:
+            _error("draft_root_edit_invalid", "the Draft root cannot be deleted")
+        parent["children"].pop(index)
+        return {"deleted_instance_id": node["instance_id"]}
+
+    def _tree_move(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        tree = self._tree(document)
+        node, old_parent, old_index = _lookup(
+            tree, arguments["instance_id"], label="instance_id"
+        )
+        if old_parent is None or old_index is None:
+            _error("draft_root_edit_invalid", "the Draft root cannot be moved")
+        new_parent = _lookup(
+            tree,
+            arguments["new_parent_instance_id"],
+            label="new_parent_instance_id",
+        )[0]
+        if _contains_instance(node, new_parent["instance_id"]):
+            _error(
+                "draft_tree_cycle_invalid",
+                "a Draft node cannot move under itself or a descendant",
+            )
+        old_parent["children"].pop(old_index)
+        children = new_parent["children"]
+        index = _insert_index(arguments, len(children))
+        children.insert(index, node)
+        return {
+            "moved_instance_id": node["instance_id"],
+            "new_parent_instance_id": new_parent["instance_id"],
+            "index": index,
+        }
+
+    def _tree_replace(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        tree = self._tree(document)
+        _node, parent, index = _lookup(
+            tree, arguments["instance_id"], label="instance_id"
+        )
+        subtree = deepcopy(arguments["subtree"])
+        if parent is None:
+            document["tree"] = subtree
+        else:
+            assert index is not None
+            parent["children"][index] = subtree
+        return {"replacement_instance_id": subtree["instance_id"]}
+
+    def _tree_change_kind(
+        self, document: dict[str, Any], arguments: dict[str, Any], catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        tree = self._tree(document)
+        node = _lookup(tree, arguments["instance_id"], label="instance_id")[0]
+        replacement = deepcopy(arguments["replacement"])
+        new_id = replacement["node_id"]
+        try:
+            entry = catalog.get(new_id)
+        except KeyError:
+            _error(
+                "draft_node_kind_unknown",
+                f"replacement node_id is absent from the active catalog: {new_id}",
+                status_code=404,
+            )
+        accepted = {parameter.id for parameter in entry.parameters}
+        old_parameters = deepcopy(node.get("parameters", {}))
+        old_sources = deepcopy(node.get("value_sources", {}))
+        mode = arguments["parameters_mode"]
+        replacement_parameters = deepcopy(replacement.get("parameters", {}))
+        replacement_sources = deepcopy(replacement.get("value_sources", {}))
+        if mode == "replace":
+            parameters = replacement_parameters
+            sources = replacement_sources
+            dropped: list[str] = []
+        else:
+            combined_parameters = {**old_parameters, **replacement_parameters}
+            combined_sources = {**old_sources, **replacement_sources}
+            dropped = sorted(
+                (set(combined_parameters) | set(combined_sources)) - accepted
+            )
+            if mode == "strict" and dropped:
+                _error(
+                    "draft_node_parameters_incompatible",
+                    "existing parameters are incompatible with the replacement kind",
+                    detail={
+                        "message": "existing parameters are incompatible with the replacement kind",
+                        "droppedParams": dropped,
+                        "acceptedParamNames": sorted(accepted),
+                    },
+                )
+            parameters = {
+                key: value
+                for key, value in combined_parameters.items()
+                if key in accepted
+            }
+            sources = {
+                key: value for key, value in combined_sources.items() if key in accepted
+            }
+        for name in replacement_parameters:
+            sources.pop(name, None)
+        for name in replacement_sources:
+            parameters.pop(name, None)
+        previous = node["node_id"]
+        node["node_id"] = new_id
+        node["parameters"] = parameters
+        if sources:
+            node["value_sources"] = sources
+        else:
+            node.pop("value_sources", None)
+        return {
+            "instance_id": node["instance_id"],
+            "old_node_id": previous,
+            "new_node_id": new_id,
+            "dropped_parameters": dropped,
+        }
+
+    def _tree_wrap(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        tree = self._tree(document)
+        target, parent, index = _lookup(
+            tree,
+            arguments["target_instance_id"],
+            label="target_instance_id",
+        )
+        wrapper = deepcopy(arguments["wrapper"])
+        if "children" in wrapper:
+            _error(
+                "draft_wrap_intent_invalid",
+                "wrapper.children is forbidden; the target becomes its only child",
+            )
+        if _tree_ref(tree, wrapper["instance_id"]) is not None:
+            _error(
+                "draft_node_exists",
+                f"Draft node already exists: {wrapper['instance_id']}",
+                status_code=409,
+            )
+        wrapper["children"] = [target]
+        if parent is None:
+            document["tree"] = wrapper
+        else:
+            assert index is not None
+            parent["children"][index] = wrapper
+        return {
+            "target_instance_id": target["instance_id"],
+            "wrapper_instance_id": wrapper["instance_id"],
+        }
+
+    @staticmethod
+    def _upsert_rows(
+        existing: list[dict[str, Any]],
+        incoming: list[dict[str, Any]],
+        identity_field: str,
+    ) -> tuple[list[str], list[str]]:
+        by_id = {row[identity_field]: row for row in existing}
+        inserted: list[str] = []
+        updated: list[str] = []
+        seen: set[str] = set()
+        for row in incoming:
+            identity = row[identity_field]
+            if identity in seen:
+                _error(
+                    "draft_declaration_duplicate",
+                    f"incoming declarations contain duplicate identity: {identity}",
+                )
+            seen.add(identity)
+            (updated if identity in by_id else inserted).append(identity)
+            by_id[identity] = deepcopy(row)
+        existing[:] = [by_id[key] for key in sorted(by_id)]
+        return inserted, updated
+
+    def _parameters_upsert(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        inserted, updated = self._upsert_rows(
+            document["parameters"], arguments["parameters"], "parameter_id"
+        )
+        return {"inserted": inserted, "updated": updated}
+
+    def _parameters_remove(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        return self._remove_rows(
+            document["parameters"],
+            arguments["parameter_ids"],
+            "parameter_id",
+            "Program parameters",
+        )
+
+    @staticmethod
+    def _blackboard(document: dict[str, Any]) -> dict[str, Any]:
+        blackboard = document.get("blackboard")
+        if type(blackboard) is not dict:
+            document["blackboard"] = {"namespaces": [], "keys": []}
+        return document["blackboard"]
+
+    def _namespaces_upsert(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        inserted, updated = self._upsert_rows(
+            self._blackboard(document)["namespaces"],
+            arguments["namespaces"],
+            "namespace_id",
+        )
+        return {"inserted": inserted, "updated": updated}
+
+    def _namespaces_remove(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        return self._remove_rows(
+            self._blackboard(document)["namespaces"],
+            arguments["namespace_ids"],
+            "namespace_id",
+            "blackboard namespaces",
+        )
+
+    def _keys_upsert(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        inserted, updated = self._upsert_rows(
+            self._blackboard(document)["keys"], arguments["keys"], "key"
+        )
+        return {"inserted": inserted, "updated": updated}
+
+    def _keys_remove(
+        self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        return self._remove_rows(
+            self._blackboard(document)["keys"],
+            arguments["keys"],
+            "key",
+            "blackboard keys",
+        )
+
+    @staticmethod
+    def _remove_rows(
+        rows: list[dict[str, Any]],
+        identities: list[str],
+        identity_field: str,
+        label: str,
+    ) -> dict[str, Any]:
+        existing = {row[identity_field] for row in rows}
+        missing = sorted(set(identities) - existing)
+        if missing:
+            _error(
+                "draft_declaration_not_found",
+                f"{label} do not exist: {missing}",
+                status_code=404,
+            )
+        removed = set(identities)
+        rows[:] = [row for row in rows if row[identity_field] not in removed]
+        return {"removed": list(identities)}
+
+
+__all__ = [
+    "ComposerDraftSession",
+    "DraftMutationResult",
+    "DraftSessionError",
+    "SUPPORTED_DRAFT_MUTATIONS",
+]

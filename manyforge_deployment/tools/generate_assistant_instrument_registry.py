@@ -32,7 +32,6 @@ INSTANCE_OR_ROOT: dict[str, Any] = {
     "oneOf": [copy.deepcopy(IDENTIFIER), {"const": "@root"}]
 }
 BOUNDED_TEXT: dict[str, Any] = {"type": "string", "maxLength": 4096}
-FORCE_DISCARD: dict[str, Any] = {"type": "boolean"}
 
 # Exact translation of the maintained pre-cutover scene-authoring allowlist.
 # The old aggregate motion node becomes the three explicit v2 motion forms.
@@ -294,6 +293,65 @@ def _catalog_schema(catalog: NodeCatalog, schema: CatalogSchema) -> dict[str, An
     return _strip_descriptions(catalog.schema_registry.to_json_schema(schema))
 
 
+def _authoring_patch_schema(
+    catalog: NodeCatalog,
+    persisted_schema: CatalogSchema,
+) -> dict[str, Any] | None:
+    """Project a catalog-declared authoring input as a partial Draft patch."""
+
+    if persisted_schema.ref is None:
+        return None
+    matches = [
+        schema
+        for schema in catalog.schema_registry.types.values()
+        if schema.resolves_to == persisted_schema.ref
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise GenerationError(
+            f"multiple authoring schemas resolve to {persisted_schema.ref}"
+        )
+    authoring = matches[0]
+    if authoring.schema_type != "object" or len(authoring.exactly_one) != 1:
+        raise GenerationError(
+            f"authoring schema for {persisted_schema.ref} is not one closed "
+            "single-intent object"
+        )
+    rendered = _catalog_schema(catalog, authoring)
+    properties = rendered.get("properties")
+    if type(properties) is not dict:
+        raise GenerationError(
+            f"authoring schema for {persisted_schema.ref} has no properties"
+        )
+    intent_fields = authoring.exactly_one[0]
+    retained_fields = tuple(sorted(set(properties) - set(intent_fields)))
+    if not retained_fields:
+        raise GenerationError(
+            f"authoring schema for {persisted_schema.ref} has no patchable "
+            "non-intent field"
+        )
+    no_intent_branch = {
+        "not": {
+            "anyOf": [
+                {"required": [field_name]} for field_name in intent_fields
+            ]
+        },
+        "anyOf": [
+            {"required": [field_name]} for field_name in retained_fields
+        ],
+    }
+    result = _object(
+        copy.deepcopy(properties),
+        one_of=[
+            *({"required": [field_name]} for field_name in intent_fields),
+            no_intent_branch,
+        ],
+    )
+    result["minProperties"] = 1
+    return result
+
+
 def _semantic_types(
     catalog: NodeCatalog,
     schema: CatalogSchema,
@@ -471,7 +529,6 @@ def _node_tool_schema(catalog: NodeCatalog, *, replace: bool) -> dict[str, Any]:
     )
     properties: dict[str, Any] = {
         payload_field: {"$ref": "#/$defs/node"},
-        "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
         **location,
     }
     required: tuple[str, ...]
@@ -510,12 +567,16 @@ def _update_node_schema(catalog: NodeCatalog) -> dict[str, Any]:
             include_children=False,
         )
         config_properties = config["properties"]
+        parameters = copy.deepcopy(config_properties["parameters"])
+        for parameter in entry.parameters:
+            authoring_patch = _authoring_patch_schema(catalog, parameter.schema)
+            if authoring_patch is not None:
+                parameters["properties"][parameter.id] = authoring_patch
         properties: dict[str, Any] = {
             "instance_id": copy.deepcopy(INSTANCE_OR_ROOT),
             "expected_node_id": {"const": node_id},
-            "parameters": config_properties["parameters"],
+            "parameters": parameters,
             "merge": {"type": "boolean"},
-            "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
         }
         if "value_sources" in config_properties:
             properties["value_sources"] = config_properties["value_sources"]
@@ -557,7 +618,6 @@ def _change_kind_schema(catalog: NodeCatalog) -> dict[str, Any]:
                 "type": "string",
                 "enum": ["replace", "merge", "strict"],
             },
-            "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
         },
         required=("instance_id", "replacement", "parameters_mode"),
     )
@@ -579,7 +639,6 @@ def _wrap_node_schema(catalog: NodeCatalog) -> dict[str, Any]:
         {
             "target_instance_id": copy.deepcopy(INSTANCE_OR_ROOT),
             "wrapper": {"oneOf": variants},
-            "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
         },
         required=("target_instance_id", "wrapper"),
     )
@@ -819,17 +878,11 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
     scene_resource = _scene_resource_schema(catalog)
     authored_scene_resource = _scene_resource_schema(catalog, authoring_pose=True)
     add_scene = _object(
-        {
-            "scene_resource": scene_resource,
-            "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-        },
+        {"scene_resource": scene_resource},
         required=("scene_resource",),
     )
     update_scene = _object(
-        {
-            "scene_resource": authored_scene_resource,
-            "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-        },
+        {"scene_resource": authored_scene_resource},
         required=("scene_resource",),
     )
     tools = [
@@ -1033,10 +1086,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "composer_draft_mutating",
             "Remove declared logical scene resources from the in-memory Composer Draft.",
             _object(
-                {
-                    "scene_resource_ids": _string_array(minimum=1),
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-                },
+                {"scene_resource_ids": _string_array(minimum=1)},
                 required=("scene_resource_ids",),
             ),
         ),
@@ -1051,10 +1101,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "composer_draft_mutating",
             "Insert or replace logical scene resources in the in-memory Composer Draft.",
             _object(
-                {
-                    "scene_resources": _array(authored_scene_resource, minimum=1),
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-                },
+                {"scene_resources": _array(authored_scene_resource, minimum=1)},
                 required=("scene_resources",),
             ),
         ),
@@ -1069,10 +1116,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "composer_draft_mutating",
             "Delete one non-root Draft subtree.",
             _object(
-                {
-                    "instance_id": copy.deepcopy(IDENTIFIER),
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-                },
+                {"instance_id": copy.deepcopy(IDENTIFIER)},
                 required=("instance_id",),
             ),
         ),
@@ -1091,7 +1135,6 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
                     "instance_id": copy.deepcopy(IDENTIFIER),
                     "new_parent_instance_id": copy.deepcopy(INSTANCE_OR_ROOT),
                     "index": {"type": "integer", "minimum": 0, "maximum": MAX_ITEMS},
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
                 },
                 required=("instance_id", "new_parent_instance_id"),
             ),
@@ -1119,10 +1162,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "composer_draft_mutating",
             "Remove Program parameter declarations from the in-memory Composer Draft.",
             _object(
-                {
-                    "parameter_ids": _string_array(minimum=1),
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-                },
+                {"parameter_ids": _string_array(minimum=1)},
                 required=("parameter_ids",),
             ),
         ),
@@ -1131,10 +1171,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "composer_draft_mutating",
             "Insert or replace strict v1 Program parameter declarations in the Draft.",
             _object(
-                {
-                    "parameters": _array(_program_parameter_schema(catalog), minimum=1),
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-                },
+                {"parameters": _array(_program_parameter_schema(catalog), minimum=1)},
                 required=("parameters",),
             ),
         ),
@@ -1143,10 +1180,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "composer_draft_mutating",
             "Remove blackboard key declarations from the in-memory Composer Draft.",
             _object(
-                {
-                    "keys": _string_array(minimum=1),
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-                },
+                {"keys": _string_array(minimum=1)},
                 required=("keys",),
             ),
         ),
@@ -1155,10 +1189,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "composer_draft_mutating",
             "Remove blackboard namespaces from the in-memory Composer Draft.",
             _object(
-                {
-                    "namespace_ids": _string_array(minimum=1),
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-                },
+                {"namespace_ids": _string_array(minimum=1)},
                 required=("namespace_ids",),
             ),
         ),
@@ -1167,10 +1198,7 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "composer_draft_mutating",
             "Insert or replace strict v1 blackboard key declarations in the Draft.",
             _object(
-                {
-                    "keys": _array(_blackboard_key_schema(), minimum=1),
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
-                },
+                {"keys": _array(_blackboard_key_schema(), minimum=1)},
                 required=("keys",),
             ),
         ),
@@ -1191,7 +1219,6 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
                         ),
                         minimum=1,
                     ),
-                    "force_discard_overrides": copy.deepcopy(FORCE_DISCARD),
                 },
                 required=("namespaces",),
             ),

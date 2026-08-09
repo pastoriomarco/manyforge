@@ -14,6 +14,7 @@ from .native import strict_json_object
 
 MAX_HTTP_RESPONSE_BYTES = 64 * 1024 * 1024
 _CONDITION_ID_PATTERN = re.compile(r"^condition-[0-9a-f]{24}$")
+_ASSISTANT_MODE_PATTERN = re.compile(r"^[a-z][a-z0-9.-]*$")
 
 
 class HeadlessClientError(RuntimeError):
@@ -164,6 +165,18 @@ class HeadlessHttpClient:
 
     def node_environment(self) -> dict[str, Any]:
         return self.request("GET", "/api/node-environment")
+
+    def source_model(self) -> dict[str, Any]:
+        return self.request("GET", "/api/source-model")
+
+    def assistant_mode(self, mode_id: str) -> dict[str, Any]:
+        if (
+            not isinstance(mode_id, str)
+            or len(mode_id.encode("utf-8")) > 256
+            or _ASSISTANT_MODE_PATTERN.fullmatch(mode_id) is None
+        ):
+            raise ValueError("assistant mode ID is invalid")
+        return self.request("GET", f"/api/assistant/modes/{mode_id}")
 
     def manager_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/manager/apply", body=body)

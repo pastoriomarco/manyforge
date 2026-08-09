@@ -333,6 +333,8 @@ run_headless_python_tests() {
     fi
     if MANYFORGE_MANAGER_DAEMON="$build/manyforge_manager_daemon" \
         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
+        MANYFORGE_ASSISTANT_AUTHORING_PACKAGE_ROOT="$build/assistant-authoring-test-fixture/retained-package" \
+        MANYFORGE_ASSISTANT_SOURCE_PUBLISHER="$build/manyforge_publish_headless_assistant_test_source" \
         pytest \
             manyforge_headless_api/tests/ \
             manyforge_headless_api/process_tests/ \

@@ -20,6 +20,7 @@
 #include "manyforge_headless/node_environment_projection.hpp"
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
 #include "manyforge_headless/source_contract.hpp"
+#include "manyforge_headless/source_model_projection.hpp"
 #include "manyforge_headless/source_snapshot.hpp"
 
 namespace manyforge::headless {
@@ -278,6 +279,18 @@ TEST(HeadlessApiCore,
   } catch (const OperatorAlarmError &error) {
     EXPECT_EQ(error.code(), "node_environment_projection_unavailable");
   }
+  try {
+    static_cast<void>(core.SourceModelProjection());
+    FAIL() << "missing Manager selection produced a source model";
+  } catch (const OperatorAlarmError& error) {
+    EXPECT_EQ(error.code(), "source_model_projection_unavailable");
+  }
+  try {
+    static_cast<void>(core.AssistantModeProjection("composer-assistant"));
+    FAIL() << "missing Manager selection produced an assistant mode";
+  } catch (const OperatorAlarmError& error) {
+    EXPECT_EQ(error.code(), "assistant_mode_projection_unavailable");
+  }
 
   const auto alarms = core.AlarmSnapshot();
   EXPECT_TRUE(Array(alarms, "alarms").empty());
@@ -397,6 +410,42 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Unsigned(Member(second, "source"), "projection_generation"), 1U);
   EXPECT_EQ(Text(Member(second, "source"), "source_content_digest"),
             Text(source, "source_content_digest"));
+}
+
+TEST(HeadlessApiCore, IndependentlyProjectsTheManagerSelectedSourceModelWithStableIdentity) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+
+  const auto first = core.SourceModelProjection();
+  const auto second = core.SourceModelProjection();
+  const deployment::FilesystemCanonicalEmptyRetainedBundleSource bundle_source(
+      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  const auto admission = bundle_source.load_verified();
+  EXPECT_EQ(Text(first, "schema_version"), kSourceModelProjectionApiVersion);
+  EXPECT_EQ(Text(first, "retained_bundle_id"), admission.retained_bundle_id().value());
+  EXPECT_TRUE(Array(first, "occurrences").empty());
+  EXPECT_TRUE(Array(first, "targets").empty());
+  const auto& source = Member(first, "source");
+  EXPECT_EQ(Text(source, "source_owner_id"), "headless-api.cell.i5.source-model");
+  EXPECT_EQ(Text(source, "selection_source_owner_id"), "component-manager.c1_build_authority_cell");
+  EXPECT_EQ(Unsigned(source, "projection_generation"), 1U);
+  EXPECT_EQ(Unsigned(Member(second, "source"), "projection_generation"), 1U);
+  EXPECT_EQ(Text(Member(second, "source"), "source_content_digest"),
+            Text(source, "source_content_digest"));
+}
+
+TEST(HeadlessApiCore, CanonicalEmptySelectionDoesNotFabricateAssistantModeAvailability) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+
+  try {
+    static_cast<void>(core.AssistantModeProjection("composer-assistant"));
+    FAIL() << "canonical-empty selection produced an assistant mode";
+  } catch (const OperatorAlarmError& error) {
+    EXPECT_EQ(error.code(), "assistant_mode_projection_unavailable");
+  }
 }
 
 TEST(HeadlessApiCore,

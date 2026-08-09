@@ -61,11 +61,16 @@ def _parser() -> argparse.ArgumentParser:
         "manager-graph",
         "manager-diff",
         "node-environment",
+        "source-model",
         "alarm-metrics",
         "historian-health",
     ):
         command = subcommands.add_parser(name)
         command.add_argument("--url", default="http://127.0.0.1:9010")
+
+    assistant_mode = subcommands.add_parser("assistant-mode")
+    assistant_mode.add_argument("--url", default="http://127.0.0.1:9010")
+    assistant_mode.add_argument("mode_id")
 
     alarms = subcommands.add_parser("alarms")
     alarms.add_argument("--url", default="http://127.0.0.1:9010")
@@ -156,6 +161,10 @@ def _request(args: argparse.Namespace) -> int:
             value = client.manager_diff()
         elif args.command == "node-environment":
             value = client.node_environment()
+        elif args.command == "source-model":
+            value = client.source_model()
+        elif args.command == "assistant-mode":
+            value = client.assistant_mode(args.mode_id)
         elif args.command == "alarm-metrics":
             value = client.alarm_metrics()
         elif args.command == "historian-health":

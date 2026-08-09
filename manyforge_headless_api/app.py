@@ -128,6 +128,8 @@ def _error_status(code: str) -> int:
         "execution_command_response_invalid",
         "execution_command_response_identity_mismatch",
         "node_environment_projection_invalid",
+        "source_model_projection_invalid",
+        "assistant_mode_projection_invalid",
     }:
         return 502
     if code == "headless_api_internal_failure":
@@ -298,6 +300,19 @@ def create_app(
     @app.get("/api/node-environment")
     def node_environment() -> dict[str, Any]:
         return service.node_environment()
+
+    @app.get("/api/source-model")
+    def source_model() -> dict[str, Any]:
+        return service.source_model()
+
+    @app.get("/api/assistant/modes/{mode_id}")
+    def assistant_mode(
+        mode_id: Annotated[
+            str,
+            Path(min_length=1, max_length=256, pattern=r"^[a-z][a-z0-9.-]*$"),
+        ],
+    ) -> dict[str, Any]:
+        return service.assistant_mode(mode_id)
 
     @app.post("/api/manager/apply")
     def manager_apply(request: ManagerApplyRequest) -> JSONResponse:

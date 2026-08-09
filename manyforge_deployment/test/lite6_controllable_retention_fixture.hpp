@@ -245,7 +245,45 @@ struct AssistantOverlayFixture final {
   };
 }
 
-[[nodiscard]] inline CanonicalValue assistant_source() {
+[[nodiscard]] inline CanonicalValue assistant_source(const bool composer_draft_enabled = false) {
+  CanonicalValue::Object modes{
+      {"query", CanonicalValue(CanonicalValue::Object{
+                    {"catalog", CanonicalValue(CanonicalValue::Object{
+                                    {"nodes", CanonicalValue(CanonicalValue::Array{})},
+                                    {"skills", CanonicalValue(CanonicalValue::Array{})},
+                                    {"tools", text_array({"scene_inspect", "status_read"})},
+                                })},
+                    {"description", CanonicalValue("Read-only H0 query")},
+                    {"enabled", CanonicalValue(true)},
+                    {"grant_policy", CanonicalValue(CanonicalValue::Object{
+                                         {"approval_mode", CanonicalValue(nullptr)},
+                                         {"review_policy", CanonicalValue("not_required")},
+                                         {"session_kind", CanonicalValue(nullptr)},
+                                     })},
+                    {"model_endpoint_alias", CanonicalValue("primary_model")},
+                    {"provider_alias", CanonicalValue("direct_local")},
+                })},
+  };
+  if (composer_draft_enabled) {
+    modes.emplace_back(
+        "composer-assistant",
+        CanonicalValue(CanonicalValue::Object{
+            {"catalog", CanonicalValue(CanonicalValue::Object{
+                            {"nodes", CanonicalValue(CanonicalValue::Array{})},
+                            {"skills", CanonicalValue(CanonicalValue::Array{})},
+                            {"tools", text_array({"program_read", "scene_draft_add_object"})},
+                        })},
+            {"description", CanonicalValue("Bounded Composer Draft authoring")},
+            {"enabled", CanonicalValue(true)},
+            {"grant_policy", CanonicalValue(CanonicalValue::Object{
+                                 {"approval_mode", CanonicalValue(nullptr)},
+                                 {"review_policy", CanonicalValue("required")},
+                                 {"session_kind", CanonicalValue(nullptr)},
+                             })},
+            {"model_endpoint_alias", CanonicalValue("primary_model")},
+            {"provider_alias", CanonicalValue("direct_local")},
+        }));
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"audit_policy", CanonicalValue(CanonicalValue::Object{
                            {"redact_argument_values", CanonicalValue(true)},
@@ -272,36 +310,16 @@ struct AssistantOverlayFixture final {
                  })},
             })},
        })},
-      {"modes",
-       CanonicalValue(CanonicalValue::Object{
-           {"query",
-            CanonicalValue(CanonicalValue::Object{
-                {"catalog",
-                 CanonicalValue(CanonicalValue::Object{
-                     {"nodes", CanonicalValue(CanonicalValue::Array{})},
-                     {"skills", CanonicalValue(CanonicalValue::Array{})},
-                     {"tools", text_array({"scene_inspect", "status_read"})},
-                 })},
-                {"description", CanonicalValue("Read-only H0 query")},
-                {"enabled", CanonicalValue(true)},
-                {"grant_policy",
-                 CanonicalValue(CanonicalValue::Object{
-                     {"approval_mode", CanonicalValue(nullptr)},
-                     {"review_policy", CanonicalValue("not_required")},
-                     {"session_kind", CanonicalValue(nullptr)},
-                 })},
-                {"model_endpoint_alias", CanonicalValue("primary_model")},
-                {"provider_alias", CanonicalValue("direct_local")},
-            })},
-       })},
+      {"modes", CanonicalValue(std::move(modes))},
       {"provider_aliases",
        CanonicalValue(CanonicalValue::Object{
-           {"direct_local", CanonicalValue(CanonicalValue::Object{
-                                {"bridge_external_resource_alias",
-                                 CanonicalValue("assistant_bridge")},
-                                {"provider_kind", CanonicalValue("direct")},
-                            })},
-      })},
+           {"direct_local",
+            CanonicalValue(CanonicalValue::Object{
+                {"bridge_external_resource_alias",
+                 CanonicalValue("assistant_bridge")},
+                {"provider_kind", CanonicalValue("direct")},
+            })},
+       })},
       {"prompt_templates", CanonicalValue(CanonicalValue::Object{})},
   });
 }
@@ -1554,7 +1572,7 @@ make_applicability_inputs(
     const QualifiedProviderManifest& provider,
     const QualifiedCapabilityDefinition* planner_capability,
     const QualifiedProviderManifest* planner_provider,
-    const AssistantOverlayFixture* assistant_overlay) {
+    const AssistantOverlayFixture* assistant_overlay, const bool composer_draft_enabled = false) {
   CanonicalValue::Array desired_configurations;
   desired_configurations.reserve(graph.graph().control_domains.size());
   for (const auto& domain : graph.graph().control_domains) {
@@ -1685,7 +1703,7 @@ make_applicability_inputs(
        CanonicalValue(std::move(capability_provider_bindings))},
   };
   if (assistant_overlay != nullptr) {
-    root_members.emplace_back("assistant", assistant_source());
+    root_members.emplace_back("assistant", assistant_source(composer_draft_enabled));
     root_members.emplace_back(
         "external_resources",
         CanonicalValue(CanonicalValue::Array{
@@ -1722,13 +1740,17 @@ make_lite6_controllable_retention_fixture(bool chained = false,
                                           std::size_t instance_count = 1U,
                                           bool aggregate_gripper = false,
                                           bool native_motion = false,
-                                          std::string_view cell_id = {}) {
+                                          std::string_view cell_id = {},
+                                          bool composer_draft_enabled = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (aggregate_gripper &&
       (chained || assistant_enabled || instance_count != 1U)) {
     throw std::logic_error(
         "Lite6 aggregate fixture currently selects one direct native "
         "component");
+  }
+  if (composer_draft_enabled && !assistant_enabled) {
+    throw std::logic_error("Composer Draft fixture requires assistant settings");
   }
   auto structural = make_lite6_structural_retention_fixture();
   auto catalog =
@@ -1750,7 +1772,8 @@ make_lite6_controllable_retention_fixture(bool chained = false,
                                              : nullptr,
       catalog.planner_provider.has_value() ? &*catalog.planner_provider
                                            : nullptr,
-      assistant_overlay.has_value() ? &*assistant_overlay : nullptr);
+      assistant_overlay.has_value() ? &*assistant_overlay : nullptr,
+      composer_draft_enabled);
 
   std::vector<core::CatalogRecordRefDTO> catalog_records{
       structural.catalog_reference,       catalog.capability.reference(),
@@ -1903,6 +1926,11 @@ make_two_lite6_same_type_controllable_retention_fixture() {
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_assistant_retention_fixture() {
   return make_lite6_controllable_retention_fixture(false, true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_composer_assistant_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(false, true, 2U, false, false, {}, true);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture

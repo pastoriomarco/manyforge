@@ -149,6 +149,22 @@ def headless_client() -> (
             "source_content_digest": "sha256:" + "a" * 64,
         },
     }
+    source_model = {
+        "schema_version": "manyforge.source_model_projection.v1",
+        "cell_id": "cell-a",
+        "retained_bundle_id": "bundle.1",
+        "graph_revision": "graph.1",
+        "model_map_contract": None,
+        "model_map_product_id": None,
+        "occurrences": [],
+        "targets": [],
+        "source": {
+            "available": True,
+            "freshness": "fresh",
+            "known_gaps": [],
+            "source_owner_id": "headless-api.source-model",
+        },
+    }
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
@@ -184,6 +200,13 @@ def headless_client() -> (
             payload = {"schema_version": "manyforge.manager_diff_projection.v1"}
         elif path == "/api/node-environment":
             payload = node_environment
+        elif path == "/api/source-model":
+            payload = source_model
+        elif path == "/api/assistant/modes/composer-assistant":
+            payload = {
+                "schema_version": "manyforge.assistant_mode_projection.v1",
+                "mode": "composer-assistant",
+            }
         elif path == "/api/manager/apply":
             return httpx.Response(
                 503,
@@ -310,6 +333,12 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         assert composer.get("/api/manager/graph").status_code == 200
         assert composer.get("/api/manager/diff").status_code == 200
         assert composer.get("/api/node-environment").json() == node_environment
+        assert composer.get(
+            "/api/assistant/modes/composer-assistant"
+        ).json()["mode"] == "composer-assistant"
+        assert composer.get("/api/source-model").json()["schema_version"] == (
+            "manyforge.source_model_projection.v1"
+        )
         catalog = composer.get("/api/catalog").json()
         assert catalog["environmentDigest"] == node_environment["environment_digest"]
         projected = composer.get("/api/nodes/environment").json()

@@ -77,9 +77,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "keys": {
             "items": {
               "maxLength": 256,
@@ -105,9 +102,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "namespace_ids": {
             "items": {
               "maxLength": 256,
@@ -177,9 +171,6 @@
         },
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "keys": {
             "items": {
               "oneOf": [
@@ -655,9 +646,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "namespaces": {
             "items": {
               "additionalProperties": false,
@@ -829,9 +817,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "parameter_ids": {
             "items": {
               "maxLength": 256,
@@ -875,9 +860,6 @@
         },
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -2583,9 +2565,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "scene_resource": {
             "additionalProperties": false,
             "properties": {
@@ -2985,9 +2964,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "scene_resource_ids": {
             "items": {
               "maxLength": 256,
@@ -3013,9 +2989,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "scene_resource": {
             "additionalProperties": false,
             "properties": {
@@ -3594,9 +3567,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "scene_resources": {
             "items": {
               "additionalProperties": false,
@@ -5611,9 +5581,6 @@
         },
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "instance_id": {
             "oneOf": [
               {
@@ -7655,9 +7622,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "instance_id": {
             "maxLength": 256,
             "pattern": "^[a-z][a-z0-9_.-]*$",
@@ -11821,9 +11785,6 @@
             "pattern": "^[a-z][a-z0-9_.-]*$",
             "type": "string"
           },
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "index": {
             "maximum": 4096,
             "minimum": 0,
@@ -11858,9 +11819,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "index": {
             "maximum": 4096,
             "minimum": 0,
@@ -16004,9 +15962,6 @@
         },
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "instance_id": {
             "oneOf": [
               {
@@ -16733,31 +16688,6 @@
             ],
             "type": "object"
           },
-          "s_3eb46c08a10d222d": {
-            "additionalProperties": false,
-            "properties": {
-              "frame_ref": {
-                "$ref": "#/$defs/s_784e720f1ce83ddf"
-              },
-              "orientation": {
-                "$ref": "#/$defs/s_e2cd150d27b9cb36"
-              },
-              "position_m": {
-                "items": {
-                  "type": "number"
-                },
-                "maxItems": 3,
-                "minItems": 3,
-                "type": "array"
-              }
-            },
-            "required": [
-              "frame_ref",
-              "position_m",
-              "orientation"
-            ],
-            "type": "object"
-          },
           "s_46e0d3d08937f9d8": {
             "allOf": [
               {
@@ -16785,6 +16715,135 @@
                 ]
               }
             ]
+          },
+          "s_47ee8a223154d1ec": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "source": {
+                      "const": "scene_resource"
+                    }
+                  },
+                  "required": [
+                    "source"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "scene_resource_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "source": {
+                      "const": "target_frame"
+                    }
+                  },
+                  "required": [
+                    "source"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role",
+                    "target_role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "source": {
+                        "const": "target_frame"
+                      }
+                    },
+                    "required": [
+                      "source"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "source": {
+                        "const": "scene_resource"
+                      }
+                    },
+                    "required": [
+                      "source"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "source": {
+                        "const": "target_frame"
+                      }
+                    },
+                    "required": [
+                      "source"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "frame_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "source": {
+                "enum": [
+                  "current_pose",
+                  "scene_resource",
+                  "target_frame"
+                ],
+                "type": "string"
+              },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              }
+            },
+            "required": [
+              "source"
+            ],
+            "type": "object"
           },
           "s_4c54ede36e5884d0": {
             "not": {
@@ -16823,6 +16882,22 @@
             "not": {
               "$ref": "#/$defs/s_d848331fe3f4a42e"
             }
+          },
+          "s_5bac21b8f130c257": {
+            "additionalProperties": false,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_e6548fbcf583f9d3"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "shape": {
+                "$ref": "#/$defs/s_37246640995e786a"
+              }
+            },
+            "type": "object"
           },
           "s_5c50d0aa42183ea4": {
             "additionalProperties": false,
@@ -17117,6 +17192,23 @@
             "properties": {},
             "type": "object"
           },
+          "s_a0df3d14b11acf67": {
+            "anyOf": [
+              {
+                "required": [
+                  "frame_ref"
+                ]
+              },
+              {
+                "required": [
+                  "position_m"
+                ]
+              }
+            ],
+            "not": {
+              "$ref": "#/$defs/s_e3ea5e8522473b9c"
+            }
+          },
           "s_a3f660b9cd0c3742": {
             "not": {
               "$ref": "#/$defs/s_ac1edfbbf9af4ae7"
@@ -17159,22 +17251,6 @@
                 ]
               }
             ]
-          },
-          "s_adc008148d962421": {
-            "additionalProperties": false,
-            "properties": {
-              "pose": {
-                "$ref": "#/$defs/s_3eb46c08a10d222d"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "shape": {
-                "$ref": "#/$defs/s_37246640995e786a"
-              }
-            },
-            "type": "object"
           },
           "s_b50417c15ae8053c": {
             "allOf": [
@@ -17350,6 +17426,35 @@
             },
             "type": "object"
           },
+          "s_e3ea5e8522473b9c": {
+            "anyOf": [
+              {
+                "required": [
+                  "orientation"
+                ]
+              },
+              {
+                "required": [
+                  "rotate_local_rpy_deg"
+                ]
+              },
+              {
+                "required": [
+                  "rotate_world_rpy_deg"
+                ]
+              },
+              {
+                "required": [
+                  "rpy_delta_deg"
+                ]
+              },
+              {
+                "required": [
+                  "orientation_from"
+                ]
+              }
+            ]
+          },
           "s_e4a9f43a4d165932": {
             "allOf": [
               {
@@ -17377,6 +17482,84 @@
                 ]
               }
             ]
+          },
+          "s_e6548fbcf583f9d3": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "oneOf": [
+              {
+                "required": [
+                  "orientation"
+                ]
+              },
+              {
+                "required": [
+                  "rotate_local_rpy_deg"
+                ]
+              },
+              {
+                "required": [
+                  "rotate_world_rpy_deg"
+                ]
+              },
+              {
+                "required": [
+                  "rpy_delta_deg"
+                ]
+              },
+              {
+                "required": [
+                  "orientation_from"
+                ]
+              },
+              {
+                "$ref": "#/$defs/s_a0df3d14b11acf67"
+              }
+            ],
+            "properties": {
+              "frame_ref": {
+                "$ref": "#/$defs/s_784e720f1ce83ddf"
+              },
+              "orientation": {
+                "$ref": "#/$defs/s_e2cd150d27b9cb36"
+              },
+              "orientation_from": {
+                "$ref": "#/$defs/s_47ee8a223154d1ec"
+              },
+              "position_m": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "rotate_local_rpy_deg": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "rotate_world_rpy_deg": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "rpy_delta_deg": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              }
+            },
+            "type": "object"
           },
           "s_e9b16b9864d776ea": {
             "allOf": [
@@ -17444,9 +17627,6 @@
             "properties": {
               "expected_node_id": {
                 "const": "fallback"
-              },
-              "force_discard_overrides": {
-                "type": "boolean"
               },
               "instance_id": {
                 "oneOf": [
@@ -17616,9 +17796,6 @@
             "properties": {
               "expected_node_id": {
                 "const": "gripper.command_position"
-              },
-              "force_discard_overrides": {
-                "type": "boolean"
               },
               "instance_id": {
                 "oneOf": [
@@ -17903,9 +18080,6 @@
               "expected_node_id": {
                 "const": "inverter"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -17987,9 +18161,6 @@
             "properties": {
               "expected_node_id": {
                 "const": "logic.set_bool"
-              },
-              "force_discard_overrides": {
-                "type": "boolean"
               },
               "instance_id": {
                 "oneOf": [
@@ -18093,9 +18264,6 @@
             "properties": {
               "expected_node_id": {
                 "const": "logic.wait_for_bool"
-              },
-              "force_discard_overrides": {
-                "type": "boolean"
               },
               "instance_id": {
                 "oneOf": [
@@ -18446,9 +18614,6 @@
               "expected_node_id": {
                 "const": "motion.follow_cartesian_path"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -18721,9 +18886,6 @@
               "expected_node_id": {
                 "const": "motion.move_to_joint_target"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -18976,9 +19138,6 @@
               "expected_node_id": {
                 "const": "motion.move_to_pose"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -19191,9 +19350,6 @@
               "expected_node_id": {
                 "const": "parallel"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -19291,9 +19447,6 @@
               "expected_node_id": {
                 "const": "repeat"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -19389,9 +19542,6 @@
               "expected_node_id": {
                 "const": "retry"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -19466,9 +19616,6 @@
               "expected_node_id": {
                 "const": "scene.add_object"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -19485,7 +19632,7 @@
                 "type": "boolean"
               },
               "parameters": {
-                "$ref": "#/$defs/s_adc008148d962421"
+                "$ref": "#/$defs/s_5bac21b8f130c257"
               },
               "value_sources": {
                 "$ref": "#/$defs/s_2b58c1c9466a15b4"
@@ -19551,9 +19698,6 @@
             "properties": {
               "expected_node_id": {
                 "const": "scene.attach_carried_object"
-              },
-              "force_discard_overrides": {
-                "type": "boolean"
               },
               "instance_id": {
                 "oneOf": [
@@ -19642,9 +19786,6 @@
               "expected_node_id": {
                 "const": "scene.detach_carried_object"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -19709,9 +19850,6 @@
               "expected_node_id": {
                 "const": "scene.remove_object"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -19775,9 +19913,6 @@
               "expected_node_id": {
                 "const": "scene.update_object_pose"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -19797,7 +19932,7 @@
                 "additionalProperties": false,
                 "properties": {
                   "pose": {
-                    "$ref": "#/$defs/s_3eb46c08a10d222d"
+                    "$ref": "#/$defs/s_e6548fbcf583f9d3"
                   },
                   "scene_resource_id": {
                     "type": "string",
@@ -19857,9 +19992,6 @@
               "expected_node_id": {
                 "const": "scene.upsert_object"
               },
-              "force_discard_overrides": {
-                "type": "boolean"
-              },
               "instance_id": {
                 "oneOf": [
                   {
@@ -19876,7 +20008,7 @@
                 "type": "boolean"
               },
               "parameters": {
-                "$ref": "#/$defs/s_adc008148d962421"
+                "$ref": "#/$defs/s_5bac21b8f130c257"
               },
               "value_sources": {
                 "$ref": "#/$defs/s_2b58c1c9466a15b4"
@@ -19909,9 +20041,6 @@
             "properties": {
               "expected_node_id": {
                 "const": "sequence"
-              },
-              "force_discard_overrides": {
-                "type": "boolean"
               },
               "instance_id": {
                 "oneOf": [
@@ -19991,9 +20120,6 @@
             "properties": {
               "expected_node_id": {
                 "const": "timer"
-              },
-              "force_discard_overrides": {
-                "type": "boolean"
               },
               "instance_id": {
                 "oneOf": [
@@ -20114,9 +20240,6 @@
         },
         "additionalProperties": false,
         "properties": {
-          "force_discard_overrides": {
-            "type": "boolean"
-          },
           "target_instance_id": {
             "oneOf": [
               {

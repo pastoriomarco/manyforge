@@ -145,6 +145,17 @@ public:
     return Invoke([this]() { return core_->NodeEnvironmentProjection(); });
   }
 
+  std::string SourceModelProjection() {
+    py::gil_scoped_release release;
+    return Invoke([this]() { return core_->SourceModelProjection(); });
+  }
+
+  std::string AssistantModeProjection(std::string mode_id) {
+    py::gil_scoped_release release;
+    return Invoke(
+        [this, mode_id = std::move(mode_id)]() { return core_->AssistantModeProjection(mode_id); });
+  }
+
   std::string AlarmSnapshot(const std::optional<std::size_t> limit,
                             const std::vector<std::string> &states,
                             const std::string &ordering) {
@@ -361,6 +372,9 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("runtime_snapshot", &HeadlessApiBridge::RuntimeSnapshot)
       .def("node_environment_projection",
            &HeadlessApiBridge::NodeEnvironmentProjection)
+      .def("source_model_projection", &HeadlessApiBridge::SourceModelProjection)
+      .def("assistant_mode_projection", &HeadlessApiBridge::AssistantModeProjection,
+           py::arg("mode_id"))
       .def("alarm_snapshot", &HeadlessApiBridge::AlarmSnapshot,
            py::arg("limit") = std::optional<std::size_t>(32U),
            py::arg("states") = std::vector<std::string>{},

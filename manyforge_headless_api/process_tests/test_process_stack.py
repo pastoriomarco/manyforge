@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -38,7 +39,15 @@ def _free_loopback_port() -> int:
 
 
 class ProcessStack:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        package_root: Path | None = None,
+        cell_id: str = "c1_build_authority_cell",
+        program_path: Path | None = None,
+        freshness_milliseconds: int = 200,
+    ) -> None:
         self.root = root
         self.manager_root = root / "manager"
         self.execution_root = root / "execution"
@@ -54,9 +63,14 @@ class ProcessStack:
         self.scene_database = root / "logical-scene.sqlite3"
         self.history_database = root / "history.sqlite3"
         self.manager_executable = _required_path("MANYFORGE_MANAGER_DAEMON")
-        self.package_root = _required_path(
+        self.package_root = package_root or _required_path(
             "MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"
         )
+        if not self.package_root.exists():
+            raise RuntimeError(f"retained package root does not exist: {self.package_root}")
+        self.cell_id = cell_id
+        self.program_path = program_path
+        self.freshness_milliseconds = freshness_milliseconds
         self.port = _free_loopback_port()
         self.composer_port = _free_loopback_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
@@ -115,11 +129,11 @@ class ProcessStack:
                 "--execution-state-root",
                 str(self.execution_root),
                 "--cell-id",
-                "c1_build_authority_cell",
+                self.cell_id,
                 "--owner-id",
                 "headless-api.process-test",
                 "--freshness-ms",
-                "200",
+                str(self.freshness_milliseconds),
             ],
             stdout=self.log,
             stderr=subprocess.STDOUT,
@@ -159,22 +173,55 @@ class ProcessStack:
             f"runtime did not reach complete={expected}: {last_error}"
         )
 
+    def publish_assistant_source(self) -> None:
+        publisher = _required_path("MANYFORGE_ASSISTANT_SOURCE_PUBLISHER")
+        subprocess.run(
+            [
+                str(publisher),
+                "--publication-root",
+                str(self.publication_root),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+
+    def wait_manager_source(self, timeout_seconds: float = 8.0) -> dict:
+        deadline = time.monotonic() + timeout_seconds
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            if self.api is not None and self.api.poll() is not None:
+                raise RuntimeError(f"API exited with {self.api.returncode}")
+            try:
+                with HeadlessHttpClient(
+                    self.base_url,
+                    timeout_seconds=0.25,
+                ) as client:
+                    return client.manager_status()
+            except HeadlessClientError as exc:
+                last_error = exc
+            time.sleep(0.01)
+        raise RuntimeError(f"Manager source did not become available: {last_error}")
+
     def start_composer(self) -> None:
         assert self.composer is None
+        command = [
+            sys.executable,
+            "-m",
+            "manyforge_composer",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.composer_port),
+            "--headless-api-url",
+            self.base_url,
+            "--headless-api-timeout-s",
+            "0.25",
+        ]
+        if self.program_path is not None:
+            command.extend(("--program-path", str(self.program_path)))
         self.composer = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "manyforge_composer",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.composer_port),
-                "--headless-api-url",
-                self.base_url,
-                "--headless-api-timeout-s",
-                "0.25",
-            ],
+            command,
             stdout=self.log,
             stderr=subprocess.STDOUT,
             env=os.environ.copy(),
@@ -263,6 +310,32 @@ def _stack(root: Path) -> Iterator[ProcessStack]:
         stack.close()
 
 
+@contextmanager
+def _assistant_stack(root: Path) -> Iterator[ProcessStack]:
+    stack = ProcessStack(
+        root,
+        package_root=_required_path("MANYFORGE_ASSISTANT_AUTHORING_PACKAGE_ROOT"),
+        cell_id="i6_two_lite6_controllable_cell",
+        program_path=Path(
+            "/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml"
+        ),
+        freshness_milliseconds=120000,
+    )
+    try:
+        # Operational Apply remains unavailable in N6. Publish one bounded,
+        # production-shaped Manager source from the independently verified
+        # test bundle so this test qualifies the real API/Composer authoring
+        # path without claiming a product deployment or runtime effect.
+        stack.publish_assistant_source()
+        stack.start_api()
+        stack.wait_manager_source()
+        stack.start_composer()
+        stack.wait_composer()
+        yield stack
+    finally:
+        stack.close()
+
+
 def _apply_body(owner_epoch: str, request_id: str) -> dict:
     return {
         "request_id": request_id,
@@ -279,6 +352,70 @@ def _apply_body(owner_epoch: str, request_id: str) -> dict:
     }
 
 
+def _assistant_callback_body(
+    *,
+    draft: dict,
+    node_environment: dict,
+    source_model: dict,
+    assistant_mode: dict,
+    scene_resource_id: str,
+    request_id: str,
+) -> dict:
+    tool = next(
+        row
+        for row in assistant_mode["tools"]
+        if row["tool_id"] == "scene_draft_add_object"
+    )
+    return {
+        "assistantMode": "composer-assistant",
+        "retainedBundleId": node_environment["retained_bundle_id"],
+        "graphRevision": node_environment["graph_revision"],
+        "nodeEnvironmentDigest": node_environment["environment_digest"],
+        "nodeEnvironmentProjectionDigest": node_environment["source"][
+            "source_content_digest"
+        ],
+        "sourceModelProjectionDigest": source_model["source"][
+            "source_content_digest"
+        ],
+        "assistantProjectionDigest": assistant_mode[
+            "assistant_projection_digest"
+        ],
+        "assistantModeProjectionDigest": assistant_mode["source"][
+            "source_content_digest"
+        ],
+        "catalogHash": assistant_mode["catalog_hash"],
+        "inputSchemaHash": tool["input_schema_hash"],
+        "draftId": draft["draft_id"],
+        "expectedDraftRevision": draft["draft_revision"],
+        "requestId": request_id,
+        "requestOwnerEpoch": "assistant.process.epoch.1",
+        "sourceLabel": "assistant_process_test",
+        "correlationId": "correlation.assistant.1",
+        "arguments": {
+            "scene_resource": {
+                "scene_resource_id": scene_resource_id,
+                "shape": {
+                    "type": "box",
+                    "box_dimensions_m": [0.1, 0.2, 0.3],
+                },
+                "pose": {
+                    "frame_ref": {"kind": "cell_frame"},
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+                },
+            }
+        },
+    }
+
+
+def _plain_package_files(root: Path) -> dict[str, tuple[int, int]]:
+    return {
+        str(path.relative_to(root)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
 def _owner_identity(runtime: dict, alarms: dict) -> tuple[object, ...]:
     return (
         runtime["projection_owner_epoch"],
@@ -287,6 +424,182 @@ def _owner_identity(runtime: dict, alarms: dict) -> tuple[object, ...]:
         alarms["generation"],
         alarms["state_revision"],
     )
+
+
+def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft(
+    tmp_path: Path,
+) -> None:
+    with _assistant_stack(tmp_path) as stack:
+        with HeadlessHttpClient(stack.composer_url) as composer:
+            node_environment = composer.node_environment()
+            source_model = composer.source_model()
+            assistant_mode = composer.assistant_mode("composer-assistant")
+            draft = composer.request("GET", "/api/program/draft")
+            manager_before = composer.manager_status()["status"]
+            runtime_before = composer.runtime()
+            package_before = _plain_package_files(stack.package_root)
+
+            assert {
+                row["model_instance_id"] for row in source_model["occurrences"]
+            } == {"lite6_fixture_instance", "lite6_fixture_instance_2"}
+            assert {
+                row["component_id"] for row in source_model["targets"]
+            } == {"lite6_arm", "lite6_arm_2"}
+            assert {row["tool_id"] for row in assistant_mode["tools"]} == {
+                "program_read",
+                "scene_draft_add_object",
+            }
+
+            accepted_body = _assistant_callback_body(
+                draft=draft,
+                node_environment=node_environment,
+                source_model=source_model,
+                assistant_mode=assistant_mode,
+                scene_resource_id="assistant_workpiece",
+                request_id="assistant.process.accepted",
+            )
+            accepted = composer.request(
+                "POST",
+                "/api/assistant/bridge/tools/scene_draft_add_object",
+                body=accepted_body,
+            )
+            assert accepted["success"] is True
+            assert accepted["draftMutated"] is True
+
+            after_accepted = composer.request("GET", "/api/program/draft")
+            assert after_accepted["draft_revision"] == draft["draft_revision"] + 1
+            assert after_accepted["saved"] is False
+            assert after_accepted["applied"] is False
+            assert "assistant_workpiece" in {
+                row["scene_resource_id"]
+                for row in after_accepted["program"]["scene"]
+            }
+
+            stale_identity = _assistant_callback_body(
+                draft=after_accepted,
+                node_environment=node_environment,
+                source_model=source_model,
+                assistant_mode=assistant_mode,
+                scene_resource_id="stale_identity_object",
+                request_id="assistant.process.stale-identity",
+            )
+            stale_identity["catalogHash"] = "sha256:" + "0" * 64
+            with pytest.raises(HeadlessClientError) as stale:
+                composer.request(
+                    "POST",
+                    "/api/assistant/bridge/tools/scene_draft_add_object",
+                    body=stale_identity,
+                )
+            assert stale.value.code == "assistant_callback_context_stale"
+
+            invalid_edit = _assistant_callback_body(
+                draft=after_accepted,
+                node_environment=node_environment,
+                source_model=source_model,
+                assistant_mode=assistant_mode,
+                scene_resource_id="invalid_edit_object",
+                request_id="assistant.process.invalid-edit",
+            )
+            resource = invalid_edit["arguments"]["scene_resource"]
+            resource["objectId"] = resource.pop("scene_resource_id")
+            rejected = composer.request(
+                "POST",
+                "/api/assistant/bridge/tools/scene_draft_add_object",
+                body=invalid_edit,
+            )
+            assert rejected["success"] is False
+            assert rejected["draftMutated"] is False
+            assert rejected["result"]["kind"] == "validation_error"
+            assert composer.request("GET", "/api/program/draft") == after_accepted
+
+            program_read = next(
+                row
+                for row in assistant_mode["tools"]
+                if row["tool_id"] == "program_read"
+            )
+            read_body = _assistant_callback_body(
+                draft=after_accepted,
+                node_environment=node_environment,
+                source_model=source_model,
+                assistant_mode=assistant_mode,
+                scene_resource_id="unused_for_program_read",
+                request_id="assistant.process.read",
+            )
+            read_body["inputSchemaHash"] = program_read["input_schema_hash"]
+            read_body["arguments"] = {}
+            callback_latencies_s: list[float] = []
+            for index in range(12):
+                read_body["requestId"] = f"assistant.process.read.{index}"
+                started = time.perf_counter()
+                read_result = composer.request(
+                    "POST",
+                    "/api/assistant/bridge/tools/program_read",
+                    body=read_body,
+                )
+                callback_latencies_s.append(time.perf_counter() - started)
+                assert read_result["success"] is True
+                assert read_result["draftMutated"] is False
+            assert max(callback_latencies_s) < 0.5, callback_latencies_s
+
+        concurrent_bodies = [
+            _assistant_callback_body(
+                draft=after_accepted,
+                node_environment=node_environment,
+                source_model=source_model,
+                assistant_mode=assistant_mode,
+                scene_resource_id=f"concurrent_object_{index}",
+                request_id=f"assistant.process.concurrent.{index}",
+            )
+            for index in range(2)
+        ]
+
+        def invoke(body: dict) -> tuple[str, str]:
+            try:
+                with HeadlessHttpClient(stack.composer_url) as client:
+                    result = client.request(
+                        "POST",
+                        "/api/assistant/bridge/tools/scene_draft_add_object",
+                        body=body,
+                    )
+                return ("accepted", str(result["result"]["draftRevision"]))
+            except HeadlessClientError as error:
+                return ("rejected", error.code)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            concurrent_results = list(executor.map(invoke, concurrent_bodies))
+        assert sum(kind == "accepted" for kind, _detail in concurrent_results) == 1
+        assert [
+            detail
+            for kind, detail in concurrent_results
+            if kind == "rejected"
+        ][0] in {
+            "assistant_callback_context_stale",
+            "composer_draft_revision_stale",
+        }
+
+        with HeadlessHttpClient(stack.composer_url) as composer:
+            final_draft = composer.request("GET", "/api/program/draft")
+            concurrent_ids = {
+                row["scene_resource_id"]
+                for row in final_draft["program"]["scene"]
+                if row["scene_resource_id"].startswith("concurrent_object_")
+            }
+            assert len(concurrent_ids) == 1
+            assert final_draft["draft_revision"] == after_accepted["draft_revision"] + 1
+            assert final_draft["saved"] is False
+            assert final_draft["applied"] is False
+            assert composer.manager_status()["status"] == manager_before
+            runtime_after = composer.runtime()
+            assert runtime_after["active_retained_bundle_id"] == runtime_before[
+                "active_retained_bundle_id"
+            ]
+            assert runtime_after["active_graph_revision"] == runtime_before[
+                "active_graph_revision"
+            ]
+            assert runtime_after["projection_generation"] == runtime_before[
+                "projection_generation"
+            ]
+            assert _plain_package_files(stack.package_root) == package_before
 
 
 def test_manager_api_cli_and_replacements_preserve_headless_owners(
@@ -368,6 +681,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             "health": "manyforge.headless_health.v1",
             "manager-graph": "manyforge.manager_graph_projection.v1",
             "node-environment": "manyforge.node_environment_projection.v1",
+            "source-model": "manyforge.source_model_projection.v1",
             "scene": "manyforge.scene_projection.v1",
             "alarms": "manyforge.operator_alarm_snapshot.v2",
             "history": "manyforge.historian_page.v1",

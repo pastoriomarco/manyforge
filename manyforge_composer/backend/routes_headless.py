@@ -102,6 +102,19 @@ def create_headless_router(client: HeadlessHttpClient) -> APIRouter:
     def node_environment() -> dict[str, Any]:
         return _call(client.node_environment)
 
+    @router.get("/api/source-model")
+    def source_model() -> dict[str, Any]:
+        return _call(client.source_model)
+
+    @router.get("/api/assistant/modes/{mode_id}")
+    def assistant_mode(
+        mode_id: Annotated[
+            str,
+            Path(min_length=1, max_length=256, pattern=r"^[a-z][a-z0-9.-]*$"),
+        ],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.assistant_mode(mode_id))
+
     @router.post("/api/manager/apply")
     def manager_apply(body: ManagerApplyRequest) -> dict[str, Any]:
         return _call(lambda: client.manager_apply(body.model_dump()))

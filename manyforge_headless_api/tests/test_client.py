@@ -45,6 +45,58 @@ def test_client_uses_the_dedicated_node_environment_route() -> None:
     assert [request.url.path for request in requests] == ["/api/node-environment"]
 
 
+def test_client_uses_the_dedicated_source_model_route() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"schema_version": "manyforge.source_model_projection.v1"},
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        assert client.source_model()["schema_version"].endswith("projection.v1")
+    finally:
+        raw.close()
+    assert [request.url.path for request in requests] == ["/api/source-model"]
+
+
+def test_client_uses_the_selected_assistant_mode_route() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"schema_version": "manyforge.assistant_mode_projection.v1"},
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        assert client.assistant_mode("composer-assistant")["schema_version"].endswith(
+            "projection.v1"
+        )
+        with pytest.raises(ValueError, match="assistant mode ID is invalid"):
+            client.assistant_mode("../runtime")
+    finally:
+        raw.close()
+    assert [request.url.path for request in requests] == [
+        "/api/assistant/modes/composer-assistant"
+    ]
+
+
 def test_client_requests_the_bounded_attention_newest_alarm_page() -> None:
     requests: list[httpx.Request] = []
 
