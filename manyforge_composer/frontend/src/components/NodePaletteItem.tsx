@@ -12,13 +12,19 @@ const KIND_ICONS: Record<string, string> = {
 interface NodePaletteItemProps {
   entry: CatalogEntry;
   disabled?: boolean;
+  onActivate?: (entry: CatalogEntry) => void;
+  executionNote?: string;
+  allowDrag?: boolean;
 }
 
 export function NodePaletteItem({
   entry,
   disabled = false,
+  onActivate,
+  executionNote,
+  allowDrag = false,
 }: NodePaletteItemProps) {
-  const onDragStart = (event: DragEvent<HTMLDivElement>) => {
+  const onDragStart = (event: DragEvent<HTMLButtonElement>) => {
     event.dataTransfer.setData('application/manyforge-node', entry.id);
     event.dataTransfer.effectAllowed = 'copy';
     const ghost = document.createElement('div');
@@ -30,10 +36,13 @@ export function NodePaletteItem({
   };
 
   return (
-    <div
-      draggable={!disabled}
+    <button
+      type="button"
+      draggable={!disabled && allowDrag}
       onDragStart={onDragStart}
-      className={`node-palette-item${disabled ? ' disabled' : ''}`}
+      onClick={() => onActivate?.(entry)}
+      disabled={disabled}
+      className={`node-palette-item${disabled ? ' disabled' : ''}${allowDrag ? ' draggable' : ''}`}
       title={disabled ? 'Authoring is currently unavailable' : entry.description}
     >
       <span className="node-palette-icon" aria-hidden="true">
@@ -42,7 +51,10 @@ export function NodePaletteItem({
       <span className="node-palette-copy">
         <strong>{entry.name}</strong>
         <small>{entry.description}</small>
+        {executionNote && (
+          <small className="node-palette-availability">{executionNote}</small>
+        )}
       </span>
-    </div>
+    </button>
   );
 }

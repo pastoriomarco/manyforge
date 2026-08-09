@@ -1,4 +1,4 @@
-"""Composer structural shell plus optional thin headless-runtime projection."""
+"""Composer structural/Program-authoring shell plus thin runtime projections."""
 
 from __future__ import annotations
 
@@ -129,13 +129,13 @@ def create_app(
     static_dir: str | None = None,
     security: SecurityConfig | None = None,
 ) -> FastAPI:
-    """Create the structural Composer and optional headless client routes.
+    """Create structural, Draft/Saved authoring, and thin headless routes.
 
-    Only immutable catalog reads, sandboxed artifact browsing, and structural
-    URDF assets are owned locally. When configured, runtime routes proxy the
-    independent headless API; every later-lane route remains caught by the
-    typed unavailable boundary before it can create a process or mutate robot
-    state.
+    Composer locally owns immutable catalog reads, sandboxed artifact browsing,
+    structural URDF assets, and one revision-fenced editable Program Draft with
+    bounded Saved-artifact persistence. Applied/runtime truth remains an
+    immutable projection from independent headless owners; every later-lane
+    effect route is caught before it can create a process or mutate robot state.
     """
 
     security = security or SecurityConfig()
@@ -147,6 +147,16 @@ def create_app(
         maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
         path_prefix="/api/assistant/bridge/tools/",
     )
+    for program_authoring_prefix in (
+        "/api/program/draft/",
+        "/api/program/open-draft",
+        "/api/program/save",
+    ):
+        app.add_middleware(
+            ComposerRequestBodyLimitMiddleware,
+            maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
+            path_prefix=program_authoring_prefix,
+        )
     if security.api_token:
         app.add_middleware(BearerAuthMiddleware, token=security.api_token)
     app.add_middleware(

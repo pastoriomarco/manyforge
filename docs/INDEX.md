@@ -227,10 +227,10 @@ plans, open points, engineering references, and LLM-agent development
 guidance live in a sibling **private** repository, `manyforge_specs`.
 
 **Operators do not need the private specifications to inspect the currently
-available structural shell or the retained historical workflows.** Product
-runtime install, bring-up, and operation remain unavailable during the
-cutover. The links below are dead unless you are a maintainer with
-`manyforge_specs` cloned alongside `manyforge`.
+available structural and Program Draft/Saved authoring shell or the retained
+historical workflows.** Product runtime install, bring-up, and operation remain
+unavailable during the cutover. The links below are dead unless you are a
+maintainer with `manyforge_specs` cloned alongside `manyforge`.
 
 Maintainers doing non-trivial behavior changes (kernel state machine,
 adapter contracts, deployment schema, assistant authority, observability

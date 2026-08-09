@@ -71,6 +71,110 @@ def test_session_is_an_unsaved_unapplied_in_memory_draft() -> None:
     assert snapshot["applied"] is False
 
 
+def test_workspace_distinguishes_saved_draft_from_unavailable_applied() -> None:
+    program = _program()
+    session = ComposerDraftSession(program, source_path=str(_PROGRAM_PATH))
+
+    workspace = session.workspace_snapshot()
+
+    assert workspace["schemaVersion"] == "manyforge.composer_program_workspace.v1"
+    assert workspace["saved"] == {
+        "available": True,
+        "matchesDraft": True,
+        "path": str(_PROGRAM_PATH.resolve()),
+        "programRevision": program.program_revision,
+    }
+    assert workspace["hasUnsavedChanges"] is False
+    assert workspace["hasUnappliedChanges"] is None
+    assert workspace["applied"]["available"] is False
+    assert workspace["applied"]["matchesDraft"] is None
+    assert workspace["applied"]["unavailableReason"]["restorationGates"] == ["N7"]
+
+    _mutate(
+        session,
+        "tree_draft_update_node_params",
+        {
+            "instance_id": "move_to_pick",
+            "expected_node_id": "motion.move_to_joint_target",
+            "parameters": {"planning_timeout_s": 3.0},
+        },
+    )
+
+    assert session.snapshot()["saved"] is False
+    assert session.workspace_snapshot()["hasUnsavedChanges"] is True
+
+
+def test_replacing_a_draft_rotates_identity_and_requires_dirty_confirmation() -> None:
+    session = ComposerDraftSession(_program(), source_path=str(_PROGRAM_PATH))
+    original = session.workspace_snapshot()
+    _mutate(
+        session,
+        "tree_draft_update_node_params",
+        {
+            "instance_id": "move_to_pick",
+            "expected_node_id": "motion.move_to_joint_target",
+            "parameters": {"planning_timeout_s": 3.0},
+        },
+    )
+    dirty = session.workspace_snapshot()
+
+    with pytest.raises(DraftSessionError) as confirmation:
+        session.require_replace_allowed(
+            draft_id=dirty["draft"]["draftId"],
+            expected_revision=dirty["draft"]["draftRevision"],
+            discard_changes=False,
+        )
+    assert confirmation.value.code == "composer_draft_discard_confirmation_required"
+
+    replacement = session.replace_program(
+        _program(),
+        source_path=str(_PROGRAM_PATH),
+        draft_id=dirty["draft"]["draftId"],
+        expected_revision=dirty["draft"]["draftRevision"],
+        discard_changes=True,
+    )
+
+    assert replacement["draft"]["draftId"] != original["draft"]["draftId"]
+    assert replacement["draft"]["draftRevision"] == 1
+    assert replacement["saved"]["matchesDraft"] is True
+    with pytest.raises(DraftSessionError) as stale:
+        session.replace_program(
+            _program(),
+            source_path=str(_PROGRAM_PATH),
+            draft_id=dirty["draft"]["draftId"],
+            expected_revision=dirty["draft"]["draftRevision"],
+            discard_changes=True,
+        )
+    assert stale.value.code == "composer_draft_id_stale"
+
+
+def test_save_updates_saved_identity_only_after_writer_success(tmp_path: Path) -> None:
+    session = ComposerDraftSession(_program())
+    before = session.workspace_snapshot()
+
+    def fail_writer(_program: Program, _path: str) -> str:
+        raise RuntimeError("disk failed")
+
+    with pytest.raises(RuntimeError, match="disk failed"):
+        session.save_program(
+            draft_id=before["draft"]["draftId"],
+            expected_revision=before["draft"]["draftRevision"],
+            target_path=str(tmp_path / "saved.program.yaml"),
+            writer=fail_writer,
+        )
+    assert session.workspace_snapshot() == before
+
+    target = tmp_path / "saved.program.yaml"
+    saved = session.save_program(
+        draft_id=before["draft"]["draftId"],
+        expected_revision=before["draft"]["draftRevision"],
+        target_path=str(target),
+        writer=lambda _program, path: path,
+    )
+    assert saved["saved"]["path"] == str(target.resolve())
+    assert saved["saved"]["matchesDraft"] is True
+
+
 def test_successful_edit_reidentifies_and_atomically_swaps_the_program() -> None:
     original = _program()
     session = ComposerDraftSession(original)

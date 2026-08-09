@@ -2397,6 +2397,42 @@ def _effective_parameter_value(
     return entry_parameter.default if entry_parameter.has_default else None
 
 
+def _reject_legacy_parameter_interpolation(value: Any, *, path: str) -> None:
+    """Reject the removed v0 string-binding form at the Program authority."""
+
+    pending: list[tuple[Any, str, int]] = [(value, path, 0)]
+    visited = 0
+    while pending:
+        current, current_path, depth = pending.pop()
+        visited += 1
+        if visited > _MAX_VALUE_NODES:
+            _program_error(path, "exceeds the fixed value-node bound")
+        if depth > _MAX_VALUE_DEPTH:
+            _program_error(current_path, "exceeds the fixed value-depth bound")
+        if type(current) is str:
+            reference = current[len("${param:") : -1]
+            if (
+                current.startswith("${param:")
+                and current.endswith("}")
+                and reference
+                and "}" not in reference
+            ):
+                _program_error(
+                    current_path,
+                    "legacy ${param:...} interpolation is invalid; use value_sources",
+                )
+        elif type(current) is list:
+            pending.extend(
+                (item, f"{current_path}[{index}]", depth + 1)
+                for index, item in reversed(tuple(enumerate(current)))
+            )
+        elif type(current) is dict:
+            pending.extend(
+                (item, f"{current_path}.{key}", depth + 1)
+                for key, item in reversed(tuple(current.items()))
+            )
+
+
 def _validate_node_capabilities(
     entry: Any,
     parameters: Mapping[str, Any],
@@ -2610,6 +2646,10 @@ def _validate_program_tree(
                 f"is missing required catalog parameter {parameter_id!r}",
             )
         if supplied_literal:
+            _reject_legacy_parameter_interpolation(
+                parameters[parameter_id],
+                path=f"{path}.parameters.{parameter_id}",
+            )
             issues = validate_value(
                 catalog_parameter.schema,
                 parameters[parameter_id],

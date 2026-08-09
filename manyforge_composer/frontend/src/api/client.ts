@@ -1,23 +1,31 @@
 import {
   parseCatalogResponse,
   parseCapabilityCommandPreviewResponse,
+  parseDraftMutationResponse,
   parseFileBrowserResponse,
   parseHealthResponse,
   parseHeadlessRuntimeSnapshot,
   parseHistorianPage,
   parseExecutionOwnerStatus,
   parseMotionPreviewResponse,
+  parseNodeEnvironmentResponse,
   parseObjectResponse,
   parseOperationAcceptance,
   parseOperationObservation,
   parseOperatorAlarmSnapshot,
+  parseProgramWorkspaceResponse,
   parseSceneUrdfManifest,
 } from './parsers';
 import type {
   ArtifactKind,
   CatalogResponse,
+  DraftFenceRequest,
+  DraftMutationResponse,
   FileBrowserResponse,
   HealthResponse,
+  JsonValue,
+  NodeEnvironmentResponse,
+  ProgramWorkspaceResponse,
   SceneUrdfManifest,
 } from '../types/api';
 import type {
@@ -141,6 +149,73 @@ export const api = {
   catalog: {
     list: (signal?: AbortSignal): Promise<CatalogResponse> =>
       requestJson('/api/catalog', parseCatalogResponse, signal),
+  },
+  nodes: {
+    environment: (signal?: AbortSignal): Promise<NodeEnvironmentResponse> =>
+      requestJson(
+        '/api/nodes/environment',
+        parseNodeEnvironmentResponse,
+        signal,
+      ),
+  },
+  programWorkspace: {
+    get: (signal?: AbortSignal): Promise<ProgramWorkspaceResponse> =>
+      requestJson(
+        '/api/program/workspace',
+        parseProgramWorkspaceResponse,
+        signal,
+      ),
+    mutate: (
+      fence: DraftFenceRequest,
+      mutation: string,
+      args: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<DraftMutationResponse> => requestJson(
+      '/api/program/draft/mutations',
+      parseDraftMutationResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, mutation, arguments: args }),
+      },
+    ),
+    openDraft: (
+      fence: DraftFenceRequest,
+      path: string,
+      confirmDiscard: boolean,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceResponse> => requestJson(
+      '/api/program/open-draft',
+      parseProgramWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, path, confirmDiscard }),
+      },
+    ),
+    save: (
+      fence: DraftFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceResponse> => requestJson(
+      '/api/program/save',
+      parseProgramWorkspaceResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(fence) },
+    ),
+    saveAs: (
+      fence: DraftFenceRequest,
+      path: string,
+      confirmOverwrite: boolean,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceResponse> => requestJson(
+      '/api/program/save-as',
+      parseProgramWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, path, confirmOverwrite }),
+      },
+    ),
   },
   files: {
     browse: (

@@ -23,8 +23,11 @@ not currently available on `dev`.
 > four-mode Robot Control workflow: joint goals, pose goals, Cartesian paths,
 > and gripper commands with source-local no-motion preview, explicit approval,
 > owner-issued progress, and operation Stop. It is not the complete manual-
-> control or product workflow. Composer Program-tree
-> execution and all three product lanes remain intentionally unavailable; the
+> control or product workflow. N6-c3 additionally restores the strict Program
+> Draft/Saved workspace: environment-aware palette/tree/property/declaration
+> authoring plus bounded Open-as-Draft, Save, and Save-As. It does not Apply or
+> execute Programs. Composer Program-tree execution and all three product lanes
+> remain intentionally unavailable; the
 > full native lane closes at I6/N, and Isaac/real
 > operation at I9/I10. The launch recipes below describe the last qualified
 > baseline; they are not valid bring-up instructions for the current `dev`
@@ -90,8 +93,10 @@ docker compose run --rm dev bash
 ```
 
 This provides catalog, sandboxed files, deployment/URDF inspection, health,
-and static UI surfaces only. `scripts/launch.sh` and runtime-specific suite
-selectors return `composable_cell_runtime_unavailable` before effects.
+the Composer-owned strict Program Draft/Saved workspace, and retained
+observation/manual-control clients. Program Apply/execution remains
+unavailable. `scripts/launch.sh` and runtime-specific suite selectors return
+`composable_cell_runtime_unavailable` before product-lane effects.
 
 **Restoring or designing the new robot-import workflow?** See
 [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md) —
@@ -317,9 +322,9 @@ rules are documented in [`CONTRIBUTING.md`](CONTRIBUTING.md) and
 reinforced in [`AGENTS.md`](AGENTS.md).
 
 ManyForge development is spec-driven by private maintainer specs. Those specs
-are not needed to inspect the current public structural shell or historical
-operator references, but non-trivial behavior changes need maintainer audit
-against them.
+are not needed to inspect the current public structural and Program Draft/Saved
+authoring shell or historical operator references, but non-trivial behavior
+changes need maintainer audit against them.
 Without that context, contributions should stay to bounded fixes,
 tests, docs, or proposals that explicitly call out the audit need.
 

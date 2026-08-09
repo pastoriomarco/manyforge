@@ -13,9 +13,11 @@
 > source-local four-mode Robot Control preview/approval/progress/operation-Stop
 > workflow over that same owner: joint goals, pose goals, Cartesian paths, and
 > gripper commands. These bounded slices are not a complete product lane. Robot
-> readiness, complete lifecycle/controls, live scene/manipulation,
-> provider/authoring effects, and general Program execution remain unavailable
-> until their later gates.
+> readiness, complete lifecycle/controls, live scene/manipulation, provider
+> effects, and general Program execution remain unavailable until their later
+> gates. N6-c3 separately restores Composer-owned strict Program Draft/Saved
+> authoring and bounded artifact persistence. It explicitly does not infer
+> Applied identity or make the Program executable.
 > Unless a section explicitly identifies a retained foundation or target
 > design, present-tense ownership and flow descriptions below refer to the
 > captured three-lane baseline.
@@ -71,7 +73,7 @@ ______________________________________________________________________
 | `manyforge_roboplan`                      | C++ + pybind11        | Primary planning/projection adapter (RRT + TOPP-RA), native execution, and native kernel composition.                                                                                               |
 | `manyforge_ros2_control_execution`        | C++20/ROS 2           | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, isolated ROS scene projection, and optional exact controller/lifecycle dispatch admission.                |
 | `manyforge_behavior`                      | Python                | Behavior-tree runner, node catalog, program/deployment loader, cycle orchestration, one versioned recovery offer, and Robot Model Authority.                                                        |
-| `manyforge_composer`                      | FastAPI + React       | Current structural authoring/operator shell plus thin H0 runtime/alarm/history clients. Historical Composer-owned alarm, scene, runtime, provider, and MCP authorities remain removed.              |
+| `manyforge_composer`                      | FastAPI + React       | Structural/operator shell, revision-fenced strict Program Draft/Saved authoring, and thin H0 runtime/alarm/history clients. Applied, alarm, scene, runtime, provider, and MCP authority remain headless or gated. |
 | `manyforge_ros` / `manyforge_ros_bringup` | C++/Python            | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                        |
 | `manyforge_assistant_bridge`              | Python                | Retained protocol/supervisor client logic and historical direct-lane reference; live HTTP provider unavailable during the cutover.                                                                  |
 

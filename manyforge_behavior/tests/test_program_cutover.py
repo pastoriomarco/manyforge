@@ -216,7 +216,7 @@ def test_program_accepts_ordered_free_text_parameter_defaults() -> None:
         ("leaf_with_child", "must contain 0-0 children"),
         ("missing_required_parameter", "missing required catalog parameter"),
         ("invalid_parameter_default", "default violates max_inclusive"),
-        ("unexpanded_interpolation", "must be a number"),
+        ("unexpanded_interpolation", "legacy.*interpolation.*value_sources"),
         ("undeclared_value_source", "names no Program parameter"),
         ("empty_blackboard_fields", "must not be empty"),
         ("unknown_viewer_role", "does not name a declared role"),

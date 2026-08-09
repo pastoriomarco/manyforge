@@ -18,6 +18,56 @@ function response(
   } as unknown as Response;
 }
 
+function workspaceFixture(): Record<string, unknown> {
+  const revision = `sha256:${'a'.repeat(64)}`;
+  return {
+    schemaVersion: 'manyforge.composer_program_workspace.v1',
+    draft: {
+      draftId: 'draft-1',
+      draftRevision: 1,
+      programLoaded: true,
+      programRevision: revision,
+      program: {
+        api_version: 'manyforge.program.v1',
+        program_id: 'fixture',
+        program_revision: revision,
+        program_profile: 'composable-cell-v1',
+        name: 'Fixture',
+        catalog: {
+          api_version: 'manyforge.node_catalog.v2',
+          content_version: '1.1.0',
+        },
+        component_roles: {},
+        target_roles: {},
+        tree: {
+          node_id: 'timer',
+          instance_id: 'wait',
+          parameters: { duration_s: 0.5 },
+          children: [],
+        },
+      },
+    },
+    saved: {
+      available: true,
+      matchesDraft: true,
+      path: '/workspace/fixture.program.yaml',
+      programRevision: revision,
+    },
+    applied: {
+      available: false,
+      matchesDraft: null,
+      programRevision: null,
+      unavailableReason: {
+        code: 'program_apply_unavailable',
+        message: 'Apply waits for N7.',
+        restorationGates: ['N7'],
+      },
+    },
+    hasUnsavedChanges: false,
+    hasUnappliedChanges: null,
+  };
+}
+
 describe('structural API client', () => {
   it('encodes sandbox browse parameters and validates the response', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
@@ -65,6 +115,39 @@ describe('structural API client', () => {
     await expect(api.health.get()).rejects.toThrow(
       'Invalid response from /api/health',
     );
+  });
+
+  it('submits one exact revision-fenced Draft mutation', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      mutation: 'tree_draft_update_node_params',
+      details: { updated_instance_id: 'wait' },
+      workspace: workspaceFixture(),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.programWorkspace.mutate(
+      { draftId: 'draft-1', expectedDraftRevision: 1 },
+      'tree_draft_update_node_params',
+      {
+        instance_id: 'wait',
+        expected_node_id: 'timer',
+        parameters: { duration_s: 1 },
+      },
+    );
+
+    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/program/draft/mutations');
+    expect(JSON.parse(String(options.body))).toEqual({
+      draftId: 'draft-1',
+      expectedDraftRevision: 1,
+      mutation: 'tree_draft_update_node_params',
+      arguments: {
+        instance_id: 'wait',
+        expected_node_id: 'timer',
+        parameters: { duration_s: 1 },
+      },
+    });
+    expect(result.workspace.saved.matchesDraft).toBe(true);
   });
 });
 

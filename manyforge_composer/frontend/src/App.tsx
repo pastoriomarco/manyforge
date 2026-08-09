@@ -1,17 +1,22 @@
+import { useCallback, useState } from 'react';
+
 import { ApiError, api } from './api/client';
 import { ArtifactBrowser } from './components/ArtifactBrowser';
 import { CatalogPanel } from './components/CatalogPanel';
+import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { StructuralViewer } from './components/StructuralViewer';
 import { UnavailableBanner } from './components/UnavailableBanner';
 import { HeadlessRuntimeSurfaces } from './components/HeadlessRuntimeSurfaces';
 import { RobotControlPanel } from './components/RobotControlPanel';
 import { useStructuralResource } from './state/structuralResource';
+import type { ArtifactKind, FileBrowserEntry } from './types/api';
 
 function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
 export default function App() {
+  const [selectedProgramPath, setSelectedProgramPath] = useState<string | null>(null);
   const [health, retryHealth] = useStructuralResource(api.health.get, {
     failureMessage: 'Could not read the Composer structural boundary.',
   });
@@ -23,8 +28,18 @@ export default function App() {
     absentMessage: 'No complete URDF is available for the authored deployment.',
     failureMessage: 'Could not read the authored-neutral URDF manifest.',
   });
+  const [nodeEnvironment, retryNodeEnvironment] = useStructuralResource(
+    api.nodes.environment,
+    { failureMessage: 'Could not read the active v2 node environment.' },
+  );
   const headlessEnabled = health.status === 'ready'
     && health.data.mode === 'headless_client';
+  const handleArtifactSelection = useCallback((
+    kind: ArtifactKind,
+    entry: FileBrowserEntry | null,
+  ) => {
+    setSelectedProgramPath(kind === 'program' ? entry?.path ?? null : null);
+  }, []);
 
   return (
     <main className="app-shell">
@@ -46,11 +61,19 @@ export default function App() {
 
       <RobotControlPanel enabled={headlessEnabled} />
 
+      <ProgramWorkspace
+        catalog={catalog}
+        environment={nodeEnvironment}
+        selectedProgramPath={selectedProgramPath}
+        onRetryCatalog={retryCatalog}
+        onRetryEnvironment={retryNodeEnvironment}
+      />
+
       <StructuralViewer manifest={manifest} onRetry={retryManifest} />
 
       <div className="lower-grid">
         <CatalogPanel catalog={catalog} onRetry={retryCatalog} />
-        <ArtifactBrowser />
+        <ArtifactBrowser onSelectionChange={handleArtifactSelection} />
       </div>
 
       <footer className="app-footer">

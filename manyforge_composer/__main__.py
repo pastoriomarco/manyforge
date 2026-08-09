@@ -1,4 +1,4 @@
-"""Run Composer as a structural shell and optional headless-runtime client."""
+"""Run Composer as a structural/Program-authoring shell and runtime client."""
 
 from __future__ import annotations
 

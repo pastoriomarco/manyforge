@@ -9,8 +9,74 @@ import {
   parseHistorianPage,
   parseOperatorAlarmSnapshot,
   parseMotionPreviewResponse,
+  parseNodeEnvironmentResponse,
+  parseProgramWorkspaceResponse,
   parseSceneUrdfManifest,
 } from './parsers';
+
+function programFixture(): Record<string, unknown> {
+  return {
+    api_version: 'manyforge.program.v1',
+    program_id: 'fixture',
+    program_revision: `sha256:${'a'.repeat(64)}`,
+    program_profile: 'composable-cell-v1',
+    name: 'Fixture',
+    catalog: {
+      api_version: 'manyforge.node_catalog.v2',
+      content_version: '1.1.0',
+    },
+    component_roles: {},
+    target_roles: {},
+    parameters: [{
+      parameter_id: 'duration',
+      type: 'float64',
+      default: 0.5,
+      runtime_mutability: 'before_run',
+    }],
+    blackboard: { namespaces: [], keys: [] },
+    tree: {
+      node_id: 'timer',
+      instance_id: 'wait',
+      parameters: {},
+      value_sources: {
+        duration_s: { kind: 'program_parameter', reference: 'duration' },
+      },
+      children: [],
+    },
+  };
+}
+
+function workspaceFixture(): Record<string, unknown> {
+  const program = programFixture();
+  return {
+    schemaVersion: 'manyforge.composer_program_workspace.v1',
+    draft: {
+      draftId: 'draft-1',
+      draftRevision: 2,
+      programLoaded: true,
+      programRevision: program.program_revision,
+      program,
+    },
+    saved: {
+      available: true,
+      matchesDraft: false,
+      path: '/workspace/fixture.program.yaml',
+      programRevision: `sha256:${'b'.repeat(64)}`,
+    },
+    applied: {
+      available: false,
+      matchesDraft: null,
+      programRevision: null,
+      unavailableReason: {
+        code: 'program_apply_unavailable',
+        message: 'Apply waits for N7.',
+        restorationGates: ['N7'],
+      },
+    },
+    hasUnsavedChanges: true,
+    hasUnappliedChanges: null,
+  };
+}
 
 function sourceSectionFixture(): Record<string, unknown> {
   return {
@@ -207,6 +273,102 @@ describe('parseCatalogResponse', () => {
   it('does not accept a historical catalog version', () => {
     expect(() => parseCatalogResponse({ apiVersion: 'v1' })).toThrow(
       'catalog.apiVersion must be the literal "manyforge.node_catalog.v2"',
+    );
+  });
+});
+
+describe('Program workspace parsers', () => {
+  it('keeps Draft, Saved, and unavailable Applied identities distinct', () => {
+    const workspace = parseProgramWorkspaceResponse(workspaceFixture());
+
+    expect(workspace.draft.program?.tree.value_sources?.duration_s).toEqual({
+      kind: 'program_parameter',
+      reference: 'duration',
+    });
+    expect(workspace.saved.matchesDraft).toBe(false);
+    expect(workspace.hasUnappliedChanges).toBeNull();
+    expect(workspace.applied.unavailableReason?.restorationGates).toEqual(['N7']);
+  });
+
+  it('rejects inconsistent or historical Program binding shapes', () => {
+    const inconsistent = workspaceFixture();
+    (inconsistent.draft as Record<string, unknown>).programRevision = 'sha256:wrong';
+    expect(() => parseProgramWorkspaceResponse(inconsistent)).toThrow(
+      'programWorkspace.draft must be internally consistent Program identity',
+    );
+
+    const falseSavedComparison = workspaceFixture();
+    (falseSavedComparison.saved as Record<string, unknown>).matchesDraft = true;
+    expect(() => parseProgramWorkspaceResponse(falseSavedComparison)).toThrow(
+      'programWorkspace.saved must be a truthful Draft/Saved comparison',
+    );
+
+    const falseAppliedIdentity = workspaceFixture();
+    (falseAppliedIdentity.applied as Record<string, unknown>).programRevision = (
+      falseAppliedIdentity.draft as Record<string, unknown>
+    ).programRevision;
+    expect(() => parseProgramWorkspaceResponse(falseAppliedIdentity)).toThrow(
+      'programWorkspace.applied must be internally consistent Applied identity',
+    );
+
+    const historical = workspaceFixture();
+    const program = (historical.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const tree = program.tree as Record<string, unknown>;
+    tree.parameters = { duration_s: '${param:duration}' };
+    delete tree.value_sources;
+    expect(() => parseProgramWorkspaceResponse(historical)).toThrow(
+      'an explicit value_sources binding',
+    );
+  });
+
+  it('projects authoring and execution availability independently', () => {
+    const payload = {
+      environmentDigest: 'sha256:environment',
+      catalog: {},
+      executableRegistry: [{
+        node_id: 'timer',
+        engine_id: 'py_trees',
+        implementation_id: 'timer_v1',
+        executable_package_id: 'manyforge_behavior',
+      }],
+      executablePackages: [],
+      sourceCoverage: [],
+      availability: {
+        binding_context: 'unselected',
+        execution_available: false,
+        implementations: [{
+          adapter_build_qualified: true,
+          authoring_available: true,
+          binding_available: false,
+          engine_id: 'py_trees',
+          executable_package_id: 'manyforge_behavior',
+          execution_available: false,
+          implementation_id: 'timer_v1',
+          implementation_identity_resolved: true,
+          node_id: 'timer',
+          owner_health_available: true,
+          reason_codes: ['program_binding_unselected'],
+          restoration_gates: [],
+        }],
+        manager_runtime_converged: true,
+        portable_authoring_available: true,
+        reason_codes: ['program_binding_unselected'],
+        restoration_gates: ['N'],
+      },
+      active: { retainedBundleId: 'bundle-1', graphRevision: 'graph-1' },
+      source: {},
+    };
+    const environment = parseNodeEnvironmentResponse(payload);
+
+    expect(environment.implementations[0]).toMatchObject({
+      authoringAvailable: true,
+      executionAvailable: false,
+    });
+    expect(environment.executionAvailable).toBe(false);
+
+    payload.availability.implementations[0].owner_health_available = 'yes' as never;
+    expect(() => parseNodeEnvironmentResponse(payload)).toThrow(
+      'owner_health_available must be a boolean',
     );
   });
 });

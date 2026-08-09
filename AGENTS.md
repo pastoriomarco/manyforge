@@ -33,7 +33,11 @@
 > historically required four manual-control forms: joint goals, pose goals,
 > Cartesian paths, and gripper commands. Preview remains effect-free; approval
 > submits through the ordinary Kernel operation path. These are bounded
-> vertical slices, not the restored native lane or an operator recipe.
+> vertical slices, not the restored native lane or an operator recipe. N6-c3
+> now restores the strict Program Draft/Saved authoring workspace: exact
+> environment-aware palette/tree/property/declaration editing plus bounded
+> Open-as-Draft, Save, and Save-As. Applied identity remains explicitly
+> unavailable until N7; authoring never implies Apply or execution.
 > Full Program-tree execution, lifecycle and execution controls, live scene
 > editing, broader motion/manipulation, provider-backed assistant/public-MCP
 > operation, Isaac/ROS product launch, and real-robot operation remain
@@ -133,7 +137,9 @@ development/qualification path through an independently restartable C++ host
 and thin public clients. N6-c1 and N6-c2 add the addressed four-mode Robot
 Control preview/approval/progress/Stop client over that owner: joint goals,
 pose goals, Cartesian paths, and gripper commands. It remains a thin client of
-the ordinary operation path, not a restored runtime product lane.
+the ordinary operation path, not a restored runtime product lane. N6-c3 adds
+the independently revision-fenced Program Draft/Saved owner and thin authoring
+UI without restoring Program Apply or execution.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).

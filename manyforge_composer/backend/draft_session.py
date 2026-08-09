@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 import threading
 import uuid
 from typing import Any, Callable, NoReturn
@@ -26,6 +27,7 @@ from manyforge_behavior.program import (
 
 
 _DRAFT_API_VERSION = "manyforge.composer_draft.v1"
+_WORKSPACE_API_VERSION = "manyforge.composer_program_workspace.v1"
 _PROGRAM_API_VERSION = "manyforge.program.v1"
 _MAXIMUM_DRAFT_REVISION = 9_007_199_254_740_991
 _ROOT_ALIAS = "@root"
@@ -367,11 +369,25 @@ def _merge_pose_authoring_patch(
 class ComposerDraftSession:
     """Own exactly one validated in-memory Program Draft."""
 
-    def __init__(self, program: Program | None = None) -> None:
+    def __init__(
+        self,
+        program: Program | None = None,
+        *,
+        source_path: str | None = None,
+    ) -> None:
+        if source_path is not None and program is None:
+            raise ValueError("source_path requires a Program Draft")
+        resolved_source = (
+            str(Path(source_path).resolve()) if source_path is not None else None
+        )
         self._lock = threading.RLock()
         self._draft_id = f"draft-{uuid.uuid4().hex}"
         self._program = program
         self._revision = 1 if program is not None else 0
+        self._saved_path = resolved_source
+        self._saved_program_revision = (
+            program.program_revision if resolved_source is not None else None
+        )
 
     @property
     def draft_id(self) -> str:
@@ -390,6 +406,12 @@ class ComposerDraftSession:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return self._snapshot_locked()
+
+    def workspace_snapshot(self) -> dict[str, Any]:
+        """Project Draft and Saved identity without inventing Applied truth."""
+
+        with self._lock:
+            return self._workspace_snapshot_locked()
 
     def validate(self, catalog: NodeCatalog) -> dict[str, Any]:
         """Revalidate the complete Draft against one exact active catalog."""
@@ -414,6 +436,7 @@ class ComposerDraftSession:
 
     def _snapshot_locked(self) -> dict[str, Any]:
         program = self._program
+        matches_saved = self._matches_saved_locked()
         return {
             "schema_version": _DRAFT_API_VERSION,
             "draft_id": self._draft_id,
@@ -423,9 +446,182 @@ class ComposerDraftSession:
                 program.program_revision if program is not None else None
             ),
             "program": program.to_dict() if program is not None else None,
-            "saved": False,
+            "saved": matches_saved,
             "applied": False,
         }
+
+    def _matches_saved_locked(self) -> bool:
+        return (
+            self._program is not None
+            and self._saved_program_revision is not None
+            and self._program.program_revision == self._saved_program_revision
+        )
+
+    def _workspace_snapshot_locked(self) -> dict[str, Any]:
+        program = self._program
+        matches_saved = self._matches_saved_locked()
+        return {
+            "schemaVersion": _WORKSPACE_API_VERSION,
+            "draft": {
+                "draftId": self._draft_id,
+                "draftRevision": self._revision,
+                "programLoaded": program is not None,
+                "programRevision": (
+                    program.program_revision if program is not None else None
+                ),
+                "program": program.to_dict() if program is not None else None,
+            },
+            "saved": {
+                "available": self._saved_program_revision is not None,
+                "matchesDraft": matches_saved,
+                "path": self._saved_path,
+                "programRevision": self._saved_program_revision,
+            },
+            "applied": {
+                "available": False,
+                "matchesDraft": None,
+                "programRevision": None,
+                "unavailableReason": {
+                    "code": "program_apply_unavailable",
+                    "message": (
+                        "authoritative Program Apply is unavailable until the "
+                        "N7 native-product gate"
+                    ),
+                    "restorationGates": ["N7"],
+                },
+            },
+            "hasUnsavedChanges": program is not None and not matches_saved,
+            "hasUnappliedChanges": None,
+        }
+
+    def _require_identity_locked(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+    ) -> None:
+        if type(draft_id) is not str or not draft_id:
+            _error(
+                "composer_draft_id_invalid",
+                "Draft identity must be a non-empty string",
+            )
+        if type(expected_revision) is not int or expected_revision < 0:
+            _error(
+                "composer_draft_revision_invalid",
+                "expected Draft revision must be a non-negative integer",
+            )
+        if draft_id != self._draft_id:
+            _error(
+                "composer_draft_id_stale",
+                "request names a replaced Composer Draft",
+                status_code=409,
+                detail={
+                    "message": "request names a replaced Composer Draft",
+                    "expectedDraftId": self._draft_id,
+                    "receivedDraftId": draft_id,
+                },
+            )
+        if expected_revision != self._revision:
+            _error(
+                "composer_draft_revision_stale",
+                "request Draft revision is stale",
+                status_code=409,
+                detail={
+                    "message": "request Draft revision is stale",
+                    "expectedDraftRevision": self._revision,
+                    "receivedDraftRevision": expected_revision,
+                },
+            )
+
+    def require_replace_allowed(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+        discard_changes: bool,
+    ) -> None:
+        """Fail before disk I/O when replacing the current Draft is ineligible."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+            if (
+                self._program is not None
+                and not self._matches_saved_locked()
+                and not discard_changes
+            ):
+                _error(
+                    "composer_draft_discard_confirmation_required",
+                    "opening another Program would discard unsaved Draft changes",
+                    status_code=409,
+                )
+
+    def replace_program(
+        self,
+        program: Program,
+        *,
+        source_path: str,
+        draft_id: str,
+        expected_revision: int,
+        discard_changes: bool,
+    ) -> dict[str, Any]:
+        """Atomically replace Draft and Saved after an independently safe read."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+            if (
+                self._program is not None
+                and not self._matches_saved_locked()
+                and not discard_changes
+            ):
+                _error(
+                    "composer_draft_discard_confirmation_required",
+                    "opening another Program would discard unsaved Draft changes",
+                    status_code=409,
+                )
+            self._draft_id = f"draft-{uuid.uuid4().hex}"
+            self._program = program
+            self._revision = 1
+            self._saved_path = str(Path(source_path).resolve())
+            self._saved_program_revision = program.program_revision
+            return self._workspace_snapshot_locked()
+
+    def save_program(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+        target_path: str | None,
+        writer: Callable[[Program, str], str],
+    ) -> dict[str, Any]:
+        """Serialize one exact Draft while blocking concurrent Draft replacement."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+            if self._program is None:
+                _error(
+                    "composer_draft_unavailable",
+                    "Composer has no loaded Program Draft",
+                    status_code=404,
+                )
+            selected_path = target_path or self._saved_path
+            if selected_path is None:
+                _error(
+                    "composer_saved_path_unavailable",
+                    "Save requires an existing Program path; use Save As",
+                )
+            saved_path = writer(self._program, selected_path)
+            self._saved_path = str(Path(saved_path).resolve())
+            self._saved_program_revision = self._program.program_revision
+            return self._workspace_snapshot_locked()
 
     def mutate(
         self,
@@ -434,14 +630,10 @@ class ComposerDraftSession:
         arguments: dict[str, Any],
         expected_revision: int,
         catalog: NodeCatalog,
+        draft_id: str | None = None,
     ) -> DraftMutationResult:
         if type(arguments) is not dict:
             _error("draft_arguments_invalid", "callback arguments must be an object")
-        if type(expected_revision) is not int or expected_revision < 0:
-            _error(
-                "composer_draft_revision_invalid",
-                "expected Draft revision must be a non-negative integer",
-            )
         with self._lock:
             if self._program is None:
                 _error(
@@ -449,7 +641,17 @@ class ComposerDraftSession:
                     "Composer has no loaded Program Draft",
                     status_code=404,
                 )
-            if expected_revision != self._revision:
+            if draft_id is not None:
+                self._require_identity_locked(
+                    draft_id=draft_id,
+                    expected_revision=expected_revision,
+                )
+            elif type(expected_revision) is not int or expected_revision < 0:
+                _error(
+                    "composer_draft_revision_invalid",
+                    "expected Draft revision must be a non-negative integer",
+                )
+            if draft_id is None and expected_revision != self._revision:
                 _error(
                     "composer_draft_revision_stale",
                     "callback Draft revision is stale",
@@ -461,12 +663,20 @@ class ComposerDraftSession:
                     },
                 )
             document = self._program.to_dict()
-            mutation, details = self._edit(
-                document,
-                tool_id=tool_id,
-                arguments=deepcopy(arguments),
-                catalog=catalog,
-            )
+            try:
+                mutation, details = self._edit(
+                    document,
+                    tool_id=tool_id,
+                    arguments=deepcopy(arguments),
+                    catalog=catalog,
+                )
+            except DraftSessionError:
+                raise
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
+                _error(
+                    "draft_arguments_invalid",
+                    f"Draft mutation arguments are invalid for {tool_id}: {error}",
+                )
             identified = _identified(document)
             try:
                 candidate = Program.from_dict(

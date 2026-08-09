@@ -5,9 +5,18 @@ import type {
   CatalogEntry,
   CatalogParameter,
   CatalogResponse,
+  DraftMutationResponse,
   FileBrowserEntry,
   FileBrowserResponse,
   HealthResponse,
+  JsonValue,
+  NodeEnvironmentResponse,
+  NodeImplementationAvailability,
+  ProgramDocument,
+  ProgramParameterDeclaration,
+  ProgramTreeNode,
+  ProgramValueSource,
+  ProgramWorkspaceResponse,
   QuaternionXyzwTuple,
   SceneUrdfCollision,
   SceneUrdfJoint,
@@ -81,6 +90,25 @@ function exactKeysAt(
   }
 }
 
+function allowedKeysAt(
+  value: JsonObject,
+  required: readonly string[],
+  optional: readonly string[],
+  path: string,
+): void {
+  const actual = new Set(Object.keys(value));
+  const allowed = new Set([...required, ...optional]);
+  if (
+    required.some((key) => !actual.has(key))
+    || [...actual].some((key) => !allowed.has(key))
+  ) {
+    fail(
+      path,
+      `an object with required [${required.join(', ')}] and optional [${optional.join(', ')}] fields`,
+    );
+  }
+}
+
 function arrayAt(value: unknown, path: string): unknown[] {
   if (!Array.isArray(value)) {
     return fail(path, 'an array');
@@ -122,6 +150,66 @@ function integerAt(value: unknown, path: string): number {
     return fail(path, 'a non-negative safe integer');
   }
   return number;
+}
+
+function jsonValueAt(value: unknown, path: string, depth = 0): JsonValue {
+  if (depth > 32) return fail(path, 'a JSON value within the Program depth bound');
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
+      return fail(path, 'a finite I-JSON number');
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => jsonValueAt(item, `${path}[${index}]`, depth + 1));
+  }
+  const record = objectAt(value, path);
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [
+      key,
+      jsonValueAt(item, `${path}.${key}`, depth + 1),
+    ]),
+  );
+}
+
+function jsonRecordAt(value: unknown, path: string): Record<string, JsonValue> {
+  const parsed = jsonValueAt(value, path);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return fail(path, 'a JSON object');
+  }
+  return parsed;
+}
+
+function programLiteralAt(value: unknown, path: string): JsonValue {
+  const parsed = jsonValueAt(value, path);
+  const inspect = (item: JsonValue, itemPath: string): void => {
+    if (typeof item === 'string' && /^\$\{param:[^}]+\}$/.test(item)) {
+      fail(itemPath, 'a literal value or an explicit value_sources binding');
+    }
+    if (Array.isArray(item)) {
+      item.forEach((nested, index) => inspect(nested, `${itemPath}[${index}]`));
+    } else if (item !== null && typeof item === 'object') {
+      Object.entries(item).forEach(([key, nested]) => inspect(nested, `${itemPath}.${key}`));
+    }
+  };
+  inspect(parsed, path);
+  return parsed;
+}
+
+function programLiteralRecordAt(
+  value: unknown,
+  path: string,
+): Record<string, JsonValue> {
+  const record = objectAt(value, path);
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [
+      key,
+      programLiteralAt(item, `${path}.${key}`),
+    ]),
+  );
 }
 
 function nullableNumberAt(value: unknown, path: string): number | null {
@@ -360,6 +448,563 @@ export function parseCatalogResponse(value: unknown): CatalogResponse {
       record.environmentDigest,
       'catalog.environmentDigest',
     ),
+  };
+}
+
+function parseProgramValueSource(value: unknown, path: string): ProgramValueSource {
+  const record = objectAt(value, path);
+  allowedKeysAt(record, ['kind', 'reference'], ['field'], path);
+  const kind = stringAt(record.kind, `${path}.kind`);
+  if (
+    kind !== 'program_parameter'
+    && kind !== 'blackboard_key'
+    && kind !== 'blackboard_field'
+  ) {
+    return fail(`${path}.kind`, 'a supported Program value-source kind');
+  }
+  const result: ProgramValueSource = {
+    kind,
+    reference: stringAt(record.reference, `${path}.reference`),
+  };
+  if (record.field !== undefined) {
+    result.field = stringAt(record.field, `${path}.field`);
+  }
+  if ((kind === 'blackboard_field') !== (result.field !== undefined)) {
+    return fail(path, 'a field only and always for blackboard_field');
+  }
+  return result;
+}
+
+function parseProgramTreeNode(
+  value: unknown,
+  path: string,
+  depth = 0,
+): ProgramTreeNode {
+  if (depth > 256) return fail(path, 'a Program tree within the depth bound');
+  const record = objectAt(value, path);
+  allowedKeysAt(
+    record,
+    ['node_id', 'instance_id', 'parameters', 'children'],
+    ['value_sources', 'metadata'],
+    path,
+  );
+  const sources = record.value_sources === undefined
+    ? undefined
+    : Object.fromEntries(
+        Object.entries(objectAt(record.value_sources, `${path}.value_sources`)).map(
+          ([key, source]) => [
+            key,
+            parseProgramValueSource(source, `${path}.value_sources.${key}`),
+          ],
+        ),
+      );
+  const node: ProgramTreeNode = {
+    node_id: stringAt(record.node_id, `${path}.node_id`),
+    instance_id: stringAt(record.instance_id, `${path}.instance_id`),
+    parameters: programLiteralRecordAt(record.parameters, `${path}.parameters`),
+    children: arrayAt(record.children, `${path}.children`).map((child, index) =>
+      parseProgramTreeNode(child, `${path}.children[${index}]`, depth + 1),
+    ),
+  };
+  if (sources !== undefined) node.value_sources = sources;
+  if (record.metadata !== undefined) {
+    node.metadata = jsonRecordAt(record.metadata, `${path}.metadata`);
+  }
+  return node;
+}
+
+function parseProgramParameter(
+  value: unknown,
+  path: string,
+): ProgramParameterDeclaration {
+  const record = objectAt(value, path);
+  allowedKeysAt(
+    record,
+    ['parameter_id', 'type', 'default', 'runtime_mutability'],
+    ['constraints', 'description'],
+    path,
+  );
+  const runtimeMutability = stringAt(
+    record.runtime_mutability,
+    `${path}.runtime_mutability`,
+  );
+  if (
+    runtimeMutability !== 'immutable'
+    && runtimeMutability !== 'before_run'
+    && runtimeMutability !== 'between_operations'
+  ) {
+    return fail(`${path}.runtime_mutability`, 'a supported mutability');
+  }
+  const parameter: ProgramParameterDeclaration = {
+    parameter_id: stringAt(record.parameter_id, `${path}.parameter_id`),
+    type: stringAt(record.type, `${path}.type`),
+    default: jsonValueAt(record.default, `${path}.default`),
+    runtime_mutability: runtimeMutability,
+  };
+  if (record.constraints !== undefined) {
+    parameter.constraints = jsonRecordAt(record.constraints, `${path}.constraints`);
+  }
+  if (record.description !== undefined) {
+    parameter.description = stringAt(record.description, `${path}.description`);
+  }
+  return parameter;
+}
+
+export function parseProgramDocument(value: unknown, path = 'program'): ProgramDocument {
+  const record = objectAt(value, path);
+  allowedKeysAt(
+    record,
+    [
+      'api_version',
+      'program_id',
+      'program_revision',
+      'program_profile',
+      'name',
+      'catalog',
+      'component_roles',
+      'target_roles',
+      'tree',
+    ],
+    [
+      'description',
+      'compatibility',
+      'viewer',
+      'scene',
+      'parameters',
+      'blackboard',
+      'contact_policies',
+    ],
+    path,
+  );
+  const apiVersion = stringAt(record.api_version, `${path}.api_version`);
+  if (apiVersion !== 'manyforge.program.v1') {
+    return fail(`${path}.api_version`, 'the literal "manyforge.program.v1"');
+  }
+  const programProfile = stringAt(record.program_profile, `${path}.program_profile`);
+  if (programProfile !== 'composable-cell-v1') {
+    return fail(`${path}.program_profile`, 'the literal "composable-cell-v1"');
+  }
+  const catalog = objectAt(record.catalog, `${path}.catalog`);
+  exactKeysAt(catalog, ['api_version', 'content_version'], `${path}.catalog`);
+  const catalogApiVersion = stringAt(catalog.api_version, `${path}.catalog.api_version`);
+  if (catalogApiVersion !== 'manyforge.node_catalog.v2') {
+    return fail(
+      `${path}.catalog.api_version`,
+      'the literal "manyforge.node_catalog.v2"',
+    );
+  }
+  const result: ProgramDocument = {
+    api_version: apiVersion,
+    program_id: stringAt(record.program_id, `${path}.program_id`),
+    program_revision: stringAt(record.program_revision, `${path}.program_revision`),
+    program_profile: programProfile,
+    name: stringAt(record.name, `${path}.name`),
+    catalog: {
+      api_version: catalogApiVersion,
+      content_version: stringAt(catalog.content_version, `${path}.catalog.content_version`),
+    },
+    component_roles: jsonRecordAt(record.component_roles, `${path}.component_roles`),
+    target_roles: jsonRecordAt(record.target_roles, `${path}.target_roles`),
+    tree: parseProgramTreeNode(record.tree, `${path}.tree`),
+  };
+  if (record.description !== undefined) {
+    result.description = stringAt(record.description, `${path}.description`);
+  }
+  if (record.compatibility !== undefined) {
+    result.compatibility = jsonRecordAt(record.compatibility, `${path}.compatibility`);
+  }
+  if (record.viewer !== undefined) {
+    result.viewer = jsonRecordAt(record.viewer, `${path}.viewer`);
+  }
+  if (record.scene !== undefined) {
+    result.scene = arrayAt(record.scene, `${path}.scene`).map((item, index) =>
+      jsonValueAt(item, `${path}.scene[${index}]`),
+    );
+  }
+  if (record.parameters !== undefined) {
+    result.parameters = arrayAt(record.parameters, `${path}.parameters`).map(
+      (item, index) => parseProgramParameter(item, `${path}.parameters[${index}]`),
+    );
+  }
+  if (record.blackboard !== undefined) {
+    const blackboard = objectAt(record.blackboard, `${path}.blackboard`);
+    exactKeysAt(blackboard, ['namespaces', 'keys'], `${path}.blackboard`);
+    result.blackboard = {
+      namespaces: arrayAt(blackboard.namespaces, `${path}.blackboard.namespaces`).map(
+        (item, index) => {
+          const rowPath = `${path}.blackboard.namespaces[${index}]`;
+          const row = objectAt(item, rowPath);
+          allowedKeysAt(row, ['namespace_id', 'owner'], ['description'], rowPath);
+          const owner = stringAt(row.owner, `${rowPath}.owner`);
+          if (owner !== 'program') return fail(`${rowPath}.owner`, 'the literal "program"');
+          return {
+            namespace_id: stringAt(row.namespace_id, `${rowPath}.namespace_id`),
+            owner,
+            ...(row.description === undefined
+              ? {}
+              : { description: stringAt(row.description, `${rowPath}.description`) }),
+          };
+        },
+      ),
+      keys: arrayAt(blackboard.keys, `${path}.blackboard.keys`).map((item, index) => {
+        const rowPath = `${path}.blackboard.keys[${index}]`;
+        const row = objectAt(item, rowPath);
+        allowedKeysAt(
+          row,
+          ['key', 'type', 'access', 'persistence'],
+          ['fields', 'description'],
+          rowPath,
+        );
+        const access = stringAt(row.access, `${rowPath}.access`);
+        const persistence = stringAt(row.persistence, `${rowPath}.persistence`);
+        if (!['read', 'write', 'read_write'].includes(access)) {
+          return fail(`${rowPath}.access`, 'a supported access mode');
+        }
+        if (!['node', 'run', 'persistent'].includes(persistence)) {
+          return fail(`${rowPath}.persistence`, 'a supported persistence mode');
+        }
+        return {
+          key: stringAt(row.key, `${rowPath}.key`),
+          type: stringAt(row.type, `${rowPath}.type`),
+          access: access as 'read' | 'write' | 'read_write',
+          persistence: persistence as 'node' | 'run' | 'persistent',
+          ...(row.fields === undefined
+            ? {}
+            : {
+                fields: arrayAt(row.fields, `${rowPath}.fields`).map((field, fieldIndex) => {
+                  const fieldPath = `${rowPath}.fields[${fieldIndex}]`;
+                  const fieldRecord = objectAt(field, fieldPath);
+                  exactKeysAt(fieldRecord, ['field', 'type'], fieldPath);
+                  return {
+                    field: stringAt(fieldRecord.field, `${fieldPath}.field`),
+                    type: stringAt(fieldRecord.type, `${fieldPath}.type`),
+                  };
+                }),
+              }),
+          ...(row.description === undefined
+            ? {}
+            : { description: stringAt(row.description, `${rowPath}.description`) }),
+        };
+      }),
+    };
+  }
+  if (record.contact_policies !== undefined) {
+    result.contact_policies = arrayAt(
+      record.contact_policies,
+      `${path}.contact_policies`,
+    ).map((item, index) => jsonValueAt(item, `${path}.contact_policies[${index}]`));
+  }
+  return result;
+}
+
+function parseRuntimeAvailability(value: unknown, path: string) {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['code', 'message', 'restorationGates'], path);
+  return {
+    code: stringAt(record.code, `${path}.code`),
+    message: stringAt(record.message, `${path}.message`),
+    restorationGates: stringArrayAt(record.restorationGates, `${path}.restorationGates`),
+  };
+}
+
+export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceResponse {
+  const record = objectAt(value, 'programWorkspace');
+  exactKeysAt(
+    record,
+    [
+      'schemaVersion',
+      'draft',
+      'saved',
+      'applied',
+      'hasUnsavedChanges',
+      'hasUnappliedChanges',
+    ],
+    'programWorkspace',
+  );
+  const schemaVersion = stringAt(record.schemaVersion, 'programWorkspace.schemaVersion');
+  if (schemaVersion !== 'manyforge.composer_program_workspace.v1') {
+    return fail('programWorkspace.schemaVersion', 'the supported workspace version');
+  }
+  const draft = objectAt(record.draft, 'programWorkspace.draft');
+  exactKeysAt(
+    draft,
+    ['draftId', 'draftRevision', 'programLoaded', 'programRevision', 'program'],
+    'programWorkspace.draft',
+  );
+  const programLoaded = booleanAt(draft.programLoaded, 'programWorkspace.draft.programLoaded');
+  const program = draft.program === null
+    ? null
+    : parseProgramDocument(draft.program, 'programWorkspace.draft.program');
+  const programRevision = nullableStringAt(
+    draft.programRevision,
+    'programWorkspace.draft.programRevision',
+  );
+  if (programLoaded !== (program !== null) || (program?.program_revision ?? null) !== programRevision) {
+    return fail('programWorkspace.draft', 'internally consistent Program identity');
+  }
+  const saved = objectAt(record.saved, 'programWorkspace.saved');
+  exactKeysAt(
+    saved,
+    ['available', 'matchesDraft', 'path', 'programRevision'],
+    'programWorkspace.saved',
+  );
+  const savedAvailable = booleanAt(saved.available, 'programWorkspace.saved.available');
+  const savedPath = nullableStringAt(saved.path, 'programWorkspace.saved.path');
+  const savedRevision = nullableStringAt(
+    saved.programRevision,
+    'programWorkspace.saved.programRevision',
+  );
+  const savedMatchesDraft = booleanAt(
+    saved.matchesDraft,
+    'programWorkspace.saved.matchesDraft',
+  );
+  if (savedAvailable !== (savedPath !== null && savedRevision !== null)) {
+    return fail('programWorkspace.saved', 'internally consistent Saved identity');
+  }
+  if (
+    savedMatchesDraft !== (
+      programRevision !== null
+      && savedRevision !== null
+      && programRevision === savedRevision
+    )
+  ) {
+    return fail('programWorkspace.saved', 'a truthful Draft/Saved comparison');
+  }
+  const applied = objectAt(record.applied, 'programWorkspace.applied');
+  exactKeysAt(
+    applied,
+    ['available', 'matchesDraft', 'programRevision', 'unavailableReason'],
+    'programWorkspace.applied',
+  );
+  const appliedAvailable = booleanAt(applied.available, 'programWorkspace.applied.available');
+  const unavailableReason = applied.unavailableReason === null
+    ? null
+    : parseRuntimeAvailability(
+        applied.unavailableReason,
+        'programWorkspace.applied.unavailableReason',
+      );
+  if (appliedAvailable === (unavailableReason !== null)) {
+    return fail('programWorkspace.applied', 'consistent availability and reason');
+  }
+  const appliedMatchesDraft = applied.matchesDraft === null
+    ? null
+    : booleanAt(applied.matchesDraft, 'programWorkspace.applied.matchesDraft');
+  const appliedRevision = nullableStringAt(
+    applied.programRevision,
+    'programWorkspace.applied.programRevision',
+  );
+  if (
+    (appliedAvailable && (appliedMatchesDraft === null || appliedRevision === null))
+    || (!appliedAvailable && (appliedMatchesDraft !== null || appliedRevision !== null))
+  ) {
+    return fail('programWorkspace.applied', 'internally consistent Applied identity');
+  }
+  const hasUnappliedChanges = record.hasUnappliedChanges === null
+    ? null
+    : booleanAt(record.hasUnappliedChanges, 'programWorkspace.hasUnappliedChanges');
+  if (!appliedAvailable && hasUnappliedChanges !== null) {
+    return fail(
+      'programWorkspace.hasUnappliedChanges',
+      'null while Applied identity is unavailable',
+    );
+  }
+  const hasUnsavedChanges = booleanAt(
+    record.hasUnsavedChanges,
+    'programWorkspace.hasUnsavedChanges',
+  );
+  if (hasUnsavedChanges !== (programLoaded && !savedMatchesDraft)) {
+    return fail(
+      'programWorkspace.hasUnsavedChanges',
+      'the exact Draft/Saved comparison',
+    );
+  }
+  return {
+    schemaVersion,
+    draft: {
+      draftId: stringAt(draft.draftId, 'programWorkspace.draft.draftId'),
+      draftRevision: integerAt(
+        draft.draftRevision,
+        'programWorkspace.draft.draftRevision',
+      ),
+      programLoaded,
+      programRevision,
+      program,
+    },
+    saved: {
+      available: savedAvailable,
+      matchesDraft: savedMatchesDraft,
+      path: savedPath,
+      programRevision: savedRevision,
+    },
+    applied: {
+      available: appliedAvailable,
+      matchesDraft: appliedMatchesDraft,
+      programRevision: appliedRevision,
+      unavailableReason,
+    },
+    hasUnsavedChanges,
+    hasUnappliedChanges,
+  };
+}
+
+function parseImplementationAvailability(
+  value: unknown,
+  path: string,
+): NodeImplementationAvailability {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'adapter_build_qualified',
+      'authoring_available',
+      'binding_available',
+      'engine_id',
+      'executable_package_id',
+      'execution_available',
+      'implementation_id',
+      'implementation_identity_resolved',
+      'node_id',
+      'owner_health_available',
+      'reason_codes',
+      'restoration_gates',
+    ],
+    path,
+  );
+  for (const field of [
+    'adapter_build_qualified',
+    'binding_available',
+    'implementation_identity_resolved',
+    'owner_health_available',
+  ]) {
+    booleanAt(record[field], `${path}.${field}`);
+  }
+  return {
+    nodeId: stringAt(record.node_id, `${path}.node_id`),
+    engineId: stringAt(record.engine_id, `${path}.engine_id`),
+    implementationId: stringAt(record.implementation_id, `${path}.implementation_id`),
+    executablePackageId: stringAt(
+      record.executable_package_id,
+      `${path}.executable_package_id`,
+    ),
+    authoringAvailable: booleanAt(record.authoring_available, `${path}.authoring_available`),
+    executionAvailable: booleanAt(record.execution_available, `${path}.execution_available`),
+    reasonCodes: stringArrayAt(record.reason_codes, `${path}.reason_codes`),
+    restorationGates: stringArrayAt(record.restoration_gates, `${path}.restoration_gates`),
+  };
+}
+
+export function parseNodeEnvironmentResponse(value: unknown): NodeEnvironmentResponse {
+  const record = objectAt(value, 'nodeEnvironment');
+  allowedKeysAt(
+    record,
+    [
+      'environmentDigest',
+      'catalog',
+      'executableRegistry',
+      'executablePackages',
+      'sourceCoverage',
+    ],
+    ['availability', 'active', 'source'],
+    'nodeEnvironment',
+  );
+  arrayAt(record.executablePackages, 'nodeEnvironment.executablePackages');
+  arrayAt(record.sourceCoverage, 'nodeEnvironment.sourceCoverage');
+  objectAt(record.catalog, 'nodeEnvironment.catalog');
+  const registry = arrayAt(record.executableRegistry, 'nodeEnvironment.executableRegistry');
+  const fallbackImplementations = registry.map((item, index) => {
+    const path = `nodeEnvironment.executableRegistry[${index}]`;
+    const row = objectAt(item, path);
+    exactKeysAt(
+      row,
+      ['node_id', 'engine_id', 'implementation_id', 'executable_package_id'],
+      path,
+    );
+    return {
+      nodeId: stringAt(row.node_id, `${path}.node_id`),
+      engineId: stringAt(row.engine_id, `${path}.engine_id`),
+      implementationId: stringAt(row.implementation_id, `${path}.implementation_id`),
+      executablePackageId: stringAt(
+        row.executable_package_id,
+        `${path}.executable_package_id`,
+      ),
+      authoringAvailable: true,
+      executionAvailable: false,
+      reasonCodes: ['active_node_environment_unavailable'],
+      restorationGates: [],
+    };
+  });
+  if (record.availability === undefined) {
+    return {
+      environmentDigest: stringAt(record.environmentDigest, 'nodeEnvironment.environmentDigest'),
+      implementations: fallbackImplementations,
+      portableAuthoringAvailable: true,
+      executionAvailable: false,
+      reasonCodes: ['active_node_environment_unavailable'],
+      restorationGates: [],
+      active: null,
+    };
+  }
+  const availability = objectAt(record.availability, 'nodeEnvironment.availability');
+  exactKeysAt(
+    availability,
+    [
+      'binding_context',
+      'execution_available',
+      'implementations',
+      'manager_runtime_converged',
+      'portable_authoring_available',
+      'reason_codes',
+      'restoration_gates',
+    ],
+    'nodeEnvironment.availability',
+  );
+  const active = objectAt(record.active, 'nodeEnvironment.active');
+  exactKeysAt(active, ['retainedBundleId', 'graphRevision'], 'nodeEnvironment.active');
+  return {
+    environmentDigest: stringAt(record.environmentDigest, 'nodeEnvironment.environmentDigest'),
+    implementations: arrayAt(
+      availability.implementations,
+      'nodeEnvironment.availability.implementations',
+    ).map((item, index) => parseImplementationAvailability(
+      item,
+      `nodeEnvironment.availability.implementations[${index}]`,
+    )),
+    portableAuthoringAvailable: booleanAt(
+      availability.portable_authoring_available,
+      'nodeEnvironment.availability.portable_authoring_available',
+    ),
+    executionAvailable: booleanAt(
+      availability.execution_available,
+      'nodeEnvironment.availability.execution_available',
+    ),
+    reasonCodes: stringArrayAt(
+      availability.reason_codes,
+      'nodeEnvironment.availability.reason_codes',
+    ),
+    restorationGates: stringArrayAt(
+      availability.restoration_gates,
+      'nodeEnvironment.availability.restoration_gates',
+    ),
+    active: {
+      retainedBundleId: stringAt(
+        active.retainedBundleId,
+        'nodeEnvironment.active.retainedBundleId',
+      ),
+      graphRevision: stringAt(
+        active.graphRevision,
+        'nodeEnvironment.active.graphRevision',
+      ),
+    },
+  };
+}
+
+export function parseDraftMutationResponse(value: unknown): DraftMutationResponse {
+  const record = objectAt(value, 'draftMutation');
+  exactKeysAt(record, ['mutation', 'details', 'workspace'], 'draftMutation');
+  return {
+    mutation: stringAt(record.mutation, 'draftMutation.mutation'),
+    details: jsonRecordAt(record.details, 'draftMutation.details'),
+    workspace: parseProgramWorkspaceResponse(record.workspace),
   };
 }
 

@@ -86,7 +86,10 @@ class ComposerState:
             if resolved_program_source is not None
             else None
         )
-        self.draft_session = ComposerDraftSession(program)
+        self.draft_session = ComposerDraftSession(
+            program,
+            source_path=self.program_source_path,
+        )
         self.allowed_fs_roots = list(allowed_fs_roots or [])
         self.headless_client = headless_client
 

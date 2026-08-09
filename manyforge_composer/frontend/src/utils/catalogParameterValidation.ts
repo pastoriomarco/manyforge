@@ -2,9 +2,9 @@ import type { CatalogParameter } from '../types/api';
 import { firstCatalogSchemaValidationMessage } from './catalogSchema';
 
 /**
- * Validate one v2 catalog parameter without assuming a Program-Binding shape.
- * Binding-reference semantics remain unavailable until I6 qualifies that
- * contract; this helper intentionally validates only presence and JSON Schema.
+ * Validate one literal v2 catalog parameter value. Program value-source
+ * compatibility is checked separately against the exact Program declaration
+ * and destination schema before the literal is replaced.
  */
 export function firstCatalogParameterValidationMessage(
   parameter: CatalogParameter,

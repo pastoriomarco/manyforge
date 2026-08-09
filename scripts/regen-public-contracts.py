@@ -147,9 +147,11 @@ def gen_rest_api() -> str:
         "# Composer REST API\n\n",
     ]
     body.append(
-        "This is the structural-only Composer surface retained during the "
-        "composable-cell runtime cutover. Catalog reads, sandboxed artifact "
-        "browsing, structural URDF assets, and health remain available. The "
+        "This is the structural and authoring-only Composer surface retained "
+        "during the composable-cell runtime cutover. Catalog reads, sandboxed "
+        "artifact browsing, structural URDF assets, health, and the strict "
+        "revision-fenced Program Draft/Saved workflow remain available. "
+        "Program Apply and execution remain unavailable. The "
         "catch-all `/api/{unavailable_path}` operations return the typed "
         "runtime-unavailable response for former product routes.\n\n"
     )

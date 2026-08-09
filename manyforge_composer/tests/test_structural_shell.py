@@ -108,12 +108,16 @@ def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None
         )
 
 
-def test_program_draft_read_is_available_without_restoring_load_save_or_run() -> None:
+def test_program_workspace_is_available_without_restoring_load_apply_or_run() -> None:
     empty = _client().get("/api/program/draft")
     assert empty.status_code == 200
     assert empty.json()["program_loaded"] is False
     assert empty.json()["saved"] is False
     assert empty.json()["applied"] is False
+    empty_workspace = _client().get("/api/program/workspace")
+    assert empty_workspace.status_code == 200
+    assert empty_workspace.json()["draft"]["programLoaded"] is False
+    assert empty_workspace.json()["hasUnappliedChanges"] is None
 
     program_path = Path(__file__).resolve().parents[2] / "examples" / (
         "pick_and_place_minimal.program.yaml"
@@ -127,7 +131,7 @@ def test_program_draft_read_is_available_without_restoring_load_save_or_run() ->
     assert loaded.json()["program_loaded"] is True
     assert loaded.json()["program"]["api_version"] == "manyforge.program.v1"
     assert loaded.json()["draft_revision"] == 1
-    assert loaded.json()["saved"] is False
+    assert loaded.json()["saved"] is True
     assert loaded.json()["applied"] is False
 
 

@@ -12,7 +12,14 @@ type BrowserState =
   | { status: 'ready'; data: FileBrowserResponse }
   | { status: 'error'; message: string };
 
-export function ArtifactBrowser() {
+interface ArtifactBrowserProps {
+  onSelectionChange?: (
+    kind: ArtifactKind,
+    entry: FileBrowserEntry | null,
+  ) => void;
+}
+
+export function ArtifactBrowser({ onSelectionChange }: ArtifactBrowserProps) {
   const [kind, setKind] = useState<ArtifactKind>('deployment');
   const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
   const [pathInput, setPathInput] = useState('');
@@ -32,6 +39,7 @@ export function ArtifactBrowser() {
         setState({ status: 'ready', data });
         setPathInput(data.currentPath);
         setSelected(null);
+        onSelectionChange?.(kind, null);
       })
       .catch((error: unknown) => {
         if (current && !controller.signal.aborted) {
@@ -45,11 +53,12 @@ export function ArtifactBrowser() {
       current = false;
       controller.abort();
     };
-  }, [browsePath, kind, reloadToken]);
+  }, [browsePath, kind, onSelectionChange, reloadToken]);
 
   const navigate = (path: string | undefined) => {
     setBrowsePath(path);
     setSelected(null);
+    onSelectionChange?.(kind, null);
   };
 
   const chooseEntry = (entry: FileBrowserEntry) => {
@@ -59,6 +68,7 @@ export function ArtifactBrowser() {
     }
     if (entry.selectable) {
       setSelected(entry);
+      onSelectionChange?.(kind, entry);
     }
   };
 
@@ -76,7 +86,12 @@ export function ArtifactBrowser() {
               type="button"
               className={kind === value ? 'active' : ''}
               aria-pressed={kind === value}
-              onClick={() => setKind(value)}
+              onClick={() => {
+                setKind(value);
+                setBrowsePath(undefined);
+                setSelected(null);
+                onSelectionChange?.(value, null);
+              }}
             >
               {value}
             </button>

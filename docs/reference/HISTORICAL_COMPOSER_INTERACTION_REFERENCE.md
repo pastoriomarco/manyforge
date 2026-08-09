@@ -100,6 +100,46 @@ must cite the consulted paths and carry their still-required failure/safety
 cases into focused tests; it must not copy the old endpoint registry or state
 owner wholesale.
 
+### N6-c3 Program-workspace closure
+
+N6-c3 has now restored the owner-neutral Program authoring subset against the
+strict `manyforge.program.v1` and active v2 node-environment contracts. The
+current replacement is intentionally split rather than recreating the former
+all-purpose Program store:
+
+- `backend/draft_session.py`, `program_artifacts.py`, and `routes_draft.py`
+  own one revision-fenced in-memory Draft, exact Saved path/revision facts,
+  descriptor-attested reads, atomic writes, and closed human authoring DTOs;
+- `frontend/src/hooks/useProgramWorkspace.ts` and
+  `state/programWorkspace.ts` are generation-fenced clients and never become
+  Program, filesystem, Applied, execution, or runtime owners;
+- `ProgramWorkspace.tsx`, `ProgramNodePalette.tsx`,
+  `ProgramTreeCanvas.tsx`, `ProgramPropertyEditor.tsx`, and
+  `ProgramDeclarationsEditor.tsx` restore grouped insertion, deterministic
+  layout, one-node selection, topology edits, schema-aware literals, explicit
+  v1 value sources, declaration usage, and artifact feedback; and
+- `ArtifactBrowser.tsx` selection remains effect-free until the separate
+  **Open as Draft** or Save-As action is invoked.
+
+The six pinned `ProgramPanel.binding.test.ts` meanings are translated in
+`utils/programAuthoring.test.ts`: compatible/unbound candidate selection,
+already-bound exclusion, mismatch/semantic-selector exclusion, Program-default
+unbind, catalog-default unbind, and unchanged-literal behavior. The pinned
+`programStore.test.ts` deterministic-name case is also active against exact v1
+instance IDs. The viewer-Draft case remains assigned to N6-c4 because c3 does
+not restore scene/viewer authoring. The Pick macro case remains assigned to a
+future explicit v2 authoring-template/tool gate because the current catalog
+contains no such template; no hidden macro or v0 Pick payload was recreated.
+
+Every mutation and write carries exact Draft ID and revision, and server-side
+Program validation remains authoritative. Catalog-valid entries may remain
+authorable while their execution implementation is separately unavailable.
+Draft, Saved, and Applied are shown separately; Applied and
+`has_unapplied_changes` remain explicitly unknown until N7 rather than being
+guessed. The old `${param:...}` syntax, v0 factories/serializers, singleton
+robot/group fields, browser runtime stores, implicit Load/Apply, and
+Composer-owned runtime truth remain absent.
+
 ## Superseded bodies, split replacements, and acceptance-source mapping
 
 These rows describe historical executable bodies, not a blanket list of paths
@@ -641,16 +681,18 @@ new contract; merely retaining this ledger is not acceptance.
   `1c7f991a4b4212ae332a9bacdca2ca45a330612e71d3459f6fdb23ba9065fcec`:
   `47 offers parameterizable, type-matching, unbound fields`;
   `55 excludes a field already bound to a program parameter`;
-  `64 excludes type-mismatched and non-parameterizable fields`. Port the
-  schema-driven candidate filter to N's Program-Binding editor, with C++
-  binding validation as the authority.
+  `64 excludes type-mismatched and non-parameterizable fields`. N6-c3 now
+  carries these cases in `utils/programAuthoring.test.ts` against exact v1
+  declarations and `value_sources`; the server Program validator remains the
+  authority.
 
 - The same file, `unbind_literal`, lines 76, 80, and 84; 3 records; digest
   `610059e2c2b85dbb6381f8d4d682b91d2a32855d2445a58a621dd784cfe714cd`:
   `76 reverts a bound field to the bound program parameter default`;
   `80 falls back to the catalog default when the bound parameter is gone`;
-  `84 returns a literal value unchanged`. Port this draft-only revert UX at N
-  against v2 catalog defaults; do not restore the v1 blackboard/binding wire.
+  `84 returns a literal value unchanged`. N6-c3 now carries all three cases in
+  the draft-only property adapter against v2 catalog and Program defaults; the
+  v1 blackboard/binding wire did not return.
 
 - `RobotControlPanel.test.tsx`, `layout`, line 46; 1 record; digest
   `136c2a9f89169518d9f1642f89031e1ef2294b370f6935bc05169e0ca3a4953d`:
@@ -771,9 +813,9 @@ new contract; merely retaining this ledger is not acceptance.
 
 - The same file, `deterministic_names`, line 284; 1 record; digest
   `3a60d71a0c9b6b7a9fab5d78586f7f49a0822d68485f7f4c6b7078829b996076`:
-  `284 uses one deterministic suffix across repeated insertions`. Port
-  deterministic draft naming at N against explicit Program node identities;
-  it remains authoring behavior, not runtime identity minting.
+  `284 uses one deterministic suffix across repeated insertions`. N6-c3 now
+  carries this behavior in `nextProgramInstanceId` against explicit Program
+  node identities; it remains authoring behavior, not runtime identity minting.
 
 - The same file, `atomic_capability_fences`, lines 301, 316, and 343; 3
   records; digest
@@ -960,22 +1002,23 @@ treated as a future TypeScript authority.
 | --- | --- | --- |
 | `src/components/AssistantOverlay.tsx` | Read-only assistant observation is available through the I5/H0 headless client. The interactive provider/conversation overlay returns at I6/N; do not restore the old deployment flag/callback contract. | `src/components/assistantRequestRecovery.ts` and its test retain bounded authoritative-request reconciliation without an old assistant DTO. |
 | `src/components/DeploymentPanel.tsx`; `src/components/DeploymentPanel.robotControlLimits.test.ts` | Deployment authoring returns at I6/N on explicit component/target artifacts. The singleton `robot_config`, adapter capability union, and old mutation endpoint do not return. | `src/utils/deploymentCapabilities.ts`, `src/utils/parameterAuthoring.ts`, `src/components/property/parameterCapValidation.test.ts`, and the v2 catalog/schema helpers retain capability filtering, optional omission, and cap behavior. |
-| `src/components/FileBrowserDialog.tsx` | Read navigation is available now. Mutation-aware open/save selection reconnects at I6; the old save endpoint shape is not retained. | `src/components/ArtifactBrowser.tsx`, `src/api/client.ts`, and their parser/client tests retain sandbox-root navigation and explicit selection. |
+| `src/components/FileBrowserDialog.tsx` | N6-c3 now reconnects mutation-aware Program selection through separately named Open-as-Draft and Save-As actions. The old implicit Load/save endpoint shape is not retained. | `src/components/ArtifactBrowser.tsx`, `ProgramWorkspace.tsx`, the closed API client, and parser/client tests retain sandbox-root navigation, effect-free selection, explicit confirmation, and exact Draft fencing. |
 | `src/components/HeaderBar.tsx`; `src/components/HeaderBar.operatorAlarms.test.ts` | The structural header plus H0 alarm, status, and history presentation are available now. Lifecycle and command integrations return through I7/I8 projections; the old all-stores monolith does not return. | `src/App.tsx`, `src/components/OperatorAlarmPanel.tsx`, `RuntimeStatusOverlay.tsx`, `RobotLifecycleCard.tsx`, `ExecutionHistoryPanel.tsx`, and `src/utils/alarmFences.ts` retain presentation, exact-record confirmation fencing, and reannunciation behavior. |
-| `src/components/Layout.tsx` | The current structural layout is available. The authoring dock composition returns at I6/N; the old store-coupled root component is not copied. | `src/App.tsx`, `src/components/CollapsedRail.tsx`, and `src/index.css` retain the shell, collapse affordance, and semantic styling. |
+| `src/components/Layout.tsx` | The structural layout remains available and N6-c3 adds the Program authoring composition. Scene/deployment/provider docks remain at their named gates; the old store-coupled root component is not copied. | `src/App.tsx`, `ProgramWorkspace.tsx`, `CollapsedRail.tsx`, and `src/index.css` retain the shell and semantic styling without a runtime store. |
 | `src/components/NodeDiscoveryDiagnostics.tsx`; `src/components/NodeDiscoveryDiagnostics.test.tsx` | Permanently superseded as a v1 dynamic-loader/source report. I5/H0 now provides a verified retained-environment identity and runtime-availability view rather than recreating this payload; execution remains explicitly unavailable until I6/N. | `useHeadlessState.ts`, `HeadlessRuntimeSurfaces.tsx`, the immutable-v2 `CatalogPanel`, and strict parsers present only owner-issued facts. |
 | `src/components/ObjectEditPanel.tsx` | Object editing/discard interaction remains required at I6/N. Direct mutation of Composer Scene Authority does not return. | `src/components/common/DraftInputs.tsx`, `src/utils/poseTransforms.ts`, `moveTo.ts`, `gizmoAuthoring.ts`, and `src/hooks/usePersistentDraft.ts` retain draft/pose interaction without an effectful endpoint. |
-| `src/components/ProgramPanel.tsx`; `src/components/ProgramPanel.binding.test.ts` | Program and Program-Binding authoring return at I6/N. V1 blackboard DTOs, singleton robot/group fields, and Pick-Plan artifact shapes do not return. | V2 `catalogSchema.ts`, `catalogParameterValidation.ts`, `parameterAuthoring.ts`, and the graph/draft extractions below retain schema-driven authoring mechanics. |
-| `src/components/PropertyPanel.tsx` | The property surface remains required at I6/N after exact Program-Binding and command-schema types exist. | `src/components/common/DraftInputs.tsx`, `src/components/property/utils.ts`, catalog schema/parameter validation, and cap tests retain dependency-independent editing behavior. |
+| `src/components/ProgramPanel.tsx`; `src/components/ProgramPanel.binding.test.ts` | N6-c3 restores strict Program Draft/Saved authoring and exact v1 value-source editing. Runtime Program Binding selection/Apply remains N7-owned. V1 blackboard DTOs, singleton robot/group fields, and Pick-Plan artifact shapes do not return. | `ProgramWorkspace.tsx`, `ProgramNodePalette.tsx`, `ProgramDeclarationsEditor.tsx`, `useProgramWorkspace.ts`, strict DTO parsers, and `programAuthoring.ts` now carry the same-role authoring mechanics and translated cases. |
+| `src/components/PropertyPanel.tsx` | N6-c3 restores schema-aware literal, Program-parameter, blackboard-key, and blackboard-field editing over exact Program v1. Specialized scene/motion controls remain at their owning gates. | `ProgramPropertyEditor.tsx`, `DraftInputs.tsx`, catalog schema/parameter validation, and focused tests retain dependency-independent editing behavior. |
 | `src/components/RobotControlPanel.tsx`; `src/components/RobotControlPanel.test.tsx` | N6-c1/c2 restore addressed, unit-tagged joint-goal, pose-goal, Cartesian-path, and gripper draft/preview/approval interaction with a fixed action footer. N6-c4 owns the remaining 3D/live-viewer composition. The old candidate endpoint, group ID, angular-only gripper payload, and browser command gate do not return. | The active `RobotControlPanel.tsx`, generation-fenced `useRobotControl.ts`/`robotControl.ts` state machine, strict parsers, and translated tests preserve the historical authoring, freshness, approval, terminal, and Revert meanings while preview and execution remain server-owned. Target-safe pose/move/gizmo/joint/gripper utilities remain reusable inputs. |
 | `src/components/SceneControls.tsx` | Viewer authoring controls reconnect at I6/N to the qualified Program presentation projection. Live scene state is not a second persistence owner. | `src/state/viewerPresentationDraft.ts`, `src/utils/viewerCamera.ts`, and `viewerPerformance.ts` retain local view preferences, camera pins, renderer selection, and render metrics. |
 | `src/components/ScenePanel.tsx`; `src/components/ScenePanel.supportContactEvidence.test.ts` | Ordinary addressed scene authoring returns at I6/N. The former inline support-contact payload is deliberately not copied: exact `contact_policy` qualification belongs to I8/P5 and tool/contact fixtures are requalified at I11/T. | Generic draft, schema, pose, and graph utilities remain. The historical support-contact test at `082221...` is explicit reimplementation evidence, not an active schema contract. |
 | `src/components/SceneViewer.tsx` | Authored-neutral structural viewing and H0 scene/initialization facts are available now. Addressed object authoring returns at I6/N; Isaac point cloud, ghost, snapshot, and simulator interaction pass I9/I. The viewer-v1 data plane does not return. | `src/components/StructuralViewer.tsx`, `SnapshotResponder.tsx`, `src/utils/{structuralTransforms,viewerCamera,viewerPerformance,snapshotCapture}.ts`, and `src/state/latestFrameSlot.ts` retain renderer, camera, capture, and protocol-independent newest-frame behavior. |
-| `src/components/Sidebar.tsx` | Catalog/palette and authoring tabs remain target behavior. The read-only catalog is available now; Program/scene/deployment tabs reconnect at I6/N. | `src/components/CatalogPanel.tsx`, `NodePaletteItem.tsx`, the v2 catalog client, and profile/capability filters retain catalog browsing and drag identity. |
+| `src/components/Sidebar.tsx` | Read-only catalog and N6-c3 Program palette/browser authoring are available. Scene/deployment/provider tabs remain at their named gates. | `CatalogPanel.tsx`, `ProgramNodePalette.tsx`, `NodePaletteItem.tsx`, the exact v2 catalog/environment clients, and profile/capability filters retain grouped browsing and explicit insertion identity. |
 | `src/components/TransportControls.tsx`; `src/components/TransportControls.runtimeGate.test.ts` | Stop/Pause/Resume/Reset interaction returns on the final resource-addressed public contract at I6/N and is requalified against the one Kernel Stop envelope at I8/P5. Old cycle endpoints and browser-side runtime gates never return. | `src/components/RecoveryActionControls.tsx`, `KernelErrorPanel.tsx`, and generic request reconciliation retain presentation, exact-offer confirmation binding, and readable failure behavior without command authority. |
-| `src/components/TreeCanvas.tsx` | The interactive graph adapter returns at I6/N after exact Program node/binding types exist. The former React-Flow/store wiring is not a compatibility surface. | `src/utils/authoringGraph.ts` and tests retain tree validation, single-parent/cycle/cardinality checks, ordering, and deterministic layout; `BtNode.tsx`, `StatusEdge.tsx`, `CanvasViewControls.tsx`, and pure `store/composerStore.ts` retain graph presentation state. |
-| `src/components/Viewport.tsx` | Resizable authoring panels and viewer composition return at I6/N. The structural shell remains truthful while those clients are unavailable. | The active `App.tsx` layout, `CollapsedRail.tsx`, structural viewer, catalog, artifact browser, and CSS preserve the non-authoritative shell responsibilities. |
-| `src/components/property/BlackboardBindingEditors.tsx`; `src/components/property/MotionEditors.tsx`; `src/components/property/PrimitiveParameterEditors.tsx`; `src/components/property/ProgramParameterBindingEditor.tsx` | These editor families return at I6/N against exact Program-Binding, component/target, coordinate-unit, and command-schema types. Former compatibility DTOs and singleton defaults do not return. | Draft inputs, primitive-list equality, schema/parameter validation, numeric caps, pose transforms, and unit-tagged joint/gripper drafts are retained with focused tests. |
+| `src/components/TreeCanvas.tsx` | N6-c3 restores the interactive strict-v1 graph adapter with selection, insertion, delete, reorder, reparent, and deterministic layout. The former React-Flow/store wiring is not a compatibility surface. | `ProgramTreeCanvas.tsx` adapts `authoringGraph.ts`, `BtNode.tsx`, `StatusEdge.tsx`, `CanvasViewControls.tsx`, and pure `composerStore.ts`; the server revalidates every atomic topology mutation. |
+| `src/components/Viewport.tsx` | N6-c3 adds the Program workspace to the structural shell. Resizable scene/viewer/deployment composition remains at its named I6 slices. | The active `App.tsx` layout, Program workspace, `CollapsedRail.tsx`, structural viewer, catalog, artifact browser, and CSS preserve non-authoritative shell responsibilities. |
+| `src/components/property/BlackboardBindingEditors.tsx`; `src/components/property/PrimitiveParameterEditors.tsx`; `src/components/property/ProgramParameterBindingEditor.tsx` | N6-c3 restores their generic strict-v1 literal/value-source/declaration behavior. Former compatibility DTOs and singleton defaults do not return. | `ProgramPropertyEditor.tsx`, `ProgramDeclarationsEditor.tsx`, Draft inputs, schema/parameter validation, usage maps, and focused tests carry the exact generic behavior. |
+| `src/components/property/MotionEditors.tsx` | Generic schema/JSON editing is available at N6-c3; specialized source-local motion controls remain assigned to the relevant later composition surface and must reuse the retained unit/pose helpers. | Pose, joint, gripper, gizmo, and numeric-cap helpers remain active inputs; c3 does not duplicate or narrow their semantics. |
 
 ### Exclusive old stores, protocols, and mixed clients
 
@@ -988,7 +1031,7 @@ treated as a future TypeScript authority.
 | `src/store/deploymentStore.ts` | Singleton deployment artifact/store and mutation API do not return. | I6/N supplies the component-instance deployment client; catalog capability filtering and authoring controls are retained independently. |
 | `src/store/operatorAlarmStore.ts`; `src/store/operatorAlarmStore.test.ts` | Old polling endpoint/store shape is permanently superseded. Browser motion admission from alarm state is not restored. | I5/H0 now uses `useHeadlessState.ts`, the bounded owner-issued WebSocket projection, `HeadlessRuntimeSurfaces.tsx`, `alarmFences.ts`, `OperatorAlarmPanel.tsx`, and `ExecutionHistoryPanel.tsx`; the C++ owner retains lifecycle and complete membership truth. |
 | `src/store/pointCloudStore.ts`; `src/store/pointCloudStore.test.ts` | The MFPC/v1 socket decoder and connection owner do not return by assumption. | I9/I owns the exact future point-cloud client. `src/state/latestFrameSlot.ts` retains epoch/sequence ordering, newest-only materialization, clear, invalidation, and stale-connection rejection without a wire schema. |
-| `src/store/programStore.ts`; `src/store/programStore.test.ts` | The v1 Program serializer, singleton identities, Pick-Plan macro payload, scene/store joins, and mutation endpoints do not return. | I6/N implements the exact Program-Binding store. `authoringGraph.ts`, pure `composerStore.ts`, catalog/schema/parameter helpers, viewer-presentation reducer, and focused tests retain independent graph/draft behavior. |
+| `src/store/programStore.ts`; `src/store/programStore.test.ts` | The v1 serializer, singleton identities, Pick-Plan macro payload, scene/store joins, and runtime mutations do not return. N6-c3 replaces only its valid authoring subset with a generation-fenced Draft client. | `programWorkspace.ts`, `useProgramWorkspace.ts`, `programAuthoring.ts`, `authoringGraph.ts`, pure `composerStore.ts`, and focused tests retain exact Draft, layout, naming, binding, and request-race behavior without browser runtime authority. |
 | `src/store/robotControlCandidateStore.ts`; `src/store/robotControlCandidateStore.test.ts` | The old candidate DTO/endpoint, shared Approve owner, and singleton move groups do not return. N6-c1/c2 replace them with a generation-fenced local reducer/hook over no-effect owner preview and ordinary operation submission. | All 17 historical debounce, freshness, approval, rejection, terminal, and Revert cases are translated into the active reducer/component/native acceptance set. Pose/gizmo/move/joint/gripper/ghost/persistent-draft utilities retain authoring and fail-closed behavior. |
 | `src/store/robotLifecycleStore.ts` | The former endpoint/poll/command store remains absent until I7/L0 freezes resource-addressed lifecycle requests and observed status. | `RobotLifecycleCard.tsx` retains observation-only presentation. I7 must reconnect enable/disable/recovery/reconcile confirmations without browser lifecycle authority. |
 | `src/store/sceneStateStore.ts`; `src/store/sceneStateStore.viewer.test.ts` | Composer Scene Authority, old scene WebSocket reduction, live placement truth, and viewer-v1 joins do not return. | I5/H0 supplies headless scene truth and I6/N addressed scene/manual clients. Structural viewing, pose transforms, view drafts, and latest-frame mechanics remain. |
@@ -1012,6 +1055,7 @@ a legacy graveyard:
 | Pose/manual-control drafts | `src/utils/{poseTransforms,moveTo,gizmoAuthoring,jointAuthoring,gripperAuthoring,gripperGhost,gripperSemantics,robotModelAuthority}.ts`, `src/hooks/usePersistentDraft.ts`, and focused tests |
 | Viewer/capture mechanics | `src/utils/{structuralTransforms,viewerCamera,viewerPerformance,snapshotCapture}.ts`, `src/state/{latestFrameSlot,viewerPresentationDraft}.ts`, `src/components/{StructuralViewer,SnapshotResponder}.tsx`, and focused tests |
 | Status, recovery, alarm, and history presentation | `src/components/{assistantRequestRecovery,RecoveryActionControls,KernelErrorPanel,RuntimeStatusOverlay,RobotLifecycleCard,OperatorAlarmPanel,ExecutionHistoryPanel}.*` and `src/utils/alarmFences.ts` |
+| Strict Program Draft/Saved authoring | `src/components/{ProgramWorkspace,ProgramNodePalette,ProgramTreeCanvas,ProgramPropertyEditor,ProgramDeclarationsEditor}.tsx`, `src/hooks/useProgramWorkspace.ts`, `src/state/programWorkspace.ts`, `src/utils/programAuthoring.ts`, exact API DTOs/parsers, and focused tests |
 
 The gate/ownership comments in these ports are part of the reconnection marker:
 they identify the exact adapter still missing and state what the retained code
