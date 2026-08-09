@@ -28,17 +28,20 @@ function joint(name: string, type: string): SceneUrdfJoint {
 
 function manifest(): SceneUrdfManifest {
   return {
-    robot_id: 'robot-1',
+    cell_id: 'cell-1',
+    graph_revision: 'graph-1',
+    retained_bundle_id: `sha256:${'a'.repeat(64)}`,
+    viewer_model_revision: `sha256:${'b'.repeat(64)}`,
     model_key: 'sha256:model',
     root_link: 'base',
     projection: {
-      kind: 'authored_neutral',
-      source: 'authored_urdf',
+      kind: 'retained_neutral',
+      source: 'active_retained_viewer_model',
       root_frame: 'base',
       position_unit: 'm',
       angle_unit: 'rad',
       quaternion_order: 'xyzw',
-      joint_coordinate_policy: 'zero_independent_with_authored_mimic',
+      joint_coordinate_policy: 'zero_independent_with_retained_mimic',
       operational_validity: 'not_asserted',
       runtime_state_used: false,
     },

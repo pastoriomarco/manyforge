@@ -43,7 +43,7 @@ export function UnavailableBanner({ health, onRetry }: UnavailableBannerProps) {
         </p>
         <p className="structural-scope">
           Available here: immutable v2 catalog inspection, sandboxed artifact-path
-          browsing, and an authored-neutral URDF view. Nothing on this page asserts
+          browsing, and an active retained-neutral URDF view. Nothing on this page asserts
           live or operational validity.
         </p>
       </div>

@@ -1,15 +1,13 @@
-"""Authored-deployment structural URDF routes.
+"""Active retained viewer-model structural routes.
 
-The cutover shell serves a read-only JSON manifest and glTF/GLB assets from
-the authored deployment. It publishes no live poses, commandability,
-runtime-authority metadata, or semantic-scene state.
+Composer serves a read-only JSON manifest and glTF/GLB assets from the exact
+Headless-selected retained viewer product. It publishes no live poses,
+commandability, runtime-authority metadata, or semantic-scene state.
 
 Caching:
-- The parsed URDF (with meshes resolved) is cached at module scope
-  keyed by `(urdf_path, frozen package_paths)` and invalidated by the
-  URDF file's mtime. Loading + mesh resolution is expensive (~10s+
-  for a UR10e with full collision meshes); the per-link mesh route
-  loads only one resource per call after the first manifest hit.
+- The parsed URDF is cached by the immutable retained-bundle/viewer-product
+  identity. Loading is expensive, while exact resource bytes are fetched only
+  when one mesh is first converted.
 - Per-link glTF bytes are cached after the first conversion. The cache
   is small (one entry per visual link) and lifetimes match the URDF
   cache entry.
@@ -22,18 +20,13 @@ import logging
 import math
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, Response
 
-from manyforge_behavior.model_paths import (
-    default_package_paths,
-    resolve_package_uri,
-    resolve_robot_model,
-)
+from manyforge_headless_api.client import HeadlessClientError
 
 from .state import ComposerState
 
@@ -174,14 +167,13 @@ class _LinkVisual:
     on the parent ``_LinkEntry`` preserves the URDF declaration order
     so the client can render them deterministically.
 
-    Exactly one of ``mesh_path`` / ``primitive`` is non-None.
+    Exactly one of ``mesh_resource_uri`` / ``primitive`` is non-None.
     """
 
     link_name: str
     visual_index: int
-    # Set when the visual references an external mesh file (.dae/.stl/.obj/.glb).
+    # Set when the visual references an exact retained mesh resource.
     mesh_resource_uri: str | None
-    mesh_path: str | None
     mesh_scale: tuple[float, float, float]
     # Set when the visual is a `<box>`, `<cylinder>` or `<sphere>` primitive.
     # The frontend turns these into native Three.js geometries to avoid a
@@ -211,7 +203,6 @@ class _LinkCollision:
     link_name: str
     collision_index: int
     mesh_resource_uri: str | None
-    mesh_path: str | None
     mesh_scale: tuple[float, float, float]
     primitive: dict[str, Any] | None
     collision_origin_xyz: tuple[float, float, float]
@@ -252,9 +243,12 @@ class _JointEntry:
 
 @dataclass
 class _UrdfCacheEntry:
-    urdf_path: str
-    package_paths: tuple[str, ...]
-    mtime_ns: int
+    cell_id: str
+    graph_revision: str
+    retained_bundle_id: str
+    viewer_model_revision: str
+    urdf_content_digest: str
+    model_key: str
     root_link: str
     links: tuple[_LinkEntry, ...]
     joints: tuple[_JointEntry, ...]
@@ -262,57 +256,28 @@ class _UrdfCacheEntry:
 
 
 _cache_lock = threading.Lock()
-_urdf_cache: dict[tuple[str, tuple[str, ...]], _UrdfCacheEntry] = {}
+_urdf_cache: dict[str, _UrdfCacheEntry] = {}
 _MAX_URDF_CACHE_ENTRIES = 8
 _MAX_GLB_CACHE_ENTRIES_PER_MODEL = 256
 
 
-def _make_package_handler(package_dirs: list[str]):
-    def handler(fname: str) -> str:
-        if not fname.startswith("package://"):
-            return fname
-        resolved = resolve_package_uri(fname, package_dirs)
-        if resolved is not None:
-            return resolved
-        return fname
-
-    return handler
+def _viewer_model_key(retained_bundle_id: str, viewer_model_revision: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(_VISUAL_ASSET_SCHEMA_VERSION.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(retained_bundle_id.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(viewer_model_revision.encode("ascii"))
+    return digest.hexdigest()
 
 
-def _resolve_deployment_urdf(state: ComposerState) -> tuple[str, tuple[str, ...]] | None:
-    deployment = state.deployment
-    if deployment is None:
-        return None
-    if not state.deployment_source_path:
-        return None
-    authored_model = deployment.model
-    if not authored_model.urdf_path:
-        return None
-    extra_package_paths = (
-        [] if authored_model.package_paths else default_package_paths()
+def _load_urdf_entry(asset: Any) -> _UrdfCacheEntry | None:
+    model_key = _viewer_model_key(
+        asset.retained_bundle_id,
+        asset.viewer_model_revision,
     )
-    try:
-        resolved = resolve_robot_model(
-            urdf_path=authored_model.urdf_path,
-            srdf_path=authored_model.srdf_path,
-            package_paths=list(authored_model.package_paths),
-            deployment_path=state.deployment_source_path,
-            extra_package_paths=extra_package_paths,
-        )
-    except Exception:
-        logger.debug("Could not resolve robot model for URDF cache", exc_info=True)
-        return None
-    return resolved.urdf_path, tuple(resolved.package_paths)
-
-
-def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCacheEntry | None:
-    try:
-        mtime_ns = Path(urdf_path).stat().st_mtime_ns
-    except OSError:
-        return None
-    cache_key = (urdf_path, package_paths)
-    cached = _urdf_cache.get(cache_key)
-    if cached is not None and cached.mtime_ns == mtime_ns:
+    cached = _urdf_cache.get(model_key)
+    if cached is not None:
         return cached
 
     try:
@@ -322,16 +287,16 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
         return None
 
     try:
-        if package_paths:
-            urdf_model = yourdfpy.URDF.load(
-                urdf_path,
-                filename_handler=_make_package_handler(list(package_paths)),
-                load_meshes=False,
-            )
-        else:
-            urdf_model = yourdfpy.URDF.load(urdf_path, load_meshes=False)
+        urdf_model = yourdfpy.URDF.load(
+            io.BytesIO(asset.bytes),
+            load_meshes=False,
+        )
     except Exception:
-        logger.warning("Failed to load URDF %s", urdf_path, exc_info=True)
+        logger.warning(
+            "Failed to load retained viewer URDF %s",
+            asset.retained_bundle_id,
+            exc_info=True,
+        )
         return None
 
     link_map = getattr(urdf_model, "link_map", {}) or {}
@@ -428,13 +393,6 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
         except Exception:
             return zero_xyz, zero_rpy, identity_quat
 
-    def _resolve_mesh_path(mesh_uri: str) -> str | None:
-        if mesh_uri.startswith("package://"):
-            return resolve_package_uri(mesh_uri, list(package_paths))
-        if mesh_uri.startswith("file://"):
-            return mesh_uri[len("file://") :]
-        return mesh_uri
-
     def _build_visual(
         link_name: str,
         visual_index: int,
@@ -463,7 +421,6 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 link_name=link_name,
                 visual_index=visual_index,
                 mesh_resource_uri=filename,
-                mesh_path=_resolve_mesh_path(filename),
                 mesh_scale=mesh_scale,
                 primitive=None,
                 visual_origin_xyz=origin_xyz,
@@ -480,7 +437,6 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 link_name=link_name,
                 visual_index=visual_index,
                 mesh_resource_uri=None,
-                mesh_path=None,
                 mesh_scale=(1.0, 1.0, 1.0),
                 primitive={
                     "type": "box",
@@ -501,7 +457,6 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 link_name=link_name,
                 visual_index=visual_index,
                 mesh_resource_uri=None,
-                mesh_path=None,
                 mesh_scale=(1.0, 1.0, 1.0),
                 primitive={
                     "type": "cylinder",
@@ -522,7 +477,6 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 link_name=link_name,
                 visual_index=visual_index,
                 mesh_resource_uri=None,
-                mesh_path=None,
                 mesh_scale=(1.0, 1.0, 1.0),
                 primitive={"type": "sphere", "radius_m": float(radius)},
                 visual_origin_xyz=origin_xyz,
@@ -559,7 +513,6 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 link_name=link_name,
                 collision_index=collision_index,
                 mesh_resource_uri=filename,
-                mesh_path=_resolve_mesh_path(filename),
                 mesh_scale=mesh_scale,
                 primitive=None,
                 collision_origin_xyz=origin_xyz,
@@ -576,7 +529,6 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 link_name=link_name,
                 collision_index=collision_index,
                 mesh_resource_uri=None,
-                mesh_path=None,
                 mesh_scale=(1.0, 1.0, 1.0),
                 primitive={
                     "type": "box",
@@ -597,7 +549,6 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 link_name=link_name,
                 collision_index=collision_index,
                 mesh_resource_uri=None,
-                mesh_path=None,
                 mesh_scale=(1.0, 1.0, 1.0),
                 primitive={
                     "type": "cylinder",
@@ -618,7 +569,6 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 link_name=link_name,
                 collision_index=collision_index,
                 mesh_resource_uri=None,
-                mesh_path=None,
                 mesh_scale=(1.0, 1.0, 1.0),
                 primitive={"type": "sphere", "radius_m": float(radius)},
                 collision_origin_xyz=origin_xyz,
@@ -634,7 +584,10 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
         or not root_link
         or root_link not in set(link_names)
     ):
-        logger.warning("URDF %s has no unambiguous authored root tree", urdf_path)
+        logger.warning(
+            "Retained viewer URDF %s has no unambiguous root tree",
+            asset.retained_bundle_id,
+        )
         return None
 
     geometry_by_link: dict[
@@ -658,7 +611,10 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
             )
             geometry_by_link[link_name] = (link_visuals, link_collisions)
     except (IndexError, TypeError, ValueError):
-        logger.warning("URDF %s has invalid authored geometry metadata", urdf_path)
+        logger.warning(
+            "Retained viewer URDF %s has invalid geometry metadata",
+            asset.retained_bundle_id,
+        )
         return None
 
     # Preserve authored joint structure and derive one deterministic neutral
@@ -755,7 +711,10 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
             joint_rows.append(row)
             joint_by_name[name] = row
     except (IndexError, KeyError, TypeError, ValueError):
-        logger.warning("URDF %s has invalid authored joint metadata", urdf_path)
+        logger.warning(
+            "Retained viewer URDF %s has invalid joint metadata",
+            asset.retained_bundle_id,
+        )
         return None
 
     neutral_positions: dict[str, float] = {}
@@ -794,7 +753,10 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
         for joint_name in joint_by_name:
             _neutral_position(joint_name, set())
     except (KeyError, ValueError):
-        logger.warning("URDF %s has an invalid authored mimic graph", urdf_path)
+        logger.warning(
+            "Retained viewer URDF %s has an invalid mimic graph",
+            asset.retained_bundle_id,
+        )
         return None
 
     link_name_set = set(link_names)
@@ -844,7 +806,10 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
         if set(link_transforms) != link_name_set:
             raise ValueError("joint graph is disconnected")
     except (KeyError, ValueError):
-        logger.warning("URDF %s does not define one complete rooted link tree", urdf_path)
+        logger.warning(
+            "Retained viewer URDF %s does not define one complete rooted link tree",
+            asset.retained_bundle_id,
+        )
         return None
 
     masters = {
@@ -899,84 +864,43 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
         )
 
     entry = _UrdfCacheEntry(
-        urdf_path=urdf_path,
-        package_paths=package_paths,
-        mtime_ns=mtime_ns,
+        cell_id=asset.cell_id,
+        graph_revision=asset.graph_revision,
+        retained_bundle_id=asset.retained_bundle_id,
+        viewer_model_revision=asset.viewer_model_revision,
+        urdf_content_digest=asset.content_digest,
+        model_key=model_key,
         root_link=root_link,
         links=tuple(links),
         joints=tuple(joints),
         mesh_glb_cache={},
     )
-    _urdf_cache[cache_key] = entry
+    _urdf_cache[model_key] = entry
     while len(_urdf_cache) > _MAX_URDF_CACHE_ENTRIES:
         _urdf_cache.pop(next(iter(_urdf_cache)))
     return entry
 
 
 def get_urdf_entry(state: ComposerState) -> _UrdfCacheEntry | None:
-    resolution = _resolve_deployment_urdf(state)
-    if resolution is None:
+    client = state.headless_client
+    if client is None:
         return None
-    urdf_path, package_paths = resolution
+    asset = client.viewer_model_urdf()
     with _cache_lock:
-        return _load_urdf_entry(urdf_path, package_paths)
+        entry = _load_urdf_entry(asset)
+    if entry is not None:
+        state.viewer_model_key = entry.model_key
+    return entry
 
 
-
-
-def _mesh_stat_key(mesh_path: str | None) -> str:
-    if mesh_path is None:
-        return "primitive"
-    path = Path(mesh_path)
-    try:
-        stat = path.stat()
-    except OSError:
-        return f"{path.resolve()}|missing"
-    return f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
-
-
-
-
-def _entry_asset_revision_key(
-    entry: _UrdfCacheEntry,
-    robot_id: str | None,
-) -> str:
-    """Return a local stale-asset key, never a retained semantic identity.
-
-    The structural shell uses this path/mtime-derived key only to prevent a
-    browser cache from showing geometry from a previously authored file.  It
-    must not be compared with compiler-owned model or bundle identities.
-    """
-    digest = hashlib.sha256()
-    digest.update(_VISUAL_ASSET_SCHEMA_VERSION.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update((robot_id or "").encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(str(Path(entry.urdf_path).resolve()).encode("utf-8", errors="replace"))
-    digest.update(b"\0")
-    digest.update(str(entry.mtime_ns).encode("ascii"))
-    digest.update(b"\0")
-    for package_path in entry.package_paths:
-        digest.update(str(Path(package_path).resolve()).encode("utf-8", errors="replace"))
-        digest.update(b"\0")
-    for link in entry.links:
-        digest.update(link.name.encode("utf-8", errors="replace"))
-        digest.update(b"\0")
-        for visual in link.visuals:
-            digest.update(str(visual.visual_index).encode("ascii"))
-            digest.update(b"\0")
-            digest.update((visual.mesh_resource_uri or "").encode("utf-8", errors="replace"))
-            digest.update(b"\0")
-            digest.update(_mesh_stat_key(visual.mesh_path).encode("utf-8", errors="replace"))
-            digest.update(b"\0")
-        for collision in link.collisions:
-            digest.update(str(collision.collision_index).encode("ascii"))
-            digest.update(b"\0")
-            digest.update((collision.mesh_resource_uri or "").encode("utf-8", errors="replace"))
-            digest.update(b"\0")
-            digest.update(_mesh_stat_key(collision.mesh_path).encode("utf-8", errors="replace"))
-            digest.update(b"\0")
-    return digest.hexdigest()[:24]
+def _cached_urdf_entry(
+    state: ComposerState,
+    requested_model_key: str,
+) -> _UrdfCacheEntry | None:
+    if state.viewer_model_key != requested_model_key:
+        return None
+    with _cache_lock:
+        return _urdf_cache.get(requested_model_key)
 
 
 def _find_visual(
@@ -1010,32 +934,23 @@ def _find_collision(
 
 
 def _render_mesh_glb(
+    state: ComposerState,
     entry: _UrdfCacheEntry,
     *,
     kind: str,
     link_name: str,
     index: int,
-    mesh_path: str | None,
+    mesh_resource_uri: str | None,
     mesh_scale: tuple[float, float, float],
 ) -> bytes | None:
-    if mesh_path is None:
-        return None
-    mesh_file = Path(mesh_path)
-    if not mesh_file.exists():
-        logger.warning(
-            "Mesh file missing for link %s %s %d at %s",
-            link_name,
-            kind,
-            index,
-            mesh_file,
-        )
+    if mesh_resource_uri is None:
         return None
     cache_key = (
         kind,
         link_name,
         index,
         _VISUAL_ASSET_SCHEMA_VERSION,
-        _mesh_stat_key(mesh_path),
+        mesh_resource_uri,
     )
     with _cache_lock:
         cached = entry.mesh_glb_cache.get(cache_key)
@@ -1046,10 +961,46 @@ def _render_mesh_glb(
     except ImportError:
         logger.warning("trimesh not installed; URDF mesh route is disabled")
         return None
+    client = state.headless_client
+    if client is None:
+        return None
+    asset = client.viewer_model_resource(
+        entry.retained_bundle_id,
+        mesh_resource_uri,
+    )
+    if (
+        asset.viewer_model_revision != entry.viewer_model_revision
+        or asset.cell_id != entry.cell_id
+        or asset.logical_uri != mesh_resource_uri
+    ):
+        raise HeadlessClientError(
+            "viewer_model_asset_invalid",
+            "viewer resource does not match the cached retained model",
+            502,
+        )
+    file_type = (
+        mesh_resource_uri.rsplit(".", 1)[1].lower()
+        if "." in mesh_resource_uri.rsplit("/", 1)[-1]
+        else None
+    )
+    if not file_type:
+        logger.warning(
+            "Retained viewer mesh has no supported type: %s",
+            mesh_resource_uri,
+        )
+        return None
     try:
-        loaded = trimesh.load(mesh_file, force="mesh")
+        loaded = trimesh.load(
+            io.BytesIO(asset.bytes),
+            file_type=file_type,
+            force="mesh",
+        )
     except Exception:
-        logger.warning("trimesh.load failed for %s", mesh_file, exc_info=True)
+        logger.warning(
+            "trimesh.load failed for retained resource %s",
+            mesh_resource_uri,
+            exc_info=True,
+        )
         return None
     mesh: Any = loaded
     if hasattr(loaded, "dump"):
@@ -1073,7 +1024,11 @@ def _render_mesh_glb(
         else:
             return None
     except Exception:
-        logger.warning("mesh.export to glb failed for %s", mesh_file, exc_info=True)
+        logger.warning(
+            "mesh.export to glb failed for retained resource %s",
+            mesh_resource_uri,
+            exc_info=True,
+        )
         return None
     glb_bytes = buffer.getvalue()
     with _cache_lock:
@@ -1084,6 +1039,7 @@ def _render_mesh_glb(
 
 
 def _render_visual_glb(
+    state: ComposerState,
     entry: _UrdfCacheEntry,
     visual: _LinkVisual,
 ) -> bytes | None:
@@ -1091,26 +1047,41 @@ def _render_visual_glb(
     # geometries — no glTF needed. The mesh route returns 404 for these
     # and the frontend uses the manifest's `primitive` block instead.
     return _render_mesh_glb(
+        state,
         entry,
         kind="visual",
         link_name=visual.link_name,
         index=visual.visual_index,
-        mesh_path=visual.mesh_path,
+        mesh_resource_uri=visual.mesh_resource_uri,
         mesh_scale=visual.mesh_scale,
     )
 
 
 def _render_collision_glb(
+    state: ComposerState,
     entry: _UrdfCacheEntry,
     collision: _LinkCollision,
 ) -> bytes | None:
     return _render_mesh_glb(
+        state,
         entry,
         kind="collision",
         link_name=collision.link_name,
         index=collision.collision_index,
-        mesh_path=collision.mesh_path,
+        mesh_resource_uri=collision.mesh_resource_uri,
         mesh_scale=collision.mesh_scale,
+    )
+
+
+def _headless_asset_error_response(exc: HeadlessClientError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code if exc.status_code is not None else 503,
+        content={
+            "detail": {
+                "code": exc.code,
+                "message": str(exc),
+            }
+        },
     )
 
 
@@ -1120,35 +1091,40 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
 
     @router.get("/manifest")
     def get_manifest() -> dict[str, Any]:
-        entry = get_urdf_entry(state)
+        try:
+            entry = get_urdf_entry(state)
+        except HeadlessClientError as exc:
+            raise HTTPException(
+                status_code=exc.status_code if exc.status_code is not None else 503,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         if entry is None:
             raise HTTPException(
                 status_code=404,
                 detail="No URDF available for the active deployment",
             )
-        deployment = state.deployment
-        robot_id = None
-        if deployment is not None:
-            robot_id = deployment.model.authored_model_id
         # Drei's GLB cache is keyed by URL string, while industrial robot
-        # models often reuse link names across arms. Key mesh URLs by the
-        # local authored-asset revision, not just robot_id, so switching
-        # UR5 <-> UR10e or editing a same-id deployment cannot reuse stale
-        # link geometry. This is deliberately not a compiler/retained identity.
-        model_key = _entry_asset_revision_key(entry, robot_id)
+        # models often reuse link names across arms. The URL therefore carries
+        # the exact active retained viewer-product identity plus this
+        # converter's public protocol revision. A later Apply cannot reuse
+        # geometry produced for an earlier immutable model.
+        model_key = entry.model_key
         return {
-            "robot_id": robot_id,
+            "cell_id": entry.cell_id,
+            "graph_revision": entry.graph_revision,
+            "retained_bundle_id": entry.retained_bundle_id,
+            "viewer_model_revision": entry.viewer_model_revision,
             "model_key": model_key,
             "root_link": entry.root_link,
             "projection": {
-                "kind": "authored_neutral",
-                "source": "authored_urdf",
+                "kind": "retained_neutral",
+                "source": "active_retained_viewer_model",
                 "root_frame": entry.root_link,
                 "position_unit": "m",
                 "angle_unit": "rad",
                 "quaternion_order": "xyzw",
                 "joint_coordinate_policy": (
-                    "zero_independent_with_authored_mimic"
+                    "zero_independent_with_retained_mimic"
                 ),
                 "operational_validity": "not_asserted",
                 "runtime_state_used": False,
@@ -1169,7 +1145,7 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
                             "mesh_url": (
                                 f"/api/scene/urdf/models/{model_key}/meshes/"
                                 f"{quote(link.name, safe='')}/{visual.visual_index}"
-                                if visual.mesh_path is not None
+                                if visual.mesh_resource_uri is not None
                                 else None
                             ),
                             "primitive": visual.primitive,
@@ -1187,7 +1163,7 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
                             "mesh_url": (
                                 f"/api/scene/urdf/models/{model_key}/collision-meshes/"
                                 f"{quote(link.name, safe='')}/{collision.collision_index}"
-                                if collision.mesh_path is not None
+                                if collision.mesh_resource_uri is not None
                                 else None
                             ),
                             "primitive": collision.primitive,
@@ -1245,22 +1221,31 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
         visual_index: int,
         requested_model_key: str | None,
     ) -> Response:
-        entry = get_urdf_entry(state)
+        if requested_model_key is None:
+            try:
+                entry = get_urdf_entry(state)
+            except HeadlessClientError as exc:
+                return _headless_asset_error_response(exc)
+        else:
+            entry = _cached_urdf_entry(state, requested_model_key)
         if entry is None:
             return JSONResponse(
-                status_code=404,
-                content={"detail": "No URDF available for the active deployment"},
+                status_code=409 if requested_model_key is not None else 404,
+                content=(
+                    {
+                        "detail": "Stale URDF mesh URL for inactive retained model",
+                        "active_model_key": state.viewer_model_key,
+                    }
+                    if requested_model_key is not None
+                    else {"detail": "No URDF available for the active deployment"}
+                ),
             )
-        deployment = state.deployment
-        robot_id = None
-        if deployment is not None:
-            robot_id = deployment.model.authored_model_id
-        active_model_key = _entry_asset_revision_key(entry, robot_id)
+        active_model_key = entry.model_key
         if requested_model_key is not None and requested_model_key != active_model_key:
             return JSONResponse(
                 status_code=409,
                 content={
-                    "detail": "Stale URDF mesh URL for inactive robot model",
+                    "detail": "Stale URDF mesh URL for inactive retained model",
                     "active_model_key": active_model_key,
                 },
             )
@@ -1272,7 +1257,10 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
                     "detail": f"Unknown link/visual '{link_name}'/{visual_index}",
                 },
             )
-        glb_bytes = _render_visual_glb(entry, visual)
+        try:
+            glb_bytes = _render_visual_glb(state, entry, visual)
+        except HeadlessClientError as exc:
+            return _headless_asset_error_response(exc)
         if glb_bytes is None:
             return JSONResponse(
                 status_code=404,
@@ -1300,22 +1288,35 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
         collision_index: int,
         requested_model_key: str | None,
     ) -> Response:
-        entry = get_urdf_entry(state)
+        if requested_model_key is None:
+            try:
+                entry = get_urdf_entry(state)
+            except HeadlessClientError as exc:
+                return _headless_asset_error_response(exc)
+        else:
+            entry = _cached_urdf_entry(state, requested_model_key)
         if entry is None:
             return JSONResponse(
-                status_code=404,
-                content={"detail": "No URDF available for the active deployment"},
+                status_code=409 if requested_model_key is not None else 404,
+                content=(
+                    {
+                        "detail": (
+                            "Stale URDF collision mesh URL for inactive retained model"
+                        ),
+                        "active_model_key": state.viewer_model_key,
+                    }
+                    if requested_model_key is not None
+                    else {"detail": "No URDF available for the active deployment"}
+                ),
             )
-        deployment = state.deployment
-        robot_id = None
-        if deployment is not None:
-            robot_id = deployment.model.authored_model_id
-        active_model_key = _entry_asset_revision_key(entry, robot_id)
+        active_model_key = entry.model_key
         if requested_model_key is not None and requested_model_key != active_model_key:
             return JSONResponse(
                 status_code=409,
                 content={
-                    "detail": "Stale URDF collision mesh URL for inactive robot model",
+                    "detail": (
+                        "Stale URDF collision mesh URL for inactive retained model"
+                    ),
                     "active_model_key": active_model_key,
                 },
             )
@@ -1327,7 +1328,10 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
                     "detail": f"Unknown link/collision '{link_name}'/{collision_index}",
                 },
             )
-        glb_bytes = _render_collision_glb(entry, collision)
+        try:
+            glb_bytes = _render_collision_glb(state, entry, collision)
+        except HeadlessClientError as exc:
+            return _headless_asset_error_response(exc)
         if glb_bytes is None:
             return JSONResponse(
                 status_code=404,

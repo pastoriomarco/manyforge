@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import httpx
 import pytest
 
@@ -66,6 +68,86 @@ def test_client_uses_the_dedicated_source_model_route() -> None:
     finally:
         raw.close()
     assert [request.url.path for request in requests] == ["/api/source-model"]
+
+
+def _viewer_headers(
+    *,
+    kind: str,
+    bundle_id: str,
+    payload: bytes,
+) -> dict[str, str]:
+    return {
+        "content-type": "application/xml" if kind == "urdf" else "model/stl",
+        "x-manyforge-asset-kind": kind,
+        "x-manyforge-cell-id": "cell-a",
+        "x-manyforge-content-digest": (
+            f"sha256:{hashlib.sha256(payload).hexdigest()}"
+        ),
+        "x-manyforge-graph-revision": "graph.1",
+        "x-manyforge-product-contract-id": "manyforge.viewer_model",
+        "x-manyforge-product-contract-revision": "sha256:" + "2" * 64,
+        "x-manyforge-product-id": "cell_viewer_model",
+        "x-manyforge-retained-bundle-id": bundle_id,
+        "x-manyforge-viewer-model-revision": "sha256:" + "3" * 64,
+    }
+
+
+def test_client_reads_exact_bounded_viewer_assets() -> None:
+    requests: list[httpx.Request] = []
+    bundle_id = "sha256:" + "1" * 64
+    logical_uri = "asset://fixture/revision/model.stl"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/urdf"):
+            payload = b"<robot/>"
+            return httpx.Response(
+                200,
+                content=payload,
+                headers=_viewer_headers(
+                    kind="urdf",
+                    bundle_id=bundle_id,
+                    payload=payload,
+                ),
+                request=request,
+            )
+        payload = b"solid"
+        return httpx.Response(
+            200,
+            content=payload,
+            headers=_viewer_headers(
+                kind="resource",
+                bundle_id=bundle_id,
+                payload=payload,
+            ),
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        urdf = client.viewer_model_urdf()
+        resource = client.viewer_model_resource(bundle_id, logical_uri)
+    finally:
+        raw.close()
+
+    assert urdf.asset_kind == "urdf"
+    assert urdf.logical_uri is None
+    assert urdf.bytes == b"<robot/>"
+    assert resource.asset_kind == "resource"
+    assert resource.logical_uri == logical_uri
+    assert resource.bytes == b"solid"
+    assert [request.url.path for request in requests] == [
+        "/api/viewer-model/urdf",
+        "/api/viewer-model/resource",
+    ]
+    assert dict(requests[1].url.params) == {
+        "retained_bundle_id": bundle_id,
+        "logical_uri": logical_uri,
+    }
 
 
 def test_client_uses_the_selected_assistant_mode_route() -> None:

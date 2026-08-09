@@ -9,7 +9,6 @@ at their named gates.
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
 from types import SimpleNamespace
 from typing import Final
@@ -17,6 +16,8 @@ from typing import Final
 import pytest
 
 from manyforge_composer.backend import routes_urdf
+from manyforge_composer.backend.state import ComposerState
+from manyforge_headless_api.native import ViewerModelAsset
 
 
 HISTORICAL_CASE_COUNT: Final = 6
@@ -70,30 +71,50 @@ class _FakeMesh:
         return b"glb"
 
 
+def _viewer_asset(index: int) -> ViewerModelAsset:
+    payload = f"<robot name='r{index}'/>".encode()
+    return ViewerModelAsset(
+        asset_kind="urdf",
+        cell_id="cell-fixture",
+        graph_revision=f"graph-{index}",
+        retained_bundle_id=f"sha256:{index:064x}",
+        product_id="cell_viewer_model",
+        product_contract_id="manyforge.viewer_model",
+        product_contract_revision=f"sha256:{'a' * 64}",
+        viewer_model_revision=f"sha256:{index + 16:064x}",
+        logical_uri=None,
+        media_type="application/xml",
+        byte_size=len(payload),
+        content_digest=f"sha256:{index + 32:064x}",
+        bytes=payload,
+    )
+
+
 def test_urdf_cache_remains_bounded_in_the_structural_shell(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(routes_urdf, "_MAX_URDF_CACHE_ENTRIES", 3)
     monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=_FakeUrdf))
     routes_urdf._urdf_cache.clear()
     try:
-        paths: list[str] = []
+        expected_keys: list[str] = []
         for index in range(9):
-            path = tmp_path / f"robot_{index}.urdf"
-            path.write_text(f"<robot name='r{index}'/>", encoding="utf-8")
-            paths.append(str(path))
-            assert routes_urdf._load_urdf_entry(str(path), ()) is not None
+            asset = _viewer_asset(index)
+            expected_keys.append(
+                routes_urdf._viewer_model_key(
+                    asset.retained_bundle_id,
+                    asset.viewer_model_revision,
+                )
+            )
+            assert routes_urdf._load_urdf_entry(asset) is not None
             assert len(routes_urdf._urdf_cache) <= 3
 
-        retained_paths = {key[0] for key in routes_urdf._urdf_cache}
-        assert retained_paths == set(paths[-3:])
+        assert set(routes_urdf._urdf_cache) == set(expected_keys[-3:])
     finally:
         routes_urdf._urdf_cache.clear()
 
 
 def test_glb_cache_remains_bounded_per_structural_model(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(routes_urdf, "_MAX_GLB_CACHE_ENTRIES_PER_MODEL", 4)
@@ -103,30 +124,55 @@ def test_glb_cache_remains_bounded_per_structural_model(
         SimpleNamespace(load=lambda *_args, **_kwargs: _FakeMesh()),
     )
     entry = routes_urdf._UrdfCacheEntry(
-        urdf_path=str(tmp_path / "robot.urdf"),
-        package_paths=(),
-        mtime_ns=1,
+        cell_id="cell-fixture",
+        graph_revision="graph-1",
+        retained_bundle_id=f"sha256:{'b' * 64}",
+        viewer_model_revision=f"sha256:{'c' * 64}",
+        urdf_content_digest=f"sha256:{'d' * 64}",
+        model_key="model-key",
         root_link="base_link",
         links=(),
         joints=(),
         mesh_glb_cache={},
     )
 
+    class FakeClient:
+        def viewer_model_resource(
+            self,
+            retained_bundle_id: str,
+            logical_uri: str,
+        ) -> ViewerModelAsset:
+            assert retained_bundle_id == entry.retained_bundle_id
+            return ViewerModelAsset(
+                asset_kind="resource",
+                cell_id=entry.cell_id,
+                graph_revision=entry.graph_revision,
+                retained_bundle_id=retained_bundle_id,
+                product_id="cell_viewer_model",
+                product_contract_id="manyforge.viewer_model",
+                product_contract_revision=f"sha256:{'a' * 64}",
+                viewer_model_revision=entry.viewer_model_revision,
+                logical_uri=logical_uri,
+                media_type="model/stl",
+                byte_size=13,
+                content_digest=f"sha256:{'e' * 64}",
+                bytes=b"solid fixture",
+            )
+
+    state = ComposerState(headless_client=FakeClient())
     for index in range(12):
-        mesh_path = tmp_path / f"mesh_{index}.stl"
-        mesh_path.write_text("solid fixture", encoding="utf-8")
+        logical_uri = f"package://fixture/mesh_{index}.stl"
         visual = routes_urdf._LinkVisual(
             link_name=f"link_{index}",
             visual_index=index,
-            mesh_resource_uri=str(mesh_path),
-            mesh_path=str(mesh_path),
+            mesh_resource_uri=logical_uri,
             mesh_scale=(1.0, 1.0, 1.0),
             primitive=None,
             visual_origin_xyz=(0.0, 0.0, 0.0),
             visual_origin_rpy=(0.0, 0.0, 0.0),
             visual_origin_xyzw=(0.0, 0.0, 0.0, 1.0),
         )
-        assert routes_urdf._render_visual_glb(entry, visual) == b"glb"
+        assert routes_urdf._render_visual_glb(state, entry, visual) == b"glb"
         assert len(entry.mesh_glb_cache) <= 4
 
     assert {key[2] for key in entry.mesh_glb_cache} == {8, 9, 10, 11}

@@ -80,8 +80,6 @@ def test_structural_options_are_not_classified_as_removed_runtime_options() -> N
             "--host=127.0.0.1",
             "--port",
             "9000",
-            "--deployment-path",
-            "deployment.yaml",
             "--static-dir=dist",
             "--headless-api-url",
             "http://127.0.0.1:9010",

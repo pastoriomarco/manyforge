@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <iterator>
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <optional>
@@ -417,6 +418,7 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
       node_environment_projection_(config_.package_root,
                                    config_.node_catalog_path),
       source_model_projection_(config_.package_root),
+      viewer_model_source_(config_.package_root),
       history_store_(std::make_shared<SqliteEventHistoryStore>(
           config_.historian_database_path, config_.historian_record_retention)),
       historian_(history_store_, config_.historian_queue_capacity),
@@ -487,14 +489,29 @@ CanonicalValue HeadlessApiCore::SourceModelProjection() {
   return SourceModelProjectionLocked(RefreshLocked());
 }
 
+ViewerModelAsset HeadlessApiCore::ViewerModelUrdf() {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  return ViewerModelAssetLocked(RefreshLocked(), std::nullopt, std::nullopt);
+}
+
+ViewerModelAsset HeadlessApiCore::ViewerModelResource(
+    const std::string_view expected_retained_bundle_id,
+    const std::string_view logical_uri) {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  return ViewerModelAssetLocked(RefreshLocked(), expected_retained_bundle_id,
+                                logical_uri);
+}
+
 CanonicalValue HeadlessApiCore::AssistantModeIndex() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   return AssistantModeIndexLocked(RefreshLocked());
 }
 
-CanonicalValue HeadlessApiCore::AssistantModeProjection(
-    const std::string_view mode_id) {
+CanonicalValue
+HeadlessApiCore::AssistantModeProjection(const std::string_view mode_id) {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   return AssistantModeProjectionLocked(RefreshLocked(), mode_id);
@@ -910,26 +927,30 @@ HeadlessRuntimeSnapshot HeadlessApiCore::RefreshLocked() {
 }
 
 std::shared_ptr<const manyforge::deployment::RetainedBundle>
-HeadlessApiCore::VerifiedActiveBundleLocked(const std::string_view retained_bundle_id,
-                                            const std::string_view graph_revision,
-                                            const std::string_view invalid_code,
-                                            const std::string_view unavailable_code) {
+HeadlessApiCore::VerifiedActiveBundleLocked(
+    const std::string_view retained_bundle_id,
+    const std::string_view graph_revision, const std::string_view invalid_code,
+    const std::string_view unavailable_code) {
   if (verified_active_bundle_ == nullptr ||
-      verified_active_bundle_->retained_bundle_id().value() != retained_bundle_id) {
+      verified_active_bundle_->retained_bundle_id().value() !=
+          retained_bundle_id) {
     std::shared_ptr<const manyforge::deployment::RetainedBundle> selected;
     try {
       selected = retained_bundle_source_.get_verified(
           manyforge::core::RetainedBundleId(std::string(retained_bundle_id)));
-    } catch (const std::exception& error) {
-      CoreFail(std::string(invalid_code),
-               "the selected retained bundle failed independent verification: " +
-                   std::string(error.what()));
+    } catch (const std::exception &error) {
+      CoreFail(
+          std::string(invalid_code),
+          "the selected retained bundle failed independent verification: " +
+              std::string(error.what()));
     }
     if (selected == nullptr) {
-      CoreFail(std::string(unavailable_code), "the Manager-selected retained bundle is absent");
+      CoreFail(std::string(unavailable_code),
+               "the Manager-selected retained bundle is absent");
     }
     Require(selected->value().cell_graph.cell_id.value() == config_.cell_id &&
-                selected->value().cell_graph.graph_revision.value() == graph_revision &&
+                selected->value().cell_graph.graph_revision.value() ==
+                    graph_revision &&
                 selected->retained_bundle_id().value() == retained_bundle_id,
             std::string(invalid_code),
             "the independently verified bundle does not match the active cell "
@@ -941,13 +962,17 @@ HeadlessApiCore::VerifiedActiveBundleLocked(const std::string_view retained_bund
     // on every authoring callback.
     verified_active_bundle_ = std::move(selected);
     source_model_projection_cache_.reset();
+    verified_viewer_model_.reset();
     assistant_mode_index_cache_.reset();
     assistant_mode_projection_cache_.clear();
   }
   Require(
-      verified_active_bundle_->value().cell_graph.cell_id.value() == config_.cell_id &&
-          verified_active_bundle_->value().cell_graph.graph_revision.value() == graph_revision &&
-          verified_active_bundle_->retained_bundle_id().value() == retained_bundle_id,
+      verified_active_bundle_->value().cell_graph.cell_id.value() ==
+              config_.cell_id &&
+          verified_active_bundle_->value().cell_graph.graph_revision.value() ==
+              graph_revision &&
+          verified_active_bundle_->retained_bundle_id().value() ==
+              retained_bundle_id,
       std::string(invalid_code),
       "the cached verified bundle does not match the active cell and "
       "graph selection");
@@ -975,8 +1000,7 @@ CanonicalValue HeadlessApiCore::NodeEnvironmentProjectionLocked(
           "Manager readiness and runtime convergence disagree");
 
   const auto active_bundle = VerifiedActiveBundleLocked(
-      retained_bundle_id, graph_revision,
-      "node_environment_projection_invalid",
+      retained_bundle_id, graph_revision, "node_environment_projection_invalid",
       "node_environment_projection_unavailable");
 
   CanonicalValue projection;
@@ -1033,27 +1057,27 @@ CanonicalValue HeadlessApiCore::NodeEnvironmentProjectionLocked(
 }
 
 CanonicalValue HeadlessApiCore::SourceModelProjectionLocked(
-    const HeadlessRuntimeSnapshot& runtime) {
-  const auto& manager_section = RequiredSection(runtime.root, "manager");
-  const auto& manager_payload = RequiredMember(manager_section, "payload");
+    const HeadlessRuntimeSnapshot &runtime) {
+  const auto &manager_section = RequiredSection(runtime.root, "manager");
+  const auto &manager_payload = RequiredMember(manager_section, "payload");
   if (std::holds_alternative<std::nullptr_t>(manager_payload.storage())) {
     CoreFail("source_model_projection_unavailable",
              "Manager has no current or last-valid active-bundle selection");
   }
   Require(manager_payload.is_object(), "source_model_projection_invalid",
           "Manager active-bundle selection is not an object");
-  const auto& active = RequiredMember(manager_payload, "active");
+  const auto &active = RequiredMember(manager_payload, "active");
   const auto retained_bundle_id = RequiredString(active, "retained_bundle_id");
   const auto graph_revision = RequiredString(active, "graph_revision");
   const auto manager_ready = RequiredBool(manager_payload, "manager_ready");
-  const auto& manager_runtime = RequiredMember(manager_payload, "runtime");
+  const auto &manager_runtime = RequiredMember(manager_payload, "runtime");
   const auto manager_converged = RequiredBool(manager_runtime, "converged");
   Require(manager_ready == manager_converged, "source_model_projection_invalid",
           "Manager readiness and runtime convergence disagree");
 
-  const auto active_bundle = VerifiedActiveBundleLocked(retained_bundle_id, graph_revision,
-                                                        "source_model_projection_invalid",
-                                                        "source_model_projection_unavailable");
+  const auto active_bundle = VerifiedActiveBundleLocked(
+      retained_bundle_id, graph_revision, "source_model_projection_invalid",
+      "source_model_projection_unavailable");
 
   CanonicalValue projection;
   if (source_model_projection_cache_.has_value()) {
@@ -1061,17 +1085,19 @@ CanonicalValue HeadlessApiCore::SourceModelProjectionLocked(
   } else {
     try {
       projection = source_model_projection_.Project(*active_bundle);
-    } catch (const SourceModelProjectionError& error) {
+    } catch (const SourceModelProjectionError &error) {
       CoreFail("source_model_projection_invalid", error.what());
     }
     source_model_projection_cache_ = projection;
   }
   const auto semantic_digest = content_identity::framed_sha256(
-      kSourceModelProjectionIdentityDomain, kSourceModelProjectionApiVersion, projection);
+      kSourceModelProjectionIdentityDomain, kSourceModelProjectionApiVersion,
+      projection);
   if (source_model_generation_ == 0U) {
     source_model_generation_ = 1U;
   } else if (semantic_digest != previous_source_model_digest_) {
-    Require(source_model_generation_ < kMaximumSafeInteger, "source_model_projection_invalid",
+    Require(source_model_generation_ < kMaximumSafeInteger,
+            "source_model_projection_invalid",
             "source model projection generation is exhausted");
     ++source_model_generation_;
   }
@@ -1084,49 +1110,160 @@ CanonicalValue HeadlessApiCore::SourceModelProjectionLocked(
           {"available", RequiredMember(manager_section, "available")},
           {"freshness", RequiredMember(manager_section, "freshness")},
           {"known_gaps", RequiredMember(manager_section, "known_gaps")},
-          {"projection_generation", Number(source_model_generation_, "projection_generation")},
+          {"projection_generation",
+           Number(source_model_generation_, "projection_generation")},
           {"projection_owner_epoch", CanonicalValue(config_.owner_epoch)},
-          {"receiver_age_ns", RequiredMember(manager_section, "receiver_age_ns")},
+          {"receiver_age_ns",
+           RequiredMember(manager_section, "receiver_age_ns")},
           {"selection_projection_generation",
            RequiredMember(manager_section, "projection_generation")},
           {"selection_source_content_digest",
            RequiredMember(manager_section, "source_content_digest")},
-          {"selection_source_generation", RequiredMember(manager_section, "source_generation")},
-          {"selection_source_owner_epoch", RequiredMember(manager_section, "source_owner_epoch")},
-          {"selection_source_owner_id", RequiredMember(manager_section, "source_owner_id")},
+          {"selection_source_generation",
+           RequiredMember(manager_section, "source_generation")},
+          {"selection_source_owner_epoch",
+           RequiredMember(manager_section, "source_owner_epoch")},
+          {"selection_source_owner_id",
+           RequiredMember(manager_section, "source_owner_id")},
           {"source_content_digest", CanonicalValue(semantic_digest)},
-          {"source_generation", Number(source_model_generation_, "source_generation")},
+          {"source_generation",
+           Number(source_model_generation_, "source_generation")},
           {"source_owner_epoch", CanonicalValue(config_.owner_epoch)},
-          {"source_owner_id", CanonicalValue(config_.owner_id + ".source-model")},
+          {"source_owner_id",
+           CanonicalValue(config_.owner_id + ".source-model")},
           {"source_owner_kind", CanonicalValue("source_model_projection")},
       }));
   return CanonicalValue(std::move(result));
 }
 
+ViewerModelAsset HeadlessApiCore::ViewerModelAssetLocked(
+    const HeadlessRuntimeSnapshot &runtime,
+    const std::optional<std::string_view> expected_retained_bundle_id,
+    const std::optional<std::string_view> logical_uri) {
+  const auto &manager_section = RequiredSection(runtime.root, "manager");
+  const auto &manager_payload = RequiredMember(manager_section, "payload");
+  if (std::holds_alternative<std::nullptr_t>(manager_payload.storage())) {
+    CoreFail("viewer_model_asset_unavailable",
+             "Manager has no current or last-valid active-bundle selection");
+  }
+  Require(manager_payload.is_object(), "viewer_model_asset_invalid",
+          "Manager active-bundle selection is not an object");
+  const auto &active = RequiredMember(manager_payload, "active");
+  const auto retained_bundle_id = RequiredString(active, "retained_bundle_id");
+  const auto graph_revision = RequiredString(active, "graph_revision");
+  const auto manager_ready = RequiredBool(manager_payload, "manager_ready");
+  const auto &manager_runtime = RequiredMember(manager_payload, "runtime");
+  const auto manager_converged = RequiredBool(manager_runtime, "converged");
+  Require(manager_ready == manager_converged, "viewer_model_asset_invalid",
+          "Manager readiness and runtime convergence disagree");
+
+  if (expected_retained_bundle_id.has_value()) {
+    Require(content_identity::is_sha256_digest(*expected_retained_bundle_id),
+            "viewer_model_asset_invalid",
+            "expected retained-bundle identity is not a SHA-256 digest");
+    Require(*expected_retained_bundle_id == retained_bundle_id,
+            "viewer_model_selection_stale",
+            "requested viewer asset belongs to an inactive retained bundle");
+  }
+  if (logical_uri.has_value()) {
+    Require(!logical_uri->empty() &&
+                logical_uri->size() <= kMaximumViewerModelResourceUriBytes &&
+                logical_uri->find('\0') == std::string_view::npos,
+            "viewer_model_asset_invalid",
+            "viewer resource URI is outside its closed byte bound");
+  }
+
+  const auto active_bundle = VerifiedActiveBundleLocked(
+      retained_bundle_id, graph_revision, "viewer_model_asset_invalid",
+      "viewer_model_asset_unavailable");
+  const auto &viewer_product =
+      active_bundle->value().compiled_products.viewer_model;
+  Require(viewer_product.has_value(), "viewer_model_asset_unavailable",
+          "the active retained bundle has no viewer-model product");
+
+  if (verified_viewer_model_ == nullptr) {
+    std::optional<deployment::VerifiedRetainedViewerModel> selected;
+    try {
+      selected = viewer_model_source_.get_verified(
+          deployment::RetainedViewerModelQuery{
+              active_bundle->retained_bundle_id(), viewer_product->product_id});
+    } catch (const std::exception &error) {
+      CoreFail("viewer_model_asset_invalid",
+               "the active viewer product failed independent verification: " +
+                   std::string(error.what()));
+    }
+    Require(selected.has_value(), "viewer_model_asset_unavailable",
+            "the active viewer product is absent");
+    verified_viewer_model_ =
+        std::make_shared<deployment::VerifiedRetainedViewerModel>(
+            std::move(*selected));
+  }
+  Require(verified_viewer_model_->query().retained_bundle_id ==
+                  active_bundle->retained_bundle_id() &&
+              verified_viewer_model_->query().product_id ==
+                  viewer_product->product_id,
+          "viewer_model_asset_invalid",
+          "the cached viewer product does not match the active selection");
+
+  const auto &output_records = active_bundle->value().provenance.output_records;
+  const auto output = std::find_if(
+      output_records.begin(), output_records.end(),
+      [&viewer_product](const core::RetainedOutputRecordDTO &candidate) {
+        return candidate.product_id == viewer_product->product_id &&
+               candidate.product_kind ==
+                   core::RetainedProductKind::kViewerModel;
+      });
+  Require(output != output_records.end(), "viewer_model_asset_invalid",
+          "the active viewer product has no exact provenance output");
+
+  std::optional<std::size_t> resource_index;
+  if (logical_uri.has_value()) {
+    const auto &resources = verified_viewer_model_->resources();
+    const auto resource = std::lower_bound(
+        resources.begin(), resources.end(), *logical_uri,
+        [](const deployment::VerifiedRetainedPlanningResource &candidate,
+           const std::string_view selected_uri) {
+          return candidate.logical_uri() < selected_uri;
+        });
+    Require(resource != resources.end() &&
+                resource->logical_uri() == *logical_uri,
+            "viewer_model_resource_not_found",
+            "the requested URI is not an active viewer-model resource");
+    resource_index =
+        static_cast<std::size_t>(std::distance(resources.begin(), resource));
+  }
+
+  return ViewerModelAsset(verified_viewer_model_, config_.cell_id,
+                          graph_revision, output->content_digest,
+                          resource_index);
+}
+
 CanonicalValue HeadlessApiCore::AssistantModeProjectionLocked(
-    const HeadlessRuntimeSnapshot& runtime, const std::string_view mode_id) {
-  Require(!mode_id.empty() && mode_id.size() <= 256U, "assistant_mode_projection_invalid",
+    const HeadlessRuntimeSnapshot &runtime, const std::string_view mode_id) {
+  Require(!mode_id.empty() && mode_id.size() <= 256U,
+          "assistant_mode_projection_invalid",
           "assistant mode identity must be bounded non-empty text");
-  const auto& manager_section = RequiredSection(runtime.root, "manager");
-  const auto& manager_payload = RequiredMember(manager_section, "payload");
+  const auto &manager_section = RequiredSection(runtime.root, "manager");
+  const auto &manager_payload = RequiredMember(manager_section, "payload");
   if (std::holds_alternative<std::nullptr_t>(manager_payload.storage())) {
     CoreFail("assistant_mode_projection_unavailable",
              "Manager has no current or last-valid active-bundle selection");
   }
   Require(manager_payload.is_object(), "assistant_mode_projection_invalid",
           "Manager active-bundle selection is not an object");
-  const auto& active = RequiredMember(manager_payload, "active");
+  const auto &active = RequiredMember(manager_payload, "active");
   const auto retained_bundle_id = RequiredString(active, "retained_bundle_id");
   const auto graph_revision = RequiredString(active, "graph_revision");
   const auto manager_ready = RequiredBool(manager_payload, "manager_ready");
-  const auto& manager_runtime = RequiredMember(manager_payload, "runtime");
+  const auto &manager_runtime = RequiredMember(manager_payload, "runtime");
   const auto manager_converged = RequiredBool(manager_runtime, "converged");
-  Require(manager_ready == manager_converged, "assistant_mode_projection_invalid",
+  Require(manager_ready == manager_converged,
+          "assistant_mode_projection_invalid",
           "Manager readiness and runtime convergence disagree");
 
-  const auto active_bundle = VerifiedActiveBundleLocked(retained_bundle_id, graph_revision,
-                                                        "assistant_mode_projection_invalid",
-                                                        "assistant_mode_projection_unavailable");
+  const auto active_bundle = VerifiedActiveBundleLocked(
+      retained_bundle_id, graph_revision, "assistant_mode_projection_invalid",
+      "assistant_mode_projection_unavailable");
 
   CanonicalValue projection;
   const std::string mode_key(mode_id);
@@ -1136,13 +1273,14 @@ CanonicalValue HeadlessApiCore::AssistantModeProjectionLocked(
   } else {
     try {
       projection = ProjectAssistantMode(*active_bundle, mode_id);
-    } catch (const AssistantModeProjectionError& error) {
+    } catch (const AssistantModeProjectionError &error) {
       CoreFail(error.code(), error.what());
     }
     assistant_mode_projection_cache_.emplace(mode_key, projection);
   }
   const auto semantic_digest = content_identity::framed_sha256(
-      kAssistantModeProjectionIdentityDomain, kAssistantModeProjectionApiVersion, projection);
+      kAssistantModeProjectionIdentityDomain,
+      kAssistantModeProjectionApiVersion, projection);
   CanonicalValue::Object result = projection.as_object();
   result.emplace_back(
       "source",
@@ -1150,43 +1288,51 @@ CanonicalValue HeadlessApiCore::AssistantModeProjectionLocked(
           {"available", RequiredMember(manager_section, "available")},
           {"freshness", RequiredMember(manager_section, "freshness")},
           {"known_gaps", RequiredMember(manager_section, "known_gaps")},
-          {"projection_generation", RequiredMember(manager_section, "projection_generation")},
+          {"projection_generation",
+           RequiredMember(manager_section, "projection_generation")},
           {"projection_owner_epoch", CanonicalValue(config_.owner_epoch)},
-          {"receiver_age_ns", RequiredMember(manager_section, "receiver_age_ns")},
+          {"receiver_age_ns",
+           RequiredMember(manager_section, "receiver_age_ns")},
           {"selection_projection_generation",
            RequiredMember(manager_section, "projection_generation")},
           {"selection_source_content_digest",
            RequiredMember(manager_section, "source_content_digest")},
-          {"selection_source_generation", RequiredMember(manager_section, "source_generation")},
-          {"selection_source_owner_epoch", RequiredMember(manager_section, "source_owner_epoch")},
-          {"selection_source_owner_id", RequiredMember(manager_section, "source_owner_id")},
+          {"selection_source_generation",
+           RequiredMember(manager_section, "source_generation")},
+          {"selection_source_owner_epoch",
+           RequiredMember(manager_section, "source_owner_epoch")},
+          {"selection_source_owner_id",
+           RequiredMember(manager_section, "source_owner_id")},
           {"source_content_digest", CanonicalValue(semantic_digest)},
-          {"source_generation", RequiredMember(manager_section, "projection_generation")},
+          {"source_generation",
+           RequiredMember(manager_section, "projection_generation")},
           {"source_owner_epoch", CanonicalValue(config_.owner_epoch)},
           {"source_owner_id",
-           CanonicalValue(config_.owner_id + ".assistant-mode." + std::string(mode_id))},
+           CanonicalValue(config_.owner_id + ".assistant-mode." +
+                          std::string(mode_id))},
           {"source_owner_kind", CanonicalValue("assistant_mode_projection")},
       }));
   return CanonicalValue(std::move(result));
 }
 
 CanonicalValue HeadlessApiCore::AssistantModeIndexLocked(
-    const HeadlessRuntimeSnapshot& runtime) {
-  const auto& manager_section = RequiredSection(runtime.root, "manager");
-  const auto& manager_payload = RequiredMember(manager_section, "payload");
+    const HeadlessRuntimeSnapshot &runtime) {
+  const auto &manager_section = RequiredSection(runtime.root, "manager");
+  const auto &manager_payload = RequiredMember(manager_section, "payload");
   if (std::holds_alternative<std::nullptr_t>(manager_payload.storage())) {
     CoreFail("assistant_mode_projection_unavailable",
              "Manager has no current or last-valid active-bundle selection");
   }
   Require(manager_payload.is_object(), "assistant_mode_projection_invalid",
           "Manager active-bundle selection is not an object");
-  const auto& active = RequiredMember(manager_payload, "active");
+  const auto &active = RequiredMember(manager_payload, "active");
   const auto retained_bundle_id = RequiredString(active, "retained_bundle_id");
   const auto graph_revision = RequiredString(active, "graph_revision");
   const auto manager_ready = RequiredBool(manager_payload, "manager_ready");
-  const auto& manager_runtime = RequiredMember(manager_payload, "runtime");
+  const auto &manager_runtime = RequiredMember(manager_payload, "runtime");
   const auto manager_converged = RequiredBool(manager_runtime, "converged");
-  Require(manager_ready == manager_converged, "assistant_mode_projection_invalid",
+  Require(manager_ready == manager_converged,
+          "assistant_mode_projection_invalid",
           "Manager readiness and runtime convergence disagree");
 
   const auto active_bundle = VerifiedActiveBundleLocked(
@@ -1199,13 +1345,14 @@ CanonicalValue HeadlessApiCore::AssistantModeIndexLocked(
   } else {
     try {
       projection = ProjectAssistantModeIndex(*active_bundle);
-    } catch (const AssistantModeProjectionError& error) {
+    } catch (const AssistantModeProjectionError &error) {
       CoreFail(error.code(), error.what());
     }
     assistant_mode_index_cache_ = projection;
   }
   const auto semantic_digest = content_identity::framed_sha256(
-      kAssistantModeIndexIdentityDomain, kAssistantModeIndexApiVersion, projection);
+      kAssistantModeIndexIdentityDomain, kAssistantModeIndexApiVersion,
+      projection);
   CanonicalValue::Object result = projection.as_object();
   result.emplace_back(
       "source",
@@ -1213,20 +1360,27 @@ CanonicalValue HeadlessApiCore::AssistantModeIndexLocked(
           {"available", RequiredMember(manager_section, "available")},
           {"freshness", RequiredMember(manager_section, "freshness")},
           {"known_gaps", RequiredMember(manager_section, "known_gaps")},
-          {"projection_generation", RequiredMember(manager_section, "projection_generation")},
+          {"projection_generation",
+           RequiredMember(manager_section, "projection_generation")},
           {"projection_owner_epoch", CanonicalValue(config_.owner_epoch)},
-          {"receiver_age_ns", RequiredMember(manager_section, "receiver_age_ns")},
+          {"receiver_age_ns",
+           RequiredMember(manager_section, "receiver_age_ns")},
           {"selection_projection_generation",
            RequiredMember(manager_section, "projection_generation")},
           {"selection_source_content_digest",
            RequiredMember(manager_section, "source_content_digest")},
-          {"selection_source_generation", RequiredMember(manager_section, "source_generation")},
-          {"selection_source_owner_epoch", RequiredMember(manager_section, "source_owner_epoch")},
-          {"selection_source_owner_id", RequiredMember(manager_section, "source_owner_id")},
+          {"selection_source_generation",
+           RequiredMember(manager_section, "source_generation")},
+          {"selection_source_owner_epoch",
+           RequiredMember(manager_section, "source_owner_epoch")},
+          {"selection_source_owner_id",
+           RequiredMember(manager_section, "source_owner_id")},
           {"source_content_digest", CanonicalValue(semantic_digest)},
-          {"source_generation", RequiredMember(manager_section, "projection_generation")},
+          {"source_generation",
+           RequiredMember(manager_section, "projection_generation")},
           {"source_owner_epoch", CanonicalValue(config_.owner_epoch)},
-          {"source_owner_id", CanonicalValue(config_.owner_id + ".assistant-mode-index")},
+          {"source_owner_id",
+           CanonicalValue(config_.owner_id + ".assistant-mode-index")},
           {"source_owner_kind", CanonicalValue("assistant_mode_index")},
       }));
   return CanonicalValue(std::move(result));

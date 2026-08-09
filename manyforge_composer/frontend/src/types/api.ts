@@ -562,7 +562,7 @@ export interface SceneUrdfCollision {
   collision_origin: SceneUrdfOrigin;
 }
 
-export interface AuthoredNeutralTransform {
+export interface RetainedNeutralTransform {
   relative_to: string;
   position_m: Vector3Tuple;
   orientation_xyzw: QuaternionXyzwTuple;
@@ -570,7 +570,7 @@ export interface AuthoredNeutralTransform {
 
 export interface SceneUrdfLink {
   name: string;
-  neutral_transform: AuthoredNeutralTransform;
+  neutral_transform: RetainedNeutralTransform;
   visuals: SceneUrdfVisual[];
   collisions: SceneUrdfCollision[];
 }
@@ -604,23 +604,26 @@ export interface SceneUrdfJoint {
   is_mimic_master: boolean;
 }
 
-export interface AuthoredNeutralProjection {
-  kind: 'authored_neutral';
-  source: 'authored_urdf';
+export interface RetainedNeutralProjection {
+  kind: 'retained_neutral';
+  source: 'active_retained_viewer_model';
   root_frame: string;
   position_unit: 'm';
   angle_unit: 'rad';
   quaternion_order: 'xyzw';
-  joint_coordinate_policy: 'zero_independent_with_authored_mimic';
+  joint_coordinate_policy: 'zero_independent_with_retained_mimic';
   operational_validity: 'not_asserted';
   runtime_state_used: false;
 }
 
 export interface SceneUrdfManifest {
-  robot_id: string | null;
+  cell_id: string;
+  graph_revision: string;
+  retained_bundle_id: string;
+  viewer_model_revision: string;
   model_key: string;
   root_link: string;
-  projection: AuthoredNeutralProjection;
+  projection: RetainedNeutralProjection;
   links: SceneUrdfLink[];
   joints: SceneUrdfJoint[];
 }

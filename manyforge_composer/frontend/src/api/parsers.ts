@@ -1,5 +1,5 @@
 import type {
-  AuthoredNeutralProjection,
+  RetainedNeutralProjection,
   CatalogBlackboardBinding,
   CatalogCapabilityRequirement,
   CatalogEntry,
@@ -2282,11 +2282,15 @@ function literalAt<T extends string | boolean>(
   return expected;
 }
 
-function parseProjection(value: unknown): AuthoredNeutralProjection {
+function parseProjection(value: unknown): RetainedNeutralProjection {
   const record = objectAt(value, 'manifest.projection');
   return {
-    kind: literalAt(record.kind, 'authored_neutral', 'manifest.projection.kind'),
-    source: literalAt(record.source, 'authored_urdf', 'manifest.projection.source'),
+    kind: literalAt(record.kind, 'retained_neutral', 'manifest.projection.kind'),
+    source: literalAt(
+      record.source,
+      'active_retained_viewer_model',
+      'manifest.projection.source',
+    ),
     root_frame: stringAt(record.root_frame, 'manifest.projection.root_frame'),
     position_unit: literalAt(
       record.position_unit,
@@ -2305,7 +2309,7 @@ function parseProjection(value: unknown): AuthoredNeutralProjection {
     ),
     joint_coordinate_policy: literalAt(
       record.joint_coordinate_policy,
-      'zero_independent_with_authored_mimic',
+      'zero_independent_with_retained_mimic',
       'manifest.projection.joint_coordinate_policy',
     ),
     operational_validity: literalAt(
@@ -2352,7 +2356,16 @@ export function parseSceneUrdfManifest(value: unknown): SceneUrdfManifest {
   }
 
   return {
-    robot_id: nullableStringAt(record.robot_id, 'manifest.robot_id'),
+    cell_id: stringAt(record.cell_id, 'manifest.cell_id'),
+    graph_revision: stringAt(record.graph_revision, 'manifest.graph_revision'),
+    retained_bundle_id: stringAt(
+      record.retained_bundle_id,
+      'manifest.retained_bundle_id',
+    ),
+    viewer_model_revision: stringAt(
+      record.viewer_model_revision,
+      'manifest.viewer_model_revision',
+    ),
     model_key: stringAt(record.model_key, 'manifest.model_key'),
     root_link: rootLink,
     projection,

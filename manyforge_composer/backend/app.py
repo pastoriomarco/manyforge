@@ -255,9 +255,7 @@ def create_app(
                     "components": {
                         "backend": "structural_client",
                         "catalog": "available",
-                        "deployment": (
-                            "authored" if state.deployment is not None else "none"
-                        ),
+                        "viewer_model": "headless",
                         "program_draft": (
                             "loaded"
                             if state.draft_session.program_loaded
@@ -285,9 +283,7 @@ def create_app(
                     "components": {
                         "backend": "structural_client",
                         "catalog": "available",
-                        "deployment": (
-                            "authored" if state.deployment is not None else "none"
-                        ),
+                        "viewer_model": "headless_unavailable",
                         "program_draft": (
                             "loaded"
                             if state.draft_session.program_loaded
@@ -325,9 +321,7 @@ def create_app(
             "components": {
                 "backend": "structural_only",
                 "catalog": "available",
-                "deployment": (
-                    "authored" if state.deployment is not None else "none"
-                ),
+                "viewer_model": "unavailable",
                 "program_draft": (
                     "loaded"
                     if state.draft_session.program_loaded

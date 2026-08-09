@@ -20,7 +20,7 @@ from .models import (
     SceneTransactionRequest,
     StopIntentRequest,
 )
-from .native import HeadlessApiError, HeadlessCorePort
+from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
 
 
 RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
@@ -305,6 +305,62 @@ class HeadlessService:
                 "native core returned an unsupported source model projection",
             )
         return projection
+
+    @staticmethod
+    def _verified_viewer_asset(
+        asset: ViewerModelAsset,
+        *,
+        expected_kind: str,
+        expected_retained_bundle_id: str | None = None,
+        expected_logical_uri: str | None = None,
+    ) -> ViewerModelAsset:
+        if (
+            asset.asset_kind != expected_kind
+            or asset.product_id != "cell_viewer_model"
+            or asset.product_contract_id != "manyforge.viewer_model"
+            or not asset.cell_id
+            or not asset.graph_revision
+            or not asset.viewer_model_revision
+            or not asset.content_digest
+            or asset.byte_size != len(asset.bytes)
+        ):
+            raise HeadlessApiError(
+                "viewer_model_asset_invalid",
+                "native core returned an incoherent viewer-model asset",
+            )
+        if expected_kind == "urdf":
+            if asset.logical_uri is not None or asset.media_type != "application/xml":
+                raise HeadlessApiError(
+                    "viewer_model_asset_invalid",
+                    "native core returned an invalid viewer URDF asset",
+                )
+        elif (
+            asset.logical_uri != expected_logical_uri
+            or asset.retained_bundle_id != expected_retained_bundle_id
+        ):
+            raise HeadlessApiError(
+                "viewer_model_asset_invalid",
+                "native core returned a different viewer resource",
+            )
+        return asset
+
+    def viewer_model_urdf(self) -> ViewerModelAsset:
+        return self._verified_viewer_asset(
+            self.core.viewer_model_urdf(),
+            expected_kind="urdf",
+        )
+
+    def viewer_model_resource(
+        self,
+        retained_bundle_id: str,
+        logical_uri: str,
+    ) -> ViewerModelAsset:
+        return self._verified_viewer_asset(
+            self.core.viewer_model_resource(retained_bundle_id, logical_uri),
+            expected_kind="resource",
+            expected_retained_bundle_id=retained_bundle_id,
+            expected_logical_uri=logical_uri,
+        )
 
     def assistant_mode(self, mode_id: str) -> dict[str, Any]:
         projection = self.core.assistant_mode_projection(mode_id)

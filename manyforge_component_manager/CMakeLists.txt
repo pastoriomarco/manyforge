@@ -412,6 +412,18 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_selected_runtime_composition_rpc_internal
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_kernel_apply_fence_rpc_internal
+    test/test_kernel_apply_fence_rpc_internal.cpp)
+  target_include_directories(
+    test_kernel_apply_fence_rpc_internal PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/include")
+  target_link_libraries(test_kernel_apply_fence_rpc_internal PRIVATE
+    manyforge_component_manager
+    GTest::gtest_main)
+  gtest_discover_tests(test_kernel_apply_fence_rpc_internal
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_native_projection_transition_internal
     test/test_native_projection_transition_internal.cpp)
   target_include_directories(

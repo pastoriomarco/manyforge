@@ -65,6 +65,61 @@ template <typename Callback> std::string Invoke(Callback &&callback) {
   }
 }
 
+py::dict AssetError(const std::string_view code,
+                    const std::string_view message) {
+  py::dict error;
+  error["code"] = py::str(code);
+  error["message"] = py::str(message);
+  py::dict result;
+  result["error"] = std::move(error);
+  result["ok"] = py::bool_(false);
+  return result;
+}
+
+template <typename Callback> py::dict InvokeAsset(Callback &&callback) {
+  try {
+    ViewerModelAsset asset = [&callback]() {
+      py::gil_scoped_release release;
+      return callback();
+    }();
+    const auto logical_uri = asset.logical_uri();
+    const CanonicalValue metadata(CanonicalValue::Object{
+        {"asset_kind", CanonicalValue(std::string(asset.asset_kind()))},
+        {"byte_size", CanonicalValue(static_cast<double>(asset.byte_size()))},
+        {"cell_id", CanonicalValue(std::string(asset.cell_id()))},
+        {"content_digest", CanonicalValue(asset.content_digest().value())},
+        {"graph_revision", CanonicalValue(std::string(asset.graph_revision()))},
+        {"logical_uri", logical_uri.has_value()
+                            ? CanonicalValue(std::string(*logical_uri))
+                            : CanonicalValue(nullptr)},
+        {"media_type", CanonicalValue(std::string(asset.media_type()))},
+        {"product_contract_id",
+         CanonicalValue(asset.product_contract_id().value())},
+        {"product_contract_revision",
+         CanonicalValue(asset.product_contract_revision().value())},
+        {"product_id", CanonicalValue(asset.product_id().value())},
+        {"retained_bundle_id",
+         CanonicalValue(asset.retained_bundle_id().value())},
+        {"schema_version",
+         CanonicalValue(std::string(kViewerModelAssetSchemaVersion))},
+        {"viewer_model_revision",
+         CanonicalValue(asset.viewer_model_revision().value())},
+    });
+    py::dict result;
+    result["bytes"] = py::bytes(asset.bytes().data(), asset.bytes().size());
+    result["metadata"] = py::str(content_identity::canonical_json(metadata));
+    result["ok"] = py::bool_(true);
+    return result;
+  } catch (const OperatorAlarmError &error) {
+    return AssetError(error.code(), error.what());
+  } catch (const std::exception &error) {
+    return AssetError("headless_api_internal_failure", error.what());
+  } catch (...) {
+    return AssetError("headless_api_internal_failure",
+                      "unknown headless API failure");
+  }
+}
+
 AlarmLifecycleState ParseState(const std::string_view state) {
   if (state == "active_unacknowledged") {
     return AlarmLifecycleState::kActiveUnacknowledged;
@@ -150,6 +205,21 @@ public:
     return Invoke([this]() { return core_->SourceModelProjection(); });
   }
 
+  py::dict ViewerModelUrdf() {
+    return InvokeAsset([this]() { return core_->ViewerModelUrdf(); });
+  }
+
+  py::dict ViewerModelResource(std::string expected_retained_bundle_id,
+                               std::string logical_uri) {
+    return InvokeAsset(
+        [this,
+         expected_retained_bundle_id = std::move(expected_retained_bundle_id),
+         logical_uri = std::move(logical_uri)]() {
+          return core_->ViewerModelResource(expected_retained_bundle_id,
+                                            logical_uri);
+        });
+  }
+
   std::string AssistantModeIndex() {
     py::gil_scoped_release release;
     return Invoke([this]() { return core_->AssistantModeIndex(); });
@@ -157,8 +227,9 @@ public:
 
   std::string AssistantModeProjection(std::string mode_id) {
     py::gil_scoped_release release;
-    return Invoke(
-        [this, mode_id = std::move(mode_id)]() { return core_->AssistantModeProjection(mode_id); });
+    return Invoke([this, mode_id = std::move(mode_id)]() {
+      return core_->AssistantModeProjection(mode_id);
+    });
   }
 
   std::string AlarmSnapshot(const std::optional<std::size_t> limit,
@@ -378,9 +449,12 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("node_environment_projection",
            &HeadlessApiBridge::NodeEnvironmentProjection)
       .def("source_model_projection", &HeadlessApiBridge::SourceModelProjection)
+      .def("viewer_model_urdf", &HeadlessApiBridge::ViewerModelUrdf)
+      .def("viewer_model_resource", &HeadlessApiBridge::ViewerModelResource,
+           py::arg("expected_retained_bundle_id"), py::arg("logical_uri"))
       .def("assistant_mode_index", &HeadlessApiBridge::AssistantModeIndex)
-      .def("assistant_mode_projection", &HeadlessApiBridge::AssistantModeProjection,
-           py::arg("mode_id"))
+      .def("assistant_mode_projection",
+           &HeadlessApiBridge::AssistantModeProjection, py::arg("mode_id"))
       .def("alarm_snapshot", &HeadlessApiBridge::AlarmSnapshot,
            py::arg("limit") = std::optional<std::size_t>(32U),
            py::arg("states") = std::vector<std::string>{},

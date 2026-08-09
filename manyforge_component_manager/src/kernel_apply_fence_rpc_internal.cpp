@@ -17,7 +17,7 @@ namespace {
 namespace core = manyforge::core;
 
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'K',
-                                              'A', 'F', 'R', '1'};
+                                              'A', 'F', 'R', '2'};
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 
 [[noreturn]] void Fail(const std::string &detail) {
@@ -470,23 +470,32 @@ ReadIntent(Reader &reader) {
   return result;
 }
 
-void WriteAccepted(Writer &writer,
-                   const core::ConfigurationFenceAcceptedDTO &accepted) {
+void WriteAccepted(
+    Writer &writer, const core::ConfigurationFenceAcceptedDTO &accepted,
+    const core::ConfigurationFenceScopeDTO *const shared_scope = nullptr) {
   if (!accepted.valid()) {
     Fail("cannot encode an invalid configuration-fence acceptance");
   }
+  if (shared_scope != nullptr && accepted.captured_scope != *shared_scope) {
+    Fail("configuration-fence acceptance differs from its shared scope");
+  }
   WriteStrong(writer, accepted.configuration_fence_id);
   WriteGeneration(writer, accepted.configuration_fence_generation);
-  WriteScope(writer, accepted.captured_scope);
+  if (shared_scope == nullptr) {
+    WriteScope(writer, accepted.captured_scope);
+  }
   writer.I64(accepted.accepted_at_ns);
   WriteReplayStatus(writer, accepted.replay_status);
 }
 
-[[nodiscard]] core::ConfigurationFenceAcceptedDTO ReadAccepted(Reader &reader) {
+[[nodiscard]] core::ConfigurationFenceAcceptedDTO ReadAccepted(
+    Reader &reader,
+    const core::ConfigurationFenceScopeDTO *const shared_scope = nullptr) {
   core::ConfigurationFenceAcceptedDTO result{
       ReadStrong<core::ConfigurationFenceId>(reader),
       ReadGeneration<core::ConfigurationFenceGeneration>(reader),
-      ReadScope(reader), reader.I64(), ReadReplayStatus(reader)};
+      shared_scope == nullptr ? ReadScope(reader) : *shared_scope, reader.I64(),
+      ReadReplayStatus(reader)};
   if (!result.valid()) {
     Fail("decoded configuration-fence acceptance is invalid");
   }
@@ -579,15 +588,21 @@ ReadAdmissionSnapshot(Reader &reader) {
 
 void WriteReconciliationEvidence(
     Writer &writer,
-    const core::ConfigurationFenceReconciliationEvidenceDTO &evidence) {
+    const core::ConfigurationFenceReconciliationEvidenceDTO &evidence,
+    const core::ConfigurationFenceScopeDTO *const shared_scope = nullptr) {
   if (!evidence.valid()) {
     Fail("cannot encode invalid fence reconciliation evidence");
+  }
+  if (shared_scope != nullptr && evidence.reconciled_scope != *shared_scope) {
+    Fail("fence reconciliation evidence differs from its shared scope");
   }
   WriteExecutionHostEpoch(writer, evidence.execution_host_epoch);
   WriteFenceOwner(writer, evidence.owner_transaction);
   WriteStrong(writer, evidence.configuration_fence_id);
   WriteGeneration(writer, evidence.configuration_fence_generation);
-  WriteScope(writer, evidence.reconciled_scope);
+  if (shared_scope == nullptr) {
+    WriteScope(writer, evidence.reconciled_scope);
+  }
   writer.U64(evidence.operation_resource_generation);
   WriteStrong(writer, evidence.active_graph_revision);
   WriteProjectionRevision(writer, evidence.active_projection_revision);
@@ -601,13 +616,15 @@ void WriteReconciliationEvidence(
 }
 
 [[nodiscard]] core::ConfigurationFenceReconciliationEvidenceDTO
-ReadReconciliationEvidence(Reader &reader) {
+ReadReconciliationEvidence(
+    Reader &reader,
+    const core::ConfigurationFenceScopeDTO *const shared_scope = nullptr) {
   core::ConfigurationFenceReconciliationEvidenceDTO result{
       ReadExecutionHostEpoch(reader),
       ReadFenceOwner(reader),
       ReadStrong<core::ConfigurationFenceId>(reader),
       ReadGeneration<core::ConfigurationFenceGeneration>(reader),
-      ReadScope(reader),
+      shared_scope == nullptr ? ReadScope(reader) : *shared_scope,
       reader.U64(),
       ReadStrong<core::GraphRevision>(reader),
       ReadProjectionRevision(reader),
@@ -665,6 +682,35 @@ void WriteReleased(Writer &writer,
   return result;
 }
 
+void WriteReleasedWithSharedEvidence(
+    Writer &writer, const core::ConfigurationFenceReleasedDTO &released,
+    const core::ConfigurationFenceReconciliationEvidenceDTO &shared_evidence) {
+  if (!released.valid() ||
+      released.request.reconciliation_evidence != shared_evidence ||
+      released.execution_host_epoch != shared_evidence.execution_host_epoch) {
+    Fail("fence release receipt differs from its shared status evidence");
+  }
+  WriteStrong(writer, released.request.manager_runtime_epoch);
+  writer.I64(released.released_at_ns);
+  WriteReplayStatus(writer, released.replay_status);
+  WriteStrong(writer, released.release_receipt_digest);
+}
+
+[[nodiscard]] core::ConfigurationFenceReleasedDTO
+ReadReleasedWithSharedEvidence(
+    Reader &reader,
+    const core::ConfigurationFenceReconciliationEvidenceDTO &shared_evidence) {
+  core::ConfigurationFenceReleasedDTO result{
+      core::ConfigurationFenceReleaseDTO{
+          shared_evidence, ReadStrong<core::RuntimeEpoch>(reader)},
+      shared_evidence.execution_host_epoch, reader.I64(),
+      ReadReplayStatus(reader), ReadStrong<core::ContentDigest>(reader)};
+  if (!result.valid()) {
+    Fail("decoded shared-evidence fence release receipt is invalid");
+  }
+  return result;
+}
+
 void WriteStatusQuery(Writer &writer,
                       const core::ConfigurationFenceStatusQueryDTO &query) {
   if (!query.valid()) {
@@ -695,23 +741,38 @@ void WriteStatus(Writer &writer,
     Fail("cannot encode an invalid fence status");
   }
   WriteStatusQuery(writer, status.echoed_query);
-  WriteReconciliationEvidence(writer, status.reconciliation_evidence);
+  // The DTO validity relation proves this scope equals expected_scope. Keep
+  // one copy on this private bounded wire and reconstruct the second value.
+  WriteReconciliationEvidence(writer, status.reconciliation_evidence,
+                              &status.echoed_query.expected_scope);
   writer.Byte(static_cast<std::uint8_t>(status.state));
   writer.Boolean(status.admission_fenced);
   WriteOptional<core::ConfigurationFenceReleasedDTO>(
-      writer, status.release_receipt, WriteReleased);
+      writer, status.release_receipt,
+      [&status](Writer &output, const auto &released) {
+        WriteReleasedWithSharedEvidence(output, released,
+                                        status.reconciliation_evidence);
+      });
   writer.String(status.required_compensation_or_operator_direction);
   WriteStrong(writer, status.result_digest);
   WriteOptional<core::ErrorDTO>(writer, status.error, WriteError);
 }
 
 [[nodiscard]] core::ConfigurationFenceStatusDTO ReadStatus(Reader &reader) {
+  auto query = ReadStatusQuery(reader);
+  auto evidence = ReadReconciliationEvidence(reader, &query.expected_scope);
+  const auto state = static_cast<core::ConfigurationFenceState>(reader.Byte());
+  const bool admission_fenced = reader.Boolean();
+  auto release_receipt = ReadOptional<core::ConfigurationFenceReleasedDTO>(
+      reader, [&evidence](Reader &input) {
+        return ReadReleasedWithSharedEvidence(input, evidence);
+      });
   core::ConfigurationFenceStatusDTO result{
-      ReadStatusQuery(reader),
-      ReadReconciliationEvidence(reader),
-      static_cast<core::ConfigurationFenceState>(reader.Byte()),
-      reader.Boolean(),
-      ReadOptional<core::ConfigurationFenceReleasedDTO>(reader, ReadReleased),
+      std::move(query),
+      std::move(evidence),
+      state,
+      admission_fenced,
+      std::move(release_receipt),
       reader.String(),
       ReadStrong<core::ContentDigest>(reader),
       ReadOptional<core::ErrorDTO>(reader, ReadError)};
@@ -752,7 +813,11 @@ void WriteAttemptResult(
   WriteAttemptQuery(writer, result.echoed_query);
   writer.Byte(static_cast<std::uint8_t>(result.state));
   WriteOptional<core::ConfigurationFenceAcceptedDTO>(
-      writer, result.accepted_fence, WriteAccepted);
+      writer, result.accepted_fence,
+      [&result](Writer &output, const auto &accepted) {
+        WriteAccepted(output, accepted,
+                      &result.echoed_query.persisted_intent.scope);
+      });
   writer.Boolean(result.admission_fenced);
   writer.String(result.required_compensation_or_operator_direction);
   WriteStrong(writer, result.result_digest);
@@ -761,11 +826,19 @@ void WriteAttemptResult(
 
 [[nodiscard]] core::ApplyFenceAcquireAttemptReconcileResultDTO
 ReadAttemptResult(Reader &reader) {
+  auto execution_host_epoch = ReadExecutionHostEpoch(reader);
+  auto query = ReadAttemptQuery(reader);
+  const auto state =
+      static_cast<core::ApplyFenceAcquireAttemptReconcileState>(reader.Byte());
+  auto accepted = ReadOptional<core::ConfigurationFenceAcceptedDTO>(
+      reader, [&query](Reader &input) {
+        return ReadAccepted(input, &query.persisted_intent.scope);
+      });
   core::ApplyFenceAcquireAttemptReconcileResultDTO result{
-      ReadExecutionHostEpoch(reader),
-      ReadAttemptQuery(reader),
-      static_cast<core::ApplyFenceAcquireAttemptReconcileState>(reader.Byte()),
-      ReadOptional<core::ConfigurationFenceAcceptedDTO>(reader, ReadAccepted),
+      std::move(execution_host_epoch),
+      std::move(query),
+      state,
+      std::move(accepted),
       reader.Boolean(),
       reader.String(),
       ReadStrong<core::ContentDigest>(reader),

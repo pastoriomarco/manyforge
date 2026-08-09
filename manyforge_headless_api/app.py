@@ -9,7 +9,7 @@ import re
 import uuid
 
 from fastapi import FastAPI, Path, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .execution import ExecutionCommandClient, ExecutionEventPump
@@ -27,7 +27,12 @@ from .models import (
     SceneTransactionRequest,
     StopIntentRequest,
 )
-from .native import HeadlessApiConfig, HeadlessApiError, NativeHeadlessCore
+from .native import (
+    HeadlessApiConfig,
+    HeadlessApiError,
+    NativeHeadlessCore,
+    ViewerModelAsset,
+)
 from .service import HeadlessService, TrustedAttribution
 
 
@@ -129,6 +134,7 @@ def _error_status(code: str) -> int:
         "execution_command_response_identity_mismatch",
         "node_environment_projection_invalid",
         "source_model_projection_invalid",
+        "viewer_model_asset_invalid",
         "assistant_mode_projection_invalid",
     }:
         return 502
@@ -304,6 +310,56 @@ def create_app(
     @app.get("/api/source-model")
     def source_model() -> dict[str, Any]:
         return service.source_model()
+
+    def viewer_asset_response(asset: ViewerModelAsset) -> Response:
+        cache_control = (
+            "public, max-age=31536000, immutable"
+            if asset.asset_kind == "resource"
+            else "no-store"
+        )
+        return Response(
+            content=asset.bytes,
+            media_type=asset.media_type,
+            headers={
+                # The resource route is addressed by bundle + logical URI.
+                # The URDF route selects the current active bundle and must
+                # never be frozen by an intermediary across a later Apply.
+                "Cache-Control": cache_control,
+                "ETag": f'"{asset.content_digest}"',
+                "X-ManyForge-Asset-Kind": asset.asset_kind,
+                "X-ManyForge-Cell-ID": asset.cell_id,
+                "X-ManyForge-Content-Digest": asset.content_digest,
+                "X-ManyForge-Graph-Revision": asset.graph_revision,
+                "X-ManyForge-Product-Contract-ID": asset.product_contract_id,
+                "X-ManyForge-Product-Contract-Revision": (
+                    asset.product_contract_revision
+                ),
+                "X-ManyForge-Product-ID": asset.product_id,
+                "X-ManyForge-Retained-Bundle-ID": asset.retained_bundle_id,
+                "X-ManyForge-Viewer-Model-Revision": (
+                    asset.viewer_model_revision
+                ),
+            },
+        )
+
+    @app.get("/api/viewer-model/urdf")
+    def viewer_model_urdf() -> Response:
+        return viewer_asset_response(service.viewer_model_urdf())
+
+    @app.get("/api/viewer-model/resource")
+    def viewer_model_resource(
+        retained_bundle_id: Annotated[
+            str,
+            Query(pattern=r"^sha256:[0-9a-f]{64}$"),
+        ],
+        logical_uri: Annotated[
+            str,
+            Query(min_length=1, max_length=4096),
+        ],
+    ) -> Response:
+        return viewer_asset_response(
+            service.viewer_model_resource(retained_bundle_id, logical_uri)
+        )
 
     @app.get("/api/assistant/modes")
     def assistant_modes() -> dict[str, Any]:

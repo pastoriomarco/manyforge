@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_deployment/apply_fence_qualification.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_applicability.hpp>
 #include <manyforge_deployment/cell_compiler.hpp>
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <concepts>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -126,6 +128,156 @@ TEST(CellCompiler, CopySharesTheSameImmutableQualifiedPredecessor) {
   EXPECT_EQ(copied.applicability().composition().graph(),
             compiled.applicability().composition().graph());
   EXPECT_EQ(copied.catalog_record_refs(), compiled.catalog_record_refs());
+}
+
+[[nodiscard]] core::ControllableComponentDTO qualification_component(
+    const std::size_t index) {
+  return {
+      core::ControllableComponentId("component-" + std::to_string(index)),
+      core::ComponentTypeId("component-type"),
+      core::ComponentTypeRevision(kZeroDigest),
+      {},
+      {},
+      std::nullopt,
+  };
+}
+
+[[nodiscard]] core::ControlDomainDTO qualification_domain(
+    const std::size_t index) {
+  return {
+      core::ControlDomainId("domain-" + std::to_string(index)),
+      core::ControlDomainRevision(kZeroDigest),
+      {},
+      core::EndpointRoleId("coordinator"),
+      core::ControllerTopologyId("topology"),
+      core::TopologyRevision(kZeroDigest),
+      core::ContainmentGranularity::kResource,
+  };
+}
+
+[[nodiscard]] core::ControlBindingDTO qualification_binding(
+    const std::size_t index) {
+  return {
+      core::ControlBindingId("binding-" + std::to_string(index)),
+      core::ControlBindingRevision(kZeroDigest),
+      core::ControllableComponentId(
+          "component-" +
+          std::to_string(
+              index %
+              kMaximumQualifiedApplyFenceControllableComponentsPerCell)),
+      core::CommandTargetId("target-" + std::to_string(index)),
+      core::CapabilityId("capability"),
+      core::CapabilityDefinitionRevision(kZeroDigest),
+      core::ControlDomainId(
+          "domain-" +
+          std::to_string(
+              index % kMaximumQualifiedApplyFenceControlDomainsPerCell)),
+      {},
+      core::ControlInterfaceContractId("interface"),
+      core::ControlInterfaceRevision(kZeroDigest),
+      core::ControllerTopologyId("topology"),
+      core::TopologyRevision(kZeroDigest),
+      {core::ControlRouteId("route")},
+      {},
+      core::ProviderInstanceId("provider"),
+      core::ProviderManifestId("manifest"),
+      core::ProviderManifestRevision(kZeroDigest),
+      core::StateAuthorityId("state-authority"),
+      core::StateAuthorityClass::kMeasured,
+      core::StopEvidencePolicyId("stop-policy"),
+      core::StopEvidencePolicyRevision(kZeroDigest),
+      core::ContainmentGranularity::kResource,
+      {},
+  };
+}
+
+[[nodiscard]] core::CellGraphDTO graph_at_apply_fence_bound() {
+  core::CellGraphDTO graph{
+      "manyforge.cell_graph.v1",
+      core::GraphRevision(kZeroDigest),
+      core::CellId("qualification-cell"),
+      {},
+      {},
+      {},
+      {},
+      {},
+      {},
+  };
+  for (std::size_t index = 0U;
+       index < kMaximumQualifiedApplyFenceControllableComponentsPerCell;
+       ++index) {
+    graph.controllable_components.push_back(qualification_component(index));
+  }
+  for (std::size_t index = 0U;
+       index < kMaximumQualifiedApplyFenceControlDomainsPerCell; ++index) {
+    graph.control_domains.push_back(qualification_domain(index));
+  }
+  for (std::size_t index = 0U;
+       index < kMaximumQualifiedApplyFenceControlBindingsPerCell; ++index) {
+    graph.control_bindings.push_back(qualification_binding(index));
+  }
+  for (std::size_t index = 0U;
+       index < kMaximumQualifiedApplyFenceResourcesPerCell; ++index) {
+    graph.control_bindings[index % graph.control_bindings.size()]
+        .resource_bindings.push_back(
+            {core::ResourceRoleId("role-" + std::to_string(index)),
+             core::ResourceId("resource-" + std::to_string(index))});
+  }
+  return graph;
+}
+
+void expect_apply_fence_bound_error(const core::CellGraphDTO& graph,
+                                    const std::string_view dimension) {
+  try {
+    detail::validate_apply_fence_qualification_bound(graph);
+    FAIL() << "expected CellCompilerError";
+  } catch (const CellCompilerError& error) {
+    EXPECT_NE(std::string_view(error.what()).find("Apply-fence envelope"),
+              std::string_view::npos)
+        << error.what();
+    EXPECT_NE(std::string_view(error.what()).find(dimension),
+              std::string_view::npos)
+        << error.what();
+  }
+}
+
+TEST(CellCompiler, ApplyFenceQualificationAcceptsTheExactPerCellEnvelope) {
+  auto graph = graph_at_apply_fence_bound();
+  EXPECT_NO_THROW(detail::validate_apply_fence_qualification_bound(graph));
+
+  // Reusing one physical resource in another binding does not enlarge the
+  // transition scope and therefore does not consume another resource row.
+  graph.control_bindings.back().resource_bindings.push_back(
+      {core::ResourceRoleId("shared-role"), core::ResourceId("resource-0")});
+  EXPECT_NO_THROW(detail::validate_apply_fence_qualification_bound(graph));
+}
+
+TEST(CellCompiler, ApplyFenceQualificationRejectsEachOversizedDimension) {
+  {
+    auto graph = graph_at_apply_fence_bound();
+    graph.controllable_components.push_back(qualification_component(
+        kMaximumQualifiedApplyFenceControllableComponentsPerCell));
+    expect_apply_fence_bound_error(graph, "controllable_components");
+  }
+  {
+    auto graph = graph_at_apply_fence_bound();
+    graph.control_domains.push_back(qualification_domain(
+        kMaximumQualifiedApplyFenceControlDomainsPerCell));
+    expect_apply_fence_bound_error(graph, "control_domains");
+  }
+  {
+    auto graph = graph_at_apply_fence_bound();
+    graph.control_bindings.push_back(qualification_binding(
+        kMaximumQualifiedApplyFenceControlBindingsPerCell));
+    expect_apply_fence_bound_error(graph, "control_bindings");
+  }
+  {
+    auto graph = graph_at_apply_fence_bound();
+    graph.control_bindings.front().resource_bindings.push_back(
+        {core::ResourceRoleId("overflow-role"),
+         core::ResourceId("overflow-resource")});
+    expect_apply_fence_bound_error(graph, "resources");
+  }
 }
 
 [[nodiscard]] core::ModelAssetCatalogRecordRefDTO model_reference(

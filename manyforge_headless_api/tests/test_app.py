@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from manyforge_headless_api.app import TrustedPrincipal, _error_status, create_app
 from manyforge_headless_api.models import ManagerApplyRequest, SceneTransactionRequest
-from manyforge_headless_api.native import HeadlessApiError
+from manyforge_headless_api.native import HeadlessApiError, ViewerModelAsset
 from manyforge_headless_api.service import HeadlessService
 
 
@@ -115,6 +115,44 @@ class FakeCore:
                 "source_owner_id": "headless-api.source-model",
             },
         }
+
+    def viewer_model_urdf(self) -> ViewerModelAsset:
+        return ViewerModelAsset(
+            asset_kind="urdf",
+            cell_id="cell-a",
+            graph_revision="graph.1",
+            retained_bundle_id="sha256:" + "1" * 64,
+            product_id="cell_viewer_model",
+            product_contract_id="manyforge.viewer_model",
+            product_contract_revision="sha256:" + "2" * 64,
+            viewer_model_revision="sha256:" + "3" * 64,
+            logical_uri=None,
+            media_type="application/xml",
+            byte_size=23,
+            content_digest="sha256:" + "4" * 64,
+            bytes=b"<robot name='fixture'/>",
+        )
+
+    def viewer_model_resource(
+        self,
+        expected_retained_bundle_id: str,
+        logical_uri: str,
+    ) -> ViewerModelAsset:
+        return ViewerModelAsset(
+            asset_kind="resource",
+            cell_id="cell-a",
+            graph_revision="graph.1",
+            retained_bundle_id=expected_retained_bundle_id,
+            product_id="cell_viewer_model",
+            product_contract_id="manyforge.viewer_model",
+            product_contract_revision="sha256:" + "2" * 64,
+            viewer_model_revision="sha256:" + "3" * 64,
+            logical_uri=logical_uri,
+            media_type="model/stl",
+            byte_size=5,
+            content_digest="sha256:" + "5" * 64,
+            bytes=b"solid",
+        )
 
     def assistant_mode_projection(self, mode_id: str) -> dict[str, Any]:
         return {
@@ -462,6 +500,30 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert source_model["source"]["source_owner_id"] == (
             "headless-api.source-model"
         )
+
+        urdf = client.get("/api/viewer-model/urdf")
+        assert urdf.status_code == 200
+        assert urdf.content == b"<robot name='fixture'/>"
+        assert urdf.headers["content-type"] == "application/xml"
+        assert urdf.headers["cache-control"] == "no-store"
+        assert urdf.headers["x-manyforge-product-id"] == "cell_viewer_model"
+
+        bundle_id = "sha256:" + "1" * 64
+        logical_uri = "asset://fixture/revision/model.stl"
+        resource = client.get(
+            "/api/viewer-model/resource",
+            params={
+                "retained_bundle_id": bundle_id,
+                "logical_uri": logical_uri,
+            },
+        )
+        assert resource.status_code == 200
+        assert resource.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
+        assert resource.content == b"solid"
+        assert resource.headers["content-type"] == "model/stl"
+        assert resource.headers["x-manyforge-retained-bundle-id"] == bundle_id
         assistant_modes = client.get("/api/assistant/modes").json()
         assert [row["mode"] for row in assistant_modes["modes"]] == [
             "composer-assistant"
@@ -757,6 +819,8 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/execution/alarms/{condition_id}/acknowledge" in paths
     assert "/api/node-environment" in paths
     assert "/api/source-model" in paths
+    assert "/api/viewer-model/urdf" in paths
+    assert "/api/viewer-model/resource" in paths
     assert "/api/assistant/modes" in paths
     assert "/api/assistant/modes/{mode_id}" in paths
     assert {

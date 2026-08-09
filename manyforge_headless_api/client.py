@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import re
 from typing import Any, Iterable, Mapping, Sequence
 
 import httpx
 
-from .native import strict_json_object
+from .native import (
+    MAX_VIEWER_MODEL_RESOURCE_BYTES,
+    MAX_VIEWER_MODEL_RESOURCE_URI_BYTES,
+    MAX_VIEWER_MODEL_URDF_BYTES,
+    ViewerModelAsset,
+    strict_json_object,
+)
 
 
 MAX_HTTP_RESPONSE_BYTES = 64 * 1024 * 1024
 _CONDITION_ID_PATTERN = re.compile(r"^condition-[0-9a-f]{24}$")
 _ASSISTANT_MODE_PATTERN = re.compile(r"^[a-z][a-z0-9.-]*$")
+_SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class HeadlessClientError(RuntimeError):
@@ -148,6 +156,159 @@ class HeadlessHttpClient:
             raise self._error_from_response(value, response.status_code)
         return value
 
+    def _request_viewer_asset(
+        self,
+        path: str,
+        *,
+        params: Sequence[tuple[str, str]] = (),
+        expected_kind: str,
+        expected_retained_bundle_id: str | None,
+        expected_logical_uri: str | None,
+        maximum_bytes: int,
+    ) -> ViewerModelAsset:
+        try:
+            with self._client.stream("GET", path, params=params) as response:
+                chunks: list[bytes] = []
+                size = 0
+                for chunk in response.iter_bytes():
+                    size += len(chunk)
+                    if size > maximum_bytes:
+                        raise HeadlessClientError(
+                            "headless_http_response_oversized",
+                            "viewer-model asset exceeds its byte bound",
+                            response.status_code,
+                        )
+                    chunks.append(chunk)
+                payload = b"".join(chunks)
+                if response.status_code >= 400:
+                    try:
+                        error_payload = strict_json_object(
+                            payload.decode("utf-8", errors="strict"),
+                            label="headless viewer-model error response",
+                        )
+                    except (UnicodeDecodeError, RuntimeError) as exc:
+                        raise HeadlessClientError(
+                            "headless_http_response_invalid",
+                            "headless viewer-model error response is invalid",
+                            response.status_code,
+                        ) from exc
+                    raise self._error_from_response(
+                        error_payload,
+                        response.status_code,
+                    )
+                headers = response.headers
+                metadata = {
+                    "asset_kind": headers.get("x-manyforge-asset-kind"),
+                    "cell_id": headers.get("x-manyforge-cell-id"),
+                    "content_digest": headers.get(
+                        "x-manyforge-content-digest"
+                    ),
+                    "graph_revision": headers.get(
+                        "x-manyforge-graph-revision"
+                    ),
+                    "product_contract_id": headers.get(
+                        "x-manyforge-product-contract-id"
+                    ),
+                    "product_contract_revision": headers.get(
+                        "x-manyforge-product-contract-revision"
+                    ),
+                    "product_id": headers.get("x-manyforge-product-id"),
+                    "retained_bundle_id": headers.get(
+                        "x-manyforge-retained-bundle-id"
+                    ),
+                    "viewer_model_revision": headers.get(
+                        "x-manyforge-viewer-model-revision"
+                    ),
+                }
+                if metadata["asset_kind"] != expected_kind:
+                    raise HeadlessClientError(
+                        "headless_http_response_invalid",
+                        "headless viewer-model asset kind is invalid",
+                        response.status_code,
+                    )
+                for field in (
+                    "cell_id",
+                    "graph_revision",
+                    "product_contract_id",
+                    "product_id",
+                ):
+                    value = metadata[field]
+                    if not isinstance(value, str) or not value:
+                        raise HeadlessClientError(
+                            "headless_http_response_invalid",
+                            f"headless viewer-model {field} is invalid",
+                            response.status_code,
+                        )
+                for field in (
+                    "content_digest",
+                    "product_contract_revision",
+                    "retained_bundle_id",
+                    "viewer_model_revision",
+                ):
+                    value = metadata[field]
+                    if (
+                        not isinstance(value, str)
+                        or _SHA256_PATTERN.fullmatch(value) is None
+                    ):
+                        raise HeadlessClientError(
+                            "headless_http_response_invalid",
+                            f"headless viewer-model {field} is invalid",
+                            response.status_code,
+                        )
+                if (
+                    metadata["product_id"] != "cell_viewer_model"
+                    or metadata["product_contract_id"]
+                    != "manyforge.viewer_model"
+                    or (
+                        expected_retained_bundle_id is not None
+                        and metadata["retained_bundle_id"]
+                        != expected_retained_bundle_id
+                    )
+                ):
+                    raise HeadlessClientError(
+                        "headless_http_response_invalid",
+                        "headless viewer-model selection identity is invalid",
+                        response.status_code,
+                    )
+                media_type = headers.get("content-type", "").split(";", 1)[0]
+                if not media_type or not payload:
+                    raise HeadlessClientError(
+                        "headless_http_response_invalid",
+                        "headless viewer-model asset is empty or untyped",
+                        response.status_code,
+                    )
+                actual_digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+                if metadata["content_digest"] != actual_digest:
+                    raise HeadlessClientError(
+                        "headless_http_response_invalid",
+                        "headless viewer-model bytes do not match their digest",
+                        response.status_code,
+                    )
+                return ViewerModelAsset(
+                    asset_kind=expected_kind,
+                    cell_id=metadata["cell_id"],
+                    graph_revision=metadata["graph_revision"],
+                    retained_bundle_id=metadata["retained_bundle_id"],
+                    product_id=metadata["product_id"],
+                    product_contract_id=metadata["product_contract_id"],
+                    product_contract_revision=metadata[
+                        "product_contract_revision"
+                    ],
+                    viewer_model_revision=metadata["viewer_model_revision"],
+                    logical_uri=expected_logical_uri,
+                    media_type=media_type,
+                    byte_size=len(payload),
+                    content_digest=metadata["content_digest"],
+                    bytes=payload,
+                )
+        except HeadlessClientError:
+            raise
+        except httpx.HTTPError as exc:
+            raise HeadlessClientError(
+                "headless_http_unavailable",
+                f"headless API request failed: {exc}",
+            ) from exc
+
     def runtime(self) -> dict[str, Any]:
         return self.request("GET", "/api/runtime")
 
@@ -168,6 +329,48 @@ class HeadlessHttpClient:
 
     def source_model(self) -> dict[str, Any]:
         return self.request("GET", "/api/source-model")
+
+    def viewer_model_urdf(self) -> ViewerModelAsset:
+        asset = self._request_viewer_asset(
+            "/api/viewer-model/urdf",
+            expected_kind="urdf",
+            expected_retained_bundle_id=None,
+            expected_logical_uri=None,
+            maximum_bytes=MAX_VIEWER_MODEL_URDF_BYTES,
+        )
+        if asset.media_type != "application/xml":
+            raise HeadlessClientError(
+                "headless_http_response_invalid",
+                "headless viewer-model URDF has the wrong media type",
+            )
+        return asset
+
+    def viewer_model_resource(
+        self,
+        retained_bundle_id: str,
+        logical_uri: str,
+    ) -> ViewerModelAsset:
+        if _SHA256_PATTERN.fullmatch(retained_bundle_id) is None:
+            raise ValueError("retained bundle ID is invalid")
+        if (
+            not isinstance(logical_uri, str)
+            or not logical_uri
+            or len(logical_uri.encode("utf-8"))
+            > MAX_VIEWER_MODEL_RESOURCE_URI_BYTES
+            or "\x00" in logical_uri
+        ):
+            raise ValueError("viewer-model resource URI is invalid")
+        return self._request_viewer_asset(
+            "/api/viewer-model/resource",
+            params=(
+                ("retained_bundle_id", retained_bundle_id),
+                ("logical_uri", logical_uri),
+            ),
+            expected_kind="resource",
+            expected_retained_bundle_id=retained_bundle_id,
+            expected_logical_uri=logical_uri,
+            maximum_bytes=MAX_VIEWER_MODEL_RESOURCE_BYTES,
+        )
 
     def assistant_modes(self) -> dict[str, Any]:
         return self.request("GET", "/api/assistant/modes")

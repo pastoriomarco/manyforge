@@ -166,6 +166,62 @@ ApplyConfigurationFenceIntentDTO FenceIntent() {
   };
 }
 
+std::string FenceIdentifier(const char prefix, const std::size_t index) {
+  auto ordinal = std::to_string(index);
+  std::string value(1U, prefix);
+  value.append(6U - ordinal.size(), '0');
+  value.append(ordinal);
+  value.append(128U - value.size(), 'x');
+  return value;
+}
+
+ApplyConfigurationFenceIntentDTO MaximumFenceIntent() {
+  auto intent = FenceIntent();
+  intent.scope = {};
+  for (std::size_t index = 0U; index < kMaximumManagerApplyFenceComponents;
+       ++index) {
+    intent.scope.controllable_component_ids.emplace_back(
+        FenceIdentifier('c', index));
+  }
+  for (std::size_t index = 0U; index < kMaximumManagerApplyFenceDomains;
+       ++index) {
+    intent.scope.domains.push_back({
+        ControlDomainId(FenceIdentifier('d', index)),
+        index % 2U == 0U ? std::optional<ControlDomainRevision>(
+                               ControlDomainRevision(std::string(kDigestOne)))
+                         : std::nullopt,
+        index % 2U == 1U ? std::optional<ControlDomainRevision>(
+                               ControlDomainRevision(std::string(kDigestTwo)))
+                         : std::nullopt,
+    });
+  }
+  for (std::size_t index = 0U; index < kMaximumManagerApplyFenceBindings;
+       ++index) {
+    intent.scope.bindings.push_back({
+        ControlBindingId(FenceIdentifier('b', index)),
+        index % 2U == 0U ? std::optional<ControlBindingRevision>(
+                               ControlBindingRevision(std::string(kDigestOne)))
+                         : std::nullopt,
+        index % 2U == 1U ? std::optional<ControlBindingRevision>(
+                               ControlBindingRevision(std::string(kDigestTwo)))
+                         : std::nullopt,
+    });
+  }
+  for (std::size_t index = 0U; index < kMaximumManagerApplyFenceResources;
+       ++index) {
+    intent.scope.resources.emplace_back(FenceIdentifier('r', index));
+  }
+  intent.expected_active_control_configurations.clear();
+  for (std::size_t index = 0U; index < intent.scope.domains.size();
+       index += 2U) {
+    intent.expected_active_control_configurations.push_back(
+        {intent.scope.domains[index].control_domain_id,
+         core::ActiveControlConfigurationId(FenceIdentifier('a', index)),
+         core::ActiveControlConfigurationGeneration(3U)});
+  }
+  return intent;
+}
+
 ManagerApplyAffectedScopeDTO AffectedScope(
     const ApplyConfigurationFenceIntentDTO &fence_intent = FenceIntent()) {
   return {
@@ -1777,6 +1833,66 @@ TEST(ManagerApplyFenceJournal, EnforcesCardinalityAndTextLimits) {
   EXPECT_THROW(EnsureAttempt(journal, intent.intent_digest, invalid_identifier),
                std::invalid_argument);
   EXPECT_EQ(journal.VerifyIntegrity().fence_attempt_count, 0);
+}
+
+TEST(ManagerApplyFenceJournal,
+     PersistsAndReloadsTheExactQualifiedTransitionEnvelope) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "maximum-fence.sqlite3";
+  const auto fence_intent = MaximumFenceIntent();
+  ASSERT_TRUE(fence_intent.valid());
+  std::optional<PersistedManagerApplyAffectedScope> expected_scope;
+  std::optional<PersistedManagerApplyFenceAttempt> expected_attempt;
+  std::optional<PersistedManagerApplyFenceAcceptance> expected_acceptance;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto intent = journal.EnsureIntent(Intent()).record;
+    expected_scope = journal
+                         .EnsureAffectedScope(intent.intent_digest,
+                                              AffectedScope(fence_intent))
+                         .record;
+    expected_attempt =
+        journal
+            .EnsureFenceAttempt(intent.intent_digest,
+                                expected_scope->affected_scope_digest,
+                                fence_intent)
+            .record;
+    expected_acceptance =
+        journal
+            .EnsureFenceAcceptance(
+                ApplyId("apply-1"), ApplyGeneration(1U),
+                expected_attempt->fence_attempt_digest,
+                ConfigurationFenceAcceptedDTO{
+                    ConfigurationFenceId("fence-maximum"),
+                    ConfigurationFenceGeneration(5U), fence_intent.scope,
+                    123456789LL, core::RequestReplayStatusDTO::kAcceptedNew})
+            .record;
+    const auto report = journal.VerifyIntegrity();
+    EXPECT_EQ(report.affected_scope_count, 1);
+    EXPECT_EQ(report.fence_attempt_count, 1);
+    EXPECT_EQ(report.fence_acceptance_count, 1);
+  }
+
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  const auto stored_scope =
+      reopened.ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U));
+  const auto stored_attempt =
+      reopened.ReadFenceAttempt(ApplyId("apply-1"), ApplyGeneration(1U));
+  const auto stored_acceptance =
+      reopened.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(stored_scope.has_value());
+  ASSERT_TRUE(stored_attempt.has_value());
+  ASSERT_TRUE(stored_acceptance.has_value());
+  EXPECT_EQ(stored_scope->affected_scope.scope, fence_intent.scope);
+  EXPECT_EQ(stored_scope->affected_scope_digest,
+            expected_scope->affected_scope_digest);
+  EXPECT_EQ(stored_attempt->fence_intent, fence_intent);
+  EXPECT_EQ(stored_attempt->fence_attempt_digest,
+            expected_attempt->fence_attempt_digest);
+  EXPECT_EQ(stored_acceptance->accepted_fence.captured_scope,
+            fence_intent.scope);
+  EXPECT_EQ(stored_acceptance->acceptance_digest,
+            expected_acceptance->acceptance_digest);
 }
 
 TEST(ManagerApplyFenceJournal,

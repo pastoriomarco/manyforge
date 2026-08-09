@@ -27,10 +27,10 @@ dependency order as follows:
   five registered Isaac deployment cases;
 * **I10/R and I11/T:** real Lite6 admission plus generalized articulated and
   fixed-pneumatic tool/gripper semantics; and
-* **retained independently:** a bounded read-only authored URDF-reference
-  projection keeps Composer's neutral structural viewer available without
-  accepting the enclosing v0 deployment; the transport-neutral Lite6 model
-  closure, digest, runtime-capture, and source-provenance cases now live in
+* **N7 replacement:** the exact active retained viewer product now supplies
+  Composer geometry through Headless, so the temporary v0 ``robot_config``
+  excerpt is removed; the transport-neutral Lite6 model closure, digest,
+  runtime-capture, and source-provenance cases remain in
   ``test_lite6_model_artifacts.py``.
 
 The old test classes ``TestDeploymentLoading``, ``TestDeploymentValidation``,
@@ -42,19 +42,15 @@ acceptance input for those gates, not evidence for a partial Python v0 loader.
 from __future__ import annotations
 
 from collections.abc import Callable
-from pathlib import Path
 
 import pytest
-import yaml
 
 from manyforge_behavior import deployment
 from manyforge_behavior.deployment import (
-    AuthoredStructuralDeployment,
     DEPLOYMENT_ARTIFACT_RESTORATION_GATES,
     DEPLOYMENT_ARTIFACT_UNAVAILABLE_REASON_CODE,
     Deployment,
     DeploymentArtifactUnavailableError,
-    StructuralDeploymentProjectionError,
 )
 
 
@@ -92,92 +88,6 @@ def test_deployment_entrypoints_fail_before_reading_legacy_input(
 
 def test_deployment_gate_names_exact_restoration_boundary() -> None:
     assert DEPLOYMENT_ARTIFACT_RESTORATION_GATES == ("I6", "N")
-
-
-def test_structural_projection_extracts_only_authored_model_reference(
-    tmp_path: Path,
-) -> None:
-    artifact = tmp_path / "cell.deployment.yaml"
-    artifact.write_text(
-        yaml.safe_dump(
-            {
-                "api_version": "manyforge.deployment.v0",
-                "robot_config": {
-                    "robot_id": "preview-arm",
-                    "group_id": "must-not-be-projected",
-                    "urdf_path": "models/preview.urdf",
-                    "srdf_path": "models/preview.srdf",
-                    "package_paths": ["models", "vendor/models"],
-                },
-                "runtime_resources": {"must": "not be projected"},
-                "launch": {"runner": {"module": "must.not.load"}},
-                "pose_sources": {"must": "not be projected"},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    projection = AuthoredStructuralDeployment.from_path(artifact)
-
-    assert projection.source_path == artifact.resolve()
-    assert projection.model.authored_model_id == "preview-arm"
-    assert projection.model.urdf_path == "models/preview.urdf"
-    assert projection.model.srdf_path == "models/preview.srdf"
-    assert projection.model.package_paths == ("models", "vendor/models")
-    for runtime_name in (
-        "robot_id",
-        "group_id",
-        "runtime_resources",
-        "launch",
-        "pose_sources",
-    ):
-        assert not hasattr(projection, runtime_name)
-        assert not hasattr(projection.model, runtime_name)
-
-
-@pytest.mark.parametrize(
-    ("robot_config", "message"),
-    [
-        ({"robot_id": "arm"}, "robot_config.urdf_path"),
-        (
-            {
-                "robot_id": "arm",
-                "urdf_path": "arm.urdf",
-                "package_paths": ["models"] * 129,
-            },
-            "128-item limit",
-        ),
-        (
-            {
-                "robot_id": "arm",
-                "urdf_path": "arm.urdf",
-                "package_paths": ["models", "models"],
-            },
-            "must not contain duplicates",
-        ),
-    ],
-)
-def test_structural_projection_rejects_unbounded_or_ambiguous_references(
-    tmp_path: Path,
-    robot_config: dict[str, object],
-    message: str,
-) -> None:
-    artifact = tmp_path / "cell.deployment.yaml"
-    artifact.write_text(
-        yaml.safe_dump({"robot_config": robot_config}),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(StructuralDeploymentProjectionError, match=message):
-        AuthoredStructuralDeployment.from_path(artifact)
-
-
-def test_structural_projection_rejects_oversize_artifact(tmp_path: Path) -> None:
-    artifact = tmp_path / "cell.deployment.yaml"
-    artifact.write_bytes(b"x" * 1_048_577)
-
-    with pytest.raises(StructuralDeploymentProjectionError, match="1048576-byte"):
-        AuthoredStructuralDeployment.from_path(artifact)
 
 
 @pytest.mark.parametrize(

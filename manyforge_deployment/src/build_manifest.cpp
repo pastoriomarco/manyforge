@@ -10,6 +10,7 @@
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
+#include <manyforge_deployment/apply_fence_qualification.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_applicability.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
@@ -462,6 +463,14 @@ struct LimitRow final {
        detail::kMaximumPortableIdentityBytes},
       {"cell_graph.quaternion_norm_squared_tolerance_parts_per_trillion",
        detail::kQuaternionNormSquaredTolerancePartsPerTrillion},
+      {"cell_graph.qualified_apply_fence_control_bindings",
+       kMaximumQualifiedApplyFenceControlBindingsPerCell},
+      {"cell_graph.qualified_apply_fence_control_domains",
+       kMaximumQualifiedApplyFenceControlDomainsPerCell},
+      {"cell_graph.qualified_apply_fence_controllable_components",
+       kMaximumQualifiedApplyFenceControllableComponentsPerCell},
+      {"cell_graph.qualified_apply_fence_resources",
+       kMaximumQualifiedApplyFenceResourcesPerCell},
       {"closed_schema.alternatives", kMaxClosedSchemaAlternatives},
       {"closed_schema.array_items", kMaxClosedSchemaArrayItems},
       {"closed_schema.constraints", kMaxClosedSchemaConstraints},

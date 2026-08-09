@@ -41,8 +41,8 @@ namespace deployment = manyforge::deployment;
 namespace persistence = manyforge::persistence;
 
 constexpr std::string_view kSchemaId =
-    "manyforge.internal.kernel-apply-fence-ledger.i6.v1";
-constexpr int kSchemaVersion = 1;
+    "manyforge.internal.kernel-apply-fence-ledger.i6.v2";
+constexpr int kSchemaVersion = 2;
 constexpr int kSqliteApplicationId = 1296451142;
 constexpr std::uint64_t kMaximumFenceRecords = 256U;
 constexpr std::uint64_t kMaximumDatabasePageImageBytes = 64U * 1024U * 1024U;

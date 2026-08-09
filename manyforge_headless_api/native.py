@@ -5,11 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Any, Protocol, Sequence
 import unicodedata
 
 
 MAX_NATIVE_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_VIEWER_MODEL_URDF_BYTES = 16 * 1024 * 1024
+MAX_VIEWER_MODEL_RESOURCE_BYTES = 256 * 1024 * 1024
+MAX_VIEWER_MODEL_RESOURCE_URI_BYTES = 4096
+_SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class HeadlessApiError(RuntimeError):
@@ -87,12 +92,37 @@ class HeadlessApiConfig:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ViewerModelAsset:
+    asset_kind: str
+    cell_id: str
+    graph_revision: str
+    retained_bundle_id: str
+    product_id: str
+    product_contract_id: str
+    product_contract_revision: str
+    viewer_model_revision: str
+    logical_uri: str | None
+    media_type: str
+    byte_size: int
+    content_digest: str
+    bytes: bytes
+
+
 class HeadlessCorePort(Protocol):
     def runtime_snapshot(self) -> dict[str, Any]: ...
 
     def node_environment_projection(self) -> dict[str, Any]: ...
 
     def source_model_projection(self) -> dict[str, Any]: ...
+
+    def viewer_model_urdf(self) -> ViewerModelAsset: ...
+
+    def viewer_model_resource(
+        self,
+        expected_retained_bundle_id: str,
+        logical_uri: str,
+    ) -> ViewerModelAsset: ...
 
     def assistant_mode_index(self) -> dict[str, Any]: ...
 
@@ -233,6 +263,151 @@ class NativeHeadlessCore:
             f"native {method} returned an invalid envelope",
         )
 
+    def _invoke_viewer_asset(
+        self,
+        method: str,
+        *args: Any,
+    ) -> ViewerModelAsset:
+        envelope = getattr(self._native, method)(*args)
+        if not isinstance(envelope, dict):
+            raise HeadlessApiError(
+                "headless_projection_response_invalid",
+                f"native {method} returned a non-object asset envelope",
+            )
+        ok = envelope.get("ok")
+        if ok is False and set(envelope) == {"error", "ok"}:
+            error = envelope["error"]
+            if (
+                isinstance(error, dict)
+                and set(error) == {"code", "message"}
+                and isinstance(error.get("code"), str)
+                and error["code"]
+                and isinstance(error.get("message"), str)
+                and error["message"]
+            ):
+                raise HeadlessApiError(error["code"], error["message"])
+        if ok is not True or set(envelope) != {"bytes", "metadata", "ok"}:
+            raise HeadlessApiError(
+                "headless_projection_response_invalid",
+                f"native {method} returned an invalid asset envelope",
+            )
+        raw_bytes = envelope["bytes"]
+        metadata_text = envelope["metadata"]
+        if not isinstance(raw_bytes, bytes) or not isinstance(metadata_text, str):
+            raise HeadlessApiError(
+                "headless_projection_response_invalid",
+                f"native {method} returned invalid asset fields",
+            )
+        metadata = strict_json_object(
+            metadata_text,
+            label=f"native {method} metadata",
+        )
+        expected_fields = {
+            "asset_kind",
+            "byte_size",
+            "cell_id",
+            "content_digest",
+            "graph_revision",
+            "logical_uri",
+            "media_type",
+            "product_contract_id",
+            "product_contract_revision",
+            "product_id",
+            "retained_bundle_id",
+            "schema_version",
+            "viewer_model_revision",
+        }
+        if set(metadata) != expected_fields or metadata.get(
+            "schema_version"
+        ) != "manyforge.viewer_model_asset.v1":
+            raise HeadlessApiError(
+                "headless_projection_response_invalid",
+                f"native {method} returned unsupported asset metadata",
+            )
+        asset_kind = metadata["asset_kind"]
+        logical_uri = metadata["logical_uri"]
+        if asset_kind == "urdf":
+            if logical_uri is not None:
+                raise HeadlessApiError(
+                    "headless_projection_response_invalid",
+                    "viewer URDF metadata unexpectedly names a resource URI",
+                )
+            maximum_bytes = MAX_VIEWER_MODEL_URDF_BYTES
+        elif asset_kind == "resource":
+            if (
+                not isinstance(logical_uri, str)
+                or not logical_uri
+                or len(logical_uri.encode("utf-8"))
+                > MAX_VIEWER_MODEL_RESOURCE_URI_BYTES
+            ):
+                raise HeadlessApiError(
+                    "headless_projection_response_invalid",
+                    "viewer resource metadata has an invalid logical URI",
+                )
+            maximum_bytes = MAX_VIEWER_MODEL_RESOURCE_BYTES
+        else:
+            raise HeadlessApiError(
+                "headless_projection_response_invalid",
+                "viewer asset kind is unsupported",
+            )
+        byte_size = metadata["byte_size"]
+        if (
+            isinstance(byte_size, bool)
+            or not isinstance(byte_size, int)
+            or byte_size <= 0
+            or byte_size > maximum_bytes
+            or byte_size != len(raw_bytes)
+        ):
+            raise HeadlessApiError(
+                "headless_projection_response_invalid",
+                "viewer asset byte size is invalid",
+            )
+        text_fields = (
+            "cell_id",
+            "graph_revision",
+            "media_type",
+            "product_contract_id",
+            "product_id",
+        )
+        if any(
+            not isinstance(metadata[field], str) or not metadata[field]
+            for field in text_fields
+        ):
+            raise HeadlessApiError(
+                "headless_projection_response_invalid",
+                "viewer asset metadata has an invalid text identity",
+            )
+        for digest_field in (
+            "content_digest",
+            "product_contract_revision",
+            "retained_bundle_id",
+            "viewer_model_revision",
+        ):
+            value = metadata[digest_field]
+            if (
+                not isinstance(value, str)
+                or _SHA256_PATTERN.fullmatch(value) is None
+            ):
+                raise HeadlessApiError(
+                    "headless_projection_response_invalid",
+                    f"viewer asset {digest_field} is not a SHA-256 digest",
+                )
+        return ViewerModelAsset(
+            asset_kind=asset_kind,
+            cell_id=metadata["cell_id"],
+            graph_revision=metadata["graph_revision"],
+            retained_bundle_id=metadata["retained_bundle_id"],
+            product_id=metadata["product_id"],
+            product_contract_id=metadata["product_contract_id"],
+            product_contract_revision=metadata["product_contract_revision"],
+            viewer_model_revision=metadata["viewer_model_revision"],
+            logical_uri=logical_uri,
+            media_type=metadata["media_type"],
+            byte_size=byte_size,
+            content_digest=metadata["content_digest"],
+            bytes=raw_bytes,
+        )
+
     @staticmethod
     def _require_object(value: Any, *, method: str) -> dict[str, Any]:
         if not isinstance(value, dict):
@@ -258,6 +433,20 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("source_model_projection"),
             method="source_model_projection",
+        )
+
+    def viewer_model_urdf(self) -> ViewerModelAsset:
+        return self._invoke_viewer_asset("viewer_model_urdf")
+
+    def viewer_model_resource(
+        self,
+        expected_retained_bundle_id: str,
+        logical_uri: str,
+    ) -> ViewerModelAsset:
+        return self._invoke_viewer_asset(
+            "viewer_model_resource",
+            expected_retained_bundle_id,
+            logical_uri,
         )
 
     def assistant_mode_index(self) -> dict[str, Any]:

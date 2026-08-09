@@ -19,8 +19,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.i4.v7";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 7;
+    "manyforge.internal.component-manager.apply-journal.i4.v8";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 8;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -50,10 +50,10 @@ inline constexpr std::size_t kMaximumManagerApplyFenceReleasedRecords =
     kMaximumManagerApplyIntents;
 inline constexpr std::size_t kMaximumManagerApplyTerminalOutcomes =
     kMaximumManagerApplyIntents;
-inline constexpr std::size_t kMaximumManagerApplyFenceComponents = 256U;
+inline constexpr std::size_t kMaximumManagerApplyFenceComponents = 128U;
 inline constexpr std::size_t kMaximumManagerApplyFenceDomains = 64U;
-inline constexpr std::size_t kMaximumManagerApplyFenceBindings = 256U;
-inline constexpr std::size_t kMaximumManagerApplyFenceResources = 1024U;
+inline constexpr std::size_t kMaximumManagerApplyFenceBindings = 128U;
+inline constexpr std::size_t kMaximumManagerApplyFenceResources = 384U;
 inline constexpr std::size_t kMaximumManagerApplyJournalIdentifierBytes = 256U;
 inline constexpr std::size_t kMaximumManagerApplySourceLabelBytes = 256U;
 inline constexpr std::size_t kMaximumManagerApplyCorrelationIdBytes = 1024U;

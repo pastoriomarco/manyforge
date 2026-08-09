@@ -123,7 +123,6 @@ def test_program_workspace_is_available_without_restoring_load_apply_or_run() ->
         "pick_and_place_minimal.program.yaml"
     )
     state = ComposerState.from_paths(
-        deployment_path=None,
         program_path=str(program_path),
     )
     loaded = TestClient(create_app(state)).get("/api/program/draft")

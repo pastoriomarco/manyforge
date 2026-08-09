@@ -1,5 +1,7 @@
 #include "manyforge_component_manager/manager_apply_journal.hpp"
 
+#include <manyforge_deployment/apply_fence_qualification.hpp>
+
 #include <openssl/evp.h>
 #include <sqlite3.h>
 
@@ -32,6 +34,18 @@
 
 namespace manyforge::component_manager {
 namespace {
+
+static_assert(
+    kMaximumManagerApplyFenceComponents ==
+    deployment::kMaximumQualifiedApplyFenceControllableComponentsPerTransition);
+static_assert(
+    kMaximumManagerApplyFenceDomains ==
+    deployment::kMaximumQualifiedApplyFenceControlDomainsPerTransition);
+static_assert(
+    kMaximumManagerApplyFenceBindings ==
+    deployment::kMaximumQualifiedApplyFenceControlBindingsPerTransition);
+static_assert(kMaximumManagerApplyFenceResources ==
+              deployment::kMaximumQualifiedApplyFenceResourcesPerTransition);
 
 using core::ActiveBundlePublicationGeneration;
 using core::ActiveBundlePublicationReceiptDTO;

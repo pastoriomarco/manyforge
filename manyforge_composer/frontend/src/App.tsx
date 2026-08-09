@@ -29,8 +29,8 @@ export default function App() {
   });
   const [manifest, retryManifest] = useStructuralResource(api.urdf.manifest, {
     absentWhen: isNotFound,
-    absentMessage: 'No complete URDF is available for the authored deployment.',
-    failureMessage: 'Could not read the authored-neutral URDF manifest.',
+    absentMessage: 'No complete URDF is available for the active retained deployment.',
+    failureMessage: 'Could not read the retained-neutral URDF manifest.',
   });
   const [nodeEnvironment, retryNodeEnvironment] = useStructuralResource(
     api.nodes.environment,

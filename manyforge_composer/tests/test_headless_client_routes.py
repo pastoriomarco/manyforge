@@ -368,7 +368,6 @@ def _composer(client: HeadlessHttpClient) -> TestClient:
 
 def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
     state = ComposerState.from_paths(
-        deployment_path=None,
         program_path=str(_PROGRAM_PATH),
         headless_client=client,
     )

@@ -282,13 +282,19 @@ TEST(HeadlessApiCore,
   try {
     static_cast<void>(core.SourceModelProjection());
     FAIL() << "missing Manager selection produced a source model";
-  } catch (const OperatorAlarmError& error) {
+  } catch (const OperatorAlarmError &error) {
     EXPECT_EQ(error.code(), "source_model_projection_unavailable");
+  }
+  try {
+    static_cast<void>(core.ViewerModelUrdf());
+    FAIL() << "missing Manager selection produced a viewer model";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "viewer_model_asset_unavailable");
   }
   try {
     static_cast<void>(core.AssistantModeProjection("composer-assistant"));
     FAIL() << "missing Manager selection produced an assistant mode";
-  } catch (const OperatorAlarmError& error) {
+  } catch (const OperatorAlarmError &error) {
     EXPECT_EQ(error.code(), "assistant_mode_projection_unavailable");
   }
 
@@ -412,7 +418,8 @@ TEST(HeadlessApiCore,
             Text(source, "source_content_digest"));
 }
 
-TEST(HeadlessApiCore, IndependentlyProjectsTheManagerSelectedSourceModelWithStableIdentity) {
+TEST(HeadlessApiCore,
+     IndependentlyProjectsTheManagerSelectedSourceModelWithStableIdentity) {
   TemporaryDirectory directory;
   PublishHealthySources(directory, "open");
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
@@ -423,19 +430,62 @@ TEST(HeadlessApiCore, IndependentlyProjectsTheManagerSelectedSourceModelWithStab
       MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
   const auto admission = bundle_source.load_verified();
   EXPECT_EQ(Text(first, "schema_version"), kSourceModelProjectionApiVersion);
-  EXPECT_EQ(Text(first, "retained_bundle_id"), admission.retained_bundle_id().value());
+  EXPECT_EQ(Text(first, "retained_bundle_id"),
+            admission.retained_bundle_id().value());
   EXPECT_TRUE(Array(first, "occurrences").empty());
   EXPECT_TRUE(Array(first, "targets").empty());
-  const auto& source = Member(first, "source");
-  EXPECT_EQ(Text(source, "source_owner_id"), "headless-api.cell.i5.source-model");
-  EXPECT_EQ(Text(source, "selection_source_owner_id"), "component-manager.c1_build_authority_cell");
+  const auto &source = Member(first, "source");
+  EXPECT_EQ(Text(source, "source_owner_id"),
+            "headless-api.cell.i5.source-model");
+  EXPECT_EQ(Text(source, "selection_source_owner_id"),
+            "component-manager.c1_build_authority_cell");
   EXPECT_EQ(Unsigned(source, "projection_generation"), 1U);
   EXPECT_EQ(Unsigned(Member(second, "source"), "projection_generation"), 1U);
   EXPECT_EQ(Text(Member(second, "source"), "source_content_digest"),
             Text(source, "source_content_digest"));
 }
 
-TEST(HeadlessApiCore, CanonicalEmptySelectionDoesNotFabricateAssistantModeAvailability) {
+TEST(HeadlessApiCore, ServesOnlyTheExactVerifiedActiveRetainedViewerProduct) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const deployment::FilesystemCanonicalEmptyRetainedBundleSource bundle_source(
+      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  const auto admission = bundle_source.load_verified();
+
+  const auto urdf = core.ViewerModelUrdf();
+  EXPECT_EQ(urdf.asset_kind(), "urdf");
+  EXPECT_EQ(urdf.cell_id(), kCellId);
+  EXPECT_EQ(urdf.graph_revision(), admission.graph_revision().value());
+  EXPECT_EQ(urdf.retained_bundle_id().value(),
+            admission.retained_bundle_id().value());
+  EXPECT_EQ(urdf.product_id().value(), "cell_viewer_model");
+  EXPECT_EQ(urdf.product_contract_id().value(), "manyforge.viewer_model");
+  EXPECT_EQ(urdf.media_type(), "application/xml");
+  EXPECT_FALSE(urdf.logical_uri().has_value());
+  EXPECT_FALSE(urdf.bytes().empty());
+  EXPECT_EQ(urdf.byte_size(), urdf.bytes().size());
+
+  try {
+    static_cast<void>(
+        core.ViewerModelResource(std::string("sha256:") + std::string(64U, 'f'),
+                                 "package://fixture/unknown.stl"));
+    FAIL() << "stale retained-bundle coordinates selected a viewer resource";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "viewer_model_selection_stale");
+  }
+  try {
+    static_cast<void>(
+        core.ViewerModelResource(admission.retained_bundle_id().value(),
+                                 "package://fixture/unknown.stl"));
+    FAIL() << "unknown logical URI selected a viewer resource";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "viewer_model_resource_not_found");
+  }
+}
+
+TEST(HeadlessApiCore,
+     CanonicalEmptySelectionDoesNotFabricateAssistantModeAvailability) {
   TemporaryDirectory directory;
   PublishHealthySources(directory, "open");
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
@@ -443,7 +493,7 @@ TEST(HeadlessApiCore, CanonicalEmptySelectionDoesNotFabricateAssistantModeAvaila
   try {
     static_cast<void>(core.AssistantModeProjection("composer-assistant"));
     FAIL() << "canonical-empty selection produced an assistant mode";
-  } catch (const OperatorAlarmError& error) {
+  } catch (const OperatorAlarmError &error) {
     EXPECT_EQ(error.code(), "assistant_mode_projection_unavailable");
   }
 }
@@ -565,22 +615,21 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(unavailable, "status"), "marked_unknown");
   const auto unknown_snapshot = core.AlarmSnapshot();
   const auto &unknown_domains = Array(unknown_snapshot, "domains");
-  const auto unknown_motion =
-      std::find_if(unknown_domains.begin(), unknown_domains.end(), [](const auto &domain) {
-        return Text(domain, "domain") == "motion";
-      });
+  const auto unknown_motion = std::find_if(
+      unknown_domains.begin(), unknown_domains.end(),
+      [](const auto &domain) { return Text(domain, "domain") == "motion"; });
   ASSERT_NE(unknown_motion, unknown_domains.end());
   EXPECT_FALSE(std::get<bool>(Member(*unknown_motion, "reconciled").storage()));
   EXPECT_EQ(Unsigned(*unknown_motion, "unknown_source_count"), 1U);
   static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 1U));
   const auto recovered_snapshot = core.AlarmSnapshot();
   const auto &recovered_domains = Array(recovered_snapshot, "domains");
-  const auto recovered_motion =
-      std::find_if(recovered_domains.begin(), recovered_domains.end(), [](const auto &domain) {
-        return Text(domain, "domain") == "motion";
-      });
+  const auto recovered_motion = std::find_if(
+      recovered_domains.begin(), recovered_domains.end(),
+      [](const auto &domain) { return Text(domain, "domain") == "motion"; });
   ASSERT_NE(recovered_motion, recovered_domains.end());
-  EXPECT_TRUE(std::get<bool>(Member(*recovered_motion, "reconciled").storage()));
+  EXPECT_TRUE(
+      std::get<bool>(Member(*recovered_motion, "reconciled").storage()));
   EXPECT_EQ(Unsigned(*recovered_motion, "unknown_source_count"), 0U);
 
   const auto deadline = std::chrono::steady_clock::now() + 2s;

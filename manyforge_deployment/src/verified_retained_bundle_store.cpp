@@ -2316,4 +2316,73 @@ FilesystemVerifiedRetainedPlanningModelSource::get_verified(
       std::move(resources));
 }
 
+FilesystemVerifiedRetainedViewerModelSource::
+    FilesystemVerifiedRetainedViewerModelSource(
+        std::filesystem::path trusted_package_root)
+    : trusted_package_root_(posix::normalize_existing_plain_root(
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
+  (void)require_read_only_retention_paths(trusted_package_root_);
+}
+
+std::optional<VerifiedRetainedViewerModel>
+FilesystemVerifiedRetainedViewerModelSource::get_verified(
+    const RetainedViewerModelQuery &query) const {
+  const std::filesystem::path current_root = require_unchanged_trusted_root(
+      trusted_package_root_, "read-only retained viewer-model");
+  const ReadOnlyRetentionPaths paths =
+      require_read_only_retention_paths(current_root);
+  const auto bundle =
+      read_verified_bundle_entry(paths.bundle_data, query.retained_bundle_id);
+  if (bundle == nullptr) {
+    return std::nullopt;
+  }
+
+  // This capability recognizes the sole cell-wide viewer placement. Equal
+  // spelling in another product table can never select a model.
+  const auto &product = bundle->value().compiled_products.viewer_model;
+  if (!product.has_value() || product->product_id != query.product_id) {
+    return std::nullopt;
+  }
+  if (product->product_kind != core::RetainedProductKind::kViewerModel) {
+    detail::fail_retained_bundle(
+        "selected viewer product has the wrong retained product kind");
+  }
+
+  // Full reference verification proves the code-owned viewer product has the
+  // exact same compiled URDF and resource map as the authoritative planning
+  // product. The narrower reader below then reconstructs only viewer inputs.
+  require_verified_bundle_references(current_root, paths.raw_data, *bundle);
+  const auto &resource_map_ref = require_exact_artifact_role(
+      *product, detail::kPlanningResourceMapArtifactRole);
+  const auto &urdf_ref = require_exact_artifact_role(*product, "urdf");
+  const std::string resource_map_bytes = read_verified_raw_reference(
+      paths.raw_data, resource_map_ref.content_addressed_store_key,
+      resource_map_ref.content_digest, resource_map_ref.byte_size,
+      "selected retained viewer resource map");
+  std::string urdf = read_verified_raw_reference(
+      paths.raw_data, urdf_ref.content_addressed_store_key,
+      urdf_ref.content_digest, urdf_ref.byte_size,
+      "selected retained viewer URDF");
+  if (urdf.empty() || urdf.size() > kMaxModelSourceXmlEntrypointBytes) {
+    detail::fail_retained_bundle(
+        "retained viewer XML violates the fixed entrypoint bound");
+  }
+
+  const std::vector<detail::PlanningResourceMapRow> resource_map =
+      detail::parse_and_verify_planning_resource_map(resource_map_bytes);
+  std::vector<VerifiedRetainedPlanningResource> resources =
+      read_verified_planning_resources(current_root, paths.raw_data,
+                                       bundle->value(), resource_map);
+  std::uint64_t result_bytes = static_cast<std::uint64_t>(urdf.size());
+  for (const auto &resource : resources) {
+    checked_accumulate(result_bytes, resource.byte_size(),
+                       kMaxModelSourceClosureBytes,
+                       "retained viewer result exceeds the global byte bound");
+  }
+
+  return VerifiedRetainedViewerModel(
+      query, product->product_contract_id, product->product_contract_revision,
+      urdf_ref, std::move(urdf), std::move(resources));
+}
+
 }  // namespace manyforge::deployment

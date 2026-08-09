@@ -230,7 +230,7 @@ function RobotCollision({ collision }: { collision: SceneUrdfCollision }) {
   );
 }
 
-function AuthoredNeutralModel({
+function RetainedNeutralModel({
   manifest,
   collisionsVisible,
 }: {
@@ -477,7 +477,7 @@ function ViewerCanvas({
         >
           <Suspense fallback={null}>
             <Bounds fit={camera === null} clip observe margin={1.25}>
-              <AuthoredNeutralModel
+              <RetainedNeutralModel
                 manifest={manifest}
                 collisionsVisible={collisionsVisible}
               />
@@ -564,7 +564,7 @@ function StructuralViewerContent({
     <section className="panel viewer-panel" aria-labelledby="viewer-title">
       <header className="panel-header viewer-header">
         <div>
-          <p className="eyebrow">Authored structure + owner-issued scene</p>
+          <p className="eyebrow">Active retained structure + owner-issued scene</p>
           <h2 id="viewer-title">Scene authoring viewport</h2>
         </div>
         <div className="viewer-controls">
@@ -602,13 +602,13 @@ function StructuralViewerContent({
 
         {manifest.status === 'loading' && visibleGeometryCount === 0 && (
           <div className="viewer-state" role="status">
-            <strong>Loading authored model…</strong>
-            <span>Waiting for a complete authored-neutral projection.</span>
+            <strong>Loading active model…</strong>
+            <span>Waiting for a complete retained-neutral projection.</span>
           </div>
         )}
         {manifest.status === 'absent' && visibleGeometryCount === 0 && (
           <div className="viewer-state">
-            <strong>No authored deployment model</strong>
+            <strong>No active retained deployment model</strong>
             <span>{manifest.message}</span>
             <span>No empty or placeholder robot is substituted.</span>
           </div>
@@ -625,8 +625,8 @@ function StructuralViewerContent({
             <strong>No geometry selected for display</strong>
             <span>
               {collisionCount > 0
-                ? 'This URDF has no visual geometry. Enable collision geometry to inspect its authored collision shapes.'
-                : 'The authored link tree contains no renderable visual or collision geometry.'}
+                ? 'This URDF has no visual geometry. Enable collision geometry to inspect its retained collision shapes.'
+                : 'The retained link tree contains no renderable visual or collision geometry.'}
             </span>
             <span>No placeholder geometry is substituted.</span>
           </div>
@@ -635,7 +635,7 @@ function StructuralViewerContent({
           <div className="viewer-state viewer-state-overlay error-state" role="alert">
             <strong>
               {classifyStructuralAssetFailure(assetError) === 'stale_model'
-                ? 'Authored model changed'
+                ? 'Active model changed'
                 : 'Structural asset unavailable'}
             </strong>
             <span>
@@ -643,13 +643,13 @@ function StructuralViewerContent({
                 ? 'A keyed mesh belongs to an inactive model. Reload the manifest.'
                 : assetError.message}
             </span>
-            <button type="button" onClick={retry}>Reload authored model</button>
+            <button type="button" onClick={retry}>Reload active model</button>
           </div>
         )}
 
         {manifest.status === 'ready' && assetError === null && visibleGeometryCount > 0 && (
           <div className="viewer-legend">
-            <span>{manifest.data.robot_id ?? 'unnamed authored robot'}</span>
+            <span>{manifest.data.cell_id}</span>
             <span>{manifest.data.links.length} links</span>
             <span>{manifest.data.joints.length} joints</span>
             <span>neutral coordinates</span>
@@ -663,6 +663,7 @@ function StructuralViewerContent({
         <footer className="viewer-contract">
           <span>Root: <code>{manifest.data.projection.root_frame}</code></span>
           <span>Model key: <code>{manifest.data.model_key}</code></span>
+          <span>Bundle: <code>{manifest.data.retained_bundle_id}</code></span>
           <span>Runtime state used: <strong>no</strong></span>
           <span>Scene overlay: <strong>owner-issued</strong></span>
           <span>Operational validity: <strong>not asserted</strong></span>

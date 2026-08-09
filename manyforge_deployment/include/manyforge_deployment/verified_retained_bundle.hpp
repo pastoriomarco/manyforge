@@ -26,7 +26,9 @@ class VerifiedRetainedPlanningConstructionAuthority;
 class FilesystemVerifiedRetainedProductArtifactSource;
 class FilesystemVerifiedRetainedModelMapSource;
 class FilesystemVerifiedRetainedPlanningModelSource;
+class FilesystemVerifiedRetainedViewerModelSource;
 class VerifiedRetainedPlanningModel;
+class VerifiedRetainedViewerModel;
 
 inline constexpr std::uint64_t kMaxDurableRetainedBlobBytes =
     512ULL * 1024ULL * 1024ULL;
@@ -546,9 +548,21 @@ struct RetainedPlanningModelQuery final {
                          const RetainedPlanningModelQuery&) = default;
 };
 
+/// Exact immutable coordinates for the cell-wide retained viewer model.
+///
+/// Product kind and placement are deliberately not caller-selectable: this
+/// capability resolves only the code-owned `manyforge.viewer_model` product.
+struct RetainedViewerModelQuery final {
+  core::RetainedBundleId retained_bundle_id;
+  core::ProductId product_id;
+
+  friend bool operator==(const RetainedViewerModelQuery &,
+                         const RetainedViewerModelQuery &) = default;
+};
+
 /// One owned, independently reverified non-XML resource from a graph-selected
 /// model asset. `logical_uri()` is the compiler-owned revision-scoped URI
-/// retained by the planning product, not the source ModelAsset URI.
+/// retained by the planning/viewer products, not the source ModelAsset URI.
 ///
 /// Construction is sealed behind the deployment reader. Copy and move are
 /// safe because every view below refers to storage owned by this value.
@@ -671,6 +685,81 @@ class IVerifiedRetainedPlanningModelSource {
 
   [[nodiscard]] virtual std::optional<VerifiedRetainedPlanningModel>
   get_verified(const RetainedPlanningModelQuery& query) const = 0;
+};
+
+/// Sealed, owned viewer input reconstructed from one exact retained bundle.
+///
+/// The URDF is the exact `manyforge.viewer_model` artifact. Resources are the
+/// independently reverified, revision-scoped non-XML source closure selected
+/// by that product's planning-resource map. No ambient package path, mutable
+/// alias, or caller-selected product kind crosses this boundary.
+class VerifiedRetainedViewerModel final {
+public:
+  VerifiedRetainedViewerModel(const VerifiedRetainedViewerModel &) = default;
+  VerifiedRetainedViewerModel &
+  operator=(const VerifiedRetainedViewerModel &) = default;
+  VerifiedRetainedViewerModel(VerifiedRetainedViewerModel &&) noexcept =
+      default;
+  VerifiedRetainedViewerModel &
+  operator=(VerifiedRetainedViewerModel &&) noexcept = default;
+  ~VerifiedRetainedViewerModel() = default;
+
+  [[nodiscard]] const RetainedViewerModelQuery &query() const noexcept {
+    return query_;
+  }
+  [[nodiscard]] const core::ProductContractId &
+  product_contract_id() const noexcept {
+    return product_contract_id_;
+  }
+  [[nodiscard]] const core::ProductContractRevision &
+  product_contract_revision() const noexcept {
+    return product_contract_revision_;
+  }
+  [[nodiscard]] const core::RetainedArtifactRefDTO &
+  urdf_artifact_ref() const noexcept {
+    return urdf_artifact_ref_;
+  }
+  [[nodiscard]] std::string_view urdf_bytes() const noexcept {
+    return urdf_bytes_;
+  }
+  [[nodiscard]] const std::vector<VerifiedRetainedPlanningResource> &
+  resources() const noexcept {
+    return resources_;
+  }
+
+private:
+  VerifiedRetainedViewerModel(
+      RetainedViewerModelQuery query,
+      core::ProductContractId product_contract_id,
+      core::ProductContractRevision product_contract_revision,
+      core::RetainedArtifactRefDTO urdf_artifact_ref, std::string urdf_bytes,
+      std::vector<VerifiedRetainedPlanningResource> resources)
+      : query_(std::move(query)),
+        product_contract_id_(std::move(product_contract_id)),
+        product_contract_revision_(std::move(product_contract_revision)),
+        urdf_artifact_ref_(std::move(urdf_artifact_ref)),
+        urdf_bytes_(std::move(urdf_bytes)), resources_(std::move(resources)) {}
+
+  RetainedViewerModelQuery query_;
+  core::ProductContractId product_contract_id_;
+  core::ProductContractRevision product_contract_revision_;
+  core::RetainedArtifactRefDTO urdf_artifact_ref_;
+  std::string urdf_bytes_;
+  std::vector<VerifiedRetainedPlanningResource> resources_;
+
+  friend class FilesystemVerifiedRetainedViewerModelSource;
+};
+
+/// Exact retained viewer-model point-read capability.
+///
+/// Unknown bundle/product coordinates return no value. Present semantic or
+/// raw content that cannot be independently verified fails closed.
+class IVerifiedRetainedViewerModelSource {
+public:
+  virtual ~IVerifiedRetainedViewerModelSource() = default;
+
+  [[nodiscard]] virtual std::optional<VerifiedRetainedViewerModel>
+  get_verified(const RetainedViewerModelQuery &query) const = 0;
 };
 
 /// Sealed, effect-free input for one exact native projection revision.
@@ -875,6 +964,36 @@ class FilesystemVerifiedRetainedPlanningModelSource final
   get_verified(const RetainedPlanningModelQuery& query) const override;
 
  private:
+  std::filesystem::path trusted_package_root_;
+};
+
+/// Filesystem-backed exact typed viewer-model reader.
+///
+/// The source independently reloads one exact bundle, fixes product kind and
+/// placement to the cell viewer product, verifies its URDF/resource-map
+/// parity and complete selected source closure, and returns owned immutable
+/// bytes. It has no listing, alias, active-selection, Apply, or mutation
+/// surface.
+class FilesystemVerifiedRetainedViewerModelSource final
+    : public IVerifiedRetainedViewerModelSource {
+public:
+  explicit FilesystemVerifiedRetainedViewerModelSource(
+      std::filesystem::path trusted_package_root);
+  ~FilesystemVerifiedRetainedViewerModelSource() override = default;
+
+  FilesystemVerifiedRetainedViewerModelSource(
+      const FilesystemVerifiedRetainedViewerModelSource &) = delete;
+  FilesystemVerifiedRetainedViewerModelSource &
+  operator=(const FilesystemVerifiedRetainedViewerModelSource &) = delete;
+  FilesystemVerifiedRetainedViewerModelSource(
+      FilesystemVerifiedRetainedViewerModelSource &&) = delete;
+  FilesystemVerifiedRetainedViewerModelSource &
+  operator=(FilesystemVerifiedRetainedViewerModelSource &&) = delete;
+
+  [[nodiscard]] std::optional<VerifiedRetainedViewerModel>
+  get_verified(const RetainedViewerModelQuery &query) const override;
+
+private:
   std::filesystem::path trusted_package_root_;
 };
 

@@ -25,8 +25,105 @@ namespace manyforge::headless {
 
 inline constexpr std::string_view kHeadlessApiMutationResponseSchemaVersion =
     "manyforge.headless_api_mutation_response.v1";
+inline constexpr std::string_view kViewerModelAssetSchemaVersion =
+    "manyforge.viewer_model_asset.v1";
+inline constexpr std::size_t kMaximumViewerModelResourceUriBytes = 4096U;
 
 class HeadlessApiOwnerLock;
+
+/// Immutable byte view into one exact active retained viewer product.
+///
+/// The shared model keeps the selected immutable closure alive after the core
+/// mutex is released and even if a later request observes a new Apply. The
+/// view carries its original bundle/product identities, so a response can
+/// never relabel old bytes as the successor selection.
+class ViewerModelAsset final {
+public:
+  ViewerModelAsset(const ViewerModelAsset &) = default;
+  ViewerModelAsset &operator=(const ViewerModelAsset &) = default;
+  ViewerModelAsset(ViewerModelAsset &&) noexcept = default;
+  ViewerModelAsset &operator=(ViewerModelAsset &&) noexcept = default;
+  ~ViewerModelAsset() = default;
+
+  [[nodiscard]] std::string_view asset_kind() const noexcept {
+    return resource_index_.has_value() ? "resource" : "urdf";
+  }
+  [[nodiscard]] std::string_view cell_id() const noexcept { return cell_id_; }
+  [[nodiscard]] std::string_view graph_revision() const noexcept {
+    return graph_revision_;
+  }
+  [[nodiscard]] const manyforge::core::RetainedBundleId &
+  retained_bundle_id() const noexcept {
+    return model_->query().retained_bundle_id;
+  }
+  [[nodiscard]] const manyforge::core::ProductId &product_id() const noexcept {
+    return model_->query().product_id;
+  }
+  [[nodiscard]] const manyforge::core::ProductContractId &
+  product_contract_id() const noexcept {
+    return model_->product_contract_id();
+  }
+  [[nodiscard]] const manyforge::core::ProductContractRevision &
+  product_contract_revision() const noexcept {
+    return model_->product_contract_revision();
+  }
+  [[nodiscard]] const manyforge::core::ContentDigest &
+  viewer_model_revision() const noexcept {
+    return viewer_model_revision_;
+  }
+  [[nodiscard]] std::optional<std::string_view> logical_uri() const noexcept {
+    if (!resource_index_.has_value()) {
+      return std::nullopt;
+    }
+    return model_->resources()[*resource_index_].logical_uri();
+  }
+  [[nodiscard]] std::string_view media_type() const noexcept {
+    if (!resource_index_.has_value()) {
+      return model_->urdf_artifact_ref().media_type;
+    }
+    return model_->resources()[*resource_index_].media_type();
+  }
+  [[nodiscard]] std::uint64_t byte_size() const noexcept {
+    if (!resource_index_.has_value()) {
+      return model_->urdf_artifact_ref().byte_size;
+    }
+    return model_->resources()[*resource_index_].byte_size();
+  }
+  [[nodiscard]] const manyforge::core::ContentDigest &
+  content_digest() const noexcept {
+    if (!resource_index_.has_value()) {
+      return model_->urdf_artifact_ref().content_digest;
+    }
+    return model_->resources()[*resource_index_].content_digest();
+  }
+  [[nodiscard]] std::string_view bytes() const noexcept {
+    if (!resource_index_.has_value()) {
+      return model_->urdf_bytes();
+    }
+    return model_->resources()[*resource_index_].bytes();
+  }
+
+private:
+  ViewerModelAsset(
+      std::shared_ptr<const manyforge::deployment::VerifiedRetainedViewerModel>
+          model,
+      std::string cell_id, std::string graph_revision,
+      manyforge::core::ContentDigest viewer_model_revision,
+      std::optional<std::size_t> resource_index)
+      : model_(std::move(model)), cell_id_(std::move(cell_id)),
+        graph_revision_(std::move(graph_revision)),
+        viewer_model_revision_(std::move(viewer_model_revision)),
+        resource_index_(resource_index) {}
+
+  std::shared_ptr<const manyforge::deployment::VerifiedRetainedViewerModel>
+      model_;
+  std::string cell_id_;
+  std::string graph_revision_;
+  manyforge::core::ContentDigest viewer_model_revision_;
+  std::optional<std::size_t> resource_index_;
+
+  friend class HeadlessApiCore;
+};
 
 struct HeadlessApiCoreConfig final {
   std::filesystem::path publication_root;
@@ -68,9 +165,14 @@ public:
   NodeEnvironmentProjection();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   SourceModelProjection();
-  [[nodiscard]] manyforge::content_identity::CanonicalValue AssistantModeIndex();
-  [[nodiscard]] manyforge::content_identity::CanonicalValue AssistantModeProjection(
-      std::string_view mode_id);
+  [[nodiscard]] ViewerModelAsset ViewerModelUrdf();
+  [[nodiscard]] ViewerModelAsset
+  ViewerModelResource(std::string_view expected_retained_bundle_id,
+                      std::string_view logical_uri);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  AssistantModeIndex();
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  AssistantModeProjection(std::string_view mode_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue AlarmSnapshot(
       std::optional<std::size_t> limit = 32U,
       const std::set<AlarmLifecycleState> &states = {},
@@ -135,6 +237,10 @@ private:
   NodeEnvironmentProjectionLocked(const HeadlessRuntimeSnapshot &runtime);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   SourceModelProjectionLocked(const HeadlessRuntimeSnapshot &runtime);
+  [[nodiscard]] ViewerModelAsset ViewerModelAssetLocked(
+      const HeadlessRuntimeSnapshot &runtime,
+      std::optional<std::string_view> expected_retained_bundle_id,
+      std::optional<std::string_view> logical_uri);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   AssistantModeIndexLocked(const HeadlessRuntimeSnapshot &runtime);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
@@ -176,9 +282,16 @@ private:
       retained_bundle_source_;
   ActiveNodeEnvironmentProjection node_environment_projection_;
   ActiveSourceModelProjection source_model_projection_;
-  std::shared_ptr<const manyforge::deployment::RetainedBundle> verified_active_bundle_;
-  std::optional<manyforge::content_identity::CanonicalValue> source_model_projection_cache_;
-  std::optional<manyforge::content_identity::CanonicalValue> assistant_mode_index_cache_;
+  manyforge::deployment::FilesystemVerifiedRetainedViewerModelSource
+      viewer_model_source_;
+  std::shared_ptr<const manyforge::deployment::RetainedBundle>
+      verified_active_bundle_;
+  std::shared_ptr<const manyforge::deployment::VerifiedRetainedViewerModel>
+      verified_viewer_model_;
+  std::optional<manyforge::content_identity::CanonicalValue>
+      source_model_projection_cache_;
+  std::optional<manyforge::content_identity::CanonicalValue>
+      assistant_mode_index_cache_;
   std::map<std::string, manyforge::content_identity::CanonicalValue>
       assistant_mode_projection_cache_;
   std::shared_ptr<SqliteEventHistoryStore> history_store_;

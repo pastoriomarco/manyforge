@@ -1938,6 +1938,89 @@ TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
       RetainedBundleError);
 }
 
+TEST(FilesystemVerifiedRetainedViewerModelSourceTest,
+     NonEmptyViewerReturnsExactUrdfAndSelectedResourceClosure) {
+  ScopedTrustedRoot root;
+  const auto materialized = materialize_durable_lite6_bundle(root.path());
+  ASSERT_TRUE(
+      materialized.bundle->value().compiled_products.viewer_model.has_value());
+  const auto &viewer =
+      *materialized.bundle->value().compiled_products.viewer_model;
+  const RetainedViewerModelQuery query{
+      materialized.bundle->retained_bundle_id(), viewer.product_id};
+  const FilesystemVerifiedRetainedViewerModelSource source(root.path());
+
+  auto loaded = source.get_verified(query);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->query(), query);
+  EXPECT_EQ(loaded->product_contract_id(), viewer.product_contract_id);
+  EXPECT_EQ(loaded->product_contract_revision(),
+            viewer.product_contract_revision);
+  EXPECT_EQ(loaded->urdf_artifact_ref().artifact_role_id.value(), "urdf");
+  EXPECT_EQ(loaded->urdf_artifact_ref().content_digest.value(),
+            sha256_digest(loaded->urdf_bytes()));
+  EXPECT_NE(loaded->urdf_bytes().find("<robot"), std::string_view::npos);
+
+  const FilesystemVerifiedRetainedPlanningModelSource planning_source(
+      root.path());
+  const auto &planning =
+      materialized.bundle->value().compiled_products.planning_collision_model;
+  const auto planning_model = planning_source.get_verified(
+      {materialized.bundle->retained_bundle_id(), planning.product_id});
+  ASSERT_TRUE(planning_model.has_value());
+  EXPECT_EQ(loaded->urdf_bytes(), planning_model->urdf_bytes());
+  ASSERT_EQ(loaded->resources().size(), planning_model->resources().size());
+  for (std::size_t index = 0U; index < loaded->resources().size(); ++index) {
+    EXPECT_EQ(loaded->resources()[index].logical_uri(),
+              planning_model->resources()[index].logical_uri());
+    EXPECT_EQ(loaded->resources()[index].content_digest(),
+              planning_model->resources()[index].content_digest());
+    EXPECT_EQ(loaded->resources()[index].bytes(),
+              planning_model->resources()[index].bytes());
+  }
+
+  VerifiedRetainedViewerModel copied = *loaded;
+  VerifiedRetainedViewerModel moved = std::move(copied);
+  loaded.reset();
+  EXPECT_EQ(moved.query(), query);
+  EXPECT_EQ(moved.urdf_artifact_ref().content_digest.value(),
+            sha256_digest(moved.urdf_bytes()));
+  EXPECT_FALSE(moved.resources().empty());
+}
+
+TEST(FilesystemVerifiedRetainedViewerModelSourceTest,
+     UnknownCoordinatesAndCorruptViewerClosureFailClosed) {
+  ScopedTrustedRoot root;
+  const auto materialized = materialize_durable_lite6_bundle(root.path());
+  ASSERT_TRUE(
+      materialized.bundle->value().compiled_products.viewer_model.has_value());
+  const auto &viewer =
+      *materialized.bundle->value().compiled_products.viewer_model;
+  const FilesystemVerifiedRetainedViewerModelSource source(root.path());
+
+  EXPECT_FALSE(
+      source
+          .get_verified({core::RetainedBundleId(std::string(kZeroDigest)),
+                         viewer.product_id})
+          .has_value());
+  EXPECT_FALSE(source
+                   .get_verified({materialized.bundle->retained_bundle_id(),
+                                  core::ProductId("unknown_viewer_product")})
+                   .has_value());
+
+  const auto urdf =
+      std::find_if(viewer.artifact_refs.begin(), viewer.artifact_refs.end(),
+                   [](const core::RetainedArtifactRefDTO &artifact) {
+                     return artifact.artifact_role_id.value() == "urdf";
+                   });
+  ASSERT_NE(urdf, viewer.artifact_refs.end());
+  write_file(raw_path(root.path(), *urdf), "corrupt viewer XML");
+  EXPECT_THROW(
+      static_cast<void>(source.get_verified(
+          {materialized.bundle->retained_bundle_id(), viewer.product_id})),
+      RetainedBundleError);
+}
+
 TEST(VerifiedRetainedProjectionInputTest,
      ExactPlanningProductAndOwnerSnapshotYieldCompositeRevision) {
   ScopedTrustedRoot root;

@@ -1,8 +1,11 @@
 #include <manyforge_deployment/cell_compiler.hpp>
+#include <manyforge_deployment/apply_fence_qualification.hpp>
 
 #include <algorithm>
 #include <cstddef>
+#include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -56,6 +59,38 @@ collect_catalog_record_refs(
 
 namespace detail {
 
+void validate_apply_fence_qualification_bound(
+    const core::CellGraphDTO& graph) {
+  std::set<core::ResourceId> resources;
+  for (const auto& binding : graph.control_bindings) {
+    for (const auto& resource : binding.resource_bindings) {
+      resources.insert(resource.resource_id);
+    }
+  }
+
+  const auto require_within = [](const std::string_view dimension,
+                                 const std::size_t actual,
+                                 const std::size_t maximum) {
+    if (actual <= maximum) {
+      return;
+    }
+    throw CellCompilerError(
+        "cell exceeds the compiler-qualified operational Apply-fence "
+        "envelope: " +
+        std::string(dimension) + " has " + std::to_string(actual) +
+        " entries; maximum is " + std::to_string(maximum));
+  };
+  require_within(
+      "controllable_components", graph.controllable_components.size(),
+      kMaximumQualifiedApplyFenceControllableComponentsPerCell);
+  require_within("control_domains", graph.control_domains.size(),
+                 kMaximumQualifiedApplyFenceControlDomainsPerCell);
+  require_within("control_bindings", graph.control_bindings.size(),
+                 kMaximumQualifiedApplyFenceControlBindingsPerCell);
+  require_within("resources", resources.size(),
+                 kMaximumQualifiedApplyFenceResourcesPerCell);
+}
+
 std::vector<core::CatalogRecordRefDTO>
 canonicalize_compiler_catalog_record_refs(
     std::vector<core::CatalogRecordRefDTO> references) {
@@ -88,6 +123,8 @@ canonicalize_compiler_catalog_record_refs(
 
 CompilerQualifiedCellIr compile_cell_ir(
     const ApplicabilityQualifiedCellIr& applicability) {
+  detail::validate_apply_fence_qualification_bound(
+      applicability.composition().graph());
   return CompilerQualifiedCellIr(
       applicability, collect_catalog_record_refs(applicability));
 }
