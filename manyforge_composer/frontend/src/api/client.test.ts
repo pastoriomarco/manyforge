@@ -161,6 +161,66 @@ describe('resolveStructuralAssetUrl', () => {
 });
 
 describe('headless intent client', () => {
+  it('submits one exact current-revision scene transaction', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      api_version: 'manyforge.manager_command_response.v1',
+      committed_projection_revision: {
+        retained_bundle_id: 'bundle-1',
+        graph_revision: 'graph-1',
+        scene_revision: {
+          scene_id: 'scene-1',
+          revision_id: 2,
+          content_hash: 'scene-hash-2',
+        },
+      },
+      error: null,
+      ok: true,
+      projection_status: 'committed',
+      replay_status: 'accepted_new',
+      request_id: 'request-scene-1',
+      request_owner_epoch: 'scene-owner-epoch-7',
+      transaction_sequence: 3,
+      update_status: 'pose_changed',
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const transaction = {
+      request_context: {
+        request_id: 'request-scene-1',
+        request_owner_epoch: 'scene-owner-epoch-7',
+        source_label: 'composer_ui' as const,
+        correlation_id: null,
+      },
+      expected_projection_revision: {
+        retained_bundle_id: 'bundle-1',
+        graph_revision: 'graph-1',
+        scene_revision: {
+          scene_id: 'scene-1',
+          revision_id: 1,
+          content_hash: 'scene-hash-1',
+        },
+      },
+      operation: {
+        kind: 'update_object_pose' as const,
+        scene_resource_id: 'part',
+        pose: {
+          position_m: { x_m: 0.4, y_m: 0, z_m: 0.2 },
+          orientation: { x: 0, y: 0, z: 0, w: 1 },
+        },
+        frame_ref: { kind: 'cell_frame' as const, cell_id: 'cell-a' },
+        provider_evidence: null,
+        expected_attached: false as const,
+      },
+    };
+
+    const receipt = await api.scene.commit(transaction);
+
+    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/scene/transactions');
+    expect(options.method).toBe('POST');
+    expect(JSON.parse(String(options.body))).toEqual(transaction);
+    expect(receipt.committed_projection_revision.scene_revision.revision_id).toBe(2);
+  });
+
   it('requests a bounded attention-newest alarm page', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({}));
     vi.stubGlobal('fetch', fetchMock);

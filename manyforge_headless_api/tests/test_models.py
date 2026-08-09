@@ -520,7 +520,7 @@ def _scene_transaction() -> dict[str, object]:
     return {
         "request_context": {
             **_caller(),
-            "request_owner_epoch": scene_id,
+            "request_owner_epoch": "scene-owner.epoch.7",
         },
         "expected_projection_revision": {
             "retained_bundle_id": "sha256:" + "b" * 64,
@@ -550,6 +550,10 @@ def _scene_transaction() -> dict[str, object]:
 def test_scene_transaction_is_strict_and_cannot_assert_attribution() -> None:
     parsed = SceneTransactionRequest.model_validate(_scene_transaction())
     assert parsed.operation.scene_resource_id == "part.1"
+    assert (
+        parsed.request_context.request_owner_epoch
+        != parsed.expected_projection_revision.scene_revision.scene_id
+    )
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         SceneTransactionRequest.model_validate(
@@ -571,14 +575,6 @@ def test_scene_transaction_is_strict_and_cannot_assert_attribution() -> None:
     }
     with pytest.raises(ValidationError):
         SceneTransactionRequest.model_validate(body)
-
-    wrong_epoch = _scene_transaction()
-    wrong_epoch["request_context"] = {
-        **wrong_epoch["request_context"],
-        "request_owner_epoch": "sha256:" + "e" * 64,
-    }
-    with pytest.raises(ValidationError, match="must equal the expected scene_id"):
-        SceneTransactionRequest.model_validate(wrong_epoch)
 
     malformed_revision = _scene_transaction()
     malformed_revision["expected_projection_revision"] = {

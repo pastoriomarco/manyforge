@@ -4,10 +4,13 @@ import { ApiError, api } from './api/client';
 import { ArtifactBrowser } from './components/ArtifactBrowser';
 import { CatalogPanel } from './components/CatalogPanel';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
-import { StructuralViewer } from './components/StructuralViewer';
+import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
 import { UnavailableBanner } from './components/UnavailableBanner';
-import { HeadlessRuntimeSurfaces } from './components/HeadlessRuntimeSurfaces';
-import { RobotControlPanel } from './components/RobotControlPanel';
+import { HeadlessRuntimeSurfacesView } from './components/HeadlessRuntimeSurfaces';
+import { RobotControlPanelView } from './components/RobotControlPanel';
+import { useHeadlessState } from './hooks/useHeadlessState';
+import { useProgramWorkspace } from './hooks/useProgramWorkspace';
+import { useRobotControl } from './hooks/useRobotControl';
 import { useStructuralResource } from './state/structuralResource';
 import type { ArtifactKind, FileBrowserEntry } from './types/api';
 
@@ -34,6 +37,9 @@ export default function App() {
   );
   const headlessEnabled = health.status === 'ready'
     && health.data.mode === 'headless_client';
+  const headlessState = useHeadlessState(headlessEnabled);
+  const programController = useProgramWorkspace();
+  const robotControl = useRobotControl(headlessEnabled);
   const handleArtifactSelection = useCallback((
     kind: ArtifactKind,
     entry: FileBrowserEntry | null,
@@ -57,11 +63,18 @@ export default function App() {
 
       <UnavailableBanner health={health} onRetry={retryHealth} />
 
-      <HeadlessRuntimeSurfaces enabled={headlessEnabled} />
+      <HeadlessRuntimeSurfacesView
+        enabled={headlessEnabled}
+        headlessState={headlessState}
+      />
 
-      <RobotControlPanel enabled={headlessEnabled} />
+      <RobotControlPanelView
+        enabled={headlessEnabled}
+        controller={robotControl}
+      />
 
       <ProgramWorkspace
+        controller={programController}
         catalog={catalog}
         environment={nodeEnvironment}
         selectedProgramPath={selectedProgramPath}
@@ -69,7 +82,15 @@ export default function App() {
         onRetryEnvironment={retryNodeEnvironment}
       />
 
-      <StructuralViewer manifest={manifest} onRetry={retryManifest} />
+      <SceneAuthoringWorkspace
+        enabled={headlessEnabled}
+        environment={nodeEnvironment}
+        headlessState={headlessState}
+        manifest={manifest}
+        onRetryManifest={retryManifest}
+        programController={programController}
+        robotControl={robotControl}
+      />
 
       <div className="lower-grid">
         <CatalogPanel catalog={catalog} onRetry={retryCatalog} />

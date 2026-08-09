@@ -10,8 +10,12 @@ import {
   parseOperatorAlarmSnapshot,
   parseMotionPreviewResponse,
   parseNodeEnvironmentResponse,
+  parseLogicalSceneProjection,
   parseProgramWorkspaceResponse,
+  parseSceneRuntimeProjection,
+  parseSceneTransactionResponse,
   parseSceneUrdfManifest,
+  parseSourceModelProjection,
 } from './parsers';
 
 function programFixture(): Record<string, unknown> {
@@ -188,6 +192,124 @@ function structuralManifestFixture(): Record<string, unknown> {
   };
 }
 
+function sourceModelFixture(): Record<string, unknown> {
+  return {
+    schema_version: 'manyforge.source_model_projection.v1',
+    cell_id: 'cell-a',
+    retained_bundle_id: 'bundle-1',
+    graph_revision: 'graph-1',
+    model_map_contract: null,
+    model_map_product_id: null,
+    occurrences: [],
+    targets: [],
+    source: {
+      available: true,
+      freshness: 'fresh',
+      known_gaps: [],
+      projection_generation: 1,
+      projection_owner_epoch: 'source-projection-1',
+      receiver_age_ns: 10,
+      selection_projection_generation: 2,
+      selection_source_content_digest: `sha256:${'a'.repeat(64)}`,
+      selection_source_generation: 3,
+      selection_source_owner_epoch: 'manager-epoch-1',
+      selection_source_owner_id: 'component-manager.cell-a',
+      source_content_digest: `sha256:${'b'.repeat(64)}`,
+      source_generation: 4,
+      source_owner_epoch: 'source-owner-epoch-1',
+      source_owner_id: 'headless-api.source-model',
+      source_owner_kind: 'source_model_projection',
+    },
+  };
+}
+
+function projectionRevisionFixture(revision = 1): Record<string, unknown> {
+  return {
+    retained_bundle_id: 'bundle-1',
+    graph_revision: 'graph-1',
+    scene_revision: {
+      scene_id: 'scene-1',
+      revision_id: revision,
+      content_hash: `sha256:${'c'.repeat(64)}`,
+    },
+  };
+}
+
+function logicalSceneFixture(): Record<string, unknown> {
+  return {
+    api_version: 'manyforge.logical_scene_source.v1',
+    access: {
+      active_projection: projectionRevisionFixture(),
+      phase: 'finalized',
+      projection_leases_open: true,
+      scene_writes_open: true,
+    },
+    snapshot: {
+      carried_object_attachments: [],
+      cell_id: 'cell-a',
+      configured_collision_policy: {},
+      objects: [{
+        collision_shapes: [{
+          type: 'box',
+          dimensions_m: { x: 0.1, y: 0.2, z: 0.3 },
+        }],
+        placement: {
+          kind: 'cell_fixed',
+          cell_id: 'cell-a',
+          pose_in_cell: {
+            position_m: { x: 0.4, y: 0, z: 0.5 },
+            orientation_xyzw: [0, 0, 0, 1],
+          },
+        },
+        provider_evidence: null,
+        scene_resource_id: 'part',
+        support_contacts: [],
+      }],
+      policy_epoch: 1,
+      revision: (projectionRevisionFixture().scene_revision as Record<string, unknown>),
+      topology_epoch: 1,
+      transaction_sequence: 1,
+    },
+  };
+}
+
+function sceneRuntimeFixture(): Record<string, unknown> {
+  return {
+    api_version: 'manyforge.scene_runtime_source.v1',
+    cell_id: 'cell-a',
+    state: {
+      active_replay_id: null,
+      api_version: 'manyforge.scene_runtime_state.v1',
+      counters: {
+        buffer_replaced: 0,
+        buffered: 0,
+        closed: 0,
+        failed: 0,
+        opened: 1,
+        replayed: 0,
+        retired: 0,
+        stale_completion_rejected: 0,
+      },
+      deferred: false,
+      error: null,
+      initialization_generation: 1,
+      initialization_token: 'token-1',
+      pose_sources: [],
+      reason: 'ready',
+      runtime_identity: {
+        deployment_generation: 1,
+        graph_revision: 'graph-1',
+        program_generation: 0,
+        retained_bundle_id: 'bundle-1',
+        runtime_generation: 1,
+      },
+      started_at_ns: 1,
+      state: 'open',
+      updated_at_ns: 2,
+    },
+  };
+}
+
 describe('parseSceneUrdfManifest', () => {
   it('accepts a complete authored-neutral projection', () => {
     const parsed = parseSceneUrdfManifest(structuralManifestFixture());
@@ -290,6 +412,35 @@ describe('Program workspace parsers', () => {
     expect(workspace.applied.unavailableReason?.restorationGates).toEqual(['N7']);
   });
 
+  it('parses the exact Program scene and viewer authoring contracts', () => {
+    const fixture = workspaceFixture();
+    const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    program.scene = [{
+      scene_resource_id: 'part',
+      shape: { type: 'sphere', sphere_radius_m: 0.02 },
+      pose: {
+        frame_ref: { kind: 'cell_frame' },
+        position_m: [0.4, 0, 0.2],
+        orientation: { xyzw: [0, 0, 0, 1] },
+      },
+    }];
+    program.viewer = {
+      frame_role_visibility: {},
+      frame_gizmo_size_m: 0.1,
+      resource_role_visibility: {},
+      object_axes_gizmo_size_m: 0.15,
+    };
+
+    const parsed = parseProgramWorkspaceResponse(fixture);
+    expect(parsed.draft.program?.scene?.[0]?.shape.type).toBe('sphere');
+    expect(parsed.draft.program?.viewer?.object_axes_gizmo_size_m).toBe(0.15);
+
+    ((program.scene as Record<string, unknown>[])[0].shape as Record<string, unknown>).radius = 1;
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow(
+      'exactly [sphere_radius_m, type]',
+    );
+  });
+
   it('rejects inconsistent or historical Program binding shapes', () => {
     const inconsistent = workspaceFixture();
     (inconsistent.draft as Record<string, unknown>).programRevision = 'sha256:wrong';
@@ -374,6 +525,59 @@ describe('Program workspace parsers', () => {
 });
 
 describe('headless projection parsers', () => {
+  it('accepts exact source-model, logical-scene, and scene-runtime facts', () => {
+    expect(parseSourceModelProjection(sourceModelFixture()).cell_id).toBe('cell-a');
+    expect(parseLogicalSceneProjection(logicalSceneFixture()).snapshot?.objects[0]
+      ?.scene_resource_id).toBe('part');
+    expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).state.state).toBe('open');
+  });
+
+  it('rejects stale shapes and cross-owner scene revisions', () => {
+    const stale = sourceModelFixture();
+    (stale.source as Record<string, unknown>).freshness = 'stale';
+    expect(() => parseSourceModelProjection(stale)).toThrow('available and fresh');
+
+    const scene = logicalSceneFixture();
+    const snapshot = scene.snapshot as Record<string, unknown>;
+    (snapshot.revision as Record<string, unknown>).revision_id = 2;
+    expect(() => parseLogicalSceneProjection(scene)).toThrow(
+      'the active projection scene revision',
+    );
+  });
+
+  it('accepts only an exact successful scene transaction receipt', () => {
+    const parsed = parseSceneTransactionResponse({
+      api_version: 'manyforge.manager_command_response.v1',
+      committed_projection_revision: projectionRevisionFixture(2),
+      error: null,
+      ok: true,
+      projection_status: 'committed',
+      replay_status: 'accepted_new',
+      request_id: 'request-1',
+      request_owner_epoch: 'scene-owner-epoch-7',
+      transaction_sequence: 1,
+      update_status: 'pose_changed',
+    });
+    expect(parsed.committed_projection_revision.scene_revision.revision_id).toBe(2);
+  });
+
+  it('keeps the maximum visible scene projection parse bounded', () => {
+    const scene = logicalSceneFixture();
+    const snapshot = scene.snapshot as Record<string, unknown>;
+    const fixture = (snapshot.objects as Record<string, unknown>[])[0];
+    snapshot.objects = Array.from({ length: 4096 }, (_, index) => ({
+      ...fixture,
+      scene_resource_id: `part-${index.toString().padStart(4, '0')}`,
+    }));
+
+    const started = performance.now();
+    const parsed = parseLogicalSceneProjection(scene);
+    const elapsedMs = performance.now() - started;
+
+    expect(parsed.snapshot?.objects).toHaveLength(4096);
+    expect(elapsedMs).toBeLessThan(1500);
+  });
+
   it('accepts structural and headless Composer health without inventing state', () => {
     const structural = parseHealthResponse({
       status: 'degraded',

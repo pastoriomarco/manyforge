@@ -1341,6 +1341,187 @@ code {
   margin-bottom: 1rem;
 }
 
+.scene-authoring-workspace {
+  margin-bottom: 1rem;
+}
+
+.scene-authoring-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-top: 1px solid #203542;
+  border-bottom: 1px solid #203542;
+}
+
+.scene-authoring-column,
+.source-occurrence-panel {
+  display: grid;
+  min-width: 0;
+  gap: 0.75rem;
+  padding: 1rem;
+  background: #0a1720;
+}
+
+.scene-authoring-grid > .scene-authoring-column:first-child {
+  border-right: 1px solid #203542;
+}
+
+.current-scene-editor {
+  border-top: 1px solid #203542;
+  background: #0b1922;
+}
+
+.scene-authoring-heading,
+.scene-authoring-actions,
+.source-occurrence-facts,
+.scene-owner-identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.scene-authoring-heading {
+  justify-content: space-between;
+}
+
+.scene-authoring-heading h3,
+.source-occurrence-panel h3 {
+  margin: 0;
+  color: #dce8ee;
+  font-size: 0.96rem;
+}
+
+.scene-authoring-column select,
+.source-occurrence-panel select,
+.scene-pose-grid input,
+.scene-shape-select input,
+.scene-shape-select select {
+  width: 100%;
+  min-width: 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #304b5a;
+  border-radius: 0.45rem;
+  color: #dce8ee;
+  background: #07141d;
+}
+
+.scene-pose-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+.scene-quaternion-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.scene-pose-grid label,
+.scene-shape-select,
+.viewer-role-controls label {
+  display: grid;
+  gap: 0.3rem;
+  color: #8fa5b1;
+  font-size: 0.7rem;
+}
+
+.viewer-role-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem 0.8rem;
+}
+
+.viewer-role-controls label {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+}
+
+.viewer-role-controls input {
+  width: auto;
+  accent-color: #67c8df;
+}
+
+.source-occurrence-panel {
+  grid-template-columns: minmax(12rem, 0.5fr) minmax(15rem, 0.8fr) minmax(18rem, 1.4fr);
+  align-items: center;
+  border-top: 1px solid #203542;
+}
+
+.source-occurrence-facts,
+.scene-owner-identity {
+  color: #8fa5b1;
+  font-size: 0.72rem;
+}
+
+.source-occurrence-facts span,
+.scene-owner-identity span {
+  padding: 0.3rem 0.45rem;
+  border: 1px solid #294553;
+  border-radius: 0.35rem;
+  background: #08151d;
+}
+
+.source-name-details {
+  grid-column: 1 / -1;
+  border: 1px solid #294553;
+  border-radius: 0.55rem;
+  padding: 0.55rem 0.7rem;
+}
+
+.source-occurrence-panel > .scene-contract-note {
+  grid-column: 1 / -1;
+}
+
+.source-name-details summary {
+  cursor: pointer;
+  color: #dce8ee;
+  font-weight: 650;
+}
+
+.source-name-details dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.35rem 0.65rem;
+  margin: 0.65rem 0 0;
+}
+
+.source-name-details dt {
+  color: #8fa5b1;
+}
+
+.source-name-details dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.scene-contract-note,
+.scene-commit-error,
+.scene-commit-success {
+  margin: 0;
+  color: #829aa7;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.scene-contract-note.warning-state,
+.scene-commit-error {
+  color: #efb7ac;
+}
+
+.scene-commit-success {
+  color: #a9d9c5;
+}
+
+.scene-authoring-actions button {
+  padding: 0.5rem 0.7rem;
+}
+
+.scene-authoring-actions .danger-button:not(:disabled) {
+  border-color: #754b47;
+  color: #efb7ac;
+  background: #311d1c;
+}
+
 .program-workspace-header-actions,
 .program-tree-actions,
 .program-staging-heading,
@@ -2140,6 +2321,14 @@ code {
     grid-template-columns: minmax(15rem, 0.7fr) minmax(28rem, 1.3fr);
   }
 
+  .source-occurrence-panel {
+    grid-template-columns: minmax(12rem, 0.7fr) minmax(16rem, 1fr);
+  }
+
+  .source-occurrence-panel .scene-contract-note {
+    grid-column: 1 / -1;
+  }
+
   .program-properties {
     grid-column: 1 / -1;
     border-top: 1px solid #203542;
@@ -2201,8 +2390,25 @@ code {
   .program-identity-strip,
   .program-artifact-actions,
   .program-authoring-grid,
-  .program-declaration-columns {
+  .program-declaration-columns,
+  .scene-authoring-grid,
+  .source-occurrence-panel {
     grid-template-columns: 1fr;
+  }
+
+  .scene-authoring-grid > .scene-authoring-column:first-child {
+    border-right: 0;
+    border-bottom: 1px solid #203542;
+  }
+
+  .source-occurrence-panel .scene-contract-note {
+    grid-column: auto;
+  }
+
+  .scene-pose-grid,
+  .scene-quaternion-grid,
+  .viewer-role-controls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .program-identity-strip > div {

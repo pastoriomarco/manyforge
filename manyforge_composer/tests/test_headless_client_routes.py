@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any, Iterator
 
 import httpx
@@ -9,6 +10,11 @@ import pytest
 from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
+from manyforge_behavior.canonical_artifact import (
+    CONTENT_IDENTITY_PREFIX,
+    canonical_json_bytes,
+    raw_sha256_digest,
+)
 from manyforge_behavior.executable_node_resolver import build_executable_node_resolver
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_composer.backend import headless_ws
@@ -47,7 +53,7 @@ def _scene_body(
     return {
         "request_context": {
             "request_id": request_id,
-            "request_owner_epoch": scene_id,
+            "request_owner_epoch": "scene-owner.epoch.7",
             "source_label": "composer_ui",
             "correlation_id": None,
         },
@@ -147,6 +153,11 @@ def headless_client() -> (
             "source_owner_epoch": "manager.epoch.1",
             "source_owner_id": "component-manager.cell-a",
             "source_content_digest": "sha256:" + "a" * 64,
+            "selection_projection_generation": 4,
+            "selection_source_content_digest": "sha256:" + "a" * 64,
+            "selection_source_generation": 2,
+            "selection_source_owner_epoch": "manager.epoch.1",
+            "selection_source_owner_id": "component-manager.cell-a",
         },
     }
     source_model = {
@@ -162,9 +173,33 @@ def headless_client() -> (
             "available": True,
             "freshness": "fresh",
             "known_gaps": [],
+            "projection_generation": 1,
+            "projection_owner_epoch": "source-model-projection.epoch.1",
+            "receiver_age_ns": 10,
+            "selection_projection_generation": 4,
+            "selection_source_content_digest": "sha256:" + "a" * 64,
+            "selection_source_generation": 2,
+            "selection_source_owner_epoch": "manager.epoch.1",
+            "selection_source_owner_id": "component-manager.cell-a",
+            "source_content_digest": "",
+            "source_generation": 1,
+            "source_owner_epoch": "source-model.epoch.1",
             "source_owner_id": "headless-api.source-model",
+            "source_owner_kind": "source_model_projection",
         },
     }
+    source_model["source"]["source_content_digest"] = raw_sha256_digest(
+        b"\0".join(
+            (
+                CONTENT_IDENTITY_PREFIX,
+                b"manyforge-source-model-projection-semantic",
+                b"manyforge.source_model_projection.v1",
+                canonical_json_bytes(
+                    {key: value for key, value in source_model.items() if key != "source"}
+                ),
+            )
+        )
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
@@ -257,7 +292,9 @@ def headless_client() -> (
                         "projection_status": "not_attempted",
                         "replay_status": "accepted_new",
                         "request_id": "request.scene.missing",
-                        "request_owner_epoch": "sha256:" + "d" * 64,
+                        "request_owner_epoch": body["request_context"][
+                            "request_owner_epoch"
+                        ],
                         "transaction_sequence": None,
                         "update_status": None,
                     },
@@ -279,7 +316,9 @@ def headless_client() -> (
                 "projection_status": "committed",
                 "replay_status": "accepted_new",
                 "request_id": "request.scene.1",
-                "request_owner_epoch": "sha256:" + "d" * 64,
+                "request_owner_epoch": body["request_context"][
+                    "request_owner_epoch"
+                ],
                 "transaction_sequence": 1,
                 "update_status": "geometry_changed",
             }
@@ -320,6 +359,15 @@ def headless_client() -> (
 
 def _composer(client: HeadlessHttpClient) -> TestClient:
     return TestClient(create_app(ComposerState(headless_client=client)))
+
+
+def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
+    state = ComposerState.from_paths(
+        deployment_path=None,
+        program_path=str(_PROGRAM_PATH),
+        headless_client=client,
+    )
+    return TestClient(create_app(state))
 
 
 def _caller() -> dict[str, Any]:
@@ -585,6 +633,48 @@ def test_composer_scene_transaction_is_a_strict_stateless_forwarder(
     ]
 
 
+def test_program_scene_and_viewer_draft_edits_have_no_runtime_effect(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        workspace = composer.get("/api/program/workspace").json()
+        table = workspace["draft"]["program"]["scene"][0]
+        scene = composer.post(
+            "/api/program/draft/mutations",
+            json={
+                "draftId": workspace["draft"]["draftId"],
+                "expectedDraftRevision": workspace["draft"]["draftRevision"],
+                "mutation": "scene_draft_update_object",
+                "arguments": {"scene_resource": table},
+            },
+        )
+        assert scene.status_code == 200, scene.text
+        scene_workspace = scene.json()["workspace"]
+        viewer = composer.post(
+            "/api/program/draft/mutations",
+            json={
+                "draftId": scene_workspace["draft"]["draftId"],
+                "expectedDraftRevision": scene_workspace["draft"][
+                    "draftRevision"
+                ],
+                "mutation": "viewer_draft_replace",
+                "arguments": {
+                    "viewer": {
+                        "frame_role_visibility": {"tcp": False},
+                        "frame_gizmo_size_m": 0.1,
+                        "object_axes_gizmo_size_m": 0.1,
+                    }
+                },
+            },
+        )
+        assert viewer.status_code == 200, viewer.text
+
+    assert not any(
+        request["path"] == "/api/scene/transactions" for request in requests
+    )
+
+
 def test_composer_preserves_complete_scene_rejection(
     headless_client,
 ) -> None:
@@ -608,7 +698,7 @@ def test_composer_preserves_complete_scene_rejection(
         "projection_status": "not_attempted",
         "replay_status": "accepted_new",
         "request_id": "request.scene.missing",
-        "request_owner_epoch": "sha256:" + "d" * 64,
+        "request_owner_epoch": "scene-owner.epoch.7",
         "transaction_sequence": None,
         "update_status": None,
     }
@@ -838,3 +928,5 @@ def test_composer_does_not_fall_back_when_the_headless_environment_is_lost() -> 
         raw.close()
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "manager_source_unavailable"
+_ROOT = Path(__file__).resolve().parents[2]
+_PROGRAM_PATH = _ROOT / "examples" / "pick_and_place_minimal.program.yaml"

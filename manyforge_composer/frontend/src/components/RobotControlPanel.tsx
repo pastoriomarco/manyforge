@@ -1,4 +1,5 @@
 import { useRobotControl } from '../hooks/useRobotControl';
+import type { RobotControlController } from '../hooks/useRobotControl';
 import {
   isCapabilityCommandReceipt,
   quaternionFromRpyDegrees,
@@ -53,7 +54,13 @@ const MODE_LABELS: Array<[RobotControlMode, string]> = [
   ['gripper', 'Gripper'],
 ];
 
-export function RobotControlPanel({ enabled }: { enabled: boolean }) {
+export function RobotControlPanelView({
+  enabled,
+  controller,
+}: {
+  enabled: boolean;
+  controller: RobotControlController;
+}) {
   const {
     state,
     selectMode,
@@ -64,7 +71,7 @@ export function RobotControlPanel({ enabled }: { enabled: boolean }) {
     revert,
     stop,
     retry,
-  } = useRobotControl(enabled);
+  } = controller;
   const status = state.status;
   const active = robotControlHasActiveOperation(state);
   const canApprove = state.phase === 'ready'
@@ -467,4 +474,9 @@ export function RobotControlPanel({ enabled }: { enabled: boolean }) {
       )}
     </section>
   );
+}
+
+export function RobotControlPanel({ enabled }: { enabled: boolean }) {
+  const controller = useRobotControl(enabled);
+  return <RobotControlPanelView enabled={enabled} controller={controller} />;
 }

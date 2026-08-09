@@ -50,6 +50,7 @@ SUPPORTED_DRAFT_MUTATIONS = (
     "tree_draft_update_node_params",
     "tree_draft_wrap_node",
 )
+OPERATOR_DRAFT_MUTATIONS = ("viewer_draft_replace",)
 
 
 class DraftSessionError(RuntimeError):
@@ -720,6 +721,7 @@ class ComposerDraftSession:
             "scene_draft_update_object": self._scene_update,
             "scene_draft_upsert_objects": self._scene_upsert,
             "scene_draft_remove_objects": self._scene_remove,
+            "viewer_draft_replace": self._viewer_replace,
             "tree_draft_insert_node": self._tree_insert,
             "tree_draft_update_node_params": self._tree_update,
             "tree_draft_delete_node": self._tree_delete,
@@ -743,6 +745,20 @@ class ComposerDraftSession:
             )
         details = handler(document, arguments, catalog)
         return tool_id, details
+
+    @staticmethod
+    def _viewer_replace(
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        if set(arguments) != {"viewer"} or type(arguments["viewer"]) is not dict:
+            _error(
+                "draft_arguments_invalid",
+                "viewer_draft_replace requires exactly one viewer object",
+            )
+        document["viewer"] = deepcopy(arguments["viewer"])
+        return {"replaced": True}
 
     @staticmethod
     def _scene(document: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1206,5 +1222,6 @@ __all__ = [
     "ComposerDraftSession",
     "DraftMutationResult",
     "DraftSessionError",
+    "OPERATOR_DRAFT_MUTATIONS",
     "SUPPORTED_DRAFT_MUTATIONS",
 ]

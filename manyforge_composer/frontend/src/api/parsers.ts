@@ -14,10 +14,23 @@ import type {
   NodeImplementationAvailability,
   ProgramDocument,
   ProgramParameterDeclaration,
+  ProgramSceneFrameRef,
+  ProgramScenePose,
+  ProgramSceneResource,
+  ProgramSceneShape,
   ProgramTreeNode,
   ProgramValueSource,
+  ProgramViewerMetadata,
   ProgramWorkspaceResponse,
+  LogicalSceneObject,
+  LogicalScenePlacement,
+  LogicalScenePose,
+  LogicalSceneProjection,
+  LogicalSceneShape,
+  ProjectionRevision,
   QuaternionXyzwTuple,
+  SceneRuntimeProjection,
+  SceneTransactionResponse,
   SceneUrdfCollision,
   SceneUrdfJoint,
   SceneUrdfLink,
@@ -25,6 +38,11 @@ import type {
   SceneUrdfOrigin,
   SceneUrdfPrimitive,
   SceneUrdfVisual,
+  SourceModelCoordinate,
+  SourceModelOccurrence,
+  SourceModelProjection,
+  SourceModelSrdfGroup,
+  SourceModelTarget,
   Vector3Tuple,
 } from '../types/api';
 import type {
@@ -152,6 +170,30 @@ function integerAt(value: unknown, path: string): number {
   return number;
 }
 
+function positiveIntegerAt(value: unknown, path: string): number {
+  const integer = integerAt(value, path);
+  if (integer === 0) return fail(path, 'a positive safe integer');
+  return integer;
+}
+
+function positiveNumberAt(value: unknown, path: string): number {
+  const number = numberAt(value, path);
+  if (number <= 0) return fail(path, 'a positive finite number');
+  return number;
+}
+
+function boundedArrayAt(
+  value: unknown,
+  path: string,
+  maximum: number,
+): unknown[] {
+  const array = arrayAt(value, path);
+  if (array.length > maximum) {
+    return fail(path, `an array with at most ${maximum} entries`);
+  }
+  return array;
+}
+
 function jsonValueAt(value: unknown, path: string, depth = 0): JsonValue {
   if (depth > 32) return fail(path, 'a JSON value within the Program depth bound');
   if (value === null || typeof value === 'string' || typeof value === 'boolean') {
@@ -223,6 +265,18 @@ function stringArrayAt(value: unknown, path: string): string[] {
   return arrayAt(value, path).map((item, index) =>
     stringAt(item, `${path}[${index}]`),
   );
+}
+
+function canonicalStringArrayAt(value: unknown, path: string): string[] {
+  const strings = stringArrayAt(value, path);
+  const canonical = [...new Set(strings)].sort();
+  if (
+    canonical.length !== strings.length
+    || canonical.some((item, index) => item !== strings[index])
+  ) {
+    return fail(path, 'a sorted array of unique strings');
+  }
+  return strings;
 }
 
 function vector3At(value: unknown, path: string): Vector3Tuple {
@@ -550,6 +604,212 @@ function parseProgramParameter(
   return parameter;
 }
 
+function parseProgramSceneShape(value: unknown, path: string): ProgramSceneShape {
+  const record = objectAt(value, path);
+  const type = stringAt(record.type, `${path}.type`);
+  if (type === 'box') {
+    exactKeysAt(record, ['type', 'box_dimensions_m'], path);
+    const dimensions = vector3At(record.box_dimensions_m, `${path}.box_dimensions_m`);
+    if (dimensions.some((item) => item <= 0)) {
+      return fail(`${path}.box_dimensions_m`, 'three positive finite numbers');
+    }
+    return { type, box_dimensions_m: dimensions };
+  }
+  if (type === 'sphere') {
+    exactKeysAt(record, ['type', 'sphere_radius_m'], path);
+    return {
+      type,
+      sphere_radius_m: positiveNumberAt(
+        record.sphere_radius_m,
+        `${path}.sphere_radius_m`,
+      ),
+    };
+  }
+  if (type === 'cylinder') {
+    exactKeysAt(
+      record,
+      ['type', 'cylinder_radius_m', 'cylinder_height_m'],
+      path,
+    );
+    return {
+      type,
+      cylinder_radius_m: positiveNumberAt(
+        record.cylinder_radius_m,
+        `${path}.cylinder_radius_m`,
+      ),
+      cylinder_height_m: positiveNumberAt(
+        record.cylinder_height_m,
+        `${path}.cylinder_height_m`,
+      ),
+    };
+  }
+  if (type === 'mesh') {
+    allowedKeysAt(record, ['type', 'mesh_resource_uri'], ['mesh_scale'], path);
+    const shape: ProgramSceneShape = {
+      type,
+      mesh_resource_uri: stringAt(
+        record.mesh_resource_uri,
+        `${path}.mesh_resource_uri`,
+      ),
+    };
+    if (record.mesh_scale !== undefined) {
+      const scale = vector3At(record.mesh_scale, `${path}.mesh_scale`);
+      if (scale.some((item) => item <= 0)) {
+        return fail(`${path}.mesh_scale`, 'three positive finite numbers');
+      }
+      shape.mesh_scale = scale;
+    }
+    return shape;
+  }
+  return fail(`${path}.type`, 'box, sphere, cylinder, or mesh');
+}
+
+function parseProgramSceneFrameRef(
+  value: unknown,
+  path: string,
+): ProgramSceneFrameRef {
+  const record = objectAt(value, path);
+  const kind = stringAt(record.kind, `${path}.kind`);
+  if (kind === 'cell_frame') {
+    exactKeysAt(record, ['kind'], path);
+    return { kind };
+  }
+  if (kind === 'component_frame') {
+    exactKeysAt(
+      record,
+      ['kind', 'component_role', 'model_role', 'frame_role'],
+      path,
+    );
+    return {
+      kind,
+      component_role: stringAt(record.component_role, `${path}.component_role`),
+      model_role: stringAt(record.model_role, `${path}.model_role`),
+      frame_role: stringAt(record.frame_role, `${path}.frame_role`),
+    };
+  }
+  return fail(`${path}.kind`, 'cell_frame or component_frame');
+}
+
+function parseProgramScenePose(value: unknown, path: string): ProgramScenePose {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['frame_ref', 'position_m', 'orientation'], path);
+  const orientation = objectAt(record.orientation, `${path}.orientation`);
+  const orientationKeys = Object.keys(orientation);
+  if (orientationKeys.length !== 1) {
+    return fail(`${path}.orientation`, 'exactly one of xyzw or rpy_deg');
+  }
+  let parsedOrientation: ProgramScenePose['orientation'];
+  if (orientationKeys[0] === 'xyzw') {
+    parsedOrientation = {
+      xyzw: quaternionAt(orientation.xyzw, `${path}.orientation.xyzw`),
+    };
+  } else if (orientationKeys[0] === 'rpy_deg') {
+    parsedOrientation = {
+      rpy_deg: vector3At(orientation.rpy_deg, `${path}.orientation.rpy_deg`),
+    };
+  } else {
+    return fail(`${path}.orientation`, 'exactly one of xyzw or rpy_deg');
+  }
+  return {
+    frame_ref: parseProgramSceneFrameRef(record.frame_ref, `${path}.frame_ref`),
+    position_m: vector3At(record.position_m, `${path}.position_m`),
+    orientation: parsedOrientation,
+  };
+}
+
+function parseProgramSceneResource(
+  value: unknown,
+  path: string,
+): ProgramSceneResource {
+  const record = objectAt(value, path);
+  allowedKeysAt(
+    record,
+    ['scene_resource_id', 'shape', 'pose'],
+    ['resource_roles', 'metadata', 'collision_policy_ids'],
+    path,
+  );
+  const resource: ProgramSceneResource = {
+    scene_resource_id: stringAt(
+      record.scene_resource_id,
+      `${path}.scene_resource_id`,
+    ),
+    shape: parseProgramSceneShape(record.shape, `${path}.shape`),
+    pose: parseProgramScenePose(record.pose, `${path}.pose`),
+  };
+  if (record.resource_roles !== undefined) {
+    resource.resource_roles = canonicalStringArrayAt(
+      record.resource_roles,
+      `${path}.resource_roles`,
+    );
+  }
+  if (record.metadata !== undefined) {
+    resource.metadata = jsonRecordAt(record.metadata, `${path}.metadata`);
+  }
+  if (record.collision_policy_ids !== undefined) {
+    resource.collision_policy_ids = canonicalStringArrayAt(
+      record.collision_policy_ids,
+      `${path}.collision_policy_ids`,
+    );
+  }
+  return resource;
+}
+
+function booleanRecordAt(value: unknown, path: string): Record<string, boolean> {
+  const record = objectAt(value, path);
+  const result: Record<string, boolean> = {};
+  for (const key of Object.keys(record).sort()) {
+    result[key] = booleanAt(record[key], `${path}.${key}`);
+  }
+  if (Object.keys(record).join('\u0000') !== Object.keys(record).sort().join('\u0000')) {
+    return fail(path, 'a canonical-sorted visibility mapping');
+  }
+  return result;
+}
+
+function parseProgramViewerMetadata(
+  value: unknown,
+  path: string,
+): ProgramViewerMetadata {
+  const record = objectAt(value, path);
+  allowedKeysAt(
+    record,
+    [],
+    [
+      'frame_role_visibility',
+      'frame_gizmo_size_m',
+      'resource_role_visibility',
+      'object_axes_gizmo_size_m',
+    ],
+    path,
+  );
+  const viewer: ProgramViewerMetadata = {};
+  if (record.frame_role_visibility !== undefined) {
+    viewer.frame_role_visibility = booleanRecordAt(
+      record.frame_role_visibility,
+      `${path}.frame_role_visibility`,
+    );
+  }
+  if (record.frame_gizmo_size_m !== undefined) {
+    viewer.frame_gizmo_size_m = positiveNumberAt(
+      record.frame_gizmo_size_m,
+      `${path}.frame_gizmo_size_m`,
+    );
+  }
+  if (record.resource_role_visibility !== undefined) {
+    viewer.resource_role_visibility = booleanRecordAt(
+      record.resource_role_visibility,
+      `${path}.resource_role_visibility`,
+    );
+  }
+  if (record.object_axes_gizmo_size_m !== undefined) {
+    viewer.object_axes_gizmo_size_m = positiveNumberAt(
+      record.object_axes_gizmo_size_m,
+      `${path}.object_axes_gizmo_size_m`,
+    );
+  }
+  return viewer;
+}
+
 export function parseProgramDocument(value: unknown, path = 'program'): ProgramDocument {
   const record = objectAt(value, path);
   allowedKeysAt(
@@ -614,12 +874,16 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
     result.compatibility = jsonRecordAt(record.compatibility, `${path}.compatibility`);
   }
   if (record.viewer !== undefined) {
-    result.viewer = jsonRecordAt(record.viewer, `${path}.viewer`);
+    result.viewer = parseProgramViewerMetadata(record.viewer, `${path}.viewer`);
   }
   if (record.scene !== undefined) {
-    result.scene = arrayAt(record.scene, `${path}.scene`).map((item, index) =>
-      jsonValueAt(item, `${path}.scene[${index}]`),
+    result.scene = boundedArrayAt(record.scene, `${path}.scene`, 4096).map(
+      (item, index) => parseProgramSceneResource(item, `${path}.scene[${index}]`),
     );
+    const ids = result.scene.map((resource) => resource.scene_resource_id);
+    if (ids.join('\u0000') !== [...new Set(ids)].sort().join('\u0000')) {
+      return fail(`${path}.scene`, 'unique resources sorted by scene_resource_id');
+    }
   }
   if (record.parameters !== undefined) {
     result.parameters = arrayAt(record.parameters, `${path}.parameters`).map(
@@ -693,6 +957,50 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
       record.contact_policies,
       `${path}.contact_policies`,
     ).map((item, index) => jsonValueAt(item, `${path}.contact_policies[${index}]`));
+  }
+  const declaredFrameRoles = new Set<string>();
+  const declaredResourceRoles = new Set<string>();
+  for (const target of Object.values(result.target_roles)) {
+    if (target === null || typeof target !== 'object' || Array.isArray(target)) continue;
+    for (const [field, destination] of [
+      ['required_frame_roles', declaredFrameRoles],
+      ['required_resource_roles', declaredResourceRoles],
+    ] as const) {
+      const roles = target[field];
+      if (!Array.isArray(roles)) continue;
+      for (const role of roles) if (typeof role === 'string') destination.add(role);
+    }
+  }
+  for (const resource of result.scene ?? []) {
+    for (const role of resource.resource_roles ?? []) declaredResourceRoles.add(role);
+    if (resource.pose.frame_ref.kind !== 'component_frame') continue;
+    const component = result.component_roles[resource.pose.frame_ref.component_role];
+    if (component === null || typeof component !== 'object' || Array.isArray(component)) {
+      return fail(
+        `${path}.scene.${resource.scene_resource_id}.pose.frame_ref.component_role`,
+        'a declared component role',
+      );
+    }
+    const modelRoles = component.required_model_roles;
+    if (
+      Array.isArray(modelRoles)
+      && !modelRoles.includes(resource.pose.frame_ref.model_role)
+    ) {
+      return fail(
+        `${path}.scene.${resource.scene_resource_id}.pose.frame_ref.model_role`,
+        'a model role required by the component role',
+      );
+    }
+  }
+  for (const [field, declared] of [
+    ['frame_role_visibility', declaredFrameRoles],
+    ['resource_role_visibility', declaredResourceRoles],
+  ] as const) {
+    for (const role of Object.keys(result.viewer?.[field] ?? {})) {
+      if (!declared.has(role)) {
+        return fail(`${path}.viewer.${field}.${role}`, 'a declared Program role');
+      }
+    }
   }
   return result;
 }
@@ -995,6 +1303,789 @@ export function parseNodeEnvironmentResponse(value: unknown): NodeEnvironmentRes
         'nodeEnvironment.active.graphRevision',
       ),
     },
+  };
+}
+
+function parseSourceModelCoordinate(
+  value: unknown,
+  path: string,
+): SourceModelCoordinate {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'coordinate_kind',
+      'joint_type',
+      'mimic',
+      'source_child_link_name',
+      'source_joint_index',
+      'source_joint_name',
+      'source_parent_link_name',
+      'unit',
+    ],
+    path,
+  );
+  const mimic = record.mimic === null
+    ? null
+    : (() => {
+        const row = objectAt(record.mimic, `${path}.mimic`);
+        exactKeysAt(row, ['multiplier', 'offset', 'source_joint_name'], `${path}.mimic`);
+        return {
+          multiplier: numberAt(row.multiplier, `${path}.mimic.multiplier`),
+          offset: numberAt(row.offset, `${path}.mimic.offset`),
+          source_joint_name: stringAt(
+            row.source_joint_name,
+            `${path}.mimic.source_joint_name`,
+          ),
+        };
+      })();
+  return {
+    coordinate_kind: stringAt(record.coordinate_kind, `${path}.coordinate_kind`),
+    joint_type: stringAt(record.joint_type, `${path}.joint_type`),
+    mimic,
+    source_child_link_name: stringAt(
+      record.source_child_link_name,
+      `${path}.source_child_link_name`,
+    ),
+    source_joint_index: integerAt(
+      record.source_joint_index,
+      `${path}.source_joint_index`,
+    ),
+    source_joint_name: stringAt(record.source_joint_name, `${path}.source_joint_name`),
+    source_parent_link_name: stringAt(
+      record.source_parent_link_name,
+      `${path}.source_parent_link_name`,
+    ),
+    unit: stringAt(record.unit, `${path}.unit`),
+  };
+}
+
+function parseSourceModelSrdfGroup(
+  value: unknown,
+  path: string,
+): SourceModelSrdfGroup {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'chains',
+      'source_group_name',
+      'source_joint_names',
+      'source_link_names',
+      'source_subgroup_names',
+    ],
+    path,
+  );
+  return {
+    chains: boundedArrayAt(record.chains, `${path}.chains`, 4096).map(
+      (item, index) => {
+        const chainPath = `${path}.chains[${index}]`;
+        const chain = objectAt(item, chainPath);
+        exactKeysAt(
+          chain,
+          ['source_base_link_name', 'source_tip_link_name'],
+          chainPath,
+        );
+        return {
+          source_base_link_name: stringAt(
+            chain.source_base_link_name,
+            `${chainPath}.source_base_link_name`,
+          ),
+          source_tip_link_name: stringAt(
+            chain.source_tip_link_name,
+            `${chainPath}.source_tip_link_name`,
+          ),
+        };
+      },
+    ),
+    source_group_name: stringAt(record.source_group_name, `${path}.source_group_name`),
+    source_joint_names: stringArrayAt(record.source_joint_names, `${path}.source_joint_names`),
+    source_link_names: stringArrayAt(record.source_link_names, `${path}.source_link_names`),
+    source_subgroup_names: stringArrayAt(
+      record.source_subgroup_names,
+      `${path}.source_subgroup_names`,
+    ),
+  };
+}
+
+function parseSourceModelOccurrence(
+  value: unknown,
+  path: string,
+): SourceModelOccurrence {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'component_id',
+      'coordinates',
+      'model_asset_id',
+      'model_instance_id',
+      'model_revision',
+      'model_role_id',
+      'source_model_name',
+      'source_robot_name',
+      'source_link_names',
+      'srdf_end_effectors',
+      'srdf_group_states',
+      'srdf_groups',
+    ],
+    path,
+  );
+  const coordinates = boundedArrayAt(record.coordinates, `${path}.coordinates`, 100_000)
+    .map((item, index) => parseSourceModelCoordinate(item, `${path}.coordinates[${index}]`));
+  if (coordinates.some((item, index) => item.source_joint_index !== index)) {
+    return fail(`${path}.coordinates`, 'source-indexed coordinates in source order');
+  }
+  return {
+    component_id: nullableStringAt(record.component_id, `${path}.component_id`),
+    coordinates,
+    model_asset_id: stringAt(record.model_asset_id, `${path}.model_asset_id`),
+    model_instance_id: stringAt(record.model_instance_id, `${path}.model_instance_id`),
+    model_revision: stringAt(record.model_revision, `${path}.model_revision`),
+    model_role_id: nullableStringAt(record.model_role_id, `${path}.model_role_id`),
+    source_model_name: stringAt(record.source_model_name, `${path}.source_model_name`),
+    source_robot_name: stringAt(record.source_robot_name, `${path}.source_robot_name`),
+    source_link_names: canonicalStringArrayAt(
+      record.source_link_names,
+      `${path}.source_link_names`,
+    ),
+    srdf_end_effectors: boundedArrayAt(
+      record.srdf_end_effectors,
+      `${path}.srdf_end_effectors`,
+      4096,
+    ).map((item, index) => {
+      const rowPath = `${path}.srdf_end_effectors[${index}]`;
+      const row = objectAt(item, rowPath);
+      exactKeysAt(
+        row,
+        [
+          'source_end_effector_name',
+          'source_group_name',
+          'source_parent_group_name',
+          'source_parent_link_name',
+        ],
+        rowPath,
+      );
+      return {
+        source_end_effector_name: stringAt(
+          row.source_end_effector_name,
+          `${rowPath}.source_end_effector_name`,
+        ),
+        source_group_name: stringAt(row.source_group_name, `${rowPath}.source_group_name`),
+        source_parent_group_name: nullableStringAt(
+          row.source_parent_group_name,
+          `${rowPath}.source_parent_group_name`,
+        ),
+        source_parent_link_name: stringAt(
+          row.source_parent_link_name,
+          `${rowPath}.source_parent_link_name`,
+        ),
+      };
+    }),
+    srdf_group_states: boundedArrayAt(
+      record.srdf_group_states,
+      `${path}.srdf_group_states`,
+      4096,
+    ).map((item, index) => {
+      const rowPath = `${path}.srdf_group_states[${index}]`;
+      const row = objectAt(item, rowPath);
+      exactKeysAt(
+        row,
+        ['source_group_name', 'source_group_state_name', 'source_joint_names'],
+        rowPath,
+      );
+      return {
+        source_group_name: stringAt(row.source_group_name, `${rowPath}.source_group_name`),
+        source_group_state_name: stringAt(
+          row.source_group_state_name,
+          `${rowPath}.source_group_state_name`,
+        ),
+        source_joint_names: stringArrayAt(
+          row.source_joint_names,
+          `${rowPath}.source_joint_names`,
+        ),
+      };
+    }),
+    srdf_groups: boundedArrayAt(record.srdf_groups, `${path}.srdf_groups`, 4096)
+      .map((item, index) => parseSourceModelSrdfGroup(item, `${path}.srdf_groups[${index}]`)),
+  };
+}
+
+function parseSourceModelTarget(value: unknown, path: string): SourceModelTarget {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['collision_bodies', 'component_id', 'frames', 'model_groups', 'target_id'],
+    path,
+  );
+  return {
+    collision_bodies: boundedArrayAt(
+      record.collision_bodies,
+      `${path}.collision_bodies`,
+      4096,
+    ).map((item, index) => {
+      const rowPath = `${path}.collision_bodies[${index}]`;
+      const row = objectAt(item, rowPath);
+      exactKeysAt(
+        row,
+        ['collision_body_role_id', 'model_instance_id', 'source_link_names'],
+        rowPath,
+      );
+      return {
+        collision_body_role_id: stringAt(
+          row.collision_body_role_id,
+          `${rowPath}.collision_body_role_id`,
+        ),
+        model_instance_id: stringAt(row.model_instance_id, `${rowPath}.model_instance_id`),
+        source_link_names: stringArrayAt(row.source_link_names, `${rowPath}.source_link_names`),
+      };
+    }),
+    component_id: stringAt(record.component_id, `${path}.component_id`),
+    frames: boundedArrayAt(record.frames, `${path}.frames`, 4096).map((item, index) => {
+      const rowPath = `${path}.frames[${index}]`;
+      const row = objectAt(item, rowPath);
+      exactKeysAt(
+        row,
+        ['frame_kind', 'frame_role_id', 'model_instance_id', 'source_link_name'],
+        rowPath,
+      );
+      const frameKind = stringAt(row.frame_kind, `${rowPath}.frame_kind`);
+      if (!['cell_frame', 'component_model_frame', 'passive_model_frame'].includes(frameKind)) {
+        return fail(`${rowPath}.frame_kind`, 'a supported source frame kind');
+      }
+      return {
+        frame_kind: frameKind as SourceModelTarget['frames'][number]['frame_kind'],
+        frame_role_id: stringAt(row.frame_role_id, `${rowPath}.frame_role_id`),
+        model_instance_id: nullableStringAt(row.model_instance_id, `${rowPath}.model_instance_id`),
+        source_link_name: nullableStringAt(row.source_link_name, `${rowPath}.source_link_name`),
+      };
+    }),
+    model_groups: boundedArrayAt(record.model_groups, `${path}.model_groups`, 4096)
+      .map((item, index) => {
+        const rowPath = `${path}.model_groups[${index}]`;
+        const row = objectAt(item, rowPath);
+        exactKeysAt(
+          row,
+          [
+            'commandable_source_joint_names',
+            'model_group_role_id',
+            'model_instance_id',
+            'source_group_name',
+            'source_joint_names',
+            'source_link_names',
+          ],
+          rowPath,
+        );
+        return {
+          commandable_source_joint_names: stringArrayAt(
+            row.commandable_source_joint_names,
+            `${rowPath}.commandable_source_joint_names`,
+          ),
+          model_group_role_id: stringAt(row.model_group_role_id, `${rowPath}.model_group_role_id`),
+          model_instance_id: stringAt(row.model_instance_id, `${rowPath}.model_instance_id`),
+          source_group_name: stringAt(row.source_group_name, `${rowPath}.source_group_name`),
+          source_joint_names: stringArrayAt(row.source_joint_names, `${rowPath}.source_joint_names`),
+          source_link_names: stringArrayAt(row.source_link_names, `${rowPath}.source_link_names`),
+        };
+      }),
+    target_id: stringAt(record.target_id, `${path}.target_id`),
+  };
+}
+
+export function parseSourceModelProjection(value: unknown): SourceModelProjection {
+  const record = objectAt(value, 'sourceModel');
+  exactKeysAt(
+    record,
+    [
+      'schema_version',
+      'cell_id',
+      'retained_bundle_id',
+      'graph_revision',
+      'model_map_contract',
+      'model_map_product_id',
+      'occurrences',
+      'targets',
+      'source',
+    ],
+    'sourceModel',
+  );
+  const schemaVersion = stringAt(record.schema_version, 'sourceModel.schema_version');
+  if (schemaVersion !== 'manyforge.source_model_projection.v1') {
+    return fail('sourceModel.schema_version', 'manyforge.source_model_projection.v1');
+  }
+  const source = objectAt(record.source, 'sourceModel.source');
+  exactKeysAt(
+    source,
+    [
+      'available',
+      'freshness',
+      'known_gaps',
+      'projection_generation',
+      'projection_owner_epoch',
+      'receiver_age_ns',
+      'selection_projection_generation',
+      'selection_source_content_digest',
+      'selection_source_generation',
+      'selection_source_owner_epoch',
+      'selection_source_owner_id',
+      'source_content_digest',
+      'source_generation',
+      'source_owner_epoch',
+      'source_owner_id',
+      'source_owner_kind',
+    ],
+    'sourceModel.source',
+  );
+  if (source.available !== true || source.freshness !== 'fresh') {
+    return fail('sourceModel.source', 'available and fresh');
+  }
+  if (arrayAt(source.known_gaps, 'sourceModel.source.known_gaps').length !== 0) {
+    return fail('sourceModel.source.known_gaps', 'empty');
+  }
+  if (source.source_owner_kind !== 'source_model_projection') {
+    return fail('sourceModel.source.source_owner_kind', 'source_model_projection');
+  }
+  const occurrences = boundedArrayAt(record.occurrences, 'sourceModel.occurrences', 4096)
+    .map((item, index) => parseSourceModelOccurrence(item, `sourceModel.occurrences[${index}]`));
+  const occurrenceIds = occurrences.map((item) => item.model_instance_id);
+  if (new Set(occurrenceIds).size !== occurrenceIds.length) {
+    return fail('sourceModel.occurrences', 'unique model_instance_id values');
+  }
+  const targets = boundedArrayAt(record.targets, 'sourceModel.targets', 4096)
+    .map((item, index) => parseSourceModelTarget(item, `sourceModel.targets[${index}]`));
+  let modelMapContract: SourceModelProjection['model_map_contract'] = null;
+  let modelMapProductId: string | null = null;
+  if (occurrences.length === 0) {
+    if (record.model_map_contract !== null || record.model_map_product_id !== null) {
+      return fail('sourceModel.model_map_contract', 'null for an empty occurrence set');
+    }
+  } else {
+    const contract = objectAt(record.model_map_contract, 'sourceModel.model_map_contract');
+    exactKeysAt(contract, ['contract_id', 'contract_revision'], 'sourceModel.model_map_contract');
+    modelMapContract = {
+      contract_id: stringAt(contract.contract_id, 'sourceModel.model_map_contract.contract_id'),
+      contract_revision: stringAt(
+        contract.contract_revision,
+        'sourceModel.model_map_contract.contract_revision',
+      ),
+    };
+    modelMapProductId = stringAt(record.model_map_product_id, 'sourceModel.model_map_product_id');
+  }
+  return {
+    schema_version: schemaVersion,
+    cell_id: stringAt(record.cell_id, 'sourceModel.cell_id'),
+    retained_bundle_id: stringAt(record.retained_bundle_id, 'sourceModel.retained_bundle_id'),
+    graph_revision: stringAt(record.graph_revision, 'sourceModel.graph_revision'),
+    model_map_contract: modelMapContract,
+    model_map_product_id: modelMapProductId,
+    occurrences,
+    targets,
+    source: {
+      available: true,
+      freshness: 'fresh',
+      known_gaps: [],
+      projection_generation: integerAt(source.projection_generation, 'sourceModel.source.projection_generation'),
+      projection_owner_epoch: stringAt(source.projection_owner_epoch, 'sourceModel.source.projection_owner_epoch'),
+      receiver_age_ns: integerAt(source.receiver_age_ns, 'sourceModel.source.receiver_age_ns'),
+      selection_projection_generation: integerAt(source.selection_projection_generation, 'sourceModel.source.selection_projection_generation'),
+      selection_source_content_digest: stringAt(source.selection_source_content_digest, 'sourceModel.source.selection_source_content_digest'),
+      selection_source_generation: integerAt(source.selection_source_generation, 'sourceModel.source.selection_source_generation'),
+      selection_source_owner_epoch: stringAt(source.selection_source_owner_epoch, 'sourceModel.source.selection_source_owner_epoch'),
+      selection_source_owner_id: stringAt(source.selection_source_owner_id, 'sourceModel.source.selection_source_owner_id'),
+      source_content_digest: stringAt(source.source_content_digest, 'sourceModel.source.source_content_digest'),
+      source_generation: integerAt(source.source_generation, 'sourceModel.source.source_generation'),
+      source_owner_epoch: stringAt(source.source_owner_epoch, 'sourceModel.source.source_owner_epoch'),
+      source_owner_id: stringAt(source.source_owner_id, 'sourceModel.source.source_owner_id'),
+      source_owner_kind: 'source_model_projection',
+    },
+  };
+}
+
+function parseProjectionRevision(value: unknown, path: string): ProjectionRevision {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['retained_bundle_id', 'graph_revision', 'scene_revision'], path);
+  const scene = objectAt(record.scene_revision, `${path}.scene_revision`);
+  exactKeysAt(scene, ['scene_id', 'revision_id', 'content_hash'], `${path}.scene_revision`);
+  return {
+    retained_bundle_id: stringAt(record.retained_bundle_id, `${path}.retained_bundle_id`),
+    graph_revision: stringAt(record.graph_revision, `${path}.graph_revision`),
+    scene_revision: {
+      scene_id: stringAt(scene.scene_id, `${path}.scene_revision.scene_id`),
+      revision_id: positiveIntegerAt(scene.revision_id, `${path}.scene_revision.revision_id`),
+      content_hash: stringAt(scene.content_hash, `${path}.scene_revision.content_hash`),
+    },
+  };
+}
+
+function parseLogicalScenePose(value: unknown, path: string): LogicalScenePose {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['position_m', 'orientation_xyzw'], path);
+  const position = objectAt(record.position_m, `${path}.position_m`);
+  exactKeysAt(position, ['x', 'y', 'z'], `${path}.position_m`);
+  return {
+    position_m: {
+      x: numberAt(position.x, `${path}.position_m.x`),
+      y: numberAt(position.y, `${path}.position_m.y`),
+      z: numberAt(position.z, `${path}.position_m.z`),
+    },
+    orientation_xyzw: quaternionAt(record.orientation_xyzw, `${path}.orientation_xyzw`),
+  };
+}
+
+function parseLogicalSceneShape(value: unknown, path: string): LogicalSceneShape {
+  const record = objectAt(value, path);
+  const type = stringAt(record.type, `${path}.type`);
+  if (type === 'box') {
+    exactKeysAt(record, ['dimensions_m', 'type'], path);
+    const dimensions = objectAt(record.dimensions_m, `${path}.dimensions_m`);
+    exactKeysAt(dimensions, ['x', 'y', 'z'], `${path}.dimensions_m`);
+    return {
+      type,
+      dimensions_m: {
+        x: positiveNumberAt(dimensions.x, `${path}.dimensions_m.x`),
+        y: positiveNumberAt(dimensions.y, `${path}.dimensions_m.y`),
+        z: positiveNumberAt(dimensions.z, `${path}.dimensions_m.z`),
+      },
+    };
+  }
+  if (type === 'sphere') {
+    exactKeysAt(record, ['radius_m', 'type'], path);
+    return { type, radius_m: positiveNumberAt(record.radius_m, `${path}.radius_m`) };
+  }
+  if (type === 'cylinder') {
+    exactKeysAt(record, ['height_m', 'radius_m', 'type'], path);
+    return {
+      type,
+      radius_m: positiveNumberAt(record.radius_m, `${path}.radius_m`),
+      height_m: positiveNumberAt(record.height_m, `${path}.height_m`),
+    };
+  }
+  if (type === 'mesh') {
+    exactKeysAt(record, ['resource_uri', 'scale', 'type'], path);
+    const scale = objectAt(record.scale, `${path}.scale`);
+    exactKeysAt(scale, ['x', 'y', 'z'], `${path}.scale`);
+    return {
+      type,
+      resource_uri: stringAt(record.resource_uri, `${path}.resource_uri`),
+      scale: {
+        x: positiveNumberAt(scale.x, `${path}.scale.x`),
+        y: positiveNumberAt(scale.y, `${path}.scale.y`),
+        z: positiveNumberAt(scale.z, `${path}.scale.z`),
+      },
+    };
+  }
+  return fail(`${path}.type`, 'box, sphere, cylinder, or mesh');
+}
+
+function parseLogicalSceneObject(value: unknown, path: string): LogicalSceneObject {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['collision_shapes', 'placement', 'provider_evidence', 'scene_resource_id', 'support_contacts'],
+    path,
+  );
+  const placementRecord = objectAt(record.placement, `${path}.placement`);
+  const kind = stringAt(placementRecord.kind, `${path}.placement.kind`);
+  let placement: LogicalScenePlacement;
+  if (kind === 'cell_fixed') {
+    exactKeysAt(placementRecord, ['cell_id', 'kind', 'pose_in_cell'], `${path}.placement`);
+    placement = {
+      kind,
+      cell_id: stringAt(placementRecord.cell_id, `${path}.placement.cell_id`),
+      pose_in_cell: parseLogicalScenePose(
+        placementRecord.pose_in_cell,
+        `${path}.placement.pose_in_cell`,
+      ),
+    };
+  } else if (kind === 'carried') {
+    exactKeysAt(
+      placementRecord,
+      ['carried_object_attachment_id', 'carried_object_attachment_revision', 'kind'],
+      `${path}.placement`,
+    );
+    placement = {
+      kind,
+      carried_object_attachment_id: stringAt(
+        placementRecord.carried_object_attachment_id,
+        `${path}.placement.carried_object_attachment_id`,
+      ),
+      carried_object_attachment_revision: stringAt(
+        placementRecord.carried_object_attachment_revision,
+        `${path}.placement.carried_object_attachment_revision`,
+      ),
+    };
+  } else {
+    return fail(`${path}.placement.kind`, 'cell_fixed or carried');
+  }
+  return {
+    scene_resource_id: stringAt(record.scene_resource_id, `${path}.scene_resource_id`),
+    collision_shapes: boundedArrayAt(record.collision_shapes, `${path}.collision_shapes`, 4096)
+      .map((item, index) => parseLogicalSceneShape(item, `${path}.collision_shapes[${index}]`)),
+    placement,
+    provider_evidence: record.provider_evidence === null
+      ? null
+      : jsonRecordAt(record.provider_evidence, `${path}.provider_evidence`),
+    support_contacts: boundedArrayAt(record.support_contacts, `${path}.support_contacts`, 4096)
+      .map((item, index) => jsonRecordAt(item, `${path}.support_contacts[${index}]`)),
+  };
+}
+
+export function parseLogicalSceneProjection(value: unknown): LogicalSceneProjection {
+  const record = objectAt(value, 'logicalScene');
+  exactKeysAt(record, ['access', 'api_version', 'snapshot'], 'logicalScene');
+  const apiVersion = stringAt(record.api_version, 'logicalScene.api_version');
+  if (apiVersion !== 'manyforge.logical_scene_source.v1') {
+    return fail('logicalScene.api_version', 'manyforge.logical_scene_source.v1');
+  }
+  const access = objectAt(record.access, 'logicalScene.access');
+  exactKeysAt(
+    access,
+    ['active_projection', 'phase', 'projection_leases_open', 'scene_writes_open'],
+    'logicalScene.access',
+  );
+  const activeProjection = access.active_projection === null
+    ? null
+    : parseProjectionRevision(access.active_projection, 'logicalScene.access.active_projection');
+  if (record.snapshot === null) {
+    if (activeProjection !== null) {
+      return fail('logicalScene', 'matching null active projection and snapshot');
+    }
+    return {
+      api_version: apiVersion,
+      access: {
+        active_projection: null,
+        phase: stringAt(access.phase, 'logicalScene.access.phase'),
+        projection_leases_open: booleanAt(
+          access.projection_leases_open,
+          'logicalScene.access.projection_leases_open',
+        ),
+        scene_writes_open: booleanAt(access.scene_writes_open, 'logicalScene.access.scene_writes_open'),
+      },
+      snapshot: null,
+    };
+  }
+  if (activeProjection === null) {
+    return fail('logicalScene', 'matching active projection and snapshot');
+  }
+  const snapshot = objectAt(record.snapshot, 'logicalScene.snapshot');
+  exactKeysAt(
+    snapshot,
+    [
+      'carried_object_attachments',
+      'cell_id',
+      'configured_collision_policy',
+      'objects',
+      'policy_epoch',
+      'revision',
+      'topology_epoch',
+      'transaction_sequence',
+    ],
+    'logicalScene.snapshot',
+  );
+  const snapshotRevisionRecord = objectAt(snapshot.revision, 'logicalScene.snapshot.revision');
+  exactKeysAt(
+    snapshotRevisionRecord,
+    ['scene_id', 'revision_id', 'content_hash'],
+    'logicalScene.snapshot.revision',
+  );
+  const snapshotRevision = {
+    scene_id: stringAt(snapshotRevisionRecord.scene_id, 'logicalScene.snapshot.revision.scene_id'),
+    revision_id: positiveIntegerAt(snapshotRevisionRecord.revision_id, 'logicalScene.snapshot.revision.revision_id'),
+    content_hash: stringAt(snapshotRevisionRecord.content_hash, 'logicalScene.snapshot.revision.content_hash'),
+  };
+  if (JSON.stringify(snapshotRevision) !== JSON.stringify(activeProjection.scene_revision)) {
+    return fail('logicalScene.snapshot.revision', 'the active projection scene revision');
+  }
+  const cellId = stringAt(snapshot.cell_id, 'logicalScene.snapshot.cell_id');
+  const objects = boundedArrayAt(snapshot.objects, 'logicalScene.snapshot.objects', 4096)
+    .map((item, index) => parseLogicalSceneObject(item, `logicalScene.snapshot.objects[${index}]`));
+  if (objects.some((item) => item.placement.kind === 'cell_fixed' && item.placement.cell_id !== cellId)) {
+    return fail('logicalScene.snapshot.objects', 'cell-fixed placements in the snapshot cell');
+  }
+  return {
+    api_version: apiVersion,
+    access: {
+      active_projection: activeProjection,
+      phase: stringAt(access.phase, 'logicalScene.access.phase'),
+      projection_leases_open: booleanAt(access.projection_leases_open, 'logicalScene.access.projection_leases_open'),
+      scene_writes_open: booleanAt(access.scene_writes_open, 'logicalScene.access.scene_writes_open'),
+    },
+    snapshot: {
+      carried_object_attachments: boundedArrayAt(
+        snapshot.carried_object_attachments,
+        'logicalScene.snapshot.carried_object_attachments',
+        4096,
+      ).map((item, index) => jsonRecordAt(
+        item,
+        `logicalScene.snapshot.carried_object_attachments[${index}]`,
+      )),
+      cell_id: cellId,
+      configured_collision_policy: jsonRecordAt(
+        snapshot.configured_collision_policy,
+        'logicalScene.snapshot.configured_collision_policy',
+      ),
+      objects,
+      policy_epoch: integerAt(snapshot.policy_epoch, 'logicalScene.snapshot.policy_epoch'),
+      revision: snapshotRevision,
+      topology_epoch: integerAt(snapshot.topology_epoch, 'logicalScene.snapshot.topology_epoch'),
+      transaction_sequence: integerAt(
+        snapshot.transaction_sequence,
+        'logicalScene.snapshot.transaction_sequence',
+      ),
+    },
+  };
+}
+
+export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProjection {
+  const record = objectAt(value, 'sceneRuntime');
+  exactKeysAt(record, ['api_version', 'cell_id', 'state'], 'sceneRuntime');
+  const apiVersion = stringAt(record.api_version, 'sceneRuntime.api_version');
+  if (apiVersion !== 'manyforge.scene_runtime_source.v1') {
+    return fail('sceneRuntime.api_version', 'manyforge.scene_runtime_source.v1');
+  }
+  const state = objectAt(record.state, 'sceneRuntime.state');
+  exactKeysAt(
+    state,
+    [
+      'active_replay_id',
+      'api_version',
+      'counters',
+      'deferred',
+      'error',
+      'initialization_generation',
+      'initialization_token',
+      'pose_sources',
+      'reason',
+      'runtime_identity',
+      'started_at_ns',
+      'state',
+      'updated_at_ns',
+    ],
+    'sceneRuntime.state',
+  );
+  const stateApiVersion = stringAt(state.api_version, 'sceneRuntime.state.api_version');
+  if (stateApiVersion !== 'manyforge.scene_runtime_state.v1') {
+    return fail('sceneRuntime.state.api_version', 'manyforge.scene_runtime_state.v1');
+  }
+  const counters = objectAt(state.counters, 'sceneRuntime.state.counters');
+  exactKeysAt(
+    counters,
+    [
+      'buffer_replaced',
+      'buffered',
+      'closed',
+      'failed',
+      'opened',
+      'replayed',
+      'retired',
+      'stale_completion_rejected',
+    ],
+    'sceneRuntime.state.counters',
+  );
+  const parsedCounters = Object.fromEntries(
+    Object.entries(counters).map(([key, item]) => [
+      key,
+      integerAt(item, `sceneRuntime.state.counters.${key}`),
+    ]),
+  );
+  const stateName = stringAt(state.state, 'sceneRuntime.state.state');
+  const stateNames = ['open', 'closed', 'resetting', 'seeding', 'replaying', 'failed', 'retired'] as const;
+  if (!stateNames.includes(stateName as typeof stateNames[number])) {
+    return fail('sceneRuntime.state.state', 'a supported scene-runtime state');
+  }
+  let runtimeIdentity: SceneRuntimeProjection['state']['runtime_identity'] = null;
+  if (state.runtime_identity !== null) {
+    const identity = objectAt(state.runtime_identity, 'sceneRuntime.state.runtime_identity');
+    exactKeysAt(
+      identity,
+      ['deployment_generation', 'graph_revision', 'program_generation', 'retained_bundle_id', 'runtime_generation'],
+      'sceneRuntime.state.runtime_identity',
+    );
+    runtimeIdentity = {
+      deployment_generation: integerAt(identity.deployment_generation, 'sceneRuntime.state.runtime_identity.deployment_generation'),
+      graph_revision: stringAt(identity.graph_revision, 'sceneRuntime.state.runtime_identity.graph_revision'),
+      program_generation: integerAt(identity.program_generation, 'sceneRuntime.state.runtime_identity.program_generation'),
+      retained_bundle_id: stringAt(identity.retained_bundle_id, 'sceneRuntime.state.runtime_identity.retained_bundle_id'),
+      runtime_generation: positiveIntegerAt(identity.runtime_generation, 'sceneRuntime.state.runtime_identity.runtime_generation'),
+    };
+  }
+  return {
+    api_version: apiVersion,
+    cell_id: stringAt(record.cell_id, 'sceneRuntime.cell_id'),
+    state: {
+      api_version: stateApiVersion,
+      active_replay_id: state.active_replay_id === null
+        ? null
+        : positiveIntegerAt(state.active_replay_id, 'sceneRuntime.state.active_replay_id'),
+      counters: parsedCounters,
+      deferred: booleanAt(state.deferred, 'sceneRuntime.state.deferred'),
+      error: nullableStringAt(state.error, 'sceneRuntime.state.error'),
+      initialization_generation: integerAt(
+        state.initialization_generation,
+        'sceneRuntime.state.initialization_generation',
+      ),
+      initialization_token: nullableStringAt(
+        state.initialization_token,
+        'sceneRuntime.state.initialization_token',
+      ),
+      pose_sources: boundedArrayAt(state.pose_sources, 'sceneRuntime.state.pose_sources', 4096)
+        .map((item, index) => jsonRecordAt(item, `sceneRuntime.state.pose_sources[${index}]`)),
+      reason: stringAt(state.reason, 'sceneRuntime.state.reason'),
+      runtime_identity: runtimeIdentity,
+      started_at_ns: integerAt(state.started_at_ns, 'sceneRuntime.state.started_at_ns'),
+      state: stateName as SceneRuntimeProjection['state']['state'],
+      updated_at_ns: integerAt(state.updated_at_ns, 'sceneRuntime.state.updated_at_ns'),
+    },
+  };
+}
+
+export function parseSceneTransactionResponse(value: unknown): SceneTransactionResponse {
+  const record = objectAt(value, 'sceneTransaction');
+  exactKeysAt(
+    record,
+    [
+      'api_version',
+      'committed_projection_revision',
+      'error',
+      'ok',
+      'projection_status',
+      'replay_status',
+      'request_id',
+      'request_owner_epoch',
+      'transaction_sequence',
+      'update_status',
+    ],
+    'sceneTransaction',
+  );
+  const apiVersion = stringAt(record.api_version, 'sceneTransaction.api_version');
+  if (apiVersion !== 'manyforge.manager_command_response.v1') {
+    return fail('sceneTransaction.api_version', 'manyforge.manager_command_response.v1');
+  }
+  if (record.ok !== true || record.error !== null) {
+    return fail('sceneTransaction', 'a successful committed response');
+  }
+  const committed = parseProjectionRevision(
+    record.committed_projection_revision,
+    'sceneTransaction.committed_projection_revision',
+  );
+  const requestOwnerEpoch = stringAt(
+    record.request_owner_epoch,
+    'sceneTransaction.request_owner_epoch',
+  );
+  return {
+    api_version: apiVersion,
+    committed_projection_revision: committed,
+    error: null,
+    ok: true,
+    projection_status: stringAt(record.projection_status, 'sceneTransaction.projection_status'),
+    replay_status: stringAt(record.replay_status, 'sceneTransaction.replay_status'),
+    request_id: stringAt(record.request_id, 'sceneTransaction.request_id'),
+    request_owner_epoch: requestOwnerEpoch,
+    transaction_sequence: positiveIntegerAt(
+      record.transaction_sequence,
+      'sceneTransaction.transaction_sequence',
+    ),
+    update_status: stringAt(record.update_status, 'sceneTransaction.update_status'),
   };
 }
 

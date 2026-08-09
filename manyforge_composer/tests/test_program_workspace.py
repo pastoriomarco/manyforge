@@ -170,7 +170,7 @@ def test_routes_reject_unsupported_mutation_malformed_body_and_legacy_load(
         "/api/program/draft/mutations",
         json={
             **_fence(workspace),
-            "mutation": "scene_draft_add_object",
+            "mutation": "runtime_apply",
             "arguments": {},
         },
     )
@@ -201,6 +201,77 @@ def test_routes_reject_unsupported_mutation_malformed_body_and_legacy_load(
     assert invalid_save_as.json()["detail"]["code"] == (
         "program_artifact_path_invalid"
     )
+
+
+def test_scene_and_viewer_edits_share_one_revision_fenced_program_draft(
+    tmp_path: Path,
+) -> None:
+    source = _copy_program(tmp_path)
+    client = _client(tmp_path)
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(source)},
+    ).json()
+
+    scene_response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(opened),
+            "mutation": "scene_draft_add_object",
+            "arguments": {
+                "scene_resource": {
+                    "scene_resource_id": "workpiece",
+                    "shape": {"type": "sphere", "sphere_radius_m": 0.03},
+                    "pose": {
+                        "frame_ref": {"kind": "cell_frame"},
+                        "position_m": [0.4, 0.0, 0.5],
+                        "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+                    },
+                }
+            },
+        },
+    )
+    assert scene_response.status_code == 200
+    scene_workspace = scene_response.json()["workspace"]
+    assert [
+        row["scene_resource_id"]
+        for row in scene_workspace["draft"]["program"]["scene"]
+    ] == ["table", "workpiece"]
+
+    stale = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(opened),
+            "mutation": "viewer_draft_replace",
+            "arguments": {"viewer": {"frame_role_visibility": {"tcp": False}}},
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "composer_draft_revision_stale"
+
+    viewer_response = client.post(
+        "/api/program/draft/mutations",
+        json={
+            **_fence(scene_workspace),
+            "mutation": "viewer_draft_replace",
+            "arguments": {
+                "viewer": {
+                    "frame_role_visibility": {"tcp": False},
+                    "frame_gizmo_size_m": 0.15,
+                    "object_axes_gizmo_size_m": 0.1,
+                }
+            },
+        },
+    )
+    assert viewer_response.status_code == 200
+    viewer_workspace = viewer_response.json()["workspace"]
+    assert viewer_workspace["draft"]["program"]["viewer"] == {
+        "frame_role_visibility": {"tcp": False},
+        "frame_gizmo_size_m": 0.15,
+        "object_axes_gizmo_size_m": 0.1,
+    }
+    assert viewer_workspace["applied"]["available"] is False
 
 
 def test_artifact_roots_symlinks_overwrite_confirmation_and_atomic_failure(

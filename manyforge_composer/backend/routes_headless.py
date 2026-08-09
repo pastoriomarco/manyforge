@@ -22,6 +22,16 @@ from manyforge_headless_api.models import (
     StopIntentRequest,
 )
 
+from .node_environment_client import (
+    ActiveNodeEnvironmentProjectionError,
+    read_active_node_environment,
+)
+from .source_model_client import (
+    ActiveSourceModelProjectionError,
+    read_active_source_model,
+)
+from .state import ComposerState
+
 
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _MAXIMUM_ALARM_PAGE = 128
@@ -77,7 +87,10 @@ def _call_scene(callback, body: SceneTransactionRequest):
         raise _translate(error) from error
 
 
-def create_headless_router(client: HeadlessHttpClient) -> APIRouter:
+def create_headless_router(
+    client: HeadlessHttpClient,
+    state: ComposerState,
+) -> APIRouter:
     """Expose only bounded reads and attributed intents; own no reducer."""
 
     router = APIRouter()
@@ -104,7 +117,20 @@ def create_headless_router(client: HeadlessHttpClient) -> APIRouter:
 
     @router.get("/api/source-model")
     def source_model() -> dict[str, Any]:
-        return _call(client.source_model)
+        try:
+            environment = read_active_node_environment(state)
+            return read_active_source_model(
+                state,
+                node_environment=environment,
+            ).payload
+        except (
+            ActiveNodeEnvironmentProjectionError,
+            ActiveSourceModelProjectionError,
+        ) as error:
+            raise HTTPException(
+                status_code=error.status_code,
+                detail={"code": error.code, "message": str(error)},
+            ) from error
 
     @router.get("/api/assistant/modes/{mode_id}")
     def assistant_mode(

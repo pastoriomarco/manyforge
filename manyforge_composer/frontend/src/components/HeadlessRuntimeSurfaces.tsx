@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { useHeadlessState } from '../hooks/useHeadlessState';
+import type { HeadlessStateResult } from '../hooks/useHeadlessState';
 import type {
   AlarmLifecycleState,
   AlarmPriority,
@@ -148,8 +149,15 @@ interface HeadlessRuntimeSurfacesProps {
   enabled: boolean;
 }
 
-export function HeadlessRuntimeSurfaces({ enabled }: HeadlessRuntimeSurfacesProps) {
-  const { snapshot, error, reconnect } = useHeadlessState(enabled);
+interface HeadlessRuntimeSurfacesViewProps extends HeadlessRuntimeSurfacesProps {
+  headlessState: HeadlessStateResult;
+}
+
+export function HeadlessRuntimeSurfacesView({
+  enabled,
+  headlessState,
+}: HeadlessRuntimeSurfacesViewProps) {
+  const { snapshot, error, reconnect } = headlessState;
   const [busyActivation, setBusyActivation] = useState<string | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [minimized, setMinimized] = useState<Set<string>>(() => new Set());
@@ -335,5 +343,15 @@ export function HeadlessRuntimeSurfaces({ enabled }: HeadlessRuntimeSurfacesProp
         error={historyError}
       />
     </>
+  );
+}
+
+export function HeadlessRuntimeSurfaces({ enabled }: HeadlessRuntimeSurfacesProps) {
+  const headlessState = useHeadlessState(enabled);
+  return (
+    <HeadlessRuntimeSurfacesView
+      enabled={enabled}
+      headlessState={headlessState}
+    />
   );
 }

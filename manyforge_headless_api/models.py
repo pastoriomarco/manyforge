@@ -714,17 +714,6 @@ class SceneTransactionRequest(StrictRequest):
     expected_projection_revision: ProjectionRevisionRequest
     operation: SceneOperationRequest
 
-    @model_validator(mode="after")
-    def require_scene_owner_epoch(self) -> "SceneTransactionRequest":
-        if (
-            self.request_context.request_owner_epoch
-            != self.expected_projection_revision.scene_revision.scene_id
-        ):
-            raise ValueError(
-                "request_owner_epoch must equal the expected scene_id"
-            )
-        return self
-
 
 class ActionSpanRequest(StrictRequest):
     action_source: Literal[

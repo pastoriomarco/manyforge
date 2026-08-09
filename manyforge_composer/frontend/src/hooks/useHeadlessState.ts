@@ -5,7 +5,7 @@ import type { ComposerHeadlessState } from '../types/headless';
 
 const RECONNECT_DELAY_MS = 1000;
 
-interface HeadlessStateResult {
+export interface HeadlessStateResult {
   snapshot: ComposerHeadlessState | null;
   error: string | null;
   reconnect: () => void;

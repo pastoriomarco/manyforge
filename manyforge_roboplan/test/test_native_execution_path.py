@@ -21,6 +21,7 @@ import pytest
 from manyforge_behavior.kernel_client import KernelClient
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_composer.backend.routes_headless import create_headless_router
+from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.app import TrustedPrincipal, create_app
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
@@ -703,7 +704,9 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
     headless = HeadlessHttpClient("http://headless.test", client=raw_api)
     behavior = KernelClient(RecordingTransport(headless))
     composer_app = FastAPI()
-    composer_app.include_router(create_headless_router(headless))
+    composer_app.include_router(
+        create_headless_router(headless, ComposerState(headless_client=headless))
+    )
     raw_composer = TestClient(composer_app)
     composer = HeadlessHttpClient("http://composer.test", client=raw_composer)
 
@@ -830,7 +833,9 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
     runner = OrchestratorRunner(KernelClient(recording))
 
     composer_app = FastAPI()
-    composer_app.include_router(create_headless_router(headless))
+    composer_app.include_router(
+        create_headless_router(headless, ComposerState(headless_client=headless))
+    )
     raw_composer = TestClient(composer_app)
     composer = HeadlessHttpClient("http://composer.test", client=raw_composer)
 

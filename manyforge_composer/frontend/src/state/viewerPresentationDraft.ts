@@ -1,22 +1,54 @@
+import type { ProgramViewerMetadata } from '../types/api';
+
 export interface ViewerPresentationDraft {
-  frameVisibility: Record<string, boolean>;
-  objectFrameVisibility: Record<string, boolean>;
+  frameRoleVisibility: Record<string, boolean>;
+  resourceRoleVisibility: Record<string, boolean>;
   frameGizmoSizeM: number;
   objectAxesGizmoSizeM: number;
 }
 
 export type ViewerPresentationDraftAction =
   | { type: 'set_frame_visibility'; frameId: string; visible: boolean }
-  | { type: 'set_object_frame_visibility'; objectId: string; visible: boolean }
+  | { type: 'set_resource_visibility'; resourceRoleId: string; visible: boolean }
   | { type: 'set_frame_gizmo_size'; sizeM: number }
   | { type: 'set_object_axes_gizmo_size'; sizeM: number };
 
 export const DEFAULT_VIEWER_PRESENTATION_DRAFT: ViewerPresentationDraft = {
-  frameVisibility: {},
-  objectFrameVisibility: {},
+  frameRoleVisibility: {},
+  resourceRoleVisibility: {},
   frameGizmoSizeM: 0.1,
   objectAxesGizmoSizeM: 0.1,
 };
+
+function orderedVisibility(
+  visibility: Record<string, boolean>,
+): Record<string, boolean> {
+  return Object.fromEntries(
+    Object.entries(visibility).sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
+export function viewerPresentationDraftFromProgram(
+  viewer: ProgramViewerMetadata | undefined,
+): ViewerPresentationDraft {
+  return {
+    frameRoleVisibility: { ...(viewer?.frame_role_visibility ?? {}) },
+    resourceRoleVisibility: { ...(viewer?.resource_role_visibility ?? {}) },
+    frameGizmoSizeM: viewer?.frame_gizmo_size_m ?? 0.1,
+    objectAxesGizmoSizeM: viewer?.object_axes_gizmo_size_m ?? 0.1,
+  };
+}
+
+export function programViewerMetadata(
+  draft: ViewerPresentationDraft,
+): ProgramViewerMetadata {
+  return {
+    frame_role_visibility: orderedVisibility(draft.frameRoleVisibility),
+    frame_gizmo_size_m: draft.frameGizmoSizeM,
+    resource_role_visibility: orderedVisibility(draft.resourceRoleVisibility),
+    object_axes_gizmo_size_m: draft.objectAxesGizmoSizeM,
+  };
+}
 
 function validGizmoSize(value: number): boolean {
   return Number.isFinite(value) && value >= 0.02 && value <= 1;
@@ -35,17 +67,17 @@ export function viewerPresentationDraftReducer(
     case 'set_frame_visibility':
       return {
         ...state,
-        frameVisibility: {
-          ...state.frameVisibility,
+        frameRoleVisibility: {
+          ...state.frameRoleVisibility,
           [action.frameId]: action.visible,
         },
       };
-    case 'set_object_frame_visibility':
+    case 'set_resource_visibility':
       return {
         ...state,
-        objectFrameVisibility: {
-          ...state.objectFrameVisibility,
-          [action.objectId]: action.visible,
+        resourceRoleVisibility: {
+          ...state.resourceRoleVisibility,
+          [action.resourceRoleId]: action.visible,
         },
       };
     case 'set_frame_gizmo_size':

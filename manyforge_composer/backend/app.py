@@ -358,7 +358,7 @@ def create_app(
         from .routes_headless import create_headless_router
 
         app.include_router(
-            create_headless_router(state.headless_client),
+            create_headless_router(state.headless_client, state),
             tags=["headless-runtime-client"],
         )
 

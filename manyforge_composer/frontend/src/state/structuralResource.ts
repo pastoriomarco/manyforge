@@ -37,6 +37,8 @@ export function errorMessage(error: unknown, fallback: string): string {
 interface StructuralResourceOptions {
   absentWhen?: (error: unknown) => boolean;
   absentMessage?: string;
+  disabledMessage?: string;
+  enabled?: boolean;
   failureMessage: string;
 }
 
@@ -48,9 +50,22 @@ export function useStructuralResource<T>(
   const [state, dispatch] = useReducer(structuralResourceReducer<T>, {
     status: 'loading',
   });
-  const { absentMessage, absentWhen, failureMessage } = options;
+  const {
+    absentMessage,
+    absentWhen,
+    disabledMessage,
+    enabled = true,
+    failureMessage,
+  } = options;
 
   useEffect(() => {
+    if (!enabled) {
+      dispatch({
+        type: 'absent',
+        message: disabledMessage ?? 'This resource is unavailable in the current mode.',
+      });
+      return undefined;
+    }
     const controller = new AbortController();
     let current = true;
     dispatch({ type: 'load' });
@@ -80,7 +95,15 @@ export function useStructuralResource<T>(
       current = false;
       controller.abort();
     };
-  }, [absentMessage, absentWhen, failureMessage, load, reloadToken]);
+  }, [
+    absentMessage,
+    absentWhen,
+    disabledMessage,
+    enabled,
+    failureMessage,
+    load,
+    reloadToken,
+  ]);
 
   return [state, () => setReloadToken((current) => current + 1)];
 }

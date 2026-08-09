@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 
-import { useProgramWorkspace } from '../hooks/useProgramWorkspace';
+import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type {
   CatalogResponse,
@@ -13,6 +13,7 @@ import { ProgramPropertyEditor } from './ProgramPropertyEditor';
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
 
 interface ProgramWorkspaceProps {
+  controller: ProgramWorkspaceController;
   catalog: StructuralResourceState<CatalogResponse>;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   selectedProgramPath: string | null;
@@ -26,6 +27,7 @@ function shortRevision(revision: string | null): string {
 }
 
 export function ProgramWorkspace({
+  controller,
   catalog,
   environment,
   selectedProgramPath,
@@ -40,7 +42,7 @@ export function ProgramWorkspace({
     save,
     saveAs,
     clearFeedback,
-  } = useProgramWorkspace();
+  } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);

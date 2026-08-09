@@ -131,3 +131,5 @@ export function useProgramWorkspace() {
     clearFeedback: () => dispatch({ type: 'clear_feedback' }),
   };
 }
+
+export type ProgramWorkspaceController = ReturnType<typeof useProgramWorkspace>;

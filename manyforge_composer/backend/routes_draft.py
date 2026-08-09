@@ -8,7 +8,7 @@ from typing import Any, NoReturn
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .draft_session import DraftSessionError
+from .draft_session import DraftSessionError, OPERATOR_DRAFT_MUTATIONS
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
     read_active_node_environment,
@@ -30,6 +30,10 @@ _AUTHORING_MUTATIONS = frozenset(
         "blackboard_draft_upsert_namespaces",
         "program_draft_remove_parameters",
         "program_draft_upsert_parameters",
+        "scene_draft_add_object",
+        "scene_draft_remove_objects",
+        "scene_draft_update_object",
+        "scene_draft_upsert_objects",
         "tree_draft_change_node_kind",
         "tree_draft_delete_node",
         "tree_draft_insert_node",
@@ -37,6 +41,7 @@ _AUTHORING_MUTATIONS = frozenset(
         "tree_draft_replace_subtree",
         "tree_draft_update_node_params",
         "tree_draft_wrap_node",
+        *OPERATOR_DRAFT_MUTATIONS,
     }
 )
 _DTO_CONFIG = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)

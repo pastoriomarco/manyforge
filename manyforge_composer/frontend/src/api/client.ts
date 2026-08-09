@@ -14,7 +14,9 @@ import {
   parseOperationObservation,
   parseOperatorAlarmSnapshot,
   parseProgramWorkspaceResponse,
+  parseSceneTransactionResponse,
   parseSceneUrdfManifest,
+  parseSourceModelProjection,
 } from './parsers';
 import type {
   ArtifactKind,
@@ -26,7 +28,10 @@ import type {
   JsonValue,
   NodeEnvironmentResponse,
   ProgramWorkspaceResponse,
+  SceneTransactionRequest,
+  SceneTransactionResponse,
   SceneUrdfManifest,
+  SourceModelProjection,
 } from '../types/api';
 import type {
   AlarmMembership,
@@ -79,6 +84,19 @@ function errorMessageFromPayload(payload: unknown, fallback: string): string {
   }
   if (typeof record.message === 'string' && record.message.trim()) {
     return record.message;
+  }
+  if (
+    record.error !== null
+    && typeof record.error === 'object'
+    && !Array.isArray(record.error)
+  ) {
+    const error = record.error as Record<string, unknown>;
+    if (typeof error.message === 'string' && error.message.trim()) {
+      return error.message;
+    }
+    if (typeof error.code === 'string' && error.code.trim()) {
+      return error.code;
+    }
   }
   return fallback;
 }
@@ -157,6 +175,10 @@ export const api = {
         parseNodeEnvironmentResponse,
         signal,
       ),
+  },
+  sourceModel: {
+    get: (signal?: AbortSignal): Promise<SourceModelProjection> =>
+      requestJson('/api/source-model', parseSourceModelProjection, signal),
   },
   programWorkspace: {
     get: (signal?: AbortSignal): Promise<ProgramWorkspaceResponse> =>
@@ -245,6 +267,17 @@ export const api = {
   runtime: {
     get: (signal?: AbortSignal): Promise<HeadlessRuntimeSnapshot> =>
       requestJson('/api/runtime', parseHeadlessRuntimeSnapshot, signal),
+  },
+  scene: {
+    commit: (
+      transaction: SceneTransactionRequest,
+      signal?: AbortSignal,
+    ): Promise<SceneTransactionResponse> => requestJson(
+      '/api/scene/transactions',
+      parseSceneTransactionResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(transaction) },
+    ),
   },
   execution: {
     status: (signal?: AbortSignal): Promise<ExecutionOwnerStatus> =>

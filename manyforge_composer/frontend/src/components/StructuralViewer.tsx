@@ -1,5 +1,5 @@
 import { Component, Suspense, useMemo, useState } from 'react';
-import type { ReactNode } from 'react';
+import type { ErrorInfo, ReactNode } from 'react';
 import { Canvas } from '@react-three/fiber';
 import {
   Bounds,
@@ -12,11 +12,15 @@ import * as THREE from 'three';
 import { resolveStructuralAssetUrl } from '../api/client';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type {
+  LogicalSceneObject,
+  LogicalSceneShape,
+  ProgramViewerMetadata,
   SceneUrdfCollision,
   SceneUrdfManifest,
   SceneUrdfPrimitive,
   SceneUrdfVisual,
 } from '../types/api';
+import type { Pose3Value } from '../types/robotControl';
 import {
   classifyStructuralAssetFailure,
   normalizeQuaternion,
@@ -36,12 +40,47 @@ import {
 interface StructuralViewerProps {
   manifest: StructuralResourceState<SceneUrdfManifest>;
   onRetry: () => void;
+  sceneObjects?: LogicalSceneObject[];
+  selectedSceneResourceId?: string | null;
+  onSelectSceneResource?: (sceneResourceId: string | null) => void;
+  candidateTcpPose?: Pose3Value | null;
+  candidateStale?: boolean;
+  viewer?: ProgramViewerMetadata;
 }
 
 interface AssetErrorBoundaryProps {
   resetKey: string;
   onError: (error: Error) => void;
   children: ReactNode;
+}
+
+interface ViewerFailureBoundaryProps {
+  fallback: ReactNode;
+  children: ReactNode;
+}
+
+interface ViewerFailureBoundaryState {
+  failed: boolean;
+}
+
+/** Keep WebGL/Three failures local so Program authoring remains usable. */
+export class ViewerFailureBoundary extends Component<
+  ViewerFailureBoundaryProps,
+  ViewerFailureBoundaryState
+> {
+  state: ViewerFailureBoundaryState = { failed: false };
+
+  static getDerivedStateFromError(): ViewerFailureBoundaryState {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo): void {
+    console.error('Scene authoring viewport failed:', error, info.componentStack);
+  }
+
+  render(): ReactNode {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
 }
 
 class AssetErrorBoundary extends Component<
@@ -227,16 +266,136 @@ function AuthoredNeutralModel({
   );
 }
 
+function LogicalShapeGeometry({ shape }: { shape: LogicalSceneShape }) {
+  if (shape.type === 'box') {
+    return <boxGeometry args={[shape.dimensions_m.x, shape.dimensions_m.y, shape.dimensions_m.z]} />;
+  }
+  if (shape.type === 'sphere') {
+    return <sphereGeometry args={[shape.radius_m, 28, 18]} />;
+  }
+  if (shape.type === 'cylinder') {
+    return (
+      <cylinderGeometry
+        args={[shape.radius_m, shape.radius_m, shape.height_m, 28]}
+      />
+    );
+  }
+  return null;
+}
+
+function LogicalSceneObjects({
+  objects,
+  selectedSceneResourceId,
+  onSelect,
+  axesSizeM,
+}: {
+  objects: LogicalSceneObject[];
+  selectedSceneResourceId: string | null;
+  onSelect: (sceneResourceId: string) => void;
+  axesSizeM: number;
+}) {
+  return (
+    <group name="owner-logical-scene">
+      {objects.map((object) => {
+        if (object.placement.kind !== 'cell_fixed') return null;
+        const pose = object.placement.pose_in_cell;
+        const selected = selectedSceneResourceId === object.scene_resource_id;
+        return (
+          <group
+            key={object.scene_resource_id}
+            name={`scene:${object.scene_resource_id}`}
+            position={[pose.position_m.x, pose.position_m.y, pose.position_m.z]}
+            quaternion={normalizeQuaternion(pose.orientation_xyzw)}
+            onClick={(event) => {
+              event.stopPropagation();
+              onSelect(object.scene_resource_id);
+            }}
+          >
+            {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
+              ? null
+              : (
+                  <mesh
+                    // Three cylinders use Y as their long axis; scene shapes use Z.
+                    rotation={shape.type === 'cylinder' ? [Math.PI / 2, 0, 0] : undefined}
+                    key={`${object.scene_resource_id}:${index}`}
+                    renderOrder={selected ? 12 : 8}
+                  >
+                    <LogicalShapeGeometry shape={shape} />
+                    <meshStandardMaterial
+                      color={selected ? '#65d3f2' : '#8c6fe0'}
+                      emissive={selected ? '#144c62' : '#251a48'}
+                      transparent
+                      opacity={selected ? 0.72 : 0.5}
+                      wireframe
+                      depthWrite={false}
+                    />
+                  </mesh>
+                ))}
+            {selected && <axesHelper args={[axesSizeM]} />}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
+function CandidateTcpGhost({
+  pose,
+  stale,
+  axesSizeM,
+}: {
+  pose: Pose3Value;
+  stale: boolean;
+  axesSizeM: number;
+}) {
+  return (
+    <group
+      name="owner-preview-final-tcp"
+      position={[pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m]}
+      quaternion={normalizeQuaternion([
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w,
+      ])}
+    >
+      <mesh renderOrder={20}>
+        <sphereGeometry args={[Math.max(axesSizeM * 0.08, 0.006), 18, 12]} />
+        <meshStandardMaterial
+          color={stale ? '#e0a45c' : '#74e3b2'}
+          emissive={stale ? '#5a3216' : '#164f3d'}
+          transparent
+          opacity={0.82}
+          depthWrite={false}
+        />
+      </mesh>
+      <axesHelper args={[axesSizeM]} />
+    </group>
+  );
+}
+
 function ViewerCanvas({
   manifest,
   collisionsVisible,
   onAssetError,
   camera,
+  sceneObjects,
+  selectedSceneResourceId,
+  onSelectSceneResource,
+  candidateTcpPose,
+  candidateStale,
+  viewer,
 }: {
-  manifest: SceneUrdfManifest;
+  manifest: SceneUrdfManifest | null;
   collisionsVisible: boolean;
   onAssetError: (error: Error) => void;
   camera: ViewerCamera | null;
+  sceneObjects: LogicalSceneObject[];
+  selectedSceneResourceId: string | null;
+  onSelectSceneResource: (sceneResourceId: string | null) => void;
+  candidateTcpPose: Pose3Value | null;
+  candidateStale: boolean;
+  viewer: ProgramViewerMetadata | undefined;
 }) {
   const devicePixelRatio = typeof window === 'undefined'
     ? 1
@@ -274,6 +433,7 @@ function ViewerCanvas({
         });
       }}
       style={{ background: '#081019' }}
+      onPointerMissed={() => onSelectSceneResource(null)}
     >
       <color attach="background" args={['#081019']} />
       <PerspectiveCamera
@@ -310,24 +470,48 @@ function ViewerCanvas({
         dampingFactor={0.1}
         target={selectedCamera.target}
       />
-      <AssetErrorBoundary
-        resetKey={manifest.model_key}
-        onError={onAssetError}
-      >
-        <Suspense fallback={null}>
-          <Bounds fit={camera === null} clip observe margin={1.25}>
-            <AuthoredNeutralModel
-              manifest={manifest}
-              collisionsVisible={collisionsVisible}
-            />
-          </Bounds>
-        </Suspense>
-      </AssetErrorBoundary>
+      {manifest !== null && (
+        <AssetErrorBoundary
+          resetKey={manifest.model_key}
+          onError={onAssetError}
+        >
+          <Suspense fallback={null}>
+            <Bounds fit={camera === null} clip observe margin={1.25}>
+              <AuthoredNeutralModel
+                manifest={manifest}
+                collisionsVisible={collisionsVisible}
+              />
+            </Bounds>
+          </Suspense>
+        </AssetErrorBoundary>
+      )}
+      <LogicalSceneObjects
+        objects={sceneObjects}
+        selectedSceneResourceId={selectedSceneResourceId}
+        onSelect={(sceneResourceId) => onSelectSceneResource(sceneResourceId)}
+        axesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
+      />
+      {candidateTcpPose !== null && (
+        <CandidateTcpGhost
+          pose={candidateTcpPose}
+          stale={candidateStale}
+          axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+        />
+      )}
     </Canvas>
   );
 }
 
-export function StructuralViewer({ manifest, onRetry }: StructuralViewerProps) {
+function StructuralViewerContent({
+  manifest,
+  onRetry,
+  sceneObjects = [],
+  selectedSceneResourceId = null,
+  onSelectSceneResource = () => undefined,
+  candidateTcpPose = null,
+  candidateStale = false,
+  viewer,
+}: StructuralViewerProps) {
   const [collisionsVisible, setCollisionsVisible] = useState(false);
   const [assetError, setAssetError] = useState<Error | null>(null);
   const camera = useMemo(
@@ -347,7 +531,14 @@ export function StructuralViewer({ manifest, onRetry }: StructuralViewerProps) {
       )
     : 0;
   const visibleGeometryCount = visualCount
-    + (collisionsVisible ? collisionCount : 0);
+    + (collisionsVisible ? collisionCount : 0)
+    + sceneObjects.reduce(
+      (total, object) => total + object.collision_shapes.filter(
+        (shape) => shape.type !== 'mesh',
+      ).length,
+      0,
+    )
+    + (candidateTcpPose === null ? 0 : 1);
 
   const retry = () => {
     if (manifest.status === 'ready') {
@@ -373,8 +564,8 @@ export function StructuralViewer({ manifest, onRetry }: StructuralViewerProps) {
     <section className="panel viewer-panel" aria-labelledby="viewer-title">
       <header className="panel-header viewer-header">
         <div>
-          <p className="eyebrow">Authored structure · not live state</p>
-          <h2 id="viewer-title">Structural model</h2>
+          <p className="eyebrow">Authored structure + owner-issued scene</p>
+          <h2 id="viewer-title">Scene authoring viewport</h2>
         </div>
         <div className="viewer-controls">
           <label className="toggle-control">
@@ -392,38 +583,44 @@ export function StructuralViewer({ manifest, onRetry }: StructuralViewerProps) {
         </div>
       </header>
 
-      <div className="viewer-stage" role="img" aria-label="Authored-neutral URDF model">
-        {manifest.status === 'ready' && visibleGeometryCount > 0 && (
+      <div className="viewer-stage" role="img" aria-label="Scene authoring viewport">
+        {visibleGeometryCount > 0 && (
           <ViewerCanvas
-            key={`${manifest.data.model_key}:${collisionsVisible ? 'collision' : 'visual'}`}
-            manifest={manifest.data}
+            key={`${manifest.status === 'ready' ? manifest.data.model_key : 'no-structural-model'}:${collisionsVisible ? 'collision' : 'visual'}`}
+            manifest={manifest.status === 'ready' ? manifest.data : null}
             collisionsVisible={collisionsVisible}
             onAssetError={setAssetError}
             camera={camera}
+            sceneObjects={sceneObjects}
+            selectedSceneResourceId={selectedSceneResourceId}
+            onSelectSceneResource={onSelectSceneResource}
+            candidateTcpPose={candidateTcpPose}
+            candidateStale={candidateStale}
+            viewer={viewer}
           />
         )}
 
-        {manifest.status === 'loading' && (
+        {manifest.status === 'loading' && visibleGeometryCount === 0 && (
           <div className="viewer-state" role="status">
             <strong>Loading authored model…</strong>
             <span>Waiting for a complete authored-neutral projection.</span>
           </div>
         )}
-        {manifest.status === 'absent' && (
+        {manifest.status === 'absent' && visibleGeometryCount === 0 && (
           <div className="viewer-state">
             <strong>No authored deployment model</strong>
             <span>{manifest.message}</span>
             <span>No empty or placeholder robot is substituted.</span>
           </div>
         )}
-        {manifest.status === 'error' && (
+        {manifest.status === 'error' && visibleGeometryCount === 0 && (
           <div className="viewer-state error-state" role="alert">
             <strong>Structural manifest unavailable</strong>
             <span>{manifest.message}</span>
             <button type="button" onClick={retry}>Retry manifest</button>
           </div>
         )}
-        {manifest.status === 'ready' && visibleGeometryCount === 0 && (
+        {visibleGeometryCount === 0 && manifest.status === 'ready' && (
           <div className="viewer-state">
             <strong>No geometry selected for display</strong>
             <span>
@@ -456,6 +653,8 @@ export function StructuralViewer({ manifest, onRetry }: StructuralViewerProps) {
             <span>{manifest.data.links.length} links</span>
             <span>{manifest.data.joints.length} joints</span>
             <span>neutral coordinates</span>
+            <span>{sceneObjects.length} owner scene objects</span>
+            {candidateTcpPose !== null && <span>validated TCP candidate</span>}
           </div>
         )}
       </div>
@@ -465,9 +664,34 @@ export function StructuralViewer({ manifest, onRetry }: StructuralViewerProps) {
           <span>Root: <code>{manifest.data.projection.root_frame}</code></span>
           <span>Model key: <code>{manifest.data.model_key}</code></span>
           <span>Runtime state used: <strong>no</strong></span>
+          <span>Scene overlay: <strong>owner-issued</strong></span>
           <span>Operational validity: <strong>not asserted</strong></span>
         </footer>
       )}
     </section>
+  );
+}
+
+export function StructuralViewer(props: StructuralViewerProps) {
+  const [recoveryGeneration, setRecoveryGeneration] = useState(0);
+  const retry = () => {
+    setRecoveryGeneration((current) => current + 1);
+    props.onRetry();
+  };
+  const fallback = (
+    <section className="panel viewer-panel" aria-labelledby="viewer-failure-title">
+      <div className="viewer-state error-state" role="alert">
+        <strong id="viewer-failure-title">3D viewer isolated</strong>
+        <span>
+          The viewport failed, but Program Draft and runtime controls remain usable and unchanged.
+        </span>
+        <button type="button" onClick={retry}>Retry viewer</button>
+      </div>
+    </section>
+  );
+  return (
+    <ViewerFailureBoundary key={recoveryGeneration} fallback={fallback}>
+      <StructuralViewerContent {...props} />
+    </ViewerFailureBoundary>
   );
 }
