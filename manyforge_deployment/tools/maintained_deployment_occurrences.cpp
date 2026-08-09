@@ -858,6 +858,7 @@ void verify_resolved_program_binding(
   std::map<std::string, std::set<std::string, std::less<>>, std::less<>>
       program_bundles;
   {
+    deployment::FilesystemProgramRepository program_repository(package_root);
     deployment::FilesystemProgramBindingRepository repository(package_root);
     for (const auto &row : rows) {
       const std::string &deployment_source = require_text(
@@ -913,6 +914,7 @@ void verify_resolved_program_binding(
         throw std::invalid_argument(
             "role assignment selects a stale Program identity");
       }
+      (void)program_repository.put_if_absent(contract, *context.bundle);
 
       core::ProgramRoleAssignmentDTO assignment;
       for (const auto &[role, value] : require_object(
@@ -966,8 +968,13 @@ void verify_resolved_program_binding(
       throw std::logic_error(
           "durable maintained Program-Binding repository has the wrong size");
     }
+    if (program_repository.size() != program_revisions.size()) {
+      throw std::logic_error(
+          "durable maintained Program repository has the wrong size");
+    }
   }
 
+  deployment::FilesystemProgramRepository program_reopened(package_root);
   deployment::FilesystemProgramBindingRepository reopened(package_root);
   for (const auto &record : stored) {
     const auto product = products.find(record.deployment_source);
@@ -984,6 +991,13 @@ void verify_resolved_program_binding(
       throw std::logic_error(
           "durable maintained Program Binding did not reload exactly");
     }
+    const auto program = program_reopened.get_verified(
+        record.program_id, record.program_revision, *product->second.bundle);
+    if (program == nullptr || program->value().program_id != record.program_id ||
+        program->value().program_revision != record.program_revision) {
+      throw std::logic_error(
+          "durable maintained Program did not reload exactly");
+    }
     verify_resolved_program_binding(*binding, *product->second.bundle,
                                     product->second.model_map);
   }
@@ -991,7 +1005,8 @@ void verify_resolved_program_binding(
       "sha256:"
       "385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a");
   if (binding_ids.size() != 8U || program_revisions.size() != 7U ||
-      reopened.size() != 8U || reused_program == program_bundles.end() ||
+      reopened.size() != 8U || program_reopened.size() != 7U ||
+      reused_program == program_bundles.end() ||
       reused_program->second.size() != 2U) {
     throw std::logic_error(
         "maintained Program-Binding set loses its seven-to-eight closure");
@@ -1118,6 +1133,9 @@ void publish_and_verify_scenario_catalog(
     const auto binding_path =
         package_root / "program-bindings" / "sha256" /
         (record.program_binding_id.value().substr(7U) + ".json");
+    const auto program_path =
+        package_root / "programs" / "sha256" /
+        (record.program_revision.value().substr(7U) + ".json");
     const auto retained_bundle_path =
         package_root / "retained-bundles" / "sha256" /
         (product->second.bundle->retained_bundle_id().value().substr(7U) +
@@ -1132,8 +1150,7 @@ void publish_and_verify_scenario_catalog(
             std::filesystem::path(record.deployment_source).filename(),
         .retained_bundle_path = retained_bundle_path,
         .program_binding_path = binding_path,
-        .program_path = package_root /
-                        std::filesystem::path(record.program_source).filename(),
+        .program_path = program_path,
         .deployment_artifact_id = product->second.deployment_artifact_id,
         .deployment_revision = product->second.deployment_revision,
         .retained_bundle_id = product->second.bundle->retained_bundle_id(),

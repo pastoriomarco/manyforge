@@ -1,9 +1,13 @@
 #pragma once
 
 #include <manyforge_core/types/program_contract.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -11,6 +15,10 @@
 #include <utility>
 
 namespace manyforge::deployment {
+
+inline constexpr std::size_t kMaxDurableProgramCount = 4096U;
+inline constexpr std::uint64_t kMaxDurableProgramBytes =
+    512ULL * 1024ULL * 1024ULL;
 
 class ProgramContractError final : public std::invalid_argument {
  public:
@@ -72,5 +80,62 @@ class ProgramBindingContract final {
 verify_program_binding_contract(
     std::string_view canonical_program_bytes,
     const RetainedBundle& retained_bundle);
+
+/// Immutable content-addressed Program repository port.
+///
+/// ProgramRevision addresses the complete canonical Program. Publication and
+/// lookup remain contextual: the exact retained bundle must still validate
+/// every catalog and capability reference before a Program is returned.
+class IProgramRepository {
+ public:
+  virtual ~IProgramRepository() = default;
+
+  [[nodiscard]] virtual bool put_if_absent(
+      std::shared_ptr<const ProgramBindingContract> program,
+      const RetainedBundle& retained_bundle) = 0;
+
+  [[nodiscard]] virtual std::shared_ptr<const ProgramBindingContract>
+  get_verified(const core::ProgramId& program_id,
+               const core::ProgramRevision& program_revision,
+               const RetainedBundle& retained_bundle) const = 0;
+};
+
+/// Durable Program repository below one pre-existing trusted package root.
+///
+/// Entries are stored by ProgramRevision with no current/latest alias. Reopen
+/// proves canonical content identity; each point lookup repeats the complete
+/// retained-bundle contextual verification before returning the sealed value.
+class FilesystemProgramRepository final : public IProgramRepository {
+ public:
+  explicit FilesystemProgramRepository(
+      std::filesystem::path trusted_root,
+      std::size_t max_program_count = kMaxDurableProgramCount,
+      std::uint64_t max_total_bytes = kMaxDurableProgramBytes,
+      std::uint64_t max_single_program_bytes = kMaxArtifactEncodedBytes);
+  ~FilesystemProgramRepository() override;
+
+  FilesystemProgramRepository(const FilesystemProgramRepository&) = delete;
+  FilesystemProgramRepository& operator=(const FilesystemProgramRepository&) =
+      delete;
+  FilesystemProgramRepository(FilesystemProgramRepository&&) = delete;
+  FilesystemProgramRepository& operator=(FilesystemProgramRepository&&) =
+      delete;
+
+  [[nodiscard]] bool put_if_absent(
+      std::shared_ptr<const ProgramBindingContract> program,
+      const RetainedBundle& retained_bundle) override;
+
+  [[nodiscard]] std::shared_ptr<const ProgramBindingContract> get_verified(
+      const core::ProgramId& program_id,
+      const core::ProgramRevision& program_revision,
+      const RetainedBundle& retained_bundle) const override;
+
+  [[nodiscard]] std::size_t size() const;
+  [[nodiscard]] std::uint64_t retained_bytes() const;
+
+ private:
+  struct Storage;
+  std::unique_ptr<Storage> storage_;
+};
 
 }  // namespace manyforge::deployment

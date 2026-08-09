@@ -290,6 +290,7 @@ target_link_libraries(manyforge_roboplan_candidate_worker PRIVATE
 # headless API; it is not a second public execution contract.
 add_executable(manyforge_native_execution_host
   src/managed_kernel_apply_fence_owner.cpp
+  src/product_backed_runtime_participant_resolver.cpp
   src/native_execution_host_main.cpp)
 target_include_directories(manyforge_native_execution_host PRIVATE
   "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
@@ -330,6 +331,8 @@ if(BUILD_TESTING)
     # qualified without introducing a second production scene or runtime
     # owner. The installed host above never compiles this fixture.
     add_executable(manyforge_native_execution_host_pick_place_fixture
+      src/managed_kernel_apply_fence_owner.cpp
+      src/product_backed_runtime_participant_resolver.cpp
       src/native_execution_host_main.cpp
       test/focused_pick_place_planning_fixture.cpp)
     target_include_directories(
@@ -347,7 +350,10 @@ if(BUILD_TESTING)
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_retained_consumer
       manyforge_component_manager
+      manyforge::content_identity
       manyforge_deployment
+      manyforge::persistence
+      SQLite::SQLite3
       Threads::Threads)
 
     if(NOT TARGET manyforge_collision)

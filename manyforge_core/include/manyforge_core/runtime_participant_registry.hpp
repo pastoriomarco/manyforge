@@ -22,6 +22,13 @@ class RuntimeParticipantRegistry final {
       const OperationIntentDTO& operation,
       std::size_t participant_index) const;
 
+  /// Validate one externally resolved sealed binding against the exact
+  /// operation address and payload. This supports a bounded product-backed
+  /// resolver without weakening the same checks used by the fixed registry.
+  [[nodiscard]] static Result<RuntimeParticipantBinding> validate_resolved(
+      const OperationIntentDTO& operation, std::size_t participant_index,
+      const RuntimeParticipantBinding& binding);
+
   [[nodiscard]] const std::vector<ResourceId>& resource_inventory()
       const noexcept {
     return resource_inventory_;

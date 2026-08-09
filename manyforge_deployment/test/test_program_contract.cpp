@@ -25,10 +25,12 @@ using manyforge::core::ComponentRoleId;
 using manyforge::core::FrameRoleId;
 using manyforge::core::ProgramCapabilityDisposition;
 using manyforge::core::ProgramId;
+using manyforge::core::ProgramRevision;
 using manyforge::core::ResourceRoleId;
 using manyforge::core::TargetRoleId;
 using manyforge::deployment::CanonicalValue;
 using manyforge::deployment::FilesystemVerifiedRetainedBundleSource;
+using manyforge::deployment::FilesystemProgramRepository;
 using manyforge::deployment::ProgramContractError;
 using manyforge::deployment::RetainedBundle;
 using manyforge::deployment::canonical_json;
@@ -334,6 +336,35 @@ TEST(ProgramContractTest, SealsExactCanonicalProgramAndRetainedCatalogContract) 
             CapabilityId("state.observed.current"));
   EXPECT_EQ(target.required_capabilities.front().disposition,
             ProgramCapabilityDisposition::kRequired);
+}
+
+TEST(ProgramContractTest,
+     DurableRepositoryPublishesAndReopensOneExactProgramRevision) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const std::string bytes = canonical_json(
+      with_program_revision(make_program_root(valid_options(*bundle))));
+  const auto contract = verify_program_binding_contract(bytes, *bundle);
+
+  {
+    FilesystemProgramRepository repository(root.path());
+    EXPECT_TRUE(repository.put_if_absent(contract, *bundle));
+    EXPECT_FALSE(repository.put_if_absent(contract, *bundle));
+    EXPECT_EQ(repository.size(), 1U);
+    EXPECT_EQ(repository.retained_bytes(), bytes.size());
+  }
+
+  FilesystemProgramRepository reopened(root.path());
+  const auto read = reopened.get_verified(
+      contract->value().program_id, contract->value().program_revision,
+      *bundle);
+  ASSERT_NE(read, nullptr);
+  EXPECT_EQ(read->value(), contract->value());
+  EXPECT_EQ(read->canonical_program_bytes(), bytes);
+  EXPECT_EQ(reopened.get_verified(
+                contract->value().program_id,
+                ProgramRevision(std::string(kZeroDigest)), *bundle),
+            nullptr);
 }
 
 TEST(ProgramContractTest,

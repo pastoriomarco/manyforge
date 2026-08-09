@@ -645,6 +645,48 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     ProductBackedResolverAdmitsAnExactProgramBindingOnPinnedPhysicalEngine) {
+  FakeClock clock;
+  clock.set(1234);
+  FakeParticipantEngine engine;
+  const auto physical = make_binding(
+      "arm", "arm", "execution.trajectory.execute",
+      CoordinateKind::kAngular);
+  auto dynamic_value = physical.value();
+  dynamic_value.program_id = ProgramId("program.dynamic");
+  dynamic_value.program_revision = ProgramRevision("program-dynamic-revision");
+  dynamic_value.program_binding_id = ProgramBindingId("program-binding-dynamic");
+  auto dynamic = verify_runtime_participant_binding(std::move(dynamic_value));
+  ASSERT_TRUE(dynamic.ok()) << dynamic.error().message;
+
+  auto intent = motion_operation("request.dynamic.1");
+  intent.program_id = ProgramId("program.dynamic");
+  intent.program_revision = ProgramRevision("program-dynamic-revision");
+  intent.program_binding_id = ProgramBindingId("program-binding-dynamic");
+  std::size_t resolver_calls = 0U;
+  ResourceAddressedExecutionKernel kernel(
+      {{physical, &engine}}, clock, default_journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), 8U,
+          [&](const OperationIntentDTO&, const std::size_t)
+              -> Result<RuntimeParticipantExecutionRegistration> {
+            ++resolver_calls;
+            return Result<RuntimeParticipantExecutionRegistration>::Ok(
+                RuntimeParticipantExecutionRegistration{dynamic.value(),
+                                                        &engine});
+          }});
+
+  const auto result = kernel.execute(intent);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(resolver_calls, 1U);
+  EXPECT_EQ(engine.execute_calls, 1);
+  ASSERT_TRUE(engine.last_execute.has_value());
+  EXPECT_EQ(engine.last_execute->binding.program_id, intent.program_id);
+  EXPECT_EQ(engine.last_execute->binding.program_binding_id,
+            intent.program_binding_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      ResolvesProgramContactGraspAndSelectedRuntimeObjectBeforeSubordinateCall) {
   FakeClock clock;
   FakeParticipantEngine engine;

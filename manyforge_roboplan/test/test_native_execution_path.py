@@ -149,8 +149,6 @@ def _start_host(
             str(execution_root),
             "--staging-root",
             str(staging_root),
-            "--program",
-            str(fixture_root / "program.json"),
             "--program-binding-id",
             manifest["program_binding_id"],
             "--motion-target-role-id",

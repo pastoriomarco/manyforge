@@ -668,11 +668,12 @@ struct ResourceAddressedExecutionKernel::PreviewSession final
           "I6 preview admits one independent participant",
           "i6_preview_single_participant_only");
     }
-    auto resolved = owner_.registry_.resolve(intent, 0U);
+    auto resolved = owner_.resolve_registration(intent, 0U);
     if (!resolved.ok()) {
       return Result<RuntimeParticipantBindingDTO>::Err(resolved.error());
     }
-    return Result<RuntimeParticipantBindingDTO>::Ok(resolved.value().value());
+    return Result<RuntimeParticipantBindingDTO>::Ok(
+        resolved.value().binding.value());
   }
 
   [[nodiscard]] Result<ExecuteRequestDTO> prepare_motion(
@@ -797,12 +798,12 @@ ResourceAddressedExecutionKernel::begin_motion_preview_session(
           "motion_preview_operation_busy");
     }
   }
-  auto resolved = registry_.resolve(primary_motion, 0U);
+  auto resolved = resolve_registration(primary_motion, 0U);
   if (!resolved.ok()) {
     return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Err(
         resolved.error());
   }
-  auto* engine = engine_for(resolved.value());
+  auto* engine = resolved.value().engine;
   auto* motion = dynamic_cast<IMotionPreview*>(engine);
   if (motion == nullptr) {
     return reject<std::unique_ptr<IAddressedMotionPreviewSession>>(
@@ -811,7 +812,8 @@ ResourceAddressedExecutionKernel::begin_motion_preview_session(
         ErrorCode::kUnsupportedCapability);
   }
   std::unique_ptr<IAddressedMotionPreviewSession> session =
-      std::make_unique<PreviewSession>(*this, std::move(resolved.value()),
+      std::make_unique<PreviewSession>(*this,
+                                       std::move(resolved.value().binding),
                                        *motion,
                                        std::move(submission_lock));
   return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(
@@ -852,11 +854,11 @@ ResourceAddressedExecutionKernel::preview_capability_command(
           "capability_command_preview_operation_busy");
     }
   }
-  auto resolved = registry_.resolve(intent, 0U);
+  auto resolved = resolve_registration(intent, 0U);
   if (!resolved.ok()) {
     return Result<CapabilityCommandPreviewResultDTO>::Err(resolved.error());
   }
-  auto* engine = engine_for(resolved.value());
+  auto* engine = resolved.value().engine;
   if (engine == nullptr) {
     return reject<CapabilityCommandPreviewResultDTO>(
         "resolved command participant has no registered subordinate engine",
@@ -865,7 +867,8 @@ ResourceAddressedExecutionKernel::preview_capability_command(
   }
   const auto& command = std::get<CapabilityCommandIntentDTO>(
       intent.participants.front().payload);
-  auto request = build_command_request(command, resolved.value().value());
+  auto request =
+      build_command_request(command, resolved.value().binding.value());
   if (!request.ok()) {
     return Result<CapabilityCommandPreviewResultDTO>::Err(request.error());
   }
@@ -881,7 +884,7 @@ ResourceAddressedExecutionKernel::preview_capability_command(
         "gripper_busy");
   }
   return Result<CapabilityCommandPreviewResultDTO>::Ok(
-      CapabilityCommandPreviewResultDTO{resolved.value().value(),
+      CapabilityCommandPreviewResultDTO{resolved.value().binding.value(),
                                         std::move(request.value())});
 }
 
@@ -892,6 +895,79 @@ IResolvedParticipantExecutionEngine* ResourceAddressedExecutionKernel::engine_fo
                                     return registration.binding.value() == binding.value();
                                   });
   return found == registrations_.end() ? nullptr : found->engine;
+}
+
+Result<RuntimeParticipantExecutionRegistration>
+ResourceAddressedExecutionKernel::resolve_registration(
+    const OperationIntentDTO& operation,
+    const std::size_t participant_index) const {
+  if (!config_.participant_resolver) {
+    auto binding = registry_.resolve(operation, participant_index);
+    if (!binding.ok()) {
+      return Result<RuntimeParticipantExecutionRegistration>::Err(
+          binding.error());
+    }
+    auto* engine = engine_for(binding.value());
+    if (engine == nullptr) {
+      return reject<RuntimeParticipantExecutionRegistration>(
+          "resolved participant has no registered subordinate engine",
+          "runtime_participant_engine_missing",
+          ErrorCode::kInvariantViolation);
+    }
+    return Result<RuntimeParticipantExecutionRegistration>::Ok(
+        RuntimeParticipantExecutionRegistration{std::move(binding.value()),
+                                                engine});
+  }
+
+  Result<RuntimeParticipantExecutionRegistration> resolved =
+      Result<RuntimeParticipantExecutionRegistration>::Err(error(
+          std::string(to_string(ErrorCode::kInternalError)),
+          "product-backed participant resolver did not return a result",
+          "runtime_participant_resolver_failed"));
+  try {
+    resolved = config_.participant_resolver(operation, participant_index);
+  } catch (const std::exception& exception) {
+    return Result<RuntimeParticipantExecutionRegistration>::Err(error(
+        std::string(to_string(ErrorCode::kInvariantViolation)),
+        std::string("product-backed participant resolution failed: ") +
+            exception.what(),
+        "runtime_participant_resolver_failed"));
+  } catch (...) {
+    return Result<RuntimeParticipantExecutionRegistration>::Err(error(
+        std::string(to_string(ErrorCode::kInvariantViolation)),
+        "product-backed participant resolution failed",
+        "runtime_participant_resolver_failed"));
+  }
+  if (!resolved.ok()) {
+    return resolved;
+  }
+  auto validated = RuntimeParticipantRegistry::validate_resolved(
+      operation, participant_index, resolved.value().binding);
+  if (!validated.ok()) {
+    return Result<RuntimeParticipantExecutionRegistration>::Err(
+        validated.error());
+  }
+  const auto engine_is_pinned = std::any_of(
+      registrations_.begin(), registrations_.end(), [&](const auto& item) {
+        return item.engine != nullptr && item.engine == resolved.value().engine;
+      });
+  if (!engine_is_pinned) {
+    return reject<RuntimeParticipantExecutionRegistration>(
+        "product-backed participant selected an unpinned subordinate engine",
+        "runtime_participant_engine_unpinned",
+        ErrorCode::kInvariantViolation);
+  }
+  const auto& inventory = registry_.resource_inventory();
+  for (const auto& resource : resolved.value().binding.value().resources) {
+    if (!std::binary_search(inventory.begin(), inventory.end(),
+                            resource.resource_id)) {
+      return reject<RuntimeParticipantExecutionRegistration>(
+          "product-backed participant widened the active resource inventory",
+          "runtime_participant_resource_outside_inventory",
+          ErrorCode::kInvariantViolation);
+    }
+  }
+  return resolved;
 }
 
 Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
@@ -966,11 +1042,11 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     }
   }
 
-  auto resolved = registry_.resolve(intent, 0U);
+  auto resolved = resolve_registration(intent, 0U);
   if (!resolved.ok()) {
     return Result<OperationAcceptedDTO>::Err(resolved.error());
   }
-  auto* engine = engine_for(resolved.value());
+  auto* engine = resolved.value().engine;
   if (engine == nullptr) {
     return reject<OperationAcceptedDTO>("resolved participant has no registered subordinate engine",
                                         "runtime_participant_engine_missing",
@@ -981,7 +1057,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                         "operation_id_exhausted", ErrorCode::kInternalError);
   }
 
-  const auto& binding = resolved.value().value();
+  const auto& binding = resolved.value().binding.value();
   std::vector<ResourceId> resources;
   resources.reserve(binding.resources.size());
   for (const auto& resource : binding.resources) {
@@ -1137,7 +1213,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   {
     std::lock_guard state_lock(state_mutex_);
     active_operation_ = std::make_unique<ActiveOperation>(ActiveOperation{
-        intent, accepted, resolved.value(), engine, slot_owner, resources, payload_kind,
+        intent, accepted, resolved.value().binding, engine, slot_owner,
+        resources, payload_kind,
         std::move(operation_state_dto), ResourceSlotState::kReserved, 0U, 0U, std::nullopt,
         std::nullopt, std::move(initial_runtime_scale_status)});
     replay_ledger_.push_back(ReplayEntry{intent, accepted});

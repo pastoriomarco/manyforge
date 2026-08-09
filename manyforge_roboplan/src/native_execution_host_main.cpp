@@ -65,6 +65,7 @@
 #include "kernel_apply_fence_rpc_internal.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "native_projection_rpc_internal.hpp"
+#include "product_backed_runtime_participant_resolver.hpp"
 
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
 #include "focused_pick_place_planning_fixture.hpp"
@@ -87,7 +88,6 @@ constexpr std::string_view kControlSocketFileName = "execution-control.sock";
 constexpr std::string_view kLockFileName = ".execution-host.lock";
 constexpr std::size_t kMaximumPacketBytes = 1024U * 1024U;
 constexpr std::size_t kMaximumResponseBytes = 4U * 1024U * 1024U;
-constexpr std::size_t kMaximumProgramBytes = 16U * 1024U * 1024U;
 constexpr std::size_t kMaximumIdentityBytes = 2048U;
 constexpr std::size_t kMaximumReasonBytes = 4096U;
 constexpr std::size_t kMaximumEventPage = 16U;
@@ -169,53 +169,6 @@ void Require(bool condition, std::string detail) {
   auto absolute = std::filesystem::absolute(path, error);
   Require(!error, std::string(label) + " cannot be resolved");
   return absolute.lexically_normal();
-}
-
-[[nodiscard]] std::string ReadBoundedFile(const std::filesystem::path& path,
-                                          std::size_t maximum_bytes) {
-  FileDescriptor descriptor(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-  if (!descriptor) {
-    FailErrno("open Program file");
-  }
-  struct stat before {};
-  if (::fstat(descriptor.get(), &before) != 0) {
-    FailErrno("inspect Program file");
-  }
-  Require(S_ISREG(before.st_mode) && before.st_size > 0 &&
-              static_cast<std::uintmax_t>(before.st_size) <= maximum_bytes,
-          "Program file is not regular, is empty, or exceeds its byte bound");
-  std::string bytes(static_cast<std::size_t>(before.st_size), '\0');
-  std::size_t offset = 0U;
-  while (offset < bytes.size()) {
-    const auto count = ::read(descriptor.get(), bytes.data() + offset, bytes.size() - offset);
-    if (count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (count < 0) {
-      FailErrno("read complete Program file");
-    }
-    Require(count != 0, "Program file ended before its inspected size");
-    offset += static_cast<std::size_t>(count);
-  }
-  char extra = '\0';
-  ssize_t trailing = 0;
-  do {
-    trailing = ::read(descriptor.get(), &extra, 1U);
-  } while (trailing < 0 && errno == EINTR);
-  if (trailing < 0) {
-    FailErrno("check Program file boundary");
-  }
-  struct stat after {};
-  if (::fstat(descriptor.get(), &after) != 0) {
-    FailErrno("reinspect Program file");
-  }
-  Require(trailing == 0 && before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
-              before.st_size == after.st_size && before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
-              before.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
-              before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
-              before.st_ctim.tv_nsec == after.st_ctim.tv_nsec,
-          "Program file changed while it was being read");
-  return bytes;
 }
 
 [[nodiscard]] std::string RandomToken(std::string_view prefix) {
@@ -332,7 +285,6 @@ struct HostConfig final {
   std::filesystem::path manager_state_root;
   std::filesystem::path execution_state_root;
   std::filesystem::path staging_root;
-  std::filesystem::path program_path;
   std::filesystem::path candidate_worker;
   std::string cell_id;
   std::string program_binding_id;
@@ -2613,14 +2565,17 @@ struct Composition final {
       bundle->retained_bundle_id(), products.symbol_role_maps.front().product_id});
   Require(model_map.has_value(), "active retained model map is absent or invalid");
 
-  const auto program_bytes = ReadBoundedFile(config.program_path, kMaximumProgramBytes);
-  auto program = deployment::verify_program_binding_contract(program_bytes, *bundle);
   const deployment::FilesystemProgramBindingRepository binding_repository(config.package_root);
   auto program_binding = binding_repository.get_verified(
       core::ProgramBindingId(config.program_binding_id), *bundle, *model_map);
-  Require(program_binding != nullptr &&
-              program_binding->value().program_id == program->value().program_id &&
-              program_binding->value().program_revision == program->value().program_revision,
+  Require(program_binding != nullptr,
+          "exact retained Program Binding is absent or invalid");
+  const deployment::FilesystemProgramRepository program_repository(
+      config.package_root);
+  auto program = program_repository.get_verified(
+      program_binding->value().program_id,
+      program_binding->value().program_revision, *bundle);
+  Require(program != nullptr,
           "Program and exact retained Program Binding disagree");
 
   const core::TargetRoleId motion_target_role(config.motion_target_role_id);
@@ -2797,13 +2752,25 @@ struct Composition final {
       ProcessContainedCandidateClientConfig{.worker_executable = config.candidate_worker});
   auto planner = std::make_unique<RoboPlanPlannerBackend>(
       inventory->projection_binding, candidate_binding, std::move(candidate_client));
+  auto product_resolver =
+      std::make_shared<ProductBackedRuntimeParticipantResolver>(
+          config.package_root, bundle, *model_map,
+          std::vector<core::RuntimeParticipantBinding>{
+              direct_control_motion_binding.value(),
+              direct_control_gripper_binding.value()});
   auto runtime = create_retained_native_runtime(
       RetainedNativeRuntimeInput{
           motion_binding.value(), gripper_binding.value(),
           {direct_control_motion_binding.value()},
           {direct_control_gripper_binding.value()}, scene, scene_mutex,
           state_projector, publisher, collision_model, std::move(planner),
-          [](const auto&) { return std::make_shared<AbsoluteOnlyReferenceResolver>(); }},
+          [](const auto&) {
+            return std::make_shared<AbsoluteOnlyReferenceResolver>();
+          },
+          [product_resolver](const core::OperationIntentDTO& operation,
+                             const std::size_t participant_index) {
+            return product_resolver->Resolve(operation, participant_index);
+          }},
       RetainedNativeRuntimeConfig{
           owner_epoch, core::CellId(config.cell_id),
           config.execution_state_root / std::string(core::kOperationJournalFilename), 1024U,
@@ -3629,8 +3596,6 @@ class NativeExecutionHost final {
       config.execution_state_root = value;
     } else if (option == "--staging-root") {
       config.staging_root = value;
-    } else if (option == "--program") {
-      config.program_path = value;
     } else if (option == "--program-binding-id") {
       config.program_binding_id = value;
     } else if (option == "--motion-target-role-id") {
@@ -3645,9 +3610,9 @@ class NativeExecutionHost final {
       Fail("unknown option " + option);
     }
   }
-  Require(seen.size() == 10U,
-          "package, Manager state, execution state, staging, Program, "
-          "Program Binding, motion/gripper target roles, candidate worker, and "
+  Require(seen.size() == 9U,
+          "package, Manager state, execution state, staging, Program Binding, "
+          "motion/gripper target roles, candidate worker, and "
           "cell options "
           "are required");
   config.package_root = ExistingDirectory(std::move(config.package_root), "package root");
@@ -3656,7 +3621,6 @@ class NativeExecutionHost final {
   config.execution_state_root =
       ExistingDirectory(std::move(config.execution_state_root), "execution state root");
   config.staging_root = ExistingDirectory(std::move(config.staging_root), "staging root");
-  config.program_path = ExistingRegularFile(std::move(config.program_path), "Program", false);
   config.candidate_worker =
       ExistingRegularFile(std::move(config.candidate_worker), "candidate worker", true);
   Require(!config.cell_id.empty() && config.cell_id.size() <= kMaximumIdentityBytes &&

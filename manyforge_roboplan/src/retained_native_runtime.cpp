@@ -407,6 +407,27 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
   for (const auto& alias : input.gripper_binding_aliases) {
     registrations.push_back({alias, runtime->participant_engine.get()});
   }
+  core::RuntimeParticipantAdmissionResolver participant_resolver;
+  if (input.participant_resolver) {
+    auto binding_resolver = std::move(input.participant_resolver);
+    auto* const participant_engine = runtime->participant_engine.get();
+    participant_resolver =
+        [binding_resolver = std::move(binding_resolver), participant_engine](
+            const core::OperationIntentDTO& operation,
+            const std::size_t participant_index)
+            -> core::Result<core::RuntimeParticipantExecutionRegistration> {
+      auto binding = binding_resolver(operation, participant_index);
+      if (!binding.ok()) {
+        return core::Result<
+            core::RuntimeParticipantExecutionRegistration>::Err(
+            binding.error());
+      }
+      return core::Result<
+          core::RuntimeParticipantExecutionRegistration>::Ok(
+          core::RuntimeParticipantExecutionRegistration{
+              std::move(binding.value()), participant_engine});
+    };
+  }
   runtime->operation_journal = std::make_unique<core::SqliteOperationJournal>(
       std::move(config.operation_journal_path), std::move(config.cell_id));
   runtime->addressed_kernel =
@@ -415,7 +436,8 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
           *runtime->operation_journal,
           core::ResourceAddressedExecutionKernelConfig{
               std::move(config.request_owner_epoch),
-              config.request_replay_capacity});
+              config.request_replay_capacity,
+              std::move(participant_resolver)});
   return runtime;
 }
 

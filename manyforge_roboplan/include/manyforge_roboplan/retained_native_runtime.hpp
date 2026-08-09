@@ -40,6 +40,10 @@ using RetainedReferenceResolverFactory =
     std::function<std::shared_ptr<core::IReferencePoseResolver>(
         const std::vector<std::shared_ptr<RetainedObservedStateChannel>> &)>;
 
+using RetainedRuntimeParticipantResolver = std::function<
+    core::Result<core::RuntimeParticipantBinding>(
+        const core::OperationIntentDTO &, std::size_t)>;
+
 /// Already-verified inputs to one native runtime composition.
 ///
 /// Deployment/product readers and the logical-scene owner remain outside this
@@ -63,6 +67,10 @@ struct RetainedNativeRuntimeInput final {
   collision::ManyForgeCollisionEngine::SharedModelPtr collision_shared_model;
   std::unique_ptr<RoboPlanPlannerBackend> planner;
   RetainedReferenceResolverFactory reference_resolver_factory;
+  /// Optional exact Program/Program-Binding point resolver. The composition
+  /// supplies only sealed bindings for this physical runtime; Core rechecks
+  /// the request address, resource inventory, and pinned engine before use.
+  RetainedRuntimeParticipantResolver participant_resolver;
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public

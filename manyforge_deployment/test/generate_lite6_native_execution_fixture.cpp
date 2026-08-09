@@ -215,6 +215,10 @@ int main(int argc, char** argv) {
                  core::TargetRoleId("gripper"),
                  core::CommandTargetId(std::string(deployment::test::kLite6GripperTargetId))}}},
         bundle, *model_map, catalog_store);
+    deployment::FilesystemProgramRepository program_repository(package_root);
+    if (!program_repository.put_if_absent(program, bundle)) {
+      throw std::logic_error("native execution fixture Program already exists");
+    }
     deployment::FilesystemProgramBindingRepository binding_repository(package_root);
     if (!binding_repository.put_if_absent(binding, bundle, *model_map)) {
       throw std::logic_error("native execution fixture Program Binding already exists");

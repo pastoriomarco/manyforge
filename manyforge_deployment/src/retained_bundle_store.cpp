@@ -21,8 +21,10 @@
 
 #include "manyforge_deployment/content_identity.hpp"
 #include "catalog_artifact_store_internal.hpp"
+#include "content_identity_internal.hpp"
 #include "posix_durability_internal.hpp"
 #include "program_binding_internal.hpp"
+#include "manyforge_deployment/program_contract.hpp"
 #include "retained_bundle_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -35,6 +37,7 @@ enum class DurableValueKind {
   kRawArtifact,
   kCatalogArtifact,
   kRetainedBundle,
+  kProgram,
   kProgramBinding,
 };
 
@@ -55,6 +58,8 @@ struct DurableStoreLayout final {
               detail::kCatalogArtifactFileSuffix};
     case DurableValueKind::kRetainedBundle:
       return {"retained-bundles", "sha256", ".json"};
+    case DurableValueKind::kProgram:
+      return {"programs", "sha256", ".json"};
     case DurableValueKind::kProgramBinding:
       return {"program-bindings", "sha256", ".json"};
   }
@@ -175,6 +180,29 @@ constexpr posix::PublicationMessages kPublicationMessages{
       if (bundle->retained_bundle_id().value() != expected_digest) {
         fail("durable retained-bundle filename does not match its "
              "semantic identity");
+      }
+      return static_cast<std::uint64_t>(bytes.size());
+    }
+    case DurableValueKind::kProgram: {
+      const auto parsed = parse_strict_json_model_yaml(bytes);
+      const auto& root = parsed.root();
+      if (canonical_json(root) != bytes ||
+          !detail::verify_content_identity(
+              root,
+              detail::ContentIdentitySpec{
+                  .identity_domain = "program-revision",
+                  .api_version = std::string(core::kProgramApiVersion),
+                  .own_field = "program_revision",
+              })) {
+        fail("durable Program entry has an invalid canonical identity");
+      }
+      const auto* revision = root.find_object_member("program_revision");
+      const auto* revision_text = revision == nullptr
+                                      ? nullptr
+                                      : std::get_if<std::string>(
+                                            &revision->storage());
+      if (revision_text == nullptr || *revision_text != expected_digest) {
+        fail("durable Program filename does not match its semantic identity");
       }
       return static_cast<std::uint64_t>(bytes.size());
     }
@@ -728,6 +756,88 @@ std::size_t FilesystemRetainedBundleRepository::size() const {
 
 std::uint64_t
 FilesystemRetainedBundleRepository::retained_bytes() const {
+  return storage_->files.retained_bytes();
+}
+
+struct FilesystemProgramRepository::Storage final {
+  Storage(std::filesystem::path trusted_root,
+          std::size_t max_program_count, std::uint64_t max_total_bytes,
+          std::uint64_t max_single_program_bytes)
+      : files(DurableValueKind::kProgram, std::move(trusted_root),
+              max_program_count, max_total_bytes,
+              max_single_program_bytes) {}
+
+  DurableFileCollection files;
+};
+
+FilesystemProgramRepository::FilesystemProgramRepository(
+    std::filesystem::path trusted_root,
+    std::size_t max_program_count, std::uint64_t max_total_bytes,
+    std::uint64_t max_single_program_bytes)
+    : storage_(std::make_unique<Storage>(
+          std::move(trusted_root), max_program_count, max_total_bytes,
+          max_single_program_bytes)) {}
+
+FilesystemProgramRepository::~FilesystemProgramRepository() = default;
+
+bool FilesystemProgramRepository::put_if_absent(
+    std::shared_ptr<const ProgramBindingContract> program,
+    const RetainedBundle& retained_bundle) {
+  storage_->files.require_owner_process();
+  if (program == nullptr) {
+    throw ProgramContractError("durable Program repository rejects null");
+  }
+  storage_->files.require_insert_size(
+      program->canonical_program_bytes().size());
+  const auto reloaded = verify_program_binding_contract(
+      program->canonical_program_bytes(), retained_bundle);
+  if (reloaded->value() != program->value() ||
+      reloaded->normalized_program_root() !=
+          program->normalized_program_root()) {
+    throw ProgramContractError(
+        "durable Program repository rejects divergent typed and canonical "
+        "values");
+  }
+  const auto hex = detail::retained_digest_hex(
+      program->value().program_revision.value());
+  if (!hex.has_value()) {
+    throw ProgramContractError(
+        "durable Program has an invalid strong identity");
+  }
+  return storage_->files.put_if_absent(
+      *hex, program->canonical_program_bytes());
+}
+
+std::shared_ptr<const ProgramBindingContract>
+FilesystemProgramRepository::get_verified(
+    const core::ProgramId& program_id,
+    const core::ProgramRevision& program_revision,
+    const RetainedBundle& retained_bundle) const {
+  storage_->files.require_owner_process();
+  const auto hex = detail::retained_digest_hex(program_revision.value());
+  if (!hex.has_value()) {
+    return nullptr;
+  }
+  const auto bytes = storage_->files.get_verified(*hex);
+  if (!bytes.has_value()) {
+    return nullptr;
+  }
+  const auto program =
+      verify_program_binding_contract(*bytes, retained_bundle);
+  if (program->value().program_id != program_id ||
+      program->value().program_revision != program_revision) {
+    throw ProgramContractError(
+        "durable Program repository key/content or Program identity "
+        "mismatch");
+  }
+  return program;
+}
+
+std::size_t FilesystemProgramRepository::size() const {
+  return storage_->files.size();
+}
+
+std::uint64_t FilesystemProgramRepository::retained_bytes() const {
   return storage_->files.retained_bytes();
 }
 

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/ports/iaddressed_operation_owner.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace manyforge::core {
@@ -26,9 +28,25 @@ struct RuntimeParticipantExecutionRegistration final {
   IResolvedParticipantExecutionEngine* engine{};
 };
 
+using RuntimeParticipantAdmissionResolver = std::function<
+    Result<RuntimeParticipantExecutionRegistration>(
+        const OperationIntentDTO&, std::size_t)>;
+
 struct ResourceAddressedExecutionKernelConfig final {
+  ResourceAddressedExecutionKernelConfig() = default;
+  ResourceAddressedExecutionKernelConfig(
+      RequestOwnerEpoch owner_epoch, std::size_t replay_capacity,
+      RuntimeParticipantAdmissionResolver resolver = {})
+      : request_owner_epoch(std::move(owner_epoch)),
+        request_replay_capacity(replay_capacity),
+        participant_resolver(std::move(resolver)) {}
+
   RequestOwnerEpoch request_owner_epoch;
   std::size_t request_replay_capacity{1024U};
+  /// Optional exact product-backed lookup. The Kernel revalidates the sealed
+  /// binding against the request and accepts only a lifetime-pinned engine
+  /// already present in registrations.
+  RuntimeParticipantAdmissionResolver participant_resolver;
 };
 
 /// Private no-effect result used to project a capability-command preview at a
@@ -115,6 +133,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   [[nodiscard]] IResolvedParticipantExecutionEngine* engine_for(
       const RuntimeParticipantBinding& binding) const noexcept;
+  [[nodiscard]] Result<RuntimeParticipantExecutionRegistration>
+  resolve_registration(const OperationIntentDTO& operation,
+                       std::size_t participant_index) const;
   void on_engine_event(IResolvedParticipantExecutionEngine* engine,
                        const KernelEvent& event);
   [[nodiscard]] Result<void> apply_subordinate_state(

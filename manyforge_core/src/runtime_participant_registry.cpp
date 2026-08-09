@@ -161,7 +161,35 @@ Result<RuntimeParticipantBinding> RuntimeParticipantRegistry::resolve(
     return reject("operation participant has no exact active runtime binding",
                   "runtime_participant_unavailable");
   }
-  return validate_payload_binding(participant, *match);
+  return validate_resolved(operation, participant_index, *match);
+}
+
+Result<RuntimeParticipantBinding> RuntimeParticipantRegistry::validate_resolved(
+    const OperationIntentDTO& operation, const std::size_t participant_index,
+    const RuntimeParticipantBinding& binding) {
+  auto operation_validation = validate_operation_intent(operation);
+  if (!operation_validation.ok()) {
+    return Result<RuntimeParticipantBinding>::Err(
+        operation_validation.error());
+  }
+  if (participant_index >= operation.participants.size()) {
+    return reject("operation participant index is outside the request",
+                  "operation_participant_index_invalid");
+  }
+  const auto& participant = operation.participants[participant_index];
+  const auto& value = binding.value();
+  if (value.program_id != operation.program_id ||
+      value.program_revision != operation.program_revision ||
+      value.program_binding_id != operation.program_binding_id ||
+      value.retained_bundle_id != operation.expected_retained_bundle_id ||
+      value.graph_revision != operation.expected_graph_revision ||
+      value.component_role_id != participant.component_role_id ||
+      value.target_role_id != participant.target_role_id ||
+      value.capability_id != participant.required_capability_id) {
+    return reject("resolved participant differs from the exact operation address",
+                  "runtime_participant_address_mismatch");
+  }
+  return validate_payload_binding(participant, binding);
 }
 
 }  // namespace manyforge::core
