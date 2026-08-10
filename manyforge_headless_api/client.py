@@ -333,6 +333,12 @@ class HeadlessHttpClient:
     def scenarios(self) -> dict[str, Any]:
         return self.request("GET", "/api/scenarios")
 
+    def program_applied(self) -> dict[str, Any]:
+        return self.request("GET", "/api/program/applied")
+
+    def program_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/program/apply", body=body)
+
     def viewer_model_urdf(self) -> ViewerModelAsset:
         asset = self._request_viewer_asset(
             "/api/viewer-model/urdf",

@@ -434,6 +434,7 @@ select_catalog_values(const std::vector<Value> &values,
 struct ScenarioProduct final {
   core::DeploymentArtifactId deployment_artifact_id;
   core::DeploymentRevision deployment_revision;
+  deployment::ScenarioDeploymentCompatibilityDTO deployment_compatibility;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   deployment::VerifiedRetainedModelMap model_map;
   std::filesystem::path canonical_empty_admission_filename;
@@ -685,11 +686,13 @@ materialize_scenarios(const std::filesystem::path &root,
     verify_gripper_resource_semantics(scenario, verified.graph().graph(),
                                       *model_map);
     if (!result
-             .emplace(std::string(scenario.source),
-                      ScenarioProduct{verified.deployment_artifact_id(),
-                                      verified.deployment_revision(), bundle,
-                                      std::move(*model_map),
-                                      admission_filename})
+             .emplace(
+                 std::string(scenario.source),
+                 ScenarioProduct{
+                     verified.deployment_artifact_id(),
+                     verified.deployment_revision(),
+                     deployment::scenario_deployment_compatibility(verified),
+                     bundle, std::move(*model_map), admission_filename})
              .second) {
       throw std::logic_error("scenario product source is duplicated");
     }
@@ -994,7 +997,8 @@ void verify_resolved_program_binding(
     }
     const auto program = program_reopened.get_verified(
         record.program_id, record.program_revision, *product->second.bundle);
-    if (program == nullptr || program->value().program_id != record.program_id ||
+    if (program == nullptr ||
+        program->value().program_id != record.program_id ||
         program->value().program_revision != record.program_revision) {
       throw std::logic_error(
           "durable maintained Program did not reload exactly");
@@ -1087,6 +1091,7 @@ void publish_and_verify_scenario_catalog(
         .deployment_revision = product->second.deployment_revision,
         .retained_bundle_id = product->second.bundle->retained_bundle_id(),
         .program_binding_id = record.program_binding_id,
+        .deployment_compatibility = product->second.deployment_compatibility,
         .assistant_mode = program_assistant_mode(program.root()),
         .typed_parameter_overrides =
             deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
@@ -1151,10 +1156,11 @@ void publish_and_verify_scenario_catalog(
         selected.node_environment_digest !=
             product->second.bundle->value()
                 .catalogs.node_environment.environment_digest ||
+        selected.deployment_compatibility !=
+            product->second.deployment_compatibility ||
         selected.assistant_mode != binding_row->assistant_mode ||
         selected.typed_parameter_overrides !=
-            deployment::CanonicalValue(
-                deployment::CanonicalValue::Object{})) {
+            deployment::CanonicalValue(deployment::CanonicalValue::Object{})) {
       throw std::logic_error(
           "maintained scenario selector did not preserve its exact closure");
     }

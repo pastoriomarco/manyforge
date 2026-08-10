@@ -56,6 +56,9 @@ template <typename Callback> std::string Invoke(Callback &&callback) {
   } catch (const SourceSnapshotError &error) {
     return content_identity::canonical_json(
         ErrorValue("headless_source_snapshot_unavailable", error.what()));
+  } catch (const ProgramApplyError &error) {
+    return content_identity::canonical_json(
+        ErrorValue(error.code(), error.what()));
   } catch (const std::exception &error) {
     return content_identity::canonical_json(
         ErrorValue("headless_api_internal_failure", error.what()));
@@ -215,6 +218,38 @@ public:
     return Invoke([this, scenario_id = std::move(scenario_id)]() {
       return core_->ScenarioProgramSelection(scenario_id);
     });
+  }
+
+  std::string PrepareProgramApply(std::string scenario_id,
+                                  std::string scenario_catalog_revision,
+                                  std::string canonical_program_json) {
+    py::gil_scoped_release release;
+    return Invoke(
+        [this, scenario_id = std::move(scenario_id),
+         scenario_catalog_revision = std::move(scenario_catalog_revision),
+         canonical_program_json = std::move(canonical_program_json)]() {
+          return core_->PrepareProgramApply(
+              scenario_id, scenario_catalog_revision, canonical_program_json);
+        });
+  }
+
+  std::string CommitProgramApply(
+      std::string canonical_preparation_json,
+      std::optional<std::string> expected_applied_record_digest) {
+    py::gil_scoped_release release;
+    return Invoke(
+        [this,
+         canonical_preparation_json = std::move(canonical_preparation_json),
+         expected_applied_record_digest =
+             std::move(expected_applied_record_digest)]() {
+          return core_->CommitProgramApply(canonical_preparation_json,
+                                           expected_applied_record_digest);
+        });
+  }
+
+  std::string AppliedProgramSelection() {
+    py::gil_scoped_release release;
+    return Invoke([this]() { return core_->AppliedProgramSelection(); });
   }
 
   py::dict ViewerModelUrdf() {
@@ -464,8 +499,15 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("scenario_catalog_projection",
            &HeadlessApiBridge::ScenarioCatalogProjection)
       .def("scenario_program_selection",
-           &HeadlessApiBridge::ScenarioProgramSelection,
-           py::arg("scenario_id"))
+           &HeadlessApiBridge::ScenarioProgramSelection, py::arg("scenario_id"))
+      .def("prepare_program_apply", &HeadlessApiBridge::PrepareProgramApply,
+           py::arg("scenario_id"), py::arg("scenario_catalog_revision"),
+           py::arg("canonical_program_json"))
+      .def("commit_program_apply", &HeadlessApiBridge::CommitProgramApply,
+           py::arg("canonical_preparation_json"),
+           py::arg("expected_applied_record_digest") = std::nullopt)
+      .def("applied_program_selection",
+           &HeadlessApiBridge::AppliedProgramSelection)
       .def("viewer_model_urdf", &HeadlessApiBridge::ViewerModelUrdf)
       .def("viewer_model_resource", &HeadlessApiBridge::ViewerModelResource,
            py::arg("expected_retained_bundle_id"), py::arg("logical_uri"))

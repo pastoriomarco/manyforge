@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
+from functools import lru_cache
+import hashlib
 from typing import Any, Sequence
+
+from manyforge_behavior.catalog import (
+    CatalogValidationError,
+    NodeCatalog,
+)
+from manyforge_behavior.node_environment import BUILTIN_CATALOG_PATH
+from manyforge_behavior.program import Program, ProgramValidationError
 
 from .execution import ExecutionPort
 from .manager import ManagerPort
@@ -12,6 +22,7 @@ from .models import (
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    ProgramApplyRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -25,6 +36,15 @@ from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
 
 RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
 MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
+PROGRAM_APPLY_RESULT_VERSION = "manyforge.program_apply_result.v1"
+APPLIED_PROGRAM_SELECTION_VERSION = "manyforge.applied_program_selection.v1"
+
+
+@lru_cache(maxsize=1)
+def _program_catalog() -> NodeCatalog:
+    """Load the build-owned authoring catalog once per headless process."""
+
+    return NodeCatalog(BUILTIN_CATALOG_PATH)
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +340,174 @@ class HeadlessService:
                 "native core returned an unsupported scenario catalog",
             )
         return projection
+
+    def program_applied(self) -> dict[str, Any]:
+        projection = self.core.applied_program_selection()
+        if (
+            projection.get("schema_version")
+            != APPLIED_PROGRAM_SELECTION_VERSION
+            or not isinstance(projection.get("program_revision"), str)
+            or not isinstance(projection.get("program_binding_id"), str)
+            or not isinstance(projection.get("retained_bundle_id"), str)
+            or not isinstance(projection.get("graph_revision"), str)
+            or not isinstance(projection.get("source"), dict)
+        ):
+            raise HeadlessApiError(
+                "program_applied_selection_invalid",
+                "native core returned an unsupported Applied Program selection",
+            )
+        return projection
+
+    def _program_apply_manager_selection(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        status = self.manager_status()
+        source = status.get("source")
+        payload = status.get("status")
+        active = payload.get("active") if isinstance(payload, dict) else None
+        runtime = payload.get("runtime") if isinstance(payload, dict) else None
+        if (
+            not isinstance(source, dict)
+            or not isinstance(payload, dict)
+            or not isinstance(active, dict)
+            or not isinstance(runtime, dict)
+            or source.get("available") is not True
+            or source.get("freshness") != "fresh"
+            or source.get("known_gaps") != []
+            or not isinstance(active.get("retained_bundle_id"), str)
+            or not isinstance(active.get("graph_revision"), str)
+            or not isinstance(source.get("source_owner_epoch"), str)
+        ):
+            raise HeadlessApiError(
+                "manager_source_invalid",
+                "Manager source has no exact active Program Apply selection",
+            )
+        return source, payload, active
+
+    def program_apply(self, request: ProgramApplyRequest) -> dict[str, Any]:
+        """Prepare, converge only a differing deployment, then CAS Applied."""
+
+        try:
+            program = Program.from_dict(
+                deepcopy(request.program),
+                _program_catalog(),
+                path="<headless-program-apply>",
+            )
+        except (CatalogValidationError, ProgramValidationError) as error:
+            raise HeadlessApiError(
+                "program_apply_program_invalid",
+                f"Program Apply candidate is invalid: {error}",
+            ) from error
+        preparation = self.core.prepare_program_apply(
+            request.scenario_id,
+            request.scenario_catalog_revision,
+            program.to_dict(),
+        )
+        target_bundle = preparation.get("retained_bundle_id")
+        target_graph = preparation.get("graph_revision")
+        preparation_digest = preparation.get("preparation_digest")
+        if not all(
+            isinstance(value, str) and value
+            for value in (target_bundle, target_graph, preparation_digest)
+        ):
+            raise HeadlessApiError(
+                "program_apply_preparation_invalid",
+                "native Program Apply preparation omitted exact identities",
+            )
+
+        source, payload, active = self._program_apply_manager_selection()
+        deployment_apply_required = (
+            active["retained_bundle_id"] != target_bundle
+            or active["graph_revision"] != target_graph
+        )
+        manager_response: dict[str, Any] | None = None
+        if deployment_apply_required:
+            apply_state = payload.get("apply")
+            if (
+                not isinstance(apply_state, dict)
+                or apply_state.get("mutation_available") is not True
+            ):
+                reason = (
+                    apply_state.get("unavailable_reason_code")
+                    if isinstance(apply_state, dict)
+                    else None
+                )
+                raise HeadlessApiError(
+                    reason
+                    if isinstance(reason, str) and reason
+                    else "manager_apply_unavailable",
+                    "Program Apply requires a deployment change, but Manager Apply "
+                    "is unavailable",
+                )
+            request_identity = "\0".join(
+                (
+                    preparation_digest,
+                    active["retained_bundle_id"],
+                    active["graph_revision"],
+                )
+            )
+            request_suffix = hashlib.sha256(
+                request_identity.encode("ascii")
+            ).hexdigest()[:24]
+            manager_response = self.manager.apply(
+                ManagerApplyRequest(
+                    request_id=f"program-apply-{request_suffix}",
+                    request_owner_epoch=source["source_owner_epoch"],
+                    source_label="headless_program_apply",
+                    correlation_id=None,
+                    deployment_artifact_id=preparation["deployment_artifact_id"],
+                    deployment_revision=preparation["deployment_revision"],
+                    expected_current={
+                        "retained_bundle_id": active["retained_bundle_id"],
+                        "graph_revision": active["graph_revision"],
+                    },
+                    reject_if_affected_busy=True,
+                )
+            )
+            if manager_response.get("ok") is not True:
+                error = manager_response.get("error")
+                code = error.get("code") if isinstance(error, dict) else None
+                message = error.get("message") if isinstance(error, dict) else None
+                raise HeadlessApiError(
+                    code
+                    if isinstance(code, str) and code
+                    else "manager_apply_rejected",
+                    message
+                    if isinstance(message, str) and message
+                    else "Manager rejected the Program deployment Apply",
+                )
+            _source, payload, active = self._program_apply_manager_selection()
+
+        runtime = payload.get("runtime")
+        manager_matches = (
+            payload.get("manager_ready") is True
+            and isinstance(runtime, dict)
+            and runtime.get("converged") is True
+            and active["retained_bundle_id"] == target_bundle
+            and active["graph_revision"] == target_graph
+        )
+        if not manager_matches:
+            return {
+                "schema_version": PROGRAM_APPLY_RESULT_VERSION,
+                "status": "pending_deployment",
+                "deployment_apply_required": deployment_apply_required,
+                "preparation": preparation,
+                "manager_response": manager_response,
+                "applied": None,
+            }
+
+        applied = self.core.commit_program_apply(
+            preparation,
+            request.expected_applied_record_digest,
+        )
+        return {
+            "schema_version": PROGRAM_APPLY_RESULT_VERSION,
+            "status": "applied",
+            "deployment_apply_required": deployment_apply_required,
+            "preparation": preparation,
+            "manager_response": manager_response,
+            "applied": applied,
+        }
 
     @staticmethod
     def _verified_viewer_asset(

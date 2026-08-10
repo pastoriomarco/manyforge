@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unicodedata
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -160,6 +160,25 @@ class ManagerApplyRequest(CallerAttributionRequest):
     def require_busy_rejection(self) -> "ManagerApplyRequest":
         if not self.reject_if_affected_busy:
             raise ValueError("reject_if_affected_busy must be true")
+        return self
+
+
+class ProgramApplyRequest(StrictRequest):
+    scenario_id: Annotated[
+        str,
+        Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
+    ]
+    scenario_catalog_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    program: dict[str, Any]
+    expected_applied_record_digest: Annotated[
+        str | None,
+        Field(pattern=SHA256_PATTERN),
+    ] = None
+
+    @model_validator(mode="after")
+    def require_program_object(self) -> "ProgramApplyRequest":
+        if not self.program:
+            raise ValueError("program must be a non-empty object")
         return self
 
 

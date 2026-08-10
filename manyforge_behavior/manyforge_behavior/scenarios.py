@@ -456,6 +456,30 @@ def _scenario_from_row(
     program_binding_id = _require_digest(
         row.get("program_binding_id"), path=f"{row_path}.program_binding_id"
     )
+    deployment_compatibility = _require_exact_fields(
+        row.get("deployment_compatibility"),
+        required=frozenset({"lane", "provides"}),
+        path=f"{row_path}.deployment_compatibility",
+    )
+    deployment_lane = deployment_compatibility.get("lane")
+    if deployment_lane not in {"manyforge-only", "isaac-sim", "real-robot"}:
+        raise ScenarioDiscoveryError(
+            f"{row_path}.deployment_compatibility.lane is invalid"
+        )
+    deployment_provides = deployment_compatibility.get("provides")
+    if type(deployment_provides) is not list or len(deployment_provides) > 4096:
+        raise ScenarioDiscoveryError(
+            f"{row_path}.deployment_compatibility.provides violates its bound"
+        )
+    qualified_provides = tuple(
+        _require_id(item, path=f"{row_path}.deployment_compatibility.provides[]")
+        for item in deployment_provides
+    )
+    if qualified_provides != tuple(sorted(set(qualified_provides))):
+        raise ScenarioDiscoveryError(
+            f"{row_path}.deployment_compatibility.provides must be "
+            "duplicate-free and canonical-sorted"
+        )
     assistant_mode = row.get("assistant_mode")
     if assistant_mode not in {"required", "optional", "forbidden"}:
         raise ScenarioDiscoveryError(f"{row_path}.assistant_mode is invalid")
@@ -662,6 +686,7 @@ def discover_scenarios(
                             "deployment_revision",
                             "retained_bundle_id",
                             "program_binding_id",
+                            "deployment_compatibility",
                             "assistant_mode",
                             "typed_parameter_overrides",
                         }

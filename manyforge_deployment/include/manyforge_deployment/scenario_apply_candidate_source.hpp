@@ -48,6 +48,7 @@ struct ScenarioProgramSelection final {
   core::ProgramId program_id;
   core::ProgramRevision program_revision;
   core::ContentDigest node_environment_digest;
+  ScenarioDeploymentCompatibilityDTO deployment_compatibility;
   ScenarioAssistantMode assistant_mode;
   CanonicalValue typed_parameter_overrides;
   CanonicalValue normalized_program_root;

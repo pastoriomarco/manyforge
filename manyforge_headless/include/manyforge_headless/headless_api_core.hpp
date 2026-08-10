@@ -11,6 +11,7 @@
 #include <manyforge_headless/event_historian.hpp>
 #include <manyforge_headless/node_environment_projection.hpp>
 #include <manyforge_headless/operator_alarm_owner.hpp>
+#include <manyforge_headless/program_apply_owner.hpp>
 #include <manyforge_headless/runtime_snapshot.hpp>
 #include <manyforge_headless/source_model_projection.hpp>
 #include <map>
@@ -172,6 +173,15 @@ public:
   ScenarioCatalogProjection();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ScenarioProgramSelection(std::string_view scenario_id);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  PrepareProgramApply(std::string_view scenario_id,
+                      std::string_view expected_scenario_catalog_revision,
+                      std::string_view canonical_program_bytes);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue CommitProgramApply(
+      std::string_view canonical_preparation_bytes,
+      const std::optional<std::string> &expected_applied_record_digest);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  AppliedProgramSelection();
   [[nodiscard]] ViewerModelAsset ViewerModelUrdf();
   [[nodiscard]] ViewerModelAsset
   ViewerModelResource(std::string_view expected_retained_bundle_id,
@@ -289,6 +299,7 @@ private:
       retained_bundle_source_;
   manyforge::deployment::FilesystemScenarioApplyCandidateSource
       scenario_catalog_source_;
+  ProgramApplyOwner program_apply_owner_;
   ActiveNodeEnvironmentProjection node_environment_projection_;
   ActiveSourceModelProjection source_model_projection_;
   manyforge::deployment::FilesystemVerifiedRetainedViewerModelSource

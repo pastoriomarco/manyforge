@@ -17,11 +17,14 @@
 
 namespace manyforge::deployment {
 
+class RevisionVerifiedDeploymentArtifact;
+
 inline constexpr std::string_view kScenarioCatalogApiVersion =
     "manyforge.scenario_catalog.v1";
 inline constexpr std::size_t kMaxScenarioCatalogRows = 4096U;
 inline constexpr std::size_t kMaxScenarioAliasesPerRow = 64U;
 inline constexpr std::size_t kMaxScenarioPresentationTextCharacters = 4096U;
+inline constexpr std::size_t kMaxScenarioDeploymentProvides = 4096U;
 
 enum class ScenarioAssistantMode : std::uint8_t {
   kRequired = 0,
@@ -29,15 +32,27 @@ enum class ScenarioAssistantMode : std::uint8_t {
   kForbidden,
 };
 
-[[nodiscard]] constexpr std::string_view to_string(
-    ScenarioAssistantMode mode) noexcept {
+/// Closed deployment facts needed to admit a Program against one exact
+/// scenario occurrence without reopening or rediscovering authored sources.
+/// Catalog construction/closure verification proves these facts came from the
+/// row's exact deployment revision.
+struct ScenarioDeploymentCompatibilityDTO final {
+  std::string lane;
+  std::vector<std::string> provides;
+
+  friend bool operator==(const ScenarioDeploymentCompatibilityDTO &,
+                         const ScenarioDeploymentCompatibilityDTO &) = default;
+};
+
+[[nodiscard]] constexpr std::string_view
+to_string(ScenarioAssistantMode mode) noexcept {
   switch (mode) {
-    case ScenarioAssistantMode::kRequired:
-      return "required";
-    case ScenarioAssistantMode::kOptional:
-      return "optional";
-    case ScenarioAssistantMode::kForbidden:
-      return "forbidden";
+  case ScenarioAssistantMode::kRequired:
+    return "required";
+  case ScenarioAssistantMode::kOptional:
+    return "optional";
+  case ScenarioAssistantMode::kForbidden:
+    return "forbidden";
   }
   return {};
 }
@@ -50,15 +65,16 @@ struct ScenarioCatalogRowDTO final {
   core::DeploymentRevision deployment_revision;
   core::RetainedBundleId retained_bundle_id;
   core::ProgramBindingId program_binding_id;
+  ScenarioDeploymentCompatibilityDTO deployment_compatibility;
   ScenarioAssistantMode assistant_mode;
   CanonicalValue typed_parameter_overrides;
 
-  friend bool operator==(const ScenarioCatalogRowDTO&,
-                         const ScenarioCatalogRowDTO&) = default;
+  friend bool operator==(const ScenarioCatalogRowDTO &,
+                         const ScenarioCatalogRowDTO &) = default;
 };
 
 class ScenarioCatalogError final : public std::invalid_argument {
- public:
+public:
   using std::invalid_argument::invalid_argument;
 };
 
@@ -71,35 +87,32 @@ class ScenarioCatalogConstructionAuthority;
 /// The value is authoring metadata only. It has no active/current deployment,
 /// Apply, caller-authority, or operation-dispatch surface.
 class ScenarioCatalog final {
- public:
+public:
   ~ScenarioCatalog() = default;
-  ScenarioCatalog(const ScenarioCatalog&) = delete;
-  ScenarioCatalog& operator=(const ScenarioCatalog&) = delete;
-  ScenarioCatalog(ScenarioCatalog&&) = delete;
-  ScenarioCatalog& operator=(ScenarioCatalog&&) = delete;
+  ScenarioCatalog(const ScenarioCatalog &) = delete;
+  ScenarioCatalog &operator=(const ScenarioCatalog &) = delete;
+  ScenarioCatalog(ScenarioCatalog &&) = delete;
+  ScenarioCatalog &operator=(ScenarioCatalog &&) = delete;
 
-  [[nodiscard]] const core::ScenarioCatalogRevision& revision()
-      const noexcept {
+  [[nodiscard]] const core::ScenarioCatalogRevision &revision() const noexcept {
     return revision_;
   }
-  [[nodiscard]] const std::vector<ScenarioCatalogRowDTO>& rows()
-      const noexcept {
+  [[nodiscard]] const std::vector<ScenarioCatalogRowDTO> &
+  rows() const noexcept {
     return rows_;
   }
-  [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
+  [[nodiscard]] const CanonicalValue &normalized_root() const noexcept {
     return normalized_root_;
   }
   [[nodiscard]] std::string_view canonical_bytes() const noexcept {
     return canonical_bytes_;
   }
 
- private:
+private:
   ScenarioCatalog(core::ScenarioCatalogRevision revision,
                   std::vector<ScenarioCatalogRowDTO> rows,
-                  CanonicalValue normalized_root,
-                  std::string canonical_bytes)
-      : revision_(std::move(revision)),
-        rows_(std::move(rows)),
+                  CanonicalValue normalized_root, std::string canonical_bytes)
+      : revision_(std::move(revision)), rows_(std::move(rows)),
         normalized_root_(std::move(normalized_root)),
         canonical_bytes_(std::move(canonical_bytes)) {}
 
@@ -112,8 +125,8 @@ class ScenarioCatalog final {
 };
 
 /// Seal one typed, canonical-sorted catalog and mint its content identity.
-[[nodiscard]] std::shared_ptr<const ScenarioCatalog> build_scenario_catalog(
-    std::vector<ScenarioCatalogRowDTO> rows);
+[[nodiscard]] std::shared_ptr<const ScenarioCatalog>
+build_scenario_catalog(std::vector<ScenarioCatalogRowDTO> rows);
 
 /// Verify a YAML-or-JSON source artifact and return its canonical sealed value.
 [[nodiscard]] std::shared_ptr<const ScenarioCatalog>
@@ -122,6 +135,22 @@ verify_scenario_catalog_artifact(std::string_view encoded_bytes);
 /// Reload canonical repository bytes, rejecting non-canonical encodings.
 [[nodiscard]] std::shared_ptr<const ScenarioCatalog>
 reload_verified_scenario_catalog(std::string_view canonical_bytes);
+
+/// Extract the exact Program-admission projection from a qualified deployment.
+[[nodiscard]] ScenarioDeploymentCompatibilityDTO
+scenario_deployment_compatibility(
+    const RevisionVerifiedDeploymentArtifact &deployment);
+
+/// Verify a schema-normalized candidate Program against one scenario row's
+/// qualified deployment projection, retained bundle, assistant disposition,
+/// and typed overrides. Program-only Apply uses this after reusing the row's
+/// exact authored role assignment; it does not mutate or republish the catalog.
+void verify_scenario_program_admission(
+    const CanonicalValue &normalized_program_root,
+    const core::RetainedBundleDTO &retained_bundle,
+    const ScenarioDeploymentCompatibilityDTO &deployment_compatibility,
+    ScenarioAssistantMode assistant_mode,
+    const CanonicalValue &typed_parameter_overrides);
 
 enum class ScenarioCatalogPublishResult : std::uint8_t {
   kPublished = 0,
@@ -135,28 +164,28 @@ enum class ScenarioCatalogPublishResult : std::uint8_t {
 /// A successful replacement is atomically published only after the new bytes
 /// are durable. Reads independently reverify the complete content identity.
 class FilesystemScenarioCatalogRepository final {
- public:
+public:
   FilesystemScenarioCatalogRepository(std::filesystem::path trusted_root,
                                       std::string catalog_name);
   ~FilesystemScenarioCatalogRepository();
 
   FilesystemScenarioCatalogRepository(
-      const FilesystemScenarioCatalogRepository&) = delete;
-  FilesystemScenarioCatalogRepository& operator=(
-      const FilesystemScenarioCatalogRepository&) = delete;
-  FilesystemScenarioCatalogRepository(
-      FilesystemScenarioCatalogRepository&&) = delete;
-  FilesystemScenarioCatalogRepository& operator=(
-      FilesystemScenarioCatalogRepository&&) = delete;
+      const FilesystemScenarioCatalogRepository &) = delete;
+  FilesystemScenarioCatalogRepository &
+  operator=(const FilesystemScenarioCatalogRepository &) = delete;
+  FilesystemScenarioCatalogRepository(FilesystemScenarioCatalogRepository &&) =
+      delete;
+  FilesystemScenarioCatalogRepository &
+  operator=(FilesystemScenarioCatalogRepository &&) = delete;
 
   [[nodiscard]] ScenarioCatalogPublishResult compare_and_set(
-      const std::optional<core::ScenarioCatalogRevision>& expected_revision,
+      const std::optional<core::ScenarioCatalogRevision> &expected_revision,
       std::shared_ptr<const ScenarioCatalog> candidate);
 
   [[nodiscard]] std::shared_ptr<const ScenarioCatalog> get_verified() const;
-  [[nodiscard]] const std::filesystem::path& catalog_path() const noexcept;
+  [[nodiscard]] const std::filesystem::path &catalog_path() const noexcept;
 
- private:
+private:
   struct Storage;
   std::unique_ptr<Storage> storage_;
 };
@@ -188,8 +217,8 @@ struct VerifiedScenarioArtifactClosure final {
   std::string lane;
   bool assistant_enabled{};
 
-  friend bool operator==(const VerifiedScenarioArtifactClosure&,
-                         const VerifiedScenarioArtifactClosure&) = default;
+  friend bool operator==(const VerifiedScenarioArtifactClosure &,
+                         const VerifiedScenarioArtifactClosure &) = default;
 };
 
 /// Compose the qualified deployment, retained-product, Program-contract,
@@ -197,6 +226,6 @@ struct VerifiedScenarioArtifactClosure final {
 /// exact scenario. This function performs no publication, Apply, activation,
 /// authority selection, network access, or robot effect.
 [[nodiscard]] VerifiedScenarioArtifactClosure
-verify_scenario_artifact_closure(const ScenarioArtifactClosureQuery& query);
+verify_scenario_artifact_closure(const ScenarioArtifactClosureQuery &query);
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

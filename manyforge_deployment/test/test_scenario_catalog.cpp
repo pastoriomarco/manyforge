@@ -56,6 +56,8 @@ class TemporaryDirectory final {
           core::RetainedBundleId(digest(identity_digit + 1)),
       .program_binding_id =
           core::ProgramBindingId(digest(identity_digit + 2)),
+      .deployment_compatibility =
+          ScenarioDeploymentCompatibilityDTO{"manyforge-only", {}},
       .assistant_mode = ScenarioAssistantMode::kForbidden,
       .typed_parameter_overrides =
           CanonicalValue(CanonicalValue::Object{}),

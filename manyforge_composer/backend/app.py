@@ -156,6 +156,8 @@ def create_app(
     for program_authoring_prefix in (
         "/api/program/draft/",
         "/api/program/open-draft",
+        "/api/program/apply",
+        "/api/program/load",
         "/api/program/save",
     ):
         app.add_middleware(

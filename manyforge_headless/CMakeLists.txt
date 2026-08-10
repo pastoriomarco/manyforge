@@ -85,6 +85,7 @@ set_target_properties(manyforge_node_environment_projection PROPERTIES
 add_library(manyforge_event_historian
   src/event_historian.cpp
   src/headless_api_core.cpp
+  src/program_apply_owner.cpp
   src/sqlite_event_history_store.cpp)
 add_library(manyforge::event_historian ALIAS manyforge_event_historian)
 target_include_directories(manyforge_event_historian PUBLIC
@@ -93,6 +94,7 @@ target_include_directories(manyforge_event_historian PUBLIC
 target_link_libraries(manyforge_event_historian PUBLIC
   manyforge_headless
   manyforge_node_environment_projection
+  manyforge::deployment
   SQLite::SQLite3
   Threads::Threads)
 set_target_properties(manyforge_event_historian PROPERTIES
@@ -465,9 +467,11 @@ if(BUILD_TESTING)
 
   add_executable(test_headless_api_core test/test_headless_api_core.cpp)
   add_dependencies(test_headless_api_core
-    manyforge_headless_test_canonical_empty_package)
+    manyforge_headless_test_canonical_empty_package
+    manyforge_headless_test_assistant_package)
   target_compile_definitions(test_headless_api_core PRIVATE
     MANYFORGE_HEADLESS_TEST_ALARM_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/resources/operator-alarm-catalog.v1.yaml"
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}"
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
     MANYFORGE_HEADLESS_TEST_NODE_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_catalog.yaml")
   target_link_libraries(test_headless_api_core PRIVATE
@@ -476,6 +480,21 @@ if(BUILD_TESTING)
     manyforge::deployment_admission
     GTest::gtest_main)
   gtest_discover_tests(test_headless_api_core
+    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_program_apply_owner
+    test/test_program_apply_owner.cpp)
+  add_dependencies(test_program_apply_owner
+    manyforge_headless_test_assistant_package)
+  target_compile_definitions(test_program_apply_owner PRIVATE
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}")
+  target_include_directories(test_program_apply_owner PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
+  target_link_libraries(test_program_apply_owner PRIVATE
+    manyforge_event_historian
+    manyforge::deployment
+    GTest::gtest_main)
+  gtest_discover_tests(test_program_apply_owner
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_owner_publication test/test_owner_publication.cpp)

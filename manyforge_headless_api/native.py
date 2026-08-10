@@ -9,11 +9,15 @@ import re
 from typing import Any, Protocol, Sequence
 import unicodedata
 
+import rfc8785
+
 
 MAX_NATIVE_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_VIEWER_MODEL_URDF_BYTES = 16 * 1024 * 1024
 MAX_VIEWER_MODEL_RESOURCE_BYTES = 256 * 1024 * 1024
 MAX_VIEWER_MODEL_RESOURCE_URI_BYTES = 4096
+MAX_STANDARD_REQUEST_BODY_BYTES = 1024 * 1024
+MAX_PROGRAM_APPLY_REQUEST_BYTES = 17 * 1024 * 1024
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -47,7 +51,7 @@ class HeadlessApiConfig:
     manager_timeout_seconds: float = 0.25
     execution_timeout_seconds: float = 10.0
     execution_event_poll_milliseconds: int = 100
-    maximum_request_body_bytes: int = 1024 * 1024
+    maximum_request_body_bytes: int = MAX_STANDARD_REQUEST_BODY_BYTES
 
     def __post_init__(self) -> None:
         for label, value in (("cell_id", self.cell_id), ("owner_id", self.owner_id)):
@@ -119,6 +123,21 @@ class HeadlessCorePort(Protocol):
     def scenario_catalog_projection(self) -> dict[str, Any]: ...
 
     def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]: ...
+
+    def prepare_program_apply(
+        self,
+        scenario_id: str,
+        scenario_catalog_revision: str,
+        program: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def commit_program_apply(
+        self,
+        preparation: dict[str, Any],
+        expected_applied_record_digest: str | None,
+    ) -> dict[str, Any]: ...
+
+    def applied_program_selection(self) -> dict[str, Any]: ...
 
     def viewer_model_urdf(self) -> ViewerModelAsset: ...
 
@@ -449,6 +468,61 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("scenario_program_selection", scenario_id),
             method="scenario_program_selection",
+        )
+
+    @staticmethod
+    def _canonical_object(value: dict[str, Any], *, label: str) -> str:
+        try:
+            encoded = rfc8785.dumps(value)
+        except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
+            raise HeadlessApiError(
+                "program_apply_request_invalid",
+                f"{label} is not canonically encodable: {exc}",
+            ) from exc
+        if len(encoded) > MAX_PROGRAM_APPLY_REQUEST_BYTES:
+            raise HeadlessApiError(
+                "program_apply_request_oversized",
+                f"{label} exceeds the Program Apply byte bound",
+            )
+        return encoded.decode("utf-8", errors="strict")
+
+    def prepare_program_apply(
+        self,
+        scenario_id: str,
+        scenario_catalog_revision: str,
+        program: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke(
+                "prepare_program_apply",
+                scenario_id,
+                scenario_catalog_revision,
+                self._canonical_object(program, label="Program Apply candidate"),
+            ),
+            method="prepare_program_apply",
+        )
+
+    def commit_program_apply(
+        self,
+        preparation: dict[str, Any],
+        expected_applied_record_digest: str | None,
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke(
+                "commit_program_apply",
+                self._canonical_object(
+                    preparation,
+                    label="Program Apply preparation",
+                ),
+                expected_applied_record_digest,
+            ),
+            method="commit_program_apply",
+        )
+
+    def applied_program_selection(self) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("applied_program_selection"),
+            method="applied_program_selection",
         )
 
     def viewer_model_urdf(self) -> ViewerModelAsset:

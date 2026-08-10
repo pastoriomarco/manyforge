@@ -416,6 +416,9 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
           config_.historian_database_path)),
       retained_bundle_source_(config_.package_root),
       scenario_catalog_source_(config_.package_root, "maintained"),
+      program_apply_owner_(config_.package_root, config_.publication_root,
+                           config_.owner_id + ".program-selection",
+                           config_.owner_epoch),
       node_environment_projection_(config_.package_root,
                                    config_.node_catalog_path),
       source_model_projection_(config_.package_root),
@@ -521,11 +524,11 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
   const auto &active = RequiredMember(manager_payload, "active");
   const auto active_bundle_id = RequiredString(active, "retained_bundle_id");
   const auto active_graph_revision = RequiredString(active, "graph_revision");
-  Require(RequiredBool(manager_payload, "manager_ready") &&
-              RequiredBool(RequiredMember(manager_payload, "runtime"),
-                           "converged"),
-          "scenario_program_selection_unavailable",
-          "Manager has not converged the active retained bundle");
+  Require(
+      RequiredBool(manager_payload, "manager_ready") &&
+          RequiredBool(RequiredMember(manager_payload, "runtime"), "converged"),
+      "scenario_program_selection_unavailable",
+      "Manager has not converged the active retained bundle");
 
   const auto selection = [&]() -> deployment::ScenarioProgramSelection {
     try {
@@ -545,7 +548,7 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
 
   const auto environment = NodeEnvironmentProjectionLocked(runtime);
   Require(RequiredString(environment, "environment_digest") ==
-              selection.node_environment_digest.value() &&
+                  selection.node_environment_digest.value() &&
               RequiredString(environment, "retained_bundle_id") ==
                   selection.retained_bundle_id.value() &&
               RequiredString(environment, "graph_revision") ==
@@ -566,10 +569,10 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
        CanonicalValue(selection.assistant_mode ==
                               deployment::ScenarioAssistantMode::kRequired
                           ? "required"
-                          : selection.assistant_mode ==
-                                    deployment::ScenarioAssistantMode::kOptional
-                                ? "optional"
-                                : "forbidden")},
+                      : selection.assistant_mode ==
+                              deployment::ScenarioAssistantMode::kOptional
+                          ? "optional"
+                          : "forbidden")},
       {"deployment_artifact_id",
        CanonicalValue(selection.deployment_artifact_id.value())},
       {"deployment_revision",
@@ -603,6 +606,71 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
        CanonicalValue(std::string(kScenarioProgramSelectionSchemaVersion))},
       {"typed_parameter_overrides", selection.typed_parameter_overrides},
   });
+}
+
+CanonicalValue HeadlessApiCore::PrepareProgramApply(
+    const std::string_view scenario_id,
+    const std::string_view expected_scenario_catalog_revision,
+    const std::string_view canonical_program_bytes) {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  return program_apply_owner_.Prepare(
+      scenario_id, expected_scenario_catalog_revision, canonical_program_bytes);
+}
+
+CanonicalValue HeadlessApiCore::CommitProgramApply(
+    const std::string_view canonical_preparation_bytes,
+    const std::optional<std::string> &expected_applied_record_digest) {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto runtime = RefreshLocked();
+  const auto &manager_section = RequiredSection(runtime.root, "manager");
+  Require(SectionFresh(manager_section), "program_apply_deployment_not_active",
+          "Program Apply commit requires a fresh Manager owner");
+  const auto &manager_payload = RequiredMember(manager_section, "payload");
+  Require(manager_payload.is_object(), "program_apply_deployment_not_active",
+          "Program Apply commit requires an active Manager selection");
+  const auto &active = RequiredMember(manager_payload, "active");
+  Require(
+      RequiredBool(manager_payload, "manager_ready") &&
+          RequiredBool(RequiredMember(manager_payload, "runtime"), "converged"),
+      "program_apply_deployment_not_active",
+      "Program Apply commit requires one converged Manager selection");
+  return program_apply_owner_.Commit(
+      canonical_preparation_bytes, expected_applied_record_digest,
+      RequiredString(active, "retained_bundle_id"),
+      RequiredString(active, "graph_revision"), clocks_.monotonic_time_ns());
+}
+
+CanonicalValue HeadlessApiCore::AppliedProgramSelection() {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto selection = program_apply_owner_.ReadApplied();
+  const auto runtime = RefreshLocked();
+  const auto &manager_section = RequiredSection(runtime.root, "manager");
+  Require(SectionFresh(manager_section),
+          "program_applied_selection_unavailable",
+          "Applied Program requires a fresh Manager owner");
+  const auto &manager_payload = RequiredMember(manager_section, "payload");
+  Require(manager_payload.is_object(), "program_applied_selection_unavailable",
+          "Applied Program requires an active Manager selection");
+  const auto &active = RequiredMember(manager_payload, "active");
+  Require(RequiredBool(manager_payload, "manager_ready") &&
+              RequiredBool(RequiredMember(manager_payload, "runtime"),
+                           "converged") &&
+              RequiredString(active, "retained_bundle_id") ==
+                  RequiredString(selection, "retained_bundle_id") &&
+              RequiredString(active, "graph_revision") ==
+                  RequiredString(selection, "graph_revision"),
+          "program_applied_selection_not_active",
+          "the last Applied Program does not belong to the fresh active "
+          "Manager selection");
+  const auto environment = NodeEnvironmentProjectionLocked(runtime);
+  Require(RequiredString(environment, "environment_digest") ==
+              RequiredString(selection, "node_environment_digest"),
+          "program_applied_selection_invalid",
+          "Applied Program and active node environment disagree");
+  return selection;
 }
 
 ViewerModelAsset HeadlessApiCore::ViewerModelUrdf() {

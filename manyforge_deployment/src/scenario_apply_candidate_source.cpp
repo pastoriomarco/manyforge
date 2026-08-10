@@ -57,8 +57,8 @@ void Require(const bool condition, const std::string &detail) {
 
 [[nodiscard]] std::size_t
 Utf8CodepointCount(const std::string_view value) noexcept {
-  return static_cast<std::size_t>(std::count_if(
-      value.begin(), value.end(), [](const unsigned char item) {
+  return static_cast<std::size_t>(
+      std::count_if(value.begin(), value.end(), [](const unsigned char item) {
         return (item & 0xc0U) != 0x80U;
       }));
 }
@@ -108,6 +108,42 @@ void ExactMembers(const CanonicalValue &value,
   }
 }
 
+[[nodiscard]] ScenarioDeploymentCompatibilityDTO
+DeploymentCompatibility(const CanonicalValue &row,
+                        const std::string_view path) {
+  const auto compatibility_path =
+      std::string(path) + ".deployment_compatibility";
+  const auto &compatibility = Member(row, "deployment_compatibility", path);
+  ExactMembers(compatibility, {"lane", "provides"}, {}, compatibility_path);
+  ScenarioDeploymentCompatibilityDTO result{
+      .lane = Text(Member(compatibility, "lane", compatibility_path),
+                   compatibility_path + ".lane"),
+      .provides = {},
+  };
+  Require(result.lane == "manyforge-only" || result.lane == "isaac-sim" ||
+              result.lane == "real-robot",
+          "scenario Apply deployment lane is unsupported");
+  const auto &provides =
+      Array(Member(compatibility, "provides", compatibility_path),
+            compatibility_path + ".provides");
+  Require(provides.size() <= kMaxScenarioDeploymentProvides,
+          "scenario Apply deployment provides exceed their bound");
+  result.provides.reserve(provides.size());
+  for (std::size_t index = 0U; index < provides.size(); ++index) {
+    const auto &item =
+        Text(provides[index], compatibility_path + ".provides[]");
+    Require(IsIdentifier(item),
+            "scenario Apply deployment provides contain an invalid ID");
+    result.provides.push_back(item);
+  }
+  Require(
+      std::is_sorted(result.provides.begin(), result.provides.end()) &&
+          std::adjacent_find(result.provides.begin(), result.provides.end()) ==
+              result.provides.end(),
+      "scenario Apply deployment provides are not canonical");
+  return result;
+}
+
 [[nodiscard]] std::filesystem::path ExistingRoot(std::filesystem::path root) {
   Require(!root.empty(), "scenario Apply package root is empty");
   std::error_code error;
@@ -148,8 +184,8 @@ private:
          left.st_ctim.tv_nsec == right.st_ctim.tv_nsec;
 }
 
-[[nodiscard]] std::string ReadExactArtifact(
-    const std::filesystem::path &path, const std::string_view label) {
+[[nodiscard]] std::string ReadExactArtifact(const std::filesystem::path &path,
+                                            const std::string_view label) {
   const FileDescriptor descriptor(
       ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
   Require(descriptor.get() >= 0, std::string(label) + " cannot be opened: " +
@@ -183,9 +219,9 @@ private:
   return bytes;
 }
 
-[[nodiscard]] std::filesystem::path DigestPath(
-    const std::filesystem::path &root, const std::string_view collection,
-    const std::string_view digest) {
+[[nodiscard]] std::filesystem::path
+DigestPath(const std::filesystem::path &root, const std::string_view collection,
+           const std::string_view digest) {
   Require(is_sha256_digest(digest),
           "scenario Program selection contains an invalid digest");
   return root / collection / "sha256" /
@@ -197,8 +233,9 @@ struct VerifiedScenarioCatalog final {
   core::ScenarioCatalogRevision revision;
 };
 
-[[nodiscard]] const CanonicalValue &ExactScenario(
-    const CanonicalValue &catalog, const std::string_view scenario_id) {
+[[nodiscard]] const CanonicalValue &
+ExactScenario(const CanonicalValue &catalog,
+              const std::string_view scenario_id) {
   Require(IsIdentifier(scenario_id), "scenario ID is invalid");
   const auto &rows = Array(Member(catalog, "scenarios", "$"), "$.scenarios");
   const auto found = std::lower_bound(
@@ -255,8 +292,8 @@ VerifyCatalog(const std::string_view bytes) {
     ExactMembers(row,
                  {"scenario_id", "deployment_artifact_id",
                   "deployment_revision", "retained_bundle_id",
-                  "program_binding_id", "assistant_mode",
-                  "typed_parameter_overrides"},
+                  "program_binding_id", "deployment_compatibility",
+                  "assistant_mode", "typed_parameter_overrides"},
                  {"description", "aliases"}, path);
     const auto &scenario_id =
         Text(Member(row, "scenario_id", path), path + ".scenario_id");
@@ -283,14 +320,14 @@ VerifyCatalog(const std::string_view bytes) {
                 (assistant_mode == "required" || assistant_mode == "optional" ||
                  assistant_mode == "forbidden"),
             "scenario Apply catalog row has an invalid closed identity");
+    static_cast<void>(DeploymentCompatibility(row, path));
     static_cast<void>(Object(Member(row, "typed_parameter_overrides", path),
                              path + ".typed_parameter_overrides"));
     if (const auto *description = row.find_object_member("description");
         description != nullptr) {
       const auto &value = Text(*description, path + ".description");
-      Require(!value.empty() &&
-                  Utf8CodepointCount(value) <=
-                      kMaxScenarioPresentationTextCharacters,
+      Require(!value.empty() && Utf8CodepointCount(value) <=
+                                    kMaxScenarioPresentationTextCharacters,
               "scenario Apply catalog description exceeds its bound");
     }
     if (const auto *aliases = row.find_object_member("aliases");
@@ -363,6 +400,19 @@ bool ScenarioApplyCandidateSelection::valid() const noexcept {
 }
 
 bool ScenarioProgramSelection::valid() const noexcept {
+  const bool compatibility_valid =
+      (deployment_compatibility.lane == "manyforge-only" ||
+       deployment_compatibility.lane == "isaac-sim" ||
+       deployment_compatibility.lane == "real-robot") &&
+      deployment_compatibility.provides.size() <=
+          kMaxScenarioDeploymentProvides &&
+      std::all_of(deployment_compatibility.provides.begin(),
+                  deployment_compatibility.provides.end(), IsIdentifier) &&
+      std::is_sorted(deployment_compatibility.provides.begin(),
+                     deployment_compatibility.provides.end()) &&
+      std::adjacent_find(deployment_compatibility.provides.begin(),
+                         deployment_compatibility.provides.end()) ==
+          deployment_compatibility.provides.end();
   return IsIdentifier(scenario_id) &&
          is_sha256_digest(scenario_catalog_revision.value()) &&
          IsIdentifier(deployment_artifact_id.value()) &&
@@ -373,7 +423,7 @@ bool ScenarioProgramSelection::valid() const noexcept {
          IsIdentifier(program_id.value()) &&
          is_sha256_digest(program_revision.value()) &&
          is_sha256_digest(node_environment_digest.value()) &&
-         typed_parameter_overrides.is_object() &&
+         compatibility_valid && typed_parameter_overrides.is_object() &&
          normalized_program_root.is_object() &&
          normalized_program_binding_root.is_object();
 }
@@ -405,12 +455,11 @@ FilesystemScenarioApplyCandidateSource::LoadVerifiedCatalog() const {
 ScenarioProgramSelection
 FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
     const std::string_view scenario_id) const {
-  const auto catalog = VerifyCatalog(
-      ReadExactArtifact(catalog_path_, "scenario catalog"));
+  const auto catalog =
+      VerifyCatalog(ReadExactArtifact(catalog_path_, "scenario catalog"));
   const auto &row = ExactScenario(catalog.root, scenario_id);
-  const auto &row_scenario_id =
-      Text(Member(row, "scenario_id", "$.scenarios[]"),
-           "$.scenarios[].scenario_id");
+  const auto &row_scenario_id = Text(
+      Member(row, "scenario_id", "$.scenarios[]"), "$.scenarios[].scenario_id");
   const core::DeploymentArtifactId deployment_artifact_id(
       Text(Member(row, "deployment_artifact_id", "$.scenarios[]"),
            "$.scenarios[].deployment_artifact_id"));
@@ -423,9 +472,11 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
   const core::ProgramBindingId program_binding_id(
       Text(Member(row, "program_binding_id", "$.scenarios[]"),
            "$.scenarios[].program_binding_id"));
-  const auto assistant_mode = AssistantMode(
-      Text(Member(row, "assistant_mode", "$.scenarios[]"),
-           "$.scenarios[].assistant_mode"));
+  const auto deployment_compatibility =
+      DeploymentCompatibility(row, "$.scenarios[]");
+  const auto assistant_mode =
+      AssistantMode(Text(Member(row, "assistant_mode", "$.scenarios[]"),
+                         "$.scenarios[].assistant_mode"));
   const auto &typed_parameter_overrides =
       Member(row, "typed_parameter_overrides", "$.scenarios[]");
 
@@ -433,8 +484,7 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
   const auto bundle = bundle_source.get_verified(retained_bundle_id);
   Require(bundle != nullptr,
           "scenario retained bundle is absent or unverifiable");
-  Require(bundle->value().deployment_artifact_id ==
-                  deployment_artifact_id &&
+  Require(bundle->value().deployment_artifact_id == deployment_artifact_id &&
               bundle->value().deployment_revision == deployment_revision &&
               bundle->value().compiled_products.symbol_role_maps.size() == 1U,
           "scenario retained bundle differs from its canonical row");
@@ -442,7 +492,8 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
   const auto graph_revision = bundle->value().cell_graph.graph_revision;
   const auto node_environment_digest =
       bundle->value().catalogs.node_environment.environment_digest;
-  const FilesystemVerifiedRetainedModelMapSource model_map_source(package_root_);
+  const FilesystemVerifiedRetainedModelMapSource model_map_source(
+      package_root_);
   const auto model_map = model_map_source.get_verified(RetainedModelMapQuery{
       retained_bundle_id,
       bundle->value().compiled_products.symbol_role_maps.front().product_id,
@@ -451,8 +502,7 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
           "scenario retained model map is absent or unverifiable");
 
   const auto binding_bytes = ReadExactArtifact(
-      DigestPath(package_root_, "program-bindings",
-                 program_binding_id.value()),
+      DigestPath(package_root_, "program-bindings", program_binding_id.value()),
       "scenario Program Binding");
   const auto binding =
       reload_verified_program_binding(binding_bytes, *bundle, *model_map);
@@ -463,10 +513,10 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
                   node_environment_digest,
           "scenario Program Binding differs from its retained closure");
 
-  const auto program_bytes = ReadExactArtifact(
-      DigestPath(package_root_, "programs",
-                 binding->value().program_revision.value()),
-      "scenario Program");
+  const auto program_bytes =
+      ReadExactArtifact(DigestPath(package_root_, "programs",
+                                   binding->value().program_revision.value()),
+                        "scenario Program");
   const auto program = verify_program_binding_contract(program_bytes, *bundle);
   Require(program->value().program_id == binding->value().program_id &&
               program->value().program_revision ==
@@ -494,6 +544,7 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
       .program_id = binding->value().program_id,
       .program_revision = binding->value().program_revision,
       .node_environment_digest = node_environment_digest,
+      .deployment_compatibility = deployment_compatibility,
       .assistant_mode = assistant_mode,
       .typed_parameter_overrides = typed_parameter_overrides,
       .normalized_program_root = program->normalized_program_root(),

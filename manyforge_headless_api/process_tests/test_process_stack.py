@@ -252,6 +252,12 @@ class ProcessStack:
         self.composer.wait(timeout=5)
         self.composer = None
 
+    def kill_api(self) -> None:
+        assert self.api is not None
+        self.api.kill()
+        self.api.wait(timeout=5)
+        self.api = None
+
     def kill_manager(self) -> None:
         assert self.manager is not None
         self.manager.kill()
@@ -384,6 +390,8 @@ def _assistant_callback_body(
             "source_content_digest"
         ],
         "catalogHash": assistant_mode["catalog_hash"],
+        "requestedTools": [],
+        "fieldPolicy": {},
         "inputSchemaHash": tool["input_schema_hash"],
         "draftId": draft["draft_id"],
         "expectedDraftRevision": draft["draft_revision"],
@@ -414,6 +422,14 @@ def _plain_package_files(root: Path) -> dict[str, tuple[int, int]]:
         for path in sorted(root.rglob("*"))
         if path.is_file() and not path.is_symlink()
     }
+
+
+def _sole_retained_program(package_root: Path) -> dict:
+    candidates = sorted((package_root / "programs" / "sha256").glob("*.json"))
+    assert len(candidates) == 1
+    value = json.loads(candidates[0].read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
 
 
 def _owner_identity(runtime: dict, alarms: dict) -> tuple[object, ...]:
@@ -600,6 +616,64 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 "projection_generation"
             ]
             assert _plain_package_files(stack.package_root) == package_before
+
+
+def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
+    tmp_path: Path,
+) -> None:
+    with _assistant_stack(tmp_path) as stack:
+        assert stack.wait_complete(True)["complete"] is True
+        package_before = _plain_package_files(stack.package_root)
+        program = _sole_retained_program(stack.package_root)
+
+        with HeadlessHttpClient(stack.base_url) as client:
+            scenarios = client.scenarios()
+            assert [row["scenario_id"] for row in scenarios["scenarios"]] == [
+                "program_apply_fixture"
+            ]
+            with pytest.raises(HeadlessClientError) as absent:
+                client.program_applied()
+            assert absent.value.code == "program_applied_selection_not_found"
+
+            result = client.program_apply(
+                {
+                    "scenario_id": "program_apply_fixture",
+                    "scenario_catalog_revision": scenarios[
+                        "scenario_catalog_revision"
+                    ],
+                    "program": program,
+                    "expected_applied_record_digest": None,
+                }
+            )
+            assert result["status"] == "applied"
+            assert result["deployment_apply_required"] is False
+            assert result["manager_response"] is None
+            assert result["applied"]["program_revision"] == program[
+                "program_revision"
+            ]
+            first_applied = client.program_applied()
+            assert first_applied == result["applied"]
+
+        stack.kill_api()
+        stack.start_api()
+        stack.wait_complete(True)
+        with HeadlessHttpClient(stack.base_url) as restarted:
+            reopened = restarted.program_applied()
+            assert reopened == first_applied
+            replay = restarted.program_apply(
+                {
+                    "scenario_id": "program_apply_fixture",
+                    "scenario_catalog_revision": scenarios[
+                        "scenario_catalog_revision"
+                    ],
+                    "program": program,
+                    "expected_applied_record_digest": first_applied["source"][
+                        "record_digest"
+                    ],
+                }
+            )
+            assert replay["applied"] == first_applied
+        assert _plain_package_files(stack.package_root) == package_before
 
 
 def test_manager_api_cli_and_replacements_preserve_headless_owners(

@@ -20,6 +20,7 @@ from manyforge_behavior.node_environment import build_node_environment
 from manyforge_composer.backend import headless_ws
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.headless_ws import serve_headless_state
+from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 
@@ -200,8 +201,10 @@ def headless_client() -> (
             )
         )
     )
+    applied_program: dict[str, Any] | None = None
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal applied_program
         body = json.loads(request.content) if request.content else None
         requests.append(
             {
@@ -237,6 +240,52 @@ def headless_client() -> (
             payload = node_environment
         elif path == "/api/source-model":
             payload = source_model
+        elif path == "/api/program/applied":
+            if applied_program is None:
+                return httpx.Response(
+                    404,
+                    json={
+                        "detail": {
+                            "code": "program_applied_selection_not_found",
+                            "message": "no Program has been authoritatively Applied",
+                        }
+                    },
+                    request=request,
+                )
+            payload = applied_program
+        elif path == "/api/program/apply":
+            assert isinstance(body, dict)
+            if body["scenario_id"] == "pending-scenario":
+                return httpx.Response(
+                    202,
+                    json={
+                        "schema_version": "manyforge.program_apply_result.v1",
+                        "status": "pending_deployment",
+                        "deployment_apply_required": True,
+                        "preparation": {},
+                        "manager_response": {"ok": True},
+                        "applied": None,
+                    },
+                    request=request,
+                )
+            program = body["program"]
+            applied_program = {
+                "schema_version": "manyforge.applied_program_selection.v1",
+                "scenario_id": body["scenario_id"],
+                "program_revision": program["program_revision"],
+                "program_binding_id": "sha256:" + "3" * 64,
+                "retained_bundle_id": "sha256:" + "4" * 64,
+                "graph_revision": "sha256:" + "5" * 64,
+                "source": {"record_digest": "sha256:" + "6" * 64},
+            }
+            payload = {
+                "schema_version": "manyforge.program_apply_result.v1",
+                "status": "applied",
+                "deployment_apply_required": False,
+                "preparation": {},
+                "manager_response": None,
+                "applied": applied_program,
+            }
         elif path == "/api/assistant/modes":
             payload = {
                 "schema_version": "manyforge.assistant_mode_index.v1",
@@ -369,9 +418,17 @@ def _composer(client: HeadlessHttpClient) -> TestClient:
 def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
     state = ComposerState.from_paths(
         program_path=str(_PROGRAM_PATH),
+        allowed_fs_roots=[str(_ROOT / "examples")],
         headless_client=client,
     )
-    return TestClient(create_app(state))
+    return TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(_ROOT / "examples")],
+            ),
+        )
+    )
 
 
 def _caller() -> dict[str, Any]:
@@ -682,6 +739,94 @@ def test_program_scene_and_viewer_draft_edits_have_no_runtime_effect(
     )
 
 
+def test_composer_program_apply_advances_only_headless_applied_identity(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        before = composer.get("/api/program/workspace").json()
+        response = composer.post(
+            "/api/program/apply",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+                "scenarioId": "cell-pick",
+                "scenarioCatalogRevision": "sha256:" + "7" * 64,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    workspace = response.json()["workspace"]
+    assert workspace["draft"] == before["draft"]
+    assert workspace["saved"] == before["saved"]
+    assert workspace["applied"]["available"] is True
+    assert workspace["applied"]["matchesDraft"] is True
+    assert workspace["hasUnappliedChanges"] is False
+    forwarded = [
+        request for request in requests if request["path"] == "/api/program/apply"
+    ]
+    assert len(forwarded) == 1
+    assert forwarded[0]["body"]["program"]["program_revision"] == (
+        before["draft"]["programRevision"]
+    )
+    assert forwarded[0]["body"]["expected_applied_record_digest"] is None
+
+
+def test_normative_load_publishes_draft_and_saved_only_after_apply(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        before = composer.get("/api/program/workspace").json()
+        loaded = composer.post(
+            "/api/program/load",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+                "scenarioId": "cell-pick",
+                "scenarioCatalogRevision": "sha256:" + "7" * 64,
+                "path": str(_LOAD_PROGRAM_PATH),
+                "confirmDiscard": True,
+            },
+        )
+
+    assert loaded.status_code == 200, loaded.text
+    workspace = loaded.json()["workspace"]
+    assert workspace["draft"]["draftId"] != before["draft"]["draftId"]
+    assert workspace["saved"]["path"] == str(_LOAD_PROGRAM_PATH.resolve())
+    assert workspace["saved"]["matchesDraft"] is True
+    assert workspace["applied"]["matchesDraft"] is True
+    forwarded = [
+        request for request in requests if request["path"] == "/api/program/apply"
+    ]
+    assert len(forwarded) == 1
+
+
+def test_pending_normative_load_preserves_the_prior_workspace(
+    headless_client,
+) -> None:
+    client, _requests, _node_environment = headless_client
+    with _composer_with_program(client) as composer:
+        before = composer.get("/api/program/workspace").json()
+        pending = composer.post(
+            "/api/program/load",
+            json={
+                "draftId": before["draft"]["draftId"],
+                "expectedDraftRevision": before["draft"]["draftRevision"],
+                "scenarioId": "pending-scenario",
+                "scenarioCatalogRevision": "sha256:" + "7" * 64,
+                "path": str(_LOAD_PROGRAM_PATH),
+                "confirmDiscard": True,
+            },
+        )
+        after = composer.get("/api/program/workspace").json()
+
+    assert pending.status_code == 202
+    assert pending.json()["status"] == "pending_deployment"
+    assert pending.json()["workspace"] == before
+    assert after == before
+
+
 def test_composer_preserves_complete_scene_rejection(
     headless_client,
 ) -> None:
@@ -937,3 +1082,4 @@ def test_composer_does_not_fall_back_when_the_headless_environment_is_lost() -> 
     assert response.json()["detail"]["code"] == "manager_source_unavailable"
 _ROOT = Path(__file__).resolve().parents[2]
 _PROGRAM_PATH = _ROOT / "examples" / "pick_and_place_minimal.program.yaml"
+_LOAD_PROGRAM_PATH = _ROOT / "examples" / "semantic_shape_pick.program.yaml"

@@ -172,6 +172,10 @@ def _write_exact_closure(
                     "deployment_revision": deployment_revision,
                     "retained_bundle_id": retained_bundle_id,
                     "program_binding_id": program_binding_id,
+                    "deployment_compatibility": {
+                        "lane": "manyforge-only",
+                        "provides": ["scene.mutable"],
+                    },
                     "assistant_mode": "forbidden",
                     "typed_parameter_overrides": {"attempts": 2},
                     "description": "Exact v1 pick scenario",

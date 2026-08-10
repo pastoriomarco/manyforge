@@ -182,6 +182,9 @@ int main(int argc, char **argv) {
             .retained_bundle_id = candidate->retained_bundle_id(),
             .program_binding_id =
                 core::ProgramBindingId(candidate->retained_bundle_id().value()),
+            .deployment_compatibility =
+                deployment::ScenarioDeploymentCompatibilityDTO{"manyforge-only",
+                                                               {}},
             .assistant_mode = deployment::ScenarioAssistantMode::kForbidden,
             .typed_parameter_overrides = deployment::CanonicalValue(
                 deployment::CanonicalValue::Object{}),

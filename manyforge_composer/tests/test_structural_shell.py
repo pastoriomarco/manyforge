@@ -93,7 +93,6 @@ def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None
         ("patch", "/api/scene/state"),
         ("delete", "/api/scene/state"),
         ("get", "/api/nodes"),
-        ("post", "/api/program/load"),
         ("get", "/api/execution/history"),
         ("get", "/api/robot-lifecycle/status"),
         ("get", "/api/scene/viewer/status"),
@@ -108,7 +107,7 @@ def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None
         )
 
 
-def test_program_workspace_is_available_without_restoring_load_apply_or_run() -> None:
+def test_program_workspace_is_available_while_effectful_actions_need_headless() -> None:
     empty = _client().get("/api/program/draft")
     assert empty.status_code == 200
     assert empty.json()["program_loaded"] is False
@@ -133,6 +132,20 @@ def test_program_workspace_is_available_without_restoring_load_apply_or_run() ->
     assert loaded.json()["saved"] is True
     assert loaded.json()["applied"] is False
 
+    unavailable_apply = TestClient(create_app(state)).post(
+        "/api/program/apply",
+        json={
+            "draftId": state.draft_session.draft_id,
+            "expectedDraftRevision": state.draft_session.revision,
+            "scenarioId": "cell-pick",
+            "scenarioCatalogRevision": "sha256:" + "a" * 64,
+        },
+    )
+    assert unavailable_apply.status_code == 503
+    assert unavailable_apply.json()["detail"]["code"] == (
+        "program_apply_unavailable"
+    )
+
 
 def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> None:
     state = ComposerState(headless_client=object())  # type: ignore[arg-type]
@@ -153,9 +166,9 @@ def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> Non
         content=b"x" * (1024 * 1024 + 1),
         headers={"content-type": "application/json"},
     )
-    assert retained_route.status_code == 503
+    assert retained_route.status_code == 413
     assert retained_route.json()["detail"]["code"] == (
-        "composable_cell_runtime_unavailable"
+        "composer_request_body_oversized"
     )
 
 

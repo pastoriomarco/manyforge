@@ -161,7 +161,7 @@ def test_dirty_open_confirmation_and_rotated_identity_are_fail_closed(
     assert stale.json()["detail"]["code"] == "composer_draft_id_stale"
 
 
-def test_routes_reject_unsupported_mutation_malformed_body_and_legacy_load(
+def test_routes_reject_unsupported_mutation_malformed_body_and_unavailable_load(
     tmp_path: Path,
 ) -> None:
     client = _client(tmp_path)
@@ -189,10 +189,7 @@ def test_routes_reject_unsupported_mutation_malformed_body_and_legacy_load(
     )
     assert malformed.status_code == 422
     legacy_load = client.post("/api/program/load", json={})
-    assert legacy_load.status_code == 503
-    assert legacy_load.json()["detail"]["code"] == (
-        "composable_cell_runtime_unavailable"
-    )
+    assert legacy_load.status_code == 422
     invalid_save_as = client.post(
         "/api/program/save-as",
         json={**_fence(workspace), "path": "/", "confirmOverwrite": False},

@@ -408,11 +408,19 @@ class ComposerDraftSession:
         with self._lock:
             return self._snapshot_locked()
 
-    def workspace_snapshot(self) -> dict[str, Any]:
-        """Project Draft and Saved identity without inventing Applied truth."""
+    def workspace_snapshot(
+        self,
+        *,
+        applied_program_revision: str | None = None,
+        applied_unavailable_reason: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Project Draft/Saved plus one externally owned Applied identity."""
 
         with self._lock:
-            return self._workspace_snapshot_locked()
+            return self._workspace_snapshot_locked(
+                applied_program_revision=applied_program_revision,
+                applied_unavailable_reason=applied_unavailable_reason,
+            )
 
     def validate(self, catalog: NodeCatalog) -> dict[str, Any]:
         """Revalidate the complete Draft against one exact active catalog."""
@@ -458,9 +466,28 @@ class ComposerDraftSession:
             and self._program.program_revision == self._saved_program_revision
         )
 
-    def _workspace_snapshot_locked(self) -> dict[str, Any]:
+    def _workspace_snapshot_locked(
+        self,
+        *,
+        applied_program_revision: str | None = None,
+        applied_unavailable_reason: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         program = self._program
         matches_saved = self._matches_saved_locked()
+        applied_available = applied_program_revision is not None
+        matches_applied = (
+            program is not None
+            and applied_program_revision is not None
+            and program.program_revision == applied_program_revision
+        )
+        unavailable_reason = applied_unavailable_reason or {
+            "code": "program_apply_unavailable",
+            "message": (
+                "authoritative Program Apply is unavailable until the "
+                "N7 native-product gate"
+            ),
+            "restorationGates": ["N7"],
+        }
         return {
             "schemaVersion": _WORKSPACE_API_VERSION,
             "draft": {
@@ -479,20 +506,17 @@ class ComposerDraftSession:
                 "programRevision": self._saved_program_revision,
             },
             "applied": {
-                "available": False,
-                "matchesDraft": None,
-                "programRevision": None,
-                "unavailableReason": {
-                    "code": "program_apply_unavailable",
-                    "message": (
-                        "authoritative Program Apply is unavailable until the "
-                        "N7 native-product gate"
-                    ),
-                    "restorationGates": ["N7"],
-                },
+                "available": applied_available,
+                "matchesDraft": matches_applied if applied_available else None,
+                "programRevision": applied_program_revision,
+                "unavailableReason": None if applied_available else unavailable_reason,
             },
             "hasUnsavedChanges": program is not None and not matches_saved,
-            "hasUnappliedChanges": None,
+            "hasUnappliedChanges": (
+                program is not None and not matches_applied
+                if applied_available
+                else None
+            ),
         }
 
     def _require_identity_locked(
@@ -591,6 +615,72 @@ class ComposerDraftSession:
             self._saved_path = str(Path(source_path).resolve())
             self._saved_program_revision = program.program_revision
             return self._workspace_snapshot_locked()
+
+    def apply_current_program(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+        applier: Callable[[Program], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Apply one exact Draft while preventing a concurrent relabeling race."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+            if self._program is None:
+                _error(
+                    "composer_draft_unavailable",
+                    "Composer has no loaded Program Draft",
+                    status_code=404,
+                )
+            return applier(self._program)
+
+    def load_and_apply_program(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+        discard_changes: bool,
+        current_applied_program_revision: str | None,
+        loader: Callable[[], tuple[Program, str]],
+        applier: Callable[[Program], dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Run normative Load under one Draft fence; publish locally last."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
+            has_unapplied_changes = (
+                self._program is not None
+                and self._program.program_revision
+                != current_applied_program_revision
+            )
+            if (
+                self._program is not None
+                and (not self._matches_saved_locked() or has_unapplied_changes)
+                and not discard_changes
+            ):
+                _error(
+                    "composer_draft_discard_confirmation_required",
+                    "loading another Program would discard unsaved or unapplied "
+                    "Draft changes",
+                    status_code=409,
+                )
+            program, source_path = loader()
+            result = applier(program)
+            self._draft_id = f"draft-{uuid.uuid4().hex}"
+            self._program = program
+            self._revision = 1
+            self._saved_path = str(Path(source_path).resolve())
+            self._saved_program_revision = program.program_revision
+            return result, self._workspace_snapshot_locked(
+                applied_program_revision=program.program_revision,
+            )
 
     def save_program(
         self,

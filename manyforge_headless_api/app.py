@@ -19,6 +19,7 @@ from .models import (
     AcknowledgeAllAlarmsRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
+    ProgramApplyRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -30,6 +31,7 @@ from .models import (
 from .native import (
     HeadlessApiConfig,
     HeadlessApiError,
+    MAX_PROGRAM_APPLY_REQUEST_BYTES,
     NativeHeadlessCore,
     ViewerModelAsset,
 )
@@ -57,14 +59,24 @@ class TrustedPrincipalAdapter(Protocol):
 class RequestBodyLimitMiddleware:
     """Bound and replay one request body before downstream JSON decoding."""
 
-    def __init__(self, app: ASGIApp, *, maximum_bytes: int) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        maximum_bytes: int,
+        path_maximum_bytes: dict[str, int] | None = None,
+    ) -> None:
         self.app = app
         self.maximum_bytes = maximum_bytes
+        self.path_maximum_bytes = path_maximum_bytes or {}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        maximum_bytes = self.path_maximum_bytes.get(
+            str(scope.get("path", "")), self.maximum_bytes
+        )
         headers = dict(scope.get("headers", ()))
         raw_length = headers.get(b"content-length")
         if raw_length is not None:
@@ -73,7 +85,7 @@ class RequestBodyLimitMiddleware:
             except ValueError:
                 await self._reject(scope, receive, send)
                 return
-            if declared < 0 or declared > self.maximum_bytes:
+            if declared < 0 or declared > maximum_bytes:
                 await self._reject(scope, receive, send)
                 return
 
@@ -87,7 +99,7 @@ class RequestBodyLimitMiddleware:
             if message["type"] != "http.request":
                 continue
             body.extend(message.get("body", b""))
-            if len(body) > self.maximum_bytes:
+            if len(body) > maximum_bytes:
                 await self._reject(scope, receive, send)
                 return
             if not message.get("more_body", False):
@@ -125,6 +137,8 @@ class RequestBodyLimitMiddleware:
 
 
 def _error_status(code: str) -> int:
+    if code == "program_apply_request_oversized":
+        return 413
     if code in {
         "headless_projection_response_invalid",
         "headless_projection_response_oversized",
@@ -133,8 +147,17 @@ def _error_status(code: str) -> int:
         "execution_command_response_invalid",
         "execution_command_response_identity_mismatch",
         "node_environment_projection_invalid",
+        "program_apply_active_selection_invalid",
+        "program_apply_baseline_binding_invalid",
+        "program_apply_bundle_invalid",
+        "program_apply_compilation_invalid",
+        "program_apply_expected_selection_invalid",
+        "program_apply_preparation_invalid",
+        "program_apply_repository_invalid",
         "source_model_projection_invalid",
         "scenario_catalog_projection_invalid",
+        "program_apply_response_invalid",
+        "program_applied_selection_invalid",
         "viewer_model_asset_invalid",
         "assistant_mode_projection_invalid",
     }:
@@ -148,6 +171,7 @@ def _error_status(code: str) -> int:
         return 404
     if "conflict" in code or "stale" in code or "fence" in code or code in {
         "object_already_exists",
+        "program_apply_deployment_not_active",
         "scene_projection_transition_in_progress",
     }:
         return 409
@@ -158,6 +182,7 @@ def _error_status(code: str) -> int:
             "headless_request_ledger_full",
             "kernel_owner_unavailable",
             "operator_alarm_state_unavailable",
+            "program_applied_selection_not_active",
             "request_ledger_full",
             "scene_projection_commit_uncertain",
         }
@@ -257,7 +282,13 @@ def create_app(
     maximum_body = (
         config.maximum_request_body_bytes if config is not None else 1024 * 1024
     )
-    app.add_middleware(RequestBodyLimitMiddleware, maximum_bytes=maximum_body)
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        maximum_bytes=maximum_body,
+        path_maximum_bytes={
+            "/api/program/apply": MAX_PROGRAM_APPLY_REQUEST_BYTES,
+        },
+    )
 
     @app.middleware("http")
     async def request_identity(request: Request, call_next):
@@ -315,6 +346,24 @@ def create_app(
     @app.get("/api/scenarios")
     def scenarios() -> dict[str, Any]:
         return service.scenarios()
+
+    @app.get("/api/program/applied")
+    def program_applied() -> dict[str, Any]:
+        return service.program_applied()
+
+    @app.post("/api/program/apply")
+    def program_apply(request: ProgramApplyRequest) -> JSONResponse:
+        response = service.program_apply(request)
+        status = response.get("status")
+        if status not in {"applied", "pending_deployment"}:
+            raise HeadlessApiError(
+                "program_apply_response_invalid",
+                "Program Apply returned an unsupported status",
+            )
+        return JSONResponse(
+            status_code=200 if status == "applied" else 202,
+            content=response,
+        )
 
     def viewer_asset_response(asset: ViewerModelAsset) -> Response:
         cache_control = (

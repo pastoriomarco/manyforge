@@ -108,10 +108,10 @@ AlarmCallerAttribution Caller(std::string request_id = "request.1",
           "principal.operator"};
 }
 
-HeadlessApiCoreConfig Config(const TemporaryDirectory &directory,
-                             std::string owner_epoch,
-                             std::filesystem::path package_root =
-                                 MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT) {
+HeadlessApiCoreConfig
+Config(const TemporaryDirectory &directory, std::string owner_epoch,
+       std::filesystem::path package_root =
+           MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT) {
   return {
       directory.publications(),
       std::move(package_root),
@@ -147,29 +147,26 @@ HeadlessApiCoreClocks Clocks() {
   };
 }
 
-CanonicalValue ManagerPayload() {
-  const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
-      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  const auto admission = source.load_verified();
+CanonicalValue ManagerPayloadFor(const deployment::RetainedBundle &bundle) {
   const auto *cell_graph =
-      admission.retained_bundle().normalized_root().find_object_member(
-          "cell_graph");
+      bundle.normalized_root().find_object_member("cell_graph");
   if (cell_graph == nullptr || !cell_graph->is_object()) {
-    throw std::runtime_error("canonical test admission has no cell graph");
+    throw std::runtime_error("test retained bundle has no cell graph");
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"active", CanonicalValue(CanonicalValue::Object{
-                     {"cell_graph", *cell_graph},
-                     {"graph_revision",
-                      CanonicalValue(admission.graph_revision().value())},
-                     {"publication", CanonicalValue(CanonicalValue::Object{})},
-                     {"retained_bundle_id",
-                      CanonicalValue(admission.retained_bundle_id().value())},
-                 })},
+      {"active",
+       CanonicalValue(CanonicalValue::Object{
+           {"cell_graph", *cell_graph},
+           {"graph_revision",
+            CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
+           {"publication", CanonicalValue(CanonicalValue::Object{})},
+           {"retained_bundle_id",
+            CanonicalValue(bundle.retained_bundle_id().value())},
+       })},
       {"api_version",
        CanonicalValue(std::string(kManagerSourcePayloadApiVersion))},
       {"apply", CanonicalValue(CanonicalValue::Object{})},
-      {"cell_id", CanonicalValue(std::string(kCellId))},
+      {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
       {"manager_ready", CanonicalValue(true)},
       {"runtime",
        CanonicalValue(CanonicalValue::Object{
@@ -178,6 +175,12 @@ CanonicalValue ManagerPayload() {
            {"observed_units", CanonicalValue(CanonicalValue::Array{})},
        })},
   });
+}
+
+CanonicalValue ManagerPayload() {
+  const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
+      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  return ManagerPayloadFor(source.load_verified().retained_bundle());
 }
 
 CanonicalValue LogicalScenePayload() {
@@ -469,14 +472,16 @@ TEST(HeadlessApiCore,
           .deployment_revision = core::DeploymentRevision(Digest('1')),
           .retained_bundle_id = core::RetainedBundleId(Digest('2')),
           .program_binding_id = core::ProgramBindingId(Digest('3')),
+          .deployment_compatibility =
+              deployment::ScenarioDeploymentCompatibilityDTO{"manyforge-only",
+                                                             {}},
           .assistant_mode = deployment::ScenarioAssistantMode::kForbidden,
-          .typed_parameter_overrides =
-              CanonicalValue(CanonicalValue::Object{}),
+          .typed_parameter_overrides = CanonicalValue(CanonicalValue::Object{}),
       },
   });
   {
-    deployment::FilesystemScenarioCatalogRepository repository(
-        directory.path(), "maintained");
+    deployment::FilesystemScenarioCatalogRepository repository(directory.path(),
+                                                               "maintained");
     ASSERT_EQ(repository.compare_and_set(std::nullopt, catalog),
               deployment::ScenarioCatalogPublishResult::kPublished);
   }
@@ -502,6 +507,43 @@ TEST(HeadlessApiCore,
     EXPECT_NE(std::string(error.what()).find("exact canonical"),
               std::string::npos);
   }
+}
+
+TEST(HeadlessApiCore,
+     ProgramApplyDependsOnFreshManagerButNotUnrelatedSceneAvailability) {
+  TemporaryDirectory directory;
+  const auto package = directory.path() / "program-apply-package";
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT, package,
+                        std::filesystem::copy_options::recursive);
+  const deployment::FilesystemScenarioApplyCandidateSource scenarios(
+      package, "maintained");
+  const auto selection =
+      scenarios.LoadExactProgramSelection("program_apply_fixture");
+  const deployment::FilesystemVerifiedRetainedBundleSource bundles(package);
+  const auto bundle = bundles.get_verified(selection.retained_bundle_id);
+  ASSERT_NE(bundle, nullptr);
+
+  AtomicSourceSnapshotChannel manager(directory.publications(),
+                                      "manager-source.json");
+  const auto cell_id = bundle->value().cell_graph.cell_id.value();
+  static_cast<void>(
+      manager.Publish("component_manager", "component-manager." + cell_id,
+                      "manager.epoch.1", 1, ManagerPayloadFor(*bundle)));
+
+  auto config = Config(directory, "api.epoch.1", package);
+  config.cell_id = cell_id;
+  HeadlessApiCore core(std::move(config), Clocks());
+  EXPECT_FALSE(
+      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+
+  const auto prepared = core.PrepareProgramApply(
+      selection.scenario_id, selection.scenario_catalog_revision.value(),
+      content_identity::canonical_json(selection.normalized_program_root));
+  const auto applied = core.CommitProgramApply(
+      content_identity::canonical_json(prepared), std::nullopt);
+  EXPECT_EQ(Text(applied, "program_revision"),
+            selection.program_revision.value());
+  EXPECT_EQ(core.AppliedProgramSelection(), applied);
 }
 
 TEST(HeadlessApiCore, ServesOnlyTheExactVerifiedActiveRetainedViewerProduct) {
