@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <map>
 #include <mutex>
@@ -39,21 +40,22 @@ struct RetainedCollisionWorldPublicationContext final {
 /// immutable bundle. Failed projection leaves the prior publication intact.
 class RetainedCollisionWorldPublisher final
     : public core::ICollisionWorldSnapshotPublisher {
- public:
+public:
+  using Clock = std::function<std::int64_t()>;
+
   static constexpr std::size_t kDefaultLedgerCapacity = 32U;
   static constexpr std::size_t kRuntimeRetirementCapacity = 64U;
 
   [[nodiscard]] static core::Result<
       std::shared_ptr<RetainedCollisionWorldPublisher>>
-  create(RetainedCollisionWorldProjector projector,
-         std::string publisher_id,
-         const core::LogicalSceneSnapshotDTO& initial_scene,
-         RetainedCollisionWorldPublicationContext initial_context,
+  create(RetainedCollisionWorldProjector projector, std::string publisher_id,
+         const core::LogicalSceneSnapshotDTO &initial_scene,
+         RetainedCollisionWorldPublicationContext initial_context, Clock clock,
          std::size_t ledger_capacity = kDefaultLedgerCapacity);
 
-  [[nodiscard]] core::Result<core::CollisionWorldRevision> publish(
-      const core::LogicalSceneSnapshotDTO& logical_scene,
-      RetainedCollisionWorldPublicationContext context);
+  [[nodiscard]] core::Result<core::CollisionWorldRevision>
+  publish(const core::LogicalSceneSnapshotDTO &logical_scene,
+          RetainedCollisionWorldPublicationContext context);
 
   /// Reserve one process-local collision-world revision for an immutable
   /// owner-private candidate. The candidate is not published, but consuming
@@ -62,9 +64,9 @@ class RetainedCollisionWorldPublisher final
   [[nodiscard]] core::Result<std::uint64_t>
   reserve_private_collision_world_revision();
 
-  [[nodiscard]] std::vector<core::CollisionWorldLedgerEntry> recent_ledger(
-      std::size_t limit = 0U) const;
-  [[nodiscard]] const collision::ManyForgeCollisionEngine::SharedModelPtr&
+  [[nodiscard]] std::vector<core::CollisionWorldLedgerEntry>
+  recent_ledger(std::size_t limit = 0U) const;
+  [[nodiscard]] const collision::ManyForgeCollisionEngine::SharedModelPtr &
   collision_shared_model() const noexcept {
     return projector_.shared_model();
   }
@@ -80,29 +82,39 @@ class RetainedCollisionWorldPublisher final
   current_scene_snapshot_lease_inventory() const override;
   [[nodiscard]] std::optional<core::CollisionWorldLeaseInventory>
   retain_scene_snapshot_lease_inventory(
-      core::ProjectionLeaseId projection_lease_id =
-          core::ProjectionLeaseId{std::string{}}) override;
+      core::ProjectionLeaseId projection_lease_id = core::ProjectionLeaseId{
+          std::string{}}) override;
+  /// Retain with an owner-captured monotonic timestamp without reading the
+  /// publisher clock a second time. This changes only lease age; per-object
+  /// source timestamps remain immutable projection evidence.
+  [[nodiscard]] std::optional<core::CollisionWorldLeaseInventory>
+  retain_scene_snapshot_lease_inventory_at(
+      core::ProjectionLeaseId projection_lease_id, std::int64_t captured_at_ns);
   void release_scene_snapshot_lease_inventory(
-      const core::ProjectionLeaseId& projection_lease_id) override;
+      const core::ProjectionLeaseId &projection_lease_id) override;
   [[nodiscard]] core::CollisionWorldLeaseRetentionStats
   scene_snapshot_lease_retention_stats() const override;
   [[nodiscard]] core::RuntimeCollisionQueryBundlePtr
   published_runtime_collision_query_bundle() const override;
 
- private:
-  RetainedCollisionWorldPublisher(
-      RetainedCollisionWorldProjector projector,
-      std::string publisher_id,
-      std::size_t ledger_capacity);
+private:
+  RetainedCollisionWorldPublisher(RetainedCollisionWorldProjector projector,
+                                  std::string publisher_id, Clock clock,
+                                  std::size_t ledger_capacity);
+
+  [[nodiscard]] std::optional<core::CollisionWorldLeaseInventory>
+  retain_scene_snapshot_lease_inventory_locked(
+      core::ProjectionLeaseId projection_lease_id, std::int64_t captured_at_ns);
 
   [[nodiscard]] core::Result<core::CollisionWorldRevision>
-  publish_locked(const core::LogicalSceneSnapshotDTO& logical_scene,
+  publish_locked(const core::LogicalSceneSnapshotDTO &logical_scene,
                  RetainedCollisionWorldPublicationContext context);
-  [[nodiscard]] bool retire_and_swap_locked(
-      core::RuntimeCollisionQueryBundlePtr next);
+  [[nodiscard]] bool
+  retire_and_swap_locked(core::RuntimeCollisionQueryBundlePtr next);
 
   RetainedCollisionWorldProjector projector_;
   std::string publisher_id_;
+  Clock clock_;
   std::size_t ledger_capacity_;
 
   mutable std::mutex writer_mutex_;

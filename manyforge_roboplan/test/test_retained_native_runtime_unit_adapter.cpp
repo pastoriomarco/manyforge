@@ -327,6 +327,39 @@ NativeProjectionBinding(const NativeFixture &fixture,
   };
 }
 
+[[nodiscard]] std::vector<core::ProjectionNativeRuntimeBindingDTO>
+NativeProjectionBindings(const NativeFixture &fixture,
+                         const core::RuntimeEpoch &runtime_epoch) {
+  std::vector<core::ProjectionNativeRuntimeBindingDTO> result;
+  for (const auto &binding :
+       fixture.bundle->value().capability_provider_bindings) {
+    if (!core::RequiresNativeSceneProjection(
+            binding.capability_id, binding.capability_definition_revision)) {
+      continue;
+    }
+    const bool belongs_to_runtime = std::any_of(
+        binding.endpoint_bindings.begin(), binding.endpoint_bindings.end(),
+        [&](const auto &endpoint) {
+          const auto *runtime_unit =
+              std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+          return endpoint.source_kind ==
+                     core::CapabilityEndpointSourceKind::kRuntimeUnit &&
+                 runtime_unit != nullptr &&
+                 *runtime_unit == fixture.query->plan.runtime_unit_id;
+        });
+    if (belongs_to_runtime) {
+      result.push_back({binding.capability_provider_binding_id,
+                        binding.capability_provider_binding_revision,
+                        fixture.query->plan.runtime_unit_id, runtime_epoch});
+    }
+  }
+  if (result.empty()) {
+    throw std::logic_error(
+        "native adapter fixture has no projection provider bindings");
+  }
+  return result;
+}
+
 [[nodiscard]] core::ConfigurationFenceScopeDTO
 PhysicalConfigurationScope(const NativeFixture &fixture) {
   const auto &graph = fixture.bundle->value().cell_graph;
@@ -645,6 +678,30 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       core::BootstrapGeneration(1U), binding, initial_revision};
   EXPECT_EQ(resolved.value()->BootstrapProjectionStatus(bootstrap_query).state,
             core::NativeProjectionBootstrapStatusState::kAbsent);
+  // Prepare every projection required by the retained product before the
+  // joint-goal projection makes the active composition buildable. This keeps
+  // the asynchronous child from observing a partially initialized provider
+  // set as a stale active composition.
+  for (const auto &required_binding :
+       NativeProjectionBindings(fixture, first_epoch)) {
+    if (required_binding == binding) {
+      continue;
+    }
+    const auto required = adapter.ResolveProjection(required_binding);
+    ASSERT_TRUE(required.ok()) << required.error().message;
+    const core::NativeProjectionBootstrapRebuildDTO required_request{
+        bootstrap_query.bootstrap_id,
+        bootstrap_query.bootstrap_generation,
+        required_binding,
+        initial_revision,
+        fixture.bundle->value().compiled_products.planning_collision_model,
+        initial_scene};
+    const auto required_result =
+        required.value()->RebuildBootstrapProjection(required_request);
+    ASSERT_TRUE(required_result.presence_valid());
+    EXPECT_TRUE(
+        required_result.resulting_health.healthy_for_target(initial_revision));
+  }
   const core::NativeProjectionBootstrapRebuildDTO bootstrap_request{
       bootstrap_query.bootstrap_id,
       bootstrap_query.bootstrap_generation,
@@ -670,8 +727,18 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       "manager-runtime-physical-admission-test");
   const core::ConfigurationFenceAdmissionQueryDTO admission_query{
       physical_scope, manager_epoch};
-  const auto admission = adapter.ObserveAdmission(admission_query);
+  auto admission = adapter.ObserveAdmission(admission_query);
+  const auto admission_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (admission.active_control_configurations.size() !=
+             physical_scope.domains.size() &&
+         std::chrono::steady_clock::now() < admission_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    admission = adapter.ObserveAdmission(admission_query);
+  }
   ASSERT_TRUE(admission.matches(admission_query));
+  ASSERT_EQ(admission.active_control_configurations.size(),
+            physical_scope.domains.size());
   EXPECT_EQ(admission.active_projection_revision, initial_revision);
   EXPECT_EQ(admission.operation_resource_generation, 0U);
   EXPECT_EQ(admission.affected_queued_operation_count, 0U);
@@ -892,6 +959,25 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_EQ(
       replacement_client.value()->ProjectionHealth().native_runtime_binding,
       replacement);
+  for (const auto &required_binding : NativeProjectionBindings(
+           fixture, core::RuntimeEpoch(restarted.process_incarnation()))) {
+    if (required_binding == replacement) {
+      continue;
+    }
+    const auto required = adapter.ResolveProjection(required_binding);
+    ASSERT_TRUE(required.ok()) << required.error().message;
+    const core::NativeProjectionRebuildDTO required_rebuild{
+        required_binding,
+        candidate_revision,
+        fixture.bundle->value().compiled_products.planning_collision_model,
+        candidate_scene_root.shared(),
+    };
+    const auto required_result =
+        required.value()->RebuildProjection(required_rebuild);
+    ASSERT_TRUE(required_result.presence_valid());
+    EXPECT_TRUE(required_result.resulting_health.healthy_for_target(
+        candidate_revision));
+  }
   const core::NativeProjectionRebuildDTO replacement_rebuild{
       replacement,
       candidate_revision,

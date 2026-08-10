@@ -2027,6 +2027,12 @@ class ProgramAssistantPort:
         task: _Task,
         reason_code: str,
     ) -> Mapping[str, Any]:
+        # This is an architectural availability gate, not a model-runtime
+        # failure.  It must fail the pre-I9 run without converting the
+        # Program's historical pause-for-operator policy into a permanent
+        # condition-failure policy for all future model errors.
+        if reason_code == "model_snapshot_image_unavailable_until_i9":
+            return {}
         parameter: str | None = None
         if task.node_id == "assistant.query_model":
             parameter = (

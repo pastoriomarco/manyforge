@@ -31,12 +31,14 @@ _LAUNCH_UNAVAILABLE_MESSAGE = (
     "orchestration remain at their later gates."
 )
 _BENCHMARK_UNAVAILABLE_MESSAGE = (
-    "composable_cell_runtime_unavailable: native benchmark execution returns "
-    "at I6/N and participates in I8/P5 regression qualification."
+    "composable_cell_runtime_unavailable: the addressed native benchmark "
+    "requires the build-qualified N7 process fixture; run its RoboPlan process "
+    "test in Docker."
 )
-_COLLISION_MAPPER_UNAVAILABLE_MESSAGE = (
-    "composable_cell_collision_mapper_probe_unavailable: exact symbol/body "
-    "lookup performance returns at I3/C1 and I6/N"
+_COLLISION_LOOKUP_DOCKER_MESSAGE = (
+    "composable_cell_collision_lookup_probe_requires_docker: rerun with "
+    "--in-container and MANYFORGE_BUILD_DIR set to an already qualified "
+    "RoboPlan build"
 )
 
 
@@ -137,7 +139,7 @@ def test_direct_benchmark_entrypoint_fails_before_product_import(
     assert not marker.exists()
 
 
-def test_collision_mapper_perf_tombstone_is_directly_executable() -> None:
+def test_collision_lookup_perf_successor_is_docker_only_and_executable() -> None:
     assert _COLLISION_MAPPER_PERF.stat().st_mode & 0o111 == 0o111
 
     completed = subprocess.run(
@@ -148,9 +150,12 @@ def test_collision_mapper_perf_tombstone_is_directly_executable() -> None:
         check=False,
     )
 
-    assert completed.returncode == 78
+    assert completed.returncode == 64
     assert completed.stdout == ""
-    assert completed.stderr.strip() == _COLLISION_MAPPER_UNAVAILABLE_MESSAGE
+    assert completed.stderr.strip() == _COLLISION_LOOKUP_DOCKER_MESSAGE
+    source = _COLLISION_MAPPER_PERF.read_text(encoding="utf-8")
+    assert "CompilerEmittedSymbolAndBodyLookupPerformanceStaysBounded" in source
+    assert "perf_collision_mapper" not in source
 
 
 def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:

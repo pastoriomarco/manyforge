@@ -25,7 +25,10 @@ from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.app import TrustedPrincipal, create_app
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
-from manyforge_headless_api.models import OperationIntentRequest
+from manyforge_headless_api.models import (
+    OperationControlRequest,
+    OperationIntentRequest,
+)
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
 
@@ -255,6 +258,67 @@ def _wait_terminal(
             return last
         time.sleep(0.01)
     raise RuntimeError(f"operation did not reach a terminal state: {last}")
+
+
+def _run_native_benchmark_move(
+    client: ExecutionCommandClient,
+    *,
+    request_id: str,
+    positions_rad: list[float],
+    cache_mode: str,
+    move_id: str | None = None,
+) -> float:
+    """Measure one complete addressed plan/execute/release cycle."""
+
+    status = client.status()["status"]
+    operation = _direct_control_joint_operation(
+        status,
+        request_id=request_id,
+        positions_rad=positions_rad,
+    )
+    payload = operation["participants"][0]["payload"]
+    payload["cache_mode"] = cache_mode
+    if move_id is not None:
+        payload["move_id"] = move_id
+    request = OperationIntentRequest.model_validate(operation)
+
+    started_at = time.perf_counter()
+    accepted = client.submit(request, trusted_principal_id=None)
+    assert accepted["ok"] is True, accepted
+    operation_id = accepted["accepted"]["operation_id"]
+    deadline = time.monotonic() + 5.0
+    terminal: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        terminal = client.read(operation_id)
+        projection = terminal.get("operation")
+        if isinstance(projection, dict) and projection.get("state") in TERMINAL_STATES:
+            break
+        time.sleep(0.005)
+    elapsed_seconds = time.perf_counter() - started_at
+    projection = terminal.get("operation")
+    assert isinstance(projection, dict), terminal
+    assert projection["state"] == "completed", terminal
+
+    released = client.acknowledge_completed(
+        OperationControlRequest.model_validate(
+            {
+                "request_context": {
+                    "request_id": f"ack-{request_id}",
+                    "request_owner_epoch": status["owner_epoch"],
+                    "source_label": "n7_b_native_benchmark",
+                    "correlation_id": "n7-b-historical-benchmark",
+                },
+                "operation_id": operation_id,
+                "expected_operation_revision": projection[
+                    "operation_revision"
+                ],
+                "reason": "release completed N7 benchmark operation",
+            }
+        ),
+        trusted_principal_id=None,
+    )
+    assert released["ok"] is True, released
+    return elapsed_seconds
 
 
 def _wait_state(
@@ -1425,6 +1489,18 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             "transport": "http",
         }
 
+        # N7-b exercises the largest maintained page through the real
+        # SOCK_SEQPACKET boundary. The preceding maintained workflow has
+        # produced more than one page; this is not a synthetic event source.
+        largest_page = native.events(
+            first_status["owner_epoch"], 0, limit=16
+        )
+        assert len(largest_page["events"]) == 16
+        assert largest_page["has_more"] is True
+        assert largest_page["next_after_sequence"] == largest_page["events"][-1][
+            "sequence"
+        ]
+
         _stop_host(process)
         process = _start_host(
             fixture_root, execution_root, staging_root, manifest
@@ -1441,6 +1517,138 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         _stop_host(process)
         raw_composer.close()
         raw_api.close()
+
+
+def test_addressed_native_benchmark_preserves_historical_measurements(
+    tmp_path: Path,
+) -> None:
+    """Restore the three historical benchmark meanings on the N7 route."""
+
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_root = tmp_path / "execution"
+    staging_root = tmp_path / "staging"
+    execution_root.mkdir()
+    staging_root.mkdir()
+    process = _start_host(
+        fixture_root, execution_root, staging_root, manifest
+    )
+    native = ExecutionCommandClient(execution_root, timeout_seconds=5.0)
+
+    goal_a = [0.1, -0.5, 0.5, -0.5, -0.5, 0.0]
+    goal_b = [0.3, -0.8, 0.8, -0.3, -0.8, 0.1]
+    five_goals = [
+        goal_a,
+        goal_b,
+        [-0.2, -1.0, 1.0, -0.5, -1.0, 0.0],
+        [0.5, -0.6, 0.6, -0.6, -0.6, 0.2],
+        [0.0, -0.7, 0.7, -0.7, -0.7, 0.0],
+    ]
+
+    try:
+        initial_status = native.status()["status"]
+        origin = [
+            float(value)
+            for value in initial_status["direct_control"]["observed_state"][
+                "positions_rad"
+            ]
+        ]
+
+        _run_native_benchmark_move(
+            native,
+            request_id="benchmark-warmup",
+            positions_rad=goal_a,
+            cache_mode="default",
+        )
+        _run_native_benchmark_move(
+            native,
+            request_id="benchmark-warmup-return",
+            positions_rad=origin,
+            cache_mode="disable",
+        )
+
+        single_plan_seconds: list[float] = []
+        for index in range(3):
+            single_plan_seconds.append(
+                _run_native_benchmark_move(
+                    native,
+                    request_id=f"benchmark-single-{index}",
+                    positions_rad=goal_a,
+                    cache_mode="disable",
+                )
+            )
+            _run_native_benchmark_move(
+                native,
+                request_id=f"benchmark-single-return-{index}",
+                positions_rad=origin,
+                cache_mode="disable",
+            )
+
+        shared_cache_move_id = "benchmark-cache-shared-motion"
+        uncached_seconds = _run_native_benchmark_move(
+            native,
+            request_id="benchmark-cache-prime",
+            positions_rad=goal_b,
+            cache_mode="default",
+            move_id=shared_cache_move_id,
+        )
+        _run_native_benchmark_move(
+            native,
+            request_id="benchmark-cache-return",
+            positions_rad=origin,
+            cache_mode="disable",
+        )
+        cached_seconds = _run_native_benchmark_move(
+            native,
+            request_id="benchmark-cache-reuse",
+            positions_rad=goal_b,
+            cache_mode="default",
+            move_id=shared_cache_move_id,
+        )
+
+        five_started_at = time.perf_counter()
+        five_move_seconds = [
+            _run_native_benchmark_move(
+                native,
+                request_id=f"benchmark-five-{index}",
+                positions_rad=goal,
+                cache_mode="disable",
+            )
+            for index, goal in enumerate(five_goals)
+        ]
+        five_total_seconds = time.perf_counter() - five_started_at
+
+        # The historical probe was informational. These broad bounds retain
+        # its regression value while the request's own planning/execution
+        # deadlines remain the authoritative product limits.
+        assert max(single_plan_seconds) < 5.0
+        assert uncached_seconds < 5.0
+        assert cached_seconds < 5.0
+        assert five_total_seconds < 25.0
+        measurement = {
+            "schema": "manyforge.i6.addressed_native_benchmark.v1",
+            "historical_source_commit": (
+                "08222188293df8e12f90dc72e204c21f22f92ea1"
+            ),
+            "single_plan_ms": [
+                round(value * 1000.0, 3) for value in single_plan_seconds
+            ],
+            "cached_vs_uncached_ms": {
+                "cached": round(cached_seconds * 1000.0, 3),
+                "uncached": round(uncached_seconds * 1000.0, 3),
+            },
+            "five_moves": {
+                "per_move_ms": [
+                    round(value * 1000.0, 3) for value in five_move_seconds
+                ],
+                "total_ms": round(five_total_seconds * 1000.0, 3),
+            },
+        }
+        print(json.dumps(measurement, sort_keys=True))
+    finally:
+        _stop_host(process)
 
 
 def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> None:

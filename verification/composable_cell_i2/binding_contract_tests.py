@@ -133,6 +133,7 @@ _EXPECTED_PROPERTIES: dict[str, tuple[str, ...]] = {
         "normalized_authored_graph_canonical_json",
     ),
     "RevisionVerifiedDeploymentApplicabilityInputs": (
+        "assistant_settings",
         "external_resources_was_present",
         "normalized_capability_provider_bindings_canonical_json",
         "normalized_desired_control_configurations_canonical_json",
@@ -190,9 +191,11 @@ _EXPECTED_PROPERTIES: dict[str, tuple[str, ...]] = {
         "verified_graph",
     ),
     "ApplicabilityQualifiedCellIr": (
+        "assistant_settings",
         "binding_interfaces",
         "capabilities",
         "capability_definitions",
+        "command_schemas",
         "composition",
         "control_interface_contracts",
         "controller_topologies",
@@ -1056,6 +1059,7 @@ def _canonical_empty_pipeline(module: ModuleType) -> dict[str, Any]:
     applicability = _callable(module, "qualify_cell_applicability")(
         composition,
         deployment_inputs,
+        (),
         (),
         (),
         (),

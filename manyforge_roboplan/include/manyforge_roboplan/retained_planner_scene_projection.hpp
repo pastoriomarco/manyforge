@@ -177,6 +177,11 @@ private:
     core::NativeProjectionRetireResultDTO result;
   };
 
+  struct RetainedProjectionLease final {
+    std::shared_ptr<RetainedCollisionWorldPublisher> publisher;
+    std::int64_t captured_at_ns{};
+  };
+
   RetainedPlannerSceneProjection(
       RetainedCollisionWorldProjector projector,
       core::RetainedProductDTO planning_collision_model,
@@ -222,8 +227,7 @@ private:
   std::optional<BootstrapRecord> bootstrap_record_;
   std::optional<StageRecord> stage_record_;
   std::optional<RetireRecord> retire_record_;
-  std::map<core::ProjectionLeaseId,
-           std::shared_ptr<RetainedCollisionWorldPublisher>>
+  std::map<core::ProjectionLeaseId, RetainedProjectionLease>
       retained_lease_publishers_;
   std::deque<core::ProjectionLeaseId> retained_lease_order_;
   std::atomic<std::shared_ptr<RetainedCollisionWorldPublisher>>

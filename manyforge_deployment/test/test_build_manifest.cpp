@@ -114,13 +114,15 @@ namespace {
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::string_view kExpectedNodeEnvironmentDigest =
-    "sha256:ed07324081fb14f6c4e4d7b1363d4d1cef12087d844200f0beb3bc8f7e8a2622";
+    "sha256:1b732bc3d8889171c713f747a3199d78b88a9e6750fd7018d6d5f011a0f8417b";
 constexpr std::string_view kExpectedCompilerContractDigest =
     "sha256:7dfd3729b456322f7c813a9819fb196e9e02202073e353f826a826730270f370";
+#ifdef MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:c32103e2945defe76739ce2d030b06afb5e1665f43626c6cb73915b55fc5214a";
+    "sha256:2eeabf905a31376ed55cd76f22581cebd65987fb79dd0921593a65b2c2aa5dbc";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:9e7e37ad7c0644678babdd7532dc9105e9f4473e4d75ad6f155756a09d75c940";
+    "sha256:84ba22f9cb49ffc7457f1e08369e2f5007670abfb1214c0d8749307bdb53c2de";
+#endif
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);
 static_assert(!std::is_aggregate_v<BuildQualifiedManifest>);
@@ -528,10 +530,11 @@ TEST(BuildManifestAuthority,
             kExpectedNodeEnvironmentDigest);
   EXPECT_EQ(first.compiler_contract_digest().value(),
             kExpectedCompilerContractDigest);
-  if (text_member(build, "build_profile") == "Release") {
-    EXPECT_EQ(first.compiler_build_digest().value(),
-              kExpectedReleaseCompilerBuildDigest);
-  }
+#ifdef MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
+  EXPECT_EQ(text_member(build, "build_profile"), "Release");
+  EXPECT_EQ(first.compiler_build_digest().value(),
+            kExpectedReleaseCompilerBuildDigest);
+#endif
 }
 
 TEST(BuildManifestAuthority,
@@ -1752,12 +1755,13 @@ TEST(BuildManifestAuthority,
             context.compiler_contract_digest());
   EXPECT_EQ(bundle->value().provenance.compiler_build_digest,
             context.compiler_build_digest());
+#ifdef MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
   const auto build = parse_strict_json_model_yaml(
       context.manifests()[2]->canonical_bytes()).root();
-  if (text_member(build, "build_profile") == "Release") {
-    EXPECT_EQ(bundle->retained_bundle_id().value(),
-              kExpectedReleaseCanonicalEmptyBundleId);
-  }
+  EXPECT_EQ(text_member(build, "build_profile"), "Release");
+  EXPECT_EQ(bundle->retained_bundle_id().value(),
+            kExpectedReleaseCanonicalEmptyBundleId);
+#endif
 }
 
 TEST(BuildManifestAuthority,

@@ -23,6 +23,7 @@
 #include <manyforge_component_manager/manager_scene_activation_coordinator.hpp>
 #include <manyforge_component_manager/manager_scene_stage_coordinator.hpp>
 #include <manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp>
+#include <manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
@@ -53,6 +54,28 @@ constexpr std::string_view kKernelLedgerDigest =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 constexpr std::string_view kKernelEvidenceDigest =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+class InstalledRuntimeCompositionPort final
+    : public component_manager::IManagerSelectedRuntimeCompositionPort {
+public:
+  [[nodiscard]]
+  component_manager::ManagerSelectedRuntimeCompositionResultDTO
+  InstallOrObserve(
+      const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
+          &request) override {
+    if (!request.valid()) {
+      throw std::runtime_error(
+          "M0 composition fixture received an invalid request");
+    }
+    ++calls;
+    return {
+        request,
+        component_manager::ManagerSelectedRuntimeCompositionState::kInstalled,
+    };
+  }
+
+  int calls{0};
+};
 
 class M0Directory final {
 public:
@@ -603,6 +626,21 @@ TEST(ComponentManagerM0Process,
         stores.apply_journal(), scene_owner);
     static_cast<void>(
         activation.ActivateOrRecover(intent.apply_id, intent.apply_generation));
+    InstalledRuntimeCompositionPort runtime_composition_port;
+    component_manager::ManagerSelectedRuntimeCompositionCoordinator
+        runtime_composition(stores.apply_journal(), bundle_source,
+                            runtime_composition_port,
+                            core::RuntimeEpoch("m0-manager-runtime-recovery"));
+    const auto installed = runtime_composition.InstallOrRecover(
+        intent.apply_id, intent.apply_generation);
+    if (installed.state !=
+            component_manager::ManagerSelectedRuntimeCompositionResultState::
+                kInstalled ||
+        !installed.durable_materialization.has_value() ||
+        runtime_composition_port.calls != 1) {
+      throw std::runtime_error(
+          "M0 selected runtime composition did not materialize");
+    }
     component_manager::ManagerSelectedBundleTransitionCoordinator selection(
         stores.apply_journal(), bundle_source,
         stores.active_bundle_publication_store(), scene_owner);

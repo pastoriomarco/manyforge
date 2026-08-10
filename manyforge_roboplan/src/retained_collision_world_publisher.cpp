@@ -27,19 +27,19 @@ bool initial_mutation_source(
 
 RetainedCollisionWorldPublisher::RetainedCollisionWorldPublisher(
     RetainedCollisionWorldProjector projector, std::string publisher_id,
-    const std::size_t ledger_capacity)
+    Clock clock, const std::size_t ledger_capacity)
     : projector_(std::move(projector)), publisher_id_(std::move(publisher_id)),
-      ledger_capacity_(ledger_capacity) {}
+      clock_(std::move(clock)), ledger_capacity_(ledger_capacity) {}
 
 core::Result<std::shared_ptr<RetainedCollisionWorldPublisher>>
 RetainedCollisionWorldPublisher::create(
     RetainedCollisionWorldProjector projector, std::string publisher_id,
     const core::LogicalSceneSnapshotDTO &initial_scene,
-    RetainedCollisionWorldPublicationContext initial_context,
+    RetainedCollisionWorldPublicationContext initial_context, Clock clock,
     const std::size_t ledger_capacity) {
-  if (publisher_id.empty()) {
+  if (publisher_id.empty() || !clock) {
     return publication_error<std::shared_ptr<RetainedCollisionWorldPublisher>>(
-        "collision-world publisher id must be non-empty");
+        "collision-world publisher id and lease clock must be available");
   }
   if (ledger_capacity == 0U || ledger_capacity > 4096U) {
     return publication_error<std::shared_ptr<RetainedCollisionWorldPublisher>>(
@@ -52,8 +52,9 @@ RetainedCollisionWorldPublisher::create(
   }
 
   auto publisher = std::shared_ptr<RetainedCollisionWorldPublisher>(
-      new RetainedCollisionWorldPublisher(
-          std::move(projector), std::move(publisher_id), ledger_capacity));
+      new RetainedCollisionWorldPublisher(std::move(projector),
+                                          std::move(publisher_id),
+                                          std::move(clock), ledger_capacity));
   auto initialized =
       publisher->publish(initial_scene, std::move(initial_context));
   if (!initialized.ok()) {
@@ -356,6 +357,33 @@ std::optional<core::CollisionWorldLeaseInventory>
 RetainedCollisionWorldPublisher::retain_scene_snapshot_lease_inventory(
     core::ProjectionLeaseId projection_lease_id) {
   std::lock_guard<std::mutex> lock(writer_mutex_);
+  if (const auto existing = retained_inventories_.find(projection_lease_id);
+      !projection_lease_id.empty() && existing != retained_inventories_.end()) {
+    return existing->second;
+  }
+  std::int64_t captured_at_ns = 0;
+  try {
+    captured_at_ns = clock_();
+  } catch (...) {
+    return std::nullopt;
+  }
+  return retain_scene_snapshot_lease_inventory_locked(
+      std::move(projection_lease_id), captured_at_ns);
+}
+
+std::optional<core::CollisionWorldLeaseInventory>
+RetainedCollisionWorldPublisher::retain_scene_snapshot_lease_inventory_at(
+    core::ProjectionLeaseId projection_lease_id,
+    const std::int64_t captured_at_ns) {
+  std::lock_guard<std::mutex> lock(writer_mutex_);
+  return retain_scene_snapshot_lease_inventory_locked(
+      std::move(projection_lease_id), captured_at_ns);
+}
+
+std::optional<core::CollisionWorldLeaseInventory>
+RetainedCollisionWorldPublisher::retain_scene_snapshot_lease_inventory_locked(
+    core::ProjectionLeaseId projection_lease_id,
+    const std::int64_t captured_at_ns) {
   if (!current_inventory_.has_value()) {
     return std::nullopt;
   }
@@ -370,11 +398,13 @@ RetainedCollisionWorldPublisher::retain_scene_snapshot_lease_inventory(
       existing != retained_inventories_.end()) {
     return existing->second;
   }
-  if (retained_inventories_.size() >= kRuntimeRetirementCapacity) {
+  if (captured_at_ns < 0 ||
+      retained_inventories_.size() >= kRuntimeRetirementCapacity) {
     return std::nullopt;
   }
   auto retained = *current_inventory_;
   retained.projection_binding.projection_lease_id = projection_lease_id;
+  retained.captured_at_ns = captured_at_ns;
   retained_inventory_order_.push_back(projection_lease_id);
   retained_inventories_.emplace(projection_lease_id, retained);
   return retained;

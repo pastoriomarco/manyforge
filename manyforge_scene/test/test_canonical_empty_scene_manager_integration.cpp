@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
@@ -9,6 +10,7 @@
 #include <manyforge_component_manager/manager_scene_stage_coordinator.hpp>
 #include <manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <optional>
 #include <stdexcept>
@@ -59,6 +61,40 @@ deployment::CanonicalEmptyRetainedBundleAdmission LoadAdmission() {
   const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
       MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
   return source.load_verified();
+}
+
+void ConfirmExactEmptyPrivateMaterialization(
+    component_manager::SqliteManagerApplyJournal& journal,
+    const deployment::IVerifiedRetainedBundleSource& bundle_source,
+    const core::ApplyId& apply_id,
+    const core::ApplyGeneration apply_generation) {
+  const auto activated =
+      journal.ReadSceneActivated(apply_id, apply_generation);
+  if (!activated.has_value()) {
+    throw std::runtime_error(
+        "empty selection fixture lacks durable scene activation");
+  }
+  const auto& activation = activated->scene_activated.activation_result;
+  const auto candidate = bundle_source.get_verified(
+      activation.candidate_projection_revision.retained_bundle_id);
+  if (candidate == nullptr || candidate->canonical_bytes().empty()) {
+    throw std::runtime_error(
+        "empty selection fixture cannot verify its retained bundle");
+  }
+  const auto canonical_bytes = candidate->canonical_bytes();
+  const auto materialized = journal.EnsurePrivateMaterialization({
+      activated->scene_activated_digest,
+      apply_id,
+      apply_generation,
+      activation.projection_stage_generation,
+      activation.candidate_projection_revision,
+      core::ContentDigest(deployment::sha256_digest(canonical_bytes)),
+      static_cast<std::uint64_t>(canonical_bytes.size()),
+  });
+  if (!materialized.record.private_materialization.valid()) {
+    throw std::runtime_error(
+        "empty selection fixture did not retain exact materialization");
+  }
 }
 
 constexpr std::string_view kKernelLedgerDigest =
@@ -376,6 +412,12 @@ TEST(CanonicalEmptySceneManagerIntegration,
     const auto activated_inventory = stores.StartupInventory();
     EXPECT_EQ(activated_inventory.apply_journal.activation_selection_count, 1);
     EXPECT_EQ(activated_inventory.apply_journal.scene_activated_count, 1);
+    // This integration case deliberately has no runtime unit. The production
+    // runtime-composition phase is covered with a real managed child in the
+    // M0 and native-adapter cases; establish its exact durable output here so
+    // this test remains focused on the Scene/selection recovery seam.
+    ConfirmExactEmptyPrivateMaterialization(
+        journal, bundle_source, apply_id, apply_generation);
     component_manager::ManagerSelectedBundleTransitionCoordinator selection(
         journal, bundle_source, stores.active_bundle_publication_store(), scene_owner);
     const auto published = selection.AdvanceOrRecover(apply_id, apply_generation);

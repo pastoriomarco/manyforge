@@ -642,6 +642,8 @@ def test_snapshot_image_program_query_is_typed_unavailable_until_i9() -> None:
         assert terminal.reason_code == (
             "model_snapshot_image_unavailable_until_i9"
         )
+        assert "authored_failure_policy" not in terminal.metadata
+        assert "authored_failure_policy_parameter" not in terminal.metadata
         assert transport.requests == []
         assert audit.records == []
     finally:

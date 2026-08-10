@@ -1,10 +1,24 @@
 #!/usr/bin/env bash
-# The historical FNV/path-derived collision mapper and its perf target were
-# deleted at manyforge@08222188293df8e12f90dc72e204c21f22f92ea1. Exact
-# compiler-emitted symbol/body lookup returns through the I3/I6 consumer; this
-# old probe must not be confused with active manyforge_collision qualification.
+# N7 successor for the deleted FNV/path-derived collision mapper probe.
+#
+# The current product performs no runtime mapper rebuild. This entrypoint runs
+# the exact compiler-emitted symbol/body point-lookup workload through the
+# retained-product consumer that uses it. It never configures or builds on the
+# host; supply an already qualified Docker build directory.
 
 set -euo pipefail
 
-echo "composable_cell_collision_mapper_probe_unavailable: exact symbol/body lookup performance returns at I3/C1 and I6/N" >&2
-exit 78
+if [[ "${1:-}" != "--in-container" ]]; then
+  echo "composable_cell_collision_lookup_probe_requires_docker: rerun with --in-container and MANYFORGE_BUILD_DIR set to an already qualified RoboPlan build" >&2
+  exit 64
+fi
+
+build_dir="${MANYFORGE_BUILD_DIR:-}"
+binary="${build_dir}/test_retained_product_consumer"
+if [[ -z "${build_dir}" || ! -x "${binary}" ]]; then
+  echo "composable_cell_collision_lookup_probe_missing_build: test_retained_product_consumer is absent from MANYFORGE_BUILD_DIR" >&2
+  exit 66
+fi
+
+exec "${binary}" \
+  --gtest_filter=RetainedProductCrossConsumer.CompilerEmittedSymbolAndBodyLookupPerformanceStaysBounded

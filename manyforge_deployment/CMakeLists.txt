@@ -706,6 +706,11 @@ add_custom_command(
     "${MANYFORGE_BUILD_QUALIFIED_ADMISSION_PROFILE_HEADER}"
   DEPENDS
     manyforge_emit_build_qualified_admission_profile
+    # Reconfiguration can change the embedded compiler/build identity without
+    # changing a source or recipe timestamp.  Bind profile regeneration to the
+    # configure-time evidence so a rebuilt provider cannot retain a stale
+    # admission profile.
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_build_evidence.hpp"
     ${MANYFORGE_COMPILER_SOURCE_INPUTS}
     ${MANYFORGE_COMPILER_RECIPE_INPUTS}
   COMMENT "Generating exact build-qualified admission profile"
@@ -1477,6 +1482,10 @@ if(BUILD_TESTING)
     manyforge_deployment GTest::gtest_main)
   target_link_options(test_build_manifest PRIVATE
     "-Wl,--wrap=fsync")
+  if(MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN)
+    target_compile_definitions(test_build_manifest PRIVATE
+      MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN=1)
+  endif()
   gtest_discover_tests(test_build_manifest
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 

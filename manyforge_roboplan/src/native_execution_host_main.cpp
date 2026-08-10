@@ -3599,7 +3599,8 @@ BuildProductComposition(CompositionBuildInput input) {
             WallClock{}.now(),
             {},
             "i6_native_execution_host_startup",
-            std::nullopt});
+            std::nullopt},
+        [] { return WallClock{}.now(); });
     if (!publisher_result.ok()) {
       Fail("retained collision publication failed: " +
            publisher_result.error().message);

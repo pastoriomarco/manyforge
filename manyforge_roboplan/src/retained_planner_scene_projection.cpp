@@ -294,7 +294,7 @@ RetainedPlannerSceneProjection::BuildPublisher(
       projector, config_.publisher_id, snapshot,
       RetainedCollisionWorldPublicationContext{
           source, {}, observed_at, {}, std::move(source_label), std::nullopt},
-      config_.collision_ledger_capacity);
+      clock_, config_.collision_ledger_capacity);
 }
 
 bool RetainedPlannerSceneProjection::HealthyAt(
@@ -518,13 +518,15 @@ RetainedPlannerSceneProjection::RetainProjection(
           "health is closed",
           "native_projection_lease_unavailable");
     }
-    const auto inventory =
-        retained->second->retain_scene_snapshot_lease_inventory(
-            projection_lease_id);
+    auto inventory =
+        retained->second.publisher->retain_scene_snapshot_lease_inventory_at(
+            projection_lease_id, retained->second.captured_at_ns);
     if (inventory.has_value() &&
         inventory->projection_binding.projection_revision ==
             projection_revision) {
-      return core::Result<core::CollisionWorldLeaseInventory>::Ok(*inventory);
+      inventory->captured_at_ns = retained->second.captured_at_ns;
+      return core::Result<core::CollisionWorldLeaseInventory>::Ok(
+          std::move(*inventory));
     }
     return projection_error<core::CollisionWorldLeaseInventory>(
         "native projection lease ID is already bound to another revision",
@@ -548,8 +550,26 @@ RetainedPlannerSceneProjection::RetainProjection(
         "native projection publisher is unavailable",
         "native_projection_lease_unavailable");
   }
-  auto inventory =
-      publisher->retain_scene_snapshot_lease_inventory(projection_lease_id);
+  std::int64_t captured_at_ns = 0;
+  try {
+    captured_at_ns = clock_();
+  } catch (const std::exception &exception) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "native projection lease clock failed: " +
+            std::string(exception.what()),
+        "native_projection_lease_clock_failed");
+  } catch (...) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "native projection lease clock failed",
+        "native_projection_lease_clock_failed");
+  }
+  if (captured_at_ns < 0) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "native projection lease clock returned a negative timestamp",
+        "native_projection_lease_clock_invalid");
+  }
+  auto inventory = publisher->retain_scene_snapshot_lease_inventory_at(
+      projection_lease_id, captured_at_ns);
   if (!inventory.has_value() ||
       inventory->projection_binding.projection_revision !=
           projection_revision) {
@@ -560,9 +580,11 @@ RetainedPlannerSceneProjection::RetainProjection(
         "native projection publisher could not retain the exact revision",
         "native_projection_lease_unavailable");
   }
+  inventory->captured_at_ns = captured_at_ns;
   try {
-    const auto [inserted, was_inserted] =
-        retained_lease_publishers_.emplace(projection_lease_id, publisher);
+    const auto [inserted, was_inserted] = retained_lease_publishers_.emplace(
+        projection_lease_id,
+        RetainedProjectionLease{publisher, captured_at_ns});
     if (!was_inserted) {
       publisher->release_scene_snapshot_lease_inventory(projection_lease_id);
       return projection_error<core::CollisionWorldLeaseInventory>(
@@ -590,7 +612,8 @@ void RetainedPlannerSceneProjection::ReleaseProjection(
   if (retained == retained_lease_publishers_.end()) {
     return;
   }
-  retained->second->release_scene_snapshot_lease_inventory(projection_lease_id);
+  retained->second.publisher->release_scene_snapshot_lease_inventory(
+      projection_lease_id);
   retained_lease_publishers_.erase(retained);
   retained_lease_order_.erase(std::remove(retained_lease_order_.begin(),
                                           retained_lease_order_.end(),

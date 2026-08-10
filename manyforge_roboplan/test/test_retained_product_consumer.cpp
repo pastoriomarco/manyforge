@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <iterator>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
@@ -1162,6 +1163,104 @@ void expect_canonical_empty_scene(const roboplan::Scene &scene) {
   EXPECT_FALSE(scene.hasCollisions(empty_configuration));
   EXPECT_NO_THROW(scene.computeCollisionDistances(empty_configuration));
   EXPECT_TRUE(scene.getCollisionData().distanceResults.empty());
+}
+
+TEST(RetainedProductCrossConsumer,
+     CompilerEmittedSymbolAndBodyLookupPerformanceStaysBounded) {
+  ScopedTemporaryRoot temporary;
+  const std::filesystem::path package_root =
+      temporary.path() / "retained-package";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+
+  const auto materialized = deployment::test::
+      materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
+          package_root);
+  ASSERT_NE(materialized.bundle, nullptr);
+  ASSERT_EQ(
+      materialized.bundle->value().compiled_products.symbol_role_maps.size(),
+      1U);
+  const auto &product =
+      materialized.bundle->value().compiled_products.symbol_role_maps.front();
+  const auto model_map = load_lite6_model_map(
+      package_root,
+      {materialized.bundle->retained_bundle_id(), product.product_id});
+  ASSERT_FALSE(model_map.symbols().empty());
+  ASSERT_FALSE(model_map.model_collision_bodies().empty());
+
+  constexpr std::size_t kWarmupIterations = 16U;
+  constexpr std::size_t kIterations = 100U;
+  constexpr std::size_t kSymbolLookupsPerIteration = 32U;
+  constexpr std::size_t kBodyLookupsPerIteration = 32U;
+  const auto lookup_batch = [&model_map]() {
+    std::size_t hits = 0U;
+    for (std::size_t index = 0U; index < kSymbolLookupsPerIteration; ++index) {
+      const auto &query =
+          model_map.symbols()[index % model_map.symbols().size()].source;
+      const auto found = std::find_if(
+          model_map.symbols().begin(), model_map.symbols().end(),
+          [&query](const deployment::OccurrenceSymbolRewrite &candidate) {
+            return candidate.source == query;
+          });
+      hits += found != model_map.symbols().end() ? 1U : 0U;
+    }
+    for (std::size_t index = 0U; index < kBodyLookupsPerIteration; ++index) {
+      const auto &query =
+          model_map.model_collision_bodies()
+              [index % model_map.model_collision_bodies().size()];
+      const auto found = std::find_if(
+          model_map.model_collision_bodies().begin(),
+          model_map.model_collision_bodies().end(),
+          [&query](const deployment::CompositionModelCollisionBodyResolution
+                       &candidate) {
+            return candidate.model_instance_id == query.model_instance_id &&
+                   candidate.collision_body_role_id ==
+                       query.collision_body_role_id;
+          });
+      hits += found != model_map.model_collision_bodies().end() ? 1U : 0U;
+    }
+    return hits;
+  };
+
+  std::size_t observed_hits = 0U;
+  for (std::size_t iteration = 0U; iteration < kWarmupIterations; ++iteration) {
+    observed_hits += lookup_batch();
+  }
+  std::vector<double> samples_us;
+  samples_us.reserve(kIterations);
+  for (std::size_t iteration = 0U; iteration < kIterations; ++iteration) {
+    const auto started_at = std::chrono::steady_clock::now();
+    observed_hits += lookup_batch();
+    samples_us.push_back(std::chrono::duration<double, std::micro>(
+                             std::chrono::steady_clock::now() - started_at)
+                             .count());
+  }
+  EXPECT_EQ(observed_hits,
+            (kWarmupIterations + kIterations) *
+                (kSymbolLookupsPerIteration + kBodyLookupsPerIteration));
+
+  const auto percentile = [&samples_us](const double ratio) {
+    auto sorted = samples_us;
+    std::sort(sorted.begin(), sorted.end());
+    return sorted[static_cast<std::size_t>(
+        ratio * static_cast<double>(sorted.size() - 1U))];
+  };
+  const double p50_us = percentile(0.50);
+  const double p95_us = percentile(0.95);
+  const double p99_us = percentile(0.99);
+
+  // The deleted mapper's benchmark was informational. The current route has
+  // no runtime map rebuild: it point-reads the immutable compiler-emitted map.
+  // Five milliseconds is a deliberately broad regression tripwire, not an
+  // attempt to compare unlike FNV and retained-product workloads.
+  EXPECT_LT(p99_us, 5000.0);
+  std::cout << "{\"schema\":\"manyforge.i6.retained_model_lookup_perf.v1\","
+            << "\"runtime_map_rebuilds\":0,"
+            << "\"symbol_lookups_per_iteration\":" << kSymbolLookupsPerIteration
+            << ","
+            << "\"body_lookups_per_iteration\":" << kBodyLookupsPerIteration
+            << ",\"iterations\":" << kIterations << ",\"lookup_batch_us\":{"
+            << "\"p50\":" << p50_us << ",\"p95\":" << p95_us
+            << ",\"p99\":" << p99_us << "}}\n";
 }
 
 TEST(RetainedProductRoboPlanConsumer,
@@ -2866,6 +2965,7 @@ TEST(RetainedProductCrossConsumer,
   const auto initial_publish_scene = make_collision_scene_snapshot(
       materialized.bundle->value().cell_graph.cell_id, 2U,
       core::SceneResourceId("carried-part"), 0.0, 0.02);
+  std::int64_t publisher_lease_clock = 6'000'000'010;
   auto publisher_result = RetainedCollisionWorldPublisher::create(
       collision_projector, "retained-lite6-publisher", initial_publish_scene,
       RetainedCollisionWorldPublicationContext{
@@ -2875,7 +2975,8 @@ TEST(RetainedProductCrossConsumer,
           {},
           "retained_product_consumer",
           std::nullopt,
-      });
+      },
+      [&publisher_lease_clock] { return publisher_lease_clock++; });
   ASSERT_TRUE(publisher_result.ok()) << publisher_result.error().message;
   const auto publisher = publisher_result.value();
   const auto initial_world = publisher->snapshot();
@@ -2901,6 +3002,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(retained_inventory.has_value());
   EXPECT_EQ(retained_inventory->projection_binding.projection_lease_id,
             operation_lease);
+  EXPECT_EQ(retained_inventory->captured_at_ns, 6'000'000'010);
   EXPECT_EQ(retained_inventory->bundle.world, initial_world);
   auto retention_stats = publisher->scene_snapshot_lease_retention_stats();
   EXPECT_EQ(retention_stats.retained_count, 1U);
@@ -3040,21 +3142,50 @@ TEST(RetainedProductCrossConsumer,
   auto projection = projection_result.value();
   ASSERT_TRUE(
       projection->ProjectionHealth().healthy_for_target(initial_revision));
+  const auto publication_inventory =
+      projection->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(publication_inventory.has_value());
+  EXPECT_EQ(publication_inventory->captured_at_ns, 10);
 
   const core::ProjectionLeaseId predecessor_lease(
       "z.operation.predecessor.oldest");
+  clock_value = 6'000'000'010;
   auto retained_predecessor =
       projection->RetainProjection(initial_revision, predecessor_lease);
   ASSERT_TRUE(retained_predecessor.ok())
       << retained_predecessor.error().message;
+  EXPECT_EQ(retained_predecessor.value().captured_at_ns, 6'000'000'010);
+  ASSERT_EQ(retained_predecessor.value().live_objects.size(),
+            publication_inventory->live_objects.size());
+  for (std::size_t index = 0;
+       index < retained_predecessor.value().live_objects.size(); ++index) {
+    EXPECT_EQ(
+        retained_predecessor.value().live_objects[index].source_timestamp_ns,
+        publication_inventory->live_objects[index].source_timestamp_ns);
+  }
   const auto predecessor_world = retained_predecessor.value().bundle.world;
   ASSERT_NE(predecessor_world, nullptr);
+  clock_value = 9'000'000'010;
+  const auto replayed_predecessor =
+      projection->RetainProjection(initial_revision, predecessor_lease);
+  ASSERT_TRUE(replayed_predecessor.ok())
+      << replayed_predecessor.error().message;
+  EXPECT_EQ(replayed_predecessor.value().captured_at_ns, 6'000'000'010);
+  EXPECT_EQ(replayed_predecessor.value().bundle.world, predecessor_world);
   const core::ProjectionLeaseId second_predecessor_lease(
       "a.operation.predecessor.newer");
   auto retained_second_predecessor =
       projection->RetainProjection(initial_revision, second_predecessor_lease);
   ASSERT_TRUE(retained_second_predecessor.ok())
       << retained_second_predecessor.error().message;
+  EXPECT_EQ(retained_second_predecessor.value().captured_at_ns, 9'000'000'010);
+  fail_clock = true;
+  const auto failed_clock_lease = projection->RetainProjection(
+      initial_revision, core::ProjectionLeaseId("clock-failure-lease"));
+  fail_clock = false;
+  ASSERT_FALSE(failed_clock_lease.ok());
+  EXPECT_EQ(failed_clock_lease.error().details.at("reason"),
+            "native_projection_lease_clock_failed");
   EXPECT_EQ(projection->scene_snapshot_lease_retention_stats()
                 .retained_ids_oldest_first,
             (std::vector<core::ProjectionLeaseId>{predecessor_lease,
