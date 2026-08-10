@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import httpx
 import pytest
@@ -95,6 +96,42 @@ def test_client_uses_the_verified_scenario_catalog_route() -> None:
     finally:
         raw.close()
     assert [request.url.path for request in requests] == ["/api/scenarios"]
+
+
+def test_client_uses_the_revision_fenced_scene_pose_route() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "api_version": "manyforge.scene_resource_pose_response.v1",
+                "poses": [],
+                "projection_revision": {},
+            },
+            request=request,
+        )
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    body = {
+        "api_version": "manyforge.scene_resource_pose_query.v1",
+        "expected_projection_revision": {},
+        "scene_resource_ids": ["part.1"],
+    }
+    try:
+        assert client.resolve_scene_resources(body)["poses"] == []
+    finally:
+        raw.close()
+    assert [request.method for request in requests] == ["POST"]
+    assert [request.url.path for request in requests] == [
+        "/api/scene/resource-poses/query"
+    ]
+    assert json.loads(requests[0].read()) == body
 
 
 def _viewer_headers(

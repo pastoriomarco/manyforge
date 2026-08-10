@@ -61,6 +61,10 @@ class ProgramRunPortContext:
     graph_revision: str
     node_environment_digest: str
     program_binding: Mapping[str, Any]
+    program: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    assistant_projection: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("program_run_id", "scenario_id", "program_id"):
@@ -97,6 +101,28 @@ class ProgramRunPortContext:
         ):
             raise ValueError("Program-run context and Program Binding disagree")
         object.__setattr__(self, "program_binding", _freeze(binding))
+        if not isinstance(self.program, Mapping):
+            raise TypeError("program must be a mapping")
+        program = dict(self.program)
+        if program and (
+            program.get("program_id") != self.program_id
+            or program.get("program_revision") != self.program_revision
+        ):
+            raise ValueError("Program-run context and Program disagree")
+        object.__setattr__(self, "program", _freeze(program))
+        if self.assistant_projection is not None and not isinstance(
+            self.assistant_projection, Mapping
+        ):
+            raise TypeError("assistant_projection must be absent or a mapping")
+        object.__setattr__(
+            self,
+            "assistant_projection",
+            (
+                None
+                if self.assistant_projection is None
+                else _freeze(dict(self.assistant_projection))
+            ),
+        )
 
 
 class ProgramRunContextPort(Protocol):

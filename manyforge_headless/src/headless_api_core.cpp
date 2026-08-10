@@ -565,6 +565,7 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
     });
   };
   return CanonicalValue(CanonicalValue::Object{
+      {"assistant_projection", selection.normalized_assistant_projection},
       {"assistant_mode",
        CanonicalValue(selection.assistant_mode ==
                               deployment::ScenarioAssistantMode::kRequired

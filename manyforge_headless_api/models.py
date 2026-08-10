@@ -12,6 +12,7 @@ MAX_IDENTITY_BYTES = 256
 MAX_ACTIVATION_ID_BYTES = 2_048
 MAX_REASON_BYTES = 4096
 MAX_BULK_MEMBERS = 256
+MAX_SCENE_POSE_QUERY_RESOURCES = 128
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -210,6 +211,32 @@ class ProjectionRevisionRequest(StrictRequest):
             label=info.field_name,
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
+
+
+class SceneResourcePoseQuery(StrictRequest):
+    api_version: Literal["manyforge.scene_resource_pose_query.v1"]
+    expected_projection_revision: ProjectionRevisionRequest
+    scene_resource_ids: Annotated[
+        list[str],
+        Field(min_length=1, max_length=MAX_SCENE_POSE_QUERY_RESOURCES),
+    ]
+
+    @field_validator("scene_resource_ids")
+    @classmethod
+    def validate_scene_resource_ids(cls, values: list[str]) -> list[str]:
+        normalized = [
+            _bounded_nfc(
+                value,
+                label="scene_resource_id",
+                maximum_bytes=MAX_IDENTITY_BYTES,
+            )
+            for value in values
+        ]
+        if normalized != sorted(set(normalized)):
+            raise ValueError(
+                "scene_resource_ids must be strictly sorted and unique"
+            )
+        return normalized
 
 
 class Vector3Request(StrictRequest):

@@ -102,6 +102,7 @@ def _validate_fields(
     fields: Mapping[str, BlackboardFieldDeclaration],
     *,
     label: str,
+    parent_type: str,
 ) -> None:
     if not fields:
         return
@@ -110,7 +111,25 @@ def _validate_fields(
             f"{label} must contain exactly declared fields {sorted(fields)}"
         )
     for field_name, declaration in fields.items():
-        if not _matches_scalar_type(value[field_name], declaration.type):
+        field_value = value[field_name]
+        empty_selection_identity = (
+            parent_type in {"model_response", "scene_selection_result"}
+            and field_name == "selected_object_id"
+            and declaration.type == "scene_resource"
+            and field_value == ""
+            and value.get("outcome") in {"no_match", "ambiguous"}
+        )
+        empty_model_reason = (
+            parent_type in {"model_response", "scene_selection_result"}
+            and field_name == "reason"
+            and declaration.type == "string"
+            and field_value == ""
+        )
+        if (
+            not empty_selection_identity
+            and not empty_model_reason
+            and not _matches_scalar_type(field_value, declaration.type)
+        ):
             raise ProgramValueError(
                 f"{label}.{field_name} does not match {declaration.type}"
             )
@@ -124,7 +143,12 @@ def _validate_blackboard_value(
 ) -> None:
     if not _matches_scalar_type(value, declaration.type):
         raise ProgramValueError(f"{label} does not match {declaration.type}")
-    _validate_fields(value, declaration.fields, label=label)
+    _validate_fields(
+        value,
+        declaration.fields,
+        label=label,
+        parent_type=declaration.type,
+    )
 
 
 def _validate_program_parameter(

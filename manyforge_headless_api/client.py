@@ -506,6 +506,13 @@ class HeadlessHttpClient:
     def scene(self) -> dict[str, Any]:
         return self.request("GET", "/api/scene")
 
+    def resolve_scene_resources(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/scene/resource-poses/query", body=body
+        )
+
     def commit_scene_transaction(
         self, body: Mapping[str, Any]
     ) -> dict[str, Any]:

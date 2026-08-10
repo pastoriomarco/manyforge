@@ -29,6 +29,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -71,6 +72,7 @@ constexpr std::string_view kManagerDaemonLockFileName = ".manager-daemon.lock";
 constexpr std::size_t kMaximumCommandBytes =
     scene::kMaximumLogicalSceneTransactionBytes + 4U * 1024U;
 constexpr std::size_t kMaximumCommandIdentityBytes = 256U;
+constexpr std::size_t kMaximumScenePoseQueryResources = 128U;
 constexpr std::size_t kOwnerEpochRandomBytes = 16U;
 constexpr std::size_t kSocketBacklog = 16U;
 constexpr int kClientReadTimeoutMilliseconds = 250;
@@ -282,21 +284,24 @@ struct DaemonConfig final {
 enum class CommandKind {
   kApply,
   kSceneCommit,
+  kScenePoseQuery,
   kReconcile,
   kShutdownRuntime,
 };
 
 struct ManagerCommand final {
   CommandKind kind;
-  std::optional<std::string> request_id;
-  std::optional<std::string> request_owner_epoch;
-  std::optional<std::string> source_label;
-  std::optional<std::string> correlation_id;
-  std::optional<core::SceneTransactionRequestDTO> scene_transaction;
-  std::optional<core::DeploymentArtifactId> deployment_artifact_id;
-  std::optional<core::DeploymentRevision> deployment_revision;
-  std::optional<core::RetainedBundleId> expected_current_retained_bundle_id;
-  std::optional<core::GraphRevision> expected_current_graph_revision;
+  std::optional<std::string> request_id{};
+  std::optional<std::string> request_owner_epoch{};
+  std::optional<std::string> source_label{};
+  std::optional<std::string> correlation_id{};
+  std::optional<core::SceneTransactionRequestDTO> scene_transaction{};
+  std::optional<core::DeploymentArtifactId> deployment_artifact_id{};
+  std::optional<core::DeploymentRevision> deployment_revision{};
+  std::optional<core::RetainedBundleId> expected_current_retained_bundle_id{};
+  std::optional<core::GraphRevision> expected_current_graph_revision{};
+  std::optional<core::ProjectionRevisionDTO> expected_scene_projection{};
+  std::vector<core::SceneResourceId> scene_resource_ids{};
 };
 
 const CanonicalValue &RequiredMember(const CanonicalValue &root,
@@ -342,6 +347,76 @@ void RequireExactObjectSize(const CanonicalValue &value, const std::size_t size,
                             const std::string_view label) {
   Require(value.is_object() && value.as_object().size() == size,
           std::string(label) + " has an unknown or missing field");
+}
+
+std::uint64_t RequiredUnsigned(const CanonicalValue &value,
+                               const std::string_view label) {
+  constexpr auto kMaximumSafeInteger = 9007199254740991ULL;
+  const auto *number = std::get_if<double>(&value.storage());
+  Require(number != nullptr && *number >= 1.0 &&
+              *number <= static_cast<double>(kMaximumSafeInteger),
+          std::string(label) + " must be one positive safe integer");
+  const auto result = static_cast<std::uint64_t>(*number);
+  Require(static_cast<double>(result) == *number,
+          std::string(label) + " must be integral");
+  return result;
+}
+
+core::ProjectionRevisionDTO
+RequiredProjectionRevision(const CanonicalValue &value) {
+  RequireExactObjectSize(value, 3U, "projection revision");
+  const auto retained_bundle_id =
+      RequiredString(value, "retained_bundle_id");
+  const auto graph_revision = RequiredString(value, "graph_revision");
+  Require(core::IsExactLowercaseSha256Digest(retained_bundle_id) &&
+              core::IsExactLowercaseSha256Digest(graph_revision),
+          "projection structural identities must be canonical SHA-256");
+  const auto &scene = RequiredMember(value, "scene_revision");
+  RequireExactObjectSize(scene, 3U, "scene revision");
+  const auto scene_id = RequiredString(scene, "scene_id");
+  const auto content_hash = RequiredString(scene, "content_hash");
+  Require(core::IsExactLowercaseSha256Digest(scene_id) &&
+              core::IsExactLowercaseSha256Digest(content_hash),
+          "scene identities must be canonical SHA-256");
+  core::ProjectionRevisionDTO result{
+      core::RetainedBundleId(retained_bundle_id),
+      core::GraphRevision(graph_revision),
+      core::SceneRevision{
+          core::SceneId(scene_id),
+          RequiredUnsigned(RequiredMember(scene, "revision_id"),
+                           "scene revision_id"),
+          core::ContentDigest(content_hash),
+      },
+  };
+  Require(result.valid(), "projection revision is invalid");
+  return result;
+}
+
+std::vector<core::SceneResourceId>
+RequiredSceneResourceIds(const CanonicalValue &value) {
+  const auto *rows = std::get_if<CanonicalValue::Array>(&value.storage());
+  Require(rows != nullptr && !rows->empty() &&
+              rows->size() <= kMaximumScenePoseQueryResources,
+          "scene_resource_ids must be one bounded non-empty array");
+  std::vector<core::SceneResourceId> result;
+  result.reserve(rows->size());
+  std::string previous;
+  for (const auto &row : *rows) {
+    const auto *identity = std::get_if<std::string>(&row.storage());
+    Require(identity != nullptr && !identity->empty() &&
+                identity->size() <= kMaximumCommandIdentityBytes &&
+                std::all_of(identity->begin(), identity->end(),
+                            [](const char character) {
+                              const auto byte =
+                                  static_cast<unsigned char>(character);
+                              return byte >= 0x21U && byte <= 0x7EU;
+                            }) &&
+                (previous.empty() || previous < *identity),
+            "scene_resource_ids must be canonical bounded identities");
+    previous = *identity;
+    result.emplace_back(*identity);
+  }
+  return result;
 }
 
 ManagerCommand DecodeCommand(const std::string_view bytes) {
@@ -403,6 +478,15 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
         std::nullopt,
     };
   }
+  if (command == "scene_pose_query") {
+    RequireExactObjectSize(root, 4U, "scene pose query command");
+    ManagerCommand result{.kind = CommandKind::kScenePoseQuery};
+    result.expected_scene_projection = RequiredProjectionRevision(
+        RequiredMember(root, "expected_projection_revision"));
+    result.scene_resource_ids = RequiredSceneResourceIds(
+        RequiredMember(root, "scene_resource_ids"));
+    return result;
+  }
   Require(command == "apply", "command kind is unsupported");
   RequireExactObjectSize(root, 10U, "Apply command");
   const auto request_id = RequiredString(root, "request_id");
@@ -457,6 +541,45 @@ CanonicalValue ProjectionRevision(const core::ProjectionRevisionDTO &value) {
             Unsigned(value.scene_revision.revision_id, "scene revision")},
            {"scene_id", CanonicalValue(value.scene_revision.scene_id.value())},
        })},
+  });
+}
+
+CanonicalValue Pose(const core::Pose3DTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"orientation_xyzw",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(value.orientation.x),
+           CanonicalValue(value.orientation.y),
+           CanonicalValue(value.orientation.z),
+           CanonicalValue(value.orientation.w),
+       })},
+      {"position_m",
+       CanonicalValue(CanonicalValue::Object{
+           {"x", CanonicalValue(value.position_m.x_m)},
+           {"y", CanonicalValue(value.position_m.y_m)},
+           {"z", CanonicalValue(value.position_m.z_m)},
+       })},
+  });
+}
+
+CanonicalValue ScenePoseResponse(
+    const core::ProjectionRevisionDTO &projection_revision,
+    const std::vector<std::pair<core::SceneResourceId, core::Pose3DTO>>
+        &poses) {
+  CanonicalValue::Array rows;
+  rows.reserve(poses.size());
+  for (const auto &[scene_resource_id, pose] : poses) {
+    rows.emplace_back(CanonicalValue::Object{
+        {"pose_in_cell", Pose(pose)},
+        {"scene_resource_id", CanonicalValue(scene_resource_id.value())},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"ok", CanonicalValue(true)},
+      {"poses", CanonicalValue(std::move(rows))},
+      {"projection_revision", ProjectionRevision(projection_revision)},
   });
 }
 
@@ -1155,6 +1278,39 @@ private:
           TryPublishLogicalScene();
         }
         TrySendResponse(client.get(), SceneCommitResponse(command, result));
+        return false;
+      }
+      case CommandKind::kScenePoseQuery: {
+        Require(command.expected_scene_projection.has_value() &&
+                    !command.scene_resource_ids.empty(),
+                "decoded scene pose query lacks its exact selection");
+        const auto current = scene_owner_.CurrentProjectionRevision();
+        if (current != *command.expected_scene_projection) {
+          TrySendResponse(
+              client.get(),
+              ErrorResponse(
+                  "scene_projection_changed",
+                  "logical-scene projection changed before pose resolution"));
+          return false;
+        }
+        std::vector<std::pair<core::SceneResourceId, core::Pose3DTO>> poses;
+        poses.reserve(command.scene_resource_ids.size());
+        for (const auto &scene_resource_id : command.scene_resource_ids) {
+          const auto pose = scene_owner_.GetObjectPose(scene_resource_id);
+          if (!pose.ok()) {
+            const auto &error = pose.error();
+            TrySendResponse(
+                client.get(),
+                ErrorResponse(
+                    error.code.empty() ? "scene_pose_unavailable" : error.code,
+                    error.message.empty()
+                        ? "logical-scene object pose is unavailable"
+                        : error.message));
+            return false;
+          }
+          poses.emplace_back(scene_resource_id, pose.value());
+        }
+        TrySendResponse(client.get(), ScenePoseResponse(current, poses));
         return false;
       }
       case CommandKind::kReconcile: {

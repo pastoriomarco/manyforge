@@ -400,6 +400,8 @@ bool ScenarioApplyCandidateSelection::valid() const noexcept {
 }
 
 bool ScenarioProgramSelection::valid() const noexcept {
+  const bool assistant_absent = std::holds_alternative<std::nullptr_t>(
+      normalized_assistant_projection.storage());
   const bool compatibility_valid =
       (deployment_compatibility.lane == "manyforge-only" ||
        deployment_compatibility.lane == "isaac-sim" ||
@@ -424,6 +426,12 @@ bool ScenarioProgramSelection::valid() const noexcept {
          is_sha256_digest(program_revision.value()) &&
          is_sha256_digest(node_environment_digest.value()) &&
          compatibility_valid && typed_parameter_overrides.is_object() &&
+         (assistant_absent ||
+          normalized_assistant_projection.is_object()) &&
+         (assistant_mode != ScenarioAssistantMode::kRequired ||
+         normalized_assistant_projection.is_object()) &&
+         (assistant_mode != ScenarioAssistantMode::kForbidden ||
+          assistant_absent) &&
          normalized_program_root.is_object() &&
          normalized_program_binding_root.is_object();
 }
@@ -533,6 +541,19 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
               !assistant_available,
           "scenario forbids the retained assistant product");
 
+  CanonicalValue assistant_projection(nullptr);
+  if (bundle->value().assistant.has_value()) {
+    try {
+      assistant_projection =
+          parse_strict_json_model_yaml(bundle->value().assistant->canonical_json)
+              .root();
+    } catch (const ArtifactCodecError &error) {
+      Fail(std::string("scenario retained assistant projection cannot be "
+                       "decoded: ") +
+           error.what());
+    }
+  }
+
   ScenarioProgramSelection result{
       .scenario_id = row_scenario_id,
       .scenario_catalog_revision = catalog.revision,
@@ -547,6 +568,7 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
       .deployment_compatibility = deployment_compatibility,
       .assistant_mode = assistant_mode,
       .typed_parameter_overrides = typed_parameter_overrides,
+      .normalized_assistant_projection = std::move(assistant_projection),
       .normalized_program_root = program->normalized_program_root(),
       .normalized_program_binding_root = binding->normalized_root(),
   };

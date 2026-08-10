@@ -441,6 +441,22 @@ std::string SceneAddRequest(const SourceSnapshot &scene_source,
   }));
 }
 
+std::string ScenePoseRequest(const SourceSnapshot &scene_source,
+                             const std::string_view scene_resource_id) {
+  using content_identity::CanonicalValue;
+  const auto &projection = RequiredMember(
+      RequiredMember(scene_source.payload, "access"), "active_projection");
+  return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"command", CanonicalValue("scene_pose_query")},
+      {"expected_projection_revision", projection},
+      {"scene_resource_ids",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(std::string(scene_resource_id)),
+       })},
+  }));
+}
+
 TEST(ManagerDaemonProcess,
      PublishesWithoutComposerAndSurvivesManagerReplacement) {
   DaemonDirectory directory;
@@ -640,6 +656,22 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(content_identity::canonical_json(published->payload)
                   .find("\"scene_resource_id\":\"scene-process-box\""),
               std::string::npos);
+    const auto pose = SendCommand(
+        directory.socket_path(),
+        ScenePoseRequest(*published, "scene-process-box"));
+    EXPECT_NE(pose.find("\"ok\":true"), std::string::npos);
+    EXPECT_NE(pose.find("\"scene_resource_id\":\"scene-process-box\""),
+              std::string::npos);
+    EXPECT_NE(pose.find("\"position_m\":{\"x\":0,\"y\":0,\"z\":0.15}"),
+              std::string::npos);
+    const auto stale_pose = SendCommand(
+        directory.socket_path(),
+        ScenePoseRequest(*initial, "scene-process-box"));
+    EXPECT_NE(stale_pose.find("\"scene_projection_changed\""),
+              std::string::npos);
+    const auto absent_pose = SendCommand(
+        directory.socket_path(), ScenePoseRequest(*published, "absent-object"));
+    EXPECT_NE(absent_pose.find("\"object_not_found\""), std::string::npos);
     committed_digest = published->semantic_content_digest;
     committed_generation = published->source_generation;
 

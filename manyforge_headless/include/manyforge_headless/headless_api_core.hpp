@@ -30,7 +30,7 @@ inline constexpr std::string_view kHeadlessApiMutationResponseSchemaVersion =
 inline constexpr std::string_view kViewerModelAssetSchemaVersion =
     "manyforge.viewer_model_asset.v1";
 inline constexpr std::string_view kScenarioProgramSelectionSchemaVersion =
-    "manyforge.scenario_program_selection.v1";
+    "manyforge.scenario_program_selection.v2";
 inline constexpr std::size_t kMaximumViewerModelResourceUriBytes = 4096U;
 
 class HeadlessApiOwnerLock;

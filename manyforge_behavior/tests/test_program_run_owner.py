@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from threading import Event, Thread
 from typing import Any
@@ -45,6 +45,14 @@ _ROOT = Path(__file__).resolve().parents[2]
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
 _DIGEST_C = "sha256:" + "c" * 64
+
+
+def _plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _plain(nested) for key, nested in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_plain(nested) for nested in value]
+    return value
 
 
 class _TaskPort:
@@ -341,6 +349,8 @@ def test_start_binds_exact_client_context_before_tree_construction() -> None:
     assert context.program_run_id == started.capture.program_run_id
     assert context.program_binding_id == admission.program_binding_id
     assert context.program_binding["program_id"] == admission.program.program_id
+    assert _plain(context.program) == admission.program.to_dict()
+    assert context.assistant_projection is None
 
 
 def test_start_initializes_scene_after_context_and_before_tree_construction() -> None:
@@ -524,7 +534,7 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
     program = admission.program
     environment = admission.environment
     return {
-        "schema_version": "manyforge.scenario_program_selection.v1",
+        "schema_version": "manyforge.scenario_program_selection.v2",
         "scenario_id": admission.scenario_id,
         "scenario_catalog_revision": admission.scenario_catalog_revision,
         "deployment_artifact_id": "cell_a",
@@ -536,6 +546,7 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
         "program_revision": program.program_revision,
         "node_environment_digest": environment.environment_digest,
         "assistant_mode": "forbidden",
+        "assistant_projection": None,
         "typed_parameter_overrides": {},
         "owner_identities": [
             {
@@ -600,7 +611,12 @@ def test_applied_program_join_uses_applied_content_and_fresh_owner_facts() -> No
     applied = {
         key: value
         for key, value in live.items()
-        if key not in {"owner_identities", "schema_version"}
+        if key
+        not in {
+            "assistant_projection",
+            "owner_identities",
+            "schema_version",
+        }
     }
     applied.update(
         {

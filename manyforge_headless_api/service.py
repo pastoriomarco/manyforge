@@ -28,6 +28,7 @@ from .models import (
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
+    SceneResourcePoseQuery,
     SceneTransactionRequest,
     StopIntentRequest,
 )
@@ -215,6 +216,12 @@ class HeadlessService:
                 "runtime snapshot version is unsupported",
             )
         return snapshot
+
+    def scene_resource_poses(
+        self,
+        request: SceneResourcePoseQuery,
+    ) -> dict[str, Any]:
+        return self.manager.resolve_scene_resources(request)
 
     def _source_section(self, name: str) -> tuple[dict[str, Any], dict[str, Any]]:
         runtime = self.runtime()

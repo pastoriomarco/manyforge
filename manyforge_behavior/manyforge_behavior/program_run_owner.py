@@ -34,7 +34,7 @@ from manyforge_behavior.program_runtime import (
 
 
 PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v1"
-SCENARIO_PROGRAM_SELECTION_API: Final = "manyforge.scenario_program_selection.v1"
+SCENARIO_PROGRAM_SELECTION_API: Final = "manyforge.scenario_program_selection.v2"
 APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v1"
 _MAX_RETAINED_RUNS: Final = 4_096
 
@@ -85,6 +85,7 @@ class ProgramRunAdmission:
     readiness: NodeExecutionReadiness
     owner_identities: tuple[ProgramRunOwnerIdentity, ...]
     program_parameter_values: Mapping[str, Any]
+    assistant_projection: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _text(self.scenario_id, field="scenario_id", maximum_bytes=128)
@@ -153,6 +154,21 @@ class ProgramRunAdmission:
             self,
             "program_parameter_values",
             MappingProxyType(deepcopy(dict(self.program_parameter_values))),
+        )
+        if self.assistant_projection is not None and not isinstance(
+            self.assistant_projection, Mapping
+        ):
+            raise TypeError("assistant_projection must be absent or one mapping")
+        object.__setattr__(
+            self,
+            "assistant_projection",
+            (
+                None
+                if self.assistant_projection is None
+                else MappingProxyType(
+                    deepcopy(dict(self.assistant_projection))
+                )
+            ),
         )
 
 
@@ -345,6 +361,8 @@ class ProgramRunOwner:
                 graph_revision=capture.graph_revision,
                 node_environment_digest=capture.node_environment_digest,
                 program_binding=admission.program_binding,
+                program=admission.program.to_dict(),
+                assistant_projection=admission.assistant_projection,
             )
             try:
                 if context_port is not None:
@@ -613,6 +631,7 @@ def build_program_run_admission(
     if not isinstance(selection, Mapping):
         raise TypeError("scenario Program selection must be a mapping")
     expected_fields = {
+        "assistant_projection",
         "assistant_mode",
         "deployment_artifact_id",
         "deployment_revision",
@@ -642,6 +661,22 @@ def build_program_run_admission(
         "forbidden",
     }:
         raise ProgramRunOwnerError("scenario assistant mode is invalid")
+    assistant_mode = selection["assistant_mode"]
+    assistant_projection = selection.get("assistant_projection")
+    if assistant_projection is not None and not isinstance(
+        assistant_projection, dict
+    ):
+        raise ProgramRunOwnerError(
+            "scenario assistant projection must be null or an object"
+        )
+    if assistant_mode == "required" and assistant_projection is None:
+        raise ProgramRunOwnerError(
+            "scenario requires an absent assistant projection"
+        )
+    if assistant_mode == "forbidden" and assistant_projection is not None:
+        raise ProgramRunOwnerError(
+            "scenario forbids a present assistant projection"
+        )
     scenario_id = _text(selection.get("scenario_id"), field="scenario_id")
     scenario_catalog_revision = _digest(
         selection.get("scenario_catalog_revision"),
@@ -772,6 +807,7 @@ def build_program_run_admission(
         readiness=readiness,
         owner_identities=owner_identities,
         program_parameter_values=overrides,
+        assistant_projection=assistant_projection,
     )
 
 
@@ -843,6 +879,9 @@ def build_applied_program_run_admission(
             "live scenario selection has no exact owner identities"
         )
     normalized_selection = {
+        "assistant_projection": deepcopy(
+            live_scenario_selection.get("assistant_projection")
+        ),
         "assistant_mode": applied["assistant_mode"],
         "deployment_artifact_id": applied["deployment_artifact_id"],
         "deployment_revision": applied["deployment_revision"],

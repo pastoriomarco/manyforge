@@ -25,6 +25,7 @@ from .models import (
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
     RuntimeScaleRequest,
+    SceneResourcePoseQuery,
     SceneTransactionRequest,
     StopIntentRequest,
 )
@@ -648,6 +649,12 @@ def create_app(
     @app.get("/api/scene")
     def scene() -> dict[str, Any]:
         return service.scene()
+
+    @app.post("/api/scene/resource-poses/query")
+    def scene_resource_poses(
+        body: SceneResourcePoseQuery,
+    ) -> dict[str, Any]:
+        return service.scene_resource_poses(body)
 
     @app.post("/api/scene/transactions")
     def scene_commit(

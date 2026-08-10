@@ -12,7 +12,11 @@ from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 
 from manyforge_headless_api.app import TrustedPrincipal, _error_status, create_app
-from manyforge_headless_api.models import ManagerApplyRequest, SceneTransactionRequest
+from manyforge_headless_api.models import (
+    ManagerApplyRequest,
+    SceneResourcePoseQuery,
+    SceneTransactionRequest,
+)
 from manyforge_headless_api.native import HeadlessApiError, ViewerModelAsset
 from manyforge_headless_api.service import HeadlessService
 
@@ -347,6 +351,7 @@ class FakeManager:
     def __init__(self) -> None:
         self.requests: list[ManagerApplyRequest] = []
         self.scene_requests: list[tuple[SceneTransactionRequest, str | None]] = []
+        self.scene_pose_requests: list[SceneResourcePoseQuery] = []
 
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         self.requests.append(request)
@@ -388,6 +393,28 @@ class FakeManager:
             "request_owner_epoch": context.request_owner_epoch,
             "transaction_sequence": 1,
             "update_status": "geometry_changed",
+        }
+
+    def resolve_scene_resources(
+        self,
+        request: SceneResourcePoseQuery,
+    ) -> dict[str, Any]:
+        self.scene_pose_requests.append(request)
+        return {
+            "api_version": "manyforge.scene_resource_pose_response.v1",
+            "poses": [
+                {
+                    "scene_resource_id": resource_id,
+                    "pose_in_cell": {
+                        "position_m": {"x": 0.1, "y": 0.2, "z": 0.3},
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                }
+                for resource_id in request.scene_resource_ids
+            ],
+            "projection_revision": (
+                request.expected_projection_revision.model_dump()
+            ),
         }
 
 
@@ -956,6 +983,32 @@ def test_scene_transaction_is_forwarded_with_adapter_only_attribution() -> None:
     assert manager.scene_requests[0][0].operation.scene_resource_id == "part.1"
     assert manager.scene_requests[0][1] == "operator.7"
     assert forged.status_code == 422
+
+
+def test_scene_pose_query_is_read_only_revision_fenced_and_canonical() -> None:
+    client, _core, manager = _client()
+    projection = _scene_body()["expected_projection_revision"]
+    body = {
+        "api_version": "manyforge.scene_resource_pose_query.v1",
+        "expected_projection_revision": projection,
+        "scene_resource_ids": ["part.1", "part.2"],
+    }
+    with client:
+        response = client.post("/api/scene/resource-poses/query", json=body)
+        noncanonical = client.post(
+            "/api/scene/resource-poses/query",
+            json={**body, "scene_resource_ids": ["part.2", "part.1"]},
+        )
+
+    assert response.status_code == 200
+    assert [row["scene_resource_id"] for row in response.json()["poses"]] == [
+        "part.1",
+        "part.2",
+    ]
+    assert manager.scene_pose_requests[0].expected_projection_revision.model_dump() == (
+        projection
+    )
+    assert noncanonical.status_code == 422
 
 
 def test_scene_support_declaration_crosses_http_without_native_names() -> None:

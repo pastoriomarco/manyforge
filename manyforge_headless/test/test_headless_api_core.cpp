@@ -193,11 +193,12 @@ CanonicalValue LogicalScenePayload() {
 }
 
 CanonicalValue SceneRuntimePayload(const std::string &state,
-                                   const std::uint64_t generation) {
+                                   const std::uint64_t generation,
+                                   const std::string_view cell_id = kCellId) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kSceneRuntimeSourcePayloadApiVersion))},
-      {"cell_id", CanonicalValue(std::string(kCellId))},
+      {"cell_id", CanonicalValue(std::string(cell_id))},
       {"state", CanonicalValue(CanonicalValue::Object{
                     {"api_version", CanonicalValue(std::string(
                                         kSceneRuntimeStateSnapshotApiVersion))},
@@ -544,6 +545,24 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(applied, "program_revision"),
             selection.program_revision.value());
   EXPECT_EQ(core.AppliedProgramSelection(), applied);
+
+  AtomicSourceSnapshotChannel scene(directory.publications(),
+                                    "logical-scene-source.json");
+  AtomicSourceSnapshotChannel runtime(directory.publications(),
+                                      "scene-runtime-source.json");
+  static_cast<void>(scene.Publish(
+      "logical_scene", "logical-scene." + cell_id, "scene.epoch.1", 1,
+      LogicalScenePayload()));
+  static_cast<void>(runtime.Publish(
+      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime.epoch.1", 1,
+      SceneRuntimePayload("open", 1, cell_id)));
+  const auto scenario = core.ScenarioProgramSelection(selection.scenario_id);
+  EXPECT_EQ(Text(scenario, "schema_version"),
+            kScenarioProgramSelectionSchemaVersion);
+  EXPECT_EQ(content_identity::canonical_json(
+                Member(scenario, "assistant_projection")),
+            content_identity::canonical_json(
+                selection.normalized_assistant_projection));
 }
 
 TEST(HeadlessApiCore, ServesOnlyTheExactVerifiedActiveRetainedViewerProduct) {

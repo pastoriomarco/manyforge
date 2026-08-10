@@ -51,6 +51,11 @@ struct ScenarioProgramSelection final {
   ScenarioDeploymentCompatibilityDTO deployment_compatibility;
   ScenarioAssistantMode assistant_mode;
   CanonicalValue typed_parameter_overrides;
+  /// Exact verified retained assistant product, or JSON null when the
+  /// selected bundle has none.  This is carried with the Program selection so
+  /// a model-request leaf cannot rediscover or substitute endpoint/template
+  /// contracts after admission.
+  CanonicalValue normalized_assistant_projection;
   CanonicalValue normalized_program_root;
   CanonicalValue normalized_program_binding_root;
 

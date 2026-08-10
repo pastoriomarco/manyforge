@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 import socket
@@ -14,6 +15,7 @@ import rfc8785
 from .models import (
     ManagerApplyRequest,
     ProjectionRevisionRequest,
+    SceneResourcePoseQuery,
     SceneTransactionRequest,
 )
 from .native import HeadlessApiError, strict_json_object
@@ -50,6 +52,11 @@ class ManagerPort(Protocol):
         request: SceneTransactionRequest,
         *,
         trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
+    def resolve_scene_resources(
+        self,
+        request: SceneResourcePoseQuery,
     ) -> dict[str, Any]: ...
 
 
@@ -327,3 +334,112 @@ class ManagerCommandClient:
         )
         self._validate_scene_response(response, request)
         return response
+
+    def resolve_scene_resources(
+        self,
+        request: SceneResourcePoseQuery,
+    ) -> dict[str, Any]:
+        response = self._exchange(
+            {
+                "api_version": MANAGER_COMMAND_VERSION,
+                "command": "scene_pose_query",
+                "expected_projection_revision": (
+                    request.expected_projection_revision.model_dump()
+                ),
+                "scene_resource_ids": request.scene_resource_ids,
+            }
+        )
+        if response.get("ok") is not True:
+            error = response.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            message = error.get("message") if isinstance(error, dict) else None
+            raise HeadlessApiError(
+                code if isinstance(code, str) and code else "scene_pose_unavailable",
+                message
+                if isinstance(message, str) and message
+                else "Manager scene pose query was rejected",
+            )
+        if set(response) != {
+            "api_version",
+            "ok",
+            "poses",
+            "projection_revision",
+        }:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "scene pose response has an unknown or missing field",
+            )
+        try:
+            projection = ProjectionRevisionRequest.model_validate(
+                response["projection_revision"]
+            )
+        except (KeyError, ValueError) as exc:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "scene pose response has an invalid projection revision",
+            ) from exc
+        if projection != request.expected_projection_revision:
+            raise HeadlessApiError(
+                "manager_command_response_identity_mismatch",
+                "scene pose response changed the expected projection revision",
+            )
+        poses = response.get("poses")
+        if not isinstance(poses, list) or len(poses) != len(
+            request.scene_resource_ids
+        ):
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "scene pose response is incomplete",
+            )
+        parsed: list[dict[str, Any]] = []
+        for index, (expected_id, row) in enumerate(
+            zip(request.scene_resource_ids, poses, strict=True)
+        ):
+            if (
+                not isinstance(row, dict)
+                or set(row) != {"pose_in_cell", "scene_resource_id"}
+                or row.get("scene_resource_id") != expected_id
+            ):
+                raise HeadlessApiError(
+                    "manager_command_response_identity_mismatch",
+                    f"scene pose response row {index} changed object identity",
+                )
+            pose = row.get("pose_in_cell")
+            if not isinstance(pose, dict) or set(pose) != {
+                "orientation_xyzw",
+                "position_m",
+            }:
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    f"scene pose response row {index} has an invalid pose",
+                )
+            position = pose.get("position_m")
+            orientation = pose.get("orientation_xyzw")
+            if (
+                not isinstance(position, dict)
+                or set(position) != {"x", "y", "z"}
+                or not isinstance(orientation, list)
+                or len(orientation) != 4
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in (*position.values(), *orientation)
+                )
+            ):
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    f"scene pose response row {index} has invalid coordinates",
+                )
+            norm = math.sqrt(sum(float(value) ** 2 for value in orientation))
+            if abs(norm - 1.0) > 1.0e-6:
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    f"scene pose response row {index} has a non-unit quaternion",
+                )
+            parsed.append(row)
+        return {
+            "api_version": "manyforge.scene_resource_pose_response.v1",
+            "poses": parsed,
+            "projection_revision": projection.model_dump(),
+        }

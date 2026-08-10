@@ -9,7 +9,11 @@ import pytest
 import rfc8785
 
 from manyforge_headless_api.manager import ManagerCommandClient
-from manyforge_headless_api.models import ManagerApplyRequest, SceneTransactionRequest
+from manyforge_headless_api.models import (
+    ManagerApplyRequest,
+    SceneResourcePoseQuery,
+    SceneTransactionRequest,
+)
 from manyforge_headless_api.native import HeadlessApiError
 
 
@@ -54,6 +58,24 @@ def _scene_request() -> SceneTransactionRequest:
                 "kind": "remove_object",
                 "scene_resource_id": "part.1",
             },
+        }
+    )
+
+
+def _pose_query() -> SceneResourcePoseQuery:
+    return SceneResourcePoseQuery.model_validate(
+        {
+            "api_version": "manyforge.scene_resource_pose_query.v1",
+            "expected_projection_revision": {
+                "retained_bundle_id": "sha256:" + "b" * 64,
+                "graph_revision": "sha256:" + "c" * 64,
+                "scene_revision": {
+                    "scene_id": "sha256:" + "d" * 64,
+                    "revision_id": 1,
+                    "content_hash": "sha256:" + "a" * 64,
+                },
+            },
+            "scene_resource_ids": ["part.1"],
         }
     )
 
@@ -299,4 +321,58 @@ def test_scene_client_rejects_mismatched_or_inconsistent_owner_result(
         client.commit_scene_transaction(
             _scene_request(), trusted_principal_id=None
         )
+    assert captured.value.code == "manager_command_response_identity_mismatch"
+
+
+def test_scene_pose_client_fences_and_validates_the_owner_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+    query = _pose_query()
+    commands: list[dict[str, object]] = []
+
+    def exchange(command: dict[str, object]) -> dict[str, object]:
+        commands.append(command)
+        return {
+            "api_version": "manyforge.manager_command_response.v1",
+            "ok": True,
+            "poses": [
+                {
+                    "scene_resource_id": "part.1",
+                    "pose_in_cell": {
+                        "position_m": {"x": 0.1, "y": 0.2, "z": 0.3},
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                }
+            ],
+            "projection_revision": (
+                query.expected_projection_revision.model_dump()
+            ),
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    response = client.resolve_scene_resources(query)
+
+    assert response["api_version"] == "manyforge.scene_resource_pose_response.v1"
+    assert response["poses"][0]["scene_resource_id"] == "part.1"
+    assert commands == [
+        {
+            "api_version": "manyforge.manager_command.v1",
+            "command": "scene_pose_query",
+            "expected_projection_revision": (
+                query.expected_projection_revision.model_dump()
+            ),
+            "scene_resource_ids": ["part.1"],
+        }
+    ]
+
+    corrupt = exchange({})
+    corrupt["projection_revision"] = {
+        **query.expected_projection_revision.model_dump(),
+        "graph_revision": "sha256:" + "e" * 64,
+    }
+    monkeypatch.setattr(client, "_exchange", lambda _command: corrupt)
+    with pytest.raises(HeadlessApiError) as captured:
+        client.resolve_scene_resources(query)
     assert captured.value.code == "manager_command_response_identity_mismatch"
