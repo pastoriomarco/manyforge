@@ -15,6 +15,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerTaskPort,
     OwnerTaskSnapshot,
     OwnerTaskState,
+    ProgramInterventionPort,
 )
 from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
@@ -128,19 +129,23 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self,
         *,
         port: OwnerTaskPort,
+        intervention_port: ProgramInterventionPort | None = None,
         require_initial_running: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._port = port
+        self._intervention_port = intervention_port
         self._require_initial_running = require_initial_running
         self._task: OwnerTaskSnapshot | None = None
         self._acknowledged = False
+        self._intervention_reported = False
 
     def initialise(self) -> None:
         super().initialise()
         self._task = None
         self._acknowledged = False
+        self._intervention_reported = False
 
     def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
         if task.state is OwnerTaskState.ACTIVE:
@@ -172,6 +177,52 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 )
                 else py_trees.common.Status.FAILURE
             )
+        policy = task.metadata.get("authored_failure_policy")
+        if policy is not None:
+            if policy not in {"pause_for_operator", "condition_failure"}:
+                self._record_failure(
+                    "owner_result_invalid",
+                    "owner returned an unknown authored failure policy",
+                )
+                return py_trees.common.Status.FAILURE
+            if policy == "pause_for_operator":
+                if self._intervention_port is None or self._identity is None:
+                    self._record_failure(
+                        "program_intervention_port_unavailable",
+                        "pause_for_operator requires the production intervention port",
+                    )
+                    return py_trees.common.Status.FAILURE
+                parameter = task.metadata.get(
+                    "authored_failure_policy_parameter"
+                )
+                if not isinstance(parameter, str) or not parameter:
+                    self._record_failure(
+                        "owner_result_invalid",
+                        "pause_for_operator has no authored policy parameter",
+                    )
+                    return py_trees.common.Status.FAILURE
+                if not self._intervention_reported:
+                    try:
+                        self._intervention_port.require(
+                            self._identity,
+                            reason_code=(
+                                task.reason_code or "operator_intervention_required"
+                            ),
+                            message=task.message,
+                            policy_parameter=parameter,
+                        )
+                    except Exception as exc:
+                        self._record_failure(
+                            "program_intervention_record_failed",
+                            str(exc),
+                        )
+                        return py_trees.common.Status.FAILURE
+                    self._intervention_reported = True
+                self._record_failure(task.reason_code, task.message)
+                # Keep this exact terminal owner task in place.  The production
+                # scheduler removes the run from automatic ticking, so neither
+                # a retry nor a stale output write can occur.
+                return py_trees.common.Status.RUNNING
         self._record_failure(task.reason_code, task.message)
         return py_trees.common.Status.FAILURE
 

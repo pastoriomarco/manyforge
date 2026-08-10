@@ -871,6 +871,179 @@ CanonicalValue HeadlessApiCore::ReconcileHistorianHealth(
   return response;
 }
 
+CanonicalValue
+HeadlessApiCore::CommitProgramModelAttempt(CanonicalValue record) {
+  constexpr std::size_t kProgramModelAttemptFieldCount = 30U;
+  const std::string error_code = "headless_program_model_attempt_invalid";
+  Require(record.is_object() &&
+              record.as_object().size() == kProgramModelAttemptFieldCount,
+          error_code, "Program model-attempt record has wrong fields");
+  const auto text = [&](const std::string_view name,
+                        const std::size_t maximum_bytes = 512U) {
+    const auto value = RequiredString(record, name);
+    Require(!value.empty() && value.size() <= maximum_bytes &&
+                content_identity::is_utf8_nfc(value),
+            error_code,
+            "Program model-attempt text field is invalid: " +
+                std::string(name));
+    return value;
+  };
+  const auto optional_digest = [&](const std::string_view name) {
+    const auto value = OptionalStringMember(record, name);
+    Require(!value.has_value() || content_identity::is_sha256_digest(*value),
+            error_code,
+            "Program model-attempt digest field is invalid: " +
+                std::string(name));
+    return value;
+  };
+  const auto counter = [&](const std::string_view name,
+                           const std::uint64_t minimum = 0U) {
+    const auto *value =
+        std::get_if<double>(&RequiredMember(record, name).storage());
+    Require(value != nullptr && std::isfinite(*value) &&
+                *value >= static_cast<double>(minimum) &&
+                std::floor(*value) == *value &&
+                *value <= static_cast<double>(kMaximumSafeInteger),
+            error_code,
+            "Program model-attempt counter field is invalid: " +
+                std::string(name));
+    return static_cast<std::uint64_t>(*value);
+  };
+  Require(text("schema_version") == "manyforge.program_model_attempt.v1",
+          error_code, "Program model-attempt version is unsupported");
+  const auto model_attempt_id = text("model_attempt_id");
+  text("program_run_id");
+  text("node_instance_id");
+  text("node_attempt_id");
+  const auto attempt_index = counter("external_attempt_index", 1U);
+  Require(attempt_index <= 2U, error_code,
+          "Program model-attempt index exceeds the bounded retry contract");
+  Require(content_identity::is_sha256_digest(
+              text("assistant_projection_digest", 71U)) &&
+              content_identity::is_sha256_digest(
+                  text("prompt_template_digest", 71U)) &&
+              content_identity::is_sha256_digest(text("prompt_digest", 71U)),
+          error_code, "Program model-attempt retained identity is invalid");
+  text("model_endpoint_alias");
+  text("external_resource_alias");
+  text("model_id");
+  text("prompt_template_id");
+  text("prompt_template_version");
+  const auto &arguments = RequiredMember(record, "argument_digests");
+  Require(arguments.is_object() && arguments.as_object().size() <= 256U,
+          error_code, "Program model-attempt argument digests are invalid");
+  for (const auto &[name, digest_value] : arguments.as_object()) {
+    const auto *digest = std::get_if<std::string>(&digest_value.storage());
+    Require(!name.empty() && name.size() <= 512U &&
+                content_identity::is_utf8_nfc(name) && digest != nullptr &&
+                content_identity::is_sha256_digest(*digest),
+            error_code, "Program model-attempt argument digest is invalid");
+  }
+  optional_digest("attachment_digest");
+  const auto &audit_policy = RequiredMember(record, "audit_policy");
+  Require(audit_policy.is_object() && audit_policy.as_object().size() == 3U,
+          error_code, "Program model-attempt audit policy is invalid");
+  const bool redact_arguments =
+      RequiredBool(audit_policy, "redact_argument_values");
+  const bool store_full_prompts =
+      RequiredBool(audit_policy, "store_full_prompts");
+  const bool store_full_responses =
+      RequiredBool(audit_policy, "store_full_responses");
+  const auto &argument_values = RequiredMember(record, "argument_values");
+  Require((redact_arguments &&
+           std::holds_alternative<std::nullptr_t>(argument_values.storage())) ||
+              (!redact_arguments && argument_values.is_object()),
+          error_code,
+          "Program model-attempt argument retention disagrees with policy");
+  const auto &prompt_text = RequiredMember(record, "prompt_text");
+  const auto *retained_prompt =
+      std::get_if<std::string>(&prompt_text.storage());
+  Require((store_full_prompts && retained_prompt != nullptr &&
+           !retained_prompt->empty()) ||
+              (!store_full_prompts &&
+               std::holds_alternative<std::nullptr_t>(prompt_text.storage())),
+          error_code,
+          "Program model-attempt prompt retention disagrees with policy");
+  const auto outcome = text("outcome", 64U);
+  const std::set<std::string> outcomes{"success",
+                                       "timeout",
+                                       "parse_error",
+                                       "schema_error",
+                                       "confidence_below_threshold",
+                                       "cancelled",
+                                       "transport_error",
+                                       "invalid_response"};
+  Require(outcomes.contains(outcome), error_code,
+          "Program model-attempt outcome is unsupported");
+  const auto attempt_error = OptionalStringMember(record, "error_code");
+  Require((outcome == "success") == !attempt_error.has_value() &&
+              (!attempt_error.has_value() ||
+               (!attempt_error->empty() && attempt_error->size() <= 256U &&
+                content_identity::is_utf8_nfc(*attempt_error))),
+          error_code,
+          "Program model-attempt error identity disagrees with outcome");
+  const auto *error_message = std::get_if<std::string>(
+      &RequiredMember(record, "error_message").storage());
+  const auto *model_version = std::get_if<std::string>(
+      &RequiredMember(record, "model_version").storage());
+  const auto occurred_at_ns = counter("occurred_at_ns");
+  const auto occurred_at_wall = text("occurred_at_wall", 128U);
+  Require(error_message != nullptr && error_message->size() <= 4096U &&
+              content_identity::is_utf8_nfc(*error_message) &&
+              model_version != nullptr && model_version->size() <= 4096U &&
+              content_identity::is_utf8_nfc(*model_version),
+          error_code, "Program model-attempt result text is invalid");
+  const auto response_digest = optional_digest("response_digest");
+  const auto output_digest = optional_digest("validated_output_digest");
+  Require((outcome != "success" ||
+           (response_digest.has_value() && output_digest.has_value())) &&
+              (outcome == "success" || !output_digest.has_value()),
+          error_code,
+          "Program model-attempt output evidence disagrees with outcome");
+  const auto &response_value = RequiredMember(record, "response_value");
+  const bool response_is_present =
+      std::holds_alternative<std::string>(response_value.storage()) ||
+      response_value.is_object();
+  Require((!store_full_responses &&
+           std::holds_alternative<std::nullptr_t>(response_value.storage())) ||
+              (store_full_responses &&
+               ((!response_digest.has_value() && !response_is_present) ||
+                (response_digest.has_value() && response_is_present))),
+          error_code,
+          "Program model-attempt response retention disagrees with policy");
+  const auto *latency =
+      std::get_if<double>(&RequiredMember(record, "latency_ms").storage());
+  Require(latency != nullptr && std::isfinite(*latency) && *latency >= 0.0 &&
+              *latency <= 3600000.0,
+          error_code, "Program model-attempt latency is invalid");
+  const auto &usage = RequiredMember(record, "usage");
+  Require(std::holds_alternative<std::nullptr_t>(usage.storage()) ||
+              usage.is_object(),
+          error_code, "Program model-attempt usage is invalid");
+  Require(content_identity::canonical_json(record).size() <=
+              kMaximumHistorianPayloadBytes,
+          error_code, "Program model-attempt record exceeds its byte bound");
+
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  auto event = MakeHistorianEvent("manyforge.program", "program_model_attempt",
+                                  outcome == "success" ? "INFO" : "WARN",
+                                  static_cast<std::int64_t>(occurred_at_ns),
+                                  occurred_at_wall, std::move(record));
+  const auto event_id = event.event_id;
+  const auto status = history_store_->Append(event);
+  return CanonicalValue(CanonicalValue::Object{
+      {"event_id", CanonicalValue(event_id)},
+      {"model_attempt_id", CanonicalValue(model_attempt_id)},
+      {"schema_version",
+       CanonicalValue("manyforge.program_model_attempt_commit.v1")},
+      {"status",
+       CanonicalValue(status == IEventHistoryStore::AppendStatus::kStored
+                          ? "stored"
+                          : "duplicate")},
+  });
+}
+
 CanonicalValue HeadlessApiCore::IngestOperationEvent(
     std::string source_owner_epoch, const std::uint64_t source_sequence,
     std::string record_kind, std::optional<std::string> request_id,

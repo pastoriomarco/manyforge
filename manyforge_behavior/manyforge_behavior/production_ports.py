@@ -319,9 +319,16 @@ class _TargetBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class _ContactGraspBinding:
+    contact_policy_id: str
+    runtime_object_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class _BoundContext:
     capture: ProgramRunPortContext
     targets: Mapping[str, _TargetBinding]
+    contact_grasps: Mapping[str, _ContactGraspBinding]
 
 
 class _SceneProgramTransport(Protocol):
@@ -369,6 +376,18 @@ class _OperationTask:
     stop_requested: bool = False
 
 
+@dataclass(slots=True)
+class _PickPlaceTask:
+    identity: NodeAttemptIdentity
+    node_id: str
+    sequence_id: str
+    kind: str
+    selected_object_id: str
+    planning_result: Mapping[str, Any]
+    snapshot: OwnerTaskSnapshot
+    active_stop_operation_id: str | None = None
+
+
 class NativeKernelProgramPort:
     """Captured context plus separate native task and Program-scope clients."""
 
@@ -378,8 +397,10 @@ class NativeKernelProgramPort:
         self._kernel = kernel
         self._contexts: dict[str, _BoundContext] = {}
         self._tasks: dict[str, _OperationTask] = {}
+        self._pick_place_tasks: dict[str, _PickPlaceTask] = {}
         self._lock = RLock()
         self.operations = _NativeKernelOperationTaskPort(self)
+        self.pick_place = _NativePickPlaceTaskPort(self)
         self.scope = _NativeKernelProgramScopePort(self)
 
     @staticmethod
@@ -427,7 +448,34 @@ class NativeKernelProgramPort:
                 component_role_id,
                 capabilities,
             )
-        return _BoundContext(context, targets)
+        contact_grasps: dict[str, _ContactGraspBinding] = {}
+        raw_contact_grasps = binding.get("contact_grasp_bindings", ())
+        if not isinstance(raw_contact_grasps, (list, tuple)):
+            raise ProductionPortError(
+                "Program Binding contact-grasp bindings are invalid"
+            )
+        for index, raw_contact in enumerate(raw_contact_grasps):
+            contact = _mapping(
+                raw_contact,
+                field=f"contact_grasp_bindings[{index}]",
+            )
+            policy_id = _text(
+                contact.get("contact_policy_id"),
+                field=f"contact_grasp_bindings[{index}].contact_policy_id",
+            )
+            runtime_object_id = _text(
+                contact.get("runtime_object_id"),
+                field=f"contact_grasp_bindings[{index}].runtime_object_id",
+            )
+            if policy_id in contact_grasps:
+                raise ProductionPortError(
+                    "Program Binding repeats a contact-grasp policy"
+                )
+            contact_grasps[policy_id] = _ContactGraspBinding(
+                policy_id,
+                runtime_object_id,
+            )
+        return _BoundContext(context, targets, contact_grasps)
 
     def bind(self, context: ProgramRunPortContext) -> None:
         if not isinstance(context, ProgramRunPortContext):
@@ -445,13 +493,47 @@ class NativeKernelProgramPort:
 
     def unbind(self, program_run_id: str) -> None:
         with self._lock:
-            if any(
-                task.identity.program_run_id == program_run_id
+            tasks = tuple(
+                task
                 for task in self._tasks.values()
-            ):
+                if task.identity.program_run_id == program_run_id
+            )
+            pick_place_tasks = tuple(
+                task
+                for task in self._pick_place_tasks.values()
+                if task.identity.program_run_id == program_run_id
+            )
+        completed: list[_OperationTask] = []
+        terminal: list[_OperationTask] = []
+        for task in tasks:
+            _operation, snapshot = self._observation(task)
+            if snapshot.state is OwnerTaskState.ACTIVE:
                 raise ProductionPortError(
-                    "cannot unbind a Program run with retained operation tasks"
+                    "cannot unbind a Program run with active native operations"
                 )
+            if snapshot.state is OwnerTaskState.SUCCEEDED:
+                completed.append(task)
+            else:
+                terminal.append(task)
+        # A sequence may settle between its final owner transition and the
+        # next tree tick. Consume successful evidence before dropping local
+        # task state; failed/interrupted native records have no acknowledge
+        # command and remain in the native historian.
+        for task in completed:
+            self._acknowledge_task(task.operation_id, task.identity)
+        terminal_pick_place: list[_PickPlaceTask] = []
+        for task in pick_place_tasks:
+            snapshot = self._observe_pick_place_task(task.sequence_id)
+            if snapshot.state is OwnerTaskState.ACTIVE:
+                raise ProductionPortError(
+                    "cannot unbind a Program run with an active pick/place sequence"
+                )
+            terminal_pick_place.append(task)
+        with self._lock:
+            for task in terminal:
+                self._tasks.pop(task.operation_id, None)
+            for task in terminal_pick_place:
+                self._pick_place_tasks.pop(task.sequence_id, None)
             self._contexts.pop(program_run_id, None)
 
     def _context(self, program_run_id: str) -> _BoundContext:
@@ -698,6 +780,659 @@ class NativeKernelProgramPort:
             ],
         }
 
+    @staticmethod
+    def _pick_synthesis(
+        parameters: Mapping[str, Any],
+        *,
+        target_role_id: str,
+        base_frame_role_id: str,
+    ) -> dict[str, Any]:
+        synthesis = _mapping(parameters.get("synthesis"), field="synthesis")
+
+        def envelope(name: str) -> dict[str, list[float]]:
+            value = _mapping(synthesis.get(name), field=f"synthesis.{name}")
+            return {
+                key: [
+                    _number(item, field=f"synthesis.{name}.{key}[{index}]")
+                    for index, item in enumerate(
+                        _sequence(
+                            value.get(key),
+                            field=f"synthesis.{name}.{key}",
+                            length=3,
+                        )
+                    )
+                ]
+                for key in (
+                    "position_min_m",
+                    "position_max_m",
+                    "orientation_rpy_min_deg",
+                    "orientation_rpy_max_deg",
+                )
+            }
+
+        def reference(name: str) -> dict[str, Any] | None:
+            return _reference(
+                synthesis.get(name),
+                field=f"synthesis.{name}",
+                target_role_id=target_role_id,
+                base_frame_role_id=base_frame_role_id,
+            )
+
+        base_orientation = synthesis.get(
+            "base_tool_orientation_rpy_deg", (180.0, 0.0, 0.0)
+        )
+        return {
+            "pick_offset_envelope": envelope("pick_offset_envelope"),
+            "approach_offset_envelope": envelope(
+                "approach_offset_envelope"
+            ),
+            "pick_offset_reference": reference("pick_offset_reference"),
+            "approach_offset_reference": reference(
+                "approach_offset_reference"
+            ),
+            "base_tool_orientation_rpy_deg": [
+                _number(value, field=f"base_tool_orientation_rpy_deg[{index}]")
+                for index, value in enumerate(
+                    _sequence(
+                        base_orientation,
+                        field="base_tool_orientation_rpy_deg",
+                        length=3,
+                    )
+                )
+            ],
+            "translation_step_m": _number(
+                synthesis.get("translation_step_m", 0.01),
+                field="translation_step_m",
+            ),
+            "rotation_step_deg": _number(
+                synthesis.get("rotation_step_deg", 15.0),
+                field="rotation_step_deg",
+            ),
+            "force_vertical_pick": synthesis.get("force_vertical_pick", False),
+            "min_tcp_z_m": synthesis.get("min_tcp_z_m"),
+            "maximum_candidate_count": synthesis.get(
+                "maximum_candidate_count", 4096
+            ),
+            "search_strategy": synthesis.get(
+                "search_strategy", "first_feasible"
+            ),
+        }
+
+    @staticmethod
+    def _phase_motion_payload(
+        *,
+        identity: NodeAttemptIdentity,
+        parameters: Mapping[str, Any],
+        phase: str,
+        motion: Mapping[str, Any],
+        contact_policy_id: str | None = None,
+        runtime_object_id: str | None = None,
+        selected_object_id: str | None = None,
+    ) -> dict[str, Any]:
+        options = _mapping(
+            parameters.get("motion_options", {}), field="motion_options"
+        )
+        velocity_key = {
+            "approach": "approach_velocity_scale",
+            "descend": "descend_velocity_scale",
+            "retreat": "retreat_velocity_scale",
+        }[phase]
+        runtime_bindings = []
+        if runtime_object_id is not None or selected_object_id is not None:
+            if runtime_object_id is None or selected_object_id is None:
+                raise ProductionPortError(
+                    "pick runtime-object binding is incomplete"
+                )
+            runtime_bindings = [
+                {
+                    "runtime_object_id": runtime_object_id,
+                    "scene_resource_id": selected_object_id,
+                }
+            ]
+        return {
+            "kind": "motion",
+            "move_id": _request_identity(
+                "pick-place-move",
+                identity.program_run_id,
+                identity.node_attempt_id,
+                phase,
+            ),
+            "base_frame_role_id": _text(
+                parameters.get("base_frame_role"), field="base_frame_role"
+            ),
+            "tcp_frame_role_id": _text(
+                parameters.get("tcp_frame_role"), field="tcp_frame_role"
+            ),
+            "tolerances": {
+                "joint_position_tol_rad": options.get(
+                    "joint_position_tol_rad", 0.05
+                ),
+                "translation_tol_m": options.get("translation_tol_m", 0.005),
+                "rotation_tol_rad": options.get("rotation_tol_rad", 0.05),
+            },
+            "speed_profile": {
+                "velocity_scale": options.get(velocity_key, 0.35),
+                "acceleration_scale": options.get("acceleration_scale", 1.0),
+                "max_tcp_linear_speed_mps": options.get(
+                    "max_tcp_linear_speed_mps"
+                ),
+            },
+            "timeouts": {
+                "planning_timeout_s": options.get("planning_timeout_s", 2.0),
+                "execution_timeout_s": options.get("execution_timeout_s", 10.0),
+            },
+            "cache_mode": options.get("cache_mode", "disable"),
+            "planning_profile": parameters.get(
+                "planning_profile", "first_feasible"
+            ),
+            "target_mode": "absolute",
+            "target_reference": None,
+            "offset_reference": None,
+            "motion": dict(motion),
+            "contact_policy_id": contact_policy_id,
+            "per_joint_dynamics_limits": {},
+            "motion_interrupt_scopes": [],
+            "runtime_object_bindings": runtime_bindings,
+        }
+
+    @staticmethod
+    def _cartesian_motion(
+        waypoints: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "kind": "cartesian_path",
+            "waypoints": [dict(waypoint) for waypoint in waypoints],
+            "max_translation_step_m": 0.005,
+            "max_rotation_step_rad": 0.05,
+            "speed_mode": "bounded",
+            "max_linear_speed_mps": 0.1,
+            "max_angular_speed_rad_s": 0.5,
+            "max_linear_acceleration_mps2": 0.5,
+            "max_angular_acceleration_rad_s2": 2.5,
+            "fallback_policy": "fail_closed",
+        }
+
+    @staticmethod
+    def _phase_operation(
+        *,
+        context: _BoundContext,
+        target: _TargetBinding,
+        capability_id: str,
+        payload: Mapping[str, Any],
+        identity: NodeAttemptIdentity,
+        owner_epoch: str,
+        scene_revision: Mapping[str, Any],
+        phase: str,
+    ) -> dict[str, Any]:
+        child_attempt_id = f"{identity.node_attempt_id}:{phase}"
+        span = ActionSpan(
+            action_source="program_node",
+            action_span_id=child_attempt_id,
+            program_run_id=identity.program_run_id,
+            node_instance_id=f"{identity.node_instance_id}/{phase}",
+            node_attempt_id=child_attempt_id,
+            parent_node_attempt_id=identity.node_attempt_id,
+        )
+        return {
+            "request_context": {
+                "request_id": _request_identity(
+                    "pick-place-phase",
+                    identity.program_run_id,
+                    identity.node_attempt_id,
+                    phase,
+                ),
+                "request_owner_epoch": owner_epoch,
+                "source_label": "manyforge_behavior",
+                "correlation_id": identity.program_run_id,
+            },
+            "program_id": context.capture.program_id,
+            "program_revision": context.capture.program_revision,
+            "program_binding_id": context.capture.program_binding_id,
+            "program_run_id": context.capture.program_run_id,
+            "expected_graph_revision": context.capture.graph_revision,
+            "expected_retained_bundle_id": context.capture.retained_bundle_id,
+            "expected_scene_revision": dict(scene_revision),
+            "participants": [
+                {
+                    "component_role_id": target.component_role_id,
+                    "target_role_id": target.target_role_id,
+                    "required_capability_id": capability_id,
+                    "action_span": span.as_request(),
+                    "payload": dict(payload),
+                }
+            ],
+            "coordination_policy": "independent",
+        }
+
+    def _pick_place_intent(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        parameters: Mapping[str, Any],
+    ) -> tuple[str, str, dict[str, Any]]:
+        context = self._context(identity.program_run_id)
+        target_role_id = _text(parameters.get("target_role"), field="target_role")
+        arm = self._target(
+            context,
+            target_role_id,
+            "execution.trajectory.execute",
+        )
+        tool_role_id = _text(
+            parameters.get("tool_target_role"), field="tool_target_role"
+        )
+        tool = self._target(context, tool_role_id, "tool.gripper.command")
+        owner_epoch, scene_revision = self._owner_status(context)
+        selected_object_id = _text(
+            parameters.get("selected_object_id"), field="selected_object_id"
+        )
+        kind = "place" if node_id == "motion.place_object" else "pick"
+        sequence_id = _request_identity(
+            kind,
+            identity.program_run_id,
+            identity.node_attempt_id,
+        )
+
+        identity_pose = {
+            "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        }
+        if kind == "pick":
+            contact_policy_id = _text(
+                parameters.get("contact_policy_id"), field="contact_policy_id"
+            )
+            try:
+                contact = context.contact_grasps[contact_policy_id]
+            except KeyError as exc:
+                raise ProductionPortError(
+                    "Program Binding has no exact pick contact-grasp policy"
+                ) from exc
+            approach_motion: Mapping[str, Any] = {
+                "kind": "pose_goal",
+                "goal": identity_pose,
+            }
+            descend_motion = self._cartesian_motion(
+                (identity_pose, identity_pose)
+            )
+            retreat_motion = self._cartesian_motion(
+                (identity_pose, identity_pose)
+            )
+            synthesis = self._pick_synthesis(
+                parameters,
+                target_role_id=target_role_id,
+                base_frame_role_id=_text(
+                    parameters.get("base_frame_role"), field="base_frame_role"
+                ),
+            )
+        else:
+            contact_policy_id = None
+            contact = None
+            place_pose = _pose3(
+                parameters.get("place_pose"),
+                field="place_pose",
+                target_role_id=target_role_id,
+                base_frame_role_id=_text(
+                    parameters.get("base_frame_role"), field="base_frame_role"
+                ),
+            )
+            offset = [
+                _number(value, field=f"approach_offset_m[{index}]")
+                for index, value in enumerate(
+                    _sequence(
+                        parameters.get("approach_offset_m", (0.0, 0.0, 0.05)),
+                        field="approach_offset_m",
+                        length=3,
+                    )
+                )
+            ]
+            approach_pose = {
+                "position_m": {
+                    axis: place_pose["position_m"][axis] + offset[index]
+                    for index, axis in enumerate(("x_m", "y_m", "z_m"))
+                },
+                "orientation": dict(place_pose["orientation"]),
+            }
+            approach_motion = {"kind": "pose_goal", "goal": approach_pose}
+            descend_motion = self._cartesian_motion(
+                (approach_pose, place_pose)
+            )
+            retreat_motion = self._cartesian_motion(
+                (place_pose, approach_pose)
+            )
+            synthesis = None
+
+        phase_payloads = {
+            "approach": self._phase_motion_payload(
+                identity=identity,
+                parameters=parameters,
+                phase="approach",
+                motion=approach_motion,
+            ),
+            "descend": self._phase_motion_payload(
+                identity=identity,
+                parameters=parameters,
+                phase="descend",
+                motion=descend_motion,
+                contact_policy_id=contact_policy_id,
+                runtime_object_id=(
+                    None if contact is None else contact.runtime_object_id
+                ),
+                selected_object_id=(
+                    None if contact is None else selected_object_id
+                ),
+            ),
+            "retreat": self._phase_motion_payload(
+                identity=identity,
+                parameters=parameters,
+                phase="retreat",
+                motion=retreat_motion,
+            ),
+        }
+        _tool_context, _tool_target, tool_payload = self._gripper_payload(
+            {
+                "target_role": tool_role_id,
+                "position": parameters.get("tool_position"),
+                "max_effort": parameters.get("tool_max_effort"),
+                "command_duration_s": parameters.get(
+                    "tool_command_duration_s", 0.0
+                ),
+                "completion_timeout_s": parameters.get(
+                    "tool_completion_timeout_s", 30.0
+                ),
+            },
+            identity,
+        )
+        operations = {
+            phase: self._phase_operation(
+                context=context,
+                target=(tool if phase == "tool" else arm),
+                capability_id=(
+                    "tool.gripper.command"
+                    if phase == "tool"
+                    else "execution.trajectory.execute"
+                ),
+                payload=(tool_payload if phase == "tool" else phase_payloads[phase]),
+                identity=identity,
+                owner_epoch=owner_epoch,
+                scene_revision=scene_revision,
+                phase=phase,
+            )
+            for phase in ("approach", "descend", "tool", "retreat")
+        }
+        intent = {
+            "sequence_id": sequence_id,
+            "selected_object_id": selected_object_id,
+            "carrier_frame_role_id": _text(
+                parameters.get("carrier_frame_role"),
+                field="carrier_frame_role",
+            ),
+            "approach_operation": operations["approach"],
+            "descend_operation": operations["descend"],
+            "tool_operation": operations["tool"],
+            "retreat_operation": operations["retreat"],
+        }
+        if kind == "pick":
+            intent["selected_runtime_object_id"] = contact.runtime_object_id
+            intent["synthesis"] = synthesis
+        return kind, selected_object_id, intent
+
+    @staticmethod
+    def _validated_planning_result(
+        response: Mapping[str, Any],
+        *,
+        sequence_id: str,
+        kind: str,
+        selected_object_id: str,
+    ) -> dict[str, Any]:
+        result = dict(
+            _mapping(response.get("planning_result"), field="planning_result")
+        )
+        status = result.get("status")
+        if (
+            result.get("schema_version")
+            != "manyforge.pick_place_planning_result.v1"
+            or result.get("sequence_id") != sequence_id
+            or result.get("kind") != kind
+            or result.get("selected_object_id") != selected_object_id
+            or status not in {"planned", "no_feasible_candidate"}
+            or type(result.get("attempted_candidate_count")) is not int
+            or result["attempted_candidate_count"] < 0
+            or not isinstance(result.get("reports"), list)
+            or (status == "planned") != isinstance(result.get("plan"), Mapping)
+        ):
+            raise ProductionPortError(
+                "pick/place planning response changed its public identity"
+            )
+        return result
+
+    @staticmethod
+    def _portable_pick_planning_output(
+        planning: Mapping[str, Any],
+        *,
+        target_role_id: str,
+        base_frame_role_id: str,
+    ) -> dict[str, Any]:
+        """Project diagnostic candidate geometry, never its prepared plan."""
+
+        candidate = _mapping(
+            planning.get("last_attempted_candidate"),
+            field="last_attempted_candidate",
+        )
+
+        def stored_pose(name: str) -> dict[str, Any]:
+            pose = _mapping(candidate.get(name), field=name)
+            position = _mapping(pose.get("position_m"), field=f"{name}.position_m")
+            orientation = _mapping(
+                pose.get("orientation"),
+                field=f"{name}.orientation",
+            )
+            return {
+                "frame_ref": {
+                    "kind": "target_frame",
+                    "target_role": target_role_id,
+                    "frame_role": base_frame_role_id,
+                },
+                "position_m": [
+                    _number(position.get(axis), field=f"{name}.position_m.{axis}")
+                    for axis in ("x_m", "y_m", "z_m")
+                ],
+                "orientation": {
+                    "xyzw": [
+                        _number(
+                            orientation.get(axis),
+                            field=f"{name}.orientation.{axis}",
+                        )
+                        for axis in ("x", "y", "z", "w")
+                    ]
+                },
+            }
+
+        return {
+            "approach_pose": stored_pose("approach_pose"),
+            "pick_pose": stored_pose("pick_pose"),
+            "retreat_pose": stored_pose("retreat_pose"),
+            "selected_object_id": _text(
+                planning.get("selected_object_id"),
+                field="selected_object_id",
+            ),
+        }
+
+    @staticmethod
+    def _sequence_snapshot(
+        task: _PickPlaceTask,
+        status: Mapping[str, Any],
+    ) -> OwnerTaskSnapshot:
+        phase = status.get("phase")
+        if (
+            status.get("schema_version")
+            != "manyforge.pick_place_sequence_status.v1"
+            or status.get("sequence_id") != task.sequence_id
+            or status.get("kind") != task.kind
+            or status.get("selected_object_id") != task.selected_object_id
+        ):
+            raise ProductionPortError(
+                "pick/place sequence response changed its public identity"
+            )
+        metadata: dict[str, Any] = {
+            "sequence_id": task.sequence_id,
+            "planning_result": dict(task.planning_result),
+            "sequence_status": dict(status),
+        }
+        if phase in {
+            "approach",
+            "descend",
+            "tool_command",
+            "scene_transition",
+            "retreat",
+        }:
+            return OwnerTaskSnapshot(
+                task_id=task.sequence_id,
+                state=OwnerTaskState.ACTIVE,
+                metadata=metadata,
+            )
+        if phase == "completed":
+            return OwnerTaskSnapshot(
+                task_id=task.sequence_id,
+                state=OwnerTaskState.SUCCEEDED,
+                metadata=metadata,
+            )
+        error = status.get("terminal_error")
+        error_value = error if isinstance(error, Mapping) else {}
+        reason_code = error_value.get("code")
+        message = error_value.get("message")
+        if not isinstance(reason_code, str) or not reason_code:
+            reason_code = f"pick_place_{phase or 'failed'}"
+        if not isinstance(message, str):
+            message = "native pick/place sequence did not complete"
+        if phase == "intervention_required":
+            metadata.update(
+                {
+                    "authored_failure_policy": "pause_for_operator",
+                    "authored_failure_policy_parameter": "owner_terminal_phase",
+                }
+            )
+        if phase not in {"failed", "intervention_required"}:
+            raise ProductionPortError("pick/place sequence has an unknown phase")
+        return OwnerTaskSnapshot(
+            task_id=task.sequence_id,
+            state=OwnerTaskState.FAILED,
+            metadata=metadata,
+            reason_code=reason_code,
+            message=message,
+        )
+
+    def _start_pick_place(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        if node_id not in {
+            "planning.plan_pick_sequence",
+            "motion.pick_object",
+            "motion.place_object",
+        }:
+            raise ProductionPortError(
+                f"pick/place port does not implement {node_id!r}"
+            )
+        kind, selected_object_id, intent = self._pick_place_intent(
+            node_id,
+            identity,
+            inputs.parameters,
+        )
+        if node_id == "planning.plan_pick_sequence":
+            response = self._kernel.plan_pick(intent)
+        elif node_id == "motion.pick_object":
+            response = self._kernel.start_pick(intent)
+        else:
+            response = self._kernel.start_place(intent)
+        response_value = _mapping(response, field="pick/place response")
+        planning = self._validated_planning_result(
+            response_value,
+            sequence_id=intent["sequence_id"],
+            kind=kind,
+            selected_object_id=selected_object_id,
+        )
+        metadata: dict[str, Any] = {
+            "sequence_id": intent["sequence_id"],
+            "planning_result": planning,
+        }
+        if planning["status"] == "no_feasible_candidate":
+            if kind == "pick":
+                metadata.update(
+                    {
+                        "authored_failure_policy": inputs.parameters.get(
+                            "no_feasible_plan_policy", "pause_for_operator"
+                        ),
+                        "authored_failure_policy_parameter": (
+                            "no_feasible_plan_policy"
+                        ),
+                    }
+                )
+            snapshot = OwnerTaskSnapshot(
+                task_id=intent["sequence_id"],
+                state=OwnerTaskState.FAILED,
+                metadata=metadata,
+                reason_code="no_feasible_candidate",
+                message="No feasible pick/place candidate was found",
+            )
+        elif node_id == "planning.plan_pick_sequence":
+            snapshot = OwnerTaskSnapshot(
+                task_id=intent["sequence_id"],
+                state=OwnerTaskState.SUCCEEDED,
+                output=self._portable_pick_planning_output(
+                    planning,
+                    target_role_id=_text(
+                        inputs.parameters.get("target_role"),
+                        field="target_role",
+                    ),
+                    base_frame_role_id=_text(
+                        inputs.parameters.get("base_frame_role"),
+                        field="base_frame_role",
+                    ),
+                ),
+                metadata=metadata,
+            )
+        else:
+            status = _mapping(
+                response_value.get("sequence_status"),
+                field="sequence_status",
+            )
+            provisional = _PickPlaceTask(
+                identity,
+                node_id,
+                intent["sequence_id"],
+                kind,
+                selected_object_id,
+                planning,
+                OwnerTaskSnapshot(
+                    task_id=intent["sequence_id"],
+                    state=OwnerTaskState.ACTIVE,
+                ),
+            )
+            snapshot = self._sequence_snapshot(provisional, status)
+        task = _PickPlaceTask(
+            identity,
+            node_id,
+            intent["sequence_id"],
+            kind,
+            selected_object_id,
+            planning,
+            snapshot,
+        )
+        with self._lock:
+            current = self._pick_place_tasks.get(task.sequence_id)
+            if current is not None and (
+                current.identity != identity or current.node_id != node_id
+            ):
+                raise ProductionPortError("pick/place task identity was reused")
+            if current is None:
+                if len(self._tasks) + len(self._pick_place_tasks) >= _MAX_TASKS:
+                    raise ProductionPortError("native task retention is full")
+                self._pick_place_tasks[task.sequence_id] = task
+            else:
+                task = current
+        return task.snapshot
+
     def _start(
         self,
         node_id: str,
@@ -942,10 +1677,20 @@ class NativeKernelProgramPort:
                 for task in self._tasks.values()
                 if task.identity.program_run_id == program_run_id
             )
+            pick_place_tasks = tuple(
+                task
+                for task in self._pick_place_tasks.values()
+                if task.identity.program_run_id == program_run_id
+            )
         try:
             active_count = sum(
                 self._observation(task)[1].state is OwnerTaskState.ACTIVE
                 for task in tasks
+            )
+            active_count += sum(
+                self._observe_pick_place_task(task.sequence_id).state
+                is OwnerTaskState.ACTIVE
+                for task in pick_place_tasks
             )
         except Exception as exc:
             return ProgramRunScopeSnapshot(
@@ -975,13 +1720,154 @@ class NativeKernelProgramPort:
                 for task in self._tasks.values()
                 if task.identity.program_run_id == program_run_id
             )
+            pick_place_tasks = tuple(
+                task
+                for task in self._pick_place_tasks.values()
+                if task.identity.program_run_id == program_run_id
+            )
         for task in tasks:
             self._cancel(task, reason)
+        for task in pick_place_tasks:
+            self._cancel_pick_place_task(
+                task.sequence_id,
+                task.identity,
+                reason=reason,
+            )
         return self._observe_scope(program_run_id)
 
     def _observe_task(self, task_id: str) -> OwnerTaskSnapshot:
         _operation, snapshot = self._observation(self._task(task_id))
         return snapshot
+
+    def _pick_place_task(self, task_id: str) -> _PickPlaceTask:
+        with self._lock:
+            try:
+                return self._pick_place_tasks[task_id]
+            except KeyError as exc:
+                raise ProductionPortError(
+                    "native pick/place task is not retained"
+                ) from exc
+
+    def _observe_pick_place_task(self, task_id: str) -> OwnerTaskSnapshot:
+        task = self._pick_place_task(task_id)
+        with self._lock:
+            if task.snapshot.state is not OwnerTaskState.ACTIVE:
+                return task.snapshot
+        response = self._kernel.pick_place_sequence(task.sequence_id)
+        status = _mapping(
+            _mapping(response, field="pick/place response").get(
+                "sequence_status"
+            ),
+            field="sequence_status",
+        )
+        snapshot = self._sequence_snapshot(task, status)
+        with self._lock:
+            current = self._pick_place_tasks.get(task.sequence_id)
+            if current is not task:
+                raise ProductionPortError("pick/place task changed during observation")
+            task.snapshot = snapshot
+            return task.snapshot
+
+    def _cancel_pick_place_task(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        reason: str | None = "Program node was invalidated",
+    ) -> None:
+        task = self._pick_place_task(task_id)
+        if task.identity != identity:
+            raise ProductionPortError(
+                "pick/place cancellation changed node attempt"
+            )
+        snapshot = self._observe_pick_place_task(task_id)
+        if snapshot.state is not OwnerTaskState.ACTIVE:
+            return
+        status = _mapping(
+            snapshot.metadata.get("sequence_status"),
+            field="sequence_status",
+        )
+        operation_id = status.get("active_operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ProductionPortError(
+                "active pick/place sequence has no cancellable operation"
+            )
+        with self._lock:
+            if task.active_stop_operation_id == operation_id:
+                return
+            task.active_stop_operation_id = operation_id
+        try:
+            operation = dict(
+                _mapping(
+                    self._kernel.operation(operation_id).get("operation"),
+                    field="operation",
+                )
+            )
+            if (
+                operation.get("operation_id") != operation_id
+                or operation.get("program_run_id") != identity.program_run_id
+            ):
+                raise ProductionPortError(
+                    "pick/place active operation changed identity"
+                )
+            if operation.get("state") not in _ACTIVE_STATES:
+                return
+            revision = operation.get("operation_revision")
+            generation = operation.get("active_stop_generation")
+            if type(revision) is not int or revision < 1:
+                raise ProductionPortError("native operation revision is invalid")
+            if generation is None:
+                generation = 0
+            if type(generation) is not int or generation < 0:
+                raise ProductionPortError("native Stop generation is invalid")
+            context = self._context(identity.program_run_id)
+            owner_epoch, _scene = self._owner_status(context)
+            self._kernel.stop(
+                {
+                    "request_context": {
+                        "request_id": _request_identity(
+                            "program-pick-place-stop",
+                            identity.program_run_id,
+                            task.sequence_id,
+                            operation_id,
+                        ),
+                        "request_owner_epoch": owner_epoch,
+                        "source_label": "manyforge_behavior",
+                        "correlation_id": identity.program_run_id,
+                    },
+                    "operations": [
+                        {
+                            "operation_id": operation_id,
+                            "expected_operation_revision": revision,
+                            "expected_stop_generation": generation,
+                        }
+                    ],
+                    "reason": reason,
+                }
+            )
+        except Exception:
+            with self._lock:
+                if task.active_stop_operation_id == operation_id:
+                    task.active_stop_operation_id = None
+            raise
+
+    def _acknowledge_pick_place_task(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+    ) -> None:
+        task = self._pick_place_task(task_id)
+        if task.identity != identity:
+            raise ProductionPortError(
+                "pick/place acknowledgement changed node attempt"
+            )
+        snapshot = self._observe_pick_place_task(task_id)
+        if snapshot.state is not OwnerTaskState.SUCCEEDED:
+            raise ProductionPortError(
+                "only successful pick/place work can be acknowledged"
+            )
+        with self._lock:
+            self._pick_place_tasks.pop(task_id, None)
 
 
 class _NativeKernelOperationTaskPort:
@@ -1006,6 +1892,30 @@ class _NativeKernelOperationTaskPort:
 
     def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
         self._owner._acknowledge_task(task_id, identity)
+
+
+class _NativePickPlaceTaskPort:
+    """OwnerTaskPort view over native pick/place planning and sequencing."""
+
+    def __init__(self, owner: NativeKernelProgramPort) -> None:
+        self._owner = owner
+
+    def start(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        return self._owner._start_pick_place(node_id, identity, inputs)
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        return self._owner._observe_pick_place_task(task_id)
+
+    def cancel(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self._owner._cancel_pick_place_task(task_id, identity)
+
+    def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self._owner._acknowledge_pick_place_task(task_id, identity)
 
 
 class _NativeKernelProgramScopePort:
@@ -1040,7 +1950,31 @@ class HeadlessSceneProgramPort:
         self._transport = transport
         self._scene = SceneClient(transport)
         self._contexts: dict[str, _SceneBoundContext] = {}
+        self._initialized: set[str] = set()
         self._lock = RLock()
+
+    def bind(self, context: ProgramRunPortContext) -> None:
+        if not isinstance(context, ProgramRunPortContext):
+            raise TypeError("bind requires one exact Program-run port context")
+        parsed = self._parse_context(context)
+        with self._lock:
+            current = self._contexts.get(context.program_run_id)
+            if current is not None:
+                if current != parsed:
+                    raise ProductionPortError(
+                        "Program-run scene context was rebound"
+                    )
+                return
+            if len(self._contexts) >= _MAX_CONTEXTS:
+                raise ProductionPortError(
+                    "Program-run scene-context retention is full"
+                )
+            self._contexts[context.program_run_id] = parsed
+
+    def unbind(self, program_run_id: str) -> None:
+        with self._lock:
+            self._initialized.discard(program_run_id)
+            self._contexts.pop(program_run_id, None)
 
     @staticmethod
     def _parse_context(context: ProgramRunPortContext) -> _SceneBoundContext:
@@ -1578,16 +2512,13 @@ class HeadlessSceneProgramPort:
         initial_scene: Sequence[Mapping[str, Any]],
     ) -> None:
         parsed = self._parse_context(context)
+        self.bind(context)
         with self._lock:
             current = self._contexts.get(context.program_run_id)
-            if current is not None:
-                if current != parsed:
-                    raise ProductionPortError("Program-run scene context was rebound")
+            if current != parsed:
+                raise ProductionPortError("Program-run scene context was rebound")
+            if context.program_run_id in self._initialized:
                 return
-            if len(self._contexts) >= _MAX_CONTEXTS:
-                raise ProductionPortError(
-                    "Program-run scene-context retention is full"
-                )
         rows = list(initial_scene)
         ids = [
             _text(
@@ -1689,14 +2620,12 @@ class HeadlessSceneProgramPort:
                 "logical-scene owner did not publish the exact initialized scene"
             )
         with self._lock:
-            current = self._contexts.get(context.program_run_id)
-            if current is not None and current != parsed:
+            if self._contexts.get(context.program_run_id) != parsed:
                 raise ProductionPortError("Program-run scene context was rebound")
-            self._contexts[context.program_run_id] = parsed
+            self._initialized.add(context.program_run_id)
 
     def release(self, program_run_id: str) -> None:
-        with self._lock:
-            self._contexts.pop(program_run_id, None)
+        self.unbind(program_run_id)
 
     def invoke(
         self,

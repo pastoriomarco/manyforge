@@ -118,6 +118,37 @@ def _assistant_projection() -> dict[str, Any]:
     }
 
 
+def _vision_assistant_projection(template_id: str) -> dict[str, Any]:
+    projection = _assistant_projection()
+    projection["model_endpoint_aliases"] = [
+        {
+            "model_endpoint_alias": "vision_model",
+            "external_resource_alias": "vision_model",
+            "model_id": "vision-model-v1",
+            "request_contract": {
+                "default_timeout_s": 90.0,
+                "max_output_tokens": 384,
+                "supported_image_transports": ["inline_data_url"],
+                "supports_image_input": True,
+                "supports_json_object": True,
+                "supports_response_tools": False,
+                "tool_call_family": "openai_chat_tools",
+            },
+        }
+    ]
+    projection["prompt_templates"] = [
+        {
+            "content_digest": _DIGEST_E,
+            "prompt_template_id": template_id,
+            "response_contract": {"response_mode": "json_object"},
+            "template_text": "Return one bounded vision result.",
+            "variable_ids": [],
+            "version": "1",
+        }
+    ]
+    return projection
+
+
 def _context(
     program: Program,
     *,
@@ -290,6 +321,20 @@ class _LateModelTransport(_ModelTransport):
         self.started.set()
         assert self.release.wait(timeout=1.0)
         return self.responses.pop(0)
+
+
+class _AuditSink:
+    def __init__(self, *, failures: int = 0) -> None:
+        self.records: list[dict[str, Any]] = []
+        self.attempted_records: list[dict[str, Any]] = []
+        self.failures = failures
+
+    def commit(self, record: Mapping[str, Any]) -> None:
+        self.attempted_records.append(deepcopy(dict(record)))
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("historian unavailable")
+        self.records.append(deepcopy(dict(record)))
 
 
 def _identity(attempt: str = "attempt-1") -> NodeAttemptIdentity:
@@ -530,7 +575,7 @@ def test_selection_validation_preserves_authored_failure_policy(
 def test_bind_requires_model_contract_only_for_programs_that_query_models() -> None:
     scene = HeadlessProgramSceneSource(_SceneTransport())
     transport = _ModelTransport()
-    port = ProgramAssistantPort(transport, scene)
+    port = ProgramAssistantPort(transport, scene, audit_sink=_AuditSink())
     try:
         ordinary = _program("pick_and_place_minimal.program.yaml")
         port.bind(_context(ordinary))
@@ -546,6 +591,128 @@ def test_bind_requires_model_contract_only_for_programs_that_query_models() -> N
                     assistant_projection=_assistant_projection(),
                 )
             )
+    finally:
+        port.close()
+
+
+def test_query_program_requires_a_durable_model_attempt_sink() -> None:
+    port = ProgramAssistantPort(
+        _ModelTransport(),
+        HeadlessProgramSceneSource(_SceneTransport()),
+    )
+    try:
+        with pytest.raises(ProgramAssistantPortError, match="durable"):
+            port.bind(
+                _context(
+                    _program(),
+                    assistant_projection=_assistant_projection(),
+                )
+            )
+    finally:
+        port.close()
+
+
+def test_snapshot_image_program_query_is_typed_unavailable_until_i9() -> None:
+    program = _program("vision_guided_pose_pick.program.yaml")
+    query = _node(program, "infer_grasp_pose")
+    transport = _ModelTransport()
+    audit = _AuditSink()
+    port = ProgramAssistantPort(
+        transport,
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
+    )
+    try:
+        port.bind(
+            _context(
+                program,
+                assistant_projection=_vision_assistant_projection(
+                    "infer_grasp_pose_v1"
+                ),
+            )
+        )
+        started = port.start(
+            "assistant.query_model",
+            _identity("snapshot-image"),
+            OwnerNodeInputs(parameters=query.parameters),
+        )
+        terminal = _wait_terminal(port, started.task_id)
+
+        assert terminal.state is OwnerTaskState.FAILED
+        assert terminal.reason_code == (
+            "model_snapshot_image_unavailable_until_i9"
+        )
+        assert transport.requests == []
+        assert audit.records == []
+    finally:
+        port.close()
+
+
+def test_model_pose_output_rejects_a_non_unit_quaternion_before_blackboard() -> (
+    None
+):
+    program = _program("vision_guided_pose_pick.program.yaml")
+    query = _node(program, "infer_grasp_pose")
+
+    def pose(quaternion: list[float]) -> dict[str, Any]:
+        return {
+            "frame_ref": {
+                "kind": "target_frame",
+                "target_role": "arm",
+                "frame_role": "base",
+            },
+            "position_m": [0.4, 0.0, 0.2],
+            "orientation": {"xyzw": quaternion},
+        }
+
+    transport = _ModelTransport(
+        [
+            ProgramModelResponse(
+                text=json.dumps(
+                    {
+                        "approach_pose": pose([0.0, 0.0, 0.0, 2.0]),
+                        "confidence": 0.95,
+                        "grasp_pose": pose([0.0, 0.0, 0.0, 1.0]),
+                        "reason": "fixture grasp",
+                        "selected_object_id": "left_part",
+                    }
+                )
+            )
+        ]
+    )
+    audit = _AuditSink()
+    port = ProgramAssistantPort(
+        transport,
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
+    )
+    try:
+        port.bind(
+            _context(
+                program,
+                assistant_projection=_vision_assistant_projection(
+                    "infer_grasp_pose_v1"
+                ),
+            )
+        )
+        started = port.start(
+            "assistant.query_model",
+            _identity("invalid-quaternion"),
+            OwnerNodeInputs(
+                parameters={
+                    **query.parameters,
+                    "scene_attachment": "none",
+                }
+            ),
+        )
+        terminal = _wait_terminal(port, started.task_id)
+
+        assert terminal.state is OwnerTaskState.FAILED
+        assert terminal.reason_code == "model_response_schema_invalid"
+        assert "unit quaternion" in terminal.message
+        assert [record["outcome"] for record in audit.records] == [
+            "schema_error"
+        ]
     finally:
         port.close()
 
@@ -623,9 +790,11 @@ def test_selection_and_model_query_use_exact_captured_contracts() -> None:
         ]
     )
     model_transport = _ModelTransport([_selected_response()])
+    audit = _AuditSink()
     port = ProgramAssistantPort(
         model_transport,
         HeadlessProgramSceneSource(scene_transport),
+        audit_sink=audit,
     )
     try:
         port.bind(
@@ -663,7 +832,70 @@ def test_selection_and_model_query_use_exact_captured_contracts() -> None:
         assert request.response_tool is not None
         assert request.response_tool["name"] == "select_scene_object"
         assert request.timeout_s <= 20.0
+        assert len(audit.records) == 1
+        assert audit.records[0]["outcome"] == "success"
+        assert audit.records[0]["program_run_id"] == "program-run-1"
+        assert audit.records[0]["external_attempt_index"] == 1
+        assert audit.records[0]["validated_output_digest"].startswith("sha256:")
         port.acknowledge(started.task_id, _identity("query-1"))
+    finally:
+        port.close()
+
+
+def test_opt_in_model_audit_content_is_committed_with_the_terminal_attempt() -> (
+    None
+):
+    projection = _assistant_projection()
+    projection["audit_policy"] = {
+        "redact_argument_values": False,
+        "store_full_prompts": True,
+        "store_full_responses": True,
+    }
+    audit = _AuditSink()
+    port = ProgramAssistantPort(
+        _ModelTransport([_selected_response()]),
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
+    )
+    selection_context = build_scene_selection_context(
+        selection_request_text="Select the sphere object.",
+        scene_objects=[
+            {
+                **_scene_object(
+                    "sphere_part",
+                    position=(0.4, -0.14, 0.009),
+                    shape="sphere",
+                ),
+                "pose_in_cell": {
+                    "position_m": {"x": 0.4, "y": -0.14, "z": 0.009},
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+                "attached": False,
+            }
+        ],
+        candidate_object_ids=["sphere_part"],
+        frame_id="cell-a",
+    )
+    try:
+        port.bind(_context(_program(), assistant_projection=projection))
+        started = port.start(
+            "assistant.query_model",
+            _identity("full-audit"),
+            _query_inputs(selection_context),
+        )
+        completed = _wait_terminal(port, started.task_id)
+
+        assert completed.state is OwnerTaskState.SUCCEEDED
+        assert len(audit.records) == 1
+        record = audit.records[0]
+        assert record["audit_policy"] == projection["audit_policy"]
+        assert record["prompt_text"].startswith("Select for")
+        assert set(record["argument_values"]) == {
+            "candidate_object_ids",
+            "scene_context_json",
+            "selection_request_text",
+        }
+        assert record["response_value"]["selected_object_id"] == "sphere_part"
     finally:
         port.close()
 
@@ -687,9 +919,11 @@ def test_query_model_performs_at_most_one_parse_repair_retry() -> None:
             ),
         ]
     )
+    audit = _AuditSink()
     port = ProgramAssistantPort(
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
     )
     try:
         port.bind(
@@ -737,6 +971,14 @@ def test_query_model_performs_at_most_one_parse_repair_retry() -> None:
         assert completed.metadata["model_response_digest"] == (
             "sha256:" + sha256(raw_response.encode("utf-8")).hexdigest()
         )
+        assert [record["outcome"] for record in audit.records] == [
+            "parse_error",
+            "success",
+        ]
+        assert [record["external_attempt_index"] for record in audit.records] == [
+            1,
+            2,
+        ]
     finally:
         port.close()
 
@@ -749,6 +991,9 @@ def test_model_transport_response_rejects_unbounded_or_non_json_metadata() -> No
     cyclic_usage["cycle"] = cyclic_usage
     with pytest.raises(ValueError, match="finite acyclic JSON"):
         ProgramModelResponse(usage=cyclic_usage)
+
+    with pytest.raises(ValueError, match="fixed byte bound"):
+        ProgramModelResponse(usage={"detail": "x" * (64 * 1024)})
 
 
 @pytest.mark.parametrize(
@@ -790,6 +1035,7 @@ def test_query_model_rejects_untrusted_identity_or_low_confidence(
     port = ProgramAssistantPort(
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=_AuditSink(),
     )
     try:
         port.bind(
@@ -839,6 +1085,7 @@ def test_unbind_cancels_and_releases_unacknowledged_run_tasks() -> None:
     port = ProgramAssistantPort(
         _ModelTransport(),
         HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=_AuditSink(),
     )
     try:
         port.bind(
@@ -865,11 +1112,118 @@ def test_unbind_cancels_and_releases_unacknowledged_run_tasks() -> None:
         port.close()
 
 
-def test_timed_out_task_suppresses_a_transport_that_returns_late() -> None:
+def test_unbind_retries_durable_cancellation_before_releasing_a_model_task() -> (
+    None
+):
     transport = _LateModelTransport(_selected_response())
+    audit = _AuditSink(failures=1)
     port = ProgramAssistantPort(
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
+    )
+    try:
+        port.bind(
+            _context(_program(), assistant_projection=_assistant_projection())
+        )
+        selection_context = build_scene_selection_context(
+            selection_request_text="Select the sphere object.",
+            scene_objects=[
+                {
+                    **_scene_object(
+                        "sphere_part",
+                        position=(0.4, -0.14, 0.009),
+                        shape="sphere",
+                    ),
+                    "pose_in_cell": {
+                        "position_m": {"x": 0.4, "y": -0.14, "z": 0.009},
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "attached": False,
+                }
+            ],
+            candidate_object_ids=["sphere_part"],
+            frame_id="cell-a",
+        )
+        started = port.start(
+            "assistant.query_model",
+            _identity("unbind-audit"),
+            _query_inputs(selection_context),
+        )
+        assert transport.started.wait(timeout=1.0)
+
+        with pytest.raises(ProgramAssistantPortError, match="not durable"):
+            port.unbind("program-run-1")
+        assert port.observe(started.task_id).state is OwnerTaskState.ACTIVE
+
+        port.unbind("program-run-1")
+        assert [record["outcome"] for record in audit.records] == ["cancelled"]
+        with pytest.raises(ProgramAssistantPortError, match="unknown"):
+            port.observe(started.task_id)
+    finally:
+        transport.release.set()
+        port.close()
+
+
+def test_unbind_retries_the_exact_completed_outcome_after_audit_failure() -> None:
+    audit = _AuditSink(failures=1)
+    port = ProgramAssistantPort(
+        _ModelTransport([_selected_response()]),
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
+    )
+    try:
+        port.bind(
+            _context(_program(), assistant_projection=_assistant_projection())
+        )
+        selection_context = build_scene_selection_context(
+            selection_request_text="Select the sphere object.",
+            scene_objects=[
+                {
+                    **_scene_object(
+                        "sphere_part",
+                        position=(0.4, -0.14, 0.009),
+                        shape="sphere",
+                    ),
+                    "pose_in_cell": {
+                        "position_m": {"x": 0.4, "y": -0.14, "z": 0.009},
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "attached": False,
+                }
+            ],
+            candidate_object_ids=["sphere_part"],
+            frame_id="cell-a",
+        )
+        started = port.start(
+            "assistant.query_model",
+            _identity("completed-audit-retry"),
+            _query_inputs(selection_context),
+        )
+        failed = _wait_terminal(port, started.task_id)
+        assert failed.reason_code == "model_audit_commit_failed"
+
+        port.unbind("program-run-1")
+
+        assert [record["outcome"] for record in audit.records] == ["success"]
+        assert audit.attempted_records[0] == audit.records[0]
+        assert type(audit.records[0]["occurred_at_ns"]) is int
+        assert audit.records[0]["occurred_at_wall"].endswith("Z")
+        assert audit.records[0]["response_digest"] is not None
+        assert audit.records[0]["validated_output_digest"] is not None
+        with pytest.raises(ProgramAssistantPortError, match="unknown"):
+            port.observe(started.task_id)
+    finally:
+        port.close()
+
+
+def test_timed_out_task_suppresses_a_transport_that_returns_late() -> None:
+    transport = _LateModelTransport(_selected_response())
+    audit = _AuditSink()
+    port = ProgramAssistantPort(
+        transport,
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
     )
     try:
         port.bind(
@@ -908,6 +1262,7 @@ def test_timed_out_task_suppresses_a_transport_that_returns_late() -> None:
         transport.release.set()
         time.sleep(0.01)
         assert port.observe(started.task_id) == timed_out
+        assert [record["outcome"] for record in audit.records] == ["timeout"]
     finally:
         transport.release.set()
         port.close()
@@ -915,9 +1270,11 @@ def test_timed_out_task_suppresses_a_transport_that_returns_late() -> None:
 
 def test_cancelled_task_suppresses_a_transport_that_returns_late() -> None:
     transport = _LateModelTransport(_selected_response())
+    audit = _AuditSink()
     port = ProgramAssistantPort(
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
     )
     try:
         port.bind(
@@ -961,6 +1318,7 @@ def test_cancelled_task_suppresses_a_transport_that_returns_late() -> None:
         transport.release.set()
         time.sleep(0.01)
         assert port.observe(started.task_id).state is OwnerTaskState.INTERRUPTED
+        assert [record["outcome"] for record in audit.records] == ["cancelled"]
     finally:
         transport.release.set()
         port.close()

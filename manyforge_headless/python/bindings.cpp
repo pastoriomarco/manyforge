@@ -373,6 +373,27 @@ public:
     return Invoke([this]() { return core_->HistorianHealth(); });
   }
 
+  std::string CommitProgramModelAttempt(std::string record_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, record_json = std::move(record_json)]() mutable {
+      CanonicalValue record;
+      try {
+        record = deployment::parse_strict_json_model_yaml(record_json).root();
+      } catch (const std::exception &error) {
+        throw OperatorAlarmError(
+            "headless_program_model_attempt_invalid",
+            "Program model-attempt record is not strict JSON: " +
+                std::string(error.what()));
+      }
+      if (content_identity::canonical_json(record) != record_json) {
+        throw OperatorAlarmError(
+            "headless_program_model_attempt_invalid",
+            "Program model-attempt record is not canonical JSON");
+      }
+      return core_->CommitProgramModelAttempt(std::move(record));
+    });
+  }
+
   std::string ReconcileHistorianHealth(
       const std::uint64_t expected_generation, std::string request_id,
       std::string request_owner_epoch, std::string source_label,
@@ -544,6 +565,9 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("event_types") = std::vector<std::string>{},
            py::arg("before_sequence") = std::nullopt, py::arg("limit") = 1000U)
       .def("historian_health", &HeadlessApiBridge::HistorianHealth)
+      .def("commit_program_model_attempt",
+           &HeadlessApiBridge::CommitProgramModelAttempt,
+           py::arg("record_json"))
       .def("reconcile_historian_health",
            &HeadlessApiBridge::ReconcileHistorianHealth,
            py::arg("expected_generation"), py::arg("request_id"),

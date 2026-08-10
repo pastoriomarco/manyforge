@@ -43,17 +43,20 @@
 > direct/`nemoclaw` provider mediation, Draft-only callbacks, and the operator
 > conversation/reconciliation surface. N7-a5.1 adds exact scenario/Program-run
 > admission, and N7-a5.2 adds authoritative immutable Program Apply/Load with a
-> durable Applied projection. N7-a5.3a now binds that captured Applied
-> Program/Binding to separate thin native motion/gripper task and Program-scope
-> Stop clients, and enables the retained C++ scene-frame resolver for closed
-> absolute/relative operation references. It does not yet provide the authored
-> scene, assistant, pick/place, production scheduler/cleanup, or public Program
-> Run surface assigned to N7-a5.3b-d and a5.4. Production Program-tree
-> execution, lifecycle,
-> complete product launch, dynamic scene/viewer behavior, public MCP, external
-> OpenClaw/Hermes loops, Isaac/ROS launch, and real-robot operation remain
-> explicitly unavailable. Do not run the historical recipes below or recreate their
-> superseded Python semantic owners. Retain or port same-role Python/TypeScript
+> durable Applied projection. N7-a5.3a-d now bind that captured Applied
+> Program/Binding to thin native motion/gripper/Stop and scene ports, apply the
+> authored initial scene, restore deterministic selection and bounded Program
+> model requests, join native pick/place, and supply the fixed-pool Program tick
+> host, atomic context rollback, durable per-attempt model audit, and exact
+> per-run cleanup. Prepared planning/execution evidence remains private to its
+> C++ owner. This is the internal production runner join, not the public Program
+> Run/status/Stop product surface assigned to N7-a5.4 or the complete input and
+> repeated-instance closure assigned to N7-a5.5. Public Program operation,
+> lifecycle, complete product launch, dynamic scene/viewer behavior, public MCP,
+> external OpenClaw/Hermes loops, Isaac/ROS launch, and real-robot operation
+> remain explicitly unavailable. Do not run the historical recipes below or
+> recreate their superseded Python semantic owners. Retain or port same-role
+> Python/TypeScript
 > clients, authoring, presentation, safety, and evidence surfaces at their
 > responsible gates. The last full Composer interaction tree is
 > `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`; use
@@ -155,11 +158,14 @@ N6-c4 adds source-local scene/viewer authoring and N6-c5 adds the strict
 direct/`nemoclaw` assistant client/bridge; neither restores product launch,
 Applied identity, external agent loops, or runtime ownership.
 N7-a5.1 and a5.2 add exact Program-run admission plus authoritative Program
-Apply/Load and durable Applied identity. N7-a5.3a adds the captured-context
-native motion/gripper/Stop client foundation and production retained-frame
-resolution. A production Program host and its scene, assistant, pick/place,
-cleanup, and public run surfaces remain unavailable until their named N7
-joins.
+Apply/Load and durable Applied identity. N7-a5.3a-d close the internal
+production runner join: captured native motion/gripper/Stop, retained-frame
+resolution, authored scene and scene leaves, deterministic selection, bounded
+model requests with a concrete site transport and durable audit, native
+pick/place, fixed-pool scheduling, atomic context rollback, and per-run
+cleanup. Public Program Run/status/Stop, complete input/repeated-instance
+closure, and the frozen cumulative N7 qualification remain unavailable until
+a5.4, a5.5, and N7-b-d respectively.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).

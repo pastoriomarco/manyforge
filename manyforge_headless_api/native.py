@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 import unicodedata
 
 import rfc8785
@@ -18,6 +18,7 @@ MAX_VIEWER_MODEL_RESOURCE_BYTES = 256 * 1024 * 1024
 MAX_VIEWER_MODEL_RESOURCE_URI_BYTES = 4096
 MAX_STANDARD_REQUEST_BODY_BYTES = 1024 * 1024
 MAX_PROGRAM_APPLY_REQUEST_BYTES = 17 * 1024 * 1024
+MAX_PROGRAM_MODEL_ATTEMPT_BYTES = 256 * 1024
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -171,6 +172,11 @@ class HeadlessCorePort(Protocol):
     def reconcile_historian_health(
         self,
         **kwargs: Any,
+    ) -> dict[str, Any]: ...
+
+    def commit_program_model_attempt(
+        self,
+        record: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
     def ingest_operation_event(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -596,6 +602,32 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("reconcile_historian_health", **kwargs),
             method="reconcile_historian_health",
+        )
+
+    def commit_program_model_attempt(
+        self,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(record, Mapping):
+            raise TypeError("Program model-attempt record must be a mapping")
+        try:
+            encoded = rfc8785.dumps(dict(record))
+        except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
+            raise HeadlessApiError(
+                "headless_program_model_attempt_invalid",
+                f"Program model-attempt record is not canonical JSON: {exc}",
+            ) from exc
+        if len(encoded) > MAX_PROGRAM_MODEL_ATTEMPT_BYTES:
+            raise HeadlessApiError(
+                "headless_program_model_attempt_invalid",
+                "Program model-attempt record exceeds its byte bound",
+            )
+        return self._require_object(
+            self._invoke(
+                "commit_program_model_attempt",
+                encoded.decode("utf-8", errors="strict"),
+            ),
+            method="commit_program_model_attempt",
         )
 
     def ingest_operation_event(self, **kwargs: Any) -> dict[str, Any]:

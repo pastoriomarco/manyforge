@@ -12,12 +12,14 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 import math
 from threading import Event, RLock
 import time
+import unicodedata
 from types import MappingProxyType
 from typing import Any, Final, Protocol
 
@@ -53,13 +55,33 @@ _MAX_WORKERS: Final = 8
 _MAX_TIMEOUT_S: Final = 3_600.0
 _MAX_MODEL_TEXT_BYTES: Final = 4 * 1024 * 1024
 _MAX_MODEL_VERSION_BYTES: Final = 4_096
+_MAX_MODEL_USAGE_BYTES: Final = 64 * 1024
+_MAX_MODEL_AUDIT_RECORD_BYTES: Final = 256 * 1024
+_MAX_MODEL_AUDIT_CANDIDATE_BYTES: Final = _MAX_MODEL_TEXT_BYTES + 512 * 1024
 _MAX_SCENE_POSE_QUERY_RESOURCES: Final = 128
+_MAX_SAFE_INTEGER: Final = 9_007_199_254_740_991
 _PARSE_RETRY_SUFFIX: Final = (
     "\n\nThe previous response did not satisfy the required structured output "
     "contract. Return ONLY valid structured output for this request. Do not "
     "include markdown fences, prose, or any extra text."
 )
 _DIGEST_PREFIX: Final = "sha256:"
+
+
+def _utc_wall_time_text() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _bounded_nfc_text(value: str, *, maximum_bytes: int) -> str:
+    normalized = unicodedata.normalize("NFC", value)
+    encoded = normalized.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return normalized
+    return encoded[:maximum_bytes].decode("utf-8", errors="ignore")
 
 
 def _thaw(value: Any) -> Any:
@@ -72,7 +94,12 @@ def _thaw(value: Any) -> Any:
     return deepcopy(value)
 
 
-def _bounded_json_copy(value: Any, *, field: str) -> Any:
+def _bounded_json_copy(
+    value: Any,
+    *,
+    field: str,
+    maximum_bytes: int = _MAX_MODEL_TEXT_BYTES,
+) -> Any:
     """Copy transport-owned JSON after enforcing one fixed byte bound."""
 
     try:
@@ -83,9 +110,9 @@ def _bounded_json_copy(value: Any, *, field: str) -> Any:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-    except (RecursionError, TypeError, ValueError) as exc:
+    except (RecursionError, TypeError, UnicodeError, ValueError) as exc:
         raise ValueError(f"{field} must be finite acyclic JSON data") from exc
-    if len(encoded) > _MAX_MODEL_TEXT_BYTES:
+    if len(encoded) > maximum_bytes:
         raise ValueError(f"{field} exceeds its fixed byte bound")
     return json.loads(encoded)
 
@@ -166,7 +193,12 @@ class ProgramModelRequest:
             (
                 None
                 if self.response_tool is None
-                else MappingProxyType(_thaw(self.response_tool))
+                else MappingProxyType(
+                    _bounded_json_copy(
+                        self.response_tool,
+                        field="model response tool",
+                    )
+                )
             ),
         )
         object.__setattr__(
@@ -175,7 +207,12 @@ class ProgramModelRequest:
             (
                 None
                 if self.attachment is None
-                else MappingProxyType(_thaw(self.attachment))
+                else MappingProxyType(
+                    _bounded_json_copy(
+                        self.attachment,
+                        field="model attachment",
+                    )
+                )
             ),
         )
 
@@ -234,7 +271,11 @@ class ProgramModelResponse:
                 None
                 if self.usage is None
                 else MappingProxyType(
-                    _bounded_json_copy(self.usage, field="model usage")
+                    _bounded_json_copy(
+                        self.usage,
+                        field="model usage",
+                        maximum_bytes=_MAX_MODEL_USAGE_BYTES,
+                    )
                 )
             ),
         )
@@ -257,6 +298,12 @@ class ProgramModelTransport(Protocol):
         request: ProgramModelRequest,
         cancel_event: Event,
     ) -> ProgramModelResponse: ...
+
+
+class ProgramModelAuditSink(Protocol):
+    """Synchronous durable boundary for one external model attempt."""
+
+    def commit(self, record: Mapping[str, Any]) -> None: ...
 
 
 class _SceneTransport(Protocol):
@@ -294,6 +341,20 @@ class _Task:
     deadline_s: float | None = None
     future: Future[_TaskResult] | None = None
     terminal: OwnerTaskSnapshot | None = None
+    external_attempts: dict[int, "_ExternalAttempt"] = field(
+        default_factory=dict
+    )
+    audit_lock: RLock = field(default_factory=RLock, repr=False)
+
+
+@dataclass(slots=True)
+class _ExternalAttempt:
+    ordinal: int
+    started_at_s: float
+    record: Mapping[str, Any]
+    store_full_response: bool
+    pending_terminal_record: Mapping[str, Any] | None = None
+    terminal_outcome: str | None = None
 
 
 class _TaskFailure(RuntimeError):
@@ -685,6 +746,57 @@ def _json_schema(
                 "items": {"type": "string"},
                 "maxItems": 4_096,
             }
+        elif declared_type == "stored_pose":
+            schema = {
+                "type": "object",
+                "properties": {
+                    "frame_ref": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": [
+                                    "cell_frame",
+                                    "target_frame",
+                                    "scene_resource",
+                                ],
+                            },
+                            "target_role": {"type": "string"},
+                            "frame_role": {"type": "string"},
+                            "scene_resource_id": {"type": "string"},
+                        },
+                        "required": ["kind"],
+                        "additionalProperties": False,
+                    },
+                    "position_m": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 3,
+                        "maxItems": 3,
+                    },
+                    "orientation": {
+                        "type": "object",
+                        "properties": {
+                            "xyzw": {
+                                "type": "array",
+                                "items": {"type": "number"},
+                                "minItems": 4,
+                                "maxItems": 4,
+                            },
+                            "rpy_deg": {
+                                "type": "array",
+                                "items": {"type": "number"},
+                                "minItems": 3,
+                                "maxItems": 3,
+                            },
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["frame_ref", "position_m", "orientation"],
+                "additionalProperties": False,
+            }
         else:
             raise ProgramAssistantPortError(
                 f"model response field {name!r} has unsupported type {declared_type!r}"
@@ -704,6 +816,117 @@ def _json_schema(
         "required": required,
         "additionalProperties": False,
     }
+
+
+def _validate_program_model_outputs(
+    parsed: Any,
+    declaration: Mapping[str, Any],
+    program: Mapping[str, Any],
+) -> None:
+    """Close Program-identity semantics outside the JSON-schema subset."""
+
+    if not isinstance(parsed, Mapping):
+        return
+    target_roles = _mapping(program.get("target_roles"), field="target_roles")
+    scene_ids = {
+        _text(
+            _mapping(row, field="Program scene row").get("scene_resource_id"),
+            field="scene_resource_id",
+        )
+        for row in _sequence(program.get("scene", ()), field="Program scene")
+    }
+    fields = _sequence(declaration.get("fields"), field="output declaration fields")
+    for index, raw in enumerate(fields):
+        field = _mapping(raw, field=f"output declaration fields[{index}]")
+        name = _text(field.get("field"), field="output field")
+        if field.get("type") == "scene_resource":
+            value = parsed.get(name)
+            empty_selection = (
+                value == ""
+                and parsed.get("outcome") in {"no_match", "ambiguous"}
+            )
+            if not empty_selection and value not in scene_ids:
+                raise ModelOutputValidationError(
+                    f"$.{name}: undeclared scene resource"
+                )
+        if field.get("type") != "stored_pose":
+            continue
+        pose = _mapping(parsed.get(name), field=f"model output {name}")
+        frame = _mapping(pose.get("frame_ref"), field=f"model output {name}.frame_ref")
+        kind = frame.get("kind")
+        if kind == "cell_frame":
+            expected_frame_fields = {"kind"}
+        elif kind == "target_frame":
+            expected_frame_fields = {"kind", "target_role", "frame_role"}
+            target_role = _text(
+                frame.get("target_role"),
+                field=f"model output {name}.frame_ref.target_role",
+            )
+            frame_role = _text(
+                frame.get("frame_role"),
+                field=f"model output {name}.frame_ref.frame_role",
+            )
+            try:
+                target = _mapping(
+                    target_roles[target_role],
+                    field=f"target role {target_role}",
+                )
+            except KeyError as exc:
+                raise ModelOutputValidationError(
+                    f"$.{name}.frame_ref.target_role: undeclared target role"
+                ) from exc
+            required_frames = _sequence(
+                target.get("required_frame_roles", ()),
+                field=f"target role {target_role}.required_frame_roles",
+            )
+            if frame_role not in required_frames:
+                raise ModelOutputValidationError(
+                    f"$.{name}.frame_ref.frame_role: undeclared frame role"
+                )
+        elif kind == "scene_resource":
+            expected_frame_fields = {"kind", "scene_resource_id"}
+            scene_resource_id = _text(
+                frame.get("scene_resource_id"),
+                field=f"model output {name}.frame_ref.scene_resource_id",
+            )
+            if scene_resource_id not in scene_ids:
+                raise ModelOutputValidationError(
+                    f"$.{name}.frame_ref.scene_resource_id: undeclared scene resource"
+                )
+        else:
+            raise ModelOutputValidationError(
+                f"$.{name}.frame_ref.kind: unsupported pose frame"
+            )
+        if set(frame) != expected_frame_fields:
+            raise ModelOutputValidationError(
+                f"$.{name}.frame_ref: fields disagree with frame kind"
+            )
+        orientation = _mapping(
+            pose.get("orientation"),
+            field=f"model output {name}.orientation",
+        )
+        if set(orientation) not in ({"xyzw"}, {"rpy_deg"}):
+            raise ModelOutputValidationError(
+                f"$.{name}.orientation: exactly one representation is required"
+            )
+        if "xyzw" in orientation:
+            quaternion = _sequence(
+                orientation["xyzw"],
+                field=f"model output {name}.orientation.xyzw",
+            )
+            try:
+                normalized_quaternion = [float(value) for value in quaternion]
+                squared_norm = sum(
+                    value * value for value in normalized_quaternion
+                )
+            except OverflowError as exc:
+                raise ModelOutputValidationError(
+                    f"$.{name}.orientation.xyzw: must be finite"
+                ) from exc
+            if not math.isfinite(squared_norm) or abs(squared_norm - 1.0) > 1e-6:
+                raise ModelOutputValidationError(
+                    f"$.{name}.orientation.xyzw: must be a unit quaternion"
+                )
 
 
 def _stringify_template_value(value: Any) -> str:
@@ -954,31 +1177,40 @@ class ProgramAssistantPort:
         model_transport: ProgramModelTransport,
         scene_source: HeadlessProgramSceneSource,
         *,
+        audit_sink: ProgramModelAuditSink | None = None,
         maximum_workers: int = 4,
         maximum_tasks: int = _MAX_TASKS,
         clock: Any = time.monotonic,
+        wall_clock: Any = _utc_wall_time_text,
     ) -> None:
         for method in ("validate_endpoint", "complete"):
             if not callable(getattr(model_transport, method, None)):
                 raise TypeError(f"model transport has no callable {method}")
         if not isinstance(scene_source, HeadlessProgramSceneSource):
             raise TypeError("scene_source must be one headless Program scene source")
+        if audit_sink is not None and not callable(
+            getattr(audit_sink, "commit", None)
+        ):
+            raise TypeError("audit_sink must commit durable model attempts")
         if (
             type(maximum_workers) is not int
             or not 1 <= maximum_workers <= _MAX_WORKERS
             or type(maximum_tasks) is not int
             or not 1 <= maximum_tasks <= _MAX_TASKS
             or not callable(clock)
+            or not callable(wall_clock)
         ):
             raise ValueError("assistant port bounds are invalid")
         self._model_transport = model_transport
         self._scene_source = scene_source
+        self._audit_sink = audit_sink
         self._executor = ThreadPoolExecutor(
             max_workers=maximum_workers,
             thread_name_prefix="manyforge-program-model",
         )
         self._maximum_tasks = maximum_tasks
         self._clock = clock
+        self._wall_clock = wall_clock
         self._contexts: dict[str, _BoundContext] = {}
         self._tasks: dict[str, _Task] = {}
         self._lock = RLock()
@@ -1019,6 +1251,10 @@ class ProgramAssistantPort:
                 raise ProgramAssistantPortError(
                     "query_model has no retained assistant projection"
                 )
+            if self._audit_sink is None:
+                raise ProgramAssistantPortError(
+                    "query_model has no durable Program model-attempt audit sink"
+                )
             assistant = _parse_assistant(context.assistant_projection)
         blackboard = _blackboard_declarations(context.program)
         if assistant is not None:
@@ -1043,17 +1279,37 @@ class ProgramAssistantPort:
 
     def unbind(self, program_run_id: str) -> None:
         with self._lock:
-            self._contexts.pop(program_run_id, None)
-            task_ids = tuple(
-                task_id
+            tasks = tuple(
+                (task_id, task)
                 for task_id, task in self._tasks.items()
                 if task.identity.program_run_id == program_run_id
             )
-            tasks = tuple(self._tasks.pop(task_id) for task_id in task_ids)
-        for task in tasks:
+        errors: list[Exception] = []
+        for _task_id, task in tasks:
             task.cancel_event.set()
             if task.future is not None:
                 task.future.cancel()
+            try:
+                self._commit_active_model_attempt(
+                    task,
+                    outcome="cancelled",
+                    error_code="model_request_cancelled",
+                    error_message="Program run released the model request",
+                )
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            detail = "; ".join(
+                str(error) or type(error).__name__ for error in errors
+            )
+            raise ProgramAssistantPortError(
+                f"Program model-attempt cleanup was not durable: {detail}"
+            ) from errors[0]
+        with self._lock:
+            for task_id, task in tasks:
+                if self._tasks.get(task_id) is task:
+                    self._tasks.pop(task_id)
+            self._contexts.pop(program_run_id, None)
 
     def _context(self, program_run_id: str) -> _BoundContext:
         with self._lock:
@@ -1179,7 +1435,7 @@ class ProgramAssistantPort:
             }
         if kind == "snapshot_image":
             raise _TaskFailure(
-                "model_snapshot_image_unavailable",
+                "model_snapshot_image_unavailable_until_i9",
                 "viewer snapshot transport returns at I9",
             )
         raise ProgramAssistantPortError("model scene_attachment is invalid")
@@ -1211,14 +1467,276 @@ class ProgramAssistantPort:
             )
         return parsed
 
+    def _begin_model_attempt(
+        self,
+        task: _Task,
+        *,
+        ordinal: int,
+        context: _BoundContext,
+        endpoint_alias: str,
+        endpoint: Mapping[str, Any],
+        template_id: str,
+        template: Mapping[str, Any],
+        prompt: str,
+        raw_variables: Mapping[str, Any],
+        attachment: Mapping[str, Any] | None,
+    ) -> None:
+        attempt_id = "model-attempt:" + sha256(
+            "\x00".join(
+                (
+                    task.identity.program_run_id,
+                    task.identity.node_instance_id,
+                    task.identity.node_attempt_id,
+                    str(ordinal),
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        record = {
+            "schema_version": "manyforge.program_model_attempt.v1",
+            "model_attempt_id": attempt_id,
+            "program_run_id": task.identity.program_run_id,
+            "node_instance_id": task.identity.node_instance_id,
+            "node_attempt_id": task.identity.node_attempt_id,
+            "external_attempt_index": ordinal,
+            "assistant_projection_digest": (
+                context.assistant.projection_digest
+                if context.assistant is not None
+                else None
+            ),
+            "model_endpoint_alias": endpoint_alias,
+            "external_resource_alias": endpoint["external_resource_alias"],
+            "model_id": endpoint["model_id"],
+            "prompt_template_id": template_id,
+            "prompt_template_version": template["version"],
+            "prompt_template_digest": template["content_digest"],
+            "prompt_digest": _DIGEST_PREFIX
+            + sha256(prompt.encode("utf-8")).hexdigest(),
+            "argument_digests": {
+                variable_id: _sha256_json(
+                    value,
+                    field=f"template variable {variable_id!r}",
+                )
+                for variable_id, value in raw_variables.items()
+            },
+            "attachment_digest": (
+                None
+                if attachment is None
+                else _sha256_json(attachment, field="model attachment")
+            ),
+            "audit_policy": dict(context.assistant.audit_policy),
+            "prompt_text": (
+                prompt
+                if context.assistant.audit_policy["store_full_prompts"]
+                else None
+            ),
+            "argument_values": (
+                None
+                if context.assistant.audit_policy["redact_argument_values"]
+                else _thaw(raw_variables)
+            ),
+        }
+        try:
+            frozen_record = MappingProxyType(
+                _bounded_json_copy(
+                    record,
+                    field="Program model-attempt initial record",
+                    maximum_bytes=_MAX_MODEL_AUDIT_RECORD_BYTES,
+                )
+            )
+        except ValueError as exc:
+            raise _TaskFailure(
+                "model_audit_record_invalid",
+                str(exc),
+            ) from exc
+        with task.audit_lock:
+            if ordinal in task.external_attempts:
+                raise _TaskFailure(
+                    "model_audit_identity_conflict",
+                    "external model attempt ordinal was reused",
+                )
+            task.external_attempts[ordinal] = _ExternalAttempt(
+                ordinal,
+                self._clock(),
+                frozen_record,
+                context.assistant.audit_policy["store_full_responses"],
+            )
+
+    def _commit_model_attempt(
+        self,
+        task: _Task,
+        ordinal: int,
+        *,
+        outcome: str,
+        error_code: str | None = None,
+        error_message: str = "",
+        response: ProgramModelResponse | None = None,
+        raw_response: Any = None,
+        validated_output: Any = None,
+    ) -> bool:
+        allowed_outcomes = {
+            "success",
+            "timeout",
+            "parse_error",
+            "schema_error",
+            "confidence_below_threshold",
+            "cancelled",
+            "transport_error",
+            "invalid_response",
+        }
+        if outcome not in allowed_outcomes:
+            raise _TaskFailure(
+                "model_audit_outcome_invalid",
+                "external model attempt outcome is unsupported",
+            )
+        with task.audit_lock:
+            try:
+                attempt = task.external_attempts[ordinal]
+            except KeyError as exc:
+                raise _TaskFailure(
+                    "model_audit_identity_missing",
+                    "external model attempt was not registered",
+                ) from exc
+            if attempt.terminal_outcome is not None:
+                return False
+            if attempt.pending_terminal_record is None:
+                completed_at_s = self._clock()
+                if (
+                    isinstance(completed_at_s, bool)
+                    or not isinstance(completed_at_s, (int, float))
+                    or not math.isfinite(float(completed_at_s))
+                    or completed_at_s < 0.0
+                    or completed_at_s * 1_000_000_000.0 > _MAX_SAFE_INTEGER
+                ):
+                    raise _TaskFailure(
+                        "model_audit_record_invalid",
+                        "model-attempt terminal time is outside its bound",
+                    )
+                try:
+                    wall_time = self._wall_clock()
+                    if not isinstance(wall_time, str) or not wall_time:
+                        raise ValueError("wall clock returned no text")
+                    occurred_at_wall = _bounded_nfc_text(
+                        wall_time,
+                        maximum_bytes=128,
+                    )
+                except (TypeError, UnicodeError, ValueError) as exc:
+                    raise _TaskFailure(
+                        "model_audit_record_invalid",
+                        "model-attempt wall time is invalid",
+                    ) from exc
+                response_digest = None
+                if raw_response is not None:
+                    response_digest = _DIGEST_PREFIX + sha256(
+                        _raw_response_bytes(raw_response)
+                    ).hexdigest()
+                attempt.pending_terminal_record = MappingProxyType(
+                    _bounded_json_copy(
+                        {
+                            **dict(attempt.record),
+                            "outcome": outcome,
+                            "error_code": error_code,
+                            "error_message": _bounded_nfc_text(
+                                error_message,
+                                maximum_bytes=4_096,
+                            ),
+                            "response_digest": response_digest,
+                            "validated_output_digest": (
+                                None
+                                if validated_output is None
+                                else _sha256_json(
+                                    validated_output,
+                                    field="validated model output",
+                                )
+                            ),
+                            "model_version": _bounded_nfc_text(
+                                "" if response is None else response.model_version,
+                                maximum_bytes=_MAX_MODEL_VERSION_BYTES,
+                            ),
+                            "occurred_at_ns": int(
+                                completed_at_s * 1_000_000_000.0
+                            ),
+                            "occurred_at_wall": occurred_at_wall,
+                            "latency_ms": min(
+                                _MAX_TIMEOUT_S * 1_000.0,
+                                max(
+                                    0.0,
+                                    (
+                                        completed_at_s - attempt.started_at_s
+                                    )
+                                    * 1_000.0,
+                                ),
+                            ),
+                            "usage": (
+                                None
+                                if response is None or response.usage is None
+                                else dict(response.usage)
+                            ),
+                            "response_value": (
+                                _thaw(raw_response)
+                                if attempt.store_full_response
+                                and raw_response is not None
+                                else None
+                            ),
+                        },
+                        field="Program model-attempt terminal record",
+                        maximum_bytes=_MAX_MODEL_AUDIT_CANDIDATE_BYTES,
+                    )
+                )
+            record = attempt.pending_terminal_record
+            if self._audit_sink is not None:
+                try:
+                    self._audit_sink.commit(record)
+                except Exception as exc:
+                    raise _TaskFailure(
+                        "model_audit_commit_failed",
+                        str(exc) or type(exc).__name__,
+                    ) from exc
+            attempt.terminal_outcome = record["outcome"]
+            return True
+
+    def _commit_active_model_attempt(
+        self,
+        task: _Task,
+        *,
+        outcome: str,
+        error_code: str,
+        error_message: str,
+    ) -> bool | None:
+        with task.audit_lock:
+            active = [
+                ordinal
+                for ordinal, attempt in task.external_attempts.items()
+                if attempt.terminal_outcome is None
+            ]
+            has_attempts = bool(task.external_attempts)
+        if active:
+            ordinal = max(active)
+            with task.audit_lock:
+                pending = task.external_attempts[ordinal].pending_terminal_record
+            return self._commit_model_attempt(
+                task,
+                ordinal,
+                outcome=(outcome if pending is None else pending["outcome"]),
+                error_code=(
+                    error_code if pending is None else pending.get("error_code")
+                ),
+                error_message=(
+                    error_message
+                    if pending is None
+                    else pending.get("error_message", "")
+                ),
+            )
+        return False if has_attempts else None
+
     def _query_model(
         self,
         context: _BoundContext,
-        inputs: OwnerNodeInputs,
-        cancel_event: Event,
+        task: _Task,
         started_at_s: float,
         deadline_s: float,
     ) -> _TaskResult:
+        inputs = task.inputs
+        cancel_event = task.cancel_event
         parameters = inputs.parameters
         if context.assistant is None:
             raise _TaskFailure(
@@ -1298,20 +1816,80 @@ class ProgramAssistantPort:
                 response_tool=response_tool,
                 attachment=attachment,
             )
+            ordinal = attempt + 1
+            self._begin_model_attempt(
+                task,
+                ordinal=ordinal,
+                context=context,
+                endpoint_alias=endpoint_alias,
+                endpoint=endpoint,
+                template_id=template_id,
+                template=template,
+                prompt=prompt_attempt,
+                raw_variables=raw_variables,
+                attachment=attachment,
+            )
             try:
                 response = self._model_transport.complete(request, cancel_event)
             except Exception as exc:
                 if cancel_event.is_set():
+                    self._commit_model_attempt(
+                        task,
+                        ordinal,
+                        outcome="cancelled",
+                        error_code="model_request_cancelled",
+                        error_message="model request was cancelled",
+                    )
                     raise _TaskFailure(
                         "model_request_cancelled", "model request was cancelled"
                     ) from exc
-                raise _TaskFailure("model_request_failed", str(exc)) from exc
+                timed_out = self._clock() >= deadline_s or "timed out" in str(
+                    exc
+                ).lower()
+                self._commit_model_attempt(
+                    task,
+                    ordinal,
+                    outcome="timeout" if timed_out else "transport_error",
+                    error_code=(
+                        "model_request_timeout"
+                        if timed_out
+                        else "model_request_failed"
+                    ),
+                    error_message=str(exc),
+                )
+                raise _TaskFailure(
+                    "model_request_timeout" if timed_out else "model_request_failed",
+                    str(exc),
+                ) from exc
             if not isinstance(response, ProgramModelResponse):
+                self._commit_model_attempt(
+                    task,
+                    ordinal,
+                    outcome="invalid_response",
+                    error_code="model_transport_response_invalid",
+                    error_message="model transport returned an invalid response type",
+                )
                 raise _TaskFailure(
                     "model_transport_response_invalid",
                     "model transport returned an invalid response type",
                 )
+            raw_response = (
+                response.tool_arguments
+                if response_mode == "tool_call"
+                else response.text
+            )
+            if isinstance(raw_response, Mapping):
+                raw_response = _thaw(raw_response)
             if cancel_event.is_set():
+                self._commit_model_attempt(
+                    task,
+                    ordinal,
+                    outcome="cancelled",
+                    error_code="model_request_cancelled",
+                    error_message="model request was cancelled",
+                    response=response,
+                    raw_response=raw_response,
+                )
                 raise _TaskFailure(
                     "model_request_cancelled",
                     "model request was cancelled",
@@ -1323,6 +1901,15 @@ class ProgramAssistantPort:
                     response_tool=response_tool,
                 )
             except _TaskFailure as exc:
+                self._commit_model_attempt(
+                    task,
+                    ordinal,
+                    outcome="parse_error",
+                    error_code=exc.reason_code,
+                    error_message=str(exc),
+                    response=response,
+                    raw_response=raw_response,
+                )
                 if (
                     exc.reason_code != "model_response_parse_failed"
                     or attempt != 0
@@ -1341,23 +1928,51 @@ class ProgramAssistantPort:
                     minimum_confidence if confidence_declared else None
                 ),
             )
-        except ModelOutputValidationError as exc:
+            _validate_program_model_outputs(
+                parsed,
+                declaration,
+                context.capture.program,
+            )
+        except (ModelOutputValidationError, ProgramAssistantPortError) as exc:
             reason = (
                 "model_confidence_below_threshold"
                 if "below minimum" in str(exc)
                 else "model_response_schema_invalid"
             )
+            self._commit_model_attempt(
+                task,
+                attempt + 1,
+                outcome=(
+                    "confidence_below_threshold"
+                    if reason == "model_confidence_below_threshold"
+                    else "schema_error"
+                ),
+                error_code=reason,
+                error_message=str(exc),
+                response=response,
+                raw_response=raw_response,
+            )
             raise _TaskFailure(reason, str(exc)) from exc
         completed_at = self._clock()
         if completed_at > deadline_s:
+            self._commit_model_attempt(
+                task,
+                attempt + 1,
+                outcome="timeout",
+                error_code="model_request_timeout",
+                error_message="model request timed out",
+                response=response,
+                raw_response=raw_response,
+            )
             raise _TaskFailure("model_request_timeout", "model request timed out")
-        raw_response = (
-            response.tool_arguments
-            if response_mode == "tool_call"
-            else response.text
+        self._commit_model_attempt(
+            task,
+            attempt + 1,
+            outcome="success",
+            response=response,
+            raw_response=raw_response,
+            validated_output=parsed,
         )
-        if isinstance(raw_response, Mapping):
-            raw_response = _thaw(raw_response)
         response_bytes = _raw_response_bytes(raw_response)
         audit = context.assistant.audit_policy
         metadata: dict[str, Any] = {
@@ -1462,14 +2077,36 @@ class ProgramAssistantPort:
             raise ProgramAssistantPortError("assistant task has no result")
         if not task.future.done():
             if task.deadline_s is not None and self._clock() >= task.deadline_s:
-                task.cancel_event.set()
-                task.future.cancel()
-                task.terminal = self._failure_snapshot(
-                    task_id,
-                    "model_request_timeout",
-                    "model request timed out",
-                    task=task,
-                )
+                try:
+                    audit_state = self._commit_active_model_attempt(
+                        task,
+                        outcome="timeout",
+                        error_code="model_request_timeout",
+                        error_message="model request timed out",
+                    )
+                except _TaskFailure as exc:
+                    task.cancel_event.set()
+                    task.future.cancel()
+                    task.terminal = self._failure_snapshot(
+                        task_id,
+                        exc.reason_code,
+                        str(exc),
+                        task=task,
+                    )
+                else:
+                    if audit_state is False:
+                        # The external attempt already reached its durable
+                        # terminal outcome before this observation raced its
+                        # worker return. Let that exact result settle.
+                        return OwnerTaskSnapshot(task_id, OwnerTaskState.ACTIVE)
+                    task.cancel_event.set()
+                    task.future.cancel()
+                    task.terminal = self._failure_snapshot(
+                        task_id,
+                        "model_request_timeout",
+                        "model request timed out",
+                        task=task,
+                    )
                 return task.terminal
             return OwnerTaskSnapshot(task_id, OwnerTaskState.ACTIVE)
         try:
@@ -1603,8 +2240,7 @@ class ProgramAssistantPort:
             task.future = self._executor.submit(
                 self._query_model,
                 context,
-                inputs,
-                task.cancel_event,
+                task,
                 started_at_s,
                 task.deadline_s,
             )
@@ -1649,12 +2285,27 @@ class ProgramAssistantPort:
             task.cancel_event.set()
             if task.future is not None:
                 task.future.cancel()
-            task.terminal = OwnerTaskSnapshot(
-                task_id,
-                OwnerTaskState.INTERRUPTED,
-                reason_code="assistant_task_cancelled",
-                message="assistant task was cancelled",
-            )
+            try:
+                self._commit_active_model_attempt(
+                    task,
+                    outcome="cancelled",
+                    error_code="model_request_cancelled",
+                    error_message="model request was cancelled",
+                )
+            except _TaskFailure as exc:
+                task.terminal = self._failure_snapshot(
+                    task_id,
+                    exc.reason_code,
+                    str(exc),
+                    task=task,
+                )
+            else:
+                task.terminal = OwnerTaskSnapshot(
+                    task_id,
+                    OwnerTaskState.INTERRUPTED,
+                    reason_code="assistant_task_cancelled",
+                    message="assistant task was cancelled",
+                )
 
     def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
         with self._lock:
@@ -1675,17 +2326,31 @@ class ProgramAssistantPort:
 
     def close(self) -> None:
         with self._lock:
-            if self._closed:
+            if self._closed and not self._tasks:
                 return
             self._closed = True
-            tasks = tuple(self._tasks.values())
-            self._contexts.clear()
-            self._tasks.clear()
-        for task in tasks:
-            task.cancel_event.set()
-            if task.future is not None:
-                task.future.cancel()
+            program_run_ids = tuple(
+                sorted(
+                    {
+                        *self._contexts,
+                        *(task.identity.program_run_id for task in self._tasks.values()),
+                    }
+                )
+            )
+        errors: list[Exception] = []
+        for program_run_id in program_run_ids:
+            try:
+                self.unbind(program_run_id)
+            except Exception as error:
+                errors.append(error)
         self._executor.shutdown(wait=False, cancel_futures=True)
+        if errors:
+            detail = "; ".join(
+                str(error) or type(error).__name__ for error in errors
+            )
+            raise ProgramAssistantPortError(
+                f"assistant port cleanup was incomplete: {detail}"
+            ) from errors[0]
 
 
 __all__ = [
@@ -1694,6 +2359,7 @@ __all__ = [
     "ProgramAssistantPortError",
     "ProgramModelRequest",
     "ProgramModelResponse",
+    "ProgramModelAuditSink",
     "ProgramModelTransport",
     "ProgramModelTransportError",
 ]

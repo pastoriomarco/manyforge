@@ -133,6 +133,70 @@ class ProgramRunContextPort(Protocol):
     def unbind(self, program_run_id: str) -> None: ...
 
 
+class ProgramRunContextError(RuntimeError):
+    """One atomic Program-run context transition could not be completed."""
+
+
+class CompositeProgramRunContextPort:
+    """Bind focused context ports as one ordered, rollback-safe unit.
+
+    The member ports keep their separate responsibilities.  This coordinator
+    only guarantees that a Program tree never observes a partly bound set.
+    """
+
+    def __init__(self, *ports: ProgramRunContextPort) -> None:
+        if not ports:
+            raise ValueError("composite context requires at least one port")
+        if any(
+            not callable(getattr(port, "bind", None))
+            or not callable(getattr(port, "unbind", None))
+            for port in ports
+        ):
+            raise TypeError("every composite member must be a context port")
+        if len({id(port) for port in ports}) != len(ports):
+            raise ValueError("composite context ports must be unique")
+        self._ports = tuple(ports)
+
+    def bind(self, context: ProgramRunPortContext) -> None:
+        bound: list[ProgramRunContextPort] = []
+        try:
+            for port in self._ports:
+                bound.append(port)
+                port.bind(context)
+        except Exception as bind_error:
+            rollback_errors: list[Exception] = []
+            for port in reversed(bound):
+                try:
+                    port.unbind(context.program_run_id)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if rollback_errors:
+                detail = "; ".join(
+                    str(error) or type(error).__name__
+                    for error in rollback_errors
+                )
+                raise ProgramRunContextError(
+                    "Program-run context bind failed and rollback was not "
+                    f"complete: {detail}"
+                ) from bind_error
+            raise
+
+    def unbind(self, program_run_id: str) -> None:
+        errors: list[Exception] = []
+        for port in reversed(self._ports):
+            try:
+                port.unbind(program_run_id)
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            detail = "; ".join(
+                str(error) or type(error).__name__ for error in errors
+            )
+            raise ProgramRunContextError(
+                f"Program-run context cleanup was incomplete: {detail}"
+            ) from errors[0]
+
+
 class ProgramRunInitializationPort(Protocol):
     """Apply captured pre-dispatch Program state before tree construction."""
 
@@ -342,6 +406,53 @@ class ProgramRunScopePort(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class ProgramInterventionSnapshot:
+    """One authored Program policy that requires an operator decision."""
+
+    identity: NodeAttemptIdentity
+    reason_code: str
+    message: str
+    policy_parameter: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, NodeAttemptIdentity):
+            raise TypeError("intervention identity is invalid")
+        for field_name, maximum_bytes in (
+            ("reason_code", 256),
+            ("policy_parameter", 256),
+        ):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value.encode("utf-8")) > maximum_bytes
+            ):
+                raise ValueError(f"{field_name} must be bounded non-empty text")
+        if (
+            not isinstance(self.message, str)
+            or len(self.message.encode("utf-8")) > 4_096
+        ):
+            raise ValueError("intervention message must be bounded text")
+
+
+class ProgramInterventionPort(Protocol):
+    """Record and read authored intervention without owning Kernel Pause."""
+
+    def require(
+        self,
+        identity: NodeAttemptIdentity,
+        *,
+        reason_code: str,
+        message: str,
+        policy_parameter: str,
+    ) -> ProgramInterventionSnapshot: ...
+
+    def read(self, program_run_id: str) -> ProgramInterventionSnapshot | None: ...
+
+    def release(self, program_run_id: str) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
 class NodeAdapterPorts:
     """Explicit focused ports; co-location never merges semantic ownership."""
 
@@ -355,14 +466,19 @@ class NodeAdapterPorts:
     program_run_scope: ProgramRunScopePort | None = None
     program_run_context: ProgramRunContextPort | None = None
     program_run_initialization: ProgramRunInitializationPort | None = None
+    program_interventions: ProgramInterventionPort | None = None
 
 
 __all__ = [
     "NodeAdapterPorts",
     "NodeAttemptIdentity",
     "NodeAttemptSource",
+    "CompositeProgramRunContextPort",
+    "ProgramRunContextError",
     "ProgramRunContextPort",
     "ProgramRunInitializationPort",
+    "ProgramInterventionPort",
+    "ProgramInterventionSnapshot",
     "ProgramRunPortContext",
     "OwnerNodeInputs",
     "OwnerInvocationPort",

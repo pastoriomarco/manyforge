@@ -18,7 +18,6 @@ using content_identity::CanonicalValue;
 constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
 constexpr std::size_t kMaximumIdentityBytes = 1024U;
 constexpr std::size_t kMaximumWallTimeBytes = 128U;
-constexpr std::size_t kMaximumHistorianPayloadBytes = 256U * 1024U;
 constexpr std::size_t kMaximumHistorianQueueCapacity = 65536U;
 
 [[noreturn]] void HistorianFail(const std::string &code,
@@ -106,6 +105,30 @@ CanonicalValue EventIdentityValue(const std::string &component,
   });
 }
 
+std::optional<std::string>
+DedicatedEventIdentity(const std::string &component,
+                       const std::string &event_type,
+                       const CanonicalValue &payload) {
+  if (component != "manyforge.program" ||
+      event_type != "program_model_attempt") {
+    return std::nullopt;
+  }
+  Require(payload.is_object(), "historian_event_invalid",
+          "Program model-attempt event payload must be an object");
+  for (const auto &[name, value] : payload.as_object()) {
+    if (name != "model_attempt_id") {
+      continue;
+    }
+    const auto *identity = std::get_if<std::string>(&value.storage());
+    Require(identity != nullptr, "historian_event_invalid",
+            "Program model-attempt event identity must be text");
+    ValidateText(*identity, "model_attempt_id", kMaximumIdentityBytes);
+    return *identity;
+  }
+  HistorianFail("historian_event_invalid",
+                "Program model-attempt event identity is absent");
+}
+
 void Advance(std::uint64_t &value) noexcept {
   if (value < kMaximumSafeInteger) {
     ++value;
@@ -127,11 +150,19 @@ HistorianEvent MakeHistorianEvent(std::string component, std::string event_type,
   ValidateText(component, "component", kMaximumIdentityBytes);
   ValidateText(event_type, "event_type", kMaximumIdentityBytes);
   ValidateText(occurred_at_wall, "occurred_at_wall", kMaximumWallTimeBytes);
+  const auto dedicated_identity =
+      DedicatedEventIdentity(component, event_type, payload);
   const auto identity =
-      EventIdentityValue(component, event_type, severity, occurred_at_ns,
-                         occurred_at_wall, payload);
+      dedicated_identity.has_value()
+          ? CanonicalValue(CanonicalValue::Object{
+                {"model_attempt_id", CanonicalValue(*dedicated_identity)},
+            })
+          : EventIdentityValue(component, event_type, severity, occurred_at_ns,
+                               occurred_at_wall, payload);
   const auto digest = content_identity::framed_sha256(
-      "manyforge-historian-event", "v1", identity);
+      dedicated_identity.has_value() ? "manyforge-program-model-attempt-event"
+                                     : "manyforge-historian-event",
+      "v1", identity);
   HistorianEvent event{
       "event-" + digest.substr(7U, 32U),
       std::move(component),

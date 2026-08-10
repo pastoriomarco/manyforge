@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+import json
 import re
 from copy import deepcopy
 from dataclasses import replace
@@ -52,6 +54,11 @@ _ROOT = Path(__file__).resolve().parents[2]
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
 _DIGEST_C = "sha256:" + "c" * 64
+_MAINTAINED_PROGRAM_INDEX = (
+    _ROOT
+    / "manyforge_deployment/resources/maintained/"
+    "maintained_program_role_assignments.v1.json"
+)
 
 
 def _catalog() -> NodeCatalog:
@@ -160,6 +167,89 @@ class _InvocationPort:
     ) -> OwnerInvocationResult:
         self.invocations.append((node_id, identity, inputs))
         return self.result
+
+
+def _portable_pose() -> dict[str, Any]:
+    return {
+        "frame_ref": {
+            "kind": "target_frame",
+            "target_role": "arm",
+            "frame_role": "base",
+        },
+        "position_m": [0.4, 0.0, 0.2],
+        "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+
+
+def _plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _plain(nested) for key, nested in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_plain(nested) for nested in value]
+    return value
+
+
+class _MaintainedProgramTaskPort(_TaskPort):
+    @staticmethod
+    def _output(node_id: str, inputs: OwnerNodeInputs) -> Any:
+        if node_id == "assistant.build_scene_selection":
+            return {
+                "candidate_object_ids": sorted(
+                    inputs.parameters["candidate_object_ids"]
+                ),
+                "scene_context_json": '{"objects":[]}',
+                "selection_request_text": inputs.parameters[
+                    "selection_request_text"
+                ],
+            }
+        if node_id == "assistant.validate_scene_selection":
+            return _plain(inputs.blackboard["selection_response_key"])
+        if node_id == "assistant.query_model":
+            output_key = inputs.parameters["output_key"]
+            if output_key == "selection.response":
+                return {
+                    "confidence": 0.95,
+                    "matched_attributes": ["shape:sphere"],
+                    "outcome": "selected",
+                    "reason": "one retained candidate",
+                    "selected_object_id": "sphere_part",
+                }
+            if output_key == "perception.pick_target":
+                return {
+                    "confidence": 0.95,
+                    "pick_left_bin": True,
+                    "reason": "left bin selected",
+                    "selected_object_id": "left_part",
+                }
+            if output_key == "perception.grasp_plan":
+                return {
+                    "approach_pose": _portable_pose(),
+                    "confidence": 0.95,
+                    "grasp_pose": _portable_pose(),
+                    "reason": "fixture grasp",
+                    "selected_object_id": "graspable",
+                }
+        if node_id == "planning.plan_pick_sequence":
+            return {
+                "approach_pose": _portable_pose(),
+                "pick_pose": _portable_pose(),
+                "retreat_pose": _portable_pose(),
+                "selected_object_id": inputs.parameters["selected_object_id"],
+            }
+        return None
+
+    def start(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        self.starts.append((node_id, identity, inputs))
+        return OwnerTaskSnapshot(
+            task_id=f"task-{len(self.starts)}",
+            state=OwnerTaskState.SUCCEEDED,
+            output=self._output(node_id, inputs),
+        )
 
 
 def _ports(
@@ -543,6 +633,60 @@ def test_program_run_reuses_thin_ports_and_preserves_portable_inputs() -> None:
     assert run.availability["execution_available"] is True
     assert run.tick_once() is py_trees.common.Status.SUCCESS
     assert len(task.starts) == 1
+
+
+def test_all_maintained_program_node_forms_execute_through_the_closed_runner() -> None:
+    index = json.loads(
+        _MAINTAINED_PROGRAM_INDEX.read_text(encoding="utf-8")
+    )
+    sources = tuple(
+        sorted(
+            {
+                assignment["program_source"]
+                for assignment in index["assignments"]
+            }
+        )
+    )
+    assert len(sources) == 7
+    environment = build_node_environment()
+    exercised: set[str] = set()
+
+    for source in sources:
+        program = Program(_ROOT / source, _catalog())
+        task = _MaintainedProgramTaskPort()
+        invocation = _InvocationPort()
+        run = ExecutableProgramRun(
+            program=program,
+            environment=environment,
+            capture=_capture(program),
+            readiness=_readiness(_DIGEST_A),
+            ports=_ports(task, invocation),
+        )
+        for _tick in range(128):
+            status = run.tick_once()
+            if status is not py_trees.common.Status.RUNNING:
+                break
+        assert status is py_trees.common.Status.SUCCESS, source
+        exercised.update(node.node_id for node in _walk(program.tree))
+
+    assert exercised == {
+        "assistant.build_scene_selection",
+        "assistant.query_model",
+        "assistant.validate_scene_selection",
+        "fallback",
+        "gripper.command_position",
+        "logic.check_bool",
+        "logic.set_bool",
+        "motion.move_to_joint_target",
+        "motion.move_to_pose",
+        "motion.pick_object",
+        "motion.place_object",
+        "planning.plan_pick_sequence",
+        "scene.attach_carried_object",
+        "scene.detach_carried_object",
+        "scene.remove_object",
+        "sequence",
+    }
 
 
 def test_stopped_program_run_cannot_restart_effects() -> None:

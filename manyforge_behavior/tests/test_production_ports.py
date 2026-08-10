@@ -7,8 +7,13 @@ from typing import Any, Mapping
 
 import pytest
 
+from manyforge_behavior.assistant_program_port import (
+    HeadlessProgramSceneSource,
+    ProgramAssistantPort,
+)
 from manyforge_behavior.kernel_client import KernelClient
 from manyforge_behavior.orchestration_ports import (
+    CompositeProgramRunContextPort,
     NodeAttemptIdentity,
     OwnerNodeInputs,
     OwnerTaskSnapshot,
@@ -163,6 +168,12 @@ def _context() -> ProgramRunPortContext:
                     ],
                 },
             ],
+            "contact_grasp_bindings": [
+                {
+                    "contact_policy_id": "pick.contact",
+                    "runtime_object_id": "selected_object",
+                }
+            ],
         },
     )
 
@@ -266,6 +277,29 @@ def test_completed_operation_is_acknowledged_with_exact_revision() -> None:
     assert scope.state is ProgramRunScopeState.SETTLED
 
 
+def test_native_context_cleanup_consumes_settled_tasks_but_refuses_active_work() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    active = port.operations.start(
+        "motion.move_to_pose", _identity(), _motion_inputs()
+    )
+
+    with pytest.raises(ProductionPortError, match="active native operations"):
+        port.unbind("program-run.1")
+
+    transport.operations[active.task_id].update(
+        {"state": "completed", "operation_revision": 5}
+    )
+    port.unbind("program-run.1")
+
+    assert transport.controls[-1][0] == "acknowledge"
+    with pytest.raises(ProductionPortError, match="not bound"):
+        port.operations.start(
+            "motion.move_to_pose", _identity("after-cleanup"), _motion_inputs()
+        )
+
+
 def test_program_scope_stop_is_exact_and_not_repeated() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -362,6 +396,306 @@ def test_stale_native_deployment_fails_before_dispatch() -> None:
         )
 
     assert transport.submissions == []
+
+
+class _PickPlaceTransport(_Transport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pick_requests: list[dict[str, Any]] = []
+        self.place_requests: list[dict[str, Any]] = []
+        self.no_feasible = False
+        self.sequence_statuses: dict[str, dict[str, Any]] = {}
+
+    def _planning_result(
+        self,
+        intent: Mapping[str, Any],
+        *,
+        kind: str,
+    ) -> dict[str, Any]:
+        planned = not self.no_feasible
+        pose = {
+            "position_m": {"x_m": 0.4, "y_m": 0.0, "z_m": 0.2},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        }
+        return {
+            "schema_version": "manyforge.pick_place_planning_result.v1",
+            "sequence_id": intent["sequence_id"],
+            "kind": kind,
+            "selected_object_id": intent["selected_object_id"],
+            "status": "planned" if planned else "no_feasible_candidate",
+            "attempted_candidate_count": 1,
+            "reports": [{"candidate_index": 1}],
+            "last_attempted_candidate": {
+                "candidate_index": 1,
+                "approach_pose": pose,
+                "pick_pose": pose,
+                "retreat_pose": pose,
+            },
+            "plan": {"kind": kind} if planned else None,
+        }
+
+    def plan_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        self.pick_requests.append(deepcopy(dict(intent)))
+        return {
+            "ok": True,
+            "planning_result": self._planning_result(intent, kind="pick"),
+        }
+
+    def start_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        self.pick_requests.append(deepcopy(dict(intent)))
+        return self._start_sequence(intent, kind="pick")
+
+    def start_place(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        self.place_requests.append(deepcopy(dict(intent)))
+        return self._start_sequence(intent, kind="place")
+
+    def _start_sequence(
+        self,
+        intent: Mapping[str, Any],
+        *,
+        kind: str,
+    ) -> dict[str, Any]:
+        planning = self._planning_result(intent, kind=kind)
+        if self.no_feasible:
+            return {
+                "ok": True,
+                "planning_result": planning,
+                "sequence_status": None,
+            }
+        operation_id = f"{intent['sequence_id']}.approach"
+        self.operations[operation_id] = {
+            "operation_id": operation_id,
+            "operation_revision": 1,
+            "program_run_id": intent["approach_operation"]["program_run_id"],
+            "state": "executing",
+            "active_stop_generation": None,
+            "participants": [],
+        }
+        status = {
+            "schema_version": "manyforge.pick_place_sequence_status.v1",
+            "sequence_id": intent["sequence_id"],
+            "kind": kind,
+            "selected_object_id": intent["selected_object_id"],
+            "phase": "approach",
+            "active_operation_id": operation_id,
+            "completed_operation_ids": [],
+            "committed_projection_revision": None,
+            "terminal_error": None,
+        }
+        self.sequence_statuses[intent["sequence_id"]] = status
+        return {
+            "ok": True,
+            "planning_result": planning,
+            "sequence_status": deepcopy(status),
+        }
+
+    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "sequence_status": deepcopy(self.sequence_statuses[sequence_id]),
+        }
+
+
+def _pick_inputs(*, policy: str = "pause_for_operator") -> OwnerNodeInputs:
+    return OwnerNodeInputs(
+        parameters={
+            "target_role": "arm",
+            "tool_target_role": "gripper",
+            "base_frame_role": "base",
+            "tcp_frame_role": "tcp",
+            "carrier_frame_role": "tcp",
+            "selected_object_id": "graspable",
+            "synthesis": {
+                "pick_offset_envelope": {
+                    "position_min_m": [0.0, 0.0, 0.0],
+                    "position_max_m": [0.0, 0.0, 0.0],
+                    "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                    "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+                },
+                "approach_offset_envelope": {
+                    "position_min_m": [0.0, 0.0, 0.05],
+                    "position_max_m": [0.0, 0.0, 0.10],
+                    "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                    "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+                },
+            },
+            "planning_profile": "first_feasible",
+            "motion_options": {},
+            "tool_position": {"kind": "linear_m", "value_m": 0.0},
+            "tool_max_effort": {
+                "kind": "linear_newton",
+                "value_n": 8.0,
+            },
+            "tool_command_duration_s": 0.5,
+            "tool_completion_timeout_s": 30.0,
+            "output_key": "pick_plan",
+            "contact_policy_id": "pick.contact",
+            "no_feasible_plan_policy": policy,
+        }
+    )
+
+
+def test_pick_planning_assembles_portable_intent_without_prepared_authority() -> None:
+    transport = _PickPlaceTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("plan-pick")
+
+    result = port.pick_place.start(
+        "planning.plan_pick_sequence", identity, _pick_inputs()
+    )
+
+    assert result.state is OwnerTaskState.SUCCEEDED
+    assert result.output == {
+        "approach_pose": {
+            "frame_ref": {
+                "kind": "target_frame",
+                "target_role": "arm",
+                "frame_role": "base",
+            },
+            "position_m": [0.4, 0.0, 0.2],
+            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+        },
+        "pick_pose": {
+            "frame_ref": {
+                "kind": "target_frame",
+                "target_role": "arm",
+                "frame_role": "base",
+            },
+            "position_m": [0.4, 0.0, 0.2],
+            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+        },
+        "retreat_pose": {
+            "frame_ref": {
+                "kind": "target_frame",
+                "target_role": "arm",
+                "frame_role": "base",
+            },
+            "position_m": [0.4, 0.0, 0.2],
+            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+        },
+        "selected_object_id": "graspable",
+    }
+    intent = transport.pick_requests[0]
+    assert intent["selected_runtime_object_id"] == "selected_object"
+    assert intent["synthesis"]["base_tool_orientation_rpy_deg"] == [
+        180.0,
+        0.0,
+        0.0,
+    ]
+    assert intent["synthesis"]["maximum_candidate_count"] == 4096
+    assert intent["descend_operation"]["participants"][0]["payload"][
+        "runtime_object_bindings"
+    ] == [
+        {
+            "runtime_object_id": "selected_object",
+            "scene_resource_id": "graspable",
+        }
+    ]
+    assert intent["approach_operation"]["participants"][0]["payload"][
+        "runtime_object_bindings"
+    ] == []
+    assert intent["tool_operation"]["participants"][0]["payload"][
+        "command_schema_revision"
+    ] == _DIGEST_E
+    request_ids = {
+        intent[f"{phase}_operation"]["request_context"]["request_id"]
+        for phase in ("approach", "descend", "tool", "retreat")
+    }
+    assert len(request_ids) == 4
+    assert "prepared" not in repr(intent).lower()
+    port.pick_place.acknowledge(result.task_id, identity)
+
+
+def test_pick_no_feasible_candidate_preserves_authored_policy_and_diagnostics() -> None:
+    transport = _PickPlaceTransport()
+    transport.no_feasible = True
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+
+    result = port.pick_place.start(
+        "motion.pick_object",
+        _identity("pick-none"),
+        _pick_inputs(policy="condition_failure"),
+    )
+
+    assert result.state is OwnerTaskState.FAILED
+    assert result.reason_code == "no_feasible_candidate"
+    assert result.metadata["authored_failure_policy"] == "condition_failure"
+    assert result.metadata["planning_result"]["reports"] == [
+        {"candidate_index": 1}
+    ]
+
+
+def test_pick_sequence_observation_cancellation_and_intervention_are_exact() -> None:
+    transport = _PickPlaceTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("execute-pick")
+    started = port.pick_place.start(
+        "motion.pick_object", identity, _pick_inputs()
+    )
+    assert started.state is OwnerTaskState.ACTIVE
+
+    port.pick_place.cancel(started.task_id, identity)
+    kind, operation_id, body = transport.controls[-1]
+    assert kind == "stop"
+    assert operation_id.endswith(".approach")
+    assert body["operations"][0]["expected_operation_revision"] == 1
+
+    transport.sequence_statuses[started.task_id].update(
+        {
+            "phase": "intervention_required",
+            "active_operation_id": None,
+            "terminal_error": {
+                "code": "pick_retreat_interrupted",
+                "message": "retreat did not settle",
+            },
+        }
+    )
+    observed = port.pick_place.observe(started.task_id)
+    assert observed.state is OwnerTaskState.FAILED
+    assert observed.reason_code == "pick_retreat_interrupted"
+    assert observed.metadata["authored_failure_policy"] == "pause_for_operator"
+    port.unbind("program-run.1")
+
+
+def test_place_intent_preserves_authored_pose_and_has_no_grasp_exception() -> None:
+    transport = _PickPlaceTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_pick_inputs().parameters)
+    parameters.pop("synthesis")
+    parameters.pop("contact_policy_id")
+    parameters.pop("no_feasible_plan_policy")
+    parameters.pop("output_key")
+    parameters.update(
+        {
+            "place_pose": {
+                "position_m": [0.4, 0.1, 0.2],
+                "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
+            },
+            "approach_offset_m": [0.0, 0.0, 0.08],
+            "tool_position": {"kind": "linear_m", "value_m": 0.04},
+        }
+    )
+
+    result = port.pick_place.start(
+        "motion.place_object",
+        _identity("place"),
+        OwnerNodeInputs(parameters=parameters),
+    )
+
+    assert result.state is OwnerTaskState.ACTIVE
+    intent = transport.place_requests[0]
+    approach = intent["approach_operation"]["participants"][0]["payload"]
+    assert approach["motion"]["goal"]["position_m"]["z_m"] == pytest.approx(
+        0.28
+    )
+    for phase in ("approach", "descend", "retreat"):
+        payload = intent[f"{phase}_operation"]["participants"][0]["payload"]
+        assert payload["contact_policy_id"] is None
+        assert payload["runtime_object_bindings"] == []
 
 
 def _scene_context() -> ProgramRunPortContext:
@@ -715,6 +1049,89 @@ def test_scene_initialization_clears_dependencies_then_applies_authored_order() 
         "frame_role_id": "base",
     }
     assert sorted(transport.objects) == ["graspable", "table"]
+
+
+def test_scene_context_can_bind_atomically_before_initialization_and_release() -> None:
+    transport = _SceneTransport()
+    port = HeadlessSceneProgramPort(transport)
+    context = _scene_context()
+
+    port.bind(context)
+    port.initialize(context, _authored_scene())
+    first_submission_count = len(transport.submissions)
+    port.initialize(context, _authored_scene())
+    assert len(transport.submissions) == first_submission_count
+
+    port.release(context.program_run_id)
+    result = port.invoke(
+        "scene.remove_object",
+        _identity("after-release"),
+        OwnerNodeInputs(parameters={"scene_resource_id": "graspable"}),
+    )
+    assert result.succeeded is False
+    assert "not initialized" in result.message
+
+
+def test_three_production_context_ports_rollback_as_one_before_dispatch() -> None:
+    class _NoModelTransport:
+        def validate_endpoint(self, **_endpoint: Any) -> None:
+            pass
+
+        def complete(self, _request: object, _cancel_event: object) -> object:
+            raise AssertionError("model transport must not be reached")
+
+    base = _scene_context()
+    context = ProgramRunPortContext(
+        program_run_id=base.program_run_id,
+        scenario_id=base.scenario_id,
+        scenario_catalog_revision=base.scenario_catalog_revision,
+        program_id=base.program_id,
+        program_revision=base.program_revision,
+        program_binding_id=base.program_binding_id,
+        retained_bundle_id=base.retained_bundle_id,
+        graph_revision=base.graph_revision,
+        node_environment_digest=base.node_environment_digest,
+        program_binding=base.program_binding,
+        program={
+            "program_id": base.program_id,
+            "program_revision": base.program_revision,
+            "blackboard": {"namespaces": [], "keys": []},
+            "tree": {
+                "node_id": "assistant.query_model",
+                "instance_id": "query",
+                "parameters": {},
+                "children": [],
+            },
+        },
+    )
+    kernel_transport = _Transport()
+    scene_transport = _SceneTransport()
+    native = NativeKernelProgramPort(KernelClient(kernel_transport))
+    scene = HeadlessSceneProgramPort(scene_transport)
+    assistant = ProgramAssistantPort(
+        _NoModelTransport(),  # type: ignore[arg-type]
+        HeadlessProgramSceneSource(scene_transport),
+    )
+    composite = CompositeProgramRunContextPort(native, scene, assistant)
+    try:
+        with pytest.raises(RuntimeError, match="no retained assistant"):
+            composite.bind(context)
+
+        with pytest.raises(ProductionPortError, match="not bound"):
+            native.operations.start(
+                "motion.move_to_pose",
+                _identity("after-rollback"),
+                _motion_inputs(),
+            )
+        scene_result = scene.invoke(
+            "scene.remove_object",
+            _identity("scene-after-rollback"),
+            OwnerNodeInputs(parameters={"scene_resource_id": "missing"}),
+        )
+        assert scene_result.succeeded is False
+        assert "not initialized" in scene_result.message
+    finally:
+        assistant.close()
 
 
 def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:

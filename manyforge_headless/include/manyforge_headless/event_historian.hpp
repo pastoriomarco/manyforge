@@ -30,6 +30,7 @@ inline constexpr std::string_view kHistorianPageSchemaVersion =
 inline constexpr std::size_t kDefaultHistorianQueueCapacity = 1024U;
 inline constexpr std::size_t kDefaultHistorianRecordRetention = 100000U;
 inline constexpr std::size_t kMaximumHistorianPageSize = 10000U;
+inline constexpr std::size_t kMaximumHistorianPayloadBytes = 256U * 1024U;
 
 class EventHistorianError : public std::runtime_error {
 public:

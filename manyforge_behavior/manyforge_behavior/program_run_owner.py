@@ -45,7 +45,9 @@ class ProgramRunOwnerError(RuntimeError):
 
 class ProgramRunState(Enum):
     RUNNING = "running"
+    INTERVENTION_REQUIRED = "intervention_required"
     STOPPING = "stopping"
+    FINALIZING = "finalizing"
     STOPPED = "stopped"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -241,6 +243,10 @@ class _RunEntry:
     state_after_stop: ProgramRunState = ProgramRunState.STOPPED
     state_after_stop_reason_code: str | None = None
     state_after_stop_message: str = ""
+    state_after_finalize: ProgramRunState = ProgramRunState.STOPPED
+    state_after_finalize_reason_code: str | None = None
+    state_after_finalize_message: str = ""
+    resources_released: bool = False
     transition_lock: RLock = field(default_factory=RLock, repr=False)
 
 
@@ -272,6 +278,7 @@ class ProgramRunOwner:
         self._run_id_factory = run_id_factory or (lambda: f"program-run-{uuid4().hex}")
         self._maximum_retained_runs = maximum_retained_runs
         self._runs: dict[str, _RunEntry] = {}
+        self._starting_run_ids: set[str] = set()
         self._lock = RLock()
 
     def _entry(self, program_run_id: str) -> _RunEntry:
@@ -309,61 +316,143 @@ class ProgramRunOwner:
             snapshot.reason_code,
         )
 
+    @staticmethod
+    def _mark_finalizing(
+        entry: _RunEntry,
+        *,
+        state_after_finalize: ProgramRunState,
+        reason_code: str | None,
+        message: str,
+    ) -> None:
+        entry.state = ProgramRunState.FINALIZING
+        entry.state_after_finalize = state_after_finalize
+        entry.state_after_finalize_reason_code = reason_code
+        entry.state_after_finalize_message = message
+        entry.active_operation_count = 0
+        entry.reason_code = reason_code
+        entry.message = message
+        entry.revision += 1
+
+    def _release_resources(self, program_run_id: str) -> tuple[Exception, ...]:
+        errors: list[Exception] = []
+        initialization = self._ports.program_run_initialization
+        context = self._ports.program_run_context
+        interventions = self._ports.program_interventions
+        if initialization is not None:
+            try:
+                initialization.release(program_run_id)
+            except Exception as error:
+                errors.append(error)
+        if context is not None:
+            try:
+                context.unbind(program_run_id)
+            except Exception as error:
+                errors.append(error)
+        if interventions is not None:
+            try:
+                interventions.release(program_run_id)
+            except Exception as error:
+                errors.append(error)
+        return tuple(errors)
+
+    def _reconcile_finalizing(self, program_run_id: str) -> ProgramRunSnapshot:
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state is not ProgramRunState.FINALIZING:
+                return self._snapshot(entry)
+            transition_lock = entry.transition_lock
+        with transition_lock:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state is not ProgramRunState.FINALIZING:
+                    return self._snapshot(entry)
+                already_released = entry.resources_released
+            errors = () if already_released else self._release_resources(program_run_id)
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if errors:
+                    message = "; ".join(
+                        str(error) or type(error).__name__ for error in errors
+                    )
+                    if (
+                        entry.reason_code != "program_run_cleanup_failed"
+                        or entry.message != message
+                    ):
+                        entry.reason_code = "program_run_cleanup_failed"
+                        entry.message = message
+                        entry.revision += 1
+                    return self._snapshot(entry)
+                entry.resources_released = True
+                entry.state = entry.state_after_finalize
+                entry.reason_code = entry.state_after_finalize_reason_code
+                entry.message = entry.state_after_finalize_message
+                entry.active_operation_count = 0
+                entry.revision += 1
+                return self._snapshot(entry)
+
     def start(self, admission: ProgramRunAdmission) -> ProgramRunSnapshot:
         if not isinstance(admission, ProgramRunAdmission):
             raise TypeError("start requires one exact Program-run admission")
         with self._lock:
-            if len(self._runs) >= self._maximum_retained_runs:
+            if (
+                len(self._runs) + len(self._starting_run_ids)
+                >= self._maximum_retained_runs
+            ):
                 raise ProgramRunOwnerError("Program-run retention is full")
             program_run_id = _text(
                 self._run_id_factory(),
                 field="program_run_id",
             )
-            if program_run_id in self._runs:
+            if (
+                program_run_id in self._runs
+                or program_run_id in self._starting_run_ids
+            ):
                 raise ProgramRunOwnerError("Program-run identity was reused")
-            owner_identities = tuple(
-                sorted(
-                    (
-                        *admission.owner_identities,
-                        ProgramRunOwnerIdentity(
-                            owner_role="program_runner",
-                            owner_id=self._owner_id,
-                            owner_epoch=self._owner_epoch,
-                        ),
+            self._starting_run_ids.add(program_run_id)
+        owner_identities = tuple(
+            sorted(
+                (
+                    *admission.owner_identities,
+                    ProgramRunOwnerIdentity(
+                        owner_role="program_runner",
+                        owner_id=self._owner_id,
+                        owner_epoch=self._owner_epoch,
                     ),
-                    key=lambda identity: identity.owner_role,
-                )
+                ),
+                key=lambda identity: identity.owner_role,
             )
-            capture = ProgramRunCapture(
-                program_run_id=program_run_id,
-                scenario_id=admission.scenario_id,
-                scenario_catalog_revision=admission.scenario_catalog_revision,
-                program_id=admission.program.program_id,
-                program_revision=admission.program.program_revision,
-                program_binding_id=admission.program_binding_id,
-                retained_bundle_id=admission.retained_bundle_id,
-                graph_revision=admission.graph_revision,
-                node_environment_digest=admission.environment.environment_digest,
-                owner_identities=owner_identities,
-            )
-            context_port = self._ports.program_run_context
-            initialization_port = self._ports.program_run_initialization
-            context_bound = False
-            initialization_started = False
-            port_context = ProgramRunPortContext(
-                program_run_id=capture.program_run_id,
-                scenario_id=capture.scenario_id,
-                scenario_catalog_revision=capture.scenario_catalog_revision,
-                program_id=capture.program_id,
-                program_revision=capture.program_revision,
-                program_binding_id=capture.program_binding_id,
-                retained_bundle_id=capture.retained_bundle_id,
-                graph_revision=capture.graph_revision,
-                node_environment_digest=capture.node_environment_digest,
-                program_binding=admission.program_binding,
-                program=admission.program.to_dict(),
-                assistant_projection=admission.assistant_projection,
-            )
+        )
+        capture = ProgramRunCapture(
+            program_run_id=program_run_id,
+            scenario_id=admission.scenario_id,
+            scenario_catalog_revision=admission.scenario_catalog_revision,
+            program_id=admission.program.program_id,
+            program_revision=admission.program.program_revision,
+            program_binding_id=admission.program_binding_id,
+            retained_bundle_id=admission.retained_bundle_id,
+            graph_revision=admission.graph_revision,
+            node_environment_digest=admission.environment.environment_digest,
+            owner_identities=owner_identities,
+        )
+        context_port = self._ports.program_run_context
+        initialization_port = self._ports.program_run_initialization
+        context_bound = False
+        initialization_started = False
+        port_context = ProgramRunPortContext(
+            program_run_id=capture.program_run_id,
+            scenario_id=capture.scenario_id,
+            scenario_catalog_revision=capture.scenario_catalog_revision,
+            program_id=capture.program_id,
+            program_revision=capture.program_revision,
+            program_binding_id=capture.program_binding_id,
+            retained_bundle_id=capture.retained_bundle_id,
+            graph_revision=capture.graph_revision,
+            node_environment_digest=capture.node_environment_digest,
+            program_binding=admission.program_binding,
+            program=admission.program.to_dict(),
+            assistant_projection=admission.assistant_projection,
+        )
+        try:
             try:
                 if context_port is not None:
                     context_port.bind(port_context)
@@ -380,6 +469,14 @@ class ProgramRunOwner:
                     ports=self._ports,
                     program_parameter_values=admission.program_parameter_values,
                 )
+                entry = _RunEntry(run=run)
+                with self._lock:
+                    if program_run_id in self._runs:
+                        raise ProgramRunOwnerError(
+                            "Program-run identity was reused"
+                        )
+                    self._runs[program_run_id] = entry
+                    return self._snapshot(entry)
             except Exception:
                 try:
                     if initialization_started and initialization_port is not None:
@@ -388,16 +485,19 @@ class ProgramRunOwner:
                     if context_bound and context_port is not None:
                         context_port.unbind(program_run_id)
                 raise
-            entry = _RunEntry(run=run)
-            self._runs[program_run_id] = entry
-            return self._snapshot(entry)
+        finally:
+            with self._lock:
+                self._starting_run_ids.discard(program_run_id)
 
     def read(self, program_run_id: str) -> ProgramRunSnapshot:
         with self._lock:
             entry = self._entry(program_run_id)
             stopping = entry.state is ProgramRunState.STOPPING
+            finalizing = entry.state is ProgramRunState.FINALIZING
         if stopping:
             return self.reconcile_stop(program_run_id)
+        if finalizing:
+            return self._reconcile_finalizing(program_run_id)
         with self._lock:
             return self._snapshot(self._entry(program_run_id))
 
@@ -421,17 +521,26 @@ class ProgramRunOwner:
                     ProgramRunState.FAILED,
                 }:
                     return self._snapshot(entry)
-                issue_stop = not entry.stop_requested
-                if issue_stop:
-                    entry.stop_requested = True
-                    entry.state = ProgramRunState.STOPPING
-                    entry.state_after_stop = state_after_stop
-                    entry.state_after_stop_reason_code = reason_code
-                    entry.state_after_stop_message = message
-                    entry.reason_code = reason_code
-                    entry.message = message
-                    entry.revision += 1
-                run = entry.run
+                if entry.state is ProgramRunState.FINALIZING:
+                    reconcile_finalize = True
+                    issue_stop = False
+                    run = entry.run
+                else:
+                    reconcile_finalize = False
+                    issue_stop = not entry.stop_requested
+                    if issue_stop:
+                        entry.stop_requested = True
+                        entry.state = ProgramRunState.STOPPING
+                        entry.state_after_stop = state_after_stop
+                        entry.state_after_stop_reason_code = reason_code
+                        entry.state_after_stop_message = message
+                        entry.reason_code = reason_code
+                        entry.message = message
+                        entry.revision += 1
+                    run = entry.run
+
+            if reconcile_finalize:
+                return self._reconcile_finalizing(program_run_id)
 
             scope_snapshot: ProgramRunScopeSnapshot | None = None
             scope_errors: list[Exception] = []
@@ -456,6 +565,7 @@ class ProgramRunOwner:
                 except Exception as exc:
                     scope_errors.append(exc)
 
+            finalize = False
             with self._lock:
                 entry = self._entry(program_run_id)
                 if scope_errors:
@@ -475,9 +585,17 @@ class ProgramRunOwner:
                         entry.reason_code = entry.state_after_stop_reason_code
                         entry.message = entry.state_after_stop_message
                     if settled:
-                        entry.state = entry.state_after_stop
-                        entry.revision += 1
-                return self._snapshot(entry)
+                        self._mark_finalizing(
+                            entry,
+                            state_after_finalize=entry.state_after_stop,
+                            reason_code=entry.state_after_stop_reason_code,
+                            message=entry.state_after_stop_message,
+                        )
+                        finalize = True
+                snapshot = self._snapshot(entry)
+            if finalize:
+                return self._reconcile_finalizing(program_run_id)
+            return snapshot
 
     def stop(
         self,
@@ -502,6 +620,7 @@ class ProgramRunOwner:
                 return self._snapshot(entry)
             transition_lock = entry.transition_lock
         with transition_lock:
+            finalize = False
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is not ProgramRunState.STOPPING:
@@ -527,9 +646,17 @@ class ProgramRunOwner:
                     entry.reason_code = entry.state_after_stop_reason_code
                     entry.message = entry.state_after_stop_message
                 if entry.state is ProgramRunState.STOPPING and settled:
-                    entry.state = entry.state_after_stop
-                    entry.revision += 1
-                return self._snapshot(entry)
+                    self._mark_finalizing(
+                        entry,
+                        state_after_finalize=entry.state_after_stop,
+                        reason_code=entry.state_after_stop_reason_code,
+                        message=entry.state_after_stop_message,
+                    )
+                    finalize = True
+                snapshot = self._snapshot(entry)
+            if finalize:
+                return self._reconcile_finalizing(program_run_id)
+            return snapshot
 
     def advance_once(self, program_run_id: str) -> ProgramRunSnapshot:
         with self._lock:
@@ -539,14 +666,21 @@ class ProgramRunOwner:
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is ProgramRunState.STOPPING:
-                    reconcile = True
+                    reconcile_stop = True
+                    reconcile_finalize = False
+                elif entry.state is ProgramRunState.FINALIZING:
+                    reconcile_stop = False
+                    reconcile_finalize = True
                 elif entry.state is not ProgramRunState.RUNNING:
                     return self._snapshot(entry)
                 else:
-                    reconcile = False
+                    reconcile_stop = False
+                    reconcile_finalize = False
                     run = entry.run
-            if reconcile:
+            if reconcile_stop:
                 return self.reconcile_stop(program_run_id)
+            if reconcile_finalize:
+                return self._reconcile_finalizing(program_run_id)
 
             try:
                 tree_status = run.tick_once()
@@ -560,6 +694,19 @@ class ProgramRunOwner:
                 )
 
             status_name = tree_status.name.lower()
+            intervention = None
+            intervention_port = self._ports.program_interventions
+            if intervention_port is not None:
+                try:
+                    intervention = intervention_port.read(program_run_id)
+                except Exception as exc:
+                    return self._begin_stop(
+                        program_run_id,
+                        reason="Program intervention state unavailable",
+                        state_after_stop=ProgramRunState.FAILED,
+                        reason_code="program_intervention_state_unknown",
+                        message=str(exc) or type(exc).__name__,
+                    )
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is not ProgramRunState.RUNNING:
@@ -567,6 +714,12 @@ class ProgramRunOwner:
                 if entry.tree_status != status_name:
                     entry.tree_status = status_name
                     entry.revision += 1
+                if intervention is not None:
+                    entry.state = ProgramRunState.INTERVENTION_REQUIRED
+                    entry.reason_code = intervention.reason_code
+                    entry.message = intervention.message
+                    entry.revision += 1
+                    return self._snapshot(entry)
                 if tree_status is py_trees.common.Status.RUNNING:
                     return self._snapshot(entry)
 
@@ -601,20 +754,23 @@ class ProgramRunOwner:
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is ProgramRunState.RUNNING:
-                    entry.active_operation_count = 0
-                    entry.state = terminal_state
-                    entry.reason_code = (
+                    reason_code = (
                         None
                         if terminal_state is ProgramRunState.SUCCEEDED
                         else "program_tree_failed"
                     )
-                    entry.message = (
+                    message = (
                         ""
                         if terminal_state is ProgramRunState.SUCCEEDED
                         else "Program tree failed"
                     )
-                    entry.revision += 1
-                return self._snapshot(entry)
+                    self._mark_finalizing(
+                        entry,
+                        state_after_finalize=terminal_state,
+                        reason_code=reason_code,
+                        message=message,
+                    )
+            return self._reconcile_finalizing(program_run_id)
 
 
 def build_program_run_admission(

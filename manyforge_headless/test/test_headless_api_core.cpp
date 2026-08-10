@@ -134,6 +134,59 @@ std::string Digest(const char digit) {
   return "sha256:" + std::string(64U, digit);
 }
 
+CanonicalValue ProgramModelAttemptRecord(const bool success = true) {
+  CanonicalValue error_code = success ? CanonicalValue(nullptr)
+                                      : CanonicalValue("model_request_timeout");
+  CanonicalValue response_digest =
+      success ? CanonicalValue(Digest('5')) : CanonicalValue(nullptr);
+  CanonicalValue validated_output_digest =
+      success ? CanonicalValue(Digest('6')) : CanonicalValue(nullptr);
+  return CanonicalValue(CanonicalValue::Object{
+      {"argument_digests", CanonicalValue(CanonicalValue::Object{
+                               {"object", CanonicalValue(Digest('4'))},
+                           })},
+      {"argument_values", CanonicalValue(nullptr)},
+      {"assistant_projection_digest", CanonicalValue(Digest('1'))},
+      {"attachment_digest", CanonicalValue(nullptr)},
+      {"audit_policy", CanonicalValue(CanonicalValue::Object{
+                           {"redact_argument_values", CanonicalValue(true)},
+                           {"store_full_prompts", CanonicalValue(false)},
+                           {"store_full_responses", CanonicalValue(false)},
+                       })},
+      {"error_code", std::move(error_code)},
+      {"error_message",
+       CanonicalValue(success ? "" : "model request timed out")},
+      {"external_attempt_index", CanonicalValue(success ? 1.0 : 2.0)},
+      {"external_resource_alias", CanonicalValue("site_llm")},
+      {"latency_ms", CanonicalValue(12.5)},
+      {"model_attempt_id",
+       CanonicalValue(success ? "model-attempt:one" : "model-attempt:two")},
+      {"model_endpoint_alias", CanonicalValue("planning_model")},
+      {"model_id", CanonicalValue("model-a")},
+      {"model_version", CanonicalValue(success ? "model-a.2026-08" : "")},
+      {"node_attempt_id", CanonicalValue("node-attempt:one")},
+      {"node_instance_id", CanonicalValue("query-model")},
+      {"occurred_at_ns", CanonicalValue(success ? 1200.0 : 1300.0)},
+      {"occurred_at_wall", CanonicalValue(success ? "2026-08-10T10:00:00Z"
+                                                  : "2026-08-10T10:00:01Z")},
+      {"outcome", CanonicalValue(success ? "success" : "timeout")},
+      {"program_run_id", CanonicalValue("program-run:one")},
+      {"prompt_digest", CanonicalValue(Digest('3'))},
+      {"prompt_text", CanonicalValue(nullptr)},
+      {"prompt_template_digest", CanonicalValue(Digest('2'))},
+      {"prompt_template_id", CanonicalValue("select")},
+      {"prompt_template_version", CanonicalValue("1")},
+      {"response_digest", std::move(response_digest)},
+      {"response_value", CanonicalValue(nullptr)},
+      {"schema_version", CanonicalValue("manyforge.program_model_attempt.v1")},
+      {"usage", success ? CanonicalValue(CanonicalValue::Object{
+                              {"total_tokens", CanonicalValue(17.0)},
+                          })
+                        : CanonicalValue(nullptr)},
+      {"validated_output_digest", std::move(validated_output_digest)},
+  });
+}
+
 HeadlessApiCoreClocks Clocks() {
   auto monotonic = std::make_shared<std::int64_t>(1000);
   return {
@@ -550,12 +603,11 @@ TEST(HeadlessApiCore,
                                     "logical-scene-source.json");
   AtomicSourceSnapshotChannel runtime(directory.publications(),
                                       "scene-runtime-source.json");
-  static_cast<void>(scene.Publish(
-      "logical_scene", "logical-scene." + cell_id, "scene.epoch.1", 1,
-      LogicalScenePayload()));
-  static_cast<void>(runtime.Publish(
-      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime.epoch.1", 1,
-      SceneRuntimePayload("open", 1, cell_id)));
+  static_cast<void>(scene.Publish("logical_scene", "logical-scene." + cell_id,
+                                  "scene.epoch.1", 1, LogicalScenePayload()));
+  static_cast<void>(runtime.Publish("scene_runtime", "scene-runtime." + cell_id,
+                                    "scene-runtime.epoch.1", 1,
+                                    SceneRuntimePayload("open", 1, cell_id)));
   const auto scenario = core.ScenarioProgramSelection(selection.scenario_id);
   EXPECT_EQ(Text(scenario, "schema_version"),
             kScenarioProgramSelectionSchemaVersion);
@@ -694,6 +746,76 @@ TEST(HeadlessApiCore,
     std::this_thread::yield();
   }
   EXPECT_EQ(HistoryCount(core), 2U);
+}
+
+TEST(HeadlessApiCore,
+     ProgramModelAttemptIsValidatedAndSynchronouslyStoredInHistorian) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const auto record = ProgramModelAttemptRecord();
+
+  const auto receipt = core.CommitProgramModelAttempt(record);
+
+  EXPECT_EQ(Text(receipt, "schema_version"),
+            "manyforge.program_model_attempt_commit.v1");
+  EXPECT_EQ(Text(receipt, "model_attempt_id"), "model-attempt:one");
+  EXPECT_EQ(Text(receipt, "status"), "stored");
+  EXPECT_FALSE(Text(receipt, "event_id").empty());
+
+  const auto duplicate_receipt = core.CommitProgramModelAttempt(record);
+  EXPECT_EQ(Text(duplicate_receipt, "status"), "duplicate");
+  EXPECT_EQ(Text(duplicate_receipt, "event_id"), Text(receipt, "event_id"));
+
+  HistorianQuery query;
+  query.components.insert("manyforge.program");
+  query.event_types.insert("program_model_attempt");
+  const auto page = core.HistoryPage(query);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  const auto &event = Member(Array(page, "events").front(), "event");
+  EXPECT_EQ(Text(event, "severity"), "INFO");
+  EXPECT_EQ(Member(event, "payload"), record);
+
+  auto conflicting_identity = record.as_object();
+  for (auto &[name, value] : conflicting_identity) {
+    if (name == "model_version") {
+      value = CanonicalValue("conflicting-version");
+    }
+  }
+  EXPECT_THROW(static_cast<void>(core.CommitProgramModelAttempt(
+                   CanonicalValue(std::move(conflicting_identity)))),
+               EventHistorianError);
+  EXPECT_EQ(Array(core.HistoryPage(query), "events").size(), 1U);
+
+  const auto failure_receipt =
+      core.CommitProgramModelAttempt(ProgramModelAttemptRecord(false));
+  EXPECT_EQ(Text(failure_receipt, "model_attempt_id"), "model-attempt:two");
+  EXPECT_EQ(Text(failure_receipt, "status"), "stored");
+  EXPECT_EQ(Array(core.HistoryPage(query), "events").size(), 2U);
+
+  try {
+    static_cast<void>(core.CommitProgramModelAttempt(
+        CanonicalValue(CanonicalValue::Object{})));
+    FAIL() << "malformed Program model-attempt record was accepted";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "headless_program_model_attempt_invalid");
+  }
+
+  auto empty_identity = ProgramModelAttemptRecord().as_object();
+  for (auto &[name, value] : empty_identity) {
+    if (name == "model_attempt_id") {
+      value = CanonicalValue("");
+    }
+  }
+  EXPECT_THROW(static_cast<void>(core.CommitProgramModelAttempt(
+                   CanonicalValue(std::move(empty_identity)))),
+               OperatorAlarmError);
+
+  core.Shutdown();
+  HeadlessApiCore replacement(Config(directory, "api.epoch.2"), Clocks());
+  const auto restart_receipt = replacement.CommitProgramModelAttempt(record);
+  EXPECT_EQ(Text(restart_receipt, "status"), "duplicate");
+  EXPECT_EQ(Text(restart_receipt, "event_id"), Text(receipt, "event_id"));
+  EXPECT_EQ(Array(replacement.HistoryPage(query), "events").size(), 2U);
 }
 
 TEST(HeadlessApiCore,

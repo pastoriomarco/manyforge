@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from threading import Event, Thread
+import time
 from typing import Any
 
 import pytest
@@ -19,6 +20,7 @@ from manyforge_behavior.node_availability import (
 )
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.orchestration_ports import (
+    CompositeProgramRunContextPort,
     NodeAdapterPorts,
     NodeAttemptIdentity,
     OwnerInvocationResult,
@@ -28,6 +30,11 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunPortContext,
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
+)
+from manyforge_behavior.program_scheduling import (
+    ProgramInterventionRegistry,
+    ProgramRunTickHost,
+    ProgramSchedulingError,
 )
 from manyforge_behavior.program import Program
 from manyforge_behavior.program_run_owner import (
@@ -119,9 +126,16 @@ class _ContextPort:
 
 
 class _InitializationPort:
-    def __init__(self, events: list[str], *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        fail: bool = False,
+        release_failures: int = 0,
+    ) -> None:
         self.events = events
         self.fail = fail
+        self.release_failures = release_failures
         self.scenes: list[list[dict[str, object]]] = []
         self.released: list[str] = []
 
@@ -138,6 +152,32 @@ class _InitializationPort:
     def release(self, program_run_id: str) -> None:
         self.events.append("scene_release")
         self.released.append(program_run_id)
+        if self.release_failures:
+            self.release_failures -= 1
+            raise RuntimeError("temporary scene release failure")
+
+
+class _PolicyTaskPort(_TaskPort):
+    def start(
+        self,
+        _node_id: str,
+        _identity: NodeAttemptIdentity,
+        _inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        self.starts += 1
+        self._events.append("leaf_start")
+        return OwnerTaskSnapshot(
+            task_id=f"task-{self.starts}",
+            state=OwnerTaskState.FAILED,
+            metadata={
+                "authored_failure_policy": "pause_for_operator",
+                "authored_failure_policy_parameter": (
+                    "no_feasible_plan_policy"
+                ),
+            },
+            reason_code="no_feasible_candidate",
+            message="No pick candidate is feasible",
+        )
 
 
 class _BlockingTaskPort(_TaskPort):
@@ -166,6 +206,49 @@ class _BlockingTaskPort(_TaskPort):
         return OwnerTaskSnapshot(
             task_id=f"task-{self.starts}",
             state=OwnerTaskState.ACTIVE,
+        )
+
+
+class _ParallelTaskPort(_TaskPort):
+    def __init__(
+        self,
+        events: list[str],
+        first_entered: Event,
+        release_first: Event,
+        second_completed: Event,
+    ) -> None:
+        super().__init__(events, OwnerTaskState.SUCCEEDED)
+        self._first_entered = first_entered
+        self._release_first = release_first
+        self._second_completed = second_completed
+
+    def start(
+        self,
+        _node_id: str,
+        identity: NodeAttemptIdentity,
+        _inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        self.starts += 1
+        task_id = f"task-{identity.program_run_id}"
+        if identity.program_run_id == "program-run-1":
+            self._first_entered.set()
+            assert self._release_first.wait(timeout=2.0)
+        return OwnerTaskSnapshot(
+            task_id=task_id,
+            state=(
+                OwnerTaskState.SUCCEEDED
+                if identity.program_run_id == "program-run-1"
+                else OwnerTaskState.ACTIVE
+            ),
+        )
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        if task_id != "task-program-run-2":
+            raise AssertionError("unexpected parallel-test task")
+        self._second_completed.set()
+        return OwnerTaskSnapshot(
+            task_id=task_id,
+            state=OwnerTaskState.SUCCEEDED,
         )
 
 
@@ -239,6 +322,8 @@ def _fixture(
     task_factory: Callable[[list[str]], _TaskPort] | None = None,
     context_port: _ContextPort | None = None,
     initialization_port: _InitializationPort | None = None,
+    interventions: ProgramInterventionRegistry | None = None,
+    run_id_factory: Callable[[], str] | None = None,
 ) -> tuple[ProgramRunOwner, ProgramRunAdmission, _TaskPort, _ScopePort, list[str]]:
     events: list[str] = []
     if context_port is not None:
@@ -263,6 +348,7 @@ def _fixture(
         program_run_scope=scope,
         program_run_context=context_port,
         program_run_initialization=initialization_port,
+        program_interventions=interventions,
     )
     environment = build_node_environment()
     program = Program(
@@ -298,7 +384,7 @@ def _fixture(
         owner_id="program-runner.cell-a",
         owner_epoch="program-runner.epoch.1",
         ports=ports,
-        run_id_factory=lambda: "program-run-1",
+        run_id_factory=run_id_factory or (lambda: "program-run-1"),
         maximum_retained_runs=8,
     )
     return owner, admission, task, scope, events
@@ -371,7 +457,12 @@ def test_start_initializes_scene_after_context_and_before_tree_construction() ->
         "table"
     ]
     owner.advance_once(started.capture.program_run_id)
-    assert fixture_events[2:] == ["leaf_start", "leaf_acknowledge"]
+    assert fixture_events[2:] == [
+        "leaf_start",
+        "leaf_acknowledge",
+        "scene_release",
+        "context_unbind",
+    ]
 
 
 def test_rejected_scene_initialization_prevents_tree_and_releases_context() -> None:
@@ -395,6 +486,224 @@ def test_rejected_scene_initialization_prevents_tree_and_releases_context() -> N
     ]
     assert task.starts == 0
     assert initialization_port.released == ["program-run-1"]
+
+
+def test_composite_context_rolls_back_partial_bind_in_reverse_order() -> None:
+    class _FailingContext(_ContextPort):
+        def bind(self, context: ProgramRunPortContext) -> None:
+            self.events.append("second_bind")
+            raise RuntimeError("second context rejected")
+
+        def unbind(self, program_run_id: str) -> None:
+            self.events.append("second_unbind")
+            self.unbound.append(program_run_id)
+
+    first = _ContextPort([])
+    second = _FailingContext([])
+    composite = CompositeProgramRunContextPort(first, second)
+    owner, admission, task, _scope, fixture_events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        context_port=composite,  # type: ignore[arg-type]
+    )
+    first.events = fixture_events
+    second.events = fixture_events
+
+    with pytest.raises(RuntimeError, match="second context rejected"):
+        owner.start(admission)
+
+    assert fixture_events == [
+        "context_bind",
+        "second_bind",
+        "second_unbind",
+        "context_unbind",
+    ]
+    assert task.starts == 0
+
+
+def test_slow_admission_does_not_block_existing_program_run_reads() -> None:
+    entered = Event()
+    release = Event()
+
+    class _BlockingSecondContext(_ContextPort):
+        def bind(self, context: ProgramRunPortContext) -> None:
+            super().bind(context)
+            if context.program_run_id == "program-run-2":
+                entered.set()
+                assert release.wait(timeout=2.0)
+
+    identifiers = iter(("program-run-1", "program-run-2"))
+    context_port = _BlockingSecondContext([])
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        context_port=context_port,
+        run_id_factory=lambda: next(identifiers),
+    )
+    first = owner.start(admission)
+    second_results: list[object] = []
+    second = Thread(target=lambda: second_results.append(owner.start(admission)))
+    second.start()
+    assert entered.wait(timeout=1.0)
+
+    read_results: list[object] = []
+    reader = Thread(
+        target=lambda: read_results.append(
+            owner.read(first.capture.program_run_id)
+        )
+    )
+    reader.start()
+    reader.join(timeout=0.2)
+    assert not reader.is_alive()
+    assert len(read_results) == 1
+
+    release.set()
+    second.join(timeout=1.0)
+    assert not second.is_alive()
+    assert len(second_results) == 1
+
+
+def test_terminal_cleanup_is_retryable_before_the_run_claims_completion() -> None:
+    events: list[str] = []
+    context_port = _ContextPort(events)
+    initialization_port = _InitializationPort(events, release_failures=1)
+    owner, admission, _task, _scope, _fixture_events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        context_port=context_port,
+        initialization_port=initialization_port,
+    )
+    started = owner.start(admission)
+
+    first = owner.advance_once(started.capture.program_run_id)
+    assert first.state is ProgramRunState.FINALIZING
+    assert first.reason_code == "program_run_cleanup_failed"
+    assert context_port.unbound == ["program-run-1"]
+
+    completed = owner.read(started.capture.program_run_id)
+    assert completed.state is ProgramRunState.SUCCEEDED
+    assert completed.reason_code is None
+    assert initialization_port.released == ["program-run-1", "program-run-1"]
+
+
+def test_authored_pause_requires_intervention_without_redispatch() -> None:
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED,
+        task_factory=lambda events: _PolicyTaskPort(
+            events,
+            OwnerTaskState.FAILED,
+        ),
+        interventions=interventions,
+    )
+    started = owner.start(admission)
+
+    paused = owner.advance_once(started.capture.program_run_id)
+    assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert paused.reason_code == "no_feasible_candidate"
+    assert task.starts == 1
+    assert owner.advance_once(started.capture.program_run_id).state is (
+        ProgramRunState.INTERVENTION_REQUIRED
+    )
+    assert task.starts == 1
+
+    stopped = owner.stop(started.capture.program_run_id)
+    assert stopped.state is ProgramRunState.STOPPED
+    assert interventions.read(started.capture.program_run_id) is None
+
+
+def test_tick_host_advances_each_scheduled_run_and_removes_terminal_work() -> None:
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+
+    started = host.start_run(admission)
+    completed = host.advance_ready_once()
+
+    assert [snapshot.state for snapshot in completed] == [
+        ProgramRunState.SUCCEEDED
+    ]
+    assert task.starts == 1
+    assert host.advance_ready_once() == ()
+    assert host.read(started.capture.program_run_id).state is (
+        ProgramRunState.SUCCEEDED
+    )
+    host.shutdown()
+
+
+def test_tick_host_cleans_an_admitted_run_if_bounded_scheduling_rejects_it() -> (
+    None
+):
+    identifiers = iter(("program-run-1", "program-run-2"))
+    initialization = _InitializationPort([])
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        initialization_port=initialization,
+        run_id_factory=lambda: next(identifiers),
+    )
+    host = ProgramRunTickHost(owner, maximum_scheduled_runs=1)
+    first = host.start_run(admission)
+
+    with pytest.raises(ProgramSchedulingError, match="set is full"):
+        host.start_run(admission)
+
+    assert owner.read("program-run-2").state is ProgramRunState.STOPPED
+    assert initialization.released == ["program-run-2"]
+    assert host.stop_run(first.capture.program_run_id).state is (
+        ProgramRunState.STOPPED
+    )
+    host.shutdown()
+
+
+def test_tick_host_does_not_let_one_slow_run_starve_another_run() -> None:
+    first_entered = Event()
+    release_first = Event()
+    second_completed = Event()
+    identifiers = iter(("program-run-1", "program-run-2"))
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        task_factory=lambda events: _ParallelTaskPort(
+            events,
+            first_entered,
+            release_first,
+            second_completed,
+        ),
+        run_id_factory=lambda: next(identifiers),
+    )
+    host = ProgramRunTickHost(
+        owner,
+        tick_interval_s=0.01,
+        maximum_workers=2,
+    )
+    first = host.start_run(admission)
+    second = host.start_run(admission)
+    host.start()
+    try:
+        assert first_entered.wait(timeout=1.0)
+        assert second_completed.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while (
+            host.read(second.capture.program_run_id).state
+            is not ProgramRunState.SUCCEEDED
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        assert host.read(second.capture.program_run_id).state is (
+            ProgramRunState.SUCCEEDED
+        )
+
+        release_first.set()
+        deadline = time.monotonic() + 1.0
+        while (
+            host.read(first.capture.program_run_id).state
+            is not ProgramRunState.SUCCEEDED
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        assert host.read(first.capture.program_run_id).state is (
+            ProgramRunState.SUCCEEDED
+        )
+    finally:
+        release_first.set()
+        host.shutdown()
 
 
 def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof() -> (
