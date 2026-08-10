@@ -965,6 +965,77 @@ class CapabilityCommandParticipantRequest(StrictRequest):
         return self
 
 
+class FrameRoleReferenceRequest(StrictRequest):
+    type: Literal["frame_role"]
+    frame_role_id: str
+
+    @field_validator("frame_role_id")
+    @classmethod
+    def validate_frame_role_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="frame_role_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class ComponentBodyRoleReferenceRequest(StrictRequest):
+    type: Literal["component_body_role"]
+    collision_body_role_id: str
+
+    @field_validator("collision_body_role_id")
+    @classmethod
+    def validate_collision_body_role_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="collision_body_role_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class SceneResourceReferenceRequest(StrictRequest):
+    type: Literal["scene_resource"]
+    scene_resource_id: str
+
+    @field_validator("scene_resource_id")
+    @classmethod
+    def validate_scene_resource_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="scene_resource_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class RuntimeObjectReferenceRequest(StrictRequest):
+    type: Literal["runtime_object"]
+    runtime_object_id: str
+
+    @field_validator("runtime_object_id")
+    @classmethod
+    def validate_runtime_object_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="runtime_object_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class InlinePoseReferenceRequest(StrictRequest):
+    type: Literal["pose"]
+    pose: Pose3Request
+
+
+MotionReferenceRequest = Annotated[
+    FrameRoleReferenceRequest
+    | ComponentBodyRoleReferenceRequest
+    | SceneResourceReferenceRequest
+    | RuntimeObjectReferenceRequest
+    | InlinePoseReferenceRequest,
+    Field(discriminator="type"),
+]
+
+
 class RuntimeObjectReferenceBindingRequest(StrictRequest):
     runtime_object_id: str
     scene_resource_id: str
@@ -989,9 +1060,9 @@ class MotionParticipantRequest(StrictRequest):
     timeouts: MotionTimeoutsRequest
     cache_mode: Literal["default", "disable"]
     planning_profile: Literal["first_feasible", "balanced", "quality_bounded"]
-    target_mode: Literal["absolute"]
-    target_reference: None = None
-    offset_reference: None = None
+    target_mode: Literal["absolute", "relative"]
+    target_reference: MotionReferenceRequest | None = None
+    offset_reference: MotionReferenceRequest | None = None
     motion: MotionSpecRequest
     contact_policy_id: str | None = None
     per_joint_dynamics_limits: dict[str, JointDynamicsLimitRequest]
@@ -1037,12 +1108,39 @@ class MotionParticipantRequest(StrictRequest):
             raise ValueError(
                 "runtime_object_bindings must have unique runtime_object_id values"
             )
-        if isinstance(self.motion, JointGoalRequest) and (
-            self.contact_policy_id is not None or self.runtime_object_bindings
+        referenced_runtime_objects = {
+            reference.runtime_object_id
+            for reference in (self.target_reference, self.offset_reference)
+            if isinstance(reference, RuntimeObjectReferenceRequest)
+        }
+        bound_runtime_objects = set(runtime_objects)
+        if not referenced_runtime_objects.issubset(bound_runtime_objects) or (
+            self.contact_policy_id is None
+            and bound_runtime_objects != referenced_runtime_objects
         ):
             raise ValueError(
-                "joint_goal cannot carry contact-policy or runtime-object bindings"
+                "runtime_object_bindings must exactly cover motion references"
             )
+        is_joint = isinstance(self.motion, JointGoalRequest)
+        if is_joint and (
+            self.contact_policy_id is not None
+            or self.runtime_object_bindings
+            or self.target_reference is not None
+            or self.offset_reference is not None
+        ):
+            raise ValueError(
+                "joint_goal cannot carry contact-policy, spatial references, or "
+                "runtime-object bindings"
+            )
+        if self.target_mode == "absolute" and (
+            self.target_reference is not None or self.offset_reference is not None
+        ):
+            raise ValueError("absolute motion cannot carry references")
+        if self.target_mode == "relative" and not is_joint:
+            if self.target_reference is None:
+                raise ValueError(
+                    "relative pose and Cartesian motion require target_reference"
+                )
         return self
 
 
@@ -1147,75 +1245,12 @@ class PickOffsetEnvelopeRequest(StrictRequest):
         return self
 
 
-class PickFrameRoleReferenceRequest(StrictRequest):
-    type: Literal["frame_role"]
-    frame_role_id: str
-
-    @field_validator("frame_role_id")
-    @classmethod
-    def validate_frame_role_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="frame_role_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-
-class PickComponentBodyRoleReferenceRequest(StrictRequest):
-    type: Literal["component_body_role"]
-    collision_body_role_id: str
-
-    @field_validator("collision_body_role_id")
-    @classmethod
-    def validate_collision_body_role_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="collision_body_role_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-
-class PickSceneResourceReferenceRequest(StrictRequest):
-    type: Literal["scene_resource"]
-    scene_resource_id: str
-
-    @field_validator("scene_resource_id")
-    @classmethod
-    def validate_scene_resource_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="scene_resource_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-
-class PickRuntimeObjectReferenceRequest(StrictRequest):
-    type: Literal["runtime_object"]
-    runtime_object_id: str
-
-    @field_validator("runtime_object_id")
-    @classmethod
-    def validate_runtime_object_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="runtime_object_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-
-class PickInlinePoseReferenceRequest(StrictRequest):
-    type: Literal["pose"]
-    pose: Pose3Request
-
-
-PickOffsetReferenceRequest = Annotated[
-    PickFrameRoleReferenceRequest
-    | PickComponentBodyRoleReferenceRequest
-    | PickSceneResourceReferenceRequest
-    | PickRuntimeObjectReferenceRequest
-    | PickInlinePoseReferenceRequest,
-    Field(discriminator="type"),
-]
+PickFrameRoleReferenceRequest = FrameRoleReferenceRequest
+PickComponentBodyRoleReferenceRequest = ComponentBodyRoleReferenceRequest
+PickSceneResourceReferenceRequest = SceneResourceReferenceRequest
+PickRuntimeObjectReferenceRequest = RuntimeObjectReferenceRequest
+PickInlinePoseReferenceRequest = InlinePoseReferenceRequest
+PickOffsetReferenceRequest = MotionReferenceRequest
 
 
 class PickCandidateSynthesisRequest(StrictRequest):

@@ -47,6 +47,66 @@ class NodeAttemptIdentity:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ProgramRunPortContext:
+    """Immutable Applied Program/Binding coordinates used by client ports."""
+
+    program_run_id: str
+    scenario_id: str
+    scenario_catalog_revision: str
+    program_id: str
+    program_revision: str
+    program_binding_id: str
+    retained_bundle_id: str
+    graph_revision: str
+    node_environment_digest: str
+    program_binding: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        for field_name in ("program_run_id", "scenario_id", "program_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field_name} must be non-empty text")
+            if len(value.encode("utf-8")) > 512:
+                raise ValueError(f"{field_name} exceeds the client-port bound")
+        for field_name in (
+            "scenario_catalog_revision",
+            "program_revision",
+            "program_binding_id",
+            "retained_bundle_id",
+            "graph_revision",
+            "node_environment_digest",
+        ):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, str)
+                or len(value) != 71
+                or not value.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in value[7:])
+            ):
+                raise ValueError(f"{field_name} must be an exact SHA-256 identity")
+        if not isinstance(self.program_binding, Mapping):
+            raise TypeError("program_binding must be a mapping")
+        binding = dict(self.program_binding)
+        if (
+            binding.get("program_id") != self.program_id
+            or binding.get("program_revision") != self.program_revision
+            or binding.get("program_binding_id") != self.program_binding_id
+            or binding.get("retained_bundle_id") != self.retained_bundle_id
+            or binding.get("graph_revision") != self.graph_revision
+        ):
+            raise ValueError("Program-run context and Program Binding disagree")
+        object.__setattr__(self, "program_binding", _freeze(binding))
+
+
+class ProgramRunContextPort(Protocol):
+    """Bind exact client-only coordinates before constructing a Program tree."""
+
+    def bind(self, context: ProgramRunPortContext) -> None: ...
+
+    def unbind(self, program_run_id: str) -> None: ...
+
+
 class NodeAttemptSource(Protocol):
     """Issue one fresh identity whenever a node attempt starts."""
 
@@ -255,12 +315,15 @@ class NodeAdapterPorts:
     pick_place: OwnerTaskPort | None = None
     kernel_controls: OwnerInvocationPort | None = None
     program_run_scope: ProgramRunScopePort | None = None
+    program_run_context: ProgramRunContextPort | None = None
 
 
 __all__ = [
     "NodeAdapterPorts",
     "NodeAttemptIdentity",
     "NodeAttemptSource",
+    "ProgramRunContextPort",
+    "ProgramRunPortContext",
     "OwnerNodeInputs",
     "OwnerInvocationPort",
     "OwnerInvocationResult",

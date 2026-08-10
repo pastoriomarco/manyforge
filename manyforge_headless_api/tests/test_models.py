@@ -322,6 +322,81 @@ def test_motion_payload_accepts_pose_and_cartesian_but_not_joint_contact() -> No
         )
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        {"type": "frame_role", "frame_role_id": "base"},
+        {
+            "type": "component_body_role",
+            "collision_body_role_id": "wrist_collision",
+        },
+        {"type": "scene_resource", "scene_resource_id": "workpiece"},
+        {"type": "pose", "pose": _planning_pose(0.2)},
+    ],
+)
+def test_relative_motion_accepts_closed_portable_references(
+    reference: dict[str, object],
+) -> None:
+    request = _planning_motion(
+        "relative-pose",
+        {"kind": "pose_goal", "goal": _planning_pose(0.1)},
+    )
+    request["target_mode"] = "relative"
+    request["target_reference"] = reference
+
+    parsed = MotionParticipantRequest.model_validate(request)
+
+    assert parsed.target_mode == "relative"
+    assert parsed.target_reference is not None
+    assert parsed.target_reference.model_dump(mode="json") == reference
+
+
+def test_motion_reference_shape_fails_closed_before_native_admission() -> None:
+    missing_reference = _planning_motion(
+        "relative-pose",
+        {"kind": "pose_goal", "goal": _planning_pose()},
+    )
+    missing_reference["target_mode"] = "relative"
+    with pytest.raises(ValidationError, match="require target_reference"):
+        MotionParticipantRequest.model_validate(missing_reference)
+
+    absolute_reference = _planning_motion(
+        "absolute-pose",
+        {"kind": "pose_goal", "goal": _planning_pose()},
+    )
+    absolute_reference["target_reference"] = {
+        "type": "frame_role",
+        "frame_role_id": "base",
+    }
+    with pytest.raises(ValidationError, match="absolute motion"):
+        MotionParticipantRequest.model_validate(absolute_reference)
+
+    relative_joint = _planning_motion(
+        "relative-joint",
+        {
+            "kind": "joint_goal",
+            "joint_names": ["joint1"],
+            "positions_rad": [0.1],
+        },
+    )
+    relative_joint["target_mode"] = "relative"
+    assert MotionParticipantRequest.model_validate(relative_joint).target_mode == (
+        "relative"
+    )
+
+    stale_runtime_binding = _planning_motion(
+        "relative-runtime-object",
+        {"kind": "pose_goal", "goal": _planning_pose()},
+    )
+    stale_runtime_binding["target_mode"] = "relative"
+    stale_runtime_binding["target_reference"] = {
+        "type": "runtime_object",
+        "runtime_object_id": "selected_object",
+    }
+    with pytest.raises(ValidationError, match="exactly cover"):
+        MotionParticipantRequest.model_validate(stale_runtime_binding)
+
+
 def test_bulk_acknowledgement_requires_exact_sorted_unique_membership() -> None:
     body = {
         **_caller(),

@@ -1070,6 +1070,58 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             },
         )
 
+        relative_status = headless.execution_status()["status"]
+        relative_direct = relative_status["direct_control"]
+        relative_start_pose = relative_direct["observed_state"][
+            "current_tcp_pose"
+        ]
+        relative_pose_intent = _direct_control_motion_operation(
+            relative_status,
+            request_id="composer-direct-relative-pose-execution",
+            motion={"kind": "pose_goal", "goal": _pose()},
+        )
+        relative_payload = relative_pose_intent["participants"][0]["payload"]
+        relative_payload["target_mode"] = "relative"
+        relative_payload["target_reference"] = {
+            "type": "frame_role",
+            "frame_role_id": relative_direct["tcp_frame_role_id"],
+        }
+        relative_payload["offset_reference"] = {
+            "type": "frame_role",
+            "frame_role_id": relative_direct["tcp_frame_role_id"],
+        }
+        relative_accepted = composer.execute(relative_pose_intent)
+        relative_operation_id = relative_accepted["accepted"]["operation_id"]
+        relative_terminal = _wait_terminal(runner, relative_operation_id)[
+            "operation"
+        ]
+        assert relative_terminal["state"] == "completed", relative_terminal
+        relative_end_pose = headless.execution_status()["status"][
+            "direct_control"
+        ]["observed_state"]["current_tcp_pose"]
+        assert _translation_error_m(
+            relative_end_pose["position_m"], relative_start_pose["position_m"]
+        ) <= relative_payload["tolerances"]["translation_tol_m"]
+        assert _rotation_error_rad(
+            relative_end_pose["orientation"], relative_start_pose["orientation"]
+        ) <= relative_payload["tolerances"]["rotation_tol_rad"]
+        composer.acknowledge_completed_operation(
+            relative_operation_id,
+            {
+                "request_context": {
+                    "request_id": "ack-composer-relative-operation",
+                    "request_owner_epoch": relative_status["owner_epoch"],
+                    "source_label": "composer_ui",
+                    "correlation_id": None,
+                },
+                "operation_id": relative_operation_id,
+                "expected_operation_revision": relative_terminal[
+                    "operation_revision"
+                ],
+                "reason": "release completed relative operation",
+            },
+        )
+
         direct_gripper_accepted = composer.execute(gripper_intent)
         direct_gripper_operation_id = direct_gripper_accepted["accepted"][
             "operation_id"

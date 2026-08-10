@@ -973,6 +973,37 @@ std::vector<double> NumberArray(const CanonicalValue &root,
                           Number(orientation, "z"), Number(orientation, "w")}};
 }
 
+[[nodiscard]] std::optional<core::ReferenceDTO>
+DecodeOptionalReference(const CanonicalValue &root,
+                        const std::string_view name) {
+  const auto &value = Member(root, name);
+  if (std::holds_alternative<std::nullptr_t>(value.storage())) {
+    return std::nullopt;
+  }
+  RequireExactObjectSize(value, 2U, "motion reference");
+  const auto type = Text(value, "type");
+  if (type == "frame_role") {
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole,
+                              Text(value, "frame_role_id"));
+  }
+  if (type == "component_body_role") {
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kComponentBodyRole,
+                              Text(value, "collision_body_role_id"));
+  }
+  if (type == "scene_resource") {
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kSceneResource,
+                              Text(value, "scene_resource_id"));
+  }
+  if (type == "runtime_object") {
+    return core::ReferenceDTO(core::ReferenceDTO::Type::kRuntimeObject,
+                              Text(value, "runtime_object_id"));
+  }
+  if (type == "pose") {
+    return core::ReferenceDTO(DecodePose(Member(value, "pose")));
+  }
+  Fail("motion reference type is unsupported");
+}
+
 [[nodiscard]] core::MotionSpecDTO
 DecodeMotionSpec(const CanonicalValue &value) {
   const auto kind = Text(value, "kind");
@@ -1138,18 +1169,34 @@ DecodeMotionPayload(const CanonicalValue &value) {
   } else {
     Fail("motion planning profile is unsupported");
   }
-  Require(Text(value, "target_mode") == "absolute",
-          "native execution admits only absolute motion");
-  Require(std::holds_alternative<std::nullptr_t>(
-              Member(value, "target_reference").storage()) &&
-              std::holds_alternative<std::nullptr_t>(
-                  Member(value, "offset_reference").storage()),
-          "native absolute motion cannot carry references");
+  core::MotionTargetModeDTO target_mode;
+  const auto target_mode_name = Text(value, "target_mode");
+  if (target_mode_name == "absolute") {
+    target_mode = core::MotionTargetModeDTO::kAbsolute;
+  } else if (target_mode_name == "relative") {
+    target_mode = core::MotionTargetModeDTO::kRelative;
+  } else {
+    Fail("motion target mode is unsupported");
+  }
+  auto target_reference = DecodeOptionalReference(value, "target_reference");
+  auto offset_reference = DecodeOptionalReference(value, "offset_reference");
   Require(Array(value, "motion_interrupt_scopes").empty(),
-          "native absolute motion cannot carry interrupt scopes");
+          "native motion cannot carry I8 interrupt scopes");
 
   const auto &motion = Member(value, "motion");
   auto decoded_motion = DecodeMotionSpec(motion);
+  const bool joint_goal =
+      std::holds_alternative<core::JointGoalDTO>(decoded_motion);
+  if (target_mode == core::MotionTargetModeDTO::kAbsolute) {
+    Require(!target_reference.has_value() && !offset_reference.has_value(),
+            "absolute motion cannot carry references");
+  } else if (joint_goal) {
+    Require(!target_reference.has_value() && !offset_reference.has_value(),
+            "relative joint motion cannot carry spatial references");
+  } else {
+    Require(target_reference.has_value(),
+            "relative spatial motion requires target_reference");
+  }
 
   std::optional<core::ContactPolicyId> contact_policy;
   if (const auto contact_name = OptionalText(value, "contact_policy_id");
@@ -1171,7 +1218,7 @@ DecodeMotionPayload(const CanonicalValue &value) {
           core::SceneResourceId(Text(encoded, "scene_resource_id"))});
     }
   }
-  if (std::holds_alternative<core::JointGoalDTO>(decoded_motion)) {
+  if (joint_goal) {
     Require(
         !contact_policy.has_value() && runtime_objects.empty(),
         "joint motion cannot carry contact-policy or runtime-object bindings");
@@ -1205,9 +1252,9 @@ DecodeMotionPayload(const CanonicalValue &value) {
                         Number(timeouts, "execution_timeout_s")},
       cache_mode,
       planning_profile,
-      core::MotionTargetModeDTO::kAbsolute,
-      std::nullopt,
-      std::nullopt,
+      target_mode,
+      std::move(target_reference),
+      std::move(offset_reference),
       std::move(decoded_motion),
       std::move(contact_policy),
       std::move(limits),
@@ -1354,37 +1401,6 @@ DecodePickEnvelope(const CanonicalValue &value) {
   return {position_min, position_max, orientation_min, orientation_max};
 }
 
-[[nodiscard]] std::optional<core::ReferenceDTO>
-DecodePickOffsetReference(const CanonicalValue &root,
-                          const std::string_view name) {
-  const auto &value = Member(root, name);
-  if (std::holds_alternative<std::nullptr_t>(value.storage())) {
-    return std::nullopt;
-  }
-  RequireExactObjectSize(value, 2U, "pick offset reference");
-  const auto type = Text(value, "type");
-  if (type == "frame_role") {
-    return core::ReferenceDTO(core::ReferenceDTO::Type::kFrameRole,
-                              Text(value, "frame_role_id"));
-  }
-  if (type == "component_body_role") {
-    return core::ReferenceDTO(core::ReferenceDTO::Type::kComponentBodyRole,
-                              Text(value, "collision_body_role_id"));
-  }
-  if (type == "scene_resource") {
-    return core::ReferenceDTO(core::ReferenceDTO::Type::kSceneResource,
-                              Text(value, "scene_resource_id"));
-  }
-  if (type == "runtime_object") {
-    return core::ReferenceDTO(core::ReferenceDTO::Type::kRuntimeObject,
-                              Text(value, "runtime_object_id"));
-  }
-  if (type == "pose") {
-    return core::ReferenceDTO(DecodePose(Member(value, "pose")));
-  }
-  Fail("pick offset reference type is unsupported");
-}
-
 [[nodiscard]] core::PickCandidateSynthesisIntentDTO
 DecodePickSynthesis(const CanonicalValue &value) {
   RequireExactObjectSize(value, 11U, "pick synthesis intent");
@@ -1409,8 +1425,8 @@ DecodePickSynthesis(const CanonicalValue &value) {
   return core::PickCandidateSynthesisIntentDTO{
       DecodePickEnvelope(Member(value, "pick_offset_envelope")),
       DecodePickEnvelope(Member(value, "approach_offset_envelope")),
-      DecodePickOffsetReference(value, "pick_offset_reference"),
-      DecodePickOffsetReference(value, "approach_offset_reference"),
+      DecodeOptionalReference(value, "pick_offset_reference"),
+      DecodeOptionalReference(value, "approach_offset_reference"),
       DecodeTriple(value, "base_tool_orientation_rpy_deg"),
       translation_step,
       rotation_step,
@@ -2539,19 +2555,6 @@ ObservedTargetValue(const core::TargetRoleId &target_role_id,
   });
 }
 
-class AbsoluteOnlyReferenceResolver final
-    : public core::IReferencePoseResolver {
-public:
-  [[nodiscard]] core::Result<core::Pose3DTO> resolve_reference_pose(
-      const core::ReferenceDTO &,
-      const core::ProgramFrameResolutionContextDTO &) const override {
-    return core::Result<core::Pose3DTO>::Err(core::ErrorDTO{
-        std::string(core::to_string(core::ErrorCode::kMissingReference)),
-        "N3 native execution host has no logical-scene reference resolver",
-        {{"reason", "n3_reference_resolution_unavailable"}}});
-  }
-};
-
 [[nodiscard]] RoboPlanCandidateBindingDTO
 CandidateBinding(const core::RuntimeParticipantBinding &runtime) {
   const auto &value = runtime.value();
@@ -2718,6 +2721,7 @@ struct CompositionBuildInput final {
   std::filesystem::path candidate_worker;
   core::CellId cell_id;
   core::RequestOwnerEpoch owner_epoch;
+  std::optional<core::RuntimeUnitId> runtime_unit_id;
   core::RuntimeEpoch runtime_epoch;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   deployment::VerifiedRetainedModelMap model_map;
@@ -2738,6 +2742,9 @@ struct CompositionBuildInput final {
 BuildProductComposition(CompositionBuildInput input) {
   Require(input.bundle != nullptr &&
               input.bundle->value().cell_graph.cell_id == input.cell_id &&
+              (!input.runtime_unit_id.has_value() ||
+               !input.runtime_unit_id->empty()) &&
+              !input.runtime_epoch.empty() &&
               input.model_map.query().retained_bundle_id ==
                   input.bundle->retained_bundle_id() &&
               input.projection_revision.retained_bundle_id ==
@@ -2871,6 +2878,29 @@ BuildProductComposition(CompositionBuildInput input) {
          direct_control_gripper_binding.error().message);
   }
 
+  auto local_runtime_unit_id = input.runtime_unit_id;
+  if (!local_runtime_unit_id.has_value()) {
+    const auto &runtime_units =
+        direct_control_motion_binding.value().value().runtime_unit_epochs;
+    Require(runtime_units.size() == 1U,
+            "standalone native execution cannot infer one local runtime "
+            "unit");
+    local_runtime_unit_id = runtime_units.front().runtime_unit_id;
+  }
+  const auto contains_local_runtime = [&](const auto &binding) {
+    const auto &runtime_units = binding.value().runtime_unit_epochs;
+    return std::find_if(
+               runtime_units.begin(), runtime_units.end(),
+               [&](const auto &runtime_unit) {
+                 return runtime_unit.runtime_unit_id == *local_runtime_unit_id &&
+                        runtime_unit.runtime_epoch == input.runtime_epoch;
+               }) != runtime_units.end();
+  };
+  Require(contains_local_runtime(direct_control_motion_binding.value()) &&
+              contains_local_runtime(direct_control_gripper_binding.value()),
+          "native execution local runtime is absent from its exact "
+          "participant bindings");
+
   const deployment::FilesystemVerifiedRetainedPlanningModelSource
       planning_source(input.package_root);
   auto retained_model =
@@ -2955,6 +2985,9 @@ BuildProductComposition(CompositionBuildInput input) {
           std::vector<core::RuntimeParticipantBinding>{
               direct_control_motion_binding.value(),
               direct_control_gripper_binding.value()});
+  const auto reference_collision_model = collision_model;
+  const auto reference_runtime_unit_id = *local_runtime_unit_id;
+  const auto reference_runtime_epoch = input.runtime_epoch;
   RetainedNativeRuntimeInput runtime_input{
       direct_control_motion_binding.value(),
       direct_control_gripper_binding.value(),
@@ -2966,8 +2999,24 @@ BuildProductComposition(CompositionBuildInput input) {
       publisher,
       collision_model,
       std::move(planner),
-      [](const auto &) {
-        return std::make_shared<AbsoluteOnlyReferenceResolver>();
+      [&, reference_collision_model, reference_runtime_unit_id,
+       reference_runtime_epoch](const auto &channels) {
+        std::vector<RetainedSceneFrameStateSourceInput> state_sources;
+        state_sources.reserve(channels.size());
+        for (const auto &channel : channels) {
+          state_sources.push_back(RetainedSceneFrameStateSourceInput{
+              channel->query_context(),
+              core::ObservedStateSourceKind::kPredictedState,
+              std::shared_ptr<const core::IObservedStateProvider>(
+                  channel, channel->addressed_publication()),
+              {}});
+        }
+        return RetainedSceneFrameResolver::create_verified(
+            reference_collision_model, *input.bundle, input.model_map,
+            *retained_model, reference_runtime_unit_id,
+            reference_runtime_epoch,
+            RetainedSceneFrameLocalStateMode::kRequireDirectProviders,
+            std::move(state_sources), 0);
       },
       [product_resolver](const core::OperationIntentDTO &operation,
                          const std::size_t participant_index) {
@@ -3093,6 +3142,7 @@ BuildComposition(const HostConfig &config,
       config.candidate_worker,
       core::CellId(config.cell_id),
       owner_epoch,
+      std::nullopt,
       runtime_epoch,
       std::move(bundle),
       std::move(*model_map),
@@ -3211,6 +3261,7 @@ TryBuildCurrentManagedCompositionInput(
       config.candidate_worker,
       core::CellId(config.cell_id),
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+      core::RuntimeUnitId(config.runtime_unit_id),
       core::RuntimeEpoch(config.runtime_epoch),
       std::move(bundle),
       std::move(*model_map),
@@ -3404,6 +3455,7 @@ LoadExactManagedCandidateBundle(
       config.candidate_worker,
       core::CellId(config.cell_id),
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+      core::RuntimeUnitId(config.runtime_unit_id),
       core::RuntimeEpoch(config.runtime_epoch),
       std::move(bundle),
       std::move(*model_map),

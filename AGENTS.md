@@ -41,7 +41,15 @@
 > source-local scene/viewer authoring and one exact owner-routed current-pose
 > Commit without restoring dynamic viewer truth. N6-c5 adds strict bounded
 > direct/`nemoclaw` provider mediation, Draft-only callbacks, and the operator
-> conversation/reconciliation surface. Full Program-tree execution, lifecycle,
+> conversation/reconciliation surface. N7-a5.1 adds exact scenario/Program-run
+> admission, and N7-a5.2 adds authoritative immutable Program Apply/Load with a
+> durable Applied projection. N7-a5.3a now binds that captured Applied
+> Program/Binding to separate thin native motion/gripper task and Program-scope
+> Stop clients, and enables the retained C++ scene-frame resolver for closed
+> absolute/relative operation references. It does not yet provide the authored
+> scene, assistant, pick/place, production scheduler/cleanup, or public Program
+> Run surface assigned to N7-a5.3b-d and a5.4. Production Program-tree
+> execution, lifecycle,
 > complete product launch, dynamic scene/viewer behavior, public MCP, external
 > OpenClaw/Hermes loops, Isaac/ROS launch, and real-robot operation remain
 > explicitly unavailable. Do not run the historical recipes below or recreate their
@@ -146,6 +154,12 @@ UI without restoring Program Apply or execution.
 N6-c4 adds source-local scene/viewer authoring and N6-c5 adds the strict
 direct/`nemoclaw` assistant client/bridge; neither restores product launch,
 Applied identity, external agent loops, or runtime ownership.
+N7-a5.1 and a5.2 add exact Program-run admission plus authoritative Program
+Apply/Load and durable Applied identity. N7-a5.3a adds the captured-context
+native motion/gripper/Stop client foundation and production retained-frame
+resolution. A production Program host and its scene, assistant, pick/place,
+cleanup, and public run surfaces remain unavailable until their named N7
+joins.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).

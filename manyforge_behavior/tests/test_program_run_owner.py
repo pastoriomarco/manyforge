@@ -23,6 +23,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerNodeInputs,
     OwnerTaskSnapshot,
     OwnerTaskState,
+    ProgramRunPortContext,
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
 )
@@ -32,6 +33,7 @@ from manyforge_behavior.program_run_owner import (
     ProgramRunOwner,
     ProgramRunOwnerError,
     ProgramRunState,
+    build_applied_program_run_admission,
     build_program_run_admission,
 )
 from manyforge_behavior.program_runtime import ProgramRunOwnerIdentity
@@ -89,6 +91,21 @@ class _TaskPort:
         _identity: NodeAttemptIdentity,
     ) -> None:
         self._events.append("leaf_acknowledge")
+
+
+class _ContextPort:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.contexts: list[ProgramRunPortContext] = []
+        self.unbound: list[str] = []
+
+    def bind(self, context: ProgramRunPortContext) -> None:
+        self.events.append("context_bind")
+        self.contexts.append(context)
+
+    def unbind(self, program_run_id: str) -> None:
+        self.events.append("context_unbind")
+        self.unbound.append(program_run_id)
 
 
 class _BlockingTaskPort(_TaskPort):
@@ -188,8 +205,11 @@ def _fixture(
     *,
     initial_task_state: OwnerTaskState,
     task_factory: Callable[[list[str]], _TaskPort] | None = None,
+    context_port: _ContextPort | None = None,
 ) -> tuple[ProgramRunOwner, ProgramRunAdmission, _TaskPort, _ScopePort, list[str]]:
     events: list[str] = []
+    if context_port is not None:
+        context_port.events = events
     task = (
         _TaskPort(events, initial_task_state)
         if task_factory is None
@@ -206,6 +226,7 @@ def _fixture(
         pick_place=task,
         kernel_controls=invocation,
         program_run_scope=scope,
+        program_run_context=context_port,
     )
     environment = build_node_environment()
     program = Program(
@@ -220,6 +241,13 @@ def _fixture(
         program_binding_id=_DIGEST_A,
         retained_bundle_id=_DIGEST_B,
         graph_revision=_DIGEST_C,
+        program_binding={
+            "program_binding_id": _DIGEST_A,
+            "program_id": program.program_id,
+            "program_revision": program.program_revision,
+            "retained_bundle_id": _DIGEST_B,
+            "graph_revision": _DIGEST_C,
+        },
         readiness=_readiness(_DIGEST_A),
         owner_identities=(
             ProgramRunOwnerIdentity(
@@ -267,6 +295,24 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
     completed = owner.advance_once(started.capture.program_run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
     assert completed.active_operation_count == 0
+
+
+def test_start_binds_exact_client_context_before_tree_construction() -> None:
+    events: list[str] = []
+    context_port = _ContextPort(events)
+    owner, admission, _task, _scope, fixture_events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        context_port=context_port,
+    )
+
+    started = owner.start(admission)
+
+    assert fixture_events[0] == "context_bind"
+    assert len(context_port.contexts) == 1
+    context = context_port.contexts[0]
+    assert context.program_run_id == started.capture.program_run_id
+    assert context.program_binding_id == admission.program_binding_id
+    assert context.program_binding["program_id"] == admission.program.program_id
 
 
 def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof() -> (
@@ -402,21 +448,18 @@ def test_program_run_snapshot_is_a_closed_serializable_owner_projection() -> Non
     assert value["capture"]["schema_version"] == ("manyforge.program_run_capture.v1")
 
 
-def test_native_selection_join_rejects_a_catalog_change_before_construction() -> None:
-    _owner, fixture_admission, _task, _scope, _events = _fixture(
-        initial_task_state=OwnerTaskState.SUCCEEDED
-    )
-    program = fixture_admission.program
-    environment = fixture_admission.environment
-    selection = {
+def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
+    program = admission.program
+    environment = admission.environment
+    return {
         "schema_version": "manyforge.scenario_program_selection.v1",
-        "scenario_id": fixture_admission.scenario_id,
-        "scenario_catalog_revision": fixture_admission.scenario_catalog_revision,
+        "scenario_id": admission.scenario_id,
+        "scenario_catalog_revision": admission.scenario_catalog_revision,
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "d" * 64,
-        "retained_bundle_id": fixture_admission.retained_bundle_id,
-        "graph_revision": fixture_admission.graph_revision,
-        "program_binding_id": fixture_admission.program_binding_id,
+        "retained_bundle_id": admission.retained_bundle_id,
+        "graph_revision": admission.graph_revision,
+        "program_binding_id": admission.program_binding_id,
         "program_id": program.program_id,
         "program_revision": program.program_revision,
         "node_environment_digest": environment.environment_digest,
@@ -431,16 +474,25 @@ def test_native_selection_join_rejects_a_catalog_change_before_construction() ->
         ],
         "program": program.to_dict(),
         "program_binding": {
-            "program_binding_id": fixture_admission.program_binding_id,
+            "program_binding_id": admission.program_binding_id,
             "program_id": program.program_id,
             "program_revision": program.program_revision,
-            "retained_bundle_id": fixture_admission.retained_bundle_id,
-            "graph_revision": fixture_admission.graph_revision,
+            "retained_bundle_id": admission.retained_bundle_id,
+            "graph_revision": admission.graph_revision,
             "node_environment": {
                 "environment_digest": environment.environment_digest,
             },
         },
     }
+
+
+def test_native_selection_join_rejects_a_catalog_change_before_construction() -> None:
+    _owner, fixture_admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    program = fixture_admission.program
+    environment = fixture_admission.environment
+    selection = _scenario_selection(fixture_admission)
 
     admitted = build_program_run_admission(
         selection,
@@ -466,3 +518,49 @@ def test_native_selection_join_rejects_a_catalog_change_before_construction() ->
         assert "catalog changed" in str(error)
     else:
         raise AssertionError("stale scenario-catalog revision was admitted")
+
+
+def test_applied_program_join_uses_applied_content_and_fresh_owner_facts() -> None:
+    _owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    live = _scenario_selection(admission)
+    applied = {
+        key: value
+        for key, value in live.items()
+        if key not in {"owner_identities", "schema_version"}
+    }
+    applied.update(
+        {
+            "schema_version": "manyforge.applied_program_selection.v1",
+            "baseline_program_binding_id": admission.program_binding_id,
+            "preparation_digest": _DIGEST_C,
+            "source": {"record_digest": _DIGEST_B},
+        }
+    )
+
+    joined = build_applied_program_run_admission(
+        applied,
+        live,
+        expected_scenario_id=admission.scenario_id,
+        expected_scenario_catalog_revision=admission.scenario_catalog_revision,
+        environment=admission.environment,
+        owner_availability=admission.readiness.owner_by_port,
+    )
+
+    assert joined.program_binding_id == admission.program_binding_id
+    assert joined.owner_identities[0].owner_role == "headless_projection"
+    live["graph_revision"] = _DIGEST_A
+    try:
+        build_applied_program_run_admission(
+            applied,
+            live,
+            expected_scenario_id=admission.scenario_id,
+            expected_scenario_catalog_revision=admission.scenario_catalog_revision,
+            environment=admission.environment,
+            owner_availability=admission.readiness.owner_by_port,
+        )
+    except ProgramRunOwnerError as error:
+        assert "disagree" in str(error)
+    else:
+        raise AssertionError("stale live owner facts were joined to Applied")

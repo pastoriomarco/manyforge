@@ -21,6 +21,7 @@ from manyforge_behavior.executable_node_resolver import (
 )
 from manyforge_behavior.orchestration_ports import (
     NodeAdapterPorts,
+    ProgramRunPortContext,
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
 )
@@ -34,6 +35,7 @@ from manyforge_behavior.program_runtime import (
 
 PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v1"
 SCENARIO_PROGRAM_SELECTION_API: Final = "manyforge.scenario_program_selection.v1"
+APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v1"
 _MAX_RETAINED_RUNS: Final = 4_096
 
 
@@ -79,6 +81,7 @@ class ProgramRunAdmission:
     program_binding_id: str
     retained_bundle_id: str
     graph_revision: str
+    program_binding: Mapping[str, Any]
     readiness: NodeExecutionReadiness
     owner_identities: tuple[ProgramRunOwnerIdentity, ...]
     program_parameter_values: Mapping[str, Any]
@@ -98,6 +101,22 @@ class ProgramRunAdmission:
             raise TypeError("environment must be one retained NodeEnvironment")
         if not isinstance(self.readiness, NodeExecutionReadiness):
             raise TypeError("readiness must contain exact owner facts")
+        if not isinstance(self.program_binding, Mapping):
+            raise TypeError("program_binding must be one verified mapping")
+        binding = dict(self.program_binding)
+        if (
+            binding.get("program_id") != self.program.program_id
+            or binding.get("program_revision") != self.program.program_revision
+            or binding.get("program_binding_id") != self.program_binding_id
+            or binding.get("retained_bundle_id") != self.retained_bundle_id
+            or binding.get("graph_revision") != self.graph_revision
+        ):
+            raise ValueError("Program-run admission and Program Binding disagree")
+        object.__setattr__(
+            self,
+            "program_binding",
+            MappingProxyType(deepcopy(binding)),
+        )
         if self.readiness.program_binding_id != self.program_binding_id:
             raise ValueError("readiness selects another Program Binding")
         if (
@@ -311,14 +330,41 @@ class ProgramRunOwner:
                 node_environment_digest=admission.environment.environment_digest,
                 owner_identities=owner_identities,
             )
-            run = ExecutableProgramRun(
-                program=admission.program,
-                environment=admission.environment,
-                capture=capture,
-                readiness=admission.readiness,
-                ports=self._ports,
-                program_parameter_values=admission.program_parameter_values,
-            )
+            context_port = self._ports.program_run_context
+            context_bound = False
+            try:
+                if context_port is not None:
+                    context_port.bind(
+                        ProgramRunPortContext(
+                            program_run_id=capture.program_run_id,
+                            scenario_id=capture.scenario_id,
+                            scenario_catalog_revision=(
+                                capture.scenario_catalog_revision
+                            ),
+                            program_id=capture.program_id,
+                            program_revision=capture.program_revision,
+                            program_binding_id=capture.program_binding_id,
+                            retained_bundle_id=capture.retained_bundle_id,
+                            graph_revision=capture.graph_revision,
+                            node_environment_digest=(
+                                capture.node_environment_digest
+                            ),
+                            program_binding=admission.program_binding,
+                        )
+                    )
+                    context_bound = True
+                run = ExecutableProgramRun(
+                    program=admission.program,
+                    environment=admission.environment,
+                    capture=capture,
+                    readiness=admission.readiness,
+                    ports=self._ports,
+                    program_parameter_values=admission.program_parameter_values,
+                )
+            except Exception:
+                if context_bound and context_port is not None:
+                    context_port.unbind(program_run_id)
+                raise
             entry = _RunEntry(run=run)
             self._runs[program_run_id] = entry
             return self._snapshot(entry)
@@ -717,13 +763,112 @@ def build_program_run_admission(
         program_binding_id=program_binding_id,
         retained_bundle_id=retained_bundle_id,
         graph_revision=graph_revision,
+        program_binding=binding_value,
         readiness=readiness,
         owner_identities=owner_identities,
         program_parameter_values=overrides,
     )
 
 
+def build_applied_program_run_admission(
+    applied: Mapping[str, Any],
+    live_scenario_selection: Mapping[str, Any],
+    *,
+    expected_scenario_id: str,
+    expected_scenario_catalog_revision: str,
+    environment: NodeEnvironment,
+    owner_availability: Mapping[str, AvailabilityFact],
+    additional_owner_identities: tuple[ProgramRunOwnerIdentity, ...] = (),
+) -> ProgramRunAdmission:
+    """Join authoritative Applied content to fresh scenario-owner identities."""
+
+    if not isinstance(applied, Mapping):
+        raise TypeError("Applied Program selection must be a mapping")
+    expected_applied_fields = {
+        "assistant_mode",
+        "baseline_program_binding_id",
+        "deployment_artifact_id",
+        "deployment_revision",
+        "graph_revision",
+        "node_environment_digest",
+        "preparation_digest",
+        "program",
+        "program_binding",
+        "program_binding_id",
+        "program_id",
+        "program_revision",
+        "retained_bundle_id",
+        "scenario_catalog_revision",
+        "scenario_id",
+        "schema_version",
+        "source",
+        "typed_parameter_overrides",
+    }
+    if set(applied) != expected_applied_fields:
+        raise ProgramRunOwnerError("Applied Program selection has wrong fields")
+    if applied.get("schema_version") != APPLIED_PROGRAM_SELECTION_API:
+        raise ProgramRunOwnerError("Applied Program selection version is unsupported")
+    _digest(applied.get("baseline_program_binding_id"), field="baseline_program_binding_id")
+    _digest(applied.get("preparation_digest"), field="preparation_digest")
+    source = applied.get("source")
+    if not isinstance(source, Mapping):
+        raise ProgramRunOwnerError("Applied Program source identity is invalid")
+    _digest(source.get("record_digest"), field="source.record_digest")
+
+    if not isinstance(live_scenario_selection, Mapping):
+        raise TypeError("live scenario Program selection must be a mapping")
+    for field_name in (
+        "assistant_mode",
+        "deployment_artifact_id",
+        "deployment_revision",
+        "graph_revision",
+        "node_environment_digest",
+        "retained_bundle_id",
+        "scenario_catalog_revision",
+        "scenario_id",
+        "typed_parameter_overrides",
+    ):
+        if live_scenario_selection.get(field_name) != applied.get(field_name):
+            raise ProgramRunOwnerError(
+                "Applied Program and live scenario occurrence disagree"
+            )
+    owner_identities = live_scenario_selection.get("owner_identities")
+    if not isinstance(owner_identities, list):
+        raise ProgramRunOwnerError(
+            "live scenario selection has no exact owner identities"
+        )
+    normalized_selection = {
+        "assistant_mode": applied["assistant_mode"],
+        "deployment_artifact_id": applied["deployment_artifact_id"],
+        "deployment_revision": applied["deployment_revision"],
+        "graph_revision": applied["graph_revision"],
+        "node_environment_digest": applied["node_environment_digest"],
+        "owner_identities": deepcopy(owner_identities),
+        "program": deepcopy(applied["program"]),
+        "program_binding": deepcopy(applied["program_binding"]),
+        "program_binding_id": applied["program_binding_id"],
+        "program_id": applied["program_id"],
+        "program_revision": applied["program_revision"],
+        "retained_bundle_id": applied["retained_bundle_id"],
+        "scenario_catalog_revision": applied["scenario_catalog_revision"],
+        "scenario_id": applied["scenario_id"],
+        "schema_version": SCENARIO_PROGRAM_SELECTION_API,
+        "typed_parameter_overrides": deepcopy(
+            applied["typed_parameter_overrides"]
+        ),
+    }
+    return build_program_run_admission(
+        normalized_selection,
+        expected_scenario_id=expected_scenario_id,
+        expected_scenario_catalog_revision=expected_scenario_catalog_revision,
+        environment=environment,
+        owner_availability=owner_availability,
+        additional_owner_identities=additional_owner_identities,
+    )
+
+
 __all__ = [
+    "APPLIED_PROGRAM_SELECTION_API",
     "PROGRAM_RUN_STATUS_API",
     "SCENARIO_PROGRAM_SELECTION_API",
     "ProgramRunAdmission",
@@ -731,5 +876,6 @@ __all__ = [
     "ProgramRunOwnerError",
     "ProgramRunSnapshot",
     "ProgramRunState",
+    "build_applied_program_run_admission",
     "build_program_run_admission",
 ]
