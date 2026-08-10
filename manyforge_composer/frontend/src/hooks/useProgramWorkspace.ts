@@ -121,6 +121,44 @@ export function useProgramWorkspace() {
     );
   }, [requireWorkspace, run]);
 
+  const apply = useCallback((
+    scenarioId: string,
+    scenarioCatalogRevision: string,
+  ) => {
+    const workspace = requireWorkspace();
+    if (!workspace) return;
+    void run(
+      'apply',
+      () => api.programWorkspace.apply(
+        fence(workspace),
+        scenarioId,
+        scenarioCatalogRevision,
+      ).then((response) => response.workspace),
+      'Apply request accepted; the owner-issued Applied state is shown above.',
+    );
+  }, [requireWorkspace, run]);
+
+  const load = useCallback((
+    path: string,
+    scenarioId: string,
+    scenarioCatalogRevision: string,
+    confirmDiscard: boolean,
+  ) => {
+    const workspace = requireWorkspace();
+    if (!workspace) return;
+    void run(
+      'load',
+      () => api.programWorkspace.load(
+        fence(workspace),
+        path,
+        scenarioId,
+        scenarioCatalogRevision,
+        confirmDiscard,
+      ).then((response) => response.workspace),
+      'Load request accepted; Draft, Saved, and Applied state are shown above.',
+    );
+  }, [requireWorkspace, run]);
+
   return {
     state,
     refresh,
@@ -128,6 +166,8 @@ export function useProgramWorkspace() {
     openDraft,
     save,
     saveAs,
+    apply,
+    load,
     clearFeedback: () => dispatch({ type: 'clear_feedback' }),
   };
 }

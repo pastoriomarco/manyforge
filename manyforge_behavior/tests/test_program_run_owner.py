@@ -419,6 +419,35 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
     assert completed.active_operation_count == 0
 
 
+def test_owner_exposes_one_bounded_local_run_index_without_downstream_reads() -> None:
+    identifiers = iter(("program-run-1", "program-run-2"))
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        run_id_factory=lambda: next(identifiers),
+    )
+    first = owner.start(admission)
+    second = owner.start(admission)
+
+    bounded, truncated = owner.list_snapshots(limit=1)
+    active, active_truncated = owner.list_snapshots(active_only=True, limit=8)
+
+    assert [row.capture.program_run_id for row in bounded] == [
+        first.capture.program_run_id
+    ]
+    assert truncated is True
+    assert [row.capture.program_run_id for row in active] == [
+        first.capture.program_run_id,
+        second.capture.program_run_id,
+    ]
+    assert active_truncated is False
+
+    owner.advance_once(first.capture.program_run_id)
+    still_active, _ = owner.list_snapshots(active_only=True, limit=8)
+    assert [row.capture.program_run_id for row in still_active] == [
+        second.capture.program_run_id
+    ]
+
+
 def test_start_binds_exact_client_context_before_tree_construction() -> None:
     events: list[str] = []
     context_port = _ContextPort(events)

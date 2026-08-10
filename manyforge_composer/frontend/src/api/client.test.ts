@@ -204,6 +204,46 @@ describe('structural API client', () => {
     });
     expect(result.workspace.saved.matchesDraft).toBe(true);
   });
+
+  it('forwards Apply and bounded runner reads without client-owned state', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({
+        status: 'applied',
+        headless: { schema_version: 'manyforge.program_apply_result.v1' },
+        workspace: workspaceFixture(),
+      }))
+      .mockResolvedValueOnce(response({
+        schema_version: 'manyforge.program_run_index.v1',
+        owner_id: 'program-runner.cell-a',
+        owner_epoch: 'program-runner.epoch.1',
+        active_only: true,
+        truncated: false,
+        runs: [],
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.programWorkspace.apply(
+      { draftId: 'draft-1', expectedDraftRevision: 1 },
+      'cell-pick',
+      `sha256:${'a'.repeat(64)}`,
+    );
+    await api.programs.runs(true, 1);
+
+    const [applyUrl, applyOptions] = fetchMock.mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    expect(applyUrl).toBe('/api/program/apply');
+    expect(JSON.parse(String(applyOptions.body))).toEqual({
+      draftId: 'draft-1',
+      expectedDraftRevision: 1,
+      scenarioId: 'cell-pick',
+      scenarioCatalogRevision: `sha256:${'a'.repeat(64)}`,
+    });
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      '/api/program/runs?active_only=true&limit=1',
+    );
+  });
 });
 
 describe('resolveStructuralAssetUrl', () => {

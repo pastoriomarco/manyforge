@@ -20,6 +20,8 @@ from manyforge_headless_api.models import (
     RuntimeScaleRequest,
     SceneTransactionRequest,
     StopIntentRequest,
+    ProgramRunStartRequest,
+    ProgramRunStopRequest,
 )
 
 from .node_environment_client import (
@@ -131,6 +133,60 @@ def create_headless_router(
                 status_code=error.status_code,
                 detail={"code": error.code, "message": str(error)},
             ) from error
+
+    @router.get("/api/scenarios")
+    def scenarios() -> dict[str, Any]:
+        return _call(client.scenarios)
+
+    @router.get("/api/program/applied")
+    def program_applied() -> dict[str, Any]:
+        return _call(client.program_applied)
+
+    @router.get("/api/program/runs")
+    def program_runs(
+        active_only: bool = False,
+        limit: Annotated[int, Query(ge=1, le=4_096)] = 128,
+    ) -> dict[str, Any]:
+        return _call(
+            lambda: client.program_runs(
+                active_only=active_only,
+                limit=limit,
+            )
+        )
+
+    @router.post("/api/program/runs")
+    def program_run_start(body: ProgramRunStartRequest) -> dict[str, Any]:
+        return _call(
+            lambda: client.program_run_start(body.model_dump(mode="json"))
+        )
+
+    @router.get("/api/program/runs/{program_run_id}")
+    def program_run_read(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.program_run(program_run_id))
+
+    @router.post("/api/program/runs/{program_run_id}/stop")
+    def program_run_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        if body.program_run_id != program_run_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "program_run_path_invalid",
+                    "message": (
+                        "Program-run identity in path and body must match"
+                    ),
+                },
+            )
+        return _call(
+            lambda: client.program_run_stop(
+                program_run_id,
+                body.model_dump(mode="json"),
+            )
+        )
 
     @router.get("/api/assistant/modes")
     def assistant_modes() -> dict[str, Any]:

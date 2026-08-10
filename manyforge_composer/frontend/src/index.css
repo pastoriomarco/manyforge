@@ -1588,6 +1588,18 @@ code {
   background: #0c1a23;
 }
 
+.program-apply-actions {
+  grid-template-columns: minmax(20rem, 1fr) auto auto minmax(18rem, 1fr);
+  background: #0a1d26;
+}
+
+.program-apply-actions small {
+  align-self: center;
+  color: #8097a4;
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+
 .program-artifact-actions > div,
 .program-save-as-path,
 .program-confirmation {
@@ -1629,6 +1641,63 @@ code {
 .program-feedback.error-state {
   color: #efb7ac;
   background: #351d1b;
+}
+
+.program-runtime-panel {
+  margin-bottom: 1rem;
+}
+
+.program-runtime-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid #203542;
+  border-bottom: 1px solid #203542;
+  background: #091720;
+}
+
+.program-runtime-fact {
+  display: grid;
+  min-width: 0;
+  gap: 0.3rem;
+  padding: 0.85rem 1rem;
+  border-right: 1px solid #203542;
+}
+
+.program-runtime-fact:last-child {
+  border-right: 0;
+}
+
+.program-runtime-fact span,
+.program-runtime-fact small {
+  overflow: hidden;
+  color: #8097a4;
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.program-runtime-fact strong {
+  color: #dbe8ee;
+  font-size: 0.88rem;
+  text-transform: capitalize;
+}
+
+.program-runtime-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  padding: 0.8rem 1rem;
+}
+
+.program-runtime-actions .danger-button:not(:disabled) {
+  border-color: #a74f45;
+  color: #ffe0d9;
+  background: #612920;
+}
+
+.program-runtime-panel .panel-intro {
+  margin: 0;
+  padding: 0 1rem 0.9rem;
 }
 
 .program-authoring-grid {
@@ -2400,6 +2469,10 @@ code {
     grid-template-columns: minmax(16rem, 1fr) auto auto;
   }
 
+  .program-apply-actions {
+    grid-template-columns: minmax(18rem, 1fr) auto auto;
+  }
+
   .program-authoring-grid {
     grid-template-columns: minmax(15rem, 0.7fr) minmax(28rem, 1.3fr);
   }
@@ -2472,6 +2545,7 @@ code {
 
   .program-identity-strip,
   .program-artifact-actions,
+  .program-runtime-grid,
   .program-authoring-grid,
   .program-declaration-columns,
   .scene-authoring-grid,

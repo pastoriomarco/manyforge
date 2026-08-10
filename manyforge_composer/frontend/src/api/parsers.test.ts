@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   StructuralContractError,
+  parseAppliedProgramSelection,
   parseCapabilityCommandPreviewResponse,
   parseCatalogResponse,
   parseExecutionOwnerStatus,
@@ -12,6 +13,10 @@ import {
   parseNodeEnvironmentResponse,
   parseLogicalSceneProjection,
   parseProgramWorkspaceResponse,
+  parseProgramWorkspaceTransitionResponse,
+  parseProgramRunIndex,
+  parseProgramRunStatus,
+  parseScenarioCatalogResponse,
   parseSceneRuntimeProjection,
   parseSceneTransactionResponse,
   parseSceneUrdfManifest,
@@ -352,6 +357,126 @@ describe('parseSceneUrdfManifest', () => {
   });
 });
 
+describe('Program product projections', () => {
+  const digestA = `sha256:${'a'.repeat(64)}`;
+  const digestB = `sha256:${'b'.repeat(64)}`;
+  const digestC = `sha256:${'c'.repeat(64)}`;
+
+  function runStatus(state = 'running'): Record<string, unknown> {
+    return {
+      schema_version: 'manyforge.program_run_status.v1',
+      owner_id: 'program-runner.cell-a',
+      owner_epoch: 'program-runner.epoch.1',
+      run_revision: 3,
+      state,
+      capture: {
+        schema_version: 'manyforge.program_run_capture.v1',
+        program_run_id: 'program-run.1',
+        scenario_id: 'cell-pick',
+        scenario_catalog_revision: digestA,
+        program_id: 'pick',
+        program_revision: digestB,
+        program_binding_id: digestC,
+        retained_bundle_id: digestA,
+        graph_revision: digestB,
+        node_environment_digest: digestC,
+        owner_identities: [{
+          owner_role: 'program_runner',
+          owner_id: 'program-runner.cell-a',
+          owner_epoch: 'program-runner.epoch.1',
+        }],
+      },
+      tree_status: 'running',
+      active_operation_count: 1,
+      reason_code: null,
+      message: '',
+    };
+  }
+
+  it('parses bounded scenarios and the exact Applied owner identity', () => {
+    const catalog = parseScenarioCatalogResponse({
+      api_version: 'manyforge.scenario_catalog.v1',
+      scenario_catalog_revision: digestA,
+      scenarios: [{
+        scenario_id: 'cell-pick',
+        description: 'Pick one object',
+        aliases: ['pick'],
+        deployment_artifact_id: 'cell-a',
+        deployment_revision: digestB,
+        retained_bundle_id: digestC,
+        program_binding_id: digestA,
+        deployment_compatibility: { lane: 'manyforge-only', provides: [] },
+        assistant_mode: 'forbidden',
+        typed_parameter_overrides: {},
+      }],
+    });
+    const applied = parseAppliedProgramSelection({
+      assistant_mode: 'forbidden',
+      baseline_program_binding_id: digestA,
+      deployment_artifact_id: 'cell-a',
+      deployment_revision: digestB,
+      graph_revision: digestC,
+      node_environment_digest: digestA,
+      preparation_digest: digestB,
+      program: programFixture(),
+      program_binding: {},
+      program_binding_id: digestC,
+      program_id: 'fixture',
+      program_revision: digestA,
+      retained_bundle_id: digestB,
+      scenario_catalog_revision: digestA,
+      scenario_id: 'cell-pick',
+      schema_version: 'manyforge.applied_program_selection.v1',
+      source: {
+        record_digest: digestC,
+        semantic_content_digest: digestB,
+        source_generation: 1,
+        source_owner_epoch: 'headless.epoch.1',
+        source_owner_id: 'headless.program-apply',
+      },
+      typed_parameter_overrides: {},
+    });
+
+    expect(catalog.scenarios[0].description).toBe('Pick one object');
+    expect(applied.recordDigest).toBe(digestC);
+    expect(applied.sourceOwnerEpoch).toBe('headless.epoch.1');
+  });
+
+  it('keeps run status and index tied to one exact runner owner', () => {
+    const status = parseProgramRunStatus(runStatus());
+    const index = parseProgramRunIndex({
+      schema_version: 'manyforge.program_run_index.v1',
+      owner_id: 'program-runner.cell-a',
+      owner_epoch: 'program-runner.epoch.1',
+      active_only: true,
+      truncated: false,
+      runs: [runStatus()],
+    });
+
+    expect(status.capture.programRunId).toBe('program-run.1');
+    expect(index.runs[0].runRevision).toBe(3);
+    expect(() => parseProgramRunIndex({
+      schema_version: 'manyforge.program_run_index.v1',
+      owner_id: 'program-runner.cell-a',
+      owner_epoch: 'another-epoch',
+      active_only: true,
+      truncated: false,
+      runs: [runStatus()],
+    })).toThrow(/exact indexed owner/);
+  });
+
+  it('parses Composer Apply and Load wrappers without trusting headless details', () => {
+    const response = parseProgramWorkspaceTransitionResponse({
+      status: 'applied',
+      headless: { schema_version: 'manyforge.program_apply_result.v1' },
+      workspace: workspaceFixture(),
+    });
+
+    expect(response.status).toBe('applied');
+    expect(response.workspace.draft.programLoaded).toBe(true);
+  });
+});
+
 describe('parseCatalogResponse', () => {
   it('accepts the v2 compiler-product identity and entry shape', () => {
     const parsed = parseCatalogResponse({
@@ -589,7 +714,7 @@ describe('headless projection parsers', () => {
       runtimeAvailability: {
         code: 'composable_cell_runtime_unavailable',
         message: 'Runtime is unavailable.',
-        restorationGates: ['N', 'L0', 'P5', 'I', 'R', 'T'],
+        restorationGates: ['N7-a5.5', 'L0', 'P5', 'I', 'R', 'T'],
       },
       timestamp: 1,
     });
@@ -603,7 +728,7 @@ describe('headless projection parsers', () => {
     });
 
     expect(structural.runtimeAvailability?.restorationGates).toEqual([
-      'N', 'L0', 'P5', 'I', 'R', 'T',
+      'N7-a5.5', 'L0', 'P5', 'I', 'R', 'T',
     ]);
     expect(structural.headless).toBeNull();
     expect(headless.mode).toBe('headless_client');

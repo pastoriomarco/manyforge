@@ -2,8 +2,9 @@
 
 This index covers documentation that travels with the implementation
 repository: current structural inspection plus historical install, operation,
-and integration references. **No product runtime task is currently
-available.** When a lane is restored, its public operator documentation must
+and integration references. **No complete product lane or supported product
+bring-up is currently available.** Bounded Headless/Composer runtime clients
+exist at their named checkpoints. When a lane is restored, its public operator documentation must
 remain self-contained here. Maintainers can also follow the "Development /
 spec references" section at the bottom.
 
@@ -18,9 +19,12 @@ branch/commit workflow).
 > reference-runtime convergence across Manager loss, crash/restart, and
 > explicit shutdown. I5/H0 now exposes independent Manager, runtime, scene,
 > alarm, history, health, and retained-NodeEnvironment projections through a
-> bounded API/CLI and thin Composer clients, but it restores no execution
-> product lane. Composer program execution and the native, Isaac, and
-> real-robot product lanes are not available. N restores native execution, and
+> bounded API/CLI and thin Composer clients. N7-a5.1-a5.4 now add exact
+> Program Apply/admission, the internal native Program join and tick host, an
+> independent Program-runner process, and strict scenario/Applied/Run/status/
+> Stop clients. Complete input coverage, repeated-instance proof, product
+> launch, and the native, Isaac, and real-robot lanes are not yet available.
+> The remainder of N closes the native lane, and
 > I/R restore Isaac/real operation. Operator
 > runbooks below remain baseline/reference material until their owning
 > restoration gate.
@@ -36,8 +40,8 @@ branch/commit workflow).
 | Study the historical robot-import workflow | [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md); v0 migration/reference input                                      |
 | Study historical physical-Lite6 qualification | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md); unavailable until R/I10                        |
 | Understand ownership and data flow          | [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)                                                                            |
-| Integrate the current structural API        | Generated [`reference/REST_API.md`](reference/REST_API.md); former clients use the historical interaction index                       |
-| Integrate the current headless API          | Generated [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md); bounded addressed execution/preview is current, while complete product readiness remains unavailable |
+| Integrate the current Composer API          | Generated [`reference/REST_API.md`](reference/REST_API.md); structural/authoring plus configured thin runtime clients are current      |
+| Integrate the current headless API          | Generated [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md); bounded addressed execution/preview and Program surfaces are current, while complete product readiness remains unavailable |
 
 ## Historical operator runbooks (`docs/operations/`)
 

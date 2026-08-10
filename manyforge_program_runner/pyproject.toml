@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manyforge_program_runner"
+version = "0.1.0"
+description = "Independently restartable ManyForge Program orchestration owner"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Marco Pastorio" }]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111",
+    "manyforge_behavior>=0.1.0,<0.2.0",
+    "manyforge_headless_api>=0.1.0,<0.2.0",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.scripts]
+manyforge-program-runner = "manyforge_program_runner.cli:main"
+
+[tool.setuptools]
+package-dir = { "manyforge_program_runner" = "." }
+packages = ["manyforge_program_runner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

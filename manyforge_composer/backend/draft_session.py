@@ -483,10 +483,9 @@ class ComposerDraftSession:
         unavailable_reason = applied_unavailable_reason or {
             "code": "program_apply_unavailable",
             "message": (
-                "authoritative Program Apply is unavailable until the "
-                "N7 native-product gate"
+                "authoritative Program Apply requires a configured Headless owner"
             ),
-            "restorationGates": ["N7"],
+            "restorationGates": [],
         }
         return {
             "schemaVersion": _WORKSPACE_API_VERSION,

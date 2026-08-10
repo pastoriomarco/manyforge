@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
+from threading import RLock
 from typing import Any, Sequence
 
 from manyforge_behavior.catalog import (
@@ -23,6 +24,9 @@ from .models import (
     HistorianReconcileRequest,
     ManagerApplyRequest,
     ProgramApplyRequest,
+    ProgramModelAttemptRequest,
+    ProgramRunStartRequest,
+    ProgramRunStopRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -33,12 +37,47 @@ from .models import (
     StopIntentRequest,
 )
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
+from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
 
 
 RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
 MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
 PROGRAM_APPLY_RESULT_VERSION = "manyforge.program_apply_result.v1"
 APPLIED_PROGRAM_SELECTION_VERSION = "manyforge.applied_program_selection.v1"
+PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
+PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v1"
+PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v1"
+_PROGRAM_RUN_STATES = frozenset(
+    {
+        "running",
+        "intervention_required",
+        "stopping",
+        "finalizing",
+        "stopped",
+        "succeeded",
+        "failed",
+    }
+)
+_ACTIVE_PROGRAM_RUN_STATES = frozenset(
+    {"running", "intervention_required", "stopping", "finalizing"}
+)
+
+
+def _bounded_text(value: object, *, maximum_bytes: int) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= maximum_bytes
+    )
+
+
+def _sha256_identity(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
 
 
 @lru_cache(maxsize=1)
@@ -62,10 +101,16 @@ class HeadlessService:
         core: HeadlessCorePort,
         manager: ManagerPort,
         execution: ExecutionPort | None = None,
+        program_runner: ProgramRunnerPort | None = None,
     ) -> None:
         self.core = core
         self.manager = manager
         self.execution = execution
+        self.program_runner = program_runner
+        # Serialize the standard Program Apply and Run admission surfaces.
+        # This is a request-ordering fence, not a runtime state owner; the
+        # runner and native owners still publish every authoritative fact.
+        self._program_transition_lock = RLock()
 
     def _execution(self) -> ExecutionPort:
         if self.execution is None:
@@ -348,6 +393,22 @@ class HeadlessService:
             )
         return projection
 
+    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
+        projection = self.core.scenario_program_selection(scenario_id)
+        if (
+            projection.get("schema_version")
+            != "manyforge.scenario_program_selection.v2"
+            or projection.get("scenario_id") != scenario_id
+            or not isinstance(projection.get("program"), dict)
+            or not isinstance(projection.get("program_binding"), dict)
+            or not isinstance(projection.get("owner_identities"), list)
+        ):
+            raise HeadlessApiError(
+                "scenario_program_selection_invalid",
+                "native core returned an unsupported scenario Program selection",
+            )
+        return projection
+
     def program_applied(self) -> dict[str, Any]:
         projection = self.core.applied_program_selection()
         if (
@@ -364,6 +425,308 @@ class HeadlessService:
                 "native core returned an unsupported Applied Program selection",
             )
         return projection
+
+    def program_model_attempt(
+        self,
+        request: ProgramModelAttemptRequest,
+    ) -> dict[str, Any]:
+        return self.core.commit_program_model_attempt(
+            request.model_dump(mode="json")
+        )
+
+    def _program_runner(self) -> ProgramRunnerPort:
+        if self.program_runner is None:
+            raise HeadlessApiError(
+                "program_runner_unavailable",
+                "independent Program runner is not configured",
+            )
+        return self.program_runner
+
+    @staticmethod
+    def _runner_error(error: ProgramRunnerClientError) -> HeadlessApiError:
+        return HeadlessApiError(error.code, str(error))
+
+    @staticmethod
+    def _validate_program_run_snapshot(
+        projection: dict[str, Any],
+        *,
+        expected_program_run_id: str | None = None,
+        expected_owner_epoch: str | None = None,
+    ) -> dict[str, Any]:
+        expected_fields = {
+            "active_operation_count",
+            "capture",
+            "message",
+            "owner_epoch",
+            "owner_id",
+            "reason_code",
+            "run_revision",
+            "schema_version",
+            "state",
+            "tree_status",
+        }
+        capture_fields = {
+            "graph_revision",
+            "node_environment_digest",
+            "owner_identities",
+            "program_binding_id",
+            "program_id",
+            "program_revision",
+            "program_run_id",
+            "retained_bundle_id",
+            "scenario_catalog_revision",
+            "scenario_id",
+            "schema_version",
+        }
+        capture = projection.get("capture")
+        owner_id = projection.get("owner_id")
+        owner_epoch = projection.get("owner_epoch")
+        state = projection.get("state")
+        active_count = projection.get("active_operation_count")
+        reason = projection.get("reason_code")
+        owner_identities = (
+            capture.get("owner_identities") if isinstance(capture, dict) else None
+        )
+        if (
+            set(projection) != expected_fields
+            or projection.get("schema_version") != PROGRAM_RUN_STATUS_VERSION
+            or not _bounded_text(owner_id, maximum_bytes=512)
+            or not _bounded_text(owner_epoch, maximum_bytes=512)
+            or type(projection.get("run_revision")) is not int
+            or not 1 <= projection["run_revision"] <= 9_007_199_254_740_991
+            or state not in _PROGRAM_RUN_STATES
+            or projection.get("tree_status")
+            not in {"invalid", "running", "success", "failure"}
+            or (
+                active_count is not None
+                and (
+                    type(active_count) is not int
+                    or not 0 <= active_count <= 4_096
+                )
+            )
+            or (
+                reason is not None
+                and not _bounded_text(reason, maximum_bytes=256)
+            )
+            or not isinstance(projection.get("message"), str)
+            or len(projection["message"].encode("utf-8")) > 4_096
+            or not isinstance(capture, dict)
+            or set(capture) != capture_fields
+            or capture.get("schema_version") != PROGRAM_RUN_CAPTURE_VERSION
+            or not _bounded_text(
+                capture.get("program_run_id"), maximum_bytes=512
+            )
+            or not _bounded_text(capture.get("scenario_id"), maximum_bytes=128)
+            or not _bounded_text(capture.get("program_id"), maximum_bytes=512)
+            or any(
+                not _sha256_identity(capture.get(field_name))
+                for field_name in (
+                    "scenario_catalog_revision",
+                    "program_revision",
+                    "program_binding_id",
+                    "retained_bundle_id",
+                    "graph_revision",
+                    "node_environment_digest",
+                )
+            )
+            or not isinstance(owner_identities, list)
+            or not 1 <= len(owner_identities) <= 4_096
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner returned an invalid run status",
+            )
+        roles: list[str] = []
+        runner_identity: dict[str, Any] | None = None
+        for identity in owner_identities:
+            if (
+                not isinstance(identity, dict)
+                or set(identity) != {"owner_epoch", "owner_id", "owner_role"}
+                or not _bounded_text(
+                    identity.get("owner_role"), maximum_bytes=128
+                )
+                or not _bounded_text(identity.get("owner_id"), maximum_bytes=512)
+                or not _bounded_text(
+                    identity.get("owner_epoch"), maximum_bytes=512
+                )
+            ):
+                raise HeadlessApiError(
+                    "program_runner_response_invalid",
+                    "Program runner returned an invalid owner identity",
+                )
+            roles.append(identity["owner_role"])
+            if identity["owner_role"] == "program_runner":
+                runner_identity = identity
+        if (
+            roles != sorted(set(roles))
+            or runner_identity is None
+            or runner_identity["owner_id"] != owner_id
+            or runner_identity["owner_epoch"] != owner_epoch
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program-run status and captured owner identities disagree",
+            )
+        if (
+            (
+                expected_program_run_id is not None
+                and capture["program_run_id"] != expected_program_run_id
+            )
+            or (
+                expected_owner_epoch is not None
+                and owner_epoch != expected_owner_epoch
+            )
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner returned a divergent run identity",
+            )
+        return projection
+
+    def program_runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
+        if type(active_only) is not bool or type(limit) is not int:
+            raise HeadlessApiError(
+                "program_run_index_request_invalid",
+                "Program-run index filter is invalid",
+            )
+        if not 1 <= limit <= 4_096:
+            raise HeadlessApiError(
+                "program_run_index_request_invalid",
+                "Program-run index limit is outside its bound",
+            )
+        try:
+            projection = self._program_runner().runs(
+                active_only=active_only,
+                limit=limit,
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        runs = projection.get("runs")
+        owner_id = projection.get("owner_id")
+        owner_epoch = projection.get("owner_epoch")
+        if (
+            set(projection)
+            != {
+                "active_only",
+                "owner_epoch",
+                "owner_id",
+                "runs",
+                "schema_version",
+                "truncated",
+            }
+            or projection.get("schema_version") != PROGRAM_RUN_INDEX_VERSION
+            or projection.get("active_only") is not active_only
+            or not _bounded_text(owner_id, maximum_bytes=512)
+            or not _bounded_text(owner_epoch, maximum_bytes=512)
+            or not isinstance(runs, list)
+            or len(runs) > limit
+            or type(projection.get("truncated")) is not bool
+        ):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program runner returned an invalid run index",
+            )
+        program_run_ids: list[str] = []
+        for row in runs:
+            if not isinstance(row, dict):
+                raise HeadlessApiError(
+                    "program_runner_response_invalid",
+                    "Program runner returned an invalid run index member",
+                )
+            self._validate_program_run_snapshot(
+                row,
+                expected_owner_epoch=owner_epoch,
+            )
+            program_run_ids.append(row["capture"]["program_run_id"])
+            if row["owner_id"] != owner_id or (
+                active_only and row["state"] not in _ACTIVE_PROGRAM_RUN_STATES
+            ):
+                raise HeadlessApiError(
+                    "program_runner_response_invalid",
+                    "Program-run index and member identities disagree",
+                )
+        if program_run_ids != sorted(set(program_run_ids)):
+            raise HeadlessApiError(
+                "program_runner_response_invalid",
+                "Program-run index must be strictly identity-sorted and unique",
+            )
+        return projection
+
+    def program_run_start(
+        self,
+        request: ProgramRunStartRequest,
+    ) -> dict[str, Any]:
+        with self._program_transition_lock:
+            applied = self.program_applied()
+            source = applied.get("source")
+            if (
+                not isinstance(source, dict)
+                or source.get("record_digest")
+                != request.expected_applied_record_digest
+                or applied.get("scenario_id") != request.scenario_id
+                or applied.get("scenario_catalog_revision")
+                != request.scenario_catalog_revision
+            ):
+                raise HeadlessApiError(
+                    "program_run_applied_selection_stale",
+                    "Applied Program changed before Run admission",
+                )
+            try:
+                projection = self._program_runner().start_run(
+                    request.model_dump(mode="json")
+                )
+            except ProgramRunnerClientError as error:
+                raise self._runner_error(error) from error
+            snapshot = self._validate_program_run_snapshot(projection)
+            capture = snapshot["capture"]
+            if (
+                any(
+                    capture[capture_field] != applied.get(applied_field)
+                    for capture_field, applied_field in (
+                        ("scenario_id", "scenario_id"),
+                        ("scenario_catalog_revision", "scenario_catalog_revision"),
+                        ("program_id", "program_id"),
+                        ("program_revision", "program_revision"),
+                        ("program_binding_id", "program_binding_id"),
+                        ("retained_bundle_id", "retained_bundle_id"),
+                        ("graph_revision", "graph_revision"),
+                        ("node_environment_digest", "node_environment_digest"),
+                    )
+                )
+            ):
+                raise HeadlessApiError(
+                    "program_runner_response_invalid",
+                    "Program runner started another Applied Program selection",
+                )
+            return snapshot
+
+    def program_run_read(self, program_run_id: str) -> dict[str, Any]:
+        try:
+            projection = self._program_runner().read_run(program_run_id)
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        return self._validate_program_run_snapshot(
+            projection,
+            expected_program_run_id=program_run_id,
+        )
+
+    def program_run_stop(
+        self,
+        program_run_id: str,
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        try:
+            projection = self._program_runner().stop_run(
+                program_run_id,
+                request.model_dump(mode="json"),
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        return self._validate_program_run_snapshot(
+            projection,
+            expected_program_run_id=program_run_id,
+            expected_owner_epoch=request.expected_owner_epoch,
+        )
 
     def _program_apply_manager_selection(
         self,
@@ -392,6 +755,14 @@ class HeadlessService:
         return source, payload, active
 
     def program_apply(self, request: ProgramApplyRequest) -> dict[str, Any]:
+        with self._program_transition_lock:
+            # An admitted run has already captured its immutable Applied
+            # Program and Binding. Program-only Apply can therefore publish a
+            # later selection without changing that run. A deployment-changing
+            # Apply remains protected by the Manager's affected-busy fence.
+            return self._program_apply(request)
+
+    def _program_apply(self, request: ProgramApplyRequest) -> dict[str, Any]:
         """Prepare, converge only a differing deployment, then CAS Applied."""
 
         try:

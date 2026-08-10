@@ -98,6 +98,47 @@ def test_client_uses_the_verified_scenario_catalog_route() -> None:
     assert [request.url.path for request in requests] == ["/api/scenarios"]
 
 
+def test_client_uses_exact_program_selection_and_run_routes() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        client.scenario_program_selection("cell-pick")
+        client.program_applied()
+        client.program_runs(active_only=True, limit=7)
+        client.program_run_start({"request_id": "request.1"})
+        client.program_run("program run:1")
+        client.program_run_stop(
+            "program run:1",
+            {"request_id": "request.2"},
+        )
+    finally:
+        raw.close()
+
+    assert [request.url.path for request in requests] == [
+        "/api/scenarios/cell-pick/program-selection",
+        "/api/program/applied",
+        "/api/program/runs",
+        "/api/program/runs",
+        "/api/program/runs/program run:1",
+        "/api/program/runs/program run:1/stop",
+    ]
+    assert dict(requests[2].url.params) == {
+        "active_only": "true",
+        "limit": "7",
+    }
+    assert json.loads(requests[3].read()) == {"request_id": "request.1"}
+    assert json.loads(requests[5].read()) == {"request_id": "request.2"}
+
+
 def test_client_uses_the_revision_fenced_scene_pose_route() -> None:
     requests: list[httpx.Request] = []
 

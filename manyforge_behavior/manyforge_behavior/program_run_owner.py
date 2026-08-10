@@ -501,6 +501,38 @@ class ProgramRunOwner:
         with self._lock:
             return self._snapshot(self._entry(program_run_id))
 
+    def list_snapshots(
+        self,
+        *,
+        active_only: bool = False,
+        limit: int = 128,
+    ) -> tuple[tuple[ProgramRunSnapshot, ...], bool]:
+        """Return one bounded owner-issued index without downstream reads.
+
+        Exact ``read`` remains responsible for reconciling a stopping or
+        finalizing run.  Enumeration intentionally takes only the local owner
+        lock, so a slow Kernel observation cannot delay discovery of other
+        runs or the independent Stop path.
+        """
+
+        if type(active_only) is not bool:
+            raise TypeError("active_only must be boolean")
+        if type(limit) is not int or not 1 <= limit <= _MAX_RETAINED_RUNS:
+            raise ValueError("Program-run index limit is outside its bound")
+        active_states = {
+            ProgramRunState.RUNNING,
+            ProgramRunState.INTERVENTION_REQUIRED,
+            ProgramRunState.STOPPING,
+            ProgramRunState.FINALIZING,
+        }
+        with self._lock:
+            snapshots = tuple(
+                self._snapshot(entry)
+                for program_run_id, entry in sorted(self._runs.items())
+                if not active_only or entry.state in active_states
+            )
+        return snapshots[:limit], len(snapshots) > limit
+
     def _begin_stop(
         self,
         program_run_id: str,

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
+import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type {
   CatalogResponse,
@@ -14,6 +15,7 @@ import { ProgramTreeCanvas } from './ProgramTreeCanvas';
 
 interface ProgramWorkspaceProps {
   controller: ProgramWorkspaceController;
+  runtime: ProgramRuntimeController;
   catalog: StructuralResourceState<CatalogResponse>;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   selectedProgramPath: string | null;
@@ -28,6 +30,7 @@ function shortRevision(revision: string | null): string {
 
 export function ProgramWorkspace({
   controller,
+  runtime,
   catalog,
   environment,
   selectedProgramPath,
@@ -41,6 +44,8 @@ export function ProgramWorkspace({
     openDraft,
     save,
     saveAs,
+    apply: applyDraft,
+    load: loadProgram,
     clearFeedback,
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -59,6 +64,12 @@ export function ProgramWorkspace({
   const authoringUnavailable = nodeEnvironment !== null
     && !nodeEnvironment.portableAuthoringAvailable;
   const authoringBusy = busy || authoringUnavailable;
+  const scenarioCatalog = runtime.state.catalog;
+  const selectedScenario = scenarioCatalog?.scenarios.find(
+    (row) => row.scenarioId === runtime.state.selectedScenarioId,
+  ) ?? null;
+  const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
+    || workspace?.hasUnappliedChanges === true;
 
   useEffect(() => {
     if (workspace?.saved.path) setSaveAsPath(workspace.saved.path);
@@ -124,11 +135,79 @@ export function ProgramWorkspace({
               <strong>{workspace.saved.available ? shortRevision(workspace.saved.programRevision) : 'not saved'}</strong>
               <small>{workspace.saved.path ?? 'Use Save As to choose a path'}</small>
             </div>
-            <div className="identity-unavailable">
+            <div className={workspace.applied.available ? 'identity-current' : 'identity-unavailable'}>
               <span>Applied</span>
-              <strong>Unavailable</strong>
-              <small>{workspace.applied.unavailableReason?.message ?? 'No owner-issued Applied identity.'}</small>
+              <strong>
+                {workspace.applied.available
+                  ? shortRevision(workspace.applied.programRevision)
+                  : 'Unavailable'}
+              </strong>
+              <small>
+                {workspace.applied.available
+                  ? workspace.applied.matchesDraft
+                    ? 'Matches the current Draft.'
+                    : 'Owner selection differs from Draft.'
+                  : workspace.applied.unavailableReason?.message
+                    ?? 'No owner-issued Applied identity.'}
+              </small>
             </div>
+          </div>
+
+          <div className="program-artifact-actions program-apply-actions">
+            <label className="program-save-as-path">
+              Qualified scenario
+              <select
+                value={runtime.state.selectedScenarioId ?? ''}
+                disabled={busy || scenarioCatalog === null}
+                onChange={(event) => runtime.selectScenario(event.target.value)}
+              >
+                {scenarioCatalog?.scenarios.map((row) => (
+                  <option key={row.scenarioId} value={row.scenarioId}>
+                    {row.description
+                      ? `${row.scenarioId} — ${row.description}`
+                      : row.scenarioId}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              disabled={busy || !program || selectedScenario === null}
+              onClick={() => {
+                if (!selectedScenario || !scenarioCatalog) return;
+                applyDraft(
+                  selectedScenario.scenarioId,
+                  scenarioCatalog.scenarioCatalogRevision,
+                );
+              }}
+            >
+              Apply Draft
+            </button>
+            <button
+              type="button"
+              disabled={
+                busy
+                || selectedProgramPath === null
+                || selectedScenario === null
+                || (replaceNeedsConfirmation && !confirmDiscard)
+              }
+              onClick={() => {
+                if (!selectedProgramPath || !selectedScenario || !scenarioCatalog) return;
+                loadProgram(
+                  selectedProgramPath,
+                  selectedScenario.scenarioId,
+                  scenarioCatalog.scenarioCatalogRevision,
+                  confirmDiscard,
+                );
+                setConfirmDiscard(false);
+              }}
+            >
+              Load and Apply
+            </button>
+            <small>
+              Apply changes runtime only. Load validates and applies the selected
+              artifact before replacing Draft and Saved.
+            </small>
           </div>
 
           <div className="program-artifact-actions">
@@ -142,7 +221,7 @@ export function ProgramWorkspace({
                 checked={confirmDiscard}
                 onChange={(event) => setConfirmDiscard(event.target.checked)}
               />
-              Allow discarding unsaved Draft changes
+              Allow discarding unsaved or unapplied Draft changes
             </label>
             <button
               type="button"
@@ -194,6 +273,17 @@ export function ProgramWorkspace({
             >
               <span>{state.error ?? state.message}</span>
               <button type="button" className="text-button" onClick={clearFeedback}>Dismiss</button>
+            </div>
+          )}
+
+          {runtime.active && (
+            <div className="panel-state" role="status">
+              <strong>Run mode is active</strong>
+              <span>
+                This run keeps its captured Program and Binding. Draft, Save,
+                Apply, and Load affect only later runs unless the Manager
+                rejects an affected deployment change as busy.
+              </span>
             </div>
           )}
 

@@ -141,17 +141,27 @@ def gen_rest_api() -> str:
     from manyforge_composer.backend.app import create_app
     from manyforge_composer.backend.state import ComposerState
 
-    spec = create_app(ComposerState()).openapi()
+    # Route construction is transport-neutral. A schema-only sentinel exposes
+    # the configured thin-client superset without making a request or starting
+    # a Headless process, so the reference does not silently omit optional
+    # runtime-client routes.
+    spec = create_app(
+        ComposerState(headless_client=object()),  # type: ignore[arg-type]
+    ).openapi()
     body: list[str] = [
         _stamp("gen_rest_api", "structural-rest"),
         "# Composer REST API\n\n",
     ]
     body.append(
-        "This is the structural and authoring-only Composer surface retained "
-        "during the composable-cell runtime cutover. Catalog reads, sandboxed "
-        "artifact browsing, structural URDF assets, health, and the strict "
-        "revision-fenced Program Draft/Saved workflow remain available. "
-        "Program Apply and execution remain unavailable. The "
+        "This is the structural, authoring, and thin runtime-client Composer "
+        "surface retained during the composable-cell runtime cutover. Catalog "
+        "reads, sandboxed artifact browsing, structural URDF assets, health, "
+        "and the strict revision-fenced Program Draft/Saved workflow remain "
+        "available. When Headless and the independent Program runner are "
+        "configured, Composer also forwards scenario, Applied, Program Run, "
+        "status, and explicit Program Stop requests without owning their state. "
+        "Complete product launch and later lifecycle/scene/backend capabilities "
+        "remain unavailable. The "
         "catch-all `/api/{unavailable_path}` operations return the typed "
         "runtime-unavailable response for former product routes.\n\n"
     )
@@ -173,19 +183,20 @@ def gen_headless_rest_api() -> str:
     body.append(
         "This is the independent headless projection over Manager, "
         "logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the "
-        "selected addressed execution owner. Reads return owner-issued facts. "
-        "Alarm acknowledgement, Manager Apply, execution submission, and "
-        "no-motion preview are attributed intents; the API never owns or "
-        "reduces execution state. Preview cannot dispatch, and approval uses "
-        "the ordinary operation endpoint. The bounded I6 execution path does "
-        "not by itself make Manager Apply's "
-        "separate Kernel fence operational. No condition mutation endpoint "
-        "exists. `/api/health` reports only "
+        "selected addressed execution owner and independent Program runner. "
+        "Reads return owner-issued facts. Alarm acknowledgement, Manager and "
+        "Program Apply, execution submission, no-motion preview, Program Run, "
+        "and explicit Program Stop are attributed intents; the API never owns "
+        "or reduces execution or Program-run state. Preview cannot dispatch, "
+        "and approval uses the ordinary operation endpoint. An unconfigured or "
+        "lost Program runner is reported as unavailable and never interpreted "
+        "as idle. No condition mutation endpoint exists. `/api/health` reports only "
         "`headless_projection_ready`; robot readiness has no H0 owner and is "
         "explicitly unavailable. The alarm page defaults to 32 records and is "
         "bounded at 128, history defaults to and is bounded at 32 records, "
-        "request bodies are bounded at 1 MiB, and native/HTTP responses are "
-        "bounded at 64 MiB.\n\n"
+        "ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, "
+        "model-attempt audit at 256 KiB, native/HTTP responses at 64 MiB, and "
+        "private Program-runner responses at 32 MiB.\n\n"
     )
     _append_openapi_routes(body, spec)
     return "".join(body)

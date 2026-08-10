@@ -12,6 +12,7 @@ import type {
   JsonValue,
   NodeEnvironmentResponse,
   NodeImplementationAvailability,
+  AppliedProgramSelection,
   ProgramDocument,
   ProgramParameterDeclaration,
   ProgramSceneFrameRef,
@@ -19,9 +20,14 @@ import type {
   ProgramSceneResource,
   ProgramSceneShape,
   ProgramTreeNode,
+  ProgramRunIndex,
+  ProgramRunStateName,
+  ProgramRunStatus,
   ProgramValueSource,
   ProgramViewerMetadata,
   ProgramWorkspaceResponse,
+  ProgramWorkspaceTransitionResponse,
+  ScenarioCatalogResponse,
   LogicalSceneObject,
   LogicalScenePlacement,
   LogicalScenePose,
@@ -139,6 +145,14 @@ function stringAt(value: unknown, path: string): string {
     return fail(path, 'a string');
   }
   return value;
+}
+
+function digestAt(value: unknown, path: string): string {
+  const digest = stringAt(value, path);
+  if (!/^sha256:[0-9a-f]{64}$/.test(digest)) {
+    return fail(path, 'an exact SHA-256 identity');
+  }
+  return digest;
 }
 
 function nullableStringAt(value: unknown, path: string): string | null {
@@ -1152,6 +1166,405 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     },
     hasUnsavedChanges,
     hasUnappliedChanges,
+  };
+}
+
+export function parseScenarioCatalogResponse(value: unknown): ScenarioCatalogResponse {
+  const record = objectAt(value, 'scenarioCatalog');
+  exactKeysAt(
+    record,
+    ['api_version', 'scenario_catalog_revision', 'scenarios'],
+    'scenarioCatalog',
+  );
+  const apiVersion = stringAt(record.api_version, 'scenarioCatalog.api_version');
+  if (apiVersion !== 'manyforge.scenario_catalog.v1') {
+    return fail('scenarioCatalog.api_version', 'manyforge.scenario_catalog.v1');
+  }
+  const scenarios = boundedArrayAt(
+    record.scenarios,
+    'scenarioCatalog.scenarios',
+    4096,
+  ).map((value, index) => {
+    const path = `scenarioCatalog.scenarios[${index}]`;
+    const row = objectAt(value, path);
+    allowedKeysAt(
+      row,
+      [
+        'assistant_mode',
+        'deployment_artifact_id',
+        'deployment_compatibility',
+        'deployment_revision',
+        'program_binding_id',
+        'retained_bundle_id',
+        'scenario_id',
+        'typed_parameter_overrides',
+      ],
+      ['aliases', 'description'],
+      path,
+    );
+    const compatibility = objectAt(
+      row.deployment_compatibility,
+      `${path}.deployment_compatibility`,
+    );
+    exactKeysAt(
+      compatibility,
+      ['lane', 'provides'],
+      `${path}.deployment_compatibility`,
+    );
+    stringAt(compatibility.lane, `${path}.deployment_compatibility.lane`);
+    stringArrayAt(
+      compatibility.provides,
+      `${path}.deployment_compatibility.provides`,
+    );
+    jsonRecordAt(row.typed_parameter_overrides, `${path}.typed_parameter_overrides`);
+    const assistantMode = stringAt(row.assistant_mode, `${path}.assistant_mode`);
+    if (!['required', 'optional', 'forbidden'].includes(assistantMode)) {
+      return fail(`${path}.assistant_mode`, 'required, optional, or forbidden');
+    }
+    return {
+      scenarioId: stringAt(row.scenario_id, `${path}.scenario_id`),
+      description: row.description === undefined
+        ? null
+        : stringAt(row.description, `${path}.description`),
+      aliases: row.aliases === undefined
+        ? []
+        : stringArrayAt(row.aliases, `${path}.aliases`),
+      deploymentArtifactId: stringAt(
+        row.deployment_artifact_id,
+        `${path}.deployment_artifact_id`,
+      ),
+      deploymentRevision: digestAt(
+        row.deployment_revision,
+        `${path}.deployment_revision`,
+      ),
+      retainedBundleId: digestAt(
+        row.retained_bundle_id,
+        `${path}.retained_bundle_id`,
+      ),
+      programBindingId: digestAt(
+        row.program_binding_id,
+        `${path}.program_binding_id`,
+      ),
+      assistantMode: assistantMode as 'required' | 'optional' | 'forbidden',
+    };
+  });
+  const scenarioIds = scenarios.map((row) => row.scenarioId);
+  if (
+    scenarioIds.some((id, index) => index > 0 && id <= scenarioIds[index - 1])
+  ) {
+    return fail('scenarioCatalog.scenarios', 'strictly scenario-ID sorted and unique');
+  }
+  return {
+    apiVersion,
+    scenarioCatalogRevision: digestAt(
+      record.scenario_catalog_revision,
+      'scenarioCatalog.scenario_catalog_revision',
+    ),
+    scenarios,
+  };
+}
+
+export function parseAppliedProgramSelection(value: unknown): AppliedProgramSelection {
+  const path = 'appliedProgram';
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'assistant_mode',
+      'baseline_program_binding_id',
+      'deployment_artifact_id',
+      'deployment_revision',
+      'graph_revision',
+      'node_environment_digest',
+      'preparation_digest',
+      'program',
+      'program_binding',
+      'program_binding_id',
+      'program_id',
+      'program_revision',
+      'retained_bundle_id',
+      'scenario_catalog_revision',
+      'scenario_id',
+      'schema_version',
+      'source',
+      'typed_parameter_overrides',
+    ],
+    path,
+  );
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.applied_program_selection.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.applied_program_selection.v1');
+  }
+  const assistantMode = stringAt(record.assistant_mode, `${path}.assistant_mode`);
+  if (!['required', 'optional', 'forbidden'].includes(assistantMode)) {
+    return fail(`${path}.assistant_mode`, 'required, optional, or forbidden');
+  }
+  digestAt(
+    record.baseline_program_binding_id,
+    `${path}.baseline_program_binding_id`,
+  );
+  stringAt(record.deployment_artifact_id, `${path}.deployment_artifact_id`);
+  digestAt(record.deployment_revision, `${path}.deployment_revision`);
+  digestAt(record.preparation_digest, `${path}.preparation_digest`);
+  jsonRecordAt(record.program, `${path}.program`);
+  jsonRecordAt(record.program_binding, `${path}.program_binding`);
+  jsonRecordAt(record.typed_parameter_overrides, `${path}.typed_parameter_overrides`);
+  const source = objectAt(record.source, `${path}.source`);
+  exactKeysAt(
+    source,
+    [
+      'record_digest',
+      'semantic_content_digest',
+      'source_generation',
+      'source_owner_epoch',
+      'source_owner_id',
+    ],
+    `${path}.source`,
+  );
+  digestAt(
+    source.semantic_content_digest,
+    `${path}.source.semantic_content_digest`,
+  );
+  return {
+    schemaVersion,
+    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    scenarioCatalogRevision: digestAt(
+      record.scenario_catalog_revision,
+      `${path}.scenario_catalog_revision`,
+    ),
+    programId: stringAt(record.program_id, `${path}.program_id`),
+    programRevision: digestAt(record.program_revision, `${path}.program_revision`),
+    programBindingId: digestAt(
+      record.program_binding_id,
+      `${path}.program_binding_id`,
+    ),
+    retainedBundleId: digestAt(
+      record.retained_bundle_id,
+      `${path}.retained_bundle_id`,
+    ),
+    graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
+    nodeEnvironmentDigest: digestAt(
+      record.node_environment_digest,
+      `${path}.node_environment_digest`,
+    ),
+    recordDigest: digestAt(source.record_digest, `${path}.source.record_digest`),
+    sourceOwnerId: stringAt(source.source_owner_id, `${path}.source.source_owner_id`),
+    sourceOwnerEpoch: stringAt(
+      source.source_owner_epoch,
+      `${path}.source.source_owner_epoch`,
+    ),
+    sourceGeneration: positiveIntegerAt(
+      source.source_generation,
+      `${path}.source.source_generation`,
+    ),
+  };
+}
+
+const PROGRAM_RUN_STATES = new Set<ProgramRunStateName>([
+  'running',
+  'intervention_required',
+  'stopping',
+  'finalizing',
+  'stopped',
+  'succeeded',
+  'failed',
+]);
+
+export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
+  const path = 'programRun';
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'active_operation_count',
+      'capture',
+      'message',
+      'owner_epoch',
+      'owner_id',
+      'reason_code',
+      'run_revision',
+      'schema_version',
+      'state',
+      'tree_status',
+    ],
+    path,
+  );
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.program_run_status.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v1');
+  }
+  const state = stringAt(record.state, `${path}.state`) as ProgramRunStateName;
+  if (!PROGRAM_RUN_STATES.has(state)) {
+    return fail(`${path}.state`, 'a supported Program-run state');
+  }
+  const capture = objectAt(record.capture, `${path}.capture`);
+  exactKeysAt(
+    capture,
+    [
+      'graph_revision',
+      'node_environment_digest',
+      'owner_identities',
+      'program_binding_id',
+      'program_id',
+      'program_revision',
+      'program_run_id',
+      'retained_bundle_id',
+      'scenario_catalog_revision',
+      'scenario_id',
+      'schema_version',
+    ],
+    `${path}.capture`,
+  );
+  if (capture.schema_version !== 'manyforge.program_run_capture.v1') {
+    return fail(`${path}.capture.schema_version`, 'manyforge.program_run_capture.v1');
+  }
+  const ownerIdentities = boundedArrayAt(
+    capture.owner_identities,
+    `${path}.capture.owner_identities`,
+    4096,
+  ).map((value, index) => {
+    const ownerPath = `${path}.capture.owner_identities[${index}]`;
+    const owner = objectAt(value, ownerPath);
+    exactKeysAt(owner, ['owner_epoch', 'owner_id', 'owner_role'], ownerPath);
+    return {
+      ownerRole: stringAt(owner.owner_role, `${ownerPath}.owner_role`),
+      ownerId: stringAt(owner.owner_id, `${ownerPath}.owner_id`),
+      ownerEpoch: stringAt(owner.owner_epoch, `${ownerPath}.owner_epoch`),
+    };
+  });
+  const ownerRoles = ownerIdentities.map((owner) => owner.ownerRole);
+  if (
+    !ownerRoles.includes('program_runner')
+    || ownerRoles.some((role, index) => index > 0 && role <= ownerRoles[index - 1])
+  ) {
+    return fail(
+      `${path}.capture.owner_identities`,
+      'strictly role-sorted unique owner identities including program_runner',
+    );
+  }
+  const treeStatus = stringAt(record.tree_status, `${path}.tree_status`);
+  if (!['invalid', 'running', 'success', 'failure'].includes(treeStatus)) {
+    return fail(`${path}.tree_status`, 'a supported tree status');
+  }
+  const ownerId = stringAt(record.owner_id, `${path}.owner_id`);
+  const ownerEpoch = stringAt(record.owner_epoch, `${path}.owner_epoch`);
+  const runnerIdentity = ownerIdentities.find(
+    (owner) => owner.ownerRole === 'program_runner',
+  );
+  if (
+    runnerIdentity?.ownerId !== ownerId
+    || runnerIdentity.ownerEpoch !== ownerEpoch
+  ) {
+    return fail(
+      `${path}.capture.owner_identities`,
+      'a program_runner identity matching the status owner',
+    );
+  }
+  const activeOperationCount = record.active_operation_count === null
+    ? null
+    : integerAt(record.active_operation_count, `${path}.active_operation_count`);
+  if (
+    activeOperationCount !== null
+    && (activeOperationCount < 0 || activeOperationCount > 4096)
+  ) {
+    return fail(`${path}.active_operation_count`, 'an integer from 0 through 4096');
+  }
+  return {
+    schemaVersion,
+    ownerId,
+    ownerEpoch,
+    runRevision: positiveIntegerAt(record.run_revision, `${path}.run_revision`),
+    state,
+    capture: {
+      programRunId: stringAt(capture.program_run_id, `${path}.capture.program_run_id`),
+      scenarioId: stringAt(capture.scenario_id, `${path}.capture.scenario_id`),
+      scenarioCatalogRevision: digestAt(
+        capture.scenario_catalog_revision,
+        `${path}.capture.scenario_catalog_revision`,
+      ),
+      programId: stringAt(capture.program_id, `${path}.capture.program_id`),
+      programRevision: digestAt(
+        capture.program_revision,
+        `${path}.capture.program_revision`,
+      ),
+      programBindingId: digestAt(
+        capture.program_binding_id,
+        `${path}.capture.program_binding_id`,
+      ),
+      retainedBundleId: digestAt(
+        capture.retained_bundle_id,
+        `${path}.capture.retained_bundle_id`,
+      ),
+      graphRevision: digestAt(
+        capture.graph_revision,
+        `${path}.capture.graph_revision`,
+      ),
+      nodeEnvironmentDigest: digestAt(
+        capture.node_environment_digest,
+        `${path}.capture.node_environment_digest`,
+      ),
+      ownerIdentities,
+    },
+    treeStatus: treeStatus as ProgramRunStatus['treeStatus'],
+    activeOperationCount,
+    reasonCode: nullableStringAt(record.reason_code, `${path}.reason_code`),
+    message: stringAt(record.message, `${path}.message`),
+  };
+}
+
+export function parseProgramRunIndex(value: unknown): ProgramRunIndex {
+  const path = 'programRunIndex';
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['active_only', 'owner_epoch', 'owner_id', 'runs', 'schema_version', 'truncated'],
+    path,
+  );
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.program_run_index.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.program_run_index.v1');
+  }
+  const ownerId = stringAt(record.owner_id, `${path}.owner_id`);
+  const ownerEpoch = stringAt(record.owner_epoch, `${path}.owner_epoch`);
+  const activeOnly = booleanAt(record.active_only, `${path}.active_only`);
+  const runs = boundedArrayAt(record.runs, `${path}.runs`, 4096)
+    .map(parseProgramRunStatus);
+  if (runs.some((run) => (
+    run.ownerId !== ownerId
+    || run.ownerEpoch !== ownerEpoch
+    || (activeOnly && ![
+      'running',
+      'intervention_required',
+      'stopping',
+      'finalizing',
+    ].includes(run.state))
+  ))) {
+    return fail(`${path}.runs`, 'statuses from the exact indexed owner and filter');
+  }
+  return {
+    schemaVersion,
+    ownerId,
+    ownerEpoch,
+    activeOnly,
+    truncated: booleanAt(record.truncated, `${path}.truncated`),
+    runs,
+  };
+}
+
+export function parseProgramWorkspaceTransitionResponse(
+  value: unknown,
+): ProgramWorkspaceTransitionResponse {
+  const path = 'programWorkspaceTransition';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['headless', 'status', 'workspace'], path);
+  jsonRecordAt(record.headless, `${path}.headless`);
+  const status = stringAt(record.status, `${path}.status`);
+  if (!['applied', 'loaded', 'pending_deployment'].includes(status)) {
+    return fail(`${path}.status`, 'applied, loaded, or pending_deployment');
+  }
+  return {
+    status: status as ProgramWorkspaceTransitionResponse['status'],
+    workspace: parseProgramWorkspaceResponse(record.workspace),
   };
 }
 

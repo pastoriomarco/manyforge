@@ -139,7 +139,7 @@ def _applied_context(
         return None, None, {
             "code": "program_apply_unavailable",
             "message": "authoritative Program Apply requires a configured headless API",
-            "restorationGates": ["N7"],
+            "restorationGates": [],
         }
     try:
         applied = state.headless_client.program_applied()

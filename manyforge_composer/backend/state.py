@@ -26,9 +26,10 @@ if TYPE_CHECKING:
 RUNTIME_UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
 RUNTIME_UNAVAILABLE_MESSAGE = (
     "Composer is not a runtime owner; configure the headless API for owner-issued "
-    "status, scene, alarm/history, preview, operation, and operation-Stop facts. "
-    "Apply, lifecycle, full Stop, simulation, and product launch remain at their "
-    "later gates. The assistant operator workflow also requires a configured "
+    "status, scene, alarm/history, preview, operation, Program Apply/Run, and "
+    "explicit operation/Program Stop facts. Complete inputs, lifecycle, full "
+    "Stop, simulation, and product launch remain at their later gates. The "
+    "assistant operator workflow also requires a configured "
     "assistant bridge"
 )
 

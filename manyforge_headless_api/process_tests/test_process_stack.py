@@ -16,6 +16,7 @@ from typing import Iterator
 import pytest
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
 
 
 CATALOG = Path("/workspace/manyforge_headless/resources/operator-alarm-catalog.v1.yaml")
@@ -47,6 +48,7 @@ class ProcessStack:
         cell_id: str = "c1_build_authority_cell",
         program_path: Path | None = None,
         freshness_milliseconds: int = 200,
+        enable_program_runner: bool = False,
     ) -> None:
         self.root = root
         self.manager_root = root / "manager"
@@ -71,12 +73,18 @@ class ProcessStack:
         self.cell_id = cell_id
         self.program_path = program_path
         self.freshness_milliseconds = freshness_milliseconds
+        self.enable_program_runner = enable_program_runner
         self.port = _free_loopback_port()
+        self.program_runner_port = _free_loopback_port()
         self.composer_port = _free_loopback_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
+        self.program_runner_url = (
+            f"http://127.0.0.1:{self.program_runner_port}"
+        )
         self.composer_url = f"http://127.0.0.1:{self.composer_port}"
         self.manager: subprocess.Popen[bytes] | None = None
         self.api: subprocess.Popen[bytes] | None = None
+        self.program_runner: subprocess.Popen[bytes] | None = None
         self.composer: subprocess.Popen[bytes] | None = None
         self.log = (root / "process-stack.log").open("wb")
 
@@ -104,41 +112,99 @@ class ProcessStack:
 
     def start_api(self) -> None:
         assert self.api is None
+        command = [
+            sys.executable,
+            "-m",
+            "manyforge_headless_api",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.port),
+            "--publication-root",
+            str(self.publication_root),
+            "--package-root",
+            str(self.package_root),
+            "--node-catalog-path",
+            str(NODE_CATALOG),
+            "--alarm-catalog-path",
+            str(CATALOG),
+            "--historian-database-path",
+            str(self.history_database),
+            "--manager-state-root",
+            str(self.manager_root),
+            "--execution-state-root",
+            str(self.execution_root),
+            "--cell-id",
+            self.cell_id,
+            "--owner-id",
+            "headless-api.process-test",
+            "--freshness-ms",
+            str(self.freshness_milliseconds),
+        ]
+        if self.enable_program_runner:
+            command.extend(
+                (
+                    "--program-runner-url",
+                    self.program_runner_url,
+                    "--program-runner-timeout-s",
+                    "0.25",
+                )
+            )
         self.api = subprocess.Popen(
+            command,
+            stdout=self.log,
+            stderr=subprocess.STDOUT,
+            env=os.environ.copy(),
+        )
+
+    def start_program_runner(self) -> None:
+        assert self.enable_program_runner
+        assert self.program_runner is None
+        self.program_runner = subprocess.Popen(
             [
                 sys.executable,
                 "-m",
-                "manyforge_headless_api",
-                "serve",
+                "manyforge_program_runner",
                 "--host",
                 "127.0.0.1",
                 "--port",
-                str(self.port),
-                "--publication-root",
-                str(self.publication_root),
-                "--package-root",
-                str(self.package_root),
-                "--node-catalog-path",
-                str(NODE_CATALOG),
-                "--alarm-catalog-path",
-                str(CATALOG),
-                "--historian-database-path",
-                str(self.history_database),
-                "--manager-state-root",
-                str(self.manager_root),
-                "--execution-state-root",
-                str(self.execution_root),
-                "--cell-id",
-                self.cell_id,
+                str(self.program_runner_port),
+                "--headless-url",
+                self.base_url,
                 "--owner-id",
-                "headless-api.process-test",
-                "--freshness-ms",
-                str(self.freshness_milliseconds),
+                "program-runner.process-test",
+                "--headless-timeout-s",
+                "0.25",
             ],
             stdout=self.log,
             stderr=subprocess.STDOUT,
             env=os.environ.copy(),
         )
+
+    def wait_program_runner(self, timeout_seconds: float = 8.0) -> dict:
+        assert self.enable_program_runner
+        deadline = time.monotonic() + timeout_seconds
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            if (
+                self.program_runner is not None
+                and self.program_runner.poll() is not None
+            ):
+                raise RuntimeError(
+                    "Program runner exited with "
+                    f"{self.program_runner.returncode}"
+                )
+            try:
+                with ProgramRunnerHttpClient(
+                    self.program_runner_url,
+                    timeout_seconds=0.25,
+                ) as client:
+                    return client.runs(active_only=True, limit=1)
+            except Exception as error:
+                last_error = error
+            time.sleep(0.01)
+        raise RuntimeError(f"Program runner did not become available: {last_error}")
 
     def wait_complete(
         self,
@@ -258,6 +324,12 @@ class ProcessStack:
         self.api.wait(timeout=5)
         self.api = None
 
+    def kill_program_runner(self) -> None:
+        assert self.program_runner is not None
+        self.program_runner.kill()
+        self.program_runner.wait(timeout=5)
+        self.program_runner = None
+
     def kill_manager(self) -> None:
         assert self.manager is not None
         self.manager.kill()
@@ -295,13 +367,22 @@ class ProcessStack:
             self.composer = None
         finally:
             try:
-                self.private_shutdown_manager()
+                if (
+                    self.program_runner is not None
+                    and self.program_runner.poll() is None
+                ):
+                    self.program_runner.terminate()
+                    self.program_runner.wait(timeout=5)
+                self.program_runner = None
             finally:
-                if self.api is not None and self.api.poll() is None:
-                    self.api.terminate()
-                    self.api.wait(timeout=5)
-                self.api = None
-                self.log.close()
+                try:
+                    self.private_shutdown_manager()
+                finally:
+                    if self.api is not None and self.api.poll() is None:
+                        self.api.terminate()
+                        self.api.wait(timeout=5)
+                    self.api = None
+                    self.log.close()
 
 
 @contextmanager
@@ -311,6 +392,20 @@ def _stack(root: Path) -> Iterator[ProcessStack]:
         stack.start_manager()
         stack.start_api()
         stack.wait_complete(True)
+        yield stack
+    finally:
+        stack.close()
+
+
+@contextmanager
+def _program_surface_stack(root: Path) -> Iterator[ProcessStack]:
+    stack = ProcessStack(root, enable_program_runner=True)
+    try:
+        stack.start_manager()
+        stack.start_program_runner()
+        stack.start_api()
+        stack.wait_complete(True)
+        stack.wait_program_runner()
         yield stack
     finally:
         stack.close()
@@ -674,6 +769,47 @@ def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
             )
             assert replay["applied"] == first_applied
         assert _plain_package_files(stack.package_root) == package_before
+
+
+def test_program_runner_headless_and_composer_are_independent_processes(
+    tmp_path: Path,
+) -> None:
+    with _program_surface_stack(tmp_path) as stack:
+        with HeadlessHttpClient(stack.base_url) as headless:
+            manager_before = headless.manager_status()["status"]["active"]
+            initial = headless.program_runs(active_only=True, limit=1)
+
+        stack.start_composer()
+        stack.wait_composer()
+        with HeadlessHttpClient(stack.composer_url) as composer:
+            through_composer = composer.program_runs(active_only=True, limit=1)
+        assert through_composer == initial
+
+        stack.kill_composer()
+        with HeadlessHttpClient(stack.base_url) as headless:
+            after_composer_loss = headless.program_runs(
+                active_only=True,
+                limit=1,
+            )
+            manager_after = headless.manager_status()["status"]["active"]
+        assert after_composer_loss == initial
+        assert manager_after == manager_before
+
+        stack.kill_program_runner()
+        with HeadlessHttpClient(stack.base_url) as headless:
+            with pytest.raises(HeadlessClientError) as unavailable:
+                headless.program_runs(active_only=True, limit=1)
+        assert unavailable.value.code == "program_runner_unavailable"
+
+        stack.start_program_runner()
+        replacement = stack.wait_program_runner()
+        with HeadlessHttpClient(stack.base_url) as headless:
+            forwarded_replacement = headless.program_runs(
+                active_only=True,
+                limit=1,
+            )
+        assert replacement["owner_epoch"] != initial["owner_epoch"]
+        assert forwarded_replacement == replacement
 
 
 def test_manager_api_cli_and_replacements_preserve_headless_owners(

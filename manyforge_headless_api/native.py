@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 from typing import Any, Mapping, Protocol, Sequence
 import unicodedata
+from urllib.parse import urlsplit
 
 import rfc8785
 
@@ -53,6 +54,8 @@ class HeadlessApiConfig:
     execution_timeout_seconds: float = 10.0
     execution_event_poll_milliseconds: int = 100
     maximum_request_body_bytes: int = MAX_STANDARD_REQUEST_BODY_BYTES
+    program_runner_url: str | None = None
+    program_runner_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         for label, value in (("cell_id", self.cell_id), ("owner_id", self.owner_id)):
@@ -90,6 +93,24 @@ class HeadlessApiConfig:
         if not 10 <= self.execution_event_poll_milliseconds <= 5_000:
             raise ValueError(
                 "execution_event_poll_milliseconds must be between 10 and 5000"
+            )
+        if self.program_runner_url is not None:
+            parsed_runner_url = urlsplit(self.program_runner_url)
+            if (
+                parsed_runner_url.scheme not in {"http", "https"}
+                or not parsed_runner_url.netloc
+                or parsed_runner_url.username is not None
+                or parsed_runner_url.password is not None
+                or parsed_runner_url.path not in {"", "/"}
+                or bool(parsed_runner_url.query)
+                or bool(parsed_runner_url.fragment)
+            ):
+                raise ValueError(
+                    "program_runner_url must be an absolute credential-free HTTP(S) URL"
+                )
+        if not 0 < self.program_runner_timeout_seconds <= 60:
+            raise ValueError(
+                "program_runner_timeout_seconds must be in (0, 60]"
             )
         if not 1_024 <= self.maximum_request_body_bytes <= 1024 * 1024:
             raise ValueError(

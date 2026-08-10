@@ -88,7 +88,7 @@ def test_workspace_distinguishes_saved_draft_from_unavailable_applied() -> None:
     assert workspace["hasUnappliedChanges"] is None
     assert workspace["applied"]["available"] is False
     assert workspace["applied"]["matchesDraft"] is None
-    assert workspace["applied"]["unavailableReason"]["restorationGates"] == ["N7"]
+    assert workspace["applied"]["unavailableReason"]["restorationGates"] == []
 
     _mutate(
         session,

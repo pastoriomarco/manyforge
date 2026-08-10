@@ -4,7 +4,8 @@
 #
 # `docs/reference/REST_API.md` is produced by
 # `scripts/regen-public-contracts.py` from
-# `create_app(ComposerState()).openapi()`; `docs/reference/HEADLESS_REST_API.md`
+# the configured schema-only Composer route superset;
+# `docs/reference/HEADLESS_REST_API.md`
 # comes from the independent H0 FastAPI route owner. Removed aggregate MCP,
 # assistant-provider, viewer, execution, and lifecycle contracts are not
 # generated.

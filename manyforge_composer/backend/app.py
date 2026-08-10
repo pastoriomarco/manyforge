@@ -41,7 +41,7 @@ _UNAVAILABLE_PAYLOAD = UnavailableResponse(
     detail=UnavailableDetail(
         code=RUNTIME_UNAVAILABLE_REASON_CODE,
         message=RUNTIME_UNAVAILABLE_MESSAGE,
-        restoration_gates=["N", "L0", "P5", "I", "R", "T"],
+        restoration_gates=["N7-a5.5", "L0", "P5", "I", "R", "T"],
     )
 ).detail.model_dump(by_alias=True)
 
@@ -158,6 +158,7 @@ def create_app(
         "/api/program/open-draft",
         "/api/program/apply",
         "/api/program/load",
+        "/api/program/runs",
         "/api/program/save",
     ):
         app.add_middleware(

@@ -87,6 +87,7 @@ def test_reduced_aggregate_has_an_explicit_retained_selector() -> None:
     assert "run_composer_frontend_build" in retained_body
     assert "run_composer_frontend_tests" in retained_body
     assert "manyforge_headless_api/process_tests/" in source
+    assert "manyforge_program_runner/tests/" in source
     assert "-p no:cacheprovider" in source
     assert "tests/test_public_contract_entrypoint_reconciliation.py" in source
     assert "tests/test_qualification_wrapper_entrypoints.py" in source
@@ -118,8 +119,9 @@ def test_direct_benchmark_entrypoint_fails_before_product_import(
         check=False,
     )
 
-    assert source.index('if __name__ == "__main__":') < source.index("import pytest")
-    assert source.index("import pytest") < source.index("from manyforge_behavior")
+    assert source.index('if __name__ == "__main__":') < source.index(
+        "from manyforge_behavior"
+    )
     assert completed.returncode == 78
     assert completed.stdout == ""
     assert completed.stderr.strip() == _BENCHMARK_UNAVAILABLE_MESSAGE
@@ -438,3 +440,4 @@ def test_deployment_package_participates_in_repository_version_guard() -> None:
         encoding="utf-8"
     )
     assert 'check "manyforge_deployment CMakeLists.txt"' in source
+    assert "manyforge_program_runner" in source

@@ -13,6 +13,7 @@ MAX_ACTIVATION_ID_BYTES = 2_048
 MAX_REASON_BYTES = 4096
 MAX_BULK_MEMBERS = 256
 MAX_SCENE_POSE_QUERY_RESOURCES = 128
+MAX_PROGRAM_RUN_REASON_BYTES = 4096
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -181,6 +182,162 @@ class ProgramApplyRequest(StrictRequest):
         if not self.program:
             raise ValueError("program must be a non-empty object")
         return self
+
+
+class ProgramRunStartRequest(CallerAttributionRequest):
+    """Start exactly the Applied Program selected by these immutable facts."""
+
+    scenario_id: Annotated[
+        str,
+        Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
+    ]
+    scenario_catalog_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    expected_applied_record_digest: Annotated[
+        str,
+        Field(pattern=SHA256_PATTERN),
+    ]
+
+
+class ProgramRunStopRequest(CallerAttributionRequest):
+    """Request Kernel-first Stop for one exact runner-owned Program run."""
+
+    program_run_id: str
+    expected_owner_epoch: str
+    reason: str | None = None
+
+    @field_validator("program_run_id", "expected_owner_epoch")
+    @classmethod
+    def validate_run_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @field_validator("reason")
+    @classmethod
+    def validate_program_stop_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value,
+            label="reason",
+            maximum_bytes=MAX_PROGRAM_RUN_REASON_BYTES,
+        )
+
+
+class ProgramModelAuditPolicy(StrictRequest):
+    """Exact retained-data policy captured before the model attempt."""
+
+    redact_argument_values: bool
+    store_full_prompts: bool
+    store_full_responses: bool
+
+
+class ProgramModelAttemptRequest(StrictRequest):
+    """Closed durable audit record emitted by the isolated Program runner."""
+
+    schema_version: Literal["manyforge.program_model_attempt.v1"]
+    model_attempt_id: str
+    program_run_id: str
+    node_instance_id: str
+    node_attempt_id: str
+    external_attempt_index: Annotated[int, Field(ge=1, le=2)]
+    assistant_projection_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    model_endpoint_alias: str
+    external_resource_alias: str
+    model_id: str
+    prompt_template_id: str
+    prompt_template_version: str
+    prompt_template_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    prompt_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    argument_digests: Annotated[
+        dict[str, Annotated[str, Field(pattern=SHA256_PATTERN)]],
+        Field(max_length=256),
+    ]
+    attachment_digest: Annotated[
+        str | None,
+        Field(pattern=SHA256_PATTERN),
+    ]
+    audit_policy: ProgramModelAuditPolicy
+    prompt_text: str | None
+    argument_values: dict[str, Any] | None
+    outcome: Literal[
+        "success",
+        "timeout",
+        "parse_error",
+        "schema_error",
+        "confidence_below_threshold",
+        "cancelled",
+        "transport_error",
+        "invalid_response",
+    ]
+    error_code: str | None
+    error_message: str
+    response_digest: Annotated[
+        str | None,
+        Field(pattern=SHA256_PATTERN),
+    ]
+    validated_output_digest: Annotated[
+        str | None,
+        Field(pattern=SHA256_PATTERN),
+    ]
+    model_version: str
+    occurred_at_ns: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+    occurred_at_wall: str
+    latency_ms: Annotated[
+        float,
+        Field(ge=0, le=3_600_000, allow_inf_nan=False),
+    ]
+    usage: dict[str, Any] | None
+    response_value: Any | None
+
+    @field_validator(
+        "model_attempt_id",
+        "program_run_id",
+        "node_instance_id",
+        "node_attempt_id",
+        "model_endpoint_alias",
+        "external_resource_alias",
+        "model_id",
+        "prompt_template_id",
+        "prompt_template_version",
+    )
+    @classmethod
+    def validate_model_attempt_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @field_validator("error_code")
+    @classmethod
+    def validate_model_attempt_error_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value,
+            label="error_code",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @field_validator("prompt_text", "error_message", "model_version", "occurred_at_wall")
+    @classmethod
+    def validate_model_attempt_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        maximum = {
+            "prompt_text": 8 * 1024 * 1024,
+            "occurred_at_wall": 128,
+        }.get(info.field_name, 4096)
+        if info.field_name == "occurred_at_wall" and not value:
+            raise ValueError("occurred_at_wall must be non-empty")
+        if unicodedata.normalize("NFC", value) != value:
+            raise ValueError(f"{info.field_name} must be NFC text")
+        if len(value.encode("utf-8")) > maximum:
+            raise ValueError(f"{info.field_name} exceeds its UTF-8 byte bound")
+        return value
 
 
 class SceneRevisionRequest(StrictRequest):

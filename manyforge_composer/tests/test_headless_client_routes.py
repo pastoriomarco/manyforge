@@ -74,6 +74,42 @@ def _scene_body(
     }
 
 
+def _program_run_status(*, state: str = "running") -> dict[str, Any]:
+    digest_a = "sha256:" + "a" * 64
+    digest_b = "sha256:" + "b" * 64
+    digest_c = "sha256:" + "c" * 64
+    return {
+        "schema_version": "manyforge.program_run_status.v1",
+        "owner_id": "program-runner.cell-a",
+        "owner_epoch": "program-runner.epoch.1",
+        "run_revision": 1,
+        "state": state,
+        "capture": {
+            "schema_version": "manyforge.program_run_capture.v1",
+            "program_run_id": "program-run.1",
+            "scenario_id": "cell-pick",
+            "scenario_catalog_revision": digest_a,
+            "program_id": "pick",
+            "program_revision": digest_b,
+            "program_binding_id": digest_c,
+            "retained_bundle_id": digest_a,
+            "graph_revision": digest_b,
+            "node_environment_digest": digest_c,
+            "owner_identities": [
+                {
+                    "owner_role": "program_runner",
+                    "owner_id": "program-runner.cell-a",
+                    "owner_epoch": "program-runner.epoch.1",
+                }
+            ],
+        },
+        "tree_status": "running",
+        "active_operation_count": 1,
+        "reason_code": None,
+        "message": "",
+    }
+
+
 @pytest.fixture
 def headless_client() -> (
     Iterator[tuple[HeadlessHttpClient, list[dict[str, Any]], dict[str, Any]]]
@@ -240,6 +276,28 @@ def headless_client() -> (
             payload = node_environment
         elif path == "/api/source-model":
             payload = source_model
+        elif path == "/api/scenarios":
+            payload = {
+                "api_version": "manyforge.scenario_catalog.v1",
+                "scenario_catalog_revision": "sha256:" + "a" * 64,
+                "scenarios": [],
+            }
+        elif path == "/api/program/runs" and request.method == "GET":
+            active_only = request.url.params.get("active_only") == "true"
+            payload = {
+                "schema_version": "manyforge.program_run_index.v1",
+                "owner_id": "program-runner.cell-a",
+                "owner_epoch": "program-runner.epoch.1",
+                "active_only": active_only,
+                "truncated": False,
+                "runs": [],
+            }
+        elif path == "/api/program/runs" and request.method == "POST":
+            payload = _program_run_status()
+        elif path == "/api/program/runs/program-run.1":
+            payload = _program_run_status()
+        elif path == "/api/program/runs/program-run.1/stop":
+            payload = _program_run_status(state="stopping")
         elif path == "/api/program/applied":
             if applied_program is None:
                 return httpx.Response(
@@ -489,6 +547,63 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
     assert alarm_request["query"] == "limit=3&ordering=attention_newest"
 
 
+def test_composer_program_routes_are_strict_stateless_forwarders(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    digest_a = "sha256:" + "a" * 64
+    start = {
+        "request_id": "request.program.1",
+        "request_owner_epoch": "composer.epoch.1",
+        "source_label": "operator_ui",
+        "correlation_id": None,
+        "scenario_id": "cell-pick",
+        "scenario_catalog_revision": digest_a,
+        "expected_applied_record_digest": "sha256:" + "b" * 64,
+    }
+    stop = {
+        "request_id": "request.program.2",
+        "request_owner_epoch": "composer.epoch.1",
+        "source_label": "operator_ui",
+        "correlation_id": None,
+        "program_run_id": "program-run.1",
+        "expected_owner_epoch": "program-runner.epoch.1",
+        "reason": "operator stop",
+    }
+
+    with _composer(client) as composer:
+        assert composer.get("/api/scenarios").status_code == 200
+        assert composer.get(
+            "/api/program/runs?active_only=true&limit=1"
+        ).json()["runs"] == []
+        started = composer.post("/api/program/runs", json=start)
+        read = composer.get("/api/program/runs/program-run.1")
+        stopped = composer.post(
+            "/api/program/runs/program-run.1/stop",
+            json=stop,
+        )
+        mismatch = composer.post(
+            "/api/program/runs/another-run/stop",
+            json=stop,
+        )
+
+    assert started.status_code == 200
+    assert read.json()["capture"]["program_run_id"] == "program-run.1"
+    assert stopped.json()["state"] == "stopping"
+    assert mismatch.status_code == 400
+    forwarded = [
+        request
+        for request in requests
+        if request["path"].startswith("/api/program/runs")
+    ]
+    assert [request["method"] for request in forwarded] == [
+        "GET",
+        "POST",
+        "GET",
+        "POST",
+    ]
+
+
 def test_composer_forwards_only_strict_attributed_alarm_intent(
     headless_client,
 ) -> None:
@@ -736,6 +851,72 @@ def test_program_scene_and_viewer_draft_edits_have_no_runtime_effect(
 
     assert not any(
         request["path"] == "/api/scene/transactions" for request in requests
+    )
+
+
+def test_composer_keeps_draft_and_save_independent_of_an_active_run(
+    headless_client,
+    tmp_path: Path,
+) -> None:
+    delegate, _requests, _node_environment = headless_client
+
+    class ActiveRunnerClient:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(delegate, name)
+
+        def program_runs(
+            self,
+            *,
+            active_only: bool,
+            limit: int,
+        ) -> dict[str, Any]:
+            assert active_only is True
+            assert limit == 1
+            return {
+                "schema_version": "manyforge.program_run_index.v1",
+                "owner_id": "program-runner.cell-a",
+                "owner_epoch": "program-runner.epoch.1",
+                "active_only": True,
+                "truncated": False,
+                "runs": [_program_run_status()],
+            }
+
+    program_path = tmp_path / "active.program.yaml"
+    program_path.write_bytes(_PROGRAM_PATH.read_bytes())
+    state = ComposerState.from_paths(
+        program_path=str(program_path),
+        allowed_fs_roots=[str(tmp_path)],
+        headless_client=ActiveRunnerClient(),  # type: ignore[arg-type]
+    )
+    snapshot = state.draft_session.snapshot()
+    body = {
+        "draftId": snapshot["draft_id"],
+        "expectedDraftRevision": snapshot["draft_revision"],
+    }
+    client = TestClient(
+        create_app(
+            state,
+            security=SecurityConfig(
+                allowed_fs_roots=[str(tmp_path)],
+            ),
+        )
+    )
+
+    with client:
+        saved = client.post("/api/program/save", json=body)
+        mutated = client.post(
+            "/api/program/draft/mutations",
+            json={
+                **body,
+                "mutation": "program_draft_upsert_parameters",
+                "arguments": {"parameters": []},
+            },
+        )
+
+    assert saved.status_code == 200, saved.text
+    assert mutated.status_code == 200, mutated.text
+    assert state.draft_session.snapshot()["draft_revision"] == (
+        snapshot["draft_revision"] + 1
     )
 
 

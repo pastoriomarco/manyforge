@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import quote
 
 import httpx
 
@@ -333,11 +334,81 @@ class HeadlessHttpClient:
     def scenarios(self) -> dict[str, Any]:
         return self.request("GET", "/api/scenarios")
 
+    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
+        if (
+            not isinstance(scenario_id, str)
+            or not scenario_id
+            or len(scenario_id.encode("utf-8")) > 128
+        ):
+            raise ValueError("scenario_id is invalid")
+        return self.request(
+            "GET",
+            f"/api/scenarios/{quote(scenario_id, safe='')}/program-selection",
+        )
+
     def program_applied(self) -> dict[str, Any]:
         return self.request("GET", "/api/program/applied")
 
     def program_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/program/apply", body=body)
+
+    def commit_program_model_attempt(
+        self,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/api/program/model-attempts",
+            body=record,
+        )
+
+    @staticmethod
+    def _program_run_path(program_run_id: str) -> str:
+        if (
+            not isinstance(program_run_id, str)
+            or not program_run_id
+            or len(program_run_id.encode("utf-8")) > 256
+            or "/" in program_run_id
+            or ".." in program_run_id
+        ):
+            raise ValueError("program_run_id is invalid")
+        return f"/api/program/runs/{quote(program_run_id, safe='')}"
+
+    def program_runs(
+        self,
+        *,
+        active_only: bool = False,
+        limit: int = 128,
+    ) -> dict[str, Any]:
+        if type(active_only) is not bool:
+            raise ValueError("active_only must be boolean")
+        if type(limit) is not int or not 1 <= limit <= 4_096:
+            raise ValueError("Program-run index limit is outside its bound")
+        return self.request(
+            "GET",
+            "/api/program/runs",
+            params=(
+                ("active_only", "true" if active_only else "false"),
+                ("limit", limit),
+            ),
+        )
+
+    def program_run_start(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/program/runs", body=body)
+
+    def program_run(self, program_run_id: str) -> dict[str, Any]:
+        return self.request("GET", self._program_run_path(program_run_id))
+
+    def program_run_stop(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            f"{self._program_run_path(program_run_id)}/stop",
+            body=body,
+        )
 
     def viewer_model_urdf(self) -> ViewerModelAsset:
         asset = self._request_viewer_asset(

@@ -348,7 +348,8 @@ function ProgramSceneEditor({
         </>
       )}
       <p className="scene-contract-note">
-        Save persists this Draft. Apply, Revert-to-Saved, and Discard-to-Applied remain unavailable until N7.
+        Save persists this Draft. Runtime Apply, Revert-to-Saved, and
+        Discard-to-Applied remain unavailable at their named scene-workflow gate.
       </p>
     </div>
   );

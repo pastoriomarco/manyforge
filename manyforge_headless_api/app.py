@@ -20,6 +20,9 @@ from .models import (
     HistorianReconcileRequest,
     ManagerApplyRequest,
     ProgramApplyRequest,
+    ProgramModelAttemptRequest,
+    ProgramRunStartRequest,
+    ProgramRunStopRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -33,10 +36,12 @@ from .native import (
     HeadlessApiConfig,
     HeadlessApiError,
     MAX_PROGRAM_APPLY_REQUEST_BYTES,
+    MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
     NativeHeadlessCore,
     ViewerModelAsset,
 )
 from .service import HeadlessService, TrustedAttribution
+from .program_runner_client import ProgramRunnerHttpClient
 
 
 _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
@@ -66,10 +71,14 @@ class RequestBodyLimitMiddleware:
         *,
         maximum_bytes: int,
         path_maximum_bytes: dict[str, int] | None = None,
+        error_code: str = "headless_request_body_oversized",
+        error_message: str = "request body exceeds the configured byte bound",
     ) -> None:
         self.app = app
         self.maximum_bytes = maximum_bytes
         self.path_maximum_bytes = path_maximum_bytes or {}
+        self.error_code = error_code
+        self.error_message = error_message
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -123,14 +132,13 @@ class RequestBodyLimitMiddleware:
 
         await self.app(scope, replay_receive, send)
 
-    @staticmethod
-    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+    async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
         response = JSONResponse(
             status_code=413,
             content={
                 "detail": {
-                    "code": "headless_request_body_oversized",
-                    "message": "request body exceeds the configured byte bound",
+                    "code": self.error_code,
+                    "message": self.error_message,
                 }
             },
         )
@@ -159,6 +167,8 @@ def _error_status(code: str) -> int:
         "scenario_catalog_projection_invalid",
         "program_apply_response_invalid",
         "program_applied_selection_invalid",
+        "program_runner_response_invalid",
+        "scenario_program_selection_invalid",
         "viewer_model_asset_invalid",
         "assistant_mode_projection_invalid",
     }:
@@ -174,6 +184,8 @@ def _error_status(code: str) -> int:
         "object_already_exists",
         "program_apply_deployment_not_active",
         "scene_projection_transition_in_progress",
+        "program_run_admission_failed",
+        "program_run_already_active",
     }:
         return 409
     if (
@@ -184,6 +196,9 @@ def _error_status(code: str) -> int:
             "kernel_owner_unavailable",
             "operator_alarm_state_unavailable",
             "program_applied_selection_not_active",
+            "program_runner_unavailable",
+            "program_run_request_ledger_full",
+            "program_run_scheduling_failed",
             "request_ledger_full",
             "scene_projection_commit_uncertain",
         }
@@ -238,6 +253,7 @@ def create_app(
         raise ValueError("provide exactly one of config or service")
     owns_core = service is None
     event_pump: ExecutionEventPump | None = None
+    program_runner_client: ProgramRunnerHttpClient | None = None
     if service is None:
         assert config is not None
         core = NativeHeadlessCore(config)
@@ -249,7 +265,17 @@ def create_app(
             config.execution_state_root,
             timeout_seconds=config.execution_timeout_seconds,
         )
-        service = HeadlessService(core, manager, execution)
+        if config.program_runner_url is not None:
+            program_runner_client = ProgramRunnerHttpClient(
+                config.program_runner_url,
+                timeout_seconds=config.program_runner_timeout_seconds,
+            )
+        service = HeadlessService(
+            core,
+            manager,
+            execution,
+            program_runner=program_runner_client,
+        )
         event_execution = ExecutionCommandClient(
             config.execution_state_root,
             timeout_seconds=min(config.execution_timeout_seconds, 1.0),
@@ -273,7 +299,11 @@ def create_app(
                     if event_pump is not None:
                         event_pump.shutdown()
                 finally:
-                    service.core.shutdown()
+                    try:
+                        if program_runner_client is not None:
+                            program_runner_client.close()
+                    finally:
+                        service.core.shutdown()
 
     app = FastAPI(
         title="ManyForge Headless Runtime API",
@@ -288,6 +318,7 @@ def create_app(
         maximum_bytes=maximum_body,
         path_maximum_bytes={
             "/api/program/apply": MAX_PROGRAM_APPLY_REQUEST_BYTES,
+            "/api/program/model-attempts": MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
         },
     )
 
@@ -348,6 +379,15 @@ def create_app(
     def scenarios() -> dict[str, Any]:
         return service.scenarios()
 
+    @app.get("/api/scenarios/{scenario_id}/program-selection")
+    def scenario_program_selection(
+        scenario_id: Annotated[
+            str,
+            Path(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
+        ],
+    ) -> dict[str, Any]:
+        return service.scenario_program_selection(scenario_id)
+
     @app.get("/api/program/applied")
     def program_applied() -> dict[str, Any]:
         return service.program_applied()
@@ -365,6 +405,41 @@ def create_app(
             status_code=200 if status == "applied" else 202,
             content=response,
         )
+
+    @app.post("/api/program/model-attempts")
+    def program_model_attempt(
+        request: ProgramModelAttemptRequest,
+    ) -> dict[str, Any]:
+        return service.program_model_attempt(request)
+
+    @app.get("/api/program/runs")
+    def program_runs(
+        active_only: bool = False,
+        limit: Annotated[int, Query(ge=1, le=4_096)] = 128,
+    ) -> dict[str, Any]:
+        return service.program_runs(active_only=active_only, limit=limit)
+
+    @app.post("/api/program/runs")
+    def program_run_start(request: ProgramRunStartRequest) -> dict[str, Any]:
+        return service.program_run_start(request)
+
+    @app.get("/api/program/runs/{program_run_id}")
+    def program_run_read(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return service.program_run_read(program_run_id)
+
+    @app.post("/api/program/runs/{program_run_id}/stop")
+    def program_run_stop(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramRunStopRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise HeadlessApiError(
+                "program_run_path_invalid",
+                "Program-run identity in the path and request body must match",
+            )
+        return service.program_run_stop(program_run_id, request)
 
     def viewer_asset_response(asset: ViewerModelAsset) -> Response:
         cache_control = (

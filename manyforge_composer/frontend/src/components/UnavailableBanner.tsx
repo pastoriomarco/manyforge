@@ -6,7 +6,7 @@ interface UnavailableBannerProps {
   onRetry: () => void;
 }
 
-const FALLBACK_GATES = ['N', 'L0', 'P5', 'I', 'R', 'T'];
+const FALLBACK_GATES = ['N7-a5.5', 'L0', 'P5', 'I', 'R', 'T'];
 
 export function UnavailableBanner({ health, onRetry }: UnavailableBannerProps) {
   const headlessConnected = health.status === 'ready'
@@ -35,27 +35,27 @@ export function UnavailableBanner({ health, onRetry }: UnavailableBannerProps) {
         </h1>
         <p>
           {headlessConnected
-            ? 'Manager, scene, alarm, and history projections no longer depend on Composer. Program execution and motion remain unavailable until their named gates.'
+            ? 'Manager, scene, alarm, history, addressed control, and the bounded Program Run surface no longer depend on Composer. Complete product readiness remains gated.'
             : availability?.message ?? (
             'Composer currently exposes authored structure only. It cannot run a '
             + 'program, command a robot, edit a live scene, or report runtime state.'
             )}
         </p>
         <p className="structural-scope">
-          Available here: immutable v2 catalog inspection, sandboxed artifact-path
-          browsing, and an active retained-neutral URDF view. Nothing on this page asserts
-          live or operational validity.
+          {headlessConnected
+            ? 'Each runtime pane reports strict owner-issued facts. Missing owners remain unknown; this page does not infer robot readiness or a complete product lane.'
+            : 'Available here: immutable v2 catalog inspection, sandboxed artifact-path browsing, and an active retained-neutral URDF view. Nothing on this page asserts live or operational validity.'}
         </p>
       </div>
       <div className="availability-meta">
         <span className="status-pill status-pill-danger">
           {headlessConnected
-            ? 'headless_h0_active'
+            ? 'headless_client_active'
             : availability?.code ?? 'runtime_unavailable'}
         </span>
         <span className="gate-list">
           {headlessConnected
-            ? 'Later capabilities restore at N · L0 · P5 · I · R · T'
+            ? 'Complete inputs at N7-a5.5 · then L0 · P5 · I · R · T'
             : gates.length > 0
               ? `Restore at ${gates.join(' · ')}`
               : 'Check headless API connectivity and configuration'}

@@ -2,8 +2,8 @@
 
 > **Current `dev` status:** this document still describes the last complete
 > three-lane runtime baseline. The composable-cell destructive cutover has
-> removed the legacy scene owner and RoboPlan native/ROS factories; program
-> execution and all three complete lanes are intentionally unavailable. The new Core,
+> removed the legacy scene owner and RoboPlan native/ROS factories; all three
+> complete lanes remain intentionally unavailable. The new Core,
 > retained-product, canonical-empty scene-owner, and Manager foundations now
 > include the I5/H0 Manager daemon, independent headless runtime/scene/alarm/
 > historian owners, public API/CLI, and thin Composer/assistant read clients.
@@ -13,15 +13,20 @@
 > source-local four-mode Robot Control preview/approval/progress/operation-Stop
 > workflow over that same owner: joint goals, pose goals, Cartesian paths, and
 > gripper commands. These bounded slices are not a complete product lane. Robot
-> readiness, complete lifecycle/controls, live scene/manipulation, provider
-> effects, and general Program execution remain unavailable until their later
+> readiness, complete lifecycle/controls, dynamic live scene/viewer behavior,
+> and unjoined provider effects remain unavailable until their later
 > gates. N6-c3 separately restores Composer-owned strict Program Draft/Saved
 > authoring and bounded artifact persistence. N6-c4 adds source-local
 > scene/viewer authoring and one exact owner-routed current-pose Commit without
 > dynamic viewer truth. N6-c5 adds strict bounded direct/`nemoclaw` mediation,
 > Draft-only callbacks, and operator conversation/reconciliation without model
-> or runtime authority. Applied identity, product launch, public MCP, external
-> agent loops, and general Program execution remain unavailable.
+> or runtime authority. N7-a5.1-a5.4 add exact Program admission and Applied
+> identity, the captured native motion/gripper/scene/model join, fixed-pool
+> ticking, an independent Program-runner process, and strict Headless/Composer
+> scenario, Run/status, and explicit Program Stop clients. The currently
+> admitted product remains limited to the joined nodes and one active Program;
+> complete inputs, repeated-instance closure, product launch, public MCP, and
+> external agent loops remain unavailable.
 > Unless a section explicitly identifies a retained foundation or target
 > design, present-tense ownership and flow descriptions below refer to the
 > captured three-lane baseline.
@@ -71,12 +76,13 @@ ______________________________________________________________________
 | `manyforge_deployment`                    | C++20                 | ROS-free, non-real-time composable-cell artifact decoding, qualified schema normalization, staged graph content identity, and compiler substrate. It is not a Kernel dependency.                    |
 | `manyforge_component_manager`             | C++20                 | Durable Apply, active retained-graph reconciliation, runtime-unit convergence, and explicit shutdown. The I5 daemon is its sole process owner and publishes immutable snapshots.                    |
 | `manyforge_headless`                      | C++20 + pybind11      | I5/H0 runtime/scene source aggregation, scene-initialization lifetime, Alarm Lifecycle Owner, asynchronous historian, verified NodeEnvironment projection, and Manager/scene publication adapters. |
-| `manyforge_headless_api`                  | Python/FastAPI        | Bounded public HTTP/CLI projection and attributed alarm/Manager intents over the C++ owners. It does not own runtime, scene, alarm conditions, or robot readiness.                                   |
+| `manyforge_headless_api`                  | Python/FastAPI        | Bounded public HTTP/CLI projection and attributed alarm/Manager/Program intents over the owners. It does not own runtime, Program-run, scene, alarm conditions, or robot readiness.                  |
+| `manyforge_program_runner`                | Python/FastAPI        | Independently restartable Program orchestration owner: exact Applied capture, tree construction/ticking, bounded status/replay, and explicit Program Stop over focused owner clients.                |
 | `manyforge_core/python`                   | pybind11              | Bindings exposing the kernel to Python (poll-based; no C++→Python callbacks).                                                                                                                       |
 | `manyforge_collision`                     | C++20                 | Planner-neutral collision-world/query implementation behind ManyForge collision ports.                                                                                                              |
 | `manyforge_roboplan`                      | C++ + pybind11        | Primary planning/projection adapter (RRT + TOPP-RA), native execution, and native kernel composition.                                                                                               |
 | `manyforge_ros2_control_execution`        | C++20/ROS 2           | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, isolated ROS scene projection, and optional exact controller/lifecycle dispatch admission.                |
-| `manyforge_behavior`                      | Python                | Behavior-tree runner, node catalog, program/deployment loader, cycle orchestration, one versioned recovery offer, and Robot Model Authority.                                                        |
+| `manyforge_behavior`                      | Python                | Node catalog/environment plus Program validation, tree, admission, scheduling, and focused client mechanisms hosted by the independent runner; it does not own robot effects.                        |
 | `manyforge_composer`                      | FastAPI + React       | Structural/operator shell, revision-fenced strict Program Draft/Saved authoring, thin runtime projections, and a thin assistant-bridge operator client. Runtime/catalog/provider authority remains outside Composer. |
 | `manyforge_ros` / `manyforge_ros_bringup` | C++/Python            | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                        |
 | `manyforge_assistant_bridge`              | Python                | Bounded direct/`nemoclaw` model mediation, strict active-mode enforcement, Draft/read callback routing, cancellation/reconciliation, conversation history, and redacted audit. It owns no runtime effects or catalog truth. |
@@ -263,13 +269,12 @@ functions; external plant safety remains independent.
   (e.g. a gripper finger touching the object it is about to grasp) is allowed
   only through a named contact policy — never by relaxing general collision
   checking.
-- **The behavior layer owns program orchestration and run identity.** It
-  decides tree structure and node sequencing, and it mints the identifiers
-  that correlate an operator's Run press through every downstream event (see
-  Observability). The kernel attaches those identifiers; it never invents them.
-  Its recovery coordinator also projects one immutable, versioned recovery
-  offer from exact kernel/cycle/fault facts. UI, REST, and assistants consume
-  that offer rather than deriving actions from errors or state labels.
+- **The independent Program runner owns orchestration and run identity.** It
+  hosts the validated Behavior tree/node mechanisms, captures one immutable
+  Program/Binding selection, sequences nodes, and mints the `ProgramRunId` that
+  correlates downstream operations. The kernel consumes that attribution; it
+  never invents the Program run. Recovery remains an owner-issued Headless/
+  Kernel projection, not a tree, UI, REST, or assistant inference.
 - **The Robot Model Authority owns model interpretation.** URDF/SRDF plus
   package paths are interpreted once, into validated metadata and internal
   views — not re-parsed ad hoc per consumer.
@@ -277,10 +282,11 @@ functions; external plant safety remains independent.
   and future adapters report command acceptance, feedback, settling, stop, and
   terminal facts through the same port. A viewer pose or behavior tick is not
   controller feedback.
-- **Composer owns presentation and operator-alarm lifecycle, not motion
-  authority.** Typed adapters set/clear catalogued conditions; one manager
-  tracks active/returned and acknowledged/unacknowledged states. Alarm
-  acknowledgement records awareness only. It cannot clear a condition, clear a
+- **Headless owns operator-alarm lifecycle; Composer owns presentation only.**
+  Typed source adapters set/clear catalogued conditions and the independent
+  Headless alarm owner tracks active/returned and acknowledged/unacknowledged
+  states. Composer projects those facts and submits attributed acknowledgement.
+  Acknowledgement records awareness only: it cannot clear a condition, clear a
   kernel latch, consume a recovery offer, reset, or move the robot.
 
 This is why the kernel is ROS-free: the governance core must not depend on any

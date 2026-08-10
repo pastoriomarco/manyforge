@@ -126,12 +126,18 @@ def _wait_provider_alarm(client: TestClient) -> tuple[dict, dict]:
     while time.monotonic() < deadline:
         snapshot = client.get("/api/execution/alarms").json()
         for alarm in snapshot.get("alarms", []):
-            if alarm.get("definition_id") == (
-                "manyforge.runtime.provider_unavailable"
+            if (
+                alarm.get("definition_id")
+                == "manyforge.runtime.provider_unavailable"
+                and alarm.get("details", {}).get("unavailable_sections")
+                == ["manager", "logical_scene", "scene_runtime"]
             ):
                 return snapshot, alarm
         time.sleep(0.01)
-    raise RuntimeError(f"provider alarm did not activate: {snapshot}")
+    raise RuntimeError(
+        "provider alarm did not settle on the complete stopped-Manager "
+        f"source set: {snapshot}"
+    )
 
 
 def test_native_http_owner_works_without_composer_and_fences_replay(

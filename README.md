@@ -34,9 +34,14 @@ checkpoints.
 > truth. N6-c5 adds the strict bounded direct/`nemoclaw` assistant bridge,
 > Draft-only callbacks, and operator conversation/reconciliation surface; its
 > live model/launcher lane and external OpenClaw/Hermes adapters remain
-> unqualified. Composer Program-tree execution and all three product lanes
-> remain intentionally unavailable; the
-> full native lane closes at I6/N, and Isaac/real
+> unqualified. N7-a5.1-a5.4 now add exact Program admission and Apply, the
+> captured native motion/gripper/scene/model join, a fixed-pool Program tick
+> host, an independently restartable Program-runner process, and strict
+> Headless/Composer scenario, Applied, Run/status, and one-click Stop clients.
+> Composer remains observational, and closing any client never implies Stop.
+> The complete seven-input/repeated-instance closure and all three complete
+> product lanes remain intentionally unavailable; the remaining native lane
+> closes in I6/N, and Isaac/real
 > operation at I9/I10. The launch recipes below describe the last qualified
 > baseline; they are not valid bring-up instructions for the current `dev`
 > branch.
@@ -61,8 +66,9 @@ checkpoints.
 
 The public structural-shell and historical operator documentation is
 self-contained in this repository. Private maintainer specifications are not
-needed to inspect those surfaces; no product lane is currently available to
-install, operate, or integrate.
+needed to inspect those surfaces; no complete product lane is currently
+available to install or operate, while bounded APIs remain integration surfaces
+only at their named checkpoints.
 
 ## Disclaimer
 
@@ -102,8 +108,10 @@ docker compose run --rm dev bash
 
 This provides catalog, sandboxed files, deployment/URDF inspection, health,
 the Composer-owned strict Program Draft/Saved workspace, and retained
-observation/manual-control clients. Program Apply/execution remains
-unavailable. `scripts/launch.sh` and runtime-specific suite selectors return
+observation/manual-control clients. The standalone structural shell does not
+configure Headless or the Program runner; its Program Apply/Run clients become
+available only when those independent processes are supplied. `scripts/launch.sh`
+and runtime-specific suite selectors return
 `composable_cell_runtime_unavailable` before product-lane effects.
 
 **Restoring or designing the new robot-import workflow?** See
@@ -194,6 +202,9 @@ manyforge_persistence/   Shared ROS-free mechanical durable-storage safety primi
 manyforge_scene/         Canonical-empty and bounded runtime-only Apply logical-scene owner
 manyforge_deployment/    ROS-free composable-cell codec, qualification, final C++ trust boundary, and retention substrate
 manyforge_component_manager/  ROS-free I4 owner for the bounded M0 Apply/runtime fixture
+manyforge_headless/      C++ Manager/scene/alarm/history and retained-product projection owners
+manyforge_headless_api/  Bounded FastAPI/CLI projection and attributed intent transport
+manyforge_program_runner/ Independent Program capture/tree/tick/status/Stop orchestration process
 manyforge_collision/     C++ planner-neutral collision query implementation
 manyforge_roboplan/      Retained planning-model staging and bounded N3 native execution host
 manyforge_ros2_control_execution/  Retained C++ ROS execution/admission library; no current product lane
@@ -201,8 +212,8 @@ manyforge_robot_lifecycle/  Retained ROS-independent lifecycle core; no current 
 manyforge_robot_lifecycle_msgs/  ROS IDL for same-host lifecycle admission transport
 manyforge_xarm_adapter/  Experimental xArm model/binding/observation inputs; no live lane
 manyforge_xarm_control/  Experimental xArm lifecycle adapter; no live provider wiring
-manyforge_behavior/      Build-owned v2 node environment and thin N3 joint-goal caller
-manyforge_composer/      Structural FastAPI/React shell and thin H0/N6 authoring/operator clients
+manyforge_behavior/      Build-owned v2 node environment and Program orchestration/client mechanisms
+manyforge_composer/      Structural FastAPI/React shell and thin H0/N6/N7 authoring/operator clients
 manyforge_assistant_bridge/ Strict bounded direct/nemoclaw provider mediation; no runtime ownership
 manyforge_ros/           Retained pure contracts and explicit unavailable runtime boundaries
 tests/                   Cutover and package contract tests
@@ -213,31 +224,30 @@ docs/                    Architecture reference
 ## Target architecture
 
 ```
-Program YAML --> Behavior Runner --> ExecutionKernel (C++) --> Planner / execution adapters
+Program YAML --> Program Runner --> ExecutionKernel (C++) --> Planner / execution adapters
                       |                    |                         |
-                 Node Catalog       validation + stop       RoboPlan / ros2_control
-                 recovery offer     collision authority              |
-                                            |                  robot / Isaac
-                                   immutable events/facts
+            Behavior tree/catalog   validation + stop       RoboPlan / ros2_control
+                      |             collision authority              |
+                      |                     |                  robot / Isaac
+                      +---------- Headless facts/intents ------------+
                                             |
                                      Composer / viewer
 ```
 
 This diagram and the ownership statements below describe the target runtime,
-not a currently connected end-to-end product. The kernel owns terminal and
-stop authority; ManyForge's collision layer owns
-collision admission; the behavior layer owns orchestration, run identity,
-and the one versioned recovery offer. Composer owns authoring, presentation,
-the non-safety-rated condition-backed alarm manager, and a bounded observer
-data plane—not motion authority. For the full component map, deployment lanes, scene
+not a complete supported product lane. The kernel owns terminal and Stop
+authority; ManyForge's collision layer owns collision admission; the
+independent Program runner hosts Behavior orchestration and run identity;
+Headless owners publish runtime, scene, alarm, and history facts. Composer owns
+authoring and presentation only—not motion, alarm, scene, or runtime authority.
+For the full component map, deployment lanes, scene
 initialization, recovery, and observability model, see
 [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md).
 
 - **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
 - **manyforge_roboplan** provides retained planning-model staging and the
-  selected native joint-goal execution/preview host and adapter. Broader
-  manual control, scene,
-  manipulation, and complete product-lane operation remain unavailable.
+  selected native motion/gripper/pick-place execution and preview host and
+  adapter. Complete product-lane operation remains unavailable.
 - Python code calls C++ through pybind11 bindings -- no duplicate state machines.
 - The Docker container includes all dependencies (Pinocchio, RoboPlan, pybind11).
 

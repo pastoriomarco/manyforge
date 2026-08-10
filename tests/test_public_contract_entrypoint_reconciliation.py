@@ -148,6 +148,25 @@ def test_explicit_headless_rest_generator_routes_write_and_check(
     assert calls == ["headless-rest"] * 3
 
 
+def test_tracked_public_contracts_include_the_program_client_boundary() -> None:
+    composer = (
+        _REPO_ROOT / "docs" / "reference" / "REST_API.md"
+    ).read_text(encoding="utf-8")
+    headless = (
+        _REPO_ROOT / "docs" / "reference" / "HEADLESS_REST_API.md"
+    ).read_text(encoding="utf-8")
+
+    for contract in (composer, headless):
+        assert "`GET` | `/api/program/runs`" in contract
+        assert "`POST` | `/api/program/runs`" in contract
+        assert (
+            "`POST` | `/api/program/runs/{program_run_id}/stop`"
+            in contract
+        )
+    assert "without owning their state" in composer
+    assert "never interpreted as idle" in headless
+
+
 def _write_recording_command(path: Path) -> None:
     path.write_text(
         "#!/usr/bin/env bash\n"

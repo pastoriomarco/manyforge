@@ -4,6 +4,8 @@ export type ProgramWorkspaceActionName =
   | 'refresh'
   | 'mutate'
   | 'open_draft'
+  | 'apply'
+  | 'load'
   | 'save'
   | 'save_as';
 

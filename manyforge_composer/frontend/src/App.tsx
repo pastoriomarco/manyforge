@@ -5,12 +5,14 @@ import { ArtifactBrowser } from './components/ArtifactBrowser';
 import { AssistantOverlay } from './components/AssistantOverlay';
 import { CatalogPanel } from './components/CatalogPanel';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
+import { ProgramRuntimePanel } from './components/ProgramRuntimePanel';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
 import { UnavailableBanner } from './components/UnavailableBanner';
 import { HeadlessRuntimeSurfacesView } from './components/HeadlessRuntimeSurfaces';
 import { RobotControlPanelView } from './components/RobotControlPanel';
 import { useHeadlessState } from './hooks/useHeadlessState';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
+import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useRobotControl } from './hooks/useRobotControl';
 import { useStructuralResource } from './state/structuralResource';
 import type { ArtifactKind, FileBrowserEntry } from './types/api';
@@ -42,6 +44,7 @@ export default function App() {
     && health.data.components.assistant_bridge === 'configured';
   const headlessState = useHeadlessState(headlessEnabled);
   const programController = useProgramWorkspace();
+  const programRuntime = useProgramRuntime(headlessEnabled);
   const robotControl = useRobotControl(headlessEnabled);
   const handleArtifactSelection = useCallback((
     kind: ArtifactKind,
@@ -78,11 +81,17 @@ export default function App() {
 
       <ProgramWorkspace
         controller={programController}
+        runtime={programRuntime}
         catalog={catalog}
         environment={nodeEnvironment}
         selectedProgramPath={selectedProgramPath}
         onRetryCatalog={retryCatalog}
         onRetryEnvironment={retryNodeEnvironment}
+      />
+
+      <ProgramRuntimePanel
+        enabled={headlessEnabled}
+        controller={programRuntime}
       />
 
       <AssistantOverlay

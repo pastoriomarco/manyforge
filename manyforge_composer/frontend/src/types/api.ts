@@ -268,6 +268,94 @@ export interface ProgramWorkspaceResponse {
   hasUnappliedChanges: boolean | null;
 }
 
+export interface ScenarioCatalogEntry {
+  scenarioId: string;
+  description: string | null;
+  aliases: string[];
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  retainedBundleId: string;
+  programBindingId: string;
+  assistantMode: 'required' | 'optional' | 'forbidden';
+}
+
+export interface ScenarioCatalogResponse {
+  apiVersion: 'manyforge.scenario_catalog.v1';
+  scenarioCatalogRevision: string;
+  scenarios: ScenarioCatalogEntry[];
+}
+
+export interface AppliedProgramSelection {
+  schemaVersion: 'manyforge.applied_program_selection.v1';
+  scenarioId: string;
+  scenarioCatalogRevision: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  nodeEnvironmentDigest: string;
+  recordDigest: string;
+  sourceOwnerId: string;
+  sourceOwnerEpoch: string;
+  sourceGeneration: number;
+}
+
+export type ProgramRunStateName =
+  | 'running'
+  | 'intervention_required'
+  | 'stopping'
+  | 'finalizing'
+  | 'stopped'
+  | 'succeeded'
+  | 'failed';
+
+export interface ProgramRunOwnerIdentity {
+  ownerRole: string;
+  ownerId: string;
+  ownerEpoch: string;
+}
+
+export interface ProgramRunCapture {
+  programRunId: string;
+  scenarioId: string;
+  scenarioCatalogRevision: string;
+  programId: string;
+  programRevision: string;
+  programBindingId: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  nodeEnvironmentDigest: string;
+  ownerIdentities: ProgramRunOwnerIdentity[];
+}
+
+export interface ProgramRunStatus {
+  schemaVersion: 'manyforge.program_run_status.v1';
+  ownerId: string;
+  ownerEpoch: string;
+  runRevision: number;
+  state: ProgramRunStateName;
+  capture: ProgramRunCapture;
+  treeStatus: 'invalid' | 'running' | 'success' | 'failure';
+  activeOperationCount: number | null;
+  reasonCode: string | null;
+  message: string;
+}
+
+export interface ProgramRunIndex {
+  schemaVersion: 'manyforge.program_run_index.v1';
+  ownerId: string;
+  ownerEpoch: string;
+  activeOnly: boolean;
+  truncated: boolean;
+  runs: ProgramRunStatus[];
+}
+
+export interface ProgramWorkspaceTransitionResponse {
+  status: 'applied' | 'loaded' | 'pending_deployment';
+  workspace: ProgramWorkspaceResponse;
+}
+
 export interface NodeImplementationAvailability {
   nodeId: string;
   engineId: string;

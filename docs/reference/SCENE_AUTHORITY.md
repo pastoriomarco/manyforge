@@ -1,11 +1,12 @@
 # Live Scene Authority Contract
 
 > **Current `dev` status:** this reference describes the last qualified
-> baseline. The legacy Core scene owner and its outward clients have been
-> destructively removed. Only the sealed canonical-empty bootstrap path in
-> `manyforge_scene` is currently implemented; live scene edits, queries,
-> projection leases, and scene-backed execution remain unavailable until their
-> composable-cell restoration gates.
+> baseline. The legacy Core scene owner and its outward clients were
+> destructively removed. The replacement now includes the sealed bootstrap,
+> authoritative scene projection/transaction owner, exact authored-scene
+> initialization, and joined Program scene leaves. Dynamic viewer truth,
+> external pose/occupancy sources, projection leases, and complete operator
+> live-scene behavior remain unavailable until their composable-cell gates.
 > The declared writers and wire behavior below describe the captured owner;
 > they are future acceptance requirements, not currently registered routes or
 > running processes.

@@ -3,13 +3,13 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-08-09 21:57:42 UTC
+  Last regenerated: 2026-08-10 09:36:36 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
 # Headless Runtime REST API
 
-This is the independent headless projection over Manager, logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the selected addressed execution owner. Reads return owner-issued facts. Alarm acknowledgement, Manager Apply, execution submission, and no-motion preview are attributed intents; the API never owns or reduces execution state. Preview cannot dispatch, and approval uses the ordinary operation endpoint. The bounded I6 execution path does not by itself make Manager Apply's separate Kernel fence operational. No condition mutation endpoint exists. `/api/health` reports only `headless_projection_ready`; robot readiness has no H0 owner and is explicitly unavailable. The alarm page defaults to 32 records and is bounded at 128, history defaults to and is bounded at 32 records, request bodies are bounded at 1 MiB, and native/HTTP responses are bounded at 64 MiB.
+This is the independent headless projection over Manager, logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the selected addressed execution owner and independent Program runner. Reads return owner-issued facts. Alarm acknowledgement, Manager and Program Apply, execution submission, no-motion preview, Program Run, and explicit Program Stop are attributed intents; the API never owns or reduces execution or Program-run state. Preview cannot dispatch, and approval uses the ordinary operation endpoint. An unconfigured or lost Program runner is reported as unavailable and never interpreted as idle. No condition mutation endpoint exists. `/api/health` reports only `headless_projection_ready`; robot readiness has no H0 owner and is explicitly unavailable. The alarm page defaults to 32 records and is bounded at 128, history defaults to and is bounded at 32 records, ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, model-attempt audit at 256 KiB, native/HTTP responses at 64 MiB, and private Program-runner responses at 32 MiB.
 
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
@@ -51,8 +51,18 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/manager/graph` |  | Manager Graph |
 | `GET` | `/api/manager/status` |  | Manager Status |
 | `GET` | `/api/node-environment` |  | Node Environment |
+| `GET` | `/api/program/applied` |  | Program Applied |
+| `POST` | `/api/program/apply` |  | Program Apply |
+| `POST` | `/api/program/model-attempts` |  | Program Model Attempt |
+| `GET` | `/api/program/runs` |  | Program Runs |
+| `POST` | `/api/program/runs` |  | Program Run Start |
+| `GET` | `/api/program/runs/{program_run_id}` |  | Program Run Read |
+| `POST` | `/api/program/runs/{program_run_id}/stop` |  | Program Run Stop |
 | `GET` | `/api/runtime` |  | Runtime |
+| `GET` | `/api/scenarios` |  | Scenarios |
+| `GET` | `/api/scenarios/{scenario_id}/program-selection` |  | Scenario Program Selection |
 | `GET` | `/api/scene` |  | Scene |
+| `POST` | `/api/scene/resource-poses/query` |  | Scene Resource Poses |
 | `POST` | `/api/scene/transactions` |  | Scene Commit |
 | `GET` | `/api/source-model` |  | Source Model |
 | `GET` | `/api/viewer-model/resource` |  | Viewer Model Resource |

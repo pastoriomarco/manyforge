@@ -1,5 +1,6 @@
 import {
   parseCatalogResponse,
+  parseAppliedProgramSelection,
   parseCapabilityCommandPreviewResponse,
   parseDraftMutationResponse,
   parseFileBrowserResponse,
@@ -14,6 +15,10 @@ import {
   parseOperationObservation,
   parseOperatorAlarmSnapshot,
   parseProgramWorkspaceResponse,
+  parseProgramWorkspaceTransitionResponse,
+  parseProgramRunIndex,
+  parseProgramRunStatus,
+  parseScenarioCatalogResponse,
   parseSceneTransactionResponse,
   parseSceneUrdfManifest,
   parseSourceModelProjection,
@@ -24,6 +29,7 @@ import {
 } from './assistantParsers';
 import type {
   ArtifactKind,
+  AppliedProgramSelection,
   CatalogResponse,
   DraftFenceRequest,
   DraftMutationResponse,
@@ -32,6 +38,10 @@ import type {
   JsonValue,
   NodeEnvironmentResponse,
   ProgramWorkspaceResponse,
+  ProgramWorkspaceTransitionResponse,
+  ProgramRunIndex,
+  ProgramRunStatus,
+  ScenarioCatalogResponse,
   SceneTransactionRequest,
   SceneTransactionResponse,
   SceneUrdfManifest,
@@ -246,6 +256,94 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ ...fence, path, confirmOverwrite }),
       },
+    ),
+    apply: (
+      fence: DraftFenceRequest,
+      scenarioId: string,
+      scenarioCatalogRevision: string,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceTransitionResponse> => requestJson(
+      '/api/program/apply',
+      parseProgramWorkspaceTransitionResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...fence,
+          scenarioId,
+          scenarioCatalogRevision,
+        }),
+      },
+    ),
+    load: (
+      fence: DraftFenceRequest,
+      path: string,
+      scenarioId: string,
+      scenarioCatalogRevision: string,
+      confirmDiscard: boolean,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceTransitionResponse> => requestJson(
+      '/api/program/load',
+      parseProgramWorkspaceTransitionResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...fence,
+          path,
+          scenarioId,
+          scenarioCatalogRevision,
+          confirmDiscard,
+        }),
+      },
+    ),
+  },
+  programs: {
+    scenarios: (signal?: AbortSignal): Promise<ScenarioCatalogResponse> =>
+      requestJson('/api/scenarios', parseScenarioCatalogResponse, signal),
+    applied: (signal?: AbortSignal): Promise<AppliedProgramSelection> =>
+      requestJson('/api/program/applied', parseAppliedProgramSelection, signal),
+    runs: (
+      activeOnly = false,
+      limit = 128,
+      signal?: AbortSignal,
+    ): Promise<ProgramRunIndex> => {
+      const params = new URLSearchParams({
+        active_only: activeOnly ? 'true' : 'false',
+        limit: String(limit),
+      });
+      return requestJson(
+        `/api/program/runs?${params.toString()}`,
+        parseProgramRunIndex,
+        signal,
+      );
+    },
+    start: (
+      body: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<ProgramRunStatus> => requestJson(
+      '/api/program/runs',
+      parseProgramRunStatus,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+    read: (
+      programRunId: string,
+      signal?: AbortSignal,
+    ): Promise<ProgramRunStatus> => requestJson(
+      `/api/program/runs/${encodeURIComponent(programRunId)}`,
+      parseProgramRunStatus,
+      signal,
+    ),
+    stop: (
+      programRunId: string,
+      body: Record<string, JsonValue>,
+      signal?: AbortSignal,
+    ): Promise<ProgramRunStatus> => requestJson(
+      `/api/program/runs/${encodeURIComponent(programRunId)}/stop`,
+      parseProgramRunStatus,
+      signal,
+      { method: 'POST', body: JSON.stringify(body) },
     ),
   },
   files: {

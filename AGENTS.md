@@ -49,9 +49,14 @@
 > model requests, join native pick/place, and supply the fixed-pool Program tick
 > host, atomic context rollback, durable per-attempt model audit, and exact
 > per-run cleanup. Prepared planning/execution evidence remains private to its
-> C++ owner. This is the internal production runner join, not the public Program
-> Run/status/Stop product surface assigned to N7-a5.4 or the complete input and
-> repeated-instance closure assigned to N7-a5.5. Public Program operation,
+> C++ owner. N7-a5.4 now adds the independently restartable
+> `manyforge_program_runner` process and bounded Headless/Composer scenario,
+> Applied, Program Run/status, and one-click Program Stop surfaces. A run keeps
+> its immutable captured Program/Binding while authoring or Program-only Apply
+> prepares a later run; deployment-changing Apply remains subject to the
+> Manager's affected-busy fence. Browser, Composer, or runner loss never sends
+> an implicit Stop, and runner replacement mints a new observable owner epoch.
+> The complete seven-input and repeated-instance closure assigned to N7-a5.5,
 > lifecycle, complete product launch, dynamic scene/viewer behavior, public MCP,
 > external OpenClaw/Hermes loops, Isaac/ROS launch, and real-robot operation
 > remain explicitly unavailable. Do not run the historical recipes below or
@@ -163,9 +168,12 @@ production runner join: captured native motion/gripper/Stop, retained-frame
 resolution, authored scene and scene leaves, deterministic selection, bounded
 model requests with a concrete site transport and durable audit, native
 pick/place, fixed-pool scheduling, atomic context rollback, and per-run
-cleanup. Public Program Run/status/Stop, complete input/repeated-instance
-closure, and the frozen cumulative N7 qualification remain unavailable until
-a5.4, a5.5, and N7-b-d respectively.
+cleanup. N7-a5.4 exposes that runner as a separate process through strict
+Headless and Composer scenario/Applied/Run/status/Stop clients while keeping
+browser state observational and retaining one active Program run as the
+current product gate. Complete input/repeated-instance closure and the frozen
+cumulative N7 qualification remain unavailable until a5.5 and N7-b-d
+respectively.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
@@ -358,8 +366,9 @@ What lives where in this repo, and what it's for:
 | [`manyforge_deployment/`](manyforge_deployment/)                         | Qualified ROS-free composable-cell compiler and immutable offline retained-product boundary                                 |
 | [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ I4 Apply/runtime-convergence owner hosted by the sole-process I5 Manager daemon; product execution unavailable   |
 | [`manyforge_headless/`](manyforge_headless/)                             | C++ H0 runtime/scene aggregation, scene lifetime, alarm owner, historian, NodeEnvironment projection, and Manager daemon      |
-| [`manyforge_headless_api/`](manyforge_headless_api/)                     | Bounded FastAPI/CLI over H0 owners plus thin addressed execution/preview transport; no robot-readiness or execution authority  |
-| [`manyforge_behavior/`](manyforge_behavior/)                             | Build-owned node catalog/environment plus the thin N3 joint-goal caller; no runtime semantic ownership                        |
+| [`manyforge_headless_api/`](manyforge_headless_api/)                     | Bounded FastAPI/CLI over owners plus thin addressed execution/preview and Program-run transport; no robot-readiness or execution authority |
+| [`manyforge_program_runner/`](manyforge_program_runner/)                 | Independently restartable Program orchestration owner over focused Headless clients; no Kernel, scene, or planner authority    |
+| [`manyforge_behavior/`](manyforge_behavior/)                             | Build-owned node catalog/environment, Program tree/admission mechanisms, and thin callers; no robot/runtime effect authority   |
 | [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
 | [`manyforge_roboplan/`](manyforge_roboplan/)                             | Retained planning-model staging plus the bounded selected native execution/preview host and RoboPlan adapter                  |
 | [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | Retained C++ ROS execution/admission library; no current product-lane wiring                                                  |
@@ -367,7 +376,7 @@ What lives where in this repo, and what it's for:
 | [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                                           |
 | [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model/binding/observation inputs; no current real-robot lane                                               |
 | [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle adapter; provider wiring unavailable until I10/R                                                 |
-| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0/N6 control, authoring, scene, and assistant clients; runtime ownership unavailable |
+| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0/N6/N7 control, authoring, Program Run, scene, and assistant clients; no runtime authority |
 | [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Strict bounded direct/`nemoclaw` provider mediation over owner facts and Draft callbacks; no runtime ownership                 |
 | [`manyforge_ros/`](manyforge_ros/)                                       | Retained pure mappings/contracts plus explicit unavailable runtime entry points                                              |
 | [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Non-activatable historical assistant interaction references                                                                 |

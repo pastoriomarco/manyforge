@@ -89,6 +89,7 @@ class FakeCore:
         self.applied_program: dict[str, Any] | None = None
         self.program_target_bundle = "bundle.1"
         self.program_target_graph = "graph.1"
+        self.model_attempts: list[dict[str, Any]] = []
 
     def runtime_snapshot(self) -> dict[str, Any]:
         return {
@@ -167,6 +168,15 @@ class FakeCore:
             ],
         }
 
+    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
+        return {
+            "schema_version": "manyforge.scenario_program_selection.v2",
+            "scenario_id": scenario_id,
+            "program": _program_document(),
+            "program_binding": {},
+            "owner_identities": [],
+        }
+
     def prepare_program_apply(
         self,
         scenario_id: str,
@@ -219,6 +229,18 @@ class FakeCore:
                 "no Program has been authoritatively Applied",
             )
         return copy.deepcopy(self.applied_program)
+
+    def commit_program_model_attempt(
+        self,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.model_attempts.append(copy.deepcopy(record))
+        return {
+            "schema_version": "manyforge.program_model_attempt_commit.v1",
+            "model_attempt_id": record["model_attempt_id"],
+            "event_id": "event.1",
+            "status": "stored",
+        }
 
     def viewer_model_urdf(self) -> ViewerModelAsset:
         return ViewerModelAsset(
@@ -602,6 +624,95 @@ class FakeTrustedAdapter:
         return TrustedPrincipal("operator.7", "authenticated:test")
 
 
+def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
+    digest_a = "sha256:" + "a" * 64
+    digest_b = "sha256:" + "b" * 64
+    digest_c = "sha256:" + "c" * 64
+    return {
+        "schema_version": "manyforge.program_run_status.v1",
+        "owner_id": "program-runner.cell-a",
+        "owner_epoch": "program-runner.epoch.1",
+        "run_revision": 1,
+        "state": state,
+        "capture": {
+            "schema_version": "manyforge.program_run_capture.v1",
+            "program_run_id": "program-run.1",
+            "scenario_id": "cell-pick",
+            "scenario_catalog_revision": "sha256:" + "6" * 64,
+            "program_id": "pick",
+            "program_revision": digest_a,
+            "program_binding_id": digest_b,
+            "retained_bundle_id": digest_c,
+            "graph_revision": digest_a,
+            "node_environment_digest": digest_b,
+            "owner_identities": [
+                {
+                    "owner_role": "program_runner",
+                    "owner_id": "program-runner.cell-a",
+                    "owner_epoch": "program-runner.epoch.1",
+                }
+            ],
+        },
+        "tree_status": "running",
+        "active_operation_count": 1,
+        "reason_code": None,
+        "message": "",
+    }
+
+
+def _applied_for_program_run() -> dict[str, Any]:
+    snapshot = _program_run_snapshot()
+    capture = snapshot["capture"]
+    return {
+        "schema_version": "manyforge.applied_program_selection.v1",
+        "scenario_id": capture["scenario_id"],
+        "scenario_catalog_revision": capture["scenario_catalog_revision"],
+        "program_id": capture["program_id"],
+        "program_revision": capture["program_revision"],
+        "program_binding_id": capture["program_binding_id"],
+        "retained_bundle_id": capture["retained_bundle_id"],
+        "graph_revision": capture["graph_revision"],
+        "node_environment_digest": capture["node_environment_digest"],
+        "source": {"record_digest": "sha256:" + "5" * 64},
+    }
+
+
+class FakeProgramRunner:
+    def __init__(self, *, active: bool = True) -> None:
+        self.active = active
+        self.calls: list[tuple[str, Any]] = []
+
+    def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
+        self.calls.append(("runs", (active_only, limit)))
+        return {
+            "schema_version": "manyforge.program_run_index.v1",
+            "owner_id": "program-runner.cell-a",
+            "owner_epoch": "program-runner.epoch.1",
+            "active_only": active_only,
+            "truncated": False,
+            "runs": [_program_run_snapshot()] if self.active else [],
+        }
+
+    def start_run(self, body: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(("start", copy.deepcopy(body)))
+        return _program_run_snapshot()
+
+    def read_run(self, program_run_id: str) -> dict[str, Any]:
+        self.calls.append(("read", program_run_id))
+        return _program_run_snapshot()
+
+    def stop_run(
+        self,
+        program_run_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.calls.append(("stop", (program_run_id, copy.deepcopy(body))))
+        return _program_run_snapshot(state="stopping")
+
+    def close(self) -> None:
+        self.calls.append(("close", None))
+
+
 def _client(*, trusted: bool = False) -> tuple[TestClient, FakeCore, FakeManager]:
     core = FakeCore()
     manager = FakeManager()
@@ -729,6 +840,200 @@ def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() 
     assert len(core.program_commits) == 1
     assert applied.status_code == 200
     assert applied.json()["program_revision"] == program["program_revision"]
+
+
+def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
+    runner = FakeProgramRunner()
+    core = FakeCore()
+    core.applied_program = _applied_for_program_run()
+    app = create_app(
+        service=HeadlessService(
+            core,
+            FakeManager(),
+            program_runner=runner,
+        )
+    )
+    client = TestClient(app)
+    start_body = {
+        **_caller(),
+        "scenario_id": "cell-pick",
+        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "expected_applied_record_digest": "sha256:" + "5" * 64,
+    }
+    stop_body = {
+        **_caller(),
+        "request_id": "request.2",
+        "program_run_id": "program-run.1",
+        "expected_owner_epoch": "program-runner.epoch.1",
+        "reason": "operator stop",
+    }
+
+    with client:
+        selection = client.get(
+            "/api/scenarios/cell-pick/program-selection"
+        )
+        index = client.get(
+            "/api/program/runs",
+            params={"active_only": "true", "limit": 1},
+        )
+        started = client.post("/api/program/runs", json=start_body)
+        read = client.get("/api/program/runs/program-run.1")
+        stopped = client.post(
+            "/api/program/runs/program-run.1/stop",
+            json=stop_body,
+        )
+
+    assert selection.status_code == 200
+    assert selection.json()["scenario_id"] == "cell-pick"
+    assert index.status_code == 200
+    assert index.json()["active_only"] is True
+    assert started.json()["capture"]["scenario_id"] == "cell-pick"
+    assert read.json()["capture"]["program_run_id"] == "program-run.1"
+    assert stopped.json()["state"] == "stopping"
+    assert [call[0] for call in runner.calls] == [
+        "runs",
+        "start",
+        "read",
+        "stop",
+    ]
+
+
+def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
+    core = FakeCore()
+    core.applied_program = _applied_for_program_run()
+    runner = FakeProgramRunner()
+    client = TestClient(
+        create_app(
+            service=HeadlessService(
+                core,
+                FakeManager(),
+                program_runner=runner,
+            )
+        )
+    )
+    body = {
+        **_caller(),
+        "scenario_id": "cell-pick",
+        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "expected_applied_record_digest": "sha256:" + "5" * 64,
+    }
+
+    with client:
+        stale = client.post(
+            "/api/program/runs",
+            json={
+                **body,
+                "expected_applied_record_digest": "sha256:" + "f" * 64,
+            },
+        )
+        original = runner.start_run
+
+        def divergent(request: dict[str, Any]) -> dict[str, Any]:
+            snapshot = original(request)
+            snapshot["capture"]["program_revision"] = "sha256:" + "f" * 64
+            return snapshot
+
+        runner.start_run = divergent  # type: ignore[method-assign]
+        divergent_response = client.post("/api/program/runs", json=body)
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == (
+        "program_run_applied_selection_stale"
+    )
+    assert divergent_response.status_code == 502
+    assert divergent_response.json()["detail"]["code"] == (
+        "program_runner_response_invalid"
+    )
+
+
+def test_program_only_apply_does_not_mutate_an_active_captured_run() -> None:
+    core = FakeCore()
+    runner = FakeProgramRunner()
+    app = create_app(
+        service=HeadlessService(
+            core,
+            FakeManager(),
+            program_runner=runner,
+        )
+    )
+    client = TestClient(app)
+
+    with client:
+        response = client.post(
+            "/api/program/apply",
+            json={
+                "scenario_id": "cell-pick",
+                "scenario_catalog_revision": "sha256:" + "6" * 64,
+                "program": _program_document(),
+                "expected_applied_record_digest": None,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "applied"
+    assert len(core.program_preparations) == 1
+    assert [call[0] for call in runner.calls] == []
+
+
+def test_program_model_attempt_is_validated_before_native_commit() -> None:
+    core = FakeCore()
+    app = create_app(service=HeadlessService(core, FakeManager()))
+    client = TestClient(app)
+    digest = "sha256:" + "a" * 64
+    body = {
+        "schema_version": "manyforge.program_model_attempt.v1",
+        "model_attempt_id": "attempt.1",
+        "program_run_id": "program-run.1",
+        "node_instance_id": "query.1",
+        "node_attempt_id": "node-attempt.1",
+        "external_attempt_index": 1,
+        "assistant_projection_digest": digest,
+        "model_endpoint_alias": "selection",
+        "external_resource_alias": "site_llm",
+        "model_id": "model-a",
+        "prompt_template_id": "select-object",
+        "prompt_template_version": "v1",
+        "prompt_template_digest": digest,
+        "prompt_digest": digest,
+        "argument_digests": {"objects": digest},
+        "attachment_digest": None,
+        "audit_policy": {
+            "redact_argument_values": True,
+            "store_full_prompts": False,
+            "store_full_responses": False,
+        },
+        "prompt_text": None,
+        "argument_values": None,
+        "outcome": "timeout",
+        "error_code": "model_timeout",
+        "error_message": "deadline reached",
+        "response_digest": None,
+        "validated_output_digest": None,
+        "model_version": "",
+        "occurred_at_ns": 123,
+        "occurred_at_wall": "2026-08-10T00:00:00Z",
+        "latency_ms": 30_000.0,
+        "usage": None,
+        "response_value": None,
+    }
+
+    with client:
+        accepted = client.post("/api/program/model-attempts", json=body)
+        invalid = client.post(
+            "/api/program/model-attempts",
+            json={
+                **body,
+                "audit_policy": {
+                    **body["audit_policy"],
+                    "invented": True,
+                },
+            },
+        )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "stored"
+    assert invalid.status_code == 422
+    assert core.model_attempts == [body]
 
 
 def test_program_apply_waits_for_manager_convergence_without_advancing_applied(

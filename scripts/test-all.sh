@@ -326,7 +326,13 @@ run_headless_python_tests() {
     cd "$WORKSPACE"
     setup_pythonpath
     export PYTHONPATH="$build:$PYTHONPATH"
-    if ! python_has_modules fastapi httpx pydantic uvicorn manyforge_headless_py; then
+    if ! python_has_modules \
+        fastapi \
+        httpx \
+        pydantic \
+        uvicorn \
+        manyforge_headless_py \
+        manyforge_program_runner; then
         echo -e "${RED}  FAIL: missing I5/H0 Python or native binding dependencies${NC}"
         FAIL=$((FAIL + 1))
         return
@@ -338,6 +344,7 @@ run_headless_python_tests() {
         pytest \
             manyforge_headless_api/tests/ \
             manyforge_headless_api/process_tests/ \
+            manyforge_program_runner/tests/ \
             -p no:cacheprovider \
             -v; then
         PASS=$((PASS + 1))

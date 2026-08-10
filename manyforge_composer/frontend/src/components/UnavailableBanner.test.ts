@@ -58,7 +58,9 @@ describe('headless availability banner', () => {
     }));
 
     expect(html).toContain('Headless runtime truth is connected');
-    expect(html).toContain('Program execution and motion remain unavailable');
-    expect(html).toContain('Later capabilities restore at N');
+    expect(html).toContain('bounded Program Run surface');
+    expect(html).toContain('Complete product readiness remains gated');
+    expect(html).toContain('Missing owners remain unknown');
+    expect(html).toContain('Complete inputs at N7-a5.5');
   });
 });
