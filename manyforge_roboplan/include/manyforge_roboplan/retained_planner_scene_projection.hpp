@@ -71,6 +71,14 @@ public:
       std::shared_ptr<const RetainedSceneFrameResolver>
           candidate_frame_resolver = nullptr);
 
+  /// Replace the command-fenced bootstrap resolver with the direct-provider
+  /// resolver assembled by the exact active physical composition. The caller
+  /// performs this once while the Apply configuration fence is held, after
+  /// candidate participants are installed and before command admission opens.
+  [[nodiscard]] core::Result<void> InstallActiveFrameResolver(
+      const core::ProjectionRevisionDTO &expected_active_revision,
+      std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver);
+
   [[nodiscard]] core::ProjectionCommitResultDTO
   ApplyTransaction(const core::SceneTransactionDTO &transaction) override;
   [[nodiscard]] core::Result<core::CollisionWorldLeaseInventory>
@@ -157,8 +165,7 @@ private:
     core::NativeProjectionStageDTO request;
     RetainedCollisionWorldProjector candidate_projector;
     core::RetainedProductDTO candidate_planning_collision_model;
-    std::shared_ptr<const RetainedSceneFrameResolver>
-        candidate_frame_resolver;
+    std::shared_ptr<const RetainedSceneFrameResolver> candidate_frame_resolver;
     std::shared_ptr<RetainedCollisionWorldPublisher> candidate_publisher;
     core::NativeProjectionStageResultDTO stage_result;
     bool activated{};

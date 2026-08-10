@@ -26,4 +26,14 @@ EncodeSceneTransaction(const manyforge::core::SceneTransactionDTO &transaction);
 [[nodiscard]] manyforge::core::SceneTransactionDTO
 DecodeSceneTransaction(std::string_view bytes);
 
+[[nodiscard]] std::string EncodeResolvedSceneCandidatePreviewRequest(
+    const manyforge::core::ResolvedSceneCandidatePreviewRequestDTO &request);
+[[nodiscard]] manyforge::core::ResolvedSceneCandidatePreviewRequestDTO
+DecodeResolvedSceneCandidatePreviewRequest(std::string_view bytes);
+
+[[nodiscard]] std::string EncodeSceneCandidatePreview(
+    const manyforge::core::SceneCandidatePreviewDTO &preview);
+[[nodiscard]] manyforge::core::SceneCandidatePreviewDTO
+DecodeSceneCandidatePreview(std::string_view bytes);
+
 } // namespace manyforge::scene

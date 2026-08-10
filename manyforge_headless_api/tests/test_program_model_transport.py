@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from threading import Event
 
 import httpx
@@ -16,6 +18,7 @@ from manyforge_headless_api.program_model_transport import (
     OpenAICompatibleProgramModelTransport,
     ProgramModelAuditCommitError,
     ProgramModelEndpointConfig,
+    load_program_model_endpoint_configs,
 )
 
 
@@ -189,6 +192,78 @@ def test_site_endpoint_rejects_credential_urls_and_ambiguous_headers() -> None:
             headers={"Authorization": "other"},
             bearer_token="secret",
         )
+
+
+def test_launcher_site_config_loads_strict_allowlist_and_indirect_secret(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model-site.json"
+    path.write_text(
+        json.dumps(
+            {
+                "api_version": "manyforge.program_model_site_config.v1",
+                "endpoints": [
+                    {
+                        "bearer_token_env": "MANYFORGE_TEST_MODEL_TOKEN",
+                        "chat_completions_url": (
+                            "http://127.0.0.1:8000/v1/chat/completions"
+                        ),
+                        "external_resource_alias": "selection_model",
+                        "headers": {"X-Site": "cell-a"},
+                        "model_endpoint_aliases": ["selection_model"],
+                        "model_ids": ["model-a", "model-b"],
+                        "tool_call_families": ["openai_chat_tools"],
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_program_model_endpoint_configs(
+        path,
+        environ={"MANYFORGE_TEST_MODEL_TOKEN": "site-secret"},
+    )
+
+    assert len(loaded) == 1
+    assert loaded[0].external_resource_alias == "selection_model"
+    assert loaded[0].model_ids == ("model-a", "model-b")
+    assert loaded[0].bearer_token == "site-secret"
+    assert "site-secret" not in path.read_text(encoding="utf-8")
+
+
+def test_launcher_site_config_rejects_unknown_fields_symlinks_and_missing_secret(
+    tmp_path: Path,
+) -> None:
+    value = {
+        "api_version": "manyforge.program_model_site_config.v1",
+        "endpoints": [
+            {
+                "bearer_token_env": "MISSING_MODEL_TOKEN",
+                "chat_completions_url": "http://models.test/v1/chat/completions",
+                "external_resource_alias": "site_llm",
+                "headers": {},
+                "model_endpoint_aliases": ["planning_model"],
+                "model_ids": ["model-a"],
+                "tool_call_families": ["openai_chat_tools"],
+            }
+        ],
+    }
+    path = tmp_path / "model-site.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="unset environment variable"):
+        load_program_model_endpoint_configs(path, environ={})
+
+    value["unexpected"] = True
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown or missing"):
+        load_program_model_endpoint_configs(path, environ={})
+
+    link = tmp_path / "model-site-link.json"
+    link.symlink_to(path)
+    with pytest.raises(ValueError, match="readable plain file"):
+        load_program_model_endpoint_configs(link, environ={})
 
 
 def test_transport_failure_does_not_expose_the_physical_endpoint() -> None:

@@ -1128,7 +1128,10 @@ ManyForgeCollisionEngine::resolve_retained_carried_object_parent(
   }
   const auto& carrier_frame = shared_model->model.frames[carrier_frame_id];
 
-  const RetainedComponentCollisionBodyProjectionInput* selected = nullptr;
+  std::map<std::string,
+           const RetainedComponentCollisionBodyProjectionInput*, std::less<>>
+      rigid_candidates_by_frame;
+  bool has_exact_carrier_body = false;
   for (const auto& candidate : target_bodies) {
     if (candidate.controllable_component_id.empty() ||
         candidate.model_instance_id.empty() ||
@@ -1151,19 +1154,35 @@ ManyForgeCollisionEngine::resolve_retained_carried_object_parent(
     if (candidate_frame.parentJoint != carrier_frame.parentJoint) {
       continue;
     }
-    if (selected != nullptr) {
-      return carried_parent_projection_error(
-          "carried-object carrier frame has multiple rigid collision-body "
-          "parents in the addressed command target");
+    const bool exact_carrier_body =
+        candidate.compiled_frame_name == compiled_carrier_frame_name;
+    if (has_exact_carrier_body && !exact_carrier_body) {
+      continue;
     }
-    selected = &candidate;
+    if (exact_carrier_body && !has_exact_carrier_body) {
+      rigid_candidates_by_frame.clear();
+      has_exact_carrier_body = true;
+    }
+    const auto [existing, inserted] = rigid_candidates_by_frame.emplace(
+        candidate.compiled_frame_name, &candidate);
+    if (!inserted &&
+        component_collision_body_id(candidate) <
+            component_collision_body_id(*existing->second)) {
+      existing->second = &candidate;
+    }
   }
 
-  if (selected == nullptr) {
+  if (rigid_candidates_by_frame.empty()) {
     return carried_parent_projection_error(
         "carried-object carrier frame has no rigid collision-body parent in "
         "the addressed command target");
   }
+  if (rigid_candidates_by_frame.size() != 1U) {
+    return carried_parent_projection_error(
+        "carried-object carrier frame has multiple rigid collision-body "
+        "parents in the addressed command target");
+  }
+  const auto* selected = rigid_candidates_by_frame.begin()->second;
 
   const auto selected_frame_id =
       shared_model->model.getFrameId(selected->compiled_frame_name);

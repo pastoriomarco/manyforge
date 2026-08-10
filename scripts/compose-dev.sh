@@ -31,7 +31,7 @@ case "${1:-}" in
     ;;
   --prod)
     echo "Starting structural + Program-authoring Composer backend debug mode (port 9000)."
-    echo "Program Apply, execution, and product lanes remain intentionally unavailable."
+    echo "This structural debug profile does not launch Manager, Headless, Program-runner, or native product owners."
     docker compose --profile composer up --build -d
     echo ""
     echo "Composer running at http://localhost:9000"
@@ -39,7 +39,7 @@ case "${1:-}" in
     ;;
   *)
     echo "Starting structural + Program-authoring Composer source/API debug mode (API :9000 + Vite :3000)."
-    echo "Program Apply, execution, and product lanes remain intentionally unavailable."
+    echo "This structural debug profile does not launch Manager, Headless, Program-runner, or native product owners."
     docker compose --profile dev-composer up --build -d
     echo ""
     echo "API:      http://localhost:9000"

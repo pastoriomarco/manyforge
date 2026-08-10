@@ -180,7 +180,7 @@ RetainedKinematicStateProjector::create(
     std::set<core::ResourceId> row_resources;
     std::set<std::pair<core::ModelInstanceId, std::string>> row_coordinates;
     for (const auto& resource : row.resources) {
-      if (resource.resource_id.empty() || resource.coordinates.empty() ||
+      if (resource.resource_id.empty() ||
           !row_resources.insert(resource.resource_id).second) {
         construction_fail(
             "retained state model map has an incomplete or duplicate resource");

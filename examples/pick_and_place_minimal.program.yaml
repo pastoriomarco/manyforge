@@ -1,6 +1,6 @@
 api_version: manyforge.program.v1
 program_id: pick_and_place_minimal
-program_revision: sha256:5c5cbd7051b279456fc74b387fd37e77bc8e2f475b41e0224bd09518ba749143
+program_revision: sha256:464a98ecaa5e5e0bf5958f1bc6f4076fd6c20537d9f6493bb623557c5feff5d6
 program_profile: composable-cell-v1
 name: pick_and_place_minimal
 description: >-
@@ -59,7 +59,9 @@ scene:
         component_role: robot
         model_role: arm_model
         frame_role: base
-      position_m: [0.5, 0.0, 0.4]
+      # This smoke object remains outside the retained start/goal envelope;
+      # collision-sensitive pick geometry belongs to the full Program.
+      position_m: [1.2, 0.0, 0.4]
       orientation: {xyzw: [0.0, 0.0, 0.0, 1.0]}
 parameters:
   - parameter_id: pick_velocity_scale

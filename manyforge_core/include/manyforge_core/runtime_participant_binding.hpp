@@ -7,6 +7,7 @@
 #include <manyforge_core/types/observed_state.hpp>
 #include <manyforge_core/types/program_binding.hpp>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -128,6 +129,18 @@ struct RuntimeParticipantBindingDTO final {
                          const RuntimeParticipantBindingDTO&) = default;
 };
 
+/// Exact semantic-body to projected-physical-body alias produced from one
+/// verified retained model map. Distinct portable collision-body roles may
+/// intentionally select the same source link; runtime collision work must
+/// preserve the role while resolving both selectors to one physical body.
+struct RuntimeCollisionBodyAliasDTO final {
+  std::string semantic_body_id;
+  std::string projected_body_id;
+
+  friend bool operator==(const RuntimeCollisionBodyAliasDTO&,
+                         const RuntimeCollisionBodyAliasDTO&) = default;
+};
+
 /// Sealed participant binding consumed by the resource-addressed Kernel.
 class RuntimeParticipantBinding final {
  public:
@@ -146,12 +159,25 @@ class RuntimeParticipantBinding final {
 
   friend Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
       RuntimeParticipantBindingDTO);
+  friend Result<RuntimeParticipantBinding>
+  bind_runtime_participant_collision_body_aliases(
+      RuntimeParticipantBinding,
+      std::span<const RuntimeCollisionBodyAliasDTO>);
 };
 
 /// Validate ordering, uniqueness, scope agreement, and complete active facts,
 /// then seal one owner-produced runtime participant.
 [[nodiscard]] Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     RuntimeParticipantBindingDTO value);
+
+/// Resolve already-verified Program role/index body identities to the exact
+/// deduplicated physical bodies in the active retained collision projection.
+/// This is an owner-to-owner adaptation after semantic binding verification;
+/// public operation callers cannot supply the alias table.
+[[nodiscard]] Result<RuntimeParticipantBinding>
+bind_runtime_participant_collision_body_aliases(
+    RuntimeParticipantBinding binding,
+    std::span<const RuntimeCollisionBodyAliasDTO> aliases);
 
 /// Derive the exact observed-state query coordinates from one sealed runtime
 /// participant. Freshness is an active runtime policy and is supplied

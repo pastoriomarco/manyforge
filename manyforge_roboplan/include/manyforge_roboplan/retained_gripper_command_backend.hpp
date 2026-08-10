@@ -7,6 +7,7 @@
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <memory>
+#include <optional>
 
 namespace manyforge::roboplan_backend {
 
@@ -30,7 +31,8 @@ class RetainedGripperCommandBackend final
   RetainedGripperCommandBackend(
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<IRetainedObservedStateChannel> state_channel,
-      RetainedGripperPositionLimits position_limits, core::IClock& clock,
+      std::optional<RetainedGripperPositionLimits> position_limits,
+      core::IClock& clock,
       core::IScheduler& scheduler,
       core::Duration update_period_ns = 10'000'000);
   ~RetainedGripperCommandBackend() override;

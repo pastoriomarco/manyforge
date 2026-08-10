@@ -714,7 +714,7 @@ describe('headless projection parsers', () => {
       runtimeAvailability: {
         code: 'composable_cell_runtime_unavailable',
         message: 'Runtime is unavailable.',
-        restorationGates: ['N7-a5.5', 'L0', 'P5', 'I', 'R', 'T'],
+        restorationGates: ['N7', 'L0', 'P5', 'I', 'R', 'T'],
       },
       timestamp: 1,
     });
@@ -728,7 +728,7 @@ describe('headless projection parsers', () => {
     });
 
     expect(structural.runtimeAvailability?.restorationGates).toEqual([
-      'N7-a5.5', 'L0', 'P5', 'I', 'R', 'T',
+      'N7', 'L0', 'P5', 'I', 'R', 'T',
     ]);
     expect(structural.headless).toBeNull();
     expect(headless.mode).toBe('headless_client');
@@ -856,6 +856,7 @@ describe('addressed Robot Control parsers', () => {
             max_position: 0.04,
             min_position: 0,
             source_coordinate_name: 'finger_joint',
+            source_kind: 'model_role',
           },
           target_role_id: 'command_target',
         },
@@ -868,7 +869,21 @@ describe('addressed Robot Control parsers', () => {
     expect(status.observedMotion.sourceJointNames).toEqual(['joint1']);
     expect(status.observedMotion.positionsRad).toEqual([0.2]);
     expect(status.observedMotion.currentTcpPose.position_m.z_m).toBe(0.4);
-    expect(status.observedGripper.position).toBe(0.02);
+    expect(status.observedGripper?.position).toBe(0.02);
+
+    const componentLocal = structuredClone(response);
+    Object.assign(componentLocal.status.direct_control_gripper.resource, {
+      source_kind: 'component_local',
+      min_position: null,
+      max_position: null,
+    });
+    Object.assign(componentLocal.status.direct_control_gripper, {
+      observed_state: null,
+    });
+    const localStatus = parseExecutionOwnerStatus(componentLocal);
+    expect(localStatus.directControlGripper.sourceKind).toBe('component_local');
+    expect(localStatus.directControlGripper.minPosition).toBeNull();
+    expect(localStatus.observedGripper).toBeNull();
 
     const leaked = structuredClone(response);
     Object.assign(leaked.status.direct_control, {
@@ -947,6 +962,7 @@ describe('addressed Robot Control parsers', () => {
         command_schema_id: 'gripper.command_position',
         command_schema_revision: 'sha256:gripper-schema',
         source_coordinate_name: 'finger_joint',
+        source_kind: 'model_role',
         coordinate_kind: 'linear_m',
         target_position: 0.03,
         min_position: 0,
@@ -958,6 +974,15 @@ describe('addressed Robot Control parsers', () => {
 
     expect(receipt.targetPosition).toBe(0.03);
     expect(receipt.coordinateKind).toBe('linear_m');
+
+    const componentLocal = structuredClone(response);
+    Object.assign(componentLocal.preview_receipt, {
+      source_kind: 'component_local',
+      min_position: null,
+      max_position: null,
+    });
+    expect(parseCapabilityCommandPreviewResponse(componentLocal).sourceKind)
+      .toBe('component_local');
 
     const undeclaredNested = structuredClone(response);
     Object.assign(undeclaredNested.preview_receipt.scene_revision, {

@@ -7,6 +7,7 @@
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
@@ -987,6 +988,14 @@ TEST(RetainedBundleMaterializer,
   EXPECT_NO_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
           manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
+  const auto runtime_configuration =
+      native_execution_runtime_contract::require_configuration(
+          *bundle, group.runtime_unit_id);
+  EXPECT_EQ(runtime_configuration.planner_rng_seed, 12345U);
+  EXPECT_EQ(runtime_configuration.initial_joint_positions_rad,
+            (std::vector<double>{0.0, 0.0, 1.57, 0.0, 0.0, 0.0}));
+  EXPECT_EQ(runtime_configuration.execution_tick_hz, 100U);
+  EXPECT_DOUBLE_EQ(runtime_configuration.collision_monitor_period_ms, 50.0);
   const std::string changed_configuration = replace_once(
       manifest, "\"execution_tick_hz\":100", "\"execution_tick_hz\":99");
   EXPECT_NO_THROW(static_cast<void>(

@@ -424,7 +424,26 @@ class _PickPlaceTransport(_Transport):
             "selected_object_id": intent["selected_object_id"],
             "status": "planned" if planned else "no_feasible_candidate",
             "attempted_candidate_count": 1,
-            "reports": [{"candidate_index": 1}],
+            "reports": [
+                {
+                    "candidate_index": 1,
+                    "stages": [
+                        {
+                            "error": {
+                                "code": "invalid_request",
+                                "details": {
+                                    "reason": "motion_start_state_in_collision"
+                                },
+                                "message": "start state is in collision",
+                            },
+                            "stage": "approach",
+                            "succeeded": False,
+                            "trajectory_duration_s": 0.0,
+                            "trajectory_waypoint_count": 0,
+                        }
+                    ],
+                }
+            ],
             "last_attempted_candidate": {
                 "candidate_index": 1,
                 "approach_pose": pose,
@@ -621,9 +640,30 @@ def test_pick_no_feasible_candidate_preserves_authored_policy_and_diagnostics() 
 
     assert result.state is OwnerTaskState.FAILED
     assert result.reason_code == "no_feasible_candidate"
+    assert result.message == (
+        "No feasible pick/place candidate was found; last rejection at "
+        "approach: start state is in collision"
+    )
     assert result.metadata["authored_failure_policy"] == "condition_failure"
     assert result.metadata["planning_result"]["reports"] == [
-        {"candidate_index": 1}
+        {
+            "candidate_index": 1,
+            "stages": [
+                {
+                    "error": {
+                        "code": "invalid_request",
+                        "details": {
+                            "reason": "motion_start_state_in_collision"
+                        },
+                        "message": "start state is in collision",
+                    },
+                    "stage": "approach",
+                    "succeeded": False,
+                    "trajectory_duration_s": 0.0,
+                    "trajectory_waypoint_count": 0,
+                }
+            ],
+        }
     ]
 
 

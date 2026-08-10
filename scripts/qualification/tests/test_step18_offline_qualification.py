@@ -1089,8 +1089,10 @@ exec bash "$1"
     assert result.returncode == 78
     assert result.stdout == ""
     assert result.stderr == (
-        "composable_cell_runtime_unavailable: native planning and execution "
-        "adapters are intentionally removed during the active rebuild.\n"
+        "composable_cell_runtime_unavailable: this legacy aggregate entrypoint "
+        "has no single qualified current replacement; use the Component "
+        "Manager, Headless, Program runner, and Composer entrypoints for "
+        "maintained ManyForge-only runtime functions.\n"
     )
     assert not marker.exists()
 

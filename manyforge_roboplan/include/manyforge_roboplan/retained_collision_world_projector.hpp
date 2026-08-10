@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -49,6 +50,24 @@ struct RetainedCollisionModelMapInput final {
   };
   std::vector<Target> targets;
 };
+
+using RetainedComponentBodyAliasMap =
+    std::map<core::CollisionBodyId, core::CollisionBodyId>;
+
+struct CanonicalRetainedComponentBodies final {
+  std::vector<collision::RetainedComponentCollisionBodyProjectionInput>
+      physical_bodies;
+  RetainedComponentBodyAliasMap aliases;
+};
+
+/// Collapse overlapping semantic role views onto one physical compiled-frame
+/// body while retaining a total alias for every role/index identity. Source
+/// URDF/SRDF roles may legally overlap; duplicated physical geometry may not.
+[[nodiscard]] CanonicalRetainedComponentBodies
+canonicalize_retained_component_bodies(
+    std::span<
+        const collision::RetainedComponentCollisionBodyProjectionInput>
+        bodies);
 
 /// Pure retained-model + logical-scene to immutable collision-world projector.
 ///
@@ -246,22 +265,29 @@ class RetainedCollisionWorldProjector final {
   shared_model() const noexcept {
     return shared_model_;
   }
+  [[nodiscard]] const RetainedComponentBodyAliasMap& component_body_aliases()
+      const noexcept {
+    return component_body_aliases_;
+  }
 
  private:
   RetainedCollisionWorldProjector(
       collision::ManyForgeCollisionEngine::SharedModelPtr shared_model,
       RetainedCollisionModelMapInput model_map,
       collision::RetainedComponentCollisionProjection component_projection,
-      std::vector<core::CollisionBodyId> static_component_body_ids)
+      std::vector<core::CollisionBodyId> static_component_body_ids,
+      RetainedComponentBodyAliasMap component_body_aliases)
       : shared_model_(std::move(shared_model)),
         model_map_(std::move(model_map)),
         component_projection_(std::move(component_projection)),
-        static_component_body_ids_(std::move(static_component_body_ids)) {}
+        static_component_body_ids_(std::move(static_component_body_ids)),
+        component_body_aliases_(std::move(component_body_aliases)) {}
 
   collision::ManyForgeCollisionEngine::SharedModelPtr shared_model_;
   RetainedCollisionModelMapInput model_map_;
   collision::RetainedComponentCollisionProjection component_projection_;
   std::vector<core::CollisionBodyId> static_component_body_ids_;
+  RetainedComponentBodyAliasMap component_body_aliases_;
 };
 
 }  // namespace manyforge::roboplan_backend

@@ -17,6 +17,7 @@
 #include <manyforge_deployment/scenario_apply_candidate_source.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_scene/canonical_empty_scene_owner.hpp>
+#include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
 
 #include <fcntl.h>
@@ -70,7 +71,9 @@ constexpr std::string_view kSceneRuntimeSourceFileName =
 constexpr std::string_view kManagerSocketFileName = "manager-command.sock";
 constexpr std::string_view kManagerDaemonLockFileName = ".manager-daemon.lock";
 constexpr std::size_t kMaximumCommandBytes =
-    scene::kMaximumLogicalSceneTransactionBytes + 4U * 1024U;
+    2U * scene::kMaximumLogicalSceneTransactionBytes + 8U * 1024U;
+constexpr std::size_t kMaximumResponseBytes =
+    3U * scene::kMaximumLogicalSceneTransactionBytes + 16U * 1024U;
 constexpr std::size_t kMaximumCommandIdentityBytes = 256U;
 constexpr std::size_t kMaximumScenePoseQueryResources = 128U;
 constexpr std::size_t kOwnerEpochRandomBytes = 16U;
@@ -234,6 +237,15 @@ public:
     if (!descriptor_) {
       FailErrno("create Manager command socket");
     }
+    const int receive_buffer_bytes = static_cast<int>(kMaximumCommandBytes);
+    const int send_buffer_bytes = static_cast<int>(kMaximumResponseBytes);
+    if (::setsockopt(descriptor_.get(), SOL_SOCKET, SO_RCVBUF,
+                     &receive_buffer_bytes,
+                     sizeof(receive_buffer_bytes)) != 0 ||
+        ::setsockopt(descriptor_.get(), SOL_SOCKET, SO_SNDBUF,
+                     &send_buffer_bytes, sizeof(send_buffer_bytes)) != 0) {
+      FailErrno("configure Manager command socket buffers");
+    }
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, spelling.c_str(), spelling.size() + 1U);
@@ -284,6 +296,8 @@ struct DaemonConfig final {
 enum class CommandKind {
   kApply,
   kSceneCommit,
+  kSceneOwnerRead,
+  kSceneCandidatePreview,
   kScenePoseQuery,
   kReconcile,
   kShutdownRuntime,
@@ -302,6 +316,8 @@ struct ManagerCommand final {
   std::optional<core::GraphRevision> expected_current_graph_revision{};
   std::optional<core::ProjectionRevisionDTO> expected_scene_projection{};
   std::vector<core::SceneResourceId> scene_resource_ids{};
+  std::optional<core::ResolvedSceneCandidatePreviewRequestDTO>
+      scene_candidate_preview{};
 };
 
 const CanonicalValue &RequiredMember(const CanonicalValue &root,
@@ -478,6 +494,19 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
         std::nullopt,
     };
   }
+  if (command == "scene_owner_read") {
+    RequireExactObjectSize(root, 2U, "scene owner read command");
+    return ManagerCommand{.kind = CommandKind::kSceneOwnerRead};
+  }
+  if (command == "scene_candidate_preview") {
+    RequireExactObjectSize(root, 3U, "scene candidate preview command");
+    ManagerCommand result{.kind = CommandKind::kSceneCandidatePreview};
+    result.scene_candidate_preview =
+        scene::DecodeResolvedSceneCandidatePreviewRequest(
+            content_identity::canonical_json(
+                RequiredMember(root, "candidate_request")));
+    return result;
+  }
   if (command == "scene_pose_query") {
     RequireExactObjectSize(root, 4U, "scene pose query command");
     ManagerCommand result{.kind = CommandKind::kScenePoseQuery};
@@ -583,6 +612,35 @@ CanonicalValue ScenePoseResponse(
   });
 }
 
+CanonicalValue CanonicalCodecValue(const std::string_view bytes,
+                                   const std::string_view label) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  Require(content_identity::canonical_json(parsed.root()) == bytes,
+          std::string(label) + " codec did not return canonical JSON");
+  return parsed.root();
+}
+
+CanonicalValue SceneOwnerReadResponse(
+    const core::RequestOwnerEpoch &request_owner_epoch,
+    const core::ProjectionRevisionDTO &projection_revision,
+    const core::LogicalSceneSnapshotDTO &snapshot) {
+  Require(!request_owner_epoch.empty() && projection_revision.valid() &&
+              snapshot.locally_valid() &&
+              snapshot.revision == projection_revision.scene_revision,
+          "logical-scene owner read is internally inconsistent");
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"logical_scene",
+       CanonicalCodecValue(scene::EncodeLogicalSceneSnapshot(snapshot),
+                           "logical-scene snapshot")},
+      {"ok", CanonicalValue(true)},
+      {"projection_revision", ProjectionRevision(projection_revision)},
+      {"request_owner_epoch",
+       CanonicalValue(request_owner_epoch.value())},
+  });
+}
+
 CanonicalValue ErrorValue(const core::ErrorDTO &error) {
   Require(!error.code.empty() && !error.message.empty(),
           "scene response error is incomplete");
@@ -595,6 +653,38 @@ CanonicalValue ErrorValue(const core::ErrorDTO &error) {
       {"code", CanonicalValue(error.code)},
       {"details", CanonicalValue(std::move(details))},
       {"message", CanonicalValue(error.message)},
+  });
+}
+
+CanonicalValue SceneCandidatePreviewResponse(
+    const core::Result<core::SceneCandidatePreviewDTO> &result) {
+  if (!result.ok()) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version",
+         CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+        {"error", ErrorValue(result.error())},
+        {"ok", CanonicalValue(false)},
+    });
+  }
+  const auto encoded = scene::EncodeSceneCandidatePreview(result.value());
+  if (encoded.size() > kMaximumResponseBytes - 1024U) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version",
+         CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+        {"error",
+         ErrorValue(core::ErrorDTO{
+             "scene_candidate_preview_oversized",
+             "scene candidate preview exceeds the bounded Manager transport",
+             {}})},
+        {"ok", CanonicalValue(false)},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"candidate_preview",
+       CanonicalCodecValue(encoded, "scene candidate preview")},
+      {"ok", CanonicalValue(true)},
   });
 }
 
@@ -753,6 +843,17 @@ void TrySendResponse(const int client,
                      const CanonicalValue &response) noexcept {
   try {
     const auto bytes = content_identity::canonical_json(response);
+    if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
+      return;
+    }
+    pollfd descriptor{client, POLLOUT, 0};
+    int ready = -1;
+    do {
+      ready = ::poll(&descriptor, 1, kClientReadTimeoutMilliseconds);
+    } while (ready < 0 && errno == EINTR);
+    if (ready <= 0 || (descriptor.revents & POLLOUT) == 0) {
+      return;
+    }
     ssize_t count = -1;
     do {
       count = ::send(client, bytes.data(), bytes.size(), MSG_NOSIGNAL);
@@ -1278,6 +1379,27 @@ private:
           TryPublishLogicalScene();
         }
         TrySendResponse(client.get(), SceneCommitResponse(command, result));
+        return false;
+      }
+      case CommandKind::kSceneOwnerRead: {
+        const auto projection = scene_owner_.CurrentProjectionRevision();
+        const auto owner_epoch = scene_owner_.CurrentRequestOwnerEpoch();
+        const auto snapshot = scene_owner_.LogicalSnapshot();
+        Require(snapshot != nullptr &&
+                    snapshot->revision == projection.scene_revision,
+                "logical-scene read crossed a projection revision");
+        TrySendResponse(client.get(), SceneOwnerReadResponse(
+                                          owner_epoch, projection, *snapshot));
+        return false;
+      }
+      case CommandKind::kSceneCandidatePreview: {
+        Require(command.scene_candidate_preview.has_value(),
+                "decoded scene candidate command lacks its request");
+        TrySendResponse(
+            client.get(),
+            SceneCandidatePreviewResponse(
+                scene_owner_.PreviewResolvedSceneCandidate(
+                    *command.scene_candidate_preview)));
         return false;
       }
       case CommandKind::kScenePoseQuery: {

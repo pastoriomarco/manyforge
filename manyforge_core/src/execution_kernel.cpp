@@ -535,6 +535,43 @@ with_dynamic_carried_start_contacts(
   return Result<CollisionPolicySnapshot>::Ok(std::move(overlay));
 }
 
+[[nodiscard]] ErrorDTO dynamic_carried_start_contact_query_error(
+    const CollisionResult &result) {
+  std::map<std::string, std::string> details{
+      {"reason", "dynamic_start_contact_query_inconclusive"},
+      {"engine_status", runtime_collision_engine_status_name(result.engine_status)}};
+  std::string message =
+      "Dynamic carried-object start-contact discovery was inconclusive "
+      "(engine_status=" +
+      std::string(runtime_collision_engine_status_name(result.engine_status)) + ")";
+  std::optional<std::pair<std::string, std::string>> displayed_diagnostic;
+  std::size_t diagnostic_index = 0U;
+  for (const auto &[key, value] : result.raw_diagnostics) {
+    if (diagnostic_index >= 8U) {
+      details["engine_diagnostics_truncated"] = "true";
+      break;
+    }
+    const auto suffix = std::to_string(diagnostic_index++);
+    details["engine_diagnostic_" + suffix + "_key"] = key.substr(0U, 128U);
+    details["engine_diagnostic_" + suffix + "_value"] = value.substr(0U, 512U);
+    if (!displayed_diagnostic.has_value() &&
+        key != "snapshot_sync_duration_ns" && key != "total_call_duration_ns") {
+      displayed_diagnostic =
+          std::pair{key.substr(0U, 128U), value.substr(0U, 512U)};
+    }
+  }
+  if (!displayed_diagnostic.has_value() && !result.raw_diagnostics.empty()) {
+    displayed_diagnostic =
+        std::pair{result.raw_diagnostics.begin()->first.substr(0U, 128U),
+                  result.raw_diagnostics.begin()->second.substr(0U, 512U)};
+  }
+  if (displayed_diagnostic.has_value()) {
+    message += ": " + displayed_diagnostic->first + "=" +
+               displayed_diagnostic->second;
+  }
+  return ErrorDTO{kErrorValidationCollision, std::move(message), std::move(details)};
+}
+
 void enrich_live_objects_with_body_hashes(
     std::vector<SceneSnapshotLiveObject> &live_objects,
     const CollisionWorldSnapshotPtr &snapshot) {
@@ -11100,12 +11137,8 @@ Result<std::size_t> ExecutionKernel::discover_dynamic_carried_start_contacts(
           world->revision.revision_id ||
       result.collision_world_revision->content_hash !=
           world->revision.content_hash) {
-    return Result<std::size_t>::Err(ErrorDTO{
-        kErrorValidationCollision,
-        "Dynamic carried-object start-contact discovery was inconclusive",
-        {{"reason", "dynamic_start_contact_query_inconclusive"},
-         {"engine_status",
-          std::to_string(static_cast<int>(result.engine_status))}}});
+    return Result<std::size_t>::Err(
+        dynamic_carried_start_contact_query_error(result));
   }
   const auto discovered = dynamic_carried_start_contact_pairs(
       *world, result.normalized_pairs, *policy);

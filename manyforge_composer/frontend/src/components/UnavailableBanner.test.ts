@@ -61,6 +61,6 @@ describe('headless availability banner', () => {
     expect(html).toContain('bounded Program Run surface');
     expect(html).toContain('Complete product readiness remains gated');
     expect(html).toContain('Missing owners remain unknown');
-    expect(html).toContain('Complete inputs at N7-a5.5');
+    expect(html).toContain('Complete I6 qualification at N7');
   });
 });

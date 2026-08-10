@@ -160,6 +160,73 @@ core::CollisionGeometryDescriptor scene_geometry_descriptor(
 
 }  // namespace
 
+CanonicalRetainedComponentBodies canonicalize_retained_component_bodies(
+    const std::span<
+        const collision::RetainedComponentCollisionBodyProjectionInput>
+        bodies) {
+  if (bodies.empty()) {
+    throw RetainedCollisionWorldProjectionError(
+        "retained collision projection has no component bodies");
+  }
+  using Input = collision::RetainedComponentCollisionBodyProjectionInput;
+  struct Selected final {
+    Input body;
+    core::CollisionBodyId body_id;
+  };
+  std::map<std::string, Selected, std::less<>> selected_by_frame;
+  std::set<core::CollisionBodyId> semantic_ids;
+  for (const auto& body : bodies) {
+    if (body.controllable_component_id.empty() ||
+        body.model_instance_id.empty() || body.model_revision.empty() ||
+        body.collision_body_role_id.empty() ||
+        body.compiled_frame_name.empty()) {
+      throw RetainedCollisionWorldProjectionError(
+          "retained collision-body alias input is incomplete");
+    }
+    const auto body_id = core::make_component_collision_body_id(
+        body.controllable_component_id, body.model_instance_id,
+        body.collision_body_role_id, body.collision_index);
+    if (!semantic_ids.insert(body_id).second) {
+      throw RetainedCollisionWorldProjectionError(
+          "retained collision-body semantic identity is duplicated");
+    }
+    const auto [selected, inserted] = selected_by_frame.emplace(
+        body.compiled_frame_name, Selected{body, body_id});
+    if (!inserted) {
+      const auto& existing = selected->second.body;
+      if (existing.controllable_component_id !=
+              body.controllable_component_id ||
+          existing.model_instance_id != body.model_instance_id ||
+          existing.model_revision != body.model_revision) {
+        throw RetainedCollisionWorldProjectionError(
+            "one compiled collision frame crosses component/model identity");
+      }
+      if (body_id < selected->second.body_id) {
+        selected->second = Selected{body, body_id};
+      }
+    }
+  }
+
+  CanonicalRetainedComponentBodies result;
+  result.physical_bodies.reserve(selected_by_frame.size());
+  for (const auto& [unused, selected] : selected_by_frame) {
+    static_cast<void>(unused);
+    result.physical_bodies.push_back(selected.body);
+  }
+  for (const auto& body : bodies) {
+    const auto semantic = core::make_component_collision_body_id(
+        body.controllable_component_id, body.model_instance_id,
+        body.collision_body_role_id, body.collision_index);
+    const auto selected = selected_by_frame.find(body.compiled_frame_name);
+    if (selected == selected_by_frame.end() ||
+        !result.aliases.emplace(semantic, selected->second.body_id).second) {
+      throw RetainedCollisionWorldProjectionError(
+          "retained collision-body alias construction is incomplete");
+    }
+  }
+  return result;
+}
+
 RetainedCollisionWorldProjector RetainedCollisionWorldProjector::create(
     collision::ManyForgeCollisionEngine::SharedModelPtr shared_model,
     RetainedCollisionModelMapInput model_map) {
@@ -214,16 +281,18 @@ RetainedCollisionWorldProjector RetainedCollisionWorldProjector::create(
     }
   }
 
+  auto canonical_bodies =
+      canonicalize_retained_component_bodies(model_map.component_bodies);
   auto projected =
       collision::ManyForgeCollisionEngine::project_retained_component_collision(
           shared_model, model_map.compiled_cell_frame_name,
-          model_map.component_bodies, model_map.component_frames);
+          canonical_bodies.physical_bodies, model_map.component_frames);
   if (!projected.ok()) {
     throw RetainedCollisionWorldProjectionError(projected.error().message);
   }
   auto static_bodies =
       collision::ManyForgeCollisionEngine::select_retained_static_component_bodies(
-          shared_model, model_map.component_bodies,
+          shared_model, canonical_bodies.physical_bodies,
           model_map.dynamic_compiled_joint_names);
   if (!static_bodies.ok()) {
     throw RetainedCollisionWorldProjectionError(static_bodies.error().message);
@@ -231,7 +300,8 @@ RetainedCollisionWorldProjector RetainedCollisionWorldProjector::create(
   return RetainedCollisionWorldProjector(std::move(shared_model),
                                          std::move(model_map),
                                          std::move(projected.value()),
-                                         std::move(static_bodies.value()));
+                                         std::move(static_bodies.value()),
+                                         std::move(canonical_bodies.aliases));
 }
 
 core::Result<core::CollisionPolicySnapshot>
@@ -350,16 +420,23 @@ RetainedCollisionWorldProjector::project_effective_policy(
           continue;
         }
         role_found = true;
-        const core::CollisionBodyId component_body_id =
+        const core::CollisionBodyId semantic_body_id =
             core::make_component_collision_body_id(
                 target_body.controllable_component_id,
                 target_body.model_instance_id,
                 target_body.collision_body_role_id,
                 target_body.collision_index);
+        const auto physical_body =
+            component_body_aliases_.find(semantic_body_id);
+        if (physical_body == component_body_aliases_.end()) {
+          return policy_projection_error(
+              "carried attachment touch role has no physical collision "
+              "projection");
+        }
         for (std::size_t shape_index = 0U;
              shape_index < object.collision_shapes.size(); ++shape_index) {
           effective.allowed_touch_link_pairs.push_back(canonical_pair(
-              component_body_id,
+              physical_body->second,
               core::make_scene_collision_body_id(object.scene_resource_id,
                                                   shape_index)));
         }
@@ -555,6 +632,13 @@ RetainedCollisionWorldProjector::project(
       if (!resolved.ok()) {
         return projection_error(resolved.error().message);
       }
+      const auto physical_parent =
+          component_body_aliases_.find(resolved.value().parent_body_id);
+      if (physical_parent == component_body_aliases_.end()) {
+        return projection_error(
+            "carried-object parent has no physical collision projection");
+      }
+      resolved.value().parent_body_id = physical_parent->second;
       carried_parent = std::move(resolved.value());
       carried_attachment = &*attachment;
     }

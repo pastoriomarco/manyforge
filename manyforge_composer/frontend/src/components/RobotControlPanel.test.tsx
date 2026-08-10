@@ -49,6 +49,7 @@ const controller = vi.hoisted(() => ({
         commandSchemaId: 'gripper.command_position',
         commandSchemaRevision: 'sha256:gripper-schema',
         sourceCoordinateName: 'finger_joint',
+        sourceKind: 'model_role',
         coordinateKind: 'linear_m',
         minPosition: 0,
         maxPosition: 0.04,

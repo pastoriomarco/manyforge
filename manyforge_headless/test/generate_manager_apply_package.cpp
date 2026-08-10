@@ -91,6 +91,7 @@ void WriteMetadata(
     const std::filesystem::path &path,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const deployment::RetainedBundle &candidate,
+    const deployment::RetainedBundle &physical_candidate,
     const std::filesystem::path &admission_filename) {
   const auto bytes = deployment::canonical_json(
       deployment::CanonicalValue(deployment::CanonicalValue::Object{
@@ -109,6 +110,15 @@ void WriteMetadata(
            deployment::CanonicalValue(admission.graph_revision().value())},
           {"predecessor_retained_bundle_id",
            deployment::CanonicalValue(admission.retained_bundle_id().value())},
+          {"physical_candidate_retained_bundle_id",
+           deployment::CanonicalValue(
+               physical_candidate.retained_bundle_id().value())},
+          {"physical_deployment_artifact_id",
+           deployment::CanonicalValue(
+               physical_candidate.value().deployment_artifact_id.value())},
+          {"physical_deployment_revision",
+           deployment::CanonicalValue(
+               physical_candidate.value().deployment_revision.value())},
       }));
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
   if (!stream) {
@@ -127,8 +137,8 @@ int main(int argc, char **argv) {
   try {
     const auto arguments = ParseArguments(argc, argv);
     std::filesystem::create_directories(arguments.package_root);
-    auto source =
-        deployment::test::make_lite6_native_motion_retention_fixture();
+    auto source = deployment::test::
+        make_lite6_native_motion_arm_gripper_aggregate_retention_fixture();
     if (!source.native_execution_runtime_profile.has_value()) {
       throw std::logic_error(
           "Manager Apply fixture lacks its native runtime profile");
@@ -157,11 +167,22 @@ int main(int argc, char **argv) {
         materialize_store_and_reload_production(
             CompileEmpty(candidate_source, profiles), manifests, input_source,
             {}, catalogs, raw_artifacts, bundles);
+    auto physical_candidate = deployment::detail::RetainedBundleMaterializer::
+        materialize_store_and_reload_production(
+            source.qualified, manifests, input_source,
+            source.structural_preparations(), catalogs, raw_artifacts,
+            bundles);
     if (predecessor == nullptr || candidate == nullptr ||
+        physical_candidate == nullptr ||
         predecessor->value().cell_graph.runtime_units !=
             candidate->value().cell_graph.runtime_units ||
         predecessor->value().compiled_products.runtime_unit_products !=
-            candidate->value().compiled_products.runtime_unit_products) {
+            candidate->value().compiled_products.runtime_unit_products ||
+        predecessor->value().cell_graph.runtime_units !=
+            physical_candidate->value().cell_graph.runtime_units ||
+        predecessor->value().compiled_products.runtime_unit_products !=
+            physical_candidate->value().compiled_products
+                .runtime_unit_products) {
       throw std::logic_error(
           "Manager Apply fixture lost exact execution-host continuity");
     }
@@ -172,8 +193,27 @@ int main(int argc, char **argv) {
         deployment::detail::publish_cell_scoped_canonical_empty_admission(
             arguments.package_root, admission_filename, *predecessor);
 
-    const auto catalog =
-        deployment::build_scenario_catalog({deployment::ScenarioCatalogRowDTO{
+    const auto catalog = deployment::build_scenario_catalog({
+        deployment::ScenarioCatalogRowDTO{
+            .scenario_id = "manager_apply_physical_recovery",
+            .description =
+                std::string("Physical managed composition recovery proof"),
+            .aliases = {},
+            .deployment_artifact_id =
+                physical_candidate->value().deployment_artifact_id,
+            .deployment_revision =
+                physical_candidate->value().deployment_revision,
+            .retained_bundle_id = physical_candidate->retained_bundle_id(),
+            .program_binding_id = core::ProgramBindingId(
+                physical_candidate->retained_bundle_id().value()),
+            .deployment_compatibility =
+                deployment::ScenarioDeploymentCompatibilityDTO{
+                    "manyforge-only", {}},
+            .assistant_mode = deployment::ScenarioAssistantMode::kForbidden,
+            .typed_parameter_overrides = deployment::CanonicalValue(
+                deployment::CanonicalValue::Object{}),
+        },
+        deployment::ScenarioCatalogRowDTO{
             .scenario_id = "manager_apply_runtime_only",
             .description = std::string("Runtime-only production Apply proof"),
             .aliases = {},
@@ -188,7 +228,8 @@ int main(int argc, char **argv) {
             .assistant_mode = deployment::ScenarioAssistantMode::kForbidden,
             .typed_parameter_overrides = deployment::CanonicalValue(
                 deployment::CanonicalValue::Object{}),
-        }});
+        },
+    });
     deployment::FilesystemScenarioCatalogRepository scenario_catalog(
         arguments.package_root, "maintained");
     if (scenario_catalog.compare_and_set(std::nullopt, catalog) !=
@@ -197,6 +238,7 @@ int main(int argc, char **argv) {
           "Manager Apply fixture scenario catalog was not published");
     }
     WriteMetadata(arguments.metadata_path, admission, *candidate,
+                  *physical_candidate,
                   admission_filename);
     return 0;
   } catch (const std::exception &error) {

@@ -198,7 +198,14 @@ create_retained_native_runtime_participants(
       config.kernel.validation_collision_workers > 64 ||
       config.kernel.runtime_collision_lookahead_workers < 1 ||
       config.kernel.runtime_collision_lookahead_workers > 64 ||
-      config.gripper_update_period_ns <= 0) {
+      config.gripper_update_period_ns <= 0 ||
+      (!config.initial_motion_positions_rad.empty() &&
+       (config.initial_motion_positions_rad.size() !=
+            input.motion_binding.value().resources.size() ||
+        std::any_of(
+            config.initial_motion_positions_rad.begin(),
+            config.initial_motion_positions_rad.end(),
+            [](const double value) { return !std::isfinite(value); })))) {
     throw std::invalid_argument(
         "native runtime composition input is incomplete or unbounded");
   }
@@ -279,9 +286,16 @@ create_retained_native_runtime_participants(
       std::make_shared<RetainedObservedStateChannel>(
           runtime->motion_binding, runtime->state_projector,
           native_state_config(runtime->motion_binding));
+  const auto initial_timestamp_ns = runtime->clock->now();
   const auto motion_initialized =
-      runtime->motion_state_channel->initialize_from_projection(
-          runtime->clock->now());
+      config.initial_motion_positions_rad.empty()
+          ? runtime->motion_state_channel->initialize_from_projection(
+                initial_timestamp_ns)
+          : runtime->motion_state_channel->publish_and_project(
+                config.initial_motion_positions_rad,
+                std::vector<double>(config.initial_motion_positions_rad.size(),
+                                    0.0),
+                initial_timestamp_ns, initial_timestamp_ns);
   if (!motion_initialized.applied()) {
     throw std::invalid_argument(
         "native motion state could not be seeded from the retained model");
@@ -309,22 +323,31 @@ create_retained_native_runtime_participants(
       throw std::invalid_argument(
           "native aggregate gripper crosses its motion component generation");
     }
+    if (gripper_value.resources.size() != 1U) {
+      throw std::invalid_argument(
+          "native gripper binding has no exact scalar resource");
+    }
+    const bool model_backed =
+        gripper_value.resources.front().source_joint_name.has_value();
     runtime->gripper_state_channel =
         std::make_shared<RetainedObservedStateChannel>(
-            *runtime->gripper_binding, runtime->state_projector,
+            *runtime->gripper_binding,
+            model_backed ? runtime->state_projector : nullptr,
             native_state_config(*runtime->gripper_binding));
-    const auto gripper_initialized =
-        runtime->gripper_state_channel->initialize_from_projection(
-            runtime->clock->now());
-    if (!gripper_initialized.applied()) {
-      throw std::invalid_argument(
-          "native gripper state could not be seeded from the retained model");
+    if (model_backed) {
+      const auto gripper_initialized =
+          runtime->gripper_state_channel->initialize_from_projection(
+              runtime->clock->now());
+      if (!gripper_initialized.applied()) {
+        throw std::invalid_argument(
+            "native gripper state could not be seeded from the retained model");
+      }
+      runtime->gripper_position_limits =
+          retained_gripper_limits(*runtime->scene, *runtime->gripper_binding);
     }
-    runtime->gripper_position_limits =
-        retained_gripper_limits(*runtime->scene, *runtime->gripper_binding);
     runtime->gripper = std::make_unique<RetainedGripperCommandBackend>(
         *runtime->gripper_binding, runtime->gripper_state_channel,
-        *runtime->gripper_position_limits, *runtime->clock, *runtime->scheduler,
+        runtime->gripper_position_limits, *runtime->clock, *runtime->scheduler,
         config.gripper_update_period_ns);
   }
 

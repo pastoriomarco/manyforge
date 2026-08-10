@@ -31,6 +31,7 @@
 #include "lite6_retained_consumer_fixture.hpp"
 #include "logical_scene_codec_internal.hpp"
 #include "manyforge_scene/canonical_empty_scene_owner.hpp"
+#include "manyforge_scene/logical_scene_value_codec.hpp"
 #include "manyforge_scene/scene_transaction_codec.hpp"
 #include "sqlite_scene_lifecycle_internal.hpp"
 
@@ -2143,6 +2144,7 @@ public:
     throw_after_next_rebuild_effect_ = false;
     frame_resolution_error_.reset();
     resolved_model_instance_override_.reset();
+    resolved_frame_role_override_.reset();
     retained_leases_.clear();
     transactions_.clear();
     health_ = core::ProjectionHealthDTO{
@@ -2179,6 +2181,11 @@ public:
   void SetResolvedModelInstanceOverride(
       std::optional<core::ModelInstanceId> model_instance_id) {
     resolved_model_instance_override_ = std::move(model_instance_id);
+  }
+
+  void SetResolvedFrameRoleOverride(
+      std::optional<core::FrameRoleId> frame_role_id) {
+    resolved_frame_role_override_ = std::move(frame_role_id);
   }
 
   [[nodiscard]] std::size_t frame_resolution_calls() const noexcept {
@@ -2327,8 +2334,11 @@ public:
                 selector.controllable_component_id,
                 resolved_model_instance_override_.value_or(
                     core::ModelInstanceId("model.1")),
-                selector.frame_role_id,
-                "compiled_" + selector.frame_role_id.value(),
+                resolved_frame_role_override_.value_or(selector.frame_role_id),
+                "compiled_" +
+                    resolved_frame_role_override_
+                        .value_or(selector.frame_role_id)
+                        .value(),
                 core::ModelRevision("model-revision-1")};
           } else {
             return std::visit(
@@ -2599,6 +2609,7 @@ private:
   std::vector<core::ComponentAttachmentRevision> attachment_revisions_;
   std::optional<core::ErrorDTO> frame_resolution_error_;
   std::optional<core::ModelInstanceId> resolved_model_instance_override_;
+  std::optional<core::FrameRoleId> resolved_frame_role_override_;
   mutable std::size_t frame_resolution_calls_{};
   mutable std::size_t policy_projection_calls_{};
   std::set<core::ProjectionLeaseId> retained_leases_;
@@ -3672,6 +3683,11 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.z_m, 3.75);
   EXPECT_EQ(projection.retained_lease_count(), 0U);
 
+  for (auto &participant : projections) {
+    participant->SetResolvedFrameRoleOverride(
+        core::FrameRoleId("asset_tool_frame"));
+  }
+
   core::SceneTransactionRequestDTO attach{
       SceneRequestContext("scene-request-attach-resolved", active),
       {},
@@ -3694,7 +3710,8 @@ TEST(CanonicalEmptySceneOwner,
       core::ResolvedComponentModelFrameDTO{
           core::ControllableComponentId("component.1"),
           core::ModelInstanceId("model.1"),
-          core::FrameRoleId("tool_frame"), "compiled_tool_frame",
+          core::FrameRoleId("asset_tool_frame"),
+          "compiled_asset_tool_frame",
           core::ModelRevision("model-revision-1")},
       core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
       {structural_revision},
@@ -3702,10 +3719,21 @@ TEST(CanonicalEmptySceneOwner,
           active, core::ProjectionLeaseId("candidate-terminal-frame")},
       Digest('8'),
       Digest('9')};
-  const auto preview = owner.PreviewResolvedSceneCandidate(
-      core::ResolvedSceneCandidatePreviewRequestDTO{attach, candidate_frame});
+  const core::ResolvedSceneCandidatePreviewRequestDTO preview_request{
+      attach, candidate_frame};
+  const auto encoded_preview_request =
+      EncodeResolvedSceneCandidatePreviewRequest(preview_request);
+  EXPECT_EQ(EncodeResolvedSceneCandidatePreviewRequest(
+                DecodeResolvedSceneCandidatePreviewRequest(
+                    encoded_preview_request)),
+            encoded_preview_request);
+  const auto preview = owner.PreviewResolvedSceneCandidate(preview_request);
   ASSERT_TRUE(preview.ok()) << preview.error().message;
   ASSERT_TRUE(preview.value().valid());
+  const auto encoded_preview = EncodeSceneCandidatePreview(preview.value());
+  EXPECT_EQ(EncodeSceneCandidatePreview(
+                DecodeSceneCandidatePreview(encoded_preview)),
+            encoded_preview);
   ASSERT_EQ(preview.value().logical_scene->objects.size(), 1U);
   ASSERT_EQ(preview.value().logical_scene->carried_object_attachments.size(),
             1U);
@@ -3742,7 +3770,7 @@ TEST(CanonicalEmptySceneOwner,
             core::SceneFrameRefDTO(core::ComponentSceneFrameRefDTO{
                 core::ControllableComponentId("component.1"),
                 core::ModelInstanceId("model.1"),
-                core::FrameRoleId("tool_frame")}));
+                core::FrameRoleId("asset_tool_frame")}));
 
   for (auto &participant : projections) {
     participant->SetFrameResolution(

@@ -760,6 +760,10 @@ class ProgramRunOwner:
                 if tree_status is py_trees.common.Status.SUCCESS
                 else ProgramRunState.FAILED
             )
+            terminal_reason_code: str | None = None
+            terminal_message = ""
+            if terminal_state is ProgramRunState.FAILED:
+                terminal_reason_code, terminal_message = run.terminal_failure()
             try:
                 scope_snapshot = self._scope.observe(program_run_id)
                 _active_count, scope_settled, _scope_reason = self._scope_fields(
@@ -786,21 +790,11 @@ class ProgramRunOwner:
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is ProgramRunState.RUNNING:
-                    reason_code = (
-                        None
-                        if terminal_state is ProgramRunState.SUCCEEDED
-                        else "program_tree_failed"
-                    )
-                    message = (
-                        ""
-                        if terminal_state is ProgramRunState.SUCCEEDED
-                        else "Program tree failed"
-                    )
                     self._mark_finalizing(
                         entry,
                         state_after_finalize=terminal_state,
-                        reason_code=reason_code,
-                        message=message,
+                        reason_code=terminal_reason_code,
+                        message=terminal_message,
                     )
             return self._reconcile_finalizing(program_run_id)
 

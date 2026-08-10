@@ -18,7 +18,11 @@ from .models import (
     SceneResourcePoseQuery,
     SceneTransactionRequest,
 )
-from .native import HeadlessApiError, strict_json_object
+from .native import (
+    DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
+    HeadlessApiError,
+    strict_json_object,
+)
 
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
@@ -73,7 +77,12 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
 class ManagerCommandClient:
     """Forward one packet at a time; never cache or reduce Manager truth."""
 
-    def __init__(self, state_root: Path, *, timeout_seconds: float = 0.25) -> None:
+    def __init__(
+        self,
+        state_root: Path,
+        *,
+        timeout_seconds: float = DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
+    ) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 5:
             raise ValueError("Manager timeout must be in (0, 5] seconds")
         self._socket_path = state_root / MANAGER_SOCKET_FILE

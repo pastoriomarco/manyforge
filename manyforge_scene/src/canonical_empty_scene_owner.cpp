@@ -2233,11 +2233,10 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                   &frame_resolution->resolved_frame);
           if (carrier == nullptr ||
               carrier->controllable_component_id !=
-                  operation.controllable_component_id ||
-              carrier->frame_role_id != operation.frame_role_id) {
+                  operation.controllable_component_id) {
             throw SceneRequestRejectionError(
                 "missing_reference",
-                "carrier target resolved to another component or frame role",
+                "carrier target resolved to another component",
                 {{"reason", "carrier_frame_resolution_foreign"}});
           }
           auto expected_revisions =

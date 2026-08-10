@@ -35,6 +35,7 @@ export interface DirectControlMotionStatus {
 }
 
 export type CoordinateKind = 'angular_rad' | 'linear_m';
+export type ResourceSourceKind = 'model_role' | 'component_local';
 
 export interface DirectControlGripperStatus {
   controllableComponentId: string;
@@ -49,9 +50,10 @@ export interface DirectControlGripperStatus {
   commandSchemaId: string;
   commandSchemaRevision: string;
   sourceCoordinateName: string;
+  sourceKind: ResourceSourceKind;
   coordinateKind: CoordinateKind;
-  minPosition: number;
-  maxPosition: number;
+  minPosition: number | null;
+  maxPosition: number | null;
 }
 
 export interface ObservedMotionTarget {
@@ -83,7 +85,7 @@ export interface ExecutionOwnerStatus {
   directControl: DirectControlMotionStatus;
   directControlGripper: DirectControlGripperStatus;
   observedMotion: ObservedMotionTarget;
-  observedGripper: ObservedGripperTarget;
+  observedGripper: ObservedGripperTarget | null;
 }
 
 export type DirectControlMotionSpec =
@@ -227,10 +229,11 @@ export interface CapabilityCommandPreviewReceipt {
   commandSchemaId: string;
   commandSchemaRevision: string;
   sourceCoordinateName: string;
+  sourceKind: ResourceSourceKind;
   coordinateKind: CoordinateKind;
   targetPosition: number;
-  minPosition: number;
-  maxPosition: number;
+  minPosition: number | null;
+  maxPosition: number | null;
   commitEligible: true;
 }
 

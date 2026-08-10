@@ -11,6 +11,7 @@ TEST(RoboPlanCompatibilityOptionsTest,
   EXPECT_EQ(rrt.group_name, "arm");
   EXPECT_DOUBLE_EQ(rrt.max_planning_time, 2.5);
   EXPECT_EQ(rrt.max_nodes, 5000);
+  EXPECT_DOUBLE_EQ(rrt.collision_check_step_size, 0.05);
   EXPECT_FALSE(rrt.rrt_star);
   EXPECT_TRUE(rrt.fast_return);
 
@@ -27,6 +28,26 @@ TEST(RoboPlanCompatibilityOptionsTest,
   EXPECT_EQ(ik.max_restarts, 50);
   EXPECT_DOUBLE_EQ(ik.max_time, 1.0);
   EXPECT_TRUE(ik.fast_return);
+}
+
+TEST(RoboPlanCompatibilityOptionsTest,
+     AuthoritativeCollisionRetriesKeepTheTighterRrtDetour) {
+  const auto initial_rrt = production_rrt_options("arm", 2.5, 0U);
+  const auto initial_shortcut =
+      production_shortcutting_options("arm", 42U, 0U);
+  EXPECT_DOUBLE_EQ(initial_rrt.collision_check_step_size, 0.05);
+  EXPECT_DOUBLE_EQ(initial_shortcut.max_step_size, 0.05);
+  EXPECT_TRUE(shortcut_candidate_for_attempt(0U));
+
+  for (const std::uint32_t attempt : {1U, 2U, 17U}) {
+    const auto retry_rrt = production_rrt_options("arm", 2.5, attempt);
+    const auto retry_shortcut =
+        production_shortcutting_options("arm", 42U, attempt);
+    EXPECT_DOUBLE_EQ(retry_rrt.collision_check_step_size, 0.01);
+    EXPECT_DOUBLE_EQ(retry_shortcut.max_step_size, 0.01);
+    EXPECT_EQ(retry_shortcut.seed, 42);
+    EXPECT_FALSE(shortcut_candidate_for_attempt(attempt));
+  }
 }
 
 TEST(RoboPlanCompatibilityOptionsTest,

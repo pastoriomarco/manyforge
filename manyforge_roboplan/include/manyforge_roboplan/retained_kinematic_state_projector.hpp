@@ -63,6 +63,9 @@ struct RetainedKinematicModelMapInput final {
 
   struct Resource final {
     core::ResourceId resource_id;
+    /// Empty only for an independently verified component-local resource.
+    /// Such a row remains in the complete retained map but can never be
+    /// selected by a RoboPlan projection target.
     std::vector<Coordinate> coordinates;
   };
 

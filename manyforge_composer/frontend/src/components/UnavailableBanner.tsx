@@ -6,7 +6,7 @@ interface UnavailableBannerProps {
   onRetry: () => void;
 }
 
-const FALLBACK_GATES = ['N7-a5.5', 'L0', 'P5', 'I', 'R', 'T'];
+const FALLBACK_GATES = ['N7', 'L0', 'P5', 'I', 'R', 'T'];
 
 export function UnavailableBanner({ health, onRetry }: UnavailableBannerProps) {
   const headlessConnected = health.status === 'ready'
@@ -55,7 +55,7 @@ export function UnavailableBanner({ health, onRetry }: UnavailableBannerProps) {
         </span>
         <span className="gate-list">
           {headlessConnected
-            ? 'Complete inputs at N7-a5.5 · then L0 · P5 · I · R · T'
+            ? 'Complete I6 qualification at N7 · then L0 · P5 · I · R · T'
             : gates.length > 0
               ? `Restore at ${gates.join(' · ')}`
               : 'Check headless API connectivity and configuration'}

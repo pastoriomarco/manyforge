@@ -62,6 +62,9 @@ struct ManagerApplyFixtureMetadata final {
   std::string cell_id;
   std::string deployment_artifact_id;
   std::string deployment_revision;
+  std::string physical_candidate_retained_bundle_id;
+  std::string physical_deployment_artifact_id;
+  std::string physical_deployment_revision;
   std::string predecessor_graph_revision;
   std::string predecessor_retained_bundle_id;
 };
@@ -75,7 +78,7 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata() {
   const std::string bytes{std::istreambuf_iterator<char>(stream),
                           std::istreambuf_iterator<char>()};
   const auto root = deployment::parse_strict_json_model_yaml(bytes).root();
-  if (!root.is_object() || root.as_object().size() != 7U ||
+  if (!root.is_object() || root.as_object().size() != 10U ||
       content_identity::canonical_json(root) != bytes) {
     throw std::runtime_error("Manager Apply fixture metadata is invalid");
   }
@@ -85,6 +88,9 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata() {
       RequiredText(root, "cell_id"),
       RequiredText(root, "deployment_artifact_id"),
       RequiredText(root, "deployment_revision"),
+      RequiredText(root, "physical_candidate_retained_bundle_id"),
+      RequiredText(root, "physical_deployment_artifact_id"),
+      RequiredText(root, "physical_deployment_revision"),
       RequiredText(root, "predecessor_graph_revision"),
       RequiredText(root, "predecessor_retained_bundle_id"),
   };
@@ -129,6 +135,9 @@ public:
   }
   [[nodiscard]] std::filesystem::path socket_path() const {
     return manager_root() / "manager-command.sock";
+  }
+  [[nodiscard]] std::filesystem::path execution_socket_path() const {
+    return runtime_root() / "execution-command.sock";
   }
   [[nodiscard]] std::filesystem::path installed_root() const {
     return root_ / "installed";
@@ -283,6 +292,87 @@ PrepareManagerApplyInstalledTargets(const DaemonDirectory &directory) {
                                protected_executable_permissions,
                                std::filesystem::perm_options::replace);
   return manager;
+}
+
+struct ExecutionReadyObservation final {
+  std::string response;
+  std::string owner_epoch;
+  bool observed_closed{};
+};
+
+ExecutionReadyObservation WaitForExecutionReady(
+    const DaemonDirectory &directory,
+    const std::string_view expected_retained_bundle_id,
+    const std::chrono::seconds timeout = std::chrono::seconds(20)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  ExecutionReadyObservation observation;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      observation.response = SendCommand(
+          directory.execution_socket_path(),
+          R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+      if (observation.response.find(
+              "\"code\":\"execution_owner_not_ready\"") !=
+          std::string::npos) {
+        observation.observed_closed = true;
+      }
+      if (observation.response.find("\"ok\":true") != std::string::npos &&
+          observation.response.find(expected_retained_bundle_id) !=
+              std::string::npos) {
+        constexpr std::string_view kOwnerEpochPrefix = "\"owner_epoch\":\"";
+        const auto owner_begin =
+            observation.response.find(kOwnerEpochPrefix);
+        if (owner_begin == std::string::npos) {
+          throw std::runtime_error(
+              "ready execution response has no owner epoch");
+        }
+        const auto value_begin = owner_begin + kOwnerEpochPrefix.size();
+        const auto value_end = observation.response.find('"', value_begin);
+        if (value_end == std::string::npos || value_end == value_begin) {
+          throw std::runtime_error(
+              "ready execution response has an invalid owner epoch");
+        }
+        observation.owner_epoch =
+            observation.response.substr(value_begin, value_end - value_begin);
+        return observation;
+      }
+    } catch (const std::exception &error) {
+      observation.observed_closed = true;
+      observation.response = std::string("transport_error:") + error.what();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  throw std::runtime_error("execution owner did not reopen exact product: " +
+                           observation.response);
+}
+
+std::vector<pid_t> ReadDirectChildren(const pid_t parent) {
+  std::ifstream stream(std::filesystem::path("/proc") /
+                       std::to_string(parent) / "task" /
+                       std::to_string(parent) / "children");
+  std::vector<pid_t> children;
+  pid_t child = 0;
+  while (stream >> child) {
+    if (child > 0) {
+      children.push_back(child);
+    }
+  }
+  return children;
+}
+
+pid_t WaitForSoleManagedChild(const pid_t manager,
+                              const pid_t excluded_child = -1) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto children = ReadDirectChildren(manager);
+    if (children.size() == 1U && children.front() != excluded_child &&
+        ::kill(children.front(), 0) == 0) {
+      return children.front();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  throw std::runtime_error("Manager did not converge one replacement child");
 }
 #endif
 
@@ -454,6 +544,23 @@ std::string ScenePoseRequest(const SourceSnapshot &scene_source,
        CanonicalValue(CanonicalValue::Array{
            CanonicalValue(std::string(scene_resource_id)),
        })},
+  }));
+}
+
+std::string ScenePreviewRequest(const SourceSnapshot &scene_source,
+                                const std::string_view request_id) {
+  using content_identity::CanonicalValue;
+  const auto transaction = deployment::parse_strict_json_model_yaml(
+                               SceneAddRequest(scene_source, request_id))
+                               .root();
+  return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"candidate_request",
+       CanonicalValue(CanonicalValue::Object{
+           {"frame_resolution", CanonicalValue(nullptr)},
+           {"request", RequiredMember(transaction, "transaction")},
+       })},
+      {"command", CanonicalValue("scene_candidate_preview")},
   }));
 }
 
@@ -641,6 +748,25 @@ TEST(ManagerDaemonProcess,
                                              "logical-scene-source.json");
     const auto initial = scene_source.Read();
     ASSERT_TRUE(initial.has_value());
+    const auto owner_read = SendCommand(
+        directory.socket_path(),
+        "{\"api_version\":\"manyforge.manager_command.v1\","
+        "\"command\":\"scene_owner_read\"}");
+    EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos);
+    EXPECT_NE(owner_read.find(initial->source_owner_epoch), std::string::npos);
+    const auto preview = SendCommand(
+        directory.socket_path(),
+        ScenePreviewRequest(*initial, "scene-process-preview.1"));
+    EXPECT_NE(preview.find("\"ok\":false"), std::string::npos) << preview;
+    EXPECT_NE(preview.find(
+                  "\"reason\":\"scene_candidate_operation_unsupported\""),
+              std::string::npos)
+        << preview;
+    const auto after_preview = scene_source.Read();
+    ASSERT_TRUE(after_preview.has_value());
+    EXPECT_EQ(after_preview->semantic_content_digest,
+              initial->semantic_content_digest);
+    EXPECT_EQ(after_preview->source_generation, initial->source_generation);
     request = SceneAddRequest(*initial, "scene-process-request.1");
     const auto committed = SendCommand(directory.socket_path(), request);
     EXPECT_NE(committed.find("\"ok\":true"), std::string::npos);
@@ -714,6 +840,27 @@ TEST(ManagerDaemonProcess,
                         std::filesystem::copy_options::recursive);
   const auto package_root = directory.apply_package_root().string();
   const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
+  const auto wait_execution_response = [&] {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::string status;
+    while (std::chrono::steady_clock::now() < deadline) {
+      try {
+        status = SendCommand(
+            directory.execution_socket_path(),
+            R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+        if (status.find("\"ok\":true") != std::string::npos ||
+            status.find("\"code\":\"execution_owner_not_ready\"") !=
+                std::string::npos) {
+          return status;
+        }
+      } catch (const std::exception &error) {
+        status = std::string("transport_error:") + error.what();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return status;
+  };
   std::string first_manager_epoch;
   std::string request;
   {
@@ -757,6 +904,13 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos);
     EXPECT_NE(applied.find(fixture.candidate_retained_bundle_id),
               std::string::npos);
+    const auto execution_status = wait_execution_response();
+    EXPECT_NE(execution_status.find("\"ok\":false"), std::string::npos)
+        << execution_status;
+    EXPECT_NE(execution_status.find(
+                  "\"code\":\"execution_owner_not_ready\""),
+              std::string::npos)
+        << execution_status;
     ASSERT_TRUE(std::filesystem::remove(directory.apply_package_root() /
                                         "maintained.scenario-catalog.yaml"));
     const auto replayed = SendCommand(directory.socket_path(), request);
@@ -813,10 +967,110 @@ TEST(ManagerDaemonProcess,
   EXPECT_NE(content_identity::canonical_json(scene_runtime_recovered->payload)
                 .find(fixture.candidate_retained_bundle_id),
             std::string::npos);
+  const auto recovered_execution_status = wait_execution_response();
+  EXPECT_NE(recovered_execution_status.find("\"ok\":false"),
+            std::string::npos)
+      << recovered_execution_status;
+  EXPECT_NE(recovered_execution_status.find(
+                "\"code\":\"execution_owner_not_ready\""),
+            std::string::npos)
+      << recovered_execution_status;
   const auto stale = SendCommand(directory.socket_path(), request);
   EXPECT_NE(stale.find("\"stale_request_owner_epoch\""), std::string::npos);
   const auto stopped = replacement.Stop(SIGTERM);
   EXPECT_TRUE(WIFEXITED(stopped));
+}
+
+TEST(ManagerDaemonProcess,
+     PhysicalCompositionReopensAfterChildAndManagerReplacement) {
+  const auto fixture = ReadManagerApplyFixtureMetadata();
+  DaemonDirectory directory;
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
+                        directory.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
+  const auto package_root = directory.apply_package_root().string();
+  const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
+  std::string first_manager_epoch;
+  std::string apply_request;
+  std::string child_recovered_owner_epoch;
+  {
+    ManagerProcess manager(directory, package_root, fixture.admission_filename,
+                           installed_manager.string());
+    manager.WaitReady(directory);
+    AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                               "manager-source.json");
+    const auto before = manager_source.Read();
+    ASSERT_TRUE(before.has_value());
+    first_manager_epoch = before->source_owner_epoch;
+    apply_request = ApplyRequest(
+        first_manager_epoch, fixture.physical_deployment_artifact_id,
+        fixture.physical_deployment_revision,
+        fixture.predecessor_graph_revision,
+        fixture.predecessor_retained_bundle_id,
+        "manager-physical-recovery-apply.1");
+
+    auto applied = SendCommand(directory.socket_path(), apply_request);
+    const auto apply_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
+           std::chrono::steady_clock::now() < apply_deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      applied = SendCommand(directory.socket_path(), apply_request);
+    }
+    ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
+        << applied;
+    ASSERT_NE(
+        applied.find(fixture.physical_candidate_retained_bundle_id),
+        std::string::npos)
+        << applied;
+
+    const auto initial = WaitForExecutionReady(
+        directory, fixture.physical_candidate_retained_bundle_id);
+    ASSERT_FALSE(initial.owner_epoch.empty());
+    const auto first_child = WaitForSoleManagedChild(manager.pid());
+    ASSERT_EQ(::kill(first_child, SIGKILL), 0);
+
+    const auto recovered = WaitForExecutionReady(
+        directory, fixture.physical_candidate_retained_bundle_id);
+    EXPECT_TRUE(recovered.observed_closed) << recovered.response;
+    EXPECT_NE(recovered.owner_epoch, initial.owner_epoch);
+    child_recovered_owner_epoch = recovered.owner_epoch;
+    const auto replacement_child =
+        WaitForSoleManagedChild(manager.pid(), first_child);
+    EXPECT_NE(replacement_child, first_child);
+
+    const auto after = manager_source.Read();
+    ASSERT_TRUE(after.has_value());
+    EXPECT_NE(content_identity::canonical_json(after->payload)
+                  .find(fixture.physical_candidate_retained_bundle_id),
+              std::string::npos);
+    const auto status = manager.Stop(SIGKILL);
+    ASSERT_TRUE(WIFSIGNALED(status));
+  }
+
+  ManagerProcess replacement(directory, package_root,
+                             fixture.admission_filename,
+                             installed_manager.string());
+  replacement.WaitReady(directory);
+  const auto recovered = WaitForExecutionReady(
+      directory, fixture.physical_candidate_retained_bundle_id);
+  EXPECT_NE(recovered.owner_epoch, child_recovered_owner_epoch);
+  EXPECT_NE(recovered.response.find(
+                fixture.physical_candidate_retained_bundle_id),
+            std::string::npos);
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                             "manager-source.json");
+  const auto manager_recovered = manager_source.Read();
+  ASSERT_TRUE(manager_recovered.has_value());
+  EXPECT_NE(manager_recovered->source_owner_epoch, first_manager_epoch);
+  EXPECT_NE(content_identity::canonical_json(manager_recovered->payload)
+                .find(fixture.physical_candidate_retained_bundle_id),
+            std::string::npos);
+  const auto stale = SendCommand(directory.socket_path(), apply_request);
+  EXPECT_NE(stale.find("\"stale_request_owner_epoch\""), std::string::npos);
+  const auto stopped = replacement.Stop(SIGTERM);
+  EXPECT_TRUE(WIFEXITED(stopped));
+  EXPECT_EQ(WEXITSTATUS(stopped), 0);
 }
 #endif
 

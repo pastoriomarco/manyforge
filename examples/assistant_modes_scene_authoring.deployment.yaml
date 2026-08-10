@@ -1108,11 +1108,11 @@
         "schema_revision": "sha256:7415c5e2df17491366755b401337e3ad96dd96703357b20c9e0d08bf3f46a9f6"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/model_asset/ur10e_robotiq_2f_140/033fb768dc05018fc84b60a8cf1ee1e744eff22d00eba21416fa1f5417c16852",
-        "content_digest": "sha256:c1a80d25d524d559864ebaac9ad3e985675205fde1642487b55c46320bf16a53",
+        "content_addressed_store_key": "catalog/maintained/model_asset/ur10e_robotiq_2f_140/b36edcfdcfba75fbb32e85b2e4fc7b4af933808f7e47567ef0882f58169178f4",
+        "content_digest": "sha256:84ac3c5cfae6845c2db9c97301de240586d51475fb914a259201f2aa50dc21e8",
         "record_id": "ur10e_robotiq_2f_140",
         "record_kind": "model_asset",
-        "record_revision": "sha256:033fb768dc05018fc84b60a8cf1ee1e744eff22d00eba21416fa1f5417c16852",
+        "record_revision": "sha256:b36edcfdcfba75fbb32e85b2e4fc7b4af933808f7e47567ef0882f58169178f4",
         "schema_id": "manyforge.model_asset.v1",
         "schema_revision": "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c"
       },
@@ -1195,7 +1195,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "deployment_revision": "sha256:6a4b04da36eadb13c3396afe2ec5aa0f51085f5a5fec65a75072663b23826685",
+  "deployment_revision": "sha256:f1f39a03b72d50774fbb21a1cf758f2c46218549379eb345b88b2541c0c3f656",
   "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
   "desired_control_configurations": [
     {
@@ -2050,7 +2050,7 @@
       {
         "model_asset_id": "ur10e_robotiq_2f_140",
         "model_instance_id": "ur10e_robot.model",
-        "model_revision": "sha256:033fb768dc05018fc84b60a8cf1ee1e744eff22d00eba21416fa1f5417c16852"
+        "model_revision": "sha256:b36edcfdcfba75fbb32e85b2e4fc7b4af933808f7e47567ef0882f58169178f4"
       }
     ],
     "runtime_units": [

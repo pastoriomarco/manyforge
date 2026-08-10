@@ -8,6 +8,11 @@ import sys
 
 import uvicorn
 
+from manyforge_headless_api.program_model_transport import (
+    OpenAICompatibleProgramModelTransport,
+    load_program_model_endpoint_configs,
+)
+
 from .app import create_app
 from .runtime import ProgramRunnerConfig, ProgramRunnerError, ProgramRuntime
 
@@ -21,6 +26,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--headless-timeout-s", type=float, default=30.0)
     parser.add_argument("--tick-interval-ms", type=float, default=10.0)
     parser.add_argument("--tick-workers", type=int, default=4)
+    parser.add_argument("--model-endpoint-config")
     return parser
 
 
@@ -34,8 +40,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             tick_interval_seconds=args.tick_interval_ms / 1_000.0,
             tick_workers=args.tick_workers,
         )
+        model_transport = (
+            None
+            if args.model_endpoint_config is None
+            else OpenAICompatibleProgramModelTransport(
+                load_program_model_endpoint_configs(args.model_endpoint_config)
+            )
+        )
         uvicorn.run(
-            create_app(ProgramRuntime(config)),
+            create_app(ProgramRuntime(config, model_transport=model_transport)),
             host=args.host,
             port=args.port,
         )

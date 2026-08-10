@@ -201,6 +201,10 @@
     },
     {
       "frame_role_id": "tcp",
+      "source_link_name": "grasp_frame"
+    },
+    {
+      "frame_role_id": "tool_mount",
       "source_link_name": "tool0"
     }
   ],
@@ -216,7 +220,7 @@
       "source_group_name": "gripper"
     }
   ],
-  "model_revision": "sha256:033fb768dc05018fc84b60a8cf1ee1e744eff22d00eba21416fa1f5417c16852",
+  "model_revision": "sha256:b36edcfdcfba75fbb32e85b2e4fc7b4af933808f7e47567ef0882f58169178f4",
   "resource_role_bindings": [
     {
       "resource_role_id": "arm_joints",

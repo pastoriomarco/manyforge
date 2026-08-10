@@ -4,6 +4,7 @@
 #include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -569,6 +570,75 @@ FakeOperationJournal default_journal;
   return std::move(sealed.value());
 }
 
+[[nodiscard]] RuntimeParticipantBinding second_same_type_occurrence(
+    const RuntimeParticipantBinding& source) {
+  auto value = source.value();
+  value.program_binding_id = ProgramBindingId("program-binding.robot.2");
+  value.controllable_component_id = ControllableComponentId("robot.2");
+  for (auto& model : value.model_bindings) {
+    model.model_instance_id = ModelInstanceId("robot.model.2");
+  }
+  for (auto& group : value.model_groups) {
+    group.model_instance_id = ModelInstanceId("robot.model.2");
+    group.compiled_group_name = "mf2_robot_2_arm_group";
+    for (auto& joint : group.expanded_compiled_joint_names) {
+      joint = "mf2_robot_2_joint_1";
+    }
+  }
+  for (auto& frame : value.frame_bindings) {
+    frame.model_instance_id = ModelInstanceId("robot.model.2");
+    frame.compiled_frame_name = "mf2_robot_2_" + frame.compiled_frame_name;
+  }
+  for (auto& resource : value.resources) {
+    resource.resource_id = ResourceId("robot.2.joint_1");
+    resource.compiled_resource_name = "mf2_robot_2_joint_1";
+  }
+  auto& control = *value.control_path;
+  control.control_domain_id = ControlDomainId("domain.arm.2");
+  control.control_binding_id = ControlBindingId("binding.arm.2");
+  control.active_control_configuration_id =
+      ActiveControlConfigurationId("active.native.2");
+  control.provider_instance_id = ProviderInstanceId("provider.native.2");
+  control.provider_runtime_epoch = RuntimeEpoch("provider-epoch.2");
+  control.state_authority_id = StateAuthorityId("state.native.2");
+  for (auto& path : value.supporting_capability_provider_paths) {
+    path.capability_provider_binding_id =
+        CapabilityProviderBindingId("planner-binding.2");
+    path.capability_provider_binding_revision =
+        CapabilityProviderBindingRevision("planner-binding-revision.2");
+    path.provider_instance_id = ProviderInstanceId("planner-provider.2");
+    path.provider_runtime_epoch = RuntimeEpoch("planner-provider-epoch.2");
+  }
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
+[[nodiscard]] RuntimeParticipantBinding with_planner_capability(
+    const RuntimeParticipantBinding& source, std::string capability_id) {
+  const auto* definition = find_builtin_capability_definition(capability_id);
+  if (definition == nullptr) {
+    throw std::logic_error("test planner capability is not registered");
+  }
+  auto value = source.value();
+  value.supporting_capability_provider_paths = {RuntimeCapabilityProviderPathDTO{
+      CapabilityId(std::move(capability_id)),
+      CapabilityDefinitionRevision(std::string(definition->capability_definition_revision)),
+      CapabilityProviderBindingId("planner-binding"),
+      CapabilityProviderBindingRevision("planner-binding-revision"),
+      ProviderInstanceId("planner-provider"),
+      ProviderManifestId("planner-provider-manifest"),
+      ProviderManifestRevision("planner-provider-revision"),
+      RuntimeEpoch("planner-provider-epoch")}};
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
 [[nodiscard]] OperationIntentDTO motion_operation(std::string request_id = "request.motion.1") {
   return OperationIntentDTO{
       PublicRequestContextDTO{RequestId(std::move(request_id)), RequestOwnerEpoch("kernel.epoch.1"),
@@ -697,6 +767,52 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
   ASSERT_TRUE(state.ok()) << state.error().message;
   EXPECT_EQ(state.value().state, OperationStateKind::kPlanning);
   EXPECT_EQ(state.value().participants.front().command_target_id.value(), "arm");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     SequentialSameTypeBindingsSelectOnlyTheirExactPhysicalEngine) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  const auto first_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute",
+                   CoordinateKind::kAngular);
+  const auto second_binding = second_same_type_occurrence(first_binding);
+  ResourceAddressedExecutionKernel kernel(
+      {{first_binding, &first_engine}, {second_binding, &second_engine}}, clock,
+      default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), 8U});
+
+  const auto first = kernel.execute(motion_operation("request.robot.1"));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  EXPECT_EQ(first_engine.execute_calls, 1);
+  EXPECT_EQ(second_engine.execute_calls, 0);
+  ASSERT_TRUE(first_engine.last_execute.has_value());
+  EXPECT_EQ(first_engine.last_execute->binding.controllable_component_id,
+            ControllableComponentId("robot.1"));
+  EXPECT_EQ(first_engine.last_execute->binding.resources.front(),
+            ResourceId("robot.joint_1"));
+  first_engine.emit_transition(ExecutionState::kPlanning,
+                               ExecutionState::kCompleted);
+  const auto acknowledged = kernel.acknowledge_completed(
+      control_request("request.robot.1.ack", first.value(), 1U));
+  ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
+
+  auto second_operation = motion_operation("request.robot.2");
+  second_operation.program_binding_id = second_binding.value().program_binding_id;
+  const auto second = kernel.execute(second_operation);
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  EXPECT_EQ(first_engine.execute_calls, 1);
+  EXPECT_EQ(second_engine.execute_calls, 1);
+  ASSERT_TRUE(second_engine.last_execute.has_value());
+  EXPECT_EQ(second_engine.last_execute->binding.controllable_component_id,
+            ControllableComponentId("robot.2"));
+  EXPECT_EQ(second_engine.last_execute->binding.resources.front(),
+            ResourceId("robot.2.joint_1"));
+  const auto& resolved_goal =
+      std::get<ResolvedJointGoalDTO>(second_engine.last_execute->motion);
+  EXPECT_EQ(resolved_goal.joint_names,
+            (std::vector<std::string>{"mf2_robot_2_joint_1"}));
 }
 
 TEST(ResourceAddressedExecutionKernelTest, UsesOneInjectedGateForTheActualSlotTableReservation) {
@@ -835,6 +951,105 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.execute_calls, 0);
   EXPECT_EQ(engine.preview_calls, 0);
   EXPECT_EQ(journal.calls, std::vector<std::string>{"begin"});
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreviewSessionAllowsMotionSpecificPlannerProvidersOnOnePinnedParticipant) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto physical =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto pose = with_planner_capability(physical, "planning.motion.pose_goal");
+  const auto cartesian =
+      with_planner_capability(physical, "planning.motion.cartesian_path");
+  ResourceAddressedExecutionKernel kernel(
+      {{pose, &engine}}, clock, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), 8U,
+          [&](const OperationIntentDTO& operation,
+              const std::size_t) -> Result<RuntimeParticipantExecutionRegistration> {
+            const auto& motion = std::get<MotionParticipantIntentDTO>(
+                operation.participants.front().payload);
+            const auto& selected = std::holds_alternative<CartesianPathDTO>(motion.motion)
+                                       ? cartesian
+                                       : pose;
+            return Result<RuntimeParticipantExecutionRegistration>::Ok(
+                RuntimeParticipantExecutionRegistration{selected, &engine});
+          }});
+  auto primary = motion_operation("request.preview.pose");
+  auto& primary_motion =
+      std::get<MotionParticipantIntentDTO>(primary.participants.front().payload);
+  primary_motion.motion = PoseGoalDTO{Pose3DTO{}};
+  primary_motion.per_joint_dynamics_limits.clear();
+
+  auto session = kernel.begin_motion_preview_session(primary);
+  ASSERT_TRUE(session.ok()) << session.error().message;
+  auto linked = motion_operation("request.preview.cartesian");
+  auto& linked_motion =
+      std::get<MotionParticipantIntentDTO>(linked.participants.front().payload);
+  linked_motion.move_id = MoveId("move.cartesian");
+  linked_motion.motion = CartesianPathDTO{{Pose3DTO{}, Pose3DTO{{0.0, 0.0, 0.1}, {}}}};
+  linked_motion.per_joint_dynamics_limits.clear();
+
+  auto prepared = session.value()->prepare_motion(linked);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  EXPECT_EQ(prepared.value().binding.planner_capability_binding.capability_id.value(),
+            "planning.motion.cartesian_path");
+  EXPECT_EQ(engine.execute_calls, 0);
+  EXPECT_EQ(engine.preview_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreviewSessionRejectsAPlannerResolutionThatChangesThePinnedEngine) {
+  FakeClock clock;
+  FakeParticipantEngine primary_engine;
+  FakeParticipantEngine other_engine;
+  FakeOperationJournal journal;
+  const auto physical =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto pose = with_planner_capability(physical, "planning.motion.pose_goal");
+  const auto cartesian =
+      with_planner_capability(physical, "planning.motion.cartesian_path");
+  const auto unrelated =
+      make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear,
+                   ProgramCommandSchemaRefDTO{
+                       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+                       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))});
+  ResourceAddressedExecutionKernel kernel(
+      {{pose, &primary_engine}, {unrelated, &other_engine}}, clock, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), 8U,
+          [&](const OperationIntentDTO& operation,
+              const std::size_t) -> Result<RuntimeParticipantExecutionRegistration> {
+            const auto& motion = std::get<MotionParticipantIntentDTO>(
+                operation.participants.front().payload);
+            const bool is_cartesian = std::holds_alternative<CartesianPathDTO>(motion.motion);
+            return Result<RuntimeParticipantExecutionRegistration>::Ok(
+                RuntimeParticipantExecutionRegistration{is_cartesian ? cartesian : pose,
+                                                        is_cartesian ? &other_engine
+                                                                     : &primary_engine});
+          }});
+  auto primary = motion_operation("request.preview.engine.pose");
+  auto& primary_motion =
+      std::get<MotionParticipantIntentDTO>(primary.participants.front().payload);
+  primary_motion.motion = PoseGoalDTO{Pose3DTO{}};
+  primary_motion.per_joint_dynamics_limits.clear();
+
+  auto session = kernel.begin_motion_preview_session(primary);
+  ASSERT_TRUE(session.ok()) << session.error().message;
+  auto linked = motion_operation("request.preview.engine.cartesian");
+  auto& linked_motion =
+      std::get<MotionParticipantIntentDTO>(linked.participants.front().payload);
+  linked_motion.move_id = MoveId("move.engine.cartesian");
+  linked_motion.motion = CartesianPathDTO{{Pose3DTO{}, Pose3DTO{{0.0, 0.0, 0.1}, {}}}};
+  linked_motion.per_joint_dynamics_limits.clear();
+
+  auto prepared = session.value()->prepare_motion(linked);
+  ASSERT_FALSE(prepared.ok());
+  EXPECT_EQ(prepared.error().details.at("reason"), "motion_preview_engine_changed");
+  EXPECT_EQ(primary_engine.execute_calls, 0);
+  EXPECT_EQ(other_engine.execute_calls, 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

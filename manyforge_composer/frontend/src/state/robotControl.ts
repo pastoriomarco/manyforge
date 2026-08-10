@@ -58,7 +58,7 @@ export interface RobotControlState {
   mode: RobotControlMode;
   draftPositionsRad: number[];
   draftPose: Pose3Value;
-  draftGripperPosition: number;
+  draftGripperPosition: number | null;
   generation: number;
   intent: DirectControlOperationIntent | null;
   preview: DirectControlPreviewReceipt | null;
@@ -105,7 +105,7 @@ export const initialRobotControlState: RobotControlState = {
   mode: 'joint',
   draftPositionsRad: [],
   draftPose: IDENTITY_POSE,
-  draftGripperPosition: 0,
+  draftGripperPosition: null,
   generation: 0,
   intent: null,
   preview: null,
@@ -186,9 +186,14 @@ function gripperPositionIsValid(
   status: ExecutionOwnerStatus,
   position: number,
 ): boolean {
-  return Number.isFinite(position)
-    && position >= status.directControlGripper.minPosition
-    && position <= status.directControlGripper.maxPosition;
+  if (!Number.isFinite(position)) return false;
+  const { minPosition, maxPosition } = status.directControlGripper;
+  return minPosition === null && maxPosition === null
+    ? true
+    : minPosition !== null
+      && maxPosition !== null
+      && position >= minPosition
+      && position <= maxPosition;
 }
 
 function commonReceiptMatches(
@@ -242,6 +247,7 @@ function receiptMatchesCurrentDraft(
     && receipt.commandSchemaRevision === payload.command_schema_revision
     && receipt.sourceCoordinateName
       === status.directControlGripper.sourceCoordinateName
+    && receipt.sourceKind === status.directControlGripper.sourceKind
     && receipt.coordinateKind === position.kind
     && receipt.targetPosition === target
     && receipt.minPosition === status.directControlGripper.minPosition
@@ -259,7 +265,7 @@ function draftFromStatus(status: ExecutionOwnerStatus) {
   return {
     draftPositionsRad: [...status.observedMotion.positionsRad],
     draftPose: copyPose(status.observedMotion.currentTcpPose),
-    draftGripperPosition: status.observedGripper.position,
+    draftGripperPosition: status.observedGripper?.position ?? null,
   };
 }
 
@@ -335,6 +341,19 @@ export function robotControlReducer(
         || robotControlHasActiveOperation(state)
         || state.mode === action.mode
       ) return state;
+      if (action.mode === 'gripper' && state.draftGripperPosition === null) {
+        return {
+          ...state,
+          mode: action.mode,
+          phase: 'idle',
+          generation: state.generation + 1,
+          intent: null,
+          preview: null,
+          ghostStale: state.ghost !== null,
+          operation: null,
+          error: null,
+        };
+      }
       return invalidateDraft(state, { mode: action.mode });
     case 'edit':
     case 'edit_joint': {
@@ -520,7 +539,7 @@ export function robotControlReducer(
           ? {
               draftPositionsRad: [],
               draftPose: IDENTITY_POSE,
-              draftGripperPosition: 0,
+              draftGripperPosition: null,
             }
           : draftFromStatus(state.status)),
         generation: state.generation + 1,
@@ -702,7 +721,13 @@ export function buildGripperCommandIntent(
   requestId: string,
 ): DirectControlOperationIntent {
   const gripper = status.directControlGripper;
-  if (!status.observedGripper.complete) {
+  if (
+    status.observedGripper === null
+    && gripper.sourceKind !== 'component_local'
+  ) {
+    throw new Error('Authoritative gripper state is unavailable.');
+  }
+  if (status.observedGripper !== null && !status.observedGripper.complete) {
     throw new Error('Authoritative gripper state is incomplete.');
   }
   if (!gripperPositionIsValid(status, position)) {
@@ -745,7 +770,7 @@ export function buildGripperCommandIntent(
         completion_timeout_s: 2,
         caller_options: [{
           option_id: 'command_duration_s',
-          value_s: 0.5,
+          value_s: status.observedGripper === null ? 0 : 0.5,
         }],
       },
     }],
@@ -783,6 +808,9 @@ export function buildPreviewIntent(
         requestId,
       );
     case 'gripper':
+      if (state.draftGripperPosition === null) {
+        throw new Error('Enter an initial component-local gripper target.');
+      }
       return buildGripperCommandIntent(
         state.status,
         state.draftGripperPosition,

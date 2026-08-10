@@ -318,6 +318,7 @@ target_link_libraries(manyforge_native_execution_host PRIVATE
   manyforge_roboplan_retained_consumer
   manyforge_component_manager
   manyforge::content_identity
+  manyforge::scene_value_codec
   manyforge_deployment
   manyforge::persistence
   SQLite::SQLite3
@@ -369,6 +370,7 @@ if(BUILD_TESTING)
       manyforge_roboplan_retained_consumer
       manyforge_component_manager
       manyforge::content_identity
+      manyforge::scene_value_codec
       manyforge_deployment
       manyforge::persistence
       SQLite::SQLite3
@@ -707,6 +709,7 @@ if(BUILD_TESTING)
       DEPENDS "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_MANIFEST}")
 
     add_executable(test_retained_product_consumer
+      src/product_backed_runtime_participant_resolver.cpp
       test/test_retained_product_consumer.cpp)
     add_dependencies(
       test_retained_product_consumer

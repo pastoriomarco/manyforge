@@ -100,6 +100,7 @@ CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS = frozenset(
         "scene_revision",
         "schema_version",
         "source_coordinate_name",
+        "source_kind",
         "target_position",
         "target_role_id",
     }
@@ -701,31 +702,44 @@ class ExecutionCommandClient:
                 "capability-command preview does not match its submitted intent",
             )
         coordinate_kind = receipt.get("coordinate_kind")
+        source_kind = receipt.get("source_kind")
         expected_target: object = None
         if isinstance(position, dict):
             if position.get("kind") == "angular_rad":
                 expected_target = position.get("value_rad")
             elif position.get("kind") == "linear_m":
                 expected_target = position.get("value_m")
-        numeric_values = [
-            receipt.get("min_position"),
-            receipt.get("max_position"),
-            receipt.get("target_position"),
-        ]
-        if (
-            not isinstance(position, dict)
-            or coordinate_kind != position.get("kind")
-            or receipt.get("target_position") != expected_target
-            or not isinstance(receipt.get("source_coordinate_name"), str)
-            or not receipt["source_coordinate_name"]
-            or not all(
+        min_position = receipt.get("min_position")
+        max_position = receipt.get("max_position")
+        target_position = receipt.get("target_position")
+        bounded_model_resource = (
+            source_kind == "model_role"
+            and all(
                 isinstance(value, (int, float))
                 and not isinstance(value, bool)
                 and math.isfinite(value)
-                for value in numeric_values
+                for value in [min_position, max_position, target_position]
             )
-            or receipt["min_position"] > receipt["target_position"]
-            or receipt["target_position"] > receipt["max_position"]
+            and min_position <= target_position <= max_position
+        )
+        unbounded_component_local_resource = (
+            source_kind == "component_local"
+            and min_position is None
+            and max_position is None
+            and isinstance(target_position, (int, float))
+            and not isinstance(target_position, bool)
+            and math.isfinite(target_position)
+        )
+        if (
+            not isinstance(position, dict)
+            or coordinate_kind != position.get("kind")
+            or target_position != expected_target
+            or not isinstance(receipt.get("source_coordinate_name"), str)
+            or not receipt["source_coordinate_name"]
+            or not (
+                bounded_model_resource
+                or unbounded_component_local_resource
+            )
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",

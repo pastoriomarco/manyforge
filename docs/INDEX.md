@@ -19,12 +19,15 @@ branch/commit workflow).
 > reference-runtime convergence across Manager loss, crash/restart, and
 > explicit shutdown. I5/H0 now exposes independent Manager, runtime, scene,
 > alarm, history, health, and retained-NodeEnvironment projections through a
-> bounded API/CLI and thin Composer clients. N7-a5.1-a5.4 now add exact
+> bounded API/CLI and thin Composer clients. N7-a5.1-a5.5 now add exact
 > Program Apply/admission, the internal native Program join and tick host, an
 > independent Program-runner process, and strict scenario/Applied/Run/status/
-> Stop clients. Complete input coverage, repeated-instance proof, product
-> launch, and the native, Isaac, and real-robot lanes are not yet available.
-> The remainder of N closes the native lane, and
+> Stop clients, all seven maintained deployment inputs/eight Program Bindings,
+> physical managed-host recovery, and unchanged-source two-Lite6 isolation.
+> This source-complete product path is not supported until the N7 freeze and
+> cumulative qualification close. Packaged product launch and the native,
+> Isaac, and real-robot lanes are not yet available. The remainder of N closes
+> the native lane, and
 > I/R restore Isaac/real operation. Operator
 > runbooks below remain baseline/reference material until their owning
 > restoration gate.

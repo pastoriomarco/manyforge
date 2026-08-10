@@ -73,6 +73,7 @@ function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
       commandSchemaId: 'gripper.command_position',
       commandSchemaRevision: 'sha256:gripper-schema',
       sourceCoordinateName: 'finger_joint',
+      sourceKind: 'model_role',
       coordinateKind: 'linear_m',
       minPosition: 0,
       maxPosition: 0.04,
@@ -186,6 +187,7 @@ function gripperReceiptFixture(
     commandSchemaId: status.directControlGripper.commandSchemaId,
     commandSchemaRevision: status.directControlGripper.commandSchemaRevision,
     sourceCoordinateName: status.directControlGripper.sourceCoordinateName,
+    sourceKind: status.directControlGripper.sourceKind,
     coordinateKind: status.directControlGripper.coordinateKind,
     targetPosition: position,
     minPosition: status.directControlGripper.minPosition,
@@ -557,7 +559,36 @@ describe('addressed Robot Control state', () => {
     expect(reverted.operation).toBeNull();
     expect(reverted.preview).toBeNull();
     expect(reverted.draftGripperPosition).toBe(
-      status.observedGripper.position,
+      status.observedGripper?.position,
     );
+  });
+
+  it('authors the first component-local command without inventing state or limits', () => {
+    const status = statusFixture();
+    status.directControlGripper = {
+      ...status.directControlGripper,
+      sourceCoordinateName: 'gripper_position',
+      sourceKind: 'component_local',
+      minPosition: null,
+      maxPosition: null,
+    };
+    status.observedGripper = null;
+
+    let state = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status,
+    });
+    expect(state.draftGripperPosition).toBeNull();
+    state = robotControlReducer(state, {
+      type: 'edit_gripper',
+      position: 0.01,
+    });
+    expect(state.phase).toBe('planning');
+
+    const intent = buildGripperCommandIntent(status, 0.01, 'local-command-1');
+    const payload = intent.participants[0].payload;
+    expect(payload.kind).toBe('capability_command');
+    if (payload.kind !== 'capability_command') return;
+    expect(payload.caller_options[0].value_s).toBe(0);
   });
 });

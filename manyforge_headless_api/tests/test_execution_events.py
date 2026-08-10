@@ -252,6 +252,7 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
             "manyforge.direct_control_capability_command_preview.v1"
         ),
         "source_coordinate_name": "finger_joint",
+        "source_kind": "model_role",
         "target_position": 0.03,
         "target_role_id": "command_target",
     }
@@ -363,6 +364,27 @@ def test_execution_client_verifies_capability_command_preview_receipt(
 
     assert captured["command"] == "preview_capability_command"
     assert response["preview_receipt"]["target_position"] == 0.03
+
+    def component_local(command: dict[str, Any]) -> dict[str, Any]:
+        response = _command_preview_response(command["operation"])
+        receipt = response["preview_receipt"]
+        receipt["source_kind"] = "component_local"
+        receipt["source_coordinate_name"] = "gripper_position"
+        receipt["min_position"] = None
+        receipt["max_position"] = None
+        receipt.pop("receipt_digest")
+        receipt["receipt_digest"] = (
+            "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
+        )
+        return response
+
+    monkeypatch.setattr(client, "_exchange", component_local)
+    local_response = client.preview_capability_command(
+        request, trusted_principal_id=None
+    )
+    assert local_response["preview_receipt"]["source_kind"] == (
+        "component_local"
+    )
 
     def stale_schema(command: dict[str, Any]) -> dict[str, Any]:
         response = _command_preview_response(command["operation"])

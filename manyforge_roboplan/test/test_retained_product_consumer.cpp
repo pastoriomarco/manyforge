@@ -4,6 +4,7 @@
 #include <Eigen/Geometry>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
@@ -45,6 +47,7 @@
 #include "lite6_retained_consumer_fixture.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "mf2_joint_name_internal.hpp"
+#include "product_backed_runtime_participant_resolver.hpp"
 #include "retained_bundle_internal.hpp"
 
 namespace manyforge::roboplan_backend {
@@ -386,9 +389,15 @@ require_fixture_one(const Range &values, Predicate predicate,
       core::CapabilityId("execution.trajectory.execute")) {
     const auto &planner = require_fixture_one(
         bundle.value().capability_provider_bindings,
-        [](const auto &candidate) {
+        [&](const auto &candidate) {
+          const auto *target = std::get_if<
+              core::TargetBindingCapabilityProviderTargetDTO>(
+              &candidate.target);
           return candidate.capability_id ==
-                 core::CapabilityId("planning.motion.joint_goal");
+                     core::CapabilityId("planning.motion.joint_goal") &&
+                 target != nullptr &&
+                 target->controllable_component_id == component_id &&
+                 target->command_target_id == target_id;
         },
         "joint-planner capability provider");
     supporting_providers.push_back(
@@ -454,6 +463,35 @@ require_fixture_one(const Range &values, Predicate predicate,
   if (!sealed.ok()) {
     throw std::logic_error("retained fixture runtime participant failed: " +
                            sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
+[[nodiscard]] core::RuntimeParticipantBinding with_program_binding_identity(
+    const core::RuntimeParticipantBinding &physical,
+    const deployment::ProgramBinding &program_binding) {
+  const auto &binding = program_binding.value();
+  if (binding.component_role_bindings.size() != 1U ||
+      binding.target_role_bindings.size() != 1U ||
+      binding.component_role_bindings.front().controllable_component_id !=
+          physical.value().controllable_component_id ||
+      binding.target_role_bindings.front().command_target_id !=
+          physical.value().command_target_id) {
+    throw std::logic_error(
+        "direct-control Program Binding crosses its physical participant");
+  }
+  auto value = physical.value();
+  value.program_id = binding.program_id;
+  value.program_revision = binding.program_revision;
+  value.program_binding_id = program_binding.program_binding_id();
+  value.component_role_id =
+      binding.component_role_bindings.front().component_role_id;
+  value.target_role_id = binding.target_role_bindings.front().target_role_id;
+  auto sealed = core::verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(
+        "direct-control physical participant identity failed: " +
+        sealed.error().message);
   }
   return std::move(sealed.value());
 }
@@ -755,22 +793,19 @@ make_gripper_operation(const core::RuntimeParticipantBinding &binding,
   std::set<core::ResourceId> resources;
   for (const auto *binding : bindings) {
     if (binding == nullptr || !binding->value().control_path.has_value()) {
-      throw std::logic_error(
-          "runtime fence fixture has no exact control path");
+      throw std::logic_error("runtime fence fixture has no exact control path");
     }
     const auto &value = binding->value();
     const auto &control = *value.control_path;
     components.insert(value.controllable_component_id);
     const auto [domain, inserted_domain] = domains.emplace(
         control.control_domain_id, control.control_domain_revision);
-    if (!inserted_domain &&
-        domain->second != control.control_domain_revision) {
+    if (!inserted_domain && domain->second != control.control_domain_revision) {
       throw std::logic_error(
           "runtime fence fixture has conflicting domain revisions");
     }
-    const auto [control_binding, inserted_binding] =
-        control_bindings.emplace(control.control_binding_id,
-                                 control.control_binding_revision);
+    const auto [control_binding, inserted_binding] = control_bindings.emplace(
+        control.control_binding_id, control.control_binding_revision);
     if (!inserted_binding &&
         control_binding->second != control.control_binding_revision) {
       throw std::logic_error(
@@ -784,18 +819,17 @@ make_gripper_operation(const core::RuntimeParticipantBinding &binding,
   std::vector<core::ConfigurationFenceDomainScopeDTO> domain_scope;
   domain_scope.reserve(domains.size());
   for (const auto &[domain_id, revision] : domains) {
-    domain_scope.push_back(
-        {domain_id, revision, revision});
+    domain_scope.push_back({domain_id, revision, revision});
   }
   std::vector<core::ConfigurationFenceBindingScopeDTO> binding_scope;
   binding_scope.reserve(control_bindings.size());
   for (const auto &[binding_id, revision] : control_bindings) {
-    binding_scope.push_back(
-        {binding_id, revision, revision});
+    binding_scope.push_back({binding_id, revision, revision});
   }
-  core::ConfigurationFenceScopeDTO scope{
-      {components.begin(), components.end()}, std::move(domain_scope),
-      std::move(binding_scope), {resources.begin(), resources.end()}};
+  core::ConfigurationFenceScopeDTO scope{{components.begin(), components.end()},
+                                         std::move(domain_scope),
+                                         std::move(binding_scope),
+                                         {resources.begin(), resources.end()}};
   if (!scope.valid()) {
     throw std::logic_error("runtime fence fixture scope is invalid");
   }
@@ -1788,6 +1822,33 @@ TEST(
       projection_binding};
   const auto neutral = resolver->Resolve(query, logical_scene.shared(), 10);
   ASSERT_TRUE(neutral.ok()) << neutral.error().message;
+  const auto *gripper_target =
+      model_map.find_target(component_id, gripper_target_id);
+  ASSERT_NE(gripper_target, nullptr);
+  const auto gripper_tcp = std::find_if(
+      gripper_target->frames.begin(), gripper_target->frames.end(),
+      [](const auto &frame) { return frame.frame_role_id.value() == "tcp"; });
+  ASSERT_NE(gripper_tcp, gripper_target->frames.end());
+  const auto *gripper_model_tcp =
+      std::get_if<deployment::CompositionComponentModelFrame>(
+          &gripper_tcp->frame);
+  ASSERT_NE(gripper_model_tcp, nullptr);
+  const auto resolved_gripper_tcp = resolver->Resolve(
+      core::SceneFrameResolutionQueryDTO{
+          core::TargetCarrierSceneFrameRefDTO{component_id, gripper_target_id,
+                                              core::FrameRoleId("tcp")},
+          projection_binding},
+      logical_scene.shared(), 10);
+  ASSERT_TRUE(resolved_gripper_tcp.ok())
+      << resolved_gripper_tcp.error().message;
+  const auto *resolved_gripper_model_tcp =
+      std::get_if<core::ResolvedComponentModelFrameDTO>(
+          &resolved_gripper_tcp.value().resolved_frame);
+  ASSERT_NE(resolved_gripper_model_tcp, nullptr);
+  EXPECT_EQ(resolved_gripper_model_tcp->frame_role_id,
+            gripper_model_tcp->frame_role_id);
+  EXPECT_EQ(resolved_gripper_model_tcp->compiled_frame_name,
+            gripper_model_tcp->compiled_frame_name);
   const auto external_neutral =
       external_resolver->Resolve(query, logical_scene.shared(), 10);
   ASSERT_TRUE(external_neutral.ok()) << external_neutral.error().message;
@@ -2102,12 +2163,20 @@ TEST(RetainedProductCrossConsumer,
       core::ExecutionKernelConfig{},
       RoboPlanExecutionBackendConfig{},
       SimpleSchedulerConfig{},
-      10'000'000};
+      10'000'000,
+      {0.0, 0.0, 1.57, 0.0, 0.0, 0.0}};
   ManagedKernelAdmissionGate admission_gate;
   auto runtime = create_retained_native_runtime(
       RetainedNativeRuntimeInput{
-          arm_binding, gripper_binding, {}, {}, scene, scene_mutex,
-          state_projector, projection, shared_collision_model,
+          arm_binding,
+          gripper_binding,
+          {},
+          {},
+          scene,
+          scene_mutex,
+          state_projector,
+          projection,
+          shared_collision_model,
           std::move(planner),
           [&](const auto &channels) {
             std::vector<RetainedSceneFrameStateSourceInput> state_sources;
@@ -2137,6 +2206,37 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(runtime->gripper_binding.has_value());
   ASSERT_NE(runtime->motion_state_channel, nullptr);
   ASSERT_NE(runtime->gripper_state_channel, nullptr);
+  const auto initial_motion_state =
+      runtime->motion_state_channel->current_controlled_state();
+  ASSERT_TRUE(initial_motion_state.ok())
+      << initial_motion_state.error().message;
+  ASSERT_EQ(initial_motion_state.value().positions.size(), 6U);
+  const std::vector<double> expected_initial_motion_positions{0.0, 0.0, 1.57,
+                                                              0.0, 0.0, 0.0};
+  for (std::size_t index = 0U; index < expected_initial_motion_positions.size();
+       ++index) {
+    ASSERT_TRUE(std::holds_alternative<core::AngularPositionDTO>(
+        initial_motion_state.value().positions[index]));
+    EXPECT_DOUBLE_EQ(std::get<core::AngularPositionDTO>(
+                         initial_motion_state.value().positions[index])
+                         .value_rad,
+                     expected_initial_motion_positions[index]);
+  }
+  auto direct_frame_resolver =
+      std::dynamic_pointer_cast<RetainedSceneFrameResolver>(
+          runtime->reference_resolver);
+  ASSERT_NE(direct_frame_resolver, nullptr);
+  const auto installed_frame_resolver = projection->InstallActiveFrameResolver(
+      inventory->projection_binding.projection_revision, direct_frame_resolver);
+  ASSERT_TRUE(installed_frame_resolver.ok())
+      << installed_frame_resolver.error().message;
+  auto foreign_revision = inventory->projection_binding.projection_revision;
+  foreign_revision.graph_revision = core::GraphRevision("foreign-graph");
+  const auto foreign_frame_resolver = projection->InstallActiveFrameResolver(
+      foreign_revision, direct_frame_resolver);
+  ASSERT_FALSE(foreign_frame_resolver.ok());
+  EXPECT_EQ(foreign_frame_resolver.error().details.at("reason"),
+            "native_projection_active_frame_resolver_invalid");
   admission_gate.BindResourceTable(
       runtime->addressed_kernel->resource_admission_table());
   const auto physical_scope = make_runtime_fence_scope(
@@ -2218,13 +2318,13 @@ TEST(RetainedProductCrossConsumer,
                 operation_first.affected_active_operation_count,
             1U);
   bool rejected_fence_commit_called = false;
-  EXPECT_THROW(
-      admission_gate.AcquireFenceDurably(
-          core::ConfigurationFenceId("fence.native.operation-first"),
-          physical_scope, operation_first.operation_resource_generation,
-          operation_first.active_control_configurations,
-          [&] { rejected_fence_commit_called = true; }),
-      std::runtime_error);
+  EXPECT_THROW(admission_gate.AcquireFenceDurably(
+                   core::ConfigurationFenceId("fence.native.operation-first"),
+                   physical_scope,
+                   operation_first.operation_resource_generation,
+                   operation_first.active_control_configurations,
+                   [&] { rejected_fence_commit_called = true; }),
+               std::runtime_error);
   EXPECT_FALSE(rejected_fence_commit_called);
   core::OperationStateKind motion_terminal =
       core::OperationStateKind::kExecuting;
@@ -2270,6 +2370,34 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_NE(first_joint, nullptr);
   EXPECT_NEAR(first_joint->value_rad, 0.05, 1.0e-6);
 
+  const core::ProjectionLeaseId frame_lease_id(
+      "native-runtime-direct-frame-resolver");
+  auto retained_frame_projection = projection->RetainProjection(
+      inventory->projection_binding.projection_revision, frame_lease_id);
+  ASSERT_TRUE(retained_frame_projection.ok())
+      << retained_frame_projection.error().message;
+  projection_clock = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+  const auto resolved_moved_tcp =
+      projection->ResolveSceneFrame(core::SceneFrameResolutionQueryDTO{
+          core::TargetCarrierSceneFrameRefDTO{component_id, arm_target_id,
+                                              core::FrameRoleId("tcp")},
+          {inventory->projection_binding.projection_revision, frame_lease_id}});
+  ASSERT_TRUE(resolved_moved_tcp.ok()) << resolved_moved_tcp.error().message;
+  const auto &moved_pose = resolved_moved_tcp.value().frame_pose_in_cell;
+  const auto &zero_pose = tcp_pose.value();
+  const double moved_pose_delta =
+      std::abs(moved_pose.position_m.x_m - zero_pose.position_m.x_m) +
+      std::abs(moved_pose.position_m.y_m - zero_pose.position_m.y_m) +
+      std::abs(moved_pose.position_m.z_m - zero_pose.position_m.z_m) +
+      std::abs(moved_pose.orientation.x - zero_pose.orientation.x) +
+      std::abs(moved_pose.orientation.y - zero_pose.orientation.y) +
+      std::abs(moved_pose.orientation.z - zero_pose.orientation.z) +
+      std::abs(moved_pose.orientation.w - zero_pose.orientation.w);
+  EXPECT_GT(moved_pose_delta, 1.0e-8);
+  projection->ReleaseProjection(frame_lease_id);
+
   const auto motion_acknowledged =
       runtime->addressed_kernel->acknowledge_completed(
           core::OperationControlRequestDTO{
@@ -2295,8 +2423,7 @@ TEST(RetainedProductCrossConsumer,
       make_gripper_operation(gripper_binding, owner_epoch);
   const auto fenced = runtime->addressed_kernel->execute(gripper_intent);
   ASSERT_FALSE(fenced.ok());
-  EXPECT_EQ(fenced.error().details.at("reason"),
-            "configuration_fence_held");
+  EXPECT_EQ(fenced.error().details.at("reason"), "configuration_fence_held");
   const auto fenced_observation = admission_gate.Observe(physical_scope);
   EXPECT_EQ(fenced_observation.operation_resource_generation,
             idle.operation_resource_generation);
@@ -2304,8 +2431,7 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(fenced_observation.affected_active_operation_count, 0U);
   admission_gate.ReleaseFence(held_fence, physical_scope);
 
-  const auto accepted =
-      runtime->addressed_kernel->execute(gripper_intent);
+  const auto accepted = runtime->addressed_kernel->execute(gripper_intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   core::OperationStateKind terminal_state =
       core::OperationStateKind::kExecuting;
@@ -2403,6 +2529,28 @@ TEST(RetainedProductCrossConsumer,
   const auto collision_projector =
       RetainedCollisionWorldProjector::create_verified(
           shared_collision_model, *materialized.bundle, model_map, retained);
+
+  auto overlapping_role_map = collision_projector.model_map();
+  ASSERT_FALSE(overlapping_role_map.component_bodies.empty());
+  const auto existing_body = overlapping_role_map.component_bodies.front();
+  auto alias_body = existing_body;
+  alias_body.collision_body_role_id =
+      core::CollisionBodyRoleId("zz_overlapping_collision_alias");
+  overlapping_role_map.component_bodies.push_back(alias_body);
+  const auto aliased_projector = RetainedCollisionWorldProjector::create(
+      shared_collision_model, std::move(overlapping_role_map));
+  const auto semantic_alias = core::make_component_collision_body_id(
+      alias_body.controllable_component_id, alias_body.model_instance_id,
+      alias_body.collision_body_role_id, alias_body.collision_index);
+  const auto physical_body = core::make_component_collision_body_id(
+      existing_body.controllable_component_id, existing_body.model_instance_id,
+      existing_body.collision_body_role_id, existing_body.collision_index);
+  ASSERT_EQ(aliased_projector.component_projection().component_bodies.size(),
+            collision_projector.component_projection().component_bodies.size());
+  ASSERT_EQ(aliased_projector.component_body_aliases().count(semantic_alias),
+            1U);
+  EXPECT_EQ(aliased_projector.component_body_aliases().at(semantic_alias),
+            physical_body);
 
   const core::SceneResourceId scene_resource_id("retained-model-obstacle");
   const std::string scene_body_id = "scene/retained-model-obstacle/shape/0";
@@ -2544,6 +2692,41 @@ TEST(RetainedProductCrossConsumer,
   const auto *carrier = std::get_if<deployment::CompositionComponentModelFrame>(
       &carrier_frame->frame);
   ASSERT_NE(carrier, nullptr);
+
+  const auto collision_target = std::find_if(
+      collision_projector.model_map().targets.begin(),
+      collision_projector.model_map().targets.end(),
+      [&](const RetainedCollisionModelMapInput::Target &candidate) {
+        return candidate.controllable_component_id == component_id &&
+               candidate.command_target_id == gripper_target_id;
+      });
+  ASSERT_NE(collision_target, collision_projector.model_map().targets.end());
+  ASSERT_FALSE(collision_target->bodies.empty());
+  auto exact_carrier_candidates = collision_target->bodies;
+  auto exact_carrier_body = collision_target->bodies.front();
+  exact_carrier_body.collision_body_role_id =
+      core::CollisionBodyRoleId("exact_carrier_collision");
+  exact_carrier_body.collision_index = 0U;
+  exact_carrier_body.compiled_frame_name = carrier->compiled_frame_name;
+  exact_carrier_candidates.push_back(exact_carrier_body);
+  auto exact_carrier_alias = exact_carrier_body;
+  exact_carrier_alias.collision_body_role_id =
+      core::CollisionBodyRoleId("zz_exact_carrier_alias");
+  exact_carrier_candidates.push_back(exact_carrier_alias);
+  const auto exact_carrier_parent =
+      ManyForgeCollisionEngine::resolve_retained_carried_object_parent(
+          shared_collision_model, carrier->compiled_frame_name,
+          exact_carrier_candidates);
+  ASSERT_TRUE(exact_carrier_parent.ok())
+      << exact_carrier_parent.error().message;
+  EXPECT_EQ(exact_carrier_parent.value().compiled_parent_frame_name,
+            carrier->compiled_frame_name);
+  EXPECT_EQ(exact_carrier_parent.value().parent_body_id,
+            core::make_component_collision_body_id(
+                exact_carrier_body.controllable_component_id,
+                exact_carrier_body.model_instance_id,
+                exact_carrier_body.collision_body_role_id,
+                exact_carrier_body.collision_index));
 
   core::LogicalSceneSnapshotDTO carried_scene = make_collision_scene_snapshot(
       materialized.bundle->value().cell_graph.cell_id, 4U,
@@ -2919,22 +3102,32 @@ TEST(RetainedProductCrossConsumer,
       core::ContentDigest(std::string(kZeroDigest))};
   ASSERT_TRUE(candidate_preview.valid());
   const auto private_candidate = projection->ProjectSceneCandidate(
-      candidate_preview,
-      retained_predecessor.value().projection_binding,
+      candidate_preview, retained_predecessor.value().projection_binding,
       core::ProjectionLeaseId("pick-candidate.attach"));
-  ASSERT_TRUE(private_candidate.ok())
-      << private_candidate.error().message;
+  ASSERT_TRUE(private_candidate.ok()) << private_candidate.error().message;
   EXPECT_EQ(private_candidate.value().projection_binding.projection_revision,
             candidate_revision);
   EXPECT_EQ(private_candidate.value().logical_scene,
             candidate_preview.logical_scene);
   ASSERT_NE(private_candidate.value().bundle.world, nullptr);
   EXPECT_NE(private_candidate.value().bundle.world, predecessor_world);
-  EXPECT_EQ(private_candidate.value().bundle.policy,
-            candidate_policy.value());
+  EXPECT_GT(private_candidate.value().bundle.world->revision.revision_id,
+            predecessor_world->revision.revision_id);
+  EXPECT_EQ(private_candidate.value().bundle.policy, candidate_policy.value());
   EXPECT_EQ(private_candidate.value().live_objects.size(), 2U);
   EXPECT_EQ(*projection->logical_snapshot(), initial_scene);
   EXPECT_EQ(projection->snapshot(), predecessor_world);
+
+  const auto repeated_private_candidate = projection->ProjectSceneCandidate(
+      candidate_preview, retained_predecessor.value().projection_binding,
+      core::ProjectionLeaseId("pick-candidate.attach.repeated"));
+  ASSERT_TRUE(repeated_private_candidate.ok())
+      << repeated_private_candidate.error().message;
+  ASSERT_NE(repeated_private_candidate.value().bundle.world, nullptr);
+  EXPECT_GT(repeated_private_candidate.value().bundle.world->revision.revision_id,
+            private_candidate.value().bundle.world->revision.revision_id);
+  EXPECT_EQ(repeated_private_candidate.value().bundle.world->revision.content_hash,
+            private_candidate.value().bundle.world->revision.content_hash);
 
   const auto committed = projection->ApplyTransaction(transaction);
   ASSERT_TRUE(committed.presence_valid());
@@ -2946,6 +3139,8 @@ TEST(RetainedProductCrossConsumer,
   const auto current_world = projection->snapshot();
   ASSERT_NE(current_world, nullptr);
   EXPECT_NE(current_world, predecessor_world);
+  EXPECT_GT(current_world->revision.revision_id,
+            repeated_private_candidate.value().bundle.world->revision.revision_id);
   EXPECT_EQ(retained_predecessor.value().bundle.world, predecessor_world);
 
   const auto replay = projection->ApplyTransaction(transaction);
@@ -3296,6 +3491,124 @@ TEST(RetainedProductCrossConsumer,
       added_projection->ProjectionStageStatus(stage_query);
   EXPECT_EQ(activated_status.state,
             core::NativeProjectionStatusState::kActivated);
+}
+
+TEST(RetainedProductCrossConsumer,
+     TwoSameTypeProgramsResolveDistinctPhysicalParticipantsWithoutAliasing) {
+  ScopedTemporaryRoot temporary;
+  const std::filesystem::path package_root =
+      temporary.path() / "retained-package";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+
+  constexpr std::string_view cell_id = "i6_two_lite6_program_binding_cell";
+  const auto materialized = deployment::test::
+      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+          package_root, cell_id);
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &bundle = *materialized.bundle;
+  ASSERT_EQ(bundle.value().compiled_products.symbol_role_maps.size(), 1U);
+  const auto model_map = load_lite6_model_map(
+      package_root,
+      {bundle.retained_bundle_id(),
+       bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
+  const auto inventory =
+      deployment::compile_direct_control_program_binding_inventory(
+          bundle, model_map, catalog_store);
+  ASSERT_EQ(inventory.motion.size(), 2U);
+  EXPECT_TRUE(inventory.gripper.empty());
+
+  std::set<core::ProgramBindingId> program_binding_ids;
+  std::set<core::ControllableComponentId> component_ids;
+  std::set<core::ModelInstanceId> model_instance_ids;
+  std::set<core::RuntimeUnitId> runtime_unit_ids;
+  std::set<core::ResourceId> all_resources;
+  std::set<std::string> all_compiled_resources;
+  std::vector<std::vector<std::string>> source_joint_orders;
+  std::vector<core::RuntimeParticipantBinding> physical_bindings;
+  physical_bindings.reserve(inventory.motion.size());
+  for (const auto &program_binding : inventory.motion) {
+    ASSERT_NE(program_binding, nullptr);
+    ASSERT_EQ(program_binding->value().component_role_bindings.size(), 1U);
+    ASSERT_EQ(program_binding->value().target_role_bindings.size(), 1U);
+    const auto component_id = program_binding->value()
+                                  .component_role_bindings.front()
+                                  .controllable_component_id;
+    EXPECT_TRUE(
+        program_binding_ids.insert(program_binding->program_binding_id())
+            .second);
+    EXPECT_TRUE(component_ids.insert(component_id).second);
+    auto physical = with_program_binding_identity(
+        make_fixture_runtime_participant(
+            bundle, model_map, component_id,
+            core::CommandTargetId(
+                std::string(deployment::test::kLite6ArmTargetId))),
+        *program_binding);
+    const auto &value = physical.value();
+    ASSERT_EQ(value.model_bindings.size(), 1U);
+    EXPECT_TRUE(
+        model_instance_ids.insert(value.model_bindings.front().model_instance_id)
+            .second);
+    ASSERT_EQ(value.runtime_unit_epochs.size(), 1U);
+    EXPECT_TRUE(runtime_unit_ids
+                    .insert(value.runtime_unit_epochs.front().runtime_unit_id)
+                    .second);
+    std::vector<std::string> source_joint_order;
+    source_joint_order.reserve(value.resources.size());
+    for (const auto &resource : value.resources) {
+      ASSERT_TRUE(resource.source_joint_name.has_value());
+      source_joint_order.push_back(*resource.source_joint_name);
+      EXPECT_TRUE(all_resources.insert(resource.resource_id).second);
+      EXPECT_TRUE(
+          all_compiled_resources.insert(resource.compiled_resource_name)
+              .second);
+    }
+    source_joint_orders.push_back(std::move(source_joint_order));
+    physical_bindings.push_back(std::move(physical));
+  }
+  EXPECT_EQ(program_binding_ids.size(), 2U);
+  EXPECT_EQ(component_ids.size(), 2U);
+  EXPECT_EQ(model_instance_ids.size(), 2U);
+  EXPECT_EQ(runtime_unit_ids.size(), 2U);
+  EXPECT_EQ(all_resources.size(), 12U);
+  EXPECT_EQ(all_compiled_resources.size(), 12U);
+  ASSERT_EQ(source_joint_orders.size(), 2U);
+  EXPECT_EQ(source_joint_orders[0], source_joint_orders[1]);
+
+  ProductBackedRuntimeParticipantResolver resolver(
+      package_root, materialized.bundle,
+      load_lite6_model_map(
+          package_root,
+          {bundle.retained_bundle_id(),
+           bundle.value().compiled_products.symbol_role_maps.front()
+               .product_id}),
+      physical_bindings);
+  const auto scene =
+      make_projection_runtime_shadow_snapshot(core::CellId(std::string(cell_id)));
+  for (std::size_t index = 0U; index < physical_bindings.size(); ++index) {
+    auto operation = make_motion_operation(
+        physical_bindings[index], core::RequestOwnerEpoch("kernel.epoch.two"),
+        scene.shared()->revision);
+    operation.request_context.request_id =
+        core::RequestId("request.two-lite6." + std::to_string(index + 1U));
+    const auto resolved = resolver.Resolve(operation, 0U);
+    ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+    EXPECT_EQ(resolved.value().value().program_binding_id,
+              physical_bindings[index].value().program_binding_id);
+    EXPECT_EQ(resolved.value().value().controllable_component_id,
+              physical_bindings[index].value().controllable_component_id);
+    EXPECT_EQ(resolved.value().value().resources,
+              physical_bindings[index].value().resources);
+  }
+
+  auto unknown = make_motion_operation(
+      physical_bindings.front(), core::RequestOwnerEpoch("kernel.epoch.two"),
+      scene.shared()->revision);
+  unknown.program_binding_id = core::ProgramBindingId("unknown-binding");
+  const auto rejected = resolver.Resolve(unknown, 0U);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "runtime_program_binding_unavailable");
 }
 
 TEST(RetainedProductCrossConsumer,

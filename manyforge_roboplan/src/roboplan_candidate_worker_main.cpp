@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cmath>
@@ -196,9 +197,10 @@ void send_frame(int descriptor, MessageType type, std::string_view payload) {
 }
 
 void add_geometry(roboplan::Scene& scene,
-                  const RoboPlanWorkerGeometryDTO& geometry) {
+                  const RoboPlanWorkerGeometryDTO& geometry,
+                  const std::string& parent_frame) {
   if (geometry.native_geometry_name.empty() ||
-      geometry.compiled_parent_frame.empty()) {
+      geometry.compiled_parent_frame.empty() || parent_frame.empty()) {
     fail("geometry identity is empty");
   }
   const Eigen::Vector4d color(0.55, 0.55, 0.55, 1.0);
@@ -213,8 +215,7 @@ void add_geometry(roboplan::Scene& scene,
             return tl::unexpected("box dimensions are invalid");
           }
           return scene.addBoxGeometry(
-              geometry.native_geometry_name,
-              geometry.compiled_parent_frame,
+              geometry.native_geometry_name, parent_frame,
               roboplan::Box(shape.dimensions_m.x_m, shape.dimensions_m.y_m,
                             shape.dimensions_m.z_m),
               pose, color);
@@ -223,8 +224,7 @@ void add_geometry(roboplan::Scene& scene,
             return tl::unexpected("sphere radius is invalid");
           }
           return scene.addSphereGeometry(
-              geometry.native_geometry_name,
-              geometry.compiled_parent_frame,
+              geometry.native_geometry_name, parent_frame,
               roboplan::Sphere(shape.radius_m), pose, color);
         } else if constexpr (std::is_same_v<Shape,
                                              core::CylinderShapeDTO>) {
@@ -233,8 +233,7 @@ void add_geometry(roboplan::Scene& scene,
             return tl::unexpected("cylinder dimensions are invalid");
           }
           return scene.addCylinderGeometry(
-              geometry.native_geometry_name,
-              geometry.compiled_parent_frame,
+              geometry.native_geometry_name, parent_frame,
               roboplan::Cylinder(shape.radius_m, shape.height_m), pose,
               color);
         } else {
@@ -249,8 +248,7 @@ void add_geometry(roboplan::Scene& scene,
             return tl::unexpected("mesh resource is invalid or unavailable");
           }
           return scene.addMeshGeometry(
-              geometry.native_geometry_name,
-              geometry.compiled_parent_frame,
+              geometry.native_geometry_name, parent_frame,
               roboplan::Mesh(
                   *geometry.resolved_mesh_path,
                   Eigen::Vector3d(shape.scale.x_m, shape.scale.y_m,
@@ -262,6 +260,35 @@ void add_geometry(roboplan::Scene& scene,
   if (!result.has_value()) {
     fail("could not add resolved scene geometry: " + result.error());
   }
+}
+
+[[nodiscard]] std::string staging_frame_for(
+    roboplan::Scene& scene, const RoboPlanWorkerModelDTO& model) {
+  const auto reserved = [&](const std::string& frame_name) {
+    const auto is_geometry_name = std::any_of(
+        model.geometries.begin(), model.geometries.end(),
+        [&](const auto& geometry) {
+          return geometry.native_geometry_name == frame_name;
+        });
+    if (is_geometry_name) {
+      return true;
+    }
+    return std::any_of(
+        model.allowed_collision_pairs.begin(),
+        model.allowed_collision_pairs.end(), [&](const auto& pair) {
+          return pair.first == frame_name || pair.second == frame_name;
+        });
+  };
+  for (const auto& frame : scene.getModel().frames) {
+    if (frame.name.empty() || reserved(frame.name)) {
+      continue;
+    }
+    const auto geometry_ids = scene.getCollisionGeometryIds(frame.name);
+    if (geometry_ids.has_value() && geometry_ids->empty()) {
+      return frame.name;
+    }
+  }
+  fail("retained projection has no collision-free geometry staging frame");
 }
 
 [[nodiscard]] std::shared_ptr<roboplan::Scene> make_scene(
@@ -287,8 +314,12 @@ void add_geometry(roboplan::Scene& scene,
       model.native_scene_name, model.urdf_path, model.srdf_path,
       model.package_paths,
       model.yaml_config_path.value_or(std::filesystem::path{}));
-  for (const auto& geometry : model.geometries) {
-    add_geometry(*scene, geometry);
+  std::string staging_frame;
+  if (!model.geometries.empty()) {
+    staging_frame = staging_frame_for(*scene, model);
+    for (const auto& geometry : model.geometries) {
+      add_geometry(*scene, geometry, staging_frame);
+    }
   }
   for (const auto& pair : model.allowed_collision_pairs) {
     if (pair.first.empty() || pair.second.empty() ||
@@ -298,6 +329,25 @@ void add_geometry(roboplan::Scene& scene,
     const auto result = scene->setCollisions(pair.first, pair.second, false);
     if (!result.has_value()) {
       fail("could not apply resolved collision policy: " + result.error());
+    }
+  }
+  for (const auto& geometry : model.geometries) {
+    const auto frame_id = scene->getFrameId(geometry.compiled_parent_frame);
+    if (!frame_id.has_value() ||
+        frame_id.value() >= scene->getModel().frames.size()) {
+      fail("resolved scene geometry has no exact compiled parent frame");
+    }
+    // RoboPlan records GeometryObject::placement in the selected frame's
+    // parent-joint coordinates even though its API accepts a frame name.
+    // Retained ManyForge poses are relative to that named frame, so preserve
+    // the semantic frame by applying its fixed parent-joint transform here.
+    Eigen::Matrix4d pose = scene->getModel().frames[frame_id.value()]
+                               .placement.toHomogeneousMatrix() *
+                           transform(geometry.pose_in_parent);
+    const auto result = scene->updateGeometryPlacement(
+        geometry.native_geometry_name, geometry.compiled_parent_frame, pose);
+    if (!result.has_value()) {
+      fail("could not place resolved scene geometry: " + result.error());
     }
   }
   return scene;

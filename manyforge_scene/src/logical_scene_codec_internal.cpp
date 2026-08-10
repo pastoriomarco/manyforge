@@ -1262,6 +1262,171 @@ DecodeResolvedOperation(const CanonicalValue &value) {
   Fail("resolved scene operation kind is unsupported");
 }
 
+CanonicalValue ResolvedFrame(const core::ResolvedFrameDTO &value) {
+  return std::visit(
+      [](const auto &frame) -> CanonicalValue {
+        using T = std::decay_t<decltype(frame)>;
+        if constexpr (std::is_same_v<T, core::ResolvedCellFrameDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"cell_id", CanonicalValue(frame.cell_id.value())},
+              {"compiled_frame_name",
+               CanonicalValue(frame.compiled_frame_name)},
+              {"kind", CanonicalValue("cell")},
+          });
+        } else if constexpr (std::is_same_v<
+                                 T, core::ResolvedComponentModelFrameDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"compiled_frame_name",
+               CanonicalValue(frame.compiled_frame_name)},
+              {"controllable_component_id",
+               CanonicalValue(frame.controllable_component_id.value())},
+              {"frame_role_id", CanonicalValue(frame.frame_role_id.value())},
+              {"kind", CanonicalValue("component")},
+              {"model_instance_id",
+               CanonicalValue(frame.model_instance_id.value())},
+              {"model_revision",
+               CanonicalValue(frame.model_revision.value())},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"compiled_frame_name",
+               CanonicalValue(frame.compiled_frame_name)},
+              {"frame_role_id", CanonicalValue(frame.frame_role_id.value())},
+              {"kind", CanonicalValue("passive")},
+              {"model_instance_id",
+               CanonicalValue(frame.model_instance_id.value())},
+              {"model_revision",
+               CanonicalValue(frame.model_revision.value())},
+          });
+        }
+      },
+      value);
+}
+
+core::ResolvedFrameDTO DecodeResolvedFrame(const CanonicalValue &value) {
+  const auto kind = String(Member(value, "kind"), "resolved frame kind");
+  if (kind == "cell") {
+    ExactObject(value, 3U, "resolved cell frame");
+    return core::ResolvedCellFrameDTO{
+        core::CellId(String(Member(value, "cell_id"), "cell_id")),
+        String(Member(value, "compiled_frame_name"),
+               "compiled_frame_name")};
+  }
+  if (kind == "component") {
+    ExactObject(value, 6U, "resolved component frame");
+    return core::ResolvedComponentModelFrameDTO{
+        core::ControllableComponentId(String(
+            Member(value, "controllable_component_id"),
+            "controllable_component_id")),
+        core::ModelInstanceId(String(Member(value, "model_instance_id"),
+                                     "model_instance_id")),
+        core::FrameRoleId(
+            String(Member(value, "frame_role_id"), "frame_role_id")),
+        String(Member(value, "compiled_frame_name"),
+               "compiled_frame_name"),
+        core::ModelRevision(
+            String(Member(value, "model_revision"), "model_revision"))};
+  }
+  if (kind == "passive") {
+    ExactObject(value, 5U, "resolved passive frame");
+    return core::ResolvedPassiveModelFrameDTO{
+        core::ModelInstanceId(String(Member(value, "model_instance_id"),
+                                     "model_instance_id")),
+        core::FrameRoleId(
+            String(Member(value, "frame_role_id"), "frame_role_id")),
+        String(Member(value, "compiled_frame_name"),
+               "compiled_frame_name"),
+        core::ModelRevision(
+            String(Member(value, "model_revision"), "model_revision"))};
+  }
+  Fail("resolved frame kind is unsupported");
+}
+
+CanonicalValue
+ProjectionLeaseBinding(const core::ProjectionLeaseBindingDTO &value) {
+  if (!value.valid()) {
+    Fail("cannot encode an invalid projection lease binding");
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"projection_lease_id",
+       CanonicalValue(value.projection_lease_id.value())},
+      {"projection_revision", Projection(value.projection_revision)},
+  });
+}
+
+core::ProjectionLeaseBindingDTO
+DecodeProjectionLeaseBinding(const CanonicalValue &value) {
+  ExactObject(value, 2U, "projection lease binding");
+  core::ProjectionLeaseBindingDTO result{
+      DecodeProjection(Member(value, "projection_revision")),
+      core::ProjectionLeaseId(String(Member(value, "projection_lease_id"),
+                                     "projection_lease_id"))};
+  if (!result.valid()) {
+    Fail("decoded projection lease binding is invalid");
+  }
+  return result;
+}
+
+CanonicalValue SceneFrameResolutionReceipt(
+    const core::SceneFrameResolutionReceiptDTO &value) {
+  if (!value.valid()) {
+    Fail("cannot encode an invalid scene-frame resolution receipt");
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"component_attachment_revisions",
+       StrongArray(value.component_attachment_revisions)},
+      {"frame_pose_in_cell", Pose(value.frame_pose_in_cell)},
+      {"predicted_state_digest",
+       value.predicted_state_digest.has_value()
+           ? CanonicalValue(value.predicted_state_digest->value())
+           : CanonicalValue(nullptr)},
+      {"projection_binding", ProjectionLeaseBinding(value.projection_binding)},
+      {"resolution_evidence_digest",
+       CanonicalValue(value.resolution_evidence_digest.value())},
+      {"resolved_frame", ResolvedFrame(value.resolved_frame)},
+  });
+}
+
+core::SceneFrameResolutionReceiptDTO
+DecodeSceneFrameResolutionReceipt(const CanonicalValue &value) {
+  ExactObject(value, 6U, "scene-frame resolution receipt");
+  std::optional<core::ContentDigest> predicted_state_digest;
+  const auto &predicted = Member(value, "predicted_state_digest");
+  if (!std::holds_alternative<std::nullptr_t>(predicted.storage())) {
+    predicted_state_digest = core::ContentDigest(
+        String(predicted, "predicted_state_digest"));
+  }
+  core::SceneFrameResolutionReceiptDTO result{
+      DecodeResolvedFrame(Member(value, "resolved_frame")),
+      DecodePose(Member(value, "frame_pose_in_cell")),
+      DecodeStrongArray<core::ComponentAttachmentRevision>(
+          Member(value, "component_attachment_revisions"),
+          "component_attachment_revisions"),
+      DecodeProjectionLeaseBinding(Member(value, "projection_binding")),
+      std::move(predicted_state_digest),
+      core::ContentDigest(String(Member(value, "resolution_evidence_digest"),
+                                 "resolution_evidence_digest"))};
+  if (!result.valid()) {
+    Fail("decoded scene-frame resolution receipt is invalid");
+  }
+  return result;
+}
+
+core::SceneUpdateStatusDTO DecodeSceneUpdateStatus(
+    const CanonicalValue &value) {
+  const auto status = String(value, "scene update status");
+  if (status == "geometry_changed") {
+    return core::SceneUpdateStatusDTO::kGeometryChanged;
+  }
+  if (status == "freshness_only") {
+    return core::SceneUpdateStatusDTO::kFreshnessOnly;
+  }
+  if (status == "no_op") {
+    return core::SceneUpdateStatusDTO::kNoOp;
+  }
+  Fail("scene update status is unsupported");
+}
+
 CanonicalValue Snapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
   if (!snapshot.locally_valid()) {
     Fail("cannot encode an invalid logical snapshot");
@@ -1540,9 +1705,132 @@ DecodeSceneTransaction(const std::string_view bytes) {
   return transaction;
 }
 
+std::string EncodeResolvedSceneCandidatePreviewRequest(
+    const core::ResolvedSceneCandidatePreviewRequestDTO &request) {
+  const auto encoded_request =
+      logical_scene_codec_internal::EncodeRequest(request.request);
+  const auto parsed_request =
+      deployment::parse_strict_json_model_yaml(encoded_request);
+  return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"frame_resolution",
+       request.frame_resolution.has_value()
+           ? logical_scene_codec_internal::SceneFrameResolutionReceipt(
+                 *request.frame_resolution)
+           : CanonicalValue(nullptr)},
+      {"request", parsed_request.root()},
+  }));
+}
+
+core::ResolvedSceneCandidatePreviewRequestDTO
+DecodeResolvedSceneCandidatePreviewRequest(const std::string_view bytes) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  const auto &root = parsed.root();
+  if (ci::canonical_json(root) != bytes) {
+    throw std::invalid_argument(
+        "logical-scene codec: scene candidate request is not canonical JSON");
+  }
+  logical_scene_codec_internal::ExactObject(root, 2U,
+                                             "scene candidate request");
+  std::optional<core::SceneFrameResolutionReceiptDTO> frame_resolution;
+  const auto &encoded_frame =
+      logical_scene_codec_internal::Member(root, "frame_resolution");
+  if (!std::holds_alternative<std::nullptr_t>(encoded_frame.storage())) {
+    frame_resolution =
+        logical_scene_codec_internal::DecodeSceneFrameResolutionReceipt(
+            encoded_frame);
+  }
+  return core::ResolvedSceneCandidatePreviewRequestDTO{
+      logical_scene_codec_internal::DecodeRequest(ci::canonical_json(
+          logical_scene_codec_internal::Member(root, "request"))),
+      std::move(frame_resolution)};
+}
+
+std::string EncodeSceneCandidatePreview(
+    const core::SceneCandidatePreviewDTO &preview) {
+  if (!preview.valid()) {
+    throw std::invalid_argument(
+        "logical-scene codec: cannot encode an invalid scene candidate");
+  }
+  return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"effective_collision_policy",
+       logical_scene_codec_internal::Policy(
+           preview.effective_collision_policy)},
+      {"logical_scene",
+       logical_scene_codec_internal::Snapshot(*preview.logical_scene)},
+      {"prior_projection_revision",
+       logical_scene_codec_internal::Projection(
+           preview.prior_projection_revision)},
+      {"proposed_projection_revision",
+       logical_scene_codec_internal::Projection(
+           preview.proposed_projection_revision)},
+      {"request_digest", CanonicalValue(preview.request_digest.value())},
+      {"resolution_evidence_digest",
+       preview.resolution_evidence_digest.has_value()
+           ? CanonicalValue(preview.resolution_evidence_digest->value())
+           : CanonicalValue(nullptr)},
+      {"resolved_operation",
+       logical_scene_codec_internal::ResolvedOperation(
+           preview.resolved_operation)},
+      {"update_status",
+       CanonicalValue(std::string(core::to_string(preview.update_status)))},
+  }));
+}
+
+core::SceneCandidatePreviewDTO
+DecodeSceneCandidatePreview(const std::string_view bytes) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  const auto &root = parsed.root();
+  if (ci::canonical_json(root) != bytes) {
+    throw std::invalid_argument(
+        "logical-scene codec: scene candidate is not canonical JSON");
+  }
+  logical_scene_codec_internal::ExactObject(root, 8U, "scene candidate");
+  std::optional<core::ContentDigest> resolution_evidence_digest;
+  const auto &encoded_resolution = logical_scene_codec_internal::Member(
+      root, "resolution_evidence_digest");
+  if (!std::holds_alternative<std::nullptr_t>(
+          encoded_resolution.storage())) {
+    resolution_evidence_digest = core::ContentDigest(
+        logical_scene_codec_internal::String(
+            encoded_resolution, "resolution_evidence_digest"));
+  }
+  auto snapshot = std::make_shared<const core::LogicalSceneSnapshotDTO>(
+      logical_scene_codec_internal::DecodeSnapshot(ci::canonical_json(
+          logical_scene_codec_internal::Member(root, "logical_scene"))));
+  core::SceneCandidatePreviewDTO result{
+      core::ContentDigest(logical_scene_codec_internal::String(
+          logical_scene_codec_internal::Member(root, "request_digest"),
+          "request_digest")),
+      logical_scene_codec_internal::DecodeProjection(
+          logical_scene_codec_internal::Member(
+              root, "prior_projection_revision")),
+      logical_scene_codec_internal::DecodeProjection(
+          logical_scene_codec_internal::Member(
+              root, "proposed_projection_revision")),
+      std::move(snapshot),
+      logical_scene_codec_internal::DecodeResolvedOperation(
+          logical_scene_codec_internal::Member(root, "resolved_operation")),
+      logical_scene_codec_internal::DecodePolicy(
+          logical_scene_codec_internal::Member(
+              root, "effective_collision_policy")),
+      logical_scene_codec_internal::DecodeSceneUpdateStatus(
+          logical_scene_codec_internal::Member(root, "update_status")),
+      std::move(resolution_evidence_digest)};
+  if (!result.valid()) {
+    throw std::invalid_argument(
+        "logical-scene codec: decoded scene candidate is invalid");
+  }
+  return result;
+}
+
 } // namespace manyforge::scene
 
 namespace manyforge::scene {
+
+std::string EncodeCanonicalSceneTransactionRequest(
+    const core::SceneTransactionRequestDTO &request) {
+  return logical_scene_codec_internal::EncodeRequest(request);
+}
 
 core::SceneTransactionRequestDTO
 DecodeCanonicalSceneTransactionRequest(const std::string_view bytes) {

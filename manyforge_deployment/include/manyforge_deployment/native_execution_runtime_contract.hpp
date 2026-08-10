@@ -1,7 +1,16 @@
 #pragma once
 
+#include <cstdint>
+#include <manyforge_core/types/strong_id.hpp>
 #include <string>
 #include <string_view>
+#include <vector>
+
+namespace manyforge::deployment {
+
+class RetainedBundle;
+
+}
 
 namespace manyforge::deployment::native_execution_runtime_contract {
 
@@ -40,6 +49,28 @@ inline constexpr std::string_view kInstalledTargetId =
     "manyforge_native_execution_host";
 inline constexpr std::string_view kCandidateWorkerInstalledTargetId =
     "manyforge_roboplan_candidate_worker";
+
+/// Closed, typed projection of one verified retained native-runtime unit.
+///
+/// The retained bundle remains the only configuration authority. Consumers
+/// use this projection instead of reparsing a manifest or accepting launch-
+/// time replacements for product-owned runtime semantics.
+struct Configuration final {
+  std::uint32_t planner_rng_seed{};
+  std::vector<double> initial_joint_positions_rad;
+  std::uint32_t execution_tick_hz{};
+  double collision_monitor_period_ms{};
+
+  friend bool operator==(const Configuration &,
+                         const Configuration &) = default;
+};
+
+/// Select and decode one exact native-runtime unit from an independently
+/// verified retained bundle. Throws RetainedBundleError when the unit,
+/// profile, or normalized configuration differs from the build-owned row.
+[[nodiscard]] Configuration
+require_configuration(const RetainedBundle &retained_bundle,
+                      const core::RuntimeUnitId &runtime_unit_id);
 
 /// Revision embedded independently in the retained descriptor and installed
 /// host. A Manager child handshake must match this build-owned value.

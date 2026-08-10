@@ -55,6 +55,13 @@ class RetainedCollisionWorldPublisher final
       const core::LogicalSceneSnapshotDTO& logical_scene,
       RetainedCollisionWorldPublicationContext context);
 
+  /// Reserve one process-local collision-world revision for an immutable
+  /// owner-private candidate. The candidate is not published, but consuming
+  /// the revision keeps shared collision-engine caches and later durable
+  /// publications in one monotonic identity domain.
+  [[nodiscard]] core::Result<std::uint64_t>
+  reserve_private_collision_world_revision();
+
   [[nodiscard]] std::vector<core::CollisionWorldLedgerEntry> recent_ledger(
       std::size_t limit = 0U) const;
   [[nodiscard]] const collision::ManyForgeCollisionEngine::SharedModelPtr&
@@ -106,6 +113,7 @@ class RetainedCollisionWorldPublisher final
       retained_inventories_;
   std::deque<core::ProjectionLeaseId> retained_inventory_order_;
   std::uint64_t next_lease_id_ = 1U;
+  std::uint64_t collision_world_revision_sequence_ = 0U;
   std::uint64_t world_revision_id_ = 0U;
   std::uint64_t policy_revision_id_ = 0U;
   std::uint64_t owner_sequence_ = 0U;

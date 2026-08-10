@@ -99,8 +99,7 @@ struct RetainedGripperCommandBackend::SharedState {
   std::string joint_name;
   std::string actuation_kind;
   std::string state_authority;
-  double lower_position{};
-  double upper_position{};
+  std::optional<RetainedGripperPositionLimits> position_limits;
 
   mutable std::mutex mutex;
   std::map<std::string, Runtime> runtimes;
@@ -364,8 +363,9 @@ bool schedule_tick(const std::shared_ptr<SharedState>& state,
         "gripper_invalid_command",
         "Native gripper command differs from its exact retained target");
   }
-  if (request.target_position < state.lower_position ||
-      request.target_position > state.upper_position) {
+  if (state.position_limits.has_value() &&
+      (request.target_position < state.position_limits->lower_position ||
+       request.target_position > state.position_limits->upper_position)) {
     return gripper_error(
         "gripper_position_limit_violation",
         "Native gripper position is outside its retained URDF limits");
@@ -378,28 +378,40 @@ bool schedule_tick(const std::shared_ptr<SharedState>& state,
 RetainedGripperCommandBackend::RetainedGripperCommandBackend(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<IRetainedObservedStateChannel> state_channel,
-    const RetainedGripperPositionLimits position_limits, core::IClock& clock,
+    std::optional<RetainedGripperPositionLimits> position_limits,
+    core::IClock& clock,
     core::IScheduler& scheduler, const core::Duration update_period_ns) {
   if (!state_channel || update_period_ns <= 0 ||
-      !std::isfinite(position_limits.lower_position) ||
-      !std::isfinite(position_limits.upper_position) ||
-      position_limits.lower_position > position_limits.upper_position) {
+      (position_limits.has_value() &&
+       (!std::isfinite(position_limits->lower_position) ||
+        !std::isfinite(position_limits->upper_position) ||
+        position_limits->lower_position > position_limits->upper_position))) {
     throw std::invalid_argument(
         "retained gripper backend requires state, "
         "limits, and a positive period");
   }
   const auto& value = binding.value();
-  if (!value.control_path.has_value() || value.model_groups.size() != 1U ||
-      value.resources.size() != 1U ||
+  const bool model_backed =
+      value.resources.size() == 1U &&
+      value.resources.front().source_joint_name.has_value();
+  const bool exact_model_scope =
+      model_backed && value.model_groups.size() == 1U &&
       std::count(
           value.model_groups.front().expanded_compiled_joint_names.begin(),
           value.model_groups.front().expanded_compiled_joint_names.end(),
-          value.resources.front().compiled_resource_name) != 1) {
+          value.resources.front().compiled_resource_name) == 1 &&
+      position_limits.has_value();
+  const bool exact_component_local_scope =
+      value.resources.size() == 1U && !model_backed &&
+      value.model_groups.empty() && !position_limits.has_value();
+  if (!value.control_path.has_value() ||
+      (!exact_model_scope && !exact_component_local_scope)) {
     throw std::invalid_argument(
         "retained gripper backend requires one exact command coordinate");
   }
-  if (value.resources.front().coordinate_kind !=
-      position_limits.coordinate_kind) {
+  if (position_limits.has_value() &&
+      value.resources.front().coordinate_kind !=
+          position_limits->coordinate_kind) {
     throw std::invalid_argument(
         "retained gripper limits differ from the bound coordinate kind");
   }
@@ -417,15 +429,16 @@ RetainedGripperCommandBackend::RetainedGripperCommandBackend(
   state_->scheduler = &scheduler;
   state_->update_period_ns = update_period_ns;
   state_->gripper_id = value.command_target_id.value();
-  state_->group_id = value.model_groups.front().compiled_group_name;
+  state_->group_id = model_backed
+                         ? value.model_groups.front().compiled_group_name
+                         : std::string{};
   state_->joint_name = value.resources.front().compiled_resource_name;
   state_->actuation_kind =
       value.resources.front().coordinate_kind == core::CoordinateKind::kAngular
           ? "angular"
           : "linear";
   state_->state_authority = value.control_path->state_authority_id.value();
-  state_->lower_position = position_limits.lower_position;
-  state_->upper_position = position_limits.upper_position;
+  state_->position_limits = std::move(position_limits);
 }
 
 RetainedGripperCommandBackend::~RetainedGripperCommandBackend() {
@@ -504,7 +517,11 @@ core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
   }
 
   auto controlled = state_->state_channel->current_controlled_state();
-  if (!controlled.ok() || controlled.value().positions.size() != 1U) {
+  const bool establish_component_local_state =
+      !controlled.ok() && !state_->position_limits.has_value() &&
+      request.duration_s == 0.0;
+  if ((!controlled.ok() && !establish_component_local_state) ||
+      (controlled.ok() && controlled.value().positions.size() != 1U)) {
     return {false, 0U, 0U,
             controlled.ok()
                 ? std::optional<core::ErrorDTO>(gripper_error(
@@ -512,8 +529,10 @@ core::GripperCommandResultDTO RetainedGripperCommandBackend::command_gripper(
                       "Native gripper start position has invalid shape"))
                 : std::optional<core::ErrorDTO>(controlled.error())};
   }
-  const double start_position =
-      position_value(controlled.value().positions.front());
+  const double start_position = establish_component_local_state
+                                    ? request.target_position
+                                    : position_value(
+                                          controlled.value().positions.front());
   if (!std::isfinite(start_position)) {
     return {false, 0U, 0U,
             gripper_error("gripper_state_not_finite",

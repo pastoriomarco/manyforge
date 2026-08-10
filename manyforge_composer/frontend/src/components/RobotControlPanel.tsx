@@ -164,7 +164,7 @@ export function RobotControlPanelView({
             </span>
             <span>
               source epoch <code>{state.mode === 'gripper'
-                ? status.observedGripper.sourceEpoch
+                ? status.observedGripper?.sourceEpoch ?? 'not-published'
                 : status.observedMotion.sourceEpoch}</code>
             </span>
           </div>
@@ -310,34 +310,40 @@ export function RobotControlPanelView({
                       {status.directControlGripper.sourceCoordinateName}
                     </strong>
                     <span>
-                      observed {status.observedGripper.position.toFixed(4)}{' '}
-                      {status.directControlGripper.coordinateKind === 'angular_rad'
-                        ? 'rad'
-                        : 'm'}
+                      {status.observedGripper === null
+                        ? 'not yet observed'
+                        : `observed ${status.observedGripper.position.toFixed(4)} ${
+                          status.directControlGripper.coordinateKind === 'angular_rad'
+                            ? 'rad'
+                            : 'm'
+                        }`}
                     </span>
                   </span>
                   <span className="robot-control-joint-inputs">
-                    <input
-                      aria-label="Gripper target"
-                      type="range"
-                      min={status.directControlGripper.minPosition}
-                      max={status.directControlGripper.maxPosition}
-                      step="any"
-                      value={state.draftGripperPosition}
-                      disabled={active}
-                      onChange={(event) => {
-                        const value = event.currentTarget.valueAsNumber;
-                        if (Number.isFinite(value)) editGripper(value);
-                      }}
-                    />
+                    {status.directControlGripper.minPosition !== null
+                      && status.directControlGripper.maxPosition !== null && (
+                      <input
+                        aria-label="Gripper target"
+                        type="range"
+                        min={status.directControlGripper.minPosition}
+                        max={status.directControlGripper.maxPosition}
+                        step="any"
+                        value={state.draftGripperPosition ?? ''}
+                        disabled={active}
+                        onChange={(event) => {
+                          const value = event.currentTarget.valueAsNumber;
+                          if (Number.isFinite(value)) editGripper(value);
+                        }}
+                      />
+                    )}
                     <span className="robot-control-number">
                       <input
                         aria-label="Gripper target value"
                         type="number"
-                        min={status.directControlGripper.minPosition}
-                        max={status.directControlGripper.maxPosition}
+                        min={status.directControlGripper.minPosition ?? undefined}
+                        max={status.directControlGripper.maxPosition ?? undefined}
                         step="any"
-                        value={state.draftGripperPosition}
+                        value={state.draftGripperPosition ?? ''}
                         disabled={active}
                         onChange={(event) => {
                           const value = event.currentTarget.valueAsNumber;
@@ -352,11 +358,14 @@ export function RobotControlPanelView({
                     </span>
                   </span>
                   <span className="robot-control-limits">
-                    {status.directControlGripper.minPosition.toFixed(4)} to{' '}
-                    {status.directControlGripper.maxPosition.toFixed(4)}{' '}
-                    {status.directControlGripper.coordinateKind === 'angular_rad'
-                      ? 'rad'
-                      : 'm'}
+                    {status.directControlGripper.minPosition === null
+                      || status.directControlGripper.maxPosition === null
+                      ? 'Component-local coordinate; enter the first target explicitly.'
+                      : `${status.directControlGripper.minPosition.toFixed(4)} to ${
+                        status.directControlGripper.maxPosition.toFixed(4)
+                      } ${status.directControlGripper.coordinateKind === 'angular_rad'
+                        ? 'rad'
+                        : 'm'}`}
                   </span>
                 </label>
               )}

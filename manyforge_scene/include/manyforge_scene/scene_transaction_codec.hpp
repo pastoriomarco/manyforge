@@ -1,10 +1,16 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 
 #include <manyforge_core/types/scene_transaction.hpp>
 
 namespace manyforge::scene {
+
+/// Encode one already-normalized scene request for the same-user Manager
+/// command transport. This is not a public wire format.
+[[nodiscard]] std::string EncodeCanonicalSceneTransactionRequest(
+    const manyforge::core::SceneTransactionRequestDTO &request);
 
 /// Decode the exact canonical internal scene-transaction packet carried over
 /// the same-user Manager command socket.

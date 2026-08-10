@@ -117,6 +117,21 @@ public:
   [[nodiscard]] manyforge::core::ConfigurationFenceStatusDTO
   QueryStatus(const manyforge::core::ConfigurationFenceStatusQueryDTO &query)
       const override;
+
+  /// Run one selected-runtime installation effect only while the exact
+  /// durable Apply fence is held and the active publication is still the
+  /// predecessor named by Component Manager. Candidate active-control
+  /// configurations are deliberately not required until after the effect:
+  /// they are facts produced by installing the candidate participants.
+  /// This is an internal Apply interlock, not command authorization.
+  void RunWithExactHeldPredecessor(
+      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
+      const manyforge::core::ActiveBundlePublicationGeneration
+          &expected_predecessor_publication_generation,
+      const manyforge::core::ContentDigest
+          &expected_predecessor_public_pointer_digest,
+      const std::function<void()> &effect) const;
+
   [[nodiscard]] manyforge::core::ConfigurationFenceReleasedDTO Release(
       const manyforge::core::ConfigurationFenceReleaseDTO &request) override;
 

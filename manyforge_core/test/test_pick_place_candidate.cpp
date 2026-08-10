@@ -223,6 +223,14 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
                                                 RobotStateDTO start_state,
                                                 const std::uint32_t planning_attempt_index,
                                                 std::stop_token) override {
+    if (!operation.expected_scene_revision.has_value() ||
+        *operation.expected_scene_revision !=
+            projection_inventory.projection_binding.projection_revision.scene_revision) {
+      return Result<MotionPreviewResultDTO>::Err(
+          ErrorDTO{"scene_changed_during_validation",
+                   "fixture preview intent does not name its exact projection",
+                   {{"reason", "motion_preview_scene_revision_mismatch"}}});
+    }
     auto prepared = prepare_motion(operation);
     if (!prepared.ok()) {
       return Result<MotionPreviewResultDTO>::Err(prepared.error());
@@ -231,6 +239,7 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
     requests.push_back(request);
     start_states.push_back(start_state);
     projection_bindings.push_back(projection_inventory.projection_binding);
+    expected_scene_revisions.push_back(*operation.expected_scene_revision);
     planning_attempt_indices.push_back(planning_attempt_index);
     if (fail_first_with_start_collision && requests.size() == 1U) {
       return Result<MotionPreviewResultDTO>::Err(ErrorDTO{
@@ -255,6 +264,7 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
   std::vector<ExecuteRequestDTO> requests;
   std::vector<RobotStateDTO> start_states;
   std::vector<ProjectionLeaseBindingDTO> projection_bindings;
+  std::vector<SceneRevision> expected_scene_revisions;
   std::vector<std::uint32_t> planning_attempt_indices;
 
  private:
@@ -874,6 +884,9 @@ TEST(AddressedPickCandidatePlanner,
   EXPECT_EQ(motion.start_states[2].positions_rad, std::vector<double>({2.0, 2.0}));
   EXPECT_EQ(motion.projection_bindings[0], motion.projection_bindings[1]);
   EXPECT_NE(motion.projection_bindings[1], motion.projection_bindings[2]);
+  ASSERT_EQ(motion.expected_scene_revisions.size(), 3U);
+  EXPECT_EQ(motion.expected_scene_revisions[2],
+            motion.projection_bindings[2].projection_revision.scene_revision);
   EXPECT_EQ(scene.call_count, 1U);
   ASSERT_TRUE(scene.last_request.has_value());
   EXPECT_TRUE(scene.last_request->frame_resolution.has_value());
@@ -930,6 +943,9 @@ TEST(AddressedPlacePlanner,
   EXPECT_EQ(motion.start_states[2].positions_rad, std::vector<double>({2.0, 2.0}));
   EXPECT_EQ(motion.projection_bindings[0], motion.projection_bindings[1]);
   EXPECT_NE(motion.projection_bindings[1], motion.projection_bindings[2]);
+  ASSERT_EQ(motion.expected_scene_revisions.size(), 3U);
+  EXPECT_EQ(motion.expected_scene_revisions[2],
+            motion.projection_bindings[2].projection_revision.scene_revision);
   EXPECT_EQ(scene.call_count, 1U);
   ASSERT_TRUE(scene.last_request.has_value());
   ASSERT_TRUE(scene.last_request->frame_resolution.has_value());

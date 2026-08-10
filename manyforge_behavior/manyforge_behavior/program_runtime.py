@@ -307,6 +307,27 @@ class ExecutableProgramRun:
             self._tree.tick()
             return self._tree.root.status
 
+    def terminal_failure(self) -> tuple[str, str]:
+        """Return the exact focused-owner failure at a failed tree tip."""
+
+        with self._lock:
+            if self._tree.root.status is not py_trees.common.Status.FAILURE:
+                raise ProgramRuntimeError(
+                    "terminal failure is available only for a failed Program tree"
+                )
+            tip = self._tree.tip()
+            reason_code = getattr(tip, "failure_reason_code", None)
+            message = getattr(tip, "failure_message", "")
+            if (
+                not isinstance(reason_code, str)
+                or not reason_code
+                or len(reason_code.encode("utf-8")) > 256
+                or not isinstance(message, str)
+                or len(message.encode("utf-8")) > 4_096
+            ):
+                return "program_tree_failed", "Program tree failed"
+            return reason_code, message
+
     def stop(self) -> None:
         """Invalidate the tree once, causing active leaves to request cancel."""
 

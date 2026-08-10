@@ -1,6 +1,9 @@
 #include "native_execution_runtime_unit_internal.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -406,7 +409,7 @@ std::string native_execution_runtime_implementation_revision() {
   return contract_revision(
       "runtime-implementation",
       "native-execution-host;deployment-bound-startup;operation-bound-program;"
-      "projection-handoff-v1;private-rpc-v1;retained-runtime-config-v1;"
+      "projection-handoff-v1;private-rpc-v1;retained-runtime-config-v2;"
       "logical-scene-services-v1;manager-managed-product-composition;"
       "build-owned-candidate-worker;sha256-projection-content;"
       "atomic-resource-table-admission;"
@@ -615,6 +618,86 @@ void require_native_execution_runtime_product_matches_retained_bundle(
 } // namespace manyforge::deployment::detail
 
 namespace manyforge::deployment::native_execution_runtime_contract {
+
+Configuration
+require_configuration(const RetainedBundle &retained_bundle,
+                      const core::RuntimeUnitId &runtime_unit_id) {
+  if (!verify_retained_bundle_identity(retained_bundle)) {
+    throw RetainedBundleError(
+        "native runtime configuration received an unverifiable bundle");
+  }
+  const auto &unit = detail::require_retained_runtime_unit(
+      retained_bundle.value(), runtime_unit_id);
+  if (unit.runtime_profile_id.value() !=
+          detail::kNativeExecutionRuntimeProfileId ||
+      unit.runtime_profile_revision.value() !=
+          detail::native_execution_runtime_profile_revision() ||
+      !unit.dependency_runtime_unit_ids.empty() ||
+      !detail::native_execution_runtime_configuration_is_qualified(
+          unit.configuration)) {
+    throw RetainedBundleError(
+        "native runtime unit differs from the build-qualified profile");
+  }
+
+  const auto require_member =
+      [&](const std::string_view name) -> const core::JsonValueDTO & {
+    const auto found = unit.configuration.find(name);
+    if (found == unit.configuration.end()) {
+      throw RetainedBundleError("native runtime configuration is missing " +
+                                std::string(name));
+    }
+    return found->second;
+  };
+  const auto require_number = [&](const std::string_view name) {
+    const auto *number = std::get_if<double>(&require_member(name).value);
+    if (number == nullptr || !std::isfinite(*number)) {
+      throw RetainedBundleError("native runtime configuration has invalid " +
+                                std::string(name));
+    }
+    return *number;
+  };
+  const auto require_uint32 = [&](const std::string_view name) {
+    const double number = require_number(name);
+    if (std::trunc(number) != number || number < 0.0 ||
+        number >
+            static_cast<double>(std::numeric_limits<std::uint32_t>::max())) {
+      throw RetainedBundleError("native runtime configuration has invalid " +
+                                std::string(name));
+    }
+    return static_cast<std::uint32_t>(number);
+  };
+
+  const auto *mode = std::get_if<std::string>(&require_member("mode").value);
+  const auto *positions = std::get_if<core::JsonValueDTO::Array>(
+      &require_member("initial_joint_positions_rad").value);
+  if (mode == nullptr || *mode != "simulated" || positions == nullptr ||
+      positions->empty()) {
+    throw RetainedBundleError(
+        "native runtime configuration has an unsupported mode or initial "
+        "state");
+  }
+
+  Configuration result;
+  result.planner_rng_seed = require_uint32("planner_rng_seed");
+  result.execution_tick_hz = require_uint32("execution_tick_hz");
+  result.collision_monitor_period_ms =
+      require_number("collision_monitor_period_ms");
+  result.initial_joint_positions_rad.reserve(positions->size());
+  for (const auto &position : *positions) {
+    const auto *number = std::get_if<double>(&position.value);
+    if (number == nullptr || !std::isfinite(*number)) {
+      throw RetainedBundleError(
+          "native runtime configuration has an invalid initial joint state");
+    }
+    result.initial_joint_positions_rad.push_back(*number);
+  }
+  if (result.execution_tick_hz == 0U ||
+      !(result.collision_monitor_period_ms > 0.0)) {
+    throw RetainedBundleError(
+        "native runtime configuration has an invalid cadence");
+  }
+  return result;
+}
 
 std::string implementation_revision() {
   return detail::native_execution_runtime_implementation_revision();

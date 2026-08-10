@@ -95,8 +95,22 @@ RetainedObservedStateChannel::RetainedObservedStateChannel(
       config_(std::move(config)),
       publication_(publication_config(binding_, config_)) {
   if (!projector_) {
+    if (!binding_.value().model_groups.empty() ||
+        std::any_of(binding_.value().resources.begin(),
+                    binding_.value().resources.end(), [](const auto& resource) {
+                      return resource.source_joint_name.has_value();
+                    })) {
+      throw std::invalid_argument(
+          "component-local observed-state channel crosses a retained model");
+    }
+    return;
+  }
+  if (std::any_of(binding_.value().resources.begin(),
+                  binding_.value().resources.end(), [](const auto& resource) {
+                    return !resource.source_joint_name.has_value();
+                  })) {
     throw std::invalid_argument(
-        "retained observed-state channel requires a projector");
+        "projected observed-state channel contains a component-local resource");
   }
   const auto& context = publication_.query_context();
   const auto contexts = projector_->query_contexts();
@@ -109,6 +123,12 @@ RetainedObservedStateChannel::RetainedObservedStateChannel(
 RetainedStateProjectionResult
 RetainedObservedStateChannel::initialize_from_projection(
     const std::int64_t timestamp_ns) {
+  if (!projector_) {
+    return {RetainedStateProjectionStatus::kRejected,
+            channel_error(
+                "component_local_state_has_no_model_projection",
+                "component-local state cannot be seeded from a model")};
+  }
   auto state = projector_->current_state(
       publication_.query_context().control_binding_id,
       publication_.query_context().control_binding_revision);
@@ -178,6 +198,9 @@ RetainedStateProjectionResult RetainedObservedStateChannel::project_latest(
   if (!snapshot.ok()) {
     return {RetainedStateProjectionStatus::kFailed, snapshot.error()};
   }
+  if (!projector_) {
+    return {RetainedStateProjectionStatus::kApplied, std::nullopt};
+  }
   return projector_->apply(snapshot.value(), now_ns, mode);
 }
 
@@ -188,6 +211,36 @@ RetainedObservedStateChannel::current_state(const std::int64_t now_ns) const {
 
 core::Result<core::ControlledStateDTO>
 RetainedObservedStateChannel::current_controlled_state() const {
+  if (!projector_) {
+    const auto& context = publication_.query_context();
+    auto current = publication_.publication(context.control_binding_id,
+                                             context.control_binding_revision);
+    if (!current.ok()) {
+      return core::Result<core::ControlledStateDTO>::Err(current.error());
+    }
+    const auto& snapshot = current.value().snapshot;
+    core::ControlledStateDTO state{
+        snapshot.controllable_component_id,
+        snapshot.command_target_id,
+        snapshot.control_domain_id,
+        snapshot.control_domain_revision,
+        snapshot.control_binding_id,
+        snapshot.control_binding_revision,
+        snapshot.controller_topology_id,
+        snapshot.topology_revision,
+        snapshot.control_route_id,
+        snapshot.active_control_configuration_id,
+        snapshot.active_control_configuration_generation,
+        snapshot.resources,
+        snapshot.joint_names,
+        snapshot.positions,
+        snapshot.velocities};
+    auto valid = core::validate_controlled_state(state);
+    if (!valid.ok()) {
+      return core::Result<core::ControlledStateDTO>::Err(valid.error());
+    }
+    return core::Result<core::ControlledStateDTO>::Ok(std::move(state));
+  }
   return projector_->current_state(
       publication_.query_context().control_binding_id,
       publication_.query_context().control_binding_revision);

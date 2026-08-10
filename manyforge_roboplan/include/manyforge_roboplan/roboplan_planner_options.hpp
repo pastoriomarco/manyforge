@@ -16,12 +16,37 @@
 
 namespace manyforge::roboplan_backend {
 
+inline constexpr double kInitialCollisionCheckStepSize = 0.05;
+inline constexpr double kCollisionRetryCheckStepSize = 0.01;
+
+inline constexpr double collision_check_step_size_for_attempt(
+    const std::uint32_t planning_attempt_index) noexcept {
+  // Preserve the qualified fast path for normal planning. A later attempt is
+  // requested only after authoritative trajectory/cache validation rejected a
+  // candidate; repeating the same sampling resolution could reproduce the
+  // same missed narrow contact instead of making the bounded retry useful.
+  return planning_attempt_index == 0U ? kInitialCollisionCheckStepSize
+                                      : kCollisionRetryCheckStepSize;
+}
+
+inline constexpr bool shortcut_candidate_for_attempt(
+    const std::uint32_t planning_attempt_index) noexcept {
+  // Shortcutting is an optional quality/performance pass, not the collision
+  // authority. Once authoritative validation has rejected a candidate, keep
+  // the retry planner's explicit collision-avoiding detour instead of letting
+  // finite-step shortcut sampling turn it back into an invalid segment.
+  return planning_attempt_index == 0U;
+}
+
 inline roboplan::RRTOptions production_rrt_options(
-    const std::string& group_name, double max_planning_time_s) {
+    const std::string& group_name, double max_planning_time_s,
+    const std::uint32_t planning_attempt_index = 0U) {
   roboplan::RRTOptions options;
   options.group_name = group_name;
   options.max_planning_time = max_planning_time_s;
   options.max_nodes = 5000;
+  options.collision_check_step_size =
+      collision_check_step_size_for_attempt(planning_attempt_index);
   // Preserve ManyForge's qualified first-feasible policy inherited from the
   // 0.4 baseline. Later RoboPlan releases add budget-spending and optimal
   // variants, but they remain opt-in capabilities.
@@ -55,10 +80,12 @@ inline roboplan::RRTOptions planning_profile_rrt_options(
 
 inline roboplan::PathShortcuttingOptions production_shortcutting_options(
     const std::string& group_name,
-    std::optional<std::uint32_t> deterministic_seed = std::nullopt) {
+    std::optional<std::uint32_t> deterministic_seed = std::nullopt,
+    const std::uint32_t planning_attempt_index = 0U) {
   roboplan::PathShortcuttingOptions options;
   options.group_name = group_name;
-  options.max_step_size = 0.05;
+  options.max_step_size =
+      collision_check_step_size_for_attempt(planning_attempt_index);
   options.max_iters = 100;
   // RoboPlan 0.4 always spent the configured 100-iteration budget. Keep that
   // compatibility behavior; convergence-shortcutting remains a separate

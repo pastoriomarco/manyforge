@@ -1205,6 +1205,58 @@ class NativeKernelProgramPort:
         return result
 
     @staticmethod
+    def _no_feasible_candidate_message(
+        planning: Mapping[str, Any],
+    ) -> str:
+        prefix = "No feasible pick/place candidate was found"
+        reports = planning.get("reports")
+        if not isinstance(reports, (list, tuple)):
+            return prefix
+        for report in reversed(reports):
+            if not isinstance(report, Mapping):
+                continue
+            stages = report.get("stages")
+            if not isinstance(stages, (list, tuple)):
+                continue
+            for stage in reversed(stages):
+                if (
+                    not isinstance(stage, Mapping)
+                    or stage.get("succeeded") is not False
+                ):
+                    continue
+                error = stage.get("error")
+                if not isinstance(error, Mapping):
+                    continue
+                stage_name = stage.get("stage")
+                code = error.get("code")
+                message = error.get("message")
+                details = error.get("details")
+                reason = (
+                    details.get("reason")
+                    if isinstance(details, Mapping)
+                    else None
+                )
+                diagnostic = next(
+                    (
+                        value
+                        for value in (message, reason, code)
+                        if isinstance(value, str) and value
+                    ),
+                    None,
+                )
+                if diagnostic is None:
+                    continue
+                stage_text = (
+                    f" at {stage_name}"
+                    if isinstance(stage_name, str) and stage_name
+                    else ""
+                )
+                return f"{prefix}; last rejection{stage_text}: {diagnostic}"[
+                    :4_096
+                ]
+        return prefix
+
+    @staticmethod
     def _portable_pick_planning_output(
         planning: Mapping[str, Any],
         *,
@@ -1373,7 +1425,7 @@ class NativeKernelProgramPort:
                 state=OwnerTaskState.FAILED,
                 metadata=metadata,
                 reason_code="no_feasible_candidate",
-                message="No feasible pick/place candidate was found",
+                message=self._no_feasible_candidate_message(planning),
             )
         elif node_id == "planning.plan_pick_sequence":
             snapshot = OwnerTaskSnapshot(

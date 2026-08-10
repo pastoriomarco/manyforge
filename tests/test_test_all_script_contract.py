@@ -18,8 +18,17 @@ _TEST_ALL = _REPO_ROOT / "scripts" / "test-all.sh"
 _BENCHMARK = _REPO_ROOT / "tests" / "test_benchmark.py"
 _COLLISION_MAPPER_PERF = _REPO_ROOT / "scripts" / "run-collision-mapper-perf.sh"
 _UNAVAILABLE_MESSAGE = (
-    "composable_cell_runtime_unavailable: native planning and execution adapters "
-    "are intentionally removed during the active rebuild."
+    "composable_cell_runtime_unavailable: this legacy aggregate entrypoint has "
+    "no single qualified current replacement; use the Component Manager, "
+    "Headless, Program runner, and Composer entrypoints for maintained "
+    "ManyForge-only runtime functions."
+)
+_LAUNCH_UNAVAILABLE_MESSAGE = (
+    "composable_cell_runtime_unavailable: this legacy aggregate launcher is not "
+    "a current product entrypoint; maintained ManyForge-only runtime functions "
+    "use the Component Manager, Headless, Program runner, and Composer "
+    "entrypoints, while unified Isaac, real-robot, and owner-issued cleanup "
+    "orchestration remain at their later gates."
 )
 _BENCHMARK_UNAVAILABLE_MESSAGE = (
     "composable_cell_runtime_unavailable: native benchmark execution returns "
@@ -244,7 +253,7 @@ def test_product_launcher_gates_operational_verbs_before_external_effect(
             check=False,
         )
         assert completed.returncode == 78, invocation
-        assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
+        assert completed.stderr.strip() == _LAUNCH_UNAVAILABLE_MESSAGE
         assert not marker.exists(), invocation
 
 

@@ -10,7 +10,9 @@
 #   parse_args, usage, wizard selection, and review rendering
 #       -> thin operator client over Manager/headless facts at I4/I5;
 #   native program/deployment launch and smoke orchestration
-#       -> addressed native client at N/I6;
+#       -> addressed Component Manager, Headless, Program-runner, and Composer
+#          entrypoints at N/I6 (now active for the maintained ManyForge-only
+#          product rows, but not through this aggregate launcher);
 #   assistant status observation
 #       -> qualified read-only headless client at H0/I5;
 #   assistant selection, setup, bridge, and provider operation
@@ -24,7 +26,9 @@
 # The historical cleanup body used mutable PID files, process command strings,
 # and container names that the relocated source can no longer authenticate.
 # Keeping it active would risk signaling a reused PID or deleting an unrelated
-# same-name container. Every verb therefore fails before argument parsing,
+# same-name container. The file also combines still-future Isaac and real-robot
+# responsibilities, so there is no one exact current successor to activate.
+# Every verb therefore fails before argument parsing,
 # imports, filesystem access, subprocesses, Docker, ROS, network, or hardware
 # activity. Future cleanup must consume identities minted by the new owners;
 # it must not revive the name/PID compatibility contract.
@@ -32,7 +36,7 @@
 set -euo pipefail
 
 readonly UNAVAILABLE_EXIT_CODE=78
-readonly UNAVAILABLE_MESSAGE="composable_cell_runtime_unavailable: native planning and execution adapters are intentionally removed during the active rebuild."
+readonly UNAVAILABLE_MESSAGE="composable_cell_runtime_unavailable: this legacy aggregate launcher is not a current product entrypoint; maintained ManyForge-only runtime functions use the Component Manager, Headless, Program runner, and Composer entrypoints, while unified Isaac, real-robot, and owner-issued cleanup orchestration remain at their later gates."
 
 printf '%s\n' "${UNAVAILABLE_MESSAGE}" >&2
 exit "${UNAVAILABLE_EXIT_CODE}"

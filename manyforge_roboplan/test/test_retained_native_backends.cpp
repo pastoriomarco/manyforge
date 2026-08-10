@@ -27,7 +27,8 @@ using namespace manyforge::core;
 using namespace std::chrono_literals;
 
 [[nodiscard]] RuntimeParticipantBinding make_binding(
-    CoordinateKind kind, std::string target = "gripper.target") {
+    CoordinateKind kind, std::string target = "gripper.target",
+    bool component_local = false) {
   const bool angular = kind == CoordinateKind::kAngular;
   const std::vector<std::string> joints =
       angular ? std::vector<std::string>{"joint_1", "joint_2"}
@@ -39,7 +40,9 @@ using namespace std::chrono_literals;
         ResourceRoleId(angular ? "arm_joints" : "finger"),
         ResourceId(angular ? "resource.joint." + std::to_string(index + 1U)
                            : "resource.finger"),
-        joints[index], joints[index], kind});
+        component_local ? std::nullopt
+                        : std::optional<std::string>(joints[index]),
+        component_local ? "resource.finger" : joints[index], kind});
   }
   std::vector<RuntimeCapabilityProviderPathDTO> supporting_paths;
   if (angular) {
@@ -74,9 +77,14 @@ using namespace std::chrono_literals;
       {ProgramModelRoleBindingDTO{ModelRoleId("body"),
                                   ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision")}},
-      {RuntimeModelGroupBindingDTO{
-          ModelGroupRoleId(angular ? "arm_group" : "gripper_group"),
-          ModelInstanceId("robot.model"), angular ? "arm" : "gripper", joints}},
+      component_local
+          ? std::vector<RuntimeModelGroupBindingDTO>{}
+          : std::vector<RuntimeModelGroupBindingDTO>{
+                RuntimeModelGroupBindingDTO{
+                    ModelGroupRoleId(angular ? "arm_group"
+                                             : "gripper_group"),
+                    ModelInstanceId("robot.model"),
+                    angular ? "arm" : "gripper", joints}},
       {ProgramFrameRoleBindingDTO{FrameRoleId("base"),
                                   ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision"), "base"},
@@ -432,7 +440,9 @@ class AutoAdvanceClock final : public IClock {
   const auto& value = binding.value();
   return GripperCommandRequestDTO{
       value.command_target_id.value(),
-      value.model_groups.front().compiled_group_name,
+      value.model_groups.empty()
+          ? std::string{}
+          : value.model_groups.front().compiled_group_name,
       value.resources.front().compiled_resource_name,
       target,
       duration_s,
@@ -506,6 +516,60 @@ TEST(RetainedGripperCommandBackendTest,
   ASSERT_EQ(state.value().positions.size(), 1U);
   EXPECT_DOUBLE_EQ(
       std::get<LinearPositionDTO>(state.value().positions[0]).value_m, 0.02);
+}
+
+TEST(RetainedGripperCommandBackendTest,
+     ComponentLocalZeroDurationCommandEstablishesAddressedStateWithoutModelProjection) {
+  auto binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  auto channel = std::make_shared<RetainedObservedStateChannel>(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "logical-gripper", 0, 1U});
+  FakeClock clock;
+  InlineScheduler scheduler;
+  RetainedGripperCommandBackend backend(binding, channel, std::nullopt, clock,
+                                        scheduler, 1);
+
+  EXPECT_FALSE(channel->current_controlled_state().ok());
+  const auto result =
+      backend.command_gripper(gripper_request(binding, 0.01, 0.0));
+
+  ASSERT_TRUE(result.accepted);
+  const auto status = backend.get_gripper_status("gripper.target");
+  EXPECT_EQ(status.state, GripperCommandState::kCompleted);
+  const auto state = channel->current_controlled_state();
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  ASSERT_EQ(state.value().positions.size(), 1U);
+  EXPECT_DOUBLE_EQ(
+      std::get<LinearPositionDTO>(state.value().positions.front()).value_m,
+      0.01);
+  EXPECT_EQ(channel->project_latest(clock.now(),
+                                    RetainedStateProjectionMode::kBlocking)
+                .status,
+            RetainedStateProjectionStatus::kApplied);
+}
+
+TEST(RetainedGripperCommandBackendTest,
+     ComponentLocalTimedCommandRequiresPreviouslyPublishedState) {
+  auto binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  auto channel = std::make_shared<RetainedObservedStateChannel>(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "logical-gripper", 0, 1U});
+  FakeClock clock;
+  ManualScheduler scheduler;
+  RetainedGripperCommandBackend backend(binding, channel, std::nullopt, clock,
+                                        scheduler);
+
+  const auto result =
+      backend.command_gripper(gripper_request(binding, 0.01, 0.5));
+
+  ASSERT_FALSE(result.accepted);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "observed_state_not_published");
 }
 
 TEST(RetainedGripperCommandBackendTest,

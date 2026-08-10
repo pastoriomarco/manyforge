@@ -2,6 +2,7 @@
 #include <cmath>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
+#include <map>
 #include <set>
 #include <string>
 #include <tuple>
@@ -102,10 +103,12 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     return invalid("runtime participant model bindings are incomplete or duplicate",
                    "runtime_model_binding_invalid");
   }
-  if (!unique_nonempty(value.model_groups,
-                       [](const auto& item) {
-                         return std::pair(item.model_group_role_id, item.model_instance_id);
-                       }) ||
+  if ((!value.model_groups.empty() &&
+       !unique_nonempty(value.model_groups,
+                        [](const auto& item) {
+                          return std::pair(item.model_group_role_id,
+                                           item.model_instance_id);
+                        })) ||
       std::any_of(value.model_groups.begin(), value.model_groups.end(), [&](const auto& item) {
         return item.model_group_role_id.empty() || item.model_instance_id.empty() ||
                item.compiled_group_name.empty() ||
@@ -255,6 +258,57 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
                    "runtime_contact_grasp_binding_invalid");
   }
   return Result<RuntimeParticipantBinding>::Ok(RuntimeParticipantBinding(std::move(value)));
+}
+
+Result<RuntimeParticipantBinding>
+bind_runtime_participant_collision_body_aliases(
+    RuntimeParticipantBinding binding,
+    const std::span<const RuntimeCollisionBodyAliasDTO> aliases) {
+  if (aliases.empty() ||
+      !sorted_unique(aliases, [](const auto& alias) {
+        return alias.semantic_body_id;
+      }) ||
+      std::any_of(aliases.begin(), aliases.end(), [](const auto& alias) {
+        return alias.semantic_body_id.empty() ||
+               alias.projected_body_id.empty();
+      })) {
+    return invalid("runtime collision-body alias table is incomplete or "
+                   "ambiguous",
+                   "runtime_collision_body_alias_table_invalid");
+  }
+
+  std::map<CollisionBodyId, CollisionBodyId> by_semantic;
+  for (const auto& alias : aliases) {
+    by_semantic.emplace(alias.semantic_body_id, alias.projected_body_id);
+  }
+  if (std::any_of(aliases.begin(), aliases.end(), [&](const auto& alias) {
+        const auto physical = by_semantic.find(alias.projected_body_id);
+        return physical == by_semantic.end() ||
+               physical->second != alias.projected_body_id;
+      })) {
+    return invalid("runtime collision-body alias table has no exact physical "
+                   "fixed point",
+                   "runtime_collision_body_alias_table_invalid");
+  }
+
+  auto value = binding.value();
+  for (auto& policy : value.contact_grasp_bindings) {
+    for (auto& body : policy.allowed_body_bindings) {
+      std::set<std::string, std::less<>> projected_ids;
+      for (auto& body_id : body.collision_body_ids) {
+        const auto alias = by_semantic.find(CollisionBodyId(body_id));
+        if (alias == by_semantic.end() ||
+            !projected_ids.insert(alias->second).second) {
+          return invalid("runtime contact-grasp body has no unique exact "
+                         "physical projection",
+                         "runtime_collision_body_alias_unresolved");
+        }
+        body_id = alias->second;
+      }
+    }
+  }
+  return Result<RuntimeParticipantBinding>::Ok(
+      RuntimeParticipantBinding(std::move(value)));
 }
 
 Result<ObservedStateQueryContextDTO> make_observed_state_query_context(

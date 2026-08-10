@@ -21,6 +21,9 @@ namespace manyforge::roboplan_backend {
 
 struct RoboPlanExecutionBackendConfig {
   double reset_completion_timeout_s = 5.0;
+  /// Retained simulated-controller update cadence. Production obtains this
+  /// from the selected runtime-unit product; it is not a caller override.
+  core::Duration execution_tick_period_ns = 10'000'000;
   /// Native-sim handoff budget for soft_on_path. This is deliberately
   /// small but non-zero so tests exercise the same wall-time contract
   /// as controller deployments.
@@ -47,28 +50,28 @@ struct RoboPlanSceneProjectionMetrics {
 /// native backend, while state publication and RoboPlan projection are routed
 /// exclusively through the sealed addressed state channel.
 class RoboPlanExecutionBackend final : public core::IExecutionBackend {
- public:
-  RoboPlanExecutionBackend(core::RuntimeParticipantBinding binding,
-                           std::shared_ptr<IRetainedObservedStateChannel>
-                               state_channel,
-                           core::IClock& clock,
-                           RoboPlanExecutionBackendConfig config = {});
+public:
+  RoboPlanExecutionBackend(
+      core::RuntimeParticipantBinding binding,
+      std::shared_ptr<IRetainedObservedStateChannel> state_channel,
+      core::IClock &clock, RoboPlanExecutionBackendConfig config = {});
   ~RoboPlanExecutionBackend() override;
 
-  core::ExecutionHandle execute_trajectory(const core::TrajectoryDTO& trajectory) override;
+  core::ExecutionHandle
+  execute_trajectory(const core::TrajectoryDTO &trajectory) override;
   core::Result<void> sync_observed_state_before_planning() override;
   core::StopResultDTO stop() override;
   core::PauseResultDTO pause() override;
-  core::ExecutionHandle resume(const core::TrajectoryDTO& trajectory) override;
+  core::ExecutionHandle resume(const core::TrajectoryDTO &trajectory) override;
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
-  const core::ObservedRobotStatePublication*
+  const core::ObservedRobotStatePublication *
   observed_robot_state_publication() const noexcept override {
-    const auto* publication =
+    const auto *publication =
         state_channel_ ? state_channel_->addressed_publication() : nullptr;
     return publication ? &publication->numeric_publication() : nullptr;
   }
-  const core::ExecutionProgressPublication*
+  const core::ExecutionProgressPublication *
   execution_progress_publication() const noexcept override {
     return execution_progress_publication_.get();
   }
@@ -84,14 +87,13 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
     return execution_progress_publication_
                ? execution_progress_publication_->claim_hazard_authority(
                      execution_generation)
-               : core::ExecutionProgressHazardClaimResult::
-                     kGenerationMismatch;
+               : core::ExecutionProgressHazardClaimResult::kGenerationMismatch;
   }
   // ADR-0018: atomic per-tick read of the runtime velocity scale so the UI
   // slider retimes in-flight discrete motion without stopping.
   void set_runtime_velocity_scale(double scale) override;
-  core::RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status()
-      const override;
+  core::RuntimeScaleMechanismStatusDTO
+  runtime_velocity_scale_status() const override;
 
   [[nodiscard]] static constexpr double
   qualified_runtime_scale_slew_per_second() noexcept {
@@ -107,12 +109,12 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   core::MotionInterruptStopCapabilityDTO
   get_motion_interrupt_stop_capability() const override;
   core::ControlledStopResultDTO execute_controlled_stop(
-      const core::MotionInterruptStopProfileDTO& profile) override;
-  core::ControlledStopResultDTO execute_controlled_stop(
-      const core::MotionInterruptStopProfileDTO& profile,
-      std::stop_token stop_token) override;
+      const core::MotionInterruptStopProfileDTO &profile) override;
+  core::ControlledStopResultDTO
+  execute_controlled_stop(const core::MotionInterruptStopProfileDTO &profile,
+                          std::stop_token stop_token) override;
 
- private:
+private:
   struct ExecutionStateData {
     core::ExecutionSnapshot snapshot;
     std::atomic<bool> running{false};
@@ -128,14 +130,14 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
     kBestEffort,
   };
 
-  std::int64_t publish_snapshot(
-      core::ExecutionState state, double progress,
-      const std::vector<double>& joint_positions,
-      std::optional<core::ErrorDTO> error = std::nullopt);
-  RetainedStateProjectionResult publish_observed_state_authority(
-      std::span<const double> positions,
-      std::span<const double> velocities,
-      std::int64_t timestamp_ns) noexcept;
+  std::int64_t
+  publish_snapshot(core::ExecutionState state, double progress,
+                   const std::vector<double> &joint_positions,
+                   std::optional<core::ErrorDTO> error = std::nullopt);
+  RetainedStateProjectionResult
+  publish_observed_state_authority(std::span<const double> positions,
+                                   std::span<const double> velocities,
+                                   std::int64_t timestamp_ns) noexcept;
 
   // Active execution must never block observed-state publication on the
   // retained projector's scene lock. During execution, call publish_snapshot()
@@ -143,7 +145,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   // monitor reads the published snapshot as the authoritative robot state;
   // scene projection is for visualization/planning convergence and may skip
   // intermediate samples under contention.
-  bool update_scene_positions(const std::vector<double>& joint_positions,
+  bool update_scene_positions(const std::vector<double> &joint_positions,
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking,
                               std::int64_t source_timestamp_ns = 0);
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory,
@@ -153,9 +155,9 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   bool end_controlled_stop_runtime_scale_freeze();
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
   void record_scene_projection_miss();
-  void schedule_terminal_scene_projection_retry(
-      std::vector<double> joint_positions,
-      std::int64_t source_timestamp_ns);
+  void
+  schedule_terminal_scene_projection_retry(std::vector<double> joint_positions,
+                                           std::int64_t source_timestamp_ns);
   void terminal_scene_projection_retry_worker(std::stop_token stop_token);
   void stop_terminal_scene_projection_retry_worker() noexcept;
 
@@ -166,7 +168,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
 
   core::RuntimeParticipantBinding binding_;
   std::shared_ptr<IRetainedObservedStateChannel> state_channel_;
-  core::IClock& clock_;
+  core::IClock &clock_;
   RoboPlanExecutionBackendConfig config_;
   std::unique_ptr<core::ExecutionProgressPublication>
       execution_progress_publication_;
@@ -182,8 +184,8 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   std::shared_ptr<std::stop_source> active_controlled_stop_source_;
 
   // Runtime velocity scale read on every worker tick. std::atomic<double> is
-  // lock-free on all supported targets; memory_order_release on the setter pairs
-  // with memory_order_acquire on the worker's per-tick read.
+  // lock-free on all supported targets; memory_order_release on the setter
+  // pairs with memory_order_acquire on the worker's per-tick read.
   std::atomic<double> runtime_velocity_scale_{1.0};
   mutable std::mutex runtime_velocity_scale_mutex_;
   int controlled_stop_runtime_scale_freeze_depth_ = 0;
@@ -192,13 +194,17 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   std::atomic<std::uint64_t> scene_projection_successes_total_{0};
   std::atomic<std::uint64_t> scene_projection_lag_max_ns_{0};
   std::atomic<std::int64_t> scene_projection_last_success_timestamp_ns_{0};
-  std::atomic<std::uint64_t> terminal_scene_projection_retries_scheduled_total_{0};
-  std::atomic<std::uint64_t> terminal_scene_projection_retry_successes_total_{0};
-  std::atomic<std::uint64_t> terminal_scene_projection_retry_exhausted_total_{0};
+  std::atomic<std::uint64_t> terminal_scene_projection_retries_scheduled_total_{
+      0};
+  std::atomic<std::uint64_t> terminal_scene_projection_retry_successes_total_{
+      0};
+  std::atomic<std::uint64_t> terminal_scene_projection_retry_exhausted_total_{
+      0};
   mutable std::mutex terminal_scene_projection_retry_mutex_;
   std::condition_variable_any terminal_scene_projection_retry_cv_;
-  std::optional<PendingTerminalSceneProjection> pending_terminal_scene_projection_;
+  std::optional<PendingTerminalSceneProjection>
+      pending_terminal_scene_projection_;
   std::jthread terminal_scene_projection_retry_thread_;
 };
 
-}  // namespace manyforge::roboplan_backend
+} // namespace manyforge::roboplan_backend

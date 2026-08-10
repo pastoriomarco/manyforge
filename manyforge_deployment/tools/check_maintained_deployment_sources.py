@@ -366,7 +366,8 @@ _EXPECTED_MODEL_FAMILIES: Final = {
             "base": "base_link",
             "flange": "flange",
             "gripper_tcp": "grasp_frame",
-            "tcp": "tool0",
+            "tcp": "grasp_frame",
+            "tool_mount": "tool0",
         },
         "groups": {"arm": "arm", "gripper": "gripper"},
         "resources": {

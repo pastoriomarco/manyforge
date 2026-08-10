@@ -118,6 +118,19 @@ extract_active_control_configurations(
       motion);
 }
 
+[[nodiscard]] bool same_linked_preview_participant(
+    const RuntimeParticipantBindingDTO& left, const RuntimeParticipantBindingDTO& right) {
+  auto left_stable_identity = left;
+  auto right_stable_identity = right;
+  // Supporting providers are selected for each motion payload. A linked
+  // pose/Cartesian sequence may therefore use different exact planners while
+  // retaining the same robot, resources, control path, epochs, and execution
+  // engine. Each complete binding is still resolved and validated before use.
+  left_stable_identity.supporting_capability_provider_paths.clear();
+  right_stable_identity.supporting_capability_provider_paths.clear();
+  return left_stable_identity == right_stable_identity;
+}
+
 [[nodiscard]] Result<std::optional<ResolvedContactGraspBindingDTO>> resolve_contact_grasp_binding(
     const MotionParticipantIntentDTO& motion, const RuntimeParticipantBindingDTO& binding) {
   if (!motion.contact_policy_id.has_value()) {
@@ -403,9 +416,23 @@ extract_active_control_configurations(
 
 [[nodiscard]] Result<GripperCommandRequestDTO> build_command_request(
     const CapabilityCommandIntentDTO& command, const RuntimeParticipantBindingDTO& binding) {
-  if (binding.model_groups.size() != 1U || binding.resources.size() != 1U) {
+  if (binding.model_groups.size() > 1U || binding.resources.size() != 1U) {
     return reject<GripperCommandRequestDTO>(
-        "the retained I6 gripper mechanism requires one model group and one command resource",
+        "the retained I6 gripper mechanism requires one exact command resource",
+        "i6_gripper_command_scope_unsupported");
+  }
+  const auto& resource = binding.resources.front();
+  const bool model_backed = resource.source_joint_name.has_value();
+  const bool exact_model_scope =
+      model_backed && binding.model_groups.size() == 1U &&
+      std::count(binding.model_groups.front().expanded_compiled_joint_names.begin(),
+                 binding.model_groups.front().expanded_compiled_joint_names.end(),
+                 resource.compiled_resource_name) == 1;
+  const bool exact_component_local_scope =
+      !model_backed && binding.model_groups.empty();
+  if (!exact_model_scope && !exact_component_local_scope) {
+    return reject<GripperCommandRequestDTO>(
+        "the retained gripper resource has no exact model-backed or component-local scope",
         "i6_gripper_command_scope_unsupported");
   }
   if (command.command_schema_id.value() != kGripperPositionCommandSchemaId ||
@@ -444,8 +471,10 @@ extract_active_control_configurations(
 
   GripperCommandRequestDTO request;
   request.gripper_id = binding.command_target_id.value();
-  request.group_id = binding.model_groups.front().compiled_group_name;
-  request.joint_name = binding.resources.front().compiled_resource_name;
+  request.group_id = model_backed
+                         ? binding.model_groups.front().compiled_group_name
+                         : std::string{};
+  request.joint_name = resource.compiled_resource_name;
   request.target_position = target_position;
   request.duration_s = command_duration_s;
   request.max_effort = max_effort;
@@ -801,9 +830,11 @@ Result<void> ResourceAddressedExecutionKernel::release_retired_engine(
 
 struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotionPreviewSession {
   PreviewSession(ResourceAddressedExecutionKernel& owner, RuntimeParticipantBinding primary_binding,
-                 IMotionPreview& motion, std::unique_lock<std::mutex> submission_lock)
+                 IResolvedParticipantExecutionEngine& primary_engine, IMotionPreview& motion,
+                 std::unique_lock<std::mutex> submission_lock)
       : owner_(owner),
         primary_binding_(std::move(primary_binding)),
+        primary_engine_(primary_engine),
         motion_(motion),
         submission_lock_(std::move(submission_lock)) {}
 
@@ -827,6 +858,11 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
     if (!resolved.ok()) {
       return Result<RuntimeParticipantBindingDTO>::Err(resolved.error());
     }
+    if (resolved.value().engine != &primary_engine_) {
+      return reject<RuntimeParticipantBindingDTO>(
+          "linked preview motions cross their exact execution engine",
+          "motion_preview_engine_changed", ErrorCode::kInvariantViolation);
+    }
     return Result<RuntimeParticipantBindingDTO>::Ok(resolved.value().binding.value());
   }
 
@@ -836,7 +872,7 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
     if (!resolved.ok()) {
       return Result<ExecuteRequestDTO>::Err(resolved.error());
     }
-    if (resolved.value() != primary_binding_.value()) {
+    if (!same_linked_preview_participant(resolved.value(), primary_binding_.value())) {
       return reject<ExecuteRequestDTO>(
           "linked preview motions cross their exact runtime participant",
           "motion_preview_binding_changed");
@@ -902,6 +938,7 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
  private:
   ResourceAddressedExecutionKernel& owner_;
   RuntimeParticipantBinding primary_binding_;
+  IResolvedParticipantExecutionEngine& primary_engine_;
   IMotionPreview& motion_;
   // This is intentionally retained for the complete multi-leg candidate
   // transaction. The independent control path never takes this mutex.
@@ -950,7 +987,7 @@ ResourceAddressedExecutionKernel::begin_motion_preview_session(
         "motion_preview_engine_unavailable", ErrorCode::kUnsupportedCapability);
   }
   std::unique_ptr<IAddressedMotionPreviewSession> session = std::make_unique<PreviewSession>(
-      *this, std::move(resolved.value().binding), *motion, std::move(submission_lock));
+      *this, std::move(resolved.value().binding), *engine, *motion, std::move(submission_lock));
   return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(std::move(session));
 }
 

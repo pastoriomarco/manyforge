@@ -385,7 +385,8 @@
           {"frame_role_id": "base", "source_link_name": "base_link"},
           {"frame_role_id": "flange", "source_link_name": "flange"},
           {"frame_role_id": "gripper_tcp", "source_link_name": "grasp_frame"},
-          {"frame_role_id": "tcp", "source_link_name": "tool0"}
+          {"frame_role_id": "tcp", "source_link_name": "grasp_frame"},
+          {"frame_role_id": "tool_mount", "source_link_name": "tool0"}
         ],
         "instance_cardinality": "multiple_per_cell",
         "model_group_role_bindings": [

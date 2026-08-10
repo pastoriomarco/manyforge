@@ -12,7 +12,11 @@ import uvicorn
 
 from .app import create_app
 from .client import HeadlessClientError, HeadlessHttpClient
-from .native import HeadlessApiConfig, HeadlessApiError
+from .native import (
+    DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
+    HeadlessApiConfig,
+    HeadlessApiError,
+)
 
 
 def _print(value: dict[str, Any]) -> None:
@@ -52,6 +56,11 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--resource-id", action="append", default=[])
     serve.add_argument("--owner-id", default="headless-api")
     serve.add_argument("--freshness-ms", type=int, default=2000)
+    serve.add_argument(
+        "--manager-timeout-s",
+        type=float,
+        default=DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
+    )
     serve.add_argument("--program-runner-url")
     serve.add_argument("--program-runner-timeout-s", type=float, default=30.0)
 
@@ -145,6 +154,7 @@ def _serve(args: argparse.Namespace) -> int:
         resource_ids=tuple(sorted(set(args.resource_id))),
         owner_id=args.owner_id,
         freshness_milliseconds=args.freshness_ms,
+        manager_timeout_seconds=args.manager_timeout_s,
         program_runner_url=args.program_runner_url,
         program_runner_timeout_seconds=args.program_runner_timeout_s,
     )

@@ -20,6 +20,7 @@ MAX_VIEWER_MODEL_RESOURCE_URI_BYTES = 4096
 MAX_STANDARD_REQUEST_BODY_BYTES = 1024 * 1024
 MAX_PROGRAM_APPLY_REQUEST_BYTES = 17 * 1024 * 1024
 MAX_PROGRAM_MODEL_ATTEMPT_BYTES = 256 * 1024
+DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS = 5.0
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -50,7 +51,11 @@ class HeadlessApiConfig:
     historian_queue_capacity: int = 1_024
     historian_record_retention: int = 100_000
     mutation_replay_capacity: int = 4_096
-    manager_timeout_seconds: float = 0.25
+    # Apply and scene commits are durable Manager transactions, not health
+    # probes. Keep their local transport wait bounded but long enough for the
+    # owner to return the authoritative result instead of reporting an
+    # ambiguous timeout after the mutation has committed.
+    manager_timeout_seconds: float = DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS
     execution_timeout_seconds: float = 10.0
     execution_event_poll_milliseconds: int = 100
     maximum_request_body_bytes: int = MAX_STANDARD_REQUEST_BODY_BYTES

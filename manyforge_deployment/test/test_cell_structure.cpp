@@ -1220,7 +1220,8 @@ void expect_checked_in_lite6_and_ur_mixed_composition_matrix() {
   ur_spec.with_srdf = true;
   ur_spec.frames = {{"base", "base_link"},
                     {"gripper_tcp", "grasp_frame"},
-                    {"tcp", "tool0"}};
+                    {"tcp", "grasp_frame"},
+                    {"tool_mount", "tool0"}};
   ur_spec.groups = {{"arm", "arm"}, {"gripper", "gripper"}};
   ur_spec.resources = {
       {"arm_joints",
@@ -1365,7 +1366,7 @@ void expect_checked_in_lite6_and_ur_mixed_composition_matrix() {
       kLite6GripperCollisionLinks);
   expect_real_vendor_target_resolution(
       mixed, ur_source, "ur10e", "arm", "ur10e_model", "arm", "tcp",
-      "tool0", kUrArmCollisionLinks);
+      "grasp_frame", kUrArmCollisionLinks);
   expect_real_vendor_target_resolution(
       mixed, ur_source, "ur10e", "gripper", "ur10e_model", "gripper",
       "gripper_tcp", "grasp_frame", kUrGripperCollisionLinks);

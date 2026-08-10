@@ -1,5 +1,7 @@
 #include "product_backed_runtime_participant_resolver.hpp"
 
+#include "manyforge_roboplan/retained_collision_world_projector.hpp"
+
 #include <algorithm>
 #include <map>
 #include <manyforge_deployment/runtime_program_binding.hpp>
@@ -280,6 +282,32 @@ ProductBackedRuntimeParticipantResolver::
         "product-backed participant resolver inputs do not share one active "
         "runtime product");
   }
+
+  std::vector<collision::RetainedComponentCollisionBodyProjectionInput>
+      semantic_bodies;
+  for (const auto& role : retained_model_map_.model_collision_bodies()) {
+    if (!role.owner_component_id.has_value()) {
+      throw std::invalid_argument(
+          "passive-model collision geometry has no runtime body alias");
+    }
+    for (std::size_t index = 0U;
+         index < role.compiled_link_names.size(); ++index) {
+      semantic_bodies.push_back({
+          *role.owner_component_id,
+          role.model_instance_id,
+          role.model_revision,
+          role.collision_body_role_id,
+          index,
+          role.compiled_link_names[index],
+      });
+    }
+  }
+  const auto canonical =
+      canonicalize_retained_component_bodies(semantic_bodies);
+  collision_body_aliases_.reserve(canonical.aliases.size());
+  for (const auto& [semantic, physical] : canonical.aliases) {
+    collision_body_aliases_.push_back({semantic, physical});
+  }
 }
 
 core::Result<core::RuntimeParticipantBinding>
@@ -302,7 +330,8 @@ ProductBackedRuntimeParticipantResolver::Resolve(
     if (const auto* precomposed = FindExactPrecomposedBinding(
             operation, participant, physical_bindings_);
         precomposed != nullptr) {
-      return core::Result<core::RuntimeParticipantBinding>::Ok(*precomposed);
+      return core::bind_runtime_participant_collision_body_aliases(
+          *precomposed, collision_body_aliases_);
     }
 
     const auto binding = bindings_.get_verified(
@@ -349,6 +378,11 @@ ProductBackedRuntimeParticipantResolver::Resolve(
                         physical),
             std::span<const deployment::RuntimeProgramTargetBinding>(
                 supporting)));
+    if (!candidate.ok()) {
+      return candidate;
+    }
+    candidate = core::bind_runtime_participant_collision_body_aliases(
+        std::move(candidate.value()), collision_body_aliases_);
     if (!candidate.ok()) {
       return candidate;
     }

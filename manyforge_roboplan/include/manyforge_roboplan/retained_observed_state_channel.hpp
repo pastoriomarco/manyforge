@@ -24,6 +24,9 @@ struct RetainedObservedStateChannelConfig final {
 /// Publication is committed before best-effort scene projection, so execution
 /// and safety readers retain the latest owner-issued state even when the
 /// mutable RoboPlan visualization/planning scene is temporarily contended.
+/// A pure component-local participant has no projector: its addressed state is
+/// still owner-issued, but it never fabricates a URDF coordinate or mutates the
+/// retained kinematic scene.
 /// Linear coordinates remain metres and angular coordinates remain radians at
 /// this boundary; only an explicitly constructed all-angular compatibility
 /// adapter may expose the historical RobotStateDTO view.

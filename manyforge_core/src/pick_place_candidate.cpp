@@ -641,6 +641,8 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
 
     auto retreat_operation = request.retreat_operation;
     set_absolute_path(retreat_operation, candidate.retreat_path);
+    retreat_operation.expected_scene_revision =
+        candidate_projection.value().projection_binding.projection_revision.scene_revision;
     auto retreat = motion_.preview_motion(std::move(retreat_operation),
                                           std::move(candidate_projection.value()),
                                           descend.value().final_state, attempt, stop_token);
@@ -817,6 +819,8 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
   }
   report.stages.push_back({PickCandidateStageDTO::kCandidateDetach, true, std::nullopt, 0.0, 0U});
 
+  retreat_operation.expected_scene_revision =
+      candidate_projection.value().projection_binding.projection_revision.scene_revision;
   auto retreat = motion_.preview_motion(std::move(retreat_operation),
                                         std::move(candidate_projection.value()),
                                         descend.value().final_state, 0U, stop_token);

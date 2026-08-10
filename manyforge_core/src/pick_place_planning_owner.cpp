@@ -156,12 +156,13 @@ template <typename T>
   const auto* expected = find_frame(binding, frame_role_id);
   const auto* resolved = std::get_if<ResolvedComponentModelFrameDTO>(
       &receipt.resolved_frame);
+  // The query already selected the portable target frame role. The resolved
+  // frame carries the model asset's role, which may have a different name.
   return expected != nullptr && resolved != nullptr && receipt.valid() &&
          receipt.projection_binding == projection_binding &&
          resolved->controllable_component_id ==
              binding.controllable_component_id &&
          resolved->model_instance_id == expected->model_instance_id &&
-         resolved->frame_role_id == expected->frame_role_id &&
          resolved->compiled_frame_name == expected->compiled_frame_name &&
          resolved->model_revision == expected->model_revision;
 }

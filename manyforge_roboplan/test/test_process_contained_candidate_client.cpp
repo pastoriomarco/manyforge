@@ -31,6 +31,12 @@ constexpr std::string_view kDigestOne =
 constexpr std::string_view kComponentBodyId =
     "component/component-a/model/model-a/body/forearm/collision/0";
 constexpr std::string_view kSceneBodyId = "scene/far-box/shape/0";
+constexpr std::string_view kToolBodyId =
+    "component/component-a/model/model-a/body/tool/collision/0";
+constexpr std::string_view kCarriedFrameBodyId =
+    "scene/carried-frame-box/shape/0";
+constexpr std::string_view kFrameWitnessBodyId =
+    "scene/frame-witness-box/shape/0";
 
 struct ProcessFixture final {
   RoboPlanWorkerModelDTO model;
@@ -168,6 +174,66 @@ box_geometry(const CollisionBodyId &body_id, CollisionOwnerKind owner_kind) {
   return geometry;
 }
 
+[[nodiscard]] CollisionWorldBody frame_relative_tool_body() {
+  CollisionWorldBody body;
+  body.body_id = CollisionBodyId(std::string(kToolBodyId));
+  body.owner_kind = CollisionOwnerKind::kComponentModelBody;
+  body.frame_id = "tool0";
+  body.pose = identity_pose();
+  body.geometries.push_back(box_geometry(body.body_id, body.owner_kind));
+  return body;
+}
+
+[[nodiscard]] RoboPlanCandidateProjectionDTO
+frame_relative_collision_projection(const ProcessFixture &fixture) {
+  constexpr double kWitnessOffsetM = 0.2;
+  auto carried = CollisionWorldBody{};
+  carried.body_id = CollisionBodyId(std::string(kCarriedFrameBodyId));
+  carried.owner_kind = CollisionOwnerKind::kSceneResource;
+  carried.parent_body_id = CollisionBodyId(std::string(kToolBodyId));
+  carried.frame_id = "tool0";
+  carried.pose = {{0.0, 0.0, kWitnessOffsetM}, {0.0, 0.0, 0.0, 1.0}};
+  carried.geometries.push_back(
+      box_geometry(carried.body_id, carried.owner_kind));
+
+  Eigen::Matrix4d tool_from_carried = Eigen::Matrix4d::Identity();
+  tool_from_carried(2, 3) = kWitnessOffsetM;
+  const auto base_from_carried =
+      fixture.reference_scene->forwardKinematics(fixture.start, "tool0", "base") *
+      tool_from_carried;
+  auto witness = CollisionWorldBody{};
+  witness.body_id = CollisionBodyId(std::string(kFrameWitnessBodyId));
+  witness.owner_kind = CollisionOwnerKind::kSceneResource;
+  witness.frame_id = "base";
+  witness.pose = pose(base_from_carried);
+  witness.geometries.push_back(
+      box_geometry(witness.body_id, witness.owner_kind));
+
+  auto policy = std::make_shared<CollisionPolicySnapshot>();
+  policy->policy_id = "process-client-frame-projection";
+  policy->revision = CollisionPolicyRevision{1U, std::string(kDigestZero)};
+  auto world = CollisionWorldSnapshotBuilder()
+                   .set_publisher_id("process-client-frame-test")
+                   .set_revision_id(1U)
+                   .set_policy_overlay_content_hash(policy->revision.content_hash)
+                   .add_body(frame_relative_tool_body())
+                   .add_body(std::move(carried))
+                   .add_body(std::move(witness))
+                   .build_shared();
+  if (!world.ok()) {
+    throw std::runtime_error(world.error().message);
+  }
+  return RoboPlanCandidateProjectionDTO{
+      ProjectionLeaseBindingDTO{
+          ProjectionRevisionDTO{
+              RetainedBundleId("retained-bundle-a"),
+              GraphRevision("graph-revision-a"),
+              SceneRevision{SceneId(std::string(kDigestZero)), 1U,
+                            ContentDigest(std::string(kDigestZero))}},
+          ProjectionLeaseId("process-client-frame-lease")},
+      std::move(world.value()), std::move(policy)};
+}
+
 [[nodiscard]] CollisionWorldBody component_body() {
   CollisionWorldBody body;
   body.body_id = CollisionBodyId(std::string(kComponentBodyId));
@@ -178,11 +244,15 @@ box_geometry(const CollisionBodyId &body_id, CollisionOwnerKind owner_kind) {
   return body;
 }
 
-[[nodiscard]] CollisionWorldBody far_scene_body() {
+[[nodiscard]] CollisionWorldBody far_scene_body(
+    const bool carried_by_component = false) {
   CollisionWorldBody body;
   body.body_id = CollisionBodyId(std::string(kSceneBodyId));
   body.owner_kind = CollisionOwnerKind::kSceneResource;
-  body.frame_id = "base";
+  body.frame_id = carried_by_component ? "forearm_link" : "base";
+  if (carried_by_component) {
+    body.parent_body_id = CollisionBodyId(std::string(kComponentBodyId));
+  }
   body.pose = identity_pose(100.0);
   body.geometries.push_back(box_geometry(body.body_id, body.owner_kind));
   return body;
@@ -195,7 +265,8 @@ box_geometry(const CollisionBodyId &body_id, CollisionOwnerKind owner_kind) {
 
 [[nodiscard]] RoboPlanCandidateProjectionDTO
 projection(std::uint64_t world_revision = 1U,
-           std::uint64_t scene_revision = 1U) {
+           std::uint64_t scene_revision = 1U,
+           const bool carried_by_component = false) {
   auto policy = std::make_shared<CollisionPolicySnapshot>();
   policy->policy_id = "process-client-projection";
   policy->revision = CollisionPolicyRevision{1U, std::string(kDigestZero)};
@@ -206,7 +277,7 @@ projection(std::uint64_t world_revision = 1U,
           .set_revision_id(world_revision)
           .set_policy_overlay_content_hash(policy->revision.content_hash)
           .add_body(component_body())
-          .add_body(far_scene_body())
+          .add_body(far_scene_body(carried_by_component))
           .build_shared();
   if (!world.ok()) {
     throw std::runtime_error(world.error().message);
@@ -333,6 +404,54 @@ TEST(ProcessContainedCandidateClientTest,
             values(fixture.start));
   EXPECT_EQ(planned.value().waypoints.back().positions_rad,
             values(fixture.goal));
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RealWorkerAppliesCarriedObjectTouchPolicyWithoutNativeSelfPair) {
+  auto fixture = make_fixture();
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      std::move(process_config));
+
+  const auto selected = client.select_retained_projection(
+      projection(1U, 1U, true));
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  const auto planned = client.compute(request(fixture));
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+  EXPECT_EQ(planned.value().waypoints.front().positions_rad,
+            values(fixture.start));
+  EXPECT_EQ(planned.value().waypoints.back().positions_rad,
+            values(fixture.goal));
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RealWorkerPreservesAProjectedPoseRelativeToANonJointFrame) {
+  auto fixture = make_fixture();
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      std::move(process_config));
+
+  const auto selected =
+      client.select_retained_projection(frame_relative_collision_projection(fixture));
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  const auto planned = client.compute(request(fixture));
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"),
+            "native_start_state_collision");
+  EXPECT_NE(planned.error().details.at("collision_body_a")
+                .find("manyforge_scene_"),
+            std::string::npos);
+  EXPECT_NE(planned.error().details.at("collision_body_b")
+                .find("manyforge_scene_"),
+            std::string::npos);
+  EXPECT_NE(planned.error().message.find("manyforge_scene_"),
+            std::string::npos);
 }
 
 TEST(ProcessContainedCandidateClientTest,

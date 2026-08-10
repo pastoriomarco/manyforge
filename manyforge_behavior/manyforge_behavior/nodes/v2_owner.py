@@ -52,12 +52,16 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         self._owner_inputs: OwnerNodeInputs | None = None
         self._identity: NodeAttemptIdentity | None = None
         self._input_error: str | None = None
+        self._failure_reason_code: str | None = None
+        self._failure_message = ""
 
     def initialise(self) -> None:
         self._inputs = None
         self._owner_inputs = None
         self._identity = None
         self._input_error = None
+        self._failure_reason_code = None
+        self._failure_message = ""
         try:
             self._identity = self._attempt_source.begin(self._node_instance_id)
             snapshot = self._input_resolver.snapshot(
@@ -74,7 +78,15 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
             )
         except (KeyError, ProgramValueError, TypeError, ValueError) as exc:
             self._input_error = str(exc)
-            self.feedback_message = f"node_input_unavailable: {exc}"
+            self._record_failure("node_input_unavailable", str(exc))
+
+    @property
+    def failure_reason_code(self) -> str | None:
+        return self._failure_reason_code
+
+    @property
+    def failure_message(self) -> str:
+        return self._failure_message
 
     def _write_output(
         self,
@@ -89,7 +101,7 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
             return False
         output_key = self._inputs[self._output_key_parameter]
         if output is None:
-            self.feedback_message = "owner_result_invalid: output is absent"
+            self._record_failure("owner_result_invalid", "output is absent")
             return False
         reserved_metadata = {
             "node_id": self._node_id,
@@ -98,9 +110,10 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         }
         collisions = set(owner_metadata) & set(reserved_metadata)
         if collisions:
-            self.feedback_message = (
-                "owner_result_invalid: owner metadata replaces reserved fields "
-                f"{sorted(collisions)}"
+            self._record_failure(
+                "owner_result_invalid",
+                "owner metadata replaces reserved fields "
+                f"{sorted(collisions)}",
             )
             return False
         try:
@@ -113,12 +126,14 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
                 },
             )
         except (KeyError, ProgramValueError, TypeError) as exc:
-            self.feedback_message = f"owner_output_rejected: {exc}"
+            self._record_failure("owner_output_rejected", str(exc))
             return False
         return True
 
     def _record_failure(self, reason_code: str | None, message: str) -> None:
         reason = reason_code or "owner_result_invalid"
+        self._failure_reason_code = reason
+        self._failure_message = message
         self.feedback_message = f"{reason}: {message}".rstrip()
 
 

@@ -612,6 +612,20 @@ def test_terminal_cleanup_is_retryable_before_the_run_claims_completion() -> Non
     assert initialization_port.released == ["program-run-1", "program-run-1"]
 
 
+def test_failed_tree_projects_the_exact_focused_owner_failure() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED
+    )
+    started = owner.start(admission)
+
+    failed = owner.advance_once(started.capture.program_run_id)
+
+    assert failed.state is ProgramRunState.FAILED
+    assert failed.tree_status == "failure"
+    assert failed.reason_code == "owner_failed"
+    assert failed.message == ""
+
+
 def test_authored_pause_requires_intervention_without_redispatch() -> None:
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
     owner, admission, task, _scope, _events = _fixture(

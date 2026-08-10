@@ -1430,8 +1430,13 @@ make_direct_control_gripper_contract(
   for (const auto& body : target.collision_body_roles) {
     model_role_names.insert(body.model_role_id.value());
   }
-  if (model_role_names.empty() || target.model_group_roles.size() != 1U ||
-      target.resource_roles.size() != 1U) {
+  const bool model_backed_resource =
+      target.resource_roles.size() == 1U &&
+      std::holds_alternative<core::ComponentTypeModelResourceRoleDTO>(
+          target.resource_roles.front());
+  if (model_role_names.empty() || target.resource_roles.size() != 1U ||
+      (model_backed_resource && target.model_group_roles.size() != 1U) ||
+      (!model_backed_resource && !target.model_group_roles.empty())) {
     fail("direct-control gripper target has no exact model/group/resource "
          "contract");
   }

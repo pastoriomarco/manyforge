@@ -20,13 +20,17 @@
 > scene/viewer authoring and one exact owner-routed current-pose Commit without
 > dynamic viewer truth. N6-c5 adds strict bounded direct/`nemoclaw` mediation,
 > Draft-only callbacks, and operator conversation/reconciliation without model
-> or runtime authority. N7-a5.1-a5.4 add exact Program admission and Applied
+> or runtime authority. N7-a5.1-a5.5 add exact Program admission and Applied
 > identity, the captured native motion/gripper/scene/model join, fixed-pool
 > ticking, an independent Program-runner process, and strict Headless/Composer
-> scenario, Run/status, and explicit Program Stop clients. The currently
-> admitted product remains limited to the joined nodes and one active Program;
-> complete inputs, repeated-instance closure, product launch, public MCP, and
-> external agent loops remain unavailable.
+> scenario, Run/status, and explicit Program Stop clients. All seven maintained
+> deployment inputs and eight Program Bindings now traverse that production
+> path; two identical Lite6 occurrences also compile and resolve without
+> cross-instance aliasing. The currently admitted product remains limited to
+> the joined nodes and one active Program. I6 cumulative qualification,
+> packaged product launch, public MCP, and external agent loops remain open,
+> while lifecycle, final Stop, Isaac, real robot, and generalized tools remain
+> at I7-I11.
 > Unless a section explicitly identifies a retained foundation or target
 > design, present-tense ownership and flow descriptions below refer to the
 > captured three-lane baseline.

@@ -41,6 +41,7 @@ class ProductBackedRuntimeParticipantResolver final {
   std::shared_ptr<const deployment::RetainedBundle> retained_bundle_;
   deployment::VerifiedRetainedModelMap retained_model_map_;
   std::vector<core::RuntimeParticipantBinding> physical_bindings_;
+  std::vector<core::RuntimeCollisionBodyAliasDTO> collision_body_aliases_;
 };
 
 }  // namespace manyforge::roboplan_backend

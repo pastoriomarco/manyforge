@@ -41,7 +41,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
         "composable_cell_runtime_unavailable"
     )
     assert health.json()["runtimeAvailability"]["restorationGates"] == [
-        "N7-a5.5",
+        "N7",
         "L0",
         "P5",
         "I",

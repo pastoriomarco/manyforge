@@ -15,6 +15,8 @@ namespace manyforge::core {
 struct TargetCarrierSceneFrameRefDTO final {
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
+  /// Portable command-target frame role. The retained target map may resolve
+  /// this to a differently named model-asset frame role.
   FrameRoleId frame_role_id;
 
   [[nodiscard]] bool valid() const noexcept {

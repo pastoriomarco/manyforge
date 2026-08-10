@@ -170,9 +170,10 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
       std::span<const RetainedComponentModelFrameProjectionInput> frames);
 
   /// Resolve one portable carrier frame to a rigidly-related collision body
-  /// selected by the addressed command target. Ambiguous or articulated
-  /// relationships fail closed: a carried object's immutable snapshot pose
-  /// must not depend on an arbitrary body choice or on a changing joint.
+  /// selected by the addressed command target. An exact carrier-frame body
+  /// wins over rigid sibling bodies; overlapping semantic aliases of the same
+  /// compiled frame collapse deterministically. Distinct sibling frames and
+  /// articulated relationships remain ambiguous and fail closed.
   [[nodiscard]] static core::Result<RetainedCarriedObjectParentProjection>
   resolve_retained_carried_object_parent(
       SharedModelPtr shared_model,

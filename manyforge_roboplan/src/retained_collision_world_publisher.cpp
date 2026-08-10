@@ -72,6 +72,18 @@ RetainedCollisionWorldPublisher::publish(
   return publish_locked(logical_scene, std::move(context));
 }
 
+core::Result<std::uint64_t>
+RetainedCollisionWorldPublisher::reserve_private_collision_world_revision() {
+  std::lock_guard<std::mutex> lock(writer_mutex_);
+  if (collision_world_revision_sequence_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    return publication_error<std::uint64_t>(
+        "collision-world revision sequence is exhausted");
+  }
+  return core::Result<std::uint64_t>::Ok(
+      ++collision_world_revision_sequence_);
+}
+
 core::Result<core::CollisionWorldRevision>
 RetainedCollisionWorldPublisher::publish_locked(
     const core::LogicalSceneSnapshotDTO &logical_scene,
@@ -93,7 +105,8 @@ RetainedCollisionWorldPublisher::publish_locked(
     return publication_error<core::CollisionWorldRevision>(
         "scene initialization cannot follow an existing publication");
   }
-  if (world_revision_id_ == std::numeric_limits<std::uint64_t>::max() ||
+  if (collision_world_revision_sequence_ ==
+          std::numeric_limits<std::uint64_t>::max() ||
       owner_sequence_ == std::numeric_limits<std::uint64_t>::max() ||
       runtime_epoch_ == std::numeric_limits<std::uint64_t>::max()) {
     return publication_error<core::CollisionWorldRevision>(
@@ -149,7 +162,8 @@ RetainedCollisionWorldPublisher::publish_locked(
     policy.value().revision.revision_id = policy_revision_id_;
   }
 
-  const std::uint64_t proposed_world_revision = world_revision_id_ + 1U;
+  const std::uint64_t proposed_world_revision =
+      collision_world_revision_sequence_ + 1U;
   auto world = projector_.project(logical_scene, proposed_world_revision,
                                   context.observed_timestamp_ns, publisher_id_);
   if (!world.ok()) {
@@ -238,6 +252,7 @@ RetainedCollisionWorldPublisher::publish_locked(
         "collision runtime bundle retirement is backpressured");
   }
 
+  collision_world_revision_sequence_ = proposed_world_revision;
   world_revision_id_ = proposed_world_revision;
   if (policy_changed) {
     policy_revision_id_ = proposed_policy_revision;

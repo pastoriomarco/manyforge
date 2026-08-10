@@ -883,6 +883,49 @@ public:
     return QueryStatusLocked(query);
   }
 
+  void RunWithExactHeldPredecessor(
+      const core::ConfigurationFenceStatusQueryDTO &query,
+      const core::ActiveBundlePublicationGeneration
+          &expected_predecessor_publication_generation,
+      const core::ContentDigest &expected_predecessor_public_pointer_digest,
+      const std::function<void()> &effect) const {
+    std::lock_guard lock(mutex_);
+    Require(query.valid() &&
+                expected_predecessor_publication_generation.nonzero() &&
+                !expected_predecessor_public_pointer_digest.empty() &&
+                static_cast<bool>(effect),
+            "fenced runtime-composition installation request is invalid");
+    const auto row = ReadByFence(query.configuration_fence_id,
+                                 query.configuration_fence_generation);
+    Require(row.has_value() && row->state == 0,
+            "runtime composition does not name a durable held fence");
+    const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
+        row->intent_bytes);
+    const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
+        row->accepted_bytes);
+    Require(intent.owner_transaction == query.owner_transaction &&
+                accepted.configuration_fence_id ==
+                    query.configuration_fence_id &&
+                accepted.configuration_fence_generation ==
+                    query.configuration_fence_generation &&
+                accepted.captured_scope == query.expected_scope,
+            "runtime composition conflicts with the durable held fence");
+
+    const auto active = ReadActivePublication();
+    Require(active.receipt.request.candidate_retained_bundle_id ==
+                    intent.expected_retained_bundle_id &&
+                active.receipt.request.candidate_graph_revision ==
+                    intent.expected_graph_revision &&
+                active.receipt.publication_generation ==
+                    expected_predecessor_publication_generation &&
+                active.receipt.durable_public_pointer_content_digest ==
+                    expected_predecessor_public_pointer_digest,
+            "runtime composition predecessor publication changed while its "
+            "fence was held");
+    admission_gate_.RunWithExactHeldFence(query.configuration_fence_id,
+                                          query.expected_scope, effect);
+  }
+
   [[nodiscard]] core::ConfigurationFenceReleasedDTO
   Release(const core::ConfigurationFenceReleaseDTO &request) {
     std::lock_guard lock(mutex_);
@@ -1326,6 +1369,17 @@ core::ApplyFenceReconcileResultDTO ManagedKernelApplyFenceOwner::Rehydrate(
 core::ConfigurationFenceStatusDTO ManagedKernelApplyFenceOwner::QueryStatus(
     const core::ConfigurationFenceStatusQueryDTO &query) const {
   return impl_->QueryStatus(query);
+}
+
+void ManagedKernelApplyFenceOwner::RunWithExactHeldPredecessor(
+    const core::ConfigurationFenceStatusQueryDTO &query,
+    const core::ActiveBundlePublicationGeneration
+        &expected_predecessor_publication_generation,
+    const core::ContentDigest &expected_predecessor_public_pointer_digest,
+    const std::function<void()> &effect) const {
+  impl_->RunWithExactHeldPredecessor(
+      query, expected_predecessor_publication_generation,
+      expected_predecessor_public_pointer_digest, effect);
 }
 
 core::ConfigurationFenceReleasedDTO ManagedKernelApplyFenceOwner::Release(

@@ -977,11 +977,11 @@
         "schema_revision": "sha256:7415c5e2df17491366755b401337e3ad96dd96703357b20c9e0d08bf3f46a9f6"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/model_asset/ur10e_robotiq_2f_140/033fb768dc05018fc84b60a8cf1ee1e744eff22d00eba21416fa1f5417c16852",
-        "content_digest": "sha256:c1a80d25d524d559864ebaac9ad3e985675205fde1642487b55c46320bf16a53",
+        "content_addressed_store_key": "catalog/maintained/model_asset/ur10e_robotiq_2f_140/b36edcfdcfba75fbb32e85b2e4fc7b4af933808f7e47567ef0882f58169178f4",
+        "content_digest": "sha256:84ac3c5cfae6845c2db9c97301de240586d51475fb914a259201f2aa50dc21e8",
         "record_id": "ur10e_robotiq_2f_140",
         "record_kind": "model_asset",
-        "record_revision": "sha256:033fb768dc05018fc84b60a8cf1ee1e744eff22d00eba21416fa1f5417c16852",
+        "record_revision": "sha256:b36edcfdcfba75fbb32e85b2e4fc7b4af933808f7e47567ef0882f58169178f4",
         "schema_id": "manyforge.model_asset.v1",
         "schema_revision": "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c"
       },
@@ -1045,7 +1045,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_pick_place_preview",
-  "deployment_revision": "sha256:00b118c2a83f1a2dca6d6a8072409d63f55f1220a99ed694262eb5c158144d12",
+  "deployment_revision": "sha256:b2b53db170dcf4b68eff5eefa10656e9a9ed7ede69b7d9e47dc8623b817624f5",
   "description": "Preview deployment for UR10e + Robotiq 2F-140 native RoboPlan pick-and-place demo.",
   "desired_control_configurations": [
     {
@@ -1880,7 +1880,7 @@
       {
         "model_asset_id": "ur10e_robotiq_2f_140",
         "model_instance_id": "ur10e_robot.model",
-        "model_revision": "sha256:033fb768dc05018fc84b60a8cf1ee1e744eff22d00eba21416fa1f5417c16852"
+        "model_revision": "sha256:b36edcfdcfba75fbb32e85b2e4fc7b4af933808f7e47567ef0882f58169178f4"
       }
     ],
     "runtime_units": [

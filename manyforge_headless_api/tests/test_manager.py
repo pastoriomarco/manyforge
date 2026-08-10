@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import socket
 import threading
+import time
 
 import pytest
 import rfc8785
@@ -134,6 +135,39 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
     }
     assert decoded["source_label"] == "test"
     assert decoded["correlation_id"] == "correlation.1"
+
+
+def test_manager_client_default_wait_covers_a_bounded_durable_mutation(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "manager-command.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    server.bind(str(socket_path))
+    server.listen(1)
+
+    def serve() -> None:
+        connection, _address = server.accept()
+        with connection:
+            connection.recv(16 * 1024)
+            # This exceeds the former 250 ms health-probe-sized default. A
+            # durable mutation may already have committed when its reply is
+            # sent, so the production client must wait for the bounded result.
+            time.sleep(0.3)
+            connection.send(
+                b'{"api_version":"manyforge.manager_command_response.v1",'
+                b'"error":null,"ok":true,"request_id":"request.1",'
+                b'"request_owner_epoch":"client.epoch.1"}'
+            )
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    try:
+        response = ManagerCommandClient(tmp_path).apply(_request())
+        assert response["ok"] is True
+    finally:
+        server.close()
+        worker.join(timeout=1.0)
+    assert not worker.is_alive()
 
 
 def test_manager_client_rejects_a_response_for_another_request(

@@ -34,6 +34,10 @@ struct RetainedNativeRuntimeConfig final {
   RoboPlanExecutionBackendConfig execution;
   SimpleSchedulerConfig scheduler;
   core::Duration gripper_update_period_ns{10'000'000};
+  /// Exact motion-resource order from the retained runtime-unit product.
+  /// Empty remains available only to lower-level fixtures that intentionally
+  /// bootstrap from the scene's already-established state.
+  std::vector<double> initial_motion_positions_rad;
 };
 
 struct RetainedNativeAddressedOwnerConfig final {

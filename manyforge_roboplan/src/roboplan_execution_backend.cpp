@@ -15,12 +15,12 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
-constexpr auto kExecutionTick = std::chrono::milliseconds(10);
 constexpr int kTerminalSceneProjectionRetryAttempts = 10;
-constexpr auto kTerminalSceneProjectionRetryDelay = std::chrono::milliseconds(20);
+constexpr auto kTerminalSceneProjectionRetryDelay =
+    std::chrono::milliseconds(20);
 
 double controlled_stop_wait_timeout_s(
-    const core::MotionInterruptStopProfileDTO& profile,
+    const core::MotionInterruptStopProfileDTO &profile,
     double stop_completion_tolerance_s) {
   if (profile.max_stop_time_s.has_value()) {
     return *profile.max_stop_time_s;
@@ -33,13 +33,11 @@ double clamp_progress(double progress) {
   return std::max(0.0, std::min(1.0, progress));
 }
 
-void atomic_max(std::atomic<std::uint64_t>& target, std::uint64_t value) {
+void atomic_max(std::atomic<std::uint64_t> &target, std::uint64_t value) {
   auto current = target.load(std::memory_order_relaxed);
-  while (current < value &&
-         !target.compare_exchange_weak(current,
-                                       value,
-                                       std::memory_order_relaxed,
-                                       std::memory_order_relaxed)) {
+  while (current < value && !target.compare_exchange_weak(
+                                current, value, std::memory_order_relaxed,
+                                std::memory_order_relaxed)) {
   }
 }
 
@@ -48,21 +46,23 @@ std::string seconds_string(std::chrono::duration<Rep, Period> duration) {
   return std::to_string(std::chrono::duration<double>(duration).count());
 }
 
-}  // namespace
+} // namespace
 
 RoboPlanExecutionBackend::RoboPlanExecutionBackend(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<IRetainedObservedStateChannel> state_channel,
-    core::IClock& clock,
-    RoboPlanExecutionBackendConfig config)
-    : binding_(std::move(binding)),
-      state_channel_(std::move(state_channel)),
-      clock_(clock),
-      config_(config) {
+    core::IClock &clock, RoboPlanExecutionBackendConfig config)
+    : binding_(std::move(binding)), state_channel_(std::move(state_channel)),
+      clock_(clock), config_(config) {
   if (config_.reset_completion_timeout_s <= 0.0 ||
       !std::isfinite(config_.reset_completion_timeout_s)) {
     throw std::invalid_argument(
         "reset_completion_timeout_s must be finite and > 0");
+  }
+  if (config_.execution_tick_period_ns <= 0 ||
+      config_.execution_tick_period_ns > 1'000'000'000) {
+    throw std::invalid_argument(
+        "execution_tick_period_ns must be in (0, 1 second]");
   }
   if (config_.soft_on_path_stop_traj_delta_s < 0.0 ||
       !std::isfinite(config_.soft_on_path_stop_traj_delta_s)) {
@@ -75,10 +75,11 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
         "soft_on_path_sample_period_s must be finite and > 0");
   }
   if (config_.soft_on_path_max_initial_velocity_deviation_rad_s.has_value() &&
-      (!std::isfinite(*config_.soft_on_path_max_initial_velocity_deviation_rad_s) ||
+      (!std::isfinite(
+           *config_.soft_on_path_max_initial_velocity_deviation_rad_s) ||
        *config_.soft_on_path_max_initial_velocity_deviation_rad_s < 0.0)) {
-    throw std::invalid_argument(
-        "soft_on_path_max_initial_velocity_deviation_rad_s must be finite and >= 0");
+    throw std::invalid_argument("soft_on_path_max_initial_velocity_deviation_"
+                                "rad_s must be finite and >= 0");
   }
   if (config_.soft_on_path_max_initial_path_deviation_rad.has_value() &&
       (!std::isfinite(*config_.soft_on_path_max_initial_path_deviation_rad) ||
@@ -86,21 +87,21 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
     throw std::invalid_argument(
         "soft_on_path_max_initial_path_deviation_rad must be finite and >= 0");
   }
-  for (const auto& [joint, jerk] : config_.soft_on_path_max_jerk_rad_s3) {
+  for (const auto &[joint, jerk] : config_.soft_on_path_max_jerk_rad_s3) {
     if (joint.empty() || !std::isfinite(jerk) || jerk <= 0.0) {
       throw std::invalid_argument(
-          "soft_on_path_max_jerk_rad_s3 entries must have non-empty joint names and finite positive values");
+          "soft_on_path_max_jerk_rad_s3 entries must have non-empty joint "
+          "names and finite positive values");
     }
   }
-  const auto& value = binding_.value();
+  const auto &value = binding_.value();
   if (!state_channel_ || !value.control_path.has_value() ||
       value.model_groups.size() != 1U || value.resources.empty()) {
     throw std::invalid_argument(
         "native execution requires one exact retained motion target");
   }
-  for (const auto& resource : value.resources) {
-    if (resource.coordinate_kind !=
-            core::CoordinateKind::kAngular ||
+  for (const auto &resource : value.resources) {
+    if (resource.coordinate_kind != core::CoordinateKind::kAngular ||
         std::count(
             value.model_groups.front().expanded_compiled_joint_names.begin(),
             value.model_groups.front().expanded_compiled_joint_names.end(),
@@ -134,7 +135,7 @@ RoboPlanExecutionBackend::~RoboPlanExecutionBackend() {
 
 std::int64_t RoboPlanExecutionBackend::publish_snapshot(
     core::ExecutionState state, double progress,
-    const std::vector<double>& joint_positions,
+    const std::vector<double> &joint_positions,
     std::optional<core::ErrorDTO> error) {
   const auto timestamp_ns = clock_.now();
   {
@@ -159,9 +160,8 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
         state == core::ExecutionState::kFailed ||
         state == core::ExecutionState::kInterventionRequired;
     const std::span<const double> velocities =
-        at_rest_state
-            ? std::span<const double>(observed_at_rest_velocities_)
-            : std::span<const double>{};
+        at_rest_state ? std::span<const double>(observed_at_rest_velocities_)
+                      : std::span<const double>{};
     const int attempts = at_rest_state ? 8 : 1;
     for (int attempt = 0; attempt < attempts; ++attempt) {
       const auto published = publish_observed_state_authority(
@@ -180,13 +180,12 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
 
 RetainedStateProjectionResult
 RoboPlanExecutionBackend::publish_observed_state_authority(
-    std::span<const double> positions,
-    std::span<const double> velocities,
+    std::span<const double> positions, std::span<const double> velocities,
     std::int64_t timestamp_ns) noexcept {
   try {
     return state_channel_->publish_state(positions, velocities, timestamp_ns,
                                          timestamp_ns);
-  } catch (const std::exception& error) {
+  } catch (const std::exception &error) {
     return {RetainedStateProjectionStatus::kFailed,
             core::ErrorDTO{
                 std::string(core::to_string(core::ErrorCode::kInternalError)),
@@ -203,8 +202,7 @@ RoboPlanExecutionBackend::publish_observed_state_authority(
 }
 
 bool RoboPlanExecutionBackend::update_scene_positions(
-    const std::vector<double>& joint_positions,
-    SceneUpdateMode mode,
+    const std::vector<double> &joint_positions, SceneUpdateMode mode,
     std::int64_t source_timestamp_ns) {
   if (joint_positions.empty()) {
     return true;
@@ -212,14 +210,14 @@ bool RoboPlanExecutionBackend::update_scene_positions(
 
   const auto now_ns = clock_.now();
   bool latest_matches = false;
-  if (auto latest = state_channel_->current_state(now_ns); latest.ok() &&
+  if (auto latest = state_channel_->current_state(now_ns);
+      latest.ok() &&
       latest.value().positions.size() == joint_positions.size()) {
     latest_matches = true;
     for (std::size_t index = 0U; index < joint_positions.size(); ++index) {
-      const auto* angular = std::get_if<core::AngularPositionDTO>(
+      const auto *angular = std::get_if<core::AngularPositionDTO>(
           &latest.value().positions[index]);
-      if (angular == nullptr ||
-          angular->value_rad != joint_positions[index]) {
+      if (angular == nullptr || angular->value_rad != joint_positions[index]) {
         latest_matches = false;
         break;
       }
@@ -250,8 +248,8 @@ void RoboPlanExecutionBackend::record_scene_projection_success(
     std::int64_t source_timestamp_ns) {
   const auto now_ns = clock_.now();
   scene_projection_successes_total_.fetch_add(1, std::memory_order_relaxed);
-  scene_projection_last_success_timestamp_ns_.store(
-      now_ns, std::memory_order_relaxed);
+  scene_projection_last_success_timestamp_ns_.store(now_ns,
+                                                    std::memory_order_relaxed);
   if (source_timestamp_ns > 0 && now_ns >= source_timestamp_ns) {
     atomic_max(scene_projection_lag_max_ns_,
                static_cast<std::uint64_t>(now_ns - source_timestamp_ns));
@@ -272,7 +270,8 @@ RoboPlanExecutionBackend::scene_projection_metrics() const {
   metrics.lag_max_ns =
       scene_projection_lag_max_ns_.load(std::memory_order_relaxed);
   metrics.last_success_timestamp_ns =
-      scene_projection_last_success_timestamp_ns_.load(std::memory_order_relaxed);
+      scene_projection_last_success_timestamp_ns_.load(
+          std::memory_order_relaxed);
   metrics.terminal_retries_scheduled_total =
       terminal_scene_projection_retries_scheduled_total_.load(
           std::memory_order_relaxed);
@@ -292,21 +291,19 @@ RoboPlanExecutionBackend::scene_projection_metrics() const {
 }
 
 void RoboPlanExecutionBackend::schedule_terminal_scene_projection_retry(
-    std::vector<double> joint_positions,
-    std::int64_t source_timestamp_ns) {
+    std::vector<double> joint_positions, std::int64_t source_timestamp_ns) {
   if (joint_positions.empty()) {
     return;
   }
   {
     std::lock_guard<std::mutex> lock(terminal_scene_projection_retry_mutex_);
-    pending_terminal_scene_projection_ =
-        PendingTerminalSceneProjection{std::move(joint_positions),
-                                       source_timestamp_ns};
+    pending_terminal_scene_projection_ = PendingTerminalSceneProjection{
+        std::move(joint_positions), source_timestamp_ns};
     terminal_scene_projection_retries_scheduled_total_.fetch_add(
         1, std::memory_order_relaxed);
     if (!terminal_scene_projection_retry_thread_.joinable()) {
-      terminal_scene_projection_retry_thread_ = std::jthread(
-          [this](std::stop_token stop_token) {
+      terminal_scene_projection_retry_thread_ =
+          std::jthread([this](std::stop_token stop_token) {
             terminal_scene_projection_retry_worker(stop_token);
           });
     }
@@ -319,17 +316,15 @@ void RoboPlanExecutionBackend::terminal_scene_projection_retry_worker(
   while (!stop_token.stop_requested()) {
     PendingTerminalSceneProjection pending;
     {
-      std::unique_lock<std::mutex> lock(
-          terminal_scene_projection_retry_mutex_);
+      std::unique_lock<std::mutex> lock(terminal_scene_projection_retry_mutex_);
       // Token-aware wait: a plain condition_variable whose predicate reads
       // stop_requested() (state that flips outside this mutex) can lose the
       // stop wakeup between predicate evaluation and enqueue, deadlocking the
       // destructor join. The (lock, stoken, pred) overload re-checks the stop
       // state under the lock and cannot lose it.
-      terminal_scene_projection_retry_cv_.wait(
-          lock, stop_token, [this]() {
-            return pending_terminal_scene_projection_.has_value();
-          });
+      terminal_scene_projection_retry_cv_.wait(lock, stop_token, [this]() {
+        return pending_terminal_scene_projection_.has_value();
+      });
       if (stop_token.stop_requested()) {
         return;
       }
@@ -362,8 +357,8 @@ void RoboPlanExecutionBackend::terminal_scene_projection_retry_worker(
   }
 }
 
-void RoboPlanExecutionBackend::stop_terminal_scene_projection_retry_worker()
-    noexcept {
+void RoboPlanExecutionBackend::
+    stop_terminal_scene_projection_retry_worker() noexcept {
   if (terminal_scene_projection_retry_thread_.joinable()) {
     // request_stop() wakes the token-aware wait through the jthread's
     // internal stop_callback; no manual notify is needed (and a manual
@@ -377,9 +372,10 @@ void RoboPlanExecutionBackend::stop_terminal_scene_projection_retry_worker()
 void RoboPlanExecutionBackend::execution_worker(
     std::stop_token st, core::TrajectoryDTO trajectory,
     std::uint64_t execution_generation) {
-  const double total_duration_s = trajectory.waypoints.empty()
-                                      ? 0.0
-                                      : trajectory.waypoints.back().time_from_start_s;
+  const double total_duration_s =
+      trajectory.waypoints.empty()
+          ? 0.0
+          : trajectory.waypoints.back().time_from_start_s;
   std::vector<double> latest_positions =
       trajectory.waypoints.empty() ? std::vector<double>{}
                                    : trajectory.waypoints.front().positions_rad;
@@ -403,7 +399,8 @@ void RoboPlanExecutionBackend::execution_worker(
   int64_t last_tick_ns = clock_.now();
   double trajectory_time_s = 0.0;
   double applied_runtime_scale = std::max(
-      0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
+      0.0,
+      std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.active_trajectory =
@@ -449,7 +446,8 @@ void RoboPlanExecutionBackend::execution_worker(
         std::max(0.0, static_cast<double>(now_ns - last_tick_ns) / 1e9);
     last_tick_ns = now_ns;
     const double target_scale = std::max(
-        0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
+        0.0,
+        std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
     const double max_delta =
         RoboPlanExecutionBackend::qualified_runtime_scale_slew_per_second() *
         dt_s;
@@ -469,16 +467,15 @@ void RoboPlanExecutionBackend::execution_worker(
     }
     (void)execution_progress_publication_->publish(
         execution_generation,
-        static_cast<std::int64_t>(
-            std::max(0.0, trajectory_time_s) * 1e9),
-        now_ns,
-        now_ns);
+        static_cast<std::int64_t>(std::max(0.0, trajectory_time_s) * 1e9),
+        now_ns, now_ns);
 
     const double progress =
-        total_duration_s <= 1e-9 ? 1.0 : clamp_progress(trajectory_time_s / total_duration_s);
+        total_duration_s <= 1e-9
+            ? 1.0
+            : clamp_progress(trajectory_time_s / total_duration_s);
     {
-      auto sample =
-          core::sample_trajectory(trajectory, trajectory_time_s);
+      auto sample = core::sample_trajectory(trajectory, trajectory_time_s);
       if (sample.ok()) {
         latest_positions = std::move(sample.value().positions_rad);
       } else {
@@ -489,8 +486,7 @@ void RoboPlanExecutionBackend::execution_worker(
         // worker so the kernel surfaces the fault instead of silently
         // freezing the visual at an empty state.
         publish_snapshot(
-            core::ExecutionState::kFailed, progress,
-            latest_positions,
+            core::ExecutionState::kFailed, progress, latest_positions,
             core::ErrorDTO{
                 std::string(core::to_string(core::ErrorCode::kInternalError)),
                 "trajectory sampler rejected the active execution "
@@ -514,12 +510,10 @@ void RoboPlanExecutionBackend::execution_worker(
           trajectory.waypoints.empty()
               ? latest_positions
               : trajectory.waypoints.back().positions_rad;
-      const auto completed_snapshot_ns =
-          publish_snapshot(core::ExecutionState::kCompleted, 1.0,
-                           completed_positions);
+      const auto completed_snapshot_ns = publish_snapshot(
+          core::ExecutionState::kCompleted, 1.0, completed_positions);
       if (!trajectory.waypoints.empty()) {
-        update_scene_positions(completed_positions,
-                               SceneUpdateMode::kBlocking,
+        update_scene_positions(completed_positions, SceneUpdateMode::kBlocking,
                                completed_snapshot_ns);
       }
       const auto terminal_progress_ns = clock_.now();
@@ -532,9 +526,11 @@ void RoboPlanExecutionBackend::execution_worker(
     }
 
     std::unique_lock<std::mutex> lock(execution_mutex_);
-    execution_cv_.wait_for(lock, kExecutionTick, [this, &st]() {
-      return st.stop_requested() || state_.pause_requested.load();
-    });
+    execution_cv_.wait_for(
+        lock, std::chrono::nanoseconds(config_.execution_tick_period_ns),
+        [this, &st]() {
+          return st.stop_requested() || state_.pause_requested.load();
+        });
   }
 
   state_.running.store(false);
@@ -549,7 +545,7 @@ void RoboPlanExecutionBackend::execution_worker(
 }
 
 core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
-    const core::TrajectoryDTO& trajectory) {
+    const core::TrajectoryDTO &trajectory) {
   // jthread auto-joins, no need to call join_worker_if_needed()
 
   const std::vector<double> initial_positions =
@@ -561,13 +557,12 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
   const auto execution_generation =
-      next_execution_progress_generation_.fetch_add(
-          1, std::memory_order_acq_rel);
+      next_execution_progress_generation_.fetch_add(1,
+                                                    std::memory_order_acq_rel);
   execution_progress_publication_->invalidate();
   const auto progress_started_at_ns = clock_.now();
   const auto initial_progress = execution_progress_publication_->publish(
-      execution_generation, 0, progress_started_at_ns,
-      progress_started_at_ns);
+      execution_generation, 0, progress_started_at_ns, progress_started_at_ns);
   if (!initial_progress.published) {
     state_.running.store(false);
     publish_snapshot(
@@ -575,10 +570,9 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
         core::ErrorDTO{core::kErrorExecutionRejected,
                        "Native execution progress authority could not be armed",
                        {{"reason", initial_progress.reason}}});
-    return core::ExecutionHandle{
-        [](int64_t) { return true; },
-        [this]() { return get_execution_snapshot(); },
-        0};
+    return core::ExecutionHandle{[](int64_t) { return true; },
+                                 [this]() { return get_execution_snapshot(); },
+                                 0};
   }
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -586,19 +580,18 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
         std::make_shared<const core::TrajectoryDTO>(trajectory);
     state_.active_trajectory_time_s = 0.0;
     state_.active_runtime_velocity_scale = std::max(
-        0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
+        0.0,
+        std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
   }
-  const auto initial_snapshot_ns =
-      publish_snapshot(core::ExecutionState::kExecuting, 0.0, initial_positions);
+  const auto initial_snapshot_ns = publish_snapshot(
+      core::ExecutionState::kExecuting, 0.0, initial_positions);
   update_scene_positions(initial_positions, SceneUpdateMode::kBestEffort,
                          initial_snapshot_ns);
 
-  worker_thread_ = std::jthread(
-      [this, trajectory_copy = core::TrajectoryDTO(trajectory),
-       execution_generation](
-          std::stop_token st) mutable {
-        execution_worker(st, std::move(trajectory_copy),
-                         execution_generation);
+  worker_thread_ =
+      std::jthread([this, trajectory_copy = core::TrajectoryDTO(trajectory),
+                    execution_generation](std::stop_token st) mutable {
+        execution_worker(st, std::move(trajectory_copy), execution_generation);
       });
 
   return core::ExecutionHandle{
@@ -612,11 +605,11 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
         execution_cv_.wait(lock, [this]() { return !state_.running.load(); });
         return true;
       },
-      [this]() { return get_execution_snapshot(); },
-      execution_generation};
+      [this]() { return get_execution_snapshot(); }, execution_generation};
 }
 
-core::Result<void> RoboPlanExecutionBackend::sync_observed_state_before_planning() {
+core::Result<void>
+RoboPlanExecutionBackend::sync_observed_state_before_planning() {
   std::vector<double> positions;
   auto controlled = state_channel_->current_controlled_state();
   if (!controlled.ok()) {
@@ -625,13 +618,13 @@ core::Result<void> RoboPlanExecutionBackend::sync_observed_state_before_planning
     return core::Result<void>::Err(std::move(error));
   }
   positions.reserve(controlled.value().positions.size());
-  for (const auto& position : controlled.value().positions) {
-    const auto* angular = std::get_if<core::AngularPositionDTO>(&position);
+  for (const auto &position : controlled.value().positions) {
+    const auto *angular = std::get_if<core::AngularPositionDTO>(&position);
     if (angular == nullptr) {
-      return core::Result<void>::Err(core::ErrorDTO{
-          core::kErrorExecutionRejected,
-          "Native motion state is not all-angular",
-          {{"reason", "observed_state_unit_mismatch"}}});
+      return core::Result<void>::Err(
+          core::ErrorDTO{core::kErrorExecutionRejected,
+                         "Native motion state is not all-angular",
+                         {{"reason", "observed_state_unit_mismatch"}}});
     }
     positions.push_back(angular->value_rad);
   }
@@ -657,8 +650,8 @@ core::Result<void> RoboPlanExecutionBackend::sync_observed_state_before_planning
   const std::span<const double> velocities =
       at_rest ? std::span<const double>(observed_at_rest_velocities_)
               : std::span<const double>{};
-  auto published = publish_observed_state_authority(
-      positions, velocities, now_ns);
+  auto published =
+      publish_observed_state_authority(positions, velocities, now_ns);
   if (!published.applied()) {
     const std::string reason =
         published.error.has_value() &&
@@ -675,8 +668,9 @@ core::Result<void> RoboPlanExecutionBackend::sync_observed_state_before_planning
 
 core::StopResultDTO RoboPlanExecutionBackend::stop() {
   if (!state_.running.load()) {
-    return core::StopResultDTO{
-        false, core::ErrorDTO{core::kErrorInvalidRequest, "No execution in flight", {}}};
+    return core::StopResultDTO{false, core::ErrorDTO{core::kErrorInvalidRequest,
+                                                     "No execution in flight",
+                                                     {}}};
   }
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
@@ -725,28 +719,23 @@ RoboPlanExecutionBackend::get_motion_interrupt_stop_capability() const {
       config_.soft_on_path_max_initial_path_deviation_rad;
   soft_config.max_initial_velocity_deviation_rad_s =
       config_.soft_on_path_max_initial_velocity_deviation_rad_s;
-  soft_config.per_joint_max_jerk_rad_s3 =
-      config_.soft_on_path_max_jerk_rad_s3;
+  soft_config.per_joint_max_jerk_rad_s3 = config_.soft_on_path_max_jerk_rad_s3;
   soft_config.allow_model_velocity_fallback = true;
   cap.soft_on_path_planner_config = std::move(soft_config);
   return cap;
 }
 
-core::ControlledStopResultDTO
-RoboPlanExecutionBackend::execute_controlled_stop(
-    const core::MotionInterruptStopProfileDTO& profile) {
+core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
+    const core::MotionInterruptStopProfileDTO &profile) {
   return execute_controlled_stop(profile, std::stop_token{});
 }
 
-core::ControlledStopResultDTO
-RoboPlanExecutionBackend::execute_controlled_stop(
-    const core::MotionInterruptStopProfileDTO& profile,
+core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
+    const core::MotionInterruptStopProfileDTO &profile,
     std::stop_token stop_token) {
   begin_controlled_stop_runtime_scale_freeze();
-  const auto runtime_scale_freeze_scope =
-      std::shared_ptr<void>(nullptr, [this](void*) {
-        end_controlled_stop_runtime_scale_freeze();
-      });
+  const auto runtime_scale_freeze_scope = std::shared_ptr<void>(
+      nullptr, [this](void *) { end_controlled_stop_runtime_scale_freeze(); });
 
   // Defense in depth: the kernel's arm-time gate already rejects
   // unsupported modes, but a backend that has been mis-wired into
@@ -760,15 +749,14 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     active_controlled_stop_source_ = backend_stop_source;
   }
   const auto clear_active_controlled_stop =
-      std::shared_ptr<void>(nullptr, [this, backend_stop_source](void*) {
+      std::shared_ptr<void>(nullptr, [this, backend_stop_source](void *) {
         std::lock_guard<std::mutex> lock(controlled_stop_mutex_);
         if (active_controlled_stop_source_ == backend_stop_source) {
           active_controlled_stop_source_.reset();
         }
       });
   const auto controlled_stop_requested = [&]() {
-    return stop_token.stop_requested() ||
-           backend_stop_source->stop_requested();
+    return stop_token.stop_requested() || backend_stop_source->stop_requested();
   };
 
   const auto cancelled_result = [&](std::string phase) {
@@ -777,8 +765,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
                                                    std::memory_order_release);
     const auto latest = get_execution_snapshot();
     const auto stopped_snapshot_ns =
-        publish_snapshot(core::ExecutionState::kStopped,
-                         latest.progress,
+        publish_snapshot(core::ExecutionState::kStopped, latest.progress,
                          latest.joint_positions_rad);
     if (!update_scene_positions(latest.joint_positions_rad,
                                 SceneUpdateMode::kBestEffort,
@@ -792,13 +779,11 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     result.error = core::ErrorDTO{
         std::string(core::kErrorMotionInterruptBackendStopFailed),
         "native controlled stop was preempted by a later intervention",
-        {{"reason", "controlled_stop_cancelled"},
-         {"phase", std::move(phase)}}};
+        {{"reason", "controlled_stop_cancelled"}, {"phase", std::move(phase)}}};
     return result;
   };
-  std::stop_callback stop_notify(stop_token, [this]() {
-    execution_cv_.notify_all();
-  });
+  std::stop_callback stop_notify(stop_token,
+                                 [this]() { execution_cv_.notify_all(); });
 
   if (profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath) {
     if (controlled_stop_requested()) {
@@ -822,9 +807,11 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       result.backend_stop_confirmed = false;
       result.error = core::ErrorDTO{
           std::string(core::kErrorMotionInterruptBackendStopFailed),
-          "native soft_on_path requires an active trajectory and observed state",
+          "native soft_on_path requires an active trajectory and observed "
+          "state",
           {{"reason", "soft_on_path_missing_active_trajectory_or_state"},
-           {"backend_capability_profile_id", "roboplan_native_v2_soft_on_path"}}};
+           {"backend_capability_profile_id",
+            "roboplan_native_v2_soft_on_path"}}};
       return result;
     }
 
@@ -835,8 +822,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     initial.position_source = core::SoftOnPathStateSource::kMeasuredFeedback;
     initial.velocity_source = core::SoftOnPathStateSource::kModelDerived;
     initial.runtime_velocity_scale_at_trip = active_runtime_scale;
-    initial.sample_age_ns = std::max<std::int64_t>(
-        0, clock_.now() - active_snapshot.timestamp_ns);
+    initial.sample_age_ns =
+        std::max<std::int64_t>(0, clock_.now() - active_snapshot.timestamp_ns);
 
     core::SoftOnPathPlannerConfig planner_config;
     planner_config.stop_traj_delta_s = config_.soft_on_path_stop_traj_delta_s;
@@ -849,17 +836,17 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     planner_config.per_joint_max_jerk_rad_s3 =
         config_.soft_on_path_max_jerk_rad_s3;
 
-    auto planned = core::plan_soft_on_path_stop(
-        *active_trajectory, profile, initial, planner_config);
+    auto planned = core::plan_soft_on_path_stop(*active_trajectory, profile,
+                                                initial, planner_config);
     if (!planned.ok()) {
       if (profile.allow_natural_completion_on_short_path &&
           core::soft_on_path_error_recommends_natural_completion(
               planned.error())) {
-        state_.natural_completion_stop_requested.store(true,
-                                                       std::memory_order_release);
+        state_.natural_completion_stop_requested.store(
+            true, std::memory_order_release);
         execution_cv_.notify_all();
         const auto natural_completion_scope =
-            std::shared_ptr<void>(nullptr, [this](void*) {
+            std::shared_ptr<void>(nullptr, [this](void *) {
               state_.natural_completion_stop_requested.store(
                   false, std::memory_order_release);
               execution_cv_.notify_all();
@@ -868,11 +855,10 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         const auto call_start_ns = clock_.now();
         const auto wait_deadline_s = controlled_stop_wait_timeout_s(
             profile, config_.soft_on_path_sample_period_s);
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::duration_cast<
-                                  std::chrono::steady_clock::duration>(
-                                  std::chrono::duration<double>(
-                                      wait_deadline_s));
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(wait_deadline_s));
         bool completed = false;
         {
           std::unique_lock<std::mutex> lock(execution_mutex_);
@@ -897,8 +883,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         result.diagnostics = planned.error().details;
         result.diagnostics["command_source"] =
             "native_simulated_natural_completion";
-        result.diagnostics["soft_on_path_phase"] =
-            "4.5G_natural_completion";
+        result.diagnostics["soft_on_path_phase"] = "4.5G_natural_completion";
         result.diagnostics["requested_stop_mode"] = "soft_on_path";
         result.diagnostics["wait_s"] = std::to_string(wait_deadline_s);
         if (!profile.max_stop_time_s.has_value()) {
@@ -907,9 +892,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         }
         result.stop_command_source =
             core::MotionInterruptStopCommandSource::kDiagnosticOther;
-        if (!completed ||
-            get_execution_snapshot().state !=
-                core::ExecutionState::kCompleted) {
+        if (!completed || get_execution_snapshot().state !=
+                              core::ExecutionState::kCompleted) {
           result.accepted = true;
           result.backend_stop_confirmed = false;
           result.error = core::ErrorDTO{
@@ -930,21 +914,21 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         // recommends a hard stop. The native backend has no hard_deceleration
         // mode (ros2_control/JTC-only); its hard-stop floor is the kernel's
         // emergency backend.stop() immediate hold. So REFUSE the soft stop here
-        // (do NOT downgrade to a spring-back hold, which is slower than the hard
-        // stop the situation demands) and let the kernel escalate to the
+        // (do NOT downgrade to a spring-back hold, which is slower than the
+        // hard stop the situation demands) and let the kernel escalate to the
         // immediate hold. The backend-agnostic enriched kernel escalation event
         // carries the planner cause (code, reason, recommended_disposition) for
-        // observability. Mirrors the ros2_control hard-stop disposition, adapted
-        // to the native lane's stop-mode floor.
+        // observability. Mirrors the ros2_control hard-stop disposition,
+        // adapted to the native lane's stop-mode floor.
         result.accepted = false;
         result.backend_stop_confirmed = false;
         result.error = planned.error();
         return result;
       }
-      const bool may_fallback = std::find(
-          profile.allowed_fallback_modes.begin(),
-          profile.allowed_fallback_modes.end(),
-          core::MotionInterruptStopMode::kSpringBackHold) !=
+      const bool may_fallback =
+          std::find(profile.allowed_fallback_modes.begin(),
+                    profile.allowed_fallback_modes.end(),
+                    core::MotionInterruptStopMode::kSpringBackHold) !=
           profile.allowed_fallback_modes.end();
       const auto recommended_fallback_it =
           planned.error().details.find("recommended_fallback");
@@ -953,9 +937,11 @@ RoboPlanExecutionBackend::execute_controlled_stop(
           recommended_fallback_it->second == "spring_back_hold";
       if (may_fallback && planner_recommends_spring_back) {
         core::MotionInterruptStopProfileDTO fallback_profile = profile;
-        fallback_profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+        fallback_profile.stop_mode =
+            core::MotionInterruptStopMode::kSpringBackHold;
         auto fallback = execute_controlled_stop(fallback_profile, stop_token);
-        fallback.executed_stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+        fallback.executed_stop_mode =
+            core::MotionInterruptStopMode::kSpringBackHold;
         fallback.fallback_reason = planned.error().details.count("reason") > 0
                                        ? planned.error().details.at("reason")
                                        : "soft_on_path_planner_rejected";
@@ -979,13 +965,11 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     execution_cv_.notify_all();
     {
       std::unique_lock<std::mutex> lock(execution_mutex_);
-      const auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::duration_cast<
-                                std::chrono::steady_clock::duration>(
-                                std::chrono::duration<double>(
-                                    controlled_stop_wait_timeout_s(
-                                        profile,
-                                        config_.soft_on_path_sample_period_s)));
+      const auto deadline =
+          std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(controlled_stop_wait_timeout_s(
+                  profile, config_.soft_on_path_sample_period_s)));
       bool stopped = false;
       while (!controlled_stop_requested()) {
         stopped = !state_.running.load();
@@ -1012,7 +996,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       }
     }
 
-    const auto& replacement = planned.value().replacement_trajectory;
+    const auto &replacement = planned.value().replacement_trajectory;
     state_.running.store(true);
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
@@ -1021,16 +1005,17 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         replacement.waypoints.empty()
             ? 0.0
             : replacement.waypoints.back().time_from_start_s;
-    for (const auto& waypoint : replacement.waypoints) {
+    for (const auto &waypoint : replacement.waypoints) {
       const auto wake_time =
-          steady_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                             std::chrono::duration<double>(waypoint.time_from_start_s));
+          steady_start +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(waypoint.time_from_start_s));
       while (!controlled_stop_requested() &&
              std::chrono::steady_clock::now() < wake_time) {
         const auto remaining = wake_time - std::chrono::steady_clock::now();
         const auto max_slice =
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                kExecutionTick);
+                std::chrono::nanoseconds(config_.execution_tick_period_ns));
         std::this_thread::sleep_for(std::min(remaining, max_slice));
       }
       if (controlled_stop_requested()) {
@@ -1040,23 +1025,20 @@ RoboPlanExecutionBackend::execute_controlled_stop(
           total_time_s <= 1e-9
               ? 1.0
               : clamp_progress(waypoint.time_from_start_s / total_time_s);
-      const auto snapshot_ns =
-          publish_snapshot(core::ExecutionState::kStopping,
-                           progress,
-                           waypoint.positions_rad);
+      const auto snapshot_ns = publish_snapshot(
+          core::ExecutionState::kStopping, progress, waypoint.positions_rad);
       if (!waypoint.velocities_rad_s.empty()) {
         std::lock_guard<std::mutex> velocity_lock(state_mutex_);
         state_.snapshot.joint_velocities_rad_s = waypoint.velocities_rad_s;
       }
       update_scene_positions(waypoint.positions_rad,
-                             SceneUpdateMode::kBestEffort,
-                             snapshot_ns);
+                             SceneUpdateMode::kBestEffort, snapshot_ns);
     }
 
     const auto call_end_ns = clock_.now();
-    const auto& final_wp = replacement.waypoints.back();
-    const auto stopped_snapshot_ns =
-        publish_snapshot(core::ExecutionState::kStopped, 1.0, final_wp.positions_rad);
+    const auto &final_wp = replacement.waypoints.back();
+    const auto stopped_snapshot_ns = publish_snapshot(
+        core::ExecutionState::kStopped, 1.0, final_wp.positions_rad);
     if (!final_wp.velocities_rad_s.empty()) {
       std::lock_guard<std::mutex> velocity_lock(state_mutex_);
       state_.snapshot.joint_velocities_rad_s = final_wp.velocities_rad_s;
@@ -1084,11 +1066,12 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         planned.value().initial_path_deviation_rad;
     result.stop_distance_rad = 0.0;
     if (!active_snapshot.joint_positions_rad.empty() &&
-        final_wp.positions_rad.size() == active_snapshot.joint_positions_rad.size()) {
+        final_wp.positions_rad.size() ==
+            active_snapshot.joint_positions_rad.size()) {
       double sum = 0.0;
       for (size_t i = 0; i < final_wp.positions_rad.size(); ++i) {
-        const double d = final_wp.positions_rad[i] -
-                         active_snapshot.joint_positions_rad[i];
+        const double d =
+            final_wp.positions_rad[i] - active_snapshot.joint_positions_rad[i];
         sum += d * d;
       }
       result.stop_distance_rad = std::sqrt(sum);
@@ -1108,7 +1091,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     result.backend_stop_confirmed = false;
     result.error = core::ErrorDTO{
         std::string(core::kErrorMotionInterruptBackendStopFailed),
-        "RoboPlanExecutionBackend supports only kSpringBackHold and kSoftOnPath in v2",
+        "RoboPlanExecutionBackend supports only kSpringBackHold and "
+        "kSoftOnPath in v2",
         {{"reason", "stop_mode_not_supported_by_backend"},
          {"backend_capability_profile_id", "roboplan_native_v2_soft_on_path"}}};
     return result;
@@ -1160,7 +1144,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     result.backend_stop_confirmed = false;
     result.error = core::ErrorDTO{
         std::string(core::kErrorMotionInterruptBackendStopFailed),
-        "native spring_back_hold requires an active trajectory and observed state",
+        "native spring_back_hold requires an active trajectory and observed "
+        "state",
         {{"reason", "spring_back_missing_active_trajectory_or_state"},
          {"backend_capability_profile_id", "roboplan_native_v2_soft_on_path"}}};
     return result;
@@ -1173,8 +1158,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   initial.position_source = core::SoftOnPathStateSource::kMeasuredFeedback;
   initial.velocity_source = core::SoftOnPathStateSource::kModelDerived;
   initial.runtime_velocity_scale_at_trip = active_runtime_scale;
-  initial.sample_age_ns = std::max<std::int64_t>(
-      0, clock_.now() - active_snapshot.timestamp_ns);
+  initial.sample_age_ns =
+      std::max<std::int64_t>(0, clock_.now() - active_snapshot.timestamp_ns);
 
   core::SoftOnPathPlannerConfig planner_config;
   planner_config.stop_traj_delta_s = config_.soft_on_path_stop_traj_delta_s;
@@ -1216,18 +1201,17 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   const auto wait_deadline_s = controlled_stop_wait_timeout_s(
       profile, config_.soft_on_path_sample_period_s);
   std::unique_lock<std::mutex> lock(execution_mutex_);
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::duration_cast<
-                            std::chrono::steady_clock::duration>(
-                            std::chrono::duration<double>(wait_deadline_s));
+  const auto deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(wait_deadline_s));
   bool stopped = false;
   while (!controlled_stop_requested()) {
     stopped = !state_.running.load();
     if (stopped) {
       break;
     }
-    if (execution_cv_.wait_until(lock, deadline) ==
-        std::cv_status::timeout) {
+    if (execution_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
       stopped = !state_.running.load();
       break;
     }
@@ -1238,11 +1222,11 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   }
 
   const auto call_end_ns = clock_.now();
-  result.confirmation_latency_ns = std::max<std::int64_t>(0, call_end_ns -
-                                                                 call_start_ns);
+  result.confirmation_latency_ns =
+      std::max<std::int64_t>(0, call_end_ns - call_start_ns);
 
   if (!stopped) {
-    result.accepted = true;  // command was accepted (worker was notified)
+    result.accepted = true; // command was accepted (worker was notified)
     result.backend_stop_confirmed = false;
     result.error = core::ErrorDTO{
         std::string(core::kErrorMotionInterruptBackendStopFailed),
@@ -1252,7 +1236,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     return result;
   }
 
-  const auto& replacement = planned.value().replacement_trajectory;
+  const auto &replacement = planned.value().replacement_trajectory;
   state_.running.store(true);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
@@ -1261,7 +1245,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       replacement.waypoints.empty()
           ? 0.0
           : replacement.waypoints.back().time_from_start_s;
-  for (const auto& waypoint : replacement.waypoints) {
+  for (const auto &waypoint : replacement.waypoints) {
     const auto wake_time =
         steady_start +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -1271,7 +1255,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       const auto remaining = wake_time - std::chrono::steady_clock::now();
       const auto max_slice =
           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-              kExecutionTick);
+              std::chrono::nanoseconds(config_.execution_tick_period_ns));
       std::this_thread::sleep_for(std::min(remaining, max_slice));
     }
     if (controlled_stop_requested()) {
@@ -1281,24 +1265,20 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         total_time_s <= 1e-9
             ? 1.0
             : clamp_progress(waypoint.time_from_start_s / total_time_s);
-    const auto snapshot_ns =
-        publish_snapshot(core::ExecutionState::kStopping,
-                         progress,
-                         waypoint.positions_rad);
+    const auto snapshot_ns = publish_snapshot(core::ExecutionState::kStopping,
+                                              progress, waypoint.positions_rad);
     if (!waypoint.velocities_rad_s.empty()) {
       std::lock_guard<std::mutex> velocity_lock(state_mutex_);
       state_.snapshot.joint_velocities_rad_s = waypoint.velocities_rad_s;
     }
-    update_scene_positions(waypoint.positions_rad,
-                           SceneUpdateMode::kBestEffort,
+    update_scene_positions(waypoint.positions_rad, SceneUpdateMode::kBestEffort,
                            snapshot_ns);
   }
 
   const auto replay_end_ns = clock_.now();
-  const auto& final_wp = replacement.waypoints.back();
-  const auto stopped_snapshot_ns =
-      publish_snapshot(core::ExecutionState::kStopped, 1.0,
-                       final_wp.positions_rad);
+  const auto &final_wp = replacement.waypoints.back();
+  const auto stopped_snapshot_ns = publish_snapshot(
+      core::ExecutionState::kStopped, 1.0, final_wp.positions_rad);
   if (!final_wp.velocities_rad_s.empty()) {
     std::lock_guard<std::mutex> velocity_lock(state_mutex_);
     state_.snapshot.joint_velocities_rad_s = final_wp.velocities_rad_s;
@@ -1330,8 +1310,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
           active_snapshot.joint_positions_rad.size()) {
     double sum = 0.0;
     for (size_t i = 0; i < final_wp.positions_rad.size(); ++i) {
-      const double d = final_wp.positions_rad[i] -
-                       active_snapshot.joint_positions_rad[i];
+      const double d =
+          final_wp.positions_rad[i] - active_snapshot.joint_positions_rad[i];
       sum += d * d;
     }
     result.stop_distance_rad = std::sqrt(sum);
@@ -1348,7 +1328,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
 core::PauseResultDTO RoboPlanExecutionBackend::pause() {
   if (!state_.running.load()) {
     return core::PauseResultDTO{
-        false, core::ErrorDTO{core::kErrorInvalidRequest, "No execution in flight", {}}};
+        false, core::ErrorDTO{
+                   core::kErrorInvalidRequest, "No execution in flight", {}}};
   }
   state_.pause_requested.store(true);
   state_.natural_completion_stop_requested.store(false,
@@ -1357,8 +1338,8 @@ core::PauseResultDTO RoboPlanExecutionBackend::pause() {
   return core::PauseResultDTO{true, std::nullopt};
 }
 
-core::ExecutionHandle RoboPlanExecutionBackend::resume(
-    const core::TrajectoryDTO& trajectory) {
+core::ExecutionHandle
+RoboPlanExecutionBackend::resume(const core::TrajectoryDTO &trajectory) {
   if (state_.running.load()) {
     state_.pause_requested.store(false);
     state_.natural_completion_stop_requested.store(false,
@@ -1390,8 +1371,7 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
   {
     std::unique_lock<std::mutex> lock(execution_mutex_);
     const bool stopped = execution_cv_.wait_for(
-        lock, reset_timeout,
-        [this]() { return !state_.running.load(); });
+        lock, reset_timeout, [this]() { return !state_.running.load(); });
     if (!stopped) {
       publish_snapshot(
           core::ExecutionState::kInterventionRequired,
@@ -1425,7 +1405,8 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
   return core::ResetResultDTO{true, std::nullopt};
 }
 
-core::ExecutionSnapshot RoboPlanExecutionBackend::get_execution_snapshot() const {
+core::ExecutionSnapshot
+RoboPlanExecutionBackend::get_execution_snapshot() const {
   std::lock_guard<std::mutex> lock(state_mutex_);
   return state_.snapshot;
 }
@@ -1434,9 +1415,12 @@ void RoboPlanExecutionBackend::set_runtime_velocity_scale(double scale) {
   // ADR-0018: clamp + atomic store. Caller (kernel) already validated
   // finiteness, but defense-in-depth keeps the workers from ever reading
   // NaN/Inf via this path.
-  if (!std::isfinite(scale)) return;
-  if (scale < 0.0) scale = 0.0;
-  if (scale > 1.0) scale = 1.0;
+  if (!std::isfinite(scale))
+    return;
+  if (scale < 0.0)
+    scale = 0.0;
+  if (scale > 1.0)
+    scale = 1.0;
   {
     std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
     if (controlled_stop_runtime_scale_freeze_depth_ > 0) {
@@ -1448,7 +1432,8 @@ void RoboPlanExecutionBackend::set_runtime_velocity_scale(double scale) {
     }
     runtime_velocity_scale_.store(scale, std::memory_order_release);
   }
-  // Wake the execution worker so a scale=0 hold or resume takes effect promptly.
+  // Wake the execution worker so a scale=0 hold or resume takes effect
+  // promptly.
   execution_cv_.notify_all();
 }
 
@@ -1493,4 +1478,4 @@ bool RoboPlanExecutionBackend::end_controlled_stop_runtime_scale_freeze() {
   return applied_deferred_scale;
 }
 
-}  // namespace manyforge::roboplan_backend
+} // namespace manyforge::roboplan_backend

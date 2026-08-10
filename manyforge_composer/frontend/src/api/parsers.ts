@@ -76,6 +76,7 @@ import type {
   OperationAcceptance,
   OperationObservation,
   OperationStateName,
+  ResourceSourceKind,
   SceneRevisionValue,
 } from '../types/robotControl';
 
@@ -3279,6 +3280,7 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
     'max_position',
     'min_position',
     'source_coordinate_name',
+    'source_kind',
   ], 'executionStatus.status.direct_control_gripper.resource');
   const coordinateKind = stringAt(
     gripperResource.coordinate_kind,
@@ -3290,85 +3292,113 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
       'angular_rad or linear_m',
     );
   }
-  const gripperMin = numberAt(
+  const sourceKind = stringAt(
+    gripperResource.source_kind,
+    'executionStatus.status.direct_control_gripper.resource.source_kind',
+  );
+  if (sourceKind !== 'model_role' && sourceKind !== 'component_local') {
+    return fail(
+      'executionStatus.status.direct_control_gripper.resource.source_kind',
+      'model_role or component_local',
+    );
+  }
+  const gripperMin = nullableNumberAt(
     gripperResource.min_position,
     'executionStatus.status.direct_control_gripper.resource.min_position',
   );
-  const gripperMax = numberAt(
+  const gripperMax = nullableNumberAt(
     gripperResource.max_position,
     'executionStatus.status.direct_control_gripper.resource.max_position',
   );
-  if (gripperMin > gripperMax) {
+  if (
+    (sourceKind === 'model_role'
+      && (gripperMin === null
+        || gripperMax === null
+        || gripperMin > gripperMax))
+    || (sourceKind === 'component_local'
+      && (gripperMin !== null || gripperMax !== null))
+  ) {
     return fail(
       'executionStatus.status.direct_control_gripper.resource',
-      'ordered finite position limits',
-    );
-  }
-  const gripperObserved = objectAt(
-    directGripper.observed_state,
-    'executionStatus.status.direct_control_gripper.observed_state',
-  );
-  exactKeysAt(gripperObserved, [
-    'complete',
-    'position',
-    'sequence',
-    'source_coordinate_name',
-    'source_epoch',
-  ], 'executionStatus.status.direct_control_gripper.observed_state');
-  const observedPosition = objectAt(
-    gripperObserved.position,
-    'executionStatus.status.direct_control_gripper.observed_state.position',
-  );
-  const expectedPositionKey = coordinateKind === 'angular_rad'
-    ? 'value_rad'
-    : 'value_m';
-  exactKeysAt(
-    observedPosition,
-    ['kind', expectedPositionKey],
-    'executionStatus.status.direct_control_gripper.observed_state.position',
-  );
-  if (stringAt(
-    observedPosition.kind,
-    'executionStatus.status.direct_control_gripper.observed_state.position.kind',
-  ) !== coordinateKind) {
-    return fail(
-      'executionStatus.status.direct_control_gripper.observed_state.position.kind',
-      coordinateKind,
+      sourceKind === 'model_role'
+        ? 'ordered finite model limits'
+        : 'no fabricated model limits for a component-local coordinate',
     );
   }
   const gripperSourceName = stringAt(
     gripperResource.source_coordinate_name,
     'executionStatus.status.direct_control_gripper.resource.source_coordinate_name',
   );
-  if (stringAt(
-    gripperObserved.source_coordinate_name,
-    'executionStatus.status.direct_control_gripper.observed_state.source_coordinate_name',
-  ) !== gripperSourceName) {
+  if (directGripper.observed_state === null && sourceKind !== 'component_local') {
     return fail(
-      'executionStatus.status.direct_control_gripper.observed_state.source_coordinate_name',
-      'the exact retained source coordinate',
+      'executionStatus.status.direct_control_gripper.observed_state',
+      'a model-backed observation',
     );
   }
-  const observedGripper: ObservedGripperTarget = {
-    sequence: integerAt(
-      gripperObserved.sequence,
-      'executionStatus.status.direct_control_gripper.observed_state.sequence',
-    ),
-    sourceEpoch: stringAt(
-      gripperObserved.source_epoch,
-      'executionStatus.status.direct_control_gripper.observed_state.source_epoch',
-    ),
-    sourceCoordinateName: gripperSourceName,
-    position: numberAt(
-      observedPosition[expectedPositionKey],
-      `executionStatus.status.direct_control_gripper.observed_state.position.${expectedPositionKey}`,
-    ),
-    coordinateKind: coordinateKind as CoordinateKind,
-    complete: booleanAt(
-      gripperObserved.complete,
-      'executionStatus.status.direct_control_gripper.observed_state.complete',
-    ),
-  };
+  let observedGripper: ObservedGripperTarget | null = null;
+  if (directGripper.observed_state !== null) {
+    const gripperObserved = objectAt(
+      directGripper.observed_state,
+      'executionStatus.status.direct_control_gripper.observed_state',
+    );
+    exactKeysAt(gripperObserved, [
+      'complete',
+      'position',
+      'sequence',
+      'source_coordinate_name',
+      'source_epoch',
+    ], 'executionStatus.status.direct_control_gripper.observed_state');
+    const observedPosition = objectAt(
+      gripperObserved.position,
+      'executionStatus.status.direct_control_gripper.observed_state.position',
+    );
+    const expectedPositionKey = coordinateKind === 'angular_rad'
+      ? 'value_rad'
+      : 'value_m';
+    exactKeysAt(
+      observedPosition,
+      ['kind', expectedPositionKey],
+      'executionStatus.status.direct_control_gripper.observed_state.position',
+    );
+    if (stringAt(
+      observedPosition.kind,
+      'executionStatus.status.direct_control_gripper.observed_state.position.kind',
+    ) !== coordinateKind) {
+      return fail(
+        'executionStatus.status.direct_control_gripper.observed_state.position.kind',
+        coordinateKind,
+      );
+    }
+    if (stringAt(
+      gripperObserved.source_coordinate_name,
+      'executionStatus.status.direct_control_gripper.observed_state.source_coordinate_name',
+    ) !== gripperSourceName) {
+      return fail(
+        'executionStatus.status.direct_control_gripper.observed_state.source_coordinate_name',
+        'the exact retained source coordinate',
+      );
+    }
+    observedGripper = {
+      sequence: integerAt(
+        gripperObserved.sequence,
+        'executionStatus.status.direct_control_gripper.observed_state.sequence',
+      ),
+      sourceEpoch: stringAt(
+        gripperObserved.source_epoch,
+        'executionStatus.status.direct_control_gripper.observed_state.source_epoch',
+      ),
+      sourceCoordinateName: gripperSourceName,
+      position: numberAt(
+        observedPosition[expectedPositionKey],
+        `executionStatus.status.direct_control_gripper.observed_state.position.${expectedPositionKey}`,
+      ),
+      coordinateKind: coordinateKind as CoordinateKind,
+      complete: booleanAt(
+        gripperObserved.complete,
+        'executionStatus.status.direct_control_gripper.observed_state.complete',
+      ),
+    };
+  }
   return {
     ownerEpoch: stringAt(status.owner_epoch, 'executionStatus.status.owner_epoch'),
     graphRevision: stringAt(
@@ -3478,6 +3508,7 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
         'executionStatus.status.direct_control_gripper.command_schema_revision',
       ),
       sourceCoordinateName: gripperSourceName,
+      sourceKind: sourceKind as ResourceSourceKind,
       coordinateKind: coordinateKind as CoordinateKind,
       minPosition: gripperMin,
       maxPosition: gripperMax,
@@ -3734,6 +3765,7 @@ export function parseCapabilityCommandPreviewResponse(
     'scene_revision',
     'schema_version',
     'source_coordinate_name',
+    'source_kind',
     'target_position',
     'target_role_id',
   ], 'capabilityCommandPreview.preview_receipt');
@@ -3760,11 +3792,21 @@ export function parseCapabilityCommandPreviewResponse(
       'angular_rad or linear_m',
     );
   }
-  const minPosition = numberAt(
+  const sourceKind = stringAt(
+    receipt.source_kind,
+    'capabilityCommandPreview.preview_receipt.source_kind',
+  );
+  if (sourceKind !== 'model_role' && sourceKind !== 'component_local') {
+    return fail(
+      'capabilityCommandPreview.preview_receipt.source_kind',
+      'model_role or component_local',
+    );
+  }
+  const minPosition = nullableNumberAt(
     receipt.min_position,
     'capabilityCommandPreview.preview_receipt.min_position',
   );
-  const maxPosition = numberAt(
+  const maxPosition = nullableNumberAt(
     receipt.max_position,
     'capabilityCommandPreview.preview_receipt.max_position',
   );
@@ -3773,8 +3815,13 @@ export function parseCapabilityCommandPreviewResponse(
     'capabilityCommandPreview.preview_receipt.target_position',
   );
   if (
-    minPosition > targetPosition
-    || targetPosition > maxPosition
+    (sourceKind === 'model_role'
+      && (minPosition === null
+        || maxPosition === null
+        || minPosition > targetPosition
+        || targetPosition > maxPosition))
+    || (sourceKind === 'component_local'
+      && (minPosition !== null || maxPosition !== null))
     || booleanAt(
       receipt.commit_eligible,
       'capabilityCommandPreview.preview_receipt.commit_eligible',
@@ -3863,6 +3910,7 @@ export function parseCapabilityCommandPreviewResponse(
       receipt.source_coordinate_name,
       'capabilityCommandPreview.preview_receipt.source_coordinate_name',
     ),
+    sourceKind: sourceKind as ResourceSourceKind,
     coordinateKind: coordinateKind as CoordinateKind,
     targetPosition,
     minPosition,
