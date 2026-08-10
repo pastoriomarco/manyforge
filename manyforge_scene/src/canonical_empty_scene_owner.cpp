@@ -1770,8 +1770,52 @@ void ValidateAndNormalizeSupportContact(core::SupportContactDTO &contact,
   }
 }
 
+std::vector<core::SupportContactDTO>
+NormalizeSupportContacts(const core::SceneResourceId &scene_resource_id,
+                         std::vector<core::SupportContactDTO> support_contacts,
+                         const core::LogicalSceneSnapshotDTO &current) {
+  for (std::size_t index = 0U; index < support_contacts.size(); ++index) {
+    ValidateAndNormalizeSupportContact(support_contacts[index], index);
+  }
+  std::sort(support_contacts.begin(), support_contacts.end(),
+            [](const auto &left, const auto &right) {
+              return left.support_object_id < right.support_object_id;
+            });
+  for (std::size_t index = 0U; index < support_contacts.size(); ++index) {
+    const auto &contact = support_contacts[index];
+    if (index != 0U && support_contacts[index - 1U].support_object_id ==
+                           contact.support_object_id) {
+      RejectSupportContact(index, "duplicate_support_contact_pair",
+                           "support_object_id",
+                           "support object is declared more than once");
+    }
+    if (contact.support_object_id == scene_resource_id.value()) {
+      RejectSupportContact(index, "self_support_contact", "support_object_id",
+                           "scene resource cannot support itself");
+    }
+    const auto support =
+        std::lower_bound(current.objects.begin(), current.objects.end(),
+                         contact.support_object_id,
+                         [](const SceneObjectSnapshotDTO &object,
+                            const std::string &support_id) {
+                           return object.scene_resource_id.value() < support_id;
+                         });
+    if (support == current.objects.end() ||
+        support->scene_resource_id.value() != contact.support_object_id) {
+      throw SceneRequestRejectionError(
+          "missing_reference",
+          "support contact names an unknown scene resource",
+          {{"reference_type", "support_scene_resource"},
+           {"reference_id", contact.support_object_id},
+           {"scene_resource_id", scene_resource_id.value()}});
+    }
+  }
+  return support_contacts;
+}
+
 const core::CellSceneFrameRefDTO &
-RequireCellFrame(const core::SceneFrameRefDTO &frame, const CellId &cell_id) {
+RequireCellFrame(const core::SceneTransactionFrameRefDTO &frame,
+                 const CellId &cell_id) {
   const auto *cell = std::get_if<core::CellSceneFrameRefDTO>(&frame);
   if (cell == nullptr) {
     throw CanonicalEmptySceneOwnerIntegrityError(
@@ -1788,7 +1832,7 @@ RequireCellFrame(const core::SceneFrameRefDTO &frame, const CellId &cell_id) {
 }
 
 [[nodiscard]] bool
-FrameReferenceMatchesResolved(const core::SceneFrameRefDTO &reference,
+FrameReferenceMatchesResolved(const core::SceneTransactionFrameRefDTO &reference,
                               const core::ResolvedFrameDTO &resolved) noexcept {
   return std::visit(
       [&](const auto &selected) {
@@ -1806,12 +1850,15 @@ FrameReferenceMatchesResolved(const core::SceneFrameRefDTO &reference,
                      selected.controllable_component_id &&
                  frame->model_instance_id == selected.model_instance_id &&
                  frame->frame_role_id == selected.frame_role_id;
-        } else {
+        } else if constexpr (std::is_same_v<
+                                 T, core::PassiveModelSceneFrameRefDTO>) {
           const auto *frame =
               std::get_if<core::ResolvedPassiveModelFrameDTO>(&resolved);
           return frame != nullptr &&
                  frame->model_instance_id == selected.model_instance_id &&
                  frame->frame_role_id == selected.frame_role_id;
+        } else {
+          return false;
         }
       },
       reference);
@@ -1823,7 +1870,7 @@ struct NormalizedScenePose final {
 };
 
 [[nodiscard]] NormalizedScenePose
-NormalizeScenePose(const core::SceneFrameRefDTO &frame_ref,
+NormalizeScenePose(const core::SceneTransactionFrameRefDTO &frame_ref,
                    const core::Pose3DTO &pose_in_frame,
                    const LogicalSceneSnapshotDTO &current,
                    const ProjectionRevisionDTO &expected_projection,
@@ -1838,6 +1885,74 @@ NormalizeScenePose(const core::SceneFrameRefDTO &frame_ref,
     }
     return {pose_in_frame,
             CellResolutionEvidence(request_digest, expected_projection)};
+  }
+  if (const auto *scene_resource =
+          std::get_if<core::SceneResourceSceneFrameRefDTO>(&frame_ref)) {
+    ValidateBoundedIdentity(scene_resource->scene_resource_id.value(),
+                            "scene_resource_id");
+    const auto reference =
+        std::lower_bound(current.objects.begin(), current.objects.end(),
+                         scene_resource->scene_resource_id,
+                         [](const SceneObjectSnapshotDTO &object,
+                            const SceneResourceId &id) {
+                           return object.scene_resource_id < id;
+                         });
+    if (reference == current.objects.end() ||
+        reference->scene_resource_id != scene_resource->scene_resource_id) {
+      throw SceneRequestRejectionError(
+          "missing_reference", "scene-resource frame does not exist",
+          {{"reference_type", "scene_resource"},
+           {"reference_id", scene_resource->scene_resource_id.value()}});
+    }
+    const auto *fixed =
+        std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+            &reference->placement);
+    if (fixed != nullptr) {
+      if (frame_resolution.has_value()) {
+        throw CanonicalEmptySceneOwnerIntegrityError(
+            "fixed scene-resource normalization unexpectedly carries native "
+            "evidence");
+      }
+      return {core::multiply_poses(fixed->pose_in_cell, pose_in_frame),
+              CellResolutionEvidence(request_digest, expected_projection)};
+    }
+    const auto &carried =
+        std::get<core::CarriedSceneObjectPlacementDTO>(reference->placement);
+    const auto attachment = std::lower_bound(
+        current.carried_object_attachments.begin(),
+        current.carried_object_attachments.end(),
+        carried.carried_object_attachment_id,
+        [](const core::CarriedObjectAttachmentDTO &entry,
+           const core::CarriedObjectAttachmentId &id) {
+          return entry.carried_object_attachment_id < id;
+        });
+    if (attachment == current.carried_object_attachments.end() ||
+        attachment->carried_object_attachment_id !=
+            carried.carried_object_attachment_id ||
+        attachment->carried_object_attachment_revision !=
+            carried.carried_object_attachment_revision) {
+      throw CanonicalEmptySceneOwnerIntegrityError(
+          "carried scene-resource frame has no exact attachment row");
+    }
+    if (!frame_resolution.has_value() || !frame_resolution->valid() ||
+        frame_resolution->projection_binding.projection_revision !=
+            expected_projection ||
+        !FrameReferenceMatchesResolved(
+            core::ToSceneTransactionFrameRef(
+                attachment->carrier_frame_ref),
+            frame_resolution->resolved_frame)) {
+      throw SceneRequestRejectionError(
+          "missing_reference",
+          "carried scene-resource frame has no exact immutable retained "
+          "resolution",
+          {{"reason", "carried_scene_resource_resolution_missing_or_foreign"},
+           {"reference_id", scene_resource->scene_resource_id.value()}});
+    }
+    const auto resource_pose_in_cell = core::multiply_poses(
+        frame_resolution->frame_pose_in_cell,
+        attachment->pose_in_carrier_frame);
+    return {core::multiply_poses(resource_pose_in_cell, pose_in_frame),
+            frame_resolution->resolution_evidence_digest};
   }
   if (!frame_resolution.has_value() || !frame_resolution->valid() ||
       frame_resolution->projection_binding.projection_revision !=
@@ -1908,7 +2023,8 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
   std::visit(
       [&](const auto &operation) {
         using T = std::decay_t<decltype(operation)>;
-        if constexpr (std::is_same_v<T, core::AddObjectRequestDTO>) {
+        if constexpr (std::is_same_v<T, core::AddObjectRequestDTO> ||
+                      std::is_same_v<T, core::UpsertObjectRequestDTO>) {
           ValidateBoundedIdentity(operation.scene_resource_id.value(),
                                   "scene_resource_id");
           const auto normalized =
@@ -1922,54 +2038,26 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                  const SceneResourceId &id) {
                 return object.scene_resource_id < id;
               });
-          if (found != candidate.snapshot.objects.end() &&
-              found->scene_resource_id == operation.scene_resource_id) {
-            throw SceneRequestRejectionError(
-                "object_already_exists", "scene resource already exists",
-                {{"scene_resource_id", operation.scene_resource_id.value()}});
-          }
-          auto support_contacts = operation.support_contacts;
-          for (std::size_t index = 0U; index < support_contacts.size();
-               ++index) {
-            ValidateAndNormalizeSupportContact(support_contacts[index], index);
-          }
-          std::sort(support_contacts.begin(), support_contacts.end(),
-                    [](const auto &left, const auto &right) {
-                      return left.support_object_id < right.support_object_id;
-                    });
-          for (std::size_t index = 0U; index < support_contacts.size();
-               ++index) {
-            const auto &contact = support_contacts[index];
-            if (index != 0U && support_contacts[index - 1U].support_object_id ==
-                                   contact.support_object_id) {
-              RejectSupportContact(index, "duplicate_support_contact_pair",
-                                   "support_object_id",
-                                   "support object is declared more than once");
-            }
-            if (contact.support_object_id ==
-                operation.scene_resource_id.value()) {
-              RejectSupportContact(index, "self_support_contact",
-                                   "support_object_id",
-                                   "scene resource cannot support itself");
-            }
-            const auto support = std::lower_bound(
-                current.objects.begin(), current.objects.end(),
-                contact.support_object_id,
-                [](const SceneObjectSnapshotDTO &object,
-                   const std::string &support_id) {
-                  return object.scene_resource_id.value() < support_id;
-                });
-            if (support == current.objects.end() ||
-                support->scene_resource_id.value() !=
-                    contact.support_object_id) {
+          const bool exists =
+              found != candidate.snapshot.objects.end() &&
+              found->scene_resource_id == operation.scene_resource_id;
+          if constexpr (std::is_same_v<T, core::AddObjectRequestDTO>) {
+            if (exists) {
               throw SceneRequestRejectionError(
-                  "missing_reference",
-                  "support contact names an unknown scene resource",
-                  {{"reference_type", "support_scene_resource"},
-                   {"reference_id", contact.support_object_id},
-                   {"scene_resource_id", operation.scene_resource_id.value()}});
+                  "object_already_exists", "scene resource already exists",
+                  {{"scene_resource_id", operation.scene_resource_id.value()}});
             }
+          } else if (exists && std::holds_alternative<
+                                   core::CarriedSceneObjectPlacementDTO>(
+                                   found->placement)) {
+            throw SceneRequestRejectionError(
+                "scene_object_state_conflict",
+                "a carried object cannot be replaced",
+                {{"reason", "scene_object_is_attached"},
+                 {"scene_resource_id", operation.scene_resource_id.value()}});
           }
+          auto support_contacts = NormalizeSupportContacts(
+              operation.scene_resource_id, operation.support_contacts, current);
           SceneObjectSnapshotDTO object{
               operation.scene_resource_id,
               {operation.shape},
@@ -1978,10 +2066,20 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
               std::nullopt,
               std::move(support_contacts),
           };
-          candidate.snapshot.objects.insert(found, object);
+          const bool unchanged = exists && *found == object;
+          if (exists) {
+            *found = object;
+          } else {
+            candidate.snapshot.objects.insert(found, object);
+          }
           candidate.operation = core::ResolvedUpsertSceneObjectDTO{object};
           candidate.resolution_evidence_digest =
               normalized.resolution_evidence_digest;
+          if (unchanged) {
+            candidate.update_status = SceneUpdateStatusDTO::kNoOp;
+            content_expected_to_change = false;
+            topology_changed = false;
+          }
         } else if constexpr (std::is_same_v<T, core::RemoveObjectRequestDTO>) {
           ValidateBoundedIdentity(operation.scene_resource_id.value(),
                                   "scene_resource_id");
@@ -2278,6 +2376,105 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
               *object, removed_id, removed_revision};
           candidate.resolution_evidence_digest =
               normalized.resolution_evidence_digest;
+          policy_changed = true;
+        } else if constexpr (
+            std::is_same_v<T,
+                           core::DetachCarriedObjectAtCurrentPoseRequestDTO>) {
+          ValidateBoundedIdentity(
+              operation.carried_object_attachment_id.value(),
+              "carried_object_attachment_id");
+          ValidateBoundedIdentity(operation.expected_scene_resource_id.value(),
+                                  "expected_scene_resource_id");
+          ValidateBoundedIdentity(
+              operation.expected_controllable_component_id.value(),
+              "expected_controllable_component_id");
+          ValidateBoundedIdentity(operation.expected_command_target_id.value(),
+                                  "expected_command_target_id");
+          const auto attachment = std::lower_bound(
+              candidate.snapshot.carried_object_attachments.begin(),
+              candidate.snapshot.carried_object_attachments.end(),
+              operation.carried_object_attachment_id,
+              [](const core::CarriedObjectAttachmentDTO &entry,
+                 const core::CarriedObjectAttachmentId &id) {
+                return entry.carried_object_attachment_id < id;
+              });
+          if (attachment ==
+                  candidate.snapshot.carried_object_attachments.end() ||
+              attachment->carried_object_attachment_id !=
+                  operation.carried_object_attachment_id ||
+              attachment->carried_object_attachment_revision !=
+                  operation.expected_carried_object_attachment_revision ||
+              attachment->scene_resource_id !=
+                  operation.expected_scene_resource_id ||
+              attachment->controllable_component_id !=
+                  operation.expected_controllable_component_id ||
+              attachment->command_target_id !=
+                  operation.expected_command_target_id) {
+            throw CanonicalEmptySceneOwnerConflictError(
+                "carried-object attachment precondition failed");
+          }
+          if (!frame_resolution.has_value() || !frame_resolution->valid() ||
+              frame_resolution->projection_binding.projection_revision !=
+                  request.expected_projection_revision) {
+            throw SceneRequestRejectionError(
+                "missing_reference",
+                "current carried-object pose has no exact carrier-frame "
+                "resolution",
+                {{"reason", "carrier_frame_resolution_missing"}});
+          }
+          const auto *expected_frame =
+              std::get_if<core::ComponentSceneFrameRefDTO>(
+                  &attachment->carrier_frame_ref);
+          const auto *resolved_frame =
+              std::get_if<core::ResolvedComponentModelFrameDTO>(
+                  &frame_resolution->resolved_frame);
+          if (expected_frame == nullptr || resolved_frame == nullptr ||
+              resolved_frame->controllable_component_id !=
+                  expected_frame->controllable_component_id ||
+              resolved_frame->model_instance_id !=
+                  expected_frame->model_instance_id ||
+              resolved_frame->frame_role_id != expected_frame->frame_role_id) {
+            throw SceneRequestRejectionError(
+                "missing_reference",
+                "current carrier frame resolved to another component, model, "
+                "or frame role",
+                {{"reason", "carrier_frame_resolution_foreign"}});
+          }
+          auto object = std::lower_bound(candidate.snapshot.objects.begin(),
+                                         candidate.snapshot.objects.end(),
+                                         attachment->scene_resource_id,
+                                         [](const SceneObjectSnapshotDTO &entry,
+                                            const SceneResourceId &id) {
+                                           return entry.scene_resource_id < id;
+                                         });
+          if (object == candidate.snapshot.objects.end() ||
+              object->scene_resource_id != attachment->scene_resource_id) {
+            throw CanonicalEmptySceneOwnerIntegrityError(
+                "carried attachment has no matching scene object");
+          }
+          const auto *carried =
+              std::get_if<core::CarriedSceneObjectPlacementDTO>(
+                  &object->placement);
+          if (carried == nullptr ||
+              carried->carried_object_attachment_id !=
+                  attachment->carried_object_attachment_id ||
+              carried->carried_object_attachment_revision !=
+                  attachment->carried_object_attachment_revision) {
+            throw CanonicalEmptySceneOwnerIntegrityError(
+                "carried scene object does not identify its attachment");
+          }
+          const auto removed_id = attachment->carried_object_attachment_id;
+          const auto removed_revision =
+              attachment->carried_object_attachment_revision;
+          object->placement = core::CellFixedSceneObjectPlacementDTO{
+              current.cell_id,
+              core::multiply_poses(frame_resolution->frame_pose_in_cell,
+                                   attachment->pose_in_carrier_frame)};
+          candidate.snapshot.carried_object_attachments.erase(attachment);
+          candidate.operation = core::ResolvedDetachCarriedObjectDTO{
+              *object, removed_id, removed_revision};
+          candidate.resolution_evidence_digest =
+              frame_resolution->resolution_evidence_digest;
           policy_changed = true;
         } else {
           topology_changed = false;
@@ -3006,25 +3203,96 @@ private:
 };
 
 [[nodiscard]] std::optional<core::SceneFrameResolutionSelectorDTO>
-FrameSelectorForRequest(const SceneTransactionRequestDTO &request) {
+FrameSelectorForRequest(const SceneTransactionRequestDTO &request,
+                        const LogicalSceneSnapshotDTO &current) {
   return std::visit(
-      [](const auto &operation)
+      [&current](const auto &operation)
           -> std::optional<core::SceneFrameResolutionSelectorDTO> {
         using T = std::remove_cvref_t<decltype(operation)>;
         if constexpr (std::is_same_v<T, core::AddObjectRequestDTO> ||
+                      std::is_same_v<T, core::UpsertObjectRequestDTO> ||
                       std::is_same_v<T, core::UpdateObjectPoseRequestDTO> ||
                       std::is_same_v<T, core::DetachCarriedObjectRequestDTO>) {
-          if (std::holds_alternative<core::CellSceneFrameRefDTO>(
-                  operation.frame_ref)) {
-            return std::nullopt;
-          }
-          return core::SceneFrameResolutionSelectorDTO{operation.frame_ref};
+          return std::visit(
+              [&current](const auto &frame)
+                  -> std::optional<core::SceneFrameResolutionSelectorDTO> {
+                using Frame = std::remove_cvref_t<decltype(frame)>;
+                if constexpr (std::is_same_v<Frame,
+                                             core::CellSceneFrameRefDTO>) {
+                  return std::nullopt;
+                } else if constexpr (std::is_same_v<
+                                         Frame,
+                                         core::SceneResourceSceneFrameRefDTO>) {
+                  const auto object = std::lower_bound(
+                      current.objects.begin(), current.objects.end(),
+                      frame.scene_resource_id,
+                      [](const core::SceneObjectSnapshotDTO &entry,
+                         const core::SceneResourceId &id) {
+                        return entry.scene_resource_id < id;
+                      });
+                  if (object == current.objects.end() ||
+                      object->scene_resource_id != frame.scene_resource_id) {
+                    return std::nullopt;
+                  }
+                  const auto *carried =
+                      std::get_if<core::CarriedSceneObjectPlacementDTO>(
+                          &object->placement);
+                  if (carried == nullptr) {
+                    return std::nullopt;
+                  }
+                  const auto attachment = std::lower_bound(
+                      current.carried_object_attachments.begin(),
+                      current.carried_object_attachments.end(),
+                      carried->carried_object_attachment_id,
+                      [](const core::CarriedObjectAttachmentDTO &entry,
+                         const core::CarriedObjectAttachmentId &id) {
+                        return entry.carried_object_attachment_id < id;
+                      });
+                  if (attachment ==
+                          current.carried_object_attachments.end() ||
+                      attachment->carried_object_attachment_id !=
+                          carried->carried_object_attachment_id ||
+                      attachment->carried_object_attachment_revision !=
+                          carried->carried_object_attachment_revision) {
+                    throw CanonicalEmptySceneOwnerIntegrityError(
+                        "carried scene-resource selector has no exact "
+                        "attachment row");
+                  }
+                  return core::SceneFrameResolutionSelectorDTO{
+                      std::in_place_type<core::SceneFrameRefDTO>,
+                      attachment->carrier_frame_ref};
+                } else {
+                  return core::SceneFrameResolutionSelectorDTO{
+                      std::in_place_type<core::SceneFrameRefDTO>,
+                      core::SceneFrameRefDTO{frame}};
+                }
+              },
+              operation.frame_ref);
         } else if constexpr (std::is_same_v<
                                  T, core::AttachCarriedObjectRequestDTO>) {
           return core::SceneFrameResolutionSelectorDTO{
               core::TargetCarrierSceneFrameRefDTO{
                   operation.controllable_component_id,
                   operation.command_target_id, operation.frame_role_id}};
+        } else if constexpr (
+            std::is_same_v<T,
+                           core::DetachCarriedObjectAtCurrentPoseRequestDTO>) {
+          const auto attachment =
+              std::lower_bound(current.carried_object_attachments.begin(),
+                               current.carried_object_attachments.end(),
+                               operation.carried_object_attachment_id,
+                               [](const core::CarriedObjectAttachmentDTO &entry,
+                                  const core::CarriedObjectAttachmentId &id) {
+                                 return entry.carried_object_attachment_id < id;
+                               });
+          if (attachment == current.carried_object_attachments.end() ||
+              attachment->carried_object_attachment_id !=
+                  operation.carried_object_attachment_id) {
+            return std::nullopt;
+          }
+          return core::SceneFrameResolutionSelectorDTO{
+              std::in_place_type<core::SceneFrameRefDTO>,
+              attachment->carrier_frame_ref};
         } else {
           return std::nullopt;
         }
@@ -3140,8 +3408,9 @@ ResolveFrameAcrossProjections(
 [[nodiscard]] std::optional<core::SceneFrameResolutionReceiptDTO>
 ResolveFrameForRequest(
     const SceneTransactionRequestDTO &request,
+    const LogicalSceneSnapshotDTO &current,
     const std::vector<RequiredSceneProjection> &projections) {
-  const auto selector = FrameSelectorForRequest(request);
+  const auto selector = FrameSelectorForRequest(request, current);
   if (!selector.has_value()) {
     return std::nullopt;
   }
@@ -9394,7 +9663,8 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   try {
-    const auto frame_resolution = ResolveFrameForRequest(request, projections);
+    const auto frame_resolution = ResolveFrameForRequest(
+        request, *observed_state.active_scene_snapshot, projections);
     candidate =
         ResolveSceneCandidate(request, *observed_state.active_scene_snapshot,
                               observed_transactions->next_transaction_sequence,

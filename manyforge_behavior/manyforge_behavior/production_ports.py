@@ -10,11 +10,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
+from heapq import heapify, heappop, heappush
 import math
 from threading import RLock
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
-from manyforge_behavior.geometry import normalize_quat, rpy_deg_to_xyzw
+from manyforge_behavior.geometry import (
+    normalize_quat,
+    rpy_deg_to_xyzw,
+)
 from manyforge_behavior.kernel_client import (
     ActionSpan,
     ExecutionState,
@@ -22,6 +26,7 @@ from manyforge_behavior.kernel_client import (
 )
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
+    OwnerInvocationResult,
     OwnerNodeInputs,
     OwnerTaskSnapshot,
     OwnerTaskState,
@@ -29,6 +34,7 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
 )
+from manyforge_behavior.scene_client import SceneClient
 
 
 _ACTIVE_STATES: Final = frozenset(
@@ -166,6 +172,109 @@ def _pose3(
     }
 
 
+def _scene_pose3(value: object, *, field: str) -> dict[str, Any]:
+    pose = _mapping(value, field=field)
+    position = _sequence(
+        pose.get("position_m"), field=f"{field}.position_m", length=3
+    )
+    orientation = _mapping(pose.get("orientation"), field=f"{field}.orientation")
+    if set(orientation) == {"xyzw"}:
+        quaternion = normalize_quat(
+            _sequence(
+                orientation["xyzw"],
+                field=f"{field}.orientation.xyzw",
+                length=4,
+            )
+        )
+    elif set(orientation) == {"rpy_deg"}:
+        quaternion = rpy_deg_to_xyzw(
+            _sequence(
+                orientation["rpy_deg"],
+                field=f"{field}.orientation.rpy_deg",
+                length=3,
+            )
+        )
+    else:
+        raise ProductionPortError(
+            f"{field}.orientation must contain exactly xyzw or rpy_deg"
+        )
+    return {
+        "position_m": {
+            "x_m": _number(position[0], field=f"{field}.position_m[0]"),
+            "y_m": _number(position[1], field=f"{field}.position_m[1]"),
+            "z_m": _number(position[2], field=f"{field}.position_m[2]"),
+        },
+        "orientation": {
+            "x": quaternion[0],
+            "y": quaternion[1],
+            "z": quaternion[2],
+            "w": quaternion[3],
+        },
+    }
+
+
+def _scene_shape(value: object, *, field: str) -> dict[str, Any]:
+    shape = _mapping(value, field=field)
+    kind = shape.get("type")
+    if kind == "box" and set(shape) == {"type", "box_dimensions_m"}:
+        dimensions = _sequence(
+            shape["box_dimensions_m"],
+            field=f"{field}.box_dimensions_m",
+            length=3,
+        )
+        return {
+            "type": "box",
+            "box_dimensions_m": {
+                "x_m": _number(dimensions[0], field=f"{field}.box_dimensions_m[0]"),
+                "y_m": _number(dimensions[1], field=f"{field}.box_dimensions_m[1]"),
+                "z_m": _number(dimensions[2], field=f"{field}.box_dimensions_m[2]"),
+            },
+        }
+    if kind == "sphere" and set(shape) == {"type", "sphere_radius_m"}:
+        return {
+            "type": "sphere",
+            "sphere_radius_m": _number(
+                shape["sphere_radius_m"], field=f"{field}.sphere_radius_m"
+            ),
+        }
+    if kind == "cylinder" and set(shape) == {
+        "type",
+        "cylinder_radius_m",
+        "cylinder_height_m",
+    }:
+        return {
+            "type": "cylinder",
+            "cylinder_radius_m": _number(
+                shape["cylinder_radius_m"], field=f"{field}.cylinder_radius_m"
+            ),
+            "cylinder_height_m": _number(
+                shape["cylinder_height_m"], field=f"{field}.cylinder_height_m"
+            ),
+        }
+    if kind == "mesh" and set(shape) == {
+        "type",
+        "mesh_resource_uri",
+        "mesh_scale",
+    }:
+        scale = _sequence(
+            shape["mesh_scale"], field=f"{field}.mesh_scale", length=3
+        )
+        return {
+            "type": "mesh",
+            "mesh_resource_uri": _text(
+                shape["mesh_resource_uri"],
+                field=f"{field}.mesh_resource_uri",
+                maximum_bytes=4096,
+            ),
+            "mesh_scale": {
+                "x_m": _number(scale[0], field=f"{field}.mesh_scale[0]"),
+                "y_m": _number(scale[1], field=f"{field}.mesh_scale[1]"),
+                "z_m": _number(scale[2], field=f"{field}.mesh_scale[2]"),
+            },
+        }
+    raise ProductionPortError(f"{field} has an unsupported shape")
+
+
 def _reference(
     value: object,
     *,
@@ -213,6 +322,43 @@ class _TargetBinding:
 class _BoundContext:
     capture: ProgramRunPortContext
     targets: Mapping[str, _TargetBinding]
+
+
+class _SceneProgramTransport(Protocol):
+    def scene(self) -> dict[str, Any]: ...
+
+    def commit_scene_transaction(
+        self, body: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def manager_graph(self) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _SceneTargetBinding:
+    target_role_id: str
+    component_role_id: str
+    controllable_component_id: str
+    command_target_id: str
+    frames: Mapping[str, tuple[str, str]]
+    collision_body_roles: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _SceneBoundContext:
+    capture: ProgramRunPortContext
+    component_models: Mapping[tuple[str, str], tuple[str, str]]
+    component_frames: Mapping[tuple[str, str, str], dict[str, str]]
+    targets: Mapping[str, _SceneTargetBinding]
+
+
+@dataclass(frozen=True, slots=True)
+class _SceneView:
+    request_owner_epoch: str
+    projection_revision: dict[str, Any]
+    cell_id: str
+    objects: Mapping[str, Mapping[str, Any]]
+    attachments: tuple[Mapping[str, Any], ...]
 
 
 @dataclass(slots=True)
@@ -879,4 +1025,867 @@ class _NativeKernelProgramScopePort:
         return self._owner._observe_scope(program_run_id)
 
 
-__all__ = ["NativeKernelProgramPort", "ProductionPortError"]
+class HeadlessSceneProgramPort:
+    """Stateless scene intents plus captured Program-role translation.
+
+    The native logical-scene owner remains the only scene authority. This port
+    keeps only immutable Program Binding context and reads fresh owner truth for
+    every initialization or node attempt.
+    """
+
+    def __init__(self, transport: _SceneProgramTransport) -> None:
+        for method in ("scene", "commit_scene_transaction", "manager_graph"):
+            if not callable(getattr(transport, method, None)):
+                raise TypeError(f"scene transport has no callable {method}")
+        self._transport = transport
+        self._scene = SceneClient(transport)
+        self._contexts: dict[str, _SceneBoundContext] = {}
+        self._lock = RLock()
+
+    @staticmethod
+    def _parse_context(context: ProgramRunPortContext) -> _SceneBoundContext:
+        if not isinstance(context, ProgramRunPortContext):
+            raise TypeError("scene context must be one Program-run port context")
+        binding = context.program_binding
+        component_rows = _sequence(
+            binding.get("component_role_bindings"),
+            field="component_role_bindings",
+        )
+        component_models: dict[tuple[str, str], tuple[str, str]] = {}
+        component_ids: dict[str, str] = {}
+        for index, raw_row in enumerate(component_rows):
+            row = _mapping(raw_row, field=f"component_role_bindings[{index}]")
+            role = _text(
+                row.get("component_role_id"),
+                field=f"component_role_bindings[{index}].component_role_id",
+            )
+            component_id = _text(
+                row.get("controllable_component_id"),
+                field=(
+                    f"component_role_bindings[{index}].controllable_component_id"
+                ),
+            )
+            if role in component_ids:
+                raise ProductionPortError("Program Binding repeats a component role")
+            component_ids[role] = component_id
+            models = _sequence(
+                row.get("model_role_bindings"),
+                field=f"component_role_bindings[{index}].model_role_bindings",
+            )
+            for model_index, raw_model in enumerate(models):
+                model = _mapping(
+                    raw_model,
+                    field=(
+                        f"component_role_bindings[{index}]."
+                        f"model_role_bindings[{model_index}]"
+                    ),
+                )
+                model_role = _text(
+                    model.get("model_role_id"), field="model_role_id"
+                )
+                key = (role, model_role)
+                value = (
+                    _text(model.get("model_instance_id"), field="model_instance_id"),
+                    _text(model.get("model_revision"), field="model_revision"),
+                )
+                if key in component_models:
+                    raise ProductionPortError(
+                        "Program Binding repeats a component/model role"
+                    )
+                component_models[key] = value
+
+        target_rows = _sequence(
+            binding.get("target_role_bindings"), field="target_role_bindings"
+        )
+        targets: dict[str, _SceneTargetBinding] = {}
+        for index, raw_row in enumerate(target_rows):
+            row = _mapping(raw_row, field=f"target_role_bindings[{index}]")
+            target_role = _text(
+                row.get("target_role_id"),
+                field=f"target_role_bindings[{index}].target_role_id",
+            )
+            component_role = _text(
+                row.get("component_role_id"),
+                field=f"target_role_bindings[{index}].component_role_id",
+            )
+            component_id = _text(
+                row.get("controllable_component_id"),
+                field=f"target_role_bindings[{index}].controllable_component_id",
+            )
+            if component_ids.get(component_role) != component_id:
+                raise ProductionPortError(
+                    "target and component role bindings disagree"
+                )
+            frames: dict[str, tuple[str, str]] = {}
+            for raw_frame in _sequence(
+                row.get("frame_role_bindings"), field="frame_role_bindings"
+            ):
+                frame = _mapping(raw_frame, field="frame_role_binding")
+                frame_role = _text(
+                    frame.get("frame_role_id"), field="frame_role_id"
+                )
+                value = (
+                    _text(
+                        frame.get("model_instance_id"), field="model_instance_id"
+                    ),
+                    _text(frame.get("model_revision"), field="model_revision"),
+                )
+                if frame_role in frames:
+                    raise ProductionPortError(
+                        f"target role {target_role!r} repeats a frame role"
+                    )
+                frames[frame_role] = value
+            body_roles: list[str] = []
+            for raw_body in _sequence(
+                row.get("collision_body_role_bindings"),
+                field="collision_body_role_bindings",
+            ):
+                body = _mapping(raw_body, field="collision_body_role_binding")
+                body_roles.append(
+                    _text(
+                        body.get("collision_body_role_id"),
+                        field="collision_body_role_id",
+                    )
+                )
+            if len(body_roles) != len(set(body_roles)):
+                raise ProductionPortError(
+                    f"target role {target_role!r} repeats a collision-body role"
+                )
+            if target_role in targets:
+                raise ProductionPortError("Program Binding repeats a target role")
+            targets[target_role] = _SceneTargetBinding(
+                target_role_id=target_role,
+                component_role_id=component_role,
+                controllable_component_id=component_id,
+                command_target_id=_text(
+                    row.get("command_target_id"), field="command_target_id"
+                ),
+                frames=frames,
+                collision_body_roles=frozenset(body_roles),
+            )
+
+        component_frames: dict[tuple[str, str, str], dict[str, str]] = {}
+        for (component_role, model_role), (
+            model_instance_id,
+            model_revision,
+        ) in component_models.items():
+            component_id = component_ids[component_role]
+            for target in targets.values():
+                if target.controllable_component_id != component_id:
+                    continue
+                for frame_role, frame_binding in target.frames.items():
+                    if frame_binding[0] != model_instance_id:
+                        continue
+                    if frame_binding[1] != model_revision:
+                        raise ProductionPortError(
+                            "component and target frame model revisions disagree"
+                        )
+                    key = (component_role, model_role, frame_role)
+                    frame = {
+                        "kind": "component_frame",
+                        "controllable_component_id": component_id,
+                        "model_instance_id": model_instance_id,
+                        "frame_role_id": frame_role,
+                    }
+                    previous = component_frames.get(key)
+                    if previous is not None and previous != frame:
+                        raise ProductionPortError(
+                            "Program Binding gives an ambiguous component frame"
+                        )
+                    component_frames[key] = frame
+        return _SceneBoundContext(
+            capture=context,
+            component_models=component_models,
+            component_frames=component_frames,
+            targets=targets,
+        )
+
+    @staticmethod
+    def _target(
+        context: _SceneBoundContext, target_role_id: str
+    ) -> _SceneTargetBinding:
+        try:
+            return context.targets[target_role_id]
+        except KeyError as exc:
+            raise ProductionPortError(
+                f"Program Binding has no target role {target_role_id!r}"
+            ) from exc
+
+    def _context(self, program_run_id: str) -> _SceneBoundContext:
+        with self._lock:
+            try:
+                return self._contexts[program_run_id]
+            except KeyError as exc:
+                raise ProductionPortError(
+                    "Program-run scene context is not initialized"
+                ) from exc
+
+    def _read_view(self, context: _SceneBoundContext) -> _SceneView:
+        projection = self._scene.snapshot()
+        logical = _mapping(projection.get("logical_scene"), field="logical_scene")
+        if (
+            logical.get("available") is not True
+            or logical.get("freshness") != "fresh"
+            or list(_sequence(logical.get("known_gaps"), field="known_gaps"))
+        ):
+            raise ProductionPortError("logical-scene owner truth is not fresh")
+        owner_epoch = _text(
+            logical.get("source_owner_epoch"), field="scene source_owner_epoch"
+        )
+        payload = _mapping(logical.get("payload"), field="logical_scene.payload")
+        if payload.get("api_version") != "manyforge.logical_scene_source.v1":
+            raise ProductionPortError("logical-scene payload version is unsupported")
+        access = _mapping(payload.get("access"), field="logical_scene.access")
+        if (
+            access.get("scene_writes_open") is not True
+            or access.get("projection_leases_open") is not True
+        ):
+            raise ProductionPortError("logical-scene writes are fenced")
+        active = dict(
+            _mapping(
+                access.get("active_projection"),
+                field="logical_scene.active_projection",
+            )
+        )
+        if (
+            active.get("retained_bundle_id")
+            != context.capture.retained_bundle_id
+            or active.get("graph_revision") != context.capture.graph_revision
+        ):
+            raise ProductionPortError(
+                "logical-scene owner and captured Program deployment disagree"
+            )
+        active_scene = _mapping(
+            active.get("scene_revision"), field="active scene revision"
+        )
+        _text(active_scene.get("scene_id"), field="scene_id")
+        _text(active_scene.get("content_hash"), field="scene content_hash")
+        if (
+            type(active_scene.get("revision_id")) is not int
+            or active_scene["revision_id"] < 1
+        ):
+            raise ProductionPortError("active scene revision is invalid")
+        snapshot = _mapping(payload.get("snapshot"), field="logical_scene.snapshot")
+        if dict(_mapping(snapshot.get("revision"), field="snapshot revision")) != dict(
+            active_scene
+        ):
+            raise ProductionPortError(
+                "logical-scene snapshot and active projection disagree"
+            )
+        cell_id = _text(snapshot.get("cell_id"), field="cell_id")
+        objects: dict[str, Mapping[str, Any]] = {}
+        object_ids: list[str] = []
+        for index, raw_object in enumerate(
+            _sequence(snapshot.get("objects"), field="scene objects")
+        ):
+            scene_object = _mapping(raw_object, field=f"scene objects[{index}]")
+            scene_resource_id = _text(
+                scene_object.get("scene_resource_id"), field="scene_resource_id"
+            )
+            object_ids.append(scene_resource_id)
+            objects[scene_resource_id] = scene_object
+        if object_ids != sorted(object_ids) or len(object_ids) != len(objects):
+            raise ProductionPortError("logical-scene objects are not canonical")
+        attachments: list[Mapping[str, Any]] = []
+        attachment_ids: list[str] = []
+        for index, raw_attachment in enumerate(
+            _sequence(
+                snapshot.get("carried_object_attachments"),
+                field="carried_object_attachments",
+            )
+        ):
+            attachment = _mapping(
+                raw_attachment, field=f"carried_object_attachments[{index}]"
+            )
+            attachment_ids.append(
+                _text(
+                    attachment.get("carried_object_attachment_id"),
+                    field="carried_object_attachment_id",
+                )
+            )
+            attachments.append(attachment)
+        if attachment_ids != sorted(attachment_ids) or len(attachment_ids) != len(
+            set(attachment_ids)
+        ):
+            raise ProductionPortError(
+                "logical-scene attachments are not canonical"
+            )
+        return _SceneView(owner_epoch, active, cell_id, objects, tuple(attachments))
+
+    def _commit(
+        self,
+        *,
+        context: _SceneBoundContext,
+        request_id: str,
+        correlation_id: str,
+        request_owner_epoch: str,
+        expected_projection_revision: Mapping[str, Any],
+        operation: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        response = self._scene.commit(
+            {
+                "request_context": {
+                    "request_id": request_id,
+                    "request_owner_epoch": request_owner_epoch,
+                    "source_label": "manyforge.behavior.program_scene",
+                    "correlation_id": correlation_id,
+                },
+                "expected_projection_revision": dict(
+                    expected_projection_revision
+                ),
+                "operation": dict(operation),
+            }
+        )
+        committed = dict(
+            _mapping(
+                response.get("committed_projection_revision"),
+                field="committed_projection_revision",
+            )
+        )
+        expected_scene = _mapping(
+            expected_projection_revision.get("scene_revision"),
+            field="expected scene revision",
+        )
+        committed_scene = _mapping(
+            committed.get("scene_revision"), field="committed scene revision"
+        )
+        if (
+            committed.get("retained_bundle_id")
+            != context.capture.retained_bundle_id
+            or committed.get("graph_revision") != context.capture.graph_revision
+            or committed_scene.get("scene_id") != expected_scene.get("scene_id")
+        ):
+            raise ProductionPortError(
+                "scene commit changed captured structural or lineage identity"
+            )
+        return committed, response
+
+    @staticmethod
+    def _initial_pose_and_frame(
+        context: _SceneBoundContext,
+        raw_pose: object,
+        *,
+        cell_id: str,
+        field: str,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        pose = _mapping(raw_pose, field=field)
+        frame = _mapping(pose.get("frame_ref"), field=f"{field}.frame_ref")
+        kind = frame.get("kind")
+        if kind == "cell_frame" and set(frame) == {"kind"}:
+            frame_ref = {"kind": "cell_frame", "cell_id": cell_id}
+        elif kind == "component_frame" and set(frame) == {
+            "kind",
+            "component_role",
+            "model_role",
+            "frame_role",
+        }:
+            key = (
+                _text(frame["component_role"], field="component_role"),
+                _text(frame["model_role"], field="model_role"),
+                _text(frame["frame_role"], field="frame_role"),
+            )
+            try:
+                frame_ref = dict(context.component_frames[key])
+            except KeyError as exc:
+                raise ProductionPortError(
+                    "Program Binding has no exact initial-scene component frame"
+                ) from exc
+        else:
+            raise ProductionPortError("initial scene pose has an invalid frame")
+        return _scene_pose3(pose, field=field), frame_ref
+
+    def _node_pose_and_frame(
+        self,
+        context: _SceneBoundContext,
+        view: _SceneView,
+        raw_pose: object,
+        *,
+        field: str,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        pose = _mapping(raw_pose, field=field)
+        frame = _mapping(pose.get("frame_ref"), field=f"{field}.frame_ref")
+        converted = _scene_pose3(pose, field=field)
+        kind = frame.get("kind")
+        if kind == "cell_frame" and set(frame) == {"kind"}:
+            return converted, {"kind": "cell_frame", "cell_id": view.cell_id}
+        if kind == "target_frame" and set(frame) == {
+            "kind",
+            "target_role",
+            "frame_role",
+        }:
+            target = self._target(
+                context, _text(frame["target_role"], field="target_role")
+            )
+            frame_role = _text(frame["frame_role"], field="frame_role")
+            try:
+                model_instance_id, _model_revision = target.frames[frame_role]
+            except KeyError as exc:
+                raise ProductionPortError(
+                    "Program Binding has no exact target frame"
+                ) from exc
+            return converted, {
+                "kind": "component_frame",
+                "controllable_component_id": target.controllable_component_id,
+                "model_instance_id": model_instance_id,
+                "frame_role_id": frame_role,
+            }
+        if kind == "scene_resource" and set(frame) == {
+            "kind",
+            "scene_resource_id",
+        }:
+            reference_id = _text(
+                frame["scene_resource_id"], field="scene_resource_id"
+            )
+            return converted, {
+                "kind": "scene_resource",
+                "scene_resource_id": reference_id,
+            }
+        raise ProductionPortError("scene pose has an unsupported frame")
+
+    @staticmethod
+    def _removal_order(
+        objects: Mapping[str, Mapping[str, Any]]
+    ) -> tuple[str, ...]:
+        dependent_count = {scene_resource_id: 0 for scene_resource_id in objects}
+        supports_by_object: dict[str, tuple[str, ...]] = {}
+        for scene_resource_id, scene_object in objects.items():
+            supports: list[str] = []
+            for raw_contact in _sequence(
+                scene_object.get("support_contacts", ()),
+                field="support_contacts",
+            ):
+                contact = _mapping(raw_contact, field="support_contact")
+                support_id = _text(
+                    contact.get("support_object_id"), field="support_object_id"
+                )
+                if support_id not in dependent_count:
+                    raise ProductionPortError(
+                        "logical scene contains an unknown support dependency"
+                    )
+                supports.append(support_id)
+            if len(supports) != len(set(supports)):
+                raise ProductionPortError(
+                    "logical scene contains a duplicate support dependency"
+                )
+            supports_by_object[scene_resource_id] = tuple(supports)
+            for support_id in supports:
+                dependent_count[support_id] += 1
+
+        removable = [
+            scene_resource_id
+            for scene_resource_id, count in dependent_count.items()
+            if count == 0
+        ]
+        heapify(removable)
+        ordered: list[str] = []
+        while removable:
+            scene_resource_id = heappop(removable)
+            ordered.append(scene_resource_id)
+            for support_id in supports_by_object[scene_resource_id]:
+                dependent_count[support_id] -= 1
+                if dependent_count[support_id] == 0:
+                    heappush(removable, support_id)
+        if len(ordered) != len(objects):
+            raise ProductionPortError(
+                "logical scene contains a cyclic support dependency"
+            )
+        return tuple(ordered)
+
+    def _component_attachment_revisions(
+        self, context: _SceneBoundContext, component_id: str
+    ) -> list[str]:
+        projection = self._transport.manager_graph()
+        if projection.get("schema_version") != "manyforge.manager_graph_projection.v1":
+            raise ProductionPortError("Manager graph projection is unsupported")
+        source = _mapping(projection.get("source"), field="manager graph source")
+        if (
+            source.get("available") is not True
+            or source.get("freshness") != "fresh"
+            or list(_sequence(source.get("known_gaps"), field="known_gaps"))
+        ):
+            raise ProductionPortError("Manager graph is not fresh")
+        if (
+            projection.get("retained_bundle_id")
+            != context.capture.retained_bundle_id
+            or projection.get("graph_revision") != context.capture.graph_revision
+        ):
+            raise ProductionPortError(
+                "Manager graph and captured Program deployment disagree"
+            )
+        graph = _mapping(projection.get("cell_graph"), field="cell_graph")
+        component_ids = {
+            _text(
+                _mapping(row, field="controllable_component").get(
+                    "controllable_component_id"
+                ),
+                field="controllable_component_id",
+            )
+            for row in _sequence(
+                graph.get("controllable_components"),
+                field="controllable_components",
+            )
+        }
+        if component_id not in component_ids:
+            raise ProductionPortError(
+                "captured carrier component is absent from the Manager graph"
+            )
+        parent_by_child: dict[str, tuple[str, str]] = {}
+        for raw_edge in _sequence(
+            graph.get("component_attachments"), field="component_attachments"
+        ):
+            edge = _mapping(raw_edge, field="component_attachment")
+            child = _mapping(edge.get("child"), field="component_attachment.child")
+            parent = _mapping(
+                edge.get("parent"), field="component_attachment.parent"
+            )
+            child_id = _text(
+                child.get("controllable_component_id"),
+                field="child.controllable_component_id",
+            )
+            value = (
+                _text(
+                    parent.get("controllable_component_id"),
+                    field="parent.controllable_component_id",
+                ),
+                _text(
+                    edge.get("component_attachment_revision"),
+                    field="component_attachment_revision",
+                ),
+            )
+            if child_id in parent_by_child:
+                raise ProductionPortError(
+                    "Manager graph gives a component more than one parent"
+                )
+            parent_by_child[child_id] = value
+        revisions: list[str] = []
+        visited: set[str] = set()
+        current = component_id
+        while current in parent_by_child:
+            if current in visited:
+                raise ProductionPortError("Manager component attachments are cyclic")
+            visited.add(current)
+            current, revision = parent_by_child[current]
+            revisions.append(revision)
+        if len(revisions) != len(set(revisions)):
+            raise ProductionPortError(
+                "Manager component attachment revisions are not unique"
+            )
+        return sorted(revisions)
+
+    def initialize(
+        self,
+        context: ProgramRunPortContext,
+        initial_scene: Sequence[Mapping[str, Any]],
+    ) -> None:
+        parsed = self._parse_context(context)
+        with self._lock:
+            current = self._contexts.get(context.program_run_id)
+            if current is not None:
+                if current != parsed:
+                    raise ProductionPortError("Program-run scene context was rebound")
+                return
+            if len(self._contexts) >= _MAX_CONTEXTS:
+                raise ProductionPortError(
+                    "Program-run scene-context retention is full"
+                )
+        rows = list(initial_scene)
+        ids = [
+            _text(
+                _mapping(row, field=f"initial_scene[{index}]").get(
+                    "scene_resource_id"
+                ),
+                field=f"initial_scene[{index}].scene_resource_id",
+            )
+            for index, row in enumerate(rows)
+        ]
+        if ids != sorted(ids) or len(ids) != len(set(ids)):
+            raise ProductionPortError("initial scene is not canonical")
+        view = self._read_view(parsed)
+        expected = view.projection_revision
+        ordinal = 0
+
+        def commit(operation: Mapping[str, Any], coordinate: str) -> None:
+            nonlocal expected, ordinal
+            ordinal += 1
+            expected, _response = self._commit(
+                context=parsed,
+                request_id=_request_identity(
+                    "scene-init",
+                    context.program_run_id,
+                    str(ordinal),
+                    coordinate,
+                ),
+                correlation_id=context.program_run_id,
+                request_owner_epoch=view.request_owner_epoch,
+                expected_projection_revision=expected,
+                operation=operation,
+            )
+
+        for attachment in view.attachments:
+            attachment_id = _text(
+                attachment.get("carried_object_attachment_id"),
+                field="carried_object_attachment_id",
+            )
+            commit(
+                {
+                    "kind": "detach_carried_object_at_current_pose",
+                    "carried_object_attachment_id": attachment_id,
+                    "expected_carried_object_attachment_revision": _text(
+                        attachment.get("carried_object_attachment_revision"),
+                        field="carried_object_attachment_revision",
+                    ),
+                    "expected_scene_resource_id": _text(
+                        attachment.get("scene_resource_id"),
+                        field="scene_resource_id",
+                    ),
+                    "expected_controllable_component_id": _text(
+                        attachment.get("controllable_component_id"),
+                        field="controllable_component_id",
+                    ),
+                    "expected_command_target_id": _text(
+                        attachment.get("command_target_id"),
+                        field="command_target_id",
+                    ),
+                },
+                f"detach:{attachment_id}",
+            )
+        for scene_resource_id in self._removal_order(view.objects):
+            commit(
+                {
+                    "kind": "remove_object",
+                    "scene_resource_id": scene_resource_id,
+                },
+                f"remove:{scene_resource_id}",
+            )
+        for index, raw_row in enumerate(rows):
+            row = _mapping(raw_row, field=f"initial_scene[{index}]")
+            scene_resource_id = ids[index]
+            pose, frame_ref = self._initial_pose_and_frame(
+                parsed,
+                row.get("pose"),
+                cell_id=view.cell_id,
+                field=f"initial_scene[{index}].pose",
+            )
+            commit(
+                {
+                    "kind": "add_object",
+                    "scene_resource_id": scene_resource_id,
+                    "shape": _scene_shape(
+                        row.get("shape"), field=f"initial_scene[{index}].shape"
+                    ),
+                    "pose": pose,
+                    "frame_ref": frame_ref,
+                    "support_contacts": [],
+                },
+                f"add:{scene_resource_id}",
+            )
+        verified = self._read_view(parsed)
+        if (
+            verified.projection_revision != expected
+            or verified.attachments
+            or tuple(verified.objects) != tuple(ids)
+        ):
+            raise ProductionPortError(
+                "logical-scene owner did not publish the exact initialized scene"
+            )
+        with self._lock:
+            current = self._contexts.get(context.program_run_id)
+            if current is not None and current != parsed:
+                raise ProductionPortError("Program-run scene context was rebound")
+            self._contexts[context.program_run_id] = parsed
+
+    def release(self, program_run_id: str) -> None:
+        with self._lock:
+            self._contexts.pop(program_run_id, None)
+
+    def invoke(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerInvocationResult:
+        try:
+            context = self._context(identity.program_run_id)
+            view = self._read_view(context)
+            parameters = inputs.parameters
+            if node_id in {"scene.add_object", "scene.upsert_object"}:
+                pose, frame_ref = self._node_pose_and_frame(
+                    context, view, parameters.get("pose"), field="pose"
+                )
+                operation = {
+                    "kind": (
+                        "add_object"
+                        if node_id == "scene.add_object"
+                        else "upsert_object"
+                    ),
+                    "scene_resource_id": _text(
+                        parameters.get("scene_resource_id"),
+                        field="scene_resource_id",
+                    ),
+                    "shape": _scene_shape(parameters.get("shape"), field="shape"),
+                    "pose": pose,
+                    "frame_ref": frame_ref,
+                    "support_contacts": [],
+                }
+            elif node_id == "scene.remove_object":
+                operation = {
+                    "kind": "remove_object",
+                    "scene_resource_id": _text(
+                        parameters.get("scene_resource_id"),
+                        field="scene_resource_id",
+                    ),
+                }
+            elif node_id == "scene.update_object_pose":
+                pose, frame_ref = self._node_pose_and_frame(
+                    context, view, parameters.get("pose"), field="pose"
+                )
+                operation = {
+                    "kind": "update_object_pose",
+                    "scene_resource_id": _text(
+                        parameters.get("scene_resource_id"),
+                        field="scene_resource_id",
+                    ),
+                    "pose": pose,
+                    "frame_ref": frame_ref,
+                    "provider_evidence": None,
+                    "expected_attached": None,
+                }
+            elif node_id == "scene.attach_carried_object":
+                target_role = _text(
+                    parameters.get("target_role"), field="target_role"
+                )
+                target = self._target(context, target_role)
+                frame_role = _text(
+                    parameters.get("carrier_frame_role"),
+                    field="carrier_frame_role",
+                )
+                if frame_role not in target.frames:
+                    raise ProductionPortError(
+                        "Program Binding has no exact carrier frame"
+                    )
+                touch_body_roles = [
+                    _text(value, field="touch_body_role")
+                    for value in _sequence(
+                        parameters.get("touch_body_roles"),
+                        field="touch_body_roles",
+                    )
+                ]
+                if (
+                    len(touch_body_roles) != len(set(touch_body_roles))
+                    or any(
+                        role not in target.collision_body_roles
+                        for role in touch_body_roles
+                    )
+                ):
+                    raise ProductionPortError(
+                        "touch-body roles are duplicate or absent from the binding"
+                    )
+                scene_resource_id = _text(
+                    parameters.get("scene_resource_id"),
+                    field="scene_resource_id",
+                )
+                operation = {
+                    "kind": "attach_carried_object",
+                    "carried_object_attachment_id": _request_identity(
+                        "carried-object",
+                        identity.program_run_id,
+                        scene_resource_id,
+                        target_role,
+                    ),
+                    "scene_resource_id": scene_resource_id,
+                    "controllable_component_id": target.controllable_component_id,
+                    "command_target_id": target.command_target_id,
+                    "frame_role_id": frame_role,
+                    "touch_body_roles": sorted(touch_body_roles),
+                    "expected_component_attachment_revisions": (
+                        self._component_attachment_revisions(
+                            context, target.controllable_component_id
+                        )
+                    ),
+                }
+            elif node_id == "scene.detach_carried_object":
+                scene_resource_id = _text(
+                    parameters.get("scene_resource_id"),
+                    field="scene_resource_id",
+                )
+                target = self._target(
+                    context,
+                    _text(parameters.get("target_role"), field="target_role"),
+                )
+                matches = [
+                    attachment
+                    for attachment in view.attachments
+                    if attachment.get("scene_resource_id") == scene_resource_id
+                ]
+                if len(matches) != 1:
+                    raise ProductionPortError(
+                        "scene resource has no unique carried-object attachment"
+                    )
+                attachment = matches[0]
+                if (
+                    attachment.get("controllable_component_id")
+                    != target.controllable_component_id
+                    or attachment.get("command_target_id")
+                    != target.command_target_id
+                ):
+                    raise ProductionPortError(
+                        "carried-object attachment belongs to another target"
+                    )
+                operation = {
+                    "kind": "detach_carried_object_at_current_pose",
+                    "carried_object_attachment_id": _text(
+                        attachment.get("carried_object_attachment_id"),
+                        field="carried_object_attachment_id",
+                    ),
+                    "expected_carried_object_attachment_revision": _text(
+                        attachment.get("carried_object_attachment_revision"),
+                        field="carried_object_attachment_revision",
+                    ),
+                    "expected_scene_resource_id": scene_resource_id,
+                    "expected_controllable_component_id": (
+                        target.controllable_component_id
+                    ),
+                    "expected_command_target_id": target.command_target_id,
+                }
+            else:
+                raise ProductionPortError(
+                    f"scene Program port does not implement {node_id!r}"
+                )
+            committed, response = self._commit(
+                context=context,
+                request_id=_request_identity(
+                    "scene-node",
+                    identity.program_run_id,
+                    identity.node_instance_id,
+                    identity.node_attempt_id,
+                    node_id,
+                ),
+                correlation_id=identity.node_attempt_id,
+                request_owner_epoch=view.request_owner_epoch,
+                expected_projection_revision=view.projection_revision,
+                operation=operation,
+            )
+            return OwnerInvocationResult(
+                True,
+                output={"committed_projection_revision": committed},
+                metadata={
+                    "transaction_sequence": response.get("transaction_sequence"),
+                    "update_status": response.get("update_status"),
+                },
+            )
+        except Exception as exc:
+            reason_code = getattr(exc, "code", None)
+            if not isinstance(reason_code, str) or not reason_code:
+                reason_code = "scene_program_request_failed"
+            return OwnerInvocationResult(
+                False,
+                reason_code=reason_code,
+                message=(str(exc) or type(exc).__name__)[:1024],
+            )
+
+
+__all__ = [
+    "HeadlessSceneProgramPort",
+    "NativeKernelProgramPort",
+    "ProductionPortError",
+]

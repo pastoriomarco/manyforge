@@ -578,6 +578,35 @@ core::SceneFrameRefDTO DecodeFrame(const CanonicalValue &value) {
   Fail("scene frame kind is unsupported");
 }
 
+CanonicalValue RequestFrame(const core::SceneTransactionFrameRefDTO &frame) {
+  return std::visit(
+      [](const auto &value) -> CanonicalValue {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<
+                          T, core::SceneResourceSceneFrameRefDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("scene_resource")},
+              {"scene_resource_id",
+               CanonicalValue(value.scene_resource_id.value())},
+          });
+        } else {
+          return Frame(core::SceneFrameRefDTO{value});
+        }
+      },
+      frame);
+}
+
+core::SceneTransactionFrameRefDTO
+DecodeRequestFrame(const CanonicalValue &value) {
+  if (String(Member(value, "kind"), "frame kind") == "scene_resource") {
+    ExactObject(value, 2U, "scene-resource frame");
+    return core::SceneResourceSceneFrameRefDTO{
+        core::SceneResourceId(String(Member(value, "scene_resource_id"),
+                                     "scene_resource_id"))};
+  }
+  return core::ToSceneTransactionFrameRef(DecodeFrame(value));
+}
+
 CanonicalValue
 ProviderEvidence(const core::SceneObjectProviderEvidenceDTO &value) {
   CanonicalValue::Object object{
@@ -909,8 +938,19 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
         using T = std::decay_t<decltype(request)>;
         if constexpr (std::is_same_v<T, core::AddObjectRequestDTO>) {
           return CanonicalValue(CanonicalValue::Object{
-              {"frame_ref", Frame(request.frame_ref)},
+              {"frame_ref", RequestFrame(request.frame_ref)},
               {"kind", CanonicalValue("add_object")},
+              {"pose", Pose(request.pose)},
+              {"scene_resource_id",
+               CanonicalValue(request.scene_resource_id.value())},
+              {"shape", Shape(request.shape)},
+              {"support_contacts",
+               SupportDeclarations(request.support_contacts)},
+          });
+        } else if constexpr (std::is_same_v<T, core::UpsertObjectRequestDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"frame_ref", RequestFrame(request.frame_ref)},
+              {"kind", CanonicalValue("upsert_object")},
               {"pose", Pose(request.pose)},
               {"scene_resource_id",
                CanonicalValue(request.scene_resource_id.value())},
@@ -931,7 +971,7 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
                request.expected_attached.has_value()
                    ? CanonicalValue(*request.expected_attached)
                    : CanonicalValue(nullptr)},
-              {"frame_ref", Frame(request.frame_ref)},
+              {"frame_ref", RequestFrame(request.frame_ref)},
               {"kind", CanonicalValue("update_object_pose")},
               {"pose", Pose(request.pose)},
               {"provider_evidence",
@@ -968,9 +1008,28 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
                CanonicalValue(
                    request.expected_carried_object_attachment_revision
                        .value())},
-              {"frame_ref", Frame(request.frame_ref)},
+              {"frame_ref", RequestFrame(request.frame_ref)},
               {"kind", CanonicalValue("detach_carried_object")},
               {"pose", Pose(request.pose)},
+          });
+        } else if constexpr (
+            std::is_same_v<T,
+                           core::DetachCarriedObjectAtCurrentPoseRequestDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"carried_object_attachment_id",
+               CanonicalValue(request.carried_object_attachment_id.value())},
+              {"expected_carried_object_attachment_revision",
+               CanonicalValue(
+                   request.expected_carried_object_attachment_revision
+                       .value())},
+              {"expected_command_target_id",
+               CanonicalValue(request.expected_command_target_id.value())},
+              {"expected_controllable_component_id",
+               CanonicalValue(
+                   request.expected_controllable_component_id.value())},
+              {"expected_scene_resource_id",
+               CanonicalValue(request.expected_scene_resource_id.value())},
+              {"kind", CanonicalValue("detach_carried_object_at_current_pose")},
           });
         } else {
           return CanonicalValue(CanonicalValue::Object{
@@ -1005,7 +1064,18 @@ DecodeRequestOperation(const CanonicalValue &value) {
             String(Member(value, "scene_resource_id"), "scene_resource_id")),
         DecodeShape(Member(value, "shape")),
         DecodePose(Member(value, "pose")),
-        DecodeFrame(Member(value, "frame_ref")),
+        DecodeRequestFrame(Member(value, "frame_ref")),
+        DecodeSupportDeclarations(Member(value, "support_contacts")),
+    };
+  }
+  if (kind == "upsert_object") {
+    ExactObject(value, 6U, "upsert-object request");
+    return core::UpsertObjectRequestDTO{
+        core::SceneResourceId(
+            String(Member(value, "scene_resource_id"), "scene_resource_id")),
+        DecodeShape(Member(value, "shape")),
+        DecodePose(Member(value, "pose")),
+        DecodeRequestFrame(Member(value, "frame_ref")),
         DecodeSupportDeclarations(Member(value, "support_contacts")),
     };
   }
@@ -1032,7 +1102,7 @@ DecodeRequestOperation(const CanonicalValue &value) {
         core::SceneResourceId(
             String(Member(value, "scene_resource_id"), "scene_resource_id")),
         DecodePose(Member(value, "pose")),
-        DecodeFrame(Member(value, "frame_ref")),
+        DecodeRequestFrame(Member(value, "frame_ref")),
         std::move(provider_evidence),
         expected_attached,
     };
@@ -1069,7 +1139,27 @@ DecodeRequestOperation(const CanonicalValue &value) {
             String(Member(value, "expected_carried_object_attachment_revision"),
                    "expected_carried_object_attachment_revision")),
         DecodePose(Member(value, "pose")),
-        DecodeFrame(Member(value, "frame_ref")),
+        DecodeRequestFrame(Member(value, "frame_ref")),
+    };
+  }
+  if (kind == "detach_carried_object_at_current_pose") {
+    ExactObject(value, 6U, "detach-carried-object-at-current-pose request");
+    return core::DetachCarriedObjectAtCurrentPoseRequestDTO{
+        core::CarriedObjectAttachmentId(
+            String(Member(value, "carried_object_attachment_id"),
+                   "carried_object_attachment_id")),
+        core::CarriedObjectAttachmentRevision(
+            String(Member(value, "expected_carried_object_attachment_revision"),
+                   "expected_carried_object_attachment_revision")),
+        core::SceneResourceId(
+            String(Member(value, "expected_scene_resource_id"),
+                   "expected_scene_resource_id")),
+        core::ControllableComponentId(
+            String(Member(value, "expected_controllable_component_id"),
+                   "expected_controllable_component_id")),
+        core::CommandTargetId(
+            String(Member(value, "expected_command_target_id"),
+                   "expected_command_target_id")),
     };
   }
   if (kind == "set_collision_policy") {

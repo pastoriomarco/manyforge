@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -105,6 +105,18 @@ class ProgramRunContextPort(Protocol):
     def bind(self, context: ProgramRunPortContext) -> None: ...
 
     def unbind(self, program_run_id: str) -> None: ...
+
+
+class ProgramRunInitializationPort(Protocol):
+    """Apply captured pre-dispatch Program state before tree construction."""
+
+    def initialize(
+        self,
+        context: ProgramRunPortContext,
+        initial_scene: Sequence[Mapping[str, Any]],
+    ) -> None: ...
+
+    def release(self, program_run_id: str) -> None: ...
 
 
 class NodeAttemptSource(Protocol):
@@ -316,6 +328,7 @@ class NodeAdapterPorts:
     kernel_controls: OwnerInvocationPort | None = None
     program_run_scope: ProgramRunScopePort | None = None
     program_run_context: ProgramRunContextPort | None = None
+    program_run_initialization: ProgramRunInitializationPort | None = None
 
 
 __all__ = [
@@ -323,6 +336,7 @@ __all__ = [
     "NodeAttemptIdentity",
     "NodeAttemptSource",
     "ProgramRunContextPort",
+    "ProgramRunInitializationPort",
     "ProgramRunPortContext",
     "OwnerNodeInputs",
     "OwnerInvocationPort",

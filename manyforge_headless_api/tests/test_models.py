@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 from pydantic import ValidationError
 
@@ -743,3 +745,42 @@ def test_scene_policy_and_attachment_sets_require_canonical_order() -> None:
     }
     with pytest.raises(ValidationError):
         SceneTransactionRequest.model_validate(body)
+
+
+def test_scene_upsert_and_current_pose_detach_are_closed_typed_operations() -> None:
+    upsert = _scene_transaction()
+    upsert["operation"] = {
+        **upsert["operation"],
+        "kind": "upsert_object",
+        "frame_ref": {
+            "kind": "scene_resource",
+            "scene_resource_id": "fixture.1",
+        },
+        "support_contacts": [],
+    }
+    parsed_upsert = SceneTransactionRequest.model_validate(upsert)
+    assert parsed_upsert.operation.kind == "upsert_object"
+    assert parsed_upsert.operation.frame_ref.kind == "scene_resource"
+
+    detach = _scene_transaction()
+    detach["operation"] = {
+        "kind": "detach_carried_object_at_current_pose",
+        "carried_object_attachment_id": "attachment.1",
+        "expected_carried_object_attachment_revision": "sha256:" + "d" * 64,
+        "expected_scene_resource_id": "part.1",
+        "expected_controllable_component_id": "robot.1",
+        "expected_command_target_id": "arm",
+    }
+    parsed_detach = SceneTransactionRequest.model_validate(detach)
+    assert (
+        parsed_detach.operation.kind
+        == "detach_carried_object_at_current_pose"
+    )
+
+    malformed = deepcopy(detach)
+    malformed["operation"]["pose"] = {
+        "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.0},
+        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+    }
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        SceneTransactionRequest.model_validate(malformed)

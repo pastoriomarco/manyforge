@@ -365,7 +365,7 @@ struct ResolvedPickOffsetBases final {
       DetachCarriedObjectRequestDTO{
           attachment.carried_object_attachment_id,
           attachment.carried_object_attachment_revision, Pose3DTO{},
-          attachment.carrier_frame_ref}};
+          ToSceneTransactionFrameRef(attachment.carrier_frame_ref)}};
 }
 
 }  // namespace

@@ -797,7 +797,8 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
   auto* candidate_detach =
       std::get_if<DetachCarriedObjectRequestDTO>(&candidate_request.request.operation);
   candidate_detach->pose = attachment->pose_in_carrier_frame;
-  candidate_detach->frame_ref = attachment->carrier_frame_ref;
+  candidate_detach->frame_ref =
+      ToSceneTransactionFrameRef(attachment->carrier_frame_ref);
   auto detached = scene_.PreviewResolvedSceneCandidate(candidate_request);
   if (!detached.ok()) {
     report.stages.push_back(

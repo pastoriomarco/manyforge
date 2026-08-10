@@ -1648,6 +1648,147 @@ TEST(LogicalSceneTransactionCodec,
                std::invalid_argument);
 }
 
+TEST(LogicalSceneTransactionCodec,
+     UpsertAndCurrentPoseDetachRequestsRoundTripCanonically) {
+  const ProjectionRevisionDTO expected{
+      core::RetainedBundleId(Digest('b').value()),
+      GraphRevision(Digest('c').value()),
+      core::SceneRevision{core::SceneId(Digest('d').value()), 1U, Digest('a')},
+  };
+  auto upsert =
+      AddBoxRequest(expected, CellId("cell-a"), "scene-request-upsert-box");
+  const auto add = std::get<core::AddObjectRequestDTO>(upsert.operation);
+  upsert.operation = core::UpsertObjectRequestDTO{
+      add.scene_resource_id, add.shape, add.pose, add.frame_ref,
+      add.support_contacts};
+  std::get<core::UpsertObjectRequestDTO>(upsert.operation).frame_ref =
+      core::SceneResourceSceneFrameRefDTO{
+          core::SceneResourceId("reference-object")};
+  const auto upsert_bytes = logical_scene_codec_internal::EncodeRequest(upsert);
+  const auto decoded_upsert =
+      DecodeCanonicalSceneTransactionRequest(upsert_bytes);
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(decoded_upsert),
+            upsert_bytes);
+  EXPECT_TRUE(std::holds_alternative<core::UpsertObjectRequestDTO>(
+      decoded_upsert.operation));
+  const auto &decoded_frame =
+      std::get<core::UpsertObjectRequestDTO>(decoded_upsert.operation)
+          .frame_ref;
+  ASSERT_TRUE(
+      std::holds_alternative<core::SceneResourceSceneFrameRefDTO>(
+          decoded_frame));
+  EXPECT_EQ(
+      std::get<core::SceneResourceSceneFrameRefDTO>(decoded_frame)
+          .scene_resource_id,
+      core::SceneResourceId("reference-object"));
+
+  core::SceneTransactionRequestDTO detach{
+      SceneRequestContext("scene-request-detach-current", expected),
+      {},
+      expected,
+      core::DetachCarriedObjectAtCurrentPoseRequestDTO{
+          core::CarriedObjectAttachmentId("attachment.1"),
+          core::CarriedObjectAttachmentRevision(Digest('e').value()),
+          core::SceneResourceId("scene-box"),
+          core::ControllableComponentId("component.1"),
+          core::CommandTargetId("arm")},
+  };
+  const auto detach_bytes = logical_scene_codec_internal::EncodeRequest(detach);
+  const auto decoded_detach =
+      DecodeCanonicalSceneTransactionRequest(detach_bytes);
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(decoded_detach),
+            detach_bytes);
+  EXPECT_TRUE(
+      std::holds_alternative<core::DetachCarriedObjectAtCurrentPoseRequestDTO>(
+          decoded_detach.operation));
+}
+
+TEST(CanonicalEmptySceneOwner, UpsertCreatesReplacesAndRecognizesAnExactNoOp) {
+  TemporaryDirectory directory("scene-upsert");
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader);
+  auto active = FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+                    .canonical_empty_target;
+
+  auto request =
+      AddBoxRequest(active, admission.cell_id(), "scene-request-upsert-create");
+  const auto add = std::get<core::AddObjectRequestDTO>(request.operation);
+  request.operation = core::UpsertObjectRequestDTO{
+      add.scene_resource_id, add.shape, add.pose, add.frame_ref,
+      add.support_contacts};
+  const auto created = owner.Commit(request);
+  ASSERT_TRUE(created.success);
+  ASSERT_TRUE(created.committed_projection_revision.has_value());
+  active = *created.committed_projection_revision;
+
+  auto replace = request;
+  replace.request_context =
+      SceneRequestContext("scene-request-upsert-replace", active);
+  replace.expected_projection_revision = active;
+  auto &replacement = std::get<core::UpsertObjectRequestDTO>(replace.operation);
+  replacement.shape = core::SphereShapeDTO{0.4};
+  replacement.pose.position_m.x_m = 1.25;
+  const auto replaced = owner.Commit(replace);
+  ASSERT_TRUE(replaced.success);
+  ASSERT_TRUE(replaced.committed_projection_revision.has_value());
+  ASSERT_TRUE(replaced.update_status.has_value());
+  EXPECT_EQ(*replaced.update_status,
+            core::SceneUpdateStatusDTO::kGeometryChanged);
+  active = *replaced.committed_projection_revision;
+  const auto objects = owner.GetSceneObjects();
+  ASSERT_EQ(objects.size(), 1U);
+  ASSERT_TRUE(std::holds_alternative<core::SphereShapeDTO>(
+      objects.front().collision_shapes.front()));
+  const auto *fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+      &objects.front().placement);
+  ASSERT_NE(fixed, nullptr);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.x_m, 1.25);
+
+  auto no_op = replace;
+  no_op.request_context =
+      SceneRequestContext("scene-request-upsert-no-op", active);
+  no_op.expected_projection_revision = active;
+  const auto unchanged = owner.Commit(no_op);
+  ASSERT_TRUE(unchanged.success);
+  ASSERT_TRUE(unchanged.update_status.has_value());
+  EXPECT_EQ(*unchanged.update_status, core::SceneUpdateStatusDTO::kNoOp);
+  EXPECT_EQ(unchanged.committed_projection_revision, active);
+
+  auto relative =
+      AddBoxRequest(active, admission.cell_id(), "scene-request-upsert-relative");
+  const auto relative_add =
+      std::get<core::AddObjectRequestDTO>(relative.operation);
+  auto relative_pose = relative_add.pose;
+  relative_pose.position_m = {0.5, 1.0, -0.25};
+  relative.operation = core::UpsertObjectRequestDTO{
+      core::SceneResourceId("scene-relative"),
+      relative_add.shape,
+      relative_pose,
+      core::SceneResourceSceneFrameRefDTO{
+          core::SceneResourceId("scene-box")},
+      relative_add.support_contacts};
+  const auto relative_result = owner.Commit(relative);
+  ASSERT_TRUE(relative_result.success)
+      << (relative_result.error.has_value() ? relative_result.error->message
+                                            : "missing error");
+  const auto with_relative = owner.GetSceneObjects();
+  const auto relative_object = std::find_if(
+      with_relative.begin(), with_relative.end(), [](const auto &object) {
+        return object.scene_resource_id ==
+               core::SceneResourceId("scene-relative");
+      });
+  ASSERT_NE(relative_object, with_relative.end());
+  const auto *relative_fixed =
+      std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+          &relative_object->placement);
+  ASSERT_NE(relative_fixed, nullptr);
+  EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.x_m, 1.75);
+  EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.y_m, 0.5);
+  EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.z_m, 0.5);
+}
+
 TEST(CanonicalEmptySceneOwner,
      ZeroNativeSceneCommitPublishesReplaysAndRestarts) {
   TemporaryDirectory directory;
@@ -2574,8 +2715,16 @@ public:
       std::initializer_list<FakePlannerSceneProjection *> projections)
       : projections_(projections) {}
 
+  explicit FakePlannerSceneProjectionResolver(
+      std::vector<FakePlannerSceneProjection *> projections)
+      : projections_(std::move(projections)) {}
+
   void ReplaceWith(FakePlannerSceneProjection &projection) {
     projections_ = {&projection};
+  }
+
+  void ReplaceWith(std::vector<FakePlannerSceneProjection *> projections) {
+    projections_ = std::move(projections);
   }
 
   core::Result<std::shared_ptr<core::IPlannerSceneProjection>>
@@ -2652,6 +2801,58 @@ NativeRuntimeBindings(const core::RetainedBundleDTO &bundle,
   return result;
 }
 
+using OwnedFakePlannerSceneProjections =
+    std::vector<std::unique_ptr<FakePlannerSceneProjection>>;
+
+[[nodiscard]] OwnedFakePlannerSceneProjections MakeFakeProjections(
+    const std::vector<ProjectionNativeRuntimeBindingDTO> &bindings) {
+  OwnedFakePlannerSceneProjections projections;
+  projections.reserve(bindings.size());
+  for (const auto &binding : bindings) {
+    projections.push_back(
+        std::make_unique<FakePlannerSceneProjection>(binding));
+  }
+  return projections;
+}
+
+[[nodiscard]] std::vector<FakePlannerSceneProjection *> ProjectionClients(
+    const OwnedFakePlannerSceneProjections &projections) {
+  std::vector<FakePlannerSceneProjection *> clients;
+  clients.reserve(projections.size());
+  for (const auto &projection : projections) {
+    clients.push_back(projection.get());
+  }
+  return clients;
+}
+
+void ResetProjections(
+    OwnedFakePlannerSceneProjections &projections,
+    const ProjectionRevisionDTO &revision,
+    const FakePlannerSceneProjection::Mode mode) {
+  for (auto &projection : projections) {
+    projection->Reset(revision, mode);
+  }
+}
+
+void SetProjectionMode(OwnedFakePlannerSceneProjections &projections,
+                       const FakePlannerSceneProjection::Mode mode) {
+  for (auto &projection : projections) {
+    projection->SetMode(mode);
+  }
+}
+
+[[nodiscard]] std::vector<ProjectionNativeRuntimeBindingDTO>
+RebindRuntimeEpochs(
+    const std::vector<ProjectionNativeRuntimeBindingDTO> &bindings,
+    const std::string_view epoch_prefix) {
+  auto rebound = bindings;
+  for (std::size_t index = 0U; index < rebound.size(); ++index) {
+    rebound[index].runtime_epoch = core::RuntimeEpoch(
+        std::string(epoch_prefix) + "-" + std::to_string(index + 1U));
+  }
+  return rebound;
+}
+
 [[nodiscard]] ProjectionRevisionDTO FinalizeNativeCandidate(
     CanonicalEmptySceneOwner &owner,
     ControlledPublicationReader &publication_reader,
@@ -2703,14 +2904,14 @@ TEST(CanonicalEmptySceneOwner,
           package_root, admission.cell_id().value());
   const auto native_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-sustained-history");
-  ASSERT_EQ(native_bindings.size(), 1U);
 
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
-  FakePlannerSceneProjection native_projection(native_bindings.front());
-  FakePlannerSceneProjectionResolver resolver(native_projection);
+  auto native_projections = MakeFakeProjections(native_bindings);
+  FakePlannerSceneProjectionResolver resolver(
+      ProjectionClients(native_projections));
   std::optional<ProjectionRevisionDTO> projection;
   RequestOwnerEpoch original_epoch(std::string{});
   RequestOwnerEpoch rotated_epoch(std::string{});
@@ -2758,8 +2959,8 @@ TEST(CanonicalEmptySceneOwner,
       projection = *committed.committed_projection_revision;
     }
 
-    native_projection.SetMode(
-        FakePlannerSceneProjection::Mode::kRollbackProven);
+    SetProjectionMode(native_projections,
+                      FakePlannerSceneProjection::Mode::kRollbackProven);
     core::SceneTransactionRequestDTO closed_failure{
         SceneRequestContext("scene-sustained-256-rollback", *projection),
         {},
@@ -2794,7 +2995,8 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_EQ(rotated.error->details.at("expected_request_owner_epoch"),
               rotated_epoch.value());
 
-    native_projection.SetMode(FakePlannerSceneProjection::Mode::kCommit);
+    SetProjectionMode(native_projections,
+                      FakePlannerSceneProjection::Mode::kCommit);
     most_recent_request->request_context.request_owner_epoch = rotated_epoch;
     const auto resumed = owner.Commit(*most_recent_request);
     ASSERT_TRUE(resumed.success)
@@ -2856,12 +3058,11 @@ TEST(CanonicalEmptySceneOwner,
           package_root, admission.cell_id().value());
   const auto original_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-original");
-  ASSERT_EQ(original_bindings.size(), 1U);
 
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-  FakePlannerSceneProjection original(original_bindings.front());
-  FakePlannerSceneProjectionResolver resolver(original);
+  auto original = MakeFakeProjections(original_bindings);
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
                                  bundle_source, resolver);
@@ -2870,25 +3071,27 @@ TEST(CanonicalEmptySceneOwner,
       original_bindings, "apply-native-runtime-recovery");
   ASSERT_TRUE(owner.ActiveProjectionHealth().healthy_for_target(active));
 
-  auto replacement_binding = original_bindings.front();
-  replacement_binding.runtime_epoch =
-      core::RuntimeEpoch("runtime-epoch-replacement-1");
-  FakePlannerSceneProjection replacement(replacement_binding);
-  resolver.ReplaceWith(replacement);
+  const auto replacement_bindings =
+      RebindRuntimeEpochs(original_bindings, "runtime-epoch-replacement");
+  auto replacement = MakeFakeProjections(replacement_bindings);
+  resolver.ReplaceWith(ProjectionClients(replacement));
   EXPECT_FALSE(owner.ActiveProjectionHealth().healthy_for_target(active));
 
-  auto foreign_binding = replacement_binding;
-  foreign_binding.runtime_unit_id = core::RuntimeUnitId("runtime-foreign");
+  auto foreign_bindings = replacement_bindings;
+  foreign_bindings.front().runtime_unit_id =
+      core::RuntimeUnitId("runtime-foreign");
   EXPECT_THROW(
       owner.ReconcileActiveProjectionRuntimes(
-          ActiveProjectionRuntimeSetDTO{active, {foreign_binding}}),
+          ActiveProjectionRuntimeSetDTO{active, foreign_bindings}),
       CanonicalEmptySceneOwnerConflictError);
-  EXPECT_EQ(replacement.rebuild_calls(), 0U);
+  for (const auto &projection : replacement) {
+    EXPECT_EQ(projection->rebuild_calls(), 0U);
+  }
   EXPECT_EQ(owner.VerifyIntegrity().native_recovery_intent_count, 0);
 
   const ActiveProjectionRuntimeSetDTO replacement_set{
       active,
-      {replacement_binding},
+      replacement_bindings,
   };
   const auto recovered =
       owner.ReconcileActiveProjectionRuntimes(replacement_set);
@@ -2897,13 +3100,18 @@ TEST(CanonicalEmptySceneOwner,
             ActiveProjectionRuntimeRecoveryState::kRecovered);
   ASSERT_TRUE(recovered.recovery_generation.has_value());
   EXPECT_EQ(recovered.recovery_generation->value(), 1U);
-  EXPECT_EQ(replacement.rebuild_calls(), 1U);
+  for (const auto &projection : replacement) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+  }
   const auto recovered_health = owner.ActiveProjectionHealth();
   ASSERT_TRUE(recovered_health.healthy_for_target(active));
-  ASSERT_EQ(recovered_health.native_projection_health.size(), 1U);
-  EXPECT_EQ(recovered_health.native_projection_health.front()
-                .native_runtime_binding,
-            replacement_binding);
+  ASSERT_EQ(recovered_health.native_projection_health.size(),
+            replacement_bindings.size());
+  for (std::size_t index = 0U; index < replacement_bindings.size(); ++index) {
+    EXPECT_EQ(recovered_health.native_projection_health[index]
+                  .native_runtime_binding,
+              replacement_bindings[index]);
+  }
 
   const auto committed =
       owner.Commit(AddBoxRequest(active, admission.cell_id(),
@@ -2912,12 +3120,16 @@ TEST(CanonicalEmptySceneOwner,
       << (committed.error.has_value() ? committed.error->message
                                       : "missing error");
   ASSERT_TRUE(committed.committed_projection_revision.has_value());
-  EXPECT_EQ(replacement.calls(), 1U);
+  for (const auto &projection : replacement) {
+    EXPECT_EQ(projection->calls(), 1U);
+  }
   const auto integrity = owner.VerifyIntegrity();
   EXPECT_EQ(integrity.native_recovery_intent_count, 1);
   EXPECT_EQ(integrity.native_recovery_completion_count, 1);
-  EXPECT_EQ(integrity.native_recovery_binding_count, 1);
-  EXPECT_EQ(integrity.native_recovery_result_count, 1);
+  EXPECT_EQ(integrity.native_recovery_binding_count,
+            static_cast<std::int64_t>(replacement_bindings.size()));
+  EXPECT_EQ(integrity.native_recovery_result_count,
+            static_cast<std::int64_t>(replacement_bindings.size()));
   owner.Close();
 
   CanonicalEmptySceneOwner reopened(database_path, admission,
@@ -2925,12 +3137,14 @@ TEST(CanonicalEmptySceneOwner,
                                     resolver);
   const ActiveProjectionRuntimeSetDTO replay_set{
       *committed.committed_projection_revision,
-      {replacement_binding},
+      replacement_bindings,
   };
   const auto replay = reopened.ReconcileActiveProjectionRuntimes(replay_set);
   ASSERT_TRUE(replay.valid());
   EXPECT_EQ(replay.state, ActiveProjectionRuntimeRecoveryState::kCurrent);
-  EXPECT_EQ(replacement.rebuild_calls(), 1U);
+  for (const auto &projection : replacement) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+  }
   EXPECT_TRUE(reopened.ActiveProjectionHealth().healthy_for_target(
       *committed.committed_projection_revision));
 }
@@ -2946,12 +3160,11 @@ TEST(CanonicalEmptySceneOwner,
           package_root, admission.cell_id().value());
   const auto original_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-crash-original");
-  ASSERT_EQ(original_bindings.size(), 1U);
 
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-  FakePlannerSceneProjection original(original_bindings.front());
-  FakePlannerSceneProjectionResolver resolver(original);
+  auto original = MakeFakeProjections(original_bindings);
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
                                  bundle_source, resolver);
@@ -2959,15 +3172,15 @@ TEST(CanonicalEmptySceneOwner,
       owner, publication_reader, admission, *candidate.bundle,
       original_bindings, "apply-native-runtime-recovery-crash");
 
-  auto first_binding = original_bindings.front();
-  first_binding.runtime_epoch = core::RuntimeEpoch("runtime-epoch-crash-1");
-  FakePlannerSceneProjection first_replacement(first_binding);
-  first_replacement.ThrowAfterNextRebuildEffect();
-  resolver.ReplaceWith(first_replacement);
-  const ActiveProjectionRuntimeSetDTO first_set{active, {first_binding}};
+  const auto first_bindings =
+      RebindRuntimeEpochs(original_bindings, "runtime-epoch-crash-1");
+  auto first_replacement = MakeFakeProjections(first_bindings);
+  first_replacement.front()->ThrowAfterNextRebuildEffect();
+  resolver.ReplaceWith(ProjectionClients(first_replacement));
+  const ActiveProjectionRuntimeSetDTO first_set{active, first_bindings};
   EXPECT_THROW(owner.ReconcileActiveProjectionRuntimes(first_set),
                std::runtime_error);
-  EXPECT_EQ(first_replacement.rebuild_calls(), 1U);
+  EXPECT_EQ(first_replacement.front()->rebuild_calls(), 1U);
   auto access = owner.ReadAccessStatus();
   EXPECT_FALSE(access.scene_writes_open);
   EXPECT_FALSE(access.projection_leases_open);
@@ -2985,45 +3198,54 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(resumed.state, ActiveProjectionRuntimeRecoveryState::kRecovered);
   ASSERT_TRUE(resumed.recovery_generation.has_value());
   EXPECT_EQ(resumed.recovery_generation->value(), 1U);
-  EXPECT_EQ(first_replacement.rebuild_calls(), 1U);
+  for (const auto &projection : first_replacement) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+  }
   access = reopened.ReadAccessStatus();
   EXPECT_TRUE(access.scene_writes_open);
   EXPECT_TRUE(access.projection_leases_open);
 
-  auto dead_binding = first_binding;
-  dead_binding.runtime_epoch = core::RuntimeEpoch("runtime-epoch-crash-2");
-  FakePlannerSceneProjection dead_replacement(dead_binding);
-  dead_replacement.ThrowAfterNextRebuildEffect();
-  resolver.ReplaceWith(dead_replacement);
+  const auto dead_bindings =
+      RebindRuntimeEpochs(original_bindings, "runtime-epoch-crash-2");
+  auto dead_replacement = MakeFakeProjections(dead_bindings);
+  dead_replacement.front()->ThrowAfterNextRebuildEffect();
+  resolver.ReplaceWith(ProjectionClients(dead_replacement));
   EXPECT_THROW(reopened.ReconcileActiveProjectionRuntimes(
-                   ActiveProjectionRuntimeSetDTO{active, {dead_binding}}),
+                   ActiveProjectionRuntimeSetDTO{active, dead_bindings}),
                std::runtime_error);
-  EXPECT_EQ(dead_replacement.rebuild_calls(), 1U);
+  EXPECT_EQ(dead_replacement.front()->rebuild_calls(), 1U);
   EXPECT_FALSE(reopened.ReadAccessStatus().scene_writes_open);
 
-  auto final_binding = first_binding;
-  final_binding.runtime_epoch = core::RuntimeEpoch("runtime-epoch-crash-3");
-  FakePlannerSceneProjection final_replacement(final_binding);
-  resolver.ReplaceWith(final_replacement);
+  const auto final_bindings =
+      RebindRuntimeEpochs(original_bindings, "runtime-epoch-crash-3");
+  auto final_replacement = MakeFakeProjections(final_bindings);
+  resolver.ReplaceWith(ProjectionClients(final_replacement));
   const auto superseded = reopened.ReconcileActiveProjectionRuntimes(
-      ActiveProjectionRuntimeSetDTO{active, {final_binding}});
+      ActiveProjectionRuntimeSetDTO{active, final_bindings});
   ASSERT_TRUE(superseded.valid());
   EXPECT_EQ(superseded.state,
             ActiveProjectionRuntimeRecoveryState::kRecovered);
   ASSERT_TRUE(superseded.recovery_generation.has_value());
   EXPECT_EQ(superseded.recovery_generation->value(), 3U);
-  EXPECT_EQ(final_replacement.rebuild_calls(), 1U);
+  for (const auto &projection : final_replacement) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+  }
   const auto final_health = reopened.ActiveProjectionHealth();
   ASSERT_TRUE(final_health.healthy_for_target(active));
-  ASSERT_EQ(final_health.native_projection_health.size(), 1U);
-  EXPECT_EQ(final_health.native_projection_health.front()
-                .native_runtime_binding,
-            final_binding);
+  ASSERT_EQ(final_health.native_projection_health.size(),
+            final_bindings.size());
+  for (std::size_t index = 0U; index < final_bindings.size(); ++index) {
+    EXPECT_EQ(final_health.native_projection_health[index]
+                  .native_runtime_binding,
+              final_bindings[index]);
+  }
   integrity = reopened.VerifyIntegrity();
   EXPECT_EQ(integrity.native_recovery_intent_count, 2);
   EXPECT_EQ(integrity.native_recovery_completion_count, 2);
-  EXPECT_EQ(integrity.native_recovery_binding_count, 2);
-  EXPECT_EQ(integrity.native_recovery_result_count, 2);
+  EXPECT_EQ(integrity.native_recovery_binding_count,
+            static_cast<std::int64_t>(2U * final_bindings.size()));
+  EXPECT_EQ(integrity.native_recovery_result_count,
+            static_cast<std::int64_t>(2U * final_bindings.size()));
   EXPECT_FALSE(integrity.projection_desynchronized);
 }
 
@@ -3038,13 +3260,12 @@ TEST(CanonicalEmptySceneOwner,
           package_root, admission.cell_id().value());
   const auto original_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-bounded-original");
-  ASSERT_EQ(original_bindings.size(), 1U);
 
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
-  FakePlannerSceneProjection original(original_bindings.front());
-  FakePlannerSceneProjectionResolver resolver(original);
+  auto original = MakeFakeProjections(original_bindings);
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
                                  bundle_source, resolver);
@@ -3052,21 +3273,23 @@ TEST(CanonicalEmptySceneOwner,
       owner, publication_reader, admission, *candidate.bundle,
       original_bindings, "apply-native-runtime-recovery-bounded");
 
-  std::vector<std::unique_ptr<FakePlannerSceneProjection>> replacements;
+  std::vector<OwnedFakePlannerSceneProjections> replacements;
   replacements.reserve(8U);
+  std::vector<ProjectionNativeRuntimeBindingDTO> current_bindings;
   for (std::uint64_t generation = 1U; generation <= 8U; ++generation) {
-    auto binding = original_bindings.front();
-    binding.runtime_epoch = core::RuntimeEpoch("runtime-epoch-bounded-" +
-                                               std::to_string(generation));
-    replacements.push_back(
-        std::make_unique<FakePlannerSceneProjection>(binding));
-    resolver.ReplaceWith(*replacements.back());
+    current_bindings = RebindRuntimeEpochs(
+        original_bindings,
+        "runtime-epoch-bounded-" + std::to_string(generation));
+    replacements.push_back(MakeFakeProjections(current_bindings));
+    resolver.ReplaceWith(ProjectionClients(replacements.back()));
     const auto recovered = owner.ReconcileActiveProjectionRuntimes(
-        ActiveProjectionRuntimeSetDTO{active, {binding}});
+        ActiveProjectionRuntimeSetDTO{active, current_bindings});
     ASSERT_TRUE(recovered.valid());
     ASSERT_TRUE(recovered.recovery_generation.has_value());
     EXPECT_EQ(recovered.recovery_generation->value(), generation);
-    EXPECT_EQ(replacements.back()->rebuild_calls(), 1U);
+    for (const auto &projection : replacements.back()) {
+      EXPECT_EQ(projection->rebuild_calls(), 1U);
+    }
     const auto integrity = owner.VerifyIntegrity();
     EXPECT_LE(
         integrity.native_recovery_intent_count,
@@ -3081,7 +3304,7 @@ TEST(CanonicalEmptySceneOwner,
       database_path, admission, publication_reader, bundle_source, resolver);
   EXPECT_TRUE(reopened.ActiveProjectionHealth().healthy_for_target(active));
   const auto replay = reopened.ReconcileActiveProjectionRuntimes(
-      ActiveProjectionRuntimeSetDTO{active, {replacements.back()->binding()}});
+      ActiveProjectionRuntimeSetDTO{active, current_bindings});
   EXPECT_EQ(replay.state, ActiveProjectionRuntimeRecoveryState::kCurrent);
   EXPECT_EQ(replay.recovery_generation->value(), 8U);
 }
@@ -3097,27 +3320,26 @@ TEST(CanonicalEmptySceneOwner,
           package_root, admission.cell_id().value());
   const auto original_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-v5-original");
-  ASSERT_EQ(original_bindings.size(), 1U);
 
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
-  FakePlannerSceneProjection original(original_bindings.front());
-  FakePlannerSceneProjectionResolver resolver(original);
+  auto original = MakeFakeProjections(original_bindings);
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   ProjectionRevisionDTO active;
-  auto migrated_binding = original_bindings.front();
-  migrated_binding.runtime_epoch = core::RuntimeEpoch("runtime-epoch-v5-1");
-  FakePlannerSceneProjection migrated_projection(migrated_binding);
+  const auto migrated_bindings =
+      RebindRuntimeEpochs(original_bindings, "runtime-epoch-v5-1");
+  auto migrated_projections = MakeFakeProjections(migrated_bindings);
   {
     CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
                                    bundle_source, resolver);
     active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         original_bindings, "apply-native-runtime-recovery-v5-migration");
-    resolver.ReplaceWith(migrated_projection);
+    resolver.ReplaceWith(ProjectionClients(migrated_projections));
     const auto recovered = owner.ReconcileActiveProjectionRuntimes(
-        ActiveProjectionRuntimeSetDTO{active, {migrated_binding}});
+        ActiveProjectionRuntimeSetDTO{active, migrated_bindings});
     ASSERT_EQ(recovered.recovery_generation->value(), 1U);
   }
 
@@ -3183,12 +3405,12 @@ COMMIT;
   EXPECT_EQ(integrity.native_recovery_completion_count, 1);
   EXPECT_TRUE(migrated.ActiveProjectionHealth().healthy_for_target(active));
 
-  auto next_binding = migrated_binding;
-  next_binding.runtime_epoch = core::RuntimeEpoch("runtime-epoch-v5-9");
-  FakePlannerSceneProjection next_projection(next_binding);
-  resolver.ReplaceWith(next_projection);
+  const auto next_bindings =
+      RebindRuntimeEpochs(original_bindings, "runtime-epoch-v5-9");
+  auto next_projections = MakeFakeProjections(next_bindings);
+  resolver.ReplaceWith(ProjectionClients(next_projections));
   const auto recovered = migrated.ReconcileActiveProjectionRuntimes(
-      ActiveProjectionRuntimeSetDTO{active, {next_binding}});
+      ActiveProjectionRuntimeSetDTO{active, next_bindings});
   ASSERT_TRUE(recovered.recovery_generation.has_value());
   EXPECT_EQ(recovered.recovery_generation->value(), 9U);
   integrity = migrated.VerifyIntegrity();
@@ -3208,13 +3430,12 @@ TEST(
           package_root, admission.cell_id().value());
   const auto original_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-transaction-original");
-  ASSERT_EQ(original_bindings.size(), 1U);
 
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
-  FakePlannerSceneProjection original(original_bindings.front());
-  FakePlannerSceneProjectionResolver resolver(original);
+  auto original = MakeFakeProjections(original_bindings);
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
   const auto database_path = directory.path() / "logical-scene.sqlite3";
   CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
                                  bundle_source, resolver);
@@ -3223,10 +3444,13 @@ TEST(
       original_bindings, "apply-native-transaction-host-loss");
 
   const core::ProjectionLeaseId old_lease("operation-before-host-loss");
-  const auto retained = original.RetainProjectionBinding(active, old_lease);
-  ASSERT_TRUE(retained.ok());
-  EXPECT_EQ(original.retained_lease_count(), 1U);
-  original.SetMode(FakePlannerSceneProjection::Mode::kUncertain);
+  for (auto &projection : original) {
+    const auto retained =
+        projection->RetainProjectionBinding(active, old_lease);
+    ASSERT_TRUE(retained.ok());
+    EXPECT_EQ(projection->retained_lease_count(), 1U);
+  }
+  SetProjectionMode(original, FakePlannerSceneProjection::Mode::kUncertain);
   const auto failed_request = AddBoxRequest(
       active, admission.cell_id(), "scene-request-interrupted-by-host-loss");
   const auto failed = owner.Commit(failed_request);
@@ -3236,16 +3460,17 @@ TEST(
   EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
   EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
 
-  auto replacement_binding = original_bindings.front();
-  replacement_binding.runtime_epoch =
-      core::RuntimeEpoch("runtime-epoch-transaction-replacement");
-  FakePlannerSceneProjection replacement(replacement_binding);
-  resolver.ReplaceWith(replacement);
+  const auto replacement_bindings = RebindRuntimeEpochs(
+      original_bindings, "runtime-epoch-transaction-replacement");
+  auto replacement = MakeFakeProjections(replacement_bindings);
+  resolver.ReplaceWith(ProjectionClients(replacement));
   const auto recovered = owner.ReconcileActiveProjectionRuntimes(
-      ActiveProjectionRuntimeSetDTO{active, {replacement_binding}});
+      ActiveProjectionRuntimeSetDTO{active, replacement_bindings});
   ASSERT_TRUE(recovered.valid());
   EXPECT_EQ(recovered.state, ActiveProjectionRuntimeRecoveryState::kRecovered);
-  EXPECT_EQ(replacement.rebuild_calls(), 1U);
+  for (const auto &projection : replacement) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+  }
   EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
   EXPECT_TRUE(owner.ReadAccessStatus().projection_leases_open);
   EXPECT_EQ(owner.CurrentProjectionRevision(), active);
@@ -3253,16 +3478,24 @@ TEST(
 
   // The lease belongs to the dead predecessor host and remains exact there;
   // rebuilding the replacement neither adopts nor mutates it.
-  EXPECT_EQ(original.retained_lease_count(), 1U);
-  EXPECT_EQ(replacement.retained_lease_count(), 0U);
-  original.ReleaseProjection(old_lease);
-  EXPECT_EQ(original.retained_lease_count(), 0U);
+  for (auto &projection : original) {
+    EXPECT_EQ(projection->retained_lease_count(), 1U);
+  }
+  for (const auto &projection : replacement) {
+    EXPECT_EQ(projection->retained_lease_count(), 0U);
+  }
+  for (auto &projection : original) {
+    projection->ReleaseProjection(old_lease);
+    EXPECT_EQ(projection->retained_lease_count(), 0U);
+  }
 
   const auto failed_replay = owner.Commit(failed_request);
   EXPECT_FALSE(failed_replay.success);
   EXPECT_EQ(failed_replay.replay_status,
             core::RequestReplayStatusDTO::kReplayedExact);
-  EXPECT_EQ(replacement.calls(), 0U);
+  for (const auto &projection : replacement) {
+    EXPECT_EQ(projection->calls(), 0U);
+  }
   auto retry = failed_request;
   retry.request_context.request_id =
       core::RequestId("scene-request-after-host-loss-recovery");
@@ -3270,7 +3503,9 @@ TEST(
   ASSERT_TRUE(committed.success)
       << (committed.error.has_value() ? committed.error->message
                                       : "missing error");
-  EXPECT_EQ(replacement.calls(), 1U);
+  for (const auto &projection : replacement) {
+    EXPECT_EQ(projection->calls(), 1U);
+  }
   EXPECT_FALSE(owner.VerifyIntegrity().projection_desynchronized);
   owner.Close();
 
@@ -3383,26 +3618,38 @@ TEST(CanonicalEmptySceneOwner,
           package_root, admission.cell_id().value());
   const auto native_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-frame-resolution");
-  ASSERT_EQ(native_bindings.size(), 1U);
 
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
-  FakePlannerSceneProjection projection(native_bindings.front());
-  FakePlannerSceneProjectionResolver projection_resolver(projection);
+  std::vector<std::unique_ptr<FakePlannerSceneProjection>> projections;
+  std::vector<FakePlannerSceneProjection *> projection_clients;
+  projections.reserve(native_bindings.size());
+  projection_clients.reserve(native_bindings.size());
+  for (const auto &binding : native_bindings) {
+    projections.push_back(
+        std::make_unique<FakePlannerSceneProjection>(binding));
+    projection_clients.push_back(projections.back().get());
+  }
+  auto &projection = *projections.front();
+  FakePlannerSceneProjectionResolver projection_resolver(projection_clients);
   CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
                                  projection_resolver);
   auto active = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle,
       native_bindings, "apply-frame-resolution-native");
-  projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+  for (auto &participant : projections) {
+    participant->Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+  }
 
   const core::ComponentAttachmentRevision structural_revision(
       "component-attachment-revision-1");
-  projection.SetFrameResolution(
-      core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
-      {structural_revision});
+  for (auto &participant : projections) {
+    participant->SetFrameResolution(
+        core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
+        {structural_revision});
+  }
   auto add = AddBoxRequest(active, admission.cell_id(),
                            "scene-request-component-add");
   std::get<core::AddObjectRequestDTO>(add.operation).frame_ref =
@@ -3497,9 +3744,11 @@ TEST(CanonicalEmptySceneOwner,
                 core::ModelInstanceId("model.1"),
                 core::FrameRoleId("tool_frame")}));
 
-  projection.SetFrameResolution(
-      core::Pose3DTO{{2.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
-      {structural_revision});
+  for (auto &participant : projections) {
+    participant->SetFrameResolution(
+        core::Pose3DTO{{2.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
+        {structural_revision});
+  }
   const auto carried_pose =
       owner.GetObjectPose(core::SceneResourceId("scene-box"));
   ASSERT_TRUE(carried_pose.ok()) << carried_pose.error().message;
@@ -3508,7 +3757,77 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_DOUBLE_EQ(carried_pose.value().position_m.z_m, 3.75);
   EXPECT_EQ(projection.retained_lease_count(), 0U);
 
+  auto relative_to_carried = AddBoxRequest(
+      active, admission.cell_id(), "scene-request-relative-to-carried");
+  auto &relative_operation =
+      std::get<core::AddObjectRequestDTO>(relative_to_carried.operation);
+  relative_operation.scene_resource_id =
+      core::SceneResourceId("scene-relative-carried");
+  relative_operation.pose.position_m = {0.5, 0.5, 0.5};
+  relative_operation.frame_ref = core::SceneResourceSceneFrameRefDTO{
+      core::SceneResourceId("scene-box")};
+  const auto relative_result = owner.Commit(relative_to_carried);
+  ASSERT_TRUE(relative_result.success)
+      << (relative_result.error.has_value() ? relative_result.error->message
+                                            : "missing error");
+  ASSERT_TRUE(relative_result.committed_projection_revision.has_value());
+  active = *relative_result.committed_projection_revision;
+  snapshot = owner.LogicalSnapshot();
+  const auto relative_object = std::find_if(
+      snapshot->objects.begin(), snapshot->objects.end(), [](const auto &entry) {
+        return entry.scene_resource_id ==
+               core::SceneResourceId("scene-relative-carried");
+      });
+  ASSERT_NE(relative_object, snapshot->objects.end());
+  const auto *relative_fixed =
+      std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+          &relative_object->placement);
+  ASSERT_NE(relative_fixed, nullptr);
+  EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.x_m, 2.75);
+  EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.y_m, 2.0);
+  EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.z_m, 4.25);
+  EXPECT_EQ(projection.retained_lease_count(), 0U);
+
   const auto attachment = snapshot->carried_object_attachments.front();
+  core::SceneTransactionRequestDTO detach_current{
+      SceneRequestContext("scene-request-detach-current", active),
+      {},
+      active,
+      core::DetachCarriedObjectAtCurrentPoseRequestDTO{
+          attachment.carried_object_attachment_id,
+          attachment.carried_object_attachment_revision,
+          attachment.scene_resource_id,
+          attachment.controllable_component_id,
+          attachment.command_target_id},
+  };
+  const auto detached_current = owner.Commit(detach_current);
+  ASSERT_TRUE(detached_current.success)
+      << (detached_current.error.has_value() ? detached_current.error->message
+                                             : "missing error");
+  ASSERT_TRUE(detached_current.committed_projection_revision.has_value());
+  active = *detached_current.committed_projection_revision;
+  snapshot = owner.LogicalSnapshot();
+  ASSERT_TRUE(snapshot->carried_object_attachments.empty());
+  fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+      &snapshot->objects.front().placement);
+  ASSERT_NE(fixed, nullptr);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.x_m, 2.25);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.y_m, 1.5);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.z_m, 3.75);
+
+  auto reattach = attach;
+  reattach.request_context =
+      SceneRequestContext("scene-request-reattach-resolved", active);
+  reattach.expected_projection_revision = active;
+  const auto reattached = owner.Commit(reattach);
+  ASSERT_TRUE(reattached.success)
+      << (reattached.error.has_value() ? reattached.error->message
+                                       : "missing error");
+  ASSERT_TRUE(reattached.committed_projection_revision.has_value());
+  active = *reattached.committed_projection_revision;
+  snapshot = owner.LogicalSnapshot();
+  ASSERT_EQ(snapshot->carried_object_attachments.size(), 1U);
+
   core::SceneTransactionRequestDTO detach{
       SceneRequestContext("scene-request-detach-resolved", active),
       {},
@@ -3552,8 +3871,10 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(stale.error->details.at("reason"),
             "carrier_attachment_revision_mismatch");
 
-  projection.SetResolvedModelInstanceOverride(
-      core::ModelInstanceId("model.foreign"));
+  for (auto &participant : projections) {
+    participant->SetResolvedModelInstanceOverride(
+        core::ModelInstanceId("model.foreign"));
+  }
   auto cross_instance = AddBoxRequest(
       active, admission.cell_id(), "scene-request-cross-instance-frame");
   std::get<core::AddObjectRequestDTO>(cross_instance.operation).frame_ref =
@@ -3568,10 +3889,12 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(crossed.error->details.at("reason"),
             "scene_frame_resolution_missing_or_foreign");
 
-  projection.SetResolvedModelInstanceOverride(std::nullopt);
-  projection.RejectFrameResolution(core::ErrorDTO{
-      "missing_reference", "test retained frame is ambiguous",
-      {{"reason", "scene_frame_reference_ambiguous"}}});
+  for (auto &participant : projections) {
+    participant->SetResolvedModelInstanceOverride(std::nullopt);
+    participant->RejectFrameResolution(core::ErrorDTO{
+        "missing_reference", "test retained frame is ambiguous",
+        {{"reason", "scene_frame_reference_ambiguous"}}});
+  }
   auto ambiguous = AddBoxRequest(
       active, admission.cell_id(), "scene-request-ambiguous-frame");
   std::get<core::AddObjectRequestDTO>(ambiguous.operation).frame_ref =
@@ -3585,14 +3908,18 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(ambiguity.error->details.at("reason"),
             "scene_frame_reference_ambiguous");
 
-  EXPECT_EQ(projection.calls(), 3U);
-  EXPECT_EQ(projection.frame_resolution_calls(), 7U);
-  EXPECT_EQ(projection.policy_projection_calls(), 4U);
-  EXPECT_EQ(projection.retained_lease_count(), 0U);
+  for (std::size_t index = 0U; index < projections.size(); ++index) {
+    EXPECT_EQ(projections[index]->calls(), 6U);
+    EXPECT_EQ(projections[index]->frame_resolution_calls(),
+              index == 0U ? 10U : 9U);
+    EXPECT_EQ(projections[index]->policy_projection_calls(), 7U);
+    EXPECT_EQ(projections[index]->retained_lease_count(), 0U);
+  }
   const auto integrity = owner.VerifyIntegrity();
-  EXPECT_EQ(integrity.transaction_intent_count, 3);
-  EXPECT_EQ(integrity.request_outcome_count, 3);
-  EXPECT_EQ(integrity.projection_attempt_count, 3);
+  EXPECT_EQ(integrity.transaction_intent_count, 6);
+  EXPECT_EQ(integrity.request_outcome_count, 6);
+  EXPECT_EQ(integrity.projection_attempt_count,
+            static_cast<std::int64_t>(6U * projections.size()));
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -3606,18 +3933,18 @@ TEST(CanonicalEmptySceneOwner,
           package_root, admission.cell_id().value());
   const auto native_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-policy-resolution");
-  ASSERT_EQ(native_bindings.size(), 1U);
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-  FakePlannerSceneProjection projection(native_bindings.front());
-  FakePlannerSceneProjectionResolver projection_resolver(projection);
+  auto projections = MakeFakeProjections(native_bindings);
+  FakePlannerSceneProjectionResolver projection_resolver(
+      ProjectionClients(projections));
   CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
                                  projection_resolver);
   const auto active = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle,
       native_bindings, "apply-policy-resolution-native");
-  projection.Reset(active,
+  ResetProjections(projections, active,
                    FakePlannerSceneProjection::Mode::kCommit);
 
   auto configured = owner.LogicalSnapshot()->configured_collision_policy;
@@ -3633,17 +3960,19 @@ TEST(CanonicalEmptySceneOwner,
   };
   const auto result = owner.Commit(request);
   ASSERT_TRUE(result.success);
-  ASSERT_EQ(projection.transactions().size(), 1U);
-  const auto *resolved = std::get_if<core::ResolvedCollisionPolicyDTO>(
-      &projection.transactions().front().resolved_operation);
-  ASSERT_NE(resolved, nullptr);
-  EXPECT_EQ(resolved->configured_policy.policy_id, "strict-diagnostics");
-  EXPECT_EQ(resolved->effective_policy.policy_id, "strict-diagnostics");
-  EXPECT_EQ(resolved->configured_policy.revision.content_hash,
-            owner.LogicalSnapshot()
-                ->configured_collision_policy.revision.content_hash);
-  EXPECT_EQ(resolved->effective_policy.revision.content_hash,
-            resolved->configured_policy.revision.content_hash);
+  for (const auto &projection : projections) {
+    ASSERT_EQ(projection->transactions().size(), 1U);
+    const auto *resolved = std::get_if<core::ResolvedCollisionPolicyDTO>(
+        &projection->transactions().front().resolved_operation);
+    ASSERT_NE(resolved, nullptr);
+    EXPECT_EQ(resolved->configured_policy.policy_id, "strict-diagnostics");
+    EXPECT_EQ(resolved->effective_policy.policy_id, "strict-diagnostics");
+    EXPECT_EQ(resolved->configured_policy.revision.content_hash,
+              owner.LogicalSnapshot()
+                  ->configured_collision_policy.revision.content_hash);
+    EXPECT_EQ(resolved->effective_policy.revision.content_hash,
+              resolved->configured_policy.revision.content_hash);
+  }
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -3836,53 +4165,60 @@ TEST(CanonicalEmptySceneOwner,
           package_root, admission.cell_id().value());
   const auto native_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-scene-projection");
-  ASSERT_EQ(native_bindings.size(), 1U);
   const auto two_robot_candidate = deployment::test::
       materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto two_robot_native_bindings = NativeRuntimeBindings(
       two_robot_candidate.bundle->value(),
       "runtime-epoch-scene-projection-partial");
-  ASSERT_EQ(two_robot_native_bindings.size(), 2U);
+  ASSERT_EQ(two_robot_native_bindings.size(), 2U * native_bindings.size());
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
 
   {
     TemporaryDirectory directory("scene-projection-commit");
     ControlledPublicationReader publication_reader;
-    FakePlannerSceneProjection projection(native_bindings.front());
-    FakePlannerSceneProjectionResolver projection_resolver(projection);
+    auto projections = MakeFakeProjections(native_bindings);
+    FakePlannerSceneProjectionResolver projection_resolver(
+        ProjectionClients(projections));
     CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader, bundle_source,
                                    projection_resolver);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, "apply-native-commit");
-    projection.Reset(active,
+    ResetProjections(projections, active,
                      FakePlannerSceneProjection::Mode::kCommit);
     const auto request = AddBoxRequest(active, admission.cell_id(),
                                        "scene-request-native-commit");
     const auto result = owner.Commit(request);
     ASSERT_TRUE(result.success);
-    EXPECT_EQ(projection.calls(), 1U);
-    EXPECT_EQ(owner.VerifyIntegrity().projection_attempt_count, 1);
-    EXPECT_EQ(owner.VerifyIntegrity().projection_result_count, 1);
+    for (const auto &projection : projections) {
+      EXPECT_EQ(projection->calls(), 1U);
+    }
+    EXPECT_EQ(owner.VerifyIntegrity().projection_attempt_count,
+              static_cast<std::int64_t>(projections.size()));
+    EXPECT_EQ(owner.VerifyIntegrity().projection_result_count,
+              static_cast<std::int64_t>(projections.size()));
     const auto replay = owner.Commit(request);
     EXPECT_TRUE(replay.success);
-    EXPECT_EQ(projection.calls(), 1U);
+    for (const auto &projection : projections) {
+      EXPECT_EQ(projection->calls(), 1U);
+    }
   }
 
   {
     TemporaryDirectory directory("scene-projection-rollback");
     ControlledPublicationReader publication_reader;
-    FakePlannerSceneProjection projection(native_bindings.front());
-    FakePlannerSceneProjectionResolver projection_resolver(projection);
+    auto projections = MakeFakeProjections(native_bindings);
+    FakePlannerSceneProjectionResolver projection_resolver(
+        ProjectionClients(projections));
     CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader, bundle_source,
                                    projection_resolver);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, "apply-native-rollback");
-    projection.Reset(active,
+    ResetProjections(projections, active,
                      FakePlannerSceneProjection::Mode::kRollbackProven);
     const auto request = AddBoxRequest(active, admission.cell_id(),
                                        "scene-request-native-rollback");
@@ -3896,21 +4232,24 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_FALSE(replay.success);
     EXPECT_EQ(replay.replay_status,
               core::RequestReplayStatusDTO::kReplayedExact);
-    EXPECT_EQ(projection.calls(), 1U);
+    for (std::size_t index = 0U; index < projections.size(); ++index) {
+      EXPECT_EQ(projections[index]->calls(), index == 0U ? 1U : 0U);
+    }
   }
 
   {
     TemporaryDirectory directory("scene-projection-uncertain");
     ControlledPublicationReader publication_reader;
-    FakePlannerSceneProjection projection(native_bindings.front());
-    FakePlannerSceneProjectionResolver projection_resolver(projection);
+    auto projections = MakeFakeProjections(native_bindings);
+    FakePlannerSceneProjectionResolver projection_resolver(
+        ProjectionClients(projections));
     CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader, bundle_source,
                                    projection_resolver);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, "apply-native-uncertain");
-    projection.Reset(active,
+    ResetProjections(projections, active,
                      FakePlannerSceneProjection::Mode::kMalformed);
     const auto result = owner.Commit(
         AddBoxRequest(active, admission.cell_id(),
@@ -3928,30 +4267,27 @@ TEST(CanonicalEmptySceneOwner,
   {
     TemporaryDirectory directory("scene-projection-partial");
     ControlledPublicationReader publication_reader;
-    FakePlannerSceneProjection committed_projection(
-        two_robot_native_bindings.front());
-    FakePlannerSceneProjection rolled_back_projection(
-        two_robot_native_bindings.back());
-    FakePlannerSceneProjectionResolver projection_resolver{
-        &rolled_back_projection, &committed_projection};
+    auto projections = MakeFakeProjections(two_robot_native_bindings);
+    FakePlannerSceneProjectionResolver projection_resolver(
+        ProjectionClients(projections));
     CanonicalEmptySceneOwner owner(
         directory.path() / "logical-scene.sqlite3", admission,
         publication_reader, bundle_source, projection_resolver);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *two_robot_candidate.bundle,
         two_robot_native_bindings, "apply-native-partial");
-    committed_projection.Reset(active,
-                               FakePlannerSceneProjection::Mode::kCommit);
-    rolled_back_projection.Reset(active,
-                                 FakePlannerSceneProjection::Mode::kRollbackProven);
+    ResetProjections(projections, active,
+                     FakePlannerSceneProjection::Mode::kRollbackProven);
+    projections.front()->SetMode(FakePlannerSceneProjection::Mode::kCommit);
     const auto result = owner.Commit(
         AddBoxRequest(active, admission.cell_id(),
                       "scene-request-native-partial"));
     ASSERT_FALSE(result.success);
     EXPECT_EQ(result.projection_status,
               core::SceneProjectionCommitStatusDTO::kFailedProjectionUncertain);
-    EXPECT_EQ(committed_projection.calls(), 1U);
-    EXPECT_EQ(rolled_back_projection.calls(), 1U);
+    for (std::size_t index = 0U; index < projections.size(); ++index) {
+      EXPECT_EQ(projections[index]->calls(), index < 2U ? 1U : 0U);
+    }
     const auto integrity = owner.VerifyIntegrity();
     EXPECT_EQ(integrity.projection_attempt_count, 2);
     EXPECT_EQ(integrity.projection_result_count, 2);
@@ -3961,20 +4297,17 @@ TEST(CanonicalEmptySceneOwner,
   {
     TemporaryDirectory directory("scene-frame-multi-projection-errors");
     ControlledPublicationReader publication_reader;
-    FakePlannerSceneProjection first_projection(
-        two_robot_native_bindings.front());
-    FakePlannerSceneProjection second_projection(
-        two_robot_native_bindings.back());
-    FakePlannerSceneProjectionResolver projection_resolver{
-        &first_projection, &second_projection};
+    auto projections = MakeFakeProjections(two_robot_native_bindings);
+    FakePlannerSceneProjectionResolver projection_resolver(
+        ProjectionClients(projections));
     CanonicalEmptySceneOwner owner(
         directory.path() / "logical-scene.sqlite3", admission,
         publication_reader, bundle_source, projection_resolver);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *two_robot_candidate.bundle,
         two_robot_native_bindings, "apply-frame-multi-projection-errors");
-    first_projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
-    second_projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+    ResetProjections(projections, active,
+                     FakePlannerSceneProjection::Mode::kCommit);
 
     auto request = AddBoxRequest(active, admission.cell_id(),
                                  "scene-request-stale-frame-owner");
@@ -3985,7 +4318,7 @@ TEST(CanonicalEmptySceneOwner,
                 .controllable_component_id,
             core::ModelInstanceId("model.owner"),
             core::FrameRoleId("tool_frame")};
-    first_projection.RejectFrameResolution(core::ErrorDTO{
+    projections.front()->RejectFrameResolution(core::ErrorDTO{
         "stale_revision", "test owner state is stale",
         {{"reason", "kinematic_state_view_stale"}}});
     const auto stale = owner.Commit(request);
@@ -3994,15 +4327,15 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_EQ(stale.error->code, "stale_revision");
     EXPECT_EQ(stale.error->details.at("reason"),
               "kinematic_state_view_stale");
-    EXPECT_EQ(first_projection.calls(), 0U);
-    EXPECT_EQ(second_projection.calls(), 0U);
-    EXPECT_EQ(first_projection.retained_lease_count(), 0U);
-    EXPECT_EQ(second_projection.retained_lease_count(), 0U);
+    for (const auto &projection : projections) {
+      EXPECT_EQ(projection->calls(), 0U);
+      EXPECT_EQ(projection->retained_lease_count(), 0U);
+    }
     EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 0);
 
-    first_projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
-    second_projection.Reset(active, FakePlannerSceneProjection::Mode::kCommit);
-    first_projection.RejectFrameResolution(core::ErrorDTO{
+    ResetProjections(projections, active,
+                     FakePlannerSceneProjection::Mode::kCommit);
+    projections.front()->RejectFrameResolution(core::ErrorDTO{
         "missing_reference", "test projection does not own this frame",
         {{"reason", "scene_frame_reference_missing"}}});
     request.request_context = SceneRequestContext(
@@ -4012,10 +4345,10 @@ TEST(CanonicalEmptySceneOwner,
         << (resolved_by_owner.error.has_value()
                 ? resolved_by_owner.error->message
                 : "missing error");
-    EXPECT_EQ(first_projection.calls(), 1U);
-    EXPECT_EQ(second_projection.calls(), 1U);
-    EXPECT_EQ(first_projection.retained_lease_count(), 0U);
-    EXPECT_EQ(second_projection.retained_lease_count(), 0U);
+    for (const auto &projection : projections) {
+      EXPECT_EQ(projection->calls(), 1U);
+      EXPECT_EQ(projection->retained_lease_count(), 0U);
+    }
   }
 }
 
@@ -4073,13 +4406,13 @@ TEST(CanonicalEmptySceneOwner,
             package_root, native_admission.cell_id().value());
     const auto native_bindings = NativeRuntimeBindings(
         candidate.bundle->value(), "runtime-epoch-scene-recovery");
-    ASSERT_EQ(native_bindings.size(), 1U);
     TemporaryDirectory directory("scene-native-recovery");
     const auto database_path = directory.path() / "logical-scene.sqlite3";
     ControlledPublicationReader publication_reader;
     deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-    FakePlannerSceneProjection projection(native_bindings.front());
-    FakePlannerSceneProjectionResolver projection_resolver(projection);
+    auto projections = MakeFakeProjections(native_bindings);
+    FakePlannerSceneProjectionResolver projection_resolver(
+        ProjectionClients(projections));
     {
       CanonicalEmptySceneOwner owner(database_path, native_admission,
                                      publication_reader, bundle_source,
@@ -4087,7 +4420,7 @@ TEST(CanonicalEmptySceneOwner,
       const auto active = FinalizeNativeCandidate(
           owner, publication_reader, native_admission, *candidate.bundle,
           native_bindings, "apply-native-recovery");
-      projection.Reset(active,
+      ResetProjections(projections, active,
                        FakePlannerSceneProjection::Mode::kCommit);
       const auto committed = owner.Commit(
           AddBoxRequest(active, native_admission.cell_id(),
@@ -4119,7 +4452,8 @@ TEST(CanonicalEmptySceneOwner,
     const auto integrity = recovered.VerifyIntegrity();
     EXPECT_TRUE(integrity.projection_desynchronized);
     EXPECT_EQ(integrity.request_outcome_count, 1);
-    EXPECT_EQ(integrity.projection_attempt_count, 1);
+    EXPECT_EQ(integrity.projection_attempt_count,
+              static_cast<std::int64_t>(projections.size()));
     EXPECT_EQ(integrity.projection_result_count, 0);
     EXPECT_FALSE(recovered.ReadAccessStatus().scene_writes_open);
     EXPECT_THROW(recovered.LogicalSnapshot(),

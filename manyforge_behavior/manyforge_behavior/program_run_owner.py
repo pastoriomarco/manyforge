@@ -331,28 +331,29 @@ class ProgramRunOwner:
                 owner_identities=owner_identities,
             )
             context_port = self._ports.program_run_context
+            initialization_port = self._ports.program_run_initialization
             context_bound = False
+            initialization_started = False
+            port_context = ProgramRunPortContext(
+                program_run_id=capture.program_run_id,
+                scenario_id=capture.scenario_id,
+                scenario_catalog_revision=capture.scenario_catalog_revision,
+                program_id=capture.program_id,
+                program_revision=capture.program_revision,
+                program_binding_id=capture.program_binding_id,
+                retained_bundle_id=capture.retained_bundle_id,
+                graph_revision=capture.graph_revision,
+                node_environment_digest=capture.node_environment_digest,
+                program_binding=admission.program_binding,
+            )
             try:
                 if context_port is not None:
-                    context_port.bind(
-                        ProgramRunPortContext(
-                            program_run_id=capture.program_run_id,
-                            scenario_id=capture.scenario_id,
-                            scenario_catalog_revision=(
-                                capture.scenario_catalog_revision
-                            ),
-                            program_id=capture.program_id,
-                            program_revision=capture.program_revision,
-                            program_binding_id=capture.program_binding_id,
-                            retained_bundle_id=capture.retained_bundle_id,
-                            graph_revision=capture.graph_revision,
-                            node_environment_digest=(
-                                capture.node_environment_digest
-                            ),
-                            program_binding=admission.program_binding,
-                        )
-                    )
+                    context_port.bind(port_context)
                     context_bound = True
+                if initialization_port is not None:
+                    initialization_started = True
+                    initial_scene = admission.program.to_dict().get("scene", [])
+                    initialization_port.initialize(port_context, initial_scene)
                 run = ExecutableProgramRun(
                     program=admission.program,
                     environment=admission.environment,
@@ -362,8 +363,12 @@ class ProgramRunOwner:
                     program_parameter_values=admission.program_parameter_values,
                 )
             except Exception:
-                if context_bound and context_port is not None:
-                    context_port.unbind(program_run_id)
+                try:
+                    if initialization_started and initialization_port is not None:
+                        initialization_port.release(program_run_id)
+                finally:
+                    if context_bound and context_port is not None:
+                        context_port.unbind(program_run_id)
                 raise
             entry = _RunEntry(run=run)
             self._runs[program_run_id] = entry

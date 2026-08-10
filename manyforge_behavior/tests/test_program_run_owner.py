@@ -7,6 +7,8 @@ from pathlib import Path
 from threading import Event, Thread
 from typing import Any
 
+import pytest
+
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
@@ -108,6 +110,28 @@ class _ContextPort:
         self.unbound.append(program_run_id)
 
 
+class _InitializationPort:
+    def __init__(self, events: list[str], *, fail: bool = False) -> None:
+        self.events = events
+        self.fail = fail
+        self.scenes: list[list[dict[str, object]]] = []
+        self.released: list[str] = []
+
+    def initialize(
+        self,
+        _context: ProgramRunPortContext,
+        initial_scene,
+    ) -> None:
+        self.events.append("scene_initialize")
+        self.scenes.append([dict(row) for row in initial_scene])
+        if self.fail:
+            raise RuntimeError("scene initialization rejected")
+
+    def release(self, program_run_id: str) -> None:
+        self.events.append("scene_release")
+        self.released.append(program_run_id)
+
+
 class _BlockingTaskPort(_TaskPort):
     def __init__(
         self,
@@ -206,10 +230,13 @@ def _fixture(
     initial_task_state: OwnerTaskState,
     task_factory: Callable[[list[str]], _TaskPort] | None = None,
     context_port: _ContextPort | None = None,
+    initialization_port: _InitializationPort | None = None,
 ) -> tuple[ProgramRunOwner, ProgramRunAdmission, _TaskPort, _ScopePort, list[str]]:
     events: list[str] = []
     if context_port is not None:
         context_port.events = events
+    if initialization_port is not None:
+        initialization_port.events = events
     task = (
         _TaskPort(events, initial_task_state)
         if task_factory is None
@@ -227,6 +254,7 @@ def _fixture(
         kernel_controls=invocation,
         program_run_scope=scope,
         program_run_context=context_port,
+        program_run_initialization=initialization_port,
     )
     environment = build_node_environment()
     program = Program(
@@ -313,6 +341,50 @@ def test_start_binds_exact_client_context_before_tree_construction() -> None:
     assert context.program_run_id == started.capture.program_run_id
     assert context.program_binding_id == admission.program_binding_id
     assert context.program_binding["program_id"] == admission.program.program_id
+
+
+def test_start_initializes_scene_after_context_and_before_tree_construction() -> None:
+    events: list[str] = []
+    context_port = _ContextPort(events)
+    initialization_port = _InitializationPort(events)
+    owner, admission, task, _scope, fixture_events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        context_port=context_port,
+        initialization_port=initialization_port,
+    )
+
+    started = owner.start(admission)
+
+    assert fixture_events == ["context_bind", "scene_initialize"]
+    assert task.starts == 0
+    assert [row["scene_resource_id"] for row in initialization_port.scenes[0]] == [
+        "table"
+    ]
+    owner.advance_once(started.capture.program_run_id)
+    assert fixture_events[2:] == ["leaf_start", "leaf_acknowledge"]
+
+
+def test_rejected_scene_initialization_prevents_tree_and_releases_context() -> None:
+    events: list[str] = []
+    context_port = _ContextPort(events)
+    initialization_port = _InitializationPort(events, fail=True)
+    owner, admission, task, _scope, fixture_events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        context_port=context_port,
+        initialization_port=initialization_port,
+    )
+
+    with pytest.raises(RuntimeError, match="scene initialization rejected"):
+        owner.start(admission)
+
+    assert fixture_events == [
+        "context_bind",
+        "scene_initialize",
+        "scene_release",
+        "context_unbind",
+    ]
+    assert task.starts == 0
+    assert initialization_port.released == ["program-run-1"]
 
 
 def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof() -> (

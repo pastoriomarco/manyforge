@@ -15,15 +15,46 @@
 
 namespace manyforge::core {
 
+/// Transaction-local reference to another logical scene resource. It is
+/// resolved by the scene owner against the exact compare-and-commit snapshot
+/// and is never persisted as object placement truth.
+struct SceneResourceSceneFrameRefDTO final {
+  SceneResourceId scene_resource_id;
+};
+
+using SceneTransactionFrameRefDTO =
+    std::variant<CellSceneFrameRefDTO, ComponentSceneFrameRefDTO,
+                 PassiveModelSceneFrameRefDTO, SceneResourceSceneFrameRefDTO>;
+
+/// Widen one persistable native scene-frame reference into the request-local
+/// frame vocabulary without changing its meaning.
+[[nodiscard]] inline SceneTransactionFrameRefDTO
+ToSceneTransactionFrameRef(const SceneFrameRefDTO &frame) {
+  return std::visit(
+      [](const auto &value) -> SceneTransactionFrameRefDTO { return value; },
+      frame);
+}
+
 /// Public request to add one portable scene resource.
 struct AddObjectRequestDTO final {
   SceneResourceId scene_resource_id;
   CollisionShapeDTO shape;
   Pose3DTO pose;
-  SceneFrameRefDTO frame_ref;
+  SceneTransactionFrameRefDTO frame_ref;
   /// Backend-neutral object-to-object support declarations. The scene owner
   /// resolves these portable resource ids to instance-scoped collision bodies;
   /// callers never author planner-native body names here.
+  std::vector<SupportContactDTO> support_contacts{};
+};
+
+/// Public request to create or completely replace one portable scene
+/// resource. Unlike UpdateObjectPoseRequestDTO, this operation replaces the
+/// authored shape and support declarations and clears provider evidence.
+struct UpsertObjectRequestDTO final {
+  SceneResourceId scene_resource_id;
+  CollisionShapeDTO shape;
+  Pose3DTO pose;
+  SceneTransactionFrameRefDTO frame_ref;
   std::vector<SupportContactDTO> support_contacts{};
 };
 
@@ -36,7 +67,7 @@ struct RemoveObjectRequestDTO final {
 struct UpdateObjectPoseRequestDTO final {
   SceneResourceId scene_resource_id;
   Pose3DTO pose;
-  SceneFrameRefDTO frame_ref;
+  SceneTransactionFrameRefDTO frame_ref;
   std::optional<SceneObjectProviderEvidenceDTO> provider_evidence;
   std::optional<bool> expected_attached;
 };
@@ -55,7 +86,18 @@ struct DetachCarriedObjectRequestDTO final {
   CarriedObjectAttachmentId carried_object_attachment_id;
   CarriedObjectAttachmentRevision expected_carried_object_attachment_revision;
   Pose3DTO pose;
-  SceneFrameRefDTO frame_ref;
+  SceneTransactionFrameRefDTO frame_ref;
+};
+
+/// Detach one carried object at its current resolved world pose. This is the
+/// bounded Program-node meaning of "detach here"; the scene owner resolves the
+/// retained carrier frame under the same compare-and-commit transaction.
+struct DetachCarriedObjectAtCurrentPoseRequestDTO final {
+  CarriedObjectAttachmentId carried_object_attachment_id;
+  CarriedObjectAttachmentRevision expected_carried_object_attachment_revision;
+  SceneResourceId expected_scene_resource_id;
+  ControllableComponentId expected_controllable_component_id;
+  CommandTargetId expected_command_target_id;
 };
 
 struct SetCollisionPolicyRequestDTO final {
@@ -64,8 +106,9 @@ struct SetCollisionPolicyRequestDTO final {
 };
 
 using SceneOperationRequestDTO =
-    std::variant<AddObjectRequestDTO, RemoveObjectRequestDTO, UpdateObjectPoseRequestDTO,
-                 AttachCarriedObjectRequestDTO, DetachCarriedObjectRequestDTO,
+    std::variant<AddObjectRequestDTO, UpsertObjectRequestDTO, RemoveObjectRequestDTO,
+                 UpdateObjectPoseRequestDTO, AttachCarriedObjectRequestDTO,
+                 DetachCarriedObjectRequestDTO, DetachCarriedObjectAtCurrentPoseRequestDTO,
                  SetCollisionPolicyRequestDTO>;
 
 struct SceneTransactionRequestDTO final {

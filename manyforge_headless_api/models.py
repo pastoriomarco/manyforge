@@ -335,6 +335,29 @@ SceneFrameRequest = Annotated[
 ]
 
 
+class SceneResourceSceneFrameRequest(StrictRequest):
+    kind: Literal["scene_resource"]
+    scene_resource_id: str
+
+    @field_validator("scene_resource_id")
+    @classmethod
+    def validate_scene_resource_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="scene_resource_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+SceneTransactionFrameRequest = Annotated[
+    CellSceneFrameRequest
+    | ComponentSceneFrameRequest
+    | PassiveModelSceneFrameRequest
+    | SceneResourceSceneFrameRequest,
+    Field(discriminator="kind"),
+]
+
+
 class CollisionPairRequest(StrictRequest):
     body_a: str
     body_b: str
@@ -574,7 +597,7 @@ class AddSceneObjectRequest(StrictRequest):
     scene_resource_id: str
     shape: CollisionShapeRequest
     pose: Pose3Request
-    frame_ref: SceneFrameRequest
+    frame_ref: SceneTransactionFrameRequest
     support_contacts: Annotated[
         list[SceneSupportContactRequest], Field(max_length=4096)
     ] = Field(default_factory=list)
@@ -609,6 +632,10 @@ class AddSceneObjectRequest(StrictRequest):
         return self
 
 
+class UpsertSceneObjectRequest(AddSceneObjectRequest):
+    kind: Literal["upsert_object"]
+
+
 class RemoveSceneObjectRequest(StrictRequest):
     kind: Literal["remove_object"]
     scene_resource_id: str
@@ -627,7 +654,7 @@ class UpdateSceneObjectPoseRequest(StrictRequest):
     kind: Literal["update_object_pose"]
     scene_resource_id: str
     pose: Pose3Request
-    frame_ref: SceneFrameRequest
+    frame_ref: SceneTransactionFrameRequest
     # Provider-backed ingress requires a separately configured trusted
     # provider adapter so received_at_ns cannot be forged by an open caller.
     provider_evidence: None = None
@@ -696,11 +723,37 @@ class DetachCarriedObjectRequest(StrictRequest):
         str, Field(pattern=SHA256_PATTERN)
     ]
     pose: Pose3Request
-    frame_ref: SceneFrameRequest
+    frame_ref: SceneTransactionFrameRequest
 
     @field_validator(
         "carried_object_attachment_id",
         "expected_carried_object_attachment_revision",
+    )
+    @classmethod
+    def validate_attachment_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class DetachCarriedObjectAtCurrentPoseRequest(StrictRequest):
+    kind: Literal["detach_carried_object_at_current_pose"]
+    carried_object_attachment_id: str
+    expected_carried_object_attachment_revision: Annotated[
+        str, Field(pattern=SHA256_PATTERN)
+    ]
+    expected_scene_resource_id: str
+    expected_controllable_component_id: str
+    expected_command_target_id: str
+
+    @field_validator(
+        "carried_object_attachment_id",
+        "expected_carried_object_attachment_revision",
+        "expected_scene_resource_id",
+        "expected_controllable_component_id",
+        "expected_command_target_id",
     )
     @classmethod
     def validate_attachment_identity(cls, value: str, info) -> str:
@@ -719,10 +772,12 @@ class SetCollisionPolicyRequest(StrictRequest):
 
 SceneOperationRequest = Annotated[
     AddSceneObjectRequest
+    | UpsertSceneObjectRequest
     | RemoveSceneObjectRequest
     | UpdateSceneObjectPoseRequest
     | AttachCarriedObjectRequest
     | DetachCarriedObjectRequest
+    | DetachCarriedObjectAtCurrentPoseRequest
     | SetCollisionPolicyRequest,
     Field(discriminator="kind"),
 ]
