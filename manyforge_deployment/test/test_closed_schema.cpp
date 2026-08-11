@@ -495,10 +495,14 @@ definitions:
 TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   const auto& registry = build_qualified_closed_schema_registry();
   ASSERT_EQ(registry.catalog_schemas().size(), core::kCatalogRecordTypeRegistry.size());
-  ASSERT_EQ(registry.value_schemas().size(), 3U);
+  ASSERT_EQ(registry.value_schemas().size(), 4U);
   for (const auto& value_schema : registry.value_schemas()) {
-    EXPECT_EQ(value_schema.compiled_schema().root_shape(),
-              ClosedSchemaRootShape::kObject);
+    const auto expected_shape =
+        value_schema.schema_id().value() ==
+                "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
+            ? ClosedSchemaRootShape::kTaggedUnion
+            : ClosedSchemaRootShape::kObject;
+    EXPECT_EQ(value_schema.compiled_schema().root_shape(), expected_shape);
   }
   std::size_t qualified_count = 0U;
   for (const auto& entry : registry.catalog_schemas()) {
@@ -570,7 +574,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kQualified);
       ASSERT_NE(entry.compiled_schema(), nullptr);
       EXPECT_EQ(entry.compiled_schema()->schema_revision().value(),
-                "sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2");
+                "sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -626,12 +630,18 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   }
   EXPECT_EQ(qualified_count, 9U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
-            "sha256:06b8e59ea852353aa1603898694a55175416c184ed987bb47388a4a57a26c118");
+            "sha256:04be79547db2bb64f9354fd2493526df785e4385264eb033b1820adbd22ca1ab");
   EXPECT_NE(registry.find_qualified_value_schema(
                 core::SchemaId(
                     "manyforge.value_schema.provider_contract.empty.v1"),
                 core::SchemaRevision(
                     "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270")),
+            nullptr);
+  EXPECT_NE(registry.find_qualified_value_schema(
+                core::SchemaId(
+                    "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"),
+                core::SchemaRevision(
+                    "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd")),
             nullptr);
   EXPECT_NE(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.value_schema.runtime.empty.v1"),
@@ -961,7 +971,7 @@ TEST(ClosedSchema, EveryPackagedYamlResourcePassesStrictUniqueKeyIngress) {
         << relative_path;
     ++parsed_count;
   }
-  EXPECT_EQ(parsed_count, 16U);
+  EXPECT_EQ(parsed_count, 17U);
 }
 
 TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjections) {
@@ -1164,9 +1174,9 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
             "catalog/manyforge.runtime_profile.v1.yaml";
       } else {
         expected_revision =
-            "sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2";
+            "sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970";
         expected_path =
-            "catalog/manyforge.stop_evidence_policy.v1.yaml";
+            "catalog/manyforge.stop_evidence_policy.v2.yaml";
       }
       EXPECT_EQ(
           std::get<std::string>(member(projected, "schema_revision").storage()),
@@ -1206,10 +1216,11 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
       "catalog/manyforge.model_asset.v1.yaml",
       "catalog/manyforge.provider_manifest.v1.yaml",
       "catalog/manyforge.runtime_profile.v1.yaml",
-      "catalog/manyforge.stop_evidence_policy.v1.yaml",
+      "catalog/manyforge.stop_evidence_policy.v2.yaml",
       "examples/manyforge.closed_schema.example_command.v1.yaml",
       "examples/manyforge.closed_schema.example_inventory.v1.yaml",
       "value/manyforge.value_schema.provider_contract.empty.v1.yaml",
+      "value/manyforge.value_schema.provider_contract.motion_controlled_stop.v1.yaml",
       "value/manyforge.value_schema.runtime.empty.v1.yaml",
       "value/manyforge.value_schema.runtime.native_execution.v1.yaml",
   };

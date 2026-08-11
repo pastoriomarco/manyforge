@@ -112,15 +112,20 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ControlBindingId);
   MANYFORGE_BIND_STRONG_STRING(ControlBindingRevision);
   MANYFORGE_BIND_STRONG_STRING(ActiveControlConfigurationId);
+  MANYFORGE_BIND_STRONG_STRING(ResolvedStopBasePlanId);
   MANYFORGE_BIND_STRONG_STRING(EndpointRoleId);
   MANYFORGE_BIND_STRONG_STRING(StateAuthorityId);
   MANYFORGE_BIND_STRONG_STRING(StopEvidencePolicyId);
   MANYFORGE_BIND_STRONG_STRING(StopEvidencePolicyRevision);
+  MANYFORGE_BIND_STRONG_STRING(StopEscalationStageId);
   MANYFORGE_BIND_STRONG_STRING(StopBudgetPhaseId);
   MANYFORGE_BIND_STRONG_STRING(StopEvidenceItemId);
   MANYFORGE_BIND_STRONG_STRING(ProviderContractRoleId);
   MANYFORGE_BIND_STRONG_STRING(RegisteredStopCommandKindId);
   MANYFORGE_BIND_STRONG_STRING(RegisteredStopEvidenceKindId);
+  MANYFORGE_BIND_STRONG_STRING(CommissionedStopInterfaceId);
+  MANYFORGE_BIND_STRONG_STRING(CommissionedStopInterfaceRevision);
+  MANYFORGE_BIND_STRONG_STRING(StopInvocationLaneId);
   MANYFORGE_BIND_STRONG_STRING(ContactPolicyId);
   MANYFORGE_BIND_STRONG_STRING(ContactPolicyRevision);
 
@@ -136,6 +141,10 @@ void register_strong_identity_bindings(py::module_& module) {
 
   MANYFORGE_BIND_STRONG_STRING(DeploymentArtifactId);
   MANYFORGE_BIND_STRONG_STRING(DeploymentRevision);
+  MANYFORGE_BIND_STRONG_STRING(ProductId);
+  MANYFORGE_BIND_STRONG_STRING(ProductContractId);
+  MANYFORGE_BIND_STRONG_STRING(ProductContractRevision);
+  MANYFORGE_BIND_STRONG_STRING(ArtifactRoleId);
 
   MANYFORGE_BIND_STRONG_STRING(ComponentAttachmentId);
   MANYFORGE_BIND_STRONG_STRING(ComponentAttachmentRevision);

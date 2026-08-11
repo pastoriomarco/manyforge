@@ -10,6 +10,7 @@
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
+#include <manyforge_core/types/stop_control.hpp>
 #include <manyforge_deployment/apply_fence_qualification.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_applicability.hpp>
@@ -189,6 +190,14 @@ constexpr posix::ReadMessages kReadOnlyManifestReadMessages{
          std::string(name));
   }
   return found->second;
+}
+
+[[nodiscard]] const CanonicalValue* find_member(
+    const CanonicalValue::Object& object, std::string_view name) {
+  const auto found = std::find_if(
+      object.begin(), object.end(),
+      [name](const auto& member) { return member.first == name; });
+  return found == object.end() ? nullptr : &found->second;
 }
 
 void require_exact_fields(
@@ -574,6 +583,7 @@ struct LimitRow final {
        static_cast<std::uint64_t>(
            core::kMaxStopEvidencePolicyDurationNs)},
       {"stop_evidence.items", core::kMaxStopEvidencePolicyItems},
+      {"stop_evidence.stages", core::kMaxStopEscalationStages},
   };
   std::sort(rows.begin(), rows.end(),
             [](const auto& lhs, const auto& rhs) {
@@ -732,6 +742,34 @@ struct IdentityContractRow final {
   return CanonicalValue(std::move(values));
 }
 
+[[nodiscard]] CanonicalValue registered_stop_command_registry() {
+  CanonicalValue::Array rows;
+  const auto definitions = core::registered_stop_command_definitions();
+  rows.reserve(definitions.size());
+  for (const auto& definition : definitions) {
+    CanonicalValue::Object row{
+        {"registered_command_kind_id",
+         CanonicalValue(definition.registered_command_kind_id.value())},
+        {"stop_action_class",
+         CanonicalValue(
+             std::string(core::to_string(definition.stop_action_class)))},
+    };
+    if (definition.safety_system_request_action_class.has_value()) {
+      row.emplace_back(
+          "safety_system_request_action_class",
+          CanonicalValue(std::string(core::to_string(
+              *definition.safety_system_request_action_class))));
+    }
+    rows.emplace_back(std::move(row));
+  }
+  const CanonicalValue canonical_rows(std::move(rows));
+  return CanonicalValue(CanonicalValue::Object{
+      {"content_digest",
+       CanonicalValue(sha256_digest(canonical_json(canonical_rows)))},
+      {"rows", canonical_rows},
+  });
+}
+
 [[nodiscard]] CanonicalValue compiler_contract_candidate(
     std::string_view own_digest) {
   const auto& schemas = build_qualified_closed_schema_registry();
@@ -757,7 +795,7 @@ struct IdentityContractRow final {
            "manyforge.retained_bundle.v1",
            "manyforge.runtime_profile.v1",
            "manyforge.site_overlay.v1",
-           "manyforge.stop_evidence_policy.v1",
+           "manyforge.stop_evidence_policy.v2",
        }))},
       {"schema_registry",
        CanonicalValue(CanonicalValue::Object{
@@ -772,6 +810,8 @@ struct IdentityContractRow final {
            {"normalized_registry", schemas.normalized_projection()},
        })},
       {"product_contract_registry", product_contract_registry()},
+      {"registered_stop_command_registry",
+       registered_stop_command_registry()},
       {"content_identity_contracts", content_identity_contracts()},
       {"source_media_contract", source_media_contract()},
       {"resource_limits", resource_limits()},
@@ -848,7 +888,10 @@ struct IdentityContractRow final {
            {"assistant",
             CanonicalValue("absent-empty-or-closed-audit-prompt-endpoint-provider-mode-"
                            "projection")},
-           {"policies", CanonicalValue("reject-if-present")},
+           {"policies",
+            CanonicalValue(
+                "closed-stop-stage-parameters-and-commissioned-interfaces;"
+                "other-policy-tables-empty")},
            {"compatibility", CanonicalValue("closed-lane-provides-tags-metadata")},
            {"i3_retention_subset",
             CanonicalValue(
@@ -1337,6 +1380,68 @@ void require_compiler_contract_nested_shapes(
                      "compiler_contract_manifest.schema_registry"),
       "compiler_contract_manifest.schema_registry.normalized_registry");
 
+  const std::string stop_registry_field =
+      "compiler_contract_manifest.registered_stop_command_registry";
+  const auto& stop_registry = require_object(
+      require_member(root, "registered_stop_command_registry",
+                     "compiler_contract_manifest"),
+      stop_registry_field);
+  require_exact_fields(stop_registry, {"content_digest", "rows"},
+                       stop_registry_field);
+  const auto& stop_rows_value = require_member(
+      stop_registry, "rows", stop_registry_field);
+  const auto& stop_rows = require_array(
+      stop_rows_value, stop_registry_field + ".rows",
+      detail::kMaximumCompilerContractRows, false);
+  std::string previous_stop_id;
+  for (std::size_t index = 0U; index < stop_rows.size(); ++index) {
+    const std::string row_field = stop_registry_field + ".rows[" +
+                                  std::to_string(index) + "]";
+    const auto& row = require_object(stop_rows[index], row_field);
+    const auto* safety_class =
+        find_member(row, "safety_system_request_action_class");
+    require_exact_fields(
+        row,
+        safety_class == nullptr
+            ? std::initializer_list<std::string_view>{
+                  "registered_command_kind_id", "stop_action_class"}
+            : std::initializer_list<std::string_view>{
+                  "registered_command_kind_id", "stop_action_class",
+                  "safety_system_request_action_class"},
+        row_field);
+    const std::string& id = require_text(
+        require_member(row, "registered_command_kind_id", row_field),
+        row_field + ".registered_command_kind_id");
+    const std::string& action = require_text(
+        require_member(row, "stop_action_class", row_field),
+        row_field + ".stop_action_class");
+    if (!previous_stop_id.empty() && previous_stop_id >= id) {
+      fail(stop_registry_field + ".rows is not canonical and unique");
+    }
+    previous_stop_id = id;
+    if (action == "safety_system_request") {
+      if (safety_class == nullptr) {
+        fail(row_field + " omits its required safety action class");
+      }
+      const std::string& value = require_text(
+          *safety_class,
+          row_field + ".safety_system_request_action_class");
+      if (value != "protective_stop_request" &&
+          value != "emergency_stop_request") {
+        fail(row_field + " has an unknown safety action class");
+      }
+    } else if ((action != "controlled" && action != "software_hard") ||
+               safety_class != nullptr) {
+      fail(row_field + " has an invalid action-class presence matrix");
+    }
+  }
+  const std::string& stop_registry_digest = require_digest(
+      require_member(stop_registry, "content_digest", stop_registry_field),
+      stop_registry_field + ".content_digest");
+  if (stop_registry_digest != sha256_digest(canonical_json(stop_rows_value))) {
+    fail(stop_registry_field + " digest does not match its canonical rows");
+  }
+
   const auto& product_contracts = require_array(
       require_member(root, "product_contract_registry",
                      "compiler_contract_manifest"),
@@ -1679,6 +1784,7 @@ void require_compiler_contract_shape(const CanonicalValue& candidate) {
       root,
       {"api_version", "compiler_contract_digest", "supported_apis",
        "schema_registry", "product_contract_registry",
+       "registered_stop_command_registry",
        "content_identity_contracts", "source_media_contract",
        "resource_limits", "composition_contract",
        "accepted_deployment_subset", "retained_projection_contract"},
@@ -1705,6 +1811,7 @@ void require_compiler_contract_shape(const CanonicalValue& candidate) {
   }
   for (const std::string_view object_name :
        {"schema_registry", "source_media_contract",
+        "registered_stop_command_registry",
         "composition_contract", "accepted_deployment_subset",
         "retained_projection_contract"}) {
     (void)require_object(
@@ -1919,6 +2026,13 @@ BuildQualifiedRetentionAuthority::qualify_candidate(
 
 BuildQualifiedRetentionContext
 BuildQualifiedRetentionAuthority::qualify() {
+  return qualify({});
+}
+
+BuildQualifiedRetentionContext
+BuildQualifiedRetentionAuthority::qualify(
+    std::span<const StopQualificationEvidenceCandidate>
+        stop_evidence_candidates) {
   const auto node = qualify_candidate(
       BuildManifestKind::kNodeEnvironment,
       current_build_manifest_candidate(
@@ -1948,13 +2062,23 @@ BuildQualifiedRetentionAuthority::qualify() {
       node, contract, build};
   return BuildQualifiedRetentionContext(
       retained_environment, contract->key().content_digest,
-      build->key().content_digest, std::move(manifests));
+      build->key().content_digest, std::move(manifests),
+      qualify_stop_evidence(stop_evidence_candidates));
 }
 
 BuildQualifiedRetentionContext
 BuildQualifiedRetentionAuthority::qualify_persisted(
     IBuildManifestRepository& repository) {
-  const BuildQualifiedRetentionContext current = qualify();
+  return qualify_persisted(repository, {});
+}
+
+BuildQualifiedRetentionContext
+BuildQualifiedRetentionAuthority::qualify_persisted(
+    IBuildManifestRepository& repository,
+    std::span<const StopQualificationEvidenceCandidate>
+        stop_evidence_candidates) {
+  const BuildQualifiedRetentionContext current =
+      qualify(stop_evidence_candidates);
   if (current.manifests().size() != 3U) {
     throw std::logic_error(
         "production retention authority omitted a required manifest");
@@ -1983,7 +2107,7 @@ BuildQualifiedRetentionAuthority::qualify_persisted(
       reloaded_manifests[2]->key().content_digest;
   return BuildQualifiedRetentionContext(
       retained_environment, compiler_contract_digest, compiler_build_digest,
-      std::move(reloaded_manifests));
+      std::move(reloaded_manifests), current.stop_evidence());
 }
 
 BuildQualifiedRetentionContext
@@ -2067,6 +2191,25 @@ BuildManifestTestAccess::qualify_candidates(
       retained_node_environment_from_manifest(*node),
       contract->key().content_digest, build->key().content_digest,
       std::move(manifests));
+}
+
+BuildQualifiedRetentionContext
+BuildManifestTestAccess::qualify_persisted_with_test_stop_build_identity(
+    IBuildManifestRepository& repository,
+    std::string_view canonical_build_identity_bytes) {
+  const auto current =
+      BuildQualifiedRetentionAuthority::qualify_persisted(repository);
+  std::vector<std::shared_ptr<const BuildQualifiedManifest>> manifests(
+      current.manifests().begin(), current.manifests().end());
+  std::vector<StopImplementationBuildIdentity> identities;
+  identities.push_back(parse_stop_implementation_build_identity(
+      canonical_build_identity_bytes));
+  BuildQualifiedStopEvidenceClosure stop_evidence(
+      std::nullopt, {}, std::nullopt, {}, std::move(identities));
+  return BuildQualifiedRetentionContext(
+      current.node_environment(), current.compiler_contract_digest(),
+      current.compiler_build_digest(), std::move(manifests),
+      std::move(stop_evidence));
 }
 
 std::shared_ptr<const RetainedBundle>

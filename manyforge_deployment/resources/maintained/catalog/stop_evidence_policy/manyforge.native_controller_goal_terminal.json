@@ -1,11 +1,5 @@
 {
-  "api_version": "manyforge.stop_evidence_policy.v1",
-  "containment_command": {
-    "command": {
-      "command_kind": "controller_goal_cancel"
-    },
-    "command_phase_id": "command"
-  },
+  "api_version": "manyforge.stop_evidence_policy.v2",
   "containment_granularity": "resource",
   "deadline_budget": {
     "kernel_completion_reserve_ns": 100000000,
@@ -16,29 +10,96 @@
         "phase_id": "command"
       },
       {
-        "deadline_offset_ns": 1900000000,
+        "deadline_offset_ns": 1000000000,
         "phase_id": "terminal"
+      },
+      {
+        "deadline_offset_ns": 1200000000,
+        "phase_id": "hard_command"
+      },
+      {
+        "deadline_offset_ns": 1900000000,
+        "phase_id": "hard_terminal"
       }
     ]
   },
   "disposition": "stoppable",
-  "evidence_conjunction": "all_of",
-  "evidence_requirements": [
+  "escalation_stages": [
     {
-      "evidence": {
-        "evidence_kind": "controller_goal_terminal"
+      "containment_command": {
+        "command": {
+          "command_kind": "controller_goal_cancel"
+        },
+        "command_phase_id": "command"
       },
-      "evidence_item_id": "goal_terminal",
-      "observation_semantics": {
-        "observation_kind": "post_command_sample"
+      "containment_granularity": "resource",
+      "evidence_conjunction": "all_of",
+      "evidence_requirements": [
+        {
+          "evidence": {
+            "evidence_kind": "controller_goal_terminal"
+          },
+          "evidence_item_id": "goal_terminal",
+          "observation_semantics": {
+            "observation_kind": "post_command_sample"
+          },
+          "phase_id": "terminal",
+          "source_requirement": {
+            "freshness_budget_ns": 100000000,
+            "source_kind": "controller_goal_status"
+          }
+        }
+      ],
+      "stage_kind": "nominal",
+      "stop_escalation_stage_id": "nominal_controller_goal_cancel"
+    },
+    {
+      "containment_command": {
+        "command": {
+          "command_kind": "registered",
+          "provider_contract_ref": {
+            "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+            "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+            "provider_contract_role_id": "software_hard_stop"
+          },
+          "registered_command_kind_id": "manyforge.stop.software_hard"
+        },
+        "command_phase_id": "hard_command"
       },
-      "phase_id": "terminal",
-      "source_requirement": {
-        "freshness_budget_ns": 100000000,
-        "source_kind": "controller_goal_status"
-      }
+      "containment_granularity": "resource",
+      "evidence_conjunction": "all_of",
+      "evidence_requirements": [
+        {
+          "evidence": {
+            "evidence_kind": "motion_rest",
+            "provider_contract_ref": {
+              "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+              "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+              "provider_contract_role_id": "software_hard_stop"
+            }
+          },
+          "evidence_item_id": "hard_rest",
+          "observation_semantics": {
+            "minimum_dwell_ns": 10000000,
+            "observation_kind": "post_command_dwell"
+          },
+          "phase_id": "hard_terminal",
+          "source_requirement": {
+            "allowed_authority_classes": [
+              "commanded",
+              "measured",
+              "predicted"
+            ],
+            "freshness_budget_ns": 100000000,
+            "source_kind": "binding_state_authority",
+            "state_endpoint_role_id": "state"
+          }
+        }
+      ],
+      "stage_kind": "software_hard",
+      "stop_escalation_stage_id": "software_hard"
     }
   ],
   "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
-  "stop_evidence_policy_revision": "sha256:fa956386a53ba6a502c7288d1a6ea10c42bf1224eaf603e762ff51292a1c4fb4"
+  "stop_evidence_policy_revision": "sha256:9b3069be646fd588348435498cedcfe1e4471b6604a0cba15565b7d59ee4809d"
 }

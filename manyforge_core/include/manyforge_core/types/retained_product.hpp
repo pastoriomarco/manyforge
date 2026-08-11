@@ -5,6 +5,7 @@
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
+#include <manyforge_core/types/retained_artifact.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
@@ -23,18 +24,6 @@ using DeploymentArtifactId = StrongString<DeploymentArtifactIdTag>;
 
 struct DeploymentRevisionTag final {};
 using DeploymentRevision = StrongString<DeploymentRevisionTag>;
-
-struct ProductIdTag final {};
-using ProductId = StrongString<ProductIdTag>;
-
-struct ProductContractIdTag final {};
-using ProductContractId = StrongString<ProductContractIdTag>;
-
-struct ProductContractRevisionTag final {};
-using ProductContractRevision = StrongString<ProductContractRevisionTag>;
-
-struct ArtifactRoleIdTag final {};
-using ArtifactRoleId = StrongString<ArtifactRoleIdTag>;
 
 struct GeneratorIdTag final {};
 using GeneratorId = StrongString<GeneratorIdTag>;
@@ -68,17 +57,6 @@ enum class RetainedProductKind : std::uint8_t {
   }
   return {};
 }
-
-/// Exact five-field immutable artifact-reference value.
-struct RetainedArtifactRefDTO final {
-  ArtifactRoleId artifact_role_id;
-  std::string media_type;
-  std::uint64_t byte_size;
-  ContentDigest content_digest;
-  ContentAddressedStoreKey content_addressed_store_key;
-
-  friend bool operator==(const RetainedArtifactRefDTO&, const RetainedArtifactRefDTO&) = default;
-};
 
 /// Exact five-field semantic retained-product value.
 struct RetainedProductDTO final {

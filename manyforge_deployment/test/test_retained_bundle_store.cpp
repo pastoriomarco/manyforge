@@ -317,7 +317,7 @@ class ScopedTrustedRoot final {
       nullptr);
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(), {}, {}, {}, {}, {},
-      {}, {}, selected_overlay);
+      {}, {}, {}, {}, selected_overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
 }
@@ -1242,8 +1242,8 @@ TEST(FilesystemVerifiedRetainedModelMapSourceTest,
   ASSERT_NE(reloaded, nullptr);
   EXPECT_EQ(reloaded->value(), materialized.bundle->value());
   ASSERT_EQ(reloaded->value().desired_control_configurations.size(), 1U);
-  EXPECT_EQ(reloaded->value().catalogs.records.size(), 7U);
-  EXPECT_EQ(reloaded->value().provenance.source_records.size(), 7U);
+  EXPECT_EQ(reloaded->value().catalogs.records.size(), 8U);
+  EXPECT_EQ(reloaded->value().provenance.source_records.size(), 8U);
   ASSERT_EQ(reloaded->value().compiled_products.control_domain_products.size(),
             1U);
   const auto &control_group =
@@ -1264,8 +1264,12 @@ TEST(FilesystemVerifiedRetainedModelMapSourceTest,
       detail::require_control_domain_control_matches_retained_bundle(
           control_artifact->bytes(), reloaded->value(),
           control_group.control_domain_id));
-  EXPECT_TRUE(
-      reloaded->value().compiled_products.runtime_unit_products.empty());
+  ASSERT_EQ(reloaded->value().compiled_products.runtime_unit_products.size(),
+            1U);
+  EXPECT_EQ(reloaded->value()
+                .compiled_products.runtime_unit_products.front()
+                .runtime_unit_id.value(),
+            test::kLite6NativeExecutionRuntimeId);
 
   const auto& planning =
       reloaded->value().compiled_products.planning_collision_model;

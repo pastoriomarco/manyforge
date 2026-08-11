@@ -120,7 +120,7 @@ inline constexpr std::array<CatalogRecordTypeDescriptor, 11> kCatalogRecordTypeR
     {CatalogRecordKind::kContactPolicy, "contact_policy", "policy_id", "version",
      "manyforge.contact_policy.v1"},
     {CatalogRecordKind::kStopEvidencePolicy, "stop_evidence_policy", "stop_evidence_policy_id",
-     "stop_evidence_policy_revision", "manyforge.stop_evidence_policy.v1"},
+     "stop_evidence_policy_revision", "manyforge.stop_evidence_policy.v2"},
     {CatalogRecordKind::kRuntimePolicy, "runtime_policy", "runtime_policy_id",
      "runtime_policy_revision", "manyforge.runtime_policy.v1"},
 }};

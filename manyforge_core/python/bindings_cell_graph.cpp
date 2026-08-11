@@ -479,6 +479,7 @@ void register_cell_graph_bindings(py::module_& module) {
                        std::vector<ControlRouteId> legal_control_route_ids,
                        std::vector<RouteEndpointProjectionDTO> route_endpoint_projections,
                        ProviderInstanceId provider_instance_id,
+                       RuntimeUnitId provider_runtime_unit_id,
                        ProviderManifestId provider_manifest_id,
                        ProviderManifestRevision provider_manifest_revision,
                        StateAuthorityId state_authority_id,
@@ -504,6 +505,7 @@ void register_cell_graph_bindings(py::module_& module) {
                  std::move(legal_control_route_ids),
                  std::move(route_endpoint_projections),
                  std::move(provider_instance_id),
+                 std::move(provider_runtime_unit_id),
                  std::move(provider_manifest_id),
                  std::move(provider_manifest_revision),
                  std::move(state_authority_id),
@@ -521,7 +523,9 @@ void register_cell_graph_bindings(py::module_& module) {
            py::arg("control_interface_contract_id"), py::arg("control_interface_revision"),
            py::arg("controller_topology_id"), py::arg("topology_revision"),
            py::arg("legal_control_route_ids"), py::arg("route_endpoint_projections"),
-           py::arg("provider_instance_id"), py::arg("provider_manifest_id"),
+           py::arg("provider_instance_id"),
+           py::arg("provider_runtime_unit_id"),
+           py::arg("provider_manifest_id"),
            py::arg("provider_manifest_revision"),
            py::arg("state_authority_id"), py::arg("state_authority_class"),
            py::arg("stop_evidence_policy_id"), py::arg("stop_evidence_policy_revision"),
@@ -545,6 +549,8 @@ void register_cell_graph_bindings(py::module_& module) {
       .def_readonly("legal_control_route_ids", &ControlBindingDTO::legal_control_route_ids)
       .def_readonly("route_endpoint_projections", &ControlBindingDTO::route_endpoint_projections)
       .def_readonly("provider_instance_id", &ControlBindingDTO::provider_instance_id)
+      .def_readonly("provider_runtime_unit_id",
+                    &ControlBindingDTO::provider_runtime_unit_id)
       .def_readonly("provider_manifest_id", &ControlBindingDTO::provider_manifest_id)
       .def_readonly("provider_manifest_revision", &ControlBindingDTO::provider_manifest_revision)
       .def_readonly("state_authority_id", &ControlBindingDTO::state_authority_id)

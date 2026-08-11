@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <stop_token>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -18,6 +19,12 @@
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 
 namespace manyforge::roboplan_backend {
+
+namespace detail {
+class INativeStopQualificationProbe;
+class NativeStopQualificationAccess;
+enum class NativeStopQualificationEvent : std::uint8_t;
+}  // namespace detail
 
 struct RoboPlanExecutionBackendConfig {
   double reset_completion_timeout_s = 5.0;
@@ -115,6 +122,12 @@ public:
                           std::stop_token stop_token) override;
 
 private:
+  RoboPlanExecutionBackend(
+      core::RuntimeParticipantBinding binding,
+      std::shared_ptr<IRetainedObservedStateChannel> state_channel,
+      core::IClock &clock, RoboPlanExecutionBackendConfig config,
+      detail::INativeStopQualificationProbe *qualification_probe);
+
   struct ExecutionStateData {
     core::ExecutionSnapshot snapshot;
     std::atomic<bool> running{false};
@@ -150,7 +163,14 @@ private:
                               std::int64_t source_timestamp_ns = 0);
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory,
                         std::uint64_t execution_generation);
+  core::ControlledStopResultDTO execute_controlled_stop_impl(
+      const core::MotionInterruptStopProfileDTO &profile,
+      std::stop_token stop_token,
+      std::uint64_t hard_stop_request_generation);
   void request_active_controlled_stop();
+  void observe_stop_qualification(
+      detail::NativeStopQualificationEvent event,
+      std::string_view detail = {});
   void begin_controlled_stop_runtime_scale_freeze();
   bool end_controlled_stop_runtime_scale_freeze();
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
@@ -170,6 +190,7 @@ private:
   std::shared_ptr<IRetainedObservedStateChannel> state_channel_;
   core::IClock &clock_;
   RoboPlanExecutionBackendConfig config_;
+  detail::INativeStopQualificationProbe *qualification_probe_{};
   std::unique_ptr<core::ExecutionProgressPublication>
       execution_progress_publication_;
   std::atomic<std::uint64_t> next_execution_progress_generation_{1};
@@ -180,8 +201,14 @@ private:
   std::condition_variable execution_cv_;
   std::jthread worker_thread_;
   ExecutionStateData state_;
-  mutable std::mutex controlled_stop_mutex_;
-  std::shared_ptr<std::stop_source> active_controlled_stop_source_;
+  static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
+                "native software-hard Stop requires a lock-free generation");
+  static_assert(
+      std::atomic<std::uint32_t>::is_always_lock_free,
+      "native software-hard Stop requires lock-free activity observation");
+  std::atomic<std::uint64_t> hard_stop_request_generation_{0U};
+  std::atomic<std::uint64_t> active_execution_hard_stop_generation_{0U};
+  std::atomic<std::uint32_t> controlled_stop_activity_count_{0U};
 
   // Runtime velocity scale read on every worker tick. std::atomic<double> is
   // lock-free on all supported targets; memory_order_release on the setter
@@ -205,6 +232,8 @@ private:
   std::optional<PendingTerminalSceneProjection>
       pending_terminal_scene_projection_;
   std::jthread terminal_scene_projection_retry_thread_;
+
+  friend class detail::NativeStopQualificationAccess;
 };
 
 } // namespace manyforge::roboplan_backend

@@ -1,6 +1,10 @@
+#include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <map>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
@@ -10,12 +14,17 @@
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "content_identity_internal.hpp"
+#include "control_domain_control_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 
 namespace {
 
@@ -28,14 +37,270 @@ using deployment::CanonicalValue;
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-[[nodiscard]] std::filesystem::path parse_output_root(int argc, char** argv) {
-  if (argc != 3 || std::string_view(argv[1]) != "--output-root" ||
-      std::string_view(argv[2]).empty()) {
+struct StopQualificationInputPaths final {
+  std::filesystem::path implementation_build;
+  std::filesystem::path installed_target;
+  std::filesystem::path runner_contract;
+  std::filesystem::path runner_executable;
+  std::filesystem::path implementation_evidence;
+  std::filesystem::path substitution_evidence;
+};
+
+struct GeneratorArguments final {
+  std::filesystem::path output_root;
+  std::optional<std::filesystem::path> test_build_identity_target;
+  std::optional<StopQualificationInputPaths> stop_qualification;
+};
+
+[[nodiscard]] GeneratorArguments parse_arguments(int argc, char** argv) {
+  if (argc < 3 || argc % 2 == 0) {
     throw std::invalid_argument(
         "usage: generate_lite6_native_execution_fixture "
-        "--output-root <path>");
+        "--output-root PATH [--test-build-identity-target PATH | "
+        "--stop-implementation-build PATH --stop-installed-target PATH "
+        "--stop-runner-contract PATH --stop-runner-executable PATH "
+        "--stop-implementation-evidence PATH "
+        "--stop-substitution-evidence PATH]");
   }
-  return std::filesystem::path(argv[2]);
+
+  std::map<std::string, std::filesystem::path, std::less<>> values;
+  for (int index = 1; index < argc; index += 2) {
+    if (argv[index] == nullptr || argv[index + 1] == nullptr ||
+        std::string_view(argv[index]).empty() ||
+        std::string_view(argv[index + 1]).empty() ||
+        !values.emplace(argv[index], argv[index + 1]).second) {
+      throw std::invalid_argument(
+          "native execution fixture arguments are malformed or duplicated");
+    }
+  }
+
+  const auto take = [&](std::string_view name)
+      -> std::optional<std::filesystem::path> {
+    const auto found = values.find(name);
+    if (found == values.end()) {
+      return std::nullopt;
+    }
+    return found->second;
+  };
+  const auto output_root = take("--output-root");
+  if (!output_root.has_value()) {
+    throw std::invalid_argument(
+        "native execution fixture output root is missing");
+  }
+  const auto test_identity = take("--test-build-identity-target");
+  const std::array qualification_names{
+      std::string_view("--stop-implementation-build"),
+      std::string_view("--stop-installed-target"),
+      std::string_view("--stop-runner-contract"),
+      std::string_view("--stop-runner-executable"),
+      std::string_view("--stop-implementation-evidence"),
+      std::string_view("--stop-substitution-evidence"),
+  };
+  std::array<std::optional<std::filesystem::path>, 6U> qualification_values;
+  std::size_t qualification_count = 0U;
+  for (std::size_t index = 0U; index < qualification_names.size(); ++index) {
+    qualification_values[index] = take(qualification_names[index]);
+    qualification_count += qualification_values[index].has_value() ? 1U : 0U;
+  }
+  const std::size_t expected_argument_count =
+      1U + (test_identity.has_value() ? 1U : 0U) + qualification_count;
+  if (values.size() != expected_argument_count ||
+      (qualification_count != 0U &&
+       qualification_count != qualification_names.size()) ||
+      (test_identity.has_value() && qualification_count != 0U)) {
+    throw std::invalid_argument(
+        "native execution fixture argument set is unknown, partial, or "
+        "combines authoritative and test-only identity modes");
+  }
+
+  GeneratorArguments result{*output_root, test_identity, std::nullopt};
+  if (qualification_count != 0U) {
+    result.stop_qualification = StopQualificationInputPaths{
+        *qualification_values[0], *qualification_values[1],
+        *qualification_values[2], *qualification_values[3],
+        *qualification_values[4], *qualification_values[5]};
+  }
+  return result;
+}
+
+[[nodiscard]] std::string read_exact_file(const std::filesystem::path& path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    throw std::runtime_error("cannot read native execution fixture input: " +
+                             path.string());
+  }
+  return {std::istreambuf_iterator<char>(stream),
+          std::istreambuf_iterator<char>()};
+}
+
+[[nodiscard]] std::string read_qualification_document(
+    const std::filesystem::path& path) {
+  std::string bytes = read_exact_file(path);
+  if (bytes.empty() ||
+      bytes.size() >
+          deployment::detail::kMaxStopQualificationEvidenceBytes) {
+    throw std::runtime_error(
+        "native Stop qualification document violates its byte bound: " +
+        path.string());
+  }
+  return bytes;
+}
+
+[[nodiscard]] const core::RetainedArtifactRefDTO& require_exact_artifact(
+    const core::RetainedProductDTO& product, std::string_view role,
+    std::string_view media_type, std::string_view expected_bytes) {
+  const auto found = std::find_if(
+      product.artifact_refs.begin(), product.artifact_refs.end(),
+      [&](const auto& artifact) {
+        return artifact.artifact_role_id.value() == role;
+      });
+  if (found == product.artifact_refs.end() ||
+      found->media_type != media_type || expected_bytes.empty() ||
+      found->byte_size != expected_bytes.size() ||
+      found->content_digest.value() !=
+          deployment::sha256_digest(expected_bytes)) {
+    throw std::logic_error(
+        "Stop-qualified retained fixture lost an exact artifact: " +
+        std::string(role));
+  }
+  return *found;
+}
+
+void require_stop_qualified_durable_projection(
+    const deployment::RetainedBundle& bundle,
+    const deployment::detail::StopQualificationEvidenceCandidate& candidate) {
+  if (!candidate.implementation_qualification_package_bytes.has_value() ||
+      !candidate.controlled_substitution_package_bytes.has_value()) {
+    throw std::logic_error(
+        "Stop-qualified retained fixture lacks one evidence family");
+  }
+  const auto& compiled = bundle.value().compiled_products;
+  if (compiled.control_domain_products.size() != 1U ||
+      compiled.control_domain_products.front().products.size() != 1U) {
+    throw std::logic_error(
+        "Stop-qualified retained fixture has no sole control product");
+  }
+  const auto& control =
+      compiled.control_domain_products.front().products.front();
+  if (control.product_contract_id.value() !=
+          deployment::detail::kControlDomainControlContractId ||
+      control.artifact_refs.size() != 3U) {
+    throw std::logic_error(
+        "Stop-qualified retained fixture has the wrong control closure");
+  }
+  const auto main = std::find_if(
+      control.artifact_refs.begin(), control.artifact_refs.end(),
+      [](const auto& artifact) {
+        return artifact.artifact_role_id.value() ==
+               deployment::detail::kControlDomainControlArtifactRole;
+      });
+  if (main == control.artifact_refs.end() ||
+      main->media_type !=
+          deployment::detail::kControlDomainControlMediaType) {
+    throw std::logic_error(
+        "Stop-qualified retained fixture lost its primary control artifact");
+  }
+  static_cast<void>(require_exact_artifact(
+      control, core::kStopImplementationQualificationArtifactRole,
+      core::kStopImplementationQualificationMediaType,
+      *candidate.implementation_qualification_package_bytes));
+  static_cast<void>(require_exact_artifact(
+      control, core::kControlledStopSubstitutionQualificationArtifactRole,
+      core::kControlledStopSubstitutionQualificationMediaType,
+      *candidate.controlled_substitution_package_bytes));
+
+  if (compiled.runtime_unit_products.size() != 1U) {
+    throw std::logic_error(
+        "Stop-qualified retained fixture has no sole runtime group");
+  }
+  const auto& runtime_group = compiled.runtime_unit_products.front();
+  const std::string expected_product_id =
+      deployment::detail::native_execution_runtime_product_id(
+          runtime_group.runtime_unit_id);
+  const auto runtime = std::find_if(
+      runtime_group.products.begin(), runtime_group.products.end(),
+      [&](const auto& product) {
+        return product.product_id.value() == expected_product_id;
+      });
+  if (runtime == runtime_group.products.end() ||
+      runtime->product_contract_id.value() !=
+          deployment::detail::kNativeExecutionRuntimeProductContractId) {
+    throw std::logic_error(
+        "Stop-qualified retained fixture lost its exact runtime product");
+  }
+  static_cast<void>(require_exact_artifact(
+      *runtime,
+      deployment::detail::kNativeExecutionRuntimeBuildIdentityArtifactRole,
+      deployment::detail::kNativeExecutionRuntimeBuildIdentityMediaType,
+      candidate.implementation_build_closure_bytes));
+}
+
+[[nodiscard]] CanonicalValue build_input(std::string id,
+                                         std::string_view digest) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"input_id", CanonicalValue(std::move(id))},
+      {"content_digest", CanonicalValue(std::string(digest))},
+  });
+}
+
+[[nodiscard]] std::string make_test_build_identity(
+    std::string_view installed_target_bytes) {
+  if (installed_target_bytes.empty()) {
+    throw std::runtime_error("native execution fixture target is empty");
+  }
+  const std::string target_digest =
+      deployment::sha256_digest(installed_target_bytes);
+  CanonicalValue root(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(
+           deployment::detail::kStopImplementationBuildClosureApiVersion))},
+      {"implementation_id",
+       CanonicalValue("manyforge.native_execution_host")},
+      {"implementation_source_build_fingerprint",
+       CanonicalValue(std::string(kZeroDigest))},
+      {"source_inputs",
+       CanonicalValue(CanonicalValue::Array{
+           build_input("source:test_fixture", target_digest)})},
+      {"generated_semantic_inputs",
+       CanonicalValue(CanonicalValue::Array{
+           build_input("generated:test_fixture", target_digest)})},
+      {"build_inputs",
+       CanonicalValue(CanonicalValue::Array{
+           build_input("abi:test_fixture", target_digest),
+           build_input("compile:test_fixture", target_digest),
+           build_input("link:test_fixture", target_digest),
+           build_input("toolchain:test_fixture", target_digest)})},
+      {"installed_target",
+       CanonicalValue(CanonicalValue::Object{
+           {"installed_target_id",
+            CanonicalValue("manyforge_native_execution_host")},
+           {"byte_size",
+            CanonicalValue(static_cast<double>(installed_target_bytes.size()))},
+           {"content_digest", CanonicalValue(target_digest)},
+       })},
+  });
+  const std::string fingerprint = deployment::detail::compute_content_identity(
+      root, deployment::detail::ContentIdentitySpec{
+                .identity_domain =
+                    "stop-implementation-source-build-fingerprint",
+                .api_version = std::string(
+                    deployment::detail::
+                        kStopImplementationBuildClosureApiVersion),
+                .own_field = "implementation_source_build_fingerprint",
+            });
+  auto members = root.as_object();
+  for (auto& [name, value] : members) {
+    if (name == "implementation_source_build_fingerprint") {
+      value = CanonicalValue(fingerprint);
+      const std::string bytes =
+          deployment::canonical_json(CanonicalValue(std::move(members)));
+      static_cast<void>(
+          deployment::detail::parse_stop_implementation_build_identity(bytes));
+      return bytes;
+    }
+  }
+  throw std::logic_error(
+      "native execution fixture build identity has no fingerprint field");
 }
 
 void write_exact_file(const std::filesystem::path& path, std::string_view bytes) {
@@ -173,18 +438,97 @@ void write_exact_file(const std::filesystem::path& path, std::string_view bytes)
 
 int main(int argc, char** argv) {
   try {
-    const auto output_root = parse_output_root(argc, argv);
+    const auto arguments = parse_arguments(argc, argv);
+    const auto& output_root = arguments.output_root;
     std::filesystem::create_directories(output_root);
     const auto package_root = output_root / "retained-package";
     const auto manager_state_root = output_root / "manager-state";
     std::filesystem::create_directories(package_root);
     std::filesystem::create_directories(manager_state_root);
 
-    const auto materialized =
-        deployment::test::materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
-            package_root);
+    std::optional<std::string> test_build_identity;
+    if (arguments.test_build_identity_target.has_value()) {
+      test_build_identity = make_test_build_identity(
+          read_exact_file(*arguments.test_build_identity_target));
+    }
+    std::optional<deployment::detail::StopQualificationEvidenceCandidate>
+        stop_candidate;
+    if (arguments.stop_qualification.has_value()) {
+      const auto& paths = *arguments.stop_qualification;
+      std::string installed_target = read_exact_file(paths.installed_target);
+      std::string runner_executable = read_exact_file(paths.runner_executable);
+      if (installed_target.empty() || runner_executable.empty()) {
+        throw std::runtime_error(
+            "native Stop qualification executable input is empty");
+      }
+      stop_candidate.emplace(
+          read_qualification_document(paths.implementation_build),
+          std::move(installed_target),
+          read_qualification_document(paths.runner_contract),
+          std::move(runner_executable),
+          read_qualification_document(paths.implementation_evidence),
+          read_qualification_document(paths.substitution_evidence));
+    }
+    auto materialized = [&]() {
+      if (stop_candidate.has_value()) {
+        return deployment::test::
+            materialize_lite6_stop_qualified_native_motion_retained_consumer_fixture(
+                package_root,
+                std::span<const deployment::detail::
+                              StopQualificationEvidenceCandidate>(
+                    &*stop_candidate, 1U));
+      }
+      if (test_build_identity.has_value()) {
+        return deployment::test::
+            materialize_lite6_test_build_identified_native_motion_arm_gripper_retained_consumer_fixture(
+                package_root, *test_build_identity);
+      }
+      return deployment::test::
+          materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
+              package_root);
+    }();
     if (materialized.bundle == nullptr) {
       throw std::logic_error("native execution fixture has no bundle");
+    }
+    if (stop_candidate.has_value()) {
+      const core::RetainedBundleId retained_bundle_id =
+          materialized.bundle->retained_bundle_id();
+      const std::string retained_bundle_bytes{
+          materialized.bundle->canonical_bytes()};
+      materialized.bundle.reset();
+      const deployment::FilesystemVerifiedRetainedBundleSource durable_source(
+          package_root);
+      const auto durable = durable_source.get_verified(retained_bundle_id);
+      if (durable == nullptr ||
+          durable->canonical_bytes() != retained_bundle_bytes) {
+        throw std::logic_error(
+            "Stop-qualified retained fixture failed fresh durable readback");
+      }
+      require_stop_qualified_durable_projection(*durable, *stop_candidate);
+      const CanonicalValue manifest(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(
+               "manyforge.i7.stop-qualified-retained-fixture.v1")},
+          {"retained_bundle_id",
+           CanonicalValue(durable->retained_bundle_id().value())},
+          {"implementation_build_digest",
+           CanonicalValue(deployment::sha256_digest(
+               stop_candidate->implementation_build_closure_bytes))},
+          {"qualification_runner_contract_document_digest",
+           CanonicalValue(deployment::sha256_digest(
+               stop_candidate->qualification_runner_contract_bytes))},
+          {"implementation_evidence_digest",
+           CanonicalValue(deployment::sha256_digest(
+               *stop_candidate
+                    ->implementation_qualification_package_bytes))},
+          {"substitution_evidence_digest",
+           CanonicalValue(deployment::sha256_digest(
+               *stop_candidate->controlled_substitution_package_bytes))},
+      });
+      write_exact_file(output_root / "manifest.json",
+                       deployment::canonical_json(manifest));
+      std::cout << (output_root / "manifest.json").string() << '\n';
+      return 0;
     }
     const auto& bundle = *materialized.bundle;
     const auto& products = bundle.value().compiled_products;

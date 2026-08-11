@@ -604,6 +604,7 @@ parse_runtime_scale_route_qualifications(const CanonicalValue& value,
                         "legal_control_route_ids",
                         "route_endpoint_projections",
                         "provider_instance_id",
+                        "provider_runtime_unit_id",
                         "provider_manifest_id",
                         "provider_manifest_revision",
                         "state_authority_id",
@@ -697,6 +698,9 @@ parse_runtime_scale_route_qualifications(const CanonicalValue& value,
       std::move(projections),
       parse_identity<ProviderInstanceId>(require_member(object, "provider_instance_id", path),
                                          child_path(path, "provider_instance_id")),
+      parse_identity<RuntimeUnitId>(
+          require_member(object, "provider_runtime_unit_id", path),
+          child_path(path, "provider_runtime_unit_id")),
       parse_identity<ProviderManifestId>(require_member(object, "provider_manifest_id", path),
                                         child_path(path, "provider_manifest_id")),
       parse_digest<ProviderManifestRevision>(
@@ -924,6 +928,8 @@ template <typename StrongType>
       {"legal_control_route_ids", identity_array(record.legal_control_route_ids)},
       {"route_endpoint_projections", CanonicalValue(std::move(projections))},
       {"provider_instance_id", identity_value(record.provider_instance_id)},
+      {"provider_runtime_unit_id",
+       identity_value(record.provider_runtime_unit_id)},
       {"provider_manifest_id", identity_value(record.provider_manifest_id)},
       {"provider_manifest_revision", identity_value(record.provider_manifest_revision)},
       {"state_authority_id", identity_value(record.state_authority_id)},
@@ -1235,14 +1241,35 @@ void validate_intrinsic(const CellGraphDTO& graph) {
     }
   }
 
-  std::map<std::string, std::pair<std::string, std::string>, std::less<>>
+  std::map<std::string,
+           std::tuple<std::string, std::string, std::string>, std::less<>>
       provider_manifest_by_instance;
   for (const auto& binding : graph.control_bindings) {
     require_reference(component_ids, binding.controllable_component_id.value(),
                       "control_bindings.controllable_component_id");
     require_reference(domain_ids, binding.control_domain_id.value(),
                       "control_bindings.control_domain_id");
+    require_reference(runtime_ids, binding.provider_runtime_unit_id.value(),
+                      "control_bindings.provider_runtime_unit_id");
     const ControlDomainDTO& domain = *domains.at(binding.control_domain_id.value());
+    const auto component = std::find_if(
+        graph.controllable_components.begin(),
+        graph.controllable_components.end(), [&](const auto& candidate) {
+          return candidate.controllable_component_id ==
+                 binding.controllable_component_id;
+        });
+    if (component == graph.controllable_components.end() ||
+        std::find(component->runtime_unit_ids.begin(),
+                  component->runtime_unit_ids.end(),
+                  binding.provider_runtime_unit_id) ==
+            component->runtime_unit_ids.end() ||
+        std::find(domain.runtime_unit_ids.begin(), domain.runtime_unit_ids.end(),
+                  binding.provider_runtime_unit_id) ==
+            domain.runtime_unit_ids.end()) {
+      fail("control_bindings.provider_runtime_unit_id",
+           "provider runtime must belong to both the binding component and "
+           "control domain");
+    }
     if (binding.controller_topology_id != domain.controller_topology_id ||
         binding.topology_revision != domain.topology_revision) {
       fail("control_bindings", "binding topology identity does not match its control domain");
@@ -1250,15 +1277,17 @@ void validate_intrinsic(const CellGraphDTO& graph) {
     const auto [selected_manifest, inserted] =
         provider_manifest_by_instance.emplace(
             binding.provider_instance_id.value(),
-            std::pair{binding.provider_manifest_id.value(),
-                      binding.provider_manifest_revision.value()});
+            std::tuple{binding.provider_runtime_unit_id.value(),
+                       binding.provider_manifest_id.value(),
+                       binding.provider_manifest_revision.value()});
     if (!inserted &&
         selected_manifest->second !=
-            std::pair{binding.provider_manifest_id.value(),
-                      binding.provider_manifest_revision.value()}) {
+            std::tuple{binding.provider_runtime_unit_id.value(),
+                       binding.provider_manifest_id.value(),
+                       binding.provider_manifest_revision.value()}) {
       fail("control_bindings",
            "provider instance '" + binding.provider_instance_id.value() +
-               "' selects more than one provider manifest ID/revision");
+               "' selects more than one provider runtime/manifest identity");
     }
   }
 

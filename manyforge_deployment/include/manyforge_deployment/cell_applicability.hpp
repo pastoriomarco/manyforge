@@ -5,6 +5,7 @@
 #include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
+#include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/command_schema_codec.hpp>
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <manyforge_deployment/controller_topology_codec.hpp>
@@ -219,6 +220,7 @@ struct LogicalExternalResourceTemplate final {
 };
 
 struct LogicalStopProviderCommandEndpoint final {
+  core::StopEscalationStageId stop_escalation_stage_id;
   core::ProviderContractRefDTO provider_contract_ref;
   core::EndpointRoleId endpoint_role_id;
   std::string logical_endpoint_symbol;
@@ -228,6 +230,7 @@ struct LogicalStopProviderCommandEndpoint final {
 };
 
 struct LogicalStopProviderEvidenceEndpoint final {
+  core::StopEscalationStageId stop_escalation_stage_id;
   core::StopEvidenceItemId evidence_item_id;
   core::ProviderContractRefDTO provider_contract_ref;
   core::EndpointRoleId endpoint_role_id;
@@ -238,6 +241,7 @@ struct LogicalStopProviderEvidenceEndpoint final {
 };
 
 struct LogicalStopBindingStateAuthoritySource final {
+  core::StopEscalationStageId stop_escalation_stage_id;
   core::StopEvidenceItemId evidence_item_id;
   core::StateAuthorityId state_authority_id;
   core::StateAuthorityClass state_authority_class;
@@ -250,6 +254,7 @@ struct LogicalStopBindingStateAuthoritySource final {
 };
 
 struct LogicalResourceStopScopeTemplate final {
+  core::StopEscalationStageId stop_escalation_stage_id;
   core::ActivationSetId activation_set_id;
   std::vector<core::ResourceId> resource_ids;
 
@@ -258,6 +263,7 @@ struct LogicalResourceStopScopeTemplate final {
 };
 
 struct LogicalControllerSetStopScopeTemplate final {
+  core::StopEscalationStageId stop_escalation_stage_id;
   core::ActivationSetId activation_set_id;
   std::vector<core::ControllerRoleId> active_controller_role_ids;
   std::vector<std::string> logical_controller_symbols;
@@ -268,6 +274,7 @@ struct LogicalControllerSetStopScopeTemplate final {
 };
 
 struct LogicalControlDomainStopScopeTemplate final {
+  core::StopEscalationStageId stop_escalation_stage_id;
   core::ActivationSetId activation_set_id;
   core::ControlDomainId control_domain_id;
   core::ControlDomainRevision control_domain_revision;
@@ -281,6 +288,29 @@ using LogicalStopScopeTemplate =
     std::variant<LogicalResourceStopScopeTemplate,
                  LogicalControllerSetStopScopeTemplate,
                  LogicalControlDomainStopScopeTemplate>;
+
+struct LogicalStopEscalationStageTemplate final {
+  core::StopEscalationStageId stop_escalation_stage_id;
+  core::StopEscalationStageKind stage_kind;
+  core::ContainmentGranularity containment_granularity;
+  core::StopContainmentCommandDTO containment_command;
+  core::StopEvidenceConjunction evidence_conjunction;
+  std::vector<core::StopEvidenceRequirementDTO>
+      all_of_evidence_requirements;
+  std::optional<core::JsonObjectDTO> default_contract_parameters;
+  std::optional<core::CommissionedStopInterfaceDTO>
+      commissioned_stop_interface;
+  std::optional<LogicalStopProviderCommandEndpoint>
+      provider_command_endpoint;
+  std::vector<LogicalStopProviderEvidenceEndpoint>
+      provider_evidence_endpoints;
+  std::vector<LogicalStopBindingStateAuthoritySource>
+      binding_state_authority_sources;
+  std::vector<LogicalStopScopeTemplate> containment_scopes;
+
+  friend bool operator==(const LogicalStopEscalationStageTemplate&,
+                         const LogicalStopEscalationStageTemplate&) = default;
+};
 
 struct LogicalNotStoppableApplicabilityTemplate final {
   core::ControlBindingId control_binding_id;
@@ -313,17 +343,8 @@ struct LogicalStoppableApplicabilityTemplate final {
   core::ContainmentGranularity containment_granularity;
   core::StopEvidenceDisposition disposition;
   std::string logical_stop_symbol;
-  core::StopContainmentCommandDTO containment_command;
   core::StopDeadlineBudgetDTO deadline_budget;
-  core::StopEvidenceConjunction evidence_conjunction;
-  std::vector<core::StopEvidenceRequirementDTO> all_of_evidence_requirements;
-  std::optional<LogicalStopProviderCommandEndpoint>
-      provider_command_endpoint;
-  std::vector<LogicalStopProviderEvidenceEndpoint>
-      provider_evidence_endpoints;
-  std::vector<LogicalStopBindingStateAuthoritySource>
-      binding_state_authority_sources;
-  std::vector<LogicalStopScopeTemplate> containment_scopes;
+  std::vector<LogicalStopEscalationStageTemplate> escalation_stages;
 
   friend bool operator==(const LogicalStoppableApplicabilityTemplate&,
                          const LogicalStoppableApplicabilityTemplate&) =
@@ -391,6 +412,14 @@ class ApplicabilityQualifiedCellIr final {
   stop_evidence_policies() const noexcept {
     return data_->stop_evidence_policies;
   }
+  [[nodiscard]] const std::vector<BuildQualifiedValueSchemaEntry>&
+  value_schemas() const noexcept {
+    return data_->value_schemas;
+  }
+  [[nodiscard]] const std::vector<QualifiedCommissioningEvidenceRef>&
+  commissioning_evidence_refs() const noexcept {
+    return data_->commissioning_evidence_refs;
+  }
   [[nodiscard]] const std::vector<LogicalBindingInterfaceTemplate>&
   binding_interfaces() const noexcept {
     return data_->binding_interfaces;
@@ -438,6 +467,9 @@ class ApplicabilityQualifiedCellIr final {
         std::vector<QualifiedControllerTopology> controller_topologies_in,
         std::vector<QualifiedProviderManifest> provider_manifests_in,
         std::vector<QualifiedStopEvidencePolicy> stop_evidence_policies_in,
+        std::vector<BuildQualifiedValueSchemaEntry> value_schemas_in,
+        std::vector<QualifiedCommissioningEvidenceRef>
+            commissioning_evidence_refs_in,
         std::vector<LogicalBindingInterfaceTemplate>
             binding_interfaces_in,
         std::vector<LogicalControllerTemplate> controllers_in,
@@ -462,6 +494,9 @@ class ApplicabilityQualifiedCellIr final {
           controller_topologies(std::move(controller_topologies_in)),
           provider_manifests(std::move(provider_manifests_in)),
           stop_evidence_policies(std::move(stop_evidence_policies_in)),
+          value_schemas(std::move(value_schemas_in)),
+          commissioning_evidence_refs(
+              std::move(commissioning_evidence_refs_in)),
           binding_interfaces(std::move(binding_interfaces_in)),
           controllers(std::move(controllers_in)),
           routes(std::move(routes_in)),
@@ -482,6 +517,9 @@ class ApplicabilityQualifiedCellIr final {
     std::vector<QualifiedControllerTopology> controller_topologies;
     std::vector<QualifiedProviderManifest> provider_manifests;
     std::vector<QualifiedStopEvidencePolicy> stop_evidence_policies;
+    std::vector<BuildQualifiedValueSchemaEntry> value_schemas;
+    std::vector<QualifiedCommissioningEvidenceRef>
+        commissioning_evidence_refs;
     std::vector<LogicalBindingInterfaceTemplate> binding_interfaces;
     std::vector<LogicalControllerTemplate> controllers;
     std::vector<LogicalControlRouteTemplate> routes;
@@ -504,6 +542,9 @@ class ApplicabilityQualifiedCellIr final {
       std::vector<QualifiedControllerTopology> controller_topologies,
       std::vector<QualifiedProviderManifest> provider_manifests,
       std::vector<QualifiedStopEvidencePolicy> stop_evidence_policies,
+      std::vector<BuildQualifiedValueSchemaEntry> value_schemas,
+      std::vector<QualifiedCommissioningEvidenceRef>
+          commissioning_evidence_refs,
       std::vector<LogicalBindingInterfaceTemplate> binding_interfaces,
       std::vector<LogicalControllerTemplate> controllers,
       std::vector<LogicalControlRouteTemplate> routes,
@@ -522,6 +563,8 @@ class ApplicabilityQualifiedCellIr final {
             std::move(controller_topologies),
             std::move(provider_manifests),
             std::move(stop_evidence_policies),
+            std::move(value_schemas),
+            std::move(commissioning_evidence_refs),
             std::move(binding_interfaces), std::move(controllers),
             std::move(routes), std::move(capabilities),
             std::move(provider_endpoints),
@@ -540,6 +583,8 @@ class ApplicabilityQualifiedCellIr final {
       std::span<const QualifiedControllerTopology>,
       std::span<const QualifiedProviderManifest>,
       std::span<const QualifiedStopEvidencePolicy>,
+      std::span<const BuildQualifiedValueSchemaEntry>,
+      std::span<const QualifiedCommissioningEvidenceRef>,
       const QualifiedSelectedSiteOverlay&);
 };
 
@@ -554,6 +599,9 @@ class ApplicabilityQualifiedCellIr final {
     std::span<const QualifiedControllerTopology> controller_topologies,
     std::span<const QualifiedProviderManifest> provider_manifests,
     std::span<const QualifiedStopEvidencePolicy> stop_evidence_policies,
+    std::span<const BuildQualifiedValueSchemaEntry> value_schemas,
+    std::span<const QualifiedCommissioningEvidenceRef>
+        commissioning_evidence_refs,
     const QualifiedSelectedSiteOverlay& selected_site_overlay);
 
 }  // namespace manyforge::deployment

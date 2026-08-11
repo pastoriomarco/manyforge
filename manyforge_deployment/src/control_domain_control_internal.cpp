@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -213,6 +215,8 @@ template <typename Strong>
        CanonicalValue(binding.control_interface_contract_id.value())},
       {"control_interface_revision", CanonicalValue(binding.control_interface_revision.value())},
       {"provider_instance_id", CanonicalValue(binding.provider_instance_id.value())},
+      {"provider_runtime_unit_id",
+       CanonicalValue(binding.provider_runtime_unit_id.value())},
       {"provider_manifest_id", CanonicalValue(binding.provider_manifest_id.value())},
       {"provider_manifest_revision", CanonicalValue(binding.provider_manifest_revision.value())},
       {"state_authority_id", CanonicalValue(binding.state_authority_id.value())},
@@ -493,6 +497,448 @@ template <typename Strong>
   });
 }
 
+[[nodiscard]] CanonicalValue provider_contract_projection(
+    const core::ProviderContractRefDTO& contract) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"provider_contract_role_id",
+       CanonicalValue(contract.provider_contract_role_id.value())},
+      {"contract_schema_id", CanonicalValue(contract.contract_schema_id.value())},
+      {"contract_schema_revision",
+       CanonicalValue(contract.contract_schema_revision.value())},
+  });
+}
+
+template <typename Strong>
+[[nodiscard]] CanonicalValue optional_strong_projection(
+    const std::optional<Strong>& value) {
+  return value.has_value() ? CanonicalValue(value->value())
+                           : CanonicalValue(nullptr);
+}
+
+[[nodiscard]] CanonicalValue optional_contract_projection(
+    const std::optional<core::ProviderContractRefDTO>& contract) {
+  return contract.has_value() ? provider_contract_projection(*contract)
+                              : CanonicalValue(nullptr);
+}
+
+[[nodiscard]] CanonicalValue json_value_projection(
+    const core::JsonValueDTO& value) {
+  return std::visit(
+      [](const auto& current) -> CanonicalValue {
+        using Value = std::decay_t<decltype(current)>;
+        if constexpr (std::is_same_v<Value, std::nullptr_t> ||
+                      std::is_same_v<Value, bool> ||
+                      std::is_same_v<Value, double> ||
+                      std::is_same_v<Value, std::string>) {
+          return CanonicalValue(current);
+        } else if constexpr (std::is_same_v<Value,
+                                            core::JsonValueDTO::Array>) {
+          CanonicalValue::Array result;
+          result.reserve(current.size());
+          for (const auto& item : current) {
+            result.push_back(json_value_projection(item));
+          }
+          return CanonicalValue(std::move(result));
+        } else {
+          CanonicalValue::Object result;
+          result.reserve(current.size());
+          for (const auto& [name, item] : current) {
+            result.emplace_back(name, json_value_projection(item));
+          }
+          return CanonicalValue(std::move(result));
+        }
+      },
+      value.value);
+}
+
+[[nodiscard]] CanonicalValue json_object_projection(
+    const core::JsonObjectDTO& object) {
+  return json_value_projection(core::JsonValueDTO{object});
+}
+
+[[nodiscard]] CanonicalValue retained_artifact_ref_projection(
+    const core::RetainedArtifactRefDTO& artifact) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"artifact_role_id", CanonicalValue(artifact.artifact_role_id.value())},
+      {"media_type", CanonicalValue(artifact.media_type)},
+      {"byte_size", CanonicalValue(static_cast<double>(artifact.byte_size))},
+      {"content_digest", CanonicalValue(artifact.content_digest.value())},
+      {"content_addressed_store_key",
+       CanonicalValue(artifact.content_addressed_store_key.value())},
+  });
+}
+
+[[nodiscard]] CanonicalValue commissioned_stop_interface_projection(
+    const core::CommissionedStopInterfaceDTO& commissioned) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"commissioned_stop_interface_id",
+       CanonicalValue(commissioned.commissioned_stop_interface_id.value())},
+      {"commissioned_stop_interface_revision",
+       CanonicalValue(
+           commissioned.commissioned_stop_interface_revision.value())},
+      {"control_domain_id",
+       CanonicalValue(commissioned.control_domain_id.value())},
+      {"control_domain_revision",
+       CanonicalValue(commissioned.control_domain_revision.value())},
+      {"control_binding_id",
+       CanonicalValue(commissioned.control_binding_id.value())},
+      {"control_binding_revision",
+       CanonicalValue(commissioned.control_binding_revision.value())},
+      {"control_route_id",
+       CanonicalValue(commissioned.control_route_id.value())},
+      {"provider_instance_id",
+       CanonicalValue(commissioned.provider_instance_id.value())},
+      {"provider_manifest_id",
+       CanonicalValue(commissioned.provider_manifest_id.value())},
+      {"provider_manifest_revision",
+       CanonicalValue(commissioned.provider_manifest_revision.value())},
+      {"registered_command_kind_id",
+       CanonicalValue(commissioned.registered_command_kind_id.value())},
+      {"provider_contract_ref",
+       provider_contract_projection(commissioned.provider_contract_ref)},
+      {"endpoint_role_id",
+       CanonicalValue(commissioned.endpoint_role_id.value())},
+      {"stop_action_class",
+       CanonicalValue(
+           std::string(core::to_string(commissioned.stop_action_class)))},
+      {"safety_system_request_action_class",
+       CanonicalValue(std::string(core::to_string(
+           commissioned.safety_system_request_action_class)))},
+      {"external_resource_alias",
+       optional_strong_projection(commissioned.external_resource_alias)},
+      {"external_resource_kind",
+       commissioned.external_resource_kind.has_value()
+           ? CanonicalValue(std::string(core::to_string(
+                 *commissioned.external_resource_kind)))
+           : CanonicalValue(nullptr)},
+      {"site_overlay_value_ref",
+       optional_strong_projection(commissioned.site_overlay_value_ref)},
+      {"commissioning_evidence_artifact_ref",
+       retained_artifact_ref_projection(
+           commissioned.commissioning_evidence_artifact_ref)},
+  });
+}
+
+[[nodiscard]] CanonicalValue stop_implementation_qualification_projection(
+    const core::StopImplementationQualificationDTO& qualification) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"registered_command_kind_id",
+       CanonicalValue(qualification.registered_command_kind_id.value())},
+      {"provider_contract_ref",
+       provider_contract_projection(qualification.provider_contract_ref)},
+      {"product_id", CanonicalValue(qualification.product_id.value())},
+      {"product_contract_id",
+       CanonicalValue(qualification.product_contract_id.value())},
+      {"product_contract_revision",
+       CanonicalValue(qualification.product_contract_revision.value())},
+      {"endpoint_role_id",
+       optional_strong_projection(qualification.endpoint_role_id)},
+      {"invocation_lane_id",
+       CanonicalValue(qualification.invocation_lane_id.value())},
+      {"qualification_artifact_ref",
+       retained_artifact_ref_projection(
+           qualification.qualification_artifact_ref)},
+  });
+}
+
+[[nodiscard]] CanonicalValue
+controlled_stop_substitution_qualification_projection(
+    const core::ControlledStopSubstitutionQualificationDTO& qualification) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"provider_contract_ref",
+       provider_contract_projection(qualification.provider_contract_ref)},
+      {"product_id", CanonicalValue(qualification.product_id.value())},
+      {"product_contract_id",
+       CanonicalValue(qualification.product_contract_id.value())},
+      {"product_contract_revision",
+       CanonicalValue(qualification.product_contract_revision.value())},
+      {"requested_stop_mode",
+       CanonicalValue(std::string(
+           core::to_string(qualification.requested_stop_mode)))},
+      {"executed_stop_mode",
+       CanonicalValue(std::string(
+           core::to_string(qualification.executed_stop_mode)))},
+      {"qualification_artifact_ref",
+       retained_artifact_ref_projection(
+           qualification.qualification_artifact_ref)},
+  });
+}
+
+[[nodiscard]] CanonicalValue stop_command_projection(
+    const core::StopContainmentCommandDTO& command) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"command_phase_id", CanonicalValue(command.command_phase_id.value())},
+      {"command_kind",
+       CanonicalValue(std::string(core::to_string(command.command_kind)))},
+      {"provider_contract_ref",
+       optional_contract_projection(command.provider_contract_ref)},
+      {"registered_command_kind_id",
+       optional_strong_projection(command.registered_command_kind_id)},
+  });
+}
+
+[[nodiscard]] CanonicalValue stop_budget_projection(
+    const core::StopDeadlineBudgetDTO& budget) {
+  CanonicalValue::Array phases;
+  phases.reserve(budget.phases.size());
+  for (const auto& phase : budget.phases) {
+    phases.emplace_back(CanonicalValue::Object{
+        {"phase_id", CanonicalValue(phase.phase_id.value())},
+        {"deadline_offset_ns",
+         CanonicalValue(static_cast<double>(phase.deadline_offset_ns))},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"outer_duration_ns",
+       CanonicalValue(static_cast<double>(budget.outer_duration_ns))},
+      {"kernel_completion_reserve_ns",
+       CanonicalValue(static_cast<double>(budget.kernel_completion_reserve_ns))},
+      {"phases", CanonicalValue(std::move(phases))},
+  });
+}
+
+[[nodiscard]] CanonicalValue stop_evidence_projection(
+    const core::StopEvidenceRequirementDTO& evidence) {
+  std::vector<std::string> authority_classes;
+  authority_classes.reserve(
+      evidence.source_requirement.allowed_authority_classes.size());
+  for (const auto authority_class :
+       evidence.source_requirement.allowed_authority_classes) {
+    authority_classes.emplace_back(core::to_string(authority_class));
+  }
+  std::sort(authority_classes.begin(), authority_classes.end());
+  const CanonicalValue source(CanonicalValue::Object{
+      {"source_kind",
+       CanonicalValue(std::string(
+           core::to_string(evidence.source_requirement.source_kind)))},
+      {"freshness_budget_ns",
+       CanonicalValue(static_cast<double>(
+           evidence.source_requirement.freshness_budget_ns))},
+      {"endpoint_role_id",
+       optional_strong_projection(
+           evidence.source_requirement.endpoint_role_id)},
+      {"allowed_authority_classes",
+       text_array(std::span(authority_classes))},
+  });
+  const CanonicalValue observation(CanonicalValue::Object{
+      {"observation_kind",
+       CanonicalValue(std::string(
+           core::to_string(evidence.observation_semantics.observation_kind)))},
+      {"minimum_dwell_ns",
+       evidence.observation_semantics.minimum_dwell_ns.has_value()
+           ? CanonicalValue(static_cast<double>(
+                 *evidence.observation_semantics.minimum_dwell_ns))
+           : CanonicalValue(nullptr)},
+  });
+  return CanonicalValue(CanonicalValue::Object{
+      {"evidence_item_id", CanonicalValue(evidence.evidence_item_id.value())},
+      {"phase_id", CanonicalValue(evidence.phase_id.value())},
+      {"evidence_kind",
+       CanonicalValue(std::string(core::to_string(evidence.evidence_kind)))},
+      {"provider_contract_ref",
+       optional_contract_projection(evidence.provider_contract_ref)},
+      {"registered_evidence_kind_id",
+       optional_strong_projection(evidence.registered_evidence_kind_id)},
+      {"source_requirement", source},
+      {"observation_semantics", observation},
+  });
+}
+
+[[nodiscard]] CanonicalValue stop_scope_projection(
+    const LogicalStopScopeTemplate& scope) {
+  return std::visit(
+      [](const auto& typed_scope) -> CanonicalValue {
+        using Scope = std::decay_t<decltype(typed_scope)>;
+        if constexpr (std::is_same_v<Scope,
+                                     LogicalResourceStopScopeTemplate>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"stop_escalation_stage_id",
+               CanonicalValue(
+                   typed_scope.stop_escalation_stage_id.value())},
+              {"scope_kind", CanonicalValue("resource")},
+              {"activation_set_id",
+               CanonicalValue(typed_scope.activation_set_id.value())},
+              {"resource_ids",
+               strong_id_array(std::span(typed_scope.resource_ids))},
+          });
+        } else if constexpr (
+            std::is_same_v<Scope, LogicalControllerSetStopScopeTemplate>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"stop_escalation_stage_id",
+               CanonicalValue(
+                   typed_scope.stop_escalation_stage_id.value())},
+              {"scope_kind", CanonicalValue("controller_set")},
+              {"activation_set_id",
+               CanonicalValue(typed_scope.activation_set_id.value())},
+              {"active_controller_role_ids",
+               strong_id_array(
+                   std::span(typed_scope.active_controller_role_ids))},
+              {"logical_controller_symbols",
+               text_array(
+                   std::span(typed_scope.logical_controller_symbols))},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"stop_escalation_stage_id",
+               CanonicalValue(
+                   typed_scope.stop_escalation_stage_id.value())},
+              {"scope_kind", CanonicalValue("control_domain")},
+              {"activation_set_id",
+               CanonicalValue(typed_scope.activation_set_id.value())},
+              {"control_domain_id",
+               CanonicalValue(typed_scope.control_domain_id.value())},
+              {"control_domain_revision",
+               CanonicalValue(typed_scope.control_domain_revision.value())},
+          });
+        }
+      },
+      scope);
+}
+
+[[nodiscard]] CanonicalValue stop_escalation_stage_projection(
+    const LogicalStopEscalationStageTemplate& stage) {
+  CanonicalValue::Array evidence;
+  evidence.reserve(stage.all_of_evidence_requirements.size());
+  for (const auto& requirement : stage.all_of_evidence_requirements) {
+    evidence.push_back(stop_evidence_projection(requirement));
+  }
+
+  CanonicalValue provider_command(nullptr);
+  if (stage.provider_command_endpoint.has_value()) {
+    const auto& endpoint = *stage.provider_command_endpoint;
+    provider_command = CanonicalValue(CanonicalValue::Object{
+        {"stop_escalation_stage_id",
+         CanonicalValue(endpoint.stop_escalation_stage_id.value())},
+        {"provider_contract_ref",
+         provider_contract_projection(endpoint.provider_contract_ref)},
+        {"endpoint_role_id", CanonicalValue(endpoint.endpoint_role_id.value())},
+        {"logical_endpoint_symbol",
+         CanonicalValue(endpoint.logical_endpoint_symbol)},
+    });
+  }
+
+  CanonicalValue::Array provider_evidence;
+  provider_evidence.reserve(stage.provider_evidence_endpoints.size());
+  for (const auto& endpoint : stage.provider_evidence_endpoints) {
+    provider_evidence.emplace_back(CanonicalValue::Object{
+        {"stop_escalation_stage_id",
+         CanonicalValue(endpoint.stop_escalation_stage_id.value())},
+        {"evidence_item_id",
+         CanonicalValue(endpoint.evidence_item_id.value())},
+        {"provider_contract_ref",
+         provider_contract_projection(endpoint.provider_contract_ref)},
+        {"endpoint_role_id", CanonicalValue(endpoint.endpoint_role_id.value())},
+        {"logical_endpoint_symbol",
+         CanonicalValue(endpoint.logical_endpoint_symbol)},
+    });
+  }
+
+  CanonicalValue::Array binding_sources;
+  binding_sources.reserve(stage.binding_state_authority_sources.size());
+  for (const auto& source : stage.binding_state_authority_sources) {
+    binding_sources.emplace_back(CanonicalValue::Object{
+        {"stop_escalation_stage_id",
+         CanonicalValue(source.stop_escalation_stage_id.value())},
+        {"evidence_item_id", CanonicalValue(source.evidence_item_id.value())},
+        {"state_authority_id",
+         CanonicalValue(source.state_authority_id.value())},
+        {"state_authority_class",
+         CanonicalValue(
+             std::string(core::to_string(source.state_authority_class)))},
+        {"state_endpoint_role_id",
+         CanonicalValue(source.state_endpoint_role_id.value())},
+        {"logical_endpoint_symbol",
+         CanonicalValue(source.logical_endpoint_symbol)},
+    });
+  }
+
+  CanonicalValue::Array scopes;
+  scopes.reserve(stage.containment_scopes.size());
+  for (const auto& scope : stage.containment_scopes) {
+    scopes.push_back(stop_scope_projection(scope));
+  }
+
+  return CanonicalValue(CanonicalValue::Object{
+      {"stop_escalation_stage_id",
+       CanonicalValue(stage.stop_escalation_stage_id.value())},
+      {"stage_kind",
+       CanonicalValue(std::string(core::to_string(stage.stage_kind)))},
+      {"containment_granularity",
+       CanonicalValue(
+           std::string(core::to_string(stage.containment_granularity)))},
+      {"containment_command",
+       stop_command_projection(stage.containment_command)},
+      {"evidence_conjunction",
+       CanonicalValue(std::string(core::to_string(stage.evidence_conjunction)))},
+      {"all_of_evidence_requirements", CanonicalValue(std::move(evidence))},
+      {"default_contract_parameters",
+       stage.default_contract_parameters.has_value()
+           ? json_object_projection(*stage.default_contract_parameters)
+           : CanonicalValue(nullptr)},
+      {"commissioned_stop_interface",
+       stage.commissioned_stop_interface.has_value()
+           ? commissioned_stop_interface_projection(
+                 *stage.commissioned_stop_interface)
+           : CanonicalValue(nullptr)},
+      {"provider_command_endpoint", std::move(provider_command)},
+      {"provider_evidence_endpoints",
+       CanonicalValue(std::move(provider_evidence))},
+      {"binding_state_authority_sources",
+       CanonicalValue(std::move(binding_sources))},
+      {"containment_scopes", CanonicalValue(std::move(scopes))},
+  });
+}
+
+template <typename Stop>
+[[nodiscard]] CanonicalValue::Object stop_common_projection(const Stop& stop) {
+  return CanonicalValue::Object{
+      {"control_binding_id", CanonicalValue(stop.control_binding_id.value())},
+      {"control_binding_revision",
+       CanonicalValue(stop.control_binding_revision.value())},
+      {"control_route_id", CanonicalValue(stop.control_route_id.value())},
+      {"stop_evidence_policy_id",
+       CanonicalValue(stop.stop_evidence_policy_id.value())},
+      {"stop_evidence_policy_revision",
+       CanonicalValue(stop.stop_evidence_policy_revision.value())},
+      {"control_domain_id", CanonicalValue(stop.control_domain_id.value())},
+      {"control_domain_revision",
+       CanonicalValue(stop.control_domain_revision.value())},
+      {"controller_topology_id",
+       CanonicalValue(stop.controller_topology_id.value())},
+      {"topology_revision", CanonicalValue(stop.topology_revision.value())},
+      {"containment_granularity",
+       CanonicalValue(
+           std::string(core::to_string(stop.containment_granularity)))},
+      {"disposition",
+       CanonicalValue(std::string(core::to_string(stop.disposition)))},
+  };
+}
+
+[[nodiscard]] CanonicalValue stop_applicability_projection(
+    const LogicalStopApplicabilityTemplate& value) {
+  return std::visit(
+      [](const auto& stop) -> CanonicalValue {
+        using Stop = std::decay_t<decltype(stop)>;
+        auto fields = stop_common_projection(stop);
+        if constexpr (std::is_same_v<Stop,
+                                     LogicalStoppableApplicabilityTemplate>) {
+          CanonicalValue::Array stages;
+          stages.reserve(stop.escalation_stages.size());
+          for (const auto& stage : stop.escalation_stages) {
+            stages.push_back(stop_escalation_stage_projection(stage));
+          }
+          fields.emplace_back("logical_stop_symbol",
+                              CanonicalValue(stop.logical_stop_symbol));
+          fields.emplace_back("deadline_budget",
+                              stop_budget_projection(stop.deadline_budget));
+          fields.emplace_back("escalation_stages",
+                              CanonicalValue(std::move(stages)));
+        }
+        return CanonicalValue(std::move(fields));
+      },
+      value);
+}
+
 [[nodiscard]] std::string manager_name(const core::ControlDomainDTO& domain) {
   std::string preimage = "manyforge.control-domain-manager-name.v1";
   preimage.push_back('\0');
@@ -528,7 +974,12 @@ template <typename Strong>
 }
 
 [[nodiscard]] CanonicalValue control_domain_projection(
-    const CompilerQualifiedCellIr& compiler_ir, const core::ControlDomainId& control_domain_id) {
+    const CompilerQualifiedCellIr& compiler_ir,
+    const core::ControlDomainId& control_domain_id,
+    std::span<const core::StopImplementationQualificationDTO>
+        stop_implementation_qualifications,
+    std::span<const core::ControlledStopSubstitutionQualificationDTO>
+        controlled_stop_substitution_qualifications) {
   const auto& domain = require_domain(compiler_ir, control_domain_id);
   const auto& desired = require_desired_configuration(compiler_ir, control_domain_id);
   const auto& topology = require_topology(compiler_ir, domain).value();
@@ -577,6 +1028,118 @@ template <typename Strong>
     fail_retained_bundle("control-domain product requires at least one exact route");
   }
 
+  std::vector<const LogicalStopApplicabilityTemplate*> domain_stops;
+  for (const auto& stop : compiler_ir.applicability().stop_applicability()) {
+    const bool belongs_to_domain = std::visit(
+        [&](const auto& row) {
+          return row.control_domain_id == control_domain_id;
+        },
+        stop);
+    if (belongs_to_domain) {
+      domain_stops.push_back(&stop);
+    }
+  }
+  std::sort(domain_stops.begin(), domain_stops.end(), [](const auto* left,
+                                                        const auto* right) {
+    const auto key = [](const auto& value) {
+      return std::visit(
+          [](const auto& row) {
+            return std::pair{row.control_binding_id.value(),
+                             row.control_route_id.value()};
+          },
+          value);
+    };
+    return key(*left) < key(*right);
+  });
+  if (domain_stops.size() != routes.size()) {
+    fail_retained_bundle(
+        "control-domain product requires one exact Stop applicability row per route");
+  }
+  CanonicalValue::Array stop_applicability;
+  std::vector<core::CommissionedStopInterfaceDTO>
+      commissioned_stop_interfaces;
+  stop_applicability.reserve(domain_stops.size());
+  for (const auto* stop : domain_stops) {
+    stop_applicability.push_back(stop_applicability_projection(*stop));
+    std::visit(
+        [&](const auto& row) {
+          using Stop = std::decay_t<decltype(row)>;
+          if constexpr (std::is_same_v<
+                            Stop, LogicalStoppableApplicabilityTemplate>) {
+            for (const auto& stage : row.escalation_stages) {
+              if (stage.commissioned_stop_interface.has_value()) {
+                commissioned_stop_interfaces.push_back(
+                    *stage.commissioned_stop_interface);
+              }
+            }
+          }
+        },
+        *stop);
+  }
+  std::sort(commissioned_stop_interfaces.begin(),
+            commissioned_stop_interfaces.end(),
+            [](const auto& left, const auto& right) {
+              return left.commissioned_stop_interface_id <
+                     right.commissioned_stop_interface_id;
+            });
+  if (std::adjacent_find(
+          commissioned_stop_interfaces.begin(),
+          commissioned_stop_interfaces.end(),
+          [](const auto& left, const auto& right) {
+            return left.commissioned_stop_interface_id ==
+                   right.commissioned_stop_interface_id;
+          }) != commissioned_stop_interfaces.end()) {
+    fail_retained_bundle(
+        "control-domain product repeats a commissioned Stop interface");
+  }
+
+  CanonicalValue::Array implementation_qualifications;
+  implementation_qualifications.reserve(
+      stop_implementation_qualifications.size());
+  for (const auto& qualification : stop_implementation_qualifications) {
+    implementation_qualifications.push_back(
+        stop_implementation_qualification_projection(qualification));
+  }
+  std::sort(implementation_qualifications.begin(),
+            implementation_qualifications.end(),
+            [](const auto& left, const auto& right) {
+              return canonical_json(left) < canonical_json(right);
+            });
+  if (std::adjacent_find(
+          implementation_qualifications.begin(),
+          implementation_qualifications.end()) !=
+      implementation_qualifications.end()) {
+    fail_retained_bundle(
+        "control-domain product repeats a Stop implementation qualification");
+  }
+
+  CanonicalValue::Array substitution_qualifications;
+  substitution_qualifications.reserve(
+      controlled_stop_substitution_qualifications.size());
+  for (const auto& qualification :
+       controlled_stop_substitution_qualifications) {
+    substitution_qualifications.push_back(
+        controlled_stop_substitution_qualification_projection(qualification));
+  }
+  std::sort(substitution_qualifications.begin(),
+            substitution_qualifications.end(),
+            [](const auto& left, const auto& right) {
+              return canonical_json(left) < canonical_json(right);
+            });
+  if (std::adjacent_find(substitution_qualifications.begin(),
+                         substitution_qualifications.end()) !=
+      substitution_qualifications.end()) {
+    fail_retained_bundle(
+        "control-domain product repeats a controlled Stop substitution qualification");
+  }
+
+  CanonicalValue::Array commissioned_rows;
+  commissioned_rows.reserve(commissioned_stop_interfaces.size());
+  for (const auto& commissioned : commissioned_stop_interfaces) {
+    commissioned_rows.push_back(
+        commissioned_stop_interface_projection(commissioned));
+  }
+
   CanonicalValue bindings_value(std::move(bindings));
   CanonicalValue controllers_value(std::move(controllers));
   CanonicalValue source_conformance =
@@ -603,16 +1166,76 @@ template <typename Strong>
       {"controllers", controllers_value},
       {"activation_sets", CanonicalValue(std::move(activation_sets))},
       {"routes", CanonicalValue(std::move(routes))},
+      {"stop_applicability", CanonicalValue(std::move(stop_applicability))},
+      {"stop_implementation_qualifications",
+       CanonicalValue(std::move(implementation_qualifications))},
+      {"controlled_stop_substitution_qualifications",
+       CanonicalValue(std::move(substitution_qualifications))},
+      {"commissioned_stop_interfaces",
+       CanonicalValue(std::move(commissioned_rows))},
       {"source_conformance", std::move(source_conformance)},
   });
 }
 
 }  // namespace
 
-std::string emit_control_domain_control(const CompilerQualifiedCellIr& compiler_ir,
-                                        const core::ControlDomainId& control_domain_id) {
+CanonicalValue stop_policy_applicability_projection(
+    const core::StopEvidencePolicyDTO& policy) {
+  CanonicalValue::Object fields{
+      {"disposition",
+       CanonicalValue(std::string(core::to_string(policy.disposition)))},
+      {"containment_granularity",
+       CanonicalValue(
+           std::string(core::to_string(policy.containment_granularity)))},
+  };
+  if (policy.disposition == core::StopEvidenceDisposition::kNotStoppable) {
+    return CanonicalValue(std::move(fields));
+  }
+  if (!policy.deadline_budget.has_value() || policy.escalation_stages.empty()) {
+    fail_retained_bundle(
+        "qualified stoppable policy lost its complete declarative semantics");
+  }
+  CanonicalValue::Array stages;
+  stages.reserve(policy.escalation_stages.size());
+  for (const auto& stage : policy.escalation_stages) {
+    CanonicalValue::Array evidence;
+    evidence.reserve(stage.evidence_requirements.size());
+    for (const auto& requirement : stage.evidence_requirements) {
+      evidence.push_back(stop_evidence_projection(requirement));
+    }
+    stages.emplace_back(CanonicalValue::Object{
+        {"stop_escalation_stage_id",
+         CanonicalValue(stage.stop_escalation_stage_id.value())},
+        {"stage_kind",
+         CanonicalValue(std::string(core::to_string(stage.stage_kind)))},
+        {"containment_granularity",
+         CanonicalValue(
+             std::string(core::to_string(stage.containment_granularity)))},
+        {"containment_command",
+         stop_command_projection(stage.containment_command)},
+        {"evidence_conjunction",
+         CanonicalValue(
+             std::string(core::to_string(stage.evidence_conjunction)))},
+        {"all_of_evidence_requirements", CanonicalValue(std::move(evidence))},
+    });
+  }
+  fields.emplace_back("deadline_budget",
+                      stop_budget_projection(*policy.deadline_budget));
+  fields.emplace_back("escalation_stages", CanonicalValue(std::move(stages)));
+  return CanonicalValue(std::move(fields));
+}
+
+std::string emit_control_domain_control(
+    const CompilerQualifiedCellIr& compiler_ir,
+    const core::ControlDomainId& control_domain_id,
+    std::span<const core::StopImplementationQualificationDTO>
+        stop_implementation_qualifications,
+    std::span<const core::ControlledStopSubstitutionQualificationDTO>
+        controlled_stop_substitution_qualifications) {
   const std::string bytes =
-      canonical_json(control_domain_projection(compiler_ir, control_domain_id));
+      canonical_json(control_domain_projection(
+          compiler_ir, control_domain_id, stop_implementation_qualifications,
+          controlled_stop_substitution_qualifications));
   const CanonicalValue parsed = parse_and_verify_control_domain_control(bytes);
   if (canonical_json(parsed) != bytes) {
     throw std::logic_error("control-domain control emitter produced noncanonical bytes");
@@ -622,9 +1245,16 @@ std::string emit_control_domain_control(const CompilerQualifiedCellIr& compiler_
 
 void require_control_domain_control_matches(std::string_view canonical_bytes,
                                             const CompilerQualifiedCellIr& compiler_ir,
-                                            const core::ControlDomainId& control_domain_id) {
+                                            const core::ControlDomainId& control_domain_id,
+                                            std::span<const core::StopImplementationQualificationDTO>
+                                                stop_implementation_qualifications,
+                                            std::span<const core::ControlledStopSubstitutionQualificationDTO>
+                                                controlled_stop_substitution_qualifications) {
   const CanonicalValue parsed = parse_and_verify_control_domain_control(canonical_bytes);
-  if (parsed != control_domain_projection(compiler_ir, control_domain_id)) {
+  if (parsed != control_domain_projection(
+                    compiler_ir, control_domain_id,
+                    stop_implementation_qualifications,
+                    controlled_stop_substitution_qualifications)) {
     fail_retained_bundle(
         "control-domain control artifact differs from the exact compiler "
         "projection");

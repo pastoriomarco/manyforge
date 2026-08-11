@@ -4,6 +4,7 @@
 
 #include <array>
 #include <manyforge_core/types/catalog.hpp>
+#include <manyforge_core/types/stop_control.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/control_interface_contract.hpp>
 #include <manyforge_core/types/controller_topology.hpp>
@@ -897,6 +898,23 @@ void register_catalog_record_bindings(py::module_& module) {
              StopContainmentCommandKind::kSafeOutputCommand)
       .value("kLogicalCancel", StopContainmentCommandKind::kLogicalCancel)
       .value("kRegistered", StopContainmentCommandKind::kRegistered);
+  py::enum_<StopEscalationStageKind>(module, "StopEscalationStageKind")
+      .value("kNominal", StopEscalationStageKind::kNominal)
+      .value("kControlledFallback",
+             StopEscalationStageKind::kControlledFallback)
+      .value("kSoftwareHard", StopEscalationStageKind::kSoftwareHard)
+      .value("kSafetySystemRequest",
+             StopEscalationStageKind::kSafetySystemRequest);
+  py::enum_<StopActionClass>(module, "StopActionClass")
+      .value("kControlled", StopActionClass::kControlled)
+      .value("kSoftwareHard", StopActionClass::kSoftwareHard)
+      .value("kSafetySystemRequest", StopActionClass::kSafetySystemRequest);
+  py::enum_<SafetySystemRequestActionClass>(
+      module, "SafetySystemRequestActionClass")
+      .value("kProtectiveStopRequest",
+             SafetySystemRequestActionClass::kProtectiveStopRequest)
+      .value("kEmergencyStopRequest",
+             SafetySystemRequestActionClass::kEmergencyStopRequest);
   py::enum_<StopEvidenceConjunction>(module, "StopEvidenceConjunction")
       .value("kAllOf", StopEvidenceConjunction::kAllOf);
   py::enum_<StopEvidenceRequirementKind>(
@@ -1290,23 +1308,46 @@ void register_catalog_record_bindings(py::module_& module) {
           },
           py::is_operator());
 
+  py::class_<StopEscalationStageDTO>(module, "StopEscalationStageDTO",
+                                      py::is_final())
+      .def(py::init<StopEscalationStageId, StopEscalationStageKind,
+                    ContainmentGranularity, StopContainmentCommandDTO,
+                    StopEvidenceConjunction,
+                    std::vector<StopEvidenceRequirementDTO>>(),
+           py::arg("stop_escalation_stage_id"), py::arg("stage_kind"),
+           py::arg("containment_granularity"),
+           py::arg("containment_command"), py::arg("evidence_conjunction"),
+           py::arg("evidence_requirements"))
+      .def_readonly("stop_escalation_stage_id",
+                    &StopEscalationStageDTO::stop_escalation_stage_id)
+      .def_readonly("stage_kind", &StopEscalationStageDTO::stage_kind)
+      .def_readonly("containment_granularity",
+                    &StopEscalationStageDTO::containment_granularity)
+      .def_readonly("containment_command",
+                    &StopEscalationStageDTO::containment_command)
+      .def_readonly("evidence_conjunction",
+                    &StopEscalationStageDTO::evidence_conjunction)
+      .def_readonly("evidence_requirements",
+                    &StopEscalationStageDTO::evidence_requirements)
+      .def(
+          "__eq__",
+          [](const StopEscalationStageDTO& lhs,
+             const StopEscalationStageDTO& rhs) { return lhs == rhs; },
+          py::is_operator());
+
   py::class_<StopEvidencePolicyDTO>(module, "StopEvidencePolicyDTO",
                                     py::is_final())
       .def(py::init<
                StopEvidencePolicyId, StopEvidencePolicyRevision,
                StopEvidenceDisposition, ContainmentGranularity,
-               std::optional<StopContainmentCommandDTO>,
                std::optional<StopDeadlineBudgetDTO>,
-               std::optional<StopEvidenceConjunction>,
-               std::vector<StopEvidenceRequirementDTO>>(),
+               std::vector<StopEscalationStageDTO>>(),
            py::arg("stop_evidence_policy_id"),
            py::arg("stop_evidence_policy_revision"),
            py::arg("disposition"), py::arg("containment_granularity"),
-           py::arg("containment_command") = std::nullopt,
            py::arg("deadline_budget") = std::nullopt,
-           py::arg("evidence_conjunction") = std::nullopt,
-           py::arg("evidence_requirements") =
-               std::vector<StopEvidenceRequirementDTO>{})
+           py::arg("escalation_stages") =
+               std::vector<StopEscalationStageDTO>{})
       .def_readonly("stop_evidence_policy_id",
                     &StopEvidencePolicyDTO::stop_evidence_policy_id)
       .def_readonly("stop_evidence_policy_revision",
@@ -1315,14 +1356,10 @@ void register_catalog_record_bindings(py::module_& module) {
                     &StopEvidencePolicyDTO::disposition)
       .def_readonly("containment_granularity",
                     &StopEvidencePolicyDTO::containment_granularity)
-      .def_readonly("containment_command",
-                    &StopEvidencePolicyDTO::containment_command)
       .def_readonly("deadline_budget",
                     &StopEvidencePolicyDTO::deadline_budget)
-      .def_readonly("evidence_conjunction",
-                    &StopEvidencePolicyDTO::evidence_conjunction)
-      .def_readonly("evidence_requirements",
-                    &StopEvidencePolicyDTO::evidence_requirements)
+      .def_readonly("escalation_stages",
+                    &StopEvidencePolicyDTO::escalation_stages)
       .def(
           "__eq__",
           [](const StopEvidencePolicyDTO& lhs,
@@ -1331,6 +1368,8 @@ void register_catalog_record_bindings(py::module_& module) {
 
   module.attr("STOP_EVIDENCE_POLICY_API_VERSION") =
       std::string(kStopEvidencePolicyApiVersion);
+  module.attr("MAX_STOP_ESCALATION_STAGES") =
+      kMaxStopEscalationStages;
   module.attr("MAX_STOP_EVIDENCE_POLICY_ITEMS") =
       kMaxStopEvidencePolicyItems;
   module.attr("MAX_STOP_EVIDENCE_POLICY_DURATION_NS") =

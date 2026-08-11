@@ -51,7 +51,7 @@ constexpr std::array<AuthoredReference, 11> kAllReferences{{
     {"contact_policy", "contact.alpha", "manyforge.contact_policy.v1", '9',
      'a', 'b', 'c'},
     {"stop_evidence_policy", "stop.alpha",
-     "manyforge.stop_evidence_policy.v1", 'a', 'b', 'c', 'd'},
+     "manyforge.stop_evidence_policy.v2", 'a', 'b', 'c', 'd'},
     {"runtime_policy", "policy.alpha", "manyforge.runtime_policy.v1", 'b',
      'c', 'd', 'e'},
 }};

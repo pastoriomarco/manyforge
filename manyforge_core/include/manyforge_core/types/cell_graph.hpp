@@ -182,6 +182,9 @@ struct ControlBindingDTO {
   std::vector<ControlRouteId> legal_control_route_ids;
   std::vector<RouteEndpointProjectionDTO> route_endpoint_projections;
   ProviderInstanceId provider_instance_id;
+  /// Exact managed runtime unit that hosts this binding's provider instance.
+  /// External endpoints remain resources reached through that managed owner.
+  RuntimeUnitId provider_runtime_unit_id;
   ProviderManifestId provider_manifest_id;
   ProviderManifestRevision provider_manifest_revision;
   StateAuthorityId state_authority_id;

@@ -16,6 +16,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <openssl/evp.h>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -29,6 +31,7 @@
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -71,6 +74,60 @@ constexpr auto kTermStopTimeout = std::chrono::seconds(1);
 [[nodiscard]] std::string ErrnoDetail(const std::string_view operation,
                                       const int error) {
   return std::string(operation) + ": " + std::strerror(error);
+}
+
+[[nodiscard]] std::string DigestRegularFile(const int fd,
+                                            const std::uint64_t byte_size) {
+  EVP_MD_CTX* raw_context = EVP_MD_CTX_new();
+  if (raw_context == nullptr) {
+    Fail("could not allocate installed-target digest context");
+  }
+  const auto free_context = [](EVP_MD_CTX* context) {
+    EVP_MD_CTX_free(context);
+  };
+  std::unique_ptr<EVP_MD_CTX, decltype(free_context)> context(raw_context,
+                                                              free_context);
+  if (EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+    Fail("could not initialize installed-target digest");
+  }
+  std::array<unsigned char, 64U * 1024U> buffer{};
+  std::uint64_t offset = 0U;
+  while (offset < byte_size) {
+    const std::uint64_t remaining = byte_size - offset;
+    const std::size_t requested = static_cast<std::size_t>(
+        std::min<std::uint64_t>(remaining, buffer.size()));
+    ssize_t count = -1;
+    do {
+      count = ::pread(fd, buffer.data(), requested,
+                      static_cast<off_t>(offset));
+    } while (count < 0 && errno == EINTR);
+    if (count <= 0) {
+      if (count < 0) {
+        Fail(ErrnoDetail("could not read installed target for verification",
+                         errno));
+      }
+      Fail("installed target ended before its retained byte size");
+    }
+    if (EVP_DigestUpdate(context.get(), buffer.data(),
+                         static_cast<std::size_t>(count)) != 1) {
+      Fail("could not update installed-target digest");
+    }
+    offset += static_cast<std::uint64_t>(count);
+  }
+  std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+  unsigned int digest_size = 0U;
+  if (EVP_DigestFinal_ex(context.get(), digest.data(), &digest_size) != 1 ||
+      digest_size != 32U) {
+    Fail("could not finalize installed-target digest");
+  }
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string result("sha256:");
+  result.reserve(7U + digest_size * 2U);
+  for (unsigned int index = 0U; index < digest_size; ++index) {
+    result.push_back(kHex[(digest[index] >> 4U) & 0x0fU]);
+    result.push_back(kHex[digest[index] & 0x0fU]);
+  }
+  return result;
 }
 
 [[nodiscard]] std::filesystem::path
@@ -608,7 +665,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     return {std::move(bundle), std::move(*admission)};
   }
 
-  [[nodiscard]] UniqueFd OpenInstalledTarget() const {
+  [[nodiscard]] UniqueFd OpenInstalledTarget(
+      const NativeExecutionRuntimeUnitAdmission& admission) const {
     const int fd = ::openat(target_root_fd.get(),
                             std::string(contract::kInstalledTargetId).c_str(),
                             O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -620,6 +678,21 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (::fstat(target.get(), &status) != 0 || !S_ISREG(status.st_mode) ||
         (status.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
       Fail("fixed native execution target is not one protected regular file");
+    }
+    const auto& build_identity =
+        admission.product().implementation_build_identity();
+    if (build_identity.has_value()) {
+      if (build_identity->installed_target_id !=
+              admission.installed_target_id() ||
+          status.st_size <= 0 ||
+          static_cast<std::uint64_t>(status.st_size) !=
+              build_identity->installed_target_byte_size ||
+          DigestRegularFile(
+              target.get(), build_identity->installed_target_byte_size) !=
+              build_identity->installed_target_content_digest.value()) {
+        Fail("fixed native execution target differs from its retained "
+             "implementation build identity");
+      }
     }
     return target;
   }
@@ -947,7 +1020,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   [[nodiscard]] Child
   LaunchChild(const NativeExecutionRuntimeUnitAdmission &admission,
               const RetainedBundle &bundle) {
-    auto target = OpenInstalledTarget();
+    auto target = OpenInstalledTarget(admission);
     auto channels = MakePacketPair();
     auto exec_pipe = MakePipe();
     SetNonBlocking(channels[0].get());

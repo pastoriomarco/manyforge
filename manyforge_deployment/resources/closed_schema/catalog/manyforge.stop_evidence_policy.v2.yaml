@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
-schema_id: manyforge.stop_evidence_policy.v1
-schema_revision: sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2
+schema_id: manyforge.stop_evidence_policy.v2
+schema_revision: sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970
 schema_purpose: artifact_document
 root_definition_id: stop_evidence_policy
 definitions:
@@ -31,7 +31,7 @@ definitions:
             constraints:
               - kind: enum
                 values:
-                  - manyforge.stop_evidence_policy.v1
+                  - manyforge.stop_evidence_policy.v2
               - kind: string_format
                 value: api_version
         - field_id: stop_evidence_policy_id
@@ -78,13 +78,6 @@ definitions:
                   - resource
                   - controller_set
                   - control_domain
-        - field_id: containment_command
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: local_ref
-            definition_id: containment_command
         - field_id: deadline_budget
           presence: required
           default:
@@ -92,30 +85,19 @@ definitions:
           value_schema:
             kind: local_ref
             definition_id: deadline_budget
-        - field_id: evidence_conjunction
-          presence: required
-          default:
-            kind: absent
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: enum
-                values:
-                  - all_of
-        - field_id: evidence_requirements
+        - field_id: escalation_stages
           presence: required
           default:
             kind: absent
           value_schema:
             kind: array
             min_items: 1
-            max_items: 64
+            max_items: 8
             collection:
               kind: ordered
             item_schema:
               kind: local_ref
-              definition_id: evidence_requirement
+              definition_id: stop_escalation_stage
   - definition_id: not_stoppable_policy
     value_schema:
       kind: object
@@ -130,7 +112,7 @@ definitions:
             constraints:
               - kind: enum
                 values:
-                  - manyforge.stop_evidence_policy.v1
+                  - manyforge.stop_evidence_policy.v2
               - kind: string_format
                 value: api_version
         - field_id: stop_evidence_policy_id
@@ -177,6 +159,78 @@ definitions:
                   - resource
                   - controller_set
                   - control_domain
+  - definition_id: stop_escalation_stage
+    value_schema:
+      kind: object
+      fields:
+        - field_id: stop_escalation_stage_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: stage_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - nominal
+                  - controlled_fallback
+                  - software_hard
+                  - safety_system_request
+        - field_id: containment_granularity
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - resource
+                  - controller_set
+                  - control_domain
+        - field_id: containment_command
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: containment_command
+        - field_id: evidence_conjunction
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - all_of
+        - field_id: evidence_requirements
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 64
+            collection:
+              kind: ordered
+            item_schema:
+              kind: local_ref
+              definition_id: evidence_requirement
   - definition_id: containment_command
     value_schema:
       kind: object

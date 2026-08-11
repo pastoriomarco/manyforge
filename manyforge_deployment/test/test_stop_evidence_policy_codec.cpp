@@ -19,7 +19,7 @@ namespace manyforge::deployment {
 namespace {
 
 constexpr std::string_view kStopEvidencePolicySchemaRevision =
-    "sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2";
+    "sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -42,21 +42,43 @@ struct EvidenceSpec final {
   std::vector<std::string> authority_classes{"measured"};
 };
 
+struct StageSpec final {
+  std::string id;
+  std::string kind;
+  std::string granularity;
+  std::string command_kind;
+  std::string command_phase_id;
+  std::vector<EvidenceSpec> evidence;
+};
+
 struct PolicySpec final {
   std::string policy_id{"application_stop"};
   std::string granularity{"control_domain"};
-  std::string command_kind{"controller_goal_cancel"};
-  std::string command_phase_id{"command"};
   std::int64_t outer_duration_ns = 1'000;
   std::int64_t kernel_completion_reserve_ns = 100;
-  std::vector<PhaseSpec> phases{{"command", 100}, {"terminal", 500}};
-  std::vector<EvidenceSpec> evidence{{
-      "goal_terminal",
-      "terminal",
-      "controller_goal_terminal",
-      "controller_goal_status",
-      "post_command_sample",
-  }};
+  std::vector<PhaseSpec> phases{
+      {"command", 100}, {"terminal", 500}, {"hard_command", 700}};
+  std::vector<StageSpec> stages{
+      {
+          "nominal",
+          "nominal",
+          "control_domain",
+          "controller_goal_cancel",
+          "command",
+          {{"goal_terminal", "terminal", "controller_goal_terminal",
+            "controller_goal_status", "post_command_sample"}},
+      },
+      {
+          "software_hard_floor",
+          "software_hard",
+          "control_domain",
+          "registered",
+          "hard_command",
+          {{"hard_acknowledged", "hard_command",
+            "discrete_acknowledgement", "command_target_status",
+            "command_result"}},
+      },
+  };
 };
 
 [[nodiscard]] CanonicalValue provider_contract_ref() {
@@ -145,15 +167,31 @@ struct PolicySpec final {
     });
   }
 
-  CanonicalValue::Array evidence;
-  evidence.reserve(spec.evidence.size());
-  for (const auto& requirement : spec.evidence) {
-    evidence.emplace_back(CanonicalValue::Object{
-        {"evidence_item_id", CanonicalValue(requirement.id)},
-        {"phase_id", CanonicalValue(requirement.phase_id)},
-        {"evidence", evidence_value(requirement.evidence_kind)},
-        {"source_requirement", source_value(requirement)},
-        {"observation_semantics", observation_value(requirement)},
+  CanonicalValue::Array stages;
+  stages.reserve(spec.stages.size());
+  for (const auto& stage : spec.stages) {
+    CanonicalValue::Array evidence;
+    evidence.reserve(stage.evidence.size());
+    for (const auto& requirement : stage.evidence) {
+      evidence.emplace_back(CanonicalValue::Object{
+          {"evidence_item_id", CanonicalValue(requirement.id)},
+          {"phase_id", CanonicalValue(requirement.phase_id)},
+          {"evidence", evidence_value(requirement.evidence_kind)},
+          {"source_requirement", source_value(requirement)},
+          {"observation_semantics", observation_value(requirement)},
+      });
+    }
+    stages.emplace_back(CanonicalValue::Object{
+        {"stop_escalation_stage_id", CanonicalValue(stage.id)},
+        {"stage_kind", CanonicalValue(stage.kind)},
+        {"containment_granularity", CanonicalValue(stage.granularity)},
+        {"containment_command",
+         CanonicalValue(CanonicalValue::Object{
+             {"command_phase_id", CanonicalValue(stage.command_phase_id)},
+             {"command", command_value(stage.command_kind)},
+         })},
+        {"evidence_conjunction", CanonicalValue("all_of")},
+        {"evidence_requirements", CanonicalValue(std::move(evidence))},
     });
   }
 
@@ -163,11 +201,6 @@ struct PolicySpec final {
       {"stop_evidence_policy_id", CanonicalValue(spec.policy_id)},
       {"disposition", CanonicalValue("stoppable")},
       {"containment_granularity", CanonicalValue(spec.granularity)},
-      {"containment_command",
-       CanonicalValue(CanonicalValue::Object{
-           {"command_phase_id", CanonicalValue(spec.command_phase_id)},
-           {"command", command_value(spec.command_kind)},
-       })},
       {"deadline_budget",
        CanonicalValue(CanonicalValue::Object{
            {"outer_duration_ns",
@@ -177,8 +210,7 @@ struct PolicySpec final {
                 spec.kernel_completion_reserve_ns))},
            {"phases", CanonicalValue(std::move(phases))},
        })},
-      {"evidence_conjunction", CanonicalValue("all_of")},
-      {"evidence_requirements", CanonicalValue(std::move(evidence))},
+      {"escalation_stages", CanonicalValue(std::move(stages))},
   });
 }
 
@@ -285,9 +317,10 @@ TEST(StopEvidencePolicyCodec,
      QualifiesArbitraryStoppablePolicyAndPreservesDeclarativeFacts) {
   PolicySpec spec;
   spec.policy_id = "application_control_domain_stop";
-  spec.command_kind = "motion_controlled_stop";
-  spec.phases = {{"command", 100}, {"ack", 300}, {"rest", 700}};
-  spec.evidence = {
+  spec.stages.front().command_kind = "motion_controlled_stop";
+  spec.phases = {{"command", 100}, {"ack", 300}, {"rest", 600},
+                 {"hard_command", 800}};
+  spec.stages.front().evidence = {
       {"command_ack", "command", "controller_goal_terminal",
        "controller_goal_status", "command_result"},
       {"discrete_ack", "ack", "discrete_acknowledgement",
@@ -308,17 +341,24 @@ TEST(StopEvidencePolicyCodec,
             core::StopEvidencePolicyId(spec.policy_id));
   EXPECT_EQ(qualified.value().disposition,
             core::StopEvidenceDisposition::kStoppable);
-  ASSERT_TRUE(qualified.value().containment_command.has_value());
-  EXPECT_EQ(qualified.value().containment_command->command_kind,
+  ASSERT_EQ(qualified.value().escalation_stages.size(), 2U);
+  EXPECT_EQ(qualified.value().escalation_stages.front().containment_command.command_kind,
             core::StopContainmentCommandKind::kMotionControlledStop);
   ASSERT_TRUE(
-      qualified.value().containment_command->provider_contract_ref.has_value());
+      qualified.value()
+          .escalation_stages.front()
+          .containment_command.provider_contract_ref.has_value());
   ASSERT_TRUE(qualified.value().deadline_budget.has_value());
-  EXPECT_EQ(qualified.value().deadline_budget->phases.size(), 3U);
-  EXPECT_EQ(qualified.value().evidence_requirements.size(), 3U);
-  EXPECT_EQ(qualified.value().evidence_requirements.back().evidence_kind,
+  EXPECT_EQ(qualified.value().deadline_budget->phases.size(), 4U);
+  EXPECT_EQ(qualified.value().escalation_stages.front().evidence_requirements.size(),
+            3U);
+  EXPECT_EQ(qualified.value()
+                .escalation_stages.front()
+                .evidence_requirements.back()
+                .evidence_kind,
             core::StopEvidenceRequirementKind::kMotionRest);
   EXPECT_EQ(qualified.value()
+                .escalation_stages.front()
                 .evidence_requirements.back()
                 .source_requirement.allowed_authority_classes,
             (std::vector<core::StateAuthorityClass>{
@@ -336,10 +376,8 @@ TEST(StopEvidencePolicyCodec,
       document);
   EXPECT_EQ(qualified.value().disposition,
             core::StopEvidenceDisposition::kNotStoppable);
-  EXPECT_FALSE(qualified.value().containment_command.has_value());
   EXPECT_FALSE(qualified.value().deadline_budget.has_value());
-  EXPECT_FALSE(qualified.value().evidence_conjunction.has_value());
-  EXPECT_TRUE(qualified.value().evidence_requirements.empty());
+  EXPECT_TRUE(qualified.value().escalation_stages.empty());
 }
 
 TEST(StopEvidencePolicyCodec,
@@ -350,7 +388,7 @@ TEST(StopEvidencePolicyCodec,
         "registered"}) {
     PolicySpec spec;
     spec.policy_id = "command_" + command_kind;
-    spec.command_kind = command_kind;
+    spec.stages.front().command_kind = command_kind;
     EXPECT_NO_THROW(qualify(spec)) << command_kind;
   }
 }
@@ -382,9 +420,9 @@ TEST(StopEvidencePolicyCodec,
   for (std::size_t index = 0U; index < requirements.size(); ++index) {
     PolicySpec spec;
     spec.policy_id = "matrix_" + std::to_string(index);
-    spec.evidence = {requirements[index]};
+    spec.stages.front().evidence = {requirements[index]};
     if (requirements[index].phase_id == "command") {
-      spec.phases = {{"command", 100}};
+      spec.phases = {{"command", 100}, {"hard_command", 200}};
     }
     EXPECT_NO_THROW(qualify(spec)) << index;
   }
@@ -448,7 +486,7 @@ TEST(StopEvidencePolicyCodec,
         PolicySpec spec;
         spec.policy_id = "matrix_exhaustive_" + std::to_string(case_index++);
         const bool command_result = observation == "command_result";
-        spec.evidence = {{
+        spec.stages.front().evidence = {{
             "terminal",
             command_result ? "command" : "terminal",
             evidence,
@@ -458,7 +496,7 @@ TEST(StopEvidencePolicyCodec,
             observation == "post_command_dwell" ? 200 : 0,
         }};
         if (command_result) {
-          spec.phases = {{"command", 100}};
+          spec.phases = {{"command", 100}, {"hard_command", 200}};
         }
         const auto document = policy_document(spec);
         const core::ContentAddressedStoreKey store_key{
@@ -486,12 +524,13 @@ TEST(StopEvidencePolicyCodec,
   PolicySpec safe_output_with_controller_evidence;
   safe_output_with_controller_evidence.policy_id =
       "safe_output_with_controller_evidence";
-  safe_output_with_controller_evidence.command_kind = "safe_output_command";
+  safe_output_with_controller_evidence.stages.front().command_kind =
+      "safe_output_command";
   EXPECT_NO_THROW(qualify(safe_output_with_controller_evidence));
 
   PolicySpec cancel_with_io_evidence;
   cancel_with_io_evidence.policy_id = "cancel_with_io_evidence";
-  cancel_with_io_evidence.evidence = {
+  cancel_with_io_evidence.stages.front().evidence = {
       {"safe", "terminal", "io_safe_output", "provider_evidence",
        "post_command_sample"},
   };
@@ -504,21 +543,23 @@ TEST(StopEvidencePolicyCodec,
        {"command_result", "post_command_sample", "post_command_dwell"}) {
     PolicySpec spec;
     spec.policy_id = "registered_" + observation;
-    spec.evidence = {{"registered_terminal",
-                      observation == "command_result" ? "command" : "terminal",
-                      "registered",
-                      "provider_evidence",
-                      observation,
-                      25,
-                      observation == "post_command_dwell" ? 200 : 0}};
+    spec.stages.front().evidence = {
+        {"registered_terminal",
+         observation == "command_result" ? "command" : "terminal",
+         "registered", "provider_evidence", observation, 25,
+         observation == "post_command_dwell" ? 200 : 0}};
     if (observation == "command_result") {
-      spec.phases = {{"command", 100}};
+      spec.phases = {{"command", 100}, {"hard_command", 200}};
     }
     const auto qualified = qualify(spec);
     ASSERT_TRUE(
-        qualified.value().evidence_requirements.front().provider_contract_ref
+        qualified.value()
+            .escalation_stages.front()
+            .evidence_requirements.front()
+            .provider_contract_ref
             .has_value());
     ASSERT_TRUE(qualified.value()
+                    .escalation_stages.front()
                     .evidence_requirements.front()
                     .registered_evidence_kind_id.has_value());
   }
@@ -566,7 +607,7 @@ TEST(StopEvidencePolicyCodec,
   for (std::size_t index = 0U; index < invalid.size(); ++index) {
     PolicySpec spec;
     spec.policy_id = "invalid_matrix_" + std::to_string(index);
-    spec.evidence = {invalid[index]};
+    spec.stages.front().evidence = {invalid[index]};
     expect_semantic_rejection(spec);
   }
 }
@@ -582,15 +623,16 @@ TEST(StopEvidencePolicyCodec,
   expect_semantic_rejection(non_increasing);
 
   PolicySpec wrong_command_phase;
-  wrong_command_phase.command_phase_id = "terminal";
+  wrong_command_phase.stages.front().command_phase_id = "terminal";
   expect_semantic_rejection(wrong_command_phase);
 
   PolicySpec unknown_evidence_phase;
-  unknown_evidence_phase.evidence.front().phase_id = "unknown";
+  unknown_evidence_phase.stages.front().evidence.front().phase_id = "unknown";
   expect_semantic_rejection(unknown_evidence_phase);
 
   PolicySpec unused_phase;
-  unused_phase.phases = {{"command", 100}, {"middle", 300}, {"terminal", 500}};
+  unused_phase.phases = {{"command", 100}, {"middle", 300},
+                         {"terminal", 500}, {"hard_command", 700}};
   expect_semantic_rejection(unused_phase);
 
   PolicySpec insufficient_reserve;
@@ -599,15 +641,58 @@ TEST(StopEvidencePolicyCodec,
   expect_semantic_rejection(insufficient_reserve);
 
   PolicySpec excessive_dwell;
-  excessive_dwell.evidence = {
+  excessive_dwell.stages.front().evidence = {
       {"rest", "terminal", "motion_rest", "binding_state_authority",
        "post_command_dwell", 25, 401},
   };
   expect_semantic_rejection(excessive_dwell);
 
   PolicySpec duplicate_evidence;
-  duplicate_evidence.evidence.push_back(duplicate_evidence.evidence.front());
+  duplicate_evidence.stages.front().evidence.push_back(
+      duplicate_evidence.stages.front().evidence.front());
   expect_semantic_rejection(duplicate_evidence);
+}
+
+TEST(StopEvidencePolicyCodec,
+     RejectsEscalationStageOrderingBoundsAndCrossStagePhaseUse) {
+  PolicySpec no_stages;
+  no_stages.policy_id = "no_stages";
+  no_stages.stages.clear();
+  const auto no_stages_document = policy_document(no_stages);
+  expect_closed_schema_rejection(no_stages.policy_id, no_stages_document,
+                                 no_stages_document);
+
+  PolicySpec too_many_stages;
+  too_many_stages.policy_id = "too_many_stages";
+  const auto repeated_stage = too_many_stages.stages.front();
+  too_many_stages.stages.resize(core::kMaxStopEscalationStages + 1U,
+                                repeated_stage);
+  const auto too_many_stages_document = policy_document(too_many_stages);
+  expect_closed_schema_rejection(too_many_stages.policy_id,
+                                 too_many_stages_document,
+                                 too_many_stages_document);
+
+  PolicySpec wrong_first_stage;
+  std::swap(wrong_first_stage.stages.front(), wrong_first_stage.stages.back());
+  expect_semantic_rejection(wrong_first_stage);
+
+  PolicySpec duplicate_stage_id;
+  duplicate_stage_id.stages.back().id = duplicate_stage_id.stages.front().id;
+  expect_semantic_rejection(duplicate_stage_id);
+
+  PolicySpec narrowing_scope;
+  narrowing_scope.stages.front().granularity = "control_domain";
+  narrowing_scope.stages.back().granularity = "resource";
+  expect_semantic_rejection(narrowing_scope);
+
+  PolicySpec reused_prior_phase;
+  reused_prior_phase.stages.back().command_phase_id = "terminal";
+  expect_semantic_rejection(reused_prior_phase);
+
+  PolicySpec wrong_command_result_phase;
+  wrong_command_result_phase.stages.back().evidence.front().phase_id =
+      "terminal";
+  expect_semantic_rejection(wrong_command_result_phase);
 }
 
 TEST(StopEvidencePolicyCodec, AcceptsAndRejectsExactCollectionBoundaries) {
@@ -616,21 +701,25 @@ TEST(StopEvidencePolicyCodec, AcceptsAndRejectsExactCollectionBoundaries) {
   exact.outer_duration_ns = 100'000;
   exact.kernel_completion_reserve_ns = 1'000;
   exact.phases.clear();
-  exact.evidence.clear();
+  exact.stages.resize(1U);
+  exact.stages.front().evidence.clear();
   for (std::size_t index = 0U; index < core::kMaxStopEvidencePolicyItems;
        ++index) {
     const auto phase_id = "phase_" + std::to_string(index);
     exact.phases.push_back(
         {phase_id, static_cast<std::int64_t>((index + 1U) * 1'000U)});
-    exact.evidence.push_back(
+    exact.stages.front().evidence.push_back(
         {"evidence_" + std::to_string(index), phase_id,
          index == 0U ? "controller_goal_terminal"
                      : "discrete_acknowledgement",
          index == 0U ? "controller_goal_status" : "command_target_status",
          index == 0U ? "command_result" : "post_command_sample"});
   }
-  exact.command_phase_id = exact.phases.front().id;
-  EXPECT_EQ(qualify(exact).value().evidence_requirements.size(),
+  exact.stages.front().command_phase_id = exact.phases.front().id;
+  EXPECT_EQ(qualify(exact)
+                .value()
+                .escalation_stages.front()
+                .evidence_requirements.size(),
             core::kMaxStopEvidencePolicyItems);
 
   auto too_many_phases = exact;
@@ -646,7 +735,7 @@ TEST(StopEvidencePolicyCodec, AcceptsAndRejectsExactCollectionBoundaries) {
 
   auto too_many_evidence = exact;
   too_many_evidence.policy_id = "too_many_evidence";
-  too_many_evidence.evidence.push_back(
+  too_many_evidence.stages.front().evidence.push_back(
       {"overflow", exact.phases.back().id, "discrete_acknowledgement",
        "command_target_status", "post_command_sample"});
   const auto evidence_document = policy_document(too_many_evidence);
@@ -664,9 +753,10 @@ TEST(StopEvidencePolicyCodec,
   exact.outer_duration_ns = core::kMaxStopEvidencePolicyDurationNs;
   exact.kernel_completion_reserve_ns = 1;
   exact.phases = {
-      {"command", core::kMaxStopEvidencePolicyDurationNs - 1},
+      {"command", core::kMaxStopEvidencePolicyDurationNs - 2},
+      {"hard_command", core::kMaxStopEvidencePolicyDurationNs - 1},
   };
-  exact.evidence = {
+  exact.stages.front().evidence = {
       {"terminal", "command", "controller_goal_terminal",
        "controller_goal_status", "command_result"},
   };
@@ -697,7 +787,7 @@ TEST(StopEvidencePolicyCodec,
 
   PolicySpec no_evidence;
   no_evidence.policy_id = "no_evidence";
-  no_evidence.evidence.clear();
+  no_evidence.stages.front().evidence.clear();
   const auto no_evidence_document = policy_document(no_evidence);
   expect_closed_schema_rejection(no_evidence.policy_id, no_evidence_document,
                                  no_evidence_document);
@@ -705,8 +795,8 @@ TEST(StopEvidencePolicyCodec,
   const PolicySpec valid;
   const auto valid_document = policy_document(valid);
   const auto wrong_api = replace_once(
-      valid_document, "manyforge.stop_evidence_policy.v1",
-      "manyforge.stop_evidence_policy.v2");
+      valid_document, "manyforge.stop_evidence_policy.v2",
+      "manyforge.stop_evidence_policy.v1");
   expect_closed_schema_rejection(valid.policy_id, valid_document, wrong_api);
 }
 
@@ -732,8 +822,7 @@ TEST(StopEvidencePolicyCodec,
   ASSERT_NE(not_closing, std::string::npos);
   not_stoppable_with_command.insert(
       not_closing,
-      ",\"containment_command\":{\"command_phase_id\":\"command\","
-      "\"command\":{\"command_kind\":\"controller_goal_cancel\"}}");
+      ",\"escalation_stages\":[]");
   auto presence_reference =
       reference_for("non_interruptible", not_stoppable_document(), store_key);
   presence_reference.content_digest =
@@ -743,7 +832,7 @@ TEST(StopEvidencePolicyCodec,
                ClosedSchemaError);
 
   PolicySpec zero_freshness;
-  zero_freshness.evidence.front().freshness_budget_ns = 0;
+  zero_freshness.stages.front().evidence.front().freshness_budget_ns = 0;
   const auto zero_document = policy_document(zero_freshness);
   EXPECT_THROW(resolve_and_qualify_stop_evidence_policy(
                    reference_for(zero_freshness.policy_id, zero_document,
@@ -752,7 +841,7 @@ TEST(StopEvidencePolicyCodec,
                ClosedSchemaError);
 
   PolicySpec duplicate_authority;
-  duplicate_authority.evidence = {
+  duplicate_authority.stages.front().evidence = {
       {"rest", "terminal", "motion_rest", "binding_state_authority",
        "post_command_dwell", 25, 200, {"measured", "measured"}},
   };
@@ -768,7 +857,7 @@ TEST(StopEvidencePolicyCodec,
      RejectsNestedUnknownMissingNullAndConditionalContractFields) {
   PolicySpec contract_policy;
   contract_policy.policy_id = "nested_contract";
-  contract_policy.command_kind = "motion_controlled_stop";
+  contract_policy.stages.front().command_kind = "motion_controlled_stop";
   const auto contract_document = policy_document(contract_policy);
 
   expect_closed_schema_rejection(
@@ -822,7 +911,7 @@ TEST(StopEvidencePolicyCodec,
 
   PolicySpec registered;
   registered.policy_id = "registered_presence";
-  registered.command_kind = "registered";
+  registered.stages.front().command_kind = "registered";
   const auto registered_document = policy_document(registered);
   expect_closed_schema_rejection(
       registered.policy_id, registered_document,
@@ -847,7 +936,7 @@ TEST(StopEvidencePolicyCodec,
 
   PolicySpec provider;
   provider.policy_id = "provider_source_shape";
-  provider.evidence = {
+  provider.stages.front().evidence = {
       {"safe", "terminal", "io_safe_output", "provider_evidence",
        "post_command_sample"},
   };
@@ -861,7 +950,7 @@ TEST(StopEvidencePolicyCodec,
 
   PolicySpec binding;
   binding.policy_id = "binding_source_shape";
-  binding.evidence = {
+  binding.stages.front().evidence = {
       {"rest", "terminal", "motion_rest", "binding_state_authority",
        "post_command_dwell", 25, 200},
   };
@@ -896,7 +985,7 @@ TEST(StopEvidencePolicyCodec,
 
   PolicySpec registered_evidence;
   registered_evidence.policy_id = "registered_evidence_presence";
-  registered_evidence.evidence = {
+  registered_evidence.stages.front().evidence = {
       {"registered", "terminal", "registered", "provider_evidence",
        "post_command_sample"},
   };
@@ -913,7 +1002,7 @@ TEST(StopEvidencePolicyCodec,
 TEST(StopEvidencePolicyCodec,
      PresentationIsIrrelevantButAuthoredEvidenceOrderIsSemantic) {
   PolicySpec spec;
-  spec.evidence = {
+  spec.stages.front().evidence = {
       {"first", "terminal", "controller_goal_terminal",
        "controller_goal_status", "post_command_sample"},
       {"second", "terminal", "discrete_acknowledgement",
@@ -931,7 +1020,8 @@ TEST(StopEvidencePolicyCodec,
   EXPECT_EQ(canonical_qualified.value(), yaml_qualified.value());
   EXPECT_NE(sha256_digest(canonical), sha256_digest(yaml));
 
-  std::swap(spec.evidence[0], spec.evidence[1]);
+  std::swap(spec.stages.front().evidence[0],
+            spec.stages.front().evidence[1]);
   EXPECT_NE(revision_from_document(canonical),
             revision_from_document(policy_document(spec)));
 }

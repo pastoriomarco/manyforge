@@ -519,7 +519,7 @@ manyforge_embed_closed_schema(
 manyforge_embed_closed_schema(
   kEmbeddedStopEvidencePolicySchema
   stop_evidence_policy
-  resources/closed_schema/catalog/manyforge.stop_evidence_policy.v1.yaml
+  resources/closed_schema/catalog/manyforge.stop_evidence_policy.v2.yaml
   mf_stop_schema)
 manyforge_embed_closed_schema(
   kEmbeddedEmptyRuntimeConfigurationSchema
@@ -537,6 +537,11 @@ manyforge_embed_closed_schema(
   resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml
   mf_pempty)
 manyforge_embed_closed_schema(
+  kEmbeddedMotionControlledStopProviderContractSchema
+  motion_controlled_stop_provider_contract
+  resources/closed_schema/value/manyforge.value_schema.provider_contract.motion_controlled_stop.v1.yaml
+  mf_stop_params)
+manyforge_embed_closed_schema(
   kEmbeddedAssistantInstrumentRegistrySource
   assistant_instrument_registry_source
   resources/assistant/assistant_instrument_registry_source.v1.json
@@ -553,15 +558,19 @@ set(MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES
   PkgConfig::LIBYAML
 )
 
-# Read-neutral parsing, identity, and exact retained-bundle verification.
-# This private substrate is deliberately free of compiler, materializer,
-# repository-writer, package-generator, and admission-selection effects.
+# Canonical projection/parsing, identity, exact build-evidence verification,
+# and retained-bundle readback. This private substrate cannot mint retention
+# authority and is deliberately free of materializer, repository-writer,
+# package-generator, and admission-selection effects.
 add_library(manyforge_deployment_verification_core
   src/assistant_settings_codec.cpp
   src/apply_affected_scope.cpp
   src/artifact_codec.cpp
   src/composed_model_symbol_role_map_verifier.cpp
+  src/control_domain_control_internal.cpp
   src/control_domain_control_verifier.cpp
+  src/control_interface_contract_codec.cpp
+  src/controller_topology_codec.cpp
   src/cell_graph_codec.cpp
   src/closed_schema.cpp
   src/content_identity.cpp
@@ -575,11 +584,14 @@ add_library(manyforge_deployment_verification_core
   src/posix_read_only_internal.cpp
   src/program_contract.cpp
   src/program_binding.cpp
+  src/provider_manifest_codec.cpp
   src/runtime_program_binding.cpp
   src/reference_runtime_unit_verifier.cpp
   src/verified_retained_projection.cpp
   src/runtime_profile_codec.cpp
   src/scenario_apply_candidate_source.cpp
+  src/stop_evidence_policy_codec.cpp
+  src/stop_qualification_evidence.cpp
   src/verified_retained_bundle.cpp
   src/verified_retained_bundle_store.cpp
 )
@@ -603,6 +615,7 @@ set_target_properties(
 # before the admission reader's generated profile exists.
 add_library(manyforge_deployment
   src/build_manifest.cpp
+  src/stop_qualification_authority.cpp
   src/build_manifest_repository.cpp
   src/capability_definition_codec.cpp
   src/command_schema_codec.cpp
@@ -612,14 +625,10 @@ add_library(manyforge_deployment
   src/cell_structure.cpp
   src/component_type_codec.cpp
   src/composed_model_symbol_role_map_internal.cpp
-  src/control_domain_control_internal.cpp
-  src/control_interface_contract_codec.cpp
-  src/controller_topology_codec.cpp
   src/mf2_joint_name_internal.cpp
   src/native_execution_runtime_unit_emitter.cpp
   src/posix_durability_internal.cpp
   src/program_binding_compiler.cpp
-  src/provider_manifest_codec.cpp
   src/reference_runtime_unit_internal.cpp
   src/retained_bundle.cpp
   src/retained_bundle_materializer.cpp
@@ -627,7 +636,6 @@ add_library(manyforge_deployment
   src/retention_qualified_deployment.cpp
   src/scenario_catalog.cpp
   src/site_overlay_resolution.cpp
-  src/stop_evidence_policy_codec.cpp
   src/structural_model_preparation.cpp
 )
 add_library(manyforge::deployment ALIAS manyforge_deployment)
@@ -1055,6 +1063,8 @@ if(BUILD_TESTING)
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_cell_structure test/test_cell_structure.cpp)
+  target_include_directories(test_cell_structure PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_cell_structure PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_cell_structure
@@ -1333,11 +1343,12 @@ if(BUILD_TESTING)
       "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}")
 
   add_test(
-    NAME MaintainedDeploymentOccurrenceQualification
+    NAME MaintainedDeploymentOccurrenceCompilationRequiresStopQualification
     COMMAND
       "$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
       --check
       --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
+      --stop-evidence-mode require-external-qualification
       --prepared
       "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
       --prepared

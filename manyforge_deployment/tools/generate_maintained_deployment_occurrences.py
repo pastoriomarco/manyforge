@@ -38,6 +38,12 @@ NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
 NATIVE_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
     "sha256:c20bf40303bddd213d8db77b7075c0fe224e00928f4e6bda3cbfd7ebba880d6e"
 )
+EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
+    "manyforge.value_schema.provider_contract.empty.v1"
+)
+EMPTY_PROVIDER_CONTRACT_SCHEMA_REVISION: Final = (
+    "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270"
+)
 
 CAPABILITIES: Final = {
     "assistant.bridge.request": (
@@ -320,7 +326,7 @@ SCHEMA_SOURCES: Final = {
     "model_asset": "manyforge_deployment/resources/closed_schema/catalog/manyforge.model_asset.v1.yaml",
     "provider_manifest": "manyforge_deployment/resources/closed_schema/catalog/manyforge.provider_manifest.v1.yaml",
     "runtime_profile": "manyforge_deployment/resources/closed_schema/catalog/manyforge.runtime_profile.v1.yaml",
-    "stop_evidence_policy": "manyforge_deployment/resources/closed_schema/catalog/manyforge.stop_evidence_policy.v1.yaml",
+    "stop_evidence_policy": "manyforge_deployment/resources/closed_schema/catalog/manyforge.stop_evidence_policy.v2.yaml",
 }
 
 
@@ -714,9 +720,37 @@ def controller_topology(target: str, contract: dict[str, Any]) -> dict[str, Any]
     )
 
 
+def software_hard_provider_contract_ref() -> dict[str, str]:
+    return {
+        "provider_contract_role_id": "software_hard_stop",
+        "contract_schema_id": EMPTY_PROVIDER_CONTRACT_SCHEMA_ID,
+        "contract_schema_revision": EMPTY_PROVIDER_CONTRACT_SCHEMA_REVISION,
+    }
+
+
 def provider_manifest(
-    provider_id: str, capability_ids: tuple[str, ...], endpoint_roles: list[str]
+    provider_id: str,
+    capability_ids: tuple[str, ...],
+    endpoint_roles: list[str],
+    *,
+    include_native_stop_support: bool = False,
 ) -> dict[str, Any]:
+    provider_contracts: list[dict[str, Any]] = []
+    if include_native_stop_support:
+        provider_contracts.append(
+            {
+                "provider_contract_ref": software_hard_provider_contract_ref(),
+                "stop_command_support": {
+                    "command_kind": "registered",
+                    "registered_command_kind_id": "manyforge.stop.software_hard",
+                    "command_endpoint_role_ids": [],
+                },
+                "stop_evidence_support": {
+                    "evidence_kind": "motion_rest",
+                    "evidence_endpoint_role_ids": ["state"],
+                },
+            }
+        )
     value = {
         "api_version": "manyforge.provider_manifest.v1",
         "provider_manifest_id": provider_id,
@@ -727,7 +761,7 @@ def provider_manifest(
             }
             for capability_id in sorted(capability_ids)
         ],
-        "provider_contracts": [],
+        "provider_contracts": provider_contracts,
     }
     return revisioned_document(
         value,
@@ -739,42 +773,97 @@ def provider_manifest(
 
 def stop_policy() -> dict[str, Any]:
     value = {
-        "api_version": "manyforge.stop_evidence_policy.v1",
+        "api_version": "manyforge.stop_evidence_policy.v2",
         "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
         "disposition": "stoppable",
         "containment_granularity": "resource",
-        "containment_command": {
-            "command_phase_id": "command",
-            "command": {"command_kind": "controller_goal_cancel"},
-        },
         "deadline_budget": {
             "outer_duration_ns": 2_000_000_000,
             "kernel_completion_reserve_ns": 100_000_000,
             "phases": [
                 {"phase_id": "command", "deadline_offset_ns": 500_000_000},
-                {"phase_id": "terminal", "deadline_offset_ns": 1_900_000_000},
+                {"phase_id": "terminal", "deadline_offset_ns": 1_000_000_000},
+                {
+                    "phase_id": "hard_command",
+                    "deadline_offset_ns": 1_200_000_000,
+                },
+                {
+                    "phase_id": "hard_terminal",
+                    "deadline_offset_ns": 1_900_000_000,
+                },
             ],
         },
-        "evidence_conjunction": "all_of",
-        "evidence_requirements": [
+        "escalation_stages": [
             {
-                "evidence_item_id": "goal_terminal",
-                "phase_id": "terminal",
-                "evidence": {"evidence_kind": "controller_goal_terminal"},
-                "source_requirement": {
-                    "source_kind": "controller_goal_status",
-                    "freshness_budget_ns": 100_000_000,
+                "stop_escalation_stage_id": "nominal_controller_goal_cancel",
+                "stage_kind": "nominal",
+                "containment_granularity": "resource",
+                "containment_command": {
+                    "command_phase_id": "command",
+                    "command": {"command_kind": "controller_goal_cancel"},
                 },
-                "observation_semantics": {
-                    "observation_kind": "post_command_sample"
+                "evidence_conjunction": "all_of",
+                "evidence_requirements": [
+                    {
+                        "evidence_item_id": "goal_terminal",
+                        "phase_id": "terminal",
+                        "evidence": {
+                            "evidence_kind": "controller_goal_terminal"
+                        },
+                        "source_requirement": {
+                            "source_kind": "controller_goal_status",
+                            "freshness_budget_ns": 100_000_000,
+                        },
+                        "observation_semantics": {
+                            "observation_kind": "post_command_sample"
+                        },
+                    }
+                ],
+            },
+            {
+                "stop_escalation_stage_id": "software_hard",
+                "stage_kind": "software_hard",
+                "containment_granularity": "resource",
+                "containment_command": {
+                    "command_phase_id": "hard_command",
+                    "command": {
+                        "command_kind": "registered",
+                        "provider_contract_ref": software_hard_provider_contract_ref(),
+                        "registered_command_kind_id": "manyforge.stop.software_hard",
+                    },
                 },
-            }
+                "evidence_conjunction": "all_of",
+                "evidence_requirements": [
+                    {
+                        "evidence_item_id": "hard_rest",
+                        "phase_id": "hard_terminal",
+                        "evidence": {
+                            "evidence_kind": "motion_rest",
+                            "provider_contract_ref": software_hard_provider_contract_ref(),
+                        },
+                        "source_requirement": {
+                            "source_kind": "binding_state_authority",
+                            "freshness_budget_ns": 100_000_000,
+                            "state_endpoint_role_id": "state",
+                            "allowed_authority_classes": [
+                                "commanded",
+                                "measured",
+                                "predicted",
+                            ],
+                        },
+                        "observation_semantics": {
+                            "observation_kind": "post_command_dwell",
+                            "minimum_dwell_ns": 10_000_000,
+                        },
+                    }
+                ],
+            },
         ],
     }
     return revisioned_document(
         value,
         domain="catalog-record-revision/stop_evidence_policy",
-        api_version="manyforge.stop_evidence_policy.v1",
+        api_version="manyforge.stop_evidence_policy.v2",
         revision_field="stop_evidence_policy_revision",
     )
 
@@ -882,6 +971,7 @@ def catalog_sources(
             "manyforge.provider.native_control",
             control_capabilities,
             ["command", "state"],
+            include_native_stop_support=True,
         ),
         "planning": provider_manifest(
             "manyforge.provider.native_planning",
@@ -929,7 +1019,7 @@ def catalog_sources(
         kind="stop_evidence_policy",
         record_id=policy["stop_evidence_policy_id"],
         record_revision=policy["stop_evidence_policy_revision"],
-        schema_id="manyforge.stop_evidence_policy.v1",
+        schema_id="manyforge.stop_evidence_policy.v2",
         schema_revision=schemas["stop_evidence_policy"],
         value=policy,
     )
@@ -1094,6 +1184,7 @@ def graph_and_applicability(
                         }
                     ],
                     "provider_instance_id": f"{occurrence}.native_control",
+                    "provider_runtime_unit_id": runtime_unit_id,
                     "provider_manifest_id": control_ref["record_id"],
                     "provider_manifest_revision": control_ref["record_revision"],
                     "state_authority_id": f"{occurrence}.{target}.predicted_state",
@@ -1251,6 +1342,57 @@ def graph_and_applicability(
         )
     provider_bindings.sort(key=lambda row: row["capability_provider_binding_id"])
     return graph, desired, provider_bindings
+
+
+def stop_policy_projection(graph: dict[str, Any]) -> dict[str, Any]:
+    domains = {
+        row["control_domain_id"]: row for row in graph["control_domains"]
+    }
+    stop_stage_parameters: list[dict[str, Any]] = []
+    for binding in graph["control_bindings"]:
+        domain = domains[binding["control_domain_id"]]
+        for route_id in binding["legal_control_route_ids"]:
+            stop_stage_parameters.append(
+                {
+                    "control_domain_id": binding["control_domain_id"],
+                    "control_domain_revision": domain["control_domain_revision"],
+                    "control_binding_id": binding["control_binding_id"],
+                    "control_binding_revision": binding["control_binding_revision"],
+                    "controller_topology_id": binding["controller_topology_id"],
+                    "topology_revision": binding["topology_revision"],
+                    "control_route_id": route_id,
+                    "stop_evidence_policy_id": binding[
+                        "stop_evidence_policy_id"
+                    ],
+                    "stop_evidence_policy_revision": binding[
+                        "stop_evidence_policy_revision"
+                    ],
+                    "stop_escalation_stage_id": "software_hard",
+                    "provider_contract_ref": software_hard_provider_contract_ref(),
+                    "default_contract_parameters": {},
+                }
+            )
+    stop_stage_parameters.sort(
+        key=lambda row: (
+            row["control_domain_id"],
+            row["control_binding_id"],
+            row["control_route_id"],
+            row["stop_escalation_stage_id"],
+        )
+    )
+    return {
+        "retained_policy_records": [],
+        "stop_stage_parameters": stop_stage_parameters,
+        "commissioned_stop_interfaces": [],
+        "interrupt_sources": [],
+        "interrupt_policies": [],
+        "interrupt_config": {
+            "queue_depth": 8,
+            "cancel_validation_timeout_ns": 1_000,
+            "motion_scope_arm_timeout_ns": 1_000,
+            "supervisory_poll_rate_hz": 100,
+        },
+    }
 
 
 def site_overlay(
@@ -1452,6 +1594,7 @@ def deployment_candidate(
         "graph": graph,
         "desired_control_configurations": desired,
         "capability_provider_bindings": provider_bindings,
+        "policies": stop_policy_projection(graph),
         "compatibility": copy.deepcopy(deployment["compatibility"]),
     }
     if profile_id is not None:
@@ -1486,6 +1629,15 @@ def refresh_cross_revisions(path: Path) -> None:
             target["control_binding_revision"] = bindings[
                 target["control_binding_id"]
             ]["control_binding_revision"]
+    for parameters in value["policies"]["stop_stage_parameters"]:
+        binding = bindings[parameters["control_binding_id"]]
+        domain = domains[parameters["control_domain_id"]]
+        parameters["control_binding_revision"] = binding[
+            "control_binding_revision"
+        ]
+        parameters["control_domain_revision"] = domain[
+            "control_domain_revision"
+        ]
     replace_file(path, pretty_bytes(value))
 
 

@@ -7,7 +7,7 @@
         "tool": "ur10e_robot"
       },
       "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-      "deployment_revision": "sha256:f1f39a03b72d50774fbb21a1cf758f2c46218549379eb345b88b2541c0c3f656",
+      "deployment_revision": "sha256:177bb332e87f60d7d1fcaea01c0d88d4aa3c37528575e96369eaa1d897f68c73",
       "deployment_source": "examples/assistant_modes_scene_authoring.deployment.yaml",
       "program_id": "pick_and_place_ur10e_robotiq_demo",
       "program_revision": "sha256:385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a",
@@ -34,7 +34,7 @@
         "tool": "lite6_robot"
       },
       "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-      "deployment_revision": "sha256:bb1e2b4cec94d7af7cf5e228e6c816daae5f898a37347157d8fd5d9c3ae5af74",
+      "deployment_revision": "sha256:378461cadbc38cd7901b2c45808b08a3ef33a53a42767d892214fad31a5d23a6",
       "deployment_source": "examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
       "program_id": "lite6_lite_gripper_pick_and_place",
       "program_revision": "sha256:3569bdaa98278af447084b31f2e2f920e4b760e8c60ce803de1a18aac78ee7f2",
@@ -59,7 +59,7 @@
         "robot": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_pick_place",
-      "deployment_revision": "sha256:155c34bfd0d8674d69d261ae2763901869ec0011385dc9f53bb9b5fe3a410183",
+      "deployment_revision": "sha256:2690434f4bfedf2480473a28116bccc1515522e3bba5b9abdbda13377ee35621",
       "deployment_source": "examples/pick_and_place.deployment.yaml",
       "program_id": "pick_and_place_demo",
       "program_revision": "sha256:622bb486587b1c47e2f0dfcace01ad702b21431de8e91601468dd445adba694b",
@@ -81,7 +81,7 @@
         "robot": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_pick_place",
-      "deployment_revision": "sha256:155c34bfd0d8674d69d261ae2763901869ec0011385dc9f53bb9b5fe3a410183",
+      "deployment_revision": "sha256:2690434f4bfedf2480473a28116bccc1515522e3bba5b9abdbda13377ee35621",
       "deployment_source": "examples/pick_and_place.deployment.yaml",
       "program_id": "pick_and_place_minimal",
       "program_revision": "sha256:464a98ecaa5e5e0bf5958f1bc6f4076fd6c20537d9f6493bb623557c5feff5d6",
@@ -103,7 +103,7 @@
         "tool": "ur10e_robot"
       },
       "deployment_artifact_id": "ur10e_robotiq_pick_place_preview",
-      "deployment_revision": "sha256:b2b53db170dcf4b68eff5eefa10656e9a9ed7ede69b7d9e47dc8623b817624f5",
+      "deployment_revision": "sha256:2a0b301431285c0ad3bebc6a1e321ab1f3432a570a7bfff9ac026304fa32b0e5",
       "deployment_source": "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
       "program_id": "pick_and_place_ur10e_robotiq_demo",
       "program_revision": "sha256:385569e5d9b2c2628abf67fc4633583e97cd9cfb0fc881d3cf3bae0750d2951a",
@@ -130,7 +130,7 @@
         "tool": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
-      "deployment_revision": "sha256:d20738e9352d0fe9fa8a76822ad82b42b41a6cd46949736954430eab44a8b535",
+      "deployment_revision": "sha256:f011215c692c75b3d2d5adfc6dce7fefce35250518936bf641a64298edecedcf",
       "deployment_source": "examples/semantic_shape_pick.deployment.yaml",
       "program_id": "semantic_shape_pick",
       "program_revision": "sha256:05679a1dd482e05553e91d3c9f5286ef6890cf30cdc7c3bc592beb80555345b2",
@@ -157,7 +157,7 @@
         "tool": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
-      "deployment_revision": "sha256:24d8e1e974e8b067634d1c5152d352ae5c286b865a06e8d15ad18f5b15f062d6",
+      "deployment_revision": "sha256:e9294b69b4a672be4d872f7b68326b7c10fca90405c76ed53cb2a7cda136e37e",
       "deployment_source": "examples/vision_guided_bin_pick.deployment.yaml",
       "program_id": "vision_guided_bin_pick",
       "program_revision": "sha256:24cce46731d8581b5c91c32cdfaf31c1bd0fd8f6ae4145b2aaefc13d54d429b3",
@@ -180,7 +180,7 @@
         "robot": "ur5_robot"
       },
       "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
-      "deployment_revision": "sha256:71d0803269b48243c4848a4b1cf39406c2ea585650104275d5f755109694d7f2",
+      "deployment_revision": "sha256:250de89f85548e1bf5570cfc22f952722ae6b84ff881150dc889f2d44689652f",
       "deployment_source": "examples/vision_guided_pose_pick.deployment.yaml",
       "program_id": "vision_guided_pose_pick",
       "program_revision": "sha256:78c9a4523c0d2d15558b5cb730c2f6a017831c3bdafb5a7d6cb63b6000477de8",

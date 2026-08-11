@@ -192,6 +192,20 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_composable_cell_contracts
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_active_control_configuration
+    test/test_active_control_configuration.cpp)
+  target_link_libraries(test_active_control_configuration PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_active_control_configuration
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_control
+    test/test_stop_control.cpp)
+  target_link_libraries(test_stop_control PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_stop_control
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_coordinate_state
     test/test_coordinate_state.cpp)
   target_link_libraries(test_coordinate_state PRIVATE

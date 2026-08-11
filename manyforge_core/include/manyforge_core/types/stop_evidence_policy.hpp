@@ -11,7 +11,8 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kStopEvidencePolicyApiVersion =
-    "manyforge.stop_evidence_policy.v1";
+    "manyforge.stop_evidence_policy.v2";
+inline constexpr std::size_t kMaxStopEscalationStages = 8U;
 inline constexpr std::size_t kMaxStopEvidencePolicyItems = 64U;
 inline constexpr std::int64_t kMaxStopEvidencePolicyDurationNs =
     9007199254740991LL;
@@ -28,6 +29,13 @@ enum class StopContainmentCommandKind : std::uint8_t {
   kSafeOutputCommand,
   kLogicalCancel,
   kRegistered,
+};
+
+enum class StopEscalationStageKind : std::uint8_t {
+  kNominal = 0,
+  kControlledFallback,
+  kSoftwareHard,
+  kSafetySystemRequest,
 };
 
 enum class StopEvidenceConjunction : std::uint8_t {
@@ -82,6 +90,21 @@ enum class StopEvidenceObservationKind : std::uint8_t {
       return "logical_cancel";
     case StopContainmentCommandKind::kRegistered:
       return "registered";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr std::string_view to_string(
+    StopEscalationStageKind value) noexcept {
+  switch (value) {
+    case StopEscalationStageKind::kNominal:
+      return "nominal";
+    case StopEscalationStageKind::kControlledFallback:
+      return "controlled_fallback";
+    case StopEscalationStageKind::kSoftwareHard:
+      return "software_hard";
+    case StopEscalationStageKind::kSafetySystemRequest:
+      return "safety_system_request";
   }
   return {};
 }
@@ -222,7 +245,22 @@ struct StopEvidenceRequirementDTO {
                          const StopEvidenceRequirementDTO&) = default;
 };
 
-/// Exact normalized payload for `manyforge.stop_evidence_policy.v1`.
+/// One fixed member of the policy's ordered escalation chain. This is
+/// configuration, not a runtime list of candidates: Kernel alone advances
+/// through the retained order under the policy's single outer deadline.
+struct StopEscalationStageDTO {
+  StopEscalationStageId stop_escalation_stage_id;
+  StopEscalationStageKind stage_kind;
+  ContainmentGranularity containment_granularity;
+  StopContainmentCommandDTO containment_command;
+  StopEvidenceConjunction evidence_conjunction;
+  std::vector<StopEvidenceRequirementDTO> evidence_requirements;
+
+  friend bool operator==(const StopEscalationStageDTO&,
+                         const StopEscalationStageDTO&) = default;
+};
+
+/// Exact normalized payload for `manyforge.stop_evidence_policy.v2`.
 ///
 /// A qualified catalog payload is still declarative. It does not prove a
 /// provider contract exists, expand containment topology, resolve endpoints,
@@ -236,10 +274,8 @@ struct StopEvidencePolicyDTO {
   StopEvidencePolicyRevision stop_evidence_policy_revision;
   StopEvidenceDisposition disposition;
   ContainmentGranularity containment_granularity;
-  std::optional<StopContainmentCommandDTO> containment_command;
   std::optional<StopDeadlineBudgetDTO> deadline_budget;
-  std::optional<StopEvidenceConjunction> evidence_conjunction;
-  std::vector<StopEvidenceRequirementDTO> evidence_requirements;
+  std::vector<StopEscalationStageDTO> escalation_stages;
 
   friend bool operator==(const StopEvidencePolicyDTO&,
                          const StopEvidencePolicyDTO&) = default;

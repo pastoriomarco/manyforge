@@ -117,7 +117,10 @@ compile_fixed_deployment(const RevisionVerifiedDeploymentArtifact &deployment) {
       std::span<const QualifiedControlInterfaceContract>{},
       std::span<const QualifiedControllerTopology>{},
       std::span<const QualifiedProviderManifest>{},
-      std::span<const QualifiedStopEvidencePolicy>{}, selected_overlay);
+      std::span<const QualifiedStopEvidencePolicy>{},
+      std::span<const BuildQualifiedValueSchemaEntry>{},
+      std::span<const QualifiedCommissioningEvidenceRef>{},
+      selected_overlay);
   return qualify_deployment_for_retention(deployment,
                                           compile_cell_ir(applicability));
 }

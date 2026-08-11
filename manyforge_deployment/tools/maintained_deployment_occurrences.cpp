@@ -62,6 +62,7 @@ struct Options final {
   std::filesystem::path workspace_root;
   std::optional<std::filesystem::path> package_root;
   std::map<std::string, std::filesystem::path, std::less<>> prepared_roots;
+  bool expect_external_stop_qualification = false;
 };
 
 struct Scenario final {
@@ -89,6 +90,7 @@ constexpr std::array<Scenario, 7U> kScenarios{{
         "usage: manyforge_maintained_deployment_occurrences --check "
         "--workspace-root <manyforge-root> "
         "[--package-root <empty-output-directory>] "
+        "[--stop-evidence-mode require-external-qualification] "
         "--prepared <family-id>=<directory> [--prepared ...]");
   }
   Options result;
@@ -117,6 +119,12 @@ constexpr std::array<Scenario, 7U> kScenarios{{
               .second) {
         continue;
       }
+    }
+    if (option == "--stop-evidence-mode" &&
+        value == "require-external-qualification" &&
+        !result.expect_external_stop_qualification) {
+      result.expect_external_stop_qualification = true;
+      continue;
     }
     throw std::invalid_argument(
         "invalid or repeated maintained qualification option");
@@ -491,7 +499,8 @@ void verify_gripper_resource_semantics(
 materialize_scenarios(const std::filesystem::path &root,
                       const QualifiedCatalogClosure &catalog,
                       const ExactCompilerInputSource &input_source,
-                      const std::filesystem::path &package_root) {
+                      const std::filesystem::path &package_root,
+                      bool expect_external_stop_qualification) {
   const std::string overlay_bytes = read_file(
       root / "manyforge_deployment/resources/maintained/site_overlays/"
              "manyforge_local_examples.site_overlay.json");
@@ -599,9 +608,52 @@ materialize_scenarios(const std::filesystem::path &root,
       return deployment::select_site_overlay_for_deployment(
           inputs.site_overlay_ref, inputs.external_resources, &projection);
     }();
+    std::map<std::pair<std::string, std::string>,
+             deployment::BuildQualifiedValueSchemaEntry>
+        selected_value_schema_map;
+    const auto &schema_registry =
+        deployment::build_qualified_closed_schema_registry();
+    for (const auto &row : inputs.stop_stage_parameters) {
+      const auto &contract = row.provider_contract_ref;
+      const auto *schema = schema_registry.find_qualified_value_schema(
+          contract.contract_schema_id, contract.contract_schema_revision);
+      if (schema == nullptr) {
+        throw std::logic_error(
+            "maintained scenario has no exact build-qualified Stop value schema");
+      }
+      selected_value_schema_map.emplace(
+          std::pair{contract.contract_schema_id.value(),
+                    contract.contract_schema_revision.value()},
+          *schema);
+    }
+    std::vector<deployment::BuildQualifiedValueSchemaEntry>
+        selected_value_schemas;
+    selected_value_schemas.reserve(selected_value_schema_map.size());
+    for (const auto &[_, schema] : selected_value_schema_map) {
+      selected_value_schemas.push_back(schema);
+    }
+
+    std::vector<deployment::QualifiedCommissioningEvidenceRef>
+        selected_commissioning_evidence;
+    selected_commissioning_evidence.reserve(
+        inputs.commissioned_stop_interfaces.size());
+    for (const auto &row : inputs.commissioned_stop_interfaces) {
+      const auto &artifact = row.commissioning_evidence_artifact_ref;
+      const auto bytes = input_source.get_verified(
+          artifact.content_addressed_store_key, artifact.content_digest,
+          artifact.byte_size);
+      if (!bytes.has_value()) {
+        throw std::logic_error(
+            "maintained scenario cannot resolve exact Stop commissioning evidence");
+      }
+      selected_commissioning_evidence.push_back(
+          deployment::resolve_and_verify_commissioning_evidence_ref(
+              row, artifact.content_addressed_store_key, *bytes));
+    }
     const auto applicability = deployment::qualify_cell_applicability(
         composition, verified.applicability_inputs(), profiles, command_schemas,
         capabilities, contracts, topologies, manifests, stop_policies,
+        selected_value_schemas, selected_commissioning_evidence,
         selected_overlay);
     const auto qualified = deployment::qualify_deployment_for_retention(
         verified, deployment::compile_cell_ir(applicability));
@@ -619,6 +671,25 @@ materialize_scenarios(const std::filesystem::path &root,
     }
     const std::array<deployment::BuildQualifiedStructuralModelPreparation, 1U>
         selected_preparation{*preparation};
+    if (expect_external_stop_qualification) {
+      try {
+        (void)deployment::detail::RetainedBundleMaterializer::
+            materialize_store_and_reload_production(
+                qualified, manifest_repository, input_source,
+                selected_preparation, catalog_store, raw_store,
+                bundle_repository);
+      } catch (const deployment::RetainedBundleError &error) {
+        if (std::string_view(error.what()).find(
+                "software-hard stage has no exact current build qualification") ==
+            std::string_view::npos) {
+          throw;
+        }
+        continue;
+      }
+      throw std::logic_error(
+          "maintained Stop deployment materialized without external build "
+          "qualification evidence");
+    }
     auto bundle = deployment::detail::RetainedBundleMaterializer::
         materialize_store_and_reload_production(
             qualified, manifest_repository, input_source, selected_preparation,
@@ -656,6 +727,8 @@ materialize_scenarios(const std::filesystem::path &root,
         std::span<const deployment::QualifiedControllerTopology>{},
         std::span<const deployment::QualifiedProviderManifest>{},
         std::span<const deployment::QualifiedStopEvidencePolicy>{},
+        std::span<const deployment::BuildQualifiedValueSchemaEntry>{},
+        std::span<const deployment::QualifiedCommissioningEvidenceRef>{},
         empty_overlay);
     const auto empty_qualified = deployment::qualify_deployment_for_retention(
         empty_deployment, deployment::compile_cell_ir(empty_applicability));
@@ -1702,7 +1775,19 @@ int main(int argc, char **argv) {
     verify_scenarios(root, catalog);
     TemporaryPackage package(options.package_root);
     const auto products =
-        materialize_scenarios(root, catalog, input_source, package.path());
+        materialize_scenarios(root, catalog, input_source, package.path(),
+                              options.expect_external_stop_qualification);
+    if (options.expect_external_stop_qualification) {
+      if (!products.empty()) {
+        throw std::logic_error(
+            "externally unqualified maintained Stop deployments produced "
+            "retained products");
+      }
+      std::cout << "7 maintained deployments compile exactly and all require "
+                   "external software-hard build qualification before "
+                   "retention\n";
+      return 0;
+    }
     const auto bindings =
         verify_program_bindings(root, products, package.path());
     publish_and_verify_scenario_catalog(root, products, bindings,

@@ -152,12 +152,16 @@ def _parse_control_product(data: bytes, manifest: dict[str, Any]) -> dict[str, A
             "controllers",
             "activation_sets",
             "routes",
+            "stop_applicability",
+            "stop_implementation_qualifications",
+            "controlled_stop_substitution_qualifications",
+            "commissioned_stop_interfaces",
             "source_conformance",
         },
         "control product",
     )
     _require(
-        control["api_version"] == "manyforge.control_domain_control.v1",
+        control["api_version"] == "manyforge.control_domain_control.v2",
         "control product API version differs",
     )
     _require(
@@ -280,6 +284,48 @@ def _parse_control_product(data: bytes, manifest: dict[str, Any]) -> dict[str, A
         ],
         "control desired route differs from its retained binding product",
     )
+    stop_rows = control["stop_applicability"]
+    _require(
+        isinstance(stop_rows, list) and len(stop_rows) == 1,
+        "direct control fixture must contain one Stop applicability row",
+    )
+    stop = stop_rows[0]
+    _require(isinstance(stop, dict), "control Stop applicability must be an object")
+    _exact_keys(
+        stop,
+        {
+            "control_binding_id",
+            "control_binding_revision",
+            "control_route_id",
+            "stop_evidence_policy_id",
+            "stop_evidence_policy_revision",
+            "control_domain_id",
+            "control_domain_revision",
+            "controller_topology_id",
+            "topology_revision",
+            "containment_granularity",
+            "disposition",
+        },
+        "control Stop applicability",
+    )
+    _require(stop["disposition"] == "not_stoppable", "direct fixture Stop disposition differs")
+    _require(
+        stop["control_binding_id"] == binding["control_binding_id"]
+        and stop["control_binding_revision"] == binding["control_binding_revision"]
+        and stop["control_route_id"] == route["control_route_id"]
+        and stop["stop_evidence_policy_id"] == binding["stop_evidence_policy_id"]
+        and stop["stop_evidence_policy_revision"] == binding["stop_evidence_policy_revision"],
+        "control Stop applicability differs from its binding route",
+    )
+    for field in (
+        "stop_implementation_qualifications",
+        "controlled_stop_substitution_qualifications",
+        "commissioned_stop_interfaces",
+    ):
+        _require(
+            control[field] == [],
+            f"non-stoppable direct control fixture unexpectedly carries {field}",
+        )
     conformance = control["source_conformance"]
     _require(isinstance(conformance, dict), "control source conformance must be an object")
     _exact_keys(conformance, {"api_version", "source_conformance_digest"}, "control source conformance")

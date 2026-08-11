@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "proof_root_transfer_test.hpp"
+#include "runtime_only_retention_fixture.hpp"
 
 #ifndef MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT
 #error "MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT is required"
@@ -815,6 +816,11 @@ struct BindingSpec final {
             [](const BindingSpec& left, const BindingSpec& right) {
               return left.id < right.id;
             });
+  const std::optional<QualifiedRuntimeProfile> provider_runtime_profile =
+      control_bindings.empty()
+          ? std::nullopt
+          : std::optional<QualifiedRuntimeProfile>(
+                test::qualify_runtime_only_profile());
 
   CanonicalValue::Array model_rows;
   for (const auto& model : models) {
@@ -854,7 +860,14 @@ struct BindingSpec final {
          CanonicalValue(
              component.type->value.value().component_type_revision.value())},
         {"model_role_bindings", CanonicalValue(std::move(bindings))},
-        {"runtime_unit_ids", CanonicalValue(CanonicalValue::Array{})},
+        {"runtime_unit_ids",
+         std::any_of(control_bindings.begin(), control_bindings.end(),
+                     [&](const auto& binding) {
+                       return binding.component_id == component.id;
+                     })
+             ? CanonicalValue(CanonicalValue::Array{
+                   CanonicalValue("test_provider_runtime")})
+             : CanonicalValue(CanonicalValue::Array{})},
     };
     if (component.placed) {
       const auto pose = component_poses.find(component.id);
@@ -897,7 +910,9 @@ struct BindingSpec final {
     domain_rows.emplace_back(CanonicalValue::Object{
         {"control_domain_id", CanonicalValue("test_domain")},
         {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
-        {"runtime_unit_ids", CanonicalValue(CanonicalValue::Array{})},
+        {"runtime_unit_ids",
+         CanonicalValue(CanonicalValue::Array{
+             CanonicalValue("test_provider_runtime")})},
         {"control_coordinator_endpoint_role", CanonicalValue("coordinator")},
         {"controller_topology_id", CanonicalValue("test_topology")},
         {"topology_revision", CanonicalValue(std::string(kZeroDigest))},
@@ -940,6 +955,8 @@ struct BindingSpec final {
                   CanonicalValue(CanonicalValue::Array{})},
              })})},
         {"provider_instance_id", CanonicalValue("test_provider")},
+        {"provider_runtime_unit_id",
+         CanonicalValue("test_provider_runtime")},
         {"provider_manifest_id", CanonicalValue("test_manifest")},
         {"provider_manifest_revision", CanonicalValue(std::string(kZeroDigest))},
         {"state_authority_id", CanonicalValue("test_authority")},
@@ -957,7 +974,24 @@ struct BindingSpec final {
            CanonicalValue(std::string(core::kCellGraphApiVersion))},
           {"graph_revision", CanonicalValue(std::string(kZeroDigest))},
           {"cell_id", CanonicalValue("structural_test")},
-          {"runtime_units", CanonicalValue(CanonicalValue::Array{})},
+          {"runtime_units",
+           provider_runtime_profile.has_value()
+               ? CanonicalValue(CanonicalValue::Array{
+                     CanonicalValue(CanonicalValue::Object{
+                         {"runtime_unit_id",
+                          CanonicalValue("test_provider_runtime")},
+                         {"runtime_profile_id",
+                          CanonicalValue(provider_runtime_profile->value()
+                                             .runtime_profile_id.value())},
+                         {"runtime_profile_revision",
+                          CanonicalValue(provider_runtime_profile->value()
+                                             .runtime_profile_revision.value())},
+                         {"dependency_runtime_unit_ids",
+                          CanonicalValue(CanonicalValue::Array{})},
+                         {"configuration",
+                          CanonicalValue(CanonicalValue::Object{})},
+                     })})
+               : CanonicalValue(CanonicalValue::Array{})},
           {"model_instances", CanonicalValue(std::move(model_rows))},
           {"controllable_components",
            CanonicalValue(std::move(component_rows))},
@@ -969,7 +1003,12 @@ struct BindingSpec final {
       })));
   const auto intrinsic = validate_intrinsic_cell_graph_candidate(
       decode_cell_graph_candidate(parsed));
-  return compute_graph_revision(prepare_cell_graph_identity(intrinsic, {}));
+  return compute_graph_revision(prepare_cell_graph_identity(
+      intrinsic,
+      provider_runtime_profile.has_value()
+          ? std::span<const QualifiedRuntimeProfile>(
+                &*provider_runtime_profile, 1U)
+          : std::span<const QualifiedRuntimeProfile>{}));
 }
 
 [[nodiscard]] std::vector<SourceVerifiedModelAsset> source_values(

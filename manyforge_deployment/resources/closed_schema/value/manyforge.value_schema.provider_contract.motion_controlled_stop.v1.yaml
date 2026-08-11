@@ -1,0 +1,331 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.value_schema.provider_contract.motion_controlled_stop.v1
+schema_revision: sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd
+schema_purpose: value
+root_definition_id: motion_controlled_stop_parameters
+definitions:
+  - definition_id: motion_controlled_stop_parameters
+    value_schema:
+      kind: tagged_union
+      tag_field: stop_mode
+      alternatives:
+        - tag_value: soft_on_path
+          value_schema:
+            kind: local_ref
+            definition_id: soft_on_path_parameters
+        - tag_value: spring_back_hold
+          value_schema:
+            kind: local_ref
+            definition_id: spring_back_hold_parameters
+        - tag_value: hard_deceleration
+          value_schema:
+            kind: local_ref
+            definition_id: hard_deceleration_parameters
+  - definition_id: soft_on_path_parameters
+    value_schema:
+      kind: object
+      fields:
+        - field_id: stop_mode
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - soft_on_path
+        - field_id: deceleration_time_s
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+              - kind: maximum
+                value: 2
+        - field_id: per_resource_limits
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: controlled_resource_limits
+        - field_id: allow_natural_completion_on_short_path
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []
+        - field_id: recoverable_substitution_mode
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - spring_back_hold
+  - definition_id: spring_back_hold_parameters
+    value_schema:
+      kind: object
+      fields:
+        - field_id: stop_mode
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - spring_back_hold
+        - field_id: deceleration_time_s
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+              - kind: maximum
+                value: 2
+        - field_id: per_resource_limits
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: controlled_resource_limits
+  - definition_id: hard_deceleration_parameters
+    value_schema:
+      kind: object
+      fields:
+        - field_id: stop_mode
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - hard_deceleration
+        - field_id: per_resource_limits
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: hard_resource_limits
+  - definition_id: controlled_resource_limits
+    value_schema:
+      kind: array
+      min_items: 1
+      max_items: 256
+      collection:
+        kind: keyed_record_set
+        key_paths:
+          - - resource_id
+      item_schema:
+        kind: local_ref
+        definition_id: controlled_resource_limit
+  - definition_id: hard_resource_limits
+    value_schema:
+      kind: array
+      min_items: 1
+      max_items: 256
+      collection:
+        kind: keyed_record_set
+        key_paths:
+          - - resource_id
+      item_schema:
+        kind: local_ref
+        definition_id: hard_resource_limit
+  - definition_id: controlled_resource_limit
+    value_schema:
+      kind: object
+      fields:
+        - field_id: resource_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: max_deceleration
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: max_deceleration
+        - field_id: settle_velocity_threshold
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: settle_velocity_threshold
+  - definition_id: hard_resource_limit
+    value_schema:
+      kind: object
+      fields:
+        - field_id: resource_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: settle_velocity_threshold
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: settle_velocity_threshold
+  - definition_id: max_deceleration
+    value_schema:
+      kind: tagged_union
+      tag_field: coordinate_kind
+      alternatives:
+        - tag_value: angular_rad_s2
+          value_schema:
+            kind: local_ref
+            definition_id: angular_max_deceleration
+        - tag_value: linear_m_s2
+          value_schema:
+            kind: local_ref
+            definition_id: linear_max_deceleration
+  - definition_id: angular_max_deceleration
+    value_schema:
+      kind: object
+      fields:
+        - field_id: coordinate_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - angular_rad_s2
+        - field_id: value_rad_s2
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+  - definition_id: linear_max_deceleration
+    value_schema:
+      kind: object
+      fields:
+        - field_id: coordinate_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - linear_m_s2
+        - field_id: value_m_s2
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+  - definition_id: settle_velocity_threshold
+    value_schema:
+      kind: tagged_union
+      tag_field: coordinate_kind
+      alternatives:
+        - tag_value: angular_rad_s
+          value_schema:
+            kind: local_ref
+            definition_id: angular_settle_velocity_threshold
+        - tag_value: linear_m_s
+          value_schema:
+            kind: local_ref
+            definition_id: linear_settle_velocity_threshold
+  - definition_id: angular_settle_velocity_threshold
+    value_schema:
+      kind: object
+      fields:
+        - field_id: coordinate_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - angular_rad_s
+        - field_id: value_rad_s
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+  - definition_id: linear_settle_velocity_threshold
+    value_schema:
+      kind: object
+      fields:
+        - field_id: coordinate_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - linear_m_s
+        - field_id: value_m_s
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0

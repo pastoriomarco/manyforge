@@ -1,8 +1,11 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdint>
 #include <exception>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -16,6 +19,11 @@
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/cell_applicability.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/controller_topology_codec.hpp"
+#include "manyforge_deployment/provider_manifest_codec.hpp"
+#include "manyforge_deployment/stop_evidence_policy_codec.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
+#include "stop_qualification_evidence_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment::detail {
@@ -74,6 +82,21 @@ constexpr std::array<ImplementationDescriptor, 3U> kImplementations{{
     fail_retained_bundle(std::string(path) + " must be a boolean");
   }
   return *result;
+}
+
+[[nodiscard]] std::int64_t require_safe_integer(const CanonicalValue& value,
+                                                std::string_view path) {
+  const auto* number = std::get_if<double>(&value.storage());
+  if (number == nullptr || !std::isfinite(*number) || std::trunc(*number) != *number ||
+      *number < -static_cast<double>(core::kMaxStopEvidencePolicyDurationNs) ||
+      *number > static_cast<double>(core::kMaxStopEvidencePolicyDurationNs)) {
+    fail_retained_bundle(std::string(path) + " must be an exact JSON safe integer");
+  }
+  return static_cast<std::int64_t>(*number);
+}
+
+[[nodiscard]] bool is_null(const CanonicalValue& value) noexcept {
+  return std::holds_alternative<std::nullptr_t>(value.storage());
 }
 
 [[nodiscard]] const CanonicalValue& require_member(const CanonicalValue::Object& object,
@@ -234,6 +257,18 @@ struct ClaimKey final {
 
 struct BindingFacts final {
   std::string revision;
+  std::string stop_policy_id;
+  std::string stop_policy_revision;
+  std::string containment;
+  std::string capability_id;
+  std::string capability_revision;
+  std::string provider_instance_id;
+  std::string provider_runtime_unit_id;
+  std::string provider_manifest_id;
+  std::string provider_manifest_revision;
+  std::string state_authority_id;
+  std::string state_authority_class;
+  std::set<std::string, std::less<>> resource_ids;
   std::vector<ClaimKey> command_claims;
   std::vector<ClaimKey> state_claims;
 };
@@ -254,6 +289,7 @@ struct BindingFacts final {
         {"control_binding_id", "control_binding_revision", "controllable_component_id",
          "command_target_id", "capability_id", "capability_definition_revision",
          "control_interface_contract_id", "control_interface_revision", "provider_instance_id",
+         "provider_runtime_unit_id",
          "provider_manifest_id", "provider_manifest_revision", "state_authority_id",
          "state_authority_class", "stop_evidence_policy_id", "stop_evidence_policy_revision",
          "containment_granularity", "command_claims", "state_claims"},
@@ -263,14 +299,16 @@ struct BindingFacts final {
       fail_retained_bundle("control bindings must be strictly sorted by binding ID");
     }
     previous = id;
-    BindingFacts facts{
-        require_digest_member(row, "control_binding_revision", path),
-        verify_claims(require_member(row, "command_claims", path), path + ".command_claims", true),
-        verify_claims(require_member(row, "state_claims", path), path + ".state_claims"),
-    };
+    BindingFacts facts;
+    facts.revision = require_digest_member(row, "control_binding_revision", path);
+    facts.command_claims = verify_claims(require_member(row, "command_claims", path),
+                                         path + ".command_claims", true);
+    facts.state_claims = verify_claims(require_member(row, "state_claims", path),
+                                       path + ".state_claims");
     for (const auto field :
          {"controllable_component_id", "command_target_id", "capability_id",
           "control_interface_contract_id", "provider_instance_id", "provider_manifest_id",
+          "provider_runtime_unit_id",
           "state_authority_id", "stop_evidence_policy_id"}) {
       static_cast<void>(require_identity_member(row, field, path));
     }
@@ -288,6 +326,31 @@ struct BindingFacts final {
     if (containment != "resource" && containment != "controller_set" &&
         containment != "control_domain") {
       fail_retained_bundle(path + " has unknown containment granularity");
+    }
+    facts.stop_policy_id =
+        require_identity_member(row, "stop_evidence_policy_id", path);
+    facts.stop_policy_revision =
+        require_digest_member(row, "stop_evidence_policy_revision", path);
+    facts.containment = containment;
+    facts.capability_id = require_identity_member(row, "capability_id", path);
+    facts.capability_revision =
+        require_digest_member(row, "capability_definition_revision", path);
+    facts.provider_instance_id =
+        require_identity_member(row, "provider_instance_id", path);
+    facts.provider_runtime_unit_id =
+        require_identity_member(row, "provider_runtime_unit_id", path);
+    facts.provider_manifest_id =
+        require_identity_member(row, "provider_manifest_id", path);
+    facts.provider_manifest_revision =
+        require_digest_member(row, "provider_manifest_revision", path);
+    facts.state_authority_id =
+        require_identity_member(row, "state_authority_id", path);
+    facts.state_authority_class = authority;
+    for (const auto& claim : facts.command_claims) {
+      facts.resource_ids.insert(claim.resource_id);
+    }
+    for (const auto& claim : facts.state_claims) {
+      facts.resource_ids.insert(claim.resource_id);
     }
     if (!result.emplace(id, std::move(facts)).second) {
       fail_retained_bundle(path + " duplicates a control binding");
@@ -547,7 +610,7 @@ struct EdgeRef final {
 }
 
 struct ActivationFacts final {
-  std::set<std::string> roles;
+  std::set<std::string, std::less<>> roles;
   std::set<EdgeRef> edges;
 };
 
@@ -601,11 +664,18 @@ struct ActivationFacts final {
 }
 
 struct RouteFacts final {
+  struct Endpoint final {
+    std::string logical_symbol;
+    bool is_command = false;
+    bool is_state = false;
+  };
+
   std::string binding_id;
   std::string binding_revision;
   std::set<std::string> activation_sets;
   std::vector<std::string> controller_roles;
   std::set<EdgeRef> path_edges;
+  std::map<std::string, Endpoint, std::less<>> endpoints;
 };
 
 [[nodiscard]] bool is_ordered_subsequence(std::span<const ClaimKey> selected,
@@ -675,7 +745,7 @@ struct RouteFacts final {
       }
     }
 
-    RouteFacts facts{binding_id, binding_revision, {}, roles, {}};
+    RouteFacts facts{binding_id, binding_revision, {}, roles, {}, {}};
     const auto compatible_activations =
         verify_identity_set(require_member(row, "compatible_activation_set_ids", path),
                             path + ".compatible_activation_set_ids", true);
@@ -775,13 +845,18 @@ struct RouteFacts final {
       previous_endpoint = endpoint_id;
       const std::string logical =
           require_identity_member(endpoint, "logical_endpoint_symbol", endpoint_path);
+      const bool is_command =
+          require_bool(require_member(endpoint, "is_command_endpoint", endpoint_path),
+                       endpoint_path + ".is_command_endpoint");
+      const bool is_state =
+          require_bool(require_member(endpoint, "is_state_endpoint", endpoint_path),
+                       endpoint_path + ".is_state_endpoint");
       if (require_identity_member(endpoint, "generated_endpoint_name", endpoint_path) != logical ||
-          (!require_bool(require_member(endpoint, "is_command_endpoint", endpoint_path),
-                         endpoint_path + ".is_command_endpoint") &&
-           !require_bool(require_member(endpoint, "is_state_endpoint", endpoint_path),
-                         endpoint_path + ".is_state_endpoint"))) {
+          (!is_command && !is_state)) {
         fail_retained_bundle(endpoint_path + " has an invalid generated endpoint mapping");
       }
+      facts.endpoints.emplace(endpoint_id,
+                              RouteFacts::Endpoint{logical, is_command, is_state});
     }
     const std::string semantic_key = binding_id + "\x1f" + route_id;
     if (!result.emplace(semantic_key, std::move(facts)).second) {
@@ -789,6 +864,1162 @@ struct RouteFacts final {
     }
   }
   return result;
+}
+
+struct ContractFacts final {
+  std::string role_id;
+  std::string schema_id;
+  std::string schema_revision;
+
+  friend bool operator==(const ContractFacts&, const ContractFacts&) = default;
+};
+
+[[nodiscard]] ContractFacts verify_provider_contract(const CanonicalValue& value,
+                                                     std::string_view path) {
+  const auto& row = require_object(value, path);
+  require_exact_fields(row,
+                       {"provider_contract_role_id", "contract_schema_id",
+                        "contract_schema_revision"},
+                       path);
+  return {
+      require_identity_member(row, "provider_contract_role_id", path),
+      require_identity_member(row, "contract_schema_id", path),
+      require_digest_member(row, "contract_schema_revision", path),
+  };
+}
+
+[[nodiscard]] std::optional<ContractFacts> verify_optional_provider_contract(
+    const CanonicalValue& value, std::string_view path) {
+  if (is_null(value)) {
+    return std::nullopt;
+  }
+  return verify_provider_contract(value, path);
+}
+
+[[nodiscard]] std::optional<std::string> verify_optional_identity(
+    const CanonicalValue& value, std::string_view path) {
+  if (is_null(value)) {
+    return std::nullopt;
+  }
+  const std::string& identity = require_string(value, path);
+  require_retained_portable_identity(identity, path);
+  return identity;
+}
+
+[[nodiscard]] bool is_one_of(std::string_view value,
+                             std::initializer_list<std::string_view> allowed) {
+  return std::find(allowed.begin(), allowed.end(), value) != allowed.end();
+}
+
+struct StopEvidenceFacts final {
+  std::string phase_id;
+  std::string source_kind;
+  std::optional<std::string> endpoint_role_id;
+  std::optional<ContractFacts> provider_contract;
+  std::vector<std::string> allowed_authority_classes;
+};
+
+void verify_stop_applicability(
+    const CanonicalValue& value, std::string_view domain_id,
+    std::string_view domain_revision, std::string_view topology_id,
+    std::string_view topology_revision,
+    const std::map<std::string, BindingFacts, std::less<>>& bindings,
+    const std::map<std::string, ControllerFacts, std::less<>>& controllers,
+    const std::map<std::string, ActivationFacts, std::less<>>& activations,
+    const std::map<std::string, RouteFacts, std::less<>>& routes) {
+  const auto& rows = require_array(value, "control.stop_applicability");
+  if (rows.size() != routes.size() ||
+      rows.size() > core::kMaxDeploymentApplicabilityRows) {
+    fail_retained_bundle(
+        "control.stop_applicability must contain one bounded row per route");
+  }
+  std::set<std::string, std::less<>> seen_routes;
+  std::pair<std::string, std::string> previous_key;
+  bool has_previous = false;
+
+  constexpr std::array<std::string_view, 11U> common_fields{
+      "control_binding_id", "control_binding_revision", "control_route_id",
+      "stop_evidence_policy_id", "stop_evidence_policy_revision",
+      "control_domain_id", "control_domain_revision", "controller_topology_id",
+      "topology_revision", "containment_granularity", "disposition"};
+
+  for (std::size_t index = 0U; index < rows.size(); ++index) {
+    const std::string path =
+        "control.stop_applicability[" + std::to_string(index) + "]";
+    const auto& row = require_object(rows[index], path);
+    const std::string& disposition =
+        require_string(require_member(row, "disposition", path),
+                       path + ".disposition");
+    if (disposition == "not_stoppable") {
+      if (row.size() != common_fields.size()) {
+        fail_retained_bundle(path +
+                             " has an incorrect closed not-stoppable shape");
+      }
+      for (const auto field : common_fields) {
+        static_cast<void>(require_member(row, field, path));
+      }
+      for (const auto& [name, unused] : row) {
+        static_cast<void>(unused);
+        if (std::find(common_fields.begin(), common_fields.end(), name) ==
+            common_fields.end()) {
+          fail_retained_bundle(path + " contains unknown member " + name);
+        }
+      }
+    } else if (disposition == "stoppable") {
+      require_exact_fields(
+          row,
+          {"control_binding_id", "control_binding_revision", "control_route_id",
+           "stop_evidence_policy_id", "stop_evidence_policy_revision",
+           "control_domain_id", "control_domain_revision", "controller_topology_id",
+           "topology_revision", "containment_granularity", "disposition",
+           "logical_stop_symbol", "deadline_budget", "escalation_stages"},
+          path);
+    } else {
+      fail_retained_bundle(path + " has an unknown Stop disposition");
+    }
+
+    const std::string binding_id =
+        require_identity_member(row, "control_binding_id", path);
+    const std::string binding_revision =
+        require_digest_member(row, "control_binding_revision", path);
+    const std::string route_id =
+        require_identity_member(row, "control_route_id", path);
+    const auto key = std::pair{binding_id, route_id};
+    if (has_previous && previous_key >= key) {
+      fail_retained_bundle(
+          "control.stop_applicability is not canonical and unique");
+    }
+    previous_key = key;
+    has_previous = true;
+    const std::string semantic_key = binding_id + "\x1f" + route_id;
+    const auto binding = bindings.find(binding_id);
+    const auto route = routes.find(semantic_key);
+    if (binding == bindings.end() || route == routes.end() ||
+        binding->second.revision != binding_revision ||
+        route->second.binding_revision != binding_revision ||
+        !seen_routes.insert(semantic_key).second) {
+      fail_retained_bundle(path + " does not select one exact binding route");
+    }
+    if (require_identity_member(row, "stop_evidence_policy_id", path) !=
+            binding->second.stop_policy_id ||
+        require_digest_member(row, "stop_evidence_policy_revision", path) !=
+            binding->second.stop_policy_revision ||
+        require_identity_member(row, "control_domain_id", path) != domain_id ||
+        require_digest_member(row, "control_domain_revision", path) !=
+            domain_revision ||
+        require_identity_member(row, "controller_topology_id", path) !=
+            topology_id ||
+        require_digest_member(row, "topology_revision", path) !=
+            topology_revision ||
+        require_string(require_member(row, "containment_granularity", path),
+                       path + ".containment_granularity") !=
+            binding->second.containment) {
+      fail_retained_bundle(path +
+                           " differs from its exact domain/binding subject");
+    }
+    if (disposition == "not_stoppable") {
+      continue;
+    }
+
+    static_cast<void>(require_identity_member(row, "logical_stop_symbol", path));
+    const auto& stop_row = row;
+    const std::string stop_path = path;
+    const auto& stage_rows = require_array(
+        require_member(stop_row, "escalation_stages", stop_path),
+        stop_path + ".escalation_stages");
+    if (stage_rows.empty() ||
+        stage_rows.size() > core::kMaxStopEvidencePolicyItems) {
+      fail_retained_bundle(stop_path +
+                           " has an invalid Stop escalation inventory");
+    }
+    std::size_t previous_stage_last_phase = 0U;
+    bool has_previous_stage = false;
+    int previous_granularity = -1;
+    std::size_t software_hard_count = 0U;
+    bool saw_safety_request = false;
+    std::set<std::string, std::less<>> stage_ids;
+    std::set<std::string, std::less<>> all_evidence_ids;
+    for (std::size_t stage_index = 0U; stage_index < stage_rows.size();
+         ++stage_index) {
+      const std::string path = stop_path + ".escalation_stages[" +
+                               std::to_string(stage_index) + "]";
+      const auto& row = require_object(stage_rows[stage_index], path);
+      require_exact_fields(
+          row,
+          {"stop_escalation_stage_id", "stage_kind",
+           "containment_granularity", "containment_command",
+           "evidence_conjunction", "all_of_evidence_requirements",
+           "default_contract_parameters", "commissioned_stop_interface",
+           "provider_command_endpoint", "provider_evidence_endpoints",
+           "binding_state_authority_sources", "containment_scopes"},
+          path);
+      const std::string stage_id =
+          require_identity_member(row, "stop_escalation_stage_id", path);
+      if (!stage_ids.insert(stage_id).second) {
+        fail_retained_bundle(path + " duplicates a Stop escalation stage ID");
+      }
+      const std::string& stage_kind = require_string(
+          require_member(row, "stage_kind", path), path + ".stage_kind");
+      const std::string& stage_containment = require_string(
+          require_member(row, "containment_granularity", path),
+          path + ".containment_granularity");
+      const int stage_granularity =
+          stage_containment == "resource"
+              ? 0
+              : stage_containment == "controller_set"
+                    ? 1
+                    : stage_containment == "control_domain" ? 2 : -1;
+      if (stage_granularity < previous_granularity ||
+          stage_granularity < 0 || saw_safety_request ||
+          (stage_index == 0U && stage_kind != "nominal") ||
+          (stage_index != 0U && stage_kind == "nominal")) {
+        fail_retained_bundle(path +
+                             " has an invalid ordered Stop stage class or granularity");
+      }
+      previous_granularity = stage_granularity;
+      if (stage_kind == "software_hard") {
+        ++software_hard_count;
+      } else if (stage_kind == "safety_system_request") {
+        saw_safety_request = true;
+        if (stage_index + 1U != stage_rows.size()) {
+          fail_retained_bundle(path +
+                               " is a non-final safety-system request");
+        }
+      } else if (stage_kind != "nominal" &&
+                 stage_kind != "controlled_fallback") {
+        fail_retained_bundle(path + " has an unknown Stop stage kind");
+      } else if (stage_kind == "controlled_fallback" &&
+                 software_hard_count != 0U) {
+        fail_retained_bundle(path +
+                             " places a controlled fallback after the software-hard floor");
+      }
+    const auto& command = require_object(
+        require_member(row, "containment_command", path),
+        path + ".containment_command");
+    require_exact_fields(command,
+                         {"command_phase_id", "command_kind",
+                          "provider_contract_ref", "registered_command_kind_id"},
+                         path + ".containment_command");
+    const std::string command_phase = require_identity_member(
+        command, "command_phase_id", path + ".containment_command");
+    const std::string& command_kind = require_string(
+        require_member(command, "command_kind", path + ".containment_command"),
+        path + ".containment_command.command_kind");
+    if (!is_one_of(command_kind,
+                   {"controller_goal_cancel", "motion_controlled_stop",
+                    "capability_command_cancel", "safe_output_command",
+                    "logical_cancel", "registered"})) {
+      fail_retained_bundle(path + " has an unknown Stop command kind");
+    }
+    const auto command_contract = verify_optional_provider_contract(
+        require_member(command, "provider_contract_ref",
+                       path + ".containment_command"),
+        path + ".containment_command.provider_contract_ref");
+    const auto registered_command = verify_optional_identity(
+        require_member(command, "registered_command_kind_id",
+                       path + ".containment_command"),
+        path + ".containment_command.registered_command_kind_id");
+    if ((command_kind == "registered") != registered_command.has_value() ||
+        (is_one_of(command_kind,
+                   {"motion_controlled_stop", "safe_output_command",
+                    "logical_cancel", "registered"}) !=
+         command_contract.has_value())) {
+      fail_retained_bundle(path + " has an incoherent Stop command shape");
+    }
+    const core::StopActionClass expected_action_class =
+        stage_kind == "software_hard"
+            ? core::StopActionClass::kSoftwareHard
+            : stage_kind == "safety_system_request"
+                  ? core::StopActionClass::kSafetySystemRequest
+                  : core::StopActionClass::kControlled;
+    core::StopActionClass actual_action_class =
+        core::StopActionClass::kControlled;
+    if (registered_command.has_value()) {
+      const auto* definition =
+          core::find_registered_stop_command_definition(
+              core::RegisteredStopCommandKindId(*registered_command));
+      if (definition == nullptr) {
+        fail_retained_bundle(path +
+                             " names an unknown registered Stop command");
+      }
+      actual_action_class = definition->stop_action_class;
+    }
+    if (actual_action_class != expected_action_class ||
+        ((expected_action_class == core::StopActionClass::kSoftwareHard ||
+          expected_action_class ==
+              core::StopActionClass::kSafetySystemRequest) &&
+         command_kind != "registered")) {
+      fail_retained_bundle(path +
+                           " stage kind differs from its code-owned command class");
+    }
+
+    const CanonicalValue& parameters =
+        require_member(row, "default_contract_parameters", path);
+    if (command_contract.has_value()) {
+      static_cast<void>(require_object(
+          parameters, path + ".default_contract_parameters"));
+    } else if (!is_null(parameters)) {
+      fail_retained_bundle(path +
+                           " retains parameters for an intrinsic command");
+    }
+    const CanonicalValue& commissioned =
+        require_member(row, "commissioned_stop_interface", path);
+    if ((stage_kind == "safety_system_request") == is_null(commissioned)) {
+      fail_retained_bundle(path +
+                           " has an invalid commissioned-interface presence");
+    }
+    if (!is_null(commissioned)) {
+      const auto& commissioned_row = require_object(
+          commissioned, path + ".commissioned_stop_interface");
+      require_exact_fields(
+          commissioned_row,
+          {"commissioned_stop_interface_id",
+           "commissioned_stop_interface_revision", "control_domain_id",
+           "control_domain_revision", "control_binding_id",
+           "control_binding_revision", "control_route_id",
+           "provider_instance_id", "provider_manifest_id",
+           "provider_manifest_revision", "registered_command_kind_id",
+           "provider_contract_ref", "endpoint_role_id",
+           "stop_action_class", "safety_system_request_action_class",
+           "external_resource_alias", "external_resource_kind",
+           "site_overlay_value_ref", "commissioning_evidence_artifact_ref"},
+          path + ".commissioned_stop_interface");
+      if (require_identity_member(commissioned_row, "control_domain_id", path) !=
+              domain_id ||
+          require_digest_member(commissioned_row, "control_domain_revision",
+                                path) != domain_revision ||
+          require_identity_member(commissioned_row, "control_binding_id",
+                                  path) != binding_id ||
+          require_digest_member(commissioned_row, "control_binding_revision",
+                                path) != binding_revision ||
+          require_identity_member(commissioned_row, "control_route_id", path) !=
+              route_id ||
+          require_string(require_member(commissioned_row, "stop_action_class",
+                                        path),
+                         path + ".commissioned_stop_interface.stop_action_class") !=
+              "safety_system_request") {
+        fail_retained_bundle(path +
+                             " commissioned interface differs from its exact stage subject");
+      }
+    }
+
+    const auto& budget = require_object(
+        require_member(stop_row, "deadline_budget", stop_path),
+        stop_path + ".deadline_budget");
+    require_exact_fields(budget,
+                         {"outer_duration_ns", "kernel_completion_reserve_ns",
+                          "phases"},
+                         stop_path + ".deadline_budget");
+    const std::int64_t outer = require_safe_integer(
+        require_member(budget, "outer_duration_ns", stop_path + ".deadline_budget"),
+        stop_path + ".deadline_budget.outer_duration_ns");
+    const std::int64_t reserve = require_safe_integer(
+        require_member(budget, "kernel_completion_reserve_ns",
+                       stop_path + ".deadline_budget"),
+        stop_path + ".deadline_budget.kernel_completion_reserve_ns");
+    const auto& phase_rows = require_array(
+        require_member(budget, "phases", stop_path + ".deadline_budget"),
+        stop_path + ".deadline_budget.phases");
+    if (outer <= 0 || reserve <= 0 || reserve >= outer || phase_rows.empty() ||
+        phase_rows.size() > core::kMaxStopEvidencePolicyItems) {
+      fail_retained_bundle(path + " has an invalid Stop deadline budget");
+    }
+    std::map<std::string, std::size_t, std::less<>> phase_order;
+    std::vector<std::int64_t> phase_deadlines;
+    phase_deadlines.reserve(phase_rows.size());
+    std::int64_t previous_deadline = 0;
+    for (std::size_t phase_index = 0U; phase_index < phase_rows.size();
+         ++phase_index) {
+      const std::string phase_path = stop_path + ".deadline_budget.phases[" +
+                                     std::to_string(phase_index) + "]";
+      const auto& phase = require_object(phase_rows[phase_index], phase_path);
+      require_exact_fields(phase, {"phase_id", "deadline_offset_ns"},
+                           phase_path);
+      const std::string phase_id =
+          require_identity_member(phase, "phase_id", phase_path);
+      const std::int64_t deadline = require_safe_integer(
+          require_member(phase, "deadline_offset_ns", phase_path),
+          phase_path + ".deadline_offset_ns");
+      if (deadline <= previous_deadline || deadline > outer - reserve ||
+          !phase_order.emplace(phase_id, phase_index).second) {
+        fail_retained_bundle(phase_path +
+                             " is not a valid ordered budget phase");
+      }
+      previous_deadline = deadline;
+      phase_deadlines.push_back(deadline);
+    }
+    const auto command_phase_position = phase_order.find(command_phase);
+    if (command_phase_position == phase_order.end() ||
+        (!has_previous_stage && command_phase_position->second != 0U) ||
+        (has_previous_stage &&
+         command_phase_position->second != previous_stage_last_phase + 1U)) {
+      fail_retained_bundle(path +
+                           " command phase is outside the exact stage order");
+    }
+    if (require_string(require_member(row, "evidence_conjunction", path),
+                       path + ".evidence_conjunction") != "all_of") {
+      fail_retained_bundle(path + " has an unsupported evidence conjunction");
+    }
+
+    const auto& evidence_rows = require_array(
+        require_member(row, "all_of_evidence_requirements", path),
+        path + ".all_of_evidence_requirements");
+    if (evidence_rows.empty() ||
+        evidence_rows.size() > core::kMaxStopEvidencePolicyItems) {
+      fail_retained_bundle(path + " has an invalid Stop evidence inventory");
+    }
+    std::map<std::string, StopEvidenceFacts, std::less<>> evidence_facts;
+    std::size_t previous_evidence_phase = command_phase_position->second;
+    bool has_evidence_phase = false;
+    for (std::size_t evidence_index = 0U;
+         evidence_index < evidence_rows.size(); ++evidence_index) {
+      const std::string evidence_path =
+          path + ".all_of_evidence_requirements[" +
+          std::to_string(evidence_index) + "]";
+      const auto& evidence =
+          require_object(evidence_rows[evidence_index], evidence_path);
+      require_exact_fields(
+          evidence,
+          {"evidence_item_id", "phase_id", "evidence_kind",
+           "provider_contract_ref", "registered_evidence_kind_id",
+           "source_requirement", "observation_semantics"},
+          evidence_path);
+      const std::string evidence_id =
+          require_identity_member(evidence, "evidence_item_id", evidence_path);
+      if (!all_evidence_ids.insert(evidence_id).second) {
+        fail_retained_bundle(evidence_path +
+                             " repeats an evidence item across Stop stages");
+      }
+      const std::string phase_id =
+          require_identity_member(evidence, "phase_id", evidence_path);
+      const auto phase = phase_order.find(phase_id);
+      const std::string& evidence_kind = require_string(
+          require_member(evidence, "evidence_kind", evidence_path),
+          evidence_path + ".evidence_kind");
+      if (phase == phase_order.end() ||
+          (!has_evidence_phase &&
+           (phase->second < command_phase_position->second ||
+            phase->second > command_phase_position->second + 1U)) ||
+          (has_evidence_phase &&
+           (previous_evidence_phase > phase->second ||
+            phase->second > previous_evidence_phase + 1U)) ||
+          !is_one_of(evidence_kind,
+                     {"controller_goal_terminal", "motion_rest",
+                      "discrete_acknowledgement", "io_safe_output",
+                      "logical_cancellation_no_continuing_effect",
+                      "registered"})) {
+        fail_retained_bundle(evidence_path +
+                             " has invalid ordered evidence semantics");
+      }
+      previous_evidence_phase = phase->second;
+      has_evidence_phase = true;
+      const auto evidence_contract = verify_optional_provider_contract(
+          require_member(evidence, "provider_contract_ref", evidence_path),
+          evidence_path + ".provider_contract_ref");
+      const auto registered_evidence = verify_optional_identity(
+          require_member(evidence, "registered_evidence_kind_id", evidence_path),
+          evidence_path + ".registered_evidence_kind_id");
+      if ((evidence_kind == "registered") !=
+              registered_evidence.has_value() ||
+          (is_one_of(evidence_kind,
+                     {"motion_rest", "io_safe_output",
+                      "logical_cancellation_no_continuing_effect",
+                      "registered"}) != evidence_contract.has_value())) {
+        fail_retained_bundle(evidence_path +
+                             " has an incoherent evidence kind shape");
+      }
+      const auto& source = require_object(
+          require_member(evidence, "source_requirement", evidence_path),
+          evidence_path + ".source_requirement");
+      require_exact_fields(source,
+                           {"source_kind", "freshness_budget_ns",
+                            "endpoint_role_id", "allowed_authority_classes"},
+                           evidence_path + ".source_requirement");
+      const std::string& source_kind = require_string(
+          require_member(source, "source_kind",
+                         evidence_path + ".source_requirement"),
+          evidence_path + ".source_requirement.source_kind");
+      if (!is_one_of(source_kind,
+                     {"controller_goal_status", "binding_state_authority",
+                      "command_target_status", "provider_evidence"}) ||
+          require_safe_integer(
+              require_member(source, "freshness_budget_ns",
+                             evidence_path + ".source_requirement"),
+              evidence_path + ".source_requirement.freshness_budget_ns") <= 0) {
+        fail_retained_bundle(evidence_path +
+                             " has an invalid evidence source");
+      }
+      const auto endpoint_role = verify_optional_identity(
+          require_member(source, "endpoint_role_id",
+                         evidence_path + ".source_requirement"),
+          evidence_path + ".source_requirement.endpoint_role_id");
+      const auto authority_classes = verify_identity_set(
+          require_member(source, "allowed_authority_classes",
+                         evidence_path + ".source_requirement"),
+          evidence_path + ".source_requirement.allowed_authority_classes");
+      if (!std::all_of(authority_classes.begin(), authority_classes.end(),
+                       [](const auto& value) {
+                         return is_one_of(value,
+                                          {"measured", "commanded", "predicted"});
+                       }) ||
+          ((source_kind == "binding_state_authority" ||
+            source_kind == "provider_evidence") != endpoint_role.has_value()) ||
+          ((source_kind == "binding_state_authority") !=
+           !authority_classes.empty())) {
+        fail_retained_bundle(evidence_path +
+                             " has an incoherent evidence source shape");
+      }
+      const auto& observation = require_object(
+          require_member(evidence, "observation_semantics", evidence_path),
+          evidence_path + ".observation_semantics");
+      require_exact_fields(observation,
+                           {"observation_kind", "minimum_dwell_ns"},
+                           evidence_path + ".observation_semantics");
+      const std::string& observation_kind = require_string(
+          require_member(observation, "observation_kind",
+                         evidence_path + ".observation_semantics"),
+          evidence_path + ".observation_semantics.observation_kind");
+      const CanonicalValue& dwell = require_member(
+          observation, "minimum_dwell_ns",
+          evidence_path + ".observation_semantics");
+      const bool compatible =
+          (evidence_kind == "controller_goal_terminal" &&
+           source_kind == "controller_goal_status" &&
+           is_one_of(observation_kind,
+                     {"command_result", "post_command_sample"})) ||
+          (evidence_kind == "motion_rest" &&
+           source_kind == "binding_state_authority" &&
+           observation_kind == "post_command_dwell") ||
+          (evidence_kind == "discrete_acknowledgement" &&
+           source_kind == "command_target_status" &&
+           is_one_of(observation_kind,
+                     {"command_result", "post_command_sample"})) ||
+          (evidence_kind == "io_safe_output" &&
+           is_one_of(source_kind,
+                     {"binding_state_authority", "provider_evidence"}) &&
+           is_one_of(observation_kind,
+                     {"post_command_sample", "post_command_dwell"})) ||
+          (evidence_kind ==
+               "logical_cancellation_no_continuing_effect" &&
+           is_one_of(source_kind,
+                     {"command_target_status", "provider_evidence"})) ||
+          (evidence_kind == "registered" &&
+           source_kind == "provider_evidence");
+      if (!compatible || !is_one_of(observation_kind,
+                     {"command_result", "post_command_sample",
+                      "post_command_dwell"}) ||
+          ((observation_kind == "post_command_dwell") != !is_null(dwell)) ||
+          (!is_null(dwell) && require_safe_integer(
+                                  dwell, evidence_path +
+                                             ".observation_semantics.minimum_dwell_ns") <= 0) ||
+          (observation_kind == "command_result" &&
+           phase->second != command_phase_position->second) ||
+          (observation_kind != "command_result" &&
+           phase->second == command_phase_position->second) ||
+          (!is_null(dwell) &&
+           require_safe_integer(
+               dwell, evidence_path +
+                          ".observation_semantics.minimum_dwell_ns") >
+               phase_deadlines[phase->second] -
+                   phase_deadlines[command_phase_position->second])) {
+        fail_retained_bundle(evidence_path +
+                             " has invalid observation semantics");
+      }
+      if (!evidence_facts
+               .emplace(evidence_id,
+                        StopEvidenceFacts{phase_id, source_kind, endpoint_role,
+                                          evidence_contract,
+                                          authority_classes})
+               .second) {
+        fail_retained_bundle(evidence_path + " duplicates an evidence item");
+      }
+    }
+    if (stage_index + 1U == stage_rows.size() &&
+        previous_evidence_phase + 1U != phase_rows.size()) {
+      fail_retained_bundle(path +
+                           " contains a Stop budget phase with no evidence");
+    }
+
+    const CanonicalValue& command_endpoint_value =
+        require_member(row, "provider_command_endpoint", path);
+    if (is_null(command_endpoint_value)) {
+      // A provider contract can deliberately be endpointless. Absence is
+      // retained explicitly and remains distinct from an empty object.
+    } else {
+      const auto& endpoint = require_object(
+          command_endpoint_value, path + ".provider_command_endpoint");
+      require_exact_fields(endpoint,
+                           {"stop_escalation_stage_id",
+                            "provider_contract_ref", "endpoint_role_id",
+                            "logical_endpoint_symbol"},
+                           path + ".provider_command_endpoint");
+      const ContractFacts contract = verify_provider_contract(
+          require_member(endpoint, "provider_contract_ref",
+                         path + ".provider_command_endpoint"),
+          path + ".provider_command_endpoint.provider_contract_ref");
+      const std::string endpoint_role = require_identity_member(
+          endpoint, "endpoint_role_id", path + ".provider_command_endpoint");
+      const auto route_endpoint = route->second.endpoints.find(endpoint_role);
+      if (require_identity_member(endpoint, "stop_escalation_stage_id",
+                                  path + ".provider_command_endpoint") !=
+              stage_id ||
+          !command_contract.has_value() || contract != *command_contract ||
+          route_endpoint == route->second.endpoints.end() ||
+          !route_endpoint->second.is_command ||
+          require_identity_member(endpoint, "logical_endpoint_symbol",
+                                  path + ".provider_command_endpoint") !=
+              route_endpoint->second.logical_symbol) {
+        fail_retained_bundle(path +
+                             " has an invalid resolved provider command endpoint");
+      }
+    }
+
+    const auto& provider_rows = require_array(
+        require_member(row, "provider_evidence_endpoints", path),
+        path + ".provider_evidence_endpoints");
+    std::set<std::string, std::less<>> provider_evidence_ids;
+    std::string previous_evidence_id;
+    for (std::size_t endpoint_index = 0U; endpoint_index < provider_rows.size();
+         ++endpoint_index) {
+      const std::string endpoint_path =
+          path + ".provider_evidence_endpoints[" +
+          std::to_string(endpoint_index) + "]";
+      const auto& endpoint = require_object(provider_rows[endpoint_index],
+                                            endpoint_path);
+      require_exact_fields(endpoint,
+                           {"stop_escalation_stage_id", "evidence_item_id",
+                            "provider_contract_ref",
+                            "endpoint_role_id", "logical_endpoint_symbol"},
+                           endpoint_path);
+      const std::string evidence_id =
+          require_identity_member(endpoint, "evidence_item_id", endpoint_path);
+      const auto evidence = evidence_facts.find(evidence_id);
+      const ContractFacts contract = verify_provider_contract(
+          require_member(endpoint, "provider_contract_ref", endpoint_path),
+          endpoint_path + ".provider_contract_ref");
+      const std::string endpoint_role =
+          require_identity_member(endpoint, "endpoint_role_id", endpoint_path);
+      const auto route_endpoint = route->second.endpoints.find(endpoint_role);
+      if (require_identity_member(endpoint, "stop_escalation_stage_id",
+                                  endpoint_path) != stage_id ||
+          (!previous_evidence_id.empty() &&
+           previous_evidence_id >= evidence_id) ||
+          evidence == evidence_facts.end() ||
+          evidence->second.source_kind != "provider_evidence" ||
+          evidence->second.endpoint_role_id != endpoint_role ||
+          !evidence->second.provider_contract.has_value() ||
+          contract != *evidence->second.provider_contract ||
+          route_endpoint == route->second.endpoints.end() ||
+          !route_endpoint->second.is_state ||
+          require_identity_member(endpoint, "logical_endpoint_symbol",
+                                  endpoint_path) !=
+              route_endpoint->second.logical_symbol ||
+          !provider_evidence_ids.insert(evidence_id).second) {
+        fail_retained_bundle(endpoint_path +
+                             " is not an exact provider evidence endpoint");
+      }
+      previous_evidence_id = evidence_id;
+    }
+
+    const auto& binding_rows = require_array(
+        require_member(row, "binding_state_authority_sources", path),
+        path + ".binding_state_authority_sources");
+    std::set<std::string, std::less<>> binding_evidence_ids;
+    previous_evidence_id.clear();
+    for (std::size_t source_index = 0U; source_index < binding_rows.size();
+         ++source_index) {
+      const std::string source_path =
+          path + ".binding_state_authority_sources[" +
+          std::to_string(source_index) + "]";
+      const auto& source = require_object(binding_rows[source_index], source_path);
+      require_exact_fields(source,
+                           {"stop_escalation_stage_id", "evidence_item_id",
+                            "state_authority_id",
+                            "state_authority_class", "state_endpoint_role_id",
+                            "logical_endpoint_symbol"},
+                           source_path);
+      const std::string evidence_id =
+          require_identity_member(source, "evidence_item_id", source_path);
+      const auto evidence = evidence_facts.find(evidence_id);
+      const std::string endpoint_role = require_identity_member(
+          source, "state_endpoint_role_id", source_path);
+      const auto route_endpoint = route->second.endpoints.find(endpoint_role);
+      if (require_identity_member(source, "stop_escalation_stage_id",
+                                  source_path) != stage_id ||
+          (!previous_evidence_id.empty() &&
+           previous_evidence_id >= evidence_id) ||
+          evidence == evidence_facts.end() ||
+          evidence->second.source_kind != "binding_state_authority" ||
+          evidence->second.endpoint_role_id != endpoint_role ||
+          std::find(evidence->second.allowed_authority_classes.begin(),
+                    evidence->second.allowed_authority_classes.end(),
+                    binding->second.state_authority_class) ==
+              evidence->second.allowed_authority_classes.end() ||
+          require_identity_member(source, "state_authority_id", source_path) !=
+              binding->second.state_authority_id ||
+          require_string(require_member(source, "state_authority_class", source_path),
+                         source_path + ".state_authority_class") !=
+              binding->second.state_authority_class ||
+          route_endpoint == route->second.endpoints.end() ||
+          !route_endpoint->second.is_state ||
+          require_identity_member(source, "logical_endpoint_symbol", source_path) !=
+              route_endpoint->second.logical_symbol ||
+          !binding_evidence_ids.insert(evidence_id).second) {
+        fail_retained_bundle(source_path +
+                             " is not an exact binding authority source");
+      }
+      previous_evidence_id = evidence_id;
+    }
+    for (const auto& [evidence_id, evidence] : evidence_facts) {
+      if ((evidence.source_kind == "provider_evidence") !=
+              provider_evidence_ids.contains(evidence_id) ||
+          (evidence.source_kind == "binding_state_authority") !=
+              binding_evidence_ids.contains(evidence_id)) {
+        fail_retained_bundle(path +
+                             " does not resolve every endpoint-backed evidence item");
+      }
+    }
+
+    const auto& scope_rows = require_array(
+        require_member(row, "containment_scopes", path),
+        path + ".containment_scopes");
+    if (scope_rows.size() != route->second.activation_sets.size()) {
+      fail_retained_bundle(path +
+                           " scope inventory differs from compatible activations");
+    }
+    std::set<std::string, std::less<>> seen_activations;
+    std::string previous_activation;
+    for (std::size_t scope_index = 0U; scope_index < scope_rows.size();
+         ++scope_index) {
+      const std::string scope_path = path + ".containment_scopes[" +
+                                     std::to_string(scope_index) + "]";
+      const auto& scope = require_object(scope_rows[scope_index], scope_path);
+      const std::string& scope_kind = require_string(
+          require_member(scope, "scope_kind", scope_path),
+          scope_path + ".scope_kind");
+      const std::string activation =
+          require_identity_member(scope, "activation_set_id", scope_path);
+      const auto activation_facts = activations.find(activation);
+      if (require_identity_member(scope, "stop_escalation_stage_id",
+                                  scope_path) != stage_id ||
+          scope_kind != stage_containment ||
+          !route->second.activation_sets.contains(activation) ||
+          activation_facts == activations.end() ||
+          (!previous_activation.empty() && previous_activation >= activation) ||
+          !seen_activations.insert(activation).second) {
+        fail_retained_bundle(scope_path +
+                             " is not an exact canonical containment scope");
+      }
+      previous_activation = activation;
+      if (scope_kind == "resource") {
+        require_exact_fields(scope,
+                             {"stop_escalation_stage_id", "scope_kind",
+                              "activation_set_id", "resource_ids"},
+                             scope_path);
+        const auto resources = verify_identity_set(
+            require_member(scope, "resource_ids", scope_path),
+            scope_path + ".resource_ids", true);
+        if (std::set<std::string, std::less<>>(resources.begin(), resources.end()) !=
+            binding->second.resource_ids) {
+          fail_retained_bundle(scope_path +
+                               " differs from the exact binding resource set");
+        }
+      } else if (scope_kind == "controller_set") {
+        require_exact_fields(
+            scope,
+            {"stop_escalation_stage_id", "scope_kind", "activation_set_id",
+             "active_controller_role_ids",
+             "logical_controller_symbols"},
+            scope_path);
+        const auto roles = verify_identity_set(
+            require_member(scope, "active_controller_role_ids", scope_path),
+            scope_path + ".active_controller_role_ids", true);
+        const auto symbols = verify_identity_sequence(
+            require_member(scope, "logical_controller_symbols", scope_path),
+            scope_path + ".logical_controller_symbols", true);
+        if (roles.size() != symbols.size() ||
+            std::set<std::string, std::less<>>(roles.begin(), roles.end()) !=
+                activation_facts->second.roles) {
+          fail_retained_bundle(scope_path +
+                               " differs from the exact active controller set");
+        }
+        for (std::size_t role_index = 0U; role_index < roles.size(); ++role_index) {
+          const auto controller = controllers.find(roles[role_index]);
+          if (controller == controllers.end() ||
+              controller->second.logical_symbol != symbols[role_index]) {
+            fail_retained_bundle(scope_path +
+                                 " has an invalid controller role/symbol mapping");
+          }
+        }
+      } else if (scope_kind == "control_domain") {
+        require_exact_fields(scope,
+                             {"stop_escalation_stage_id", "scope_kind",
+                              "activation_set_id",
+                              "control_domain_id", "control_domain_revision"},
+                             scope_path);
+        if (require_identity_member(scope, "control_domain_id", scope_path) !=
+                domain_id ||
+            require_digest_member(scope, "control_domain_revision", scope_path) !=
+                domain_revision) {
+          fail_retained_bundle(scope_path +
+                               " differs from the exact control domain");
+        }
+      } else {
+        fail_retained_bundle(scope_path + " has an unknown containment scope kind");
+      }
+    }
+    previous_stage_last_phase = previous_evidence_phase;
+    has_previous_stage = true;
+  }
+  const int top_level_granularity =
+      binding->second.containment == "resource"
+          ? 0
+          : binding->second.containment == "controller_set" ? 1 : 2;
+  if (software_hard_count != 1U ||
+      previous_granularity != top_level_granularity) {
+    fail_retained_bundle(
+        stop_path +
+        " has an invalid software-hard count or coarsest containment projection");
+  }
+  }
+}
+
+struct RetainedArtifactFacts final {
+  std::string role;
+  std::string media_type;
+  std::uint64_t byte_size;
+  std::string digest;
+  std::string store_key;
+
+  friend bool operator==(const RetainedArtifactFacts&,
+                         const RetainedArtifactFacts&) = default;
+};
+
+[[nodiscard]] RetainedArtifactFacts verify_retained_artifact_ref(
+    const CanonicalValue& value, std::string_view path) {
+  const auto& row = require_object(value, path);
+  require_exact_fields(
+      row,
+      {"artifact_role_id", "media_type", "byte_size", "content_digest",
+       "content_addressed_store_key"},
+      path);
+  const std::string role =
+      require_identity_member(row, "artifact_role_id", path);
+  const std::string media = require_string(
+      require_member(row, "media_type", path), std::string(path) + ".media_type");
+  const std::int64_t size = require_safe_integer(
+      require_member(row, "byte_size", path), std::string(path) + ".byte_size");
+  const std::string digest =
+      require_digest_member(row, "content_digest", path);
+  const std::string key = require_string(
+      require_member(row, "content_addressed_store_key", path),
+      std::string(path) + ".content_addressed_store_key");
+  if (size <= 0 || key != retained_store_key_for_digest(digest)) {
+    fail_retained_bundle(std::string(path) +
+                         " is not a safe non-empty retained artifact reference");
+  }
+  return {role, media, static_cast<std::uint64_t>(size), digest, key};
+}
+
+struct StopQualificationArtifactExpectations final {
+  std::optional<RetainedArtifactFacts> implementation;
+  std::optional<RetainedArtifactFacts> substitution;
+  std::optional<RetainedArtifactFacts> commissioning;
+};
+
+[[nodiscard]] StopQualificationArtifactExpectations
+verify_stop_qualification_tables(
+    const CanonicalValue::Object& control,
+    const std::map<std::string, BindingFacts, std::less<>>& bindings) {
+  std::set<std::string, std::less<>> hard_subjects;
+  std::set<std::string, std::less<>> substitution_subjects;
+  CanonicalValue::Array nested_commissioned;
+  const auto contract_key = [](const CanonicalValue& value,
+                               std::string_view path) {
+    const ContractFacts contract = verify_provider_contract(value, path);
+    return contract.role_id + "\x1f" + contract.schema_id + "\x1f" +
+           contract.schema_revision;
+  };
+  const auto optional_text = [](const CanonicalValue::Object& object,
+                                std::string_view field)
+      -> std::optional<std::string_view> {
+    const auto found = std::find_if(
+        object.begin(), object.end(), [&](const auto& member) {
+          return member.first == field;
+        });
+    if (found == object.end()) {
+      return std::nullopt;
+    }
+    const auto* text = std::get_if<std::string>(&found->second.storage());
+    return text == nullptr ? std::nullopt
+                           : std::optional<std::string_view>(*text);
+  };
+
+  for (const auto& stop_value : require_array(
+           require_member(control, "stop_applicability", "control"),
+           "control.stop_applicability")) {
+    const auto& stop = require_object(stop_value, "control.stop_applicability");
+    const auto disposition = require_string(
+        require_member(stop, "disposition", "control.stop_applicability"),
+        "control.stop_applicability.disposition");
+    if (disposition != "stoppable") {
+      continue;
+    }
+    const std::string binding_id = require_identity_member(
+        stop, "control_binding_id", "control.stop_applicability");
+    const auto binding = bindings.find(binding_id);
+    if (binding == bindings.end()) {
+      fail_retained_bundle(
+          "Stop qualification subject has no exact control binding");
+    }
+    const std::string runtime_product_id = native_execution_runtime_product_id(
+        core::RuntimeUnitId(binding->second.provider_runtime_unit_id));
+    const std::string runtime_product_key =
+        runtime_product_id + "\x1f" +
+        std::string(kNativeExecutionRuntimeProductContractId) + "\x1f" +
+        native_execution_runtime_product_contract_revision().value();
+    for (const auto& stage_value : require_array(
+             require_member(stop, "escalation_stages",
+                            "control.stop_applicability"),
+             "control.stop_applicability.escalation_stages")) {
+      const auto& stage = require_object(
+          stage_value, "control.stop_applicability.escalation_stages");
+      const std::string& kind = require_string(
+          require_member(stage, "stage_kind", "control.stop_applicability"),
+          "control.stop_applicability.stage_kind");
+      const auto& command = require_object(
+          require_member(stage, "containment_command",
+                         "control.stop_applicability"),
+          "control.stop_applicability.containment_command");
+      const CanonicalValue& contract_value = require_member(
+          command, "provider_contract_ref", "control.stop_applicability");
+      if (kind == "software_hard") {
+        const std::string command_id = require_identity_member(
+            command, "registered_command_kind_id",
+            "control.stop_applicability.containment_command");
+        const CanonicalValue& endpoint_value = require_member(
+            stage, "provider_command_endpoint",
+            "control.stop_applicability");
+        std::string endpoint;
+        if (!is_null(endpoint_value)) {
+          endpoint = require_identity_member(
+              require_object(endpoint_value,
+                             "control.stop_applicability.provider_command_endpoint"),
+              "endpoint_role_id",
+              "control.stop_applicability.provider_command_endpoint");
+        }
+        hard_subjects.insert(contract_key(
+                                 contract_value,
+                                 "control.stop_applicability.provider_contract_ref") +
+                             "\x1f" + command_id + "\x1f" + endpoint +
+                             "\x1f" + runtime_product_key);
+      }
+      const CanonicalValue& parameters = require_member(
+          stage, "default_contract_parameters", "control.stop_applicability");
+      if (!is_null(parameters)) {
+        const auto& object = require_object(
+            parameters,
+            "control.stop_applicability.default_contract_parameters");
+        if (optional_text(object, "stop_mode") ==
+                std::optional<std::string_view>("soft_on_path") &&
+            optional_text(object, "recoverable_substitution_mode") ==
+                std::optional<std::string_view>("spring_back_hold")) {
+          substitution_subjects.insert(contract_key(
+              contract_value,
+              "control.stop_applicability.provider_contract_ref") +
+              "\x1f" + runtime_product_key);
+        }
+      }
+      const CanonicalValue& commissioned = require_member(
+          stage, "commissioned_stop_interface",
+          "control.stop_applicability");
+      if (!is_null(commissioned)) {
+        nested_commissioned.push_back(commissioned);
+      }
+    }
+  }
+
+  std::set<std::string, std::less<>> qualified_hard_subjects;
+  std::optional<RetainedArtifactFacts> implementation_artifact;
+  std::string previous;
+  for (const auto& value : require_array(
+           require_member(control, "stop_implementation_qualifications",
+                          "control"),
+           "control.stop_implementation_qualifications")) {
+    const std::string canonical = canonical_json(value);
+    if (!previous.empty() && previous >= canonical) {
+      fail_retained_bundle(
+          "Stop implementation qualifications are not canonical and unique");
+    }
+    previous = canonical;
+    const auto& row = require_object(
+        value, "control.stop_implementation_qualifications");
+    require_exact_fields(
+        row,
+        {"registered_command_kind_id", "provider_contract_ref", "product_id",
+         "product_contract_id", "product_contract_revision",
+         "endpoint_role_id", "invocation_lane_id",
+         "qualification_artifact_ref"},
+        "control.stop_implementation_qualifications");
+    const std::string command_id = require_identity_member(
+        row, "registered_command_kind_id",
+        "control.stop_implementation_qualifications");
+    const auto* definition = core::find_registered_stop_command_definition(
+        core::RegisteredStopCommandKindId(command_id));
+    const auto endpoint = verify_optional_identity(
+        require_member(row, "endpoint_role_id",
+                       "control.stop_implementation_qualifications"),
+        "control.stop_implementation_qualifications.endpoint_role_id");
+    const std::string product_id = require_identity_member(
+        row, "product_id", "control.stop_implementation_qualifications");
+    if (definition == nullptr ||
+        definition->stop_action_class !=
+            core::StopActionClass::kSoftwareHard ||
+        require_identity_member(row, "product_contract_id",
+                                "control.stop_implementation_qualifications") !=
+            kNativeExecutionRuntimeProductContractId ||
+        require_digest_member(
+            row, "product_contract_revision",
+            "control.stop_implementation_qualifications") !=
+            native_execution_runtime_product_contract_revision().value() ||
+        require_identity_member(row, "invocation_lane_id",
+                                "control.stop_implementation_qualifications") !=
+            "manyforge.native_execution_host.focused_software_hard.v1") {
+      fail_retained_bundle(
+          "Stop implementation qualification is not the exact native hard lane");
+    }
+    const RetainedArtifactFacts artifact = verify_retained_artifact_ref(
+        require_member(row, "qualification_artifact_ref",
+                       "control.stop_implementation_qualifications"),
+        "control.stop_implementation_qualifications.qualification_artifact_ref");
+    if (artifact.role != core::kStopImplementationQualificationArtifactRole ||
+        artifact.media_type !=
+            core::kStopImplementationQualificationMediaType ||
+        (implementation_artifact.has_value() &&
+         *implementation_artifact != artifact)) {
+      fail_retained_bundle(
+          "Stop implementation qualifications do not share one exact evidence artifact");
+    }
+    implementation_artifact = artifact;
+    qualified_hard_subjects.insert(
+        contract_key(require_member(row, "provider_contract_ref",
+                                    "control.stop_implementation_qualifications"),
+                     "control.stop_implementation_qualifications.provider_contract_ref") +
+        "\x1f" + command_id + "\x1f" + endpoint.value_or("") + "\x1f" +
+        product_id + "\x1f" +
+        std::string(kNativeExecutionRuntimeProductContractId) + "\x1f" +
+        native_execution_runtime_product_contract_revision().value());
+  }
+  if (qualified_hard_subjects != hard_subjects) {
+    fail_retained_bundle(
+        "Stop implementation qualifications do not exactly cover the retained hard stages");
+  }
+
+  std::set<std::string, std::less<>> qualified_substitution_subjects;
+  std::optional<RetainedArtifactFacts> substitution_artifact;
+  previous.clear();
+  for (const auto& value : require_array(
+           require_member(control,
+                          "controlled_stop_substitution_qualifications",
+                          "control"),
+           "control.controlled_stop_substitution_qualifications")) {
+    const std::string canonical = canonical_json(value);
+    if (!previous.empty() && previous >= canonical) {
+      fail_retained_bundle(
+          "controlled Stop substitution qualifications are not canonical and unique");
+    }
+    previous = canonical;
+    const auto& row = require_object(
+        value, "control.controlled_stop_substitution_qualifications");
+    require_exact_fields(
+        row,
+        {"provider_contract_ref", "product_id", "product_contract_id",
+         "product_contract_revision", "requested_stop_mode",
+         "executed_stop_mode", "qualification_artifact_ref"},
+        "control.controlled_stop_substitution_qualifications");
+    const std::string product_id = require_identity_member(
+        row, "product_id",
+        "control.controlled_stop_substitution_qualifications");
+    if (require_identity_member(
+            row, "product_contract_id",
+            "control.controlled_stop_substitution_qualifications") !=
+            kNativeExecutionRuntimeProductContractId ||
+        require_digest_member(
+            row, "product_contract_revision",
+            "control.controlled_stop_substitution_qualifications") !=
+            native_execution_runtime_product_contract_revision().value() ||
+        require_string(require_member(row, "requested_stop_mode", "control"),
+                       "control.requested_stop_mode") != "soft_on_path" ||
+        require_string(require_member(row, "executed_stop_mode", "control"),
+                       "control.executed_stop_mode") != "spring_back_hold") {
+      fail_retained_bundle(
+          "controlled Stop substitution qualification has an invalid exact mode/product pair");
+    }
+    const RetainedArtifactFacts artifact = verify_retained_artifact_ref(
+        require_member(row, "qualification_artifact_ref", "control"),
+        "control.controlled_stop_substitution_qualifications.qualification_artifact_ref");
+    if (artifact.role !=
+            core::kControlledStopSubstitutionQualificationArtifactRole ||
+        artifact.media_type !=
+            core::kControlledStopSubstitutionQualificationMediaType ||
+        (substitution_artifact.has_value() &&
+         *substitution_artifact != artifact)) {
+      fail_retained_bundle(
+          "controlled Stop substitution qualifications do not share one exact evidence artifact");
+    }
+    substitution_artifact = artifact;
+    qualified_substitution_subjects.insert(contract_key(
+        require_member(row, "provider_contract_ref", "control"),
+        "control.controlled_stop_substitution_qualifications.provider_contract_ref") +
+        "\x1f" + product_id + "\x1f" +
+        std::string(kNativeExecutionRuntimeProductContractId) + "\x1f" +
+        native_execution_runtime_product_contract_revision().value());
+  }
+  if (qualified_substitution_subjects != substitution_subjects) {
+    fail_retained_bundle(
+        "controlled Stop substitution qualifications do not exactly cover their retained stages");
+  }
+
+  std::sort(nested_commissioned.begin(), nested_commissioned.end(),
+            [](const auto& left, const auto& right) {
+              return canonical_json(left) < canonical_json(right);
+            });
+  CanonicalValue::Array top_level_commissioned = require_array(
+      require_member(control, "commissioned_stop_interfaces", "control"),
+      "control.commissioned_stop_interfaces");
+  std::sort(top_level_commissioned.begin(), top_level_commissioned.end(),
+            [](const auto& left, const auto& right) {
+              return canonical_json(left) < canonical_json(right);
+            });
+  if (top_level_commissioned != nested_commissioned ||
+      std::adjacent_find(top_level_commissioned.begin(),
+                         top_level_commissioned.end()) !=
+          top_level_commissioned.end()) {
+    fail_retained_bundle(
+        "commissioned Stop interface table differs from the exact final-stage projection");
+  }
+
+  std::optional<RetainedArtifactFacts> commissioning_artifact;
+  for (const auto& value : top_level_commissioned) {
+    const auto& row = require_object(value, "control.commissioned_stop_interfaces");
+    const RetainedArtifactFacts artifact = verify_retained_artifact_ref(
+        require_member(row, "commissioning_evidence_artifact_ref",
+                       "control.commissioned_stop_interfaces"),
+        "control.commissioned_stop_interfaces."
+        "commissioning_evidence_artifact_ref");
+    if (artifact.role != core::kStopInterfaceCommissioningArtifactRole ||
+        artifact.media_type != core::kStopInterfaceCommissioningMediaType ||
+        (commissioning_artifact.has_value() &&
+         *commissioning_artifact != artifact)) {
+      fail_retained_bundle(
+          "commissioned Stop interfaces do not share one exact evidence "
+          "artifact");
+    }
+    commissioning_artifact = artifact;
+  }
+  return StopQualificationArtifactExpectations{
+      implementation_artifact, substitution_artifact,
+      commissioning_artifact};
 }
 
 void verify_reference_profile_shape(
@@ -910,6 +2141,429 @@ void verify_source_conformance(const CanonicalValue& value, const CanonicalValue
   }
 }
 
+void verify_catalog_source_closure(
+    const CanonicalValue::Object& control, std::string_view topology_id,
+    std::string_view topology_revision,
+    const std::map<std::string, BindingFacts, std::less<>>& bindings,
+    const std::map<std::string, ControllerFacts, std::less<>>& controllers,
+    const std::map<std::string, ActivationFacts, std::less<>>& activations,
+    const std::map<std::string, RouteFacts, std::less<>>& routes,
+    std::span<const QualifiedStopEvidencePolicy> stop_policies,
+    std::span<const QualifiedControllerTopology> controller_topologies,
+    std::span<const QualifiedProviderManifest> provider_manifests) {
+  if (stop_policies.empty() && controller_topologies.empty() &&
+      provider_manifests.empty()) {
+    return;
+  }
+
+  using Identity = std::pair<std::string, std::string>;
+  std::set<Identity> expected_policy_ids;
+  std::set<Identity> expected_manifest_ids;
+  for (const auto& [unused, binding] : bindings) {
+    static_cast<void>(unused);
+    expected_policy_ids.emplace(binding.stop_policy_id,
+                                binding.stop_policy_revision);
+    expected_manifest_ids.emplace(binding.provider_manifest_id,
+                                  binding.provider_manifest_revision);
+  }
+  std::map<Identity, const QualifiedStopEvidencePolicy*> policies;
+  for (const auto& policy : stop_policies) {
+    const Identity key{policy.value().stop_evidence_policy_id.value(),
+                       policy.value().stop_evidence_policy_revision.value()};
+    if (!policies.emplace(key, &policy).second) {
+      fail_retained_bundle("qualified Stop-policy closure is duplicate");
+    }
+  }
+  std::map<Identity, const QualifiedProviderManifest*> manifests;
+  for (const auto& manifest : provider_manifests) {
+    const Identity key{manifest.value().provider_manifest_id.value(),
+                       manifest.value().provider_manifest_revision.value()};
+    if (!manifests.emplace(key, &manifest).second) {
+      fail_retained_bundle("qualified provider-manifest closure is duplicate");
+    }
+  }
+  std::set<Identity> supplied_policy_ids;
+  for (const auto& [key, unused] : policies) {
+    static_cast<void>(unused);
+    supplied_policy_ids.insert(key);
+  }
+  std::set<Identity> supplied_manifest_ids;
+  for (const auto& [key, unused] : manifests) {
+    static_cast<void>(unused);
+    supplied_manifest_ids.insert(key);
+  }
+  if (supplied_policy_ids != expected_policy_ids ||
+      supplied_manifest_ids != expected_manifest_ids) {
+    fail_retained_bundle(
+        "control artifact does not have its exact qualified policy/provider "
+        "source closure");
+  }
+
+  const QualifiedControllerTopology* selected_topology = nullptr;
+  for (const auto& topology : controller_topologies) {
+    if (topology.value().controller_topology_id.value() == topology_id &&
+        topology.value().topology_revision.value() == topology_revision) {
+      if (selected_topology != nullptr) {
+        fail_retained_bundle("qualified topology closure is duplicate");
+      }
+      selected_topology = &topology;
+    } else {
+      fail_retained_bundle(
+          "qualified topology closure contains an unrelated topology");
+    }
+  }
+  if (selected_topology == nullptr) {
+    fail_retained_bundle(
+        "control artifact has no exact qualified topology source");
+  }
+  const auto& topology = selected_topology->value();
+
+  std::set<std::string, std::less<>> topology_controller_ids;
+  for (const auto& controller : topology.controllers) {
+    topology_controller_ids.insert(controller.controller_role_id.value());
+  }
+  std::set<std::string, std::less<>> retained_controller_ids;
+  for (const auto& [role, unused] : controllers) {
+    static_cast<void>(unused);
+    retained_controller_ids.insert(role);
+  }
+  if (topology_controller_ids != retained_controller_ids) {
+    fail_retained_bundle(
+        "retained controller roles differ from their qualified topology");
+  }
+
+  std::map<std::string, const core::ControllerActivationSetDTO*, std::less<>>
+      topology_activations;
+  for (const auto& activation : topology.activation_sets) {
+    topology_activations.emplace(activation.activation_set_id.value(),
+                                 &activation);
+  }
+  if (topology_activations.size() != activations.size()) {
+    fail_retained_bundle(
+        "retained activation-set inventory differs from its qualified topology");
+  }
+  for (const auto& [id, retained] : activations) {
+    const auto source = topology_activations.find(id);
+    if (source == topology_activations.end()) {
+      fail_retained_bundle(
+          "retained activation set is absent from its qualified topology");
+    }
+    std::set<std::string, std::less<>> roles;
+    for (const auto& role : source->second->active_controller_role_ids) {
+      roles.insert(role.value());
+    }
+    std::set<EdgeRef> edges;
+    for (const auto& edge : source->second->active_chain_edges) {
+      edges.insert(
+          {edge.upstream_controller_role_id.value(),
+           edge.downstream_controller_role_id.value()});
+    }
+    if (roles != retained.roles || edges != retained.edges) {
+      fail_retained_bundle(
+          "retained activation set differs from its qualified topology");
+    }
+  }
+
+  std::map<std::string, const core::ControlRouteDTO*, std::less<>>
+      topology_routes;
+  for (const auto& route : topology.legal_routes) {
+    topology_routes.emplace(route.control_route_id.value(), &route);
+  }
+  for (const auto& [route_key, retained] : routes) {
+    const auto source = topology_routes.find(
+        route_key.substr(route_key.find('\x1f') + 1U));
+    if (source == topology_routes.end()) {
+      fail_retained_bundle(
+          "retained route is absent from its qualified topology");
+    }
+    std::vector<std::string> roles;
+    for (const auto& role : source->second->ordered_controller_role_ids) {
+      roles.push_back(role.value());
+    }
+    std::set<std::string> compatible;
+    for (const auto& activation :
+         source->second->compatible_activation_set_ids) {
+      compatible.insert(activation.value());
+    }
+    if (roles != retained.controller_roles ||
+        compatible != retained.activation_sets) {
+      fail_retained_bundle(
+          "retained route differs from its qualified topology");
+    }
+  }
+
+  for (const auto& stop_value : require_array(
+           require_member(control, "stop_applicability", "control"),
+           "control.stop_applicability")) {
+    const auto& stop = require_object(stop_value,
+                                      "control.stop_applicability");
+    const std::string binding_id = require_identity_member(
+        stop, "control_binding_id", "control.stop_applicability");
+    const auto binding = bindings.find(binding_id);
+    if (binding == bindings.end()) {
+      fail_retained_bundle("retained Stop row lost its binding source");
+    }
+    const Identity policy_key{
+        require_identity_member(stop, "stop_evidence_policy_id", "control"),
+        require_digest_member(stop, "stop_evidence_policy_revision", "control")};
+    const auto policy = policies.find(policy_key);
+    if (policy == policies.end()) {
+      fail_retained_bundle("retained Stop row lost its exact policy source");
+    }
+    CanonicalValue::Object policy_fields{
+        {"disposition", require_member(stop, "disposition", "control")},
+        {"containment_granularity",
+         require_member(stop, "containment_granularity", "control")}};
+    if (require_string(require_member(stop, "disposition", "control"),
+                       "control.stop_applicability.disposition") ==
+        "stoppable") {
+      policy_fields.emplace_back(
+          "deadline_budget", require_member(stop, "deadline_budget", "control"));
+      CanonicalValue::Array stages;
+      for (const auto& stage_value : require_array(
+               require_member(stop, "escalation_stages", "control"),
+               "control.stop_applicability.escalation_stages")) {
+        const auto& stage = require_object(
+            stage_value, "control.stop_applicability.escalation_stages");
+        stages.emplace_back(CanonicalValue::Object{
+            {"stop_escalation_stage_id",
+             require_member(stage, "stop_escalation_stage_id", "control")},
+            {"stage_kind", require_member(stage, "stage_kind", "control")},
+            {"containment_granularity",
+             require_member(stage, "containment_granularity", "control")},
+            {"containment_command",
+             require_member(stage, "containment_command", "control")},
+            {"evidence_conjunction",
+             require_member(stage, "evidence_conjunction", "control")},
+            {"all_of_evidence_requirements",
+             require_member(stage, "all_of_evidence_requirements", "control")},
+        });
+      }
+      policy_fields.emplace_back("escalation_stages",
+                                 CanonicalValue(std::move(stages)));
+    }
+    if (canonical_json(CanonicalValue(std::move(policy_fields))) !=
+        canonical_json(stop_policy_applicability_projection(
+            policy->second->value()))) {
+      fail_retained_bundle(
+          "retained Stop semantics differ from their qualified policy source");
+    }
+
+    const Identity manifest_key{binding->second.provider_manifest_id,
+                                binding->second.provider_manifest_revision};
+    const auto manifest = manifests.find(manifest_key);
+    if (manifest == manifests.end()) {
+      fail_retained_bundle(
+          "retained binding lost its exact provider-manifest source");
+    }
+    const auto offered = std::find_if(
+        manifest->second->value().offered_capabilities.begin(),
+        manifest->second->value().offered_capabilities.end(),
+        [&](const auto& capability) {
+          return capability.capability_id.value() ==
+                     binding->second.capability_id &&
+                 capability.capability_definition_revision.value() ==
+                     binding->second.capability_revision;
+        });
+    if (offered == manifest->second->value().offered_capabilities.end()) {
+      fail_retained_bundle(
+          "retained binding capability is absent from its provider manifest");
+    }
+    if (require_string(require_member(stop, "disposition", "control"),
+                       "control.stop_applicability.disposition") !=
+        "stoppable") {
+      continue;
+    }
+    const auto declaration_for = [&](const ContractFacts& contract)
+        -> const core::ProviderContractDeclarationDTO* {
+      const auto found = std::find_if(
+          manifest->second->value().provider_contracts.begin(),
+          manifest->second->value().provider_contracts.end(),
+          [&](const auto& declaration) {
+            const auto& candidate = declaration.provider_contract_ref;
+            return candidate.provider_contract_role_id.value() ==
+                       contract.role_id &&
+                   candidate.contract_schema_id.value() ==
+                       contract.schema_id &&
+                   candidate.contract_schema_revision.value() ==
+                       contract.schema_revision;
+          });
+      return found == manifest->second->value().provider_contracts.end()
+                 ? nullptr
+                 : &*found;
+    };
+    for (const auto& stage_value : require_array(
+             require_member(stop, "escalation_stages", "control"),
+             "control.stop_applicability.escalation_stages")) {
+      const auto& stage = require_object(
+          stage_value, "control.stop_applicability.escalation_stages");
+      const auto& command = require_object(
+          require_member(stage, "containment_command", "control"),
+          "control.stop_applicability.containment_command");
+      const auto contract = verify_optional_provider_contract(
+          require_member(command, "provider_contract_ref", "control"),
+          "control.stop_applicability.provider_contract_ref");
+      if (contract.has_value()) {
+        const auto* declaration = declaration_for(*contract);
+        if (declaration == nullptr ||
+            !declaration->stop_command_support.has_value()) {
+          fail_retained_bundle(
+              "retained Stop command is absent from its provider manifest");
+        }
+        const auto& support = *declaration->stop_command_support;
+        const std::string& command_kind = require_string(
+            require_member(command, "command_kind", "control"),
+            "control.stop_applicability.command_kind");
+        const auto registered = verify_optional_identity(
+            require_member(command, "registered_command_kind_id", "control"),
+            "control.stop_applicability.registered_command_kind_id");
+        if (core::to_string(support.command_kind) != command_kind ||
+            support.registered_command_kind_id.has_value() !=
+                registered.has_value() ||
+            (registered.has_value() &&
+             support.registered_command_kind_id->value() != *registered)) {
+          fail_retained_bundle(
+              "retained Stop command semantics differ from their provider "
+              "manifest");
+        }
+        const CanonicalValue& endpoint_value = require_member(
+            stage, "provider_command_endpoint", "control");
+        std::optional<std::string> endpoint;
+        if (!is_null(endpoint_value)) {
+          endpoint = require_identity_member(
+              require_object(endpoint_value,
+                             "control.stop_applicability."
+                             "provider_command_endpoint"),
+              "endpoint_role_id",
+              "control.stop_applicability.provider_command_endpoint");
+        }
+        const auto endpoint_supported = [&](std::string_view value) {
+          return std::any_of(
+              support.command_endpoint_role_ids.begin(),
+              support.command_endpoint_role_ids.end(), [&](const auto& role) {
+                return role.value() == value;
+              });
+        };
+        if (support.command_endpoint_role_ids.empty() !=
+                !endpoint.has_value() ||
+            (endpoint.has_value() && !endpoint_supported(*endpoint))) {
+          fail_retained_bundle(
+              "retained Stop command endpoint differs from its provider "
+              "manifest");
+        }
+      }
+
+      for (const auto& evidence_value : require_array(
+               require_member(stage, "all_of_evidence_requirements", "control"),
+               "control.stop_applicability.all_of_evidence_requirements")) {
+        const auto& evidence = require_object(
+            evidence_value,
+            "control.stop_applicability.all_of_evidence_requirements");
+        const auto evidence_contract = verify_optional_provider_contract(
+            require_member(evidence, "provider_contract_ref", "control"),
+            "control.stop_applicability.evidence.provider_contract_ref");
+        if (!evidence_contract.has_value()) {
+          continue;
+        }
+        const auto* declaration = declaration_for(*evidence_contract);
+        if (declaration == nullptr ||
+            !declaration->stop_evidence_support.has_value()) {
+          fail_retained_bundle(
+              "retained Stop evidence is absent from its provider manifest");
+        }
+        const auto& support = *declaration->stop_evidence_support;
+        const std::string& evidence_kind = require_string(
+            require_member(evidence, "evidence_kind", "control"),
+            "control.stop_applicability.evidence_kind");
+        const auto registered = verify_optional_identity(
+            require_member(evidence, "registered_evidence_kind_id", "control"),
+            "control.stop_applicability.registered_evidence_kind_id");
+        if (core::to_string(support.evidence_kind) != evidence_kind ||
+            support.registered_evidence_kind_id.has_value() !=
+                registered.has_value() ||
+            (registered.has_value() &&
+             support.registered_evidence_kind_id->value() != *registered)) {
+          fail_retained_bundle(
+              "retained Stop evidence semantics differ from their provider "
+              "manifest");
+        }
+        const auto& source = require_object(
+            require_member(evidence, "source_requirement", "control"),
+            "control.stop_applicability.source_requirement");
+        const auto endpoint = verify_optional_identity(
+            require_member(source, "endpoint_role_id", "control"),
+            "control.stop_applicability.source_requirement.endpoint_role_id");
+        const auto endpoint_supported = [&](std::string_view value) {
+          return std::any_of(
+              support.evidence_endpoint_role_ids.begin(),
+              support.evidence_endpoint_role_ids.end(), [&](const auto& role) {
+                return role.value() == value;
+              });
+        };
+        if (support.evidence_endpoint_role_ids.empty() !=
+                !endpoint.has_value() ||
+            (endpoint.has_value() && !endpoint_supported(*endpoint))) {
+          fail_retained_bundle(
+              "retained Stop evidence endpoint differs from its provider "
+              "manifest");
+        }
+      }
+    }
+  }
+}
+
+[[nodiscard]] const core::RetainedProductDTO& require_retained_control_product(
+    const core::RetainedBundleDTO& retained_bundle,
+    const core::ControlDomainId& control_domain_id) {
+  const core::RetainedProductDTO* retained_product = nullptr;
+  for (const auto& group :
+       retained_bundle.compiled_products.control_domain_products) {
+    if (group.control_domain_id != control_domain_id) {
+      continue;
+    }
+    if (retained_product != nullptr || group.products.size() != 1U) {
+      fail_retained_bundle(
+          "retained bundle does not contain one exact control-domain product");
+    }
+    retained_product = &group.products.front();
+  }
+  if (retained_product == nullptr ||
+      retained_product->product_id != core::ProductId(
+          control_domain_control_product_id(control_domain_id)) ||
+      retained_product->product_kind !=
+          core::RetainedProductKind::kControlDomainControl ||
+      retained_product->product_contract_id.value() !=
+          control_domain_control_product_contract_id() ||
+      retained_product->product_contract_revision !=
+          control_domain_control_product_contract_revision()) {
+    fail_retained_bundle(
+        "retained bundle has no exact qualified control-domain artifact anchor");
+  }
+  return *retained_product;
+}
+
+void require_retained_control_artifact_anchor(
+    std::string_view canonical_bytes,
+    const core::RetainedBundleDTO& retained_bundle,
+    const core::ControlDomainId& control_domain_id) {
+  const auto& retained_product =
+      require_retained_control_product(retained_bundle, control_domain_id);
+  const auto artifact = std::find_if(
+      retained_product.artifact_refs.begin(),
+      retained_product.artifact_refs.end(), [](const auto& candidate) {
+        return candidate.artifact_role_id.value() ==
+               kControlDomainControlArtifactRole;
+      });
+  if (artifact == retained_product.artifact_refs.end() ||
+      artifact->media_type != kControlDomainControlMediaType ||
+      artifact->byte_size !=
+          static_cast<std::uint64_t>(canonical_bytes.size()) ||
+      artifact->content_digest.value() != sha256_digest(canonical_bytes)) {
+    fail_retained_bundle(
+        "control-domain artifact bytes differ from the trusted retained producer digest");
+  }
+}
+
 }  // namespace
 
 std::string control_domain_control_product_id(const core::ControlDomainId& control_domain_id) {
@@ -941,7 +2595,10 @@ CanonicalValue parse_and_verify_control_domain_control(std::string_view canonica
       {"api_version", "control_domain_id", "control_domain_revision", "controller_topology_id",
        "topology_revision", "control_coordinator_endpoint_role", "containment_granularity",
        "implementation_profile", "desired_configuration", "bindings", "controllers",
-       "activation_sets", "routes", "source_conformance"},
+       "activation_sets", "routes", "stop_applicability",
+       "stop_implementation_qualifications",
+       "controlled_stop_substitution_qualifications",
+       "commissioned_stop_interfaces", "source_conformance"},
       "control");
   if (require_string(require_member(object, "api_version", "control"), "control.api_version") !=
       kControlDomainControlApiVersion) {
@@ -995,6 +2652,11 @@ CanonicalValue parse_and_verify_control_domain_control(std::string_view canonica
   const auto routes = verify_routes(require_member(object, "routes", "control"), bindings,
                                     controllers, activations);
   verify_reference_profile_shape(controllers, routes);
+  verify_stop_applicability(require_member(object, "stop_applicability", "control"),
+                            domain_id, domain_revision, topology_id,
+                            topology_revision, bindings, controllers,
+                            activations, routes);
+  static_cast<void>(verify_stop_qualification_tables(object, bindings));
   verify_desired_configuration(require_member(object, "desired_configuration", "control"),
                                domain_id, domain_revision, topology_id, topology_revision, bindings,
                                activations, routes);
@@ -1005,9 +2667,81 @@ CanonicalValue parse_and_verify_control_domain_control(std::string_view canonica
 
 void require_control_domain_control_matches_retained_bundle(
     std::string_view canonical_bytes, const core::RetainedBundleDTO& retained_bundle,
-    const core::ControlDomainId& control_domain_id) {
+    const core::ControlDomainId& control_domain_id,
+    std::span<const QualifiedStopEvidencePolicy> stop_policies,
+    std::span<const QualifiedControllerTopology> controller_topologies,
+    std::span<const QualifiedProviderManifest> provider_manifests) {
+  require_retained_control_artifact_anchor(canonical_bytes, retained_bundle,
+                                           control_domain_id);
   const CanonicalValue root = parse_and_verify_control_domain_control(canonical_bytes);
   const auto& object = require_object(root, "control");
+  const auto source_bindings =
+      verify_bindings(require_member(object, "bindings", "control"));
+  const auto source_controllers = verify_controllers(
+      require_member(object, "controllers", "control"), source_bindings);
+  const auto source_activations = verify_activation_sets(
+      require_member(object, "activation_sets", "control"),
+      source_controllers);
+  const auto source_routes = verify_routes(
+      require_member(object, "routes", "control"), source_bindings,
+      source_controllers, source_activations);
+  verify_catalog_source_closure(
+      object,
+      require_identity_member(object, "controller_topology_id", "control"),
+      require_digest_member(object, "topology_revision", "control"),
+      source_bindings, source_controllers, source_activations, source_routes,
+      stop_policies, controller_topologies, provider_manifests);
+  std::set<std::string, std::less<>> qualified_runtime_product_ids;
+  for (const auto field : {"stop_implementation_qualifications",
+                           "controlled_stop_substitution_qualifications"}) {
+    for (const auto& qualification : require_array(
+             require_member(object, field, "control"),
+             std::string("control.") + field)) {
+      const auto& row = require_object(
+          qualification, std::string("control.") + field);
+      qualified_runtime_product_ids.insert(require_identity_member(
+          row, "product_id", std::string("control.") + field));
+    }
+  }
+  std::set<std::string, std::less<>> matched_runtime_product_ids;
+  for (const auto& binding_value : require_array(
+           require_member(object, "bindings", "control"),
+           "control.bindings")) {
+    const auto& binding = require_object(binding_value, "control.bindings");
+    const core::RuntimeUnitId runtime_unit_id(require_identity_member(
+        binding, "provider_runtime_unit_id", "control.bindings"));
+    const std::string expected_product_id =
+        native_execution_runtime_product_id(runtime_unit_id);
+    if (!qualified_runtime_product_ids.contains(expected_product_id)) {
+      continue;
+    }
+    const auto group = std::find_if(
+        retained_bundle.compiled_products.runtime_unit_products.begin(),
+        retained_bundle.compiled_products.runtime_unit_products.end(),
+        [&](const auto& candidate) {
+          return candidate.runtime_unit_id == runtime_unit_id;
+        });
+    if (group ==
+            retained_bundle.compiled_products.runtime_unit_products.end() ||
+        group->products.size() != 1U ||
+        group->products.front().product_id.value() != expected_product_id ||
+        group->products.front().product_kind !=
+            core::RetainedProductKind::kRuntimeUnitConfiguration ||
+        group->products.front().product_contract_id.value() !=
+            kNativeExecutionRuntimeProductContractId ||
+        group->products.front().product_contract_revision.value() !=
+            native_execution_runtime_product_contract_revision().value()) {
+      fail_retained_bundle(
+          "Stop qualification does not name one exact retained native "
+          "provider runtime product");
+    }
+    matched_runtime_product_ids.insert(expected_product_id);
+  }
+  if (matched_runtime_product_ids != qualified_runtime_product_ids) {
+    fail_retained_bundle(
+        "Stop qualification names a runtime product outside its exact "
+        "control-binding owners");
+  }
   const auto& graph = retained_bundle.cell_graph;
   const auto domain = std::find_if(
       graph.control_domains.begin(), graph.control_domains.end(),
@@ -1065,6 +2799,8 @@ void require_control_domain_control_matches_retained_bundle(
             binding.control_interface_revision.value() ||
         require_identity_member(row, "provider_instance_id", path) !=
             binding.provider_instance_id.value() ||
+        require_identity_member(row, "provider_runtime_unit_id", path) !=
+            binding.provider_runtime_unit_id.value() ||
         require_identity_member(row, "provider_manifest_id", path) !=
             binding.provider_manifest_id.value() ||
         require_digest_member(row, "provider_manifest_revision", path) !=
@@ -1211,6 +2947,380 @@ void require_control_domain_control_matches_retained_bundle(
         state_roles != strong_set(expected->second->state_endpoint_role_ids)) {
       fail_retained_bundle(path + " endpoint roles differ from its retained binding");
     }
+  }
+}
+
+void require_control_domain_control_matches_retained_bundle(
+    const ControlDomainControlArtifactClosure& artifacts,
+    const core::RetainedBundleDTO& retained_bundle,
+    const core::ControlDomainId& control_domain_id,
+    std::span<const QualifiedStopEvidencePolicy> stop_policies,
+    std::span<const QualifiedControllerTopology> controller_topologies,
+    std::span<const QualifiedProviderManifest> provider_manifests) {
+  require_control_domain_control_matches_retained_bundle(
+      artifacts.control_domain_control, retained_bundle, control_domain_id,
+      stop_policies, controller_topologies, provider_manifests);
+
+  const CanonicalValue root =
+      parse_and_verify_control_domain_control(artifacts.control_domain_control);
+  const auto& control = require_object(root, "control");
+  const auto bindings =
+      verify_bindings(require_member(control, "bindings", "control"));
+  const StopQualificationArtifactExpectations expected =
+      verify_stop_qualification_tables(control, bindings);
+
+  const auto require_exact_artifact_bytes = [](
+      const std::optional<RetainedArtifactFacts>& reference,
+      const std::optional<std::string_view>& bytes, std::string_view label) {
+    if (reference.has_value() != bytes.has_value()) {
+      fail_retained_bundle(std::string(label) +
+                           " presence differs from its retained semantic rows");
+    }
+    if (!reference.has_value()) {
+      return;
+    }
+    if (bytes->empty() ||
+        static_cast<std::uint64_t>(bytes->size()) != reference->byte_size ||
+        sha256_digest(*bytes) != reference->digest ||
+        reference->store_key != retained_store_key_for_digest(reference->digest)) {
+      fail_retained_bundle(std::string(label) +
+                           " bytes differ from the retained artifact reference");
+    }
+  };
+  require_exact_artifact_bytes(
+      expected.implementation,
+      artifacts.stop_implementation_qualification_evidence,
+      "Stop implementation qualification evidence");
+  require_exact_artifact_bytes(
+      expected.substitution,
+      artifacts.stop_controlled_substitution_qualification_evidence,
+      "controlled Stop substitution qualification evidence");
+  require_exact_artifact_bytes(
+      expected.commissioning,
+      artifacts.stop_interface_commissioning_evidence,
+      "commissioned Stop-interface evidence");
+
+  std::map<std::string, StopImplementationBuildIdentity, std::less<>>
+      build_identities_by_product;
+  for (const auto& retained_identity :
+       artifacts.native_runtime_build_identities) {
+    const auto identity = parse_stop_implementation_build_identity(
+        retained_identity.canonical_bytes);
+    if (identity.implementation_id !=
+            kNativeExecutionRuntimeImplementationId ||
+        identity.installed_target_id !=
+            kNativeExecutionRuntimeInstalledTargetId) {
+      fail_retained_bundle(
+          "retained native runtime build identity names a different "
+          "implementation target");
+    }
+    const core::RetainedProductDTO* matched_product = nullptr;
+    for (const auto& group :
+         retained_bundle.compiled_products.runtime_unit_products) {
+      for (const auto& product : group.products) {
+        if (product.product_id != retained_identity.product_id) {
+          continue;
+        }
+        if (matched_product != nullptr ||
+            product.product_contract_id.value() !=
+                kNativeExecutionRuntimeProductContractId ||
+            product.product_contract_revision !=
+                native_execution_runtime_product_contract_revision()) {
+          fail_retained_bundle(
+              "native build identity does not name one exact retained "
+              "runtime product");
+        }
+        matched_product = &product;
+      }
+    }
+    if (matched_product == nullptr) {
+      fail_retained_bundle(
+          "native build identity has no retained runtime product");
+    }
+    const core::RetainedArtifactRefDTO* matched_ref = nullptr;
+    for (const auto& artifact : matched_product->artifact_refs) {
+      if (artifact.artifact_role_id.value() !=
+          kNativeExecutionRuntimeBuildIdentityArtifactRole) {
+        continue;
+      }
+      if (matched_ref != nullptr) {
+        fail_retained_bundle(
+            "native runtime product repeats its build identity artifact");
+      }
+      matched_ref = &artifact;
+    }
+    if (matched_ref == nullptr ||
+        matched_ref->media_type !=
+            kNativeExecutionRuntimeBuildIdentityMediaType ||
+        matched_ref->byte_size != retained_identity.canonical_bytes.size() ||
+        matched_ref->content_digest.value() !=
+            sha256_digest(retained_identity.canonical_bytes) ||
+        !build_identities_by_product
+             .emplace(retained_identity.product_id.value(), identity)
+             .second) {
+      fail_retained_bundle(
+          "native runtime product has an incoherent build identity artifact");
+    }
+  }
+
+  const auto contract_matches = [](const core::ProviderContractRefDTO& entry,
+                                   const CanonicalValue& value,
+                                   std::string_view path) {
+    const ContractFacts retained = verify_provider_contract(value, path);
+    return entry.provider_contract_role_id.value() == retained.role_id &&
+           entry.contract_schema_id.value() == retained.schema_id &&
+           entry.contract_schema_revision.value() == retained.schema_revision;
+  };
+
+  std::optional<core::ContentDigest> implementation_runner_digest;
+  std::optional<core::ContentDigest> substitution_runner_digest;
+  if (artifacts.stop_implementation_qualification_evidence.has_value()) {
+    auto [runner_digest, entries] =
+        parse_stop_implementation_qualification_evidence_package(
+            *artifacts.stop_implementation_qualification_evidence);
+    implementation_runner_digest = runner_digest;
+    std::vector<bool> used(entries.size(), false);
+    for (const auto& row_value : require_array(
+             require_member(control, "stop_implementation_qualifications",
+                            "control"),
+             "control.stop_implementation_qualifications")) {
+      const auto& row = require_object(
+          row_value, "control.stop_implementation_qualifications");
+      const std::string command_id = require_identity_member(
+          row, "registered_command_kind_id",
+          "control.stop_implementation_qualifications");
+      const auto endpoint = verify_optional_identity(
+          require_member(row, "endpoint_role_id",
+                         "control.stop_implementation_qualifications"),
+          "control.stop_implementation_qualifications.endpoint_role_id");
+      const std::string lane = require_identity_member(
+          row, "invocation_lane_id",
+          "control.stop_implementation_qualifications");
+      const std::string contract_id = require_identity_member(
+          row, "product_contract_id",
+          "control.stop_implementation_qualifications");
+      const std::string contract_revision = require_digest_member(
+          row, "product_contract_revision",
+          "control.stop_implementation_qualifications");
+      const std::string product_id = require_identity_member(
+          row, "product_id", "control.stop_implementation_qualifications");
+      std::optional<std::size_t> match;
+      for (std::size_t index = 0U; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        if (entry.implementation_id !=
+                kNativeExecutionRuntimeImplementationId ||
+            entry.registered_command_kind_id.value() != command_id ||
+            entry.endpoint_role_id.has_value() != endpoint.has_value() ||
+            (endpoint.has_value() &&
+             entry.endpoint_role_id->value() != *endpoint) ||
+            entry.invocation_lane_id.value() != lane ||
+            entry.product_contract_id.value() != contract_id ||
+            entry.product_contract_revision.value() != contract_revision ||
+            !contract_matches(
+                entry.provider_contract_ref,
+                require_member(row, "provider_contract_ref",
+                               "control.stop_implementation_qualifications"),
+                "control.stop_implementation_qualifications."
+                "provider_contract_ref")) {
+          continue;
+        }
+        if (match.has_value()) {
+          fail_retained_bundle(
+              "one Stop implementation qualification row resolves multiple "
+              "evidence entries");
+        }
+        match = index;
+      }
+      if (!match.has_value()) {
+        fail_retained_bundle(
+            "Stop implementation qualification row has no exact evidence "
+            "entry");
+      }
+      const auto build_identity = build_identities_by_product.find(product_id);
+      if (build_identity == build_identities_by_product.end() ||
+          build_identity->second.implementation_source_build_fingerprint !=
+              entries[*match].implementation_source_build_fingerprint) {
+        fail_retained_bundle(
+            "Stop implementation qualification differs from the exact "
+            "runtime-product build identity");
+      }
+      used[*match] = true;
+
+      std::optional<std::uint64_t> phase_budget;
+      for (const auto& stop_value : require_array(
+               require_member(control, "stop_applicability", "control"),
+               "control.stop_applicability")) {
+        const auto& stop = require_object(stop_value,
+                                          "control.stop_applicability");
+        if (require_string(require_member(stop, "disposition", "control"),
+                           "control.stop_applicability.disposition") !=
+            "stoppable") {
+          continue;
+        }
+        const auto stop_binding = bindings.find(require_identity_member(
+            stop, "control_binding_id", "control.stop_applicability"));
+        if (stop_binding == bindings.end() ||
+            native_execution_runtime_product_id(core::RuntimeUnitId(
+                stop_binding->second.provider_runtime_unit_id)) != product_id) {
+          continue;
+        }
+        const auto& phases = require_array(
+            require_member(
+                require_object(require_member(stop, "deadline_budget", "control"),
+                               "control.stop_applicability.deadline_budget"),
+                "phases", "control.stop_applicability.deadline_budget"),
+            "control.stop_applicability.deadline_budget.phases");
+        for (const auto& stage_value : require_array(
+                 require_member(stop, "escalation_stages", "control"),
+                 "control.stop_applicability.escalation_stages")) {
+          const auto& stage = require_object(
+              stage_value, "control.stop_applicability.escalation_stages");
+          if (require_string(require_member(stage, "stage_kind", "control"),
+                             "control.stop_applicability.stage_kind") !=
+              "software_hard") {
+            continue;
+          }
+          const auto& command = require_object(
+              require_member(stage, "containment_command", "control"),
+              "control.stop_applicability.containment_command");
+          const CanonicalValue& endpoint_value = require_member(
+              stage, "provider_command_endpoint", "control");
+          std::optional<std::string> stage_endpoint;
+          if (!is_null(endpoint_value)) {
+            stage_endpoint = require_identity_member(
+                require_object(
+                    endpoint_value,
+                    "control.stop_applicability.provider_command_endpoint"),
+                "endpoint_role_id",
+                "control.stop_applicability.provider_command_endpoint");
+          }
+          if (require_identity_member(
+                  command, "registered_command_kind_id", "control") !=
+                  command_id ||
+              stage_endpoint != endpoint ||
+              !contract_matches(
+                  entries[*match].provider_contract_ref,
+                  require_member(command, "provider_contract_ref", "control"),
+                  "control.stop_applicability.provider_contract_ref")) {
+            continue;
+          }
+          const std::string phase_id = require_identity_member(
+              command, "command_phase_id", "control");
+          std::uint64_t previous_deadline_offset_ns = 0U;
+          for (const auto& phase_value : phases) {
+            const auto& phase = require_object(
+                phase_value,
+                "control.stop_applicability.deadline_budget.phases");
+            const auto deadline_offset_ns = static_cast<std::uint64_t>(
+                require_safe_integer(
+                    require_member(phase, "deadline_offset_ns", "control"),
+                    "control.stop_applicability.deadline_offset_ns"));
+            if (deadline_offset_ns <= previous_deadline_offset_ns) {
+              fail_retained_bundle(
+                  "retained Stop deadline phases are not strictly ordered");
+            }
+            if (require_identity_member(phase, "phase_id", "control") ==
+                phase_id) {
+              const std::uint64_t candidate =
+                  deadline_offset_ns - previous_deadline_offset_ns;
+              phase_budget = phase_budget.has_value()
+                                 ? std::min(*phase_budget, candidate)
+                                 : candidate;
+            }
+            previous_deadline_offset_ns = deadline_offset_ns;
+          }
+        }
+      }
+      if (!phase_budget.has_value() || *phase_budget == 0U ||
+          entries[*match].qualified_issue_time_bound_ns > *phase_budget) {
+        fail_retained_bundle(
+            "Stop implementation qualification exceeds its retained hard "
+            "stage phase budget");
+      }
+    }
+    if (std::find(used.begin(), used.end(), false) != used.end()) {
+      fail_retained_bundle(
+          "Stop implementation evidence contains an unreferenced entry");
+    }
+  }
+
+  if (artifacts.stop_controlled_substitution_qualification_evidence
+          .has_value()) {
+    auto [runner_digest, entries] =
+        parse_controlled_stop_substitution_qualification_evidence_package(
+            *artifacts.stop_controlled_substitution_qualification_evidence);
+    substitution_runner_digest = runner_digest;
+    std::vector<bool> used(entries.size(), false);
+    for (const auto& row_value : require_array(
+             require_member(control,
+                            "controlled_stop_substitution_qualifications",
+                            "control"),
+             "control.controlled_stop_substitution_qualifications")) {
+      const auto& row = require_object(
+          row_value,
+          "control.controlled_stop_substitution_qualifications");
+      const std::string contract_id = require_identity_member(
+          row, "product_contract_id",
+          "control.controlled_stop_substitution_qualifications");
+      const std::string contract_revision = require_digest_member(
+          row, "product_contract_revision",
+          "control.controlled_stop_substitution_qualifications");
+      const std::string product_id = require_identity_member(
+          row, "product_id",
+          "control.controlled_stop_substitution_qualifications");
+      std::optional<std::size_t> match;
+      for (std::size_t index = 0U; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        if (entry.implementation_id !=
+                kNativeExecutionRuntimeImplementationId ||
+            entry.product_contract_id.value() != contract_id ||
+            entry.product_contract_revision.value() != contract_revision ||
+            entry.requested_stop_mode !=
+                core::MotionControlledStopMode::kSoftOnPath ||
+            entry.executed_stop_mode !=
+                core::MotionControlledStopMode::kSpringBackHold ||
+            !contract_matches(
+                entry.provider_contract_ref,
+                require_member(
+                    row, "provider_contract_ref",
+                    "control.controlled_stop_substitution_qualifications"),
+                "control.controlled_stop_substitution_qualifications."
+                "provider_contract_ref")) {
+          continue;
+        }
+        if (match.has_value()) {
+          fail_retained_bundle(
+              "one controlled Stop substitution row resolves multiple "
+              "evidence entries");
+        }
+        match = index;
+      }
+      if (!match.has_value()) {
+        fail_retained_bundle(
+            "controlled Stop substitution row has no exact evidence entry");
+      }
+      const auto build_identity = build_identities_by_product.find(product_id);
+      if (build_identity == build_identities_by_product.end() ||
+          build_identity->second.implementation_source_build_fingerprint !=
+              entries[*match].implementation_source_build_fingerprint) {
+        fail_retained_bundle(
+            "controlled Stop substitution qualification differs from the "
+            "exact runtime-product build identity");
+      }
+      used[*match] = true;
+    }
+    if (std::find(used.begin(), used.end(), false) != used.end()) {
+      fail_retained_bundle(
+          "controlled Stop substitution evidence contains an unreferenced "
+          "entry");
+    }
+  }
+  if (implementation_runner_digest.has_value() &&
+      substitution_runner_digest.has_value() &&
+      implementation_runner_digest != substitution_runner_digest) {
+    fail_retained_bundle(
+        "Stop implementation and substitution qualification use different "
+        "runner contracts");
   }
 }
 

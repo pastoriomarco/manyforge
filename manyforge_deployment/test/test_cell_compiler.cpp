@@ -86,7 +86,7 @@ make_empty_applicability_inputs() {
       deployment_inputs.value().site_overlay_ref,
       deployment_inputs.value().external_resources, nullptr);
   auto applicability = qualify_cell_applicability(
-      composition, deployment_inputs, {}, {}, {}, {}, {}, {}, {},
+      composition, deployment_inputs, {}, {}, {}, {}, {}, {}, {}, {}, {},
       selected_overlay);
   return compile_cell_ir(applicability);
 }
@@ -180,6 +180,7 @@ TEST(CellCompiler, CopySharesTheSameImmutableQualifiedPredecessor) {
       {core::ControlRouteId("route")},
       {},
       core::ProviderInstanceId("provider"),
+      core::RuntimeUnitId("provider-runtime"),
       core::ProviderManifestId("manifest"),
       core::ProviderManifestRevision(kZeroDigest),
       core::StateAuthorityId("state-authority"),

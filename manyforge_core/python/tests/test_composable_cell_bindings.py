@@ -57,20 +57,27 @@ STRONG_STRING_TYPES = (
     "ControllerRoleId",
     "ActivationSetId",
     "ControlRouteId",
+    "ScalingDomainId",
+    "CoordinatedScalingBarrierId",
     "ControlDomainId",
     "ControlDomainRevision",
     "ControlBindingId",
     "ControlBindingRevision",
     "ActiveControlConfigurationId",
+    "ResolvedStopBasePlanId",
     "EndpointRoleId",
     "StateAuthorityId",
     "StopEvidencePolicyId",
     "StopEvidencePolicyRevision",
+    "StopEscalationStageId",
     "StopBudgetPhaseId",
     "StopEvidenceItemId",
     "ProviderContractRoleId",
     "RegisteredStopCommandKindId",
     "RegisteredStopEvidenceKindId",
+    "CommissionedStopInterfaceId",
+    "CommissionedStopInterfaceRevision",
+    "StopInvocationLaneId",
     "ContactPolicyId",
     "ContactPolicyRevision",
     "ProviderInstanceId",
@@ -82,6 +89,10 @@ STRONG_STRING_TYPES = (
     "SiteOverlayRevision",
     "ExternalResourceAlias",
     "SiteOverlayValueRef",
+    "ProductId",
+    "ProductContractId",
+    "ProductContractRevision",
+    "ArtifactRoleId",
     "ComponentAttachmentId",
     "ComponentAttachmentRevision",
     "RetainedBundleId",
@@ -168,7 +179,7 @@ CATALOG_REF_CASES = (
         "StopEvidencePolicyId",
         "StopEvidencePolicyRevision",
         "kStopEvidencePolicy",
-        "manyforge.stop_evidence_policy.v1",
+        "manyforge.stop_evidence_policy.v2",
     ),
     (
         "RuntimePolicyCatalogRecordRefDTO",
@@ -305,39 +316,89 @@ def _stop_evidence_policy_document(
     if observation_kind == "post_command_dwell":
         observation["minimum_dwell_ns"] = 200
 
+    phases = [
+        {"phase_id": "command", "deadline_offset_ns": 100},
+        {"phase_id": "terminal", "deadline_offset_ns": 500},
+    ]
+    stages = [
+        {
+            "stop_escalation_stage_id": "nominal",
+            "stage_kind": "nominal",
+            "containment_granularity": "control_domain",
+            "containment_command": {
+                "command_phase_id": "command",
+                "command": {"command_kind": "controller_goal_cancel"},
+            },
+            "evidence_conjunction": "all_of",
+            "evidence_requirements": [
+                {
+                    "evidence_item_id": "terminal",
+                    "phase_id": "terminal",
+                    "evidence": evidence,
+                    "source_requirement": source,
+                    "observation_semantics": observation,
+                }
+            ],
+        }
+    ]
+    if evidence_kind == "motion_rest":
+        phases.append({"phase_id": "hard_command", "deadline_offset_ns": 700})
+        stages.append(
+            {
+                "stop_escalation_stage_id": "software_hard_floor",
+                "stage_kind": "software_hard",
+                "containment_granularity": "control_domain",
+                "containment_command": {
+                    "command_phase_id": "hard_command",
+                    "command": {
+                        "command_kind": "registered",
+                        "registered_command_kind_id": "software_hard_stop",
+                        "provider_contract_ref": {
+                            "provider_contract_role_id": "software_hard_stop",
+                            "contract_schema_id": (
+                                "manyforge.stop_provider_contract.v1"
+                            ),
+                            "contract_schema_revision": ZERO_DIGEST,
+                        },
+                    },
+                },
+                "evidence_conjunction": "all_of",
+                "evidence_requirements": [
+                    {
+                        "evidence_item_id": "hard_acknowledged",
+                        "phase_id": "hard_command",
+                        "evidence": {
+                            "evidence_kind": "discrete_acknowledgement"
+                        },
+                        "source_requirement": {
+                            "source_kind": "command_target_status",
+                            "freshness_budget_ns": 25,
+                        },
+                        "observation_semantics": {
+                            "observation_kind": "command_result"
+                        },
+                    }
+                ],
+            }
+        )
+
     payload = {
-        "api_version": "manyforge.stop_evidence_policy.v1",
+        "api_version": "manyforge.stop_evidence_policy.v2",
         "stop_evidence_policy_id": policy_id,
         "disposition": "stoppable",
         "containment_granularity": "control_domain",
-        "containment_command": {
-            "command_phase_id": "command",
-            "command": {"command_kind": "controller_goal_cancel"},
-        },
         "deadline_budget": {
             "outer_duration_ns": 1000,
             "kernel_completion_reserve_ns": 100,
-            "phases": [
-                {"phase_id": "command", "deadline_offset_ns": 100},
-                {"phase_id": "terminal", "deadline_offset_ns": 500},
-            ],
+            "phases": phases,
         },
-        "evidence_conjunction": "all_of",
-        "evidence_requirements": [
-            {
-                "evidence_item_id": "terminal",
-                "phase_id": "terminal",
-                "evidence": evidence,
-                "source_requirement": source,
-                "observation_semantics": observation,
-            }
-        ],
+        "escalation_stages": stages,
     }
     canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     preimage = (
         b"manyforge.content-identity.v1"
         b"\x00catalog-record-revision/stop_evidence_policy"
-        b"\x00manyforge.stop_evidence_policy.v1\x00" + canonical_payload.encode()
+        b"\x00manyforge.stop_evidence_policy.v2\x00" + canonical_payload.encode()
     )
     payload["stop_evidence_policy_revision"] = (
         "sha256:" + hashlib.sha256(preimage).hexdigest()
@@ -352,9 +413,9 @@ def _stop_evidence_policy_reference(document: str, policy_id: str):
         record_revision=core.StopEvidencePolicyRevision(
             parsed["stop_evidence_policy_revision"]
         ),
-        schema_id=core.SchemaId("manyforge.stop_evidence_policy.v1"),
+        schema_id=core.SchemaId("manyforge.stop_evidence_policy.v2"),
         schema_revision=core.SchemaRevision(
-            "sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2"
+            "sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970"
         ),
         content_digest=core.ContentDigest(
             "sha256:" + hashlib.sha256(document.encode()).hexdigest()
@@ -440,6 +501,7 @@ def _cell_graph():
         legal_control_route_ids=[route_projection.control_route_id],
         route_endpoint_projections=[route_projection],
         provider_instance_id=core.ProviderInstanceId("provider/fake"),
+        provider_runtime_unit_id=runtime_unit.runtime_unit_id,
         provider_manifest_id=core.ProviderManifestId("provider/xarm"),
         provider_manifest_revision=core.ProviderManifestRevision(
             "sha256:provider-manifest"
@@ -564,6 +626,8 @@ def _applicability_constructor_fixture():
         "desired_control_configurations": (configuration,),
         "capability_provider_bindings": (provider,),
         "external_resources": (external,),
+        "stop_stage_parameters": (),
+        "commissioned_stop_interfaces": (),
     }
     return {
         "binding_routes": (
@@ -673,7 +737,7 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
         with pytest.raises(TypeError):
             cls()
 
-    assert len(STRONG_STRING_TYPES) == 79
+    assert len(STRONG_STRING_TYPES) == 90
     assert len({type(value) for value in values}) == len(STRONG_STRING_TYPES)
     assert len(set(values)) == len(STRONG_STRING_TYPES)
     for index, left in enumerate(values):
@@ -1011,7 +1075,8 @@ def test_control_interface_contract_rejects_referent_identity_mismatches():
 
 
 def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
-    assert core.STOP_EVIDENCE_POLICY_API_VERSION == "manyforge.stop_evidence_policy.v1"
+    assert core.STOP_EVIDENCE_POLICY_API_VERSION == "manyforge.stop_evidence_policy.v2"
+    assert core.MAX_STOP_ESCALATION_STAGES == 8
     assert core.MAX_STOP_EVIDENCE_POLICY_ITEMS == 64
     assert core.MAX_STOP_EVIDENCE_POLICY_DURATION_NS == (2**53) - 1
 
@@ -1031,6 +1096,7 @@ def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
         phases=[
             core.StopBudgetPhaseDTO(core.StopBudgetPhaseId("command"), 100),
             core.StopBudgetPhaseDTO(core.StopBudgetPhaseId("rest"), 500),
+            core.StopBudgetPhaseDTO(core.StopBudgetPhaseId("hard_command"), 700),
         ],
     )
     evidence = core.StopEvidenceRequirementDTO(
@@ -1049,21 +1115,54 @@ def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
             minimum_dwell_ns=200,
         ),
     )
+    nominal_stage = core.StopEscalationStageDTO(
+        stop_escalation_stage_id=core.StopEscalationStageId("nominal_controlled"),
+        stage_kind=core.StopEscalationStageKind.kNominal,
+        containment_granularity=core.ContainmentGranularity.kResource,
+        containment_command=command,
+        evidence_conjunction=core.StopEvidenceConjunction.kAllOf,
+        evidence_requirements=[evidence],
+    )
+    hard_command = core.StopContainmentCommandDTO(
+        command_phase_id=core.StopBudgetPhaseId("hard_command"),
+        command_kind=core.StopContainmentCommandKind.kRegistered,
+        provider_contract_ref=contract,
+        registered_command_kind_id=core.RegisteredStopCommandKindId(
+            "software_hard_stop"
+        ),
+    )
+    hard_evidence = core.StopEvidenceRequirementDTO(
+        evidence_item_id=core.StopEvidenceItemId("hard_acknowledged"),
+        phase_id=core.StopBudgetPhaseId("hard_command"),
+        evidence_kind=core.StopEvidenceRequirementKind.kDiscreteAcknowledgement,
+        source_requirement=core.StopEvidenceSourceRequirementDTO(
+            source_kind=core.StopEvidenceSourceKind.kCommandTargetStatus,
+            freshness_budget_ns=25,
+        ),
+        observation_semantics=core.StopEvidenceObservationDTO(
+            observation_kind=core.StopEvidenceObservationKind.kCommandResult,
+        ),
+    )
+    hard_stage = core.StopEscalationStageDTO(
+        stop_escalation_stage_id=core.StopEscalationStageId("software_hard_floor"),
+        stage_kind=core.StopEscalationStageKind.kSoftwareHard,
+        containment_granularity=core.ContainmentGranularity.kControlDomain,
+        containment_command=hard_command,
+        evidence_conjunction=core.StopEvidenceConjunction.kAllOf,
+        evidence_requirements=[hard_evidence],
+    )
     dto = core.StopEvidencePolicyDTO(
         stop_evidence_policy_id=core.StopEvidencePolicyId("typed_stop"),
         stop_evidence_policy_revision=core.StopEvidencePolicyRevision(ZERO_DIGEST),
         disposition=core.StopEvidenceDisposition.kStoppable,
         containment_granularity=core.ContainmentGranularity.kControlDomain,
-        containment_command=command,
         deadline_budget=budget,
-        evidence_conjunction=core.StopEvidenceConjunction.kAllOf,
-        evidence_requirements=[evidence],
+        escalation_stages=[nominal_stage, hard_stage],
     )
-    assert dto.containment_command == command
     assert dto.deadline_budget == budget
-    assert dto.evidence_requirements == [evidence]
+    assert dto.escalation_stages == [nominal_stage, hard_stage]
     with pytest.raises(AttributeError):
-        dto.evidence_requirements = []
+        dto.escalation_stages = []
     with pytest.raises(AttributeError):
         evidence.evidence_kind = (
             core.StopEvidenceRequirementKind.kControllerGoalTerminal
@@ -1080,7 +1179,7 @@ def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
         "measured_rest"
     )
     assert (
-        qualified.value.evidence_requirements[0].evidence_kind
+        qualified.value.escalation_stages[0].evidence_requirements[0].evidence_kind
         == core.StopEvidenceRequirementKind.kControllerGoalTerminal
     )
     assert json.loads(qualified.normalized_canonical_json) == json.loads(document)
@@ -1341,6 +1440,7 @@ def test_control_binding_requires_distinct_manifest_identity():
         "legal_control_route_ids",
         "route_endpoint_projections",
         "provider_instance_id",
+        "provider_runtime_unit_id",
         "provider_manifest_id",
         "provider_manifest_revision",
         "state_authority_id",
@@ -1380,6 +1480,123 @@ def test_runtime_scale_route_qualification_preserves_strong_id_types():
     )
     assert qualification.maximum_slew_per_second == 4.0
     assert qualification.freshness_budget_ns == 100_000_000
+
+
+def test_active_control_configuration_is_complete_typed_and_read_only():
+    binding_source = core.KinematicControlBindingSourceDTO(
+        control_binding_id=core.ControlBindingId("binding/arm/trajectory"),
+        control_binding_revision=core.ControlBindingRevision("sha256:binding"),
+    )
+    route = core.ActiveControlConfigurationBindingRouteDTO(
+        control_binding_id=binding_source.control_binding_id,
+        control_binding_revision=binding_source.control_binding_revision,
+        control_route_id=core.ControlRouteId("route/jtc"),
+    )
+    projection = core.KinematicResourceSourceProjectionDTO(
+        resource_id=core.ResourceId("arm_joint1"),
+        contributing_control_bindings=[binding_source],
+        provider_instance_id=core.ProviderInstanceId("provider/fake"),
+        provider_manifest_id=core.ProviderManifestId("provider/xarm"),
+        provider_manifest_revision=core.ProviderManifestRevision(
+            "sha256:provider-manifest"
+        ),
+        state_authority_id=core.StateAuthorityId("state/measured"),
+        state_authority_class=core.StateAuthorityClass.kMeasured,
+        publication_source=core.ObservedStateSourceKind.kJointState,
+    )
+    configuration = core.ActiveControlConfigurationDTO(
+        active_control_configuration_id=core.ActiveControlConfigurationId(
+            "active/arm"
+        ),
+        control_domain_id=core.ControlDomainId("domain/arm"),
+        control_domain_revision=core.ControlDomainRevision("sha256:domain"),
+        binding_routes=[route],
+        activation_set_id=core.ActivationSetId("activation/arm"),
+        controller_topology_id=core.ControllerTopologyId("topology/arm"),
+        topology_revision=core.TopologyRevision("sha256:topology"),
+        source_runtime_unit_id=core.RuntimeUnitId("runtime/arm"),
+        source_runtime_epoch=core.RuntimeEpoch("epoch/1"),
+        source_sequence=7,
+        kinematic_resource_source_projections=[projection],
+        active_control_configuration_generation=(
+            core.ActiveControlConfigurationGeneration(3)
+        ),
+        state=core.ActiveControlConfigurationStateDTO.kReconciled,
+    )
+
+    assert route.locally_valid()
+    assert configuration.locally_valid()
+    assert configuration.source_runtime_unit_id == core.RuntimeUnitId("runtime/arm")
+    assert configuration.binding_routes == (route,)
+    assert configuration.kinematic_resource_source_projections == (projection,)
+
+    projected_routes = configuration.binding_routes
+    with pytest.raises(AttributeError):
+        projected_routes.append(route)
+    with pytest.raises(AttributeError):
+        configuration.source_runtime_unit_id = core.RuntimeUnitId("runtime/other")
+
+
+def test_public_stop_contract_dtos_are_typed_and_authority_rows_are_read_only():
+    controlled_limit = core.ControlledStopResourceLimitDTO(
+        resource_id=core.ResourceId("arm_joint1"),
+        max_deceleration=core.AngularAccelerationDTO(2.0),
+        settle_velocity_threshold=core.AngularVelocityDTO(0.01),
+    )
+    hard_limit = core.HardStopResourceLimitDTO(
+        resource_id=controlled_limit.resource_id,
+        settle_velocity_threshold=core.AngularVelocityDTO(0.02),
+    )
+    soft = core.SoftOnPathStopParametersDTO(
+        stop_mode=core.MotionControlledStopMode.kSoftOnPath,
+        deceleration_time_s=0.25,
+        per_resource_limits=[controlled_limit],
+        allow_natural_completion_on_short_path=False,
+        recoverable_substitution_mode=(
+            core.MotionControlledStopMode.kSpringBackHold
+        ),
+    )
+    spring = core.SpringBackHoldStopParametersDTO(
+        stop_mode=core.MotionControlledStopMode.kSpringBackHold,
+        deceleration_time_s=0.2,
+        per_resource_limits=[controlled_limit],
+    )
+    hard = core.HardDecelerationStopParametersDTO(
+        stop_mode=core.MotionControlledStopMode.kHardDeceleration,
+        per_resource_limits=[hard_limit],
+    )
+
+    assert typing.get_args(core.MotionControlledStopContractParametersDTO) == (
+        core.SoftOnPathStopParametersDTO,
+        core.SpringBackHoldStopParametersDTO,
+        core.HardDecelerationStopParametersDTO,
+    )
+    assert soft.per_resource_limits == (controlled_limit,)
+    assert spring.per_resource_limits == (controlled_limit,)
+    assert hard.per_resource_limits == (hard_limit,)
+    assert (
+        soft.recoverable_substitution_mode
+        == core.MotionControlledStopMode.kSpringBackHold
+    )
+
+    definitions = core.registered_stop_command_definitions()
+    assert isinstance(definitions, tuple)
+    assert [row.registered_command_kind_id.value for row in definitions] == [
+        "manyforge.stop.controlled.provider",
+        "manyforge.stop.safety.emergency_request",
+        "manyforge.stop.safety.protective_request",
+        "manyforge.stop.software_hard",
+    ]
+    assert definitions[-1].stop_action_class == core.StopActionClass.kSoftwareHard
+    with pytest.raises(AttributeError):
+        definitions[-1].stop_action_class = core.StopActionClass.kControlled
+
+    for authority_type in (
+        core.StopImplementationQualificationDTO,
+        core.ControlledStopSubstitutionQualificationDTO,
+    ):
+        with pytest.raises(TypeError):
+            authority_type()
 
 
 def test_graph_dto_constructors_do_not_coerce_raw_strings_to_strong_ids():
@@ -1551,14 +1768,14 @@ target: 0.5
         "catalog/manyforge.model_asset.v1.yaml",
         "catalog/manyforge.provider_manifest.v1.yaml",
         "catalog/manyforge.runtime_profile.v1.yaml",
-        "catalog/manyforge.stop_evidence_policy.v1.yaml",
+        "catalog/manyforge.stop_evidence_policy.v2.yaml",
     }
     assert all(
         entry.compiled_schema is None and entry.relative_path == ""
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kUnqualified
     )
-    assert len(registry.value_schemas) == 3
+    assert len(registry.value_schemas) == 4
     assert {
         (entry.schema_id.value, entry.schema_revision.value)
         for entry in registry.value_schemas
@@ -1566,6 +1783,10 @@ target: 0.5
         (
             "manyforge.value_schema.provider_contract.empty.v1",
             "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+        ),
+        (
+            "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
+            "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd",
         ),
         (
             "manyforge.value_schema.runtime.empty.v1",
@@ -1577,7 +1798,7 @@ target: 0.5
         ),
     }
     assert registry.qualification_registry_digest.value == (
-        "sha256:06b8e59ea852353aa1603898694a55175416c184ed987bb47388a4a57a26c118"
+        "sha256:04be79547db2bb64f9354fd2493526df785e4385264eb033b1820adbd22ca1ab"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][

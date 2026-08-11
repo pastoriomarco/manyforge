@@ -175,6 +175,21 @@ class IVerifiedRetainedProductArtifactSource {
   get_verified(const RetainedProductArtifactQuery& query) const = 0;
 };
 
+/// Exact executable build identity carried by a retained native runtime
+/// product. Presence does not itself claim Stop qualification; it lets the
+/// Manager prove that the protected installed target it is about to execute
+/// is the same target whose offline qualification evidence was retained.
+struct VerifiedRuntimeImplementationBuildIdentity final {
+  core::ContentDigest implementation_source_build_fingerprint;
+  std::string installed_target_id;
+  std::uint64_t installed_target_byte_size;
+  core::ContentDigest installed_target_content_digest;
+
+  friend bool operator==(
+      const VerifiedRuntimeImplementationBuildIdentity&,
+      const VerifiedRuntimeImplementationBuildIdentity&) = default;
+};
+
 /// Sealed verification result for one exact build-qualified runtime-product
 /// row.
 ///
@@ -268,6 +283,11 @@ class VerifiedRetainedRuntimeUnitProduct final {
   retrieval_contract_revision() const noexcept {
     return retrieval_contract_revision_;
   }
+  [[nodiscard]] const std::optional<
+      VerifiedRuntimeImplementationBuildIdentity>&
+  implementation_build_identity() const noexcept {
+    return implementation_build_identity_;
+  }
 
  private:
   VerifiedRetainedRuntimeUnitProduct(
@@ -287,7 +307,9 @@ class VerifiedRetainedRuntimeUnitProduct final {
       std::string process_adapter_contract_id,
       std::string process_adapter_contract_revision,
       std::string retrieval_contract_id,
-      std::string retrieval_contract_revision)
+      std::string retrieval_contract_revision,
+      std::optional<VerifiedRuntimeImplementationBuildIdentity>
+          implementation_build_identity)
       : retained_bundle_id_(std::move(retained_bundle_id)),
         runtime_unit_id_(std::move(runtime_unit_id)),
         product_id_(std::move(product_id)),
@@ -310,7 +332,9 @@ class VerifiedRetainedRuntimeUnitProduct final {
         process_adapter_contract_revision_(
             std::move(process_adapter_contract_revision)),
         retrieval_contract_id_(std::move(retrieval_contract_id)),
-        retrieval_contract_revision_(std::move(retrieval_contract_revision)) {}
+        retrieval_contract_revision_(std::move(retrieval_contract_revision)),
+        implementation_build_identity_(
+            std::move(implementation_build_identity)) {}
 
   core::RetainedBundleId retained_bundle_id_;
   core::RuntimeUnitId runtime_unit_id_;
@@ -332,6 +356,8 @@ class VerifiedRetainedRuntimeUnitProduct final {
   std::string process_adapter_contract_revision_;
   std::string retrieval_contract_id_;
   std::string retrieval_contract_revision_;
+  std::optional<VerifiedRuntimeImplementationBuildIdentity>
+      implementation_build_identity_;
 
   friend std::optional<VerifiedRetainedRuntimeUnitProduct>
   verify_reference_runtime_unit_product(

@@ -1895,6 +1895,10 @@ void register_model_compiler_bindings(py::module_& module) {
   py::class_<deployment::LogicalStopProviderCommandEndpoint>(
       module, "LogicalStopProviderCommandEndpoint", py::is_final())
       .def_readonly(
+          "stop_escalation_stage_id",
+          &deployment::LogicalStopProviderCommandEndpoint::
+              stop_escalation_stage_id)
+      .def_readonly(
           "provider_contract_ref",
           &deployment::LogicalStopProviderCommandEndpoint::
               provider_contract_ref)
@@ -1909,6 +1913,10 @@ void register_model_compiler_bindings(py::module_& module) {
       .def(py::self != py::self);
   py::class_<deployment::LogicalStopProviderEvidenceEndpoint>(
       module, "LogicalStopProviderEvidenceEndpoint", py::is_final())
+      .def_readonly(
+          "stop_escalation_stage_id",
+          &deployment::LogicalStopProviderEvidenceEndpoint::
+              stop_escalation_stage_id)
       .def_readonly(
           "evidence_item_id",
           &deployment::LogicalStopProviderEvidenceEndpoint::evidence_item_id)
@@ -1927,6 +1935,10 @@ void register_model_compiler_bindings(py::module_& module) {
       .def(py::self != py::self);
   py::class_<deployment::LogicalStopBindingStateAuthoritySource>(
       module, "LogicalStopBindingStateAuthoritySource", py::is_final())
+      .def_readonly(
+          "stop_escalation_stage_id",
+          &deployment::LogicalStopBindingStateAuthoritySource::
+              stop_escalation_stage_id)
       .def_readonly(
           "evidence_item_id",
           &deployment::LogicalStopBindingStateAuthoritySource::evidence_item_id)
@@ -1951,6 +1963,10 @@ void register_model_compiler_bindings(py::module_& module) {
   py::class_<deployment::LogicalResourceStopScopeTemplate>(
       module, "LogicalResourceStopScopeTemplate", py::is_final())
       .def_readonly(
+          "stop_escalation_stage_id",
+          &deployment::LogicalResourceStopScopeTemplate::
+              stop_escalation_stage_id)
+      .def_readonly(
           "activation_set_id",
           &deployment::LogicalResourceStopScopeTemplate::activation_set_id)
       .def_property_readonly(
@@ -1962,6 +1978,10 @@ void register_model_compiler_bindings(py::module_& module) {
       .def(py::self != py::self);
   py::class_<deployment::LogicalControllerSetStopScopeTemplate>(
       module, "LogicalControllerSetStopScopeTemplate", py::is_final())
+      .def_readonly(
+          "stop_escalation_stage_id",
+          &deployment::LogicalControllerSetStopScopeTemplate::
+              stop_escalation_stage_id)
       .def_readonly(
           "activation_set_id",
           &deployment::LogicalControllerSetStopScopeTemplate::
@@ -1980,6 +2000,10 @@ void register_model_compiler_bindings(py::module_& module) {
       .def(py::self != py::self);
   py::class_<deployment::LogicalControlDomainStopScopeTemplate>(
       module, "LogicalControlDomainStopScopeTemplate", py::is_final())
+      .def_readonly(
+          "stop_escalation_stage_id",
+          &deployment::LogicalControlDomainStopScopeTemplate::
+              stop_escalation_stage_id)
       .def_readonly(
           "activation_set_id",
           &deployment::LogicalControlDomainStopScopeTemplate::
@@ -2005,6 +2029,62 @@ void register_model_compiler_bindings(py::module_& module) {
       py::module_::import("typing")
           .attr("Union")
           .attr("__getitem__")(stop_scope_types);
+
+  py::class_<deployment::LogicalStopEscalationStageTemplate>(
+      module, "LogicalStopEscalationStageTemplate", py::is_final())
+      .def_readonly(
+          "stop_escalation_stage_id",
+          &deployment::LogicalStopEscalationStageTemplate::
+              stop_escalation_stage_id)
+      .def_readonly(
+          "stage_kind",
+          &deployment::LogicalStopEscalationStageTemplate::stage_kind)
+      .def_readonly(
+          "containment_granularity",
+          &deployment::LogicalStopEscalationStageTemplate::
+              containment_granularity)
+      .def_readonly(
+          "containment_command",
+          &deployment::LogicalStopEscalationStageTemplate::
+              containment_command)
+      .def_readonly(
+          "evidence_conjunction",
+          &deployment::LogicalStopEscalationStageTemplate::
+              evidence_conjunction)
+      .def_property_readonly(
+          "all_of_evidence_requirements",
+          [](const deployment::LogicalStopEscalationStageTemplate& value) {
+            return immutable_snapshot(value.all_of_evidence_requirements);
+          })
+      .def_readonly(
+          "default_contract_parameters",
+          &deployment::LogicalStopEscalationStageTemplate::
+              default_contract_parameters)
+      .def_readonly(
+          "commissioned_stop_interface",
+          &deployment::LogicalStopEscalationStageTemplate::
+              commissioned_stop_interface)
+      .def_readonly(
+          "provider_command_endpoint",
+          &deployment::LogicalStopEscalationStageTemplate::
+              provider_command_endpoint)
+      .def_property_readonly(
+          "provider_evidence_endpoints",
+          [](const deployment::LogicalStopEscalationStageTemplate& value) {
+            return immutable_snapshot(value.provider_evidence_endpoints);
+          })
+      .def_property_readonly(
+          "binding_state_authority_sources",
+          [](const deployment::LogicalStopEscalationStageTemplate& value) {
+            return immutable_snapshot(value.binding_state_authority_sources);
+          })
+      .def_property_readonly(
+          "containment_scopes",
+          [](const deployment::LogicalStopEscalationStageTemplate& value) {
+            return immutable_snapshot(value.containment_scopes);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
 
   py::class_<deployment::LogicalNotStoppableApplicabilityTemplate>(
       module, "LogicalNotStoppableApplicabilityTemplate", py::is_final())
@@ -2100,39 +2180,12 @@ void register_model_compiler_bindings(py::module_& module) {
           &deployment::LogicalStoppableApplicabilityTemplate::
               logical_stop_symbol)
       .def_readonly(
-          "containment_command",
-          &deployment::LogicalStoppableApplicabilityTemplate::
-              containment_command)
-      .def_readonly(
           "deadline_budget",
           &deployment::LogicalStoppableApplicabilityTemplate::deadline_budget)
-      .def_readonly(
-          "evidence_conjunction",
-          &deployment::LogicalStoppableApplicabilityTemplate::
-              evidence_conjunction)
       .def_property_readonly(
-          "all_of_evidence_requirements",
+          "escalation_stages",
           [](const deployment::LogicalStoppableApplicabilityTemplate& value) {
-            return immutable_snapshot(value.all_of_evidence_requirements);
-          })
-      .def_readonly(
-          "provider_command_endpoint",
-          &deployment::LogicalStoppableApplicabilityTemplate::
-              provider_command_endpoint)
-      .def_property_readonly(
-          "provider_evidence_endpoints",
-          [](const deployment::LogicalStoppableApplicabilityTemplate& value) {
-            return immutable_snapshot(value.provider_evidence_endpoints);
-          })
-      .def_property_readonly(
-          "binding_state_authority_sources",
-          [](const deployment::LogicalStoppableApplicabilityTemplate& value) {
-            return immutable_snapshot(value.binding_state_authority_sources);
-          })
-      .def_property_readonly(
-          "containment_scopes",
-          [](const deployment::LogicalStoppableApplicabilityTemplate& value) {
-            return immutable_snapshot(value.containment_scopes);
+            return immutable_snapshot(value.escalation_stages);
           })
       .def(py::self == py::self)
       .def(py::self != py::self);
@@ -2352,6 +2405,8 @@ void register_model_compiler_bindings(py::module_& module) {
          const py::iterable& controller_topologies,
          const py::iterable& provider_manifests,
          const py::iterable& stop_evidence_policies,
+         const py::iterable& value_schemas,
+         const py::iterable& commissioning_evidence_refs,
          const deployment::QualifiedSelectedSiteOverlay&
              selected_site_overlay) {
         auto bounded_runtime_profiles =
@@ -2390,6 +2445,17 @@ void register_model_compiler_bindings(py::module_& module) {
                 deployment::QualifiedStopEvidencePolicy>(
                 stop_evidence_policies, "stop_evidence_policies",
                 "QualifiedStopEvidencePolicy");
+        auto bounded_value_schemas =
+            bounded_qualified_closure_from_python<
+                deployment::BuildQualifiedValueSchemaEntry>(
+                value_schemas, "value_schemas",
+                "BuildQualifiedValueSchemaEntry");
+        auto bounded_commissioning_evidence_refs =
+            bounded_qualified_closure_from_python<
+                deployment::QualifiedCommissioningEvidenceRef>(
+                commissioning_evidence_refs,
+                "commissioning_evidence_refs",
+                "QualifiedCommissioningEvidenceRef");
         py::gil_scoped_release release;
         return deployment::qualify_cell_applicability(
             composition, deployment_inputs,
@@ -2407,6 +2473,10 @@ void register_model_compiler_bindings(py::module_& module) {
                 bounded_provider_manifests},
             std::span<const deployment::QualifiedStopEvidencePolicy>{
                 bounded_stop_evidence_policies},
+            std::span<const deployment::BuildQualifiedValueSchemaEntry>{
+                bounded_value_schemas},
+            std::span<const deployment::QualifiedCommissioningEvidenceRef>{
+                bounded_commissioning_evidence_refs},
             selected_site_overlay);
       },
       py::arg("composition"), py::arg("deployment_inputs"),
@@ -2415,6 +2485,8 @@ void register_model_compiler_bindings(py::module_& module) {
       py::arg("control_interface_contracts"),
       py::arg("controller_topologies"), py::arg("provider_manifests"),
       py::arg("stop_evidence_policies"),
+      py::arg("value_schemas"),
+      py::arg("commissioning_evidence_refs"),
       py::arg("selected_site_overlay"));
 
   module.def("compile_cell_ir", &deployment::compile_cell_ir,

@@ -3,6 +3,7 @@
 #include <array>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string_view>
 
 #include "manyforge_deployment/build_manifest.hpp"
@@ -18,16 +19,26 @@ reload_self_verified_build_manifest(BuildManifestKind kind,
 
 /// Sole production owner of build-qualified retention authority.
 ///
-/// The producer accepts no caller values, paths, digests, manifests, or
-/// environment variables. It verifies the build-embedded behavior manifest,
-/// regenerates the compiler contract from live code-owned registries, and
-/// regenerates the compiler build manifest from configure-time closed build
-/// evidence before minting the private retention context.
+/// Ordinary manifest qualification accepts no caller values, paths, digests,
+/// manifests, or environment variables. It verifies the build-embedded
+/// behavior manifest, regenerates the compiler contract from live code-owned
+/// registries, and regenerates the compiler build manifest from configure-time
+/// closed build evidence. The explicit Stop-evidence overload additionally
+/// accepts bounded untrusted offline runner output and exact executable bytes;
+/// it independently verifies and seals that closure before minting the private
+/// retention context.
 class BuildQualifiedRetentionAuthority final {
  public:
   [[nodiscard]] static BuildQualifiedRetentionContext qualify();
+  [[nodiscard]] static BuildQualifiedRetentionContext qualify(
+      std::span<const StopQualificationEvidenceCandidate>
+          stop_evidence_candidates);
   [[nodiscard]] static BuildQualifiedRetentionContext qualify_persisted(
       IBuildManifestRepository& repository);
+  [[nodiscard]] static BuildQualifiedRetentionContext qualify_persisted(
+      IBuildManifestRepository& repository,
+      std::span<const StopQualificationEvidenceCandidate>
+          stop_evidence_candidates);
   [[nodiscard]] static BuildQualifiedRetentionContext qualify_existing(
       const std::filesystem::path& trusted_package_root);
 
@@ -37,6 +48,9 @@ class BuildQualifiedRetentionAuthority final {
       BuildManifestKind kind, const CanonicalValue& candidate);
   [[nodiscard]] static std::shared_ptr<const BuildQualifiedManifest>
   qualify_candidate(BuildManifestKind kind, const CanonicalValue& candidate);
+  [[nodiscard]] static BuildQualifiedStopEvidenceClosure
+  qualify_stop_evidence(
+      std::span<const StopQualificationEvidenceCandidate> candidates);
 
   friend class BuildManifestTestAccess;
   friend std::shared_ptr<const BuildQualifiedManifest>
@@ -59,6 +73,10 @@ class BuildManifestTestAccess final {
       const CanonicalValue& node_environment,
       const CanonicalValue& compiler_contract,
       const CanonicalValue& compiler_build);
+  [[nodiscard]] static BuildQualifiedRetentionContext
+  qualify_persisted_with_test_stop_build_identity(
+      IBuildManifestRepository& repository,
+      std::string_view canonical_build_identity_bytes);
   [[nodiscard]] static std::shared_ptr<const RetainedBundle>
   materialize_with_candidates(
       const RetentionQualifiedDeployment& qualified,

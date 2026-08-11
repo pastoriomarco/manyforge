@@ -33,6 +33,8 @@
 #include "reference_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
+#include <manyforge_core/types/stop_control.hpp>
+
 namespace manyforge::deployment {
 namespace {
 
@@ -71,10 +73,16 @@ constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
          detail::kPlanningResourceMapMediaType, true},
         {"urdf", "application/xml", true},
     }};
-constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 1U>
+constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 4U>
     kControlDomainControlArtifactRoles{{
         {detail::kControlDomainControlArtifactRole,
          detail::kControlDomainControlMediaType, true},
+        {core::kControlledStopSubstitutionQualificationArtifactRole,
+         core::kControlledStopSubstitutionQualificationMediaType, false},
+        {core::kStopImplementationQualificationArtifactRole,
+         core::kStopImplementationQualificationMediaType, false},
+        {core::kStopInterfaceCommissioningArtifactRole,
+         core::kStopInterfaceCommissioningMediaType, false},
     }};
 constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
     kReferenceRuntimeArtifactRoles{{
@@ -83,8 +91,10 @@ constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
         {detail::kReferenceRuntimeManifestArtifactRole,
          detail::kReferenceRuntimeManifestMediaType, true},
     }};
-constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
+constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 3U>
     kNativeExecutionRuntimeArtifactRoles{{
+        {detail::kNativeExecutionRuntimeBuildIdentityArtifactRole,
+         detail::kNativeExecutionRuntimeBuildIdentityMediaType, false},
         {detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole,
          detail::kNativeExecutionRuntimeLaunchDescriptorMediaType, true},
         {detail::kNativeExecutionRuntimeManifestArtifactRole,
@@ -502,13 +512,15 @@ verify_structural_graph_projection(
   for (const auto& component : graph.controllable_components) {
     if (!component.root_pose_in_cell.has_value() ||
         component.model_role_bindings.empty() ||
-        (has_native_runtime ? component.runtime_unit_ids.size() != 1U
-                            : !component.runtime_unit_ids.empty()) ||
-        (has_native_runtime &&
-         !native_runtime_units.contains(component.runtime_unit_ids.front()))) {
+        !has_native_runtime || component.runtime_unit_ids.empty() ||
+        !std::all_of(component.runtime_unit_ids.begin(),
+                     component.runtime_unit_ids.end(),
+                     [&](const auto& runtime_unit_id) {
+                       return native_runtime_units.contains(runtime_unit_id);
+                     })) {
       detail::fail_retained_bundle(
           "retained native component requires a direct cell placement, at "
-          "least one model role, and its exact execution-runtime owner");
+          "least one model role, and qualified execution-runtime owners");
     }
     for (const auto& role : component.model_role_bindings) {
       const auto model = std::find_if(
@@ -535,13 +547,15 @@ verify_structural_graph_projection(
   }
 
   for (const auto &domain : graph.control_domains) {
-    if ((has_native_runtime ? domain.runtime_unit_ids.size() != 1U
-                            : !domain.runtime_unit_ids.empty()) ||
-        (has_native_runtime &&
-         !native_runtime_units.contains(domain.runtime_unit_ids.front()))) {
+    if (!has_native_runtime || domain.runtime_unit_ids.empty() ||
+        !std::all_of(domain.runtime_unit_ids.begin(),
+                     domain.runtime_unit_ids.end(),
+                     [&](const auto& runtime_unit_id) {
+                       return native_runtime_units.contains(runtime_unit_id);
+                     })) {
       detail::fail_retained_bundle(
-          "retained native control domain has no exact execution-runtime "
-          "owner");
+          "retained native control domain has no qualified execution-runtime "
+          "owner set");
     }
   }
   for (const auto& binding : graph.control_bindings) {
@@ -564,7 +578,15 @@ verify_structural_graph_projection(
         binding.route_endpoint_projections.size() !=
             binding.legal_control_route_ids.size() ||
         binding.controller_topology_id != domain->controller_topology_id ||
-        binding.topology_revision != domain->topology_revision) {
+        binding.topology_revision != domain->topology_revision ||
+        !native_runtime_units.contains(binding.provider_runtime_unit_id) ||
+        std::find(component->runtime_unit_ids.begin(),
+                  component->runtime_unit_ids.end(),
+                  binding.provider_runtime_unit_id) ==
+            component->runtime_unit_ids.end() ||
+        std::find(domain->runtime_unit_ids.begin(), domain->runtime_unit_ids.end(),
+                  binding.provider_runtime_unit_id) ==
+            domain->runtime_unit_ids.end()) {
       detail::fail_retained_bundle(
           "retained native control binding violates its exact component, "
           "route, or domain closure");

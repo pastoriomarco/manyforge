@@ -12,6 +12,7 @@
 #include "manyforge_deployment/retention_qualified_deployment.hpp"
 #include "manyforge_deployment/retained_bundle.hpp"
 #include "manyforge_deployment/structural_model_preparation.hpp"
+#include "stop_qualification_evidence_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment::detail {
@@ -20,9 +21,24 @@ class RetentionMaterializerTestAccess;
 class BuildQualifiedRetentionAuthority;
 class BuildManifestTestAccess;
 
+/// Compiler-internal input for one product-contract artifact role.
+///
+/// This type and the retention functions below are deliberately absent from
+/// the installed API: only the deployment compiler may turn qualified
+/// semantics into retained products.
+struct RetainedArtifactInput final {
+  core::ArtifactRoleId artifact_role_id;
+  std::string media_type;
+  std::string bytes;
+};
+
 struct PreparedControlDomainArtifact final {
   core::ControlDomainId control_domain_id;
-  std::string bytes;
+  std::vector<RetainedArtifactInput> artifacts;
+  std::vector<core::StopImplementationQualificationDTO>
+      stop_implementation_qualifications;
+  std::vector<core::ControlledStopSubstitutionQualificationDTO>
+      controlled_stop_substitution_qualifications;
 };
 
 enum class PreparedRuntimeUnitKind {
@@ -34,6 +50,7 @@ struct PreparedRuntimeUnitArtifact final {
   core::RuntimeUnitId runtime_unit_id;
   std::string manifest_bytes;
   std::string launchable_bytes;
+  std::optional<std::string> implementation_build_identity_bytes;
   PreparedRuntimeUnitKind kind;
   const BuildQualifiedProductContract *contract;
 };
@@ -124,22 +141,29 @@ class BuildQualifiedRetentionContext final {
   manifests() const noexcept {
     return manifests_;
   }
+  [[nodiscard]] const BuildQualifiedStopEvidenceClosure&
+  stop_evidence() const noexcept {
+    return stop_evidence_;
+  }
 
  private:
   BuildQualifiedRetentionContext(
       core::RetainedNodeEnvironmentDTO node_environment,
       core::ContentDigest compiler_contract_digest,
-      core::ContentDigest compiler_build_digest);
+      core::ContentDigest compiler_build_digest,
+      BuildQualifiedStopEvidenceClosure stop_evidence = {});
   BuildQualifiedRetentionContext(
       core::RetainedNodeEnvironmentDTO node_environment,
       core::ContentDigest compiler_contract_digest,
       core::ContentDigest compiler_build_digest,
-      std::vector<std::shared_ptr<const BuildQualifiedManifest>> manifests);
+      std::vector<std::shared_ptr<const BuildQualifiedManifest>> manifests,
+      BuildQualifiedStopEvidenceClosure stop_evidence = {});
 
   core::RetainedNodeEnvironmentDTO node_environment_;
   core::ContentDigest compiler_contract_digest_;
   core::ContentDigest compiler_build_digest_;
   std::vector<std::shared_ptr<const BuildQualifiedManifest>> manifests_;
+  BuildQualifiedStopEvidenceClosure stop_evidence_;
 
   // This friend exists only in the uninstalled internal header so focused
   // tests can exercise the otherwise sealed materializer. It is not a
@@ -172,7 +196,9 @@ class RetainedBundleMaterializer final {
           structural_model_preparations,
       ICatalogArtifactStore& catalog_artifact_store,
       IRawArtifactStore& artifact_store,
-      IRetainedBundleRepository& bundle_repository);
+      IRetainedBundleRepository& bundle_repository,
+      std::span<const StopQualificationEvidenceCandidate>
+          stop_evidence_candidates = {});
 
   /// Private, explicitly non-authoritative fixture path retained only for the
   /// bounded mechanical tests that preceded C1.0.
@@ -203,17 +229,6 @@ class RetainedBundleMaterializer final {
       std::span<const core::RetainedSourceRecordDTO> source_records,
       std::span<const core::RetainedGeneratorRecordDTO> generator_records,
       IRawArtifactStore& artifact_store);
-};
-
-/// Compiler-internal input for one product-contract artifact role.
-///
-/// This type and the retention functions below are deliberately absent from
-/// the installed API: only the deployment compiler may turn qualified
-/// semantics into retained products.
-struct RetainedArtifactInput final {
-  core::ArtifactRoleId artifact_role_id;
-  std::string media_type;
-  std::string bytes;
 };
 
 /// Current I3 planning/collision import profile.

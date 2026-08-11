@@ -71,6 +71,8 @@ namespace lite6_controllable_fixture_detail {
 
 inline constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+inline constexpr std::string_view kEmptyProviderContractSchemaRevision =
+    "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270";
 
 [[nodiscard]] inline CanonicalValue text_array(
     std::initializer_list<std::string_view> values) {
@@ -80,6 +82,32 @@ inline constexpr std::string_view kZeroDigest =
     result.emplace_back(std::string(value));
   }
   return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] inline const std::string& provider_contract_role_id(
+    const CanonicalValue& declaration) {
+  const auto* reference =
+      declaration.find_object_member("provider_contract_ref");
+  const auto* role = reference == nullptr
+                         ? nullptr
+                         : reference->find_object_member(
+                               "provider_contract_role_id");
+  if (role == nullptr || !std::holds_alternative<std::string>(role->storage())) {
+    throw std::logic_error(
+        "provider-contract fixture declaration has no role identity");
+  }
+  return std::get<std::string>(role->storage());
+}
+
+[[nodiscard]] inline CanonicalValue software_hard_provider_contract_ref() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"provider_contract_role_id", CanonicalValue("software_hard_stop")},
+      {"contract_schema_id",
+       CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+      {"contract_schema_revision",
+       CanonicalValue(
+           "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270")},
+  });
 }
 
 [[nodiscard]] inline CanonicalValue native_execution_configuration() {
@@ -339,7 +367,9 @@ struct AssistantOverlayFixture final {
 }
 
 [[nodiscard]] inline QualifiedControlCatalog qualify_control_catalog(
-    bool chained, bool native_motion = false) {
+    bool chained, bool native_motion = false, bool stoppable = false,
+    std::string_view containment_granularity = "resource",
+    bool qualified_soft_to_spring_substitution = false) {
   const std::string_view primary_capability_id =
       native_motion ? "execution.trajectory.execute" : "state.observed.current";
   const auto* descriptor =
@@ -428,26 +458,24 @@ struct AssistantOverlayFixture final {
 
   std::optional<QualifiedRuntimeProfile> native_execution_runtime_profile;
   std::optional<std::string> native_execution_runtime_profile_bytes;
-  if (native_motion) {
-    native_execution_runtime_profile_bytes =
-        detail::native_execution_runtime_profile_document();
-    const core::ContentDigest profile_digest(
-        sha256_digest(*native_execution_runtime_profile_bytes));
-    const core::ContentAddressedStoreKey profile_key(
-        catalog_key("runtime_profile", profile_digest.value()));
-    const core::RuntimeProfileCatalogRecordRefDTO profile_ref{
-        core::RuntimeProfileId(
-            std::string(detail::kNativeExecutionRuntimeProfileId)),
-        core::RuntimeProfileRevision(
-            detail::native_execution_runtime_profile_revision()),
-        core::SchemaId(std::string(core::kRuntimeProfileApiVersion)),
-        schema_revision_for(core::CatalogRecordKind::kRuntimeProfile),
-        profile_digest,
-        profile_key,
-    };
-    native_execution_runtime_profile = resolve_and_qualify_runtime_profile(
-        profile_ref, profile_key, *native_execution_runtime_profile_bytes);
-  }
+  native_execution_runtime_profile_bytes =
+      detail::native_execution_runtime_profile_document();
+  const core::ContentDigest profile_digest(
+      sha256_digest(*native_execution_runtime_profile_bytes));
+  const core::ContentAddressedStoreKey profile_key(
+      catalog_key("runtime_profile", profile_digest.value()));
+  const core::RuntimeProfileCatalogRecordRefDTO profile_ref{
+      core::RuntimeProfileId(
+          std::string(detail::kNativeExecutionRuntimeProfileId)),
+      core::RuntimeProfileRevision(
+          detail::native_execution_runtime_profile_revision()),
+      core::SchemaId(std::string(core::kRuntimeProfileApiVersion)),
+      schema_revision_for(core::CatalogRecordKind::kRuntimeProfile),
+      profile_digest,
+      profile_key,
+  };
+  native_execution_runtime_profile = resolve_and_qualify_runtime_profile(
+      profile_ref, profile_key, *native_execution_runtime_profile_bytes);
 
   CanonicalValue::Array target_capabilities{
       CanonicalValue(CanonicalValue::Object{
@@ -715,6 +743,76 @@ struct AssistantOverlayFixture final {
       topology_ref, topology_key, topology_bytes,
       std::span<const QualifiedControlInterfaceContract>(&contract, 1U));
 
+  const auto stop_provider_contract_ref =
+      [qualified_soft_to_spring_substitution] {
+    return CanonicalValue(CanonicalValue::Object{
+        {"provider_contract_role_id", CanonicalValue("stop_contract")},
+        {"contract_schema_id",
+         CanonicalValue(
+             qualified_soft_to_spring_substitution
+                 ? std::string(core::kMotionControlledStopContractSchemaId)
+                 : "manyforge.value_schema.provider_contract.empty.v1")},
+        {"contract_schema_revision",
+         CanonicalValue(
+             qualified_soft_to_spring_substitution
+                 ? std::string(
+                       core::kMotionControlledStopContractSchemaRevision)
+                 : std::string(kEmptyProviderContractSchemaRevision))},
+    });
+  };
+  const auto software_hard_contract_ref = [] {
+    return CanonicalValue(CanonicalValue::Object{
+        {"provider_contract_role_id",
+         CanonicalValue("software_hard_stop")},
+        {"contract_schema_id",
+         CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+        {"contract_schema_revision",
+         CanonicalValue(
+             std::string(kEmptyProviderContractSchemaRevision))},
+    });
+  };
+  CanonicalValue::Array provider_contracts;
+  if (stoppable) {
+    CanonicalValue::Object nominal_contract{
+        {"provider_contract_ref", stop_provider_contract_ref()},
+        {"stop_evidence_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"evidence_kind", CanonicalValue("motion_rest")},
+             {"evidence_endpoint_role_ids", text_array({"state"})},
+         })},
+    };
+    if (qualified_soft_to_spring_substitution) {
+      nominal_contract.emplace_back(
+          "stop_command_support",
+          CanonicalValue(CanonicalValue::Object{
+              {"command_kind", CanonicalValue("motion_controlled_stop")},
+              {"command_endpoint_role_ids", text_array({"command"})},
+          }));
+    }
+    provider_contracts.emplace_back(std::move(nominal_contract));
+    provider_contracts.emplace_back(CanonicalValue::Object{
+        {"provider_contract_ref", software_hard_contract_ref()},
+        {"stop_command_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"command_kind", CanonicalValue("registered")},
+             {"registered_command_kind_id",
+              CanonicalValue("manyforge.stop.software_hard")},
+             {"command_endpoint_role_ids",
+              CanonicalValue(CanonicalValue::Array{})},
+         })},
+        {"stop_evidence_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"evidence_kind", CanonicalValue("motion_rest")},
+             {"evidence_endpoint_role_ids", text_array({"state"})},
+         })},
+    });
+  }
+  std::sort(provider_contracts.begin(), provider_contracts.end(),
+            [](const auto& left, const auto& right) {
+              return provider_contract_role_id(left) <
+                     provider_contract_role_id(right);
+            });
+
   const std::string provider_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
           {"api_version",
@@ -732,7 +830,8 @@ struct AssistantOverlayFixture final {
                    {"required_endpoint_role_ids",
                     text_array({"command", "state"})},
                })})},
-          {"provider_contracts", CanonicalValue(CanonicalValue::Array{})},
+          {"provider_contracts",
+           CanonicalValue(std::move(provider_contracts))},
       }),
       "catalog-record-revision/provider_manifest",
       core::kProviderManifestApiVersion, "provider_manifest_revision");
@@ -798,21 +897,182 @@ struct AssistantOverlayFixture final {
         planner_provider_ref, planner_provider_key, *planner_provider_bytes);
   }
 
-  const std::string stop_bytes = revisioned_document(
-      CanonicalValue(CanonicalValue::Object{
+  const std::string stop_policy_id =
+      !stoppable
+          ? "lite6_not_stoppable"
+          : qualified_soft_to_spring_substitution
+                ? "lite6_qualified_soft_to_spring_stop"
+                : "lite6_binding_state_stop";
+  const CanonicalValue stop_identity = [&]() {
+    if (!stoppable) {
+      return CanonicalValue(CanonicalValue::Object{
           {"api_version",
            CanonicalValue(std::string(core::kStopEvidencePolicyApiVersion))},
-          {"stop_evidence_policy_id", CanonicalValue("lite6_not_stoppable")},
+          {"stop_evidence_policy_id", CanonicalValue(stop_policy_id)},
           {"disposition", CanonicalValue("not_stoppable")},
-          {"containment_granularity", CanonicalValue("resource")},
-      }),
+          {"containment_granularity",
+           CanonicalValue(std::string(containment_granularity))},
+      });
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version",
+         CanonicalValue(std::string(core::kStopEvidencePolicyApiVersion))},
+        {"stop_evidence_policy_id", CanonicalValue(stop_policy_id)},
+        {"disposition", CanonicalValue("stoppable")},
+        {"containment_granularity",
+         CanonicalValue(std::string(containment_granularity))},
+        {"deadline_budget",
+         CanonicalValue(CanonicalValue::Object{
+             {"outer_duration_ns", CanonicalValue(1'000'000'000.0)},
+             {"kernel_completion_reserve_ns", CanonicalValue(100'000'000.0)},
+             {"phases",
+              CanonicalValue(CanonicalValue::Array{
+                  CanonicalValue(CanonicalValue::Object{
+                      {"phase_id", CanonicalValue("nominal_command")},
+                      {"deadline_offset_ns", CanonicalValue(100'000'000.0)},
+                  }),
+                  CanonicalValue(CanonicalValue::Object{
+                      {"phase_id", CanonicalValue("nominal_terminal")},
+                      {"deadline_offset_ns", CanonicalValue(300'000'000.0)},
+                  }),
+                  CanonicalValue(CanonicalValue::Object{
+                      {"phase_id", CanonicalValue("hard_command")},
+                      {"deadline_offset_ns", CanonicalValue(500'000'000.0)},
+                  }),
+                  CanonicalValue(CanonicalValue::Object{
+                      {"phase_id", CanonicalValue("hard_terminal")},
+                      {"deadline_offset_ns", CanonicalValue(800'000'000.0)},
+                  }),
+              })},
+         })},
+        {"escalation_stages",
+         CanonicalValue(CanonicalValue::Array{
+             CanonicalValue(CanonicalValue::Object{
+                 {"stop_escalation_stage_id", CanonicalValue("nominal")},
+                 {"stage_kind", CanonicalValue("nominal")},
+                 {"containment_granularity",
+                  CanonicalValue(std::string(containment_granularity))},
+                 {"containment_command",
+                  CanonicalValue(CanonicalValue::Object{
+                      {"command_phase_id",
+                       CanonicalValue("nominal_command")},
+                      {"command",
+                       qualified_soft_to_spring_substitution
+                           ? CanonicalValue(CanonicalValue::Object{
+                                 {"command_kind",
+                                  CanonicalValue(
+                                      "motion_controlled_stop")},
+                                 {"provider_contract_ref",
+                                  stop_provider_contract_ref()},
+                             })
+                           : CanonicalValue(CanonicalValue::Object{
+                                 {"command_kind",
+                                  CanonicalValue(
+                                      "controller_goal_cancel")},
+                             })},
+                  })},
+                 {"evidence_conjunction", CanonicalValue("all_of")},
+                 {"evidence_requirements",
+                  CanonicalValue(CanonicalValue::Array{
+                      CanonicalValue(CanonicalValue::Object{
+                          {"evidence_item_id",
+                           CanonicalValue("nominal_rest")},
+                          {"phase_id",
+                           CanonicalValue("nominal_terminal")},
+                          {"evidence",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"evidence_kind",
+                                CanonicalValue("motion_rest")},
+                               {"provider_contract_ref",
+                                stop_provider_contract_ref()},
+                           })},
+                          {"source_requirement",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"source_kind",
+                                CanonicalValue(
+                                    "binding_state_authority")},
+                               {"freshness_budget_ns",
+                                CanonicalValue(25.0)},
+                               {"state_endpoint_role_id",
+                                CanonicalValue("state")},
+                               {"allowed_authority_classes",
+                                text_array(
+                                    {"commanded", "measured", "predicted"})},
+                           })},
+                          {"observation_semantics",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"observation_kind",
+                                CanonicalValue("post_command_dwell")},
+                               {"minimum_dwell_ns", CanonicalValue(10.0)},
+                           })},
+                      }),
+                  })},
+             }),
+             CanonicalValue(CanonicalValue::Object{
+                 {"stop_escalation_stage_id",
+                  CanonicalValue("software_hard")},
+                 {"stage_kind", CanonicalValue("software_hard")},
+                 {"containment_granularity",
+                  CanonicalValue(std::string(containment_granularity))},
+                 {"containment_command",
+                  CanonicalValue(CanonicalValue::Object{
+                      {"command_phase_id", CanonicalValue("hard_command")},
+                      {"command",
+                       CanonicalValue(CanonicalValue::Object{
+                           {"command_kind", CanonicalValue("registered")},
+                           {"provider_contract_ref",
+                            software_hard_contract_ref()},
+                           {"registered_command_kind_id",
+                            CanonicalValue("manyforge.stop.software_hard")},
+                       })},
+                  })},
+                 {"evidence_conjunction", CanonicalValue("all_of")},
+                 {"evidence_requirements",
+                  CanonicalValue(CanonicalValue::Array{
+                      CanonicalValue(CanonicalValue::Object{
+                          {"evidence_item_id", CanonicalValue("hard_rest")},
+                          {"phase_id", CanonicalValue("hard_terminal")},
+                          {"evidence",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"evidence_kind",
+                                CanonicalValue("motion_rest")},
+                               {"provider_contract_ref",
+                                software_hard_contract_ref()},
+                           })},
+                          {"source_requirement",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"source_kind",
+                                CanonicalValue(
+                                    "binding_state_authority")},
+                               {"freshness_budget_ns",
+                                CanonicalValue(25.0)},
+                               {"state_endpoint_role_id",
+                                CanonicalValue("state")},
+                               {"allowed_authority_classes",
+                                text_array(
+                                    {"commanded", "measured", "predicted"})},
+                           })},
+                          {"observation_semantics",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"observation_kind",
+                                CanonicalValue("post_command_dwell")},
+                               {"minimum_dwell_ns", CanonicalValue(10.0)},
+                           })},
+                      }),
+                  })},
+             }),
+         })},
+    });
+  }();
+  const std::string stop_bytes = revisioned_document(
+      stop_identity,
       "catalog-record-revision/stop_evidence_policy",
       core::kStopEvidencePolicyApiVersion, "stop_evidence_policy_revision");
   const core::ContentDigest stop_digest(sha256_digest(stop_bytes));
   const core::ContentAddressedStoreKey stop_key(
       catalog_key("stop", stop_digest.value()));
   const core::StopEvidencePolicyCatalogRecordRefDTO stop_ref{
-      core::StopEvidencePolicyId("lite6_not_stoppable"),
+      core::StopEvidencePolicyId(stop_policy_id),
       core::StopEvidencePolicyRevision(
           revision_from_document(stop_bytes, "stop_evidence_policy_revision")),
       core::SchemaId(std::string(core::kStopEvidencePolicyApiVersion)),
@@ -861,7 +1121,7 @@ struct AssistantOverlayFixture final {
         *native_execution_runtime_profile));
   }
   artifacts.push_back(catalog_artifact(
-      "catalog://stop_policy/lite6_not_stoppable", stop_bytes, stop));
+      "catalog://stop_policy/" + stop_policy_id, stop_bytes, stop));
 
   return {
       std::move(capability),
@@ -1312,7 +1572,8 @@ struct AssistantOverlayFixture final {
 [[nodiscard]] inline GraphRevisionVerifiedCellGraph make_graph(
     const Lite6StructuralRetentionFixture& structural,
     const QualifiedControlCatalog& catalog, std::size_t instance_count = 1U,
-    std::string_view cell_id = {}) {
+    std::string_view cell_id = {},
+    std::string_view containment_granularity = "resource") {
   const bool aggregate = catalog.gripper_capability.has_value();
   const bool native_motion = !catalog.planner_capabilities.empty();
   if (instance_count == 0U || instance_count > 32U) {
@@ -1334,7 +1595,7 @@ struct AssistantOverlayFixture final {
   CanonicalValue::Array domains;
   CanonicalValue::Array bindings;
   model_instances.reserve(instance_count);
-  runtime_units.reserve(native_motion ? instance_count : 0U);
+  runtime_units.reserve(instance_count);
   components.reserve(instance_count);
   domains.reserve(instance_count);
   bindings.reserve(instance_count);
@@ -1367,19 +1628,17 @@ struct AssistantOverlayFixture final {
         {"model_revision",
          CanonicalValue(structural.catalog_reference.record_revision.value())},
     });
-    if (native_motion) {
-      runtime_units.emplace_back(CanonicalValue::Object{
-          {"runtime_unit_id", CanonicalValue(runtime_unit_id)},
-          {"runtime_profile_id",
-           CanonicalValue(
-               std::string(detail::kNativeExecutionRuntimeProfileId))},
-          {"runtime_profile_revision",
-           CanonicalValue(detail::native_execution_runtime_profile_revision())},
-          {"dependency_runtime_unit_ids",
-           CanonicalValue(CanonicalValue::Array{})},
-          {"configuration", native_execution_configuration()},
-      });
-    }
+    runtime_units.emplace_back(CanonicalValue::Object{
+        {"runtime_unit_id", CanonicalValue(runtime_unit_id)},
+        {"runtime_profile_id",
+         CanonicalValue(
+             std::string(detail::kNativeExecutionRuntimeProfileId))},
+        {"runtime_profile_revision",
+         CanonicalValue(detail::native_execution_runtime_profile_revision())},
+        {"dependency_runtime_unit_ids",
+         CanonicalValue(CanonicalValue::Array{})},
+        {"configuration", native_execution_configuration()},
+    });
     components.emplace_back(CanonicalValue::Object{
         {"controllable_component_id", CanonicalValue(component_id)},
         {"component_type_id",
@@ -1394,25 +1653,22 @@ struct AssistantOverlayFixture final {
                  {"model_role_id", CanonicalValue("arm_model")},
                  {"model_instance_id", CanonicalValue(model_instance_id)},
              })})},
-        {"runtime_unit_ids", native_motion
-                                 ? text_array({runtime_unit_id})
-                                 : CanonicalValue(CanonicalValue::Array{})},
+        {"runtime_unit_ids", text_array({runtime_unit_id})},
         {"root_pose_in_cell",
          translated_pose(static_cast<double>(instance) * 2.0)},
     });
     domains.emplace_back(CanonicalValue::Object{
         {"control_domain_id", CanonicalValue(domain_id)},
         {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
-        {"runtime_unit_ids", native_motion
-                                 ? text_array({runtime_unit_id})
-                                 : CanonicalValue(CanonicalValue::Array{})},
+        {"runtime_unit_ids", text_array({runtime_unit_id})},
         {"control_coordinator_endpoint_role", CanonicalValue("coordinator")},
         {"controller_topology_id",
          CanonicalValue(
              catalog.topology.value().controller_topology_id.value())},
         {"topology_revision",
          CanonicalValue(catalog.topology.value().topology_revision.value())},
-        {"containment_granularity", CanonicalValue("resource")},
+        {"containment_granularity",
+         CanonicalValue(std::string(containment_granularity))},
     });
     CanonicalValue::Object arm_binding{
         {"control_binding_id", CanonicalValue(binding_id)},
@@ -1447,6 +1703,7 @@ struct AssistantOverlayFixture final {
              })})},
         {"provider_instance_id",
          CanonicalValue(indexed_id("lite6_arm_provider_instance", instance))},
+        {"provider_runtime_unit_id", CanonicalValue(runtime_unit_id)},
         {"provider_manifest_id",
          CanonicalValue(catalog.provider.value().provider_manifest_id.value())},
         {"provider_manifest_revision",
@@ -1463,7 +1720,8 @@ struct AssistantOverlayFixture final {
         {"stop_evidence_policy_revision",
          CanonicalValue(
              catalog.stop.value().stop_evidence_policy_revision.value())},
-        {"containment_granularity", CanonicalValue("resource")},
+        {"containment_granularity",
+         CanonicalValue(std::string(containment_granularity))},
     };
     if (native_motion) {
       arm_binding.emplace_back(
@@ -1490,9 +1748,7 @@ struct AssistantOverlayFixture final {
           {"control_domain_id",
            CanonicalValue(std::string(kLite6GripperDomainId))},
           {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
-          {"runtime_unit_ids", native_motion
-                                   ? text_array({runtime_unit_id})
-                                   : CanonicalValue(CanonicalValue::Array{})},
+          {"runtime_unit_ids", text_array({runtime_unit_id})},
           {"control_coordinator_endpoint_role", CanonicalValue("coordinator")},
           {"controller_topology_id",
            CanonicalValue(
@@ -1543,6 +1799,7 @@ struct AssistantOverlayFixture final {
                })})},
           {"provider_instance_id",
            CanonicalValue("lite6_gripper_provider_instance")},
+          {"provider_runtime_unit_id", CanonicalValue(runtime_unit_id)},
           {"provider_manifest_id",
            CanonicalValue(
                gripper_provider.value().provider_manifest_id.value())},
@@ -1601,7 +1858,10 @@ make_applicability_inputs(
     const QualifiedProviderManifest& provider,
     std::span<const QualifiedCapabilityDefinition> planner_capabilities,
     const QualifiedProviderManifest* planner_provider,
-    const AssistantOverlayFixture* assistant_overlay, const bool composer_draft_enabled = false) {
+    const AssistantOverlayFixture* assistant_overlay,
+    const bool composer_draft_enabled = false,
+    const bool stoppable = false,
+    const bool qualified_soft_to_spring_substitution = false) {
   CanonicalValue::Array desired_configurations;
   desired_configurations.reserve(graph.graph().control_domains.size());
   for (const auto& domain : graph.graph().control_domains) {
@@ -1743,6 +2003,130 @@ make_applicability_inputs(
       {"capability_provider_bindings",
        CanonicalValue(std::move(capability_provider_bindings))},
   };
+  if (stoppable) {
+    CanonicalValue::Array stop_stage_parameters;
+    for (const auto& binding : graph.graph().control_bindings) {
+      const auto domain = std::find_if(
+          graph.graph().control_domains.begin(),
+          graph.graph().control_domains.end(), [&](const auto& candidate) {
+            return candidate.control_domain_id == binding.control_domain_id;
+          });
+      if (domain == graph.graph().control_domains.end()) {
+        throw std::logic_error(
+            "Lite6 Stop parameter binding has no exact control domain");
+      }
+      for (const auto& route_id : binding.legal_control_route_ids) {
+        if (qualified_soft_to_spring_substitution) {
+          CanonicalValue::Array resource_limits;
+          resource_limits.reserve(binding.resource_bindings.size());
+          for (const auto& resource : binding.resource_bindings) {
+            resource_limits.emplace_back(CanonicalValue::Object{
+                {"resource_id",
+                 CanonicalValue(resource.resource_id.value())},
+                {"max_deceleration",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"coordinate_kind",
+                      CanonicalValue("angular_rad_s2")},
+                     {"value_rad_s2", CanonicalValue(4.0)},
+                 })},
+                {"settle_velocity_threshold",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"coordinate_kind",
+                      CanonicalValue("angular_rad_s")},
+                     {"value_rad_s", CanonicalValue(0.01)},
+                 })},
+            });
+          }
+          stop_stage_parameters.emplace_back(CanonicalValue::Object{
+              {"control_domain_id",
+               CanonicalValue(binding.control_domain_id.value())},
+              {"control_domain_revision",
+               CanonicalValue(domain->control_domain_revision.value())},
+              {"control_binding_id",
+               CanonicalValue(binding.control_binding_id.value())},
+              {"control_binding_revision",
+               CanonicalValue(binding.control_binding_revision.value())},
+              {"controller_topology_id",
+               CanonicalValue(binding.controller_topology_id.value())},
+              {"topology_revision",
+               CanonicalValue(binding.topology_revision.value())},
+              {"control_route_id", CanonicalValue(route_id.value())},
+              {"stop_evidence_policy_id",
+               CanonicalValue(binding.stop_evidence_policy_id.value())},
+              {"stop_evidence_policy_revision",
+               CanonicalValue(binding.stop_evidence_policy_revision.value())},
+              {"stop_escalation_stage_id", CanonicalValue("nominal")},
+              {"provider_contract_ref",
+               CanonicalValue(CanonicalValue::Object{
+                   {"provider_contract_role_id",
+                    CanonicalValue("stop_contract")},
+                   {"contract_schema_id",
+                    CanonicalValue(std::string(
+                        core::kMotionControlledStopContractSchemaId))},
+                   {"contract_schema_revision",
+                    CanonicalValue(std::string(
+                        core::kMotionControlledStopContractSchemaRevision))},
+               })},
+              {"default_contract_parameters",
+               CanonicalValue(CanonicalValue::Object{
+                   {"stop_mode", CanonicalValue("soft_on_path")},
+                   {"deceleration_time_s", CanonicalValue(0.25)},
+                   {"per_resource_limits",
+                    CanonicalValue(std::move(resource_limits))},
+                   {"allow_natural_completion_on_short_path",
+                    CanonicalValue(false)},
+                   {"recoverable_substitution_mode",
+                    CanonicalValue("spring_back_hold")},
+               })},
+          });
+        }
+        stop_stage_parameters.emplace_back(CanonicalValue::Object{
+            {"control_domain_id",
+             CanonicalValue(binding.control_domain_id.value())},
+            {"control_domain_revision",
+             CanonicalValue(domain->control_domain_revision.value())},
+            {"control_binding_id",
+             CanonicalValue(binding.control_binding_id.value())},
+            {"control_binding_revision",
+             CanonicalValue(binding.control_binding_revision.value())},
+            {"controller_topology_id",
+             CanonicalValue(binding.controller_topology_id.value())},
+            {"topology_revision",
+             CanonicalValue(binding.topology_revision.value())},
+            {"control_route_id", CanonicalValue(route_id.value())},
+            {"stop_evidence_policy_id",
+             CanonicalValue(binding.stop_evidence_policy_id.value())},
+            {"stop_evidence_policy_revision",
+             CanonicalValue(binding.stop_evidence_policy_revision.value())},
+            {"stop_escalation_stage_id",
+             CanonicalValue("software_hard")},
+            {"provider_contract_ref",
+             software_hard_provider_contract_ref()},
+            {"default_contract_parameters",
+             CanonicalValue(CanonicalValue::Object{})},
+        });
+      }
+    }
+    root_members.emplace_back(
+        "policies",
+        CanonicalValue(CanonicalValue::Object{
+            {"retained_policy_records",
+             CanonicalValue(CanonicalValue::Array{})},
+            {"stop_stage_parameters",
+             CanonicalValue(std::move(stop_stage_parameters))},
+            {"commissioned_stop_interfaces",
+             CanonicalValue(CanonicalValue::Array{})},
+            {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
+            {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
+            {"interrupt_config",
+             CanonicalValue(CanonicalValue::Object{
+                 {"queue_depth", CanonicalValue(8.0)},
+                 {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
+                 {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
+                 {"supervisory_poll_rate_hz", CanonicalValue(100.0)},
+             })},
+        }));
+  }
   if (assistant_overlay != nullptr) {
     root_members.emplace_back("assistant", assistant_source(composer_draft_enabled));
     root_members.emplace_back(
@@ -1782,7 +2166,12 @@ make_lite6_controllable_retention_fixture(bool chained = false,
                                           bool aggregate_gripper = false,
                                           bool native_motion = false,
                                           std::string_view cell_id = {},
-                                          bool composer_draft_enabled = false) {
+                                          bool composer_draft_enabled = false,
+                                          bool stoppable = false,
+                                          std::string_view containment_granularity =
+                                              "resource",
+                                          bool qualified_soft_to_spring_substitution =
+                                              false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (aggregate_gripper &&
       (chained || assistant_enabled || instance_count != 1U)) {
@@ -1793,14 +2182,25 @@ make_lite6_controllable_retention_fixture(bool chained = false,
   if (composer_draft_enabled && !assistant_enabled) {
     throw std::logic_error("Composer Draft fixture requires assistant settings");
   }
+  if (qualified_soft_to_spring_substitution &&
+      (!stoppable || !native_motion || chained || aggregate_gripper ||
+       instance_count != 1U)) {
+    throw std::logic_error(
+        "qualified soft-to-spring fixture requires one direct stoppable "
+        "native arm");
+  }
   auto structural = make_lite6_structural_retention_fixture();
   auto catalog =
-      fixture_detail::qualify_control_catalog(chained, native_motion);
+      fixture_detail::qualify_control_catalog(chained, native_motion,
+                                              stoppable,
+                                              containment_granularity,
+                                              qualified_soft_to_spring_substitution);
   if (aggregate_gripper) {
     catalog = fixture_detail::add_aggregate_gripper_catalog(std::move(catalog));
   }
   const auto graph =
-      fixture_detail::make_graph(structural, catalog, instance_count, cell_id);
+      fixture_detail::make_graph(structural, catalog, instance_count, cell_id,
+                                 containment_granularity);
   const std::optional<fixture_detail::AssistantOverlayFixture>
       assistant_overlay =
           assistant_enabled
@@ -1813,7 +2213,8 @@ make_lite6_controllable_retention_fixture(bool chained = false,
       catalog.planner_provider.has_value() ? &*catalog.planner_provider
                                            : nullptr,
       assistant_overlay.has_value() ? &*assistant_overlay : nullptr,
-      composer_draft_enabled);
+      composer_draft_enabled, stoppable,
+      qualified_soft_to_spring_substitution);
 
   std::vector<core::CatalogRecordRefDTO> catalog_records{
       structural.catalog_reference,       catalog.capability.reference(),
@@ -1875,6 +2276,10 @@ make_lite6_controllable_retention_fixture(bool chained = false,
       {"capability_provider_bindings",
        inputs.normalized_capability_provider_bindings()},
   };
+  if (inputs.normalized_policies().has_value()) {
+    deployment_members.emplace_back("policies",
+                                    *inputs.normalized_policies());
+  }
   if (assistant_enabled) {
     deployment_members.emplace_back(
         "assistant", inputs.assistant_settings().normalized_source());
@@ -1928,10 +2333,38 @@ make_lite6_controllable_retention_fixture(bool chained = false,
     providers.push_back(*catalog.planner_provider);
   }
   const std::array<QualifiedStopEvidencePolicy, 1U> stop_policies{catalog.stop};
+  std::map<std::pair<std::string, std::string>,
+           BuildQualifiedValueSchemaEntry>
+      selected_value_schema_map;
+  const auto& applicability_inputs = deployment.applicability_inputs().value();
+  const auto& schema_registry = build_qualified_closed_schema_registry();
+  for (const auto& row : applicability_inputs.stop_stage_parameters) {
+    const auto& contract = row.provider_contract_ref;
+    const auto* schema = schema_registry.find_qualified_value_schema(
+        contract.contract_schema_id, contract.contract_schema_revision);
+    if (schema == nullptr) {
+      throw std::logic_error(
+          "Lite6 control fixture has no exact build-qualified Stop value schema");
+    }
+    selected_value_schema_map.emplace(
+        std::pair{contract.contract_schema_id.value(),
+                  contract.contract_schema_revision.value()},
+        *schema);
+  }
+  std::vector<BuildQualifiedValueSchemaEntry> selected_value_schemas;
+  selected_value_schemas.reserve(selected_value_schema_map.size());
+  for (const auto& [_, schema] : selected_value_schema_map) {
+    selected_value_schemas.push_back(schema);
+  }
+  if (!applicability_inputs.commissioned_stop_interfaces.empty()) {
+    throw std::logic_error(
+        "Lite6 control fixture does not declare a commissioned safety Stop stage");
+  }
   const auto applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(), runtime_profiles,
       command_schemas, capabilities, contracts, topologies, providers,
-      stop_policies, overlay);
+      stop_policies, selected_value_schemas,
+      std::span<const QualifiedCommissioningEvidenceRef>{}, overlay);
   auto qualified = qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
 
@@ -1962,6 +2395,14 @@ make_lite6_chained_controllable_retention_fixture() {
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_stoppable_controllable_retention_fixture(
+    std::string_view containment_granularity = "resource") {
+  return make_lite6_controllable_retention_fixture(false, false, 1U, false,
+                                                   false, {}, false, true,
+                                                   containment_granularity);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
 make_two_lite6_same_type_controllable_retention_fixture() {
   return make_lite6_controllable_retention_fixture(false, false, 2U);
 }
@@ -1985,6 +2426,12 @@ make_lite6_arm_gripper_aggregate_retention_fixture() {
 make_lite6_native_motion_retention_fixture() {
   return make_lite6_controllable_retention_fixture(false, false, 1U, false,
                                                    true);
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_stop_qualified_native_motion_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, false, true, {}, false, true, "resource", true);
 }
 
 [[nodiscard]] inline Lite6ControllableRetentionFixture

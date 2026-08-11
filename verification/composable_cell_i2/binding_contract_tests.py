@@ -138,6 +138,7 @@ _EXPECTED_PROPERTIES: dict[str, tuple[str, ...]] = {
         "normalized_capability_provider_bindings_canonical_json",
         "normalized_desired_control_configurations_canonical_json",
         "normalized_external_resources_canonical_json",
+        "normalized_policies_canonical_json",
         "normalized_site_overlay_ref_canonical_json",
         "site_overlay_ref_presence",
         "value",
@@ -337,9 +338,11 @@ _EXPECTED_CONSTRUCTIBLE_DTO_PROPERTIES: dict[str, tuple[str, ...]] = {
     ),
     "DeploymentApplicabilityInputsDTO": (
         "capability_provider_bindings",
+        "commissioned_stop_interfaces",
         "desired_control_configurations",
         "external_resources",
         "site_overlay_ref",
+        "stop_stage_parameters",
     ),
     "DesiredControlBindingRouteDTO": (
         "control_binding_id",
@@ -416,6 +419,8 @@ _EXPECTED_CONSTRUCTOR_PARAMETERS: dict[str, tuple[str, ...]] = {
         "desired_control_configurations",
         "capability_provider_bindings",
         "external_resources",
+        "stop_stage_parameters",
+        "commissioned_stop_interfaces",
     ),
     "DesiredControlBindingRouteDTO": (
         "control_binding_id",
@@ -1066,6 +1071,8 @@ def _canonical_empty_pipeline(module: ModuleType) -> dict[str, Any]:
         (),
         (),
         (),
+        (),
+        (),
         selected_overlay,
     )
     compiler = _callable(module, "compile_cell_ir")(applicability)
@@ -1292,6 +1299,8 @@ def _constructible_dto_fixture(module: ModuleType) -> dict[str, Any]:
         "desired_control_configurations": (configuration,),
         "capability_provider_bindings": (provider_binding,),
         "external_resources": (external_b, external_a),
+        "stop_stage_parameters": (),
+        "commissioned_stop_interfaces": (),
     }
     applicability_inputs = module.DeploymentApplicabilityInputsDTO(
         **applicability_inputs_kwargs
@@ -2275,7 +2284,7 @@ deployment = module.compute_deployment_artifact_revision(parsed, ())
 composition = module.compose_cell_occurrences(deployment.graph, (), ())
 inputs = deployment.applicability_inputs
 overlay = module.select_site_overlay_for_deployment(inputs.value.site_overlay_ref, inputs.value.external_resources, None)
-applicability = module.qualify_cell_applicability(composition, inputs, (), (), (), (), (), (), (), overlay)
+applicability = module.qualify_cell_applicability(composition, inputs, (), (), (), (), (), (), (), (), (), overlay)
 compiler = module.compile_cell_ir(applicability)
 observation = {"module_file": module.__file__, "module_origin": module.__spec__.origin, "compiler_type": type(compiler).__name__, "cell_id": compiler.applicability.composition.graph.cell_id.value, "catalog_record_count": len(compiler.catalog_record_refs)}
 del compiler, applicability, composition, deployment

@@ -25,12 +25,17 @@
 #include "control_domain_control_internal.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/control_interface_contract_codec.hpp"
+#include "manyforge_deployment/controller_topology_codec.hpp"
 #include "manyforge_deployment/model_asset_codec.hpp"
 #include "manyforge_deployment/model_source.hpp"
+#include "manyforge_deployment/provider_manifest_codec.hpp"
+#include "manyforge_deployment/stop_evidence_policy_codec.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "posix_durability_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
+#include "stop_qualification_evidence_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
@@ -1323,14 +1328,150 @@ void require_symbol_role_map_matches_retained_graph(
   }
 }
 
+struct RetainedControlCatalogClosure final {
+  std::vector<QualifiedControlInterfaceContract> control_interfaces;
+  std::vector<QualifiedControllerTopology> controller_topologies;
+  std::vector<QualifiedProviderManifest> provider_manifests;
+  std::vector<QualifiedStopEvidencePolicy> stop_policies;
+};
+
+[[nodiscard]] RetainedControlCatalogClosure
+load_retained_control_catalog_closure(
+    const std::filesystem::path& catalog_data,
+    std::span<const core::CatalogRecordRefDTO> records) {
+  using ControlInput = std::pair<
+      core::ControlInterfaceContractCatalogRecordRefDTO, std::string>;
+  using TopologyInput =
+      std::pair<core::ControllerTopologyCatalogRecordRefDTO, std::string>;
+  using ManifestInput =
+      std::pair<core::ProviderManifestCatalogRecordRefDTO, std::string>;
+  using PolicyInput =
+      std::pair<core::StopEvidencePolicyCatalogRecordRefDTO, std::string>;
+  std::vector<ControlInput> control_inputs;
+  std::vector<TopologyInput> topology_inputs;
+  std::vector<ManifestInput> manifest_inputs;
+  std::vector<PolicyInput> policy_inputs;
+
+  for (const auto& record : records) {
+    std::visit(
+        [&](const auto& typed_record) {
+          std::string bytes = read_verified_catalog_reference(
+              catalog_data, typed_record.content_addressed_store_key,
+              typed_record.content_digest, std::nullopt,
+              "retained catalog-record reference");
+          using Record = std::decay_t<decltype(typed_record)>;
+          if constexpr (std::is_same_v<
+                            Record,
+                            core::ControlInterfaceContractCatalogRecordRefDTO>) {
+            control_inputs.emplace_back(typed_record, std::move(bytes));
+          } else if constexpr (
+              std::is_same_v<Record,
+                             core::ControllerTopologyCatalogRecordRefDTO>) {
+            topology_inputs.emplace_back(typed_record, std::move(bytes));
+          } else if constexpr (
+              std::is_same_v<Record,
+                             core::ProviderManifestCatalogRecordRefDTO>) {
+            manifest_inputs.emplace_back(typed_record, std::move(bytes));
+          } else if constexpr (
+              std::is_same_v<Record,
+                             core::StopEvidencePolicyCatalogRecordRefDTO>) {
+            policy_inputs.emplace_back(typed_record, std::move(bytes));
+          }
+        },
+        record);
+  }
+
+  RetainedControlCatalogClosure result;
+  result.control_interfaces.reserve(control_inputs.size());
+  for (const auto& [reference, bytes] : control_inputs) {
+    result.control_interfaces.push_back(
+        resolve_and_qualify_control_interface_contract(
+            reference, reference.content_addressed_store_key, bytes));
+  }
+  result.controller_topologies.reserve(topology_inputs.size());
+  for (const auto& [reference, bytes] : topology_inputs) {
+    result.controller_topologies.push_back(resolve_and_qualify_controller_topology(
+        reference, reference.content_addressed_store_key, bytes,
+        result.control_interfaces));
+  }
+  result.provider_manifests.reserve(manifest_inputs.size());
+  for (const auto& [reference, bytes] : manifest_inputs) {
+    result.provider_manifests.push_back(resolve_and_qualify_provider_manifest(
+        reference, reference.content_addressed_store_key, bytes));
+  }
+  result.stop_policies.reserve(policy_inputs.size());
+  for (const auto& [reference, bytes] : policy_inputs) {
+    result.stop_policies.push_back(resolve_and_qualify_stop_evidence_policy(
+        reference, reference.content_addressed_store_key, bytes));
+  }
+  return result;
+}
+
+[[nodiscard]] RetainedControlCatalogClosure select_control_catalogs_for_domain(
+    const RetainedControlCatalogClosure& available,
+    const core::CellGraphDTO& graph,
+    const core::ControlDomainId& control_domain_id) {
+  RetainedControlCatalogClosure result;
+  const auto domain = std::find_if(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [&](const auto& candidate) {
+        return candidate.control_domain_id == control_domain_id;
+      });
+  if (domain == graph.control_domains.end()) {
+    detail::fail_retained_bundle(
+        "cannot select catalogs for an unknown control domain");
+  }
+  for (const auto& topology : available.controller_topologies) {
+    if (topology.value().controller_topology_id ==
+            domain->controller_topology_id &&
+        topology.value().topology_revision == domain->topology_revision) {
+      result.controller_topologies.push_back(topology);
+    }
+  }
+  std::set<std::pair<std::string, std::string>> policy_ids;
+  std::set<std::pair<std::string, std::string>> manifest_ids;
+  for (const auto& binding : graph.control_bindings) {
+    if (binding.control_domain_id != control_domain_id) {
+      continue;
+    }
+    policy_ids.emplace(binding.stop_evidence_policy_id.value(),
+                       binding.stop_evidence_policy_revision.value());
+    manifest_ids.emplace(binding.provider_manifest_id.value(),
+                         binding.provider_manifest_revision.value());
+  }
+  for (const auto& policy : available.stop_policies) {
+    if (policy_ids.contains(
+            {policy.value().stop_evidence_policy_id.value(),
+             policy.value().stop_evidence_policy_revision.value()})) {
+      result.stop_policies.push_back(policy);
+    }
+  }
+  for (const auto& manifest : available.provider_manifests) {
+    if (manifest_ids.contains(
+            {manifest.value().provider_manifest_id.value(),
+             manifest.value().provider_manifest_revision.value()})) {
+      result.provider_manifests.push_back(manifest);
+    }
+  }
+  return result;
+}
+
 void require_verified_product_artifacts(
     const std::filesystem::path &raw_data,
     const core::RetainedProductDTO &product,
     const core::RetainedBundleDTO &bundle,
     const core::ControlDomainId *control_domain_subject = nullptr,
-    const core::RuntimeUnitId* runtime_unit_subject = nullptr) {
+    const core::RuntimeUnitId* runtime_unit_subject = nullptr,
+    std::span<const QualifiedStopEvidencePolicy> stop_policies = {},
+    std::span<const QualifiedControllerTopology> controller_topologies = {},
+    std::span<const QualifiedProviderManifest> provider_manifests = {}) {
   std::optional<std::string> runtime_manifest;
   std::optional<std::string> runtime_launchable;
+  std::optional<std::string> runtime_implementation_build_identity;
+  std::optional<std::string> control_domain_control;
+  std::optional<std::string> stop_implementation_evidence;
+  std::optional<std::string> stop_substitution_evidence;
+  std::optional<std::string> stop_commissioning_evidence;
   for (const auto &artifact : product.artifact_refs) {
     const std::string bytes = read_verified_raw_reference(
         raw_data, artifact.content_addressed_store_key, artifact.content_digest,
@@ -1347,18 +1488,43 @@ void require_verified_product_artifacts(
       require_symbol_role_map_matches_retained_graph(map, bundle.cell_graph);
     } else if (product.product_kind ==
                core::RetainedProductKind::kControlDomainControl) {
-      if (artifact.artifact_role_id.value() !=
-              detail::kControlDomainControlArtifactRole ||
-          artifact.media_type != detail::kControlDomainControlMediaType) {
+      const std::string_view role = artifact.artifact_role_id.value();
+      if (role == detail::kControlDomainControlArtifactRole) {
+        if (artifact.media_type != detail::kControlDomainControlMediaType ||
+            control_domain_control.has_value()) {
+          detail::fail_retained_bundle(
+              "control-domain product has an incoherent primary artifact");
+        }
+        control_domain_control = bytes;
+      } else if (role ==
+                 core::kStopImplementationQualificationArtifactRole) {
+        if (artifact.media_type !=
+                core::kStopImplementationQualificationMediaType ||
+            stop_implementation_evidence.has_value()) {
+          detail::fail_retained_bundle(
+              "control-domain product has incoherent implementation evidence");
+        }
+        stop_implementation_evidence = bytes;
+      } else if (role ==
+                 core::kControlledStopSubstitutionQualificationArtifactRole) {
+        if (artifact.media_type !=
+                core::kControlledStopSubstitutionQualificationMediaType ||
+            stop_substitution_evidence.has_value()) {
+          detail::fail_retained_bundle(
+              "control-domain product has incoherent substitution evidence");
+        }
+        stop_substitution_evidence = bytes;
+      } else if (role == core::kStopInterfaceCommissioningArtifactRole) {
+        if (artifact.media_type != core::kStopInterfaceCommissioningMediaType ||
+            stop_commissioning_evidence.has_value()) {
+          detail::fail_retained_bundle(
+              "control-domain product has incoherent commissioning evidence");
+        }
+        stop_commissioning_evidence = bytes;
+      } else {
         detail::fail_retained_bundle(
             "control-domain product has an unexpected artifact role");
       }
-      if (control_domain_subject == nullptr) {
-        detail::fail_retained_bundle(
-            "control-domain product is missing its envelope subject");
-      }
-      detail::require_control_domain_control_matches_retained_bundle(
-          bytes, bundle, *control_domain_subject);
     } else if (product.product_kind ==
                core::RetainedProductKind::kRuntimeUnitConfiguration) {
       if (runtime_unit_subject == nullptr) {
@@ -1397,10 +1563,89 @@ void require_verified_product_artifacts(
               "runtime-unit product has an incoherent launchable artifact");
         }
         runtime_launchable = bytes;
+      } else if (native_execution &&
+                 artifact.artifact_role_id.value() ==
+                     detail::kNativeExecutionRuntimeBuildIdentityArtifactRole) {
+        if (artifact.media_type !=
+                detail::kNativeExecutionRuntimeBuildIdentityMediaType ||
+            runtime_implementation_build_identity.has_value()) {
+          detail::fail_retained_bundle(
+              "native runtime product has an incoherent implementation "
+              "build identity");
+        }
+        runtime_implementation_build_identity = bytes;
       } else {
         detail::fail_retained_bundle("runtime-unit product has an unexpected artifact role");
       }
     }
+  }
+  if (product.product_kind ==
+      core::RetainedProductKind::kControlDomainControl) {
+    if (control_domain_subject == nullptr ||
+        !control_domain_control.has_value()) {
+      detail::fail_retained_bundle(
+          "control-domain product is missing its envelope subject or primary "
+          "artifact");
+    }
+    std::vector<std::pair<core::ProductId, std::string>>
+        native_build_identity_storage;
+    native_build_identity_storage.reserve(
+        bundle.compiled_products.runtime_unit_products.size());
+    for (const auto& runtime_group :
+         bundle.compiled_products.runtime_unit_products) {
+      if (runtime_group.products.size() != 1U) {
+        detail::fail_retained_bundle(
+            "control readback found an incoherent runtime product group");
+      }
+      const auto& runtime_product = runtime_group.products.front();
+      if (runtime_product.product_contract_id.value() !=
+              detail::kNativeExecutionRuntimeProductContractId ||
+          runtime_product.product_contract_revision !=
+              detail::native_execution_runtime_product_contract_revision()) {
+        continue;
+      }
+      const auto identity_ref = std::find_if(
+          runtime_product.artifact_refs.begin(),
+          runtime_product.artifact_refs.end(), [](const auto& artifact) {
+            return artifact.artifact_role_id.value() ==
+                   detail::kNativeExecutionRuntimeBuildIdentityArtifactRole;
+          });
+      if (identity_ref == runtime_product.artifact_refs.end()) {
+        continue;
+      }
+      if (identity_ref->media_type !=
+          detail::kNativeExecutionRuntimeBuildIdentityMediaType) {
+        detail::fail_retained_bundle(
+            "native runtime build identity has an incoherent media type");
+      }
+      native_build_identity_storage.emplace_back(
+          runtime_product.product_id,
+          read_verified_raw_reference(
+              raw_data, identity_ref->content_addressed_store_key,
+              identity_ref->content_digest, identity_ref->byte_size,
+              "native runtime implementation build identity"));
+    }
+    std::vector<detail::NativeRuntimeBuildIdentityArtifact>
+        native_build_identities;
+    native_build_identities.reserve(native_build_identity_storage.size());
+    for (const auto& [product_id, bytes] : native_build_identity_storage) {
+      native_build_identities.push_back({product_id, bytes});
+    }
+    detail::require_control_domain_control_matches_retained_bundle(
+        detail::ControlDomainControlArtifactClosure{
+            *control_domain_control,
+            stop_implementation_evidence.has_value()
+                ? std::optional<std::string_view>(*stop_implementation_evidence)
+                : std::nullopt,
+            stop_substitution_evidence.has_value()
+                ? std::optional<std::string_view>(*stop_substitution_evidence)
+                : std::nullopt,
+            stop_commissioning_evidence.has_value()
+                ? std::optional<std::string_view>(*stop_commissioning_evidence)
+                : std::nullopt,
+            native_build_identities},
+        bundle, *control_domain_subject, stop_policies, controller_topologies,
+        provider_manifests);
   }
   if (product.product_kind ==
       core::RetainedProductKind::kRuntimeUnitConfiguration) {
@@ -1413,7 +1658,12 @@ void require_verified_product_artifacts(
         product.product_contract_revision ==
             detail::native_execution_runtime_product_contract_revision()) {
       detail::require_native_execution_runtime_product_matches_retained_bundle(
-          *runtime_manifest, *runtime_launchable, bundle,
+          *runtime_manifest, *runtime_launchable,
+          runtime_implementation_build_identity.has_value()
+              ? std::optional<std::string_view>(
+                    *runtime_implementation_build_identity)
+              : std::nullopt,
+          bundle,
           *runtime_unit_subject);
     } else {
       detail::require_reference_runtime_product_matches_retained_bundle(
@@ -1427,19 +1677,12 @@ void require_verified_bundle_references(
     const std::filesystem::path& trusted_root,
     const std::filesystem::path& raw_data, const RetainedBundle& bundle) {
   const auto& value = bundle.value();
+  RetainedControlCatalogClosure control_catalogs;
   if (!value.catalogs.records.empty()) {
     const std::filesystem::path catalog_data =
         require_read_only_catalog_data(trusted_root);
-    for (const auto& record : value.catalogs.records) {
-      std::visit(
-          [&catalog_data](const auto& typed_record) {
-            static_cast<void>(read_verified_catalog_reference(
-                catalog_data, typed_record.content_addressed_store_key,
-                typed_record.content_digest, std::nullopt,
-                "retained catalog-record reference"));
-          },
-          record);
-    }
+    control_catalogs = load_retained_control_catalog_closure(
+        catalog_data, value.catalogs.records);
   }
   for (const auto& schema : value.catalogs.schema_artifacts) {
     static_cast<void>(read_verified_raw_reference(
@@ -1455,9 +1698,15 @@ void require_verified_bundle_references(
     require_verified_product_artifacts(raw_data, *products.viewer_model, value);
   }
   for (const auto &group : products.control_domain_products) {
+    const RetainedControlCatalogClosure domain_catalogs =
+        select_control_catalogs_for_domain(
+            control_catalogs, value.cell_graph, group.control_domain_id);
     for (const auto &product : group.products) {
       require_verified_product_artifacts(raw_data, product, value,
-                                         &group.control_domain_id);
+                                         &group.control_domain_id, nullptr,
+                                         domain_catalogs.stop_policies,
+                                         domain_catalogs.controller_topologies,
+                                         domain_catalogs.provider_manifests);
     }
   }
   for (const auto &product : products.symbol_role_maps) {
@@ -1980,12 +2229,6 @@ FilesystemVerifiedRetainedProductArtifactSource::get_verified(
                                                    bundle->value().cell_graph);
   } else if (product->product_kind ==
              core::RetainedProductKind::kControlDomainControl) {
-    if (artifact->artifact_role_id.value() !=
-            detail::kControlDomainControlArtifactRole ||
-        artifact->media_type != detail::kControlDomainControlMediaType) {
-      detail::fail_retained_bundle(
-          "selected control-domain artifact has an incoherent contract");
-    }
     const core::ControlDomainId *subject = nullptr;
     for (const auto &group :
          bundle->value().compiled_products.control_domain_products) {
@@ -2000,8 +2243,18 @@ FilesystemVerifiedRetainedProductArtifactSource::get_verified(
       detail::fail_retained_bundle(
           "selected control-domain artifact lost its envelope subject");
     }
-    detail::require_control_domain_control_matches_retained_bundle(
-        bytes, bundle->value(), *subject);
+    const RetainedControlCatalogClosure control_catalogs =
+        load_retained_control_catalog_closure(
+            require_read_only_catalog_data(current_root),
+            bundle->value().catalogs.records);
+    const RetainedControlCatalogClosure domain_catalogs =
+        select_control_catalogs_for_domain(
+            control_catalogs, bundle->value().cell_graph, *subject);
+    require_verified_product_artifacts(paths.raw_data, *product,
+                                       bundle->value(), subject, nullptr,
+                                       domain_catalogs.stop_policies,
+                                       domain_catalogs.controller_topologies,
+                                       domain_catalogs.provider_manifests);
   } else if (product->product_kind ==
              core::RetainedProductKind::kRuntimeUnitConfiguration) {
     const core::RuntimeUnitId* subject = nullptr;
@@ -2080,6 +2333,37 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
   };
   const auto manifest = artifact_source.get_verified(manifest_query);
   const auto launchable = artifact_source.get_verified(launchable_query);
+  std::optional<VerifiedRetainedProductArtifact> implementation_build_identity;
+  if (native_execution) {
+    const auto identity_ref = std::find_if(
+        product.artifact_refs.begin(), product.artifact_refs.end(),
+        [](const auto& artifact) {
+          return artifact.artifact_role_id.value() ==
+                 detail::kNativeExecutionRuntimeBuildIdentityArtifactRole;
+        });
+    if (identity_ref != product.artifact_refs.end()) {
+      const RetainedProductArtifactQuery identity_query{
+          bundle.retained_bundle_id(),
+          product.product_id,
+          core::RetainedProductKind::kRuntimeUnitConfiguration,
+          core::ArtifactRoleId(std::string(
+              detail::kNativeExecutionRuntimeBuildIdentityArtifactRole)),
+      };
+      implementation_build_identity =
+          artifact_source.get_verified(identity_query);
+      if (!implementation_build_identity.has_value() ||
+          implementation_build_identity->query() != identity_query ||
+          implementation_build_identity->product_contract_id() !=
+              product.product_contract_id ||
+          implementation_build_identity->product_contract_revision() !=
+              product.product_contract_revision ||
+          implementation_build_identity->artifact_ref() != *identity_ref) {
+        detail::fail_retained_bundle(
+            "runtime-unit artifact source did not return the exact native "
+            "build identity");
+      }
+    }
+  }
   if (!manifest.has_value() || !launchable.has_value() ||
       manifest->query() != manifest_query ||
       launchable->query() != launchable_query ||
@@ -2092,12 +2376,29 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
   }
   if (native_execution) {
     detail::require_native_execution_runtime_product_matches_retained_bundle(
-        manifest->bytes(), launchable->bytes(), bundle.value(),
+        manifest->bytes(), launchable->bytes(),
+        implementation_build_identity.has_value()
+            ? std::optional<std::string_view>(
+                  implementation_build_identity->bytes())
+            : std::nullopt,
+        bundle.value(),
         runtime_unit_id);
   } else {
     detail::require_reference_runtime_product_matches_retained_bundle(
         manifest->bytes(), launchable->bytes(), bundle.value(),
         runtime_unit_id);
+  }
+  std::optional<VerifiedRuntimeImplementationBuildIdentity>
+      verified_implementation_build_identity;
+  if (implementation_build_identity.has_value()) {
+    const auto identity = detail::parse_stop_implementation_build_identity(
+        implementation_build_identity->bytes());
+    verified_implementation_build_identity =
+        VerifiedRuntimeImplementationBuildIdentity{
+            identity.implementation_source_build_fingerprint,
+            identity.installed_target_id,
+            identity.installed_target_byte_size,
+            identity.installed_target_content_digest};
   }
   return VerifiedRetainedRuntimeUnitProduct(
       bundle.retained_bundle_id(), runtime_unit_id, product.product_id,
@@ -2135,7 +2436,8 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
           : std::string(detail::kReferenceRuntimeRetrievalContractId),
       native_execution
           ? detail::native_execution_runtime_retrieval_contract_revision()
-          : detail::reference_runtime_retrieval_contract_revision());
+          : detail::reference_runtime_retrieval_contract_revision(),
+      std::move(verified_implementation_build_identity));
 }
 
 std::optional<VerifiedRetainedRuntimeUnitProduct>

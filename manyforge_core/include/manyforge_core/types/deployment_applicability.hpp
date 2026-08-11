@@ -5,6 +5,7 @@
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <manyforge_core/types/stop_control.hpp>
 #include <optional>
 #include <string_view>
 #include <variant>
@@ -207,7 +208,35 @@ struct ExternalResourceDTO final {
                          const ExternalResourceDTO&) = default;
 };
 
-/// Grouping projection for the three deployment-level C0.2n input tables.
+/// Explicit deployment-owned proof that one final registered safety-system
+/// request is wired through an exact managed provider/route and has an
+/// immutable site commissioning package.
+struct CommissionedStopInterfaceDTO final {
+  CommissionedStopInterfaceId commissioned_stop_interface_id;
+  CommissionedStopInterfaceRevision commissioned_stop_interface_revision;
+  ControlDomainId control_domain_id;
+  ControlDomainRevision control_domain_revision;
+  ControlBindingId control_binding_id;
+  ControlBindingRevision control_binding_revision;
+  ControlRouteId control_route_id;
+  ProviderInstanceId provider_instance_id;
+  ProviderManifestId provider_manifest_id;
+  ProviderManifestRevision provider_manifest_revision;
+  RegisteredStopCommandKindId registered_command_kind_id;
+  ProviderContractRefDTO provider_contract_ref;
+  EndpointRoleId endpoint_role_id;
+  StopActionClass stop_action_class;
+  SafetySystemRequestActionClass safety_system_request_action_class;
+  std::optional<ExternalResourceAlias> external_resource_alias;
+  std::optional<ExternalResourceKind> external_resource_kind;
+  std::optional<SiteOverlayValueRef> site_overlay_value_ref;
+  RetainedArtifactRefDTO commissioning_evidence_artifact_ref;
+
+  friend bool operator==(const CommissionedStopInterfaceDTO&,
+                         const CommissionedStopInterfaceDTO&) = default;
+};
+
+/// Grouping projection for deployment-level C0.2n input tables.
 ///
 /// This is not another artifact envelope or graph kind. The deployment codec
 /// retains the three independently normalized arrays used to rebuild the
@@ -217,6 +246,8 @@ struct DeploymentApplicabilityInputsDTO final {
   std::vector<DesiredControlConfigurationDTO> desired_control_configurations;
   std::vector<CapabilityProviderBindingDTO> capability_provider_bindings;
   std::vector<ExternalResourceDTO> external_resources;
+  std::vector<StopStageParametersDTO> stop_stage_parameters;
+  std::vector<CommissionedStopInterfaceDTO> commissioned_stop_interfaces;
 
   friend bool operator==(const DeploymentApplicabilityInputsDTO&,
                          const DeploymentApplicabilityInputsDTO&) = default;

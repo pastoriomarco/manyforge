@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 #include "manyforge_deployment/artifact_codec.hpp"
@@ -30,6 +31,56 @@ enum class SiteOverlayRefSourcePresence : std::uint8_t {
 };
 
 class RevisionVerifiedDeploymentApplicabilityInputs;
+
+/// Immutable-store readback proof for one deployment-authored commissioning
+/// row.
+///
+/// The private constructor deliberately prevents C0.2n or an ordinary caller
+/// from promoting an authored digest into evidence.  The sole producer below
+/// requires the exact resolved CAS key and stored bytes and independently
+/// checks the complete artifact reference before constructing this value.
+class QualifiedCommissioningEvidenceRef final {
+ public:
+  QualifiedCommissioningEvidenceRef(
+      const QualifiedCommissioningEvidenceRef&) = default;
+  QualifiedCommissioningEvidenceRef& operator=(
+      const QualifiedCommissioningEvidenceRef&) = default;
+
+  [[nodiscard]] const core::CommissionedStopInterfaceId&
+  commissioned_stop_interface_id() const noexcept {
+    return commissioned_stop_interface_id_;
+  }
+  [[nodiscard]] const core::CommissionedStopInterfaceRevision&
+  commissioned_stop_interface_revision() const noexcept {
+    return commissioned_stop_interface_revision_;
+  }
+  [[nodiscard]] const core::RetainedArtifactRefDTO& artifact_ref()
+      const noexcept {
+    return artifact_ref_;
+  }
+
+ private:
+  QualifiedCommissioningEvidenceRef(
+      core::CommissionedStopInterfaceId commissioned_stop_interface_id,
+      core::CommissionedStopInterfaceRevision
+          commissioned_stop_interface_revision,
+      core::RetainedArtifactRefDTO artifact_ref)
+      : commissioned_stop_interface_id_(
+            std::move(commissioned_stop_interface_id)),
+        commissioned_stop_interface_revision_(
+            std::move(commissioned_stop_interface_revision)),
+        artifact_ref_(std::move(artifact_ref)) {}
+
+  core::CommissionedStopInterfaceId commissioned_stop_interface_id_;
+  core::CommissionedStopInterfaceRevision
+      commissioned_stop_interface_revision_;
+  core::RetainedArtifactRefDTO artifact_ref_;
+
+  friend QualifiedCommissioningEvidenceRef
+  resolve_and_verify_commissioning_evidence_ref(
+      const core::CommissionedStopInterfaceDTO&,
+      const core::ContentAddressedStoreKey&, std::string_view);
+};
 
 /// Strictly typed and collection-normalized deployment applicability inputs
 /// whose declared capability-provider-binding revisions remain untrusted.
@@ -61,6 +112,13 @@ class TypedDeploymentApplicabilityInputsCandidate final {
       const noexcept {
     return data_->normalized_external_resources;
   }
+  [[nodiscard]] const std::optional<CanonicalValue>& normalized_policies()
+      const noexcept {
+    return data_->normalized_policies;
+  }
+  [[nodiscard]] bool policies_was_present() const noexcept {
+    return data_->normalized_policies.has_value();
+  }
   [[nodiscard]] SiteOverlayRefSourcePresence site_overlay_ref_presence()
       const noexcept {
     return data_->site_overlay_ref_presence;
@@ -85,6 +143,7 @@ class TypedDeploymentApplicabilityInputsCandidate final {
          CanonicalValue normalized_desired_control_configurations_in,
          CanonicalValue normalized_capability_provider_bindings_in,
          CanonicalValue normalized_external_resources_in,
+         std::optional<CanonicalValue> normalized_policies_in,
          SiteOverlayRefSourcePresence site_overlay_ref_presence_in,
          std::optional<CanonicalValue> normalized_site_overlay_ref_in,
          bool external_resources_was_present_in,
@@ -96,6 +155,7 @@ class TypedDeploymentApplicabilityInputsCandidate final {
               std::move(normalized_capability_provider_bindings_in)),
           normalized_external_resources(
               std::move(normalized_external_resources_in)),
+          normalized_policies(std::move(normalized_policies_in)),
           site_overlay_ref_presence(site_overlay_ref_presence_in),
           normalized_site_overlay_ref(
               std::move(normalized_site_overlay_ref_in)),
@@ -106,6 +166,7 @@ class TypedDeploymentApplicabilityInputsCandidate final {
     CanonicalValue normalized_desired_control_configurations;
     CanonicalValue normalized_capability_provider_bindings;
     CanonicalValue normalized_external_resources;
+    std::optional<CanonicalValue> normalized_policies;
     SiteOverlayRefSourcePresence site_overlay_ref_presence{
         SiteOverlayRefSourcePresence::kAbsent};
     std::optional<CanonicalValue> normalized_site_overlay_ref;
@@ -118,6 +179,7 @@ class TypedDeploymentApplicabilityInputsCandidate final {
       CanonicalValue normalized_desired_control_configurations,
       CanonicalValue normalized_capability_provider_bindings,
       CanonicalValue normalized_external_resources,
+      std::optional<CanonicalValue> normalized_policies,
       SiteOverlayRefSourcePresence site_overlay_ref_presence,
       std::optional<CanonicalValue> normalized_site_overlay_ref,
       bool external_resources_was_present,
@@ -127,6 +189,7 @@ class TypedDeploymentApplicabilityInputsCandidate final {
             std::move(normalized_desired_control_configurations),
             std::move(normalized_capability_provider_bindings),
             std::move(normalized_external_resources),
+            std::move(normalized_policies),
             site_overlay_ref_presence,
             std::move(normalized_site_overlay_ref),
             external_resources_was_present, assistant_settings)) {}
@@ -177,6 +240,13 @@ class RevisionVerifiedDeploymentApplicabilityInputs final {
   [[nodiscard]] const CanonicalValue& normalized_external_resources()
       const noexcept {
     return data_->candidate.normalized_external_resources();
+  }
+  [[nodiscard]] const std::optional<CanonicalValue>& normalized_policies()
+      const noexcept {
+    return data_->candidate.normalized_policies();
+  }
+  [[nodiscard]] bool policies_was_present() const noexcept {
+    return data_->candidate.policies_was_present();
   }
   [[nodiscard]] SiteOverlayRefSourcePresence site_overlay_ref_presence()
       const noexcept {
@@ -253,5 +323,17 @@ compute_capability_provider_binding_revisions(
 [[nodiscard]] RevisionVerifiedDeploymentApplicabilityInputs
 verify_capability_provider_binding_revisions(
     const TypedDeploymentApplicabilityInputsCandidate& candidate);
+
+/// Resolves one commissioning row through immutable-store readback.
+///
+/// This is the only producer of QualifiedCommissioningEvidenceRef.  It
+/// verifies the fixed role/media type, exact safe CAS key, byte count and
+/// SHA-256 digest against the bytes returned by the outer deployment
+/// resolver.  C0.2n receives only the resulting prefiltered proof closure.
+[[nodiscard]] QualifiedCommissioningEvidenceRef
+resolve_and_verify_commissioning_evidence_ref(
+    const core::CommissionedStopInterfaceDTO& commissioned_interface,
+    const core::ContentAddressedStoreKey& resolved_store_key,
+    std::string_view stored_bytes);
 
 }  // namespace manyforge::deployment

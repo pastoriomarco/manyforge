@@ -178,6 +178,7 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
         {EndpointRoleId{"trajectory_command"}},
         {EndpointRoleId{"joint_state"}}}},
       ProviderInstanceId{"xarm_hardware.a"},
+      runtime_unit.runtime_unit_id,
       ProviderManifestId{"xarm_hardware"},
       ProviderManifestRevision{kDigest},
       StateAuthorityId{"xarm_measured_state"},
@@ -346,12 +347,17 @@ TEST(ComposableCellContracts, ProviderManifestRegistryUsesReusableManifestIdenti
 }
 
 TEST(ComposableCellContracts, StopEvidencePolicyTypesPreserveTheClosedDeclarativeVocabulary) {
-  EXPECT_EQ(kStopEvidencePolicyApiVersion, "manyforge.stop_evidence_policy.v1");
+  EXPECT_EQ(kStopEvidencePolicyApiVersion, "manyforge.stop_evidence_policy.v2");
+  EXPECT_EQ(kMaxStopEscalationStages, 8U);
   EXPECT_EQ(kMaxStopEvidencePolicyItems, 64U);
   EXPECT_EQ(kMaxStopEvidencePolicyDurationNs, 9007199254740991LL);
   EXPECT_EQ(to_string(StopEvidenceDisposition::kStoppable), "stoppable");
   EXPECT_EQ(to_string(StopEvidenceDisposition::kNotStoppable), "not_stoppable");
   EXPECT_EQ(to_string(StopContainmentCommandKind::kRegistered), "registered");
+  EXPECT_EQ(to_string(StopEscalationStageKind::kControlledFallback),
+            "controlled_fallback");
+  EXPECT_EQ(to_string(StopEscalationStageKind::kSoftwareHard),
+            "software_hard");
   EXPECT_EQ(to_string(StopEvidenceConjunction::kAllOf), "all_of");
   EXPECT_EQ(to_string(StopEvidenceRequirementKind::kLogicalCancellationNoContinuingEffect),
             "logical_cancellation_no_continuing_effect");
@@ -368,45 +374,86 @@ TEST(ComposableCellContracts, StopEvidencePolicyTypesPreserveTheClosedDeclarativ
       StopEvidencePolicyRevision{kDigest},
       StopEvidenceDisposition::kStoppable,
       ContainmentGranularity::kControlDomain,
-      StopContainmentCommandDTO{
-          StopBudgetPhaseId{"command"},
-          StopContainmentCommandKind::kMotionControlledStop,
-          contract,
-          std::nullopt,
-      },
       StopDeadlineBudgetDTO{
           1'000,
           100,
           {
               {StopBudgetPhaseId{"command"}, 100},
               {StopBudgetPhaseId{"rest"}, 500},
+              {StopBudgetPhaseId{"hard_command"}, 700},
           },
       },
-      StopEvidenceConjunction::kAllOf,
       {
           {
-              StopEvidenceItemId{"rest"},
-              StopBudgetPhaseId{"rest"},
-              StopEvidenceRequirementKind::kMotionRest,
-              contract,
-              std::nullopt,
+              StopEscalationStageId{"nominal_controlled"},
+              StopEscalationStageKind::kNominal,
+              ContainmentGranularity::kResource,
               {
-                  StopEvidenceSourceKind::kBindingStateAuthority,
-                  25,
-                  EndpointRoleId{"measured_state"},
-                  {StateAuthorityClass::kMeasured},
+                  StopBudgetPhaseId{"command"},
+                  StopContainmentCommandKind::kMotionControlledStop,
+                  contract,
+                  std::nullopt,
               },
+              StopEvidenceConjunction::kAllOf,
+              {{
+                  StopEvidenceItemId{"rest"},
+                  StopBudgetPhaseId{"rest"},
+                  StopEvidenceRequirementKind::kMotionRest,
+                  contract,
+                  std::nullopt,
+                  {
+                      StopEvidenceSourceKind::kBindingStateAuthority,
+                      25,
+                      EndpointRoleId{"measured_state"},
+                      {StateAuthorityClass::kMeasured},
+                  },
+                  {
+                      StopEvidenceObservationKind::kPostCommandDwell,
+                      200,
+                  },
+              }},
+          },
+          {
+              StopEscalationStageId{"software_hard_floor"},
+              StopEscalationStageKind::kSoftwareHard,
+              ContainmentGranularity::kControlDomain,
               {
-                  StopEvidenceObservationKind::kPostCommandDwell,
-                  200,
+                  StopBudgetPhaseId{"hard_command"},
+                  StopContainmentCommandKind::kRegistered,
+                  contract,
+                  RegisteredStopCommandKindId{"software_hard_stop"},
               },
+              StopEvidenceConjunction::kAllOf,
+              {{
+                  StopEvidenceItemId{"hard_acknowledged"},
+                  StopBudgetPhaseId{"hard_command"},
+                  StopEvidenceRequirementKind::kDiscreteAcknowledgement,
+                  std::nullopt,
+                  std::nullopt,
+                  {
+                      StopEvidenceSourceKind::kCommandTargetStatus,
+                      25,
+                      std::nullopt,
+                      {},
+                  },
+                  {
+                      StopEvidenceObservationKind::kCommandResult,
+                      std::nullopt,
+                  },
+              }},
           },
       },
   };
   ASSERT_TRUE(policy.deadline_budget.has_value());
-  EXPECT_EQ(policy.deadline_budget->phases.size(), 2U);
-  ASSERT_EQ(policy.evidence_requirements.size(), 1U);
-  EXPECT_EQ(policy.evidence_requirements.front().provider_contract_ref, contract);
+  EXPECT_EQ(policy.deadline_budget->phases.size(), 3U);
+  ASSERT_EQ(policy.escalation_stages.size(), 2U);
+  EXPECT_EQ(policy.escalation_stages.front().stage_kind,
+            StopEscalationStageKind::kNominal);
+  ASSERT_EQ(policy.escalation_stages.front().evidence_requirements.size(), 1U);
+  EXPECT_EQ(policy.escalation_stages.front()
+                .evidence_requirements.front()
+                .provider_contract_ref,
+            contract);
 }
 
 TEST(ComposableCellContracts, CapabilityDefinitionRegistryIsExactTypedAndCodeOwned) {

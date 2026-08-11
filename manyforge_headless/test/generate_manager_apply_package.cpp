@@ -62,7 +62,10 @@ struct Arguments final {
       std::span<const deployment::QualifiedControlInterfaceContract>{},
       std::span<const deployment::QualifiedControllerTopology>{},
       std::span<const deployment::QualifiedProviderManifest>{},
-      std::span<const deployment::QualifiedStopEvidencePolicy>{}, overlay);
+      std::span<const deployment::QualifiedStopEvidencePolicy>{},
+      std::span<const deployment::BuildQualifiedValueSchemaEntry>{},
+      std::span<const deployment::QualifiedCommissioningEvidenceRef>{},
+      overlay);
   return deployment::qualify_deployment_for_retention(
       source, deployment::compile_cell_ir(applicability));
 }

@@ -3,6 +3,8 @@
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 
+#include "native_stop_qualification_probe.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -52,8 +54,17 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<IRetainedObservedStateChannel> state_channel,
     core::IClock &clock, RoboPlanExecutionBackendConfig config)
+    : RoboPlanExecutionBackend(std::move(binding), std::move(state_channel),
+                               clock, std::move(config), nullptr) {}
+
+RoboPlanExecutionBackend::RoboPlanExecutionBackend(
+    core::RuntimeParticipantBinding binding,
+    std::shared_ptr<IRetainedObservedStateChannel> state_channel,
+    core::IClock &clock, RoboPlanExecutionBackendConfig config,
+    detail::INativeStopQualificationProbe *qualification_probe)
     : binding_(std::move(binding)), state_channel_(std::move(state_channel)),
-      clock_(clock), config_(config) {
+      clock_(clock), config_(std::move(config)),
+      qualification_probe_(qualification_probe) {
   if (config_.reset_completion_timeout_s <= 0.0 ||
       !std::isfinite(config_.reset_completion_timeout_s)) {
     throw std::invalid_argument(
@@ -131,6 +142,13 @@ RoboPlanExecutionBackend::~RoboPlanExecutionBackend() {
   stop_terminal_scene_projection_retry_worker();
   (void)reset();
   // jthread auto-joins
+}
+
+void RoboPlanExecutionBackend::observe_stop_qualification(
+    detail::NativeStopQualificationEvent event, std::string_view detail) {
+  if (qualification_probe_ != nullptr) {
+    qualification_probe_->observe(event, detail);
+  }
 }
 
 std::int64_t RoboPlanExecutionBackend::publish_snapshot(
@@ -382,7 +400,18 @@ void RoboPlanExecutionBackend::execution_worker(
   bool completed_normally = false;
 
   if (st.stop_requested()) {
-    state_.running.store(false);
+    observe_stop_qualification(
+        detail::NativeStopQualificationEvent::
+            kWorkerStopObservedBeforeTerminal);
+    const auto stopped_snapshot_ns = publish_snapshot(
+        core::ExecutionState::kStopped, get_execution_snapshot().progress,
+        latest_positions);
+    if (!update_scene_positions(latest_positions, SceneUpdateMode::kBestEffort,
+                                stopped_snapshot_ns)) {
+      schedule_terminal_scene_projection_retry(latest_positions,
+                                               stopped_snapshot_ns);
+    }
+    state_.running.store(false, std::memory_order_release);
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
     execution_cv_.notify_all();
@@ -408,11 +437,16 @@ void RoboPlanExecutionBackend::execution_worker(
     state_.active_trajectory_time_s = trajectory_time_s;
     state_.active_runtime_velocity_scale = applied_runtime_scale;
   }
+  observe_stop_qualification(
+      detail::NativeStopQualificationEvent::kExecutionLoopArmed);
 
   while (true) {
     const bool pause_requested = state_.pause_requested.load();
 
     if (st.stop_requested()) {
+      observe_stop_qualification(
+          detail::NativeStopQualificationEvent::
+              kWorkerStopObservedBeforeTerminal);
       const auto stopped_snapshot_ns =
           publish_snapshot(core::ExecutionState::kStopped,
                            get_execution_snapshot().progress, latest_positions);
@@ -552,6 +586,13 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
       trajectory.waypoints.empty() ? std::vector<double>{}
                                    : trajectory.waypoints.front().positions_rad;
 
+  // Bind this execution to the exact software-hard generation that admitted
+  // it. A controlled Stop that starts after a hard issue must not treat the
+  // newly incremented generation as a fresh baseline and resurrect the
+  // execution through a replacement trajectory.
+  active_execution_hard_stop_generation_.store(
+      hard_stop_request_generation_.load(std::memory_order_acquire),
+      std::memory_order_release);
   state_.running.store(true);
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
@@ -667,7 +708,15 @@ RoboPlanExecutionBackend::sync_observed_state_before_planning() {
 }
 
 core::StopResultDTO RoboPlanExecutionBackend::stop() {
-  if (!state_.running.load()) {
+  // Advance first, even in the brief controlled-stop handoff where the old
+  // worker is down and its replacement has not yet been rearmed. Otherwise a
+  // hard Stop issued in that window can be rejected and then lost when the
+  // controlled path starts moving again.
+  request_active_controlled_stop();
+  const bool execution_running = state_.running.load(std::memory_order_acquire);
+  const bool controlled_stop_active =
+      controlled_stop_activity_count_.load(std::memory_order_acquire) > 0U;
+  if (!execution_running && !controlled_stop_active) {
     return core::StopResultDTO{false, core::ErrorDTO{core::kErrorInvalidRequest,
                                                      "No execution in flight",
                                                      {}}};
@@ -675,21 +724,17 @@ core::StopResultDTO RoboPlanExecutionBackend::stop() {
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
-  request_active_controlled_stop();
   worker_thread_.request_stop();
   execution_cv_.notify_all();
   return core::StopResultDTO{true, std::nullopt};
 }
 
 void RoboPlanExecutionBackend::request_active_controlled_stop() {
-  std::shared_ptr<std::stop_source> source;
-  {
-    std::lock_guard<std::mutex> lock(controlled_stop_mutex_);
-    source = active_controlled_stop_source_;
-  }
-  if (source) {
-    source->request_stop();
-  }
+  // This is the independently progress-capable cancellation edge used by the
+  // software-hard lane. Controlled-stop code snapshots the generation at
+  // entry and observes a mismatch without sharing any nominal mutex, future,
+  // provider call, or result-wait state.
+  hard_stop_request_generation_.fetch_add(1U, std::memory_order_acq_rel);
 }
 
 // Controlled-stop capability + result surface.
@@ -733,9 +778,27 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
 core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
     const core::MotionInterruptStopProfileDTO &profile,
     std::stop_token stop_token) {
+  const auto hard_stop_request_generation =
+      active_execution_hard_stop_generation_.load(std::memory_order_acquire);
+  return execute_controlled_stop_impl(profile, stop_token,
+                                      hard_stop_request_generation);
+}
+
+core::ControlledStopResultDTO
+RoboPlanExecutionBackend::execute_controlled_stop_impl(
+    const core::MotionInterruptStopProfileDTO &profile,
+    std::stop_token stop_token,
+    std::uint64_t hard_stop_request_generation) {
+  controlled_stop_activity_count_.fetch_add(1U, std::memory_order_acq_rel);
   begin_controlled_stop_runtime_scale_freeze();
   const auto runtime_scale_freeze_scope = std::shared_ptr<void>(
-      nullptr, [this](void *) { end_controlled_stop_runtime_scale_freeze(); });
+      nullptr, [this](void *) {
+        end_controlled_stop_runtime_scale_freeze();
+        controlled_stop_activity_count_.fetch_sub(1U,
+                                                  std::memory_order_acq_rel);
+      });
+  observe_stop_qualification(
+      detail::NativeStopQualificationEvent::kNominalProviderEntry);
 
   // Defense in depth: the kernel's arm-time gate already rejects
   // unsupported modes, but a backend that has been mis-wired into
@@ -743,37 +806,34 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
   // silently producing a hold for a path-preserving request.
   core::ControlledStopResultDTO result;
   result.executed_stop_mode = profile.stop_mode;
-  auto backend_stop_source = std::make_shared<std::stop_source>();
-  {
-    std::lock_guard<std::mutex> lock(controlled_stop_mutex_);
-    active_controlled_stop_source_ = backend_stop_source;
-  }
-  const auto clear_active_controlled_stop =
-      std::shared_ptr<void>(nullptr, [this, backend_stop_source](void *) {
-        std::lock_guard<std::mutex> lock(controlled_stop_mutex_);
-        if (active_controlled_stop_source_ == backend_stop_source) {
-          active_controlled_stop_source_.reset();
-        }
-      });
   const auto controlled_stop_requested = [&]() {
-    return stop_token.stop_requested() || backend_stop_source->stop_requested();
+    return stop_token.stop_requested() ||
+           hard_stop_request_generation_.load(std::memory_order_acquire) !=
+               hard_stop_request_generation;
   };
 
-  const auto cancelled_result = [&](std::string phase) {
-    state_.running.store(false);
-    state_.natural_completion_stop_requested.store(false,
-                                                   std::memory_order_release);
-    const auto latest = get_execution_snapshot();
-    const auto stopped_snapshot_ns =
-        publish_snapshot(core::ExecutionState::kStopped, latest.progress,
-                         latest.joint_positions_rad);
-    if (!update_scene_positions(latest.joint_positions_rad,
-                                SceneUpdateMode::kBestEffort,
-                                stopped_snapshot_ns)) {
-      schedule_terminal_scene_projection_retry(latest.joint_positions_rad,
-                                               stopped_snapshot_ns);
+  const auto cancelled_result = [&](std::string phase,
+                                    bool replay_lane_has_ceased = false) {
+    // Before replacement replay, the real worker owns terminal publication;
+    // never forge Stopped merely because cancellation was observed. During
+    // synchronous replacement replay this caller is the command lane, so its
+    // return is the actual cessation edge and may publish the terminal state.
+    if (replay_lane_has_ceased) {
+      state_.natural_completion_stop_requested.store(
+          false, std::memory_order_release);
+      const auto latest = get_execution_snapshot();
+      const auto stopped_snapshot_ns =
+          publish_snapshot(core::ExecutionState::kStopped, latest.progress,
+                           latest.joint_positions_rad);
+      if (!update_scene_positions(latest.joint_positions_rad,
+                                  SceneUpdateMode::kBestEffort,
+                                  stopped_snapshot_ns)) {
+        schedule_terminal_scene_projection_retry(latest.joint_positions_rad,
+                                                 stopped_snapshot_ns);
+      }
+      state_.running.store(false, std::memory_order_release);
+      execution_cv_.notify_all();
     }
-    execution_cv_.notify_all();
     result.accepted = true;
     result.backend_stop_confirmed = false;
     result.error = core::ErrorDTO{
@@ -785,14 +845,17 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
   std::stop_callback stop_notify(stop_token,
                                  [this]() { execution_cv_.notify_all(); });
 
+  if (controlled_stop_requested()) {
+    return cancelled_result("controlled_stop_entry");
+  }
+
   if (profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath) {
-    if (controlled_stop_requested()) {
-      return cancelled_result("soft_on_path_entry");
-    }
     std::shared_ptr<const core::TrajectoryDTO> active_trajectory;
     core::ExecutionSnapshot active_snapshot;
     double active_time_s = 0.0;
     double active_runtime_scale = 1.0;
+    observe_stop_qualification(
+        detail::NativeStopQualificationEvent::kNominalAdapterLockAttempt);
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       active_snapshot = state_.snapshot;
@@ -860,6 +923,9 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                 std::chrono::duration<double>(wait_deadline_s));
         bool completed = false;
+        observe_stop_qualification(
+            detail::NativeStopQualificationEvent::kNominalResultWaitEnter,
+            "natural_completion");
         {
           std::unique_lock<std::mutex> lock(execution_mutex_);
           while (!controlled_stop_requested()) {
@@ -939,7 +1005,13 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
         core::MotionInterruptStopProfileDTO fallback_profile = profile;
         fallback_profile.stop_mode =
             core::MotionInterruptStopMode::kSpringBackHold;
-        auto fallback = execute_controlled_stop(fallback_profile, stop_token);
+        observe_stop_qualification(
+            detail::NativeStopQualificationEvent::kSubstitutionSelected,
+            planned.error().details.count("reason") > 0
+                ? planned.error().details.at("reason")
+                : "soft_on_path_planner_rejected");
+        auto fallback = execute_controlled_stop_impl(
+            fallback_profile, stop_token, hard_stop_request_generation);
         fallback.executed_stop_mode =
             core::MotionInterruptStopMode::kSpringBackHold;
         fallback.fallback_reason = planned.error().details.count("reason") > 0
@@ -958,11 +1030,20 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
     }
 
     const auto call_start_ns = clock_.now();
+    if (controlled_stop_requested()) {
+      return cancelled_result("soft_on_path_before_dispatch");
+    }
     state_.pause_requested.store(false);
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
+    observe_stop_qualification(
+        detail::NativeStopQualificationEvent::kPhysicalDispatch,
+        "soft_on_path");
     worker_thread_.request_stop();
     execution_cv_.notify_all();
+    observe_stop_qualification(
+        detail::NativeStopQualificationEvent::kNominalResultWaitEnter,
+        "soft_on_path");
     {
       std::unique_lock<std::mutex> lock(execution_mutex_);
       const auto deadline =
@@ -997,7 +1078,16 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
     }
 
     const auto &replacement = planned.value().replacement_trajectory;
+    observe_stop_qualification(
+        detail::NativeStopQualificationEvent::kNominalRearmAttempt,
+        "soft_on_path");
+    if (controlled_stop_requested()) {
+      return cancelled_result("soft_on_path_before_rearm");
+    }
     state_.running.store(true);
+    if (controlled_stop_requested()) {
+      return cancelled_result("soft_on_path_rearm", true);
+    }
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
     const auto steady_start = std::chrono::steady_clock::now();
@@ -1019,7 +1109,7 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
         std::this_thread::sleep_for(std::min(remaining, max_slice));
       }
       if (controlled_stop_requested()) {
-        return cancelled_result("soft_on_path_replay");
+        return cancelled_result("soft_on_path_replay", true);
       }
       const double progress =
           total_time_s <= 1e-9
@@ -1102,6 +1192,8 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
   core::ExecutionSnapshot active_snapshot;
   double active_time_s = 0.0;
   double active_runtime_scale = 1.0;
+  observe_stop_qualification(
+      detail::NativeStopQualificationEvent::kNominalAdapterLockAttempt);
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     active_snapshot = state_.snapshot;
@@ -1195,11 +1287,17 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
+  observe_stop_qualification(
+      detail::NativeStopQualificationEvent::kPhysicalDispatch,
+      "spring_back_hold");
   worker_thread_.request_stop();
   execution_cv_.notify_all();
 
   const auto wait_deadline_s = controlled_stop_wait_timeout_s(
       profile, config_.soft_on_path_sample_period_s);
+  observe_stop_qualification(
+      detail::NativeStopQualificationEvent::kNominalResultWaitEnter,
+      "spring_back_hold");
   std::unique_lock<std::mutex> lock(execution_mutex_);
   const auto deadline =
       std::chrono::steady_clock::now() +
@@ -1237,7 +1335,16 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
   }
 
   const auto &replacement = planned.value().replacement_trajectory;
+  observe_stop_qualification(
+      detail::NativeStopQualificationEvent::kNominalRearmAttempt,
+      "spring_back_hold");
+  if (controlled_stop_requested()) {
+    return cancelled_result("spring_back_before_rearm");
+  }
   state_.running.store(true);
+  if (controlled_stop_requested()) {
+    return cancelled_result("spring_back_rearm", true);
+  }
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
   const auto steady_start = std::chrono::steady_clock::now();
@@ -1259,7 +1366,7 @@ core::ControlledStopResultDTO RoboPlanExecutionBackend::execute_controlled_stop(
       std::this_thread::sleep_for(std::min(remaining, max_slice));
     }
     if (controlled_stop_requested()) {
-      return cancelled_result("spring_back_replay");
+      return cancelled_result("spring_back_replay", true);
     }
     const double progress =
         total_time_s <= 1e-9

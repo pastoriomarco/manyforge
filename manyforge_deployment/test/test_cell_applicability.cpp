@@ -51,7 +51,7 @@ constexpr std::string_view kProviderManifestSchemaRevision =
 constexpr std::string_view kRuntimeProfileSchemaRevision =
     "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7";
 constexpr std::string_view kStopEvidencePolicySchemaRevision =
-    "sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2";
+    "sha256:c75dcdd59f2101b1c47ccc020cc61b28037256a40dc71fe896f0e4d912f4a970";
 constexpr std::string_view kEmptyRuntimeConfigurationSchemaRevision =
     "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785";
 constexpr std::string_view kEmptyProviderContractSchemaRevision =
@@ -212,11 +212,13 @@ builtin_capability(std::string_view id) {
       CanonicalValue(CanonicalValue::Object{
           {"resource_role_id", CanonicalValue("axis")},
           {"source_kind", CanonicalValue("component_local")},
+          {"coordinate_kind", CanonicalValue("angular")},
       })};
   if (include_plus_one_role) {
     resource_roles.emplace_back(CanonicalValue::Object{
         {"resource_role_id", CanonicalValue("trigger")},
         {"source_kind", CanonicalValue("component_local")},
+        {"coordinate_kind", CanonicalValue("angular")},
     });
   }
   const std::string document = revisioned_document(
@@ -718,6 +720,27 @@ enum class BindingStateStopCase : std::uint8_t {
   return CanonicalValue(CanonicalValue::Object{
       {"provider_contract_role_id", CanonicalValue("stop_contract")},
       {"contract_schema_id",
+       CanonicalValue(std::string(core::kMotionControlledStopContractSchemaId))},
+      {"contract_schema_revision",
+       CanonicalValue(
+           std::string(core::kMotionControlledStopContractSchemaRevision))},
+  });
+}
+
+[[nodiscard]] CanonicalValue software_hard_contract_ref() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"provider_contract_role_id", CanonicalValue("software_hard_stop")},
+      {"contract_schema_id",
+       CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+      {"contract_schema_revision",
+       CanonicalValue(std::string(kEmptyProviderContractSchemaRevision))},
+  });
+}
+
+[[nodiscard]] CanonicalValue safety_request_contract_ref() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"provider_contract_role_id", CanonicalValue("safety_stop_request")},
+      {"contract_schema_id",
        CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
       {"contract_schema_revision",
        CanonicalValue(std::string(kEmptyProviderContractSchemaRevision))},
@@ -735,7 +758,8 @@ enum class BindingStateStopCase : std::uint8_t {
         ProviderStopCompatibilityCase::kExact,
     ControlProviderOfferCase control_offer_case =
         ControlProviderOfferCase::kExact,
-    std::string_view selected_control_capability_id = {}) {
+    std::string_view selected_control_capability_id = {},
+    bool include_safety_stage = false) {
   const bool provider_defined_stop =
       stop_form == StopForm::kProviderDefined;
   const bool binding_state_stop =
@@ -859,6 +883,40 @@ enum class BindingStateStopCase : std::uint8_t {
         CanonicalValue(std::move(evidence_support)));
     contracts.emplace_back(std::move(contract));
   }
+  if (stop_form != StopForm::kNotStoppable) {
+    contracts.emplace_back(CanonicalValue::Object{
+        {"provider_contract_ref", software_hard_contract_ref()},
+        {"stop_command_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"command_kind", CanonicalValue("registered")},
+             {"registered_command_kind_id",
+              CanonicalValue("manyforge.stop.software_hard")},
+             {"command_endpoint_role_ids",
+              CanonicalValue(CanonicalValue::Array{})},
+         })},
+        {"stop_evidence_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"evidence_kind", CanonicalValue("motion_rest")},
+             {"evidence_endpoint_role_ids", string_set({"state"})},
+         })},
+    });
+  }
+  if (include_safety_stage) {
+    contracts.emplace_back(CanonicalValue::Object{
+        {"provider_contract_ref", safety_request_contract_ref()},
+        {"stop_command_support",
+         CanonicalValue(CanonicalValue::Object{
+             {"command_kind", CanonicalValue("registered")},
+             {"registered_command_kind_id",
+              CanonicalValue("manyforge.stop.safety.protective_request")},
+             {"command_endpoint_role_ids", string_set({"stop_command"})},
+         })},
+    });
+  }
+  std::sort(contracts.begin(), contracts.end(), [](const auto& left,
+                                                   const auto& right) {
+    return canonical_json(left) < canonical_json(right);
+  });
   const std::string document = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
           {"api_version",
@@ -940,7 +998,10 @@ enum class BindingStateStopCase : std::uint8_t {
     BindingStateStopCase binding_state_case =
         BindingStateStopCase::kExact,
     ProviderStopCompatibilityCase compatibility_case =
-        ProviderStopCompatibilityCase::kExact) {
+        ProviderStopCompatibilityCase::kExact,
+    bool include_safety_stage = false,
+    bool safety_stage_nonfinal = false,
+    bool omit_software_hard_floor = false) {
   CanonicalValue identity = [&]() {
     if (form == StopForm::kNotStoppable) {
       return CanonicalValue(CanonicalValue::Object{
@@ -995,16 +1056,168 @@ enum class BindingStateStopCase : std::uint8_t {
     if (binding_state) {
       observation.emplace_back("minimum_dwell_ns", CanonicalValue(10.0));
     }
+    const bool distinct_nominal_evidence_phase =
+        form == StopForm::kProviderDefined || binding_state;
+    const bool requires_hard_floor =
+        form != StopForm::kNotStoppable && !omit_software_hard_floor;
+    const std::string nominal_command_phase =
+        distinct_nominal_evidence_phase ? "nominal_command" : "command";
+    const std::string nominal_evidence_phase =
+        distinct_nominal_evidence_phase ? "nominal_terminal" : "command";
     CanonicalValue::Array phases{
         CanonicalValue(CanonicalValue::Object{
-            {"phase_id", CanonicalValue("command")},
+            {"phase_id", CanonicalValue(nominal_command_phase)},
             {"deadline_offset_ns", CanonicalValue(100.0)},
         })};
-    if (form == StopForm::kProviderDefined || binding_state) {
+    if (distinct_nominal_evidence_phase) {
       phases.emplace_back(CanonicalValue::Object{
-          {"phase_id", CanonicalValue("terminal")},
+          {"phase_id", CanonicalValue(nominal_evidence_phase)},
+          {"deadline_offset_ns", CanonicalValue(300.0)},
+      });
+    }
+    if (requires_hard_floor) {
+      phases.emplace_back(CanonicalValue::Object{
+          {"phase_id", CanonicalValue("hard_command")},
           {"deadline_offset_ns", CanonicalValue(500.0)},
       });
+      phases.emplace_back(CanonicalValue::Object{
+          {"phase_id", CanonicalValue("hard_terminal")},
+          {"deadline_offset_ns", CanonicalValue(800.0)},
+      });
+    }
+    if (include_safety_stage) {
+      if (!requires_hard_floor) {
+        throw std::logic_error(
+            "safety-stage fixture requires the complete motion Stop chain");
+      }
+      phases.emplace_back(CanonicalValue::Object{
+          {"phase_id", CanonicalValue("safety_command")},
+          {"deadline_offset_ns", CanonicalValue(1000.0)},
+      });
+      phases.emplace_back(CanonicalValue::Object{
+          {"phase_id", CanonicalValue("safety_terminal")},
+          {"deadline_offset_ns", CanonicalValue(1200.0)},
+      });
+    }
+    CanonicalValue::Array stages;
+    stages.emplace_back(CanonicalValue::Object{
+        {"stop_escalation_stage_id", CanonicalValue("nominal")},
+        {"stage_kind", CanonicalValue("nominal")},
+        {"containment_granularity",
+         CanonicalValue(std::string(containment_granularity))},
+        {"containment_command",
+         CanonicalValue(CanonicalValue::Object{
+             {"command_phase_id", CanonicalValue(nominal_command_phase)},
+             {"command", stop_command(form, compatibility_case)},
+         })},
+        {"evidence_conjunction", CanonicalValue("all_of")},
+        {"evidence_requirements",
+         CanonicalValue(CanonicalValue::Array{CanonicalValue(
+             CanonicalValue::Object{
+                 {"evidence_item_id", CanonicalValue("nominal_evidence")},
+                 {"phase_id", CanonicalValue(nominal_evidence_phase)},
+                 {"evidence", stop_evidence(form, compatibility_case)},
+                 {"source_requirement", CanonicalValue(std::move(source))},
+                 {"observation_semantics",
+                  CanonicalValue(std::move(observation))},
+             })})},
+    });
+    if (requires_hard_floor) {
+      stages.emplace_back(CanonicalValue::Object{
+          {"stop_escalation_stage_id", CanonicalValue("software_hard")},
+          {"stage_kind", CanonicalValue("software_hard")},
+          {"containment_granularity",
+           CanonicalValue(std::string(containment_granularity))},
+          {"containment_command",
+           CanonicalValue(CanonicalValue::Object{
+               {"command_phase_id", CanonicalValue("hard_command")},
+               {"command",
+                CanonicalValue(CanonicalValue::Object{
+                    {"command_kind", CanonicalValue("registered")},
+                    {"provider_contract_ref", software_hard_contract_ref()},
+                    {"registered_command_kind_id",
+                     CanonicalValue("manyforge.stop.software_hard")},
+                })},
+           })},
+          {"evidence_conjunction", CanonicalValue("all_of")},
+          {"evidence_requirements",
+           CanonicalValue(CanonicalValue::Array{CanonicalValue(
+               CanonicalValue::Object{
+                   {"evidence_item_id", CanonicalValue("hard_rest")},
+                   {"phase_id", CanonicalValue("hard_terminal")},
+                   {"evidence",
+                    CanonicalValue(CanonicalValue::Object{
+                        {"evidence_kind", CanonicalValue("motion_rest")},
+                        {"provider_contract_ref",
+                         software_hard_contract_ref()},
+                    })},
+                   {"source_requirement",
+                    CanonicalValue(CanonicalValue::Object{
+                        {"source_kind",
+                         CanonicalValue("binding_state_authority")},
+                        {"freshness_budget_ns", CanonicalValue(25.0)},
+                        {"state_endpoint_role_id", CanonicalValue("state")},
+                        {"allowed_authority_classes",
+                         string_set({"measured"})},
+                    })},
+                   {"observation_semantics",
+                    CanonicalValue(CanonicalValue::Object{
+                        {"observation_kind",
+                         CanonicalValue("post_command_dwell")},
+                        {"minimum_dwell_ns", CanonicalValue(10.0)},
+                    })},
+               })})},
+      });
+    }
+    if (include_safety_stage) {
+      stages.emplace_back(CanonicalValue::Object{
+          {"stop_escalation_stage_id", CanonicalValue("safety_request")},
+          {"stage_kind", CanonicalValue("safety_system_request")},
+          {"containment_granularity",
+           CanonicalValue(std::string(containment_granularity))},
+          {"containment_command",
+           CanonicalValue(CanonicalValue::Object{
+               {"command_phase_id", CanonicalValue("safety_command")},
+               {"command",
+                CanonicalValue(CanonicalValue::Object{
+                    {"command_kind", CanonicalValue("registered")},
+                    {"provider_contract_ref", safety_request_contract_ref()},
+                    {"registered_command_kind_id",
+                     CanonicalValue(
+                         "manyforge.stop.safety.protective_request")},
+                })},
+           })},
+          {"evidence_conjunction", CanonicalValue("all_of")},
+          {"evidence_requirements",
+           CanonicalValue(CanonicalValue::Array{CanonicalValue(
+               CanonicalValue::Object{
+                   {"evidence_item_id", CanonicalValue("safety_ack")},
+                   {"phase_id", CanonicalValue("safety_terminal")},
+                   {"evidence",
+                    CanonicalValue(CanonicalValue::Object{
+                        {"evidence_kind",
+                         CanonicalValue("discrete_acknowledgement")},
+                    })},
+                   {"source_requirement",
+                    CanonicalValue(CanonicalValue::Object{
+                        {"source_kind",
+                         CanonicalValue("command_target_status")},
+                        {"freshness_budget_ns", CanonicalValue(25.0)},
+                    })},
+                   {"observation_semantics",
+                    CanonicalValue(CanonicalValue::Object{
+                        {"observation_kind",
+                         CanonicalValue("post_command_sample")},
+                    })},
+               })})},
+      });
+    }
+    if (safety_stage_nonfinal) {
+      if (stages.size() < 3U) {
+        throw std::logic_error(
+            "non-final safety-stage fixture lacks a complete Stop chain");
+      }
+      std::swap(stages[1], stages[2]);
     }
     return CanonicalValue(CanonicalValue::Object{
         {"api_version",
@@ -1019,32 +1232,14 @@ enum class BindingStateStopCase : std::uint8_t {
         {"disposition", CanonicalValue("stoppable")},
         {"containment_granularity",
          CanonicalValue(std::string(containment_granularity))},
-        {"containment_command",
-         CanonicalValue(CanonicalValue::Object{
-             {"command_phase_id", CanonicalValue("command")},
-             {"command", stop_command(form, compatibility_case)},
-         })},
         {"deadline_budget",
          CanonicalValue(CanonicalValue::Object{
-             {"outer_duration_ns", CanonicalValue(1000.0)},
+             {"outer_duration_ns",
+              CanonicalValue(include_safety_stage ? 1400.0 : 1000.0)},
              {"kernel_completion_reserve_ns", CanonicalValue(100.0)},
              {"phases", CanonicalValue(std::move(phases))},
          })},
-        {"evidence_conjunction", CanonicalValue("all_of")},
-        {"evidence_requirements",
-         CanonicalValue(CanonicalValue::Array{CanonicalValue(
-             CanonicalValue::Object{
-                 {"evidence_item_id", CanonicalValue("terminal_evidence")},
-                 {"phase_id",
-                  CanonicalValue(form == StopForm::kIntrinsic
-                                     ? "command"
-                                     : "terminal")},
-                 {"evidence",
-                  stop_evidence(form, compatibility_case)},
-                 {"source_requirement", CanonicalValue(std::move(source))},
-                 {"observation_semantics",
-                  CanonicalValue(std::move(observation))},
-             })})},
+        {"escalation_stages", CanonicalValue(std::move(stages))},
     });
   }();
   const std::string policy_id =
@@ -1132,6 +1327,30 @@ enum class ControlEndpointProjectionCase : std::uint8_t {
   kDualSideRole,
 };
 
+enum class StopParameterCase : std::uint8_t {
+  kExact,
+  kMissingHardStage,
+  kUnusedStage,
+  kStalePolicyRevision,
+  kMissingResource,
+  kWrongCoordinateKind,
+};
+
+enum class CommissionedSafetyCase : std::uint8_t {
+  kNone,
+  kExact,
+  kMissingRow,
+  kMissingProof,
+  kUnusedRow,
+  kWrongRoute,
+  kWrongActionClass,
+  kUnknownExternalResource,
+  kNonFinalStage,
+};
+
+inline constexpr std::string_view kCommissioningEvidenceBytes =
+    R"({"api_version":"manyforge.stop_interface_commissioning_evidence.v1","site":"test"})";
+
 struct GraphOptions final {
   std::size_t binding_count = 1U;
   std::size_t resource_count = 1U;
@@ -1152,6 +1371,7 @@ struct GraphOptions final {
   std::string binding_containment_granularity = "resource";
   std::string domain_containment_granularity = "resource";
   std::string state_authority_class = "measured";
+  StopParameterCase stop_parameter_case = StopParameterCase::kExact;
 };
 
 [[nodiscard]] GraphRevisionVerifiedCellGraph make_graph(
@@ -1344,6 +1564,7 @@ struct GraphOptions final {
          CanonicalValue(std::move(endpoint_projections))},
         {"provider_instance_id",
          CanonicalValue("provider_" + suffix)},
+        {"provider_runtime_unit_id", CanonicalValue("planner_runtime")},
         {"provider_manifest_id",
          CanonicalValue(manifest.value().provider_manifest_id.value())},
         {"provider_manifest_revision",
@@ -1570,6 +1791,10 @@ struct InputOptions final {
       ProviderEndpointCase::kExact;
   ExternalResourceCase external_resource_case =
       ExternalResourceCase::kExact;
+  StopForm stop_form = StopForm::kNotStoppable;
+  StopParameterCase stop_parameter_case = StopParameterCase::kExact;
+  CommissionedSafetyCase commissioned_safety_case =
+      CommissionedSafetyCase::kNone;
 };
 
 [[nodiscard]] std::string desired_route_json(
@@ -1947,6 +2172,209 @@ struct InputOptions final {
        CanonicalValue(std::move(provider_bindings))},
       {"external_resources", CanonicalValue(std::move(external_resources))},
   };
+  if (options.stop_form != StopForm::kNotStoppable) {
+    CanonicalValue::Array parameter_rows;
+    CanonicalValue::Array commissioned_rows;
+    for (const auto& binding : graph.control_bindings) {
+      for (const auto& route_id : binding.legal_control_route_ids) {
+        const auto parameter_row = [&](std::string_view stage_id,
+                                       CanonicalValue contract,
+                                       CanonicalValue parameters) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"control_domain_id",
+               CanonicalValue(binding.control_domain_id.value())},
+              {"control_domain_revision",
+               CanonicalValue(graph.control_domains.front()
+                                  .control_domain_revision.value())},
+              {"control_binding_id",
+               CanonicalValue(binding.control_binding_id.value())},
+              {"control_binding_revision",
+               CanonicalValue(binding.control_binding_revision.value())},
+              {"controller_topology_id",
+               CanonicalValue(binding.controller_topology_id.value())},
+              {"topology_revision",
+               CanonicalValue(binding.topology_revision.value())},
+              {"control_route_id", CanonicalValue(route_id.value())},
+              {"stop_evidence_policy_id",
+               CanonicalValue(binding.stop_evidence_policy_id.value())},
+              {"stop_evidence_policy_revision",
+               CanonicalValue(binding.stop_evidence_policy_revision.value())},
+              {"stop_escalation_stage_id",
+               CanonicalValue(std::string(stage_id))},
+              {"provider_contract_ref", std::move(contract)},
+              {"default_contract_parameters", std::move(parameters)},
+          });
+        };
+        if (options.stop_form == StopForm::kProviderDefined) {
+          CanonicalValue::Array resource_limits;
+          resource_limits.reserve(binding.resource_bindings.size());
+          for (std::size_t resource_index = 0U;
+               resource_index < binding.resource_bindings.size();
+               ++resource_index) {
+            if (options.stop_parameter_case ==
+                    StopParameterCase::kMissingResource &&
+                resource_index + 1U == binding.resource_bindings.size()) {
+              continue;
+            }
+            const auto& resource = binding.resource_bindings[resource_index];
+            const bool wrong_kind =
+                options.stop_parameter_case ==
+                StopParameterCase::kWrongCoordinateKind;
+            resource_limits.emplace_back(CanonicalValue::Object{
+                {"resource_id", CanonicalValue(resource.resource_id.value())},
+                {"max_deceleration",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"coordinate_kind",
+                      CanonicalValue(wrong_kind ? "linear_m_s2"
+                                                : "angular_rad_s2")},
+                     {wrong_kind ? "value_m_s2" : "value_rad_s2",
+                      CanonicalValue(1.0)},
+                 })},
+                {"settle_velocity_threshold",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"coordinate_kind",
+                      CanonicalValue(wrong_kind ? "linear_m_s"
+                                                : "angular_rad_s")},
+                     {wrong_kind ? "value_m_s" : "value_rad_s",
+                      CanonicalValue(0.01)},
+                 })},
+            });
+          }
+          parameter_rows.push_back(parameter_row(
+              "nominal", provider_contract_ref(),
+              CanonicalValue(CanonicalValue::Object{
+                  {"stop_mode", CanonicalValue("soft_on_path")},
+                  {"deceleration_time_s", CanonicalValue(0.25)},
+                  {"per_resource_limits",
+                   CanonicalValue(std::move(resource_limits))},
+                  {"allow_natural_completion_on_short_path",
+                   CanonicalValue(false)},
+              })));
+        }
+        if (options.stop_parameter_case !=
+            StopParameterCase::kMissingHardStage) {
+          CanonicalValue hard_row = parameter_row(
+              options.stop_parameter_case ==
+                      StopParameterCase::kUnusedStage
+                  ? "unused_stage"
+                  : "software_hard",
+              software_hard_contract_ref(),
+              CanonicalValue(CanonicalValue::Object{}));
+          if (options.stop_parameter_case ==
+              StopParameterCase::kStalePolicyRevision) {
+            auto fields = hard_row.as_object();
+            for (auto& [name, value] : fields) {
+              if (name == "stop_evidence_policy_revision") {
+                value = CanonicalValue(std::string(kZeroDigest));
+              }
+            }
+            hard_row = CanonicalValue(std::move(fields));
+          }
+          parameter_rows.push_back(std::move(hard_row));
+        }
+        if (options.commissioned_safety_case !=
+                CommissionedSafetyCase::kNone &&
+            options.commissioned_safety_case !=
+                CommissionedSafetyCase::kUnusedRow) {
+          parameter_rows.push_back(parameter_row(
+              "safety_request", safety_request_contract_ref(),
+              CanonicalValue(CanonicalValue::Object{})));
+        }
+      }
+    }
+    if (options.commissioned_safety_case !=
+            CommissionedSafetyCase::kNone &&
+        options.commissioned_safety_case !=
+            CommissionedSafetyCase::kMissingRow) {
+      const auto& binding = graph.control_bindings.front();
+      const std::string evidence_digest =
+          sha256_digest(kCommissioningEvidenceBytes);
+      CanonicalValue::Object commissioned{
+          {"commissioned_stop_interface_id",
+           CanonicalValue("commissioned_safety_request")},
+          {"commissioned_stop_interface_revision",
+           CanonicalValue(std::string(kZeroDigest))},
+          {"control_domain_id",
+           CanonicalValue(binding.control_domain_id.value())},
+          {"control_domain_revision",
+           CanonicalValue(graph.control_domains.front()
+                              .control_domain_revision.value())},
+          {"control_binding_id",
+           CanonicalValue(binding.control_binding_id.value())},
+          {"control_binding_revision",
+           CanonicalValue(binding.control_binding_revision.value())},
+          {"control_route_id",
+           CanonicalValue(
+               options.commissioned_safety_case ==
+                       CommissionedSafetyCase::kWrongRoute
+                   ? "unknown_route"
+                   : binding.legal_control_route_ids.front().value())},
+          {"provider_instance_id",
+           CanonicalValue(binding.provider_instance_id.value())},
+          {"provider_manifest_id",
+           CanonicalValue(binding.provider_manifest_id.value())},
+          {"provider_manifest_revision",
+           CanonicalValue(binding.provider_manifest_revision.value())},
+          {"registered_command_kind_id",
+           CanonicalValue("manyforge.stop.safety.protective_request")},
+          {"provider_contract_ref", safety_request_contract_ref()},
+          {"endpoint_role_id", CanonicalValue("stop_command")},
+          {"stop_action_class",
+           CanonicalValue(
+               options.commissioned_safety_case ==
+                       CommissionedSafetyCase::kWrongActionClass
+                   ? "controlled"
+                   : "safety_system_request")},
+          {"safety_system_request_action_class",
+           CanonicalValue("protective_stop_request")},
+          {"commissioning_evidence_artifact_ref",
+           CanonicalValue(CanonicalValue::Object{
+               {"artifact_role_id",
+                CanonicalValue(std::string(
+                    core::kStopInterfaceCommissioningArtifactRole))},
+               {"media_type",
+                CanonicalValue(std::string(
+                    core::kStopInterfaceCommissioningMediaType))},
+               {"byte_size",
+                CanonicalValue(static_cast<double>(
+                    kCommissioningEvidenceBytes.size()))},
+               {"content_digest", CanonicalValue(evidence_digest)},
+               {"content_addressed_store_key",
+                CanonicalValue("sha256/" + evidence_digest.substr(7U))},
+           })},
+      };
+      if (options.commissioned_safety_case ==
+          CommissionedSafetyCase::kUnknownExternalResource) {
+        commissioned.emplace_back("external_resource_alias",
+                                  CanonicalValue("unknown_safety_endpoint"));
+        commissioned.emplace_back("external_resource_kind",
+                                  CanonicalValue("service_endpoint"));
+        commissioned.emplace_back(
+            "site_overlay_value_ref",
+            CanonicalValue("resources.unknown_safety_endpoint"));
+      }
+      commissioned_rows.emplace_back(std::move(commissioned));
+    }
+    root.emplace_back(
+        "policies",
+        CanonicalValue(CanonicalValue::Object{
+            {"retained_policy_records",
+             CanonicalValue(CanonicalValue::Array{})},
+            {"stop_stage_parameters",
+             CanonicalValue(std::move(parameter_rows))},
+            {"commissioned_stop_interfaces",
+             CanonicalValue(std::move(commissioned_rows))},
+            {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
+            {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
+            {"interrupt_config",
+             CanonicalValue(CanonicalValue::Object{
+                 {"queue_depth", CanonicalValue(8.0)},
+                 {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
+                 {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
+                 {"supervisory_poll_rate_hz", CanonicalValue(100.0)},
+             })},
+        }));
+  }
   if (overlay_reference.has_value()) {
     root.emplace_back(
         "site_overlay_ref",
@@ -2033,6 +2461,10 @@ struct FixtureOptions final {
   std::string binding_containment_granularity = "resource";
   std::string domain_containment_granularity = "resource";
   std::string state_authority_class = "measured";
+  StopParameterCase stop_parameter_case = StopParameterCase::kExact;
+  CommissionedSafetyCase commissioned_safety_case =
+      CommissionedSafetyCase::kNone;
+  bool omit_policy_software_hard_floor = false;
 };
 
 struct ApplicabilityFixture final {
@@ -2044,6 +2476,8 @@ struct ApplicabilityFixture final {
   std::vector<QualifiedControllerTopology> topologies;
   std::vector<QualifiedProviderManifest> manifests;
   std::vector<QualifiedStopEvidencePolicy> stop_policies;
+  std::vector<BuildQualifiedValueSchemaEntry> value_schemas;
+  std::vector<QualifiedCommissioningEvidenceRef> commissioning_evidence_refs;
   QualifiedSelectedSiteOverlay selected_overlay;
 };
 
@@ -2126,10 +2560,16 @@ struct ApplicabilityFixture final {
         options.repeated_routes_and_activation_sets,
         options.incompatible_route_activation_sets);
   }();
+  const bool include_safety_stage =
+      options.commissioned_safety_case != CommissionedSafetyCase::kNone &&
+      options.commissioned_safety_case != CommissionedSafetyCase::kUnusedRow;
   const auto stop_policy = qualify_stop_policy(
       options.stop_form, options.policy_containment_granularity,
       options.binding_state_stop_case,
-      options.provider_stop_compatibility_case);
+      options.provider_stop_compatibility_case, include_safety_stage,
+      options.commissioned_safety_case ==
+          CommissionedSafetyCase::kNonFinalStage,
+      options.omit_policy_software_hard_floor);
   const auto primary_manifest = qualify_manifest(
       "primary_provider_manifest", capabilities, options.stop_form,
       options.include_provider_binding ||
@@ -2137,7 +2577,8 @@ struct ApplicabilityFixture final {
       options.provider_stop_endpoint_case,
       options.provider_stop_compatibility_case,
       options.control_provider_offer_case,
-      capabilities.front().value().capability_id.value());
+      capabilities.front().value().capability_id.value(),
+      include_safety_stage);
   std::optional<QualifiedProviderManifest> conflicting_manifest;
   if (options.include_assistant_only_external ||
       options.provider_instance_conflict !=
@@ -2146,10 +2587,11 @@ struct ApplicabilityFixture final {
         "conflicting_provider_manifest", capabilities,
         StopForm::kNotStoppable, options.include_provider_binding);
   }
-  std::optional<QualifiedRuntimeProfile> runtime_profile;
-  if (options.include_provider_binding) {
-    runtime_profile = qualify_runtime_profile();
-  }
+  // Every command-bearing control binding names its exact managed provider
+  // runtime, independently of whether this fixture also authors a planning
+  // capability-provider binding.
+  std::optional<QualifiedRuntimeProfile> runtime_profile(
+      qualify_runtime_profile());
   const auto graph = make_graph(
       {.binding_count = options.binding_count,
        .resource_count = options.resource_count,
@@ -2157,7 +2599,7 @@ struct ApplicabilityFixture final {
        .expand_second_role = options.expand_second_role,
        .repeated_routes_and_activation_sets =
            options.repeated_routes_and_activation_sets,
-       .include_runtime = options.include_provider_binding,
+       .include_runtime = true,
        .reverse_source_order = options.reverse_source_order,
        .stale_control_capability_revision =
            options.stale_control_capability_revision,
@@ -2226,7 +2668,10 @@ struct ApplicabilityFixture final {
        .provider_target_case = options.provider_target_case,
        .provider_coverage_case = options.provider_coverage_case,
        .provider_endpoint_case = options.provider_endpoint_case,
-       .external_resource_case = options.external_resource_case},
+       .external_resource_case = options.external_resource_case,
+       .stop_form = options.stop_form,
+       .stop_parameter_case = options.stop_parameter_case,
+       .commissioned_safety_case = options.commissioned_safety_case},
       overlay_reference);
 
   QualifiedSelectedSiteOverlay selected_overlay = [&]() {
@@ -2252,6 +2697,52 @@ struct ApplicabilityFixture final {
   if (conflicting_manifest.has_value()) {
     manifests.push_back(std::move(*conflicting_manifest));
   }
+  std::vector<BuildQualifiedValueSchemaEntry> value_schemas;
+  if (options.stop_form != StopForm::kNotStoppable) {
+    const auto& registry = build_qualified_closed_schema_registry();
+    const auto* empty = registry.find_qualified_value_schema(
+        core::SchemaId("manyforge.value_schema.provider_contract.empty.v1"),
+        core::SchemaRevision(std::string(kEmptyProviderContractSchemaRevision)));
+    const auto* motion = registry.find_qualified_value_schema(
+        core::SchemaId(
+            std::string(core::kMotionControlledStopContractSchemaId)),
+        core::SchemaRevision(
+            std::string(core::kMotionControlledStopContractSchemaRevision)));
+    const bool needs_empty_provider_schema =
+        !options.omit_policy_software_hard_floor;
+    if ((needs_empty_provider_schema && empty == nullptr) ||
+        ((options.stop_form == StopForm::kProviderDefined ||
+          options.stop_form == StopForm::kBindingStateAuthority) &&
+         motion == nullptr)) {
+      throw std::logic_error(
+          "Stop applicability fixture lacks its exact value-schema closure");
+    }
+    if (needs_empty_provider_schema) {
+      value_schemas.push_back(*empty);
+    }
+    if (motion != nullptr &&
+        (options.stop_form == StopForm::kProviderDefined ||
+         options.stop_form == StopForm::kBindingStateAuthority)) {
+      value_schemas.push_back(*motion);
+    }
+    std::sort(value_schemas.begin(), value_schemas.end(),
+              [](const auto& left, const auto& right) {
+                return std::tie(left.schema_id(), left.schema_revision()) <
+                       std::tie(right.schema_id(), right.schema_revision());
+              });
+  }
+  std::vector<QualifiedCommissioningEvidenceRef> commissioning_evidence_refs;
+  if (options.commissioned_safety_case !=
+      CommissionedSafetyCase::kMissingProof) {
+    for (const auto& row : inputs.value().commissioned_stop_interfaces) {
+      commissioning_evidence_refs.push_back(
+          resolve_and_verify_commissioning_evidence_ref(
+              row,
+              row.commissioning_evidence_artifact_ref
+                  .content_addressed_store_key,
+              kCommissioningEvidenceBytes));
+    }
+  }
   return {
       composition,
       inputs,
@@ -2261,6 +2752,8 @@ struct ApplicabilityFixture final {
       {topology},
       std::move(manifests),
       {stop_policy},
+      std::move(value_schemas),
+      std::move(commissioning_evidence_refs),
       std::move(selected_overlay),
   };
 }
@@ -2271,6 +2764,7 @@ struct ApplicabilityFixture final {
       fixture.composition, fixture.inputs, fixture.runtime_profiles,
       {}, fixture.capabilities, fixture.contracts, fixture.topologies,
       fixture.manifests, fixture.stop_policies,
+      fixture.value_schemas, fixture.commissioning_evidence_refs,
       fixture.selected_overlay);
 }
 
@@ -2324,7 +2818,7 @@ TEST(CellApplicability,
       inputs.value().site_overlay_ref, inputs.value().external_resources,
       nullptr);
   const auto result = qualify_cell_applicability(
-      composition, inputs, {}, {}, {}, {}, {}, {}, {}, overlay);
+      composition, inputs, {}, {}, {}, {}, {}, {}, {}, {}, {}, overlay);
 
   EXPECT_EQ(result.composition().graph().cell_id,
             core::CellId("empty_cell"));
@@ -2922,6 +3416,7 @@ TEST(CellApplicability,
           {}, fixture.capabilities,
           std::span<const QualifiedControlInterfaceContract>{},
           fixture.topologies, fixture.manifests, fixture.stop_policies,
+          {}, {},
           fixture.selected_overlay),
       CellApplicabilityError);
 
@@ -2932,6 +3427,7 @@ TEST(CellApplicability,
           fixture.composition, fixture.inputs, fixture.runtime_profiles,
           {}, fixture.capabilities, duplicate_contracts, fixture.topologies,
           fixture.manifests, fixture.stop_policies,
+          {}, {},
           fixture.selected_overlay),
       CellApplicabilityError);
 
@@ -2942,6 +3438,7 @@ TEST(CellApplicability,
           fixture.composition, fixture.inputs, fixture.runtime_profiles,
           {}, fixture.capabilities, extra_contracts, fixture.topologies,
           fixture.manifests, fixture.stop_policies,
+          {}, {},
           fixture.selected_overlay),
       CellApplicabilityError);
 }
@@ -2960,7 +3457,7 @@ TEST(CellApplicability,
             (void)qualify_cell_applicability(
                 fixture.composition, fixture.inputs, runtime_profiles,
                 {}, capabilities, contracts, topologies, manifests,
-                stop_policies, fixture.selected_overlay),
+                stop_policies, {}, {}, fixture.selected_overlay),
             CellApplicabilityError);
       };
 
@@ -3141,6 +3638,7 @@ TEST(CellApplicability,
           fixture.composition, fixture.inputs, fixture.runtime_profiles,
           {}, fixture.capabilities, stale_contract, fixture.topologies,
           fixture.manifests, fixture.stop_policies,
+          {}, {},
           fixture.selected_overlay),
       CellApplicabilityError);
 
@@ -3153,6 +3651,7 @@ TEST(CellApplicability,
           {}, runtime_fixture.capabilities, runtime_fixture.contracts,
           runtime_fixture.topologies, runtime_fixture.manifests,
           runtime_fixture.stop_policies,
+          {}, {},
           runtime_fixture.selected_overlay),
       CellApplicabilityError);
 }
@@ -3618,15 +4117,17 @@ TEST(CellApplicability,
       result.stop_applicability().front()));
   const auto& stop = std::get<LogicalStoppableApplicabilityTemplate>(
       result.stop_applicability().front());
-  EXPECT_FALSE(stop.provider_command_endpoint.has_value());
-  EXPECT_TRUE(stop.provider_evidence_endpoints.empty());
-  EXPECT_TRUE(stop.binding_state_authority_sources.empty());
-  ASSERT_EQ(stop.containment_scopes.size(), 1U);
+  ASSERT_EQ(stop.escalation_stages.size(), 2U);
+  const auto& nominal = stop.escalation_stages.front();
+  EXPECT_FALSE(nominal.provider_command_endpoint.has_value());
+  EXPECT_TRUE(nominal.provider_evidence_endpoints.empty());
+  EXPECT_TRUE(nominal.binding_state_authority_sources.empty());
+  ASSERT_EQ(nominal.containment_scopes.size(), 1U);
   ASSERT_TRUE(std::holds_alternative<LogicalResourceStopScopeTemplate>(
-      stop.containment_scopes.front()));
+      nominal.containment_scopes.front()));
   EXPECT_EQ(
       std::get<LogicalResourceStopScopeTemplate>(
-          stop.containment_scopes.front())
+          nominal.containment_scopes.front())
           .resource_ids,
       std::vector<core::ResourceId>{core::ResourceId("axis_a")});
 }
@@ -3642,9 +4143,10 @@ TEST(CellApplicability,
   ASSERT_EQ(result.stop_applicability().size(), 1U);
   const auto& stop = std::get<LogicalStoppableApplicabilityTemplate>(
       result.stop_applicability().front());
-  ASSERT_EQ(stop.containment_scopes.size(), 1U);
+  ASSERT_EQ(stop.escalation_stages.size(), 2U);
+  ASSERT_EQ(stop.escalation_stages.front().containment_scopes.size(), 1U);
   const auto& scope = std::get<LogicalResourceStopScopeTemplate>(
-      stop.containment_scopes.front());
+      stop.escalation_stages.front().containment_scopes.front());
   EXPECT_EQ(
       scope.resource_ids,
       (std::vector<core::ResourceId>{
@@ -3671,8 +4173,10 @@ TEST(CellApplicability,
                 LogicalStoppableApplicabilityTemplate>(stop_variant));
     const auto& stop =
         std::get<LogicalStoppableApplicabilityTemplate>(stop_variant);
-    ASSERT_EQ(stop.containment_scopes.size(), 2U);
-    for (const auto& scope : stop.containment_scopes) {
+    ASSERT_EQ(stop.escalation_stages.size(), 2U);
+    ASSERT_EQ(stop.escalation_stages.front().containment_scopes.size(), 2U);
+    for (const auto& scope :
+         stop.escalation_stages.front().containment_scopes) {
       ASSERT_TRUE(
           std::holds_alternative<LogicalControllerSetStopScopeTemplate>(
               scope));
@@ -3697,13 +4201,15 @@ TEST(CellApplicability,
   const auto& domain_stop =
       std::get<LogicalStoppableApplicabilityTemplate>(
           domain_result.stop_applicability().front());
-  ASSERT_EQ(domain_stop.containment_scopes.size(), 1U);
+  ASSERT_EQ(domain_stop.escalation_stages.size(), 2U);
+  ASSERT_EQ(domain_stop.escalation_stages.front().containment_scopes.size(),
+            1U);
   ASSERT_TRUE(
       std::holds_alternative<LogicalControlDomainStopScopeTemplate>(
-          domain_stop.containment_scopes.front()));
+          domain_stop.escalation_stages.front().containment_scopes.front()));
   const auto& domain_scope =
       std::get<LogicalControlDomainStopScopeTemplate>(
-          domain_stop.containment_scopes.front());
+          domain_stop.escalation_stages.front().containment_scopes.front());
   EXPECT_EQ(domain_scope.control_domain_id,
             core::ControlDomainId("axis_domain"));
   EXPECT_EQ(domain_scope.control_domain_revision,
@@ -3720,8 +4226,10 @@ TEST(CellApplicability,
       result.stop_applicability().front()));
   const auto& stop = std::get<LogicalStoppableApplicabilityTemplate>(
       result.stop_applicability().front());
-  ASSERT_TRUE(stop.provider_command_endpoint.has_value());
-  ASSERT_EQ(stop.provider_evidence_endpoints.size(), 1U);
+  ASSERT_EQ(stop.escalation_stages.size(), 2U);
+  const auto& nominal = stop.escalation_stages.front();
+  ASSERT_TRUE(nominal.provider_command_endpoint.has_value());
+  ASSERT_EQ(nominal.provider_evidence_endpoints.size(), 1U);
   const auto& route = result.routes().front();
   const auto command_endpoint = std::find_if(
       route.endpoint_templates.begin(), route.endpoint_templates.end(),
@@ -3737,10 +4245,175 @@ TEST(CellApplicability,
       });
   ASSERT_NE(command_endpoint, route.endpoint_templates.end());
   ASSERT_NE(evidence_endpoint, route.endpoint_templates.end());
-  EXPECT_EQ(stop.provider_command_endpoint->logical_endpoint_symbol,
+  EXPECT_EQ(nominal.provider_command_endpoint->logical_endpoint_symbol,
             command_endpoint->logical_endpoint_symbol);
-  EXPECT_EQ(stop.provider_evidence_endpoints.front().logical_endpoint_symbol,
+  EXPECT_EQ(nominal.provider_evidence_endpoints.front().logical_endpoint_symbol,
             evidence_endpoint->logical_endpoint_symbol);
+}
+
+TEST(CellApplicability,
+     StopV2MaterializesExactOrderedStagesParametersAndHardFloor) {
+  const auto result =
+      qualify(make_fixture({.stop_form = StopForm::kProviderDefined}));
+  ASSERT_EQ(result.stop_applicability().size(), 1U);
+  const auto& stop = std::get<LogicalStoppableApplicabilityTemplate>(
+      result.stop_applicability().front());
+  ASSERT_EQ(stop.escalation_stages.size(), 2U);
+  const auto& nominal = stop.escalation_stages[0];
+  const auto& hard = stop.escalation_stages[1];
+  EXPECT_EQ(nominal.stop_escalation_stage_id,
+            core::StopEscalationStageId("nominal"));
+  EXPECT_EQ(nominal.stage_kind, core::StopEscalationStageKind::kNominal);
+  ASSERT_TRUE(nominal.default_contract_parameters.has_value());
+  EXPECT_EQ(hard.stop_escalation_stage_id,
+            core::StopEscalationStageId("software_hard"));
+  EXPECT_EQ(hard.stage_kind,
+            core::StopEscalationStageKind::kSoftwareHard);
+  ASSERT_TRUE(hard.default_contract_parameters.has_value());
+  EXPECT_TRUE(hard.default_contract_parameters->empty());
+  ASSERT_TRUE(hard.containment_command.registered_command_kind_id.has_value());
+  EXPECT_EQ(*hard.containment_command.registered_command_kind_id,
+            core::RegisteredStopCommandKindId(
+                "manyforge.stop.software_hard"));
+  EXPECT_EQ(result.value_schemas().size(), 2U);
+  EXPECT_TRUE(result.commissioning_evidence_refs().empty());
+}
+
+TEST(CellApplicability,
+     StopV2MaterializesFinalCommissionedSafetyRequestAndMatchesPreflight) {
+  const auto result = qualify(make_fixture({
+      .stop_form = StopForm::kProviderDefined,
+      .commissioned_safety_case = CommissionedSafetyCase::kExact,
+  }));
+  ASSERT_EQ(result.stop_applicability().size(), 1U);
+  const auto& stop = std::get<LogicalStoppableApplicabilityTemplate>(
+      result.stop_applicability().front());
+  ASSERT_EQ(stop.escalation_stages.size(), 3U);
+  const auto& safety = stop.escalation_stages.back();
+  EXPECT_EQ(safety.stage_kind,
+            core::StopEscalationStageKind::kSafetySystemRequest);
+  ASSERT_TRUE(safety.commissioned_stop_interface.has_value());
+  EXPECT_EQ(safety.commissioned_stop_interface->registered_command_kind_id,
+            core::RegisteredStopCommandKindId(
+                "manyforge.stop.safety.protective_request"));
+  EXPECT_EQ(result.commissioning_evidence_refs().size(), 1U);
+}
+
+TEST(CellApplicability,
+     StopV2RejectsMissingUnusedOrMismatchedCommissioningClosure) {
+  for (const auto commissioned_case : {
+           CommissionedSafetyCase::kMissingRow,
+           CommissionedSafetyCase::kMissingProof,
+           CommissionedSafetyCase::kUnusedRow,
+           CommissionedSafetyCase::kWrongRoute,
+           CommissionedSafetyCase::kUnknownExternalResource,
+       }) {
+    EXPECT_THROW(
+        (void)qualify(make_fixture({
+            .stop_form = StopForm::kProviderDefined,
+            .commissioned_safety_case = commissioned_case,
+        })),
+        CellApplicabilityError);
+  }
+}
+
+TEST(CellApplicability,
+     StopV2RejectsMalformedCommissioningProofAndStageClassification) {
+  const auto exact = make_fixture({
+      .stop_form = StopForm::kProviderDefined,
+      .commissioned_safety_case = CommissionedSafetyCase::kExact,
+  });
+  ASSERT_EQ(exact.inputs.value().commissioned_stop_interfaces.size(), 1U);
+  const auto& row = exact.inputs.value().commissioned_stop_interfaces.front();
+  EXPECT_THROW(
+      (void)resolve_and_verify_commissioning_evidence_ref(
+          row,
+          row.commissioning_evidence_artifact_ref
+              .content_addressed_store_key,
+          "wrong commissioning bytes"),
+      DeploymentApplicabilityCodecError);
+
+  EXPECT_THROW(
+      (void)make_fixture({
+          .stop_form = StopForm::kProviderDefined,
+          .commissioned_safety_case =
+              CommissionedSafetyCase::kWrongActionClass,
+      }),
+      DeploymentApplicabilityCodecError);
+  EXPECT_THROW(
+      (void)make_fixture({
+          .stop_form = StopForm::kProviderDefined,
+          .commissioned_safety_case =
+              CommissionedSafetyCase::kNonFinalStage,
+      }),
+      StopEvidencePolicyCodecError);
+}
+
+TEST(CellApplicability,
+     MotionBindingRejectsAStoppablePolicyWithoutSoftwareHardFloor) {
+  EXPECT_THROW(
+      (void)qualify(make_fixture({
+          .stop_form = StopForm::kIntrinsic,
+          .stop_parameter_case = StopParameterCase::kMissingHardStage,
+          .omit_policy_software_hard_floor = true,
+      })),
+      CellApplicabilityError);
+}
+
+TEST(CellApplicability,
+     StopV2RejectsMissingAndExtraBuildQualifiedSchemaClosure) {
+  auto missing = make_fixture({.stop_form = StopForm::kProviderDefined});
+  ASSERT_EQ(missing.value_schemas.size(), 2U);
+  missing.value_schemas.pop_back();
+  EXPECT_THROW((void)qualify(missing), CellApplicabilityError);
+
+  auto extra = make_fixture({.stop_form = StopForm::kProviderDefined});
+  const auto* unrelated =
+      build_qualified_closed_schema_registry().find_qualified_value_schema(
+          core::SchemaId("manyforge.value_schema.runtime.empty.v1"),
+          core::SchemaRevision(
+              std::string(kEmptyRuntimeConfigurationSchemaRevision)));
+  ASSERT_NE(unrelated, nullptr);
+  extra.value_schemas.push_back(*unrelated);
+  std::sort(extra.value_schemas.begin(), extra.value_schemas.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.schema_id(), left.schema_revision()) <
+                     std::tie(right.schema_id(), right.schema_revision());
+            });
+  EXPECT_THROW((void)qualify(extra), CellApplicabilityError);
+}
+
+TEST(CellApplicability,
+     StopV2RejectsMissingUnusedAndStaleParameterRows) {
+  for (const auto parameter_case : {
+           StopParameterCase::kMissingHardStage,
+           StopParameterCase::kUnusedStage,
+           StopParameterCase::kStalePolicyRevision,
+       }) {
+    EXPECT_THROW(
+        (void)qualify(make_fixture({
+            .stop_form = StopForm::kProviderDefined,
+            .stop_parameter_case = parameter_case,
+        })),
+        CellApplicabilityError);
+  }
+}
+
+TEST(CellApplicability,
+     StopV2RejectsIncompleteResourceCoverageAndUnitKindMismatch) {
+  EXPECT_THROW(
+      (void)qualify(make_fixture({
+          .resource_count = 2U,
+          .stop_form = StopForm::kProviderDefined,
+          .stop_parameter_case = StopParameterCase::kMissingResource,
+      })),
+      CellApplicabilityError);
+  EXPECT_THROW(
+      (void)qualify(make_fixture({
+          .stop_form = StopForm::kProviderDefined,
+          .stop_parameter_case = StopParameterCase::kWrongCoordinateKind,
+      })),
+      CellApplicabilityError);
 }
 
 TEST(CellApplicability,
@@ -3753,9 +4426,11 @@ TEST(CellApplicability,
   ASSERT_EQ(result.stop_applicability().size(), 1U);
   const auto& stop = std::get<LogicalStoppableApplicabilityTemplate>(
       result.stop_applicability().front());
-  EXPECT_FALSE(stop.provider_command_endpoint.has_value());
-  ASSERT_EQ(stop.provider_evidence_endpoints.size(), 1U);
-  EXPECT_EQ(stop.provider_evidence_endpoints.front().endpoint_role_id,
+  ASSERT_EQ(stop.escalation_stages.size(), 2U);
+  const auto& nominal = stop.escalation_stages.front();
+  EXPECT_FALSE(nominal.provider_command_endpoint.has_value());
+  ASSERT_EQ(nominal.provider_evidence_endpoints.size(), 1U);
+  EXPECT_EQ(nominal.provider_evidence_endpoints.front().endpoint_role_id,
             core::EndpointRoleId("stop_evidence"));
   const auto& endpoints = result.routes().front().endpoint_templates;
   EXPECT_EQ(std::count_if(
@@ -3828,10 +4503,12 @@ TEST(CellApplicability,
       result.stop_applicability().front()));
   const auto& stop = std::get<LogicalStoppableApplicabilityTemplate>(
       result.stop_applicability().front());
-  EXPECT_FALSE(stop.provider_command_endpoint.has_value());
-  EXPECT_TRUE(stop.provider_evidence_endpoints.empty());
-  ASSERT_EQ(stop.binding_state_authority_sources.size(), 1U);
-  const auto& source = stop.binding_state_authority_sources.front();
+  ASSERT_EQ(stop.escalation_stages.size(), 2U);
+  const auto& nominal = stop.escalation_stages.front();
+  EXPECT_FALSE(nominal.provider_command_endpoint.has_value());
+  EXPECT_TRUE(nominal.provider_evidence_endpoints.empty());
+  ASSERT_EQ(nominal.binding_state_authority_sources.size(), 1U);
+  const auto& source = nominal.binding_state_authority_sources.front();
   EXPECT_EQ(source.state_authority_id,
             core::StateAuthorityId("authority_a"));
   EXPECT_EQ(source.state_authority_class,

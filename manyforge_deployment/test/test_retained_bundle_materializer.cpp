@@ -142,7 +142,8 @@ qualify_empty(std::string_view cell_id) {
       deployment.applicability_inputs().value().external_resources, nullptr);
   const auto applicability =
       qualify_cell_applicability(composition, deployment.applicability_inputs(),
-                                 {}, {}, {}, {}, {}, {}, {}, selected_overlay);
+                                 {}, {}, {}, {}, {}, {}, {}, {}, {},
+                                 selected_overlay);
   return qualify_deployment_for_retention(deployment,
                                           compile_cell_ir(applicability));
 }
@@ -784,11 +785,11 @@ TEST(RetainedBundleMaterializer,
 
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-  EXPECT_EQ(bundle->value().catalogs.records.size(), 7U);
-  EXPECT_EQ(bundle->value().catalogs.schema_artifacts.size(), 7U);
-  EXPECT_EQ(bundle->value().provenance.source_records.size(), 7U);
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 8U);
+  EXPECT_EQ(bundle->value().catalogs.schema_artifacts.size(), 8U);
+  EXPECT_EQ(bundle->value().provenance.source_records.size(), 8U);
   EXPECT_EQ(bundle->value().provenance.generator_records.size(), 1U);
-  EXPECT_EQ(catalog_store.size(), 7U);
+  EXPECT_EQ(catalog_store.size(), 8U);
   ASSERT_EQ(bundle->value().desired_control_configurations.size(), 1U);
   EXPECT_TRUE(bundle->value().capability_provider_bindings.empty());
   ASSERT_EQ(bundle->value().compiled_products.control_domain_products.size(),
@@ -836,12 +837,45 @@ TEST(RetainedBundleMaterializer,
       array_member(array_member(control, "bindings").front(), "state_claims")
           .size(),
       6U);
+  const auto &not_stoppable = array_member(control, "stop_applicability");
+  ASSERT_EQ(not_stoppable.size(), 1U);
+  EXPECT_EQ(string_member(not_stoppable.front(), "disposition"),
+            "not_stoppable");
+  EXPECT_EQ(string_member(not_stoppable.front(), "control_route_id"),
+            "arm_position");
+  EXPECT_EQ(string_member(not_stoppable.front(), "stop_evidence_policy_id"),
+            "lite6_not_stoppable");
+  EXPECT_EQ(not_stoppable.front().find_object_member("containment_command"),
+            nullptr);
+  CanonicalValue::Array opened_stop_rows = not_stoppable;
+  CanonicalValue::Object opened_not_stoppable =
+      opened_stop_rows.front().as_object();
+  opened_not_stoppable.emplace_back("containment_command",
+                                    CanonicalValue(nullptr));
+  opened_stop_rows.front() =
+      CanonicalValue(std::move(opened_not_stoppable));
+  const CanonicalValue opened_control = replace_object_member(
+      control, "stop_applicability",
+      CanonicalValue(std::move(opened_stop_rows)));
+  EXPECT_THROW(static_cast<void>(
+                   detail::parse_and_verify_control_domain_control(
+                       canonical_json(opened_control))),
+               RetainedBundleError);
   ASSERT_EQ(array_member(control, "controllers").size(), 1U);
   EXPECT_EQ(string_member(member(array_member(control, "controllers").front(),
                                  "implementation"),
                           "implementation_id"),
             "manyforge.ros2_control.joint_trajectory_controller.direct");
-  EXPECT_TRUE(bundle->value().compiled_products.runtime_unit_products.empty());
+  ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(),
+            1U);
+  EXPECT_EQ(bundle->value()
+                .compiled_products.runtime_unit_products.front()
+                .runtime_unit_id.value(),
+            test::kLite6NativeExecutionRuntimeId);
+  ASSERT_EQ(bundle->value()
+                .compiled_products.runtime_unit_products.front()
+                .products.size(),
+            1U);
   ASSERT_TRUE(bundle->value().compiled_products.viewer_model.has_value());
   EXPECT_EQ(
       require_product_artifact_bytes(
@@ -987,7 +1021,8 @@ TEST(RetainedBundleMaterializer,
       R"({"collision_monitor_period_ms":50,"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"mode":"simulated","planner_rng_seed":12345})");
   EXPECT_NO_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
-          manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
+          manifest, launch_descriptor, std::nullopt, bundle->value(),
+          group.runtime_unit_id));
   const auto runtime_configuration =
       native_execution_runtime_contract::require_configuration(
           *bundle, group.runtime_unit_id);
@@ -1003,7 +1038,8 @@ TEST(RetainedBundleMaterializer,
           changed_configuration)));
   EXPECT_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
-          changed_configuration, launch_descriptor, bundle->value(),
+          changed_configuration, launch_descriptor, std::nullopt,
+          bundle->value(),
           group.runtime_unit_id),
       RetainedBundleError);
 
@@ -1077,7 +1113,7 @@ TEST(RetainedBundleMaterializer,
     EXPECT_NO_THROW(
         detail::
             require_native_execution_runtime_product_matches_retained_bundle(
-                manifest, launch_descriptor, bundle->value(),
+                manifest, launch_descriptor, std::nullopt, bundle->value(),
                 group.runtime_unit_id));
   }
   ASSERT_EQ(capabilities_by_runtime.size(), 2U);
@@ -1178,11 +1214,11 @@ TEST(RetainedBundleMaterializer,
           replace_once(launch_descriptor,
                        detail::kNativeExecutionRuntimeInstalledTargetId,
                        "caller_selected_target"),
-          bundle->value(), group.runtime_unit_id),
+          std::nullopt, bundle->value(), group.runtime_unit_id),
       RetainedBundleError);
   EXPECT_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
-          manifest, launch_descriptor, bundle->value(),
+          manifest, launch_descriptor, std::nullopt, bundle->value(),
           core::RuntimeUnitId("different_runtime")),
       RetainedBundleError);
 }
@@ -1206,9 +1242,11 @@ TEST(RetainedBundleMaterializer,
   ASSERT_EQ(bundle->value().cell_graph.controllable_components.size(), 2U);
   ASSERT_EQ(bundle->value().cell_graph.control_domains.size(), 2U);
   ASSERT_EQ(bundle->value().cell_graph.control_bindings.size(), 2U);
-  EXPECT_EQ(bundle->value().catalogs.records.size(), 7U);
-  EXPECT_EQ(catalog_store.size(), 7U);
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 8U);
+  EXPECT_EQ(catalog_store.size(), 8U);
   EXPECT_EQ(bundle->value().compiled_products.control_domain_products.size(),
+            2U);
+  EXPECT_EQ(bundle->value().compiled_products.runtime_unit_products.size(),
             2U);
 
   const auto &components = bundle->value().cell_graph.controllable_components;
@@ -1346,6 +1384,170 @@ TEST(RetainedBundleMaterializer,
       reidentify_retained_bundle(std::move(changed_resources_root));
   EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
                    canonical_json(changed_resources_root))),
+               RetainedBundleError);
+}
+
+TEST(ControlDomainControlVerifier,
+     StoppableRowsRoundTripCloseAndRejectScopeTampering) {
+  const auto fixture =
+      test::make_lite6_stoppable_controllable_retention_fixture();
+  const core::ControlDomainId domain_id(
+      std::string(test::kLite6ArmDomainId));
+  // Structural emitter/verifier coverage needs the exact row shape but must
+  // not mint or imply production qualification. The production materializer
+  // obtains the equivalent row only from sealed runner evidence.
+  const std::array<core::StopImplementationQualificationDTO, 1U>
+      structural_qualifications{{
+          {
+              core::RegisteredStopCommandKindId(
+                  "manyforge.stop.software_hard"),
+              core::ProviderContractRefDTO{
+                  core::ProviderContractRoleId("software_hard_stop"),
+                  core::SchemaId(
+                      "manyforge.value_schema.provider_contract.empty.v1"),
+                  core::SchemaRevision(std::string(
+                      test::lite6_controllable_fixture_detail::
+                          kEmptyProviderContractSchemaRevision)),
+              },
+              core::ProductId(detail::native_execution_runtime_product_id(
+                  core::RuntimeUnitId(std::string(
+                      test::kLite6NativeExecutionRuntimeId)))),
+              core::ProductContractId(
+                  std::string(detail::kNativeExecutionRuntimeProductContractId)),
+              detail::native_execution_runtime_product_contract_revision(),
+              std::nullopt,
+              core::StopInvocationLaneId(
+                  "manyforge.native_execution_host.focused_software_hard.v1"),
+              core::RetainedArtifactRefDTO{
+                  core::ArtifactRoleId(std::string(
+                      core::kStopImplementationQualificationArtifactRole)),
+                  std::string(
+                      core::kStopImplementationQualificationMediaType),
+                  1U,
+                  core::ContentDigest(std::string(kZeroDigest)),
+                  core::ContentAddressedStoreKey(
+                      "sha256/0000000000000000000000000000000000000000000000000000000000000000"),
+              },
+          },
+      }};
+  const std::string bytes = detail::emit_control_domain_control(
+      fixture.qualified.compiler_ir(), domain_id,
+      structural_qualifications);
+  const CanonicalValue control =
+      detail::parse_and_verify_control_domain_control(bytes);
+  EXPECT_NO_THROW(detail::require_control_domain_control_matches(
+      bytes, fixture.qualified.compiler_ir(), domain_id,
+      structural_qualifications));
+  const auto not_stoppable_fixture =
+      test::make_lite6_controllable_retention_fixture();
+  const std::string not_stoppable_bytes =
+      detail::emit_control_domain_control(
+          not_stoppable_fixture.qualified.compiler_ir(),
+          domain_id);
+  EXPECT_THROW(
+      detail::require_control_domain_control_matches(
+          not_stoppable_bytes, fixture.qualified.compiler_ir(), domain_id),
+      RetainedBundleError);
+
+  const auto &stops = array_member(control, "stop_applicability");
+  ASSERT_EQ(stops.size(), 1U);
+  const CanonicalValue &stop = stops.front();
+  EXPECT_EQ(string_member(stop, "disposition"), "stoppable");
+  EXPECT_EQ(string_member(stop, "stop_evidence_policy_id"),
+            "lite6_binding_state_stop");
+  EXPECT_DOUBLE_EQ(
+      std::get<double>(member(member(stop, "deadline_budget"),
+                              "outer_duration_ns")
+                           .storage()),
+      1'000'000'000.0);
+
+  const auto &stages = array_member(stop, "escalation_stages");
+  ASSERT_EQ(stages.size(), 2U);
+  const CanonicalValue &nominal = stages.front();
+  EXPECT_EQ(string_member(nominal, "stop_escalation_stage_id"), "nominal");
+  EXPECT_EQ(string_member(nominal, "stage_kind"), "nominal");
+  const CanonicalValue &command = member(nominal, "containment_command");
+  EXPECT_EQ(string_member(command, "command_phase_id"), "nominal_command");
+  EXPECT_EQ(string_member(command, "command_kind"),
+            "controller_goal_cancel");
+  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
+      member(command, "provider_contract_ref").storage()));
+  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
+      member(command, "registered_command_kind_id").storage()));
+  const auto &evidence =
+      array_member(nominal, "all_of_evidence_requirements");
+  ASSERT_EQ(evidence.size(), 1U);
+  EXPECT_EQ(string_member(evidence.front(), "evidence_kind"),
+            "motion_rest");
+  EXPECT_FALSE(std::holds_alternative<std::nullptr_t>(
+      member(evidence.front(), "provider_contract_ref").storage()));
+  EXPECT_EQ(string_member(member(evidence.front(), "source_requirement"),
+                          "source_kind"),
+            "binding_state_authority");
+  EXPECT_EQ(string_member(member(evidence.front(), "source_requirement"),
+                          "endpoint_role_id"),
+            "state");
+  EXPECT_TRUE(
+      array_member(nominal, "provider_evidence_endpoints").empty());
+  const auto &binding_sources =
+      array_member(nominal, "binding_state_authority_sources");
+  ASSERT_EQ(binding_sources.size(), 1U);
+  EXPECT_EQ(string_member(binding_sources.front(), "evidence_item_id"),
+            "nominal_rest");
+  EXPECT_EQ(string_member(binding_sources.front(), "state_authority_class"),
+            "measured");
+  EXPECT_EQ(string_member(binding_sources.front(), "state_endpoint_role_id"),
+            "state");
+  const auto &scopes = array_member(nominal, "containment_scopes");
+  ASSERT_EQ(scopes.size(), 1U);
+  EXPECT_EQ(string_member(scopes.front(), "scope_kind"), "resource");
+  ASSERT_EQ(array_member(scopes.front(), "resource_ids").size(), 6U);
+
+  const CanonicalValue &software_hard = stages.back();
+  EXPECT_EQ(string_member(software_hard, "stop_escalation_stage_id"),
+            "software_hard");
+  EXPECT_EQ(string_member(software_hard, "stage_kind"), "software_hard");
+  const CanonicalValue &hard_command =
+      member(software_hard, "containment_command");
+  EXPECT_EQ(string_member(hard_command, "command_phase_id"), "hard_command");
+  EXPECT_EQ(string_member(hard_command, "command_kind"), "registered");
+  EXPECT_EQ(string_member(hard_command, "registered_command_kind_id"),
+            "manyforge.stop.software_hard");
+  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
+      member(software_hard, "provider_command_endpoint").storage()));
+
+  CanonicalValue::Array open_rows = stops;
+  CanonicalValue::Object open_stop = open_rows.front().as_object();
+  open_stop.emplace_back("unqualified_extension", CanonicalValue(true));
+  open_rows.front() = CanonicalValue(std::move(open_stop));
+  const CanonicalValue open_control = replace_object_member(
+      control, "stop_applicability", CanonicalValue(std::move(open_rows)));
+  EXPECT_THROW(static_cast<void>(
+                   detail::parse_and_verify_control_domain_control(
+                       canonical_json(open_control))),
+               RetainedBundleError);
+
+  CanonicalValue::Array tampered_rows = stops;
+  CanonicalValue::Array tampered_stages = stages;
+  CanonicalValue::Array tampered_scopes = scopes;
+  tampered_scopes.front() = replace_object_member(
+      tampered_scopes.front(), "resource_ids",
+      CanonicalValue(CanonicalValue::Array{
+          CanonicalValue("foreign_resource"),
+      }));
+  tampered_stages.front() = replace_object_member(
+      tampered_stages.front(), "containment_scopes",
+      CanonicalValue(std::move(tampered_scopes)));
+  tampered_rows.front() = replace_object_member(
+      tampered_rows.front(), "escalation_stages",
+      CanonicalValue(std::move(tampered_stages)));
+  const CanonicalValue tampered_control = replace_object_member(
+      control, "stop_applicability",
+      CanonicalValue(std::move(tampered_rows)));
+  const std::string tampered_bytes = canonical_json(tampered_control);
+  EXPECT_THROW(static_cast<void>(
+                   detail::parse_and_verify_control_domain_control(
+                       tampered_bytes)),
                RetainedBundleError);
 }
 

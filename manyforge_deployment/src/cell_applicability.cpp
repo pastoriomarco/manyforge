@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "cell_applicability_budget_internal.hpp"
+#include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/site_overlay_resolution.hpp"
 #include "mf1_name_internal.hpp"
 
@@ -107,6 +108,91 @@ template <typename Qualified, typename Map>
     result.push_back(*value);
   }
   return result;
+}
+
+[[nodiscard]] CanonicalValue json_value_to_canonical(
+    const core::JsonValueDTO& value) {
+  return std::visit(
+      [](const auto& selected) -> CanonicalValue {
+        using Selected = std::decay_t<decltype(selected)>;
+        if constexpr (std::is_same_v<Selected, std::nullptr_t> ||
+                      std::is_same_v<Selected, bool> ||
+                      std::is_same_v<Selected, double> ||
+                      std::is_same_v<Selected, std::string>) {
+          return CanonicalValue(selected);
+        } else if constexpr (std::is_same_v<
+                                 Selected, core::JsonValueDTO::Array>) {
+          CanonicalValue::Array array;
+          array.reserve(selected.size());
+          for (const auto& item : selected) {
+            array.push_back(json_value_to_canonical(item));
+          }
+          return CanonicalValue(std::move(array));
+        } else {
+          CanonicalValue::Object object;
+          object.reserve(selected.size());
+          for (const auto& [name, member] : selected) {
+            object.emplace_back(name, json_value_to_canonical(member));
+          }
+          return CanonicalValue(std::move(object));
+        }
+      },
+      value.value);
+}
+
+[[nodiscard]] CanonicalValue json_object_to_canonical(
+    const core::JsonObjectDTO& object) {
+  return json_value_to_canonical(core::JsonValueDTO{object});
+}
+
+using StopStageParameterKey =
+    std::tuple<std::string, std::string, std::string, std::string,
+               std::string, std::string, std::string, std::string,
+               std::string, std::string, std::string, std::string,
+               std::string>;
+
+[[nodiscard]] StopStageParameterKey stop_stage_parameter_key(
+    const core::StopStageParametersDTO& row) {
+  return {
+      row.control_domain_id.value(),
+      row.control_domain_revision.value(),
+      row.control_binding_id.value(),
+      row.control_binding_revision.value(),
+      row.controller_topology_id.value(),
+      row.topology_revision.value(),
+      row.control_route_id.value(),
+      row.stop_evidence_policy_id.value(),
+      row.stop_evidence_policy_revision.value(),
+      row.stop_escalation_stage_id.value(),
+      row.provider_contract_ref.provider_contract_role_id.value(),
+      row.provider_contract_ref.contract_schema_id.value(),
+      row.provider_contract_ref.contract_schema_revision.value(),
+  };
+}
+
+[[nodiscard]] StopStageParameterKey stop_stage_parameter_key(
+    const core::ControlDomainDTO& domain,
+    const core::ControlBindingDTO& binding,
+    const core::ControllerTopologyDTO& topology,
+    const core::ControlRouteId& route_id,
+    const core::StopEvidencePolicyDTO& policy,
+    const core::StopEscalationStageDTO& stage,
+    const core::ProviderContractRefDTO& contract) {
+  return {
+      domain.control_domain_id.value(),
+      domain.control_domain_revision.value(),
+      binding.control_binding_id.value(),
+      binding.control_binding_revision.value(),
+      topology.controller_topology_id.value(),
+      topology.topology_revision.value(),
+      route_id.value(),
+      policy.stop_evidence_policy_id.value(),
+      policy.stop_evidence_policy_revision.value(),
+      stage.stop_escalation_stage_id.value(),
+      contract.provider_contract_role_id.value(),
+      contract.contract_schema_id.value(),
+      contract.contract_schema_revision.value(),
+  };
 }
 
 template <typename Range, typename Predicate>
@@ -986,6 +1072,100 @@ struct BindingContext final {
   std::optional<LogicalBindingInterfaceTemplate> interface_template;
 };
 
+struct QualifiedStopDependencies final {
+  std::map<PairKey, const BuildQualifiedValueSchemaEntry*> value_schemas;
+  std::map<PairKey, const QualifiedCommissioningEvidenceRef*>
+      commissioning_evidence_refs;
+  std::map<StopStageParameterKey, const core::StopStageParametersDTO*>
+      stage_parameters;
+  std::set<StopStageParameterKey> used_stage_parameters;
+  std::set<PairKey> used_commissioning_rows;
+};
+
+[[nodiscard]] QualifiedStopDependencies qualify_stop_dependencies(
+    const std::vector<BindingContext>& bindings,
+    const core::DeploymentApplicabilityInputsDTO& inputs,
+    std::span<const BuildQualifiedValueSchemaEntry> value_schemas,
+    std::span<const QualifiedCommissioningEvidenceRef>
+        commissioning_evidence_refs) {
+  QualifiedStopDependencies result;
+  result.value_schemas = index_exact_span(
+      value_schemas,
+      [](const BuildQualifiedValueSchemaEntry& value) {
+        return pair_key(value.schema_id(), value.schema_revision());
+      },
+      "value-schema closure");
+
+  std::set<PairKey> required_value_schemas;
+  const auto select_contract_schema = [&required_value_schemas](
+                                          const core::ProviderContractRefDTO&
+                                              contract) {
+    required_value_schemas.insert(
+        pair_key(contract.contract_schema_id,
+                 contract.contract_schema_revision));
+  };
+  for (const auto& context : bindings) {
+    const auto& policy = context.stop_policy->value();
+    for (const auto& stage : policy.escalation_stages) {
+      if (stage.containment_command.provider_contract_ref.has_value()) {
+        select_contract_schema(
+            *stage.containment_command.provider_contract_ref);
+      }
+      for (const auto& requirement : stage.evidence_requirements) {
+        if (requirement.provider_contract_ref.has_value()) {
+          select_contract_schema(*requirement.provider_contract_ref);
+        }
+      }
+    }
+  }
+  for (const auto& row : inputs.stop_stage_parameters) {
+    select_contract_schema(row.provider_contract_ref);
+    if (!result.stage_parameters
+             .emplace(stop_stage_parameter_key(row), &row)
+             .second) {
+      fail("Stop-stage parameter table contains a duplicate complete key");
+    }
+  }
+  require_exact_closure(result.value_schemas, required_value_schemas,
+                        "value-schema closure");
+
+  result.commissioning_evidence_refs = index_exact_span(
+      commissioning_evidence_refs,
+      [](const QualifiedCommissioningEvidenceRef& value) {
+        return pair_key(value.commissioned_stop_interface_id(),
+                        value.commissioned_stop_interface_revision());
+      },
+      "commissioning-evidence closure");
+  std::set<PairKey> required_commissioning_refs;
+  std::set<core::CommissionedStopInterfaceId> commissioned_ids;
+  std::map<core::ControlDomainId, core::RetainedArtifactRefDTO>
+      commissioning_package_by_domain;
+  for (const auto& row : inputs.commissioned_stop_interfaces) {
+    if (!commissioned_ids.insert(row.commissioned_stop_interface_id).second) {
+      fail("commissioned Stop-interface table contains a duplicate stable ID");
+    }
+    const PairKey key = pair_key(row.commissioned_stop_interface_id,
+                                 row.commissioned_stop_interface_revision);
+    required_commissioning_refs.insert(key);
+    const auto [package, inserted] = commissioning_package_by_domain.emplace(
+        row.control_domain_id, row.commissioning_evidence_artifact_ref);
+    if (!inserted &&
+        package->second != row.commissioning_evidence_artifact_ref) {
+      fail("commissioned Stop interfaces in one control domain must reference one byte-identical evidence package");
+    }
+    const auto found = result.commissioning_evidence_refs.find(key);
+    if (found != result.commissioning_evidence_refs.end() &&
+        found->second->artifact_ref() !=
+            row.commissioning_evidence_artifact_ref) {
+      fail("qualified commissioning evidence differs from the deployment row's exact artifact reference");
+    }
+  }
+  require_exact_closure(result.commissioning_evidence_refs,
+                        required_commissioning_refs,
+                        "commissioning-evidence closure");
+  return result;
+}
+
 void require_target_capability(
     const core::ComponentTypeCommandTargetDTO& target,
     const core::CapabilityId& capability_id,
@@ -1145,60 +1325,66 @@ void preflight_stop_rows(
       core::StopEvidenceDisposition::kNotStoppable) {
     return;
   }
-  if (!policy.containment_command.has_value() ||
-      !policy.deadline_budget.has_value() ||
-      !policy.evidence_conjunction.has_value()) {
-    fail("qualified stoppable policy lost command, deadline budget, or "
-         "evidence conjunction");
+  if (!policy.deadline_budget.has_value() ||
+      policy.escalation_stages.empty()) {
+    fail("qualified stoppable policy lost its deadline budget or stages");
   }
 
   budget.charge_logical_rows(policy.deadline_budget->phases.size());
-  budget.charge_logical_rows(policy.evidence_requirements.size());
-  if (policy.containment_command->provider_contract_ref.has_value()) {
-    const auto& contract = require_provider_contract(
-        context.manifest->value(),
-        *policy.containment_command->provider_contract_ref);
-    if (!contract.stop_command_support.has_value()) {
-      fail("selected provider contract does not support the Stop command");
-    }
-    if (!contract.stop_command_support->command_endpoint_role_ids.empty()) {
+  budget.charge_logical_rows(policy.escalation_stages.size());
+  for (const auto& stage : policy.escalation_stages) {
+    budget.charge_logical_rows(stage.evidence_requirements.size());
+    if (stage.containment_command.provider_contract_ref.has_value()) {
       budget.charge_logical_rows(1U);
-    }
-  }
-
-  for (const auto& requirement : policy.evidence_requirements) {
-    budget.charge_logical_rows(
-        requirement.source_requirement.allowed_authority_classes.size());
-    if (requirement.source_requirement.source_kind ==
-            core::StopEvidenceSourceKind::kProviderEvidence &&
-        requirement.source_requirement.endpoint_role_id.has_value()) {
-      budget.charge_logical_rows(1U);
-    }
-    if (requirement.source_requirement.source_kind ==
-        core::StopEvidenceSourceKind::kBindingStateAuthority) {
-      budget.charge_logical_rows(1U);
-    }
-  }
-
-  budget.charge_logical_rows(route.compatible_activation_set_ids.size());
-  for (const auto& activation_set_id :
-       route.compatible_activation_set_ids) {
-    switch (context.binding->containment_granularity) {
-      case core::ContainmentGranularity::kResource:
-        budget.charge_logical_rows(
-            context.binding->resource_bindings.size());
-        break;
-      case core::ContainmentGranularity::kControllerSet: {
-        const auto& activation = require_activation_set(
-            context.topology->value(), activation_set_id);
-        budget.charge_logical_rows(
-            activation.active_controller_role_ids.size());
-        budget.charge_logical_rows(
-            activation.active_controller_role_ids.size());
-        break;
+      const auto& contract = require_provider_contract(
+          context.manifest->value(),
+          *stage.containment_command.provider_contract_ref);
+      if (!contract.stop_command_support.has_value()) {
+        fail("selected provider contract does not support the Stop command");
       }
-      case core::ContainmentGranularity::kControlDomain:
-        break;
+      if (!contract.stop_command_support->command_endpoint_role_ids.empty()) {
+        budget.charge_logical_rows(1U);
+      }
+    }
+    if (stage.stage_kind ==
+        core::StopEscalationStageKind::kSafetySystemRequest) {
+      budget.charge_logical_rows(1U);
+    }
+
+    for (const auto& requirement : stage.evidence_requirements) {
+      budget.charge_logical_rows(
+          requirement.source_requirement.allowed_authority_classes.size());
+      if (requirement.source_requirement.source_kind ==
+              core::StopEvidenceSourceKind::kProviderEvidence &&
+          requirement.source_requirement.endpoint_role_id.has_value()) {
+        budget.charge_logical_rows(1U);
+      }
+      if (requirement.source_requirement.source_kind ==
+          core::StopEvidenceSourceKind::kBindingStateAuthority) {
+        budget.charge_logical_rows(1U);
+      }
+    }
+
+    budget.charge_logical_rows(route.compatible_activation_set_ids.size());
+    for (const auto& activation_set_id :
+         route.compatible_activation_set_ids) {
+      switch (stage.containment_granularity) {
+        case core::ContainmentGranularity::kResource:
+          budget.charge_logical_rows(
+              context.binding->resource_bindings.size());
+          break;
+        case core::ContainmentGranularity::kControllerSet: {
+          const auto& activation = require_activation_set(
+              context.topology->value(), activation_set_id);
+          budget.charge_logical_rows(
+              activation.active_controller_role_ids.size());
+          budget.charge_logical_rows(
+              activation.active_controller_role_ids.size());
+          break;
+        }
+        case core::ContainmentGranularity::kControlDomain:
+          break;
+      }
     }
   }
 }
@@ -1284,6 +1470,8 @@ preflight_applicability_output(
   budget.charge_logical_rows(bindings.size());
   budget.charge_logical_rows(inputs.capability_provider_bindings.size());
   budget.charge_logical_rows(inputs.external_resources.size());
+  budget.charge_logical_rows(inputs.stop_stage_parameters.size());
+  budget.charge_logical_rows(inputs.commissioned_stop_interfaces.size());
   for (const auto& binding : inputs.capability_provider_bindings) {
     budget.charge_logical_rows(binding.endpoint_bindings.size());
   }
@@ -2226,6 +2414,7 @@ find_route_endpoint(const LogicalControlRouteTemplate& route,
 
 [[nodiscard]] std::optional<LogicalStopProviderCommandEndpoint>
 qualify_stop_command_endpoint(
+    const core::StopEscalationStageId& stage_id,
     const core::StopContainmentCommandDTO& command,
     const core::ProviderManifestDTO& manifest,
     const LogicalControlRouteTemplate& route) {
@@ -2262,6 +2451,7 @@ qualify_stop_command_endpoint(
          "one route command role");
   }
   return LogicalStopProviderCommandEndpoint{
+      stage_id,
       *command.provider_contract_ref,
       candidates.front()->endpoint_role_id,
       candidates.front()->logical_endpoint_symbol,
@@ -2269,6 +2459,7 @@ qualify_stop_command_endpoint(
 }
 
 void qualify_stop_evidence_sources(
+    const core::StopEscalationStageId& stage_id,
     const core::StopEvidenceRequirementDTO& requirement,
     const BindingContext& context,
     const LogicalControlRouteTemplate& route,
@@ -2299,7 +2490,8 @@ void qualify_stop_evidence_sources(
            "state-side projection");
     }
     binding_state_sources.push_back(
-        {requirement.evidence_item_id,
+        {stage_id,
+         requirement.evidence_item_id,
          context.binding->state_authority_id,
          context.binding->state_authority_class,
          *source.endpoint_role_id,
@@ -2343,7 +2535,8 @@ void qualify_stop_evidence_sources(
         fail("provider Stop evidence has no exact provider support");
       }
       provider_endpoints.push_back(
-          {requirement.evidence_item_id,
+          {stage_id,
+           requirement.evidence_item_id,
            *requirement.provider_contract_ref,
            *source.endpoint_role_id,
            endpoint->logical_endpoint_symbol});
@@ -2378,13 +2571,15 @@ void qualify_stop_evidence_sources(
 }
 
 [[nodiscard]] std::vector<LogicalStopScopeTemplate> qualify_stop_scopes(
+    const core::StopEscalationStageId& stage_id,
+    core::ContainmentGranularity granularity,
     const BindingContext& context, const core::ControlRouteDTO& route,
     const std::vector<LogicalControllerTemplate>& controllers) {
   std::vector<LogicalStopScopeTemplate> result;
   result.reserve(route.compatible_activation_set_ids.size());
   for (const auto& activation_set_id :
        route.compatible_activation_set_ids) {
-    switch (context.binding->containment_granularity) {
+    switch (granularity) {
       case core::ContainmentGranularity::kResource: {
         std::vector<core::ResourceId> resources;
         resources.reserve(context.binding->resource_bindings.size());
@@ -2395,7 +2590,7 @@ void qualify_stop_evidence_sources(
           fail("resource-granularity Stop scope has no bound resources");
         }
         result.emplace_back(LogicalResourceStopScopeTemplate{
-            activation_set_id, std::move(resources)});
+            stage_id, activation_set_id, std::move(resources)});
         break;
       }
       case core::ContainmentGranularity::kControllerSet: {
@@ -2413,18 +2608,347 @@ void qualify_stop_evidence_sources(
                   .logical_controller_symbol);
         }
         result.emplace_back(LogicalControllerSetStopScopeTemplate{
-            activation_set_id, activation.active_controller_role_ids,
+            stage_id, activation_set_id,
+            activation.active_controller_role_ids,
             std::move(symbols)});
         break;
       }
       case core::ContainmentGranularity::kControlDomain:
         result.emplace_back(LogicalControlDomainStopScopeTemplate{
-            activation_set_id, context.domain->control_domain_id,
+            stage_id, activation_set_id,
+            context.domain->control_domain_id,
             context.domain->control_domain_revision});
         break;
     }
   }
   return result;
+}
+
+[[nodiscard]] const core::JsonValueDTO& require_json_member(
+    const core::JsonObjectDTO& object, std::string_view name,
+    std::string_view context) {
+  const auto found = object.find(name);
+  if (found == object.end()) {
+    fail(std::string(context) + " lost required normalized member '" +
+         std::string(name) + "'");
+  }
+  return found->second;
+}
+
+[[nodiscard]] const core::JsonObjectDTO& require_json_object(
+    const core::JsonValueDTO& value, std::string_view context) {
+  const auto* object = std::get_if<core::JsonObjectDTO>(&value.value);
+  if (object == nullptr) {
+    fail(std::string(context) + " is not a normalized object");
+  }
+  return *object;
+}
+
+[[nodiscard]] const core::JsonValueDTO::Array& require_json_array(
+    const core::JsonValueDTO& value, std::string_view context) {
+  const auto* array =
+      std::get_if<core::JsonValueDTO::Array>(&value.value);
+  if (array == nullptr) {
+    fail(std::string(context) + " is not a normalized array");
+  }
+  return *array;
+}
+
+[[nodiscard]] std::string_view require_json_string(
+    const core::JsonValueDTO& value, std::string_view context) {
+  const auto* text = std::get_if<std::string>(&value.value);
+  if (text == nullptr) {
+    fail(std::string(context) + " is not normalized text");
+  }
+  return *text;
+}
+
+[[nodiscard]] core::CoordinateKind resource_coordinate_kind(
+    const BindingContext& context, const core::ResourceId& resource_id) {
+  const auto* row = find_one(
+      context.coordinate_map->resources,
+      [&resource_id](const auto& value) {
+        return value.resource_id == resource_id;
+      });
+  if (row == nullptr) {
+    fail("motion-controlled Stop parameters name a resource outside the exact binding coordinate map");
+  }
+  if (row->component_local_coordinate_kind.has_value()) {
+    return *row->component_local_coordinate_kind;
+  }
+  if (row->coordinates.empty()) {
+    fail("motion-controlled Stop resource has no scalar coordinate kind");
+  }
+  switch (row->coordinates.front().coordinate_kind) {
+    case UrdfCoordinateKind::kAngular:
+      return core::CoordinateKind::kAngular;
+    case UrdfCoordinateKind::kLinear:
+      return core::CoordinateKind::kLinear;
+    case UrdfCoordinateKind::kNone:
+    case UrdfCoordinateKind::kPlanar:
+    case UrdfCoordinateKind::kFloating:
+      fail("motion-controlled Stop resource is not an angular or linear scalar coordinate");
+  }
+  fail("motion-controlled Stop resource has an unknown coordinate kind");
+}
+
+[[nodiscard]] bool binding_affects_motion_resources(
+    const BindingContext& context) noexcept {
+  return std::any_of(
+      context.coordinate_map->resources.begin(),
+      context.coordinate_map->resources.end(), [](const auto& resource) {
+        if (resource.component_local_coordinate_kind.has_value()) {
+          return true;
+        }
+        return std::any_of(
+            resource.coordinates.begin(), resource.coordinates.end(),
+            [](const auto& coordinate) {
+              return coordinate.coordinate_kind == UrdfCoordinateKind::kAngular ||
+                     coordinate.coordinate_kind == UrdfCoordinateKind::kLinear;
+            });
+      });
+}
+
+void qualify_motion_controlled_stop_parameters(
+    const BindingContext& context,
+    const core::JsonObjectDTO& parameters) {
+  const auto& limits = require_json_array(
+      require_json_member(parameters, "per_resource_limits",
+                          "motion-controlled Stop parameters"),
+      "motion-controlled Stop per_resource_limits");
+  std::set<core::ResourceId> expected_resources;
+  for (const auto& resource : context.binding->resource_bindings) {
+    expected_resources.insert(resource.resource_id);
+  }
+  std::set<core::ResourceId> actual_resources;
+  for (const auto& value : limits) {
+    const auto& row = require_json_object(
+        value, "motion-controlled Stop resource limit");
+    const core::ResourceId resource_id(std::string(require_json_string(
+        require_json_member(row, "resource_id", "Stop resource limit"),
+        "Stop resource_id")));
+    if (!actual_resources.insert(resource_id).second) {
+      fail("motion-controlled Stop resource limits repeat a resource");
+    }
+    const auto expected_kind = resource_coordinate_kind(context, resource_id);
+    const auto& velocity = require_json_object(
+        require_json_member(row, "settle_velocity_threshold",
+                            "Stop resource limit"),
+        "Stop settle_velocity_threshold");
+    const auto velocity_tag = require_json_string(
+        require_json_member(velocity, "coordinate_kind",
+                            "Stop settle_velocity_threshold"),
+        "Stop settle velocity coordinate_kind");
+    const std::string_view expected_velocity_tag =
+        expected_kind == core::CoordinateKind::kAngular
+            ? "angular_rad_s"
+            : "linear_m_s";
+    if (velocity_tag != expected_velocity_tag) {
+      fail("motion-controlled Stop settle threshold coordinate kind differs from the retained resource kind");
+    }
+    const auto acceleration_found = row.find("max_deceleration");
+    if (acceleration_found != row.end()) {
+      const auto& acceleration = require_json_object(
+          acceleration_found->second, "Stop max_deceleration");
+      const auto acceleration_tag = require_json_string(
+          require_json_member(acceleration, "coordinate_kind",
+                              "Stop max_deceleration"),
+          "Stop deceleration coordinate_kind");
+      const std::string_view expected_acceleration_tag =
+          expected_kind == core::CoordinateKind::kAngular
+              ? "angular_rad_s2"
+              : "linear_m_s2";
+      if (acceleration_tag != expected_acceleration_tag) {
+        fail("motion-controlled Stop deceleration coordinate kind differs from the retained resource kind");
+      }
+    }
+  }
+  if (actual_resources != expected_resources) {
+    fail("motion-controlled Stop resource limits do not exactly cover the binding's affected resources");
+  }
+}
+
+[[nodiscard]] std::optional<core::JsonObjectDTO>
+qualify_stop_stage_parameters(
+    const BindingContext& context, const core::ControlRouteId& route_id,
+    const core::StopEvidencePolicyDTO& policy,
+    const core::StopEscalationStageDTO& stage,
+    QualifiedStopDependencies& dependencies) {
+  if (!stage.containment_command.provider_contract_ref.has_value()) {
+    return std::nullopt;
+  }
+  const auto& contract =
+      *stage.containment_command.provider_contract_ref;
+  const auto key = stop_stage_parameter_key(
+      *context.domain, *context.binding, context.topology->value(), route_id,
+      policy, stage, contract);
+  const auto found = dependencies.stage_parameters.find(key);
+  if (found == dependencies.stage_parameters.end()) {
+    fail("provider-defined Stop stage has no exact deployment-owned parameter row");
+  }
+  if (!dependencies.used_stage_parameters.insert(key).second) {
+    fail("one Stop-stage parameter row was selected by more than one emitted stage");
+  }
+  const auto schema_key =
+      pair_key(contract.contract_schema_id,
+               contract.contract_schema_revision);
+  const auto schema = dependencies.value_schemas.find(schema_key);
+  if (schema == dependencies.value_schemas.end()) {
+    fail("Stop-stage parameter row lost its caller-prefiltered value schema");
+  }
+  const CanonicalValue authored =
+      json_object_to_canonical(found->second->default_contract_parameters);
+  const auto normalized = validate_and_normalize_build_qualified_value(
+      *schema->second, authored);
+  if (canonical_json(normalized.normalized_value()) !=
+      canonical_json(authored)) {
+    fail("Stop-stage parameter row was not normalized before deployment identity verification");
+  }
+  if (stage.containment_command.command_kind ==
+      core::StopContainmentCommandKind::kMotionControlledStop) {
+    if (contract.contract_schema_id.value() !=
+            core::kMotionControlledStopContractSchemaId ||
+        contract.contract_schema_revision.value() !=
+            core::kMotionControlledStopContractSchemaRevision) {
+      fail("motion-controlled Stop stage does not select the fixed v1 motion parameter schema");
+    }
+    qualify_motion_controlled_stop_parameters(
+        context, found->second->default_contract_parameters);
+  }
+  return found->second->default_contract_parameters;
+}
+
+[[nodiscard]] core::StopActionClass qualify_stop_action_class(
+    const core::StopEscalationStageDTO& stage) {
+  core::StopActionClass action_class = core::StopActionClass::kControlled;
+  if (stage.containment_command.command_kind ==
+      core::StopContainmentCommandKind::kRegistered) {
+    if (!stage.containment_command.registered_command_kind_id.has_value()) {
+      fail("registered Stop command lost its exact registered kind ID");
+    }
+    const auto* definition = core::find_registered_stop_command_definition(
+        *stage.containment_command.registered_command_kind_id);
+    if (definition == nullptr) {
+      fail("registered Stop command kind is absent from the build-qualified code table");
+    }
+    action_class = definition->stop_action_class;
+  }
+  const core::StopActionClass required_class = [&]() {
+    switch (stage.stage_kind) {
+      case core::StopEscalationStageKind::kNominal:
+      case core::StopEscalationStageKind::kControlledFallback:
+        return core::StopActionClass::kControlled;
+      case core::StopEscalationStageKind::kSoftwareHard:
+        return core::StopActionClass::kSoftwareHard;
+      case core::StopEscalationStageKind::kSafetySystemRequest:
+        return core::StopActionClass::kSafetySystemRequest;
+    }
+    fail("Stop stage has an unknown action class");
+  }();
+  if (action_class != required_class) {
+    fail("Stop stage kind differs from the independently registered command action class");
+  }
+  if ((required_class == core::StopActionClass::kSoftwareHard ||
+       required_class == core::StopActionClass::kSafetySystemRequest) &&
+      stage.containment_command.command_kind !=
+          core::StopContainmentCommandKind::kRegistered) {
+    fail("software-hard and safety-system Stop stages must use a registered command");
+  }
+  return action_class;
+}
+
+[[nodiscard]] std::optional<core::CommissionedStopInterfaceDTO>
+qualify_commissioned_stop_interface(
+    const BindingContext& context, const core::ControlRouteId& route_id,
+    const core::StopEscalationStageDTO& stage,
+    const std::optional<LogicalStopProviderCommandEndpoint>& endpoint,
+    const core::DeploymentApplicabilityInputsDTO& inputs,
+    QualifiedStopDependencies& dependencies) {
+  if (stage.stage_kind !=
+      core::StopEscalationStageKind::kSafetySystemRequest) {
+    return std::nullopt;
+  }
+  if (!stage.containment_command.registered_command_kind_id.has_value() ||
+      !stage.containment_command.provider_contract_ref.has_value() ||
+      !endpoint.has_value()) {
+    fail("final safety-system Stop stage lacks its registered provider endpoint identity");
+  }
+  const auto* registered = core::find_registered_stop_command_definition(
+      *stage.containment_command.registered_command_kind_id);
+  if (registered == nullptr ||
+      registered->stop_action_class !=
+          core::StopActionClass::kSafetySystemRequest ||
+      !registered->safety_system_request_action_class.has_value()) {
+    fail("final safety-system Stop stage has no exact registered safety request classification");
+  }
+
+  const core::CommissionedStopInterfaceDTO* match = nullptr;
+  for (const auto& row : inputs.commissioned_stop_interfaces) {
+    if (row.control_domain_id != context.domain->control_domain_id ||
+        row.control_domain_revision !=
+            context.domain->control_domain_revision ||
+        row.control_binding_id != context.binding->control_binding_id ||
+        row.control_binding_revision !=
+            context.binding->control_binding_revision ||
+        row.control_route_id != route_id ||
+        row.provider_instance_id != context.binding->provider_instance_id ||
+        row.provider_manifest_id != context.binding->provider_manifest_id ||
+        row.provider_manifest_revision !=
+            context.binding->provider_manifest_revision ||
+        row.registered_command_kind_id !=
+            *stage.containment_command.registered_command_kind_id ||
+        row.provider_contract_ref !=
+            *stage.containment_command.provider_contract_ref ||
+        row.endpoint_role_id != endpoint->endpoint_role_id) {
+      continue;
+    }
+    if (match != nullptr) {
+      fail("final safety-system Stop stage matches more than one commissioned interface");
+    }
+    match = &row;
+  }
+  if (match == nullptr) {
+    fail("final safety-system Stop stage has no exact commissioned interface");
+  }
+  if (match->stop_action_class !=
+          core::StopActionClass::kSafetySystemRequest ||
+      match->safety_system_request_action_class !=
+          *registered->safety_system_request_action_class) {
+    fail("commissioned Stop interface action classification differs from the code-owned registered command table");
+  }
+
+  const bool has_external_alias = match->external_resource_alias.has_value();
+  if (has_external_alias != match->external_resource_kind.has_value() ||
+      has_external_alias != match->site_overlay_value_ref.has_value()) {
+    fail("commissioned Stop external-resource identity is not jointly present or absent");
+  }
+  if (has_external_alias) {
+    const auto& resource = require_external_resource(
+        inputs, *match->external_resource_alias);
+    if (resource.resource_kind != *match->external_resource_kind ||
+        resource.provider_instance_id != match->provider_instance_id ||
+        resource.provider_manifest_id != match->provider_manifest_id ||
+        resource.provider_manifest_revision !=
+            match->provider_manifest_revision ||
+        resource.endpoint_role_id != match->endpoint_role_id ||
+        resource.site_overlay_value_ref !=
+            *match->site_overlay_value_ref) {
+      fail("commissioned Stop external endpoint differs from its exact deployment resource/overlay reference");
+    }
+  }
+
+  const PairKey key = pair_key(match->commissioned_stop_interface_id,
+                               match->commissioned_stop_interface_revision);
+  const auto proof = dependencies.commissioning_evidence_refs.find(key);
+  if (proof == dependencies.commissioning_evidence_refs.end() ||
+      proof->second->artifact_ref() !=
+          match->commissioning_evidence_artifact_ref) {
+    fail("commissioned Stop interface lost its immutable-store readback proof");
+  }
+  if (!dependencies.used_commissioning_rows.insert(key).second) {
+    fail("one commissioned Stop interface was selected by more than one final stage");
+  }
+  return *match;
 }
 
 [[nodiscard]] std::size_t stop_nested_logical_rows(
@@ -2433,50 +2957,63 @@ void qualify_stop_evidence_sources(
   checked_add(rows, stoppable.deadline_budget.phases.size(),
               kMaxCellLogicalApplicabilityRows,
               "cell logical applicability rows");
-  checked_add(rows, stoppable.all_of_evidence_requirements.size(),
+  checked_add(rows, stoppable.escalation_stages.size(),
               kMaxCellLogicalApplicabilityRows,
               "cell logical applicability rows");
-  checked_add(rows, stoppable.provider_evidence_endpoints.size(),
-              kMaxCellLogicalApplicabilityRows,
-              "cell logical applicability rows");
-  checked_add(rows, stoppable.binding_state_authority_sources.size(),
-              kMaxCellLogicalApplicabilityRows,
-              "cell logical applicability rows");
-  checked_add(rows, stoppable.containment_scopes.size(),
-              kMaxCellLogicalApplicabilityRows,
-              "cell logical applicability rows");
-  if (stoppable.provider_command_endpoint.has_value()) {
-    checked_add(rows, 1U, kMaxCellLogicalApplicabilityRows,
+  for (const auto& stage : stoppable.escalation_stages) {
+    checked_add(rows, stage.all_of_evidence_requirements.size(),
+                kMaxCellLogicalApplicabilityRows,
                 "cell logical applicability rows");
-  }
-  for (const auto& requirement : stoppable.all_of_evidence_requirements) {
-    checked_add(
-        rows,
-        requirement.source_requirement.allowed_authority_classes.size(),
-        kMaxCellLogicalApplicabilityRows,
-        "cell logical applicability rows");
-  }
-  for (const auto& scope : stoppable.containment_scopes) {
-    std::visit(
-        [&rows](const auto& value) {
-          using Scope = std::decay_t<decltype(value)>;
-          if constexpr (std::is_same_v<
-                            Scope, LogicalResourceStopScopeTemplate>) {
-            checked_add(rows, value.resource_ids.size(),
-                        kMaxCellLogicalApplicabilityRows,
-                        "cell logical applicability rows");
-          } else if constexpr (std::is_same_v<
-                                   Scope,
-                                   LogicalControllerSetStopScopeTemplate>) {
-            checked_add(rows, value.active_controller_role_ids.size(),
-                        kMaxCellLogicalApplicabilityRows,
-                        "cell logical applicability rows");
-            checked_add(rows, value.logical_controller_symbols.size(),
-                        kMaxCellLogicalApplicabilityRows,
-                        "cell logical applicability rows");
-          }
-        },
-        scope);
+    checked_add(rows, stage.provider_evidence_endpoints.size(),
+                kMaxCellLogicalApplicabilityRows,
+                "cell logical applicability rows");
+    checked_add(rows, stage.binding_state_authority_sources.size(),
+                kMaxCellLogicalApplicabilityRows,
+                "cell logical applicability rows");
+    checked_add(rows, stage.containment_scopes.size(),
+                kMaxCellLogicalApplicabilityRows,
+                "cell logical applicability rows");
+    if (stage.default_contract_parameters.has_value()) {
+      checked_add(rows, 1U, kMaxCellLogicalApplicabilityRows,
+                  "cell logical applicability rows");
+    }
+    if (stage.commissioned_stop_interface.has_value()) {
+      checked_add(rows, 1U, kMaxCellLogicalApplicabilityRows,
+                  "cell logical applicability rows");
+    }
+    if (stage.provider_command_endpoint.has_value()) {
+      checked_add(rows, 1U, kMaxCellLogicalApplicabilityRows,
+                  "cell logical applicability rows");
+    }
+    for (const auto& requirement : stage.all_of_evidence_requirements) {
+      checked_add(
+          rows,
+          requirement.source_requirement.allowed_authority_classes.size(),
+          kMaxCellLogicalApplicabilityRows,
+          "cell logical applicability rows");
+    }
+    for (const auto& scope : stage.containment_scopes) {
+      std::visit(
+          [&rows](const auto& value) {
+            using Scope = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<
+                              Scope, LogicalResourceStopScopeTemplate>) {
+              checked_add(rows, value.resource_ids.size(),
+                          kMaxCellLogicalApplicabilityRows,
+                          "cell logical applicability rows");
+            } else if constexpr (std::is_same_v<
+                                     Scope,
+                                     LogicalControllerSetStopScopeTemplate>) {
+              checked_add(rows, value.active_controller_role_ids.size(),
+                          kMaxCellLogicalApplicabilityRows,
+                          "cell logical applicability rows");
+              checked_add(rows, value.logical_controller_symbols.size(),
+                          kMaxCellLogicalApplicabilityRows,
+                          "cell logical applicability rows");
+            }
+          },
+          scope);
+    }
   }
   return rows;
 }
@@ -2487,6 +3024,8 @@ qualify_stop_applicability(
     const std::vector<BindingContext>& bindings,
     const std::vector<LogicalControlRouteTemplate>& logical_routes,
     const std::vector<LogicalControllerTemplate>& logical_controllers,
+    const core::DeploymentApplicabilityInputsDTO& inputs,
+    QualifiedStopDependencies& dependencies,
     LogicalNameRegistry& names, std::size_t& logical_rows) {
   std::vector<LogicalStopApplicabilityTemplate> result;
   for (const auto& context : bindings) {
@@ -2515,38 +3054,84 @@ qualify_stop_applicability(
         continue;
       }
 
-      if (!policy.containment_command.has_value() ||
-          !policy.deadline_budget.has_value() ||
-          !policy.evidence_conjunction.has_value()) {
-        fail("qualified stoppable policy lost command, deadline budget, or "
-             "evidence conjunction");
+      if (!policy.deadline_budget.has_value() ||
+          policy.escalation_stages.empty()) {
+        fail("qualified stoppable policy lost its deadline budget or escalation chain");
+      }
+      if (binding_affects_motion_resources(context) &&
+          std::count_if(
+              policy.escalation_stages.begin(),
+              policy.escalation_stages.end(), [](const auto& stage) {
+                return stage.stage_kind ==
+                       core::StopEscalationStageKind::kSoftwareHard;
+              }) != 1) {
+        fail("stoppable angular/linear motion binding requires exactly one distinct software-hard floor");
       }
       const auto& route =
           require_route(context.topology->value(), route_id);
-      auto provider_command_endpoint = qualify_stop_command_endpoint(
-          *policy.containment_command, context.manifest->value(),
-          logical_route);
-      std::vector<LogicalStopProviderEvidenceEndpoint> provider_evidence;
-      std::vector<LogicalStopBindingStateAuthoritySource>
-          binding_state_sources;
-      for (const auto& requirement :
-           policy.evidence_requirements) {
-        qualify_stop_evidence_sources(
-            requirement, context, logical_route, provider_evidence,
-            binding_state_sources);
+      std::vector<LogicalStopEscalationStageTemplate> stages;
+      stages.reserve(policy.escalation_stages.size());
+      for (std::size_t stage_index = 0U;
+           stage_index < policy.escalation_stages.size(); ++stage_index) {
+        const auto& stage = policy.escalation_stages[stage_index];
+        (void)qualify_stop_action_class(stage);
+        if (stage.stage_kind ==
+                core::StopEscalationStageKind::kSafetySystemRequest &&
+            stage_index + 1U != policy.escalation_stages.size()) {
+          fail("safety-system Stop request is not the final escalation stage");
+        }
+        auto provider_command_endpoint = qualify_stop_command_endpoint(
+            stage.stop_escalation_stage_id, stage.containment_command,
+            context.manifest->value(), logical_route);
+        auto default_parameters = qualify_stop_stage_parameters(
+            context, route_id, policy, stage, dependencies);
+        std::vector<LogicalStopProviderEvidenceEndpoint>
+            provider_evidence;
+        std::vector<LogicalStopBindingStateAuthoritySource>
+            binding_state_sources;
+        for (const auto& requirement : stage.evidence_requirements) {
+          qualify_stop_evidence_sources(
+              stage.stop_escalation_stage_id, requirement, context,
+              logical_route, provider_evidence, binding_state_sources);
+        }
+        std::sort(
+            provider_evidence.begin(), provider_evidence.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.stop_escalation_stage_id,
+                              left.evidence_item_id) <
+                     std::tie(right.stop_escalation_stage_id,
+                              right.evidence_item_id);
+            });
+        std::sort(
+            binding_state_sources.begin(), binding_state_sources.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.stop_escalation_stage_id,
+                              left.evidence_item_id) <
+                     std::tie(right.stop_escalation_stage_id,
+                              right.evidence_item_id);
+            });
+        auto scopes = qualify_stop_scopes(
+            stage.stop_escalation_stage_id,
+            stage.containment_granularity, context, route,
+            logical_controllers);
+        auto commissioned_interface = qualify_commissioned_stop_interface(
+            context, route_id, stage, provider_command_endpoint, inputs,
+            dependencies);
+        stages.push_back(LogicalStopEscalationStageTemplate{
+            stage.stop_escalation_stage_id,
+            stage.stage_kind,
+            stage.containment_granularity,
+            stage.containment_command,
+            stage.evidence_conjunction,
+            stage.evidence_requirements,
+            std::move(default_parameters),
+            std::move(commissioned_interface),
+            std::move(provider_command_endpoint),
+            std::move(provider_evidence),
+            std::move(binding_state_sources),
+            std::move(scopes),
+        });
       }
-      std::sort(
-          provider_evidence.begin(), provider_evidence.end(),
-          [](const auto& left, const auto& right) {
-            return left.evidence_item_id < right.evidence_item_id;
-          });
-      std::sort(
-          binding_state_sources.begin(), binding_state_sources.end(),
-          [](const auto& left, const auto& right) {
-            return left.evidence_item_id < right.evidence_item_id;
-          });
-      auto scopes =
-          qualify_stop_scopes(context, route, logical_controllers);
       LogicalStoppableApplicabilityTemplate stoppable{
           binding.control_binding_id,
           binding.control_binding_revision,
@@ -2572,14 +3157,8 @@ qualify_stop_applicability(
                 policy.stop_evidence_policy_id.value()},
                {"stop_evidence_policy_revision",
                 policy.stop_evidence_policy_revision.value()}}),
-          *policy.containment_command,
           *policy.deadline_budget,
-          *policy.evidence_conjunction,
-          policy.evidence_requirements,
-          std::move(provider_command_endpoint),
-          std::move(provider_evidence),
-          std::move(binding_state_sources),
-          std::move(scopes),
+          std::move(stages),
       };
       checked_add(logical_rows, 1U, kMaxCellLogicalApplicabilityRows,
                   "cell logical applicability rows");
@@ -2588,6 +3167,14 @@ qualify_stop_applicability(
                   "cell logical applicability rows");
       result.emplace_back(std::move(stoppable));
     }
+  }
+  if (dependencies.used_stage_parameters.size() !=
+      dependencies.stage_parameters.size()) {
+    fail("Stop-stage parameter table contains an unused, stale, cross-route, cross-policy, or contract-mismatched row");
+  }
+  if (dependencies.used_commissioning_rows.size() !=
+      inputs.commissioned_stop_interfaces.size()) {
+    fail("commissioned Stop-interface table contains an unused, nonfinal, stale, or cross-route row");
   }
   return result;
 }
@@ -2605,6 +3192,9 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
     std::span<const QualifiedControllerTopology> controller_topologies,
     std::span<const QualifiedProviderManifest> provider_manifests,
     std::span<const QualifiedStopEvidencePolicy> stop_evidence_policies,
+    std::span<const BuildQualifiedValueSchemaEntry> value_schemas,
+    std::span<const QualifiedCommissioningEvidenceRef>
+        commissioning_evidence_refs,
     const QualifiedSelectedSiteOverlay& selected_site_overlay) {
   const QualifiedAssistantSettings assistant_settings =
       qualify_assistant_settings(
@@ -2621,6 +3211,9 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
       composition.graph(), deployment_inputs.value());
 
   auto bindings = qualify_binding_contexts(composition, indexes);
+  auto stop_dependencies = qualify_stop_dependencies(
+      bindings, deployment_inputs.value(), value_schemas,
+      commissioning_evidence_refs);
   qualify_desired_configurations(composition.graph(),
                                  deployment_inputs.value(), indexes);
   qualify_complete_capability_coverage(
@@ -2630,6 +3223,14 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
 
   LogicalNameRegistry names(composition);
   std::size_t logical_rows = 0U;
+  checked_add(logical_rows,
+              deployment_inputs.value().stop_stage_parameters.size(),
+              kMaxCellLogicalApplicabilityRows,
+              "cell logical applicability rows");
+  checked_add(logical_rows,
+              deployment_inputs.value().commissioned_stop_interfaces.size(),
+              kMaxCellLogicalApplicabilityRows,
+              "cell logical applicability rows");
   materialize_binding_interfaces(
       composition.graph().cell_id, bindings, names,
       logical_rows);
@@ -2643,7 +3244,7 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
   auto stop_applicability = qualify_stop_applicability(
       composition.graph().cell_id, bindings,
       controllers_and_routes.routes, controllers_and_routes.controllers,
-      names, logical_rows);
+      deployment_inputs.value(), stop_dependencies, names, logical_rows);
 
   std::vector<LogicalBindingInterfaceTemplate> binding_interfaces;
   binding_interfaces.reserve(bindings.size());
@@ -2689,6 +3290,10 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
           indexes.manifests, indexes.required_manifests),
       copy_closure_in_key_order<QualifiedStopEvidencePolicy>(
           indexes.stop_policies, indexes.required_stop_policies),
+      copy_index_in_key_order<BuildQualifiedValueSchemaEntry>(
+          stop_dependencies.value_schemas),
+      copy_index_in_key_order<QualifiedCommissioningEvidenceRef>(
+          stop_dependencies.commissioning_evidence_refs),
       std::move(binding_interfaces),
       std::move(controllers_and_routes.controllers),
       std::move(controllers_and_routes.routes),

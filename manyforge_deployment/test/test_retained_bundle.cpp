@@ -319,13 +319,31 @@ TEST(ProductContractRegistryTest,
   EXPECT_EQ(control->product_kind(),
             core::RetainedProductKind::kControlDomainControl);
   EXPECT_EQ(control->placement(), ProductPlacement::kControlDomain);
-  ASSERT_EQ(control->artifact_roles().size(), 1U);
+  ASSERT_EQ(control->artifact_roles().size(), 4U);
   EXPECT_EQ(control->artifact_roles().front().artifact_role_id.value(),
             "control_domain_control");
   EXPECT_EQ(control->artifact_roles().front().media_type,
-            "application/vnd.manyforge.control-domain-control+json");
+            "application/vnd.manyforge.control-domain-control.v2+json");
   EXPECT_EQ(control->artifact_roles().front().cardinality,
             ProductArtifactCardinality::kRequiredExactlyOne);
+  const std::array<std::pair<std::string_view, std::string_view>, 3U>
+      conditional_control_roles{{
+          {core::kControlledStopSubstitutionQualificationArtifactRole,
+           core::kControlledStopSubstitutionQualificationMediaType},
+          {core::kStopImplementationQualificationArtifactRole,
+           core::kStopImplementationQualificationMediaType},
+          {core::kStopInterfaceCommissioningArtifactRole,
+           core::kStopInterfaceCommissioningMediaType},
+      }};
+  for (std::size_t index = 0U;
+       index < conditional_control_roles.size(); ++index) {
+    const auto& role = control->artifact_roles()[index + 1U];
+    EXPECT_EQ(role.artifact_role_id.value(),
+              conditional_control_roles[index].first);
+    EXPECT_EQ(role.media_type, conditional_control_roles[index].second);
+    EXPECT_EQ(role.cardinality,
+              ProductArtifactCardinality::kOptionalAtMostOne);
+  }
 
   const auto runtime = std::find_if(
       contracts.begin(), contracts.end(), [](const auto &candidate) {
@@ -362,19 +380,25 @@ TEST(ProductContractRegistryTest,
   EXPECT_EQ(native_runtime->product_kind(),
             core::RetainedProductKind::kRuntimeUnitConfiguration);
   EXPECT_EQ(native_runtime->placement(), ProductPlacement::kRuntimeUnit);
-  ASSERT_EQ(native_runtime->artifact_roles().size(), 2U);
+  ASSERT_EQ(native_runtime->artifact_roles().size(), 3U);
   EXPECT_EQ(native_runtime->artifact_roles()[0].artifact_role_id.value(),
-            detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole);
+            detail::kNativeExecutionRuntimeBuildIdentityArtifactRole);
   EXPECT_EQ(native_runtime->artifact_roles()[0].media_type,
-            detail::kNativeExecutionRuntimeLaunchDescriptorMediaType);
+            detail::kNativeExecutionRuntimeBuildIdentityMediaType);
+  EXPECT_EQ(native_runtime->artifact_roles()[0].cardinality,
+            ProductArtifactCardinality::kOptionalAtMostOne);
   EXPECT_EQ(native_runtime->artifact_roles()[1].artifact_role_id.value(),
-            detail::kNativeExecutionRuntimeManifestArtifactRole);
+            detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole);
   EXPECT_EQ(native_runtime->artifact_roles()[1].media_type,
+            detail::kNativeExecutionRuntimeLaunchDescriptorMediaType);
+  EXPECT_EQ(native_runtime->artifact_roles()[2].artifact_role_id.value(),
+            detail::kNativeExecutionRuntimeManifestArtifactRole);
+  EXPECT_EQ(native_runtime->artifact_roles()[2].media_type,
             detail::kNativeExecutionRuntimeManifestMediaType);
-  for (const auto &role : native_runtime->artifact_roles()) {
-    EXPECT_EQ(role.cardinality,
-              ProductArtifactCardinality::kRequiredExactlyOne);
-  }
+  EXPECT_EQ(native_runtime->artifact_roles()[1].cardinality,
+            ProductArtifactCardinality::kRequiredExactlyOne);
+  EXPECT_EQ(native_runtime->artifact_roles()[2].cardinality,
+            ProductArtifactCardinality::kRequiredExactlyOne);
   EXPECT_EQ(registry.find(native_runtime->product_contract_id(),
                           native_runtime->product_contract_revision()),
             &*native_runtime);

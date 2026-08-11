@@ -128,8 +128,9 @@ TextMember(const deployment::CanonicalValue &root,
 }
 
 struct NativeFixture final {
-  NativeFixture()
-      : root(MANYFORGE_I6_NATIVE_FIXTURE_ROOT),
+  explicit NativeFixture(
+      std::filesystem::path fixture_root = MANYFORGE_I6_NATIVE_FIXTURE_ROOT)
+      : root(std::move(fixture_root)),
         bundle_source(root / "retained-package"),
         artifact_source(root / "retained-package") {
     const auto manifest = deployment::parse_strict_json_model_yaml(
@@ -463,6 +464,8 @@ TEST(NativeExecutionRuntimeUnitAdmission,
 TEST(RetainedNativeRuntimeUnitAdapter,
      DirectChildReportsClosedReadinessAndRestartMintsAnotherEpoch) {
   NativeFixture fixture;
+  ASSERT_TRUE(fixture.product.has_value());
+  EXPECT_FALSE(fixture.product->implementation_build_identity().has_value());
   auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
 
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
@@ -508,6 +511,62 @@ TEST(RetainedNativeRuntimeUnitAdapter,
             component_manager::ProcessPresenceState::kPresent);
   EXPECT_NE(restarted.process_incarnation(), first_epoch.value());
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     RetainedBuildIdentityMatchesOnceAndRejectsTargetDigestMismatchBeforeLaunch) {
+  NativeFixture fixture(MANYFORGE_I7_BUILD_IDENTIFIED_NATIVE_FIXTURE_ROOT);
+  ASSERT_TRUE(fixture.product.has_value());
+  ASSERT_TRUE(fixture.product->implementation_build_identity().has_value());
+
+  ScopedTemporaryRoot target_root;
+  const auto source =
+      std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT) /
+      std::string(contract::kInstalledTargetId);
+  const auto target =
+      target_root.path() / std::string(contract::kInstalledTargetId);
+  ASSERT_TRUE(std::filesystem::copy_file(
+      source, target, std::filesystem::copy_options::none));
+  std::filesystem::permissions(
+      target, std::filesystem::status(source).permissions(),
+      std::filesystem::perm_options::replace);
+  const auto candidate_worker_source =
+      std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT) /
+      std::string(contract::kCandidateWorkerInstalledTargetId);
+  const auto candidate_worker_target =
+      target_root.path() /
+      std::string(contract::kCandidateWorkerInstalledTargetId);
+  ASSERT_TRUE(std::filesystem::copy_file(
+      candidate_worker_source, candidate_worker_target,
+      std::filesystem::copy_options::none));
+  std::filesystem::permissions(
+      candidate_worker_target,
+      std::filesystem::status(candidate_worker_source).permissions(),
+      std::filesystem::perm_options::replace);
+
+  auto adapter = MakeAdapter(fixture, target_root.path());
+  EXPECT_EQ(adapter.EnsureRunning(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kPresent);
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+
+  {
+    std::fstream stream(target,
+                        std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(stream.good());
+    char first = 0;
+    stream.read(&first, 1U);
+    ASSERT_EQ(stream.gcount(), 1);
+    first = static_cast<char>(static_cast<unsigned char>(first) ^ 0x01U);
+    stream.seekp(0);
+    stream.write(&first, 1U);
+    ASSERT_TRUE(stream.good());
+  }
+
+  EXPECT_THROW(static_cast<void>(adapter.EnsureRunning(*fixture.query)),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
 }
 

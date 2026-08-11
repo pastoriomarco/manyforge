@@ -345,6 +345,7 @@ control_bindings:
         command_endpoint_role_ids: [command_a]
         state_endpoint_role_ids: [state_a]
     provider_instance_id: hardware
+    provider_runtime_unit_id: driver
     provider_manifest_id: xarm_hardware
     provider_manifest_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
@@ -396,7 +397,7 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "ute_b\"],\"provider_instance_id\":\"hardware\",\"provider_manifest_id\":\"xarm_hardware\","
     "\"provider_manifest_revision\":\"sha256:"
     "00000"
-    "00000000000000000000000000000000000000000000000000000000000\",\"resource_bindings\":[{\"reso"
+    "00000000000000000000000000000000000000000000000000000000000\",\"provider_runtime_unit_id\":\"driver\",\"resource_bindings\":[{\"reso"
     "urce_id\":\"joint_2\",\"resource_role_id\":\"arm_joints\"},{\"resource_id\":\"joint_1\","
     "\"resource_r"
     "ole_id\":\"arm_joints\"}],\"route_endpoint_projections\":[{\"command_endpoint_role_ids\":["
@@ -460,7 +461,8 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
 [[nodiscard]] std::string two_control_binding_graph(
     std::string_view second_provider_instance_id,
     std::string_view second_provider_manifest_id,
-    std::string_view second_provider_manifest_revision) {
+    std::string_view second_provider_manifest_revision,
+    std::string_view second_provider_runtime_unit_id = "driver") {
   std::string graph = full_graph();
   const std::size_t binding_start =
       graph.find("  - control_binding_id: arm_trajectory\n");
@@ -477,6 +479,10 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
   second_binding = replace_once(
       std::move(second_binding), "provider_instance_id: hardware",
       "provider_instance_id: " + std::string(second_provider_instance_id));
+  second_binding = replace_once(
+      std::move(second_binding), "provider_runtime_unit_id: driver",
+      "provider_runtime_unit_id: " +
+          std::string(second_provider_runtime_unit_id));
   second_binding = replace_once(
       std::move(second_binding), "provider_manifest_id: xarm_hardware",
       "provider_manifest_id: " + std::string(second_provider_manifest_id));
@@ -919,6 +925,29 @@ TEST(CellGraphCodec,
     (void)validate(two_control_binding_graph(
         "hardware_aux", "other_hardware", kOneDigest));
   });
+}
+
+TEST(CellGraphCodec,
+     ExplicitProviderRuntimeSelectsOneOfSeveralComponentAndDomainRuntimes) {
+  const auto with_two_domain_runtimes = [](std::string graph) {
+    return replace_once(std::move(graph), "    runtime_unit_ids: [driver]\n",
+                        "    runtime_unit_ids: [driver, observer]\n");
+  };
+
+  EXPECT_NO_THROW({
+    const auto graph = with_two_domain_runtimes(two_control_binding_graph(
+        "hardware_aux", "other_hardware", kOneDigest, "observer"));
+    const auto validated = validate(graph);
+    ASSERT_EQ(validated.graph().control_bindings.size(), 2U);
+    EXPECT_NE(validated.graph().control_bindings[0].provider_runtime_unit_id,
+              validated.graph().control_bindings[1].provider_runtime_unit_id);
+  });
+  EXPECT_THROW(
+      {
+        (void)validate(with_two_domain_runtimes(two_control_binding_graph(
+            "hardware", "xarm_hardware", kZeroDigest, "observer")));
+      },
+      CellGraphCodecError);
 }
 
 TEST(CellGraphCodec, EnforcesOwnedPassiveAndComponentRootPlacement) {

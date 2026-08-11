@@ -28,6 +28,7 @@
 #include "embedded_controller_topology_schema.hpp"
 #include "embedded_empty_runtime_configuration_schema.hpp"
 #include "embedded_empty_provider_contract_schema.hpp"
+#include "embedded_motion_controlled_stop_provider_contract_schema.hpp"
 #include "embedded_native_execution_runtime_configuration_schema.hpp"
 #include "embedded_model_asset_schema.hpp"
 #include "embedded_provider_manifest_schema.hpp"
@@ -1817,12 +1818,14 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        "catalog/manyforge.runtime_profile.v1.yaml",
        detail::kEmbeddedRuntimeProfileSchema},
       {core::CatalogRecordKind::kStopEvidencePolicy,
-       "catalog/manyforge.stop_evidence_policy.v1.yaml",
+       "catalog/manyforge.stop_evidence_policy.v2.yaml",
        detail::kEmbeddedStopEvidencePolicySchema},
   }};
-  const std::array<QualifiedValueSchemaSource, 3U> qualified_value_sources{{
+  const std::array<QualifiedValueSchemaSource, 4U> qualified_value_sources{{
       {"value/manyforge.value_schema.provider_contract.empty.v1.yaml",
        detail::kEmbeddedEmptyProviderContractSchema},
+      {"value/manyforge.value_schema.provider_contract.motion_controlled_stop.v1.yaml",
+       detail::kEmbeddedMotionControlledStopProviderContractSchema},
       {"value/manyforge.value_schema.runtime.empty.v1.yaml",
        detail::kEmbeddedEmptyRuntimeConfigurationSchema},
       {"value/manyforge.value_schema.runtime.native_execution.v1.yaml",

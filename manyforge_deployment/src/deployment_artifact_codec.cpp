@@ -286,10 +286,6 @@ struct DecodedDeployment final {
     fail("$.api_version", "expected manyforge.deployment.v1");
   }
 
-  if (find_member(root, "policies") != nullptr) {
-    fail("$.policies",
-         "the policy block is not qualified by the current compiler subset");
-  }
   std::optional<CanonicalValue> compatibility;
   if (const CanonicalValue* authored = find_member(root, "compatibility"); authored != nullptr) {
     validate_compatibility(*authored);
@@ -422,6 +418,9 @@ struct DecodedDeployment final {
   if (applicability.external_resources_was_present()) {
     root.emplace_back("external_resources",
                       applicability.normalized_external_resources());
+  }
+  if (applicability.policies_was_present()) {
+    root.emplace_back("policies", *applicability.normalized_policies());
   }
   if (applicability.assistant_settings().source_was_present()) {
     root.emplace_back("assistant",

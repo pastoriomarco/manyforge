@@ -98,7 +98,26 @@
       ]
     }
   ],
-  "provider_contracts": [],
+  "provider_contracts": [
+    {
+      "provider_contract_ref": {
+        "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+        "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+        "provider_contract_role_id": "software_hard_stop"
+      },
+      "stop_command_support": {
+        "command_endpoint_role_ids": [],
+        "command_kind": "registered",
+        "registered_command_kind_id": "manyforge.stop.software_hard"
+      },
+      "stop_evidence_support": {
+        "evidence_endpoint_role_ids": [
+          "state"
+        ],
+        "evidence_kind": "motion_rest"
+      }
+    }
+  ],
   "provider_manifest_id": "manyforge.provider.native_control",
-  "provider_manifest_revision": "sha256:6fa8317ddf53ae5bf1fdd164a587cfa138b637845aafdccfa1c1e82068f385d7"
+  "provider_manifest_revision": "sha256:d1c03f762af34a90ac3d3d5071432c9a4a27ee26dc2a9e7b06c422089c49018d"
 }

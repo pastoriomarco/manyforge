@@ -2,7 +2,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <manyforge_core/types/active_control_configuration.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
+#include <manyforge_core/types/stop_control.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
@@ -542,13 +544,462 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
+  py::class_<KinematicControlBindingSourceDTO>(
+      module, "KinematicControlBindingSourceDTO", py::is_final())
+      .def(py::init<ControlBindingId, ControlBindingRevision>(),
+           py::arg("control_binding_id"),
+           py::arg("control_binding_revision"))
+      .def_readonly("control_binding_id",
+                    &KinematicControlBindingSourceDTO::control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &KinematicControlBindingSourceDTO::control_binding_revision)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<KinematicResourceSourceProjectionDTO>(
+      module, "KinematicResourceSourceProjectionDTO", py::is_final())
+      .def(py::init<ResourceId,
+                    std::vector<KinematicControlBindingSourceDTO>,
+                    ProviderInstanceId, ProviderManifestId,
+                    ProviderManifestRevision, StateAuthorityId,
+                    StateAuthorityClass, ObservedStateSourceKind>(),
+           py::arg("resource_id"),
+           py::arg("contributing_control_bindings"),
+           py::arg("provider_instance_id"),
+           py::arg("provider_manifest_id"),
+           py::arg("provider_manifest_revision"),
+           py::arg("state_authority_id"),
+           py::arg("state_authority_class"),
+           py::arg("publication_source"))
+      .def_readonly("resource_id",
+                    &KinematicResourceSourceProjectionDTO::resource_id)
+      .def_property_readonly(
+          "contributing_control_bindings",
+          [](const KinematicResourceSourceProjectionDTO& value) {
+            return immutable_snapshot(value.contributing_control_bindings);
+          })
+      .def_readonly("provider_instance_id",
+                    &KinematicResourceSourceProjectionDTO::provider_instance_id)
+      .def_readonly("provider_manifest_id",
+                    &KinematicResourceSourceProjectionDTO::provider_manifest_id)
+      .def_readonly(
+          "provider_manifest_revision",
+          &KinematicResourceSourceProjectionDTO::provider_manifest_revision)
+      .def_readonly("state_authority_id",
+                    &KinematicResourceSourceProjectionDTO::state_authority_id)
+      .def_readonly(
+          "state_authority_class",
+          &KinematicResourceSourceProjectionDTO::state_authority_class)
+      .def_readonly("publication_source",
+                    &KinematicResourceSourceProjectionDTO::publication_source)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<ActiveControlConfigurationBindingRouteDTO>(
+      module, "ActiveControlConfigurationBindingRouteDTO", py::is_final())
+      .def(py::init<ControlBindingId, ControlBindingRevision, ControlRouteId>(),
+           py::arg("control_binding_id"),
+           py::arg("control_binding_revision"), py::arg("control_route_id"))
+      .def_readonly(
+          "control_binding_id",
+          &ActiveControlConfigurationBindingRouteDTO::control_binding_id)
+      .def_readonly(
+          "control_binding_revision",
+          &ActiveControlConfigurationBindingRouteDTO::control_binding_revision)
+      .def_readonly("control_route_id",
+                    &ActiveControlConfigurationBindingRouteDTO::control_route_id)
+      .def("locally_valid",
+           &ActiveControlConfigurationBindingRouteDTO::locally_valid)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::enum_<ActiveControlConfigurationStateDTO>(
+      module, "ActiveControlConfigurationStateDTO")
+      .value("kExternalOrUnknownUnreconciled",
+             ActiveControlConfigurationStateDTO::
+                 kExternalOrUnknownUnreconciled)
+      .value("kReconciled", ActiveControlConfigurationStateDTO::kReconciled);
+
+  py::class_<ActiveControlConfigurationDTO>(
+      module, "ActiveControlConfigurationDTO", py::is_final())
+      .def(py::init<
+               ActiveControlConfigurationId, ControlDomainId,
+               ControlDomainRevision,
+               std::vector<ActiveControlConfigurationBindingRouteDTO>,
+               ActivationSetId, ControllerTopologyId, TopologyRevision,
+               RuntimeUnitId, RuntimeEpoch, std::uint64_t,
+               std::vector<KinematicResourceSourceProjectionDTO>,
+               ActiveControlConfigurationGeneration,
+               ActiveControlConfigurationStateDTO>(),
+           py::arg("active_control_configuration_id"),
+           py::arg("control_domain_id"), py::arg("control_domain_revision"),
+           py::arg("binding_routes"), py::arg("activation_set_id"),
+           py::arg("controller_topology_id"), py::arg("topology_revision"),
+           py::arg("source_runtime_unit_id"), py::arg("source_runtime_epoch"),
+           py::arg("source_sequence"),
+           py::arg("kinematic_resource_source_projections"),
+           py::arg("active_control_configuration_generation"),
+           py::arg("state"))
+      .def_readonly(
+          "active_control_configuration_id",
+          &ActiveControlConfigurationDTO::active_control_configuration_id)
+      .def_readonly("control_domain_id",
+                    &ActiveControlConfigurationDTO::control_domain_id)
+      .def_readonly("control_domain_revision",
+                    &ActiveControlConfigurationDTO::control_domain_revision)
+      .def_property_readonly(
+          "binding_routes", [](const ActiveControlConfigurationDTO& value) {
+            return immutable_snapshot(value.binding_routes);
+          })
+      .def_readonly("activation_set_id",
+                    &ActiveControlConfigurationDTO::activation_set_id)
+      .def_readonly("controller_topology_id",
+                    &ActiveControlConfigurationDTO::controller_topology_id)
+      .def_readonly("topology_revision",
+                    &ActiveControlConfigurationDTO::topology_revision)
+      .def_readonly("source_runtime_unit_id",
+                    &ActiveControlConfigurationDTO::source_runtime_unit_id)
+      .def_readonly("source_runtime_epoch",
+                    &ActiveControlConfigurationDTO::source_runtime_epoch)
+      .def_readonly("source_sequence",
+                    &ActiveControlConfigurationDTO::source_sequence)
+      .def_property_readonly(
+          "kinematic_resource_source_projections",
+          [](const ActiveControlConfigurationDTO& value) {
+            return immutable_snapshot(
+                value.kinematic_resource_source_projections);
+          })
+      .def_readonly(
+          "active_control_configuration_generation",
+          &ActiveControlConfigurationDTO::active_control_configuration_generation)
+      .def_readonly("state", &ActiveControlConfigurationDTO::state)
+      .def("locally_valid", &ActiveControlConfigurationDTO::locally_valid)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<RetainedArtifactRefDTO>(module, "RetainedArtifactRefDTO",
+                                     py::is_final())
+      .def(py::init<ArtifactRoleId, std::string, std::uint64_t,
+                    ContentDigest, ContentAddressedStoreKey>(),
+           py::arg("artifact_role_id"), py::arg("media_type"),
+           py::arg("byte_size"), py::arg("content_digest"),
+           py::arg("content_addressed_store_key"))
+      .def_readonly("artifact_role_id",
+                    &RetainedArtifactRefDTO::artifact_role_id)
+      .def_readonly("media_type", &RetainedArtifactRefDTO::media_type)
+      .def_readonly("byte_size", &RetainedArtifactRefDTO::byte_size)
+      .def_readonly("content_digest",
+                    &RetainedArtifactRefDTO::content_digest)
+      .def_readonly("content_addressed_store_key",
+                    &RetainedArtifactRefDTO::content_addressed_store_key)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::enum_<MotionControlledStopMode>(module, "MotionControlledStopMode")
+      .value("kSoftOnPath", MotionControlledStopMode::kSoftOnPath)
+      .value("kSpringBackHold", MotionControlledStopMode::kSpringBackHold)
+      .value("kHardDeceleration",
+             MotionControlledStopMode::kHardDeceleration);
+
+  py::class_<ControlledStopResourceLimitDTO>(
+      module, "ControlledStopResourceLimitDTO", py::is_final())
+      .def(py::init<ResourceId, CoordinateAccelerationDTO,
+                    CoordinateVelocityDTO>(),
+           py::arg("resource_id"), py::arg("max_deceleration"),
+           py::arg("settle_velocity_threshold"))
+      .def_readonly("resource_id",
+                    &ControlledStopResourceLimitDTO::resource_id)
+      .def_readonly("max_deceleration",
+                    &ControlledStopResourceLimitDTO::max_deceleration)
+      .def_readonly(
+          "settle_velocity_threshold",
+          &ControlledStopResourceLimitDTO::settle_velocity_threshold)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<HardStopResourceLimitDTO>(
+      module, "HardStopResourceLimitDTO", py::is_final())
+      .def(py::init<ResourceId, CoordinateVelocityDTO>(),
+           py::arg("resource_id"), py::arg("settle_velocity_threshold"))
+      .def_readonly("resource_id", &HardStopResourceLimitDTO::resource_id)
+      .def_readonly("settle_velocity_threshold",
+                    &HardStopResourceLimitDTO::settle_velocity_threshold)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<SoftOnPathStopParametersDTO>(
+      module, "SoftOnPathStopParametersDTO", py::is_final())
+      .def(py::init<MotionControlledStopMode, double,
+                    std::vector<ControlledStopResourceLimitDTO>, bool,
+                    std::optional<MotionControlledStopMode>>(),
+           py::arg("stop_mode"), py::arg("deceleration_time_s"),
+           py::arg("per_resource_limits"),
+           py::arg("allow_natural_completion_on_short_path"),
+           py::arg("recoverable_substitution_mode") = std::nullopt)
+      .def_readonly("stop_mode", &SoftOnPathStopParametersDTO::stop_mode)
+      .def_readonly("deceleration_time_s",
+                    &SoftOnPathStopParametersDTO::deceleration_time_s)
+      .def_property_readonly(
+          "per_resource_limits",
+          [](const SoftOnPathStopParametersDTO& value) {
+            return immutable_snapshot(value.per_resource_limits);
+          })
+      .def_readonly(
+          "allow_natural_completion_on_short_path",
+          &SoftOnPathStopParametersDTO::allow_natural_completion_on_short_path)
+      .def_readonly(
+          "recoverable_substitution_mode",
+          &SoftOnPathStopParametersDTO::recoverable_substitution_mode)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<SpringBackHoldStopParametersDTO>(
+      module, "SpringBackHoldStopParametersDTO", py::is_final())
+      .def(py::init<MotionControlledStopMode, double,
+                    std::vector<ControlledStopResourceLimitDTO>>(),
+           py::arg("stop_mode"), py::arg("deceleration_time_s"),
+           py::arg("per_resource_limits"))
+      .def_readonly("stop_mode",
+                    &SpringBackHoldStopParametersDTO::stop_mode)
+      .def_readonly("deceleration_time_s",
+                    &SpringBackHoldStopParametersDTO::deceleration_time_s)
+      .def_property_readonly(
+          "per_resource_limits",
+          [](const SpringBackHoldStopParametersDTO& value) {
+            return immutable_snapshot(value.per_resource_limits);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<HardDecelerationStopParametersDTO>(
+      module, "HardDecelerationStopParametersDTO", py::is_final())
+      .def(py::init<MotionControlledStopMode,
+                    std::vector<HardStopResourceLimitDTO>>(),
+           py::arg("stop_mode"), py::arg("per_resource_limits"))
+      .def_readonly("stop_mode",
+                    &HardDecelerationStopParametersDTO::stop_mode)
+      .def_property_readonly(
+          "per_resource_limits",
+          [](const HardDecelerationStopParametersDTO& value) {
+            return immutable_snapshot(value.per_resource_limits);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::tuple motion_controlled_stop_parameter_types{3U};
+  motion_controlled_stop_parameter_types[0] =
+      module.attr("SoftOnPathStopParametersDTO");
+  motion_controlled_stop_parameter_types[1] =
+      module.attr("SpringBackHoldStopParametersDTO");
+  motion_controlled_stop_parameter_types[2] =
+      module.attr("HardDecelerationStopParametersDTO");
+  module.attr("MotionControlledStopContractParametersDTO") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(motion_controlled_stop_parameter_types);
+
+  py::class_<RegisteredStopCommandDefinitionDTO>(
+      module, "RegisteredStopCommandDefinitionDTO", py::is_final())
+      .def_readonly(
+          "registered_command_kind_id",
+          &RegisteredStopCommandDefinitionDTO::registered_command_kind_id)
+      .def_readonly("stop_action_class",
+                    &RegisteredStopCommandDefinitionDTO::stop_action_class)
+      .def_readonly(
+          "safety_system_request_action_class",
+          &RegisteredStopCommandDefinitionDTO::
+              safety_system_request_action_class)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  module.def("registered_stop_command_definitions", [] {
+    return immutable_snapshot(registered_stop_command_definitions());
+  });
+
+  // These rows are public read-only projections of build-qualified retained
+  // products. Python may inspect them but cannot manufacture authority.
+  py::class_<StopImplementationQualificationDTO>(
+      module, "StopImplementationQualificationDTO", py::is_final())
+      .def_readonly(
+          "registered_command_kind_id",
+          &StopImplementationQualificationDTO::registered_command_kind_id)
+      .def_readonly("provider_contract_ref",
+                    &StopImplementationQualificationDTO::provider_contract_ref)
+      .def_readonly("product_id",
+                    &StopImplementationQualificationDTO::product_id)
+      .def_readonly("product_contract_id",
+                    &StopImplementationQualificationDTO::product_contract_id)
+      .def_readonly(
+          "product_contract_revision",
+          &StopImplementationQualificationDTO::product_contract_revision)
+      .def_readonly("endpoint_role_id",
+                    &StopImplementationQualificationDTO::endpoint_role_id)
+      .def_readonly("invocation_lane_id",
+                    &StopImplementationQualificationDTO::invocation_lane_id)
+      .def_readonly(
+          "qualification_artifact_ref",
+          &StopImplementationQualificationDTO::qualification_artifact_ref)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<ControlledStopSubstitutionQualificationDTO>(
+      module, "ControlledStopSubstitutionQualificationDTO", py::is_final())
+      .def_readonly(
+          "provider_contract_ref",
+          &ControlledStopSubstitutionQualificationDTO::provider_contract_ref)
+      .def_readonly("product_id",
+                    &ControlledStopSubstitutionQualificationDTO::product_id)
+      .def_readonly(
+          "product_contract_id",
+          &ControlledStopSubstitutionQualificationDTO::product_contract_id)
+      .def_readonly(
+          "product_contract_revision",
+          &ControlledStopSubstitutionQualificationDTO::
+              product_contract_revision)
+      .def_readonly(
+          "requested_stop_mode",
+          &ControlledStopSubstitutionQualificationDTO::requested_stop_mode)
+      .def_readonly(
+          "executed_stop_mode",
+          &ControlledStopSubstitutionQualificationDTO::executed_stop_mode)
+      .def_readonly(
+          "qualification_artifact_ref",
+          &ControlledStopSubstitutionQualificationDTO::
+              qualification_artifact_ref)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<StopStageParametersDTO>(module, "StopStageParametersDTO",
+                                     py::is_final())
+      .def(py::init<ControlDomainId, ControlDomainRevision,
+                    ControlBindingId, ControlBindingRevision,
+                    ControllerTopologyId, TopologyRevision, ControlRouteId,
+                    StopEvidencePolicyId, StopEvidencePolicyRevision,
+                    StopEscalationStageId, ProviderContractRefDTO,
+                    JsonObjectDTO>(),
+           py::arg("control_domain_id"),
+           py::arg("control_domain_revision"),
+           py::arg("control_binding_id"),
+           py::arg("control_binding_revision"),
+           py::arg("controller_topology_id"),
+           py::arg("topology_revision"), py::arg("control_route_id"),
+           py::arg("stop_evidence_policy_id"),
+           py::arg("stop_evidence_policy_revision"),
+           py::arg("stop_escalation_stage_id"),
+           py::arg("provider_contract_ref"),
+           py::arg("default_contract_parameters"))
+      .def_readonly("control_domain_id",
+                    &StopStageParametersDTO::control_domain_id)
+      .def_readonly("control_domain_revision",
+                    &StopStageParametersDTO::control_domain_revision)
+      .def_readonly("control_binding_id",
+                    &StopStageParametersDTO::control_binding_id)
+      .def_readonly("control_binding_revision",
+                    &StopStageParametersDTO::control_binding_revision)
+      .def_readonly("controller_topology_id",
+                    &StopStageParametersDTO::controller_topology_id)
+      .def_readonly("topology_revision",
+                    &StopStageParametersDTO::topology_revision)
+      .def_readonly("control_route_id",
+                    &StopStageParametersDTO::control_route_id)
+      .def_readonly("stop_evidence_policy_id",
+                    &StopStageParametersDTO::stop_evidence_policy_id)
+      .def_readonly("stop_evidence_policy_revision",
+                    &StopStageParametersDTO::stop_evidence_policy_revision)
+      .def_readonly("stop_escalation_stage_id",
+                    &StopStageParametersDTO::stop_escalation_stage_id)
+      .def_readonly("provider_contract_ref",
+                    &StopStageParametersDTO::provider_contract_ref)
+      .def_readonly("default_contract_parameters",
+                    &StopStageParametersDTO::default_contract_parameters)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<CommissionedStopInterfaceDTO>(
+      module, "CommissionedStopInterfaceDTO", py::is_final())
+      .def(py::init<
+               CommissionedStopInterfaceId,
+               CommissionedStopInterfaceRevision, ControlDomainId,
+               ControlDomainRevision, ControlBindingId,
+               ControlBindingRevision, ControlRouteId, ProviderInstanceId,
+               ProviderManifestId, ProviderManifestRevision,
+               RegisteredStopCommandKindId, ProviderContractRefDTO,
+               EndpointRoleId, StopActionClass,
+               SafetySystemRequestActionClass,
+               std::optional<ExternalResourceAlias>,
+               std::optional<ExternalResourceKind>,
+               std::optional<SiteOverlayValueRef>, RetainedArtifactRefDTO>(),
+           py::arg("commissioned_stop_interface_id"),
+           py::arg("commissioned_stop_interface_revision"),
+           py::arg("control_domain_id"),
+           py::arg("control_domain_revision"),
+           py::arg("control_binding_id"),
+           py::arg("control_binding_revision"),
+           py::arg("control_route_id"), py::arg("provider_instance_id"),
+           py::arg("provider_manifest_id"),
+           py::arg("provider_manifest_revision"),
+           py::arg("registered_command_kind_id"),
+           py::arg("provider_contract_ref"), py::arg("endpoint_role_id"),
+           py::arg("stop_action_class"),
+           py::arg("safety_system_request_action_class"),
+           py::arg("external_resource_alias"),
+           py::arg("external_resource_kind"),
+           py::arg("site_overlay_value_ref"),
+           py::arg("commissioning_evidence_artifact_ref"))
+      .def_readonly("commissioned_stop_interface_id",
+                    &CommissionedStopInterfaceDTO::
+                        commissioned_stop_interface_id)
+      .def_readonly("commissioned_stop_interface_revision",
+                    &CommissionedStopInterfaceDTO::
+                        commissioned_stop_interface_revision)
+      .def_readonly("control_domain_id",
+                    &CommissionedStopInterfaceDTO::control_domain_id)
+      .def_readonly("control_domain_revision",
+                    &CommissionedStopInterfaceDTO::control_domain_revision)
+      .def_readonly("control_binding_id",
+                    &CommissionedStopInterfaceDTO::control_binding_id)
+      .def_readonly("control_binding_revision",
+                    &CommissionedStopInterfaceDTO::control_binding_revision)
+      .def_readonly("control_route_id",
+                    &CommissionedStopInterfaceDTO::control_route_id)
+      .def_readonly("provider_instance_id",
+                    &CommissionedStopInterfaceDTO::provider_instance_id)
+      .def_readonly("provider_manifest_id",
+                    &CommissionedStopInterfaceDTO::provider_manifest_id)
+      .def_readonly("provider_manifest_revision",
+                    &CommissionedStopInterfaceDTO::provider_manifest_revision)
+      .def_readonly("registered_command_kind_id",
+                    &CommissionedStopInterfaceDTO::registered_command_kind_id)
+      .def_readonly("provider_contract_ref",
+                    &CommissionedStopInterfaceDTO::provider_contract_ref)
+      .def_readonly("endpoint_role_id",
+                    &CommissionedStopInterfaceDTO::endpoint_role_id)
+      .def_readonly("stop_action_class",
+                    &CommissionedStopInterfaceDTO::stop_action_class)
+      .def_readonly("safety_system_request_action_class",
+                    &CommissionedStopInterfaceDTO::
+                        safety_system_request_action_class)
+      .def_readonly("external_resource_alias",
+                    &CommissionedStopInterfaceDTO::external_resource_alias)
+      .def_readonly("external_resource_kind",
+                    &CommissionedStopInterfaceDTO::external_resource_kind)
+      .def_readonly("site_overlay_value_ref",
+                    &CommissionedStopInterfaceDTO::site_overlay_value_ref)
+      .def_readonly("commissioning_evidence_artifact_ref",
+                    &CommissionedStopInterfaceDTO::
+                        commissioning_evidence_artifact_ref)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
   py::class_<DeploymentApplicabilityInputsDTO>(
       module, "DeploymentApplicabilityInputsDTO", py::is_final())
       .def(py::init([](
                std::optional<SiteOverlayRefDTO> site_overlay_ref,
                const py::iterable& desired_control_configurations,
                const py::iterable& capability_provider_bindings,
-               const py::iterable& external_resources) {
+               const py::iterable& external_resources,
+               const py::iterable& stop_stage_parameters,
+               const py::iterable& commissioned_stop_interfaces) {
              auto bounded_configurations = bounded_values_from_python<
                  DesiredControlConfigurationDTO,
                  deployment::DeploymentApplicabilityCodecError>(
@@ -568,16 +1019,31 @@ void register_deployment_candidate_bindings(py::module_& module) {
                  deployment::DeploymentApplicabilityCodecError>(
                  external_resources, kMaxDeploymentApplicabilityRows,
                  "external_resources", "ExternalResourceDTO");
+             auto bounded_stop_parameters = bounded_values_from_python<
+                 StopStageParametersDTO,
+                 deployment::DeploymentApplicabilityCodecError>(
+                 stop_stage_parameters, kMaxDeploymentApplicabilityRows,
+                 "stop_stage_parameters", "StopStageParametersDTO");
+             auto bounded_commissioned = bounded_values_from_python<
+                 CommissionedStopInterfaceDTO,
+                 deployment::DeploymentApplicabilityCodecError>(
+                 commissioned_stop_interfaces, 256U,
+                 "commissioned_stop_interfaces",
+                 "CommissionedStopInterfaceDTO");
              return DeploymentApplicabilityInputsDTO{
                  std::move(site_overlay_ref),
                  std::move(bounded_configurations),
                  std::move(bounded_providers),
-                 std::move(bounded_resources)};
+                 std::move(bounded_resources),
+                 std::move(bounded_stop_parameters),
+                 std::move(bounded_commissioned)};
            }),
            py::arg("site_overlay_ref"),
            py::arg("desired_control_configurations"),
            py::arg("capability_provider_bindings"),
-           py::arg("external_resources"))
+           py::arg("external_resources"),
+           py::arg("stop_stage_parameters"),
+           py::arg("commissioned_stop_interfaces"))
       .def_readonly("site_overlay_ref",
                     &DeploymentApplicabilityInputsDTO::site_overlay_ref)
       .def_readonly(
@@ -588,6 +1054,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
           &DeploymentApplicabilityInputsDTO::capability_provider_bindings)
       .def_readonly("external_resources",
                     &DeploymentApplicabilityInputsDTO::external_resources)
+      .def_readonly("stop_stage_parameters",
+                    &DeploymentApplicabilityInputsDTO::stop_stage_parameters)
+      .def_readonly("commissioned_stop_interfaces",
+                    &DeploymentApplicabilityInputsDTO::
+                        commissioned_stop_interfaces)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
@@ -620,6 +1091,16 @@ void register_deployment_candidate_bindings(py::module_& module) {
             py::gil_scoped_release release;
             return deployment::canonical_json(
                 candidate.normalized_external_resources());
+          })
+      .def_property_readonly(
+          "normalized_policies_canonical_json",
+          [](const deployment::TypedDeploymentApplicabilityInputsCandidate&
+                 candidate) -> std::optional<std::string> {
+            if (!candidate.normalized_policies().has_value()) {
+              return std::nullopt;
+            }
+            py::gil_scoped_release release;
+            return deployment::canonical_json(*candidate.normalized_policies());
           })
       .def_property_readonly(
           "site_overlay_ref_presence",
@@ -672,6 +1153,16 @@ void register_deployment_candidate_bindings(py::module_& module) {
                 inputs.normalized_external_resources());
           })
       .def_property_readonly(
+          "normalized_policies_canonical_json",
+          [](const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
+                 inputs) -> std::optional<std::string> {
+            if (!inputs.normalized_policies().has_value()) {
+              return std::nullopt;
+            }
+            py::gil_scoped_release release;
+            return deployment::canonical_json(*inputs.normalized_policies());
+          })
+      .def_property_readonly(
           "site_overlay_ref_presence",
           &deployment::RevisionVerifiedDeploymentApplicabilityInputs::
               site_overlay_ref_presence)
@@ -689,6 +1180,20 @@ void register_deployment_candidate_bindings(py::module_& module) {
           "assistant_settings",
           [](const deployment::RevisionVerifiedDeploymentApplicabilityInputs&
                  inputs) { return inputs.assistant_settings(); });
+
+  py::class_<deployment::QualifiedCommissioningEvidenceRef>(
+      module, "QualifiedCommissioningEvidenceRef", py::is_final())
+      .def_property_readonly(
+          "commissioned_stop_interface_id",
+          &deployment::QualifiedCommissioningEvidenceRef::
+              commissioned_stop_interface_id)
+      .def_property_readonly(
+          "commissioned_stop_interface_revision",
+          &deployment::QualifiedCommissioningEvidenceRef::
+              commissioned_stop_interface_revision)
+      .def_property_readonly(
+          "artifact_ref",
+          &deployment::QualifiedCommissioningEvidenceRef::artifact_ref);
 
   py::class_<deployment::VerifiedSiteOverlayArtifactProjection>(
       module, "VerifiedSiteOverlayArtifactProjection", py::is_final())
@@ -1268,6 +1773,17 @@ void register_deployment_candidate_bindings(py::module_& module) {
       "verify_capability_provider_binding_revisions",
       &deployment::verify_capability_provider_binding_revisions,
       py::arg("candidate"), py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "resolve_and_verify_commissioning_evidence_ref",
+      [](const CommissionedStopInterfaceDTO& commissioned_interface,
+         const ContentAddressedStoreKey& resolved_store_key,
+         const std::string& stored_bytes) {
+        py::gil_scoped_release release;
+        return deployment::resolve_and_verify_commissioning_evidence_ref(
+            commissioned_interface, resolved_store_key, stored_bytes);
+      },
+      py::arg("commissioned_interface"), py::arg("resolved_store_key"),
+      py::arg("stored_bytes"));
   module.def(
       "resolve_and_verify_site_overlay_artifact_projection",
       [](const SiteOverlayRefDTO& expected_reference,

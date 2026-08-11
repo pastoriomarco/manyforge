@@ -257,7 +257,7 @@ constexpr std::array<CatalogFixture, 11> kAllCatalogKinds{{
      "manyforge.capability_definition.v1"},
     {"contact_policy", "contact", "manyforge.contact_policy.v1"},
     {"stop_evidence_policy", "stop",
-     "manyforge.stop_evidence_policy.v1"},
+     "manyforge.stop_evidence_policy.v2"},
     {"runtime_policy", "runtime_policy",
      "manyforge.runtime_policy.v1"},
 }};
@@ -474,7 +474,7 @@ TEST(DeploymentArtifactCodec,
                ",\"assistant\":{\"enabled\":false}"),
       "$.assistant: unknown field 'enabled'");
   expect_compute_error(document(empty_graph(), "[]", "{\"records\":[]}", ",\"policies\":{}"),
-                       "policy block is not qualified");
+                       "missing required field 'retained_policy_records'");
   const auto compatible = produce(document(empty_graph(), "[]", "{\"records\":[]}",
                                            ",\"compatibility\":{\"lane\":\"manyforge-only\","
                                            "\"provides\":[],\"tags\":[\"pick-and-place\"]}"));
