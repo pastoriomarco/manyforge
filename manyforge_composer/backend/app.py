@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 import re
 import time
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.exception_handlers import http_exception_handler
@@ -18,20 +18,19 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .log_throttle import ThrottledLog
 from .models import UnavailableDetail, UnavailableResponse
-from .routes_catalog import create_catalog_router
-from .routes_assistant_draft import create_assistant_draft_router
 from .routes_assistant import create_assistant_router
+from .routes_assistant_draft import create_assistant_draft_router
+from .routes_catalog import create_catalog_router
 from .routes_draft import create_draft_router
 from .routes_filesystem import create_filesystem_router
 from .routes_nodes import create_nodes_router
 from .routes_urdf import create_urdf_router
-from .security import BearerAuthMiddleware, SecurityConfig, check_ws_bearer_token
+from .security import SecurityConfig
 from .state import (
-    ComposerState,
     RUNTIME_UNAVAILABLE_MESSAGE,
     RUNTIME_UNAVAILABLE_REASON_CODE,
+    ComposerState,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -166,13 +165,11 @@ def create_app(
             maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
             path_prefix=program_authoring_prefix,
         )
-    if security.api_token:
-        app.add_middleware(BearerAuthMiddleware, token=security.api_token)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=security.cors_origins,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Content-Type", "X-Request-ID"],
     )
 
     # Request correlation and bounded access logging are shell infrastructure,
@@ -260,9 +257,7 @@ def create_app(
                         "catalog": "available",
                         "viewer_model": "headless",
                         "program_draft": (
-                            "loaded"
-                            if state.draft_session.program_loaded
-                            else "none"
+                            "loaded" if state.draft_session.program_loaded else "none"
                         ),
                         "headless_projection": (
                             "ready"
@@ -288,9 +283,7 @@ def create_app(
                         "catalog": "available",
                         "viewer_model": "headless_unavailable",
                         "program_draft": (
-                            "loaded"
-                            if state.draft_session.program_loaded
-                            else "none"
+                            "loaded" if state.draft_session.program_loaded else "none"
                         ),
                         "headless_projection": "unavailable",
                         "assistant_bridge": (
@@ -326,9 +319,7 @@ def create_app(
                 "catalog": "available",
                 "viewer_model": "unavailable",
                 "program_draft": (
-                    "loaded"
-                    if state.draft_session.program_loaded
-                    else "none"
+                    "loaded" if state.draft_session.program_loaded else "none"
                 ),
                 "runtime": "unavailable",
                 "assistant_bridge": "unconfigured",
@@ -383,12 +374,6 @@ def create_app(
 
         @app.websocket("/ws/state")
         async def headless_state_websocket(websocket: WebSocket) -> None:
-            if security.api_token and not check_ws_bearer_token(
-                websocket,
-                security.api_token,
-            ):
-                await websocket.close(code=1008, reason="Unauthorized")
-                return
             await serve_headless_state(websocket, state.headless_client)
 
     async def unavailable_api(

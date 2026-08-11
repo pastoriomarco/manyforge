@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from typing import Any, Final, Sequence
 
@@ -13,14 +12,10 @@ from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import (
-    ComposerState,
     RUNTIME_UNAVAILABLE_MESSAGE,
     RUNTIME_UNAVAILABLE_REASON_CODE,
+    ComposerState,
 )
-
-
-logger = logging.getLogger(__name__)
-
 
 _REMOVED_RUNTIME_OPTIONS: Final = (
     "--catalog-path",
@@ -96,16 +91,6 @@ def main() -> None:
 
     setup_logging(args.log_level)
     security = SecurityConfig.from_env()
-    if not security.api_token and args.host not in {
-        "127.0.0.1",
-        "localhost",
-        "::1",
-    }:
-        logger.warning(
-            "No MANYFORGE_API_TOKEN set — Composer API is unauthenticated on %s:%d",
-            args.host,
-            args.port,
-        )
     headless_client = None
     assistant_client = None
     if args.headless_api_url is not None:

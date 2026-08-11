@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
 from manyforge_composer.backend import routes_filesystem
 from manyforge_composer.backend.app import _find_static_dir, create_app
@@ -17,12 +17,10 @@ from manyforge_composer.backend.state import ComposerState
 
 def _client(
     *,
-    api_token: str | None = None,
     allowed_fs_roots: list[str] | None = None,
     cors_origins: list[str] | None = None,
 ) -> TestClient:
     security = SecurityConfig(
-        api_token=api_token,
         allowed_fs_roots=allowed_fs_roots or ["/workspace"],
         cors_origins=cors_origins or ["http://localhost:3000"],
     )
@@ -118,8 +116,10 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
     assert empty_workspace.json()["draft"]["programLoaded"] is False
     assert empty_workspace.json()["hasUnappliedChanges"] is None
 
-    program_path = Path(__file__).resolve().parents[2] / "examples" / (
-        "pick_and_place_minimal.program.yaml"
+    program_path = (
+        Path(__file__).resolve().parents[2]
+        / "examples"
+        / ("pick_and_place_minimal.program.yaml")
     )
     state = ComposerState.from_paths(
         program_path=str(program_path),
@@ -142,9 +142,7 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
         },
     )
     assert unavailable_apply.status_code == 503
-    assert unavailable_apply.json()["detail"]["code"] == (
-        "program_apply_unavailable"
-    )
+    assert unavailable_apply.json()["detail"]["code"] == ("program_apply_unavailable")
 
 
 def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> None:
@@ -157,9 +155,7 @@ def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> Non
     )
 
     assert response.status_code == 413
-    assert response.json()["detail"]["code"] == (
-        "composer_request_body_oversized"
-    )
+    assert response.json()["detail"]["code"] == ("composer_request_body_oversized")
 
     retained_route = client.post(
         "/api/program/load",
@@ -197,8 +193,7 @@ def test_unavailable_catch_all_has_stable_unique_openapi_operation_ids() -> None
     spec = app.openapi()
     operations = spec["paths"]["/api/{unavailable_path}"]
     assert {
-        method: operation["operationId"]
-        for method, operation in operations.items()
+        method: operation["operationId"] for method, operation in operations.items()
     } == expected_ids
     operation_ids = [
         operation["operationId"]
@@ -245,19 +240,23 @@ def test_structural_routes_preserve_http_errors_and_request_correlation() -> Non
     assert missing.json()["detail"]
 
 
-def test_auth_still_protects_non_health_structural_and_unavailable_routes() -> None:
-    client = _client(api_token="secret-token")
+def test_composer_ingress_remains_open_when_legacy_token_env_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MANYFORGE_API_TOKEN", "stale-legacy-token")
+    security = SecurityConfig.from_env()
+    client = TestClient(create_app(ComposerState(), security=security))
 
+    assert not hasattr(security, "api_token")
     assert client.get("/api/health").status_code == 200
-    assert client.get("/api/catalog").status_code == 401
-    assert client.get(
-        "/api/catalog",
-        headers={"Authorization": "Bearer secret-token"},
-    ).status_code == 200
-    unavailable = client.get(
-        "/api/scene/state",
-        headers={"Authorization": "Bearer secret-token"},
+    assert (
+        client.get(
+            "/api/catalog",
+            headers={"Authorization": "Bearer wrong-token"},
+        ).status_code
+        == 200
     )
+    unavailable = client.get("/api/scene/state")
     assert unavailable.status_code == 503
 
 
@@ -331,15 +330,13 @@ def test_filesystem_browser_preserves_bounded_sorted_authoring_entries(
         True,
     ]
 
-    browse_operation = client.get("/openapi.json").json()["paths"][
-        "/api/files/browse"
-    ]["get"]
+    browse_operation = client.get("/openapi.json").json()["paths"]["/api/files/browse"][
+        "get"
+    ]
     response_schema = browse_operation["responses"]["200"]["content"][
         "application/json"
     ]["schema"]
-    assert response_schema == {
-        "$ref": "#/components/schemas/FileBrowserResponse"
-    }
+    assert response_schema == {"$ref": "#/components/schemas/FileBrowserResponse"}
 
 
 def test_filesystem_browser_stops_at_root_and_rejects_symlink_escape(
@@ -369,9 +366,7 @@ def test_filesystem_browser_stops_at_root_and_rejects_symlink_escape(
 
     assert child_response.json()["parentPath"] == str(allowed.resolve())
     assert root_response.json()["parentPath"] is None
-    assert "escape" not in {
-        entry["name"] for entry in root_response.json()["entries"]
-    }
+    assert "escape" not in {entry["name"] for entry in root_response.json()["entries"]}
     assert escape_response.status_code == 403
     assert str(outside) not in escape_response.json()["detail"]
 
@@ -615,9 +610,7 @@ def test_structural_cors_reflects_only_configured_origins() -> None:
         headers={"Origin": "http://evil.example.com", **request_headers},
     )
 
-    assert allowed.headers["access-control-allow-origin"] == (
-        "http://localhost:3000"
-    )
+    assert allowed.headers["access-control-allow-origin"] == ("http://localhost:3000")
     assert rejected.headers.get("access-control-allow-origin") is None
 
 

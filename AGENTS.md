@@ -56,10 +56,13 @@
 > prepares a later run; deployment-changing Apply remains subject to the
 > Manager's affected-busy fence. Browser, Composer, or runner loss never sends
 > an implicit Stop, and runner replacement mints a new observable owner epoch.
-> The complete seven-input and repeated-instance closure assigned to N7-a5.5,
-> lifecycle, complete product launch, dynamic scene/viewer behavior, public MCP,
-> external OpenClaw/Hermes loops, Isaac/ROS launch, and real-robot operation
-> remain explicitly unavailable. Do not run the historical recipes below or
+> N7 now closes the maintained seven-input/eight-Program native product path,
+> including unchanged-source repeated-instance isolation, through the Component
+> Manager, Headless API, independent Program runner, and thin Composer clients.
+> The historical aggregate launcher, packaged product installation, lifecycle,
+> dynamic scene/viewer behavior, public MCP, external OpenClaw/Hermes loops,
+> Isaac/ROS launch, and real-robot operation remain explicitly unavailable. Do
+> not run the historical recipes below or
 > recreate their superseded Python semantic owners. Retain or port same-role
 > Python/TypeScript
 > clients, authoring, presentation, safety, and evidence surfaces at their
@@ -73,19 +76,20 @@ ______________________________________________________________________
 ## What this repo is
 
 ManyForge is the deployment-side repository for the target robot-execution
-framework. During the active destructive cutover it intentionally does not
-ship an operable product runtime. Surviving headless packages and the
-structural Composer shell live here; removed products return only after their
-named restoration gates.
+framework. During the active destructive cutover it ships one maintained
+ManyForge-only native product path through explicit Component Manager,
+Headless, Program-runner, native-owner, and thin Composer entrypoints. Packaged
+installation, the historical aggregate launcher, and the I7-I11 product lanes
+remain unavailable until their named restoration gates.
 
 Three sibling repositories form the full stack; the cross-repo
 authority map is:
 
-| Question                                                          | Authoritative repo          | Notes                                                                                                                             |
-| ----------------------------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| **How do I install / deploy / run ManyForge?**                    | this repo (`manyforge`)     | deployment-side authority; current `dev` exposes structural/offline plus H0 headless observation, not a runnable non-AI product lane |
-| **How do I run the LLM assistant on Jetson Thor?**                | `NemoClaw-Thor`             | platform glue: vLLM serving, sandbox provisioner, OpenClaw bridge launcher. Required only when using the `openclaw` lane on Thor. |
-| **What is the spec / contract / ADR — what should this code do?** | `manyforge_specs` (private) | dev-only; **not required at runtime**. Specs/ADRs/plans live there for maintainer use.                                            |
+| Question                                                          | Authoritative repo          | Notes                                                                                                                                |
+| ----------------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **How do I install / deploy / run ManyForge?**                    | this repo (`manyforge`)     | deployment-side authority; current `dev` exposes the explicit maintained native path, but not packaged or historical aggregate bring-up |
+| **How do I run the LLM assistant on Jetson Thor?**                | `NemoClaw-Thor`             | platform glue: vLLM serving, sandbox provisioner, OpenClaw bridge launcher. Required only when using the `openclaw` lane on Thor.    |
+| **What is the spec / contract / ADR — what should this code do?** | `manyforge_specs` (private) | dev-only; **not required at runtime**. Specs/ADRs/plans live there for maintainer use.                                               |
 
 ### Repository locations and fallbacks
 
@@ -101,10 +105,12 @@ repo is missing locally, inspect or clone the matching repository under
 | `isaac_ros_custom_bringup` | `${HOME}/workspaces/dev_ws/src/isaac_ros_custom_bringup` | `${HOME}/workspaces/isaac_ros-dev/src/isaac_ros_custom_bringup` | `https://github.com/pastoriomarco/isaac_ros_custom_bringup` |
 
 **This file covers the runtime/operator boundary completely.** On the current
-cutover branch, that coverage includes the explicit product outage; it is not a
-promise that a runtime lane can be started. A brief section at the bottom
-points dev maintainers at `manyforge_specs` for spec-level work; that's the
-only reason an operator/LLM should ever follow that link.
+cutover branch, that coverage includes both the explicit maintained native path
+and the remaining product outages. It is not a promise that the historical
+aggregate recipes, packaged installation, or I7-I11 lanes can be started. A
+brief section at the bottom points dev maintainers at `manyforge_specs` for
+spec-level work; that's the only reason an operator/LLM should ever follow that
+link.
 
 For development, the distinction is load-bearing: ManyForge is
 implemented according to `manyforge_specs`. If that repo is missing, current
@@ -171,9 +177,11 @@ pick/place, fixed-pool scheduling, atomic context rollback, and per-run
 cleanup. N7-a5.4 exposes that runner as a separate process through strict
 Headless and Composer scenario/Applied/Run/status/Stop clients while keeping
 browser state observational and retaining one active Program run as the
-current product gate. Complete input/repeated-instance closure and the frozen
-cumulative N7 qualification remain unavailable until a5.5 and N7-b-d
-respectively.
+current product gate. N7-a5.5 and the cumulative N7 qualification close all
+seven maintained deployment inputs, eight Program Bindings, six successful
+native workflows, two truthful I9 gates, and unchanged-source two-Lite6
+isolation. This is the maintained native product path, not restoration of the
+historical aggregate launcher or any I7-I11 lane.
 
 For the captured deterministic/direct/full-assistant operator baseline, see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
@@ -313,12 +321,12 @@ contracts remain in this repo as non-operative reimplementation inputs. Use
 [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md) for the
 hand-maintained ownership and end-to-end flow map.
 
-| Topic                   | Doc                                                                                                  | Source-of-truth                                                                                                   |
-| ----------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| Composer REST API       | [`docs/reference/REST_API.md`](docs/reference/REST_API.md)                                           | FastAPI app's `/openapi.json` (live at `:9000/openapi.json` when Composer is running)                             |
-| MCP runtime contract    | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md)                   | Historical at `082221...`; unavailable                                                                          |
-| Assistant-provider HTTP | [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)     | Historical at `082221...`; live bridge removed and unavailable; retained protocol/supervisor logic is porting input |
-| Viewer data plane       | [`docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md) | Pinned historical implementation plus responsibility/test ledger; unavailable               |
+| Topic                   | Doc                                                                                                                          | Source-of-truth                                                                                                     |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Composer REST API       | [`docs/reference/REST_API.md`](docs/reference/REST_API.md)                                                                   | FastAPI app's `/openapi.json` (live at `:9000/openapi.json` when Composer is running)                               |
+| MCP runtime contract    | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md)                                           | Historical at `082221...`; unavailable                                                                              |
+| Assistant-provider HTTP | [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)                             | Historical at `082221...`; live bridge removed and unavailable; retained protocol/supervisor logic is porting input |
+| Viewer data plane       | [`docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md) | Pinned historical implementation plus responsibility/test ledger; unavailable                                       |
 
 `REST_API.md` alone is generated from the retained FastAPI application. To
 regenerate it:
@@ -357,32 +365,32 @@ ______________________________________________________________________
 
 What lives where in this repo, and what it's for:
 
-| Path                                                                     | What                                                                                                                        |
-| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                                                      |
-| [`manyforge_content_identity/`](manyforge_content_identity/)             | Shared ROS-free RFC 8785 serialization and domain-separated content-digest primitives                                      |
-| [`manyforge_persistence/`](manyforge_persistence/)                       | Shared ROS-free mechanical durable-storage safety primitives; no semantic state ownership                                  |
-| [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free canonical-empty and bounded runtime-only Apply logical-scene owner; no live scene surface                           |
-| [`manyforge_deployment/`](manyforge_deployment/)                         | Qualified ROS-free composable-cell compiler and immutable offline retained-product boundary                                 |
-| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ I4 Apply/runtime-convergence owner hosted by the sole-process I5 Manager daemon; product execution unavailable   |
-| [`manyforge_headless/`](manyforge_headless/)                             | C++ H0 runtime/scene aggregation, scene lifetime, alarm owner, historian, NodeEnvironment projection, and Manager daemon      |
+| Path                                                                     | What                                                                                                                                       |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                                                                     |
+| [`manyforge_content_identity/`](manyforge_content_identity/)             | Shared ROS-free RFC 8785 serialization and domain-separated content-digest primitives                                                      |
+| [`manyforge_persistence/`](manyforge_persistence/)                       | Shared ROS-free mechanical durable-storage safety primitives; no semantic state ownership                                                  |
+| [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free canonical-empty and bounded runtime-only Apply logical-scene owner; no live scene surface                                         |
+| [`manyforge_deployment/`](manyforge_deployment/)                         | Qualified ROS-free composable-cell compiler and immutable offline retained-product boundary                                                |
+| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ I4 Apply/runtime-convergence owner hosted by the sole-process I5 Manager daemon; product execution unavailable                |
+| [`manyforge_headless/`](manyforge_headless/)                             | C++ H0 runtime/scene aggregation, scene lifetime, alarm owner, historian, NodeEnvironment projection, and Manager daemon                   |
 | [`manyforge_headless_api/`](manyforge_headless_api/)                     | Bounded FastAPI/CLI over owners plus thin addressed execution/preview and Program-run transport; no robot-readiness or execution authority |
-| [`manyforge_program_runner/`](manyforge_program_runner/)                 | Independently restartable Program orchestration owner over focused Headless clients; no Kernel, scene, or planner authority    |
-| [`manyforge_behavior/`](manyforge_behavior/)                             | Build-owned node catalog/environment, Program tree/admission mechanisms, and thin callers; no robot/runtime effect authority   |
-| [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
-| [`manyforge_roboplan/`](manyforge_roboplan/)                             | Retained planning-model staging plus the bounded selected native execution/preview host and RoboPlan adapter                  |
-| [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | Retained C++ ROS execution/admission library; no current product-lane wiring                                                  |
-| [`manyforge_robot_lifecycle/`](manyforge_robot_lifecycle/)               | Retained ROS-independent lifecycle core; no current physical ingress                                                         |
-| [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                                           |
-| [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model/binding/observation inputs; no current real-robot lane                                               |
-| [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle adapter; provider wiring unavailable until I10/R                                                 |
-| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0/N6/N7 control, authoring, Program Run, scene, and assistant clients; no runtime authority |
-| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Strict bounded direct/`nemoclaw` provider mediation over owner facts and Draft callbacks; no runtime ownership                 |
-| [`manyforge_ros/`](manyforge_ros/)                                       | Retained pure mappings/contracts plus explicit unavailable runtime entry points                                              |
-| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Non-activatable historical assistant interaction references                                                                 |
-| [`examples/`](examples/)                                                 | Reference `*.program.yaml` + `*.deployment.yaml`                                                                            |
-| [`scripts/`](scripts/)                                                   | Operator scripts (`demo-assistant-known-good.sh`, `setup-docker.sh`, etc.)                                                  |
-| [`docs/`](docs/)                                                         | Operator docs (`operations/`, `guides/`, `reference/`)                                                                      |
+| [`manyforge_program_runner/`](manyforge_program_runner/)                 | Independently restartable Program orchestration owner over focused Headless clients; no Kernel, scene, or planner authority                |
+| [`manyforge_behavior/`](manyforge_behavior/)                             | Build-owned node catalog/environment, Program tree/admission mechanisms, and thin callers; no robot/runtime effect authority               |
+| [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                                       |
+| [`manyforge_roboplan/`](manyforge_roboplan/)                             | Retained planning-model staging plus the bounded selected native execution/preview host and RoboPlan adapter                               |
+| [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | Retained C++ ROS execution/admission library; no current product-lane wiring                                                               |
+| [`manyforge_robot_lifecycle/`](manyforge_robot_lifecycle/)               | Retained ROS-independent lifecycle core; no current physical ingress                                                                       |
+| [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                                                          |
+| [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model/binding/observation inputs; no current real-robot lane                                                             |
+| [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle adapter; provider wiring unavailable until I10/R                                                               |
+| [`manyforge_composer/`](manyforge_composer/)                             | Structural FastAPI/React shell plus thin H0/N6/N7 control, authoring, Program Run, scene, and assistant clients; no runtime authority      |
+| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Strict bounded direct/`nemoclaw` provider mediation over owner facts and Draft callbacks; no runtime ownership                             |
+| [`manyforge_ros/`](manyforge_ros/)                                       | Retained pure mappings/contracts plus explicit unavailable runtime entry points                                                            |
+| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | Non-activatable historical assistant interaction references                                                                                |
+| [`examples/`](examples/)                                                 | Reference `*.program.yaml` + `*.deployment.yaml`                                                                                           |
+| [`scripts/`](scripts/)                                                   | Operator scripts (`demo-assistant-known-good.sh`, `setup-docker.sh`, etc.)                                                                 |
+| [`docs/`](docs/)                                                         | Operator docs (`operations/`, `guides/`, `reference/`)                                                                                     |
 
 ______________________________________________________________________
 

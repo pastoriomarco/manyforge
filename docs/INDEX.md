@@ -2,11 +2,12 @@
 
 This index covers documentation that travels with the implementation
 repository: current structural inspection plus historical install, operation,
-and integration references. **No complete product lane or supported product
-bring-up is currently available.** Bounded Headless/Composer runtime clients
-exist at their named checkpoints. When a lane is restored, its public operator documentation must
-remain self-contained here. Maintainers can also follow the "Development /
-spec references" section at the bottom.
+and integration references. **The maintained ManyForge-only native product path
+is restored through its explicit Manager, Headless, Program-runner, and thin
+Composer entrypoints; no packaged or historical aggregate product bring-up is
+currently supported.** When a lane is restored, its public operator
+documentation must remain self-contained here. Maintainers can also follow the
+"Development / spec references" section at the bottom.
 
 `README.md` remains the project entrypoint. For LLM agents,
 [`../AGENTS.md`](../AGENTS.md) is the canonical landing page (covers the
@@ -24,27 +25,26 @@ branch/commit workflow).
 > independent Program-runner process, and strict scenario/Applied/Run/status/
 > Stop clients, all seven maintained deployment inputs/eight Program Bindings,
 > physical managed-host recovery, and unchanged-source two-Lite6 isolation.
-> This source-complete product path is not supported until the N7 freeze and
-> cumulative qualification close. Packaged product launch and the native,
-> Isaac, and real-robot lanes are not yet available. The remainder of N closes
-> the native lane, and
-> I/R restore Isaac/real operation. Operator
+> N7 cumulative qualification closes that maintained native path. Packaged
+> product launch and the Isaac and real-robot lanes are not yet available. The
+> explicit native entrypoints above do not make the historical aggregate
+> launcher current. I/R restore Isaac/real operation. Operator
 > runbooks below remain baseline/reference material until their owning
 > restoration gate.
 
 ## Choose A Path
 
-| Task                                        | Start here                                                                                                                          |
-| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Start the structural Composer shell         | `../scripts/compose-dev.sh`; catalog/files/URDF/health only                                                                          |
-| Study former stack workflows                | [`operations/LAUNCHER_QUICKSTART.md`](operations/LAUNCHER_QUICKSTART.md), marked historical                                           |
-| Study historical runtime diagnosis          | [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md) and [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md)     |
-| Study historical stop/recovery controls     | [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)                                                                         |
-| Study the historical robot-import workflow | [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md); v0 migration/reference input                                      |
-| Study historical physical-Lite6 qualification | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md); unavailable until R/I10                        |
-| Understand ownership and data flow          | [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)                                                                            |
-| Integrate the current Composer API          | Generated [`reference/REST_API.md`](reference/REST_API.md); structural/authoring plus configured thin runtime clients are current      |
-| Integrate the current headless API          | Generated [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md); bounded addressed execution/preview and Program surfaces are current, while complete product readiness remains unavailable |
+| Task                                          | Start here                                                                                                                                                                                                                            |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Start the structural Composer shell           | `../scripts/compose-dev.sh`; catalog/files/URDF/health only                                                                                                                                                                           |
+| Study former stack workflows                  | [`operations/LAUNCHER_QUICKSTART.md`](operations/LAUNCHER_QUICKSTART.md), marked historical                                                                                                                                           |
+| Study historical runtime diagnosis            | [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md) and [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md)                                                                                                     |
+| Study historical stop/recovery controls       | [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)                                                                                                                                                                          |
+| Study the historical robot-import workflow    | [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md); v0 migration/reference input                                                                                                                                          |
+| Study historical physical-Lite6 qualification | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md); unavailable until R/I10                                                                                                                           |
+| Understand ownership and data flow            | [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)                                                                                                                                                                              |
+| Integrate the current Composer API            | Generated [`reference/REST_API.md`](reference/REST_API.md); structural/authoring plus configured thin runtime clients are current                                                                                                     |
+| Integrate the current headless API            | Generated [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md); bounded addressed execution/preview and the maintained native Program path are current, while packaged/Isaac/real product readiness remains unavailable |
 
 ## Historical operator runbooks (`docs/operations/`)
 
@@ -189,6 +189,7 @@ rather than silently checking only a reduced projection.
 
   - Composer REST surface generated from FastAPI/OpenAPI. The live schema is
     also at `:9000/openapi.json` while Composer is running.
+
 - [`reference/HEADLESS_REST_API.md`](reference/HEADLESS_REST_API.md)
 
   - Independent I5/H0 owner-issued projection, generated from the headless
@@ -235,9 +236,10 @@ guidance live in a sibling **private** repository, `manyforge_specs`.
 
 **Operators do not need the private specifications to inspect the currently
 available structural and Program Draft/Saved authoring shell or the retained
-historical workflows.** Product runtime install, bring-up, and operation remain
-unavailable during the cutover. The links below are dead unless you are a
-maintainer with `manyforge_specs` cloned alongside `manyforge`.
+historical workflows.** Packaged runtime installation and the historical
+aggregate bring-up remain unavailable during the cutover. The links below are
+dead unless you are a maintainer with `manyforge_specs` cloned alongside
+`manyforge`.
 
 Maintainers doing non-trivial behavior changes (kernel state machine,
 adapter contracts, deployment schema, assistant authority, observability

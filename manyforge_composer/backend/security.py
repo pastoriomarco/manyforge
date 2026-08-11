@@ -1,44 +1,29 @@
-"""Security configuration and middleware for ManyForge Composer."""
+"""Bounded transport and filesystem configuration for ManyForge Composer."""
+
 from __future__ import annotations
 
-import hashlib
 import os
-import secrets
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import HTTPException, Request, WebSocket
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.types import ASGIApp
+from fastapi import HTTPException
 
 # Maximum WebSocket text message size (bytes).
 WS_MAX_MESSAGE_SIZE = 256
 
 
-def principal_id_for_api_token(token: str) -> str:
-    """Return a bounded server-derived identity for one configured token.
-
-    The token is the authentication input configured by the server. Request
-    headers and payload fields never participate in this value. H0 may replace
-    this single-token boundary with a configured external authentication
-    adapter, but open callers must never self-assert trusted identity.
-    """
-
-    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    return f"token:{digest[:24]}"
-
-
 @dataclass
 class SecurityConfig:
-    """Runtime security settings for the Composer backend."""
+    """Transport and filesystem safety settings for the Composer backend.
+
+    Composer ingress is deliberately open and attributed. Authentication, if
+    a deployment needs it, belongs in an external trusted adapter and cannot
+    become ManyForge caller admission.
+    """
 
     # CORS allowed origins.  Empty list → deny all cross-origin requests.
     cors_origins: list[str] = field(default_factory=lambda: ["http://localhost:3000"])
-
-    # Bearer token for API authentication.  None → auth disabled (dev-only).
-    api_token: str | None = None
 
     # Filesystem roots that the file-browser endpoint is allowed to traverse.
     # Paths outside these roots (after symlink resolution) are rejected.
@@ -46,7 +31,8 @@ class SecurityConfig:
 
     @classmethod
     def from_env(cls) -> SecurityConfig:
-        """Build from environment variables (MANYFORGE_CORS_ORIGINS, MANYFORGE_API_TOKEN, MANYFORGE_FS_ROOTS)."""
+        """Build the CORS and filesystem bounds from environment variables."""
+
         def _csv(var: str) -> list[str] | None:
             raw = os.environ.get(var, "")
             items = [s.strip() for s in raw.split(",") if s.strip()]
@@ -54,56 +40,8 @@ class SecurityConfig:
 
         return cls(
             cors_origins=_csv("MANYFORGE_CORS_ORIGINS") or ["http://localhost:3000"],
-            api_token=os.environ.get("MANYFORGE_API_TOKEN"),
             allowed_fs_roots=_csv("MANYFORGE_FS_ROOTS") or ["/workspace"],
         )
-
-
-def check_bearer_token(request: Request, token: str) -> bool:
-    """Return True if the request carries a valid bearer token."""
-    auth = request.headers.get("authorization", "")
-    if not auth.startswith("Bearer "):
-        return False
-    return secrets.compare_digest(auth[7:], token)
-
-
-def check_ws_bearer_token(ws: WebSocket, token: str) -> bool:
-    """Return True if the WebSocket upgrade carries a valid bearer token.
-
-    Checks both the Authorization header and a ``token`` query parameter
-    (browsers cannot set headers on WebSocket connections).
-    """
-    auth = ws.headers.get("authorization", "")
-    if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], token):
-        return True
-    query_token = ws.query_params.get("token", "")
-    if query_token and secrets.compare_digest(query_token, token):
-        return True
-    return False
-
-
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Reject HTTP requests that do not carry a valid bearer token.
-
-    The /api/health endpoint is always allowed (for liveness probes).
-    """
-
-    def __init__(self, app: ASGIApp, *, token: str) -> None:
-        super().__init__(app)
-        self._token = token
-
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-        if request.url.path == "/api/health":
-            return await call_next(request)
-        if not check_bearer_token(request, self._token):
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-        # This middleware is the configured authentication boundary. Derive
-        # identity only from its server-side credential; X-Principal-ID and
-        # payload fields are untrusted caller attribution and are deliberately
-        # ignored. A future external adapter may stamp a different trusted
-        # principal only after its own H0 contract is qualified.
-        request.state.principal_id = principal_id_for_api_token(self._token)
-        return await call_next(request)
 
 
 def is_path_within_roots(path: Path, roots: list[str]) -> bool:
@@ -168,10 +106,14 @@ def normalize_existing_file_path(
     try:
         resolved = Path(raw_path).expanduser().resolve()
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid {kind_label.lower()}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {kind_label.lower()}"
+        ) from exc
 
     if not is_path_within_roots(resolved, allowed_roots):
-        raise HTTPException(status_code=403, detail=f"{kind_label} is outside allowed roots")
+        raise HTTPException(
+            status_code=403, detail=f"{kind_label} is outside allowed roots"
+        )
     if not resolved.exists():
         raise HTTPException(status_code=404, detail=f"{kind_label} not found")
     if not resolved.is_file():
@@ -196,17 +138,27 @@ def normalize_writable_file_path(
         candidate = Path(raw_path).expanduser()
         resolved_parent = candidate.parent.resolve()
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid {kind_label.lower()}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {kind_label.lower()}"
+        ) from exc
 
     if candidate.name in {"", ".", ".."}:
-        raise HTTPException(status_code=400, detail=f"Invalid {kind_label.lower()} filename")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {kind_label.lower()} filename"
+        )
 
     if not resolved_parent.exists():
-        raise HTTPException(status_code=404, detail=f"{kind_label} parent does not exist")
+        raise HTTPException(
+            status_code=404, detail=f"{kind_label} parent does not exist"
+        )
     if not resolved_parent.is_dir():
-        raise HTTPException(status_code=400, detail=f"{kind_label} parent is not a directory")
+        raise HTTPException(
+            status_code=400, detail=f"{kind_label} parent is not a directory"
+        )
     if not is_path_within_roots(resolved_parent, allowed_roots):
-        raise HTTPException(status_code=403, detail=f"{kind_label} is outside allowed roots")
+        raise HTTPException(
+            status_code=403, detail=f"{kind_label} is outside allowed roots"
+        )
     target = resolved_parent / candidate.name
     try:
         target_metadata = target.lstat()
@@ -223,7 +175,9 @@ def normalize_writable_file_path(
     if stat.S_ISLNK(target_metadata.st_mode):
         # ``lstat`` makes this include dangling symlinks, for which
         # ``Path.exists()`` would otherwise be false.
-        raise HTTPException(status_code=400, detail=f"{kind_label} must not be a symlink")
+        raise HTTPException(
+            status_code=400, detail=f"{kind_label} must not be a symlink"
+        )
     if not stat.S_ISREG(target_metadata.st_mode):
         raise HTTPException(
             status_code=400,
@@ -242,6 +196,8 @@ def normalize_writable_file_path(
             detail=f"Invalid {kind_label.lower()}",
         ) from exc
     if not is_path_within_roots(resolved_target, allowed_roots):
-        raise HTTPException(status_code=403, detail=f"{kind_label} is outside allowed roots")
+        raise HTTPException(
+            status_code=403, detail=f"{kind_label} is outside allowed roots"
+        )
 
     return target

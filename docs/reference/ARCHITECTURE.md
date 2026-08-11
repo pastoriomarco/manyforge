@@ -2,8 +2,8 @@
 
 > **Current `dev` status:** this document still describes the last complete
 > three-lane runtime baseline. The composable-cell destructive cutover has
-> removed the legacy scene owner and RoboPlan native/ROS factories; all three
-> complete lanes remain intentionally unavailable. The new Core,
+> removed the legacy scene owner and RoboPlan native/ROS factories. The
+> maintained ManyForge-only native path is now restored through the new Core,
 > retained-product, canonical-empty scene-owner, and Manager foundations now
 > include the I5/H0 Manager daemon, independent headless runtime/scene/alarm/
 > historian owners, public API/CLI, and thin Composer/assistant read clients.
@@ -26,9 +26,10 @@
 > scenario, Run/status, and explicit Program Stop clients. All seven maintained
 > deployment inputs and eight Program Bindings now traverse that production
 > path; two identical Lite6 occurrences also compile and resolve without
-> cross-instance aliasing. The currently admitted product remains limited to
-> the joined nodes and one active Program. I6 cumulative qualification,
-> packaged product launch, public MCP, and external agent loops remain open,
+> cross-instance aliasing. The currently admitted native product remains
+> limited to the joined nodes and one active Program. I6 cumulative
+> qualification is complete; packaged product launch, public MCP, and external
+> agent loops remain open,
 > while lifecycle, final Stop, Isaac, real robot, and generalized tools remain
 > at I7-I11.
 > Unless a section explicitly identifies a retained foundation or target
@@ -74,22 +75,22 @@ ______________________________________________________________________
 
 ## Components
 
-| Component                                 | Language              | Responsibility                                                                                                                                                                                      |
-| ----------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `manyforge_core`                          | C++20                 | Execution kernel: lifecycle state machine, terminal authority, stop/pause/reset semantics, collision-validation policy, runtime collision monitoring, execution snapshots and events. **ROS-free.** |
-| `manyforge_deployment`                    | C++20                 | ROS-free, non-real-time composable-cell artifact decoding, qualified schema normalization, staged graph content identity, and compiler substrate. It is not a Kernel dependency.                    |
-| `manyforge_component_manager`             | C++20                 | Durable Apply, active retained-graph reconciliation, runtime-unit convergence, and explicit shutdown. The I5 daemon is its sole process owner and publishes immutable snapshots.                    |
-| `manyforge_headless`                      | C++20 + pybind11      | I5/H0 runtime/scene source aggregation, scene-initialization lifetime, Alarm Lifecycle Owner, asynchronous historian, verified NodeEnvironment projection, and Manager/scene publication adapters. |
-| `manyforge_headless_api`                  | Python/FastAPI        | Bounded public HTTP/CLI projection and attributed alarm/Manager/Program intents over the owners. It does not own runtime, Program-run, scene, alarm conditions, or robot readiness.                  |
-| `manyforge_program_runner`                | Python/FastAPI        | Independently restartable Program orchestration owner: exact Applied capture, tree construction/ticking, bounded status/replay, and explicit Program Stop over focused owner clients.                |
-| `manyforge_core/python`                   | pybind11              | Bindings exposing the kernel to Python (poll-based; no C++→Python callbacks).                                                                                                                       |
-| `manyforge_collision`                     | C++20                 | Planner-neutral collision-world/query implementation behind ManyForge collision ports.                                                                                                              |
-| `manyforge_roboplan`                      | C++ + pybind11        | Primary planning/projection adapter (RRT + TOPP-RA), native execution, and native kernel composition.                                                                                               |
-| `manyforge_ros2_control_execution`        | C++20/ROS 2           | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, isolated ROS scene projection, and optional exact controller/lifecycle dispatch admission.                |
-| `manyforge_behavior`                      | Python                | Node catalog/environment plus Program validation, tree, admission, scheduling, and focused client mechanisms hosted by the independent runner; it does not own robot effects.                        |
-| `manyforge_composer`                      | FastAPI + React       | Structural/operator shell, revision-fenced strict Program Draft/Saved authoring, thin runtime projections, and a thin assistant-bridge operator client. Runtime/catalog/provider authority remains outside Composer. |
-| `manyforge_ros` / `manyforge_ros_bringup` | C++/Python            | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                        |
-| `manyforge_assistant_bridge`              | Python                | Bounded direct/`nemoclaw` model mediation, strict active-mode enforcement, Draft/read callback routing, cancellation/reconciliation, conversation history, and redacted audit. It owns no runtime effects or catalog truth. |
+| Component                                 | Language         | Responsibility                                                                                                                                                                                                              |
+| ----------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `manyforge_core`                          | C++20            | Execution kernel: lifecycle state machine, terminal authority, stop/pause/reset semantics, collision-validation policy, runtime collision monitoring, execution snapshots and events. **ROS-free.**                         |
+| `manyforge_deployment`                    | C++20            | ROS-free, non-real-time composable-cell artifact decoding, qualified schema normalization, staged graph content identity, and compiler substrate. It is not a Kernel dependency.                                            |
+| `manyforge_component_manager`             | C++20            | Durable Apply, active retained-graph reconciliation, runtime-unit convergence, and explicit shutdown. The I5 daemon is its sole process owner and publishes immutable snapshots.                                            |
+| `manyforge_headless`                      | C++20 + pybind11 | I5/H0 runtime/scene source aggregation, scene-initialization lifetime, Alarm Lifecycle Owner, asynchronous historian, verified NodeEnvironment projection, and Manager/scene publication adapters.                          |
+| `manyforge_headless_api`                  | Python/FastAPI   | Bounded public HTTP/CLI projection and attributed alarm/Manager/Program intents over the owners. It does not own runtime, Program-run, scene, alarm conditions, or robot readiness.                                         |
+| `manyforge_program_runner`                | Python/FastAPI   | Independently restartable Program orchestration owner: exact Applied capture, tree construction/ticking, bounded status/replay, and explicit Program Stop over focused owner clients.                                       |
+| `manyforge_core/python`                   | pybind11         | Bindings exposing the kernel to Python (poll-based; no C++→Python callbacks).                                                                                                                                               |
+| `manyforge_collision`                     | C++20            | Planner-neutral collision-world/query implementation behind ManyForge collision ports.                                                                                                                                      |
+| `manyforge_roboplan`                      | C++ + pybind11   | Primary planning/projection adapter (RRT + TOPP-RA), native execution, and native kernel composition.                                                                                                                       |
+| `manyforge_ros2_control_execution`        | C++20/ROS 2      | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, isolated ROS scene projection, and optional exact controller/lifecycle dispatch admission.                                      |
+| `manyforge_behavior`                      | Python           | Node catalog/environment plus Program validation, tree, admission, scheduling, and focused client mechanisms hosted by the independent runner; it does not own robot effects.                                               |
+| `manyforge_composer`                      | FastAPI + React  | Structural/operator shell, revision-fenced strict Program Draft/Saved authoring, thin runtime projections, and a thin assistant-bridge operator client. Runtime/catalog/provider authority remains outside Composer.        |
+| `manyforge_ros` / `manyforge_ros_bringup` | C++/Python       | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                                                |
+| `manyforge_assistant_bridge`              | Python           | Bounded direct/`nemoclaw` model mediation, strict active-mode enforcement, Draft/read callback routing, cancellation/reconciliation, conversation history, and redacted audit. It owns no runtime effects or catalog truth. |
 
 ### Layers
 
@@ -406,9 +407,9 @@ layered:
 
 1. local command, final-dispatch, and active-goal fences close without waiting
    for process management;
-2. a ROS-free NRT reducer checks receiver-local heartbeat/progress ages,
+1. a ROS-free NRT reducer checks receiver-local heartbeat/progress ages,
    component epochs, generation identities, and the dependency DAG; and
-3. an external host supervisor observes the owner and Composer containers,
+1. an external host supervisor observes the owner and Composer containers,
    consumes Composer's already-reduced critical-health snapshot with its own
    receiver-local freshness/epoch fence, and owns bounded
    dependency-ordered teardown. Composer fences dispatch on the first

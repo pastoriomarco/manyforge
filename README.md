@@ -1,11 +1,10 @@
 # ManyForge
 
 Repository for a modular robot-execution framework built around headless C++
-semantic owners and thin authoring/operator clients. The complete native,
-Isaac, ROS, external-agent, and real-robot product lanes described by
-historical material are not currently available on `dev`; bounded native and
-direct-assistant development components are available only at their named
-checkpoints.
+semantic owners and thin authoring/operator clients. The maintained
+ManyForge-only native path is current on `dev` through explicit owner
+entrypoints. Packaged installation, the historical aggregate launcher, and the
+Isaac, ROS, external-agent, and real-robot product lanes are not yet available.
 
 > **`dev` migration status:** the composable-cell destructive implementation
 > window is active. I2's pure ROS-free compiler and `manyforge_core_py`
@@ -18,14 +17,15 @@ checkpoints.
 > it across Manager replacement, reconciles crash/restart, and shuts it down
 > explicitly. I5/H0 now exposes the independent Manager/headless API, CLI,
 > alarms/history, verified NodeEnvironment projection, and thin Composer read
-> clients without restoring a product lane. I6/N3 now proves one bounded native
-> absolute joint-goal path through an independently restartable C++ owner,
-> headless API, Behavior caller, and Composer proxy. It is development evidence,
-> not the complete native lane. N6-c1 and N6-c2 now add a bounded addressed
+> clients. At I6/N3, one bounded native absolute joint-goal path first crossed
+> an independently restartable C++ owner, headless API, Behavior caller, and
+> Composer proxy; that checkpoint alone was not the complete native lane. N6-c1
+> and N6-c2 then added a bounded addressed
 > four-mode Robot Control workflow: joint goals, pose goals, Cartesian paths,
 > and gripper commands with source-local no-motion preview, explicit approval,
-> owner-issued progress, and operation Stop. It is the complete maintained
-> manual-control breadth, not a runnable product lane. N6-c3 additionally
+> owner-issued progress, and operation Stop. That checkpoint completed the
+> maintained manual-control breadth but not yet the full product join. N6-c3
+> additionally
 > restores the strict Program
 > Draft/Saved workspace: environment-aware palette/tree/property/declaration
 > authoring plus bounded Open-as-Draft, Save, and Save-As. It does not Apply or
@@ -39,12 +39,13 @@ checkpoints.
 > host, an independently restartable Program-runner process, and strict
 > Headless/Composer scenario, Applied, Run/status, and one-click Stop clients.
 > Composer remains observational, and closing any client never implies Stop.
-> The complete seven-input/repeated-instance closure and all three complete
-> product lanes remain intentionally unavailable; the remaining native lane
-> closes in I6/N, and Isaac/real
-> operation at I9/I10. The launch recipes below describe the last qualified
-> baseline; they are not valid bring-up instructions for the current `dev`
-> branch.
+> N7 now closes the maintained seven-input/eight-Program native path and
+> unchanged-source repeated-instance isolation through the Component Manager,
+> Headless API, Program runner, and thin Composer clients. Isaac and real
+> operation remain I9/I10 work, and the historical aggregate launcher and
+> packaged installation are not restored by I6. The launch recipes below
+> describe the last qualified baseline; they are not valid bring-up
+> instructions for the current `dev` branch.
 
 > **For LLMs** (Claude, ChatGPT, agentic IDEs): read
 > [`AGENTS.md`](AGENTS.md) before making any change. It tells you what
@@ -55,20 +56,20 @@ checkpoints.
 
 ## Documentation map
 
-| You want to…                                        | Start here                                                                                                                                         |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Start the retained structural Composer shell        | `./scripts/compose-dev.sh`; runtime operations remain unavailable                                                                                  |
-| Study historical operator workflows                 | [`docs/INDEX.md`](docs/INDEX.md) → runbooks, each marked as restoration input                                                                      |
-| Understand architecture and authority boundaries    | [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md)                                                                                 |
-| Inspect current REST or historical client contracts | [`docs/INDEX.md`](docs/INDEX.md) → structural REST and historical interaction references                                                           |
-| Study the historical robot-import workflow         | [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md); v0 migration/reference input until the replacement gates qualify          |
-| Contribute code or documentation                    | [`CONTRIBUTING.md`](CONTRIBUTING.md); LLM agents also read [`AGENTS.md`](AGENTS.md)                                                                |
+| You want to…                                        | Start here                                                                                                                                 |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Start the retained structural Composer shell        | `./scripts/compose-dev.sh`; runtime operations remain unavailable                                                                          |
+| Study historical operator workflows                 | [`docs/INDEX.md`](docs/INDEX.md) → runbooks, each marked as restoration input                                                              |
+| Understand architecture and authority boundaries    | [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md)                                                                         |
+| Inspect current REST or historical client contracts | [`docs/INDEX.md`](docs/INDEX.md) → structural REST and historical interaction references                                                   |
+| Study the historical robot-import workflow          | [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md); v0 migration/reference input until the replacement gates qualify |
+| Contribute code or documentation                    | [`CONTRIBUTING.md`](CONTRIBUTING.md); LLM agents also read [`AGENTS.md`](AGENTS.md)                                                        |
 
 The public structural-shell and historical operator documentation is
 self-contained in this repository. Private maintainer specifications are not
-needed to inspect those surfaces; no complete product lane is currently
-available to install or operate, while bounded APIs remain integration surfaces
-only at their named checkpoints.
+needed to inspect those surfaces. The maintained native path is available
+through explicit owner entrypoints; packaged installation, historical aggregate
+bring-up, and the remaining product lanes are still unavailable.
 
 ## Disclaimer
 

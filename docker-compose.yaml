@@ -44,7 +44,6 @@ services:
       - .:/workspace
     environment:
       MANYFORGE_CORS_ORIGINS: ${MANYFORGE_CORS_ORIGINS:-http://localhost:3000}
-      MANYFORGE_API_TOKEN: ${MANYFORGE_API_TOKEN:-}
       MANYFORGE_FS_ROOTS: ${MANYFORGE_FS_ROOTS:-/workspace}
     working_dir: /workspace
     command: ["bash", "-lc", "python -m manyforge_composer --host 0.0.0.0 --port 9000"]
@@ -72,7 +71,6 @@ services:
       - .:/workspace
     environment:
       MANYFORGE_CORS_ORIGINS: ${MANYFORGE_CORS_ORIGINS:-http://localhost:3000}
-      MANYFORGE_API_TOKEN: ${MANYFORGE_API_TOKEN:-}
       MANYFORGE_FS_ROOTS: ${MANYFORGE_FS_ROOTS:-/workspace}
     working_dir: /workspace
     command: ["bash", "-lc", "python -m manyforge_composer --host 0.0.0.0 --port 9000"]
