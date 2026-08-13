@@ -51,6 +51,10 @@ namespace {
   return std::tie(row.expected_owner.operation_id, row.expected_owner.participant_id);
 }
 
+[[nodiscard]] auto reservation_owner_key(const ResourceSlotReservationOwnerDTO& row) noexcept {
+  return std::tie(row.owner.operation_id, row.owner.participant_id);
+}
+
 template <typename Value>
 [[nodiscard]] Result<Value> reject_value(std::string message, std::string reason,
                                          ErrorCode code = ErrorCode::kExecutionRejected) {
@@ -160,6 +164,71 @@ Result<void> ResourceSlotTable::reserve(const ResourceSlotOwnerDTO& owner,
   for (const auto index : indices) {
     slots_[index].state = ResourceSlotState::kReserved;
     slots_[index].owner = owner;
+  }
+  advance_generation_locked();
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceSlotTable::reserve_batch(
+    const std::vector<ResourceSlotReservationOwnerDTO>& owners) {
+  if (owners.empty() || owners.size() > slots_.size()) {
+    return reject("coordinated resource reservation owner count is invalid",
+                  "resource_reservation_owner_count_invalid", ErrorCode::kInvalidRequest);
+  }
+  if (!std::is_sorted(owners.begin(), owners.end(),
+                      [](const auto& left, const auto& right) {
+                        return reservation_owner_key(left) < reservation_owner_key(right);
+                      }) ||
+      std::adjacent_find(owners.begin(), owners.end(), [](const auto& left, const auto& right) {
+        return reservation_owner_key(left) == reservation_owner_key(right);
+      }) != owners.end()) {
+    return reject("coordinated resource reservation owners are not canonical",
+                  "resource_reservation_not_canonical", ErrorCode::kInvalidRequest);
+  }
+
+  std::lock_guard lock(*admission_mutex_);
+  std::vector<std::pair<std::size_t, const ResourceSlotOwnerDTO*>> assignments;
+  assignments.reserve(slots_.size());
+  std::set<ResourceId> complete_resources;
+  std::optional<std::pair<OperationId, OperationRevision>> operation_revision;
+  std::vector<std::size_t> indices;
+  for (const auto& row : owners) {
+    if (!row.owner.valid() || row.resources.empty() ||
+        !std::is_sorted(row.resources.begin(), row.resources.end()) ||
+        std::adjacent_find(row.resources.begin(), row.resources.end()) != row.resources.end()) {
+      return reject("coordinated resource reservation row is invalid",
+                    "resource_reservation_row_invalid", ErrorCode::kInvalidRequest);
+    }
+    if (!operation_revision.has_value() || operation_revision->first != row.owner.operation_id) {
+      operation_revision = std::pair(row.owner.operation_id, row.owner.operation_revision);
+    } else if (operation_revision->second != row.owner.operation_revision) {
+      return reject("participant owners disagree on their operation revision",
+                    "resource_reservation_operation_revision_inconsistent",
+                    ErrorCode::kInvalidRequest);
+    }
+    auto validation = validate_resource_set_locked(row.resources, indices);
+    if (!validation.ok()) {
+      return validation;
+    }
+    for (std::size_t offset = 0U; offset < row.resources.size(); ++offset) {
+      if (!complete_resources.insert(row.resources[offset]).second) {
+        return reject("coordinated resource reservation scopes overlap",
+                      "resource_reservation_scope_overlap", ErrorCode::kInvalidRequest);
+      }
+      const auto index = indices[offset];
+      if (slots_[index].state != ResourceSlotState::kFree) {
+        return reject("one or more resources are not free", "resource_scope_busy");
+      }
+      assignments.emplace_back(index, &row.owner);
+    }
+  }
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) {
+    return generation;
+  }
+  for (const auto& [index, owner] : assignments) {
+    slots_[index].state = ResourceSlotState::kReserved;
+    slots_[index].owner = *owner;
   }
   advance_generation_locked();
   return Result<void>::Ok();

@@ -46,6 +46,10 @@ public:
   reserve(manyforge::core::ResourceSlotTable &table,
           const manyforge::core::ResourceSlotOwnerDTO &owner,
           const std::vector<manyforge::core::ResourceId> &resources) override;
+  [[nodiscard]] manyforge::core::Result<void> reserve_batch(
+      manyforge::core::ResourceSlotTable &table,
+      const std::vector<manyforge::core::ResourceSlotReservationOwnerDTO>
+          &owners) override;
 
   /// Attach the exact table owned by the currently composed addressed Kernel.
   /// The gate keeps only a weak reference and owns no duplicate operation or

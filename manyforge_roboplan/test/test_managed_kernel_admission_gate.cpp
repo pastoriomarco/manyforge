@@ -484,6 +484,42 @@ TEST(ManagedKernelAdmissionGate,
 }
 
 TEST(ManagedKernelAdmissionGate,
+     BatchReservationRejectsOneFencedParticipantWithoutReservingAnother) {
+  ManagedKernelAdmissionGate gate;
+  const auto scope = AffectedScope();
+  auto table = std::make_shared<core::ResourceSlotTable>(
+      scope.resources, ActiveConfigurations(), gate.shared_admission_mutex());
+  gate.BindResourceTable(table);
+  auto first = OperationOwner();
+  first.participant_id = core::OperationParticipantId("participant.1");
+  auto second = first;
+  second.participant_id = core::OperationParticipantId("participant.2");
+
+  const core::ConfigurationFenceScopeDTO second_scope{
+      scope.controllable_component_ids,
+      scope.domains,
+      scope.bindings,
+      {core::ResourceId("joint.2")}};
+  gate.RestoreFence(core::ConfigurationFenceId("fence.participant.2"),
+                    second_scope);
+  const std::vector<core::ResourceSlotReservationOwnerDTO> owners{
+      {first, {core::ResourceId("joint.1")}},
+      {second, {core::ResourceId("joint.2")}}};
+  const auto blocked = gate.reserve_batch(*table, owners);
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "configuration_fence_held");
+  EXPECT_EQ(table->coherent_snapshot().operation_resource_generation, 0U);
+  EXPECT_TRUE(table->active_operation_ids().empty());
+
+  gate.ReleaseFence(core::ConfigurationFenceId("fence.participant.2"),
+                    second_scope);
+  ASSERT_TRUE(gate.reserve_batch(*table, owners).ok());
+  EXPECT_EQ(table->coherent_snapshot().operation_resource_generation, 1U);
+  EXPECT_EQ(table->active_operation_ids(),
+            std::vector<core::OperationId>{core::OperationId("operation.1")});
+}
+
+TEST(ManagedKernelAdmissionGate,
      AllowsDisjointFencesButRejectsAnOverlappingFence) {
   ManagedKernelAdmissionGate gate;
   const auto first = AffectedScope();

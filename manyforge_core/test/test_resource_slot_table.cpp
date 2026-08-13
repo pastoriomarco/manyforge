@@ -43,6 +43,11 @@ using namespace manyforge::core;
                                        next_revision};
 }
 
+[[nodiscard]] ResourceSlotReservationOwnerDTO reservation_owner(ResourceSlotOwnerDTO value,
+                                                                std::vector<ResourceId> resources) {
+  return ResourceSlotReservationOwnerDTO{std::move(value), std::move(resources)};
+}
+
 TEST(ResourceSlotTableTest, RunsOneExactScopeThroughTerminalAndRelease) {
   ResourceSlotTable table({ResourceId("joint.2"), ResourceId("gripper.1"), ResourceId("joint.1")});
   const auto operation = owner();
@@ -140,6 +145,68 @@ TEST(ResourceSlotTableTest, DeduplicatesOneOperationAcrossDisjointParticipantOwn
       table.admission_snapshot({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
   EXPECT_EQ(admission.affected_queued_operation_count, 1U);
   EXPECT_EQ(admission.affected_active_operation_count, 0U);
+}
+
+TEST(ResourceSlotTableTest, BatchReservationPublishesEveryParticipantWithOneGenerationAdvance) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("coordinated.op", "participant.a");
+  const auto second = owner("coordinated.op", "participant.b");
+
+  const auto reserved =
+      table.reserve_batch({reservation_owner(first, {ResourceId("robot.a.joint")}),
+                           reservation_owner(second, {ResourceId("robot.b.joint")})});
+  ASSERT_TRUE(reserved.ok()) << reserved.error().message;
+
+  const auto snapshot = table.coherent_snapshot();
+  EXPECT_EQ(snapshot.operation_resource_generation, 1U);
+  ASSERT_EQ(snapshot.slots.size(), 2U);
+  EXPECT_EQ(snapshot.slots[0].owner, std::optional(first));
+  EXPECT_EQ(snapshot.slots[1].owner, std::optional(second));
+  EXPECT_EQ(table.active_operation_ids(), std::vector<OperationId>{OperationId("coordinated.op")});
+}
+
+TEST(ResourceSlotTableTest, BatchReservationRejectsAnyBusyOrInvalidRowWithoutMutation) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto occupied = owner("existing.op", "existing.participant");
+  ASSERT_TRUE(table.reserve(occupied, {ResourceId("robot.b.joint")}).ok());
+  const auto before = table.coherent_snapshot();
+  const auto first = owner("coordinated.op", "participant.a");
+  const auto second = owner("coordinated.op", "participant.b");
+
+  const auto busy = table.reserve_batch({reservation_owner(first, {ResourceId("robot.a.joint")}),
+                                         reservation_owner(second, {ResourceId("robot.b.joint")})});
+  ASSERT_FALSE(busy.ok());
+  EXPECT_EQ(busy.error().details.at("reason"), "resource_scope_busy");
+  EXPECT_EQ(table.coherent_snapshot(), before);
+
+  const auto noncanonical =
+      table.reserve_batch({reservation_owner(second, {ResourceId("robot.a.joint")}),
+                           reservation_owner(first, {ResourceId("robot.b.joint")})});
+  ASSERT_FALSE(noncanonical.ok());
+  EXPECT_EQ(noncanonical.error().details.at("reason"), "resource_reservation_not_canonical");
+  EXPECT_EQ(table.coherent_snapshot(), before);
+}
+
+TEST(ResourceSlotTableTest, BatchReservationRejectsOverlapAndRevisionDisagreement) {
+  ResourceSlotTable table({ResourceId("robot.a.joint"), ResourceId("robot.b.joint")});
+  const auto first = owner("coordinated.op", "participant.a");
+  auto second = owner("coordinated.op", "participant.b");
+
+  const auto overlap =
+      table.reserve_batch({reservation_owner(first, {ResourceId("robot.a.joint")}),
+                           reservation_owner(second, {ResourceId("robot.a.joint")})});
+  ASSERT_FALSE(overlap.ok());
+  EXPECT_EQ(overlap.error().details.at("reason"), "resource_reservation_scope_overlap");
+  EXPECT_EQ(table.coherent_snapshot().operation_resource_generation, 0U);
+
+  second.operation_revision = OperationRevision(2U);
+  const auto inconsistent =
+      table.reserve_batch({reservation_owner(first, {ResourceId("robot.a.joint")}),
+                           reservation_owner(second, {ResourceId("robot.b.joint")})});
+  ASSERT_FALSE(inconsistent.ok());
+  EXPECT_EQ(inconsistent.error().details.at("reason"),
+            "resource_reservation_operation_revision_inconsistent");
+  EXPECT_EQ(table.coherent_snapshot().operation_resource_generation, 0U);
 }
 
 TEST(ResourceSlotTableTest, ProjectsExactGenerationConfigurationsAndAffectedOperationCounts) {

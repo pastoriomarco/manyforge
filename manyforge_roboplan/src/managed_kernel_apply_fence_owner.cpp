@@ -697,6 +697,38 @@ core::Result<void> ManagedKernelAdmissionGate::reserve(
   return table.reserve(owner, resources);
 }
 
+core::Result<void> ManagedKernelAdmissionGate::reserve_batch(
+    core::ResourceSlotTable &table,
+    const std::vector<core::ResourceSlotReservationOwnerDTO> &owners) {
+  std::lock_guard lock(*admission_mutex_);
+  const auto bound = resource_table_.lock();
+  if (bound == nullptr || bound.get() != &table ||
+      !table.shares_admission_mutex(admission_mutex_)) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+        "Kernel operation admission has no exact bound resource table",
+        {{"reason", "resource_admission_table_unbound"}}});
+  }
+  const auto blocked = std::any_of(
+      held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
+        return std::any_of(owners.begin(), owners.end(), [&](const auto &row) {
+          return std::any_of(row.resources.begin(), row.resources.end(),
+                             [&](const auto &resource) {
+                               return std::binary_search(
+                                   held.scope.resources.begin(),
+                                   held.scope.resources.end(), resource);
+                             });
+        });
+      });
+  if (blocked) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+        "Kernel operation admission is closed by a configuration fence",
+        {{"reason", "configuration_fence_held"}}});
+  }
+  return table.reserve_batch(owners);
+}
+
 ManagedKernelAdmissionObservation ManagedKernelAdmissionGate::Observe(
     const core::ConfigurationFenceScopeDTO &scope) const {
   Require(scope.valid(), "admission observation scope is invalid");

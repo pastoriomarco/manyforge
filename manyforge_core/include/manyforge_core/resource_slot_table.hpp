@@ -67,6 +67,18 @@ struct ResourceSlotTableSnapshotDTO final {
                          const ResourceSlotTableSnapshotDTO&) = default;
 };
 
+/// One participant owner in an atomic coordinated-operation reservation.
+/// Rows form a canonical keyed set ordered by (operation_id, participant_id).
+/// Each resource scope is non-empty, sorted, and unique; scopes are disjoint
+/// across the complete batch.
+struct ResourceSlotReservationOwnerDTO final {
+  ResourceSlotOwnerDTO owner;
+  std::vector<ResourceId> resources;
+
+  friend bool operator==(const ResourceSlotReservationOwnerDTO&,
+                         const ResourceSlotReservationOwnerDTO&) = default;
+};
+
 /// One exact participant owner in an atomic multi-owner Stop fence. Rows are a
 /// canonical keyed set ordered by (operation_id, participant_id); resources are
 /// non-empty, sorted, unique, and disjoint across the complete request.
@@ -133,6 +145,12 @@ class ResourceSlotTable final {
 
   [[nodiscard]] Result<void> reserve(const ResourceSlotOwnerDTO& owner,
                                      const std::vector<ResourceId>& resources);
+
+  /// Reserve every participant scope atomically. Every row and resource is
+  /// prevalidated before mutation, and success advances the table generation
+  /// exactly once regardless of participant count.
+  [[nodiscard]] Result<void> reserve_batch(
+      const std::vector<ResourceSlotReservationOwnerDTO>& owners);
 
   [[nodiscard]] Result<void> transition(const ResourceSlotOwnerDTO& owner,
                                         const std::vector<ResourceId>& resources,
@@ -214,6 +232,8 @@ class IResourceOperationAdmissionGate {
   [[nodiscard]] virtual Result<void> reserve(ResourceSlotTable& table,
                                              const ResourceSlotOwnerDTO& owner,
                                              const std::vector<ResourceId>& resources) = 0;
+  [[nodiscard]] virtual Result<void> reserve_batch(
+      ResourceSlotTable& table, const std::vector<ResourceSlotReservationOwnerDTO>& owners) = 0;
 };
 
 }  // namespace manyforge::core

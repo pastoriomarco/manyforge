@@ -1032,6 +1032,19 @@ class FakeResourceAdmissionGate final : public IResourceOperationAdmissionGate {
     return table.reserve(owner, resources);
   }
 
+  [[nodiscard]] Result<void> reserve_batch(
+      ResourceSlotTable& table,
+      const std::vector<ResourceSlotReservationOwnerDTO>& owners) override {
+    std::lock_guard lock(*admission_mutex_);
+    ++reserve_calls;
+    if (reject_reservation) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                        "test configuration fence is held",
+                                        {{"reason", "configuration_fence_held"}}});
+    }
+    return table.reserve_batch(owners);
+  }
+
   bool reject_reservation{true};
   int reserve_calls{};
 
