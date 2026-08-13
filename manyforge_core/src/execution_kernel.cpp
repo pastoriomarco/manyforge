@@ -656,6 +656,52 @@ std::map<std::string, std::string> runtime_lookahead_authority_details(
   return details;
 }
 
+[[nodiscard]] bool prepared_command_matches_private_request(
+    const PreparedOperationParticipantDTO& participant, const RuntimeParticipantBindingDTO& binding,
+    const GripperCommandRequestDTO& request) noexcept {
+  const auto* command = std::get_if<PreparedCapabilityCommandDTO>(&participant.payload);
+  if (command == nullptr || binding.resources.size() != 1U || !binding.control_path.has_value() ||
+      participant.command_target_id != binding.command_target_id) {
+    return false;
+  }
+  const auto& resource = binding.resources.front();
+  const auto& value = std::get<GripperPositionCommandValueDTO>(command->command_value);
+  const auto kind = coordinate_kind(value.position);
+  const auto target = kind == CoordinateKind::kAngular
+                          ? std::get<AngularPositionDTO>(value.position).value_rad
+                          : std::get<LinearPositionDTO>(value.position).value_m;
+  std::optional<double> effort;
+  if (value.max_effort.has_value()) {
+    effort = kind == CoordinateKind::kAngular
+                 ? std::get<AngularEffortDTO>(*value.max_effort).value_nm
+                 : std::get<LinearEffortDTO>(*value.max_effort).value_n;
+  }
+  double duration = 0.0;
+  for (const auto& option : command->validated_options) {
+    if (option.option_id.value() != "command_duration_s") {
+      return false;
+    }
+    duration = option.value_s;
+  }
+  const bool model_backed = resource.source_joint_name.has_value();
+  const auto expected_group = model_backed && binding.model_groups.size() == 1U
+                                  ? binding.model_groups.front().compiled_group_name
+                                  : std::string{};
+  return request.gripper_id == binding.command_target_id.value() &&
+         request.group_id == expected_group &&
+         request.joint_name == resource.compiled_resource_name &&
+         request.target_position == target && request.duration_s == duration &&
+         request.max_effort == effort && request.commanded_state == "position" &&
+         request.actuation_kind == (kind == CoordinateKind::kAngular ? "angular" : "linear") &&
+         request.state_authority == binding.control_path->state_authority_id.value() &&
+         request.completion_policy == "goal_fenced_target_reached" &&
+         request.grasp_confirmation_policy == "binding_feedback_required" &&
+         request.transport_kind == "resolved_binding" &&
+         request.evidence == std::vector<std::string>{"command_terminal"} &&
+         request.evidence_state == "required_pending" &&
+         request.completion_timeout_s == command->completion_timeout_s;
+}
+
 }  // namespace
 
 class ExecutionKernel::EventDeferralScope {
@@ -723,6 +769,23 @@ struct ExecutionKernel::PreparedMotionSession final {
   std::optional<ErrorDTO> error;
   bool dispatch_requested{};
   bool cancel_requested{};
+};
+
+struct ExecutionKernel::PreparedCapabilityCommandSession final {
+  explicit PreparedCapabilityCommandSession(
+      ResolvedPreparedCapabilityCommandExecutionRequestDTO supplied)
+      : authority(std::move(supplied)) {}
+
+  ResolvedPreparedCapabilityCommandExecutionRequestDTO authority;
+  mutable std::mutex mutex;
+  std::uint64_t preparation_id{};
+  ResolvedPreparedCapabilityCommandStateDTO state{
+      ResolvedPreparedCapabilityCommandStateDTO::kPreparationFailed};
+  std::optional<PrepareParticipantResultDTO> backend_prepare_result;
+  std::optional<ControllerGoalId> controller_goal_id;
+  std::optional<ControllerGoalGeneration> controller_goal_generation;
+  std::optional<GripperCommandResultDTO> dispatch_result;
+  std::optional<ErrorDTO> error;
 };
 
 ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts ports,
@@ -7657,6 +7720,222 @@ Result<void> ExecutionKernel::CancelPreparedMotion(const std::uint64_t execution
   session->changed.notify_all();
   request_active_planning_cancel();
   request_active_validation_cancel("prepared_motion_cancelled_pre_dispatch");
+  return Result<void>::Ok();
+}
+
+Result<std::uint64_t> ExecutionKernel::PrepareCapabilityCommand(
+    ResolvedPreparedCapabilityCommandExecutionRequestDTO request) {
+  if (!request.participant) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "Prepared capability command requires one immutable participant",
+                 {{"reason", "prepared_command_participant_missing"}}});
+  }
+  const auto verified = VerifyPreparedOperationParticipant(
+      *request.participant, request.binding, request.stop_readiness, nullptr,
+      request.retained_default_stop_limits, request.stop_node_category);
+  if (!verified.ok()) {
+    return Result<std::uint64_t>::Err(verified.error());
+  }
+  if (!std::holds_alternative<PreparedCapabilityCommandDTO>(request.participant->payload) ||
+      !prepared_command_matches_private_request(*request.participant, request.binding.value(),
+                                                request.command_request)) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "Prepared capability command differs from its compiled private request",
+                 {{"reason", "prepared_command_authority_mismatch"}}});
+  }
+  auto validated = validate_gripper_command(request.command_request);
+  if (!validated.ok()) {
+    return Result<std::uint64_t>::Err(validated.error());
+  }
+  auto prepared = MakePrepareParticipantResult(*request.participant,
+                                               PrepareParticipantResultStateDTO::kPrepared);
+  if (!prepared.ok()) {
+    return Result<std::uint64_t>::Err(prepared.error());
+  }
+
+  std::shared_ptr<PreparedCapabilityCommandSession> session;
+  try {
+    session = std::make_shared<PreparedCapabilityCommandSession>(std::move(request));
+  } catch (...) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{kErrorInternalError,
+                 "Prepared capability-command session allocation failed",
+                 {{"reason", "prepared_command_session_allocation_failed"}}});
+  }
+  const auto preparation_id = next_execution_id_.fetch_add(1U, std::memory_order_relaxed);
+  if (preparation_id == 0U || preparation_id == std::numeric_limits<std::uint64_t>::max()) {
+    return Result<std::uint64_t>::Err(
+        ErrorDTO{kErrorInternalError,
+                 "Prepared capability-command identity space is exhausted",
+                 {{"reason", "prepared_command_identity_exhausted"}}});
+  }
+  session->preparation_id = preparation_id;
+  session->state = ResolvedPreparedCapabilityCommandStateDTO::kPrepared;
+  session->backend_prepare_result = std::move(prepared.value());
+
+  std::lock_guard active_lock(prepared_command_session_mutex_);
+  if (active_prepared_command_session_) {
+    std::lock_guard prior_lock(active_prepared_command_session_->mutex);
+    const auto& prior = *active_prepared_command_session_;
+    if (prior.authority.participant &&
+        prior.authority.participant->prepared_contract_digest ==
+            session->authority.participant->prepared_contract_digest) {
+      return Result<std::uint64_t>::Ok(prior.preparation_id);
+    }
+    bool prior_effect_active =
+        prior.state == ResolvedPreparedCapabilityCommandStateDTO::kDispatchRequested;
+    if (prior.state == ResolvedPreparedCapabilityCommandStateDTO::kDispatched &&
+        prior.dispatch_result.has_value() && prior.dispatch_result->accepted) {
+      const auto status =
+          get_gripper_status(prior.authority.participant->command_target_id.value());
+      prior_effect_active = status.state == GripperCommandState::kExecuting &&
+                            status.command_id == prior.dispatch_result->command_id &&
+                            status.generation == prior.dispatch_result->generation;
+    }
+    if (prior.state == ResolvedPreparedCapabilityCommandStateDTO::kPrepared ||
+        prior_effect_active) {
+      return Result<std::uint64_t>::Err(
+          ErrorDTO{kErrorInvalidRequest,
+                   "Another prepared capability command is still resident",
+                   {{"reason", "prepared_command_session_busy"}}});
+    }
+  }
+  active_prepared_command_session_ = std::move(session);
+  return Result<std::uint64_t>::Ok(preparation_id);
+}
+
+Result<ResolvedPreparedCapabilityCommandSnapshotDTO>
+ExecutionKernel::ObservePreparedCapabilityCommand(const std::uint64_t preparation_id) const {
+  std::shared_ptr<PreparedCapabilityCommandSession> session;
+  {
+    std::lock_guard lock(prepared_command_session_mutex_);
+    session = active_prepared_command_session_;
+  }
+  if (!session) {
+    return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Err(
+        ErrorDTO{kErrorMissingReference,
+                 "Prepared capability-command session is not resident",
+                 {{"reason", "prepared_command_session_missing"}}});
+  }
+  std::lock_guard lock(session->mutex);
+  if (session->preparation_id != preparation_id) {
+    return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Err(
+        ErrorDTO{kErrorMissingReference,
+                 "Prepared capability-command identity is stale",
+                 {{"reason", "prepared_command_identity_mismatch"}}});
+  }
+  return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Ok(
+      ResolvedPreparedCapabilityCommandSnapshotDTO{
+          session->preparation_id, session->state, session->authority.participant,
+          session->backend_prepare_result, session->controller_goal_id,
+          session->controller_goal_generation, session->dispatch_result, session->error});
+}
+
+Result<GripperCommandResultDTO> ExecutionKernel::DispatchPreparedCapabilityCommand(
+    const std::uint64_t preparation_id, const ContentDigest& prepared_contract_digest,
+    const ControllerGoalId& controller_goal_id,
+    const ControllerGoalGeneration controller_goal_generation) {
+  std::shared_ptr<PreparedCapabilityCommandSession> session;
+  {
+    std::lock_guard lock(prepared_command_session_mutex_);
+    session = active_prepared_command_session_;
+  }
+  if (!session) {
+    return Result<GripperCommandResultDTO>::Err(
+        ErrorDTO{kErrorMissingReference,
+                 "Prepared capability-command session is not resident",
+                 {{"reason", "prepared_command_session_missing"}}});
+  }
+  {
+    std::lock_guard lock(session->mutex);
+    if (session->preparation_id != preparation_id) {
+      return Result<GripperCommandResultDTO>::Err(
+          ErrorDTO{kErrorMissingReference,
+                   "Prepared capability-command identity is stale",
+                   {{"reason", "prepared_command_identity_mismatch"}}});
+    }
+    const bool exact_dispatch =
+        session->authority.participant &&
+        session->authority.participant->prepared_contract_digest == prepared_contract_digest &&
+        session->controller_goal_id == controller_goal_id &&
+        session->controller_goal_generation == controller_goal_generation;
+    if ((session->state == ResolvedPreparedCapabilityCommandStateDTO::kDispatched ||
+         session->state == ResolvedPreparedCapabilityCommandStateDTO::kDispatchFailed) &&
+        exact_dispatch && session->dispatch_result.has_value()) {
+      return Result<GripperCommandResultDTO>::Ok(*session->dispatch_result);
+    }
+    if (session->state != ResolvedPreparedCapabilityCommandStateDTO::kPrepared ||
+        !session->authority.participant ||
+        session->authority.participant->prepared_contract_digest != prepared_contract_digest ||
+        controller_goal_id.empty() || !controller_goal_generation.nonzero()) {
+      return Result<GripperCommandResultDTO>::Err(
+          ErrorDTO{kErrorInvalidRequest,
+                   "Prepared capability-command dispatch identity is invalid",
+                   {{"reason", "prepared_command_dispatch_mismatch"}}});
+    }
+    session->controller_goal_id = controller_goal_id;
+    session->controller_goal_generation = controller_goal_generation;
+    session->state = ResolvedPreparedCapabilityCommandStateDTO::kDispatchRequested;
+  }
+
+  GripperCommandResultDTO dispatched;
+  try {
+    dispatched = command_gripper(session->authority.command_request);
+  } catch (const std::exception& exception) {
+    dispatched = GripperCommandResultDTO{
+        false, 0U, 0U,
+        ErrorDTO{
+            kErrorExecutionRejected,
+            "Capability-command backend threw during dispatch",
+            {{"reason", "prepared_command_dispatch_exception"}, {"exception", exception.what()}}}};
+  } catch (...) {
+    dispatched =
+        GripperCommandResultDTO{false, 0U, 0U,
+                                ErrorDTO{kErrorExecutionRejected,
+                                         "Capability-command backend threw during dispatch",
+                                         {{"reason", "prepared_command_dispatch_exception"},
+                                          {"exception", reason_codes::kUnknownNonStdException}}}};
+  }
+  {
+    std::lock_guard lock(session->mutex);
+    session->dispatch_result = dispatched;
+    session->error = dispatched.error;
+    session->state = dispatched.accepted && !dispatched.error.has_value()
+                         ? ResolvedPreparedCapabilityCommandStateDTO::kDispatched
+                         : ResolvedPreparedCapabilityCommandStateDTO::kDispatchFailed;
+  }
+  return Result<GripperCommandResultDTO>::Ok(std::move(dispatched));
+}
+
+Result<void> ExecutionKernel::CancelPreparedCapabilityCommand(const std::uint64_t preparation_id) {
+  std::shared_ptr<PreparedCapabilityCommandSession> session;
+  {
+    std::lock_guard lock(prepared_command_session_mutex_);
+    session = active_prepared_command_session_;
+  }
+  if (!session) {
+    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
+                                      "Prepared capability-command session is not resident",
+                                      {{"reason", "prepared_command_session_missing"}}});
+  }
+  std::lock_guard lock(session->mutex);
+  if (session->preparation_id != preparation_id) {
+    return Result<void>::Err(ErrorDTO{kErrorMissingReference,
+                                      "Prepared capability-command identity is stale",
+                                      {{"reason", "prepared_command_identity_mismatch"}}});
+  }
+  if (session->state == ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch) {
+    return Result<void>::Ok();
+  }
+  if (session->state != ResolvedPreparedCapabilityCommandStateDTO::kPrepared &&
+      session->state != ResolvedPreparedCapabilityCommandStateDTO::kPreparationFailed) {
+    return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                                      "A released capability command requires the Stop-stage path",
+                                      {{"reason", "prepared_command_already_dispatched"}}});
+  }
+  session->state = ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch;
   return Result<void>::Ok();
 }
 

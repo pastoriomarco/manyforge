@@ -301,6 +301,15 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   Result<void> DispatchPreparedMotion(std::uint64_t execution_id,
                                       const ContentDigest& prepared_contract_digest) override;
   Result<void> CancelPreparedMotion(std::uint64_t execution_id) override;
+  Result<std::uint64_t> PrepareCapabilityCommand(
+      ResolvedPreparedCapabilityCommandExecutionRequestDTO request) override;
+  Result<ResolvedPreparedCapabilityCommandSnapshotDTO> ObservePreparedCapabilityCommand(
+      std::uint64_t preparation_id) const override;
+  Result<GripperCommandResultDTO> DispatchPreparedCapabilityCommand(
+      std::uint64_t preparation_id, const ContentDigest& prepared_contract_digest,
+      const ControllerGoalId& controller_goal_id,
+      ControllerGoalGeneration controller_goal_generation) override;
+  Result<void> CancelPreparedCapabilityCommand(std::uint64_t preparation_id) override;
 
   /// Plan and authoritatively validate one already-resolved motion without
   /// dispatching, journaling, caching, publishing execution state, or
@@ -519,6 +528,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
  private:
   struct PreparedMotionSession;
+  struct PreparedCapabilityCommandSession;
   struct PlanningSuccess;
   struct ExecuteWorkerPlanPhaseResult;
   struct ExecuteWorkerValidationPhaseResult;
@@ -1083,6 +1093,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   mutable std::mutex prepared_motion_session_mutex_;
   std::shared_ptr<PreparedMotionSession> active_prepared_motion_session_;
+  mutable std::mutex prepared_command_session_mutex_;
+  std::shared_ptr<PreparedCapabilityCommandSession> active_prepared_command_session_;
 
   // Declared last so its destructor runs first after the kernel destructor body.
   // The destructor body already stops/drains it explicitly; this member order is

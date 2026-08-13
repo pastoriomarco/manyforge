@@ -336,6 +336,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                      std::optional<ErrorDTO> terminal_error);
   [[nodiscard]] Result<void> advance_prepared_motion(const OperationId& operation_id,
                                                      IResolvedParticipantExecutionEngine* engine);
+  [[nodiscard]] Result<void> advance_prepared_capability_command(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine);
+  [[nodiscard]] Result<void> release_prepared_dispatch_barrier(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
+      std::uint64_t preparation_id, const PreparedOperationParticipantDTO& participant_product);
   [[nodiscard]] Result<OperationAcceptedDTO> execute_coordinated_motion_after_preflight(
       const OperationIntentDTO& intent);
   [[nodiscard]] Result<void> fail_coordinated_pre_dispatch(

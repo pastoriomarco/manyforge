@@ -153,6 +153,116 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return Result<void>::Ok();
   }
 
+  Result<std::uint64_t> PrepareCapabilityCommand(
+      ResolvedPreparedCapabilityCommandExecutionRequestDTO request) override {
+    ++prepare_command_calls;
+    Trace("engine:prepare_command");
+    last_prepared_command_request = std::move(request);
+    if (!last_prepared_command_request->participant) {
+      return Result<std::uint64_t>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "fake command preparation has no participant",
+                   {{"reason", "prepared_command_participant_missing"}}});
+    }
+    auto private_validation =
+        validate_gripper_command(last_prepared_command_request->command_request);
+    if (!private_validation.ok()) {
+      return Result<std::uint64_t>::Err(private_validation.error());
+    }
+    if (prepare_command_hook) {
+      prepare_command_hook();
+    }
+    if (prepare_command_failure.has_value()) {
+      return Result<std::uint64_t>::Err(*prepare_command_failure);
+    }
+    auto prepared = MakePrepareParticipantResult(*last_prepared_command_request->participant,
+                                                 PrepareParticipantResultStateDTO::kPrepared);
+    if (!prepared.ok()) {
+      return Result<std::uint64_t>::Err(prepared.error());
+    }
+    prepared_command_snapshot = ResolvedPreparedCapabilityCommandSnapshotDTO{
+        next_execution_id,
+        ResolvedPreparedCapabilityCommandStateDTO::kPrepared,
+        last_prepared_command_request->participant,
+        std::move(prepared.value()),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt};
+    return Result<std::uint64_t>::Ok(next_execution_id);
+  }
+
+  Result<ResolvedPreparedCapabilityCommandSnapshotDTO> ObservePreparedCapabilityCommand(
+      std::uint64_t preparation_id) const override {
+    ++observe_prepared_command_calls;
+    if (!prepared_command_snapshot.has_value() ||
+        prepared_command_snapshot->preparation_id != preparation_id) {
+      return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
+                   "fake prepared command is unavailable",
+                   {{"reason", "prepared_command_missing"}}});
+    }
+    return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Ok(*prepared_command_snapshot);
+  }
+
+  Result<GripperCommandResultDTO> DispatchPreparedCapabilityCommand(
+      std::uint64_t preparation_id, const ContentDigest& prepared_contract_digest,
+      const ControllerGoalId& controller_goal_id,
+      ControllerGoalGeneration controller_goal_generation) override {
+    ++dispatch_prepared_command_calls;
+    Trace("engine:dispatch_prepared_command");
+    if (!prepared_command_snapshot.has_value() || !prepared_command_snapshot->participant ||
+        prepared_command_snapshot->preparation_id != preparation_id ||
+        prepared_command_snapshot->participant->prepared_contract_digest !=
+            prepared_contract_digest ||
+        !last_prepared_command_request.has_value()) {
+      return Result<GripperCommandResultDTO>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "fake prepared command dispatch identity mismatch",
+                   {{"reason", "prepared_command_dispatch_mismatch"}}});
+    }
+    if (prepared_command_snapshot->dispatch_result.has_value()) {
+      if (prepared_command_snapshot->controller_goal_id != controller_goal_id ||
+          prepared_command_snapshot->controller_goal_generation != controller_goal_generation) {
+        return Result<GripperCommandResultDTO>::Err(
+            ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                     "fake prepared command goal identity conflict",
+                     {{"reason", "prepared_command_goal_conflict"}}});
+      }
+      return Result<GripperCommandResultDTO>::Ok(*prepared_command_snapshot->dispatch_result);
+    }
+    prepared_command_snapshot->controller_goal_id = controller_goal_id;
+    prepared_command_snapshot->controller_goal_generation = controller_goal_generation;
+    auto dispatched = command_gripper(last_prepared_command_request->command_request);
+    prepared_command_snapshot->dispatch_result = dispatched;
+    prepared_command_snapshot->error = dispatched.error;
+    prepared_command_snapshot->state =
+        dispatched.accepted && !dispatched.error.has_value()
+            ? ResolvedPreparedCapabilityCommandStateDTO::kDispatched
+            : ResolvedPreparedCapabilityCommandStateDTO::kDispatchFailed;
+    return Result<GripperCommandResultDTO>::Ok(std::move(dispatched));
+  }
+
+  Result<void> CancelPreparedCapabilityCommand(std::uint64_t preparation_id) override {
+    ++cancel_prepared_command_calls;
+    Trace("engine:cancel_prepared_command");
+    if (!prepared_command_snapshot.has_value() ||
+        prepared_command_snapshot->preparation_id != preparation_id) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
+                                        "fake prepared command is unavailable",
+                                        {{"reason", "prepared_command_missing"}}});
+    }
+    if (prepared_command_snapshot->state ==
+        ResolvedPreparedCapabilityCommandStateDTO::kDispatched) {
+      return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                                        "fake prepared command already dispatched",
+                                        {{"reason", "prepared_command_already_dispatched"}}});
+    }
+    prepared_command_snapshot->state =
+        ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch;
+    return Result<void>::Ok();
+  }
+
   Result<RobotStateDTO> current_preview_state(std::int64_t) const override {
     return Result<RobotStateDTO>::Ok(RobotStateDTO{{"mf2_joint_1"}, {0.0}, {}});
   }
@@ -472,6 +582,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   mutable int observe_prepared_motion_calls{};
   int dispatch_prepared_motion_calls{};
   int cancel_prepared_motion_calls{};
+  int prepare_command_calls{};
+  mutable int observe_prepared_command_calls{};
+  int dispatch_prepared_command_calls{};
+  int cancel_prepared_command_calls{};
   int preview_calls{};
   int command_calls{};
   mutable int validate_command_calls{};
@@ -499,12 +613,16 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::optional<KernelEvent> event_during_execute;
   bool defer_prepare_completion{};
   std::optional<ErrorDTO> prepare_failure;
+  std::optional<ErrorDTO> prepare_command_failure;
   std::function<void()> pause_effect_hook;
+  std::function<void()> prepare_command_hook;
   std::function<void()> translate_stop_stage_hook;
   GripperCommandStatusDTO gripper_status{};
   std::optional<ExecuteRequestDTO> last_execute;
   std::optional<ResolvedPreparedMotionExecutionRequestDTO> last_prepared_request;
   mutable std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> prepared_snapshot;
+  std::optional<ResolvedPreparedCapabilityCommandExecutionRequestDTO> last_prepared_command_request;
+  mutable std::optional<ResolvedPreparedCapabilityCommandSnapshotDTO> prepared_command_snapshot;
   std::optional<ExecuteRequestDTO> last_preview;
   std::optional<ResolvedRuntimeScaleCommandDTO> last_runtime_scale_command;
   std::optional<GripperCommandRequestDTO> last_command;
@@ -1455,17 +1573,18 @@ FakeOperationJournal default_journal;
 [[nodiscard]] RuntimeParticipantBinding coordinated_occurrence(
     const RuntimeParticipantBinding& source, const std::string& suffix) {
   auto value = source.value();
+  const bool angular = value.resources.front().coordinate_kind == CoordinateKind::kAngular;
   value.component_role_id = ComponentRoleId("robot_" + suffix);
-  value.target_role_id = TargetRoleId("arm_" + suffix);
+  value.target_role_id = TargetRoleId(value.target_role_id.value() + "_" + suffix);
   value.controllable_component_id = ControllableComponentId("robot." + suffix);
   for (auto& model : value.model_bindings) {
     model.model_instance_id = ModelInstanceId("robot.model." + suffix);
   }
   for (auto& group : value.model_groups) {
     group.model_instance_id = ModelInstanceId("robot.model." + suffix);
-    group.compiled_group_name = "mf2_robot_" + suffix + "_arm_group";
+    group.compiled_group_name = "mf2_robot_" + suffix + (angular ? "_arm_group" : "_gripper_group");
     for (auto& joint : group.expanded_compiled_joint_names) {
-      joint = "mf2_robot_" + suffix + "_joint_1";
+      joint = "mf2_robot_" + suffix + (angular ? "_joint_1" : "_finger_joint");
     }
   }
   for (auto& frame : value.frame_bindings) {
@@ -1473,12 +1592,15 @@ FakeOperationJournal default_journal;
     frame.compiled_frame_name = "mf2_robot_" + suffix + "_" + frame.compiled_frame_name;
   }
   for (auto& resource : value.resources) {
-    resource.resource_id = ResourceId("robot." + suffix + ".joint_1");
-    resource.compiled_resource_name = "mf2_robot_" + suffix + "_joint_1";
+    resource.resource_id = ResourceId("robot." + suffix + (angular ? ".joint_1" : ".finger"));
+    resource.compiled_resource_name =
+        "mf2_robot_" + suffix + (angular ? "_joint_1" : "_finger_joint");
   }
   auto& control = *value.control_path;
-  control.control_domain_id = ControlDomainId("domain.arm." + suffix);
-  control.control_binding_id = ControlBindingId("binding.arm." + suffix);
+  control.control_domain_id =
+      ControlDomainId(std::string(angular ? "domain.arm." : "domain.gripper.") + suffix);
+  control.control_binding_id =
+      ControlBindingId(std::string(angular ? "binding.arm." : "binding.gripper.") + suffix);
   control.active_control_configuration_id = ActiveControlConfigurationId("active.native." + suffix);
   control.provider_instance_id = ProviderInstanceId("provider.native." + suffix);
   control.state_authority_id = StateAuthorityId("state.native." + suffix);
@@ -1588,11 +1710,11 @@ FakeOperationJournal default_journal;
   return operation;
 }
 
-[[nodiscard]] OperationIntentDTO command_operation() {
+[[nodiscard]] OperationIntentDTO command_operation(std::string request_id = "request.command.1") {
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  auto operation = motion_operation("request.command.1");
+  auto operation = motion_operation(std::move(request_id));
   operation.participants.front() = OperationParticipantIntentDTO{
       ComponentRoleId("robot"), TargetRoleId("gripper"), CapabilityId("tool.gripper.command"),
       std::nullopt,
@@ -1602,6 +1724,31 @@ FakeOperationJournal default_journal;
           GripperPositionCommandValueDTO{LinearPositionDTO{0.02}, LinearEffortDTO{8.0}},
           2.0,
           {CommandDurationOptionDTO{CommandOptionId("command_duration_s"), 0.5}}}};
+  return operation;
+}
+
+[[nodiscard]] OperationIntentDTO coordinated_command_operation(
+    std::string request_id, const std::size_t participant_count = 2U) {
+  auto operation = command_operation(std::move(request_id));
+  operation.coordination_policy = OperationCoordinationPolicy::kCoordinatedAll;
+  operation.participants.reserve(participant_count);
+  for (std::size_t index = 1U; index < participant_count; ++index) {
+    auto participant = operation.participants.front();
+    const auto suffix = std::to_string(index + 1U);
+    participant.component_role_id = ComponentRoleId("robot_" + suffix);
+    participant.target_role_id = TargetRoleId("gripper_" + suffix);
+    operation.participants.push_back(std::move(participant));
+  }
+  return operation;
+}
+
+[[nodiscard]] OperationIntentDTO coordinated_motion_command_operation(std::string request_id) {
+  auto operation = motion_operation(std::move(request_id));
+  operation.coordination_policy = OperationCoordinationPolicy::kCoordinatedAll;
+  auto command = command_operation().participants.front();
+  command.component_role_id = ComponentRoleId("robot_2");
+  command.target_role_id = TargetRoleId("gripper_2");
+  operation.participants.push_back(std::move(command));
   return operation;
 }
 
@@ -2015,6 +2162,258 @@ TEST(ResourceAddressedExecutionKernelTest,
       return call == "state:operation_partial_dispatch";
     }));
   }
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  ASSERT_EQ(state.value().participants.size(), 3U);
+  EXPECT_EQ(state.value().participants[2].state, OperationStateKind::kCancelledPreDispatch);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedCapabilityCommandsPrepareAllBeforeDeterministicDispatch) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  std::vector<std::string> timeline;
+  first_engine.timeline = &timeline;
+  second_engine.timeline = &timeline;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                  CoordinateKind::kLinear, schema);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(coordinated_command_operation("request.command.coordinated.success"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(first_engine.prepare_command_calls, 1);
+  EXPECT_EQ(second_engine.prepare_command_calls, 1);
+  EXPECT_EQ(first_engine.dispatch_prepared_command_calls, 1);
+  EXPECT_EQ(second_engine.dispatch_prepared_command_calls, 1);
+  EXPECT_EQ(timeline, (std::vector<std::string>{
+                          "engine:prepare_command", "engine:prepare_command",
+                          "engine:dispatch_prepared_command", "engine:command_gripper",
+                          "engine:dispatch_prepared_command", "engine:command_gripper"}));
+  ASSERT_TRUE(first_engine.prepared_command_snapshot.has_value());
+  ASSERT_TRUE(second_engine.prepared_command_snapshot.has_value());
+  EXPECT_TRUE(std::holds_alternative<PreparedCapabilityCommandDTO>(
+      first_engine.prepared_command_snapshot->participant->payload));
+  EXPECT_TRUE(std::holds_alternative<PreparedCapabilityCommandDTO>(
+      second_engine.prepared_command_snapshot->participant->payload));
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().state, OperationStateKind::kExecuting);
+  const auto slots = kernel.resource_snapshot();
+  EXPECT_TRUE(std::all_of(slots.begin(), slots.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kDispatched;
+  }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedCommandPreparationFailureCancelsPreparedPeersAndReleasesAllResources) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  second_engine.prepare_command_failure =
+      ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+               "injected coordinated command preparation failure",
+               {{"reason", "injected_command_prepare_failure"}}};
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                  CoordinateKind::kLinear, schema);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(coordinated_command_operation("request.command.coordinated.failure"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(first_engine.cancel_prepared_command_calls, 1);
+  EXPECT_EQ(second_engine.cancel_prepared_command_calls, 0);
+  EXPECT_EQ(first_engine.dispatch_prepared_command_calls, 0);
+  EXPECT_EQ(second_engine.dispatch_prepared_command_calls, 0);
+  const auto slots = kernel.resource_snapshot();
+  EXPECT_TRUE(std::all_of(slots.begin(), slots.end(),
+                          [](const auto& slot) { return slot.state == ResourceSlotState::kFree; }));
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_EQ(state.value().participants.size(), 2U);
+  EXPECT_EQ(state.value().participants[0].state, OperationStateKind::kCancelledPreDispatch);
+  EXPECT_EQ(state.value().participants[1].state, OperationStateKind::kInterventionRequired);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     MixedCoordinatedOperationHoldsMotionUntilCommandPreparationCompletes) {
+  FakeClock clock;
+  FakeParticipantEngine motion_engine;
+  FakeParticipantEngine command_engine;
+  std::vector<std::string> timeline;
+  motion_engine.timeline = &timeline;
+  command_engine.timeline = &timeline;
+  std::promise<void> command_prepare_entered;
+  std::promise<void> release_command_prepare;
+  auto release_future = release_command_prepare.get_future().share();
+  command_engine.prepare_command_hook = [&] {
+    command_prepare_entered.set_value();
+    release_future.wait();
+  };
+  const auto motion =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto command_source = make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                           CoordinateKind::kLinear, schema);
+  const auto command = coordinated_occurrence(command_source, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(motion, motion_engine), registration(command, command_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  auto executing = std::async(std::launch::async, [&] {
+    return kernel.execute(coordinated_motion_command_operation("request.mixed.coordinated.held"));
+  });
+  ASSERT_EQ(command_prepare_entered.get_future().wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  EXPECT_EQ(motion_engine.prepare_motion_calls, 1);
+  EXPECT_EQ(motion_engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(command_engine.dispatch_prepared_command_calls, 0);
+  const auto reserved_slots = kernel.resource_snapshot();
+  EXPECT_TRUE(std::all_of(reserved_slots.begin(), reserved_slots.end(), [](const auto& slot) {
+    return slot.state == ResourceSlotState::kReserved;
+  }));
+
+  release_command_prepare.set_value();
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(timeline,
+            (std::vector<std::string>{
+                "engine:prepare_motion", "engine:prepare_command",
+                "engine:dispatch_prepared_motion", "engine:execute", "engine:set_runtime_scale",
+                "engine:dispatch_prepared_command", "engine:command_gripper"}));
+  EXPECT_EQ(motion_engine.dispatch_prepared_motion_calls, 1);
+  EXPECT_EQ(command_engine.dispatch_prepared_command_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopDuringCoordinatedCommandPreparationCancelsEveryPreparationWithoutDispatch) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  std::promise<void> second_prepare_entered;
+  std::promise<void> release_second_prepare;
+  auto release_future = release_second_prepare.get_future().share();
+  second_engine.prepare_command_hook = [&] {
+    second_prepare_entered.set_value();
+    release_future.wait();
+  };
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                  CoordinateKind::kLinear, schema);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)}, clock,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  auto executing = std::async(std::launch::async, [&] {
+    return kernel.execute(coordinated_command_operation("request.command.coordinated.stop"));
+  });
+  ASSERT_EQ(second_prepare_entered.get_future().wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  const OperationAcceptedDTO expected{RequestId("request.command.coordinated.stop"),
+                                      RequestReplayStatusDTO::kAcceptedNew,
+                                      OperationId("operation.kernel.epoch.1.1"),
+                                      OperationRevision(1U),
+                                      {},
+                                      0};
+  const auto stopped = kernel.stop(stop_request("request.stop.coordinated.command", expected, 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  release_second_prepare.set_value();
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.cancel_prepared_command_calls == 1 &&
+           second_engine.cancel_prepared_command_calls == 1;
+  }));
+  EXPECT_EQ(first_engine.dispatch_prepared_command_calls, 0);
+  EXPECT_EQ(second_engine.dispatch_prepared_command_calls, 0);
+  EXPECT_EQ(first_engine.command_calls, 0);
+  EXPECT_EQ(second_engine.command_calls, 0);
+  EXPECT_EQ(first_engine.translate_stop_stage_calls.load(), 0);
+  EXPECT_EQ(second_engine.translate_stop_stage_calls.load(), 0);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  ASSERT_TRUE(status.value().stop_certificate.has_value());
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  ASSERT_EQ(certificate.value().scope_entries.size(), 2U);
+  EXPECT_TRUE(std::all_of(certificate.value().scope_entries.begin(),
+                          certificate.value().scope_entries.end(), [](const auto& entry) {
+                            return entry.dispatch_state ==
+                                   StopScopeDispatchStateDTO::kNeverDispatchedCancelled;
+                          }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PartialCapabilityCommandDispatchStopsAttemptedAndCancelsUnreleasedParticipants) {
+  FakeClock clock;
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  FakeParticipantEngine third_engine;
+  second_engine.next_command_result =
+      GripperCommandResultDTO{false, 0U, 0U,
+                              ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                       "injected command dispatch failure",
+                                       {{"reason", "injected_command_dispatch_failure"}}}};
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                  CoordinateKind::kLinear, schema);
+  const auto second = coordinated_occurrence(first, "2");
+  const auto third = coordinated_occurrence(first, "3");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine),
+       registration(third, third_engine)},
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+
+  const auto accepted =
+      kernel.execute(coordinated_command_operation("request.command.coordinated.partial", 3U));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(first_engine.dispatch_prepared_command_calls, 1);
+  EXPECT_EQ(second_engine.dispatch_prepared_command_calls, 1);
+  EXPECT_EQ(third_engine.dispatch_prepared_command_calls, 0);
+  EXPECT_EQ(third_engine.cancel_prepared_command_calls, 1);
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.translate_stop_stage_calls.load() == 1 &&
+           second_engine.translate_stop_stage_calls.load() == 1;
+  }));
+  EXPECT_EQ(third_engine.translate_stop_stage_calls.load(), 0);
+  const StopId stop_id("stop.kernel.epoch.1.1");
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  const auto status = kernel.get_stop_status(stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  ASSERT_TRUE(status.value().stop_certificate.has_value());
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  ASSERT_EQ(certificate.value().scope_entries.size(), 2U);
   const auto state = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(state.ok()) << state.error().message;
   ASSERT_EQ(state.value().participants.size(), 3U);
@@ -2992,8 +3391,21 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_DOUBLE_EQ(*engine.last_command->max_effort, 8.0);
   EXPECT_DOUBLE_EQ(engine.last_command->duration_s, 0.5);
   EXPECT_DOUBLE_EQ(engine.last_command->completion_timeout_s, 2.0);
-  EXPECT_EQ(engine.validate_command_calls, 1);
+  EXPECT_EQ(engine.validate_command_calls, 2);
+  EXPECT_EQ(engine.prepare_command_calls, 1);
+  EXPECT_EQ(engine.dispatch_prepared_command_calls, 1);
+  ASSERT_TRUE(engine.prepared_command_snapshot.has_value());
+  ASSERT_TRUE(engine.prepared_command_snapshot->participant);
+  EXPECT_TRUE(std::holds_alternative<PreparedCapabilityCommandDTO>(
+      engine.prepared_command_snapshot->participant->payload));
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kDispatched);
+
+  const auto replay = kernel.execute(command_operation());
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(engine.prepare_command_calls, 1);
+  EXPECT_EQ(engine.dispatch_prepared_command_calls, 1);
+  EXPECT_EQ(engine.command_calls, 1);
 
   engine.gripper_status.state = GripperCommandState::kCompleted;
   engine.gripper_status.progress = 1.0;
@@ -3003,6 +3415,61 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto state = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(state.ok());
   EXPECT_EQ(state.value().state, OperationStateKind::kCompleted);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopDuringCapabilityCommandPrepareCancelsWithoutDispatchOrStopStage) {
+  FakeClock clock;
+  FakeParticipantEngine engine;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  std::promise<void> prepare_entered;
+  std::promise<void> release_prepare;
+  auto release_future = release_prepare.get_future().share();
+  engine.prepare_command_hook = [&] {
+    prepare_entered.set_value();
+    release_future.wait();
+  };
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                 CoordinateKind::kLinear, schema),
+                    engine)},
+      clock, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+
+  auto executing =
+      std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
+  ASSERT_EQ(prepare_entered.get_future().wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  const OperationAcceptedDTO expected{RequestId("request.command.1"),
+                                      RequestReplayStatusDTO::kAcceptedNew,
+                                      OperationId("operation.kernel.epoch.1.1"),
+                                      OperationRevision(1U),
+                                      {},
+                                      0};
+  const auto stopped = kernel.stop(stop_request("request.command.prepare.stop", expected, 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  release_prepare.set_value();
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] { return engine.cancel_prepared_command_calls == 1; }));
+  EXPECT_EQ(engine.dispatch_prepared_command_calls, 0);
+  EXPECT_EQ(engine.command_calls, 0);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  ASSERT_TRUE(status.value().stop_certificate.has_value());
+  const auto certificate =
+      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  ASSERT_EQ(certificate.value().scope_entries.size(), 1U);
+  EXPECT_EQ(certificate.value().scope_entries.front().dispatch_state,
+            StopScopeDispatchStateDTO::kNeverDispatchedCancelled);
+  EXPECT_TRUE(certificate.value().attempted_stage_results.empty());
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
