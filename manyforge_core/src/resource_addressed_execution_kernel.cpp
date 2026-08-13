@@ -1044,9 +1044,7 @@ struct ResourceAddressedExecutionKernel::StopFaultRecoveryReplayEntry final {
   StopFaultRecoveryResultDTO result;
 };
 
-struct ResourceAddressedExecutionKernel::ActiveOperation final {
-  OperationIntentDTO intent;
-  OperationAcceptedDTO accepted;
+struct ActiveOperationParticipant final {
   RuntimeParticipantBinding binding;
   RuntimeParticipantStopReadiness stop_readiness;
   std::optional<RuntimeParticipantPolicySelection> runtime_policy;
@@ -1060,23 +1058,107 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   ResourceSlotOwnerDTO slot_owner;
   std::vector<ResourceId> resources;
   OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
-  OperationStateDTO state;
   ResourceSlotState slot_state{ResourceSlotState::kReserved};
   std::uint64_t subordinate_id{};
   std::uint64_t subordinate_generation{};
-  std::optional<OperationControlKind> pending_control;
+  bool stop_cancelled_pre_dispatch{};
   bool reconciliation_in_flight{};
-  bool runtime_scale_effect_in_flight{};
-  bool stop_effect_in_flight{};
-  bool ordinary_acceptance_pending{};
-  bool ordinary_acceptance_durable{};
   bool prepare_in_flight{};
   bool prepared_advance_in_flight{};
   bool prepared_dispatch_released{};
   bool dispatch_effect_in_flight{};
   std::optional<ErrorDTO> last_subordinate_error;
-  std::optional<RuntimeScaleStatusDTO> runtime_scale_status;
 };
+
+struct ResourceAddressedExecutionKernel::ActiveOperation final {
+  OperationIntentDTO intent;
+  OperationAcceptedDTO accepted;
+  std::vector<ActiveOperationParticipant> participants;
+  OperationStateDTO state;
+  std::optional<OperationControlKind> pending_control;
+  bool runtime_scale_effect_in_flight{};
+  bool stop_effect_in_flight{};
+  bool ordinary_acceptance_pending{};
+  bool ordinary_acceptance_durable{};
+  std::optional<RuntimeScaleStatusDTO> runtime_scale_status;
+
+  [[nodiscard]] ActiveOperationParticipant* participant_for(
+      const IResolvedParticipantExecutionEngine* selected_engine) noexcept {
+    const auto found = std::find_if(
+        participants.begin(), participants.end(),
+        [&](const auto& participant) { return participant.engine == selected_engine; });
+    return found == participants.end() ? nullptr : &*found;
+  }
+
+  [[nodiscard]] const ActiveOperationParticipant* participant_for(
+      const IResolvedParticipantExecutionEngine* selected_engine) const noexcept {
+    const auto found = std::find_if(
+        participants.begin(), participants.end(),
+        [&](const auto& participant) { return participant.engine == selected_engine; });
+    return found == participants.end() ? nullptr : &*found;
+  }
+
+  [[nodiscard]] bool dispatch_effect_in_flight() const noexcept {
+    return std::any_of(participants.begin(), participants.end(), [](const auto& participant) {
+      return participant.dispatch_effect_in_flight;
+    });
+  }
+
+  [[nodiscard]] bool reconciliation_in_flight() const noexcept {
+    return std::any_of(participants.begin(), participants.end(), [](const auto& participant) {
+      return participant.reconciliation_in_flight;
+    });
+  }
+};
+
+[[nodiscard]] OperationStateKind aggregate_participant_state(
+    const std::vector<OperationParticipantStateDTO>& participants) noexcept {
+  const auto all_state = [&](OperationStateKind state) {
+    return std::all_of(participants.begin(), participants.end(),
+                       [&](const auto& participant) { return participant.state == state; });
+  };
+  const auto any_state = [&](OperationStateKind state) {
+    return std::any_of(participants.begin(), participants.end(),
+                       [&](const auto& participant) { return participant.state == state; });
+  };
+  const bool all_terminal =
+      !participants.empty() &&
+      std::all_of(participants.begin(), participants.end(),
+                  [](const auto& participant) { return terminal(participant.state); });
+  if (all_terminal) {
+    for (const auto state :
+         {OperationStateKind::kCompleted, OperationStateKind::kStopped, OperationStateKind::kFailed,
+          OperationStateKind::kInterrupted, OperationStateKind::kInterventionRequired,
+          OperationStateKind::kCancelledPreDispatch}) {
+      if (all_state(state)) {
+        return state;
+      }
+    }
+    return OperationStateKind::kInterventionRequired;
+  }
+  if (any_state(OperationStateKind::kStopping)) {
+    return OperationStateKind::kStopping;
+  }
+  if (any_state(OperationStateKind::kExecuting)) {
+    return OperationStateKind::kExecuting;
+  }
+  if (all_state(OperationStateKind::kPaused)) {
+    return OperationStateKind::kPaused;
+  }
+  if (any_state(OperationStateKind::kDispatching)) {
+    return OperationStateKind::kDispatching;
+  }
+  if (all_state(OperationStateKind::kPrepared)) {
+    return OperationStateKind::kPrepared;
+  }
+  if (any_state(OperationStateKind::kValidating)) {
+    return OperationStateKind::kValidating;
+  }
+  if (any_state(OperationStateKind::kPlanning)) {
+    return OperationStateKind::kPlanning;
+  }
+  return OperationStateKind::kResolving;
+}
 
 struct StopParticipantAttempt final {
   bool started{};
@@ -1685,18 +1767,25 @@ StopScopeResolverSnapshotDTO ResourceAddressedExecutionKernel::capture_stop_scop
   snapshot.operations.reserve(active_operations_.size() + historical_operations_.size());
   for (const auto& [operation_id, operation] : active_operations_) {
     const bool effect_uncertain =
-        operation->stop_effect_in_flight || operation->dispatch_effect_in_flight ||
+        operation->stop_effect_in_flight || operation->dispatch_effect_in_flight() ||
         operation->state.state == OperationStateKind::kInterrupted ||
         operation->state.state == OperationStateKind::kInterventionRequired;
+    std::vector<ControllableComponentId> components;
+    std::vector<ResourceId> resources;
+    components.reserve(operation->participants.size());
+    for (const auto& participant : operation->participants) {
+      components.push_back(participant.binding.value().controllable_component_id);
+      resources.insert(resources.end(), participant.resources.begin(), participant.resources.end());
+    }
+    std::sort(components.begin(), components.end());
+    components.erase(std::unique(components.begin(), components.end()), components.end());
+    std::sort(resources.begin(), resources.end());
+    resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
     snapshot.operations.push_back(StopScopeOperationSnapshotDTO{
-        operation_id,
-        operation->state.operation_revision,
+        operation_id, operation->state.operation_revision,
         operation->state.active_stop_generation.value_or(StopGeneration(0U)),
-        operation->state.state,
-        true,
-        effect_uncertain,
-        {operation->binding.value().controllable_component_id},
-        operation->resources});
+        operation->state.state, true, effect_uncertain, std::move(components),
+        std::move(resources)});
   }
   for (const auto& operation : historical_operations_) {
     if (active_operations_.contains(operation.operation_id)) {
@@ -1722,7 +1811,8 @@ StopScopeResolverSnapshotDTO ResourceAddressedExecutionKernel::capture_stop_scop
     if (slot.owner.has_value()) {
       const auto* operation = find_active_operation_locked(slot.owner->operation_id);
       effect_uncertain = effect_uncertain || operation == nullptr ||
-                         operation->stop_effect_in_flight || operation->dispatch_effect_in_flight ||
+                         operation->stop_effect_in_flight ||
+                         operation->dispatch_effect_in_flight() ||
                          operation->state.state == OperationStateKind::kInterrupted ||
                          operation->state.state == OperationStateKind::kInterventionRequired;
     }
@@ -1739,7 +1829,8 @@ std::optional<OperationId> ResourceAddressedExecutionKernel::find_event_operatio
   }
   std::optional<OperationId> result;
   for (const auto& [operation_id, operation] : active_operations_) {
-    if (operation->engine != engine || operation->subordinate_id != subordinate_id) {
+    const auto* participant = operation->participant_for(engine);
+    if (participant == nullptr || participant->subordinate_id != subordinate_id) {
       continue;
     }
     if (result.has_value()) {
@@ -2362,8 +2453,9 @@ bool ResourceAddressedExecutionKernel::participant_engine_in_use(
   }
   std::lock_guard submit_lock(submission_mutex_);
   std::lock_guard state_lock(state_mutex_);
-  return std::any_of(active_operations_.begin(), active_operations_.end(),
-                     [&](const auto& item) { return item.second->engine == engine; }) ||
+  return std::any_of(
+             active_operations_.begin(), active_operations_.end(),
+             [&](const auto& item) { return item.second->participant_for(engine) != nullptr; }) ||
          std::any_of(registrations_.begin(), registrations_.end(),
                      [&](const auto& registration) { return registration.engine == engine; });
 }
@@ -2378,8 +2470,9 @@ Result<void> ResourceAddressedExecutionKernel::release_retired_engine(
   std::lock_guard submit_lock(submission_mutex_);
   {
     std::lock_guard state_lock(state_mutex_);
-    if (std::any_of(active_operations_.begin(), active_operations_.end(),
-                    [&](const auto& item) { return item.second->engine == engine; }) ||
+    if (std::any_of(
+            active_operations_.begin(), active_operations_.end(),
+            [&](const auto& item) { return item.second->participant_for(engine) != nullptr; }) ||
         std::any_of(registrations_.begin(), registrations_.end(),
                     [&](const auto& registration) { return registration.engine == engine; })) {
       return Result<void>::Err(error(std::string(to_string(ErrorCode::kExecutionRejected)),
@@ -2806,9 +2899,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   }
   {
     std::lock_guard state_lock(state_mutex_);
-    const auto engine_in_use =
-        std::any_of(active_operations_.begin(), active_operations_.end(),
-                    [&](const auto& item) { return item.second->engine == engine; });
+    const auto engine_in_use = std::any_of(
+        active_operations_.begin(), active_operations_.end(),
+        [&](const auto& item) { return item.second->participant_for(engine) != nullptr; });
     if (engine_in_use) {
       return reject<OperationAcceptedDTO>(
           "the resolved single-participant engine already owns an unsettled operation",
@@ -3023,38 +3116,40 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     retained_stop_plan = std::make_shared<const PreparedParticipantStopPlanDTO>(
         std::move(ordinary_stop_plan.value()));
     std::map<OperationId, std::unique_ptr<ActiveOperation>> staging;
-    staging.emplace(operation_id, std::make_unique<ActiveOperation>(
-                                      ActiveOperation{intent,
-                                                      accepted,
-                                                      resolved.value().binding,
-                                                      *resolved.value().stop_readiness,
-                                                      resolved.value().runtime_policy,
-                                                      resolved.value().retained_default_stop_limits,
-                                                      resolved.value().stop_node_category,
-                                                      retained_stop_plan,
-                                                      std::nullopt,
-                                                      engine,
-                                                      resolved.value().prepared_motion_engine,
-                                                      resolved.value().stop_execution_port,
-                                                      slot_owner,
-                                                      resources,
-                                                      payload_kind,
-                                                      operation_state_dto,
-                                                      ResourceSlotState::kReserved,
-                                                      0U,
-                                                      0U,
-                                                      std::nullopt,
-                                                      false,
-                                                      false,
-                                                      false,
-                                                      true,
-                                                      false,
-                                                      false,
-                                                      false,
-                                                      false,
-                                                      false,
-                                                      std::nullopt,
-                                                      std::move(initial_runtime_scale_status)}));
+    staging.emplace(operation_id,
+                    std::make_unique<ActiveOperation>(ActiveOperation{
+                        intent,
+                        accepted,
+                        {ActiveOperationParticipant{resolved.value().binding,
+                                                    *resolved.value().stop_readiness,
+                                                    resolved.value().runtime_policy,
+                                                    resolved.value().retained_default_stop_limits,
+                                                    resolved.value().stop_node_category,
+                                                    retained_stop_plan,
+                                                    std::nullopt,
+                                                    engine,
+                                                    resolved.value().prepared_motion_engine,
+                                                    resolved.value().stop_execution_port,
+                                                    slot_owner,
+                                                    resources,
+                                                    payload_kind,
+                                                    ResourceSlotState::kReserved,
+                                                    0U,
+                                                    0U,
+                                                    false,
+                                                    false,
+                                                    false,
+                                                    false,
+                                                    false,
+                                                    false,
+                                                    std::nullopt}},
+                        operation_state_dto,
+                        std::nullopt,
+                        false,
+                        false,
+                        true,
+                        false,
+                        std::move(initial_runtime_scale_status)}));
     prepared_operation = staging.extract(operation_id);
   } catch (...) {
     return reject<OperationAcceptedDTO>(
@@ -3077,9 +3172,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
           error("request_id_conflict", "operation request ID became retained by emergency Stop",
                 "request_id_conflict"));
     }
-    const bool engine_in_use =
-        std::any_of(active_operations_.begin(), active_operations_.end(),
-                    [&](const auto& item) { return item.second->engine == engine; });
+    const bool engine_in_use = std::any_of(
+        active_operations_.begin(), active_operations_.end(),
+        [&](const auto& item) { return item.second->participant_for(engine) != nullptr; });
     const bool request_id_used =
         std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
                     [&](const ReplayEntry& entry) {
@@ -3150,8 +3245,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     if (active_operation != nullptr) {
       active_operation->ordinary_acceptance_pending = false;
       if (!active_operation->state.active_stop_id.has_value()) {
+        auto& participant = active_operation->participants.front();
         const auto released =
-            resource_slots_->release(active_operation->slot_owner, active_operation->resources);
+            resource_slots_->release(participant.slot_owner, participant.resources);
         if (!released.ok()) {
           return Result<OperationAcceptedDTO>::Err(released.error());
         }
@@ -3172,13 +3268,14 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     active_operation->ordinary_acceptance_pending = false;
     active_operation->ordinary_acceptance_durable = true;
     replay_ledger_.push_back(std::move(prepared_replay));
+    auto& participant = active_operation->participants.front();
     dispatch_allowed = !active_operation->state.active_stop_id.has_value() &&
-                       active_operation->slot_state == ResourceSlotState::kReserved;
+                       participant.slot_state == ResourceSlotState::kReserved;
     if (dispatch_allowed) {
       if (payload_kind == OperationParticipantPayloadKind::kMotion) {
-        active_operation->prepare_in_flight = true;
+        participant.prepare_in_flight = true;
       } else {
-        active_operation->dispatch_effect_in_flight = true;
+        participant.dispatch_effect_in_flight = true;
       }
     }
   }
@@ -3209,16 +3306,18 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
             std::string(to_string(ErrorCode::kInvariantViolation)),
             "active operation disappeared during subordinate admission", "active_operation_lost"));
       } else {
-        active_operation->prepare_in_flight = false;
+        active_operation->participants.front().prepare_in_flight = false;
       }
-      if (active_operation != nullptr && active_operation->subordinate_id != 0U &&
-          active_operation->subordinate_id != prepared_execution.value()) {
+      auto* participant =
+          active_operation == nullptr ? nullptr : &active_operation->participants.front();
+      if (participant != nullptr && participant->subordinate_id != 0U &&
+          participant->subordinate_id != prepared_execution.value()) {
         dispatch_result =
             Result<void>::Err(error(std::string(to_string(ErrorCode::kInvariantViolation)),
                                     "subordinate event and execute result identities disagree",
                                     "subordinate_execution_id_mismatch"));
-      } else if (active_operation != nullptr) {
-        active_operation->subordinate_id = prepared_execution.value();
+      } else if (participant != nullptr) {
+        participant->subordinate_id = prepared_execution.value();
         if (active_operation->state.state == OperationStateKind::kResolving) {
           auto planning_state = active_operation->state;
           planning_state.state = OperationStateKind::kPlanning;
@@ -3239,7 +3338,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       }
     }
     if (dispatch_result.ok()) {
-      dispatch_result = advance_prepared_motion(operation_id);
+      dispatch_result = advance_prepared_motion(operation_id, engine);
     }
   } else {
     const auto dispatch = engine->command_gripper(*command_request);
@@ -3255,9 +3354,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
             std::string(to_string(ErrorCode::kInvariantViolation)),
             "active command disappeared during subordinate admission", "active_operation_lost"));
       } else {
-        active_operation->dispatch_effect_in_flight = false;
-        active_operation->subordinate_id = dispatch.command_id;
-        active_operation->subordinate_generation = dispatch.generation;
+        auto& participant = active_operation->participants.front();
+        participant.dispatch_effect_in_flight = false;
+        participant.subordinate_id = dispatch.command_id;
+        participant.subordinate_generation = dispatch.generation;
         if (!active_operation->state.active_stop_id.has_value()) {
           auto executing_state = active_operation->state;
           executing_state.state = OperationStateKind::kExecuting;
@@ -3275,7 +3375,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
             if (!transition.ok()) {
               dispatch_result = transition;
             } else {
-              active_operation->slot_state = ResourceSlotState::kDispatched;
+              participant.slot_state = ResourceSlotState::kDispatched;
               active_operation->state = std::move(executing_state);
             }
           } else {
@@ -3290,10 +3390,11 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     std::lock_guard state_lock(state_mutex_);
     auto* active_operation = find_active_operation_locked(operation_id);
     if (active_operation != nullptr) {
-      active_operation->prepare_in_flight = false;
-      active_operation->dispatch_effect_in_flight = false;
+      auto& participant = active_operation->participants.front();
+      participant.prepare_in_flight = false;
+      participant.dispatch_effect_in_flight = false;
       if (active_operation->state.active_stop_id.has_value()) {
-        active_operation->last_subordinate_error = dispatch_result.error();
+        participant.last_subordinate_error = dispatch_result.error();
         return Result<OperationAcceptedDTO>::Ok(accepted);
       }
       auto failed_state = active_operation->state;
@@ -3308,12 +3409,11 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                             : nullptr,
                                         "subordinate_dispatch_failed_after_acceptance");
       if (durable_failure.ok()) {
-        if (active_operation->slot_state != ResourceSlotState::kTerminal) {
-          const auto transition =
-              resource_slots_->transition(active_operation->slot_owner, active_operation->resources,
-                                          ResourceSlotState::kTerminal);
+        if (participant.slot_state != ResourceSlotState::kTerminal) {
+          const auto transition = resource_slots_->transition(
+              participant.slot_owner, participant.resources, ResourceSlotState::kTerminal);
           if (transition.ok()) {
-            active_operation->slot_state = ResourceSlotState::kTerminal;
+            participant.slot_state = ResourceSlotState::kTerminal;
           }
         }
         active_operation->state = std::move(failed_state);
@@ -3447,18 +3547,19 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       return reject<OperationControlAcceptedDTO>(
           "another operation control is already being admitted", "operation_control_busy");
     }
-    if (settles_operation && (active_operation->reconciliation_in_flight ||
+    if (settles_operation && (active_operation->reconciliation_in_flight() ||
                               active_operation->runtime_scale_effect_in_flight ||
                               active_operation->stop_effect_in_flight)) {
       return reject<OperationControlAcceptedDTO>(
           "operation settlement cannot overtake an in-flight subordinate effect",
           "operation_effect_in_flight");
     }
-    engine = active_operation->engine;
-    subordinate_id = active_operation->subordinate_id;
-    subordinate_generation = active_operation->subordinate_generation;
-    command_target = active_operation->binding.value().command_target_id.value();
-    payload_kind = active_operation->payload_kind;
+    auto& participant = active_operation->participants.front();
+    engine = participant.engine;
+    subordinate_id = participant.subordinate_id;
+    subordinate_generation = participant.subordinate_generation;
+    command_target = participant.binding.value().command_target_id.value();
+    payload_kind = participant.payload_kind;
     if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
         (control == OperationControlKind::kPause || control == OperationControlKind::kResume)) {
       return reject<OperationControlAcceptedDTO>(
@@ -3490,12 +3591,12 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       return Result<OperationControlAcceptedDTO>::Err(durable_acceptance.error());
     }
 
-    auto revised = settles_operation && active_operation->slot_state != ResourceSlotState::kTerminal
+    auto revised = settles_operation && participant.slot_state != ResourceSlotState::kTerminal
                        ? resource_slots_->transition_and_revise_owner(
-                             active_operation->slot_owner, active_operation->resources,
+                             participant.slot_owner, participant.resources,
                              ResourceSlotState::kTerminal, next_revision)
-                       : resource_slots_->revise_owner(active_operation->slot_owner,
-                                                       active_operation->resources, next_revision);
+                       : resource_slots_->revise_owner(participant.slot_owner,
+                                                       participant.resources, next_revision);
     control_replay_ledger_.push_back(ControlReplayEntry{request, accepted});
     if (!revised.ok()) {
       auto intervention = accepted_state;
@@ -3511,9 +3612,9 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       }
       return Result<OperationControlAcceptedDTO>::Ok(accepted);
     }
-    active_operation->slot_owner = revised.value();
+    participant.slot_owner = revised.value();
     if (settles_operation) {
-      active_operation->slot_state = ResourceSlotState::kTerminal;
+      participant.slot_state = ResourceSlotState::kTerminal;
     }
     active_operation->state = std::move(accepted_state);
     if (active_operation->runtime_scale_status.has_value()) {
@@ -3585,8 +3686,8 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
   }
   active_operation->pending_control.reset();
   if (settles_operation) {
-    auto release =
-        resource_slots_->release(active_operation->slot_owner, active_operation->resources);
+    auto& participant = active_operation->participants.front();
+    auto release = resource_slots_->release(participant.slot_owner, participant.resources);
     if (!release.ok()) {
       auto intervention = active_operation->state;
       intervention.state = OperationStateKind::kInterventionRequired;
@@ -4693,9 +4794,16 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
       std::vector<ResourceSlotStopFenceOwnerDTO> owner_rows;
       std::vector<OperationId> newly_fenced_operations;
       EmergencyStopAffectedStateSnapshotDTO affected_state;
+      std::size_t participant_capacity = 0U;
+      for (const auto& operation_id : resolution.value().operations) {
+        const auto* operation = find_active_operation_locked(operation_id);
+        if (operation != nullptr) {
+          participant_capacity += operation->participants.size();
+        }
+      }
       affected_revisions.reserve(resolution.value().operations.size());
-      plans.reserve(resolution.value().operations.size());
-      owner_rows.reserve(resolution.value().operations.size());
+      plans.reserve(participant_capacity);
+      owner_rows.reserve(participant_capacity);
       newly_fenced_operations.reserve(resolution.value().operations.size());
       affected_state.operations.reserve(resolution.value().operations.size());
       for (const auto& operation_id : resolution.value().operations) {
@@ -4725,10 +4833,17 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
         }
         const OperationRevision next_revision(operation->state.operation_revision.value() + 1U);
         affected_revisions.push_back({operation_id, next_revision});
-        plans.push_back(*operation->ordinary_stop_plan);
         newly_fenced_operations.push_back(operation_id);
-        owner_rows.push_back(ResourceSlotStopFenceOwnerDTO{operation->slot_owner,
-                                                           operation->resources, next_revision});
+        for (const auto& participant : operation->participants) {
+          if (participant.ordinary_stop_plan == nullptr) {
+            return reject<StopAcceptedDTO>("resolved Stop participant has no prepared plan",
+                                           "stop_participant_plan_missing",
+                                           ErrorCode::kInvariantViolation);
+          }
+          plans.push_back(*participant.ordinary_stop_plan);
+          owner_rows.push_back(ResourceSlotStopFenceOwnerDTO{participant.slot_owner,
+                                                             participant.resources, next_revision});
+        }
       }
       std::sort(owner_rows.begin(), owner_rows.end(), [](const auto& left, const auto& right) {
         return std::tie(left.expected_owner.operation_id, left.expected_owner.participant_id) <
@@ -4798,18 +4913,28 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
           continue;
         }
         operation->state.operation_revision = affected.operation_revision_after_acceptance;
+        for (auto& participant : operation->participants) {
+          participant.stop_cancelled_pre_dispatch =
+              !participant.prepared_dispatch_released &&
+              participant.slot_state == ResourceSlotState::kReserved;
+        }
         const bool cancelled_pre_dispatch =
             operation->ordinary_acceptance_pending ||
-            (operation->payload_kind == OperationParticipantPayloadKind::kMotion &&
-             !operation->prepared_dispatch_released);
+            std::all_of(
+                operation->participants.begin(), operation->participants.end(),
+                [](const auto& participant) { return participant.stop_cancelled_pre_dispatch; });
         operation->state.state = cancelled_pre_dispatch ? OperationStateKind::kCancelledPreDispatch
                                                         : OperationStateKind::kStopping;
         operation->state.active_stop_id = StopId(std::string(outcome.stop_id()));
         operation->state.active_stop_generation = outcome.stop_generation;
         operation->state.updated_at_ns = accepted_at_ns;
-        operation->state.participants.front().state = operation->state.state;
-        operation->slot_owner.operation_revision = affected.operation_revision_after_acceptance;
-        operation->slot_state = ResourceSlotState::kStopping;
+        for (auto& participant_state : operation->state.participants) {
+          participant_state.state = operation->state.state;
+        }
+        for (auto& participant : operation->participants) {
+          participant.slot_owner.operation_revision = affected.operation_revision_after_acceptance;
+          participant.slot_state = ResourceSlotState::kStopping;
+        }
         operation->stop_effect_in_flight = true;
         affected_state.operations.push_back(operation->state);
       }
@@ -5746,7 +5871,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
     std::vector<PreparedCancellation> prepared_cancellations;
     std::optional<StopControlWorkToken> terminal_projection;
     std::optional<std::pair<StopCertificateId, std::int64_t>> surveillance_schedule;
-    bool terminal = false;
+    bool transaction_became_terminal = false;
     {
       std::lock_guard state_lock(state_mutex_);
       if (!token.locally_valid() || token.slot >= stop_transactions_.size()) {
@@ -5767,38 +5892,45 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         transaction.participants.reserve(transaction.operations.size());
         for (const auto& operation_id : transaction.operations) {
           const auto* operation = find_active_operation_locked(operation_id);
-          if (operation == nullptr || operation->state.participants.size() != 1U ||
-              operation->ordinary_stop_plan == nullptr) {
+          if (operation == nullptr ||
+              operation->state.participants.size() != operation->participants.size()) {
             motion_admission_closed_ = true;
             continue;
           }
-          const auto& participant = operation->state.participants.front();
-          StopParticipantWork work{
-              operation_id,
-              operation->state.operation_revision,
-              participant.controller_goal_id,
-              participant.controller_goal_generation,
-              operation->binding,
-              operation->stop_readiness,
-              operation->retained_default_stop_limits,
-              operation->stop_node_category,
-              *operation->ordinary_stop_plan,
-              operation->resources,
-              operation->stop_execution_port,
-              operation->prepared_motion_engine,
-              operation->subordinate_id,
-              operation->state.state == OperationStateKind::kCancelledPreDispatch,
-              false,
-              false,
-              false,
-              false,
-              0U,
-              1U,
-              std::nullopt,
-              {},
-              {}};
-          work.retained_results.reserve(kMaxStopEscalationStages * 2U);
-          transaction.participants.push_back(std::move(work));
+          for (std::size_t index = 0U; index < operation->participants.size(); ++index) {
+            const auto& active_participant = operation->participants[index];
+            const auto& participant_state = operation->state.participants[index];
+            if (active_participant.ordinary_stop_plan == nullptr ||
+                active_participant.slot_owner.participant_id != participant_state.participant_id) {
+              motion_admission_closed_ = true;
+              continue;
+            }
+            StopParticipantWork work{operation_id,
+                                     operation->state.operation_revision,
+                                     participant_state.controller_goal_id,
+                                     participant_state.controller_goal_generation,
+                                     active_participant.binding,
+                                     active_participant.stop_readiness,
+                                     active_participant.retained_default_stop_limits,
+                                     active_participant.stop_node_category,
+                                     *active_participant.ordinary_stop_plan,
+                                     active_participant.resources,
+                                     active_participant.stop_execution_port,
+                                     active_participant.prepared_motion_engine,
+                                     active_participant.subordinate_id,
+                                     active_participant.stop_cancelled_pre_dispatch,
+                                     false,
+                                     false,
+                                     false,
+                                     false,
+                                     0U,
+                                     1U,
+                                     std::nullopt,
+                                     {},
+                                     {}};
+            work.retained_results.reserve(kMaxStopEscalationStages * 2U);
+            transaction.participants.push_back(std::move(work));
+          }
         }
         transaction.participant_work_initialized = true;
       }
@@ -5979,29 +6111,72 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           motion_admission_closed_ = true;
           continue;
         }
-        operation->state.state = item.contained ? OperationStateKind::kStopped
-                                                : OperationStateKind::kInterventionRequired;
-        operation->state.participants.front().state = operation->state.state;
-        operation->state.participants.front().terminal_error =
-            item.contained ? std::nullopt : item.terminal_error;
+        const auto participant_state =
+            std::find_if(operation->state.participants.begin(), operation->state.participants.end(),
+                         [&](const auto& candidate) {
+                           return candidate.participant_id == item.plan.participant_id;
+                         });
+        const auto active_participant =
+            std::find_if(operation->participants.begin(), operation->participants.end(),
+                         [&](const auto& candidate) {
+                           return candidate.slot_owner.participant_id == item.plan.participant_id;
+                         });
+        if (participant_state == operation->state.participants.end() ||
+            active_participant == operation->participants.end()) {
+          motion_admission_closed_ = true;
+          continue;
+        }
+        participant_state->state = item.contained ? OperationStateKind::kStopped
+                                                  : OperationStateKind::kInterventionRequired;
+        participant_state->terminal_error = item.contained ? std::nullopt : item.terminal_error;
+        const bool all_participants_terminal =
+            std::all_of(operation->state.participants.begin(), operation->state.participants.end(),
+                        [](const auto& candidate) { return terminal(candidate.state); });
+        if (all_participants_terminal) {
+          operation->state.state =
+              std::all_of(operation->state.participants.begin(),
+                          operation->state.participants.end(),
+                          [](const auto& candidate) {
+                            return candidate.state == OperationStateKind::kStopped;
+                          })
+                  ? OperationStateKind::kStopped
+                  : OperationStateKind::kInterventionRequired;
+        }
         operation->state.updated_at_ns = now;
-        const auto transitioned = resource_slots_->transition(
-            operation->slot_owner, operation->resources, ResourceSlotState::kTerminal);
+        const auto transitioned = resource_slots_->transition(active_participant->slot_owner,
+                                                              active_participant->resources,
+                                                              ResourceSlotState::kTerminal);
         if (transitioned.ok()) {
-          operation->slot_state = ResourceSlotState::kTerminal;
+          active_participant->slot_state = ResourceSlotState::kTerminal;
         } else {
           motion_admission_closed_ = true;
           operation->state.state = OperationStateKind::kInterventionRequired;
-          operation->state.participants.front().state = OperationStateKind::kInterventionRequired;
-          operation->state.participants.front().terminal_error = transitioned.error();
+          participant_state->state = OperationStateKind::kInterventionRequired;
+          participant_state->terminal_error = transitioned.error();
         }
-        operation->stop_effect_in_flight = false;
+      }
+
+      for (const auto& operation_id : transaction.operations) {
+        auto* operation = find_active_operation_locked(operation_id);
+        if (operation != nullptr &&
+            std::all_of(transaction.participants.begin(), transaction.participants.end(),
+                        [&](const auto& participant) {
+                          return participant.operation_id != operation_id || participant.terminal;
+                        })) {
+          operation->stop_effect_in_flight = false;
+        }
       }
 
       transaction.fresh_scope_complete =
           std::all_of(transaction.participants.begin(), transaction.participants.end(),
                       [](const auto& participant) { return participant.terminal; });
-      if (transaction.participants.size() != transaction.operations.size()) {
+      const auto expected_participant_count = static_cast<std::size_t>(std::count_if(
+          transaction.accepted->participant_budget_allocations.begin(),
+          transaction.accepted->participant_budget_allocations.end(), [&](const auto& budget) {
+            return budget.origin_stop_id == stop_id &&
+                   budget.origin_stop_generation == stop_generation;
+          }));
+      if (transaction.participants.size() != expected_participant_count) {
         transaction.fresh_scope_complete = false;
         motion_admission_closed_ = true;
       }
@@ -6014,8 +6189,8 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                      stop_transactions_[predecessor_token.slot]->token == predecessor_token &&
                      stop_transactions_[predecessor_token.slot]->certificate.has_value();
             });
-        terminal = transaction.fresh_scope_complete && predecessors_terminal;
-        if (terminal) {
+        transaction_became_terminal = transaction.fresh_scope_complete && predecessors_terminal;
+        if (transaction_became_terminal) {
           // The immutable local certificate is the terminal handoff boundary.
           // Do not expose terminal state, release the emergency reserve slot,
           // or wake dependent aggregates until the complete predecessor and
@@ -6063,7 +6238,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         }
       }
       transaction.progress_in_flight = false;
-      if (terminal) {
+      if (transaction_became_terminal) {
         stop_control_executor_->CancelDeadline(token);
       } else if (next_deadline.has_value()) {
         stop_control_executor_->ArmDeadline(token, *next_deadline);
@@ -6119,7 +6294,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       ProgressStop(token);
       return;
     }
-    if (terminal) {
+    if (transaction_became_terminal) {
       if (terminal_projection.has_value()) {
         stop_projection_worker_->Publish(*terminal_projection);
       }
@@ -6228,9 +6403,15 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
       return reject<RuntimeScaleAcceptedDTO>("runtime scale expected operation revision is stale",
                                              "operation_revision_stale");
     }
-    if (active_operation->payload_kind != OperationParticipantPayloadKind::kMotion ||
-        !active_operation->binding.value().control_path.has_value() ||
-        !active_operation->binding.value().control_path->runtime_scale_qualification.has_value() ||
+    if (active_operation->participants.size() != 1U) {
+      return reject<RuntimeScaleAcceptedDTO>(
+          "coordinated runtime scaling requires one qualified shared barrier",
+          "coordinated_runtime_scale_not_qualified", ErrorCode::kUnsupportedCapability);
+    }
+    auto& active_participant = active_operation->participants.front();
+    if (active_participant.payload_kind != OperationParticipantPayloadKind::kMotion ||
+        !active_participant.binding.value().control_path.has_value() ||
+        !active_participant.binding.value().control_path->runtime_scale_qualification.has_value() ||
         !active_operation->runtime_scale_status.has_value()) {
       return reject<RuntimeScaleAcceptedDTO>(
           "the exact operation binding has no qualified runtime scaling",
@@ -6290,8 +6471,8 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
     active_operation->state = std::move(accepted_state);
     active_operation->runtime_scale_status = std::move(accepted_status);
     runtime_scale_replay_ledger_.push_back(RuntimeScaleReplayEntry{request, accepted});
-    engine = active_operation->engine;
-    const auto& binding = active_operation->binding.value();
+    engine = active_participant.engine;
+    const auto& binding = active_participant.binding.value();
     const auto& control = *binding.control_path;
     const auto& qualification = *control.runtime_scale_qualification;
     const auto& operation_participant = active_operation->state.participants.front();
@@ -6313,7 +6494,7 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
                                        control.control_route_id,
                                        qualification.scaling_domain_id,
                                        qualification.coordinated_barrier_id,
-                                       active_operation->resources,
+                                       active_participant.resources,
                                        control.active_control_configuration_id,
                                        control.active_control_configuration_generation,
                                        current_generation,
@@ -6429,13 +6610,17 @@ Result<void> ResourceAddressedExecutionKernel::apply_runtime_scale_status(
     const ResolvedRuntimeScaleStatusDTO& resolved_status) {
   std::lock_guard state_lock(state_mutex_);
   auto* active_operation = find_active_operation_locked(resolved_status.operation_id);
-  if (active_operation == nullptr || active_operation->engine != engine ||
+  if (active_operation == nullptr || active_operation->participants.size() != 1U ||
       !active_operation->runtime_scale_status.has_value()) {
+    return Result<void>::Ok();
+  }
+  auto& active_participant = active_operation->participants.front();
+  if (active_participant.engine != engine) {
     return Result<void>::Ok();
   }
   auto status = *active_operation->runtime_scale_status;
   auto& participant = status.participants.front();
-  const auto& binding = active_operation->binding.value();
+  const auto& binding = active_participant.binding.value();
   const auto& control = *binding.control_path;
   const auto& qualification = *control.runtime_scale_qualification;
   const bool exact_target_matches =
@@ -6580,7 +6765,7 @@ Result<OperationStateDTO> ResourceAddressedExecutionKernel::get_operation_state(
 }
 
 Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
-    const OperationId& operation_id) {
+    const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine) {
   struct Target final {
     IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
     IResolvedParticipantExecutionEngine* engine{};
@@ -6597,24 +6782,27 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
   {
     std::lock_guard state_lock(state_mutex_);
     auto* operation = find_active_operation_locked(operation_id);
-    if (operation == nullptr ||
-        operation->payload_kind != OperationParticipantPayloadKind::kMotion ||
-        operation->prepared_motion_engine == nullptr || operation->subordinate_id == 0U ||
-        operation->prepared_dispatch_released || operation->prepared_advance_in_flight) {
+    auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
+    if (participant == nullptr ||
+        participant->payload_kind != OperationParticipantPayloadKind::kMotion ||
+        participant->prepared_motion_engine == nullptr || participant->subordinate_id == 0U ||
+        participant->prepared_dispatch_released || participant->prepared_advance_in_flight) {
       return Result<void>::Ok();
     }
-    operation->prepared_advance_in_flight = true;
-    target.emplace(Target{operation->prepared_motion_engine, operation->engine,
-                          operation->subordinate_id, operation->binding, operation->stop_readiness,
-                          operation->runtime_policy, operation->retained_default_stop_limits,
-                          operation->stop_node_category, operation->ordinary_stop_plan});
+    participant->prepared_advance_in_flight = true;
+    target.emplace(Target{participant->prepared_motion_engine, participant->engine,
+                          participant->subordinate_id, participant->binding,
+                          participant->stop_readiness, participant->runtime_policy,
+                          participant->retained_default_stop_limits,
+                          participant->stop_node_category, participant->ordinary_stop_plan});
   }
 
   const auto release_claim = [&]() {
     std::lock_guard state_lock(state_mutex_);
     auto* operation = find_active_operation_locked(operation_id);
-    if (operation != nullptr && operation->subordinate_id == target->subordinate_id) {
-      operation->prepared_advance_in_flight = false;
+    auto* participant = operation == nullptr ? nullptr : operation->participant_for(target->engine);
+    if (participant != nullptr && participant->subordinate_id == target->subordinate_id) {
+      participant->prepared_advance_in_flight = false;
     }
   };
 
@@ -6648,9 +6836,11 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
     {
       std::lock_guard state_lock(state_mutex_);
       auto* operation = find_active_operation_locked(operation_id);
-      if (operation != nullptr) {
-        operation->prepared_advance_in_flight = false;
-        operation->last_subordinate_error = failure;
+      auto* participant =
+          operation == nullptr ? nullptr : operation->participant_for(target->engine);
+      if (participant != nullptr) {
+        participant->prepared_advance_in_flight = false;
+        participant->last_subordinate_error = failure;
         stop_owns_terminal = operation->state.active_stop_id.has_value();
       }
     }
@@ -6690,12 +6880,13 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
   {
     std::lock_guard state_lock(state_mutex_);
     auto* operation = find_active_operation_locked(operation_id);
-    if (operation == nullptr || operation->subordinate_id != target->subordinate_id) {
+    auto* participant = operation == nullptr ? nullptr : operation->participant_for(target->engine);
+    if (participant == nullptr || participant->subordinate_id != target->subordinate_id) {
       return Result<void>::Ok();
     }
-    operation->prepared_advance_in_flight = false;
+    participant->prepared_advance_in_flight = false;
     if (operation->state.active_stop_id.has_value() ||
-        operation->slot_state != ResourceSlotState::kReserved) {
+        participant->slot_state != ResourceSlotState::kReserved) {
       cancel_instead = true;
     } else {
       auto prepared_state = operation->state;
@@ -6709,16 +6900,16 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
       if (!durable.ok()) {
         return Result<void>::Err(durable.error());
       }
-      auto transitioned = resource_slots_->transition(operation->slot_owner, operation->resources,
-                                                      ResourceSlotState::kDispatched);
+      auto transitioned = resource_slots_->transition(
+          participant->slot_owner, participant->resources, ResourceSlotState::kDispatched);
       if (!transitioned.ok()) {
         return transitioned;
       }
-      operation->slot_state = ResourceSlotState::kDispatched;
+      participant->slot_state = ResourceSlotState::kDispatched;
       operation->state = std::move(prepared_state);
-      operation->prepared_participant = *snapshot.value().participant;
-      operation->prepared_dispatch_released = true;
-      operation->dispatch_effect_in_flight = true;
+      participant->prepared_participant = *snapshot.value().participant;
+      participant->prepared_dispatch_released = true;
+      participant->dispatch_effect_in_flight = true;
     }
   }
 
@@ -6732,10 +6923,11 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
   {
     std::lock_guard state_lock(state_mutex_);
     auto* operation = find_active_operation_locked(operation_id);
-    if (operation != nullptr && operation->subordinate_id == target->subordinate_id) {
-      operation->dispatch_effect_in_flight = false;
+    auto* participant = operation == nullptr ? nullptr : operation->participant_for(target->engine);
+    if (participant != nullptr && participant->subordinate_id == target->subordinate_id) {
+      participant->dispatch_effect_in_flight = false;
       if (!dispatched.ok()) {
-        operation->last_subordinate_error = dispatched.error();
+        participant->last_subordinate_error = dispatched.error();
       }
     }
   }
@@ -6753,7 +6945,9 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     std::optional<ErrorDTO> terminal_error) {
   std::lock_guard state_lock(state_mutex_);
   auto* active_operation = find_active_operation_locked(operation_id);
-  if (active_operation == nullptr || active_operation->engine != engine) {
+  auto* active_participant =
+      active_operation == nullptr ? nullptr : active_operation->participant_for(engine);
+  if (active_participant == nullptr) {
     return Result<void>::Ok();
   }
   if (state == OperationStateKind::kPrepared &&
@@ -6778,7 +6972,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     // settle to one of the explicit Stop/failure outcomes.
     return Result<void>::Ok();
   }
-  if (active_operation->payload_kind == OperationParticipantPayloadKind::kMotion) {
+  if (active_participant->payload_kind == OperationParticipantPayloadKind::kMotion) {
     if (subordinate_id == 0U) {
       return reject<void>("subordinate execution identity is empty",
                           "subordinate_execution_id_empty", ErrorCode::kInvariantViolation);
@@ -6786,8 +6980,8 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     // The execute result establishes event ownership. Events observed before
     // that result are ignored rather than guessed from an engine-global slot;
     // reconcile_subordinate_state() closes the resulting observation window.
-    if (active_operation->subordinate_id == 0U ||
-        active_operation->subordinate_id != subordinate_id) {
+    if (active_participant->subordinate_id == 0U ||
+        active_participant->subordinate_id != subordinate_id) {
       return Result<void>::Ok();
     }
   }
@@ -6800,10 +6994,19 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     // is reserved for terminal containment/Reset paths.
     desired_slot.reset();
   }
-  const auto desired_slot_value = desired_slot.value_or(active_operation->slot_state);
+  const auto desired_slot_value = desired_slot.value_or(active_participant->slot_state);
   const bool slot_changed =
-      desired_slot.has_value() && active_operation->slot_state != desired_slot_value;
-  const auto& participant = active_operation->state.participants.front();
+      desired_slot.has_value() && active_participant->slot_state != desired_slot_value;
+  const auto participant_iterator = std::find_if(
+      active_operation->state.participants.begin(), active_operation->state.participants.end(),
+      [&](const auto& participant) {
+        return participant.participant_id == active_participant->slot_owner.participant_id;
+      });
+  if (participant_iterator == active_operation->state.participants.end()) {
+    return reject<void>("active participant has no public operation-state row",
+                        "operation_participant_state_missing", ErrorCode::kInvariantViolation);
+  }
+  const auto& participant = *participant_iterator;
   const double bounded_progress = std::clamp(progress, 0.0, 1.0);
   const bool failure_terminal = state == OperationStateKind::kFailed ||
                                 state == OperationStateKind::kStopped ||
@@ -6814,8 +7017,8 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
         terminal_error.has_value() && terminal_error->details.contains("reason") &&
         terminal_error->details.at("reason") == "subordinate_terminal_error";
     if ((!terminal_error.has_value() || generic_subordinate_error) &&
-        active_operation->last_subordinate_error.has_value()) {
-      terminal_error = active_operation->last_subordinate_error;
+        active_participant->last_subordinate_error.has_value()) {
+      terminal_error = active_participant->last_subordinate_error;
     }
   }
   const bool same_terminal_error =
@@ -6830,13 +7033,17 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
   }
 
   auto observed_state = active_operation->state;
-  auto& observed_participant = observed_state.participants.front();
-  observed_state.state = state;
+  auto& observed_participant = *std::find_if(
+      observed_state.participants.begin(), observed_state.participants.end(),
+      [&](const auto& candidate) {
+        return candidate.participant_id == active_participant->slot_owner.participant_id;
+      });
   observed_participant.state = state;
   observed_participant.progress = bounded_progress;
   if (terminal(state)) {
     observed_participant.terminal_error = std::move(terminal_error);
   }
+  observed_state.state = aggregate_participant_state(observed_state.participants);
   observed_state.updated_at_ns = clock_.now();
   auto durable_state = journal_.RecordOperationState(
       config_.request_owner_epoch, observed_state,
@@ -6847,13 +7054,18 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     return Result<void>::Err(durable_state.error());
   }
   if (slot_changed) {
-    auto transition = resource_slots_->transition(active_operation->slot_owner,
-                                                  active_operation->resources, desired_slot_value);
+    auto transition = resource_slots_->transition(
+        active_participant->slot_owner, active_participant->resources, desired_slot_value);
     if (!transition.ok()) {
       auto intervention = observed_state;
       intervention.state = OperationStateKind::kInterventionRequired;
-      intervention.participants.front().state = OperationStateKind::kInterventionRequired;
-      intervention.participants.front().terminal_error = transition.error();
+      auto& failed_participant = *std::find_if(
+          intervention.participants.begin(), intervention.participants.end(),
+          [&](const auto& candidate) {
+            return candidate.participant_id == active_participant->slot_owner.participant_id;
+          });
+      failed_participant.state = OperationStateKind::kInterventionRequired;
+      failed_participant.terminal_error = transition.error();
       intervention.updated_at_ns = clock_.now();
       auto durable_failure =
           journal_.RecordOperationState(config_.request_owner_epoch, intervention,
@@ -6866,7 +7078,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       }
       return transition;
     }
-    active_operation->slot_state = desired_slot_value;
+    active_participant->slot_state = desired_slot_value;
   }
   active_operation->state = std::move(observed_state);
   return Result<void>::Ok();
@@ -6881,7 +7093,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
       operation_id = find_event_operation_locked(engine, event.execution_id);
     }
     if (operation_id.has_value()) {
-      (void)advance_prepared_motion(*operation_id);
+      (void)advance_prepared_motion(*operation_id, engine);
     }
     return;
   }
@@ -6894,7 +7106,10 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     if (operation_id.has_value()) {
       auto* active_operation = find_active_operation_locked(*operation_id);
       if (active_operation != nullptr) {
-        active_operation->last_subordinate_error = event.error;
+        auto* participant = active_operation->participant_for(engine);
+        if (participant != nullptr) {
+          participant->last_subordinate_error = event.error;
+        }
       }
     }
     return;
@@ -6943,32 +7158,44 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
   std::vector<ReconcileTarget> targets;
   {
     std::lock_guard state_lock(state_mutex_);
-    targets.reserve(active_operations_.size());
+    targets.reserve(active_operations_.size() * 2U);
     for (const auto& [operation_id, operation] : active_operations_) {
       // Operation controls own their subordinate transition until their
       // accepted effect returns. A scheduler pass skips, rather than waits on,
       // that exact operation; disjoint operations still reconcile. The claim
       // also coalesces concurrent scheduler calls without holding a lock over
       // subordinate I/O.
-      if (operation->pending_control.has_value() || operation->reconciliation_in_flight ||
-          operation->runtime_scale_effect_in_flight || operation->stop_effect_in_flight) {
+      if (operation->pending_control.has_value() || operation->runtime_scale_effect_in_flight ||
+          operation->stop_effect_in_flight) {
         continue;
       }
-      if (operation->payload_kind == OperationParticipantPayloadKind::kMotion &&
-          (operation->prepare_in_flight || operation->subordinate_id == 0U)) {
-        continue;
+      for (auto& participant : operation->participants) {
+        if (participant.reconciliation_in_flight ||
+            (participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
+             (participant.prepare_in_flight || participant.subordinate_id == 0U))) {
+          continue;
+        }
+        const auto public_participant =
+            std::find_if(operation->state.participants.begin(), operation->state.participants.end(),
+                         [&](const auto& candidate) {
+                           return candidate.participant_id == participant.slot_owner.participant_id;
+                         });
+        if (public_participant == operation->state.participants.end()) {
+          continue;
+        }
+        participant.reconciliation_in_flight = true;
+        std::optional<ControlBindingId> runtime_scale_control_binding_id;
+        if (operation->participants.size() == 1U && operation->runtime_scale_status.has_value()) {
+          runtime_scale_control_binding_id =
+              participant.binding.value().control_path->control_binding_id;
+        }
+        targets.push_back(ReconcileTarget{
+            operation_id, participant.engine, participant.prepared_motion_engine,
+            participant.payload_kind, participant.subordinate_id,
+            participant.subordinate_generation,
+            participant.binding.value().command_target_id.value(), public_participant->state,
+            participant.prepared_dispatch_released, std::move(runtime_scale_control_binding_id)});
       }
-      operation->reconciliation_in_flight = true;
-      std::optional<ControlBindingId> runtime_scale_control_binding_id;
-      if (operation->runtime_scale_status.has_value()) {
-        runtime_scale_control_binding_id =
-            operation->binding.value().control_path->control_binding_id;
-      }
-      targets.push_back(ReconcileTarget{
-          operation_id, operation->engine, operation->prepared_motion_engine,
-          operation->payload_kind, operation->subordinate_id, operation->subordinate_generation,
-          operation->binding.value().command_target_id.value(), operation->state.state,
-          operation->prepared_dispatch_released, std::move(runtime_scale_control_binding_id)});
     }
   }
 
@@ -6978,10 +7205,12 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
     if (target.payload_kind == OperationParticipantPayloadKind::kMotion) {
       bool dispatch_released = target.prepared_dispatch_released;
       if (target.prepared_motion_engine != nullptr && !dispatch_released) {
-        applied = advance_prepared_motion(target.operation_id);
+        applied = advance_prepared_motion(target.operation_id, target.engine);
         std::lock_guard state_lock(state_mutex_);
         const auto* operation = find_active_operation_locked(target.operation_id);
-        dispatch_released = operation != nullptr && operation->prepared_dispatch_released;
+        const auto* participant =
+            operation == nullptr ? nullptr : operation->participant_for(target.engine);
+        dispatch_released = participant != nullptr && participant->prepared_dispatch_released;
       }
       if (!applied.ok() || !dispatch_released) {
         // Preparation is effect-free. Do not reinterpret the subordinate's
@@ -7068,7 +7297,10 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
       std::lock_guard state_lock(state_mutex_);
       auto* active_operation = find_active_operation_locked(target.operation_id);
       if (active_operation != nullptr) {
-        active_operation->reconciliation_in_flight = false;
+        auto* participant = active_operation->participant_for(target.engine);
+        if (participant != nullptr && participant->subordinate_id == target.subordinate_id) {
+          participant->reconciliation_in_flight = false;
+        }
       }
     }
   }

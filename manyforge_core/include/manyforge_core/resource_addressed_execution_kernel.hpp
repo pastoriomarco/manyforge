@@ -333,7 +333,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                      std::uint64_t subordinate_id,
                                                      OperationStateKind state, double progress,
                                                      std::optional<ErrorDTO> terminal_error);
-  [[nodiscard]] Result<void> advance_prepared_motion(const OperationId& operation_id);
+  [[nodiscard]] Result<void> advance_prepared_motion(const OperationId& operation_id,
+                                                     IResolvedParticipantExecutionEngine* engine);
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
       const OperationControlRequestDTO& request, OperationControlKind control);
   [[nodiscard]] Result<void> apply_runtime_scale_status(
