@@ -120,6 +120,7 @@ Bundle(core::CellGraphDTO graph, core::RetainedCompiledProductsDTO products) {
       },
       {},
       {},
+      {},
       std::move(products),
       core::RetainedBundleProvenanceDTO{
           core::ContentDigest("compiler-contract"),

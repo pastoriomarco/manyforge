@@ -599,7 +599,6 @@ add_library(manyforge_deployment_verification_core
   src/runtime_program_binding.cpp
   src/reference_runtime_unit_verifier.cpp
   src/verified_retained_projection.cpp
-  src/verified_controller_lifecycle_expected_domain.cpp
   src/runtime_profile_codec.cpp
   src/runtime_policy_codec.cpp
   src/scenario_apply_candidate_source.cpp
@@ -622,6 +621,31 @@ target_link_libraries(manyforge_deployment_verification_core PUBLIC
 set_target_properties(
   manyforge_deployment_verification_core
   PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Sealing a retained controller-domain projection calls Core's independently
+# qualified controller-lifecycle validator.  Keep that composition boundary
+# out of the standalone Deployment verifier, which consumes Core headers but
+# deliberately has no dependency on the concrete Core library.
+if(TARGET manyforge_core)
+  add_library(manyforge_deployment_verified_controller_lifecycle_expected_domain
+    src/verified_controller_lifecycle_expected_domain.cpp)
+  add_library(
+    manyforge::deployment_verified_controller_lifecycle_expected_domain ALIAS
+    manyforge_deployment_verified_controller_lifecycle_expected_domain)
+  target_include_directories(
+    manyforge_deployment_verified_controller_lifecycle_expected_domain PUBLIC
+    ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
+  target_include_directories(
+    manyforge_deployment_verified_controller_lifecycle_expected_domain PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(
+    manyforge_deployment_verified_controller_lifecycle_expected_domain PUBLIC
+    manyforge_deployment_verification_core
+    manyforge_core)
+  set_target_properties(
+    manyforge_deployment_verified_controller_lifecycle_expected_domain
+    PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # Active-control Stop-plan composition is a cross-owner NRT adapter. Keep it
 # outside the standalone Deployment verifier: it calls Core's independently
@@ -655,6 +679,7 @@ if(MANYFORGE_BUILD_RESOLVED_STOP_BASE_PLAN_RESOLVER)
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(
     manyforge_deployment_resolved_stop_base_plan_resolver PUBLIC
+    manyforge_deployment_verified_controller_lifecycle_expected_domain
     manyforge_deployment_verification_core
     manyforge_core)
   set_target_properties(
@@ -691,6 +716,7 @@ if(MANYFORGE_BUILD_COMPONENT_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE)
     ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
   target_link_libraries(
     manyforge_deployment_component_lifecycle_current_snapshot_source PUBLIC
+    manyforge_deployment_verified_controller_lifecycle_expected_domain
     manyforge_deployment_verification_core
     manyforge_core)
   set_target_properties(
@@ -1602,19 +1628,23 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_retained_bundle_store
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  add_executable(test_verified_controller_lifecycle_expected_domain
-    test/test_verified_controller_lifecycle_expected_domain.cpp)
-  target_compile_definitions(
-    test_verified_controller_lifecycle_expected_domain PRIVATE
-    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
-    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
-  target_include_directories(
-    test_verified_controller_lifecycle_expected_domain PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src")
-  target_link_libraries(test_verified_controller_lifecycle_expected_domain PRIVATE
-    manyforge_deployment GTest::gtest_main)
-  gtest_discover_tests(test_verified_controller_lifecycle_expected_domain
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+  if(TARGET manyforge_deployment_verified_controller_lifecycle_expected_domain)
+    add_executable(test_verified_controller_lifecycle_expected_domain
+      test/test_verified_controller_lifecycle_expected_domain.cpp)
+    target_compile_definitions(
+      test_verified_controller_lifecycle_expected_domain PRIVATE
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
+    target_include_directories(
+      test_verified_controller_lifecycle_expected_domain PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_verified_controller_lifecycle_expected_domain PRIVATE
+      manyforge_deployment_verified_controller_lifecycle_expected_domain
+      manyforge_deployment
+      GTest::gtest_main)
+    gtest_discover_tests(test_verified_controller_lifecycle_expected_domain
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+  endif()
 
   if(TARGET manyforge_deployment_resolved_stop_base_plan_resolver)
     add_executable(test_resolved_stop_base_plan_resolver

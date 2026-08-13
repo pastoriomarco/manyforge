@@ -624,11 +624,25 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   competing_intent.expected_fence_generation =
       accepted.configuration_fence_generation;
   ASSERT_TRUE(competing_intent.valid());
-  EXPECT_THROW(adapter.Acquire(competing_intent),
-               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  const auto competing = adapter.Acquire(competing_intent);
+  EXPECT_EQ(competing.replay_status,
+            core::RequestReplayStatusDTO::kAcceptedNew);
+  EXPECT_TRUE(competing.captured_scope.resources.empty());
   EXPECT_EQ(adapter.ObserveAdmission(observation_query)
                 .configuration_fence_generation,
-            accepted.configuration_fence_generation);
+            competing.configuration_fence_generation);
+
+  const core::ConfigurationFenceStatusQueryDTO competing_status_query{
+      competing_intent.owner_transaction, competing.configuration_fence_id,
+      competing.configuration_fence_generation, competing.captured_scope,
+      manager_epoch};
+  const auto competing_status = adapter.QueryStatus(competing_status_query);
+  ASSERT_EQ(competing_status.state, core::ConfigurationFenceState::kHeld);
+  const auto competing_release = adapter.Release(
+      core::ConfigurationFenceReleaseDTO{
+          competing_status.reconciliation_evidence, manager_epoch});
+  EXPECT_EQ(competing_release.request.reconciliation_evidence,
+            competing_status.reconciliation_evidence);
 
   const core::ApplyFenceAcquireAttemptQueryDTO attempt_query{
       intent, core::ContentDigest(std::string(kIntentDigest)), manager_epoch};
@@ -701,7 +715,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_EQ(restored_status.state, core::ConfigurationFenceState::kReleased);
   EXPECT_EQ(adapter.Release(release_request), released);
   const auto next_observation = adapter.ObserveAdmission(observation_query);
-  EXPECT_EQ(next_observation.configuration_fence_generation.value(), 1U);
+  EXPECT_EQ(next_observation.configuration_fence_generation.value(), 2U);
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,

@@ -67,7 +67,7 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
 
   const auto verified = load_verified_controller_lifecycle_expected_domain(
       *retained.bundle, source, desired,
-      core::RuntimeUnitId(test::kLite6NativeExecutionRuntimeId),
+      core::RuntimeUnitId(std::string(test::kLite6NativeExecutionRuntimeId)),
       core::RuntimeEpoch("runtime.controller_manager.epoch.1"));
   const auto &value = verified.value();
   EXPECT_EQ(value.control_domain_id, desired.control_domain_id);
@@ -76,7 +76,8 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
   EXPECT_EQ(value.topology_revision, desired.topology_revision);
   EXPECT_EQ(value.desired_configuration, desired);
   EXPECT_EQ(value.source_runtime_unit_id,
-            core::RuntimeUnitId(test::kLite6NativeExecutionRuntimeId));
+            core::RuntimeUnitId(
+                std::string(test::kLite6NativeExecutionRuntimeId)));
   EXPECT_EQ(value.source_runtime_epoch,
             core::RuntimeEpoch("runtime.controller_manager.epoch.1"));
   ASSERT_EQ(value.expected_controllers.size(), 1U);
@@ -94,7 +95,8 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
   EXPECT_THROW(
       static_cast<void>(load_verified_controller_lifecycle_expected_domain(
           *retained.bundle, source, stale_route,
-          core::RuntimeUnitId(test::kLite6NativeExecutionRuntimeId),
+          core::RuntimeUnitId(
+              std::string(test::kLite6NativeExecutionRuntimeId)),
           core::RuntimeEpoch("runtime.controller_manager.epoch.1"))),
       RetainedBundleError);
 
@@ -103,7 +105,8 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
   EXPECT_THROW(
       static_cast<void>(load_verified_controller_lifecycle_expected_domain(
           *retained.bundle, source, incomplete,
-          core::RuntimeUnitId(test::kLite6NativeExecutionRuntimeId),
+          core::RuntimeUnitId(
+              std::string(test::kLite6NativeExecutionRuntimeId)),
           core::RuntimeEpoch("runtime.controller_manager.epoch.1"))),
       RetainedBundleError);
 
@@ -124,7 +127,8 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
   EXPECT_THROW(
       static_cast<void>(load_verified_controller_lifecycle_expected_domain(
           *retained.bundle, absent, desired,
-          core::RuntimeUnitId(test::kLite6NativeExecutionRuntimeId),
+          core::RuntimeUnitId(
+              std::string(test::kLite6NativeExecutionRuntimeId)),
           core::RuntimeEpoch("runtime.controller_manager.epoch.1"))),
       RetainedBundleError);
 }
@@ -141,7 +145,7 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
 
   const auto verified = load_verified_controller_lifecycle_expected_domain(
       *retained.bundle, source, desired,
-      core::RuntimeUnitId(test::kLite6NativeExecutionRuntimeId),
+      core::RuntimeUnitId(std::string(test::kLite6NativeExecutionRuntimeId)),
       core::RuntimeEpoch("runtime.controller_manager.epoch.7"));
   const auto &value = verified.value();
   ASSERT_EQ(value.controller_topology.controllers.size(), 2U);
